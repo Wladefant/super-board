@@ -1,5 +1,15 @@
 # Release notes
 
+## v1.7.0 — 2026-06-11
+
+### Model-tier flags for `super-board run`
+
+`super-board run` now takes a model ladder: `--low` (haiku/sonnet/opus by card
+complexity), default medium (sonnet/opus/session model), `--high` (opus floor,
+session model above). Config key `model_tier` sets the default; the flag wins.
+The classify router stays on haiku except on `--high` runs (sonnet). Haiku
+never does lane work outside an explicit `--low` run.
+
 ## v1.6.0 — 2026-06-10
 
 ### Workflow backend is now the default; claude-p is explicit opt-in

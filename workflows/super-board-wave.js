@@ -15,9 +15,13 @@ export const meta = {
 //   variant: 'full' | 'qa-only',
 //   cards: [{ number, status, title }],     // output of super-board-wave-plan.sh
 //   humanApprovesMerge: boolean (optional, default false),
+//   tier: 'low' | 'medium' | 'high' (optional, default 'medium'),  // run model ladder
 // }
 if (!args || !Array.isArray(args.cards) || !args.configPath || !args.variant) {
   throw new Error('super-board-wave needs args {configPath, variant, cards:[{number,status,title}]}')
+}
+if (args.tier && !['low', 'medium', 'high'].includes(args.tier)) {
+  throw new Error(`super-board-wave: unknown tier "${args.tier}" — use low | medium | high`)
 }
 
 const CLASSIFY_SCHEMA = {
@@ -73,14 +77,22 @@ const lanePrompt = (lane, card) => [
   `column = the column the card is in when you exit. detail = one line. Include prUrl/branch when they exist.`,
 ].join('\n')
 
-// Cheap cards run on cheaper models; 'high' — and cards entering past
-// Ready (cls null, never classified) — inherit the session model.
-const tierFor = (cls) => {
-  if (!cls) return undefined
-  if (cls.complexity === 'low') return 'haiku'
-  if (cls.complexity === 'medium') return 'sonnet'
-  return undefined
+// Run-tier model ladders. Card complexity indexes into the active ladder;
+// undefined = inherit the session model (the strongest available — e.g.
+// Fable/Opus). Cards entering past Ready (cls null, never classified)
+// always inherit the session model.
+//   low    (run --low):  haiku / sonnet / opus
+//   medium (default):    sonnet / opus / session
+//   high   (run --high): opus / session / session
+const LADDERS = {
+  low: { low: 'haiku', medium: 'sonnet', high: 'opus' },
+  medium: { low: 'sonnet', medium: 'opus', high: undefined },
+  high: { low: 'opus', medium: undefined, high: undefined },
 }
+const ladder = LADDERS[args.tier || 'medium']
+const tierFor = (cls) => (cls ? ladder[cls.complexity] : undefined)
+// The classify router writes no code — haiku is fine except on --high runs.
+const classifyModel = (args.tier || 'medium') === 'high' ? 'sonnet' : 'haiku'
 
 const runLane = async (lane, card, model, history) => {
   const r = await agent(lanePrompt(lane, card), {
@@ -102,7 +114,7 @@ const results = await pipeline(
     const cls = await agent(
       `Read GitHub issue #${card.number} ("${card.title}") — body and all comments — using gh issue view. ` +
       `Classify it: kind (feature|bug|docs|chore) and complexity (low|medium|high) judged by the scope of code change required.`,
-      { label: `classify:#${card.number}`, phase: 'Classify', model: 'haiku', schema: CLASSIFY_SCHEMA }
+      { label: `classify:#${card.number}`, phase: 'Classify', model: classifyModel, schema: CLASSIFY_SCHEMA }
     )
     return { card, cls }
   },
