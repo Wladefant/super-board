@@ -17,11 +17,17 @@ export const meta = {
 //   humanApprovesMerge: boolean (optional, default false),
 //   tier: 'low' | 'medium' | 'high' (optional, default 'medium'),  // run model ladder
 // }
-if (!args || !Array.isArray(args.cards) || !args.configPath || !args.variant) {
+// The harness can deliver `args` as a JSON-encoded string (the tool param is
+// untyped) — normalize before validating.
+const input = (() => {
+  if (typeof args !== 'string') return args
+  try { return JSON.parse(args) } catch { return args }
+})()
+if (!input || !Array.isArray(input.cards) || !input.configPath || !input.variant) {
   throw new Error('super-board-wave needs args {configPath, variant, cards:[{number,status,title}]}')
 }
-if (args.tier && !['low', 'medium', 'high'].includes(args.tier)) {
-  throw new Error(`super-board-wave: unknown tier "${args.tier}" — use low | medium | high`)
+if (input.tier && !['low', 'medium', 'high'].includes(input.tier)) {
+  throw new Error(`super-board-wave: unknown tier "${input.tier}" — use low | medium | high`)
 }
 
 const CLASSIFY_SCHEMA = {
@@ -67,7 +73,7 @@ const lanePrompt = (lane, card) => [
   `Run ${LANE[lane].skill} on issue #${card.number} ("${card.title}") for a super-board workflow wave.`,
   `Read .claude/skills/super-board/references/run.md → "${LANE[lane].section}" lifecycle and follow it EXACTLY:`,
   `create your own worktree under .worktrees/, work on the issue branch, post the required PR/issue comments,`,
-  `move the project card yourself, clean up the worktree on exit. Config: ${args.configPath}.`,
+  `move the project card yourself, clean up the worktree on exit. Config: ${input.configPath}.`,
   ``,
   `Report your exit via structured output:`,
   `- status=advanced  → card moved forward (Building→QA, QA→Review, Review→Done/merged)`,
@@ -89,10 +95,10 @@ const LADDERS = {
   medium: { low: 'sonnet', medium: 'opus', high: undefined },
   high: { low: 'opus', medium: undefined, high: undefined },
 }
-const ladder = LADDERS[args.tier || 'medium']
+const ladder = LADDERS[input.tier || 'medium']
 const tierFor = (cls) => (cls ? ladder[cls.complexity] : undefined)
 // The classify router writes no code — haiku is fine except on --high runs.
-const classifyModel = (args.tier || 'medium') === 'high' ? 'sonnet' : 'haiku'
+const classifyModel = (input.tier || 'medium') === 'high' ? 'sonnet' : 'haiku'
 
 const runLane = async (lane, card, model, history) => {
   const r = await agent(lanePrompt(lane, card), {
@@ -107,7 +113,7 @@ const runLane = async (lane, card, model, history) => {
 }
 
 const results = await pipeline(
-  args.cards,
+  input.cards,
   // Stage 1: classify cards entering at Ready (router for model tiering)
   async (card) => {
     if (card.status !== 'Ready') return { card, cls: null }
@@ -126,14 +132,14 @@ const results = await pipeline(
     const model = tierFor(prev && prev.cls)
     let at = card.status
 
-    if (at === 'Ready' && args.variant === 'full') {
+    if (at === 'Ready' && input.variant === 'full') {
       const b = await runLane('build', card, model, history)
       if (b.status !== 'advanced') return { number: card.number, history }
       at = 'QA'
     }
     // By design: qa-only boards have no Builder lane — Ready cards go
     // straight to the Tester (run.md "Lane mapping by variant").
-    if (at === 'Ready' && args.variant === 'qa-only') at = 'QA'
+    if (at === 'Ready' && input.variant === 'qa-only') at = 'QA'
     if (at === 'QA') {
       const q = await runLane('qa', card, model, history)
       if (q.status !== 'advanced') return { number: card.number, history }
@@ -142,7 +148,7 @@ const results = await pipeline(
     if (at === 'Review') {
       // Reviewer always on session model; serialized unless a human merges.
       const review = () => runLane('review', card, undefined, history)
-      if (args.humanApprovesMerge) { await review() } else { await withReviewLock(review) }
+      if (input.humanApprovesMerge) { await review() } else { await withReviewLock(review) }
     }
     return { number: card.number, history }
   }

@@ -1,5 +1,13 @@
 # Release notes
 
+## v1.7.1 — 2026-06-11
+
+### Fix: tolerate JSON-string `args` at wave launch
+
+The Workflow tool can deliver `args` as a JSON-encoded string. The wave script
+now normalizes (`JSON.parse` when given a string) before validating, instead of
+dying at the args guard. Found live on the magnetgate board.
+
 ## v1.7.0 — 2026-06-11
 
 ### Model-tier flags for `super-board run`
