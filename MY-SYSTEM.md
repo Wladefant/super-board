@@ -2,7 +2,7 @@
 
 Per-project agent-driven development on top of this [Wladefant/super-board](https://github.com/Wladefant/super-board) fork of [EricTechPro/super-board](https://github.com/EricTechPro/super-board).
 
-## Four design deltas vs upstream
+## Five design deltas vs upstream
 
 ### 1. Token-safe lanes
 
@@ -22,6 +22,14 @@ Epics and milestones stay visible on the **same** GitHub Project the run loop dr
 
 Every project gets its own GitHub Project + its own `.claude/super-board/configs/<slug>.json`. Same system, same verbs, everywhere — deliberately no cross-project umbrella board.
 
+### 5. Design collaboration
+
+Issues labeled `design` are **human-designer-owned**. The designer moves her own cards through the lanes and pastes the Figma link into the issue; agent lanes NEVER dispatch a `design`-labeled issue. An implementation issue becomes `Ready` only once its linked `design` issue is `Done` — design lands first, build follows. This delta is core for designer-fronted projects (e.g. HeyLolo) and dormant everywhere else, where no `design` cards exist.
+
+## Linking rule
+
+Every commit, doc, or post reference on a card or in a report is a full clickable `https://` link — never a bare sha. Link a commit as [`sha`](https://github.com/.../commit/<sha>), an issue as its `https://github.com/.../issues/N` URL, and so on. A bare sha or bare `#N` is an unclickable dead end on the board; the link is the receipt.
+
 ## Full history lives on the board
 
 Past issues, fixes, and developments stay as `Done` cards. The board doubles as the changelog — no separate write-up required for “what shipped.”
@@ -36,6 +44,8 @@ Past issues, fixes, and developments stay as `Done` cards. The board doubles as 
 | [#13](https://github.com/EricTechPro/super-board/issues/13) | Windows-safe locks + run ceilings | `stale_lock_seconds` on Windows/MSYS when `kill -0` can't verify PIDs; hard `max_dispatches` / `max_hours` ceilings with drain. |
 
 Config keys (all optional, defaults in parentheses): `noprogress_halt_ticks` (10), `max_dispatches` (20), `max_hours` (3), `stale_lock_seconds` (900). See `skills/super-board/references/config-schema.json`.
+
+**Known hazard:** label-filtering is not yet implemented in the dispatchers — a `history` or `design` card dragged into `Ready` would be dispatched as buildable work. Tracked in [soundcore-work-workflow#26](https://github.com/Wladefant/soundcore-work-workflow/issues/26).
 
 ## Spin up a new project
 
