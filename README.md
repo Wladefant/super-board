@@ -4,6 +4,8 @@ An autonomous GitHub Project board executor for Claude Code. Drag a card into th
 
 Super Board watches your GitHub Project, dispatches agents to Build / QA / Review the cards, and moves each card across the board as it goes. Default backend: dynamic workflows (in-session waves); a legacy headless `claude -p` dispatcher remains as explicit opt-in.
 
+> **Wlad's Superboard** — how this fork is used day-to-day: [MY-SYSTEM.md](./MY-SYSTEM.md) · docs convention: [DOCS-SYSTEM.md](./DOCS-SYSTEM.md)
+
 ## Watch it run
 
 [![Watch the super-board walkthrough on YouTube](https://img.youtube.com/vi/nX_bGyIOFM4/maxresdefault.jpg)](https://youtu.be/nX_bGyIOFM4)
