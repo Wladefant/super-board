@@ -258,7 +258,13 @@ If a screenshot file is >5MB, downscale to ≤1920px wide before committing; Git
    - **Above threshold** — continue to step 7.
    - **No Reproducer needed** — Tester's tests were re-run in step 5.
 7. Decide per finding:
-   - **No findings + threads clean + truth ≥ threshold + tests green** → squash-merge PR (or mark ready if `human_approves_merge`), delete branch, close issue, move card Review → Done.
+   - **No findings + threads clean + truth ≥ threshold + tests green** → merge path (draft-aware):
+     1. Check draft status: `gh pr view <PR> --json isDraft -q '.isDraft'`.
+     2. If draft **and** `human_approves_merge: false` (auto-merge): mark ready first (`gh pr ready <PR>`), then squash-merge (`gh pr merge --squash`), then verify the merge commit landed on `base_branch` before moving the card. If `gh pr ready` or the merge fails (checks failing, conflicts, permissions) — do **not** leave the card in Review to be silently re-picked; move it to Blocked with a `🛡`-tagged comment (see `block-template.md`) stating the specific failure (e.g. `PR #N still draft / merge blocked: <reason>`).
+     3. If draft **and** `human_approves_merge: true` (human-merge): mark ready-for-review (`gh pr ready <PR>`) and stop there (a human merges).
+     4. If not draft and `human_approves_merge: false`: squash-merge as usual. If not draft and `human_approves_merge: true`: mark ready (no-op if already ready) and stop.
+     5. On successful merge: delete branch, close issue, move card Review → Done.
+     **Invariant:** the card must **never** transition to Done while its PR is unmerged.
    - **Code-side new finding** → open new `[builder]`-prefixed PR thread, comment, move card Review → Ready (label `loop:rebuild-N`).
    - **Test-side new finding** → open new `[QA]`-prefixed PR thread, comment, move card Review → QA (label `loop:rebuild-N`).
    - **CI-budget block (💳, added 2026-05-22)** — if remote CI jobs `failed_to_start` due to `Actions budget` AND `config.auto_merge_on_ci_budget_block` is true AND local-evidence is strong (truth ≥ threshold, Tester suite green on rerun in step 5, all `[builder]`/`[QA]` threads clean) → **squash-merge anyway** on local evidence; do NOT move to Blocked. Add a `🛡 → ✅ CI-budget bypass` comment to both the PR and the issue citing: (a) the failed CI run ID, (b) the Tester pass-count, (c) the truth-gate score. Reason: CI failure-to-start ≠ test failure; with strong local evidence, parking the card wastes pipeline time. This bypass is ONLY for `💳` — never for `🛡` truth-fail, `🔐` missing creds, or `🧑` human-only decisions.

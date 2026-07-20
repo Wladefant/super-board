@@ -47,6 +47,10 @@ TICK_SECONDS=$(jq -r '.tick_seconds // 120' "$CONFIG_PATH")
 MAX_WORKERS=$(jq -r '.max_workers // 3' "$CONFIG_PATH")
 BOT_LOGIN=$(jq -r '.notifications.bot_identity // .bot_identity // ""' "$CONFIG_PATH")
 WORKER_BACKEND=$(jq -r '.worker_backend // "workflow"' "$CONFIG_PATH")
+NOPROGRESS_HALT_TICKS=$(jq -r '.noprogress_halt_ticks // 10' "$CONFIG_PATH")
+MAX_DISPATCHES=$(jq -r '.max_dispatches // 20' "$CONFIG_PATH")
+MAX_HOURS=$(jq -r '.max_hours // 3' "$CONFIG_PATH")
+STALE_LOCK_SECONDS=$(jq -r '.stale_lock_seconds // 900' "$CONFIG_PATH")
 
 # Workflow is the default backend (v1.6.0). This legacy dispatcher only runs
 # when the config opts in explicitly — never by accident or stale habit.
@@ -62,8 +66,18 @@ RUN_MANIFEST="docs/super-board/runs/${RUN_DATE}-${CONFIG_SLUG}.md"
 INFLIGHT_DIR=".claude/super-board/inflight"
 mkdir -p "docs/super-board/runs" .worktrees "$INFLIGHT_DIR"
 
+TOTAL_DISPATCHES=0
+TOTAL_REAPS=0
+
 # ───────────────────────────── helpers ─────────────────────────────
 log() { printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" | tee -a "$RUN_MANIFEST"; }
+
+sb_is_windows() {
+  case "${OSTYPE:-$(uname -s 2>/dev/null || echo '')}" in
+    msys*|MINGW*|MSYS*|cygwin*|CYGWIN*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 PROJECT_ITEMS_JSON=""
 fetch_project_items() {
@@ -77,16 +91,26 @@ column_count() {
 
 top_card_in_column() {
   # Returns the FIRST issue number in $1 with no assignee AND no local in-flight lock.
-  local col="$1" issue
+  # Skips CLOSED issues (board Status can drift while issue is already closed).
+  local col="$1" issue state
   for issue in $(echo "$PROJECT_ITEMS_JSON" | jq -r --arg col "$col" '
         .items[]
         | select(.status == $col and .content.type == "Issue")
         | select((.content.assignees // []) | length == 0)
         | .content.number'); do
-    if ! issue_locked "$issue"; then
-      echo "$issue"
-      return 0
+    if issue_locked "$issue"; then
+      continue
     fi
+    if ! state=$(gh issue view "$issue" --json state -q '.state' 2>/dev/null); then
+      log "⚠ issue state lookup failed for #${issue} — treating as OPEN (fail-open)"
+      state="OPEN"
+    fi
+    if [ "$state" != "OPEN" ]; then
+      log "skip dispatch — issue #${issue} is CLOSED but card status='${col}' (stuck; needs manual board reconcile) — trying next candidate"
+      continue
+    fi
+    echo "$issue"
+    return 0
   done
 }
 
@@ -108,11 +132,23 @@ read_lock() {
 
 issue_locked() {
   # Returns 0 if the issue has a live in-flight lock; cleans stale locks.
+  # On Windows/MSYS, unverifiable PIDs are treated as alive until stale_lock_seconds.
   local issue="$1" lock="$INFLIGHT_DIR/$1"
   [ -f "$lock" ] || return 1
   read_lock "$issue"
   if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
     return 0
+  fi
+  if [ -n "$PID" ] && sb_is_windows; then
+    local lock_mtime now age
+    lock_mtime=$(date -r "$lock" +%s 2>/dev/null || echo 0)
+    now=$(date +%s)
+    age=$((now - lock_mtime))
+    if [ "$age" -lt "$STALE_LOCK_SECONDS" ]; then
+      log "cannot verify PID ${PID} for #${issue} on Windows — treating as alive, skipping reap (age=${age}s < ${STALE_LOCK_SECONDS}s)"
+      return 0
+    fi
+    log "reaped unverifiable Windows lock for #${issue} (pid=${PID}, age=${age}s ≥ ${STALE_LOCK_SECONDS}s)"
   fi
   rm -f "$lock"
   return 1
@@ -181,6 +217,7 @@ dispatch_lane() {
     qa) QA_PID="$pid"; QA_ISSUE="$issue" ;;
     review) REVIEW_PID="$pid"; REVIEW_ISSUE="$issue" ;;
   esac
+  TOTAL_DISPATCHES=$((TOTAL_DISPATCHES + 1))
   log "dispatch lane=${lane} issue=#${issue} pid=${pid} claim=${BOT_LOGIN:-local-only}"
 }
 
@@ -236,6 +273,7 @@ reap_finished_locks() {
   # Sweep inflight/ for dead PIDs; remove locks AND sweep stale assignees so the
   # next dispatch can re-claim the card if the worker crashed without releasing.
   # The assignee remove is idempotent — no-op if the worker exited cleanly.
+  # On Windows/MSYS, unverifiable PIDs are treated as alive until stale_lock_seconds.
   local lock issue
   for lock in "$INFLIGHT_DIR"/*; do
     [ -f "$lock" ] || continue
@@ -245,20 +283,48 @@ reap_finished_locks() {
     # would dissolve the backend mutual exclusion mid-run.
     case "$issue" in *[!0-9]*|'') continue ;; esac
     read_lock "$issue"
-    if [ -z "$PID" ] || ! kill -0 "$PID" 2>/dev/null; then
-      rm -f "$lock"
-      if [ -n "$BOT_LOGIN" ]; then
-        gh issue edit "$issue" --remove-assignee "$BOT_LOGIN" >/dev/null 2>&1 || true
-        log "reaped stale lock + swept assignee on #${issue} (pid=${PID:-empty})"
-      else
-        log "reaped stale lock for #${issue} (pid=${PID:-empty})"
+    if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+      continue
+    fi
+    if [ -n "$PID" ] && sb_is_windows; then
+      local lock_mtime now age
+      lock_mtime=$(date -r "$lock" +%s 2>/dev/null || echo 0)
+      now=$(date +%s)
+      age=$((now - lock_mtime))
+      if [ "$age" -lt "$STALE_LOCK_SECONDS" ]; then
+        log "cannot verify PID ${PID} for #${issue} on Windows — treating as alive, skipping reap (age=${age}s < ${STALE_LOCK_SECONDS}s)"
+        continue
       fi
+      log "reaped unverifiable Windows lock for #${issue} (pid=${PID}, age=${age}s ≥ ${STALE_LOCK_SECONDS}s)"
+    fi
+    rm -f "$lock"
+    TOTAL_REAPS=$((TOTAL_REAPS + 1))
+    if [ -n "$BOT_LOGIN" ]; then
+      gh issue edit "$issue" --remove-assignee "$BOT_LOGIN" >/dev/null 2>&1 || true
+      log "reaped stale lock + swept assignee on #${issue} (pid=${PID:-empty})"
+    else
+      log "reaped stale lock for #${issue} (pid=${PID:-empty})"
     fi
   done
 }
 
+drain_in_flight() {
+  # Wait for in-flight lane workers to exit (or bound the wait) after a hard ceiling.
+  local wait_ticks=0 max_drain_ticks=30
+  while [ "$wait_ticks" -lt "$max_drain_ticks" ]; do
+    reap_finished_locks
+    if lane_idle "${BUILD_PID:-}" && lane_idle "${QA_PID:-}" && lane_idle "${REVIEW_PID:-}"; then
+      return 0
+    fi
+    wait_ticks=$((wait_ticks + 1))
+    log "draining in-flight workers (${wait_ticks}/${max_drain_ticks})..."
+    sleep "$TICK_SECONDS"
+  done
+  log "⚠ drain timed out after ${max_drain_ticks} ticks — exiting anyway"
+}
+
 # ───────────────────────────── preconditions ─────────────────────────────
-log "super-board run started — config=${CONFIG_SLUG} variant=${VARIANT} base=${BASE_BRANCH} tick=${TICK_SECONDS}s max_workers=${MAX_WORKERS}"
+log "super-board run started — config=${CONFIG_SLUG} variant=${VARIANT} base=${BASE_BRANCH} tick=${TICK_SECONDS}s max_workers=${MAX_WORKERS} noprogress_halt_ticks=${NOPROGRESS_HALT_TICKS} max_dispatches=${MAX_DISPATCHES} max_hours=${MAX_HOURS}"
 
 # Orphan-worker guard. `|| true` defends against pipefail when pgrep finds nothing.
 ORPHANS=$(pgrep -f 'claude -p .*super-board run' 2>/dev/null | grep -v "^$$\$" | wc -l | tr -d ' ' || true)
@@ -309,6 +375,9 @@ INITIAL_READY=$(column_count "Ready")
 log "initial Ready count: $INITIAL_READY"
 
 NO_PROGRESS_TICKS=0
+NOMERGE_TICKS=0
+PREV_DONE_COUNT=$(column_count "Done")
+RUN_START_EPOCH=$(date +%s)
 BUILD_PID=""; BUILD_ISSUE=""
 QA_PID=""; QA_ISSUE=""
 REVIEW_PID=""; REVIEW_ISSUE=""
@@ -324,6 +393,22 @@ while true; do
   fi
 
   reap_finished_locks  # cheap local sweep; runs every tick
+
+  # ── Hard ceiling: wall-clock (every tick, no API).
+  ELAPSED=$(( $(date +%s) - RUN_START_EPOCH ))
+  MAX_SECONDS=$(( MAX_HOURS * 3600 ))
+  if [ "$ELAPSED" -ge "$MAX_SECONDS" ]; then
+    log "🛑 halt — reached max_hours (${MAX_HOURS}) — draining in-flight workers then exiting (dispatches=${TOTAL_DISPATCHES}, reaps=${TOTAL_REAPS})"
+    drain_in_flight
+    break
+  fi
+
+  # ── Hard ceiling: dispatch budget (stop new dispatches; drain; exit).
+  if [ "$TOTAL_DISPATCHES" -ge "$MAX_DISPATCHES" ]; then
+    log "🛑 halt — reached max_dispatches (${MAX_DISPATCHES}) — draining in-flight workers then exiting (dispatches=${TOTAL_DISPATCHES}, reaps=${TOTAL_REAPS})"
+    drain_in_flight
+    break
+  fi
 
   # ── Zombie sweep against the LAST cached project state (no extra API).
   #    Catches workers whose card already moved out of the lane's source column
@@ -371,8 +456,22 @@ while true; do
   QA=$(column_count "QA")
   REVIEW=$(column_count "Review")
   BLOCKED=$(column_count "Blocked")
+  DONE=$(column_count "Done")
 
-  log "tick — Ready=$READY Building=$BUILDING QA=$QA Review=$REVIEW Blocked=$BLOCKED lanes: b_idle=$BUILD_IDLE(#${BUILD_ISSUE:-_}) q_idle=$QA_IDLE(#${QA_ISSUE:-_}) r_idle=$REVIEW_IDLE(#${REVIEW_ISSUE:-_})"
+  log "tick — Ready=$READY Building=$BUILDING QA=$QA Review=$REVIEW Blocked=$BLOCKED Done=$DONE lanes: b_idle=$BUILD_IDLE(#${BUILD_ISSUE:-_}) q_idle=$QA_IDLE(#${QA_ISSUE:-_}) r_idle=$REVIEW_IDLE(#${REVIEW_ISSUE:-_})"
+
+  # Done-count progress gate (issue #8): fires independent of lane occupancy.
+  # Catches zero-merge token runaways (issue #8).
+  if [ "$DONE" -gt "$PREV_DONE_COUNT" ]; then
+    NOMERGE_TICKS=0
+    PREV_DONE_COUNT=$DONE
+  else
+    NOMERGE_TICKS=$((NOMERGE_TICKS + 1))
+    if [ "$NOMERGE_TICKS" -ge "$NOPROGRESS_HALT_TICKS" ]; then
+      log "🛑 halt — zero landed progress for ${NOPROGRESS_HALT_TICKS} ticks (Done delta=0, dispatches=${TOTAL_DISPATCHES}, reaps=${TOTAL_REAPS})"
+      break
+    fi
+  fi
 
   if [ "$READY" -eq 0 ] && [ "$BUILDING" -eq 0 ] && [ "$QA" -eq 0 ] && [ "$REVIEW" -eq 0 ] \
      && [ "$BUILD_IDLE" -eq 1 ] && [ "$QA_IDLE" -eq 1 ] && [ "$REVIEW_IDLE" -eq 1 ]; then
@@ -434,7 +533,7 @@ while true; do
     else
       NO_PROGRESS_TICKS=$((NO_PROGRESS_TICKS + 1))
       if [ "$NO_PROGRESS_TICKS" -ge 3 ]; then
-        log "🛑 halt — no card progressed for 3 ticks while all lanes idle"
+        log "🛑 halt — no card progressed for 3 ticks while all lanes idle (dispatches=${TOTAL_DISPATCHES}, reaps=${TOTAL_REAPS})"
         break
       fi
     fi

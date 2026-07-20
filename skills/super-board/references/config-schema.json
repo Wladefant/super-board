@@ -93,6 +93,24 @@
   // defined in §7 Halt gates.
   "rebuild_cap": 2,
 
+  // Consecutive expensive ticks with zero Done-count increase before halt.
+  // Fires independent of lane occupancy (catches zero-merge token runaways).
+  // Default `10`.
+  "noprogress_halt_ticks": 10,
+
+  // Hard per-run ceiling: max worker dispatches before graceful halt + drain.
+  // Default `20`.
+  "max_dispatches": 20,
+
+  // Hard per-run ceiling: wall-clock hours before graceful halt + drain.
+  // Default `3`.
+  "max_hours": 3,
+
+  // Windows/MSYS only: when a lock PID is unverifiable via kill -0, treat the
+  // lock as alive until this many seconds of age, then reap on elapsed time.
+  // Default `900` (15 min). Unused on Linux/macOS (kill -0 is reliable there).
+  "stale_lock_seconds": 900,
+
   // When the count of Blocked cards exceeds this percent of the initial Ready
   // count, send a mid-run breakdown notification. Default `30`. Set to `0`
   // to disable.
