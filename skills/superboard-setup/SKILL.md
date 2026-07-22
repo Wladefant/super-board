@@ -42,7 +42,17 @@ gh label create decision --force --color F9D0C4 --description "Blocked on or rec
 gh label create risk --force --color B60205 --description "Documented open risk needing a policy call"
 ```
 Note in prose that domain labels (ui, ado, test-data ...) are project-specific examples to rename per project, while type labels (build, docs, research, proof) are universal.
-- Commit ONLY the `.claude/` additions, then push.
+- Copy the `.github` board payload into the target repo (the payload lives at `payload/github/` in the super-board clone; `install.sh` also copies it, but do it explicitly here so it lands and commits in the same script):
+```
+mkdir -p .github/ISSUE_TEMPLATE .github/workflows
+cp "$SB_SRC/payload/github/ISSUE_TEMPLATE/superboard-issue.yml" .github/ISSUE_TEMPLATE/
+cp "$SB_SRC/payload/github/ISSUE_TEMPLATE/config.yml"           .github/ISSUE_TEMPLATE/
+cp "$SB_SRC/payload/github/workflows/auto-add-to-project.yml"   .github/workflows/
+# sed THIS board's URL into the guarded workflow's placeholder:
+sed -i "s#__PROJECT_URL__#https://github.com/users/Wladefant/projects/<N>#" .github/workflows/auto-add-to-project.yml
+```
+  (`$SB_SRC` = the super-board clone, `~/.claude/super-board-src`.) This installs the structured Issue Form (enforced Context/Steps/Acceptance + Type dropdown + `environment-constraint` checkbox) and the guarded auto-add workflow. The workflow stays OFF until the operator sets `ENABLE_ADD_TO_PROJECT=true` + the `ADD_TO_PROJECT_PAT` secret (instructions are in the file header) - GitHub's built-in project auto-add (Step 2) is the primary path; this Action is the redundant backup.
+- Commit ONLY the `.claude/` additions AND the `.github/` board payload, then push.
 
 ## Step 2 — Browser part (route to an Opus claude-in-chrome lane; the API cannot do this)
 
@@ -57,6 +67,13 @@ Note in prose that domain labels (ui, ado, test-data ...) are project-specific e
 - Enable the "Auto-add to project" workflow (repo, filter `is:issue is:open`).
 - Enable the "Item added to project" workflow → set Status to Backlog.
 - GOTCHA: GitHub's visibility timer means Chrome must be FOREGROUNDED or the Authorize/Save buttons stay disabled.
+- Create the four standard custom fields (Projects UI → "+" / "New field" in the table header of any view):
+  - **Effort (tokens)** — type Number. Rough per-card effort/size for burn-up and prioritization.
+  - **Target Date** — type Date. The date driving the Roadmap view.
+  - **Priority** — type Single select, options `P1` / `P2` / `P3`.
+  - **Test Area** — type Single select. NOTE: Test Area options are PER-PROJECT — do NOT hardcode; PROMPT THE OPERATOR for this project's areas (e.g. for a QA project: Login / Payments / Search / Reporting) and create those options. If the operator has none, create the field with no options and leave it for later.
+- Create + save a **"Roadmap by Phase"** view: click the view tab "+" → set Layout = **Roadmap** → set the Date field = **Target Date** → slice/group by **Milestone** (markers = milestones) → Save as a new view named `Roadmap by Phase`. This gives the milestone-per-phase timeline; the saved-view link is shareable.
+- Open the **Insights** tab (project → Insights) → add/select a **Burn-up** chart → group/filter by **Milestone** (optionally sum **Effort (tokens)**) → Save. Gives at-a-glance phase progress. (Insights is available on personal free/pro accounts.)
 
 ## Step 3 — Seed
 

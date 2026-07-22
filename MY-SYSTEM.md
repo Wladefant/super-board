@@ -68,6 +68,25 @@ Plus the two system labels design and history created by the base setup.
 
 **Single source of truth for the doctrine.** Any change to the milestones/labels doctrine or the setup flow lands in ONE place: `skills/superboard-setup/SKILL.md` in this repo. Do not fork-edit local copies. Installed payload copies in each project refresh by re-running `install.sh` (or `git pull` on a junctioned clone); the local `~/.claude/skills/superboard-setup` is a directory junction into a clone of this repo, so editing the canonical file and pushing is the only supported way to evolve the taxonomy.
 
+## Board feature standard
+
+The labels + milestones above are the floor, not the whole spec. A **fully-equipped Superboard** — what `superboard-setup` provisions and what every project board should converge to — has ALL of the following. This is the one canonical checklist; the setup mechanics live in `skills/superboard-setup/SKILL.md`.
+
+1. **Status columns** — exactly seven: `Backlog` / `Ready` / `Building` / `QA` / `Review` / `Done` / `Blocked`.
+2. **Milestones** — one per roadmap phase; every issue carries one at creation. Due dates only when the roadmap actually commits to one.
+3. **Labels** — the 13-label taxonomy (type labels universal; domain labels per-project) plus the system labels `design` + `history`.
+4. **Custom fields** — four, created in the Projects UI:
+   - **Effort (tokens)** (Number) — per-card size for burn-up + prioritization.
+   - **Target Date** (Date) — drives the Roadmap view.
+   - **Priority** (Single select) — `P1` / `P2` / `P3`.
+   - **Test Area** (Single select) — options are PER-PROJECT (prompt the operator; never hardcode).
+5. **Saved "Roadmap by Phase" view** — Roadmap layout, Date = Target Date, sliced/marked by Milestone. The milestone-per-phase timeline stays on the board, not in a drifting doc.
+6. **Insights burn-up by milestone** — Insights tab, Burn-up chart grouped by Milestone (optionally summing Effort (tokens)). At-a-glance phase progress; personal free/pro accounts support it.
+7. **Structured Issue Form** — `.github/ISSUE_TEMPLATE/superboard-issue.yml`: enforced Context / Steps / Acceptance criteria + a Type dropdown + an `environment-constraint` checkbox. Blank issues stay enabled (`config.yml`) because agents create issues via `gh` CLI.
+8. **Guarded auto-add Actions workflow** — `.github/workflows/auto-add-to-project.yml`: a redundant backup to GitHub's built-in project auto-add, DISABLED BY DEFAULT behind `ENABLE_ADD_TO_PROJECT`. Primary auto-add is the built-in project workflow (item 1's board settings); this Action is belt-and-suspenders and stores no token.
+
+Items 7–8 ship as repo payload at `payload/github/` in this repo and are copied into each target repo's `.github/` by `install.sh` and by `superboard-setup` Step 1 (which also `sed`s the board URL into the workflow placeholder). Items 4–6 are browser-only (`superboard-setup` Step 2). A board missing any of 1–8 is under-equipped; bring it up to standard rather than inventing a per-project variant.
+
 ## Production hardening (ported from ops)
 
 | Issue | Fix | What it does |

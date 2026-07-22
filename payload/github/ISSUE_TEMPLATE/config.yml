@@ -1,0 +1,2 @@
+# Agents still create issues via gh CLI, so blank issues stay enabled.
+blank_issues_enabled: true

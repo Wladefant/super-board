@@ -48,6 +48,18 @@ if [ -f "$REPO_ROOT/workflows/super-board-wave.js" ]; then
   echo "    ✓ super-board-wave.js"
 fi
 
+echo "→ installing .github board payload (issue form + guarded auto-add workflow) into $TARGET/.github/"
+if [ -d "$REPO_ROOT/payload/github" ]; then
+  mkdir -p "$TARGET/.github/ISSUE_TEMPLATE" "$TARGET/.github/workflows"
+  cp "$REPO_ROOT/payload/github/ISSUE_TEMPLATE/superboard-issue.yml" "$TARGET/.github/ISSUE_TEMPLATE/"
+  cp "$REPO_ROOT/payload/github/ISSUE_TEMPLATE/config.yml" "$TARGET/.github/ISSUE_TEMPLATE/"
+  cp "$REPO_ROOT/payload/github/workflows/auto-add-to-project.yml" "$TARGET/.github/workflows/"
+  echo "    ✓ .github issue form + config + guarded auto-add workflow"
+  echo "    ! next: replace __PROJECT_URL__ in .github/workflows/auto-add-to-project.yml with this board's URL (superboard-setup Step 1 does this via sed), then enable the guard — see the header of that file"
+else
+  echo "    ✗ missing payload/github in repo — skipping" >&2
+fi
+
 echo
 echo "✓ installed. next steps:"
 echo "  1. write a config at $TARGET/.claude/super-board/configs/<slug>.json"

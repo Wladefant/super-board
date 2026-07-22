@@ -1,0 +1,63 @@
+name: "Superboard task"
+description: "Structured task with enforced Context / Steps / Acceptance criteria"
+labels: []
+
+body:
+  - type: input
+    id: title-summary
+    attributes:
+      label: "Title"
+      description: "One-line summary of the task"
+    validations:
+      required: true
+  - type: dropdown
+    id: type
+    attributes:
+      label: "Type"
+      description: "Work classification (mirror as a label after creation)"
+      options:
+        - build
+        - docs
+        - research
+        - proof
+        - decision
+        - risk
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: "Context"
+      description: "Why this task exists; background and links"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: "Steps"
+      description: "Concrete steps to complete the work"
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: "Acceptance criteria"
+      description: "Binary, checkable criteria"
+      placeholder: |
+        - [ ] Given <state>, When <action>, Then <observable result>
+        - [ ] Given ..., When ..., Then ...
+    validations:
+      required: true
+  - type: input
+    id: milestone-phase
+    attributes:
+      label: "Milestone phase (informational)"
+      description: "Informational only - the actual milestone is still set via gh CLI or the UI. Name the roadmap phase this belongs to (e.g. 'Phase 0 - Install + Smoke')."
+    validations:
+      required: false
+  - type: checkboxes
+    id: environment-constraint
+    attributes:
+      label: "Environment"
+      options:
+        - label: "Needs a specific machine/environment (add the `environment-constraint` label after creation so agents without that environment skip the card)"

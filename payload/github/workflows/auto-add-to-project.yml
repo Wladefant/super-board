@@ -1,0 +1,31 @@
+# Guarded auto-add: a REDUNDANT / robust layer on top of GitHub's built-in Projects
+# auto-add workflow (which already covers `is:issue is:open` once you enable it in the
+# project UI). This Action is a belt-and-suspenders backup and is DISABLED BY DEFAULT.
+#
+# SETUP (superboard-setup Step 1 does the sed; do the secret/variable by hand once):
+#   1. Replace __PROJECT_URL__ below with this project's board URL
+#      (e.g. https://github.com/users/<owner>/projects/<N>).
+#      superboard-setup does this automatically:  sed -i "s#__PROJECT_URL__#<url>#" .github/workflows/auto-add-to-project.yml
+#   2. Create a fine-grained PAT with read/write access to the owner's Projects, then:
+#        gh secret set ADD_TO_PROJECT_PAT       # paste the token
+#   3. Turn the guard on:
+#        gh variable set ENABLE_ADD_TO_PROJECT --body true
+#   Without the variable set to the string "true" the job is SKIPPED, so nothing errors.
+#   Do NOT store any token in this file.
+
+name: "Auto-add issues to Superboard"
+on:
+  issues:
+    types: [opened]
+permissions:
+  contents: read
+jobs:
+  add-to-project:
+    runs-on: ubuntu-latest
+    if: ${{ vars.ENABLE_ADD_TO_PROJECT == 'true' }}
+    steps:
+      - name: Add issue to project
+        uses: actions/add-to-project@v1
+        with:
+          project-url: __PROJECT_URL__
+          github-token: ${{ secrets.ADD_TO_PROJECT_PAT }}
