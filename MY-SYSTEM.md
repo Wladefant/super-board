@@ -66,6 +66,8 @@ Plus the two system labels design and history created by the base setup.
 - Note that type labels are universal; domain labels are project-specific examples to rename/adapt.
 - Discipline: every issue gets >=1 type label + relevant domain labels at creation; labels are updated when scope changes. Environment-constraint labels like `laptop` double as dispatch filters - an agent session must not pick up a card labeled with an environment it does not have.
 
+**Single source of truth for the doctrine.** Any change to the milestones/labels doctrine or the setup flow lands in ONE place: `skills/superboard-setup/SKILL.md` in this repo. Do not fork-edit local copies. Installed payload copies in each project refresh by re-running `install.sh` (or `git pull` on a junctioned clone); the local `~/.claude/skills/superboard-setup` is a directory junction into a clone of this repo, so editing the canonical file and pushing is the only supported way to evolve the taxonomy.
+
 ## Production hardening (ported from ops)
 
 | Issue | Fix | What it does |

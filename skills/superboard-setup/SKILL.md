@@ -7,7 +7,7 @@ description: "Spin up Wlad's Superboard (GitHub-Projects agent pipeline from the
 
 Spin up Wlad's Superboard on a project: one board PER project. Route CLI work to an Opus claude subagent lane; route browser work to an Opus claude-in-chrome lane. The session model only does judgment + verification.
 
-Install for yourself: copy this `superboard-setup/` directory into `~/.claude/skills/`.
+**Canonical home: this repo** (`skills/superboard-setup/SKILL.md`). The local `~/.claude/skills/superboard-setup` is a directory junction into a clone of this repo at `~/.claude/super-board-src` - edit here, `git commit` + `git push` to share, `git pull` to update. Never edit the local junction copy as a separate fork; there is one source of truth.
 
 ## Step 0 — Identify the repo(s)
 
@@ -23,22 +23,25 @@ Collapse this into a SINGLE bash script the lane just executes (keeps the lane c
 - Link EACH repo via GraphQL mutation `linkProjectV2ToRepository` (note: `gh project link` may not exist in gh 2.39.1, so use the GraphQL mutation).
 - Install the payload from https://github.com/Wladefant/super-board using its `install.sh` into the repo's `.claude/`.
 - Write `.claude/super-board/configs/<slug>.json` containing: owner, project number, base_branch, max_workers 2, rebuild_cap 2, human_approves_merge true, worker_backend "claude-p", exclude_labels ["history","design"].
-- Create labels in EVERY linked repo with these commands (use --force for idempotency; gh 2.39.1 silently fails on em-dashes in descriptions):
-  - gh label create build --force --color 1D76DB --description "Implementation work producing code or working artifacts"
-  - gh label create docs --force --color 0E8A16 --description "Documentation, guides, handouts"
-  - gh label create research --force --color 5319E7 --description "Sourced research with web and X evidence"
-  - gh label create proof --force --color FBCA04 --description "Evidence task: prove a claim against the real system"
-  - gh label create ui --force --color C5DEF5 --description "Product/tester interface surface"
-  - gh label create ado --force --color 0052CC --description "External integration (e.g. Azure DevOps)"
-  - gh label create test-data --force --color D93F0B --description "Test data pools, claiming, fixtures"
-  - gh label create security --force --color B60205 --description "Secret handling, redaction, disclosure"
-  - gh label create governance --force --color D4C5F9 --description "Governance, compliance, BIA track"
-  - gh label create laptop-environment-constraint --force --color E99695 --description "Requires a specific machine/environment; doubles as a dispatch filter"
-  - gh label create meeting-prep --force --color BFDADC --description "Preparation for a stakeholder meeting"
-  - gh label create decision --force --color F9D0C4 --description "Blocked on or records a human decision"
-  - gh label create risk --force --color B60205 --description "Documented open risk needing a policy call"
-  - gh label create design --force --color BFD4F2 --description "Design collaboration"
-  - gh label create history --force --color EEEE EE --description "History and changelog"
+- Create labels `design` and `history` in EVERY linked repo. IMPORTANT: NO em-dashes in label descriptions (gh 2.39.1 silently fails on them).
+```
+gh label create design --force --color BFD4F2 --description "Human designer owned. Agents never dispatch or edit."
+gh label create history --force --color EEEEEE --description "Historical record card. Not dispatchable work."
+gh label create build --force --color 1D76DB --description "Implementation work producing code or working artifacts"
+gh label create docs --force --color 0E8A16 --description "Documentation, guides, handouts"
+gh label create research --force --color 5319E7 --description "Sourced research with web and X evidence"
+gh label create proof --force --color FBCA04 --description "Evidence task: prove a claim against the real system"
+gh label create ui --force --color C5DEF5 --description "Product or tester interface surface"
+gh label create ado --force --color 0052CC --description "External integration such as Azure DevOps"
+gh label create test-data --force --color D93F0B --description "Test data pools, claiming, fixtures"
+gh label create security --force --color B60205 --description "Secret handling, redaction, disclosure"
+gh label create governance --force --color D4C5F9 --description "Governance, compliance, BIA track"
+gh label create laptop --force --color E99695 --description "Requires a specific machine or environment; doubles as a dispatch filter"
+gh label create meeting-prep --force --color BFDADC --description "Preparation for a stakeholder meeting"
+gh label create decision --force --color F9D0C4 --description "Blocked on or records a human decision"
+gh label create risk --force --color B60205 --description "Documented open risk needing a policy call"
+```
+Note in prose that domain labels (ui, ado, test-data ...) are project-specific examples to rename per project, while type labels (build, docs, research, proof) are universal.
 - Commit ONLY the `.claude/` additions, then push.
 
 ## Step 2 — Browser part (route to an Opus claude-in-chrome lane; the API cannot do this)
@@ -78,4 +81,4 @@ Milestones = roadmap phases. One milestone per roadmap phase (e.g. "Phase 0 - In
 
 Every issue gets a milestone AND at least one type label at creation time (gh issue create --label a,b --milestone "<phase>").
 
-The standard 13-label taxonomy is created at seeding time (see Step 1 for the full `gh label create` commands). Type labels are universal across every project; domain labels are per-project examples to rename/adapt. Environment-constraint labels like `laptop-environment-constraint` double as dispatch filters - an agent session must not pick up a card labeled with an environment it does not have.
+The standard 13-label taxonomy is created at seeding time (see Step 1 for the full `gh label create` commands). Type labels are universal across every project; domain labels are per-project examples to rename/adapt. Environment-constraint labels like `laptop` double as dispatch filters - an agent session must not pick up a card labeled with an environment it does not have.
