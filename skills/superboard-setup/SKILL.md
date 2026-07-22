@@ -23,7 +23,22 @@ Collapse this into a SINGLE bash script the lane just executes (keeps the lane c
 - Link EACH repo via GraphQL mutation `linkProjectV2ToRepository` (note: `gh project link` may not exist in gh 2.39.1, so use the GraphQL mutation).
 - Install the payload from https://github.com/Wladefant/super-board using its `install.sh` into the repo's `.claude/`.
 - Write `.claude/super-board/configs/<slug>.json` containing: owner, project number, base_branch, max_workers 2, rebuild_cap 2, human_approves_merge true, worker_backend "claude-p", exclude_labels ["history","design"].
-- Create labels `design` and `history` in EVERY linked repo. IMPORTANT: NO em-dashes in label descriptions (gh 2.39.1 silently fails on them).
+- Create labels in EVERY linked repo with these commands (use --force for idempotency; gh 2.39.1 silently fails on em-dashes in descriptions):
+  - gh label create build --force --color 1D76DB --description "Implementation work producing code or working artifacts"
+  - gh label create docs --force --color 0E8A16 --description "Documentation, guides, handouts"
+  - gh label create research --force --color 5319E7 --description "Sourced research with web and X evidence"
+  - gh label create proof --force --color FBCA04 --description "Evidence task: prove a claim against the real system"
+  - gh label create ui --force --color C5DEF5 --description "Product/tester interface surface"
+  - gh label create ado --force --color 0052CC --description "External integration (e.g. Azure DevOps)"
+  - gh label create test-data --force --color D93F0B --description "Test data pools, claiming, fixtures"
+  - gh label create security --force --color B60205 --description "Secret handling, redaction, disclosure"
+  - gh label create governance --force --color D4C5F9 --description "Governance, compliance, BIA track"
+  - gh label create laptop-environment-constraint --force --color E99695 --description "Requires a specific machine/environment; doubles as a dispatch filter"
+  - gh label create meeting-prep --force --color BFDADC --description "Preparation for a stakeholder meeting"
+  - gh label create decision --force --color F9D0C4 --description "Blocked on or records a human decision"
+  - gh label create risk --force --color B60205 --description "Documented open risk needing a policy call"
+  - gh label create design --force --color BFD4F2 --description "Design collaboration"
+  - gh label create history --force --color EEEE EE --description "History and changelog"
 - Commit ONLY the `.claude/` additions, then push.
 
 ## Step 2 — Browser part (route to an Opus claude-in-chrome lane; the API cannot do this)
@@ -56,3 +71,11 @@ Collapse this into a SINGLE bash script the lane just executes (keeps the lane c
 - Ready is a live wire until the label filter ships — see https://github.com/Wladefant/soundcore-work-workflow/issues/26
 - Token safety: Opus claude lanes do implementation (grok is reserved for X research and explicitly-requested jobs only); the session model is only for judgment + verification.
 - Verify each phase with real `gh project view` / `gh project item-list` output — NEVER trust reports.
+
+## Milestones & Labels
+
+Milestones = roadmap phases. One milestone per roadmap phase (e.g. "Phase 0 - Install + Smoke", "Phase 4 - Governance track (on demand)"), created at seeding time. EVERY issue gets a milestone at creation. Never invent due dates - set a due date only when the roadmap actually commits to one.
+
+Every issue gets a milestone AND at least one type label at creation time (gh issue create --label a,b --milestone "<phase>").
+
+The standard 13-label taxonomy is created at seeding time (see Step 1 for the full `gh label create` commands). Type labels are universal across every project; domain labels are per-project examples to rename/adapt. Environment-constraint labels like `laptop-environment-constraint` double as dispatch filters - an agent session must not pick up a card labeled with an environment it does not have.

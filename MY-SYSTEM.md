@@ -34,6 +34,38 @@ Every commit, doc, or post reference on a card or in a report is a full clickabl
 
 Past issues, fixes, and developments stay as `Done` cards. The board doubles as the changelog — no separate write-up required for “what shipped.”
 
+## Milestones & Labels
+
+Milestones = roadmap phases. One milestone per roadmap phase (e.g. "Phase 0 - Install + Smoke", "Phase 4 - Governance track (on demand)"), created at seeding time. EVERY issue gets a milestone at creation. Never invent due dates - set a due date only when the roadmap actually commits to one.
+
+Every issue gets a milestone AND at least one type label at creation time (gh issue create --label a,b --milestone "<phase>").
+
+The standard 13-label taxonomy proven on the ing board, grouped, each with its hex color and a one-line description. Use EXACTLY these (colors and descriptions must match; NO em-dashes, NO en-dashes, use a plain hyphen or colon only):
+
+Type labels (universal across every project):
+- build (1D76DB): Implementation work producing code or working artifacts
+- docs (0E8A16): Documentation, guides, handouts
+- research (5319E7): Sourced research with web and X evidence
+- proof (FBCA04): Evidence task: prove a claim against the real system
+
+Domain labels (per-project examples; adapt names to the project, keep the pattern):
+- ui (C5DEF5): Product/tester interface surface
+- ado (0052CC): External integration (e.g. Azure DevOps)
+- test-data (D93F0B): Test data pools, claiming, fixtures
+- security (B60205): Secret handling, redaction, disclosure
+- governance (D4C5F9): Governance, compliance, BIA track
+
+Process labels:
+- laptop / environment-constraint (E99695): Requires a specific machine/environment; doubles as a dispatch filter
+- meeting-prep (BFDADC): Preparation for a stakeholder meeting
+- decision (F9D0C4): Blocked on or records a human decision
+- risk (B60205): Documented open risk needing a policy call
+
+Plus the two system labels design and history created by the base setup.
+
+- Note that type labels are universal; domain labels are project-specific examples to rename/adapt.
+- Discipline: every issue gets >=1 type label + relevant domain labels at creation; labels are updated when scope changes. Environment-constraint labels like `laptop` double as dispatch filters - an agent session must not pick up a card labeled with an environment it does not have.
+
 ## Production hardening (ported from ops)
 
 | Issue | Fix | What it does |
