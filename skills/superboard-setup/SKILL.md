@@ -81,4 +81,6 @@ Milestones = roadmap phases. One milestone per roadmap phase (e.g. "Phase 0 - In
 
 Every issue gets a milestone AND at least one type label at creation time (gh issue create --label a,b --milestone "<phase>").
 
-The standard 13-label taxonomy is created at seeding time (see Step 1 for the full `gh label create` commands). Type labels are universal across every project; domain labels are per-project examples to rename/adapt. Environment-constraint labels like `laptop` double as dispatch filters - an agent session must not pick up a card labeled with an environment it does not have.
+The standard 13-label taxonomy is created at seeding time (see Step 1 for the full `gh label create` commands). Type labels are universal across every project; domain labels are per-project examples to rename/adapt.
+
+Discipline: every issue gets >=1 type label + domain labels at creation; labels are updated when scope changes (e.g. add `laptop` the moment a task turns out to need the work laptop). Prefer assigning the governance/on-demand phase to cross-phase history/risk cards rather than leaving them milestone-less. Environment-constraint labels like `laptop` double as dispatch filters: an agent session must not pick up a card labeled with an environment it does not have. Milestone views answer "how far is phase X" - keep them honest by closing issues only when their milestone-relevant work is truly done.
