@@ -84,6 +84,7 @@ The labels + milestones above are the floor, not the whole spec. A **fully-equip
 6. **Insights burn-up by milestone** — Insights tab, Burn-up chart grouped by Milestone (optionally summing Effort (tokens)). At-a-glance phase progress; personal free/pro accounts support it.
 7. **Structured Issue Form** — `.github/ISSUE_TEMPLATE/superboard-issue.yml`: enforced Context / Steps / Acceptance criteria + a Type dropdown + an `environment-constraint` checkbox. Blank issues stay enabled (`config.yml`) because agents create issues via `gh` CLI.
 8. **Guarded auto-add Actions workflow** — `.github/workflows/auto-add-to-project.yml`: a redundant backup to GitHub's built-in project auto-add, DISABLED BY DEFAULT behind `ENABLE_ADD_TO_PROJECT`. Primary auto-add is the built-in project workflow (item 1's board settings); this Action is belt-and-suspenders and stores no token.
+9. **`docs/README.md` master linked index** — every doc referenced as a full clickable blob URL (`https://github.com/<owner>/<repo>/blob/main/<path>`); kept current whenever a doc is added or moved.
 
 Items 7–8 ship as repo payload at `payload/github/` in this repo and are copied into each target repo's `.github/` by `install.sh` and by `superboard-setup` Step 1 (which also `sed`s the board URL into the workflow placeholder). Items 4–6 are browser-only (`superboard-setup` Step 2). A board missing any of 1–8 is under-equipped; bring it up to standard rather than inventing a per-project variant.
 
