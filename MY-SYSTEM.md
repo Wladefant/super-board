@@ -1,4 +1,4 @@
-# Wlad's Superboard
+﻿# Wlad's Superboard
 
 Per-project agent-driven development on top of this [Wladefant/super-board](https://github.com/Wladefant/super-board) fork of [EricTechPro/super-board](https://github.com/EricTechPro/super-board).
 
@@ -18,9 +18,9 @@ Write **one** short core idea. The system expands it into multiple lint-passing,
 
 Epics and milestones stay visible on the **same** GitHub Project the run loop drains. The roadmap is board state, not a separate document that drifts.
 
-### 4. One board per project, no master board
+### 4. One board per project, plus a life-level Master Board
 
-Every project gets its own GitHub Project + its own `.claude/super-board/configs/<slug>.json`. Same system, same verbs, everywhere — deliberately no cross-project umbrella board.
+Every project gets its own GitHub Project + its own `.claude/super-board/configs/<slug>.json`. Same system, same verbs, everywhere. Above them sits a single **Master Board** ([#6](https://github.com/users/Wladefant/projects/6)) for the cross-project life view. The Master Board holds **only** (a) personal/life task cards and (b) one abstract epic card per project, each linking to that project's own per-project board. Granular dev issues live **exclusively** on their per-project boards — never bulk-add dev issues to the Master Board (#6).
 
 ### 5. Design collaboration
 
@@ -60,3 +60,4 @@ Config keys (all optional, defaults in parentheses): `noprogress_halt_ticks` (10
    - `stop` — graceful shutdown of in-flight workers
 
 Docs convention for session notes vs canon: [DOCS-SYSTEM.md](./DOCS-SYSTEM.md).
+
