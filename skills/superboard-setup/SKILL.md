@@ -67,7 +67,7 @@ sed -i "s#__PROJECT_URL__#https://github.com/users/Wladefant/projects/<N>#" .git
 - Configure ALL built-in workflows (⋯ menu → Workflows) — set EVERY one deliberately, and READ each target back after saving; a wrong target silently corrupts the board:
   - **Auto-add to project**: enabled (repo, filter `is:issue is:open`).
   - **Item added to project**: enabled → Status: **Backlog**.
-  - **Item closed**: enabled → Status: **Done**. ⚠ VERIFY THE TARGET COLUMN. On HeyLolo (2026-07-23) this workflow pointed at **Building** — every closed issue's card got yanked out of Done back into Building, repeatedly, for two days, and it looked like cards "vanishing"/reverting. No API exposes workflow config, so the only check is reading the UI.
+  - **Item closed**: enabled → Status: **Done**. ⚠ VERIFY THE TARGET COLUMN. On HeyLolo (2026-07-23) this workflow pointed at **Building** — and because **"Auto-close issue"** (Status=Done → close) was also on, the two formed a loop: set Done → auto-close → "Item closed" fires → card bounced to Building. Setting a card to Done actively reverted it, for two days, looking like cards "vanishing". Fingerprint of this failure: cards you move to Done reappear in another column within a minute. No API exposes workflow config, so the only check is reading the UI.
   - **Item reopened**: enabled → Status: **Building**.
   - **Pull request merged**: enabled → Status: **Done**.
   - **Auto-archive items**: **DISABLED**. Done cards are the system's visible history (anti-loop memory) — archiving hides them.
