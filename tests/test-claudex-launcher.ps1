@@ -35,6 +35,16 @@ function Invoke-SetupFixture {
     return Invoke-Process 'powershell.exe' $arguments
 }
 
+function Invoke-AuditFixture {
+    param([string]$Profile, [string]$Junction, [string]$Canonical, [string]$RoutingState)
+    $arguments = @(
+        '-NoProfile','-ExecutionPolicy','Bypass','-File',$Audit,
+        '-ProfilePath',$Profile,'-JunctionPath',$Junction,'-CanonicalSkillPath',$Canonical,
+        '-RoutingStatePath',$RoutingState,'-RoutingStateMaxAgeHours','24','-SkipProxyModelInventory'
+    )
+    return Invoke-Process 'powershell.exe' $arguments
+}
+
 function New-FixtureCase([string]$Name) {
     $case = Join-Path $tempRoot $Name
     $canonical = Join-Path $case 'canonical\claudex-optimized'
@@ -93,7 +103,8 @@ try {
     Assert-True ($launchText.Contains('Get-NetTCPConnection -LocalPort $port -State Listen')) 'approved listener PID comes from the listening socket'
     Assert-True ($launchText.Contains("`$deadline = [DateTime]::UtcNow.AddSeconds(`$HealthTimeoutSeconds)")) 'approved daemon startup has a bounded deadline'
     Assert-True ($launchText.Contains('while ((-not $ownerVerified -or $null -eq $health -or -not $health.Ready)')) 'approved daemon startup polls owner identity and inventory'
-    Assert-True ($launchText.Contains('& claude --model opus @EffectiveClaudeArgs')) 'main CLI retains Opus identity for Sol mapping and tool search'
+    Assert-True ($launchText.Contains("`$code = Invoke-ClaudeExact (@('--model', 'opus') + `$EffectiveClaudeArgs)")) 'main CLI retains Opus identity through exact native argv forwarding'
+    Assert-True ($launchText.Contains('ConvertTo-WindowsCommandLineArgument')) 'native forwarding preserves empty and JSON arguments on Windows PowerShell 5.1'
     Write-Output '  ok  PowerShell syntax and no-touch probe ordering parse'
 
     $sentinels = [ordered]@{
@@ -394,11 +405,77 @@ ThreadingHTTPServer(('127.0.0.1',port),H).serve_forever()
     Assert-True ($closedHealth.ExitCode -ne 0) 'closed non-approved gateway refuses auto-start'
     Write-Output '  ok  authenticated gateway model health and wrong-listener validation'
 
-    $auditRaw = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Audit -ProfilePath $fixture.Profile -JunctionPath $fixture.Junction -CanonicalSkillPath $fixture.Canonical -SkipProxyModelInventory
-    $auditJson = $auditRaw | ConvertFrom-Json
-    Assert-True (($auditRaw -join '') -notmatch [regex]::Escape($HOME)) 'audit output does not expose home prefix'
-    Assert-True (($auditRaw -join '') -notmatch [regex]::Escape([Environment]::UserName)) 'audit output does not expose username paths'
-    Write-Output '  ok  audit home and username path redaction'
+    $routingStateDir = Join-Path $tempRoot 'routing-state'
+    $null = New-Item -ItemType Directory -Path $routingStateDir
+    $missingRoutingState = Join-Path $routingStateDir 'missing.json'
+    $missingAudit = Invoke-AuditFixture $fixture.Profile $fixture.Junction $fixture.Canonical $missingRoutingState
+    Assert-Equal $missingAudit.ExitCode 0 "missing routing state audit succeeds: $($missingAudit.Output)"
+    $missingAuditJson = $missingAudit.Output | ConvertFrom-Json
+    Assert-True (-not $missingAuditJson.liveAliasRoutingVerified) 'missing routing state reports false'
+    Assert-Equal $missingAuditJson.lastProbe.stateStatus 'missing' 'missing routing state is identified'
+
+    $malformedRoutingState = Join-Path $routingStateDir 'malformed.json'
+    [IO.File]::WriteAllText($malformedRoutingState, '{not-json', (New-Object Text.UTF8Encoding($false)))
+    $malformedAudit = Invoke-AuditFixture $fixture.Profile $fixture.Junction $fixture.Canonical $malformedRoutingState
+    Assert-Equal $malformedAudit.ExitCode 0 "malformed routing state audit succeeds: $($malformedAudit.Output)"
+    $malformedAuditJson = $malformedAudit.Output | ConvertFrom-Json
+    Assert-True (-not $malformedAuditJson.liveAliasRoutingVerified) 'malformed routing state reports false'
+    Assert-Equal $malformedAuditJson.lastProbe.stateStatus 'malformed' 'malformed routing state is identified'
+
+    $aliasRoutes = @(
+        [ordered]@{ model='gpt-5.6-luna'; turn='initial'; scope='subagent'; agent_key='a1b2c3d4e5f6' },
+        [ordered]@{ model='gpt-5.6-luna'; turn='resume'; scope='subagent'; agent_key='a1b2c3d4e5f6' },
+        [ordered]@{ model='gpt-5.6-terra'; turn='initial'; scope='subagent'; agent_key='b1c2d3e4f5a6' },
+        [ordered]@{ model='gpt-5.6-terra'; turn='resume'; scope='subagent'; agent_key='b1c2d3e4f5a6' },
+        [ordered]@{ model='gpt-5.6-sol'; turn='initial'; scope='subagent'; agent_key='c1d2e3f4a5b6' },
+        [ordered]@{ model='gpt-5.6-sol'; turn='resume'; scope='subagent'; agent_key='c1d2e3f4a5b6' }
+    )
+    $freshTimestamp = [DateTimeOffset]::UtcNow.ToString('o')
+    $freshAliases = [ordered]@{
+        timestamp_utc=$freshTimestamp; skill_version='1'; probe_schema_version=2
+        claude_code_version='2.1.217'; cli_proxy_api_version=$null; probe='live-aliases'
+        verified=$true; gateway_ingress_model_routing_verified=$true; upstream_provider_verified=$false
+        routes=$aliasRoutes
+    }
+    $failedAttempt = [ordered]@{
+        timestamp_utc=$freshTimestamp; skill_version='1'; probe_schema_version=2
+        claude_code_version='2.1.217'; cli_proxy_api_version=$null; probe='live-alias-terra'
+        verified=$false; gateway_ingress_model_routing_verified=$false; upstream_provider_verified=$false
+        routes=@()
+    }
+    $verifiedRoutingState = Join-Path $routingStateDir 'verified.json'
+    [IO.File]::WriteAllText(
+        $verifiedRoutingState,
+        ([ordered]@{ state_schema_version=2; last_attempt=$failedAttempt; last_successful_aliases=$freshAliases } | ConvertTo-Json -Depth 8 -Compress),
+        (New-Object Text.UTF8Encoding($false))
+    )
+    $verifiedAudit = Invoke-AuditFixture $fixture.Profile $fixture.Junction $fixture.Canonical $verifiedRoutingState
+    Assert-Equal $verifiedAudit.ExitCode 0 "verified routing state audit succeeds: $($verifiedAudit.Output)"
+    $verifiedAuditJson = $verifiedAudit.Output | ConvertFrom-Json
+    Assert-True $verifiedAuditJson.liveAliasRoutingVerified 'fresh exact alias matrix reports true even after a later failed probe'
+    Assert-Equal $verifiedAuditJson.lastProbe.stateStatus 'verified' 'verified routing state is identified'
+    Assert-Equal $verifiedAuditJson.lastProbe.probe 'live-alias-terra' 'lastProbe reports the compact direct-alias last-attempt metadata'
+    Assert-True (-not $verifiedAuditJson.lastProbe.verified) 'lastProbe preserves the later failed attempt status'
+    Assert-True (-not $verifiedAuditJson.lastProbe.upstreamProviderVerified) 'provider remains explicitly unverified'
+
+    $staleAliases = [ordered]@{}
+    foreach ($entry in $freshAliases.GetEnumerator()) { $staleAliases[$entry.Key] = $entry.Value }
+    $staleAliases.timestamp_utc = [DateTimeOffset]::UtcNow.AddDays(-2).ToString('o')
+    $staleRoutingState = Join-Path $routingStateDir 'stale.json'
+    [IO.File]::WriteAllText(
+        $staleRoutingState,
+        ([ordered]@{ state_schema_version=2; last_attempt=$staleAliases; last_successful_aliases=$staleAliases } | ConvertTo-Json -Depth 8 -Compress),
+        (New-Object Text.UTF8Encoding($false))
+    )
+    $staleAudit = Invoke-AuditFixture $fixture.Profile $fixture.Junction $fixture.Canonical $staleRoutingState
+    Assert-Equal $staleAudit.ExitCode 0 "stale routing state audit succeeds: $($staleAudit.Output)"
+    $staleAuditJson = $staleAudit.Output | ConvertFrom-Json
+    Assert-True (-not $staleAuditJson.liveAliasRoutingVerified) 'stale routing state reports false'
+    Assert-Equal $staleAuditJson.lastProbe.stateStatus 'stale' 'stale routing state is identified'
+
+    Assert-True ($verifiedAudit.Output -notmatch [regex]::Escape($HOME)) 'audit output does not expose home prefix'
+    Assert-True ($verifiedAudit.Output -notmatch [regex]::Escape([Environment]::UserName)) 'audit output does not expose username paths'
+    Write-Output '  ok  audit routing-state validation and path redaction'
 
     Write-Output "`n8/8 PowerShell groups passed."
 }

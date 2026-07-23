@@ -53,6 +53,50 @@ function Decode-Argv([string]$Encoded, [string[]]$Fallback) {
 }
 $EffectiveClaudeArgs = @(Decode-Argv $EncodedArgv $ClaudeArgs)
 
+function ConvertTo-WindowsCommandLineArgument([string]$Argument) {
+    if ($null -eq $Argument) { $Argument = '' }
+    if ($Argument.Length -gt 0 -and $Argument -notmatch '[\s"]') { return $Argument }
+    $builder = New-Object System.Text.StringBuilder
+    $null = $builder.Append('"')
+    $backslashes = 0
+    foreach ($character in $Argument.ToCharArray()) {
+        if ($character -eq '\') {
+            $backslashes++
+            continue
+        }
+        if ($character -eq '"') {
+            if ($backslashes -gt 0) { $null = $builder.Append(('\' * ($backslashes * 2))) }
+            $null = $builder.Append('\"')
+            $backslashes = 0
+            continue
+        }
+        if ($backslashes -gt 0) {
+            $null = $builder.Append(('\' * $backslashes))
+            $backslashes = 0
+        }
+        $null = $builder.Append($character)
+    }
+    if ($backslashes -gt 0) { $null = $builder.Append(('\' * ($backslashes * 2))) }
+    $null = $builder.Append('"')
+    return $builder.ToString()
+}
+
+function Invoke-ClaudeExact([string[]]$Arguments) {
+    $command = Get-Command claude -CommandType Application -ErrorAction Stop
+    $start = New-Object System.Diagnostics.ProcessStartInfo
+    $start.FileName = $command.Source
+    $start.UseShellExecute = $false
+    $start.Arguments = (@($Arguments | ForEach-Object { ConvertTo-WindowsCommandLineArgument ([string]$_) }) -join ' ')
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $start
+    try {
+        $null = $process.Start()
+        $process.WaitForExit()
+        return $process.ExitCode
+    }
+    finally { $process.Dispose() }
+}
+
 if ($ProbeArgvRoundTrip) {
     ConvertTo-Json -InputObject @($EffectiveClaudeArgs) -Compress
     exit 0
@@ -193,9 +237,7 @@ if ($ValidateGatewayOnly) {
 }
 
 try {
-    & claude --model opus @EffectiveClaudeArgs
-    $code = $LASTEXITCODE
-    if ($null -eq $code) { $code = 0 }
+    $code = Invoke-ClaudeExact (@('--model', 'opus') + $EffectiveClaudeArgs)
     exit $code
 }
 catch [System.Management.Automation.CommandNotFoundException] { exit 127 }
