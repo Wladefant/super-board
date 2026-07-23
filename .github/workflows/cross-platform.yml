@@ -1,10 +1,8 @@
 name: cross-platform
 
-# Smoke + syntax check for the pure-Python super-board-status renderer
-# across Ubuntu, macOS, and Windows. No `gh` auth, no GitHub Project —
-# just proves Python can parse + execute the script on each platform and
-# that the "no config" code path exits with the documented code (64)
-# everywhere.
+# Cross-platform syntax and zero-quota fixture checks for Super Board and
+# claudex-optimized. No `gh` auth, provider credentials, GitHub Project,
+# proxy daemon, or live model calls are used.
 #
 # Security note: this workflow only interpolates `matrix.*` values (which
 # are defined in this file). It does NOT consume any `github.event.*` input,
@@ -15,6 +13,12 @@ on:
   push:
     branches: [main, dev]
   pull_request:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
 
 jobs:
   smoke:
@@ -35,9 +39,9 @@ jobs:
 
       # Step 1 — proves the script is syntactically valid on this Python
       # version. Catches typing-syntax, f-string, walrus, etc. regressions
-      # without needing any runtime state.
+      # without needing runtime state or writing .pyc files.
       - name: compile super-board-status
-        run: python -m py_compile scripts/super-board-status.py
+        run: python -c "from pathlib import Path; p=Path('scripts/super-board-status.py'); compile(p.read_text(encoding='utf-8'), str(p), 'exec')"
 
       # Step 2 — exercise the "no config + no active marker + no single
       # config" path of super-board-status.py. Documented to exit 64.
@@ -60,7 +64,69 @@ jobs:
       # regression that ships when the parser's regexes drift away from
       # what the dispatcher actually emits.
       - name: status — parser fixture tests
-        run: python tests/test_status_parse.py
+        run: python -B tests/test_status_parse.py
+
+      - name: claudex — compile zero-quota helpers
+        run: python -c "from pathlib import Path; paths=[Path('skills/claudex-optimized/scripts/preflight.py'),Path('skills/claudex-optimized/scripts/probe-routing.py')]; [compile(p.read_text(encoding='utf-8'), str(p), 'exec') for p in paths]"
+
+      - name: claudex — policy and structural fixture tests
+        run: python -B tests/test_claudex_optimized.py
+
+  claudex-powershell:
+    name: claudex PowerShell fixtures
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: claudex — launcher and setup fixtures
+        shell: powershell
+        run: .\tests\test-claudex-launcher.ps1
+
+  claudex-zero-quota-integration:
+    name: claudex zero-quota integration (Claude Code 2.1.218)
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install pinned Claude Code CLI
+        shell: powershell
+        run: |
+          npm install --global @anthropic-ai/claude-code@2.1.218
+          $version = claude --version
+          if ($LASTEXITCODE -ne 0 -or $version -notmatch '^2\.1\.218\b') {
+            throw "Pinned Claude Code 2.1.218 is required; observed: $version"
+          }
+          Write-Output "Claude Code integration CLI: $version"
+
+      - name: Run 176-tool fake-gateway integration
+        shell: powershell
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -B .\skills\claudex-optimized\scripts\probe-routing.py local-tool-search --tools 176
+
+      - name: Run live-bundle syntax integration against fake gateway
+        shell: powershell
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -B .\skills\claudex-optimized\scripts\probe-routing.py local-bundle-syntax
+
+      - name: Integration completion gate
+        shell: powershell
+        run: Write-Output 'Zero-quota integrations executed; this job never reports a unit-only skip as success.'
 
   wave-plan:
     name: wave-plan (${{ matrix.os }})
