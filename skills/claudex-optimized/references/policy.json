@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "route": {
+    "envelope_tokens": 272000,
+    "warning_tokens": 180000,
+    "admission_tokens": 190000,
+    "rotation_tokens": 208000,
+    "hard_block_above_tokens": 208000,
+    "reserve_tokens": 64000,
+    "unknown_large_eager_tools": 12,
+    "unknown_block_eager_tools": 50
+  },
+  "roles": {
+    "luna": {
+      "model": "gpt-5.6-luna",
+      "alias": "haiku",
+      "purpose": "Bulk file inventory, search, extraction, simple tests, mechanical edits, and bounded research"
+    },
+    "terra": {
+      "model": "gpt-5.6-terra",
+      "alias": "sonnet",
+      "purpose": "Ordinary implementation, QA, documentation, and medium research"
+    },
+    "sol": {
+      "model": "gpt-5.6-sol",
+      "alias": "opus",
+      "purpose": "Hard implementation, research synthesis, architecture support, and quality-first reasoning"
+    }
+  },
+  "tool_profiles": {
+    "research-readonly": {
+      "allowed": ["Read", "Glob", "Grep", "WebSearch", "WebFetch"],
+      "excluded": ["Edit", "Write", "Bash", "remote writes", "deployment tools", "credential or authentication tools"]
+    },
+    "implementation-local": {
+      "allowed": ["Read", "Glob", "Grep", "Edit", "Write", "Bash"],
+      "excluded": ["unnamed MCP servers", "remote writes", "deployment tools", "credential or authentication tools"]
+    },
+    "review-readonly": {
+      "allowed": ["Read", "Glob", "Grep", "read-only Bash commands"],
+      "excluded": ["Edit", "Write", "remote mutation", "deployment tools", "credential or authentication tools"]
+    },
+    "routing-probe": {
+      "allowed": ["agent or model invocation surface", "metadata inspection", "log inspection"],
+      "excluded": ["source edits", "remote writes", "credential or authentication mutation", "daemon control"]
+    }
+  },
+  "runtime": {
+    "base_url": "http://127.0.0.1:8317",
+    "tool_search": true,
+    "effort": 1,
+    "tool_concurrency": 3,
+    "gateway_model_discovery": 1,
+    "main_model": "gpt-5.6-sol"
+  },
+  "forbidden_targets": [
+    "~/.claude/settings.json",
+    "~/.claude/settings.local.json",
+    "~/.claude/config.json",
+    "~/.claude.json",
+    "~/.config/anthropic",
+    "CLIProxyAPI config.yaml",
+    "CLIProxyAPI auth directories",
+    "provider credential or OAuth files",
+    "Antigravity login state",
+    "Gemini CLI login state",
+    "global Claude model defaults",
+    "unrelated PowerShell profile functions"
+  ],
+  "antigravity": {
+    "official_handoff_only": true,
+    "third_party_oauth_prohibited": true,
+    "never_invoke_authenticate_or_proxy": true,
+    "allowed_supported_alternatives": ["Google AI Studio API key", "Vertex AI credentials"]
+  },
+  "non_retryable_errors": ["context", "auth", "unknown_model"]
+}

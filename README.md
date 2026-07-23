@@ -32,7 +32,7 @@ To stop everything cleanly: `/super-board stop`. It posts a "stopped mid-flight"
 
 ## How it works
 
-There are four skills in this repo:
+There are five tracked skills in this repo. Four are project-installed Super Board skills; `claudex-optimized` is user-level only.
 
 | Skill | Role |
 |---|---|
@@ -40,6 +40,7 @@ There are four skills in this repo:
 | **super-build** | Builder lane agent. Reads a `Ready` card, spins up a git worktree, implements the change, opens a PR, moves the card to `QA`. |
 | **super-qa** | Tester lane agent. Reads a `QA` card, runs Playwright path specs against the worker's branch, captures evidence (screenshots, logs), comments on the PR, and either moves the card to `Review` or kicks it back to `Ready` with a rebuild label. |
 | **super-review** | Reviewer lane agent. Reads a `Review` card, runs the merge-readiness checks, posts findings, and either merges (or hands off to a human gate). |
+| **claudex-optimized** | User-level, process-local launcher policy and zero-quota diagnostics for Luna/Terra/Sol aliases, deferred tool search, context preflight, and fixture-safe setup/rollback. It is intentionally excluded from `install.sh`. |
 
 The three lane skills run as workflow agents inside `super-board-wave` by default; on the legacy `claude-p` backend the same skills run as headless `claude -p` workers. Same lifecycles either way.
 
@@ -141,7 +142,7 @@ Variants:
 
 ## Skill structure
 
-Each skill lives under `skills/<name>/` with a `SKILL.md` (the agent-facing prompt) and optional `references/` and `scripts/` directories. Drop the whole `.claude/` tree into your project and Claude Code picks them up automatically.
+Each skill lives under `skills/<name>/` with a `SKILL.md` (the agent-facing prompt) and optional `references/` and `scripts/` directories. `install.sh` copies only the four project-scoped Super Board skills. The canonical `claudex-optimized` skill is exposed at user level through a directory junction into this tracked clone; setup never auto-commits, pulls, or pushes.
 
 ## What this is NOT
 

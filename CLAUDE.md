@@ -1,11 +1,12 @@
 # super-board — agent-facing notes
 
-This repo ships four skills under `skills/`:
+This repo tracks five skills under `skills/`:
 
 - `super-board` — orchestrator (you, when invoked via `/super-board run`)
 - `super-build` — headless builder worker
 - `super-qa` — headless QA worker
 - `super-review` — headless reviewer worker
+- `claudex-optimized` — user-level, process-local Claude Code-to-Codex launcher policy and diagnostics; intentionally excluded from `install.sh`
 
 ## The cardinal rule
 
@@ -55,3 +56,5 @@ This repo is consumed by dropping its `.claude/`-shaped tree into a target proje
 ```
 
 The orchestrator skill expects `scripts/super-board-run.sh` to exist on the project's path. The release zip places it at `.claude/bin/`; users who prefer can symlink to `scripts/`.
+
+`claudex-optimized` has a different installation contract: its canonical source stays in this clone and `setup.ps1` may create only the exact user-level directory junction plus its marker-delimited `claude-codex` profile block. It must not edit Claude global settings, CLIProxyAPI config/auth, credentials, or unrelated profile text, and it never runs git publication commands.
