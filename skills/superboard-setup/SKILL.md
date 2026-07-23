@@ -64,8 +64,14 @@ sed -i "s#__PROJECT_URL__#https://github.com/users/Wladefant/projects/<N>#" .git
   - Review — awaiting human/code review
   - Done — merged and complete
   - Blocked — cannot proceed until something is unblocked
-- Enable the "Auto-add to project" workflow (repo, filter `is:issue is:open`).
-- Enable the "Item added to project" workflow → set Status to Backlog.
+- Configure ALL built-in workflows (⋯ menu → Workflows) — set EVERY one deliberately, and READ each target back after saving; a wrong target silently corrupts the board:
+  - **Auto-add to project**: enabled (repo, filter `is:issue is:open`).
+  - **Item added to project**: enabled → Status: **Backlog**.
+  - **Item closed**: enabled → Status: **Done**. ⚠ VERIFY THE TARGET COLUMN. On HeyLolo (2026-07-23) this workflow pointed at **Building** — every closed issue's card got yanked out of Done back into Building, repeatedly, for two days, and it looked like cards "vanishing"/reverting. No API exposes workflow config, so the only check is reading the UI.
+  - **Item reopened**: enabled → Status: **Building**.
+  - **Pull request merged**: enabled → Status: **Done**.
+  - **Auto-archive items**: **DISABLED**. Done cards are the system's visible history (anti-loop memory) — archiving hides them.
+- SMOKE-VERIFY the workflow wiring before finishing: close a seeded test issue → its card must land in **Done** (not any other column) within a minute; reopen it → card returns to Building. If either lands elsewhere, the workflow target is wrong — fix it now, not later.
 - GOTCHA: GitHub's visibility timer means Chrome must be FOREGROUNDED or the Authorize/Save buttons stay disabled.
 - Create the four standard custom fields (Projects UI → "+" / "New field" in the table header of any view):
   - **Effort (tokens)** — type Number. Rough per-card effort/size for burn-up and prioritization.
@@ -79,6 +85,40 @@ sed -i "s#__PROJECT_URL__#https://github.com/users/Wladefant/projects/<N>#" .git
 
 - Create backlog issues. Each issue body has `## Context`, `## Steps`, `## Acceptance criteria` — with binary Given/When/Then acceptance criteria.
 - Optionally seed history as closed + Done cards: closed issues bypass auto-add, so add them manually via `gh project item-add`, then `gh project item-edit` to set Status=Done. Discover the field id and option ids via `gh project field-list`.
+
+## Board hygiene — the reconcile sweep (keep the board ALWAYS up to date)
+
+The board is only trustworthy if card status matches issue reality. Two standing duties for every agent session working a board:
+
+1. **Move the card the moment reality changes** — pick up = Building, implementation done = QA, awaiting human = Review, closed = Done. Closing an issue without its card landing in Done is a defect (the "Item closed → Done" workflow is the primary mechanism; `gh project item-edit` is the fallback the same minute).
+2. **Run the reconcile sweep at session start and after any batch of closes.** It finds closed issues whose card is stranded outside Done (the exact corruption a mis-targeted "Item closed" workflow causes):
+
+```bash
+cat > /tmp/sweep.graphql <<'EOF'
+query($endCursor: String) {
+  user(login: "<OWNER>") {
+    projectV2(number: <N>) {
+      items(first: 100, after: $endCursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          isArchived
+          fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name } }
+          content { ... on Issue { number state repository { name } } }
+        }
+      }
+    }
+  }
+}
+EOF
+# gh api graphql --paginate REQUIRES the cursor variable to be named $endCursor.
+# Pipe the (concatenated-JSON) output through a JSONDecoder.raw_decode loop; flag
+# every node where content.state == "CLOSED" && Status != "Done" && !isArchived,
+# then fix each: gh project item-edit --project-id <PID> --id <itemId> \
+#   --field-id <StatusFieldId> --single-select-option-id <DoneOptId>
+```
+
+(On Windows/git-bash: native `python.exe` cannot open `/tmp/...` — pipe the file via stdin, don't `open()` the MSYS path.) A sweep that finds >0 stranded cards means the workflow wiring is broken — re-run the Step 2 workflow verification, don't just patch the cards.
 
 ## Rules
 
