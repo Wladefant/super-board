@@ -89,6 +89,58 @@ The labels + milestones above are the floor, not the whole spec. A **fully-equip
 
 Items 7–8 ship as repo payload at `payload/github/` in this repo and are copied into each target repo's `.github/` by `install.sh` and by `superboard-setup` Step 1 (which also `sed`s the board URL into the workflow placeholder). Items 4–6 are browser-only (`superboard-setup` Step 2). A board missing any of 1–8 is under-equipped; bring it up to standard rather than inventing a per-project variant.
 
+## Board audit — run this before trusting a board
+
+A board drifts silently. Provisioning the nine items once does not keep them true, and the
+failure mode is invisible: the board still *looks* fine. Real drift found on the ing board
+after three weeks of heavy use — **42 closed issues still sitting in `Review`/`Building`**,
+three of four custom fields provisioned but **never populated on a single card**, the project
+**missing from the Master Board entirely**, and stale single-select options naming a component
+that had since been retired.
+
+Audit with these, and fix what they surface:
+
+```bash
+# 1. Closed issues whose card never moved to Done  (expect: none)
+gh api graphql -f query='{user(login:"OWNER"){projectV2(number:N){items(first:100){nodes{
+  fieldValues(first:20){nodes{... on ProjectV2ItemFieldSingleSelectValue{name field{
+  ... on ProjectV2SingleSelectField{name}}}}} content{... on Issue{number state}}}}}}}' \
+  --jq '.data.user.projectV2.items.nodes[]|select(.content.state=="CLOSED")
+        |{n:.content.number,st:((.fieldValues.nodes[]|select(.field.name=="Status")|.name)//"none")}
+        |select(.st!="Done")|"#\(.n) \(.st)"'
+
+# 2. Custom-field coverage — a field used on 0 cards is a field that does not exist
+gh api graphql -f query='{user(login:"OWNER"){projectV2(number:N){items(first:100){nodes{
+  fieldValues(first:25){nodes{
+  ... on ProjectV2ItemFieldSingleSelectValue{field{... on ProjectV2SingleSelectField{name}}}
+  ... on ProjectV2ItemFieldNumberValue{field{... on ProjectV2Field{name}}}
+  ... on ProjectV2ItemFieldDateValue{field{... on ProjectV2Field{name}}}}}}}}}}' \
+  --jq '[.data.user.projectV2.items.nodes[].fieldValues.nodes[]|.field.name|select(.)]
+        |group_by(.)|map({f:.[0],n:length})|.[]|"\(.f)\t\(.n)"'
+
+# 3. Open issues with no milestone  (expect: none)
+gh issue list --repo OWNER/REPO --state open --json number,milestone \
+  --jq '.[]|select(.milestone==null)|"#\(.number) NO MILESTONE"'
+
+# 4. Is this project represented on the Master Board (#6) by exactly one epic card?
+gh api graphql -f query='{user(login:"OWNER"){projectV2(number:6){items(first:50){nodes{
+  content{... on DraftIssue{title} ... on Issue{title}}}}}}}' --jq '..|.title? //empty'
+
+# 5. Labels actually in use vs the taxonomy — catches drift toward GitHub's defaults
+gh issue list --repo OWNER/REPO --state all --limit 200 --json labels \
+  --jq '[.[].labels[].name]|group_by(.)|map({l:.[0],n:length})|sort_by(-.n)|.[]|"\(.n)\t\(.l)"'
+```
+
+Rules the audit enforces:
+
+- **Closed ⇒ `Done`.** A closed issue parked in `Review` makes the board lie about what is left.
+- **A field nobody fills is worse than no field** — it fakes rigour and breaks Insights (an
+  Effort-weighted burn-up over empty Effort values charts nothing).
+- **Every open issue carries a milestone**, or it is invisible to the roadmap.
+- **Single-select options are living config.** When a component is retired, its option goes too.
+- **Every project appears on the Master Board as exactly one epic card**, and granular dev
+  issues never do.
+
 ## The inbound channel: comments are how the human talks to the board
 
 The board was write-only for agents and read-only for the human. **Comments close the loop
