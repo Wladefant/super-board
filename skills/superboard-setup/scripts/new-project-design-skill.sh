@@ -103,12 +103,25 @@ echo "wrote $OUT_DIR/SKILL.md"
 
 # Junction it into ~/.claude/skills so Claude Code loads it, matching how
 # superboard-setup and claudex-optimized are wired. Junctions need no admin.
+#
+# Use PowerShell New-Item, NOT `cmd.exe /c mklink /J`. Observed 2026-07-28:
+# mklink invoked this way exited 0 and printed its success line while leaving no
+# junction behind, so `set -e` never fired and the skill silently did not load.
+# Always verify afterwards rather than trusting the exit code.
 LINK="$HOME/.claude/skills/${SLUG}-design"
 if [ -e "$LINK" ]; then
   echo "note: $LINK already exists -- left untouched"
 else
-  cmd.exe /c mklink /J "$(cygpath -w "$LINK")" "$(cygpath -w "$OUT_DIR")" >/dev/null
-  echo "junctioned $LINK -> $OUT_DIR"
+  powershell.exe -NoProfile -Command \
+    "New-Item -ItemType Junction -Path '$(cygpath -w "$LINK")' -Target '$(cygpath -w "$OUT_DIR")' | Out-Null" >/dev/null
+  if [ -f "$LINK/SKILL.md" ]; then
+    echo "junctioned $LINK -> $OUT_DIR"
+  else
+    echo "ERROR: junction $LINK was not created -- the skill will not load." >&2
+    echo "Create it manually, then re-check:" >&2
+    echo "  powershell -Command \"New-Item -ItemType Junction -Path '<link>' -Target '<target>'\"" >&2
+    exit 1
+  fi
 fi
 
 echo
