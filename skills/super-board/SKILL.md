@@ -42,6 +42,7 @@ super-board is an **autonomous trader**. The interactive Claude session that inv
 
 - Validates preconditions, then dispatches per the config's `worker_backend`: `"workflow"` (default) → stay in-session and run the wave loop in `references/run-workflow.md` (launch workflow, reconcile, repeat); `"claude-p"` (legacy, explicit opt-in only) → `nohup ./scripts/super-board-run.sh`, report PID + log path, exit. In both backends the orchestrator never does product work itself.
 - Delegates all build / QA / review work to workers — headless `claude -p` (claude-p backend) or workflow lane agents (workflow backend).
+- Performs card add/status moves itself; never delegates a card move or status check to a worker. Prefer GitHub MCP Projects v2 tools when loaded; otherwise use targeted top-level `gh api graphql` mutations (`addProjectV2ItemById`, `updateProjectV2ItemFieldValue`) and trust the returned item ID.
 - Must NOT do product work itself, must NOT patch the dispatcher mid-run, must NOT wait for workers, must NOT hold context for multi-card progress.
 
 If anything goes wrong during a run, the orchestrator captures the symptom and reports back — it does not silently expand the task into a fix. See `references/run.md` "Orchestrator delegation contract" for the full rule.
