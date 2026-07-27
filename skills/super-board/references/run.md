@@ -317,8 +317,8 @@ Sample issue comment (Tester fail rebuild — with mandatory inline screenshots 
 
 | Viewport | Screenshot |
 |---|---|
-| Desktop 1920×1080 | ![desktop](https://github.com/EricTechPro/BookKeepingApp/raw/issue-42-feature-slug/docs/super-board/runs/issue-42-qa-v1/desktop.png) |
-| Mobile 375×667    | ![mobile](https://github.com/EricTechPro/BookKeepingApp/raw/issue-42-feature-slug/docs/super-board/runs/issue-42-qa-v1/mobile.png) |
+| Desktop 1920×1080 | ![desktop](https://github.com/<OWNER>/<REPO>/raw/<BRANCH>/docs/super-board/runs/issue-<N>-qa-v<V>/desktop.png) |
+| Mobile 375×667    | ![mobile](https://github.com/<OWNER>/<REPO>/raw/<BRANCH>/docs/super-board/runs/issue-<N>-qa-v<V>/mobile.png) |
 ```
 
 Pass-state comment uses the same `### Visual evidence` block but with screenshots of the **working** UI per AC.
