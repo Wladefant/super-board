@@ -1,5 +1,14 @@
 # GStack voting for Super Build workers
 
+> **Precondition (checked 2026-07-28): neither the `gstack` CLI nor the
+> `/plan-*` advisor commands are installed in this environment.** Verify with
+> `command -v gstack` and `ls ~/.claude/commands/`. The inline fallback below
+> is therefore the *normal* path, not the exception — tag every vote
+> `inline fallback` so it is never mistaken for a real advisory poll. This file
+> already degraded gracefully; its sibling `worker-preamble.md` did not, and
+> now does. Background:
+> https://github.com/Wladefant/super-board/blob/main/docs/reference/MISSING-UPSTREAM-DEPENDENCIES.md
+
 Per the PDF guide ("Stop Using /goal"), Super Build workers should consult
 GStack (the multi-role AI advisory plan by Gary Tan / Y Combinator) on
 ambiguous fix decisions. GStack polls CEO, eng manager, security, design,

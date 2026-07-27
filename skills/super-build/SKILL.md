@@ -31,12 +31,13 @@ Reads `Ready` from the repo's feature project. Resolution order:
 
 Surface: `🎯 Reading project: EricTechPro/Fitbox Admin (#2), column "Ready"`.
 
-### QA-loop mode (orchestrator-driven — drain `Bug` column)
+### QA-loop mode (drain `Bug` column)
 
-When invoked by `super-orchestrator` as part of the QA↔Build loop, Super Build drains the `Bug` column on the **Super Ultimate QA** project rather than `Ready` on the feature project. Enabled by:
+In QA↔Build loop mode, Super Build drains the `Bug` column on the **Super Ultimate QA** project rather than `Ready` on the feature project. Enabled by:
 
-- `BUILD_LOOP_QA_MODE=1` env var, **or**
-- `super-orchestrator` exporting it via the dispatch wrapper.
+- `BUILD_LOOP_QA_MODE=1` env var — **this is the only way to enter QA-loop mode.**
+
+The mode was designed to be triggered by a `super-orchestrator` skill that would chain QA and Build automatically. **That skill does not exist in this repo and never did** (see [missing upstream dependencies](https://github.com/Wladefant/super-board/blob/main/docs/reference/MISSING-UPSTREAM-DEPENDENCIES.md)). Nothing chains the loop: a human sets `BUILD_LOOP_QA_MODE=1`, invokes `/super-build`, and decides when to run the next QA wave. If you were waiting for an orchestrator to hand you work, no one is going to.
 
 Resolution:
 
@@ -196,7 +197,7 @@ Super Build treats acceptance criteria as the completion contract. Workers must 
 - **Never modify code in the main worktree** while workers are running. Only run `gh issue` commands and merge/cleanup operations.
 - **Merge conflicts** between concurrent workers' branches → halt loop, notify Telegram with conflict files, leave `loop:in-progress` label so a human can resolve. Don't auto-resolve.
 - **Telegram cadence:** 1 message at start, 1 per dispatch wave, 1 per completion (success/fail), 1 final summary. Don't spam.
-- **Workers MUST use the right skills.** The worker preamble enforces: workers parse the `Skills:` line from the issue body if present, otherwise use defaults (`superpowers:test-driven-development`, `superpowers:verification-before-completion`). All decision points use gstack advisors (`/plan-ceo-review`, `/plan-eng-review`, `/cso`, `/plan-design-review`) with majority vote (tie → smallest blast radius). See `references/gstack-voting.md` for when to invoke vs. when to escalate, and the required `--- gstack-vote ---` commit trailer.
+- **Workers MUST use the right skills.** The worker preamble enforces: workers parse the `Skills:` line from the issue body if present, otherwise use defaults (`superpowers:test-driven-development`, `superpowers:verification-before-completion`). All decision points use gstack advisors (`/plan-ceo-review`, `/plan-eng-review`, `/cso`, `/plan-design-review`) with majority vote (tie → smallest blast radius) **where those commands are installed — they are not, here.** Workers degrade to the inline role-play vote and tag it `inline fallback` in the commit trailer; this is a judgment-quality downgrade, not a halt. See `references/gstack-voting.md` for the fallback and the escalate-to-human conditions, `references/worker-preamble.md` §1 for the precondition check, and the required `--- gstack-vote ---` commit trailer.
 
 ## Worker preamble
 

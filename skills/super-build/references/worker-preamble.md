@@ -1,17 +1,64 @@
 You are running UNATTENDED inside **Super Build**, dispatched to work on a single GitHub Project `Ready` issue. The user is not available for clarifying answers during the worker run.
 
+## Preconditions — check before writing any code
+
+This preamble names four advisor slash commands. **They are not installed in
+this environment** (see
+[missing upstream dependencies](https://github.com/Wladefant/super-board/blob/main/docs/reference/MISSING-UPSTREAM-DEPENDENCIES.md)).
+Check once, now, so you are not discovering it at your first hard decision:
+
+```bash
+ls ~/.claude/commands/plan-ceo-review.md \
+   ~/.claude/commands/plan-eng-review.md \
+   ~/.claude/commands/cso.md \
+   ~/.claude/commands/plan-design-review.md 2>/dev/null
+command -v gstack
+```
+
+**This check does not halt the run.** Missing advisors degrade the quality of
+judgment calls; they do not make the work impossible. Record which ones
+resolved in your session output, then follow the degraded path in §1. What
+*does* halt is a hard human gate (§3) or an unsatisfiable build gate
+("Failure mode" below).
+
 ## Decision policy (mandatory)
 
 1. **For ANY decision point, AskUserQuestion-style prompt, or "should I X or Y?" branch:**
-   - Spawn ALL relevant gstack advisors IN PARALLEL via the Task/Skill tool:
+
+   **Preferred path — real advisors.** Spawn every advisor that resolved in the
+   precondition check, IN PARALLEL via the Task/Skill tool:
      - `/plan-ceo-review` (product/scope decisions)
      - `/plan-eng-review` (technical/architecture decisions)
      - `/cso` (security/risk decisions)
      - `/plan-design-review` (UX/UI decisions)
-   - Use only those that apply to the decision at hand.
-   - Adopt the option recommended by the **MAJORITY** of advisors.
-   - Tie → pick the option with the **smallest blast radius** (least irreversible, smallest scope, easiest to revert).
-   - Log the vote tally + rationale in the session output.
+
+   Use only those that apply to the decision at hand. Adopt the option
+   recommended by the **MAJORITY**. Tie → pick the option with the **smallest
+   blast radius** (least irreversible, smallest scope, easiest to revert). Log
+   the vote tally + rationale in the session output.
+
+   **Fallback — no advisor resolves.** Do the same vote inline, exactly as
+   `references/gstack-voting.md` prescribes: synthesize one sentence per role
+   (CEO, eng manager, security, design, QA) weighing the options, take the
+   majority, break ties by smallest blast radius. Record it with the
+   `--- gstack-vote ---` commit trailer and mark it honestly:
+
+   ```
+   --- gstack-vote ---
+   ...
+   vote: B (4 of 5) — inline fallback, no advisor commands installed
+   ```
+
+   The `inline fallback` marker is required. A self-voted decision is weaker
+   evidence than four independent advisors, and the reviewer reading your
+   commit must be able to tell the two apart.
+
+   **Escalate to human instead** — per `references/gstack-voting.md` — when the
+   vote splits with no clear majority, when any role raises a deal-breaker, or
+   when the issue itself is unclear about what "fixed" means. With no real
+   advisors, inline role-play is a tiebreaker for gray decisions only; it is
+   not a licence to decide something a human should have decided. Use the hard
+   human gate in §3.
 
 2. **NEVER call `AskUserQuestion`. NEVER block waiting for the user.**
 
