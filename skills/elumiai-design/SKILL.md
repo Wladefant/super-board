@@ -20,7 +20,7 @@ Work lives on the board: Elumi AI Website https://github.com/users/Wladefant/pro
 |---|---|
 | Repo | https://github.com/Wladefant/elumiai-website |
 | Design tokens | `styles.css` in that repo -- read it live, do not trust the table below if it disagrees |
-| Production | https://elumi.ai (og:url declared in index.html) |
+| Production | https://elumiai.com -- verified live (200). **Not** `elumi.ai`: the repo's `index.html` declares `og:url` as `https://elumi.ai`, but that host has no DNS record and cannot be fetched. Trust the working domain, and treat the `og:url`/canonical in the site repo as a separate bug to fix there. |
 | Staging | NONE -- no staging URL in the repo. |
 | Shared toolkit | [Wladefant/design-kit](https://github.com/Wladefant/design-kit) -- prototype linter, gallery + pin-comment overlay, DTCG token schema |
 
@@ -171,7 +171,7 @@ design task:
   `/privacy/`, `/terms/`
 
 Derived from markup and CSS class names, so it is a floor, not a census.
-Confirm scope against https://elumi.ai.
+Confirm scope against https://elumiai.com.
 <!-- SURFACES:END -->
 
 ## House-ban conflicts
@@ -253,5 +253,5 @@ the migration is partial — that is the correct interim state, not a regression
   here — and light is what a first-time visitor actually sees.
 - Values come from the token table above, not hard-coded hexes.
 - Any new motion is covered by the existing `prefers-reduced-motion` block.
-- Verified against https://elumi.ai — there is no staging environment.
+- Verified against https://elumiai.com — there is no staging environment.
 - Approved by the operator before any production file is edited.
