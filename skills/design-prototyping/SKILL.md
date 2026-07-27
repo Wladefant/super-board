@@ -61,7 +61,8 @@ variant exploration, and design-to-code handoff.
 
 **Use the offline HTML fallback when** any of these is true:
 
-- the Design endpoint above is still `PENDING` and the upstream connector is not authenticated;
+- neither the self-hosted app nor the upstream connector can be authenticated (the self-hosted
+  instance is live but its sign-in is unproven — if it rejects you, that counts, and say so);
 - the connector returns `Session terminated` / `needs auth` and reconnect is not possible right now;
 - there is no network, or the operator explicitly asks for a local self-contained file;
 - the artifact must be committed into a product repo and viewable with zero dependencies
