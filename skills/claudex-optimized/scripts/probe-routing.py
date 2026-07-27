@@ -154,14 +154,23 @@ def _sanitize_summary(summary: Any) -> dict[str, Any] | None:
             versions[key] = value
         else:
             return None
+    # Persisted state is untrusted: it may have been hand-edited or corrupted. Coercing
+    # with bool() would read the string "false" as True and promote a never-successful
+    # probe to verified, so require real booleans and reject anything else. A missing key
+    # stays False, which is the safe direction.
+    flags: dict[str, bool] = {}
+    for key in ("verified", "gateway_ingress_model_routing_verified"):
+        value = summary.get(key, False)
+        if not isinstance(value, bool):
+            return None
+        flags[key] = value
     return {
         "timestamp_utc": timestamp,
         "skill_version": SKILL_VERSION,
         "probe_schema_version": PROBE_SUMMARY_SCHEMA_VERSION,
         **versions,
         "probe": probe,
-        "verified": bool(summary.get("verified")),
-        "gateway_ingress_model_routing_verified": bool(summary.get("gateway_ingress_model_routing_verified")),
+        **flags,
         "upstream_provider_verified": False,
         "routes": routes,
     }

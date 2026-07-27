@@ -488,6 +488,49 @@ def test_alias_matrix_rejects_stale_or_version_mismatched_components() -> None:
     assert probe_routing._matching_alias_summaries(wrong_schema, now=now) is None
 
 
+def test_sanitize_summary_rejects_non_boolean_verification_flags() -> None:
+    with mock.patch.object(probe_routing, "_probe_versions", return_value={"claude_code_version": "2.1.217", "cli_proxy_api_version": None}):
+        summary = probe_routing._routing_probe_summary(
+            "live-alias-luna", _verified_single_alias_result("live-alias-luna", "a1b2c3d4e5f6"),
+        )
+    assert probe_routing._sanitize_summary(json.loads(json.dumps(summary)))["verified"] is True
+    # bool("false") is True, so coercion here would promote a never-successful probe.
+    for key in ("verified", "gateway_ingress_model_routing_verified"):
+        for corrupt in ("false", "true", 0, 1, None):
+            poisoned = json.loads(json.dumps(summary))
+            poisoned[key] = corrupt
+            assert probe_routing._sanitize_summary(poisoned) is None, (key, corrupt)
+    # A missing flag is absence, not corruption: default False rather than reject.
+    for key in ("verified", "gateway_ingress_model_routing_verified"):
+        absent = json.loads(json.dumps(summary))
+        del absent[key]
+        assert probe_routing._sanitize_summary(absent)[key] is False
+
+
+def test_string_flags_in_persisted_state_cannot_report_verified_alias_routing() -> None:
+    keys = {
+        "live-alias-luna": "a1b2c3d4e5f6",
+        "live-alias-terra": "b1c2d3e4f5a6",
+        "live-alias-sol": "c1d2e3f4a5b6",
+    }
+    now = probe_routing.datetime.now(probe_routing.timezone.utc)
+    summaries = {}
+    with mock.patch.object(probe_routing, "_probe_versions", return_value={"claude_code_version": "2.1.217", "cli_proxy_api_version": None}):
+        for command in probe_routing.LIVE_ALIAS_COMMANDS:
+            summaries[command] = probe_routing._routing_probe_summary(command, _verified_single_alias_result(command, keys[command]))
+    assert probe_routing._matching_alias_summaries(json.loads(json.dumps(summaries)), now=now) is not None
+    poisoned = json.loads(json.dumps(summaries))
+    poisoned["live-alias-terra"]["verified"] = "false"
+    sanitized = {
+        command: probe_routing._sanitize_summary(summary)
+        for command, summary in poisoned.items()
+    }
+    assert sanitized["live-alias-terra"] is None
+    assert probe_routing._matching_alias_summaries(
+        {command: summary for command, summary in sanitized.items() if summary is not None}, now=now,
+    ) is None
+
+
 def test_live_capture_validation_fails_closed_for_all_review_conditions() -> None:
     good = {
         "sequence": 0, "model": "gpt-5.6-sol", "message_count": 1, "subagent_scope": False,
