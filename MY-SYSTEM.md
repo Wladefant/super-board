@@ -85,8 +85,49 @@ The labels + milestones above are the floor, not the whole spec. A **fully-equip
 7. **Structured Issue Form** — `.github/ISSUE_TEMPLATE/superboard-issue.yml`: enforced Context / Steps / Acceptance criteria + a Type dropdown + an `environment-constraint` checkbox. Blank issues stay enabled (`config.yml`) because agents create issues via `gh` CLI.
 8. **Guarded auto-add Actions workflow** — `.github/workflows/auto-add-to-project.yml`: a redundant backup to GitHub's built-in project auto-add, DISABLED BY DEFAULT behind `ENABLE_ADD_TO_PROJECT`. Primary auto-add is the built-in project workflow (item 1's board settings); this Action is belt-and-suspenders and stores no token.
 9. **`docs/README.md` master linked index** — every doc referenced as a full clickable blob URL (`https://github.com/<owner>/<repo>/blob/main/<path>`); kept current whenever a doc is added or moved.
+10. **Comment sweep** — `scripts/super-board-sweep-comments.mjs`, the board's **inbound channel** (see below). A board you can only write to is half a system.
 
 Items 7–8 ship as repo payload at `payload/github/` in this repo and are copied into each target repo's `.github/` by `install.sh` and by `superboard-setup` Step 1 (which also `sed`s the board URL into the workflow placeholder). Items 4–6 are browser-only (`superboard-setup` Step 2). A board missing any of 1–8 is under-equipped; bring it up to standard rather than inventing a per-project variant.
+
+## The inbound channel: comments are how the human talks to the board
+
+The board was write-only for agents and read-only for the human. **Comments close the loop
+in the other direction.** Leave a comment on any card at any time — a correction, a decision,
+a "no, do it this way" — and the next session picks up every one of them in a single pass:
+
+```bash
+node scripts/super-board-sweep-comments.mjs            # new since the last sweep
+node scripts/super-board-sweep-comments.mjs --mine     # only what OTHER people wrote
+node scripts/super-board-sweep-comments.mjs --all      # the whole history
+node scripts/super-board-sweep-comments.mjs --repo owner/name   # any board
+```
+
+Why it is part of the standard, not a convenience script:
+
+- **Nothing is missed.** It sweeps issue comments *and* pull-request review comments — two
+  different endpoints, and the second is the one people forget. A watermark per project means
+  a repeat run shows only what is new; `--peek` inspects without consuming.
+- **It surfaces other people.** `--mine` filters to what collaborators said. On the ing board
+  its first run immediately surfaced a teammate's open PR and two upstream defects that no
+  session had noticed.
+- **It removes the need to re-state instructions.** The human comments on the card, in context,
+  next to the acceptance criteria — instead of repeating context in chat.
+
+**Session-start discipline:** checking the board now means *board state + comment sweep*, not
+board state alone.
+
+**On reactivity — be honest about the limits.** Nothing can push into a Claude session from
+outside; GitHub cannot wake an agent. Three tiers, in increasing durability:
+
+1. **On demand** — the sweep above. Always available, zero setup.
+2. **Live, within a session** — a `Monitor` polling for new comments streams them into the
+   running session as they appear. Dies with the session.
+3. **Always-on** — a GitHub Actions workflow on `issue_comment` can react mechanically
+   (label, move the card to `Blocked`, acknowledge) with no agent involved, so a comment left
+   while nothing is running still changes board state. The agent reconciles on the next sweep.
+
+Tier 3 plus a marker convention (`@claude` in the comment, or an `agent` label) is the closest
+thing to true reactivity that does not require an always-running session.
 
 ## Production hardening (ported from ops)
 
