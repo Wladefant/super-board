@@ -237,7 +237,11 @@ if ($ValidateGatewayOnly) {
 }
 
 try {
-    $code = Invoke-ClaudeExact (@('--model', 'opus') + $EffectiveClaudeArgs)
+    # The gateway serves a 200K-token context window, but Claude Code sizes auto-compact
+    # against the declared 1M `opus[1m]` window and so never compacts in time. Cap the
+    # compact threshold for Claudex sessions only; user settings keep the 1M-appropriate
+    # value for direct (non-gateway) sessions.
+    $code = Invoke-ClaudeExact (@('--model', 'opus', '--settings', '{"autoCompactWindow":150000}') + $EffectiveClaudeArgs)
     exit $code
 }
 catch [System.Management.Automation.CommandNotFoundException] { exit 127 }
