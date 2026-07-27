@@ -1,5 +1,9 @@
 # Super Board documentation
 
+## Architecture
+
+- [Agent Native production layer for Superboard and Claudex](https://github.com/Wladefant/super-board/blob/main/docs/architecture/AGENT-NATIVE-SUPERBOARD-PRODUCTION.md) — decision, ownership boundaries, secure VPS topology, evidence contract, and constrained real-project pilot for a reusable web/SaaS coding cockpit.
+
 ## System diagnostics
 
 - [Intermittent DNS failures: prior-session distinction and confirmed MSI Center UDP leak](https://github.com/Wladefant/super-board/blob/main/docs/_session/dns-resolver-recurrence-2026-07/PRIOR-SESSION-FINDINGS.md) — separates the earlier orphaned Claude-process cleanup from the confirmed WinSock 10055 incident, records the MSI Central Server endpoint leak, and provides a narrow recurrence runbook.
