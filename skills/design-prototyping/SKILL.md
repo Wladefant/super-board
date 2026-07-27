@@ -36,8 +36,8 @@ The standalone HTML prototype remains, demoted to the **offline / no-host fallba
 
 | Field | Value |
 |---|---|
-| **Self-hosted app URL** | `PENDING` — a `*.wladefant.de` subdomain is being deployed; fill in when live |
-| **Self-hosted MCP URL** | `PENDING` — normally `<app URL>/mcp` |
+| **Self-hosted app URL** | `https://design.wladefant.de` — live, HTTP 200 (verified 2026-07-27T23:45Z). Sign-in has **not** been exercised yet; if auth blocks you, say so rather than silently falling back |
+| **Self-hosted MCP URL** | `https://design.wladefant.de/mcp` |
 | **Upstream hosted fallback** | `https://design.agent-native.com` · MCP `https://design.agent-native.com/mcp` |
 | **Local dev** | `http://127.0.0.1:8099` (`pnpm install && pnpm dev` in the design template) |
 | **MCP server name** | `agent-native-design` |
