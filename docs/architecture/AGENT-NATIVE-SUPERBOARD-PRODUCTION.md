@@ -21,7 +21,7 @@ The decisive test is reversibility: if the Agent Native service disappears, the 
 
 ## Why now
 
-Current Agent Native is substantially broader than the ING-era Clips snapshot. Upstream now includes:
+Current upstream Agent Native includes:
 
 - A shared `defineAction()` model that can expose one validated operation to UI, HTTP, CLI, MCP, A2A, jobs, and agents.
 - A reusable browser coding workspace through `@agent-native/code-agents-ui`.
@@ -29,13 +29,12 @@ Current Agent Native is substantially broader than the ING-era Clips snapshot. U
 - A visual Plan/Recap product for coding plans, diagrams, prototypes, annotated walkthroughs, review comments, and PR recaps.
 - Production deployment, authentication, tenant-scoping, encrypted credentials, SSRF protection, approvals, and durable run primitives.
 
-The old inlined ING copy is not an appropriate production base. It contains `@agent-native/core` **0.79.25**, while the reviewed upstream snapshot contains **0.123.2** and newer Code UI, Toolkit, Harness, Plan, security, and deployment contracts. The ING copy remains historical evidence only.
+Use current upstream packages pinned to explicit versions. Do not base the cross-project system on an older product-specific copy or a floating `@latest` dependency.
 
 Sources:
 
 - [Upstream framework README](https://github.com/BuilderIO/agent-native/blob/c24e1695a028c344a35eb58db6537cb6819156ff/README.md)
 - [Current upstream core package 0.123.2](https://github.com/BuilderIO/agent-native/blob/c24e1695a028c344a35eb58db6537cb6819156ff/packages/core/package.json)
-- [Historical ING copy at core 0.79.25](https://github.com/Wladefant/ing-qa-automation/blob/main/agent-native/packages/core/package.json)
 - [Agent Native Plan](https://github.com/BuilderIO/agent-native/blob/c24e1695a028c344a35eb58db6537cb6819156ff/templates/plan/README.md)
 
 ## Current capability assessment
@@ -255,7 +254,6 @@ The pilot issue belongs on the HeyLolo board, not the Superboard System board. T
 - Human QA, approval, and merge.
 - Polling/outbound relay before webhooks.
 - No Dispatch control plane.
-- No Clips dependency.
 - No automatic merge.
 - No migration of HeyLolo HQ to Agent Native internals.
 
@@ -345,6 +343,6 @@ Only after the cockpit pilot succeeds, select one SaaS product operation and imp
 
 **Build the pilot now, with the boundaries above.**
 
-Do not deploy the old ING snapshot, do not treat Clips as the coding platform, and do not replace Superboard with Dispatch. Build a small Agent Native cockpit from current pinned upstream packages, host it on Dokploy with Postgres, and connect it to one private Claudex/Claude Code runner through an authenticated, signed, expiring, replay-protected outbound relay. Execute repository code only inside an ephemeral container or VM and enforce human approval and merge through GitHub rulesets.
+Do not replace Superboard with Dispatch. Build a small Agent Native cockpit from current pinned upstream packages, host it on Dokploy with Postgres, and connect it to one private Claudex/Claude Code runner through an authenticated, signed, expiring, replay-protected outbound relay. Execute repository code only inside an ephemeral container or VM and enforce human approval and merge through GitHub rulesets.
 
 This gives the user the missing visual, interactive, agent-native layer for web/SaaS coding while preserving the Superboard system that already works.
