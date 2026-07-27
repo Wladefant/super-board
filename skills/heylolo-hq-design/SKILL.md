@@ -153,6 +153,78 @@ Derived from the repo file listing, so it is a census of *pages*, not of the
 components inside them. Confirm scope against the running site.
 <!-- SURFACES:END -->
 
+## House-ban conflicts
+
+<!-- BANS:BEGIN -- audited 2026-07-28 against main @ 6ea8eb3 -->
+What HeyLolo Business HQ **actually ships** against the five hard bans in
+[`design-prototyping`](https://github.com/Wladefant/super-board/blob/main/skills/design-prototyping/SKILL.md#house-style--the-hard-bans),
+audited at [`6ea8eb3`](https://github.com/Wladefant/heylolo-hq/commit/6ea8eb3a571b47003347b0a508239fe0f3294fd9)
+across all 96 standalone HTML pages. This is a record of reality, never edited to make the
+site look compliant. For anything you design new,
+[the ban wins](https://github.com/Wladefant/super-board/blob/main/skills/design-prototyping/SKILL.md#when-a-real-token-collides-with-a-hard-ban)
+— drop the pattern, keep the tokens above unchanged. **No named brand exceptions exist
+here**; this is an internal knowledge base and nothing below is a brand mark.
+
+Remember the no-shared-stylesheet problem above: every violation is copy-pasted into every
+page that uses it, so "remove the eyebrows" is a 49-file change, not a one-file change.
+
+**1. Left-edge accent rails — VIOLATED, systemically. The worst offender of the five.**
+**250 `border-left` declarations across 94 of 96 files** — it is the house callout idiom,
+not incidental decoration: `index.html:181` `.decision{border-left:4px solid var(--warn);
+background:var(--warn-wash)}`; `index.html:248` `.placeholder{border-left:4px solid
+var(--accent)}`; `act-now.html:71` `border-left:5px solid var(--accent)`; `tina.html:73`
+`.say{border-left:4px solid var(--accent)}`. The recurring family is
+`.decision` / `.reco` / `.risk` / `.warnbox` / `.angle` / `.say` / `.placeholder`. A
+redesigned callout needs a different emphasis device — background wash plus a weighted
+label, not a rail. Not a violation: `index.html:229` `.timeline{border-left:2px solid
+var(--grid)}` is a structural neutral rule.
+
+**2. Arrows / chevrons — VIOLATED, widely, but read the character of it.** 324 Unicode
+arrow glyphs across 55 files plus 317 `&rarr;`/`&larr;` entities across 44. **The majority
+are prose connectors inside content** — "Trial→paid", "BITKRAFT→Buddy.ai",
+`act-now.html:213` "plan the Dubai&rarr;GmbH flip" — which is writing, not UI chrome. The
+genuine UI offenders are narrower: the `→ <a class="issue" …>` link prefix repeated ~34×
+on `features.html:155-166`, and the `&larr; Companies` back-links across `companies/` and
+`investors/` (e.g. `companies/amira.html:111`). `index.html` itself has exactly one, in a
+JS data string (`:2175`). **Zero SVG arrows** — the repo contains no `<svg>` at all.
+
+**3. Gradient clichés / gradient text / generic fonts — gradients CLEAN, font VIOLATED.**
+- *Gradient washes*: **ABSENT** — zero `linear-gradient`, `radial-gradient` or
+  `conic-gradient` in any HTML file.
+- *Gradient text*: **ABSENT** — zero `background-clip:text` / `-webkit-text-fill-color`.
+- *Font*: **VIOLATED in both roles.** `index.html:67`
+  `font: 16px/1.62 system-ui, -apple-system, "Segoe UI", sans-serif;` — `system-ui` is
+  first, and this stack (whitespace variants included) appears ~99×; one variant adds
+  Roboto. **No distinctive display face exists** — headings inherit the same system stack,
+  so unlike Elumi AI there is no compliant display half. No webfont is loaded anywhere
+  (zero `fonts.googleapis.com`, zero `@font-face`). The only alternates are
+  `ui-monospace,SFMono-Regular,Menlo,monospace` (91×, for code and figures) and
+  `ui-rounded,system-ui,sans-serif` (4×).
+
+**4. Emoji — VIOLATED (147 pictographic emoji across 52 files), but concentrated.**
+`features.html:268` defines a workstream legend — `🎨 <strong>Brandy (design)</strong> ·
+📱 <strong>Wlad app (FE)</strong> · 🏛 ops/raise.` — and `:272-302` uses those three as row
+markers throughout the weekly plan (38 on that page). Heaviest by volume:
+`docs/kids-ai-apps-feature-insights-what-users-want.html` and `docs/competitor-analysis.html`.
+**`index.html` has zero true emoji** — its symbol-range hits are `&#9733;` star entities and
+⚠-class dingbats. So the dashboard itself is clean; the problem lives in `features.html`
+and `docs/`.
+
+**5. Eyebrows / overlines — VIOLATED, systemically.** `class="eyebrow"` **77×** across
+**49 files**. The rule (`index.html:136-139`, `12px / 700 / letter-spacing .14em /
+uppercase`) is copy-pasted into `tina.html:52` and ~48 other pages, and it sits directly
+above headings: `index.html:358` `<p class="eyebrow">HeyLolo · ElumiAI · Business HQ ·
+updated 5 July 2026</p>` before the `<h1>`, then `:441`, `:457`, `:464`, `:484` before
+`<h2>`s.
+
+> **`class="kicker"` here is a NAME COLLISION, not a violation.** `index.html:166`
+> `.kicker{font-size:15px;color:var(--ink-2);max-width:70ch;margin-top:0}` is a
+> **standfirst/deck paragraph placed *after* the `<h2>`** (`:459`, `:466`, `:486`), 39 uses.
+> It is not an overline and the ban's "above a heading" clause is not breached. Do not
+> "fix" it — a deck under a heading is good typography. Verify placement before touching
+> anything named `kicker` on this site.
+<!-- BANS:END -->
+
 ## Checks before handing a design to code
 
 - Both themes rendered and screenshotted, per design-prototyping. Both are real here.
