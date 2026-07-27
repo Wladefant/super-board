@@ -189,10 +189,15 @@ Results before remediation:
 Lineage inspection showed:
 
 ```text
-MSI.CentralServer.exe (PID 8360)
-└── MSI_Central_Service.exe (PID 4924)
-    └── Windows service: MSI_Center_Service
+Windows service: MSI_Center_Service
+└── MSI_Central_Service.exe (PID 4924)      <- service host process
+    └── MSI.CentralServer.exe (PID 8360)    <- owned 16,018 UDP endpoints
 ```
+
+The service is the ancestor, not the descendant. This is what makes the remediation
+below work: restarting `MSI_Center_Service` tears down the socket-owning
+`MSI.CentralServer.exe` beneath it. Reading the tree the other way round would imply a
+service could be terminated by restarting its own child, which is not what happened.
 
 Changing DNS servers was not a cure. Direct queries through both the VPN resolver and the physical-router resolver encountered local 10055 failures. The resource failure occurred on the client before DNS could operate reliably.
 
