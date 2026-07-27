@@ -1,7 +1,10 @@
 # super-board onboard — verb reference
 
-Source of truth: `docs/superpowers/specs/2026-05-21-super-board-design.md` §5
-(with §4 config schema and field notes referenced from `config-schema.json`).
+> **Source of truth: this file**, plus `config-schema.json` for the config
+> fields. It used to be spec
+> `docs/superpowers/specs/2026-05-21-super-board-design.md` §5 (and §4 for the
+> schema), which is missing from this fork. See `SKILL.md` for what that
+> changes.
 
 This file documents the interactive setup wizard. It is loaded by `SKILL.md`
 when the user invokes `super-board onboard …`.

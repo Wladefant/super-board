@@ -1,6 +1,9 @@
 # super-board run — full contract
 
-Pointer: spec `docs/superpowers/specs/2026-05-21-super-board-design.md` §7 "Verb 3 — super-board run".
+> **Source of truth: this file.** It used to defer to spec
+> `docs/superpowers/specs/2026-05-21-super-board-design.md` §7 "Verb 3 —
+> super-board run", which is missing from this fork. See `SKILL.md` for what
+> that changes.
 
 **Where it runs:** headless. Spawned as a `nohup`-backgrounded process; the current Claude session exits immediately after dispatch. The runner script (`scripts/super-board-run.sh`) is a pure shell while-loop that dispatches one `claude -p` worker per lane and never holds Claude session state. Each `claude -p` worker is its own short-lived headless context — load this file at the start of every lane.
 

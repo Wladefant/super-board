@@ -1,7 +1,8 @@
 # `super-board status` — read-only live snapshot
 
-> **Source of truth:** spec §7.5 in
-> `docs/superpowers/specs/2026-05-21-super-board-design.md`.
+> **Source of truth: this file.** It used to be spec §7.5 in
+> `docs/superpowers/specs/2026-05-21-super-board-design.md`, which is missing
+> from this fork. See `SKILL.md` for what that changes.
 >
 > This is the **only read-only verb** in the `super-board` skill. It performs
 > no GitHub mutations and is safe to invoke during a headless `super-board run`.

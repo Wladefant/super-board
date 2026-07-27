@@ -1,8 +1,11 @@
-// Source of truth: docs/superpowers/specs/2026-05-21-super-board-design.md §4
+// Source of truth: THIS FILE. It used to be
+// docs/superpowers/specs/2026-05-21-super-board-design.md §4, which is missing
+// from this fork — see skills/super-board/SKILL.md for what that changes.
 //
 // This file is a REFERENCE DOC, not parsed by the skill at runtime. It uses
-// JSON5-style `//` line comments to inline field notes from spec §4 alongside
-// the schema. Strip comments before validating an actual config file as JSON.
+// JSON5-style `//` line comments to inline field notes (originally lifted from
+// spec §4) alongside the schema. Strip comments before validating an actual
+// config file as JSON.
 //
 // One config per GitHub project this repo drives, written to
 // `.claude/super-board/configs/<slug>.json` (committed). The active

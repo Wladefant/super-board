@@ -9,7 +9,7 @@ You are the orchestrator. The source of truth is the **`Ready` column of the con
 
 **Curation contract:** the human moves cards into `Ready` when they should be worked. The loop never reads `Backlog`, `In Progress`, or `Done` cards. If `Ready` is empty, the loop reports "queue empty" and exits cleanly — no error.
 
-**This skill is single-purpose: EXECUTE curated GitHub Project `Ready` issues.** It is INDEPENDENT of `/super-qa` / **Super QA** (the autonomous bug-bash loop that hardens shipped code). They share no state unless **Super Orchestrator** explicitly sequences them. Run **Super Build** to make forward progress on the issue queue; run **Super QA** to bug-bash the existing codebase. They CAN run concurrently in different orchestrator sessions, but expect merge conflicts if both touch the same files.
+**This skill is single-purpose: EXECUTE curated GitHub Project `Ready` issues.** It is INDEPENDENT of `/super-qa` / **Super QA** (the autonomous bug-bash loop that hardens shipped code). They share no state, and **nothing sequences them** — a Super Orchestrator skill was supposed to, but it does not exist here (see [missing upstream dependencies](https://github.com/Wladefant/super-board/blob/main/docs/reference/MISSING-UPSTREAM-DEPENDENCIES.md)). A human picks: run **Super Build** to make forward progress on the issue queue; run **Super QA** to bug-bash the existing codebase. They CAN run concurrently in different sessions, but expect merge conflicts if both touch the same files.
 
 ## Role boundary
 
@@ -60,7 +60,7 @@ Before reading the board:
 - Confirm `jq`, `git`, and `claude` are available.
 - Resolve and print `BUILD_LOOP_OWNER` and `BUILD_LOOP_PROJECT`.
 - Run `git fetch origin` and identify the base branch from the current checkout; do **not** assume `main`.
-- If this run is part of Super Orchestrator, update the run manifest with preset `Build Queue`, input project, base branch, and done definition.
+- (Skip: this step updated a Super Orchestrator run manifest. There is no Super Orchestrator and no manifest — do not create one to satisfy the step.)
 
 ### 1. Read the source column
 
@@ -228,7 +228,7 @@ If the user invokes `/super-build` after a partial run:
 
 ## Companion skill
 
-`/super-qa` / **Super QA** is the autonomous bug-bash iteration loop. It is **independent of this skill** unless Super Orchestrator explicitly sequences them. Run **Super Build** for forward progress on Ready issues; run **Super QA** to harden the existing codebase by hunting bugs.
+`/super-qa` / **Super QA** is the autonomous bug-bash iteration loop. It is **independent of this skill**, and nothing sequences the two (no Super Orchestrator exists here). Run **Super Build** for forward progress on Ready issues; run **Super QA** to harden the existing codebase by hunting bugs. Note that `/super-qa` currently halts on its own preconditions — see its SKILL.md.
 
 ## super-board integration
 

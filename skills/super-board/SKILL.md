@@ -5,7 +5,28 @@ description: GitHub-Project-driven autonomous pipeline. Five verbs — onboard, 
 
 # super-board — autonomous GitHub Project pipeline
 
-Spec: `docs/superpowers/specs/2026-05-21-super-board-design.md`
+## The design spec is missing — read this before citing it
+
+This skill and its seven reference files used to cite
+`docs/superpowers/specs/2026-05-21-super-board-design.md` as their source of
+truth. **That file was never carried across from the upstream fork.** Verify:
+
+```bash
+ls docs/superpowers/specs/2026-05-21-super-board-design.md
+```
+
+Consequences, in order of how likely they are to bite you:
+
+- **`SKILL.md` and the files under `references/` are now the source of truth.**
+  Not a summary of one — the whole of it.
+- **Where two reference files disagree, there is nothing to appeal to.** A human
+  decides and writes the decision into the files. Do not reconstruct the spec's
+  intent from surrounding prose and present it as settled.
+- **Section pointers below (§4, §6, §7, §9…) are dead.** They are kept only
+  because they say which part of a lost document a behaviour came from.
+
+Background:
+[missing upstream dependencies](https://github.com/Wladefant/super-board/blob/main/docs/reference/MISSING-UPSTREAM-DEPENDENCIES.md).
 
 ## Five verbs
 
@@ -17,7 +38,8 @@ Spec: `docs/superpowers/specs/2026-05-21-super-board-design.md`
 | `super-board run` | headless | the autonomous loop; spawned via `scripts/super-board-run.sh`. Also the resume command — state lives on the board, not in process memory. Accepts a model-tier flag: `--low` (haiku/sonnet/opus ladder), default = medium (sonnet/opus/session), `--high` (opus/session — strongest models only). |
 | `super-board stop` | interactive | graceful shutdown: posts "stopped mid-flight" comments on every in-flight issue + PR, releases assignee mutexes, kills workers + dispatcher. Next `super-board run` resumes. |
 
-If invoked with no verb, ask which (see no-verb behavior in spec §8).
+If invoked with no verb, ask which. (The detail lived in spec §8, which is gone
+— asking is the whole behaviour; do not infer more.)
 
 ## Routing
 

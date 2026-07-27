@@ -1,6 +1,6 @@
 ---
 name: super-review
-description: Super Review canonical workflow for PR/code/architecture readiness across EricTechOS apps. Use when the user says "Super Review", "review this branch", "review loop", "make sure this is merge-ready", "PR review", or asks for code, architecture, security, QA evidence, or release-readiness judgment. Produces findings and routes fixes to Super Build, Super QA, or Super UX instead of silently pushing changes unless explicitly authorized.
+description: Super Review canonical workflow for PR/code/architecture readiness across EricTechOS apps. Use when the user says "Super Review", "review this branch", "review loop", "make sure this is merge-ready", "PR review", or asks for code, architecture, security, QA evidence, or release-readiness judgment. Produces findings and routes fixes to Super Build or Super QA (design work is marked unassigned — there is no Super UX skill) instead of silently pushing changes unless explicitly authorized.
 ---
 
 # Super Review — PR/code readiness reviewer
@@ -15,15 +15,32 @@ Use this skill for:
 
 - PR or branch review before merge.
 - Code, architecture, security, data-model, or migration judgment.
-- Release-readiness checks after Super Build, Super QA, or Super UX.
-- The **Review Loop** preset in Super Orchestrator.
+- Release-readiness checks after Super Build or Super QA.
 - A final pass that needs risks, blockers, and human gates summarized.
+
+## Preconditions — who you are allowed to route to
+
+Check which downstream owners actually exist before you promise one:
+
+```bash
+ls skills/ | grep -E '^super-(build|qa|review|ux|orchestrator)$'
+```
+
+**`super-ux` and `super-orchestrator` do not exist** and never shipped with this
+fork (see
+[missing upstream dependencies](https://github.com/Wladefant/super-board/blob/main/docs/reference/MISSING-UPSTREAM-DEPENDENCIES.md)).
+This does not halt a review — reviewing is useful regardless of who fixes it —
+but **naming a nonexistent owner is worse than naming none**, because a
+blocker routed to `Super UX` reads as assigned and is in fact abandoned.
 
 Do **not** use this as the primary implementation workflow. Route fixes to:
 
 - **Super Build** for feature/task implementation from GitHub Project `Ready` issues.
 - **Super QA** for functional bugs, broken behavior, failing Playwright paths, or missing QA coverage.
-- **Super UX** for visual fidelity, layout, screenshots, wireframes, or design-system drift.
+- **`unassigned — needs a human`** for visual fidelity, layout, screenshots, wireframes, or design-system drift. This was Super UX's lane; there is no automated owner for it. Say so explicitly in the report rather than leaving the finding unrouted.
+
+There is also no orchestrator to hand your report to. Whoever invoked
+`/super-review` is the router — address the report to them.
 
 ## Inputs
 
@@ -33,7 +50,7 @@ Accept any of these inputs:
 - GitHub PR number or URL;
 - commit range;
 - user-provided file list;
-- QA report, screenshots, or Super Orchestrator manifest;
+- QA report or screenshots (the Super Orchestrator manifest this also listed is not a real input — no such skill exists to produce one);
 - release goal / done definition.
 
 If the input is ambiguous, default to reviewing the current branch against its upstream/base branch. Ask only when the base branch, PR, or target scope materially changes the result.
@@ -65,7 +82,7 @@ If the input is ambiguous, default to reviewing the current branch against its u
 4. **Route fixes**
    - If a blocker is an implementation task, hand it to **Super Build**.
    - If a blocker is a functional regression, hand it to **Super QA**.
-   - If a blocker is visual/design fidelity, hand it to **Super UX**.
+   - If a blocker is visual/design fidelity, mark it `unassigned — needs a human`. There is no Super UX skill to hand it to.
    - If the user explicitly authorizes Super Review to fix, make the smallest safe patch, verify it, and clearly report that review also changed code.
 
 5. **Verify evidence**
@@ -90,7 +107,7 @@ If the input is ambiguous, default to reviewing the current branch against its u
 - Verification: <commands + pass/fail/skipped>
 
 ### Blockers
-- [ ] <finding> → route to <Super Build | Super QA | Super UX | human>
+- [ ] <finding> → route to <Super Build | Super QA | unassigned — needs a human>
 
 ### Should fix
 - [ ] <finding> → route to <workflow>
@@ -115,12 +132,15 @@ For Telegram summaries, keep it short and phone-friendly:
 
 ## Review Loop behavior
 
-When Super Orchestrator runs **Review Loop**, use this sequence:
+**This loop is manual.** It was written for a Super Orchestrator that would
+drive it automatically; that skill does not exist here, so a human performs
+step 2 and step 4. Say that in your report — do not report "handed to the
+orchestrator" and stop.
 
 1. Super Review inspects branch/PR and writes findings.
-2. Super Orchestrator routes each actionable finding to Super Build, Super QA, or Super UX.
+2. **A human** routes each actionable finding to Super Build, Super QA, or keeps it as `unassigned — needs a human`.
 3. The owning workflow fixes and verifies its scope.
-4. Super Review runs again against the updated branch.
+4. **A human** re-invokes Super Review against the updated branch.
 5. Stop only when no blocking review findings remain, or unresolved items are explicitly human-gated.
 
 Super Review should not silently push fixes during Review Loop unless the user or orchestrator explicitly grants that authority.
@@ -182,7 +202,7 @@ See `.claude/skills/super-board/references/run.md` → Reviewer. Summary of 8 su
 - Inline human review-thread replies → context only, no Block.
 
 ### `super-truth` is folded into super-review
-The standalone `super-truth` skill is removed (spec §10 item 8.9). The adversarial pattern is now built in — see next section.
+The standalone `super-truth` skill is removed. (The removal was recorded in spec §10 item 8.9 of `docs/superpowers/specs/2026-05-21-super-board-design.md`, which is itself missing from this fork — the pointer is dead, the removal stands.) The adversarial pattern is now built in — see next section.
 
 ## Adversarial mode (folded from super-truth)
 

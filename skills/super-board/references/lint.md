@@ -1,8 +1,10 @@
 # super-board lint — 7-phase interactive ticket clarifier
 
-> Reference for the `super-board lint` verb. See spec §6 of
-> `docs/superpowers/specs/2026-05-21-super-board-design.md` for the full
-> design rationale. This file is the worker-facing playbook.
+> Reference for the `super-board lint` verb, and its **source of truth**. It
+> used to defer to spec §6 of
+> `docs/superpowers/specs/2026-05-21-super-board-design.md` for design
+> rationale; that file is missing from this fork, so the rationale is gone and
+> the playbook below is all there is. See `SKILL.md` for what that changes.
 
 **Where it runs:** current Claude Code session. Interactive. Single-pass.
 **Purpose:** clarify issues so a headless worker won't hallucinate. Every
@@ -104,17 +106,39 @@ An issue is flagged if any of these apply. An issue can fail multiple criteria; 
 
 ## Phase 4 — skill routing
 
+**Precondition — run this before dispatching anything:**
+
+```bash
+ls ~/.claude/skills/qa-test-planner ~/.claude/commands/investigate.md 2>/dev/null
+```
+
+Five of the seven routes this phase originally used —  `qa-test-planner`,
+`gstack:shape`, `gstack:clarify`, `investigate`, `gsd-discuss-phase` — **are not
+installed and never shipped with this fork** (see
+[missing upstream dependencies](https://github.com/Wladefant/super-board/blob/main/docs/reference/MISSING-UPSTREAM-DEPENDENCIES.md)).
+Dispatching to them silently does nothing while the lint report claims the
+issue was routed for clarification.
+
+This does not halt `lint`. The catch-all row was always a complete mechanism on
+its own, so the table collapses onto it:
+
 | Flagged pattern | Skill dispatched |
 |---|---|
-| QA ticket, vague test surface | `qa-test-planner` |
-| Feature ticket, undefined UX | `gstack:shape` |
-| Copy / microcopy / error message AC | `gstack:clarify` |
-| Bug ticket, no repro steps | `investigate` |
-| Issue needing fundamental rethink (criteria #10, #11) | `superpowers:brainstorming` |
-| Issue with multiple interpretations (criterion #12) | `gsd-discuss-phase` |
-| Catch-all (none of above) | Inline draft (sub-agent in lint itself) |
+| Issue needing fundamental rethink (criteria #10, #11) | `superpowers:brainstorming` — installed, use it |
+| Everything else (vague test surface, undefined UX, copy AC, no repro steps, multiple interpretations) | Inline draft (sub-agent in lint itself) |
+
+For the inline-draft path, the sub-agent writes the clarification directly into
+the lint output as a proposed AC rewrite for the human to accept or reject. It
+does **not** edit the issue, and it does **not** name a specialist skill as the
+next owner. If an issue genuinely needs a specialist this fork does not have,
+say so in the report — `needs a human: no <thing> skill installed` — and leave
+the issue in its current column.
 
 One sub-agent per issue. User stays in control of pacing.
+
+If any of the five routes is installed later, restore its row here and delete
+it from the missing-dependencies doc. Do not restore a row for a skill you have
+not verified with the check above.
 
 ---
 

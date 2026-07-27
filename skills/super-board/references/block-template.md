@@ -1,6 +1,9 @@
 # Block & Skip exit template
 
-Pointer: spec `docs/superpowers/specs/2026-05-21-super-board-design.md` §4 "Cross-cutting: Block & Skip exits".
+> **Source of truth: this file.** It used to defer to spec
+> `docs/superpowers/specs/2026-05-21-super-board-design.md` §4 "Cross-cutting:
+> Block & Skip exits", which is missing from this fork — the §4 pointer is dead.
+> See `SKILL.md` for what that changes.
 
 `Blocked` and `Skipped` sit AFTER `Done` on the board — they're not workflow steps, they're exit ramps.
 
