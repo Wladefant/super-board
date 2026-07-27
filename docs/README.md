@@ -3,6 +3,7 @@
 ## Architecture
 
 - [Agent Native production layer for Superboard and Claudex](https://github.com/Wladefant/super-board/blob/main/docs/architecture/AGENT-NATIVE-SUPERBOARD-PRODUCTION.md) — decision, ownership boundaries, secure VPS topology, evidence contract, and constrained real-project pilot for a reusable web/SaaS coding cockpit.
+- [Agent Native operating guide](https://github.com/Wladefant/super-board/blob/main/docs/architecture/AGENT-NATIVE-OPERATING-GUIDE.md) — the short operator version: capability→surface routing table, what must never move into Agent Native, the standing no-code-execution constraint for the public cockpit, and the deployed app URLs.
 
 ## System diagnostics
 
