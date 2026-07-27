@@ -7,6 +7,7 @@
 
 ## Reference
 
+- [Missing upstream dependencies in the pipeline skills](https://github.com/Wladefant/super-board/blob/main/docs/reference/MISSING-UPSTREAM-DEPENDENCIES.md) — **read before running `/super-qa` or trusting a spec citation.** The scripts, design spec, slash commands and skill owners the inherited pipeline skills reference but that were never carried across the fork, why they are deliberately not being reconstructed, and how each skill now halts instead of failing midway.
 - [Superboard GraphQL IDs](https://github.com/Wladefant/super-board/blob/main/docs/reference/BOARD-IDS.md) — single lookup table of every board's project node ID, Status field ID and seven Status option IDs, plus repo node IDs, why Backlog/Ready/Building share IDs across boards, and the two mutation traps (numeric-looking option IDs, and `updateProjectV2Field` replacing the whole option set).
 
 ## Runbooks
