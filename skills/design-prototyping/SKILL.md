@@ -100,13 +100,74 @@ absolute, never any overline/kicker label above a heading (uppercase, letter-spa
 accent, or grey alike). The heading leads alone.** Do **not** flatten the design into bland
 editorial to avoid "AI slop" — keep it rich, confident, and specific to the product.
 
-**ALWAYS pair with `frontend-design` and `make-interfaces-feel-better`.** Invoke
-`frontend-design` at the start of every pass to set the bar for type, motion, and avoiding
-generic AI aesthetics. Then run `make-interfaces-feel-better` (concentric radii,
-tabular-nums, scale-0.96 press, staggered interruptible reveals, layered shadows, image
-outlines, glassy elevated surfaces, reduced-motion). The operator confirmed it "makes
-everything so much better" and specifically loves the smoothness + glassiness. Both are
-house standard, not optional.
+**ALWAYS pair with `frontend-design`.** Invoke it at the start of every pass to set the bar
+for type, motion, and avoiding generic AI aesthetics. Then apply the house polish standard
+below — every rule, every variant, both paths. It is house standard, not optional: the
+operator confirmed this polish pass "makes everything so much better", and specifically
+loves the **smoothness** and the **glassiness**. A design that skips it is not done.
+
+---
+
+## House polish standard (mandatory, both paths)
+
+Eight rules. Each is checkable — read the CSS and answer yes or no. If you cannot point at
+the line that satisfies a rule, the rule is not satisfied.
+
+1. **Concentric radii.** Any rounded thing inside another rounded thing computes its radius:
+   `inner = outer − padding`. A 16px card with 8px padding holds 8px children. Never give a
+   nested element the same radius as its parent, and never nest a sharper corner inside a
+   softer one — the gap between the curves is the tell. Prefer
+   `border-radius: calc(var(--radius) - 8px)` over a hardcoded guess so it survives a token change.
+2. **Tabular numerals on anything that changes.** Prices, balances, counters, timers,
+   percentages, countdowns, table columns of figures — `font-variant-numeric: tabular-nums`
+   (plus `font-feature-settings: "tnum" 1` where the face needs it). Digits must not shift
+   width as they tick. Static labels may stay proportional.
+3. **Press feedback on every interactive element.** `:active { transform: scale(0.96) }` for
+   buttons and controls, ~0.98 for large cards and rows, with a fast ease-out transition
+   (~120ms in, ~200ms out). Hover is not enough — the press must be felt. Give the element a
+   `transform-origin: center` and never animate `width`/`height` to fake it.
+4. **Staggered, interruptible reveals.** Lists, grids and stacked panels enter with a
+   per-item delay (40–60ms apart, cap the stagger at ~8 items so long lists don't crawl).
+   Every transition must be interruptible: animate `transform` and `opacity` only, and let a
+   new state take over mid-flight rather than queueing. If a user can click through the
+   animation and the UI locks or jumps, it is wrong. Entrances are short — 200–400ms.
+5. **Layered shadows, never a single one.** Elevation is at least two stacked shadows: a
+   tight contact shadow (~1–2px blur, low alpha) plus a wide ambient shadow (~12–32px blur,
+   lower alpha), optionally a third for high elevation. One fat `0 4px 12px rgba(0,0,0,.1)`
+   is the default-template look and is banned. In the light theme, shadows carry the
+   elevation; in the dark theme, lean on surface lightness and a hairline border instead —
+   dark shadows on dark surfaces do nothing.
+6. **Subtle outlines on images and media.** Every photo, avatar, thumbnail, chart canvas and
+   embedded media block gets a hairline inset edge —
+   `box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.08)` on dark,
+   `inset 0 0 0 1px rgb(0 0 0 / 0.06)` on light — so it reads as a placed object rather than
+   a hole punched in the surface. It applies to the light theme too, at lower alpha.
+7. **Glassy elevated surfaces.** Anything floating above the page — modals, popovers, sheets,
+   sticky headers, toasts, command palettes — uses a translucent background plus
+   `backdrop-filter: blur(16px) saturate(140%)` (ship the `-webkit-` prefix), a hairline
+   border, and a layered shadow per rule 5. The background must be genuinely translucent
+   (roughly 70–85% opaque) so content behind it moves through the blur; an opaque panel with
+   a blur declared on it is not glass. Always provide an opaque fallback under
+   `@supports not (backdrop-filter: blur(1px))`. Do not glass the base page surface — glass
+   only means elevation.
+8. **Honour `prefers-reduced-motion` fully.** Every animation and transition above sits
+   inside a motion-safe path, with a real reduced branch:
+
+   ```css
+   @media (prefers-reduced-motion: reduce) {
+     *, *::before, *::after {
+       animation-duration: 0.01ms !important;
+       animation-iteration-count: 1 !important;
+       transition-duration: 0.01ms !important;
+       scroll-behavior: auto !important;
+     }
+   }
+   ```
+
+   Reduced motion means the end state appears immediately — it never means the element fails
+   to appear. Keep opacity/colour state changes; drop movement, scale, parallax and
+   auto-playing loops. Test it: toggle the OS setting (or emulate it in DevTools) and confirm
+   every screen still reaches its final state.
 
 ---
 
@@ -304,6 +365,8 @@ when the primary path is available.
 - `references/prototype-template.md` — single-file skeleton + JS wiring for the fallback.
 - `references/self-host-gallery-comments.md` — hosting the fallback gallery + pin-comment
   overlay on Dokploy, with author/owner-role gating. Code in `assets/design-gallery/`.
-- **The project's own design skill** (e.g. `polysim-design`) — real tokens, brand, staging
-  URLs, design-system source, and any product-specific direction.
+- **The project's own design skill, if that project defines one** (naming pattern:
+  `<project>-design`) — real tokens, brand, staging URLs, design-system source, and any
+  product-specific direction. Check the available-skills list before invoking it; when the
+  project has no design skill, read the live `tailwind.config` / `globals.css` instead.
 - Routing across surfaces: [Agent Native operating guide](https://github.com/Wladefant/super-board/blob/main/docs/architecture/AGENT-NATIVE-OPERATING-GUIDE.md).

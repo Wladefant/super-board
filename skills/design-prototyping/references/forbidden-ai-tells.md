@@ -32,13 +32,17 @@
 > class and for `text-transform:uppercase` + `letter-spacing` on any small label/span above a heading —
 > there must be **ZERO**. If you think a section needs a category label, it does not. Delete it.
 
-> ## ⚠ ALWAYS PAIR WITH make-interfaces-feel-better 2026-06-28 — operator-confirmed
-> Every time this design skill is used, also apply the **`make-interfaces-feel-better`** skill. Operator:
-> *"we should definitely use this skill every time the upstream design skill is used, it does not change
-> anything but makes everything so much better"* — and he specifically praised the **smoothness and
-> glassiness** it adds. It is not optional polish; it is part of the house standard now (concentric radii,
-> tabular-nums, scale-0.96 press, staggered interruptible reveals, layered shadows, image outlines,
-> glassy elevated surfaces, reduced-motion). See SKILL.md "The loop".
+> ## ⚠ THE HOUSE POLISH STANDARD IS MANDATORY 2026-06-28 — operator-confirmed
+> Every time this design skill is used, also apply the **house polish standard** — the eight
+> checkable rules in SKILL.md → "House polish standard (mandatory, both paths)": concentric radii,
+> tabular-nums on changing figures, scale-0.96 press feedback, staggered interruptible reveals,
+> layered shadows, subtle image outlines, glassy elevated surfaces, full reduced-motion honouring.
+> Operator: *"we should definitely use this skill every time the upstream design skill is used, it
+> does not change anything but makes everything so much better"* — and he specifically praised the
+> **smoothness and glassiness** it adds. It is not optional polish; it is house standard.
+> (This content was previously delegated to a separate `make-interfaces-feel-better` skill that no
+> longer exists anywhere on this machine; it now lives inline in SKILL.md so there is no dangling
+> dependency. Do not re-add an external skill invocation here.)
 
 # FORBIDDEN — the "Opus"/AI design tells (historical list — see correction banner above)
 
