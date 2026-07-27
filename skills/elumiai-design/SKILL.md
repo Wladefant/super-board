@@ -174,6 +174,79 @@ Derived from markup and CSS class names, so it is a floor, not a census.
 Confirm scope against https://elumi.ai.
 <!-- SURFACES:END -->
 
+## House-ban conflicts
+
+<!-- BANS:BEGIN -- audited 2026-07-28 against main @ 86bd517 -->
+This site is the reason the precedence rule exists. What it **actually ships** against the
+five hard bans in
+[`design-prototyping`](https://github.com/Wladefant/super-board/blob/main/skills/design-prototyping/SKILL.md#house-style--the-hard-bans),
+audited across `index.html`, `styles.css`, `script.js` and the three legal pages at
+[`86bd517`](https://github.com/Wladefant/elumiai-website/commit/86bd51731536623c65d0dc5b393283cd9c0aadd4).
+
+This is a record of reality and is never edited to make the site look compliant. For
+anything you design new,
+[the ban wins](https://github.com/Wladefant/super-board/blob/main/skills/design-prototyping/SKILL.md#when-a-real-token-collides-with-a-hard-ban):
+drop the pattern, keep the tokens above unchanged.
+
+**1. Left-edge accent rails — CLEAN.** Zero `border-left` in any file. The one accent bar
+is *horizontal*: `styles.css:235` `.card::after{top:-1px;left:0;height:2px;width:24px;
+background:linear-gradient(90deg,var(--turq),var(--violet))}`. `.nav-links a::after` is an
+underline; `.flag-art::before` / `.invest-card::before` are radial halos.
+
+**2. Arrows / chevrons — VIOLATED (site-wide pattern, 5 sites).** Right-arrow SVGs inside
+both primary CTAs — `index.html:78` and `:169`,
+`<svg viewBox="0 0 24 24" class="ico"><path d="M5 12h14M13 6l6 6-6 6"/></svg>` — reinforced
+by the hover nudge `styles.css:107` `.btn:hover .ico{transform:translateX(4px)}`. Plus
+`&larr; Back to Elumi AI` on all three legal pages (`imprint.html:38`, `privacy.html:38`,
+`terms.html:38`). Borderline, not counted: `styles.css:242` `.i-build::after` draws a
+chevron *pair* that reads as code brackets `< >`, a card icon rather than navigation.
+
+**3. Gradient clichés / gradient text / generic fonts — VIOLATED, all three clauses.**
+- *Gradient text*: `styles.css:177-181` `.grad` — `linear-gradient(100deg,var(--turq),
+  var(--violet) 45%,var(--coral) 80%,var(--turq))` with `background-clip:text;
+  color:transparent`, applied to the word "love." in the hero `<h1>` (`index.html:69`).
+  One instance, but it is the headline.
+- *Teal→violet washes*: the `--turq #5ed3d1` → `--violet #8b7cf6` ramp drives every primary
+  button (`styles.css:109` `.btn-primary{background:linear-gradient(135deg,…)}`), the
+  aurora blobs `.b1`/`.b2`, `.timeline::before`, `.card::after` and `.invest-card`.
+- *Fonts*: Inter and Space Grotesk are loaded from Google Fonts at `index.html:26`. The
+  **display** face is `--display:'Space Grotesk','Inter',sans-serif` — distinctive, and
+  compliant; it drives `h1`, `h2`, `.card h3`, `.brand`, `.marquee-track`, `.t-step`. The
+  **body** face is `--font:'Inter',…` (`styles.css:30`), applied at `styles.css:61` —
+  **Inter is first, and that is the violation.** Replacing the body face does not touch the
+  display face.
+
+> **NAMED BRAND EXCEPTION — the orb mark only.** `favicon.svg` and `.brand-orb`
+> (`styles.css:130-135`) render the same teal→violet radial, and that mark **is** the Elumi
+> AI identity. The gradient is therefore permitted **on the logo/orb and nowhere else**.
+> It does **not** licence `.btn-primary`, `.grad` hero text, the aurora blobs or any other
+> surface — those are decorative uses of the brand ramp and a redesign drops them. This is
+> the only named exception for this product; anything else needs the operator to approve it
+> and be written in here first.
+
+**4. Emoji — CLEAN.** No pictographic emoji (U+1F300–1FAFF) in HTML, CSS or JS. Two
+Dingbats-block *typographic* glyphs exist and are recorded so nobody re-litigates them:
+`<em>✳</em>` (U+2733) as a marquee separator (`index.html:104-105`, 14×) and
+`<span class="tick" aria-hidden="true">✓</span>` (U+2713, `index.html:155-157`, 3×). Both
+are monochrome with no VS16 presentation selector — not emoji, but do not add more.
+
+**5. Eyebrows / kickers / overlines — VIOLATED, and this is the most systematic one.**
+Every major section carries one:
+- `.eyebrow` (`styles.css:165-169`, `.16em` uppercase) → `index.html:64`
+  `<p class="eyebrow reveal"><span class="dot"></span>AI product studio</p>` immediately
+  before the `<h1>`.
+- `.kicker` (`styles.css:224`, `.16em` uppercase, turquoise) → **4 uses**, each directly
+  before an `<h2>`: "The studio" (`:112`), "Flagship product" (`:146`), "How we work"
+  (`:187`), "For investors" (`:223`).
+- `.legal-eyebrow` (`styles.css:368`, `.18em` uppercase) → `<p>Legal</p>` before the `<h1>`
+  on all three legal pages.
+- The same shape unnamed: `.t-step` (`styles.css:279`, `.12em` uppercase) sits immediately
+  before each timeline `<h3>` — "Step 01"–"Step 04".
+
+Any redesigned section here ships with the heading leading alone. Expect a mixed page while
+the migration is partial — that is the correct interim state, not a regression.
+<!-- BANS:END -->
+
 ## Checks before handing a design to code
 
 - Both themes rendered and screenshotted, per design-prototyping. Both are real
