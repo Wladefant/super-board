@@ -5,16 +5,34 @@ without rediscovering them. All boards belong to the **user** `Wladefant`
 (node `U_kgDOBL7E1Q`; the legacy form `MDQ6VXNlcjc5NjExMDkz` still works but the API
 now returns a deprecation warning for it).
 
-Verified against the live API on 2026-07-28 by re-reading every board after mutation.
+Verified against the live API on 2026-07-28 by re-reading every board after mutation,
+and re-verified end-to-end on 2026-07-28 by enumerating project numbers 1–14 and
+diffing every node ID, Status field ID and all seven option IDs against this table.
 
-## Why the first three option IDs are identical everywhere
+**Completeness of the numbering.** Projects 1 (`Infinity Tracker`) and 2 (`LEO Project`)
+exist but are *not* Superboards — they still carry the stock `Todo` / `In progress` /
+`Done` field and are deliberately out of scope here. Project 14 and above do not exist.
+So the eleven boards below are every Superboard, and the gap at 1–2 is intentional
+rather than an omission.
+
+## Why the first three option IDs repeat on most boards — but not all
 
 A new ProjectV2 is born with a Status field holding exactly three options —
 `Todo` / `In Progress` / `Done` — whose IDs are always `f75ad846`, `47fc9ee4`,
-`98236657`. The house pattern renames those three in place into
-Backlog / Ready / Building and appends the remaining four, so **Backlog, Ready and
-Building share the same IDs on every board** while QA, Review, Done and Blocked are
-unique per board. Do not assume the last four; look them up here.
+`98236657`. The house pattern renames those three *in place* into
+Backlog / Ready / Building and appends the remaining four, so on every board set up
+that way Backlog, Ready and Building carry those three inherited IDs while QA,
+Review, Done and Blocked are unique per board.
+
+**This is a habit, not a guarantee — do not hardcode it.** Board 9 (Dubai Holding)
+is the live counterexample: all seven of its options have board-specific IDs,
+including Backlog `cf25cc1c`, Ready `1fcb52e5` and Building `00e99186`. That is the
+signature of a Status field whose options were destroyed and recreated instead of
+renamed in place — precisely the `updateProjectV2Field` trap documented at the bottom
+of this file. Any agent that assumes `f75ad846` means Backlog will mis-target that
+board silently.
+
+Look up all seven IDs in the table below. Assume nothing.
 
 ## Boards
 
@@ -26,6 +44,7 @@ unique per board. Do not assume the last four; look them up here.
 | [6](https://github.com/users/Wladefant/projects/6) | Master Board | `PVT_kwHOBL7E1c4Bd5SF` | `PVTSSF_lAHOBL7E1c4Bd5SFzhYXcXQ` | super-board, soundcore-work-workflow, heylolo-api, heylolo-app |
 | [7](https://github.com/users/Wladefant/projects/7) | ING QA Automation | `PVT_kwHOBL7E1c4Bd5mk` | `PVTSSF_lAHOBL7E1c4Bd5mkzhYXurc` | Wladefant/ing-qa-automation |
 | [8](https://github.com/users/Wladefant/projects/8) | Thibault Consulting | `PVT_kwHOBL7E1c4BeBUb` | `PVTSSF_lAHOBL7E1c4BeBUbzhYelYY` | (none linked) |
+| [9](https://github.com/users/Wladefant/projects/9) | Dubai Holding | `PVT_kwHOBL7E1c4BeQ9D` | `PVTSSF_lAHOBL7E1c4BeQ9DzhYseFk` | Wladefant/dubai-holding |
 | [10](https://github.com/users/Wladefant/projects/10) | PolySimulator | `PVT_kwHOBL7E1c4Beofu` | `PVTSSF_lAHOBL7E1c4BeofuzhZBOrU` | (none — cross-owner, see below) |
 | [11](https://github.com/users/Wladefant/projects/11) | Shipnovo | `PVT_kwHOBL7E1c4Beofv` | `PVTSSF_lAHOBL7E1c4BeofvzhZBOsI` | Wladefant/shipnovo |
 | [12](https://github.com/users/Wladefant/projects/12) | Elumi AI Website | `PVT_kwHOBL7E1c4Beofw` | `PVTSSF_lAHOBL7E1c4BeofwzhZBOs8` | Wladefant/elumiai-website |
@@ -44,6 +63,7 @@ Blocked as the side lane for human input.
 | 6 Master | `f75ad846` | `47fc9ee4` | `98236657` | `f65a95b3` | `33df03d0` | `4acd15c3` | `ab393a52` |
 | 7 ing | `f75ad846` | `47fc9ee4` | `98236657` | `364cbc8f` | `9bf3d984` | `d8dcc1e3` | `8035ca10` |
 | 8 Thibault | `f75ad846` | `47fc9ee4` | `98236657` | `b6d016c6` | `3bb790bf` | `7fe023a7` | `0a54e6c8` |
+| 9 Dubai Holding | `cf25cc1c` | `1fcb52e5` | `00e99186` | `f0d61446` | `53ceeef1` | `5920852a` | `574d38ae` |
 | 10 PolySimulator | `f75ad846` | `47fc9ee4` | `98236657` | `5de74f26` | `a01edbeb` | `5814971c` | `b5d6975c` |
 | 11 Shipnovo | `f75ad846` | `47fc9ee4` | `98236657` | `385a2862` | `1e892abc` | `366606f2` | `d7f17b89` |
 | 12 Elumi AI Website | `f75ad846` | `47fc9ee4` | `98236657` | `fb824b82` | `43401ea2` | `a0289e5c` | `bab47200` |
@@ -54,6 +74,7 @@ Blocked as the side lane for human input.
 | Repo | Node ID |
 |------|---------|
 | Bavariance/polysimulator | `R_kgDOQXg0Lg` |
+| Wladefant/dubai-holding | `R_kgDOSgDJIA` |
 | Wladefant/shipnovo | `R_kgDOS-Tbhw` |
 | Wladefant/elumiai-website | `R_kgDOTNUZEA` |
 | Wladefant/FNSKUWarehouseScanner | `R_kgDOQhDJ6A` |
