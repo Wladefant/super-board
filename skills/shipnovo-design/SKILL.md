@@ -161,6 +161,81 @@ Derived from the route tree, so it is a floor, not a census — components and
 modals inside these routes are not listed. Confirm scope against the running app.
 <!-- SURFACES:END -->
 
+## House-ban conflicts
+
+<!-- BANS:BEGIN -- audited 2026-07-28 against main @ 9d199a9 -->
+What Shipnovo **actually ships** against the five hard bans in
+[`design-prototyping`](https://github.com/Wladefant/super-board/blob/main/skills/design-prototyping/SKILL.md#house-style--the-hard-bans),
+audited over 103 `.tsx` files at
+[`9d199a9`](https://github.com/Wladefant/shipnovo/commit/9d199a9467049e3074e255537cbf496bb3ba4402).
+**This is by far the cleanest of the five products** — most violations are single-instance.
+It records reality and is never edited to make the product look compliant. For anything you
+design new,
+[the ban wins](https://github.com/Wladefant/super-board/blob/main/skills/design-prototyping/SKILL.md#when-a-real-token-collides-with-a-hard-ban)
+— drop the pattern, keep the tokens above unchanged. **No named brand exceptions exist**
+for this product.
+
+**1. Left-edge accent rails — VIOLATED, one instance.**
+`src/components/portal/nav-links.tsx:43` pins a brand-teal bar to the left edge of the
+active sidebar item: `{active && (<span className="bg-brand absolute inset-y-1.5 left-0
+w-0.5 rounded-full" />)}`. It is a selection-state affordance rather than decorative card
+trim, but it is literally a coloured left-edge rail — replace it with a filled/tinted row
+plus weight, not with a thicker rail. Not violations: `ui/scroll-area.tsx:43`
+(`border-l-transparent`) and `ui/sheet.tsx:65` (uncoloured panel edge).
+
+**2. Arrows / chevrons — VIOLATED (decorative group ~10 sites); the rest is structural.**
+- *Decorative*: `<ArrowRight className="size-4" />` inside marketing CTAs —
+  `src/app/(marketing)/page.tsx:93` (`14 Tage kostenlos testen`), `:175`, `:212`, and
+  `(marketing)/pricing/page.tsx:157`; the raw glyph in link copy
+  `Versandart anlegen →` (`(app)/settings/tracking/tracking-form.tsx:162`); and
+  `<ChevronRight>` as a ticket-row affordance (`(app)/admin/support/page.tsx:105`).
+  `<ArrowLeft/> Zurück…` back-links appear in six places — directional, borderline, counted.
+- *Structural (stock shadcn / real state)*: select caret and scroll buttons
+  (`ui/select.tsx:47,156,174`), submenu indicator (`ui/dropdown-menu.tsx:220`),
+  `TooltipPrimitive.Arrow`, `ArrowUp/Down/ArrowUpDown` column-sort state and
+  `ChevronLeft/Right` pagination in `features/orders/orders-table.tsx`, and `ChevronDown`
+  with `group-open:rotate-180` on `<details>` disclosures.
+- *Prose connectors*: `→` about 10× inside German copy (`Einstellungen → eBay`,
+  `Schwere Pakete → DHL`) — writing, not chrome, but still an arrow glyph in UI copy.
+
+**3. Gradient clichés / gradient text / generic fonts — font VIOLATED; gradients nearly clean.**
+- *Font*: **the clear violation.** `src/app/layout.tsx:2` imports `Inter` from
+  `next/font/google` as `--font-inter`; `src/app/globals.css:174-175` sets
+  `--font-sans: var(--font-inter), ui-sans-serif, system-ui, sans-serif` and `:186` applies
+  it. **Inter is first for body and — since no heading stack is declared anywhere — for
+  headings too.** Loading it via `next/font` doesn't change the face; Inter is named in the
+  ban. `--font-mono` (Geist Mono) is fine and stays for tabular contexts.
+- *Gradient text*: **ABSENT** — `bg-clip-text` / `text-transparent` / `background-clip`
+  return zero hits across `src`.
+- *Washes*: exactly **one** gradient in the whole repo —
+  `src/app/(marketing)/page.tsx:73` `from-brand/[0.07] … bg-gradient-to-b to-transparent`.
+  `--brand` is teal (`#0d9488` / `#2dd4bf`), so it is technically a teal wash, but at 7%
+  alpha fading to transparent it is a hairline hero tint, not the cliché. Flagged, not
+  condemned — judgement call; don't grow it.
+
+**4. Emoji — CLEAN.** A full Unicode-range scan (U+1F300–1FAFF, U+2600–27BF, U+2B00–2BFF,
+U+FE0F, regional indicators) over every `.ts`/`.tsx`/`.css` in `src` returns **one** hit,
+and it never reaches the DOM: `src/lib/env.ts:60`
+`console.error("❌ Invalid environment variables:", …)`. `drizzle/`, `scripts/` and `e2e/`
+add nine more, all CLI output. Every `toast.success/error/info` call site was checked —
+plain German sentences, no emoji.
+
+**5. Eyebrows / kickers / overlines — VIOLATED, three instances, one file.**
+`src/app/(app)/templates/page.tsx:301,312,322` — three identical blocks putting
+`<p className="text-brand text-xs font-semibold tracking-wide uppercase">Schritt 1</p>`
+directly above the card title. Classic overline; fold the step number into the title or
+render it as a numbered marker instead. No `.eyebrow`/`.kicker`/`.overline` class exists
+anywhere, and only 13 `uppercase` occurrences exist repo-wide.
+
+*Checked and judged NOT eyebrows*, so nobody re-opens them: nav **group labels** in
+`portal/nav-links.tsx:22` and `settings/settings-nav.tsx:17` (they head a list of links, not
+a heading); `features/orders/order-detail-sheet.tsx:90,109,169,237` where the uppercase
+element **is** the `<h3>`; print-sheet field labels in `features/shipping/run-packing-list.tsx`
+and `features/import/import-preview.tsx`; and the marketing hero's
+`<Badge variant="outline">` above the `<h1>` (`(marketing)/page.tsx:76-80`) — a pill, not an
+uppercase letter-spaced eyebrow.
+<!-- BANS:END -->
+
 ## Checks before handing a design to code
 
 - Both themes rendered and screenshotted, per design-prototyping. Both are real here.
