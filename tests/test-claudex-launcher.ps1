@@ -103,7 +103,7 @@ try {
     Assert-True ($launchText.Contains('Get-NetTCPConnection -LocalPort $port -State Listen')) 'approved listener PID comes from the listening socket'
     Assert-True ($launchText.Contains("`$deadline = [DateTime]::UtcNow.AddSeconds(`$HealthTimeoutSeconds)")) 'approved daemon startup has a bounded deadline'
     Assert-True ($launchText.Contains('while ((-not $ownerVerified -or $null -eq $health -or -not $health.Ready)')) 'approved daemon startup polls owner identity and inventory'
-    Assert-True ($launchText.Contains("`$code = Invoke-ClaudeExact (@('--model', 'opus') + `$EffectiveClaudeArgs)")) 'main CLI retains Opus identity through exact native argv forwarding'
+    Assert-True ($launchText.Contains("`$code = Invoke-ClaudeExact (@('--model', 'opus', '--settings', '{`"autoCompactWindow`":150000}') + `$EffectiveClaudeArgs)")) 'main CLI retains Opus identity and the gateway compact cap through exact native argv forwarding'
     Assert-True ($launchText.Contains('ConvertTo-WindowsCommandLineArgument')) 'native forwarding preserves empty and JSON arguments on Windows PowerShell 5.1'
     Write-Output '  ok  PowerShell syntax and no-touch probe ordering parse'
 
