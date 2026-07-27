@@ -10,6 +10,47 @@ description: >-
 
 # super-qa — BFS Route-Crawler that Builds the Spec Suite
 
+## Preconditions — check these FIRST, before touching anything
+
+This skill drives two dispatcher scripts. **They are not present in this
+repository** (see
+[missing upstream dependencies](https://github.com/Wladefant/super-board/blob/main/docs/reference/MISSING-UPSTREAM-DEPENDENCIES.md)).
+Everything below this section assumes they exist.
+
+Run this before any other step:
+
+```bash
+ls scripts/super-qa-dispatch.sh scripts/super-qa-file-bug.sh
+```
+
+**If either path is missing, STOP. Do not start the loop.** Report exactly:
+
+```
+super-qa HALTED — missing dependency, nothing was run.
+
+Absent: scripts/super-qa-dispatch.sh, scripts/super-qa-file-bug.sh
+These were never carried across from the upstream fork. The loop dispatches
+every iteration through the first and files every bug through the second, so
+starting would fail partway: a crawled app, evidence on disk, and findings
+that were never filed.
+
+Do not write replacements. The spec that defined their interface
+(docs/superpowers/specs/2026-05-21-super-board-design.md) is also missing, so
+a reconstruction would be a guess that looks official.
+See docs/reference/MISSING-UPSTREAM-DEPENDENCIES.md.
+```
+
+Halting here costs one message. Halting at iteration 4 costs a dirty tree, an
+inconsistent QA board, and bugs found but never recorded.
+
+**Manual substitution is not a workaround.** Running the crawl by hand and
+filing issues with `gh issue create` skips the body validation, label
+resolution, and project-column placement that `super-qa-file-bug.sh` owned —
+which produces exactly the weak tickets the rest of this skill forbids.
+
+If the scripts are present (someone recovered them from a real upstream
+source), continue normally — the rest of this file is unchanged and correct.
+
 ## Auth bootstrap — auto-discover, never ask
 
 Before iter 1, resolve a test login. **Never ask the user; discover or create.** Order:
@@ -41,7 +82,7 @@ State for the QA↔Build loop lives in a GitHub Project named **`Super Ultimate 
 | Flaky    | Only passes on retry; quarantine + investigate       |
 | Skip     | Out of scope; documented and parked                  |
 
-This board is the durable, machine-readable state for the loop. `docs/super-qa/queue.md` remains the BFS route seed and audit log, but **all actionable findings land on the project board** so `super-orchestrator` can gate on `Bug` column non-empty without parsing markdown.
+This board is the durable, machine-readable state for the loop. `docs/super-qa/queue.md` remains the BFS route seed and audit log, but **all actionable findings land on the project board** so a gate on "`Bug` column non-empty" needs no markdown parsing. The original gate-holder was a `super-orchestrator` skill that does not exist in this repo; until something real claims that role, **a human reads the `Bug` column and decides when the next QA wave starts.**
 
 ### Project resolution
 
@@ -172,7 +213,7 @@ Examples:
 - Priority: `priority:high`, `priority:medium`, or `priority:low`.
 - Area: `area:<product-area>` when known (`area:settings`, `area:imports`, `area:admin-shell`, etc.).
 - QA category when relevant: `qa:functional`, `qa:visual`, `qa:network`, `qa:console`, `qa:i18n`, `qa:a11y`, `qa:data`, `qa:testability`.
-- Suggested skill owner when helpful: `skill:super-build`, `skill:super-qa`, `skill:super-ux`, or `skill:super-review`.
+- Suggested skill owner when helpful: `skill:super-build`, `skill:super-qa`, or `skill:super-review` — these three exist. **`skill:super-ux` does not exist and must never be applied**; design-polish findings get no owner label and the body says `unassigned — needs a human`.
 
 The script adds the issue to the resolved `Super Ultimate QA` project and moves it into the `Bug` column (override with `SUPER_QA_TARGET_OPTION_NAME`) so `super-build` in QA-loop mode (or a human) can pick it up immediately. The repo's standalone feature project is not touched by this flow.
 
@@ -212,7 +253,9 @@ Every auto-filed finding must give a future headless Claude/Super Build session 
 - Spec: `<e2e/paths/...spec.ts>`
 
 ## Suggested fix path
-- Suggested owner: `super-build` | `super-ux` | `super-qa` | `super-review`
+- Suggested owner: `super-build` | `super-qa` | `super-review` | `unassigned — needs a human`
+  (Use `unassigned — needs a human` for design/UX polish. There is no `super-ux`
+  skill; naming one makes an unowned bug look owned.)
 - Suggested skills: `systematic-debugging`, `test-driven-development`, `verification-before-completion`
 - Notes for implementer: <first suspected file/function, if known>
 
@@ -285,6 +328,9 @@ Notify Telegram once: `🐛 Super QA starting — N iterations`.
 ### 2. For each iteration N (sequential)
 
 **2a. Pre-flight**
+- Re-assert the preconditions at the top of this file: `scripts/super-qa-dispatch.sh`
+  and `scripts/super-qa-file-bug.sh` both present. If not, halt with the message
+  given there — this is the last point where halting is still free.
 - `next_n = max(existing iteration-*.md numbers in docs/super-qa/iter/) + 1`. If none exist, start at 1.
 - Confirm working tree is clean (`git status` has no staged/unstaged tracked
   changes — untracked files are OK). If dirty → halt and notify.
@@ -496,7 +542,7 @@ The worker (per `references/iteration-preamble.md`) must load and follow:
 `super-qa-file-bug.sh` files bugs into the **Super Ultimate QA** project's `Bug` column. This is a separate board from `/super-build`'s standalone feature queue (`BUILD_LOOP_PROJECT`), so the two skills can run concurrently without column races:
 
 - **Standalone `/super-build`** keeps reading `Ready` from its configured feature project (e.g. `Fitbox Admin #2`). Untouched by `/super-qa`.
-- **Orchestrator-driven `/super-build` in QA-loop mode** drains the `Bug` column on `Super Ultimate QA` and moves cards to `Done`. `super-orchestrator` gates on this column being empty before kicking off the next QA wave.
+- **`/super-build` in QA-loop mode** drains the `Bug` column on `Super Ultimate QA` and moves cards to `Done`. The next QA wave is supposed to start once that column is empty — but there is **no `super-orchestrator` skill to hold that gate** (it never existed here). Someone must invoke `/super-build` in QA-loop mode and then re-invoke `/super-qa` by hand; nothing chains the two automatically.
 
 If you intentionally want a single board for both lanes, set `BUILD_LOOP_PROJECT=$SUPER_QA_PROJECT_NUMBER` and `BUILD_LOOP_QA_MODE=1`. Don't do this by accident — the column semantics differ.
 
@@ -509,7 +555,7 @@ Safety rails (enforced by the iteration preamble):
 - All written test data is prefixed `[TEST] ` so it's greppable.
 - Sentry tag `source=super-qa` on errors.
 - DB resets DISABLED (`RESET_DB=false`) — would wipe prod.
-- Email sending mocked via `RESEND_API_KEY=mock_<anything>`. **Required:** run against a staging deploy (`NODE_ENV=staging`, `EMAIL_DRY_RUN=1`) — not prod. See `docs/super-orchestrator/STAGING-ENV.md` for the 7-step playbook. If no staging URL is configured, halt with `STATUS: halt (no-staging-env)`.
+- Email sending mocked via `RESEND_API_KEY=mock_<anything>`. **Required:** run against a staging deploy (`NODE_ENV=staging`, `EMAIL_DRY_RUN=1`) — not prod. If no staging URL is configured, halt with `STATUS: halt (no-staging-env)`. (The 7-step setup playbook this used to cite, `docs/super-orchestrator/STAGING-ENV.md`, does not exist — the halt is still correct, but a human has to stand the staging env up unaided.)
 - Override the target via `BASE_URL=…` env var on the dispatcher.
 
 ## Files involved
@@ -521,7 +567,8 @@ Safety rails (enforced by the iteration preamble):
    └─ iteration-preamble.md            ← worker contract (verbatim prompt)
 
 scripts/
-└─ super-qa-dispatch.sh         ← thin dispatcher
+├─ super-qa-dispatch.sh         ← thin dispatcher   [ABSENT — never forked in]
+└─ super-qa-file-bug.sh         ← issue filer       [ABSENT — never forked in]
 
 docs/super-qa/
 ├─ README.md                           ← operator's guide
