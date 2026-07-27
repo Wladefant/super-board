@@ -12,7 +12,7 @@ Mobbin references, no production edit before approval. This file owns the
 method here.
 
 Surface routing is the [Agent Native operating guide](https://github.com/Wladefant/super-board/blob/main/docs/architecture/AGENT-NATIVE-OPERATING-GUIDE.md).
-Work lives on the board: NOT YET PROVISIONED -- PolySimulator has no Superboard. Provision it first (superboard-setup Step 1), then replace this line.
+Work lives on the board: PolySimulator https://github.com/users/Wladefant/projects/10 -- the board is owned by the Wladefant user while `Bavariance/polysimulator` is an org repo, so GitHub refuses the repo link; add issues to the board by node ID. IDs in [BOARD-IDS](https://github.com/Wladefant/super-board/blob/main/docs/reference/BOARD-IDS.md).
 
 ## Where the truth lives
 

@@ -12,7 +12,7 @@ Mobbin references, no production edit before approval. This file owns the
 method here.
 
 Surface routing is the [Agent Native operating guide](https://github.com/Wladefant/super-board/blob/main/docs/architecture/AGENT-NATIVE-OPERATING-GUIDE.md).
-Work lives on the board: NOT YET PROVISIONED -- FNSKU Warehouse Scanner has no Superboard. Provision it first (superboard-setup Step 1), then replace this line.
+Work lives on the board: FNSKU Warehouse Scanner https://github.com/users/Wladefant/projects/13 -- linked to `Wladefant/FNSKUWarehouseScanner`. IDs in [BOARD-IDS](https://github.com/Wladefant/super-board/blob/main/docs/reference/BOARD-IDS.md).
 
 ## Where the truth lives
 

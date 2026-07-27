@@ -12,7 +12,7 @@ Mobbin references, no production edit before approval. This file owns the
 method here.
 
 Surface routing is the [Agent Native operating guide](https://github.com/Wladefant/super-board/blob/main/docs/architecture/AGENT-NATIVE-OPERATING-GUIDE.md).
-Work lives on the board: NOT YET PROVISIONED -- the Elumi AI website has no Superboard. Provision it first (superboard-setup Step 1), then replace this line.
+Work lives on the board: Elumi AI Website https://github.com/users/Wladefant/projects/12 -- linked to `Wladefant/elumiai-website`. IDs in [BOARD-IDS](https://github.com/Wladefant/super-board/blob/main/docs/reference/BOARD-IDS.md).
 
 ## Where the truth lives
 
