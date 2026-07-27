@@ -5,6 +5,10 @@
 - [Agent Native production layer for Superboard and Claudex](https://github.com/Wladefant/super-board/blob/main/docs/architecture/AGENT-NATIVE-SUPERBOARD-PRODUCTION.md) — decision, ownership boundaries, secure VPS topology, evidence contract, and constrained real-project pilot for a reusable web/SaaS coding cockpit.
 - [Agent Native operating guide](https://github.com/Wladefant/super-board/blob/main/docs/architecture/AGENT-NATIVE-OPERATING-GUIDE.md) — the short operator version: capability→surface routing table, what must never move into Agent Native, the standing no-code-execution constraint for the public cockpit, and the deployed app URLs.
 
+## Reference
+
+- [Superboard GraphQL IDs](https://github.com/Wladefant/super-board/blob/main/docs/reference/BOARD-IDS.md) — single lookup table of every board's project node ID, Status field ID and seven Status option IDs, plus repo node IDs, why Backlog/Ready/Building share IDs across boards, and the two mutation traps (numeric-looking option IDs, and `updateProjectV2Field` replacing the whole option set).
+
 ## Runbooks
 
 - [Deploying a new app on Dokploy](https://github.com/Wladefant/super-board/blob/main/docs/runbooks/DOKPLOY-NEW-APP.md) — the deploy leg of the new-project bootstrap: pick the GitHub provider by repo owner (the personal-vs-Bavariance trap that fails silently on private repos), Cloudflare wildcard domains, the no-HEALTHCHECK constraint, and the build-type MCP quirk.
