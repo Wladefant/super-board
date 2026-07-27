@@ -21,6 +21,36 @@ Full guide: [Agent Native operating guide](https://github.com/Wladefant/super-bo
 - **UI/visual work** → Agent Native Design via the `design-prototyping` skill, before any production component is edited.
 - **Standing constraint:** the public Agent Native cockpit never executes repository code — `AGENT_PROD_CODE_EXECUTION=off`, no Docker socket, no runner filesystem mount, no repository checkout, no trusted shell. Repo code runs only inside the private runner's ephemeral container/VM.
 
+## New project bootstrap — the whole stack, in order
+
+Use this when a project is starting from nothing. It is the map; Steps 0–5 below
+are the detail. **The order is load-bearing** — each stage produces the thing the
+next stage needs, and doing them out of order is how you end up with a deployed
+app that no issue asked for.
+
+**Board first.**
+
+1. Identify the repo(s) — Step 0.
+2. Create the board and link every repo; install payload, config and labels — Step 1.
+3. Set Status options, workflows and custom fields in the browser; smoke-verify — Step 2.
+4. Seed the backlog: issues with Context / Steps / binary acceptance criteria, each with a milestone and a type label — Step 3.
+
+**Then repo and skills.**
+
+5. Record which Agent Native surfaces the project uses, and generate its design skill — Step 4.
+
+**Then deploy.**
+
+6. Stand the app up on Dokploy — Step 5.
+
+Two rules that decide where a task goes before you start:
+
+- **Product work → that product's own board.** Global setup and tooling —
+  Claudex, MCP servers, launchers, Superboard mechanics itself — goes to
+  https://github.com/Wladefant/super-board and https://github.com/users/Wladefant/projects/5 instead.
+- **No task exists outside an issue**, including this bootstrap. If you are
+  doing stage 5 or 6, a card is already in Building.
+
 ## Step 0 — Identify the repo(s)
 
 - Find the LIVE repo the user actually works in.
@@ -98,6 +128,81 @@ sed -i "s#__PROJECT_URL__#https://github.com/users/Wladefant/projects/<N>#" .git
 
 - Create backlog issues. Each issue body has `## Context`, `## Steps`, `## Acceptance criteria` — with binary Given/When/Then acceptance criteria.
 - Optionally seed history as closed + Done cards: closed issues bypass auto-add, so add them manually via `gh project item-add`, then `gh project item-edit` to set Status=Done. Discover the field id and option ids via `gh project field-list`.
+
+## Step 4 — Project skills (route to an Opus claude lane)
+
+The board now exists. Give the project the two things a session needs in order to
+work on it without being told: which Agent Native surfaces it uses, and where its
+design work lives.
+
+**4a — Record the surfaces.** Amend the config written in Step 1 with these
+ADDITIVE keys (leave every existing key exactly as Step 1 wrote it):
+
+```json
+{
+  "design_skill": "<slug>-design",
+  "agent_native": {
+    "design": true,
+    "plan": false,
+    "analytics": false,
+    "clips": false
+  },
+  "deploy": { "target": "dokploy", "domain": "<app>.wladefant.de" }
+}
+```
+
+Set each surface from what the project will actually use — do not switch them all
+on. Which surface is allowed to own what is not a per-project choice: it is the
+[Agent Native operating guide](https://github.com/Wladefant/super-board/blob/main/docs/architecture/AGENT-NATIVE-OPERATING-GUIDE.md),
+and this block only records which of them are in play. In particular Agent Native
+stays a projection here — the board is still the only place work exists.
+
+**4b — Generate the design skill.** The
+[`design-prototyping`](https://github.com/Wladefant/super-board/blob/main/skills/design-prototyping/SKILL.md)
+skill looks for a per-project `<slug>-design` skill holding real tokens, brand and
+staging URLs. Generate it:
+
+```bash
+PROJECT="<Project>" SLUG=<slug> REPO=<owner>/<repo> \
+BOARD=https://github.com/users/Wladefant/projects/<N> \
+PROD=https://<app>.wladefant.de STAGING=<staging url> \
+TOKENS=<path to the real token file, e.g. app/globals.css> \
+bash "$SB_SRC/skills/superboard-setup/scripts/new-project-design-skill.sh"
+```
+
+It writes `skills/<slug>-design/SKILL.md` into the super-board clone and junctions
+it into `~/.claude/skills`, matching how `superboard-setup` and `claudex-optimized`
+are wired — so it is versioned, shared, and actually loaded.
+
+Every variable is required and there are no defaults, deliberately: a design skill
+carrying a guessed token or a guessed staging URL is worse than no skill, because
+it will be trusted. The generated file has three marked blocks — TOKENS, BRAND,
+SURFACES — that are **not** filled by the script. Fill them from the repo's real
+token file and the real running UI in the same session, then commit. See
+[`polysim-design`](https://github.com/Wladefant/super-board/blob/main/skills/polysim-design/SKILL.md)
+for what filled-in looks like.
+
+If the project has no UI, skip 4b and set `"design_skill": null`.
+
+## Step 5 — Deploy path (last, never first)
+
+Full runbook: [Deploying a new app on Dokploy](https://github.com/Wladefant/super-board/blob/main/docs/runbooks/DOKPLOY-NEW-APP.md).
+Three things that will cost you a day if they are not read before you start:
+
+- **Pick the GitHub provider by repo OWNER.** Personal **Wladefant** repos MUST
+  use `Dokploy-2025-10-26-hostinger` (githubId `Y4Ma48-dyFxauwE5Jo4L0`,
+  installation 91677512). `Dokploy-Bavariance` (githubId
+  `0-mOov2-Synn7Cl3JzfbP`) is installed on the **Bavariance org** and will
+  silently appear to work on a *public* personal repo — it is only doing an
+  anonymous clone — then break the moment the repo is private, with an error that
+  looks like a credential problem and is not. **Never copy a `githubId` from an
+  existing app's config**; that is exactly how the wrong one spreads. Read
+  `gitProvider.getAll` and match the installation to the owner.
+- **`*.wladefant.de` is a Cloudflare wildcard** — a new subdomain needs no DNS step.
+- **Never add a Docker `HEALTHCHECK`** on this swarm; it caused a permanent 502
+  crash-loop. Plain `nginx:alpine` works for static sites.
+
+Deploying is not completion. The card moves on evidence in GitHub.
 
 ## Board hygiene — the reconcile sweep (keep the board ALWAYS up to date)
 

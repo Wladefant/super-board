@@ -365,8 +365,13 @@ when the primary path is available.
 - `references/prototype-template.md` — single-file skeleton + JS wiring for the fallback.
 - `references/self-host-gallery-comments.md` — hosting the fallback gallery + pin-comment
   overlay on Dokploy, with author/owner-role gating. Code in `assets/design-gallery/`.
-- **The project's own design skill, if that project defines one** (naming pattern:
-  `<project>-design`) — real tokens, brand, staging URLs, design-system source, and any
-  product-specific direction. Check the available-skills list before invoking it; when the
-  project has no design skill, read the live `tailwind.config` / `globals.css` instead.
+- **The project's own design skill** (naming pattern: `<project>-design`) — real tokens,
+  brand, staging URLs, design-system source, and any product-specific direction. Check the
+  available-skills list before invoking it. If the project has none, **generate it** rather
+  than working without one:
+  `bash ~/.claude/super-board-src/skills/superboard-setup/scripts/new-project-design-skill.sh`
+  (usage in [`superboard-setup` Step 4b](https://github.com/Wladefant/super-board/blob/main/skills/superboard-setup/SKILL.md);
+  worked example: [`polysim-design`](https://github.com/Wladefant/super-board/blob/main/skills/polysim-design/SKILL.md)).
+  Until it is generated and its TOKENS block is filled from the repo, read the live
+  `tailwind.config` / `globals.css` directly — and never design against invented values.
 - Routing across surfaces: [Agent Native operating guide](https://github.com/Wladefant/super-board/blob/main/docs/architecture/AGENT-NATIVE-OPERATING-GUIDE.md).
