@@ -9,6 +9,18 @@ Spin up Wlad's Superboard on a project: one board PER project. Route CLI work to
 
 **Canonical home: this repo** (`skills/superboard-setup/SKILL.md`). The local `~/.claude/skills/superboard-setup` is a directory junction into a clone of this repo at `~/.claude/super-board-src` - edit here, `git commit` + `git push` to share, `git pull` to update. Never edit the local junction copy as a separate fork; there is one source of truth.
 
+## Surface routing (apply automatically, do not wait to be told)
+
+Full guide: [Agent Native operating guide](https://github.com/Wladefant/super-board/blob/main/docs/architecture/AGENT-NATIVE-OPERATING-GUIDE.md).
+
+- **Work state** — issues, acceptance criteria, card status, priority → **Superboard**. Nothing else may hold a second Project status or completion ledger.
+- **Model, context, tool profile, permission mode** → **Claudex**. Never set these in Agent Native, never improvise them in-session.
+- **Reading/changing repos, running tests** → **Claude Code**.
+- **Cockpit, transcripts, plans, recaps, previews, design, analytics, clips** → **Agent Native** (projection and presentation only; rebuildable, never authoritative).
+- **Source, branches, PRs, checks, durable evidence, merge authority** → **GitHub**. Completion must be provable from GitHub alone.
+- **UI/visual work** → Agent Native Design via the `design-prototyping` skill, before any production component is edited.
+- **Standing constraint:** the public Agent Native cockpit never executes repository code — `AGENT_PROD_CODE_EXECUTION=off`, no Docker socket, no runner filesystem mount, no repository checkout, no trusted shell. Repo code runs only inside the private runner's ephemeral container/VM.
+
 ## Step 0 — Identify the repo(s)
 
 - Find the LIVE repo the user actually works in.

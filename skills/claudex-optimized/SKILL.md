@@ -16,6 +16,18 @@ This is a **user-level** skill whose canonical source is `skills/claudex-optimiz
 - Read thresholds, roles, tool profiles, and forbidden targets from `references/policy.json`.
 - Do not claim live alias routing is verified unless fresh proxy evidence proves initial and resumed Haiku/Luna, Sonnet/Terra, and Opus/Sol routes.
 
+## Surface routing (apply automatically, do not wait to be told)
+
+Full guide: [Agent Native operating guide](https://github.com/Wladefant/super-board/blob/main/docs/architecture/AGENT-NATIVE-OPERATING-GUIDE.md).
+
+Claudex is authoritative for **model/provider selection, context admission, tool profile, permission mode, and escalation** — and only those. Everything else routes elsewhere: work state and card status to **Superboard**; repository reads/edits and tests to **Claude Code**; cockpit, transcripts, plans, recaps, previews, design, analytics and clips to **Agent Native** as rebuildable projections; source, branches, PRs, checks, durable evidence and merge authority to **GitHub**.
+
+Consequences to enforce without being asked:
+
+- Agent Native may **display** a resolved Claudex role, tool profile and permission mode; an attempt to change any of them through Agent Native is rejected and leaves the Claudex receipt unchanged. Never reimplement routing policy there.
+- Global permission or model policy never moves into Agent Native, and Agent Native never holds a repository credential store.
+- The public Agent Native cockpit never executes repository code: `AGENT_PROD_CODE_EXECUTION=off`, no Docker socket, no runner filesystem mount, no repository checkout, no trusted shell. `trusted` is acceptable only inside the private runner's isolated boundary — if a task appears to need repo execution in the cockpit, the answer is a runner command, not a relaxed flag.
+
 ## Commands
 
 Route the first argument exactly:
