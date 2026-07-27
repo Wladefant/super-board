@@ -180,6 +180,85 @@ Derived from the page file listing, so it is a floor, not a census. Confirm
 scope against the running app.
 <!-- SURFACES:END -->
 
+## House-ban conflicts
+
+<!-- BANS:BEGIN -- audited 2026-07-28 against main @ 8c53661 -->
+What FNSKU Warehouse Scanner **actually ships** against the five hard bans in
+[`design-prototyping`](https://github.com/Wladefant/super-board/blob/main/skills/design-prototyping/SKILL.md#house-style--the-hard-bans).
+This is a record of reality, not a to-do list, and it is never edited to make the
+product look compliant. For anything you design new,
+[the ban wins](https://github.com/Wladefant/super-board/blob/main/skills/design-prototyping/SKILL.md#when-a-real-token-collides-with-a-hard-ban)
+— drop the pattern, keep the tokens. **No named brand exceptions exist for this
+product**; nothing here is load-bearing for brand recognition.
+
+Audited against [`8c53661`](https://github.com/Wladefant/FNSKUWarehouseScanner/commit/8c53661bbaf4dd2331543e56ca4e1044263fa9c3).
+
+**1. Accent rails — VIOLATED, narrowly (~4 sites, 2 files).**
+`client/src/pages/MatchQueue.tsx:485-491` puts a state-coloured rail on each row
+(`"border-l-2"` + `border-l-emerald-500 bg-emerald-500/[0.04]`), and `:696` adds
+`border-l-2 border-l-blue-500/20`; `client/src/components/VineReportMatcher.tsx:702-703`
+uses `border-l-2 border-l-primary` for selection. *Not* violations: the
+`border-l-4`/`border-l-3` in `BarcodeScanner.tsx:353` and `QuickScanner.tsx:205`
+pair with `border-t`/`border-b` to draw camera viewfinder corner brackets, and the
+1px neutral `::before` spines in `ActivityFeed.tsx:53` / `ItemDetailSheet.tsx:1057`
+are timeline rules, not accent rails.
+
+**2. Arrows / chevrons — VIOLATED, pervasively (93 occurrences across 35 files).**
+Three distinct groups, and only the first is a design decision:
+- *Decorative* — `Dashboard.tsx:459` `<span …>ready to list →</span>` (the canonical
+  banned pattern); `<ArrowRight className="w-4 h-4 ml-auto" />` inside both Login CTAs
+  (`Login.tsx:225,234`); hover-sliding `<ChevronRight … group-hover:translate-x-0.5 />`
+  in `LocationManager.tsx:548` and `WarehouseManager.tsx:513`; `→` as a connector in
+  copy and toast bodies (`SettingsPanel.tsx:159`, `PhotoScanTab.tsx:425,435,468`,
+  `Scanner.tsx:382,794`, `Pipeline.tsx:153`, and others).
+- *Navigational* — `ArrowLeft` back-buttons on ~16 pages. Arrow glyphs, but they carry
+  a real affordance; replace deliberately, not reflexively.
+- *Structural* — carets shipped inside stock shadcn primitives under
+  `client/src/components/ui/` (`select.tsx:29,47,64`, `accordion.tsx:35`,
+  `pagination.tsx:72,89`, `dropdown-menu.tsx:35`, breadcrumb/calendar/carousel/
+  context-menu/menubar/navigation-menu). Untouched vendor code.
+- *Functional* — keyboard legends `↑↓←→↵` (`hooks/use-keyboard-shortcuts.ts:87-93`,
+  `GlobalSearch.tsx:170-171`) and sort indicators (`ItemizedReport.tsx:222`). These
+  render key state; they are not ornament.
+
+**3. Gradient clichés / gradient text / generic fonts — VIOLATED (washes + font);
+gradient text is clean.**
+- *Washes*: contained entirely to `client/src/pages/Login.tsx` — `:140`
+  `bg-gradient-to-br from-slate-50 via-blue-50 to-indigo-100 dark:…dark:to-indigo-950`
+  and `:143` `from-primary/90 to-indigo-600`, squarely the indigo→blue cliché, with the
+  companion blurred white orbs at `:145-146` (`w-72 h-72 bg-white rounded-full blur-3xl`).
+  Other gradients in the app are utilitarian (camera scrim, muted image backdrop, a 3px
+  shelf edge) and are not clichés.
+- *Gradient text*: **ABSENT** — `bg-clip-text` and `text-transparent` return zero hits
+  across `client/`.
+- *Font*: `--font-sans: Arial, Helvetica, sans-serif` at `client/src/index.css:47`,
+  mapped through `tailwind.config.ts` and inherited by headings — there is no heading
+  override anywhere in `client/src`, no `@font-face`, and no webfont link in
+  `client/index.html`. **Arial is named explicitly in the ban.** The honest reading: no
+  typographic choice was ever made here, which is a different failure from picking Inter
+  on purpose — but the outcome is the same and any redesign selects a real face.
+
+**4. Emoji — VIOLATED, systemically (36 lines across 10 client files, plus the server).**
+Emoji are baked into rendered data, not just decoration: `Analytics.tsx:405-409` carries
+`emoji: "✅"` (and `🔍 💲 🔵 💰`) inside a constant array; `Dashboard.tsx:509-554` renders
+six quick-action tiles as `<span className="text-lg">⚡</span>` etc.; `ItemDetailSheet.tsx:522-596`
+passes `icon="📦"`, `icon="🛒"`, `icon="🏷️"`…; `ShipmentDetailPanel.tsx:41-45` defines a
+`STATUS_EMOJI` map and `:315` ships the **button label** `✅ Mark Delivered`. Critically,
+`server/dhlService.ts:21-26` (`DHL_STATUS_MAP`) sends emoji from the API, rendered at
+`Orders.tsx:176` — **so clearing this ban is not a client-only change.** Say that in any
+handoff that proposes removing them.
+
+**5. Eyebrows / kickers / overlines — CLEAN.** No `eyebrow`/`kicker`/`overline` class
+exists (zero hits, `.tsx` and `.css`), and all 21 `uppercase` + `tracking-*` combinations
+were inspected in context: none sits above an `h1`/`h2`/`h3` or a `CardTitle`. The pattern
+is used *as* the heading (`BusinessReport.tsx:78,91,102,113` — `<h2 class="… uppercase
+tracking-wider">Profit & Loss</h2>`) or as a section/table/address label. One judgment
+call: `Sellers.tsx:544-568` places a `text-[10px] uppercase tracking-wider` micro-label
+directly above a `text-2xl font-bold` figure inside a stat card — eyebrow *shape*, but it
+labels a metric rather than heading a section. Do not reproduce that shape on new stat
+tiles; put the label under the figure or fold it into the value.
+<!-- BANS:END -->
+
 ## Checks before handing a design to code
 
 - Both themes rendered and screenshotted, per design-prototyping. Both are real here.
