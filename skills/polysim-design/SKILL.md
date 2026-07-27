@@ -125,6 +125,82 @@ This list is derived from CSS, so it is a floor, not a census — surfaces with 
 bespoke CSS will not appear here. Confirm scope against the running app.
 <!-- SURFACES:END -->
 
+## House-ban conflicts
+
+<!-- BANS:BEGIN -- audited 2026-07-28 against main @ 3c82c13 -->
+What PolySimulator **actually ships** against the five hard bans in
+[`design-prototyping`](https://github.com/Wladefant/super-board/blob/main/skills/design-prototyping/SKILL.md#house-style--the-hard-bans),
+audited over 274 `.tsx` files at
+[`3c82c13`](https://github.com/Bavariance/polysimulator/commit/3c82c13e21bf1eb210506c7b82eebaf219b55faf).
+This records reality and is never edited to make the product look compliant. For anything
+you design new,
+[the ban wins](https://github.com/Wladefant/super-board/blob/main/skills/design-prototyping/SKILL.md#when-a-real-token-collides-with-a-hard-ban)
+— drop the pattern, keep the tokens above unchanged. **No named brand exceptions exist**
+for this product.
+
+**1. Left-edge accent rails — VIOLATED, pervasively and by design.** There is a module
+whose only job is emitting them: `frontend/lib/categoryStripe.ts:5-15` maps categories to
+`border-l-orange-500/60`, `border-l-blue-500/60` etc., consumed by
+`frontend/components/MarketCard.tsx:155` (`border border-l-2 … ${getCategoryStripe(...)}`)
+on every card in the market grid, and by `GroupedMarketCard.tsx:354`. Also
+`components/market/PositionsPanel.tsx:509` and `app/admin/b2b-api/page.tsx:115`
+(`border-l-2 border-violet-300/40`). **Category identity currently rides on the rail** —
+a redesign has to re-encode that signal (a category chip, or the label's own colour) rather
+than just deleting the border. `globals.css` itself is clean: zero `::before`, zero
+`border-left` in 609 lines.
+
+**2. Arrows / chevrons — VIOLATED, pervasively.** 269 lines across 87 files contain an
+arrow glyph; decorative CTA arrows dominate: `app/about/page.tsx:118`
+`View all paper trading FAQs →`, `app/backtesting/page.tsx:300` `Start Paper Trading Free →`
+and `:544` `buttonLabel="Notify Me at Launch →"`, plus `Compare plans →`,
+`Full roadmap →`, `Open preview →`, `Full reference ↗`, and an animated one at
+`app/integrations/telegram/TelegramClient.tsx:663`
+(`<span className="transition group-hover:translate-x-0.5">→</span>`). Icons are
+`react-icons/fi`: decorative uses include `FiArrowUpRight` on a guide link and
+`FiChevronRight` as a row affordance; structural uses (pagination `FiChevronLeft/Right`,
+`FiArrowUp/Down` sort state, `FiChevronDown` with `group-open:rotate-180` on `<details>`)
+are a separate class of thing. Many `→` hits are inside code comments and don't count.
+
+**3. Gradient clichés / gradient text / generic fonts — gradients VIOLATED; font CLEAN.**
+- *Gradient text*: four files — `components/CompactHero.tsx:52`
+  (`text-transparent bg-clip-text bg-gradient-to-r from-accent-green to-emerald-400` on
+  "Risk-Free"), `app/markets/[id]/radar/page.tsx:303` (`from-purple-400 to-cyan-400` on
+  "AI ANALYSIS"), `app/leaderboard/S1HallOfFame.tsx:427`,
+  `app/topup/success/TopupSuccessClient.tsx:343`.
+- *Washes*: 99 `bg-gradient-to-*` lines, squarely in the banned hue family —
+  `app/page.tsx:162` `from-purple-500/20 to-pink-500/20`; `app/backtesting/page.tsx:531`
+  `from-purple-500/20 via-accent-blue/10 to-accent-green/20`;
+  `app/profile/[username]/page.tsx:380` `from-indigo-500/10 …`;
+  `app/markets/[id]/radar/page.tsx:300,330` `from-purple-500 to-cyan-500`.
+- *Font*: **not a violation.** `--font-sans` is never defined in the repo, so the real first
+  face is **DM Sans** for body *and* headings (`globals.css:6`, `tailwind.config.ts:39`),
+  loaded by a raw Google Fonts `<link>` at `app/layout.tsx:166` rather than `next/font` —
+  deliberate, per the comment at `:22-34` (the build host could not reach
+  `fonts.gstatic.com`). **Stale artifact to be aware of:** `app/layout.tsx:221-226`
+  preloads an **Inter** `.woff2`, but Inter appears in no `font-family` anywhere — a dead
+  preload, not a type choice. Don't read it as an Inter dependency, and don't "restore" it.
+
+**4. Emoji — VIOLATED, pervasively.** 375 lines across 69 files. Rendered instances include
+`app/leaderboard/page.tsx:59` `<h1>🏆 Leaderboard</h1>`, rank medals `👑 🥈 🥉` in
+`LeaderboardClient.tsx:146-148` (plus `🏁` and empty-state `🔍`), six emoji-prefixed FAQ
+section headers (`app/faq/page.tsx:171-243`), a constants array literally keyed `emoji:`
+rendered into feature cards (`app/backtesting/page.tsx:220-240,393-403`), and
+`app/admin/page.tsx:842` `Hot 🔥`. Note a chunk of the raw count is *comments in the
+OG-image routes explaining that emoji were removed* because they tofu'd — those routes now
+use SVG marks and are not violations.
+
+**5. Eyebrows / kickers / overlines — VIOLATED, pervasively, and one is a named component.**
+`app/api-keys/components/primitives.tsx:130-149` ships a `kicker` prop with the comment
+"Section heading with an eyebrow kicker", rendering
+`font-mono text-[10px] uppercase tracking-[0.18em]` directly above the `<h2>`. The same
+shape is hand-rolled ~20 times above an `h1/h2/h3` — `app/api-trading/page.tsx:567→570`
+(repeated at `:657,:681,:737,:881`), `app/company/page.tsx:168→171`,
+`app/admin/b2b-api/page.tsx:255`, `app/admin/page.tsx:705`, `app/blog/[slug]/page.tsx:90`,
+`app/roadmap/page.tsx:279`, and all five `app/integrations/*Client.tsx`. `eyebrow` is also
+a first-class prop of the OG-image brand lockup (`app/api/og/_shared/layout.tsx:51-87`).
+Removing the pattern means changing `primitives.tsx` and the OG lockup, not just page copy.
+<!-- BANS:END -->
+
 ## Checks before handing a design to code
 
 - Both themes rendered and screenshotted, per design-prototyping.
