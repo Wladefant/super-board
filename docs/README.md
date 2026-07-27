@@ -1,5 +1,9 @@
 # Super Board documentation
 
+## Start here
+
+- [START HERE — what actually works right now](https://github.com/Wladefant/super-board/blob/main/docs/START-HERE.md) — **the front door.** What is live and verified by a real HTTP response, what is deployed but unproven, what is still pending, and the five open decisions with their tradeoffs — plus the shortest path to starting work on any product. Status is timestamped; re-check commands included.
+
 ## Architecture
 
 - [Agent Native production layer for Superboard and Claudex](https://github.com/Wladefant/super-board/blob/main/docs/architecture/AGENT-NATIVE-SUPERBOARD-PRODUCTION.md) — decision, ownership boundaries, secure VPS topology, evidence contract, and constrained real-project pilot for a reusable web/SaaS coding cockpit.
