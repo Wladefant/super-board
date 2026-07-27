@@ -81,7 +81,9 @@ Say which path you took and why. Do not silently downgrade.
    `filter: invert`**, not a token flip.
 3. **Ground in the REAL tokens.** Use the app's actual colors, fonts, radii, shadows — see
    the project's own design skill for the verified token reference. Confirm against the
-   live `tailwind.config` / `globals.css` rather than trusting memory.
+   live `tailwind.config` / `globals.css` rather than trusting memory. When what actually
+   ships breaks a hard ban, do not improvise —
+   [one precedence rule settles it](#when-a-real-token-collides-with-a-hard-ban).
 4. **Fully interactive.** Buttons toggle, inputs recompute, the primary action opens a
    confirm → executing → success flow where that matches reality. A static mock is not enough.
 5. **Look at it before calling it done.** Render/screenshot the key states and verify they
@@ -105,6 +107,49 @@ for type, motion, and avoiding generic AI aesthetics. Then apply the house polis
 below — every rule, every variant, both paths. It is house standard, not optional: the
 operator confirmed this polish pass "makes everything so much better", and specifically
 loves the **smoothness** and the **glassiness**. A design that skips it is not done.
+
+### When a real token collides with a hard ban
+
+Real products ship banned patterns. Non-negotiable 3 says ground in what actually ships;
+the bans say never do those things. On a live product both instructions fire at once —
+[`elumiai-website`](https://github.com/Wladefant/elumiai-website/blob/main/index.html)
+ships `.eyebrow`/`.kicker` overlines above headings, a gradient-clipped hero word, `Inter`
+as the body face and arrow SVGs inside buttons, and
+[`elumiai-design`](https://github.com/Wladefant/super-board/blob/main/skills/elumiai-design/SKILL.md)
+documents every bit of that faithfully. **One rule settles it, always:**
+
+> **The ban wins for everything you design new.** The shipped violation is documented,
+> never silently replicated. A banned pattern is carried forward only where it *is* the
+> brand mark — and that exception must be named explicitly in the product's own design
+> skill *before* it is used, never assumed in the moment.
+
+In practice:
+
+1. **Redesigning a surface is the moment to drop the banned pattern, not to preserve it.**
+   "Matching the existing style" is not a licence to ship another eyebrow. If the old hero
+   put a kicker above the `h1`, the new hero's heading leads alone.
+2. **Tokens are not patterns.** The bans target *patterns* — an overline label, an arrow
+   glyph, a gradient fill on text, an accent rail. The product's real colours, radii,
+   shadows, spacing and type scale stay exactly as documented. Dropping a banned gradient
+   never means changing the brand colour that gradient was made of.
+3. **The named-exception escape hatch, and its limits.** Where removing the pattern would
+   destroy brand recognition — a logo, a wordmark, a signature gradient that *is* the mark
+   — that specific element is listed as an allowed exception in the product's design skill,
+   scoped to that element only. A gradient logo does not licence gradient headings. **If the
+   exception is not written down, it does not exist:** propose it to the operator and write
+   it into the product skill before relying on it.
+4. **Never edit a product's design skill to make the product look compliant.** Those files
+   report reality. Deleting a documented violation is falsifying the record; the fix is to
+   change the product, in a real approved redesign, and then update the record.
+5. **Mixed surfaces are the expected interim state.** A redesigned section with no eyebrows
+   next to an untouched section that still has them is correct, not a regression.
+6. **Say it in the handoff:** which banned patterns the old surface carried, which you
+   dropped, and any named exception you honoured.
+
+**Before designing, read the product skill's `House-ban conflicts` section** — every
+generated `<project>-design` skill carries one, listing exactly which bans that product
+violates today, or stating explicitly that it violates none. An absent section means the
+audit has not been done, not that the product is clean.
 
 ---
 
@@ -361,13 +406,15 @@ when the primary path is available.
 
 ## References
 
-- `references/forbidden-ai-tells.md` — the hard bans (READ FIRST, both paths).
+- `references/forbidden-ai-tells.md` — the hard bans (READ FIRST, both paths), opening with
+  the precedence banner for when the real product already violates one.
 - `references/prototype-template.md` — single-file skeleton + JS wiring for the fallback.
 - `references/self-host-gallery-comments.md` — hosting the fallback gallery + pin-comment
   overlay on Dokploy, with author/owner-role gating. Code in `assets/design-gallery/`.
 - **The project's own design skill** (naming pattern: `<project>-design`) — real tokens,
-  brand, staging URLs, design-system source, and any product-specific direction. Check the
-  available-skills list before invoking it. If the project has none, **generate it** rather
+  brand, staging URLs, design-system source, the **House-ban conflicts** audit (which bans
+  that product violates today, or an explicit "none"), and any product-specific direction.
+  Check the available-skills list before invoking it. If the project has none, **generate it** rather
   than working without one:
   `bash ~/.claude/super-board-src/skills/superboard-setup/scripts/new-project-design-skill.sh`
   (usage in [`superboard-setup` Step 4b](https://github.com/Wladefant/super-board/blob/main/skills/superboard-setup/SKILL.md);

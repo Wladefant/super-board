@@ -1,3 +1,16 @@
+> ## ⚠ PRECEDENCE 2026-07-28 — what to do when the REAL product already violates a ban
+> Live products ship banned patterns (elumiai-website ships eyebrows, gradient text, `Inter`
+> body and arrow SVGs). "Ground in the real tokens" and "obey the bans" then collide. **The
+> rule: the ban wins for everything you design new; the shipped violation is documented and
+> never silently replicated; a banned pattern is carried forward ONLY where it *is* the brand
+> mark, and only when that exception is already named in the product's own design skill.**
+> Redesigning a surface is the moment to drop the pattern, not to preserve it — "matching the
+> existing style" is not a licence to ship another eyebrow. Tokens (colour, radius, shadow,
+> type scale) are never changed to satisfy a ban; only the *pattern* goes. Full rule + the
+> named-exception mechanics:
+> [SKILL.md → When a real token collides with a hard ban](https://github.com/Wladefant/super-board/blob/main/skills/design-prototyping/SKILL.md#when-a-real-token-collides-with-a-hard-ban).
+> Each product's `<project>-design` skill lists its own violations under **House-ban conflicts** — read it first.
+
 > ## ⚠ CORRECTION 2026-06-20 PM — the operator prefers the RICH betting look
 > I over-applied this list and shipped a flat/editorial "Wikipedia" page; the operator REJECTED
 > that and confirmed they like the **rich, dark betting/trading aesthetic** (the `trade-panel`,
