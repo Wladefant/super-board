@@ -14,12 +14,33 @@
 #
 # Every field is required. There are no invented defaults on purpose: a design
 # skill carrying guessed tokens or a guessed staging URL is worse than none.
+#
+# PROD and STAGING accept EITHER a real URL or a prose "there is none" note
+# (e.g. STAGING="NONE -- no staging URL in the repo."). The generator detects
+# which it got and words the closing verification line accordingly -- see
+# VERIFY_LINE below. Never pass a guessed URL just to get a clean sentence.
 
 set -euo pipefail
 
 for v in PROJECT SLUG REPO BOARD PROD STAGING TOKENS; do
   [ -n "${!v:-}" ] || { echo "missing required env var: $v" >&2; exit 1; }
 done
+
+# The closing "Checks before handing a design to code" bullet used to inline
+# {{STAGING}} unconditionally, which rendered as the nonsense sentence
+#   "Verified against NOT VERIFIED -- no staging URL in the repo., not only
+#    against the prototype."
+# whenever a project had no staging environment. Pick the wording from what the
+# inputs actually are, in all three cases.
+is_url() { case "$1" in http://*|https://*) return 0 ;; *) return 1 ;; esac; }
+
+if is_url "$STAGING"; then
+  VERIFY_LINE="- Verified against $STAGING, not only against the prototype."
+elif is_url "$PROD"; then
+  VERIFY_LINE="- Verified against production $PROD, not only against the prototype. This project has no staging environment (see the table above), so production is the only live reference -- treat it accordingly."
+else
+  VERIFY_LINE="- Verified against a real running instance, not only against the prototype. Neither a production nor a staging URL is recorded above -- ask the operator where $PROJECT actually runs before calling a design verified."
+fi
 
 SB_SRC="${SB_SRC:-$HOME/.claude/super-board-src}"
 OUT_DIR="$SB_SRC/skills/${SLUG}-design"
@@ -80,11 +101,29 @@ modals a design task will be scoped to), so "work one surface at a time" has
 something to point at.
 <!-- SURFACES:END -->
 
+## House-ban conflicts
+
+<!-- BANS:BEGIN -- audit the real source against the five hard bans -->
+Not yet audited. Read the live source and check it against the five hard bans in
+[`design-prototyping`](https://github.com/Wladefant/super-board/blob/main/skills/design-prototyping/SKILL.md#house-style--the-hard-bans)
+-- accent rails; arrows/chevrons; gradient clichés, gradient text and generic
+fonts; emoji; eyebrows/kickers -- and list every one {{PROJECT}} actually ships,
+with the file and the class or literal. If it ships none, write
+"**None.** Audited <date> @ <sha>; no ban conflicts found." explicitly -- an
+empty section is ambiguous, not a clean bill of health.
+
+Precedence when a shipped pattern collides with a ban: **the ban wins for
+anything new** -- see
+[When a real token collides with a hard ban](https://github.com/Wladefant/super-board/blob/main/skills/design-prototyping/SKILL.md#when-a-real-token-collides-with-a-hard-ban).
+Never delete a violation from this list to make the product look compliant; this
+file reports what ships.
+<!-- BANS:END -->
+
 ## Checks before handing a design to code
 
 - Both themes rendered and screenshotted, per design-prototyping.
 - Values come from the token table above, not hard-coded hexes.
-- Verified against {{STAGING}}, not only against the prototype.
+{{VERIFY_LINE}}
 - Approved by the operator before any production component is edited.
 TEMPLATE
 
@@ -97,6 +136,7 @@ sed -i \
   -e "s|{{PROD}}|$PROD|g" \
   -e "s|{{STAGING}}|$STAGING|g" \
   -e "s|{{TOKENS}}|$TOKENS|g" \
+  -e "s|{{VERIFY_LINE}}|$VERIFY_LINE|g" \
   "$OUT_DIR/SKILL.md"
 
 echo "wrote $OUT_DIR/SKILL.md"
