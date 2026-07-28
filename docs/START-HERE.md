@@ -7,10 +7,18 @@ were observed in a real browser on `2026-07-28` (UTC) and are dated separately.
 Every HTTP status below is a real response to a real request made in that window, not an
 inference from container health.
 
-> **A deployment was still in flight while this was written.** The Clips app was mid-deploy.
-> Anything in this document about Clips is a snapshot of a moving target — re-check it before
-> acting. See [Re-check the deployment yourself](#re-check-the-deployment-yourself) for the
-> exact commands.
+> **Clips update, `2026-07-28T01:15Z`.** Clips was mid-deploy when the body of this document
+> was written and its 502/500 readings below are **superseded**: `https://clips.wladefant.de/`
+> now returns **302 → `/library` → 200**, serving 148 KB of real SSR HTML titled
+> *Clips - Open Source screen recorder*, on commit
+> [`834c57e69`](https://github.com/Wladefant/agent-native-platform/commit/834c57e69). All three
+> apps are up. Re-check any status yourself with
+> [these commands](#re-check-the-deployment-yourself).
+>
+> Two things this does **not** mean: nobody has signed in to Clips, and recording upload
+> remains unproven — the chunk endpoint is not an action route, so it needs a real browser
+> session. Container packaging defects that break frame extraction, remux and transcription
+> are tracked in https://github.com/Wladefant/super-board/issues/46.
 
 **The distinction this document refuses to blur:** a container reporting healthy is not a
 reachable app. An app is only in the LIVE bucket if a request to its public URL returned a
@@ -266,16 +274,12 @@ These exist and respond. Nothing below has been proven end to end.
 
 ## 3. PENDING — not finished
 
-- **Agent Native Clips is not usable.** At `2026-07-27T23:36Z` https://clips.wladefant.de
-  returned **HTTP 502**; at `23:39Z` and again at `23:40Z` it returned **HTTP 500** with body
-  `Internal Server Error`. Dokploy reported `applicationStatus: running` (i.e. mid-deploy, not
-  settled) while its three siblings reported `done`. A domain *is* attached
-  (`clips.wladefant.de`, Let's Encrypt). **A deploy lane was still working on this as this
-  document was written** — the 502→500 change within three minutes is that lane making progress.
-  Re-check before concluding anything.
-- **`design-prototyping` still points at `PENDING`** instead of https://design.wladefant.de.
-  With sign-in now verified, this one-line edit is the *only* thing standing between the hosted
-  Design app and real design work.
+- **Clips SSR is fixed — see the LIVE section.** The earlier 502/500 readings in this document
+  are superseded. Retained above as history because the diagnosis is reusable.
+- **`design-prototyping` pointed at `PENDING`** instead of https://design.wladefant.de.
+  Fixed in https://github.com/Wladefant/super-board/commit/0acde12 and
+  https://github.com/Wladefant/super-board/commit/102488f — the skill now names the live
+  instance and the stale `PENDING` fallback trigger is retired.
 - **Password reset on Design is a dead end.** No mail transport is configured, and `sendEmail()`
   refuses to send in production rather than logging a reset token — so the reset mail can never
   arrive. The *"Forgot password?"* link on the sign-in screen is `href="#"` and does nothing
