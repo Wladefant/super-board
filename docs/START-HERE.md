@@ -1,8 +1,9 @@
 # START HERE — what actually works right now
 
 **All status in this document was observed between `2026-07-27T23:36Z` and `2026-07-27T23:40Z` (UTC)**,
-except [the Design sign-in section](#a-human-can-sign-in-to-design--verified-in-a-browser), which
-was observed in a real browser on `2026-07-28` (UTC) and is dated separately.
+except [the Design sign-in section](#a-human-can-sign-in-to-design--verified-in-a-browser) and
+[the Analytics sign-in section](#a-human-can-sign-in-to-analytics--verified-in-a-browser), which
+were observed in a real browser on `2026-07-28` (UTC) and are dated separately.
 Every HTTP status below is a real response to a real request made in that window, not an
 inference from container health.
 
@@ -111,6 +112,84 @@ The four known Better Auth self-host failure modes, each checked rather than ass
   are the direct consequence of their credentials being unset. Nothing is broken; there is simply
   no SSO until those variables are set.
 
+### A human can sign in to Analytics — verified in a browser
+
+**Observed `2026-07-28` (UTC), in Chrome, against https://analytics.wladefant.de.** Until now the
+only evidence for Analytics was a machine token: an ingest call that returned
+`202 {"success":true,"accepted":1}` and an API key whose `lastUsedAt` flipped from `null` to a
+timestamp. That proved a Postgres write by a *robot*. This section is the person-shaped
+equivalent — sign-up, sign-out, sign-in, and a write made and then seen through the UI.
+
+**What the sign-in screen actually offers** (read off the page, not assumed). The root URL
+redirects to `/_agent-native/sign-in?c=…`, where `c` is the base64 return path. Exactly two tabs:
+
+- **Create account** — email, password (min 8 chars), confirm password.
+- **Sign in** — email, password, plus a *"Forgot password?"* link whose `href` is literally `#`.
+
+**No Google button, no GitHub button, no SSO of any kind** — identical to Design, and for the same
+reason: those provider credentials are unset.
+
+**What was done, in order:**
+
+1. Created an account through the form with the synthetic address
+   `analytics-probe-20260728@wladefant.de`. **Signup returned a session immediately** and landed
+   on `/ask`. No verification screen, no mail interstitial.
+2. **Signed out** via the account menu. Then requested a protected route (`/monitoring`) directly:
+   it **redirected back to the sign-in screen**. The session is genuinely destroyed server-side —
+   sign-out is not a cosmetic UI reset, and the routes really are auth-gated.
+3. **Signed back in** with the same account through the Sign in tab. It succeeded *and* landed on
+   `/monitoring` — the deep link that had bounced — so the `c=` return path survives the
+   round-trip. **Sign-in is therefore proven independently of signup's auto-session**, which is
+   the whole point: a signup that auto-sessions can otherwise hide a completely broken login.
+4. **Made a real write through the UI and saw it come back.** On *Data Sources* → *First-party
+   Analytics* (which started at **Not configured**), pressed **Generate Key**. The panel flipped
+   to **Configured** and listed the new key as `anpk_…` **"never used"**. After a full page
+   reload the green *✓ Configured* badge and the key were still there — so the write reached
+   Postgres.
+5. **Closed the ingest→UI loop as a human would see it.** Posting an event to the app's own
+   endpoint `POST /api/analytics/track` with that key returned
+   `202 {"success":true,"accepted":1}`, and on reload the key row in the UI had changed from
+   **"never used"** to **"last used 7/28/2026"**. A signed-in person can therefore both cause an
+   ingest and *see the application reflect it*.
+
+No console errors at any step.
+
+**Variable names only — no key or password value is recorded here, in this repo, or in any commit.**
+
+#### What this does NOT prove — the honest limit
+
+**A human still cannot look at ingested event data itself.** Every surface that would display
+events is gated:
+
+| Surface | State | Why |
+|---|---|---|
+| **Ask** | blocked | *"Connect AI to start chatting"* — **no AI provider configured**, same root cause as Design ([#42](https://github.com/Wladefant/super-board/issues/42)) |
+| **Dashboards** | blocked | `/dashboards` **redirects to `/ask`**; dashboards are agent-built, so they inherit the same AI gate |
+| **Sessions** | empty | *"Connect replay storage"* — session replay needs S3/Builder.io storage; shows *"No sessions found"* |
+| **Monitoring** | empty | uptime monitors only (*"No monitors yet"*); the **Errors** view is a tab, not the route `/monitoring/errors`, which 404s |
+
+So the verified claim is precise: **sign-in, session handling and the app→Postgres write path all
+work for a real person, and the UI reflects a real ingest — but the analytics data itself is not
+yet viewable, because the app's two data-rendering surfaces both require an AI provider.**
+
+Two further findings from the same probe:
+
+- **The pre-existing ingested event is not visible to a new account, and that is by design.**
+  Analytics data and keys are **organization-scoped**. A fresh signup creates its own empty
+  workspace (here *"Analytics Probe 20260728's workspace"*) whose First-party Analytics began at
+  *Not configured*. The earlier machine token belongs to a different organization, so its event
+  was never going to appear. This is correct multi-tenancy, not a fault — but it does mean
+  **"an event was ingested" and "a human can see that event" are separate claims**, and the first
+  never implied the second.
+- **The endpoint the UI advertises is the vendor's, not this deployment's.** The First-party
+  Analytics panel displays `Endpoint https://analytics.agent-native.com/track`. The self-hosted
+  instance actually accepts events at `/api/analytics/track` on its own domain (confirmed: `202`).
+  **Anyone following the UI would ship their events to Builder's hosted service instead of their
+  own.** Also cosmetic but confusing: the page header still reads **"0 configured"** while the
+  item beneath it reads **"Configured"**.
+- **The probe account, its workspace and its generated key still exist** on the deployment.
+  Delete them when convenient.
+
 ### The platform repo
 
 - https://github.com/Wladefant/agent-native-platform — private, default branch `main`,
@@ -162,12 +241,13 @@ see [decision 1](#decision-1--the-polysimulator-board-cannot-link-to-its-repo).
 
 These exist and respond. Nothing below has been proven end to end.
 
-- **Analytics sign-in and database.** The 401 above proves the server answers. It does **not**
-  prove Postgres connectivity, that a user can register or sign in, or that any write persists.
-  **No account has been created on Analytics.** It has a dedicated Postgres
-  (`agent-native-analytics-db`, `applicationStatus: done`), but the app→DB path is untested.
-  *(Design is no longer in this bucket — its sign-in and its app→DB write path are both proven in
-  [section 1](#a-human-can-sign-in-to-design--verified-in-a-browser).)*
+- **Analytics event data is not viewable by a human.** Sign-in and the app→Postgres write path are
+  no longer in this bucket — both are proven in
+  [section 1](#a-human-can-sign-in-to-analytics--verified-in-a-browser), and its dedicated Postgres
+  (`agent-native-analytics-db`, `applicationStatus: done`) is confirmed reachable through the app.
+  What remains unverified is the product's actual purpose: **no one has seen an ingested event
+  rendered as data**, because *Ask* and *Dashboards* both require an AI provider and none is
+  configured. *(Design left this bucket for the same reason on the same day.)*
 - **MinIO object storage.** https://minio-an.wladefant.de returned **HTTP 403** at
   `2026-07-27T23:40Z`. For an S3 API root with no credentials this is the *expected* answer and
   proves TLS, DNS and routing work. It proves nothing about whether the `clips` bucket exists
@@ -205,6 +285,17 @@ These exist and respond. Nothing below has been proven end to end.
 - **No AI provider is configured on Design.** Design creation works without one, but
   prompt-driven generation — the reason to use the app — is untested and will prompt for
   Builder.io or provider keys on first use.
+- **No AI provider is configured on Analytics either, and it costs more here.** On Design the AI
+  gate blocks *generation*; on Analytics it blocks **reading your own data**. *Ask* refuses to
+  chat and `/dashboards` redirects to `/ask`, so a signed-in user with successfully ingested
+  events has **no way to view them**. This is the same decision already open as
+  [#42](https://github.com/Wladefant/super-board/issues/42) — it should be decided for both apps
+  at once, not twice.
+- **The Analytics UI advertises the wrong ingest endpoint.** *Data Sources → First-party
+  Analytics* shows `https://analytics.agent-native.com/track` — Builder's hosted service. The
+  self-hosted instance accepts events at `/api/analytics/track` on its own domain. Following the
+  UI sends your events to the vendor. The same panel also reports **"0 configured"** in its header
+  while showing an item as **"Configured"**.
 - **Open issues on https://github.com/users/Wladefant/projects/5:**
   - https://github.com/Wladefant/super-board/issues/27 — containerize templates
   - https://github.com/Wladefant/super-board/issues/28 — deploy Design
@@ -390,9 +481,15 @@ Application IDs, for direct lookup:
 
 ## What this document does not claim
 
-- That anyone has signed in to **Analytics** or **Clips**. Only **Design** has a verified human
-  sign-in — created, signed out, signed back in, design persisted
-  ([section 1](#a-human-can-sign-in-to-design--verified-in-a-browser)).
+- That anyone has signed in to **Clips**. **Design** and **Analytics** both now have a verified
+  human sign-in — created, signed out, signed back in, write persisted
+  ([Design](#a-human-can-sign-in-to-design--verified-in-a-browser) ·
+  [Analytics](#a-human-can-sign-in-to-analytics--verified-in-a-browser)). Clips does not.
+- That anyone has **seen analytics data** in Analytics. A human caused an ingest and watched the
+  UI reflect it (the key flipped to *"last used"*), but *Ask* and *Dashboards* are both blocked by
+  the missing AI provider, so **no event has ever been rendered as data for a person**.
+- That Analytics survives a container restart, or that its password reset works — the
+  *"Forgot password?"* link is `href="#"` there too, and no mail transport is configured.
 - That Design's AI generation works. A design was created via **Skip to editor**; no AI provider
   is configured.
 - That Design's sessions survive a container restart. The secret is pinned in the environment,
