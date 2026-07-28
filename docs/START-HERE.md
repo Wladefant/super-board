@@ -1,6 +1,8 @@
 # START HERE — what actually works right now
 
-**All status in this document was observed between `2026-07-27T23:36Z` and `2026-07-27T23:40Z` (UTC).**
+**All status in this document was observed between `2026-07-27T23:36Z` and `2026-07-27T23:40Z` (UTC)**,
+except [the Design sign-in section](#a-human-can-sign-in-to-design--verified-in-a-browser), which
+was observed in a real browser on `2026-07-28` (UTC) and is dated separately.
 Every HTTP status below is a real response to a real request made in that window, not an
 inference from container health.
 
@@ -32,6 +34,82 @@ placeholder. Both apps have a Let's Encrypt cert and resolve over HTTPS.
 
 Both build from the parameterized root `Dockerfile` in the platform repo via the `TEMPLATE`
 build arg: https://github.com/Wladefant/agent-native-platform/blob/main/Dockerfile
+
+### A human can sign in to Design — verified in a browser
+
+**Observed `2026-07-28` (UTC), in Chrome, against https://design.wladefant.de.** Every earlier
+check in this document used a machine token derived from `A2A_SECRET`. This one did not: it is a
+person-shaped sign-up, sign-out and sign-in through the actual forms.
+
+**What the sign-in screen actually offers** (read off the page, not assumed). The root URL
+redirects to `/_agent-native/sign-in`, which has exactly two tabs:
+
+- **Create account** — email, password (min 8 chars), confirm password.
+- **Sign in** — email, password, plus a *"Forgot password?"* link whose `href` is literally `#`.
+
+There is **no Google button, no GitHub button, no SSO of any kind.** That is expected, not a
+fault — see the failure-mode table below.
+
+**What was done, in order:**
+
+1. Created an account through the form with the synthetic address
+   `superboard-probe-20260728@example.com`. **Signup returned a session immediately** — no
+   verification screen, no "check your email" interstitial, no dead end. It landed straight on
+   the Designs page.
+2. Created a design through the UI, renamed it **"Superboard signin probe 2026-07-28"**
+   (`/design/xIZFnucw7n_j2DCfZuM3j`). It appears on the Designs list after a full page load, so
+   the write reached Postgres and came back.
+3. **Signed out** via the account menu, then **signed back in** with the same account through the
+   Sign in tab. The session was restored and the design was still listed. Sign-*in* is therefore
+   proven independently of signup's auto-session.
+
+No console errors at any step.
+
+Two honest limits on this result:
+
+- **Creating a design does not exercise the AI.** "New Design" opens a **Connect AI** dialog
+  (Builder.io free credits, or your own provider keys); **"Skip to editor"** bypasses it and
+  creates a blank design, which is the path used here. **No AI provider is configured on this
+  deployment**, so prompt-driven generation — the app's headline feature — remains untested.
+- **The probe account and its design still exist** on the deployment. Delete them when convenient.
+
+#### Email verification is NOT required here — definitively
+
+Account creation on this deployment **does not require email delivery, and no mail transport is
+configured.** This is not an inference from the browser behaviour alone; the code says why:
+
+[`better-auth-instance.ts`](https://github.com/Wladefant/agent-native-platform/blob/main/packages/core/src/server/better-auth-instance.ts)
+computes `requireEmailVerification = (await isEmailConfigured()) && !shouldSkipEmailVerification()`,
+and [`email.ts`](https://github.com/Wladefant/agent-native-platform/blob/main/packages/core/src/server/email.ts)
+returns `isEmailConfigured() === false` unless a provider secret resolves. With no provider, the
+app deliberately leaves verification off rather than locking people out of signup.
+
+**Variable names only — no values are recorded here or anywhere in this repo.**
+
+| Variable | Status in the Design deployment |
+|---|---|
+| `BETTER_AUTH_SECRET` | **set** |
+| `BETTER_AUTH_URL`, `APP_URL` | **set** (both `https://design.wladefant.de`) |
+| `DATABASE_URL`, `A2A_SECRET`, `SECRETS_ENCRYPTION_KEY` | **set** |
+| `NODE_ENV`, `PORT`, `APP_NAME` | **set** |
+| `RESEND_API_KEY`, `SENDGRID_API_KEY`, `EMAIL_FROM` | **unset** — no mail transport |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | **unset** |
+| `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` | **unset** |
+| `AUTH_SKIP_EMAIL_VERIFICATION` | **unset** (not needed — verification is already off) |
+
+The four known Better Auth self-host failure modes, each checked rather than assumed:
+
+- **Unstable secret resetting sessions on restart** — not present. `BETTER_AUTH_SECRET` is pinned
+  explicitly in the deploy environment. *Caveat:* this was not empirically restart-tested, because
+  a redeploy was still building when this was written. The code path is reassuring though — in
+  production it throws at boot when the secret is missing rather than quietly generating an
+  ephemeral one, so this failure could not have been hiding.
+- **Wrong base URL breaking the callback** — not present. `BETTER_AUTH_URL` and `APP_URL` both
+  match the live host exactly.
+- **Email verification blocking signup with no mail transport** — not present, per above.
+- **Social providers silently absent** — *present, and benign.* The missing Google/GitHub buttons
+  are the direct consequence of their credentials being unset. Nothing is broken; there is simply
+  no SSO until those variables are set.
 
 ### The platform repo
 
@@ -84,11 +162,12 @@ see [decision 1](#decision-1--the-polysimulator-board-cannot-link-to-its-repo).
 
 These exist and respond. Nothing below has been proven end to end.
 
-- **Design and Analytics sign-in and database.** The 401 above proves the server answers. It
-  does **not** prove Postgres connectivity, that a user can register or sign in, or that any
-  write persists. No account has been created on either app. Both have a dedicated Postgres
-  (`agent-native-design-db`, `agent-native-analytics-db`, both `applicationStatus: done`), but
-  the app→DB path is untested.
+- **Analytics sign-in and database.** The 401 above proves the server answers. It does **not**
+  prove Postgres connectivity, that a user can register or sign in, or that any write persists.
+  **No account has been created on Analytics.** It has a dedicated Postgres
+  (`agent-native-analytics-db`, `applicationStatus: done`), but the app→DB path is untested.
+  *(Design is no longer in this bucket — its sign-in and its app→DB write path are both proven in
+  [section 1](#a-human-can-sign-in-to-design--verified-in-a-browser).)*
 - **MinIO object storage.** https://minio-an.wladefant.de returned **HTTP 403** at
   `2026-07-27T23:40Z`. For an S3 API root with no credentials this is the *expected* answer and
   proves TLS, DNS and routing work. It proves nothing about whether the `clips` bucket exists
@@ -115,6 +194,17 @@ These exist and respond. Nothing below has been proven end to end.
   document was written** — the 502→500 change within three minutes is that lane making progress.
   Re-check before concluding anything.
 - **`design-prototyping` still points at `PENDING`** instead of https://design.wladefant.de.
+  With sign-in now verified, this one-line edit is the *only* thing standing between the hosted
+  Design app and real design work.
+- **Password reset on Design is a dead end.** No mail transport is configured, and `sendEmail()`
+  refuses to send in production rather than logging a reset token — so the reset mail can never
+  arrive. The *"Forgot password?"* link on the sign-in screen is `href="#"` and does nothing
+  anyway. **A user who forgets their password cannot self-recover.** Fixing it means setting
+  `RESEND_API_KEY` or `SENDGRID_API_KEY` (plus `EMAIL_FROM`) — note that doing so also switches
+  email verification **on** for new signups, since the same check gates both.
+- **No AI provider is configured on Design.** Design creation works without one, but
+  prompt-driven generation — the reason to use the app — is untested and will prompt for
+  Builder.io or provider keys on first use.
 - **Open issues on https://github.com/users/Wladefant/projects/5:**
   - https://github.com/Wladefant/super-board/issues/27 — containerize templates
   - https://github.com/Wladefant/super-board/issues/28 — deploy Design
@@ -300,7 +390,13 @@ Application IDs, for direct lookup:
 
 ## What this document does not claim
 
-- That anyone has successfully signed in to any deployed app. No one has.
+- That anyone has signed in to **Analytics** or **Clips**. Only **Design** has a verified human
+  sign-in — created, signed out, signed back in, design persisted
+  ([section 1](#a-human-can-sign-in-to-design--verified-in-a-browser)).
+- That Design's AI generation works. A design was created via **Skip to editor**; no AI provider
+  is configured.
+- That Design's sessions survive a container restart. The secret is pinned in the environment,
+  which is what makes that work, but it was not tested across a restart.
 - That Clips works. At the last observation it returned HTTP 500.
 - That the `clips` MinIO bucket exists or that its credentials are accepted.
 - That the upstream sync is durable. One scheduled run has succeeded, once, after one failure.
