@@ -57,6 +57,7 @@ from typing import Any, Callable, Iterator, Mapping, Optional, Sequence
 try:  # normal package import
     from . import EXIT_CONFIG, EXIT_OK, EXIT_USAGE
     from .config import ConfigError, NormalizedConfig, load_and_validate_config
+    from .publication import UnsafePublication, publish
 except ImportError:  # executed as a plain file path
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from super_board_runtime import EXIT_CONFIG, EXIT_OK, EXIT_USAGE
@@ -65,6 +66,7 @@ except ImportError:  # executed as a plain file path
         NormalizedConfig,
         load_and_validate_config,
     )
+    from super_board_runtime.publication import UnsafePublication, publish
 
 #: The one SHA-bound required check QA publishes. Bound to the tested commit,
 #: never to a branch name.
@@ -409,16 +411,59 @@ def record_qa_result(result: QaResult) -> QaLedgerEntry:
     )
 
 
+def _publish_structured(
+    surface: str,
+    payload: Mapping[str, Any],
+    *,
+    writer: Callable[[Mapping[str, Any]], Any],
+    dry_run: bool,
+    environment: Optional[Mapping[str, str]],
+) -> dict[str, Any]:
+    """Route a COMPLETE structured GitHub payload through the one sanitizer.
+
+    A structured write is a write. The payload is rendered whole, sanitized,
+    rescanned, and only then handed back to the caller's writer — as the
+    sanitized mapping, never the original. If sanitization changed the render
+    so much that it is no longer a mapping, nothing is written at all: a status
+    or an issue we cannot reconstruct is not one we may guess at.
+    """
+    rendered = json.dumps(dict(payload), sort_keys=True)
+
+    def _write(_surface: str, text: str) -> Any:
+        try:
+            sanitized = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise QaError(
+                "qa-publication-unreconstructable",
+                f"the sanitized {surface} payload is no longer a structured payload; "
+                "refusing to write a reconstruction",
+            ) from exc
+        if not isinstance(sanitized, dict):
+            raise QaError(
+                "qa-publication-unreconstructable",
+                f"the sanitized {surface} payload is no longer a mapping",
+            )
+        return writer(sanitized)
+
+    return publish(surface, rendered, environment or {}, writer=_write, dry_run=dry_run)
+
+
 def publish_qa_status(
     entry: QaLedgerEntry,
     *,
     writer: Callable[[Mapping[str, Any]], Any],
     dry_run: bool = False,
+    environment: Optional[Mapping[str, str]] = None,
 ) -> dict[str, Any]:
     """Publish the SHA-bound status for a successful, non-invalidated entry.
 
     The status is created on the **tested** commit, never on a branch, so a
     later head inherits nothing. A dry run issues zero GitHub writes.
+
+    The status is a GitHub write, so the complete payload goes through the
+    publication boundary first. `target_url` is copied from the evidence URL,
+    and an evidence URL carrying `user:password@` would otherwise be written to
+    GitHub verbatim.
     """
     if entry.invalidated or entry.result == "discarded":
         raise QaError(
@@ -435,16 +480,19 @@ def publish_qa_status(
         "state": "success",
         "target_url": entry.sanitized_evidence_url,
     }
-    if dry_run:
-        return {"dry_run": True, "github_writes": 0, "payload": payload, "published": False}
-    response = writer(payload)
-    url = response.get("url") if isinstance(response, Mapping) else None
+    result = _publish_structured(
+        "commit-status",
+        payload,
+        writer=writer,
+        dry_run=dry_run,
+        environment=environment,
+    )
     return {
-        "dry_run": False,
-        "github_writes": 1,
-        "payload": payload,
-        "published": True,
-        "url": url,
+        "dry_run": result["dry_run"],
+        "github_writes": result["github_writes"],
+        "payload": json.loads(result["text"]),
+        "published": result["published"],
+        "url": result.get("url"),
     }
 
 
@@ -692,15 +740,28 @@ def file_qa_failure(
     *,
     issue_writer: Callable[[Mapping[str, Any]], Any],
     dry_run: bool = False,
+    environment: Optional[Mapping[str, str]] = None,
 ) -> QaFailureDisposition:
     """Apply the disposition, filing at most one follow-up issue.
 
     Exactly one write when the failure is outside the acceptance criteria and
     the run is not a dry run; zero writes otherwise.
+
+    The follow-up is a GitHub write, so it goes through the publication
+    boundary — there is no path from here to `issue_writer` that the sanitizer
+    has not seen. The issue carries identifiers straight from the run, and a
+    pull request URL with a credential in its query string is exactly the shape
+    that a direct write would have published.
     """
     disposition = disposition_qa_failure(result, config)
-    if disposition.follow_up_issue_required and not dry_run:
-        issue_writer(build_follow_up_issue(result, config))
+    if disposition.follow_up_issue_required:
+        _publish_structured(
+            "bug-report",
+            build_follow_up_issue(result, config),
+            writer=issue_writer,
+            dry_run=dry_run,
+            environment=environment,
+        )
     return disposition
 
 
@@ -846,7 +907,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         disposition = file_qa_failure(
             result, config, issue_writer=writes.append, dry_run=args.dry_run
         )
-    except QaError as exc:
+    except (QaError, UnsafePublication) as exc:
+        # An unsafe follow-up is refused with zero writes, exit 78 — the same
+        # boundary every other GitHub-bound payload passes through.
         print(f"super-board-qa: {exc}", file=sys.stderr)
         print(json.dumps({"ok": False, "reason": exc.reason}, sort_keys=True), file=sys.stderr)
         return exc.exit_code

@@ -148,14 +148,20 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
             r"(?i)(?<![-\w])(?:Bearer|Basic|Digest|OAuth|Token)[ \t]+[A-Za-z0-9._~+/=\-]{16,}"
         ),
     ),
-    # Credentials embedded in a URL: scheme://user:password@host
-    ("credentialed-url", re.compile(r"\b[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s/@:]+:[^\s/@]+@\S+")),
+    # Credentials embedded in a URL: scheme://user:password@host.
+    # Quote-terminated: a payload rendered as JSON or YAML must still be a
+    # payload after redaction, and a match that eats the closing quote leaves
+    # something nobody can write.
+    (
+        "credentialed-url",
+        re.compile(r"""\b[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s/@:]+:[^\s/@]+@[^\s"']+"""),
+    ),
     # Credential-bearing command arguments, both `--flag value` and `--flag=value`.
     (
         "credential-argument",
         re.compile(
-            r"(?i)--(?:token|password|passwd|api[-_]?key|secret|private[-_]?key|credential)"
-            r"(?:[= \t]+)\S+"
+            r"""(?i)--(?:token|password|passwd|api[-_]?key|secret|private[-_]?key|credential)"""
+            r"""(?:[= \t]+)[^\s"']+"""
         ),
     ),
 )
