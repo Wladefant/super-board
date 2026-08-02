@@ -30,9 +30,6 @@ if (input.tier && !['low', 'medium', 'high'].includes(input.tier)) {
   throw new Error(`super-board-wave: unknown tier "${input.tier}" — use low | medium | high`)
 }
 
-// Mirrors `super_board_runtime.routing.NON_DISPATCH_BRANCHES`.
-const NON_DISPATCH_BRANCHES = ['designstaging', 'main', 'master', 'default']
-
 // Eligibility is NOT re-derived here. `super-board-wave-plan.sh` already ran the
 // shared runtime (super_board_runtime.eligibility), which is the only place the
 // rules live: issue cards only, never `design`/`history`, status EXACTLY `Ready`,
@@ -58,20 +55,16 @@ for (const card of input.cards) {
     )
   }
   // The route travels with the card too, decided by
-  // `super_board_runtime.routing`. This workflow never infers a branch from a
-  // Test Area, from geography in the prose, or from the current checkout — and
-  // `designstaging` is never a dispatch route.
+  // `super_board_runtime.routing` — the ONE authority on which branch a card
+  // may get and whether it may dispatch at all. This workflow never infers a
+  // branch from a Test Area, from geography in the prose, or from the current
+  // checkout, and it does not keep its own copy of the refused-branch list:
+  // a second list is a second answer, and the two drift.
   const base = card.selectedBaseBranch || card.selected_base_branch
   if (!base) {
     throw new Error(
       `super-board-wave: card #${card.number} carries no resolved base branch — the planner ` +
       `refused its branch route. Re-run super-board-wave-plan.sh; do not hand-assemble cards.`
-    )
-  }
-  if (NON_DISPATCH_BRANCHES.includes(base)) {
-    throw new Error(
-      `super-board-wave: card #${card.number} resolved to "${base}", which is never a dispatch ` +
-      `route. Refusing the wave.`
     )
   }
 }
@@ -103,37 +96,75 @@ const STAGE_SCHEMA = {
     detail: { type: 'string' },
     prUrl: { type: 'string' },
     branch: { type: 'string' },
-    // Exact-SHA QA evidence travels with every stage result so the merge
-    // handoff can be validated without re-deriving anything downstream.
+    // The reviewer reports WHICH commit QA attested to. It does not report
+    // whether that commit is still the head, and it does not report how the
+    // required check concluded — those are read live by the authority below.
     testedSha: { type: 'string' },
-    currentHeadSha: { type: 'string' },
-    checkConclusion: { type: 'string' },
   },
   required: ['status', 'column', 'detail'],
 }
 
-// The read-only merge handoff. Mirrors
-// `super_board_runtime.qa.validate_merge_handoff`: the live head must still be
-// the tested commit AND the SHA-bound required check on that commit must have
-// concluded success. It performs no writes and it never merges — the runtime
-// has no merge path. It only decides whether a card may be REPORTED as ready
-// for the human's rebase merge.
-const QA_CHECK_CONTEXT = 'superboard/exact-sha-qa'
-const validateMergeHandoff = (result) => {
-  const tested = (result && result.testedSha) || null
-  const current = (result && result.currentHeadSha) || null
-  const conclusion = (result && result.checkConclusion) || null
-  if (!tested) return { mergeReady: false, reasonCode: 'qa-evidence-missing', tested, current }
-  if (!current || current !== tested) {
-    return { mergeReady: false, reasonCode: 'head-moved', tested, current }
+// The merge handoff is decided by ONE authority:
+// `python -m super_board_runtime.qa merge-handoff`. It rereads the live pull
+// request head itself and reads the live SHA-bound required check itself, then
+// returns a `MergeHandoffDecision`. This workflow used to reimplement that
+// comparison here, in camelCase, over three fields the reviewing agent handed
+// back — so a stale or invented stage result could mark a moved head
+// merge-ready, and two of the authority's reason codes did not exist here at
+// all.
+//
+// The decision is now obtained by a lane whose ONLY job is to run that command
+// and return its JSON verbatim — deliberately not the reviewer, so the agent
+// that formed an opinion about the branch is not the agent that reports the
+// verdict. Anything that is not the authority's own shape is refused.
+const HANDOFF_SCHEMA = {
+  type: 'object',
+  properties: {
+    merge_ready: { type: 'boolean' },
+    reason_code: { type: 'string' },
+    tested_sha: { type: 'string' },
+    current_head_sha: { type: 'string' },
+    check_context: { type: 'string' },
+    exit_code: { type: 'number' },
+  },
+  required: ['merge_ready'],
+}
+
+const handoffPrompt = (card, testedSha, prUrl) => [
+  `Decide nothing. Run exactly this command and report its JSON output verbatim:`,
+  ``,
+  `  python -m super_board_runtime.qa merge-handoff \\`,
+  `    --pull-request ${prUrl} \\`,
+  `    --tested-sha ${testedSha} \\`,
+  `    --config ${input.configPath}`,
+  ``,
+  `(PYTHONPATH must include .claude/bin — .claude/bin/super-board-python.sh sets it.)`,
+  ``,
+  `Report the command's fields as your structured output: merge_ready, reason_code,`,
+  `tested_sha, current_head_sha, check_context, plus exit_code. Do not interpret them,`,
+  `do not retry a refusal, and do not substitute your own judgement about issue`,
+  `#${card.number}: this command is the authority and its answer is the answer.`,
+  `If the command cannot be run at all, report merge_ready=false with reason_code`,
+  `"handoff-command-unavailable".`,
+].join('\n')
+
+const requestMergeHandoff = async (card, reviewResult) => {
+  const testedSha = reviewResult && reviewResult.testedSha
+  const prUrl = (reviewResult && reviewResult.prUrl) || card.prUrl
+  if (!testedSha || !prUrl) {
+    // Nothing to ask about. Not merge-ready, and no agent is spawned to guess.
+    return { merge_ready: false, reason_code: 'handoff-inputs-missing', tested_sha: testedSha || null }
   }
-  if (!conclusion || !String(conclusion).trim()) {
-    return { mergeReady: false, reasonCode: 'check-missing', tested, current }
+  const decision = await agent(handoffPrompt(card, testedSha, prUrl), {
+    label: `handoff:#${card.number}`,
+    phase: 'Review',
+    schema: HANDOFF_SCHEMA,
+    model: 'haiku',
+  })
+  if (!decision || typeof decision.merge_ready !== 'boolean') {
+    return { merge_ready: false, reason_code: 'handoff-decision-unreadable', tested_sha: testedSha }
   }
-  if (String(conclusion).trim().toLowerCase() !== 'success') {
-    return { mergeReady: false, reasonCode: 'check-not-success', tested, current }
-  }
-  return { mergeReady: true, reasonCode: null, tested, current }
+  return decision
 }
 
 const LANE = {
@@ -165,7 +196,8 @@ const lanePrompt = (lane, card) => [
   `Report your exit via structured output:`,
   `- status=advanced  → card moved forward (Building→QA, QA→Review, Review→human handoff)`,
   `  Review is where you STOP. Never merge, never close the issue, never write the Done status.`,
-  `  On a clean review, carry testedSha/currentHeadSha/checkConclusion back so the handoff can be validated.`,
+  `  Carry testedSha (the commit QA attested to) and prUrl back. Do NOT report whether the`,
+  `  head still matches or how the required check concluded — the merge handoff reads both live.`,
   `- status=bounced   → card moved backward (QA fail → Ready, Reviewer bounce → Ready/QA)`,
   `- status=blocked or human-gate → you wrote the Block template and moved the card to Blocked`,
   `- status=failed    → you could not complete the lifecycle (say why in detail)`,
@@ -241,19 +273,19 @@ const results = await pipeline(
       // The Review→human transition is gated on the exact-SHA handoff. A card
       // whose head moved, or whose SHA-bound check did not conclude success,
       // is NOT reported as merge-ready however clean the review read.
-      const handoff = validateMergeHandoff(reviewResult)
-      history[history.length - 1].mergeReady = handoff.mergeReady
-      history[history.length - 1].handoffReason = handoff.reasonCode
+      const handoff = await requestMergeHandoff(card, reviewResult)
+      history[history.length - 1].mergeReady = handoff.merge_ready === true
+      history[history.length - 1].handoffReason = handoff.reason_code || null
       // The wave ends at Review on every path. There is no branch of this
       // workflow that merges, closes the issue, or writes Done — Done is
       // produced by the closure normalizer after a real human merge.
       history[history.length - 1].column = 'Review'
       history[history.length - 1].awaiting = 'human-rebase-merge'
-      if (!handoff.mergeReady) {
+      if (handoff.merge_ready !== true) {
         log(
-          `#${card.number} stops in Review — not merge-ready (${handoff.reasonCode}); ` +
-          `tested=${handoff.tested || 'none'} head=${handoff.current || 'unknown'} ` +
-          `check=${QA_CHECK_CONTEXT}`
+          `#${card.number} stops in Review — not merge-ready (${handoff.reason_code || 'refused'}); ` +
+          `tested=${handoff.tested_sha || 'none'} head=${handoff.current_head_sha || 'unknown'} ` +
+          `check=${handoff.check_context || 'the SHA-bound QA check'}`
         )
       }
     }

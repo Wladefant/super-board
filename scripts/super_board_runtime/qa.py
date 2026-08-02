@@ -793,13 +793,23 @@ def build_parser() -> argparse.ArgumentParser:
     handoff = sub.add_parser(
         "merge-handoff", help="read-only: may this item be reported merge-ready?"
     )
-    handoff.add_argument("--ledger", required=True, help="the QA ledger entry JSON file")
+    handoff.add_argument("--ledger", default=None, help="the QA ledger entry JSON file")
+    handoff.add_argument(
+        "--tested-sha",
+        default=None,
+        help="the commit QA attested to, when no ledger file is at hand; the live "
+        "head and the live SHA-bound check are still read here, so this names the "
+        "evidence rather than asserting it",
+    )
     handoff.add_argument("--pull-request", required=True)
+    handoff.add_argument("--config", default=None, help="needed to read the check live")
     handoff.add_argument("--payload", default=None, help="read the PR payload from a file, not gh")
     handoff.add_argument(
         "--check-conclusion",
         default=None,
-        help=f"conclusion of the {QA_CHECK_CONTEXT} status on the tested SHA",
+        help=f"conclusion of the {QA_CHECK_CONTEXT} status on the tested SHA; "
+        "omit it and the status is read live from GitHub, which is the only "
+        "form callers that cannot be trusted to report it may use",
     )
 
     status = sub.add_parser(
@@ -826,6 +836,71 @@ def build_parser() -> argparse.ArgumentParser:
     disposition.add_argument("--failure-kind", default=None)
     disposition.add_argument("--dry-run", action="store_true")
     return parser
+
+
+def _attested_entry(tested_sha: Any, pull_request_url: str) -> QaLedgerEntry:
+    """A ledger entry for a named tested commit, with no other claim attached.
+
+    Used by the merge handoff when the caller has no ledger file. It records
+    only which commit is being asked about; whether that commit is still the
+    head, and whether it carries a successful SHA-bound check, is read live.
+    """
+    sha = _normalize_sha(tested_sha, "qa-head-invalid")
+    now = utc_now()
+    return QaLedgerEntry(
+        schema_version=1,
+        issue_url="",
+        issue_node_id=None,
+        pull_request_url=pull_request_url,
+        pull_request_node_id=None,
+        tested_sha=sha,
+        current_head_sha=sha,
+        selected_base_branch=None,
+        branch_declaration=None,
+        check_context=QA_CHECK_CONTEXT,
+        check_url=None,
+        sanitized_evidence_url=None,
+        result="success",
+        invalidated=False,
+        started_at=now,
+        completed_at=now,
+    )
+
+
+def _gh_commit_status_conclusion(
+    repo_remote: Optional[str], sha: str, context: str
+) -> Optional[str]:
+    """The live state of the SHA-bound check on one commit, or None.
+
+    None means "no such check on that commit", which the handoff refuses as
+    `check-missing`. Every failure path here returns None: an unreadable check
+    is never an assumed pass.
+    """
+    if not repo_remote:
+        return None
+    try:
+        result = subprocess.run(
+            [gh_binary(), "api", f"repos/{repo_remote}/commits/{sha}/status"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    statuses = payload.get("statuses") if isinstance(payload, Mapping) else None
+    if not isinstance(statuses, list):
+        return None
+    for status in statuses:  # GitHub returns the newest state per context first
+        if isinstance(status, Mapping) and status.get("context") == context:
+            state = status.get("state")
+            return state if isinstance(state, str) else None
+    return None
 
 
 def _gh_commit_status_writer(
@@ -930,9 +1005,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             def fetch(_url):  # noqa: F811 - deliberate local rebinding
                 return json.loads(payload_path.read_text(encoding="utf-8"))
 
+        if not args.ledger and not args.tested_sha:
+            print(
+                "super-board-qa: merge-handoff needs --ledger or --tested-sha",
+                file=sys.stderr,
+            )
+            return EXIT_USAGE
+        raw: dict[str, Any] = {}
         try:
-            raw = json.loads(Path(args.ledger).read_text(encoding="utf-8"))
-            entry = QaLedgerEntry(**raw)
+            if args.ledger:
+                raw = json.loads(Path(args.ledger).read_text(encoding="utf-8"))
+                entry = QaLedgerEntry(**raw)
+            else:
+                # No ledger file: the caller names the commit QA attested to and
+                # nothing else. Naming a commit asserts nothing — the live head
+                # and the live SHA-bound check are both read here, so a claim
+                # about a commit that is not the head, or that carries no
+                # successful check, is refused exactly as it would be with a
+                # ledger. This is what lets a caller that cannot be trusted to
+                # report a verdict still ask for one.
+                entry = _attested_entry(args.tested_sha, args.pull_request)
+                raw = {"tested_sha": entry.tested_sha}
             head = resolve_pull_request_head(args.pull_request, fetch=fetch)
         except QaError as exc:
             # An unreadable head is not merge-ready; report it, never fail open.
@@ -947,7 +1040,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 file=sys.stderr,
             )
             return EXIT_CONFIG
-        decision = validate_merge_handoff(entry, head, args.check_conclusion)
+
+        conclusion = args.check_conclusion
+        if conclusion is None:
+            if not args.config:
+                print(
+                    "super-board-qa: reading the check live needs --config; "
+                    "a missing conclusion is never assumed successful",
+                    file=sys.stderr,
+                )
+                return EXIT_USAGE
+            live_config = _load_config_or_exit(args.config)
+            conclusion = _gh_commit_status_conclusion(
+                live_config.repo_remote, entry.tested_sha, entry.check_context
+            )
+
+        decision = validate_merge_handoff(entry, head, conclusion)
         print(json.dumps({**decision.to_dict(), "ok": True}, sort_keys=True))
         return EXIT_OK
 
