@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""super-board-publish.py — the ONLY supported GitHub evidence-publication CLI.
+
+Every GitHub-bound payload the pipeline produces goes through this one command:
+issue creation and edits, pull-request bodies and comments, review summaries, QA
+comments, checks, commit statuses, closure comments, bug reports, release text,
+Project text fields, and dispatch/reconciliation manifests.
+
+It renders the complete payload, redacts, rescans the complete redacted result,
+and fails closed with exit 78 before any write happens. A second publication
+path would be a second place to forget a secret category — there isn't one.
+
+Input is a JSON document:
+
+    {
+      "surface": "qa-comment",
+      "text": "…",                       // or "template_fragments": ["…", "…"]
+      "environment": {"NAME": "value"},   // optional; values are redacted
+      "artifacts": [{"name": "…", "classification": "image/png"}]
+    }
+
+`template_fragments` exists because a secret can be split across two fragments
+and neither matches anything alone. They are joined BEFORE scanning.
+
+Usage:
+    super-board-publish.py publish --input PATH [--surface NAME] [--json]
+                                   [--execute --target <gh-target>]
+
+Without `--execute` nothing is written: the sanitized payload is printed and
+`github_writes` is 0. That is the default on purpose — a dry sanitize is always
+safe to run.
+
+Exit: 0 ok · 64 invalid invocation · 65 invalid input/unknown surface ·
+      78 unsafe evidence rejected (nothing written).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, Optional, Sequence
+
+_SCRIPTS = Path(__file__).resolve().parent
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
+
+from super_board_runtime import EXIT_CONFIG, EXIT_OK, EXIT_USAGE  # noqa: E402
+from super_board_runtime.publication import (  # noqa: E402
+    PUBLICATION_SURFACES,
+    PublicationError,
+    UnsafePublication,
+    publish,
+    render_payload,
+)
+
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, message: str):
+        self.print_usage(sys.stderr)
+        print(f"super-board-publish: {message}", file=sys.stderr)
+        raise SystemExit(EXIT_USAGE)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = _Parser(prog="super-board-publish.py", description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    pub = sub.add_parser("publish", help="sanitize a payload and optionally write it")
+    pub.add_argument("--input", required=True, help="path to the payload JSON")
+    pub.add_argument(
+        "--surface",
+        default=None,
+        choices=PUBLICATION_SURFACES,
+        help="override the payload's surface",
+    )
+    pub.add_argument("--json", action="store_true", help="machine-readable output (default)")
+    pub.add_argument(
+        "--execute",
+        action="store_true",
+        help="actually write; without it nothing is published",
+    )
+    pub.add_argument("--target", default=None, help="the gh target for --execute")
+    return parser
+
+
+def _gh_writer(target: Optional[str]):
+    def write(surface: str, text: str) -> dict[str, Any]:
+        if not target:
+            raise PublicationError(
+                "publication-target-missing", "--execute requires --target"
+            )
+        # The sanitized text is handed over on stdin, never on a command line:
+        # a command line is visible in the process table.
+        result = subprocess.run(
+            ["gh", "api", "--method", "POST", target, "--input", "-"],
+            input=json.dumps({"body": text}),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode != 0:
+            raise PublicationError("publication-write-failed", "the GitHub write failed")
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return {}
+
+    return write
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    try:
+        raw = json.loads(Path(args.input).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"super-board-publish: unreadable payload: {exc}", file=sys.stderr)
+        print(json.dumps({"ok": False, "reason": "payload-unreadable"}, sort_keys=True), file=sys.stderr)
+        return EXIT_CONFIG
+    if not isinstance(raw, dict):
+        print("super-board-publish: the payload must be a JSON object", file=sys.stderr)
+        print(json.dumps({"ok": False, "reason": "payload-invalid"}, sort_keys=True), file=sys.stderr)
+        return EXIT_CONFIG
+
+    surface = args.surface or raw.get("surface")
+    fragments = raw.get("template_fragments")
+    if isinstance(fragments, list):
+        text = render_payload(fragments)
+    else:
+        text = raw.get("text")
+    if not isinstance(text, str):
+        print("super-board-publish: payload needs 'text' or 'template_fragments'", file=sys.stderr)
+        print(json.dumps({"ok": False, "reason": "payload-invalid"}, sort_keys=True), file=sys.stderr)
+        return EXIT_CONFIG
+
+    environment = raw.get("environment") if isinstance(raw.get("environment"), dict) else {}
+    artifacts = raw.get("artifacts") if isinstance(raw.get("artifacts"), list) else []
+
+    try:
+        result = publish(
+            surface if isinstance(surface, str) else "",
+            text,
+            environment,
+            writer=_gh_writer(args.target),
+            artifacts=artifacts,
+            dry_run=not args.execute,
+        )
+    except UnsafePublication as exc:
+        # Category and offset only. Quoting the leak would be a second leak.
+        print(f"🛑 super-board-publish: {exc}", file=sys.stderr)
+        print(
+            json.dumps(
+                {
+                    "findings": [f.to_dict() for f in exc.findings],
+                    "github_writes": 0,
+                    "ok": False,
+                    "reason": exc.reason,
+                },
+                sort_keys=True,
+            ),
+            file=sys.stderr,
+        )
+        return exc.exit_code
+    except PublicationError as exc:
+        print(f"super-board-publish: {exc}", file=sys.stderr)
+        print(json.dumps({"ok": False, "reason": exc.reason}, sort_keys=True), file=sys.stderr)
+        return exc.exit_code
+
+    print(json.dumps({**result, "ok": True}, sort_keys=True))
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

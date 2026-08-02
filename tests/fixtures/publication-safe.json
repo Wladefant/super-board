@@ -1,0 +1,11 @@
+{
+  "artifacts": [
+    {
+      "classification": "text/markdown",
+      "name": "summary.md"
+    }
+  ],
+  "environment": {},
+  "surface": "qa-comment",
+  "text": "Exact-SHA QA passed. 18 tests, 0 failures. No credential material in this payload."
+}

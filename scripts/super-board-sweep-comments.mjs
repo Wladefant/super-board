@@ -23,8 +23,10 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 function detectRepo() {
   try {
@@ -111,28 +113,66 @@ if (rows.length) {
 }
 
 // ---------------------------------------------------------------- report
+// The report is RENDERED first and sanitized as one complete payload, because a
+// secret can be split across two comment bodies and neither half matches
+// anything alone. Inbound comments are attacker-controlled text: somebody
+// pasting a token into a card must not have it re-rendered into a terminal, a
+// scrollback buffer, or whatever the operator forwards next.
+const out = [];
+const emit = (line = '') => out.push(line);
+
 const label = mode === 'new' ? `new since ${since}` : mode === 'since' ? `since ${since}` : 'all time';
-console.log(`# Comment sweep — ${REPO} (${label})`);
-console.log(`# ${rows.length} comment(s)${author ? ` by ${author}` : ''}${has('--mine') ? ` from people other than ${OWNER}` : ''}\n`);
+emit(`# Comment sweep — ${REPO} (${label})`);
+emit(`# ${rows.length} comment(s)${author ? ` by ${author}` : ''}${has('--mine') ? ` from people other than ${OWNER}` : ''}\n`);
 
 if (rows.length === 0) {
-  console.log('Nothing new.');
+  emit('Nothing new.');
 } else {
   const byAuthor = rows.reduce((m, r) => (m[r.who] = (m[r.who] ?? 0) + 1, m), {});
-  console.log('By author: ' + Object.entries(byAuthor).map(([k, v]) => `${k}=${v}`).join('  ') + '\n');
+  emit('By author: ' + Object.entries(byAuthor).map(([k, v]) => `${k}=${v}`).join('  ') + '\n');
 
   for (const r of rows) {
     const where = r.path ? ` · ${r.path}` : '';
-    console.log('─'.repeat(78));
-    console.log(`#${r.num} ${titles.get(r.num) ?? ''}   <${states.get(r.num) ?? '?'}>`);
-    console.log(`${r.at}  ${r.who}  [${r.kind}${r.edited ? ', edited' : ''}]${where}`);
-    console.log(r.url);
-    console.log('');
+    emit('─'.repeat(78));
+    emit(`#${r.num} ${titles.get(r.num) ?? ''}   <${states.get(r.num) ?? '?'}>`);
+    emit(`${r.at}  ${r.who}  [${r.kind}${r.edited ? ', edited' : ''}]${where}`);
+    emit(r.url);
+    emit('');
     const body = r.body.length > BODY_LIMIT ? r.body.slice(0, BODY_LIMIT) + `\n… (${r.body.length - BODY_LIMIT} more chars, use --full)` : r.body;
-    console.log(body);
-    console.log('');
+    emit(body);
+    emit('');
   }
 }
+
+// One sanitizer, immediately before the payload is surfaced. Exit 78 means
+// something sensitive survived redaction and NOTHING is printed — the same
+// fail-closed contract every GitHub-bound payload obeys.
+const sanitizeSweep = (text) => {
+  const scripts = dirname(fileURLToPath(import.meta.url));
+  const payload = join(tmpdir(), `super-board-sweep-${process.pid}.json`);
+  writeFileSync(payload, JSON.stringify({ surface: 'pull-request-comment', text }));
+  try {
+    const raw = execFileSync(
+      process.env.SUPER_BOARD_PYTHON || 'python3',
+      [join(scripts, 'super-board-publish.py'), 'publish', '--input', payload, '--json'],
+      { encoding: 'utf8' },
+    );
+    return JSON.parse(raw).text;
+  } catch (err) {
+    if (err && err.status === 78) {
+      console.error('🛑 comment sweep refused: the rendered report still carries sensitive material after redaction. Nothing was printed.');
+      process.exit(78);
+    }
+    // The sanitizer could not run at all. Fail closed: an unsanitized sweep is
+    // exactly the payload this wiring exists to stop.
+    console.error(`🛑 comment sweep refused: the sanitizer could not run (${err && err.message}). Nothing was printed.`);
+    process.exit(78);
+  } finally {
+    try { rmSync(payload, { force: true }); } catch { /* best effort */ }
+  }
+};
+
+console.log(sanitizeSweep(out.join('\n')));
 
 // ---------------------------------------------------------------- watermark
 if (!has('--peek') && !has('--all') && !val('--since')) {

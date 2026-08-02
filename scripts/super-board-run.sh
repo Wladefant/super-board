@@ -270,6 +270,38 @@ release_claim() {
   gh issue edit "$1" --remove-assignee "$BOT_LOGIN" >/dev/null 2>&1 || true
 }
 
+sb_publish() {
+  # $1 = publication surface, $2 = path to the rendered payload.
+  # The ONLY way anything leaves this dispatcher for GitHub. The payload is
+  # rendered first, then redacted, then the complete redacted result is scanned
+  # again, and exit 78 means nothing was written. Never call `gh issue comment`
+  # or any other write path directly from here — a second path is a second place
+  # to forget a secret category.
+  local surface="$1" file="$2" payload rc=0
+  payload=$(jq -n --arg s "$surface" --rawfile t "$file" '{surface:$s, text:$t}' | sb_config_file)
+  "$(sb_python)" -B "$SB_SCRIPTS_DIR/super-board-publish.py" \
+    publish --input "$payload" --json || rc=$?
+  return "$rc"
+}
+
+publish_run_manifest() {
+  # The run manifest carries GitHub-controlled issue titles and worker output,
+  # so it is sanitized as ONE complete payload before it is surfaced anywhere.
+  local rc=0 out
+  out=$(sb_publish dispatch-manifest "$RUN_MANIFEST") || rc=$?
+  if [ "$rc" -eq 78 ]; then
+    log "🛑 the run manifest was rejected at the publication boundary — it is NOT safe to share. Nothing was published."
+    return 78
+  fi
+  if [ "$rc" -ne 0 ]; then
+    log "🛑 the run manifest could not be sanitized (exit ${rc}) — treating it as unpublishable (fail closed)."
+    return "$rc"
+  fi
+  echo "$out" | jq -r '.text' > "${RUN_MANIFEST}.sanitized"
+  log "run manifest sanitized → ${RUN_MANIFEST}.sanitized ($(echo "$out" | jq '.redactions | length') redaction(s))"
+  return 0
+}
+
 report_qa_evidence() {
   # $1 = issue number, $2 = ledger entry path, $3 = pull request URL.
   # Read-only freshness check for a card sitting in QA or Review. Emits the
@@ -680,3 +712,4 @@ while true; do
 done
 
 log "super-board run finished. manifest: $RUN_MANIFEST"
+publish_run_manifest || true
