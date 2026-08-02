@@ -55,12 +55,12 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Optional, Sequence
 
 try:  # normal package import
-    from . import EXIT_CONFIG, EXIT_OK, EXIT_USAGE
+    from . import EXIT_CONFIG, EXIT_OK, EXIT_USAGE, gh_binary
     from .config import ConfigError, NormalizedConfig, load_and_validate_config
     from .publication import UnsafePublication, publish
 except ImportError:  # executed as a plain file path
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from super_board_runtime import EXIT_CONFIG, EXIT_OK, EXIT_USAGE
+    from super_board_runtime import EXIT_CONFIG, EXIT_OK, EXIT_USAGE, gh_binary
     from super_board_runtime.config import (
         ConfigError,
         NormalizedConfig,
@@ -113,20 +113,10 @@ class PullRequestHead:
         return dict(asdict(self))
 
 
-def _gh_binary() -> str:
-    """The `gh` executable. `SUPERBOARD_GH` overrides it with an absolute path.
-
-    Mirrors `SUPER_BOARD_PYTHON` in `super-board-python.sh`. It exists so the
-    GitHub boundary can be exercised by a test without a network, an account,
-    or a repository — the alternative is a write path no test ever executes.
-    """
-    return os.environ.get("SUPERBOARD_GH") or "gh"
-
-
 def _gh_pull_request_view(url: str) -> Any:
     result = subprocess.run(
         [
-            _gh_binary(),
+            gh_binary(),
             "pr",
             "view",
             url,
@@ -860,7 +850,7 @@ def _gh_commit_status_writer(
         }
         result = subprocess.run(
             [
-                _gh_binary(),
+                gh_binary(),
                 "api",
                 "--method",
                 "POST",
@@ -1023,8 +1013,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     writes: list[Any] = []
     try:
+        # `disposition` is plan-only, whatever `--dry-run` says: it decides where
+        # the card goes and hands back a sanitized follow-up payload, and the
+        # single GitHub write is performed by the caller through
+        # `super-board-publish.py --execute`. Reporting a write here that no
+        # `gh` call backs is how the follow-up came to be "filed" for months
+        # without ever existing on GitHub.
         disposition = file_qa_failure(
-            result, config, issue_writer=writes.append, dry_run=args.dry_run
+            result, config, issue_writer=writes.append, dry_run=True
         )
     except (QaError, UnsafePublication) as exc:
         # An unsafe follow-up is refused with zero writes, exit 78 — the same
@@ -1043,7 +1039,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     # The follow-up is emitted as a payload, never written from here: every
     # GitHub-bound byte leaves through `super-board-publish.py` so exactly one
-    # sanitizer sees it.
+    # sanitizer sees it. The caller MUST perform that write — see
+    # `super-qa-file-bug.sh`, which is the supported caller.
     if disposition.follow_up_issue_required:
         follow_up = build_follow_up_issue(result, config)
         body["follow_up"] = {

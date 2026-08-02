@@ -72,20 +72,35 @@ if [ "$RC" -ne 0 ]; then
   exit "$RC"
 fi
 
-# The follow-up issue is published through the ONE sanitizer. Nothing here
-# writes to GitHub directly: `super-board-publish.py` renders the complete
-# payload, redacts, rescans the redacted result, and exits 78 before any write
-# if anything sensitive survived.
+# The follow-up issue is published through the ONE sanitizer, and — unless this
+# is a dry run — it is actually CREATED. `super-board-publish.py` renders the
+# complete payload, redacts, rescans the redacted result, and exits 78 before
+# any write if anything sensitive survived; only then does it POST the issue.
+#
+# Sanitizing the payload and then discarding it is what this script used to do,
+# which left the card Blocked pointing at a follow-up that existed nowhere.
 if echo "$OUT" | jq -e '.follow_up != null' >/dev/null 2>&1; then
   PAYLOAD=$(echo "$OUT" | jq '.follow_up | {surface, text}' | sb_config_file)
+  PUB_ARGS=(publish --input "$PAYLOAD" --json)
+  if [ "$DRY_RUN" -eq 0 ]; then
+    REPO=$(jq -r '.repo.remote // empty' "$CONFIG")
+    if [ -z "$REPO" ]; then
+      echo "🛑 super-qa-file-bug: the config names no repo remote — refusing to guess where to file." >&2
+      exit 65
+    fi
+    PUB_ARGS+=(--execute --target "repos/${REPO}/issues")
+  fi
   PUB_RC=0
-  PUB=$("$(sb_python)" -B "$SB_SCRIPTS_DIR/super-board-publish.py" \
-          publish --input "$PAYLOAD" --json) || PUB_RC=$?
+  PUB=$("$(sb_python)" -B "$SB_SCRIPTS_DIR/super-board-publish.py" "${PUB_ARGS[@]}") || PUB_RC=$?
   if [ "$PUB_RC" -ne 0 ]; then
-    echo "🛑 super-qa-file-bug: the follow-up payload was rejected at the publication boundary — nothing was filed." >&2
+    echo "🛑 super-qa-file-bug: the follow-up was rejected at the publication boundary — nothing was filed." >&2
     exit "$PUB_RC"
   fi
-  OUT=$(echo "$OUT" | jq --argjson pub "$PUB" '.follow_up.sanitized = $pub.text | .follow_up.redactions = $pub.redactions')
+  OUT=$(echo "$OUT" | jq --argjson pub "$PUB" \
+    '.follow_up.sanitized = $pub.text
+     | .follow_up.redactions = $pub.redactions
+     | .follow_up.url = ($pub.url // null)
+     | .github_writes = $pub.github_writes')
 fi
 
 printf '%s\n' "$OUT"

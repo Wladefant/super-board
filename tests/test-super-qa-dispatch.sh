@@ -213,4 +213,33 @@ SIG_RC=0; wait "$SIG_PID" || SIG_RC=$?
 [ "$SIG_RC" -eq 143 ] || fail "a TERM during QA should exit 143, got $SIG_RC"
 [ -z "$(ls -A "$TMP/wt-signal/locks" 2>/dev/null)" ] || fail "the QA lock survived a TERM"
 
-echo "PASS: test-super-qa-dispatch.sh (12 scenarios)"
+# Scenario 13 — an out-of-scope failure actually FILES the promised follow-up.
+# Sanitizing a payload and then discarding it leaves the card Blocked with a
+# follow-up that exists only in a JSON line nobody reads.
+: > "$TMP/gh-calls.txt"; : > "$TMP/gh-stdin.txt"
+OUT13=$("$FILEBUG" --config "$CFG" \
+        --issue-url https://github.com/test-owner/test-repo/issues/123 \
+        --pull-request https://github.com/test-owner/test-repo/pull/456 \
+        --tested-sha "$SHA_A" --failure-kind outside-acceptance)
+echo "$OUT13" | jq -e '.github_writes == 1' >/dev/null \
+  || fail "an out-of-scope failure files exactly one follow-up, got: $OUT13"
+grep -q "repos/test-owner/test-repo/issues" "$TMP/gh-calls.txt" \
+  || fail "the follow-up must be created on the configured repo, got: $(cat "$TMP/gh-calls.txt")"
+grep -q '"title"' "$TMP/gh-stdin.txt" \
+  || fail "a created issue needs a title, got: $(cat "$TMP/gh-stdin.txt")"
+grep -q "$SHA_A" "$TMP/gh-stdin.txt" \
+  || fail "the follow-up must name the tested SHA, got: $(cat "$TMP/gh-stdin.txt")"
+
+# Scenario 14 — the other two dispositions still write nothing at all.
+for kind in repairable external-input; do
+  : > "$TMP/gh-calls.txt"
+  OUT14=$("$FILEBUG" --config "$CFG" \
+          --issue-url https://github.com/test-owner/test-repo/issues/123 \
+          --pull-request https://github.com/test-owner/test-repo/pull/456 \
+          --tested-sha "$SHA_A" --failure-kind "$kind")
+  echo "$OUT14" | jq -e '.github_writes == 0' >/dev/null \
+    || fail "$kind must file nothing, got: $OUT14"
+  [ ! -s "$TMP/gh-calls.txt" ] || fail "$kind issued a GitHub write: $(cat "$TMP/gh-calls.txt")"
+done
+
+echo "PASS: test-super-qa-dispatch.sh (14 scenarios)"

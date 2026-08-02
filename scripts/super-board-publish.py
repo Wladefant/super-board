@@ -50,7 +50,7 @@ _SCRIPTS = Path(__file__).resolve().parent
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
-from super_board_runtime import EXIT_CONFIG, EXIT_OK, EXIT_USAGE  # noqa: E402
+from super_board_runtime import EXIT_CONFIG, EXIT_OK, EXIT_USAGE, gh_binary  # noqa: E402
 from super_board_runtime.publication import (  # noqa: E402
     MIN_REDACTABLE_ENV_VALUE_LEN,
     PUBLICATION_SURFACES,
@@ -89,6 +89,20 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+#: Surfaces that CREATE an issue. GitHub needs a title as well as a body, and
+#: the only title we may send is the one that came out of the sanitizer — so it
+#: is taken from the first line of the sanitized text, never passed alongside it
+#: as a second, unscanned channel.
+_ISSUE_CREATING_SURFACES = ("issue-create", "bug-report")
+
+
+def _issue_body(surface: str, text: str) -> dict[str, str]:
+    if surface not in _ISSUE_CREATING_SURFACES:
+        return {"body": text}
+    head, _, rest = text.partition("\n")
+    return {"title": head.lstrip("#").strip(), "body": rest.lstrip("\n")}
+
+
 def _gh_writer(target: Optional[str]):
     def write(surface: str, text: str) -> dict[str, Any]:
         if not target:
@@ -98,8 +112,8 @@ def _gh_writer(target: Optional[str]):
         # The sanitized text is handed over on stdin, never on a command line:
         # a command line is visible in the process table.
         result = subprocess.run(
-            ["gh", "api", "--method", "POST", target, "--input", "-"],
-            input=json.dumps({"body": text}),
+            [gh_binary(), "api", "--method", "POST", target, "--input", "-"],
+            input=json.dumps(_issue_body(surface, text)),
             capture_output=True,
             text=True,
             timeout=60,
