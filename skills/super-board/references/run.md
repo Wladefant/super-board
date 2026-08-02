@@ -51,7 +51,7 @@ Progress: ✅ onboard  →  ✅ lint  →  🤖 run (you are here)
 | Stale worktree scan | Auto-clean: for each dir in `.worktrees/`, if its branch no longer exists OR no `loop:in-*` label on its issue, `git worktree remove --force` it. Log each removal in the run manifest. Halt only if a removal fails. |
 | Production-merge guard | If `base_branch == "main"` AND `human_approves_merge == false` AND production-detection signals fire (see §5 step 8), halt with: `🛡 Refusing to start: would auto-merge to production main. Either set human_approves_merge: true or switch base_branch to staging.` |
 | Orphan-worker scan (added 2026-05-22 after #381 worker storm) | `pgrep -f 'claude -p .*super-board run'` must return zero. If any super-board worker is already alive from a prior crashed run, halt with: `🛑 ${N} super-board workers already running. Stop them first: pkill -f 'claude -p .*super-board run'`. The dispatcher must never run while orphan workers exist — they will collide on assignee claims and produce duplicate PRs. |
-| GraphQL rate-limit guard | Before each tick, query `gh api rate_limit`. If GraphQL remaining < 200, sleep until reset. Prevents the runner from dying mid-loop when the user has burned quota in another tool. |
+| GraphQL reserve guard | Before each tick, read the quota once per cycle and require `remaining - estimated_cost >= effective_floor`, where the floor is the immutable 1000-point reserve (a config may raise it, never lower it). Reaching the reserve — or being unable to read the quota at all — stops the runner cleanly with exit 75. No sleep-through-reset, no retry loop, no fabricated fallback capacity. |
 
 ## Lane mapping by variant
 
@@ -71,7 +71,7 @@ Tester:    QA → Review
 Reviewer:  Review → Done
            worker   = claude -p with super-review skill
            worktree = .worktrees/issue-<N>-review/
-           branch   = same issue-<N>-<slug>  (squash-merged on approval)
+           branch   = same issue-<N>-<slug>  (a human rebase-merges on approval)
 ```
 
 QA-only variant — 2 lanes:
@@ -113,8 +113,7 @@ There is **exactly one branch per issue** and **exactly one PR per issue**. All 
 
 - Builder creates the branch off `config.base_branch`, writes code, commits + pushes, opens a **draft PR**.
 - Tester checks out the same branch in a fresh worktree, adds tests, commits to the same branch, pushes.
-- Reviewer is the **only lane that merges**. On approval: squash-merges PR into `base_branch`, deletes the branch.
-- If `config.human_approves_merge: true`, Reviewer instead marks the PR ready for review and stops; a human clicks merge.
+- Reviewer **never merges**. On approval it marks the PR ready for review, moves the card to Review, and stops; a human rebase-merges. The runtime has no merge path, no auto-merge, and no substitute for a merge (it may not close the implementation issue in place of one).
 
 ## PR description template
 
@@ -135,7 +134,7 @@ Resolves #<N> — <title>
 |----|----------|-------------|---------|----------------------------------|
 | 1  | Builder  | ✅ done     | <time>  | <commit-sha>                     |
 | 2  | Tester   | ❌/✅ vN    | <time>  | runs/issue-<N>-qa-vN/            |
-| 3  | Reviewer | ✅ merged   | <time>  | squash → <merge-commit>          |
+| 3  | Reviewer | ✅ ready    | <time>  | awaiting human rebase-merge      |
 
 ## Evidence folders
 - `docs/super-board/runs/issue-<N>-qa-v1/`
@@ -261,16 +260,17 @@ If a screenshot file is >5MB, downscale to ≤1920px wide before committing; Git
    - **Above threshold** — continue to step 7.
    - **No Reproducer needed** — Tester's tests were re-run in step 5.
 7. Decide per finding:
-   - **No findings + threads clean + truth ≥ threshold + tests green** → merge path (draft-aware):
+   - **No findings + threads clean + truth ≥ threshold + tests green** → human-merge handoff (draft-aware):
      1. Check draft status: `gh pr view <PR> --json isDraft -q '.isDraft'`.
-     2. If draft **and** `human_approves_merge: false` (auto-merge): mark ready first (`gh pr ready <PR>`), then squash-merge (`gh pr merge --squash`), then verify the merge commit landed on `base_branch` before moving the card. If `gh pr ready` or the merge fails (checks failing, conflicts, permissions) — do **not** leave the card in Review to be silently re-picked; move it to Blocked with a `🛡`-tagged comment (see `block-template.md`) stating the specific failure (e.g. `PR #N still draft / merge blocked: <reason>`).
-     3. If draft **and** `human_approves_merge: true` (human-merge): mark ready-for-review (`gh pr ready <PR>`) and stop there (a human merges).
-     4. If not draft and `human_approves_merge: false`: squash-merge as usual. If not draft and `human_approves_merge: true`: mark ready (no-op if already ready) and stop.
-     5. On successful merge: delete branch, close issue, move card Review → Done.
-     **Invariant:** the card must **never** transition to Done while its PR is unmerged.
+     2. If draft: mark ready-for-review (`gh pr ready <PR>`). If that fails (checks failing, conflicts, permissions) — do **not** leave the card in Review to be silently re-picked; move it to Blocked with a `🛡`-tagged comment (see `block-template.md`) stating the specific failure (e.g. `PR #N still draft: <reason>`).
+     3. If not draft: mark ready (no-op if already ready).
+     4. Leave the card in Review and stop. A human rebase-merges.
+     **Invariant:** the runtime never merges, never enables auto-merge, never closes the
+     implementation issue as a substitute for a merge, and never moves a card to Done. Done is
+     produced by the built-in workflows and the closure normalizer *after* a real human merge.
    - **Code-side new finding** → open new `[builder]`-prefixed PR thread, comment, move card Review → Ready (label `loop:rebuild-N`).
    - **Test-side new finding** → open new `[QA]`-prefixed PR thread, comment, move card Review → QA (label `loop:rebuild-N`).
-   - **CI-budget block (💳, added 2026-05-22)** — if remote CI jobs `failed_to_start` due to `Actions budget` AND `config.auto_merge_on_ci_budget_block` is true AND local-evidence is strong (truth ≥ threshold, Tester suite green on rerun in step 5, all `[builder]`/`[QA]` threads clean) → **squash-merge anyway** on local evidence; do NOT move to Blocked. Add a `🛡 → ✅ CI-budget bypass` comment to both the PR and the issue citing: (a) the failed CI run ID, (b) the Tester pass-count, (c) the truth-gate score. Reason: CI failure-to-start ≠ test failure; with strong local evidence, parking the card wastes pipeline time. This bypass is ONLY for `💳` — never for `🛡` truth-fail, `🔐` missing creds, or `🧑` human-only decisions.
+   - **CI-budget block (💳)** — if remote CI jobs `failed_to_start` due to `Actions budget` AND local evidence is strong (truth ≥ threshold, Tester suite green on rerun in step 5, all `[builder]`/`[QA]` threads clean) → mark the PR ready and hand off to the human anyway; do NOT move to Blocked. Add a `🛡 → ✅ CI-budget bypass` comment to both the PR and the issue citing: (a) the failed CI run ID, (b) the Tester pass-count, (c) the truth-gate score. Reason: CI failure-to-start ≠ test failure; with strong local evidence, parking the card wastes pipeline time. The bypass affects the handoff only — it never merges. This bypass is ONLY for `💳` — never for `🛡` truth-fail, `🔐` missing creds, or `🧑` human-only decisions.
    - **Human-gate / Blocker (schema, API contract, money, auth, migration) / rebuild cap hit (config.rebuild_cap)** → write the full Block template (see §4), move card Review → Blocked.
 8. Clean up worktree.
 
@@ -379,7 +379,7 @@ Claim uses a **GitHub Issue assignee mutex** — atomic compare-and-set via `gh 
    └─ Present → proceed.
 3. Do the lane's work (build / QA / review).
 4. Comment evidence on issue + PR (structured handoff).
-5. Move card to next column (or Blocked/Skipped with the full §4 template).
+5. Move card to next column (or Blocked with the full §4 template).
 6. RELEASE CLAIM (`gh issue edit --remove-assignee super-board-bot[bot]`) and remove descriptive label.
 ```
 
@@ -435,7 +435,7 @@ Different hash on the same card resets the counter — the bot recognizes that p
 
 The loop exits cleanly when:
 - All active-pipeline columns are empty; OR
-- Only Blocked/Skipped/Done cards remain; OR
+- Only Blocked/Done cards remain; OR
 - A halt gate fires.
 
 ## Run manifest
@@ -460,9 +460,9 @@ Records: config used, variant, columns, target, per-card history (claim → comp
 Workers share the dispatcher's gh-auth token bucket. The dispatcher's `gh_rate_guard` does NOT protect worker traffic. Every worker MUST follow `rate-limit-etiquette.md` (in this directory):
 
 - Source `scripts/super-board-gh-guard.sh` at worker start.
-- Call `sb_gh_guard_check 200` before any burst of gh calls (thread reads, sub-agent spawn, exit verification).
+- Call `sb_gh_guard_check <estimated-cost>` before any burst of gh calls (thread reads, sub-agent spawn, exit verification). It stops the worker with exit 75 when the call would break the immutable reserve, or when the quota cannot be read at all.
 - Adversarial sub-agents are capped at 50 gh calls each — prefer `git blame` (local) over `gh api graphql`.
-- Final PR handoff comment MUST include `gh-quota-on-exit: graphql=<n>/5000 rest=<n>/5000` (use `sb_gh_guard_summary`).
+- Final PR handoff comment MUST include `gh-quota-on-exit: graphql=<remaining> floor=<effective-floor> reset=<time>` (use `sb_gh_guard_summary`).
 - On 403 / secondary-rate-limit: sleep 60s, re-check at threshold 500, then resume.
 
 ## Worker self-check (mandatory on exit, every lane)
@@ -470,10 +470,10 @@ Workers share the dispatcher's gh-auth token bucket. The dispatcher's `gh_rate_g
 Before releasing the claim assignee and exiting, every worker MUST verify:
 
 - [ ] Issue comment AND PR comment both written (per "Commenting cadence" above).
-- [ ] Card column move's mutation returned success. **Do NOT re-query `gh project item-list` for verification** — trust the mutation exit code (the 500-item GraphQL refetch was the per-worker quota tax; see `rate-limit-etiquette.md` §3). If the mutation returned non-zero, call `sb_gh_guard_check 200`, retry the move ONCE, and if it still fails, leave the assignee in place and write a halt comment.
+- [ ] Card column move's mutation returned success. **Do NOT re-query `gh project item-list` for verification** — trust the mutation exit code (the 500-item GraphQL refetch was the per-worker quota tax; see `rate-limit-etiquette.md` §3). If the mutation returned non-zero, call `sb_gh_guard_check`, retry the move ONCE, and if it still fails, leave the assignee in place and write a halt comment.
 - [ ] Claim assignee released (`gh issue edit --remove-assignee <bot_identity>`) and the descriptive `loop:in-*` label removed.
 - [ ] On failure handoff: `root-cause-hash:` line is present in the PR handoff comment (per "Root-cause hash" above).
-- [ ] On Block/Skip exit: the full template from `block-template.md` is populated on BOTH the issue and the PR (if a PR exists); the reason emoji is one of the nine in the vocabulary table (🔐 💳 🔑 ❓ 🛡 🧑 🤷 📦 🎨).
+- [ ] On Block exit: the full template from `block-template.md` is populated on BOTH the issue and the PR (if a PR exists); the reason emoji is one of the nine in the vocabulary table (🔐 💳 🔑 ❓ 🛡 🧑 🤷 📦 🎨).
 - [ ] `gh-quota-on-exit:` line appended to PR handoff comment.
 
 A worker that cannot satisfy this checklist must NOT release its claim. It either fixes the gap and re-checks, or — if the gap itself is structural (e.g., GitHub API refusing to move the card) — it leaves the assignee in place and writes a halt comment so the runner's "no progress for 3 ticks" gate can fire deterministically.

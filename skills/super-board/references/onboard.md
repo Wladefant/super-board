@@ -23,7 +23,7 @@ super-board onboard
 super-board = a GitHub Project pipeline that runs autonomously.
               It drains issues from Ready across columns
               (Building → QA → Review → Done) until the board
-              is empty or only Blocked/Skipped cards remain.
+              is empty or only Blocked/Done cards remain.
 
 Progress: 🛠 onboard (you are here)  →  🧹 lint  →  🤖 run
 ─────────────────────────────────────────────────────────
@@ -75,9 +75,12 @@ Progress: 🛠 onboard (you are here)  →  🧹 lint  →  🤖 run
    ├─ If picked → validate column shape matches variant (fix if not)
    └─ If new → `gh project create --title <name>` → create columns for variant
 
-6. VALIDATE / CREATE COLUMNS (idempotent)
-   ├─ Full variant (7 total):    Ready · Building · QA · Review · Done · Blocked · Skipped
-   ├─ QA-only variant (6 total): Ready ·            QA · Review · Done · Blocked · Skipped
+6. VALIDATE / REPAIR THE FIXED LIFECYCLE (idempotent)
+   ├─ The lifecycle is NOT configurable. Every board carries exactly these seven
+   │  Status options, whatever the variant:
+   │     Backlog · Ready · Building · QA · Review · Blocked · Done
+   ├─ `Skipped` is not a status. If the board still has it, report it for manual
+   │  reconciliation — never treat it as a lifecycle value, never dispatch from it.
    └─ Read Status field, add missing options, re-read to confirm.
 
 7. AUTO-GENERATE PROJECT.md (skip if URL-only or user opts out)
@@ -102,8 +105,8 @@ Progress: 🛠 onboard (you are here)  →  🧹 lint  →  🤖 run
    │    • `vercel.json` / `netlify.toml` present at repo root
    │    • Branch protection rules require PR review on base (gh api repos/.../branches/<base>/protection)
    │    • README contains "production" or live URL on the base branch
-   ├─ Ask: "Which branch should super-board cut feature branches from
-   │        and squash-merge them back into?"
+   ├─ Ask: "Which branch should super-board cut feature branches from,
+   │        for a human to rebase-merge them back into?"
    ├─ Default: main (unless production-detected, then default to creating `staging`)
    └─ ⚠️ WARN if base looks production-y (any signal above fires):
        "Heads up — using main means every merged ticket lands in
@@ -113,9 +116,10 @@ Progress: 🛠 onboard (you are here)  →  🧹 lint  →  🤖 run
 9. MERGE POLICY (Full variant with local repo, OR QA-only with a local repo)
    (Tester commits test files to the same branch; merge policy applies.
    Skip only when target.type == "url" with no repo.)
-   ├─ "Should super-board auto-merge approved PRs into base, or wait
-   │   for a human to click merge? [auto / human]"
-   ├─ Sets config.human_approves_merge accordingly.
+   ├─ There is nothing to ask: the runtime NEVER merges. Reviewer marks the PR
+   │   ready and stops; a human rebase-merges.
+   ├─ Writes config.human_approves_merge = true and config.merge_method = "rebase".
+   │   Any other combination exits 65 at validation time.
    └─ HARD RULE: if base_branch was production-detected (step 8) AND user
        did NOT switch to staging/develop, force human_approves_merge = true
        and tell the user: "Auto-merge to production is disabled. Approved
@@ -183,8 +187,7 @@ Before exiting `onboard` successfully, the worker MUST verify:
 3. **Project columns are present on GitHub** — running
    `gh project field-list <project.number> --owner <project.owner>` returns all
    required column options for the chosen variant:
-   - Full: `Ready, Building, QA, Review, Done, Blocked, Skipped`
-   - QA-only: `Ready, QA, Review, Done, Blocked, Skipped`
+   - Every variant: `Backlog, Ready, Building, QA, Review, Blocked, Done`
 4. **PROJECT.md exists** — when `paths.project_md` is non-null (i.e. any flow with
    a local repo), the file at that path exists and is non-empty.
 

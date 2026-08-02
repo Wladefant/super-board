@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "description": "PolySimulator board",
+  "variant": "full",
+  "project": { "owner": "Bavariance", "title": "PolySimulator", "number": 1 },
+  "repo": { "path": ".", "remote": "Bavariance/polysimulator" },
+  "base_branch": "staging",
+  "branch_routes": {
+    "route:staging": "staging",
+    "route:staging-frankfurt": "staging-frankfurt",
+    "route:designstaging": "designstaging"
+  },
+  "worker_backend": "claude-p",
+  "human_approves_merge": true,
+  "merge_method": "rebase",
+  "activation_mode": "off",
+  "proof_issue_url": null,
+  "max_workers": 2,
+  "rebuild_cap": 2,
+  "exclude_labels": ["design", "history"],
+  "minimum_graphql_reserve": 1000,
+  "github_auth": {
+    "mode": "unattended",
+    "token_env_var": "SUPERBOARD_GITHUB_TOKEN",
+    "login_env_var": "SUPERBOARD_GITHUB_LOGIN",
+    "expected_login": "superboard-machine",
+    "required_scopes": ["repo", "project", "read:org"],
+    "required_projects": [
+      { "name": "superboard-system", "owner": "Wladefant", "number": 5 },
+      { "name": "master-board", "owner": "Wladefant", "number": 6 }
+    ]
+  },
+  "design_skill": { "enabled": true, "label": "design" },
+  "agent_native": { "enabled": true, "projection_only": true },
+  "deploy": { "provider": "dokploy", "auto_deploy": false }
+}

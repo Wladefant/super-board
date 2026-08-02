@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "description": "invalid: the lifecycle is fixed, so 'columns' may not be configured",
+  "variant": "full",
+  "project": { "owner": "Bavariance", "number": 1 },
+  "repo": { "remote": "Bavariance/polysimulator" },
+  "base_branch": "staging",
+  "columns": ["Ready", "QA", "Review", "Done", "Blocked", "Skipped"]
+}
