@@ -36,8 +36,8 @@ The standalone HTML prototype remains, demoted to the **offline / no-host fallba
 
 | Field | Value |
 |---|---|
-| **Self-hosted app URL** | `https://design.wladefant.de` — live, HTTP 200 (verified 2026-07-27T23:45Z). Sign-in has **not** been exercised yet; if auth blocks you, say so rather than silently falling back |
-| **Self-hosted MCP URL** | `https://design.wladefant.de/mcp` |
+| **Self-hosted app URL** | `https://design.wladefant.de` — **PARKED, currently returns 502.** The stack was deliberately stopped on 2026-08-02, not deleted. Do not try to use it; use the upstream fallback below. To bring it back, start the apps and Postgres in the Dokploy project `Agent Native` (`mtRLA9hkop95jktJchjHD`) |
+| **Self-hosted MCP URL** | `https://design.wladefant.de/mcp` — parked with the app |
 | **Upstream hosted fallback** | `https://design.agent-native.com` · MCP `https://design.agent-native.com/mcp` |
 | **Local dev** | `http://127.0.0.1:8099` (`pnpm install && pnpm dev` in the design template) |
 | **MCP server name** | `agent-native-design` |
@@ -61,8 +61,9 @@ variant exploration, and design-to-code handoff.
 
 **Use the offline HTML fallback when** any of these is true:
 
-- neither the self-hosted app nor the upstream connector can be authenticated (the self-hosted
-  instance is live but its sign-in is unproven — if it rejects you, that counts, and say so);
+- neither the self-hosted app nor the upstream connector can be authenticated. **The
+  self-hosted instance is currently parked and returns 502**, so today this means the upstream
+  connector alone decides: if it is not authenticated, take the offline path and say so;
 - the connector returns `Session terminated` / `needs auth` and reconnect is not possible right now;
 - there is no network, or the operator explicitly asks for a local self-contained file;
 - the artifact must be committed into a product repo and viewable with zero dependencies

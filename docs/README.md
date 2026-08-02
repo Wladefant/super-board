@@ -1,5 +1,9 @@
 # Super Board documentation
 
+## Status
+
+- [Agent Native is PARKED (2026-08-02)](https://github.com/Wladefant/super-board/blob/main/docs/runbooks/AGENT-NATIVE-PARKED.md) — the self-hosted stack was stopped, not deleted; what was done, exact IDs to restart it, and what to fix first.
+
 ## Start here
 
 - [START HERE — what actually works right now](https://github.com/Wladefant/super-board/blob/main/docs/START-HERE.md) — **the front door.** What is live and verified by a real HTTP response, what is deployed but unproven, what is still pending, and the five open decisions with their tradeoffs — plus the shortest path to starting work on any product. Status is timestamped; re-check commands included.
