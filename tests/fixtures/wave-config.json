@@ -2,5 +2,6 @@
   "version": 1,
   "variant": "full",
   "max_workers": 3,
+  "activation_mode": "active",
   "project": { "owner": "test-owner", "number": 99 }
 }

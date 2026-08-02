@@ -15,8 +15,23 @@
 #      claimed issue has already moved out of the lane's expected source column. The worker's logical
 #      work is done; if the claude -p process lingers, lane appears busy forever and downstream cards
 #      pile up unprocessed. Uses the project-items cache so it costs zero extra API calls per tick.
+#
+# Dispatch eligibility is NOT decided here. It is delegated to the shared runtime
+# (`super_board_runtime.eligibility`), which the read-only planner and the dynamic
+# workflow also use, so a card cannot be eligible in one path and ineligible in
+# another. Consequences worth knowing before reading the loop:
+#   • Status must be EXACTLY `Ready`. There is no "eligible for the requested
+#     lane": Backlog, Building, QA, Review, Blocked, and Done are all rejected.
+#     A worker carries its own card forward through its lifecycle; the dispatcher
+#     does not re-pick cards out of QA or Review.
+#   • `design` and `history` cards are never dispatchable, whatever the config says.
+#   • A failed issue-state lookup makes a card ineligible. Nothing fails open.
 
 set -euo pipefail
+
+# shellcheck source=scripts/super-board-python.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/super-board-python.sh"
+trap sb_tmp_cleanup EXIT
 
 # ───────────────────────────── args + paths ─────────────────────────────
 CONFIG_SLUG="${1:-}"
@@ -36,28 +51,41 @@ if [ ! -f "$CONFIG_PATH" ]; then
 fi
 
 # ───────────────────────────── config read ─────────────────────────────
-VARIANT=$(jq -r '.variant' "$CONFIG_PATH")
-PROJECT_OWNER=$(jq -r '.project.owner' "$CONFIG_PATH")
-PROJECT_NUMBER=$(jq -r '.project.number' "$CONFIG_PATH")
-BASE_BRANCH=$(jq -r '.base_branch // "main"' "$CONFIG_PATH")
-HUMAN_APPROVES=$(jq -r '.human_approves_merge // false' "$CONFIG_PATH")
-REBUILD_CAP=$(jq -r '.rebuild_cap // 2' "$CONFIG_PATH")
+# The normalized config is the single source of truth for every policy value.
+# An invalid config stops the dispatcher before it can touch GitHub (exit 65).
+CONFIG_NATIVE=$(sb_native_path "$CONFIG_PATH")
+if ! NORMALIZED_CONFIG=$("$(sb_python)" -B "$SB_SCRIPTS_DIR/super-board-config.py" \
+      validate --config "$CONFIG_NATIVE" --json); then
+  echo "🛑 refusing to start: config did not validate — see the diagnostics above." >&2
+  exit 65
+fi
+cfg() { echo "$NORMALIZED_CONFIG" | jq -r "$1"; }
+
+PROJECT_OWNER=$(cfg '.project_owner')
+PROJECT_NUMBER=$(cfg '.project_number')
+BASE_BRANCH=$(cfg '.base_branch')
+HUMAN_APPROVES=$(cfg '.human_approves_merge')
+REBUILD_CAP=$(cfg '.rebuild_cap')
+MAX_WORKERS=$(cfg '.max_workers')
+WORKER_BACKEND=$(cfg '.worker_backend')
+ACTIVATION_MODE=$(cfg '.activation_mode')
+
+# Operational knobs that carry no policy meaning stay on the raw config.
+VARIANT=$(jq -r '.variant // "full"' "$CONFIG_PATH")
 BLOCK_ALERT_PCT=$(jq -r '.block_rate_alert_pct // 30' "$CONFIG_PATH")
 TICK_SECONDS=$(jq -r '.tick_seconds // 120' "$CONFIG_PATH")
-MAX_WORKERS=$(jq -r '.max_workers // 3' "$CONFIG_PATH")
 BOT_LOGIN=$(jq -r '.notifications.bot_identity // .bot_identity // ""' "$CONFIG_PATH")
-WORKER_BACKEND=$(jq -r '.worker_backend // "workflow"' "$CONFIG_PATH")
 NOPROGRESS_HALT_TICKS=$(jq -r '.noprogress_halt_ticks // 10' "$CONFIG_PATH")
 MAX_DISPATCHES=$(jq -r '.max_dispatches // 20' "$CONFIG_PATH")
 MAX_HOURS=$(jq -r '.max_hours // 3' "$CONFIG_PATH")
 STALE_LOCK_SECONDS=$(jq -r '.stale_lock_seconds // 900' "$CONFIG_PATH")
 
-# Workflow is the default backend (v1.6.0). This legacy dispatcher only runs
-# when the config opts in explicitly — never by accident or stale habit.
+# This dispatcher is the "claude-p" backend. A board configured for the
+# in-session workflow backend must not be drained here.
 if [ "$WORKER_BACKEND" != "claude-p" ]; then
   echo "🛑 board '${CONFIG_SLUG}' uses the workflow backend (worker_backend=${WORKER_BACKEND})." >&2
   echo "    Run it in-session: /super-board run ${CONFIG_SLUG}  (see references/run-workflow.md)" >&2
-  echo "    To use this legacy dispatcher, set \"worker_backend\": \"claude-p\" in the config." >&2
+  echo "    To use this dispatcher, set \"worker_backend\": \"claude-p\" in the config." >&2
   exit 78
 fi
 
@@ -89,24 +117,35 @@ column_count() {
   echo "$PROJECT_ITEMS_JSON" | jq --arg col "$1" '[.items[] | select(.status == $col)] | length'
 }
 
-top_card_in_column() {
-  # Returns the FIRST issue number in $1 with no assignee AND no local in-flight lock.
-  # Skips CLOSED issues (board Status can drift while issue is already closed).
-  local col="$1" issue state
-  for issue in $(echo "$PROJECT_ITEMS_JSON" | jq -r --arg col "$col" '
-        .items[]
-        | select(.status == $col and .content.type == "Issue")
-        | select((.content.assignees // []) | length == 0)
-        | .content.number'); do
+ELIGIBLE_CARDS_JSON="[]"
+refresh_eligible_cards() {
+  # ONE runtime call per tick decides which cards may be dispatched at all.
+  # Every gate lives in super_board_runtime.eligibility, so this dispatcher
+  # cannot drift from the planner or the workflow. Fails closed: if the
+  # evaluation itself fails, nothing is dispatched this tick.
+  local plan rc=0
+  plan=$(printf '%s' "$PROJECT_ITEMS_JSON" | sb_runtime super_board_runtime.eligibility \
+           --items - --config "$CONFIG_NATIVE" 2>/dev/null) || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    ELIGIBLE_CARDS_JSON="[]"
+    log "🛑 eligibility evaluation failed (exit ${rc}) — dispatching nothing this tick (fail closed)"
+    return 0
+  fi
+  ELIGIBLE_CARDS_JSON=$(echo "$plan" | jq -c '.cards // []')
+  local skipped
+  skipped=$(echo "$plan" | jq -r '
+    [.decisions[] | select(.eligible == false) | .reason_codes[]] | group_by(.)
+    | map("\(.[0])×\(length)") | join(" ")')
+  [ -n "$skipped" ] && log "eligibility — dispatchable=$(echo "$ELIGIBLE_CARDS_JSON" | jq 'length') skipped: ${skipped}"
+  return 0
+}
+
+next_dispatchable_card() {
+  # First runtime-eligible card without a local in-flight lock. No fail-open
+  # branch exists: a card the runtime did not return is not dispatched, period.
+  local issue
+  for issue in $(echo "$ELIGIBLE_CARDS_JSON" | jq -r '.[].number // empty'); do
     if issue_locked "$issue"; then
-      continue
-    fi
-    if ! state=$(gh issue view "$issue" --json state -q '.state' 2>/dev/null); then
-      log "⚠ issue state lookup failed for #${issue} — treating as OPEN (fail-open)"
-      state="OPEN"
-    fi
-    if [ "$state" != "OPEN" ]; then
-      log "skip dispatch — issue #${issue} is CLOSED but card status='${col}' (stuck; needs manual board reconcile) — trying next candidate"
       continue
     fi
     echo "$issue"
@@ -177,8 +216,8 @@ gh_rate_guard() {
 try_claim_assignee() {
   # Atomic claim. Returns 0 if we won the claim, 1 if someone else beat us.
   # Skipped when bot_identity is unset (solo single-user runs rely on local locks only).
-  # We rely on `top_card_in_column` having already filtered out cards with assignees
-  # from the cached project item-list — so we attempt the edit directly without a
+  # We rely on the runtime's eligibility pass having already filtered out cards with
+  # assignees from the cached project item-list — so we attempt the edit directly without a
   # pre-check `gh issue view`. Saves one GraphQL call per dispatch. The edit is
   # idempotent for self-assign; on race-loss, gh returns non-zero and we skip.
   local issue="$1"
@@ -324,7 +363,7 @@ drain_in_flight() {
 }
 
 # ───────────────────────────── preconditions ─────────────────────────────
-log "super-board run started — config=${CONFIG_SLUG} variant=${VARIANT} base=${BASE_BRANCH} tick=${TICK_SECONDS}s max_workers=${MAX_WORKERS} noprogress_halt_ticks=${NOPROGRESS_HALT_TICKS} max_dispatches=${MAX_DISPATCHES} max_hours=${MAX_HOURS}"
+log "super-board run started — config=${CONFIG_SLUG} variant=${VARIANT} base=${BASE_BRANCH} activation=${ACTIVATION_MODE} tick=${TICK_SECONDS}s max_workers=${MAX_WORKERS} noprogress_halt_ticks=${NOPROGRESS_HALT_TICKS} max_dispatches=${MAX_DISPATCHES} max_hours=${MAX_HOURS}"
 
 # Orphan-worker guard. `|| true` defends against pipefail when pgrep finds nothing.
 ORPHANS=$(pgrep -f 'claude -p .*super-board run' 2>/dev/null | grep -v "^$$\$" | wc -l | tr -d ' ' || true)
@@ -438,6 +477,7 @@ while true; do
   # ── Expensive-tick path: we have capacity, fetch real state.
   gh_rate_guard
   fetch_project_items
+  refresh_eligible_cards
 
   # Re-sweep zombies against fresh cache; the previous sweep used stale data.
   sweep_lane_zombies
@@ -494,37 +534,28 @@ while true; do
     [ "$ACTIVE_WORKERS" -lt "$MAX_WORKERS" ]
   }
 
-  if can_dispatch && [ "$REVIEW" -gt 0 ] && [ "$REVIEW_IDLE" -eq 1 ]; then
-    card=$(top_card_in_column "Review")
+  # There is no "eligible for the requested lane". The runtime hands back the
+  # cards that may be dispatched AT ALL — status exactly Ready, open issue, not
+  # excluded, not claimed — and the variant decides which lane carries them in.
+  # A worker then carries its own card forward through its lifecycle; the
+  # dispatcher never re-picks a card out of QA or Review.
+  ENTRY_LANE=build
+  [ "$VARIANT" = "qa-only" ] && ENTRY_LANE=qa
+  ENTRY_LANE_IDLE=$BUILD_IDLE
+  [ "$ENTRY_LANE" = "qa" ] && ENTRY_LANE_IDLE=$QA_IDLE
+
+  if can_dispatch && [ "$ENTRY_LANE_IDLE" -eq 1 ]; then
+    card=$(next_dispatchable_card)
     if [ -n "${card:-}" ]; then
-      dispatch_lane review "$card"
+      dispatch_lane "$ENTRY_LANE" "$card"
       PROGRESS=1
       ACTIVE_WORKERS=$((ACTIVE_WORKERS + 1))
     fi
   fi
-  if can_dispatch && [ "$QA" -gt 0 ] && [ "$QA_IDLE" -eq 1 ]; then
-    card=$(top_card_in_column "QA")
-    if [ -n "${card:-}" ]; then
-      dispatch_lane qa "$card"
-      PROGRESS=1
-      ACTIVE_WORKERS=$((ACTIVE_WORKERS + 1))
-    fi
-  fi
-  if can_dispatch && [ "$VARIANT" = "full" ] && [ "$READY" -gt 0 ] && [ "$BUILD_IDLE" -eq 1 ]; then
-    card=$(top_card_in_column "Ready")
-    if [ -n "${card:-}" ]; then
-      dispatch_lane build "$card"
-      PROGRESS=1
-      ACTIVE_WORKERS=$((ACTIVE_WORKERS + 1))
-    fi
-  fi
-  if can_dispatch && [ "$VARIANT" = "qa-only" ] && [ "$READY" -gt 0 ] && [ "$QA_IDLE" -eq 1 ]; then
-    card=$(top_card_in_column "Ready")
-    if [ -n "${card:-}" ]; then
-      dispatch_lane qa "$card"
-      PROGRESS=1
-      ACTIVE_WORKERS=$((ACTIVE_WORKERS + 1))
-    fi
+
+  if [ "${DOWNSTREAM_NOTE_SENT:-0}" -eq 0 ] && { [ "$QA" -gt 0 ] || [ "$REVIEW" -gt 0 ]; }; then
+    log "note — ${QA} QA / ${REVIEW} Review card(s) present. Only status 'Ready' is dispatchable; a lane worker carries its own card forward. Cards parked downstream are not re-dispatched."
+    DOWNSTREAM_NOTE_SENT=1
   fi
 
   if [ "$PROGRESS" -eq 0 ]; then
