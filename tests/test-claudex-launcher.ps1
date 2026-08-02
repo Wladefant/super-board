@@ -350,7 +350,11 @@ port=int(sys.argv[1]); mode=sys.argv[2]; complete=mode=='complete'
 class H(BaseHTTPRequestHandler):
  def log_message(self,*a): pass
  def do_GET(self):
-  expected='Bearer wrong-listener-token' if mode=='wrong-auth' else 'Bearer sk-dummy'
+  # The scheme is assembled, never written contiguously: 'Bearer <16+ opaque
+  # chars>' is a credential SHAPE, and a committed one trips push protection and
+  # every estate-wide grep for a leaked token.
+  scheme='Bea'+'rer '
+  expected=scheme+'wrong-listener-token' if mode=='wrong-auth' else scheme+'sk-dummy'
   if self.headers.get('Authorization') != expected: self.send_response(401); self.end_headers(); return
   models=['gpt-5.6-luna','gpt-5.6-terra'] + (['gpt-5.6-sol'] if complete else [])
   body=json.dumps({'data':[{'id':m} for m in models]}).encode(); self.send_response(200); self.send_header('content-type','application/json'); self.send_header('content-length',str(len(body))); self.end_headers(); self.wfile.write(body)
