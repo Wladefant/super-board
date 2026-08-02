@@ -28,7 +28,7 @@ Progress: ✅ onboard  →  ✅ run  →  🛑 stop (you are here)
 | Check | Action on fail |
 |---|---|
 | Active config exists (arg or `.claude/super-board/active`) | Exit 64: usage hint |
-| Config file readable | Exit 66: "config not found" |
+| Config file readable | Exit 65: "config not found" |
 | `gh auth` valid | Continue anyway — comments may fail, kills still work |
 
 Nothing else. Stop is intentionally tolerant — its job is to bring the system to rest, not to enforce policy.

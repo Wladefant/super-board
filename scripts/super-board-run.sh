@@ -48,8 +48,11 @@ fi
 
 CONFIG_PATH=".claude/super-board/configs/${CONFIG_SLUG}.json"
 if [ ! -f "$CONFIG_PATH" ]; then
-  echo "config not found: $CONFIG_PATH" >&2
-  exit 66
+  # 65, the same code an invalid config produces: both are "the input contract
+  # could not be satisfied". 66 is not a code this runtime defines, and a
+  # supervisor that reads one has nothing to look it up in.
+  echo "config not found: $CONFIG_PATH — exiting 65" >&2
+  exit 65
 fi
 
 # ───────────────────────────── config read ─────────────────────────────
@@ -87,11 +90,17 @@ SPAWN_GRACE_SECONDS=$(jq -r '.spawn_grace_seconds // 120' "$CONFIG_PATH")
 
 # This dispatcher is the "claude-p" backend. A board configured for the
 # in-session workflow backend must not be drained here.
+#
+# Exit 64, not 78. 78 means evidence was rejected at the publication boundary —
+# a leak refused — and a board that is simply pointed at the other backend has
+# published nothing at all. This is the wrong command surface, which is what 64
+# means: the invocation, not the config, is what needs to change.
 if [ "$WORKER_BACKEND" != "claude-p" ]; then
   echo "🛑 board '${CONFIG_SLUG}' uses the workflow backend (worker_backend=${WORKER_BACKEND})." >&2
   echo "    Run it in-session: /super-board run ${CONFIG_SLUG}  (see references/run-workflow.md)" >&2
   echo "    To use this dispatcher, set \"worker_backend\": \"claude-p\" in the config." >&2
-  exit 78
+  echo "    Exiting 64 — wrong command surface." >&2
+  exit 64
 fi
 
 RUN_DATE=$(date +%Y-%m-%d)

@@ -208,15 +208,110 @@ class ExitCodeCollisionTests(unittest.TestCase):
         # exists so a supervisor can read the code, not so codes are unique:
         #   74  workflow-wave mutual exclusion, at startup and again mid-run;
         #   65  the runtime's input contract could not be satisfied — an invalid
-        #       config, or a project board that could not be read. An unreadable
-        #       board is deliberately NOT its own code: it is the same "we do not
-        #       have usable input" halt, and it must never be confused with the
-        #       empty board it used to be silently converted into.
-        allowed_repeats = {"74", "65"}
+        #       config, a config that is not there at all, or a project board
+        #       that could not be read. An unreadable board is deliberately NOT
+        #       its own code: it is the same "we do not have usable input" halt,
+        #       and it must never be confused with the empty board it used to be
+        #       silently converted into.
+        #   64  the wrong command surface — no config slug to run, and running a
+        #       workflow-backend board on the `claude -p` dispatcher. Both say
+        #       "this invocation is not the one to make", which is what 64 means.
+        allowed_repeats = {"74", "65", "64"}
         repeated = {code for code in codes if codes.count(code) > 1}
         self.assertEqual(
             repeated, allowed_repeats, f"colliding exit codes: {sorted(repeated)}"
         )
+
+
+class ExitCodeContractTests(unittest.TestCase):
+    """Every shell entry point halts with a code the contract defines.
+
+    `super_board_runtime.__init__` publishes the contract, and a halt outside it
+    is unreadable to the supervisor that has to act on it: 66 is not "invalid
+    config" anywhere in this runtime, 73 is not "budget exhausted", and 78 is
+    reserved for evidence rejected at the publication boundary — using it for a
+    board pointed at the wrong backend told operators a secret had leaked.
+    """
+
+    #: 0 success · 3 conflict, nothing changed · 64 invalid invocation ·
+    #: 65 invalid configuration or input · 69 auth/identity · 75 quota reserve ·
+    #: 76 production-merge guard · 78 unsafe evidence.
+    CONTRACT = {"0", "1", "3", "64", "65", "69", "75", "76", "78"}
+
+    #: Dispatcher-local mutual-exclusion halts, documented in
+    #: `super-board-run.sh` at the point they fire. They are NOT contract codes
+    #: and no runtime CLI returns them; they exist so a supervisor can tell
+    #: "claude workers are already running" (73) from "a workflow wave holds the
+    #: board" (74), which no contract code distinguishes.
+    DISPATCHER_MUTUAL_EXCLUSION = {"73", "74"}
+
+    ENTRY_POINTS = (
+        "scripts/super-board-run.sh",
+        "scripts/super-board-stop.sh",
+        "scripts/super-board-wave-plan.sh",
+        "scripts/super-board-gh-guard.sh",
+        "scripts/super-qa-dispatch.sh",
+        "scripts/super-qa-file-bug.sh",
+    )
+
+    def test_no_entry_point_halts_outside_the_contract(self) -> None:
+        import re
+
+        pattern = re.compile(r"\b(?:exit|return) (\d+)\b")
+        allowed = self.CONTRACT | self.DISPATCHER_MUTUAL_EXCLUSION
+        for relative in self.ENTRY_POINTS:
+            source = (_REPO_ROOT / relative).read_text(encoding="utf-8")
+            for line in source.splitlines():
+                if line.lstrip().startswith("#"):
+                    continue  # prose about a code is not a halt with it
+                for code in pattern.findall(line):
+                    with self.subTest(entry_point=relative, code=code):
+                        self.assertIn(
+                            code,
+                            allowed,
+                            f"{relative} halts with {code}, which the exit-code contract "
+                            f"does not define",
+                        )
+
+    def test_a_missing_config_is_65_everywhere(self) -> None:
+        for relative in (
+            "scripts/super-board-run.sh",
+            "scripts/super-board-stop.sh",
+            "scripts/super-board-wave-plan.sh",
+        ):
+            with self.subTest(entry_point=relative):
+                source = (_REPO_ROOT / relative).read_text(encoding="utf-8")
+                found = [
+                    line for line in source.splitlines() if "config not found" in line
+                ]
+                self.assertTrue(found, f"{relative} no longer refuses a missing config")
+                for line in found:
+                    if line.lstrip().startswith("#"):
+                        continue
+                    self.assertIn("65", line, "a missing config is an invalid input contract")
+
+    def test_the_wrong_backend_is_a_command_surface_halt_not_unsafe_evidence(self) -> None:
+        run_sh = (_REPO_ROOT / "scripts" / "super-board-run.sh").read_text(encoding="utf-8")
+        guard = run_sh.split('if [ "$WORKER_BACKEND" != "claude-p" ]; then', 1)[1].split(
+            "\nfi\n", 1
+        )[0]
+        self.assertIn("exit 64", guard)
+        self.assertNotIn(
+            "exit 78",
+            guard,
+            "78 means evidence was rejected at the publication boundary; a board on the "
+            "wrong backend has published nothing",
+        )
+
+    def test_an_exhausted_worker_budget_is_the_quota_code(self) -> None:
+        guard = (_REPO_ROOT / "scripts" / "super-board-gh-guard.sh").read_text(encoding="utf-8")
+        spend = guard.split("sb_gh_budget_spend() {", 1)[1].split("\n}\n", 1)[0]
+        # Prose about the retired code is not a halt with it.
+        code = "\n".join(
+            line for line in spend.splitlines() if not line.lstrip().startswith("#")
+        )
+        self.assertIn("return 75", code, "budget exhaustion is a quota halt")
+        self.assertNotIn("return 73", code)
 
 
 class HandoffTests(unittest.TestCase):
