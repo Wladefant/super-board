@@ -107,7 +107,7 @@ variables are referenced by NAME.
 | `super-board lint ...` | `references/lint.md` |
 | `super-board status ...` | `references/status.md` |
 | `super-board run ...` (default — `worker_backend` unset or `"claude-p"`) | `references/run.md` |
-| `super-board run ...` with config `worker_backend: "workflow"` | `references/run-workflow.md` (lane lifecycles still come from `references/run.md`) |
+| `super-board run ...` with config `worker_backend: "workflow"` (opt-in; `claude-p` is the default) | `references/run-workflow.md` (lane lifecycles still come from `references/run.md`) |
 | `super-board stop ...` / "stop the run" / "pause the loop" / "kill super-board" | `references/stop.md` |
 | "resume" / "pick up where I left off" / "restart after stop" | `references/stop.md` (resume = run; no separate verb) |
 | Anything about Block/Skip exits | `references/block-template.md` |

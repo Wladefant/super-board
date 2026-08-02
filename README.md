@@ -2,7 +2,7 @@
 
 An autonomous GitHub Project board executor for Claude Code. Drag a card into the `Ready` column, walk away, come back to merged PRs.
 
-Super Board watches your GitHub Project, dispatches agents to Build / QA / Review the cards, and moves each card across the board as it goes. Default backend: dynamic workflows (in-session waves); a legacy headless `claude -p` dispatcher remains as explicit opt-in.
+Super Board watches your GitHub Project, dispatches agents to Build / QA / Review the cards, and moves each card across the board as it goes. The default backend is `claude-p` (headless workers); the in-session dynamic-workflow backend is explicit opt-in. **The runtime never merges** - a successful Review hands off, and a human rebase-merges.
 
 > **Wlad's Superboard** — how this fork is used day-to-day: [MY-SYSTEM.md](./MY-SYSTEM.md) · docs convention: [DOCS-SYSTEM.md](./DOCS-SYSTEM.md)
 
@@ -20,13 +20,13 @@ Super Board watches your GitHub Project, dispatches agents to Build / QA / Revie
    cd your-project
    unzip ~/Downloads/super-board-v*.zip -d .claude/
    ```
-3. Wire up a GitHub Project board with a `Status` field whose columns are `Backlog`, `Ready`, `Building`, `QA`, `Review`, `Done`.
+3. Wire up a GitHub Project board with a `Status` field whose columns are exactly the seven-state lifecycle: `Backlog`, `Ready`, `Building`, `QA`, `Review`, `Blocked`, `Done`.
 4. Drop a config at `.claude/super-board/configs/<slug>.json` pointing at your board.
 5. From inside Claude Code, type `/super-board run <slug>`. The orchestrator plans a wave, launches the `super-board-wave` dynamic workflow, reconciles results, and repeats until the board is drained.
 
 That's it. Move cards into `Ready`, watch them flow through the board.
 
-**Backends (default flipped in 1.6.0):** `"worker_backend": "workflow"` is the default — waves are drained in-session via dynamic workflows (requires dynamic workflows enabled in `/config`); see `skills/super-board/references/run-workflow.md`. The legacy headless dispatcher (`"claude-p"`, `claude -p` workers spawned by `scripts/super-board-run.sh`) is explicit opt-in only — the dispatcher refuses to run (exit 78) unless the config sets it. Lane lifecycles are identical in both.
+**Backends:** `"worker_backend": "claude-p"` is the default — headless workers spawned by `scripts/super-board-run.sh`. The in-session dynamic-workflow backend (`"workflow"`, see `skills/super-board/references/run-workflow.md`) is explicit opt-in and requires dynamic workflows enabled in `/config`. Lane lifecycles are identical in both.
 
 To stop everything cleanly: `/super-board stop`. It posts a "stopped mid-flight" comment on every in-flight issue + PR (lane, last commit, resume hint), releases the assignee mutex, kills the workers and dispatcher. To resume, just `/super-board run <slug>` again — the board is the state, so cards are picked up from whichever column they were in.
 
@@ -39,10 +39,10 @@ There are five tracked skills in this repo. Four are project-installed Super Boa
 | **super-board** | The orchestrator. Invoked by the human via `/super-board run`. Validates preconditions, plans waves, launches the `super-board-wave` workflow (or the legacy headless runner on opt-in). Holds NO product context. |
 | **super-build** | Builder lane agent. Reads a `Ready` card, spins up a git worktree, implements the change, opens a PR, moves the card to `QA`. |
 | **super-qa** | Tester lane agent. Reads a `QA` card, runs Playwright path specs against the worker's branch, captures evidence (screenshots, logs), comments on the PR, and either moves the card to `Review` or kicks it back to `Ready` with a rebuild label. |
-| **super-review** | Reviewer lane agent. Reads a `Review` card, runs the merge-readiness checks, posts findings, and either merges (or hands off to a human gate). |
+| **super-review** | Reviewer lane agent. Reads a `Review` card, runs the local Codex review fleet and the readiness checks, posts findings, and stops in `Review`. It never merges: a human rebase-merges, and the closure normalizer writes the completion column afterwards. |
 | **claudex-optimized** | User-level, process-local launcher policy and zero-quota diagnostics for Luna/Terra/Sol aliases, deferred tool search, context preflight, and fixture-safe setup/rollback. It is intentionally excluded from `install.sh`. |
 
-The three lane skills run as workflow agents inside `super-board-wave` by default; on the legacy `claude-p` backend the same skills run as headless `claude -p` workers. Same lifecycles either way.
+The three lane skills run as headless `claude -p` workers by default; on the opt-in workflow backend the same skills run as agents inside `super-board-wave`. Same lifecycles either way.
 
 ## The five verbs
 
@@ -107,8 +107,32 @@ Worker storms are the failure mode that bit early users. Super Board prevents th
 2. **In-flight lockfiles** at `.claude/super-board/inflight/<issue-N>` — survive runner restart and gate `top_card_in_column` even when GitHub state hasn't propagated.
 3. **Atomic assignee claim BEFORE worker spawn** — closes the 10–30s `claude -p` cold-start race.
 4. **One worker per lane** — at most one Builder, one Tester, one Reviewer at a time. A 30-card `Ready` backlog does NOT start 30 Builders.
-5. **GraphQL rate-limit guard** — sleeps until reset when remaining quota dips under 200.
+5. **Immutable GraphQL reserve** — a 1,000-point floor the pipeline will not spend. It is not configurable downward; a run that would break it halts (exit 75) rather than borrowing against it.
 6. **120-second tick** — keeps ProjectsV2 query cost (~103 GraphQL pts/tick) at ~3.1k/hr, well under the 5k budget. Bump in your config if you have more headroom.
+
+## What 2.0 guarantees
+
+The contracts below are not configurable. Each one exists because its absence
+produced a specific failure.
+
+| Contract | What it means |
+|---|---|
+| **Seven-state lifecycle** | `Backlog · Ready · Building · QA · Review · Blocked · Done`. Not configurable. `Skipped` is refused where a lifecycle value is expected rather than quietly mapped onto something else. |
+| **`claude-p` default backend** | Headless workers by default; the in-session dynamic-workflow backend is explicit opt-in. |
+| **Three activation modes** | `off`, `proof`, `on`. A board stays at `off` until every installation and repository gate passes; `proof` restricts work to an explicit allowlist. |
+| **Immutable 1,000-point GraphQL reserve** | Cannot be configured downward. A run that would break it halts (exit 75) rather than borrowing against it. |
+| **Exact-SHA QA and invalidation** | Evidence is bound to the commit it was produced on. A pull-request head that moves discards the result instead of letting it attest to a commit nobody tested. |
+| **Fail-closed branch routing** | An issue declares its route exactly once — `staging` or `staging-frankfurt`. Anything else refuses to create a branch. |
+| **The local Codex review gate** | Review runs a parallel maximum-level local Codex fleet and fixes every finding, at every severity. |
+| **Human rebase-only merge** | The runtime never merges. A successful Review hands off and stops; a person rebase-merges. |
+| **Intake normalizer** | Every issue and pull-request event re-normalizes the card against the canonical form. Incomplete intake is never promoted to `Ready`. |
+| **Closure normalizer** | A card reaches the completion column only with a merge, typed and linked completion evidence, a linked duplicate, or a stated not-planned decision. |
+| **Guarded fallback auto-add** | Installed disabled, membership decided by immutable content node ID, and armed only through a documented re-enable gate. |
+| **Agent Native read-only projection** | The cockpit renders the board. It holds no Project write credential and is never a completion ledger. |
+| **Pinned installer** | `install.sh` refuses a source tree that is not at the pinned commit and writes an install manifest with a SHA-256 for every installed file. |
+
+Full detail: [RELEASE-NOTES.md](./RELEASE-NOTES.md) and
+[docs/version-reconciliation.md](./docs/version-reconciliation.md).
 
 ## Configuration
 
@@ -116,11 +140,12 @@ Minimal config at `.claude/super-board/configs/<slug>.json`:
 
 ```json
 {
+  "activation_mode": "off",
   "variant": "full",
-  "worker_backend": "workflow",
+  "worker_backend": "claude-p",
   "project": { "owner": "your-gh-login-or-org", "number": 12 },
   "base_branch": "main",
-  "human_approves_merge": false,
+  "human_approves_merge": true,
   "rebuild_cap": 2,
   "tick_seconds": 120,
   "max_workers": 3,
@@ -147,7 +172,7 @@ Each skill lives under `skills/<name>/` with a `SKILL.md` (the agent-facing prom
 ## What this is NOT
 
 - Not a CI replacement. Workers commit and push branches; your existing CI still runs.
-- Not a free pass on review. Set `human_approves_merge: true` if you want a person to OK every merge.
+- Not a free pass on review. `human_approves_merge` is `true` and cannot be turned off: the runtime never merges anything.
 - Not for unreviewed AC-free issues. Cards need acceptance criteria — Super QA grades against them.
 
 ## Licence
