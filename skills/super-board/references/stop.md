@@ -35,7 +35,7 @@ Nothing else. Stop is intentionally tolerant — its job is to bring the system 
 
 ## What stop reads
 
-- `.claude/super-board/inflight/<issue-N>` — one file per in-flight worker. New (v1.3.0+) format: `PID=…\nLANE=…\nSTARTED=…`. Legacy single-line PID format is also supported.
+- `.claude/super-board/inflight/<issue-N>` — one file per in-flight worker. New (v1.3.0+) format: `PID=…\nLANE=…\nSTARTED=…`. Legacy single-line PID format is also supported. **Only files whose name is an issue number are issue locks.** Anything else in that directory — notably the workflow backend's `workflow-wave.lock` — belongs to another backend and is never commented on, killed, or deleted here; it is removed by that backend's own stop path (`references/run-workflow.md` §Stop / resume).
 - `pgrep -f 'super-board-run\.sh'` — dispatcher PID(s).
 - `pgrep -f 'claude -p .*super-board'` — orphan worker scan (workers without a lock file, e.g. from a crashed dispatcher).
 
@@ -48,6 +48,13 @@ Nothing else. Stop is intentionally tolerant — its job is to bring the system 
    - Lane, worker PID, UTC timestamp.
    - Last commit on the branch (the "resume point" — anything past it was unpushed and is lost).
    - Plain-English resume hint: `super-board run <slug>`.
+
+   The body embeds a commit subject, which is text this runtime never inspected,
+   so it is a GitHub-bound payload like any other: it is sanitized ONCE through
+   `super-board-publish.py` **before either write**. If the boundary refuses it,
+   **zero** comments are posted — not one on the issue and none on the PR — and
+   the stop continues: the claim is still released and the worker is still
+   stopped, only the comment is withheld.
 3. **Release the assignee mutex** on the issue (`gh issue edit --remove-assignee <bot>`).
 4. **Remove descriptive labels** (`loop:in-build`, `loop:in-qa`, `loop:in-review`) — best-effort.
 5. **SIGTERM the worker PID**, sleep 1s, SIGKILL if still alive.
@@ -56,7 +63,7 @@ Nothing else. Stop is intentionally tolerant — its job is to bring the system 
 
 6. **Sweep orphan workers** — `pgrep -f 'claude -p .*super-board'` catches any `claude -p` worker that wasn't in `inflight/` (defensive against crashed dispatchers).
 7. **Kill the dispatcher loop** — `pgrep -f 'super-board-run\.sh'`, SIGTERM → 1s → SIGKILL.
-8. **Clear in-flight locks** — `rm -f .claude/super-board/inflight/*`. The PIDs they reference are dead now.
+8. **Clear the issue locks that were wrapped up** — remove `inflight/<issue-N>` for each worker in the inventory. The PIDs they reference are dead now. Never `rm -f inflight/*`: that takes another backend's locks with it.
 9. **Print summary** — workers stopped, dispatchers stopped, resume command.
 
 ## What stop does NOT do (deliberate)
