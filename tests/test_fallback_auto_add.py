@@ -33,6 +33,7 @@ _SCRIPTS = _REPO_ROOT / "scripts"
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
+from super_board_runtime.auth import REQUIRED_SCOPES, classify_token  # noqa: E402
 from super_board_runtime.project import (  # noqa: E402
     FALLBACK_ENABLE_VALUE,
     FALLBACK_ENABLE_VARIABLE,
@@ -230,6 +231,40 @@ class PreflightTests(unittest.TestCase):
         preflight = _Preflight()
         _decide(project=_project(ISSUE_NODE), preflight=preflight)
         self.assertEqual(preflight.calls, [])
+
+
+class CredentialContractTests(unittest.TestCase):
+    """One credential contract for the whole pipeline, not two.
+
+    The workflow header instructed a FINE-GRAINED PAT, which
+    `super_board_runtime.auth` refuses outright as `token-class-not-classic`.
+    Two contracts for one pipeline is one contract nobody can state, and the
+    contradiction surfaces on the day the fallback is finally needed.
+    """
+
+    WORKFLOW = (
+        _REPO_ROOT / "payload" / "github" / "workflows" / "auto-add-to-project.yml"
+    )
+
+    def setUp(self) -> None:
+        self.source = self.WORKFLOW.read_text(encoding="utf-8")
+
+    def test_the_workflow_asks_for_the_class_the_runtime_accepts(self) -> None:
+        header = self.source.split("name:", 1)[0]
+        self.assertIn("CLASSIC PAT", header)
+        for scope in REQUIRED_SCOPES:
+            with self.subTest(scope=scope):
+                self.assertIn(scope, header)
+
+    def test_the_identity_preflight_refuses_a_non_classic_token(self) -> None:
+        # A comment cannot refuse a token; the guard has to.
+        self.assertIn("classify_token", self.source)
+        self.assertIn('token_class != "classic"', self.source)
+
+    def test_the_runtime_still_refuses_a_fine_grained_token(self) -> None:
+        # The prefix the header used to instruct.
+        self.assertEqual(classify_token("github" + "_pat_" + "x" * 30), "fine-grained")
+        self.assertEqual(classify_token("gh" + "p_" + "y" * 36), "classic")
 
 
 class DecisionShapeTests(unittest.TestCase):
