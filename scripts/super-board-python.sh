@@ -55,22 +55,60 @@ sb_runtime() {
   PYTHONPATH="$(sb_native_path "$SB_SCRIPTS_DIR")" "$py" -B -m "$@"
 }
 
-SB_TMP_FILES=""
+# ───────────────────────────── temp files ─────────────────────────────
+#
+# What lands in these files is exactly what must not be left lying in shared
+# temp space: rendered publication payloads, which carry the caller's whole
+# environment on their way to the sanitizer.
+#
+# Cleanup used to track paths in a space-delimited STRING, so a path under
+# `/tmp/dir with spaces/` split into three nonexistent paths and `rm -f` removed
+# none of them. An array fixes that — but not the larger half of the same bug:
+# every real caller invokes `sb_config_file` inside a pipeline and a command
+# substitution (`payload=$(jq … | sb_config_file)`), both of which run in a
+# SUBSHELL, so any registration the function performed died with it and NOTHING
+# was ever cleaned up, spaces or no spaces.
+#
+# So the unit of cleanup is a private DIRECTORY, created once here in the
+# sourcing shell with mode 0700, before any subshell exists. Files land inside
+# it, so registration is implicit and cannot be lost. `SB_TMP_FILES` remains for
+# paths a caller creates elsewhere and registers by hand.
+if [ -z "${SB_TMP_DIR:-}" ] || [ ! -d "${SB_TMP_DIR:-}" ]; then
+  SB_TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/super-board.XXXXXX") || return 65 2>/dev/null || exit 65
+  chmod 700 "$SB_TMP_DIR" 2>/dev/null || true
+fi
+SB_TMP_FILES=()
+
+sb_tmp_dir() {
+  # Echo the private per-run temp directory.
+  printf '%s' "$SB_TMP_DIR"
+}
+
+sb_tmp_register() {
+  # Track one path created OUTSIDE `SB_TMP_DIR` for `sb_tmp_cleanup`. Only
+  # useful from the sourcing shell — a subshell's registration cannot survive.
+  SB_TMP_FILES+=("$1")
+}
 
 sb_config_file() {
   # Echo a natively-openable path holding the given config CONTENT (stdin).
-  # Registers the temp file for `sb_tmp_cleanup`.
+  # The file is inside `SB_TMP_DIR`, so `sb_tmp_cleanup` removes it however
+  # deep in subshells this was called.
   local tmp
-  tmp=$(mktemp "${TMPDIR:-/tmp}/super-board-config.XXXXXX") || return 65
+  tmp=$(mktemp "$SB_TMP_DIR/config.XXXXXX") || return 65
+  chmod 600 "$tmp" 2>/dev/null || true
   cat > "$tmp" || return 65
-  SB_TMP_FILES="$SB_TMP_FILES $tmp"
   sb_native_path "$tmp"
 }
 
 sb_tmp_cleanup() {
   local file
-  for file in $SB_TMP_FILES; do
+  # `${arr+"${arr[@]}"}` so an empty array is not an unbound-variable error
+  # under `set -u` on the bash versions this runs on.
+  for file in ${SB_TMP_FILES+"${SB_TMP_FILES[@]}"}; do
     rm -f "$file"
   done
-  SB_TMP_FILES=""
+  SB_TMP_FILES=()
+  [ -n "${SB_TMP_DIR:-}" ] && [ -d "${SB_TMP_DIR:-}" ] && rm -rf "$SB_TMP_DIR"
+  return 0
 }
