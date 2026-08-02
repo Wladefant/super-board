@@ -15,7 +15,9 @@ Input is a JSON document:
     {
       "surface": "qa-comment",
       "text": "…",                       // or "template_fragments": ["…", "…"]
-      "environment": {"NAME": "value"},   // optional; values are redacted
+      "environment": {"NAME": "value"},   // optional EXTRA names; the calling
+                                          // process environment is always in
+                                          // scope and never has to be declared
       "artifacts": [{"name": "…", "classification": "image/png"}]
     }
 
@@ -38,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -49,6 +52,7 @@ if str(_SCRIPTS) not in sys.path:
 
 from super_board_runtime import EXIT_CONFIG, EXIT_OK, EXIT_USAGE  # noqa: E402
 from super_board_runtime.publication import (  # noqa: E402
+    MIN_REDACTABLE_ENV_VALUE_LEN,
     PUBLICATION_SURFACES,
     PublicationError,
     UnsafePublication,
@@ -110,6 +114,39 @@ def _gh_writer(target: Optional[str]):
     return write
 
 
+def _environment_in_scope(declared: Any) -> dict[str, str]:
+    """Every value the sanitizer should treat as known credential material.
+
+    The calling process environment is always in scope. Shell callers publish
+    `{surface, text}` and nothing else, and the credential most likely to be
+    echoed into their payload is the one already exported in the process they
+    are running in — a value that matches no provider pattern is only ever
+    caught by being a *known* value.
+
+    Ambient values are admitted only when they are long enough to be redacted.
+    A credential-NAMED variable can hold something that is plainly not a
+    credential (`SESSIONNAME=Console`, `..._SESSION=1`), and admitting those
+    would refuse every payload containing the character `1` — which is a
+    boundary nobody can publish through, not a boundary that fails closed.
+    A value the caller DECLARES carries no such floor: the declaration itself
+    says it is credential material, so a short one still fails the publication.
+    """
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if isinstance(value, str) and len(value) >= MIN_REDACTABLE_ENV_VALUE_LEN
+    }
+    if isinstance(declared, dict):
+        environment.update(
+            {
+                name: value
+                for name, value in declared.items()
+                if isinstance(name, str) and isinstance(value, str)
+            }
+        )
+    return environment
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -135,7 +172,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(json.dumps({"ok": False, "reason": "payload-invalid"}, sort_keys=True), file=sys.stderr)
         return EXIT_CONFIG
 
-    environment = raw.get("environment") if isinstance(raw.get("environment"), dict) else {}
+    environment = _environment_in_scope(raw.get("environment"))
     artifacts = raw.get("artifacts") if isinstance(raw.get("artifacts"), list) else []
 
     try:
