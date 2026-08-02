@@ -174,32 +174,25 @@ def _resolve_branch(
 ) -> tuple[Optional[str], Optional[str]]:
     """Return (branch, reason_code). A reason code means the card is ineligible.
 
-    When the board sets `require_branch_route_declaration`, routing is delegated
-    entirely to `routing.resolve_branch_route`: the issue must carry exactly one
-    explicit, normalized `Branch route:` declaration whose redundant label
-    agrees with it. Missing, `default`, unknown, duplicated, and conflicting
-    declarations are ineligible and fail here — before any branch is created.
+    Routing is delegated in full to `routing.resolve_branch_route`, which is the
+    only authority on which base branch a card gets and whether it is allowed at
+    all. The issue must carry exactly one explicit, normalized `Branch route:`
+    declaration whose redundant label agrees with it; missing, `default`,
+    unknown, duplicated, and conflicting declarations are ineligible and fail
+    here — before any branch is created.
 
-    Boards that have not opted in keep the label-routing contract: a single
-    route label selects its branch, two labels naming different branches is a
-    routing error, and no label falls back to the configured base branch.
+    This module used to carry a SECOND, more permissive implementation: a single
+    route label selected its branch whatever it named, and a card with no label
+    at all inherited `config.base_branch`. The two implementations disagreed
+    about the same card — a `route:main` card was eligible here while the
+    routing layer refused it as `route-declaration-unknown` — and the permissive
+    one is the one that would have handed a worker its base branch. There is now
+    one implementation, so the layers cannot drift apart again.
     """
-    if config.require_branch_route_declaration:
-        route = resolve_branch_route(issue, config)
-        if not route.valid:
-            return None, route.reason_code or "route-declaration-missing"
-        return route.base_branch, None
-
-    declared = {
-        config.branch_routes[key]
-        for key in config.branch_routes
-        if key.strip().casefold() in {label.strip().casefold() for label in issue.labels}
-    }
-    if len(declared) > 1:
-        return None, "branch-route-ambiguous"
-    if declared:
-        return declared.pop(), None
-    return config.base_branch, None
+    route = resolve_branch_route(issue, config)
+    if not route.valid:
+        return None, route.reason_code or "route-declaration-missing"
+    return route.base_branch, None
 
 
 def _decision(

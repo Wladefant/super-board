@@ -29,6 +29,11 @@ from super_board_runtime.eligibility import (  # noqa: E402
     plan_dispatch,
     snapshot_from_project_item,
 )
+from super_board_runtime.routing import (  # noqa: E402
+    FRANKFURT_LABEL,
+    NON_DISPATCH_BRANCHES,
+    resolve_branch_route,
+)
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 NON_READY_STATUSES = ("Backlog", "Building", "QA", "Review", "Blocked", "Done")
@@ -58,7 +63,9 @@ def _issue(**overrides: object) -> IssueSnapshot:
         "content_type": "Issue",
         "state": "OPEN",
         "title": "a perfectly formed card",
-        "body": "## Acceptance Criteria\n- [ ] it works",
+        # A perfectly formed card declares its branch route. Routing is
+        # fail-closed, so a card that says nothing is not dispatchable.
+        "body": "## Acceptance Criteria\n- [ ] it works\n\nBranch route: staging\n",
         "labels": (),
         "assignees": (),
         "status": "Ready",
@@ -77,11 +84,14 @@ def _item(
     content_type="Issue",
     title=None,
     state="OPEN",
+    body="Branch route: staging\n",
 ):
     """One `gh project item-list --format json` item.
 
     `state=None` models the real payload, which does not carry issue state — it
-    forces the runtime to reach for the injected state lookup.
+    forces the runtime to reach for the injected state lookup. `body` carries
+    the branch-route declaration the intake normalizer writes; a card without
+    one is not dispatchable.
     """
     return {
         "status": status,
@@ -93,6 +103,7 @@ def _item(
             "url": f"https://github.com/Bavariance/polysimulator/issues/{number}",
             "assignees": list(assignees),
             "state": state,
+            "body": body,
         },
     }
 
@@ -285,24 +296,66 @@ class ContentTypeAndLookupTests(unittest.TestCase):
 
 
 class BranchRouteTests(unittest.TestCase):
-    def test_route_label_selects_the_declared_branch(self) -> None:
+    """Eligibility routes through ONE authority: `routing.resolve_branch_route`.
+
+    It used to carry a second, more permissive copy of "which base branch does
+    this card get" — one that trusted any configured route label and fell back
+    to `config.base_branch` when a card declared nothing. The two copies
+    disagreed about the same card, and the permissive one is the one that would
+    have handed a worker its base branch.
+    """
+
+    def test_a_route_label_naming_a_non_dispatch_branch_is_ineligible(self) -> None:
+        # PREVIOUSLY LOCKED THE OPPOSITE. This assertion used to require a
+        # `route:main` card to be ELIGIBLE with `selected_base_branch == "main"`
+        # while `resolve_branch_route` refused the very same route, because
+        # `main` is a repository default branch listed in NON_DISPATCH_BRANCHES.
+        # Routing is the correct layer; the eligibility assertion was wrong.
         config = _config(branch_routes={"route:main": "main", "route:staging": "staging"})
         decision = evaluate_dispatch(_issue(labels=("route:main",)), config)
-        self.assertTrue(decision.eligible, decision.reason_codes)
-        self.assertEqual(decision.branch_declaration, "main")
-        self.assertEqual(decision.selected_base_branch, "main")
+        self.assertFalse(decision.eligible)
+        self.assertEqual(decision.reason_codes, ("route-declaration-unknown",))
+        self.assertIsNone(decision.selected_base_branch)
+        self.assertIsNone(decision.branch_declaration)
 
-    def test_no_route_label_falls_back_to_the_configured_base_branch(self) -> None:
-        decision = evaluate_dispatch(_issue(), _config())
+    def test_a_declared_route_selects_its_branch(self) -> None:
+        decision = evaluate_dispatch(_issue(body="Branch route: staging\n"), _config())
+        self.assertTrue(decision.eligible, decision.reason_codes)
         self.assertEqual(decision.branch_declaration, "staging")
         self.assertEqual(decision.selected_base_branch, "staging")
 
-    def test_conflicting_route_labels_fail_closed(self) -> None:
-        config = _config(branch_routes={"route:main": "main", "route:staging": "staging"})
-        decision = evaluate_dispatch(_issue(labels=("route:main", "route:staging")), config)
+    def test_no_declaration_is_ineligible_and_never_the_base_branch(self) -> None:
+        # PREVIOUSLY LOCKED THE OPPOSITE: an undeclared card used to inherit
+        # `config.base_branch`. A fallback base branch is a branch nobody chose.
+        decision = evaluate_dispatch(_issue(body="No declaration anywhere.\n"), _config())
         self.assertFalse(decision.eligible)
-        self.assertEqual(decision.reason_codes, ("branch-route-ambiguous",))
+        self.assertEqual(decision.reason_codes, ("route-declaration-missing",))
         self.assertIsNone(decision.selected_base_branch)
+
+    def test_conflicting_route_labels_fail_closed(self) -> None:
+        config = _config(
+            branch_routes={"branch:staging": "staging", FRANKFURT_LABEL: "staging-frankfurt"}
+        )
+        decision = evaluate_dispatch(
+            _issue(labels=("branch:staging", FRANKFURT_LABEL)), config
+        )
+        self.assertFalse(decision.eligible)
+        self.assertEqual(decision.reason_codes, ("route-label-conflict",))
+        self.assertIsNone(decision.selected_base_branch)
+
+    def test_eligibility_and_routing_agree_on_every_non_dispatch_branch(self) -> None:
+        # The contradiction this class exists to prevent: the same card, judged
+        # by the two layers, must reach the same verdict and the same code.
+        config = _config()
+        for branch in NON_DISPATCH_BRANCHES:
+            with self.subTest(branch=branch):
+                issue = _issue(body=f"Branch route: {branch}\n")
+                route = resolve_branch_route(issue, config)
+                decision = evaluate_dispatch(issue, config)
+                self.assertFalse(route.valid)
+                self.assertFalse(decision.eligible)
+                self.assertEqual(decision.reason_codes, (route.reason_code,))
+                self.assertIsNone(decision.selected_base_branch)
 
 
 class PlanShapeAndCliTests(unittest.TestCase):

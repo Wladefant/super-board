@@ -27,7 +27,7 @@ _SCRIPTS = _REPO_ROOT / "scripts"
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
-from super_board_runtime.config import load_and_validate_config  # noqa: E402
+from super_board_runtime.config import ConfigError, load_and_validate_config  # noqa: E402
 from super_board_runtime.eligibility import IssueSnapshot  # noqa: E402
 from super_board_runtime.routing import (  # noqa: E402
     FRANKFURT_LABEL,
@@ -171,6 +171,19 @@ class InvalidRouteTests(unittest.TestCase):
             "route-declaration-duplicate",
         )
 
+    def test_a_route_label_naming_a_non_dispatch_branch(self) -> None:
+        # A config may map a label onto any branch name, so `route:main` loads
+        # fine. It still never dispatches, and the refusal has to come from this
+        # module or a caller reading labels reaches a different verdict from a
+        # caller reading declarations.
+        config = _config(branch_routes={"route:main": "main"})
+        for body in ("Branch route: staging\n", "nothing declared\n"):
+            with self.subTest(body=body):
+                route = resolve_branch_route(_issue(body, ("route:main",)), config)
+                self.assertFalse(route.valid)
+                self.assertEqual(route.reason_code, "route-declaration-unknown")
+                self.assertIsNone(route.base_branch)
+
     def test_two_conflicting_route_labels(self) -> None:
         config = _config(
             branch_routes={FRANKFURT_LABEL: "staging-frankfurt", "branch:staging": "staging"}
@@ -254,13 +267,25 @@ class EligibilityIntegrationTests(unittest.TestCase):
                 self.assertEqual(decision.reason_codes, (reason,))
                 self.assertIsNone(decision.selected_base_branch)
 
-    def test_boards_that_have_not_opted_in_keep_label_routing(self) -> None:
+    def test_no_board_can_opt_out_of_declared_routing(self) -> None:
+        # PREVIOUSLY LOCKED THE OPPOSITE. This assertion used to require that a
+        # board which had not set `require_branch_route_declaration` kept a
+        # permissive label-routing path, in which an undeclared card was
+        # ELIGIBLE on `config.base_branch`. That is the same defect as a
+        # `route:main` card being eligible: a fallback base branch is a branch
+        # nobody chose. The flag can now only state the requirement.
+        with self.assertRaises(ConfigError) as ctx:
+            _config(require_branch_route_declaration=False)
+        self.assertEqual(ctx.exception.reason, "branch-route-declaration-required")
+
+    def test_an_undeclared_card_is_ineligible_on_every_board(self) -> None:
         from super_board_runtime.eligibility import evaluate_dispatch
 
         config = _config(activation_mode="active")
         decision = evaluate_dispatch(_issue("no declaration anywhere"), config)
-        self.assertTrue(decision.eligible, decision.reason_codes)
-        self.assertEqual(decision.selected_base_branch, "staging")
+        self.assertFalse(decision.eligible)
+        self.assertEqual(decision.reason_codes, ("route-declaration-missing",))
+        self.assertIsNone(decision.selected_base_branch)
 
 
 class BranchCreationTests(unittest.TestCase):
