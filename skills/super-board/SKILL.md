@@ -54,6 +54,31 @@ The contract lives in `scripts/super_board_runtime/lifecycle.py`; anything offer
 `Skipped` where a lifecycle value is expected is rejected (exit 65) rather than mapped
 onto something else. Dispatch requires status **exactly `Ready`**.
 
+`Review` is where the runtime stops. It is a **human handoff**, not a step the
+runtime completes: the reviewer marks the pull request ready, writes a handoff
+record, and leaves the card there. `Done` is written by the closure normalizer
+after a confirmed external merge — never by a dispatcher, builder, tester,
+reviewer, or workflow.
+
+## Merging — a human does it, by rebase
+
+The runtime has **no merge path**. It may not run a merge command, call a merge
+REST endpoint, invoke a merge mutation or MCP merge tool, enable auto-merge,
+squash, create a merge commit, close the implementation issue as a substitute
+for a merge, or move a card to `Done`.
+
+This is a release gate, not a convention:
+`super_board_runtime.review.scan_merge_prohibitions` source-scans every
+executable runtime, workflow, skill, and reviewer path for all eight mechanisms,
+and any active occurrence fails. Exclusions live in the explicit
+`merge-scan-allowlist.txt` at the repository root — never a path heuristic.
+
+Required configuration: `human_approves_merge: true`, `merge_method: "rebase"`.
+Required repository settings: `allow_rebase_merge: true`,
+`allow_squash_merge: false`, `allow_merge_commit: false`. Squash collapses the
+TDD breadcrumb trail; rebase keeps every commit on trunk with its original
+message, author, and date.
+
 ## Identity — who Superboard acts as
 
 Two modes, verified by `scripts/super-board-auth.py preflight` before any scan or

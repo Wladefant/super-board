@@ -1,0 +1,48 @@
+# merge-scan-allowlist.txt — explicit exclusions for the merge-prohibition gate.
+#
+# `super_board_runtime.review.scan_merge_prohibitions` fails the release gate on
+# ANY occurrence of a merge mechanism in an executable path. Two kinds of file
+# legitimately contain those strings:
+#
+#   1. the scanner and its contract tests, which must name the patterns;
+#   2. documentation and fixtures that describe or seed the prohibition.
+#
+# Both are listed here BY NAME. There is deliberately no path heuristic — a rule
+# like "skip anything under docs/" is exactly how a real merge path hides in a
+# file called docs/deploy-helper.sh. Adding a line here is a decision somebody
+# has to make and a reviewer can see.
+#
+# A trailing slash excludes a whole subtree.
+
+# 1. The scanner itself and its contract test.
+scripts/super_board_runtime/review.py
+tests/test_human_merge_contract.py
+tests/fixtures/merge-prohibition-seed/
+
+# The config layer enumerates the merge methods in order to REFUSE all but
+# rebase, and its tests assert that refusal.
+scripts/super_board_runtime/config.py
+tests/test_config_contract.py
+
+# 2. Documentation that states the prohibition. These describe what the runtime
+#    must never do; they contain no executable merge path.
+RELEASE-NOTES.md
+README.md
+skills/super-board/SKILL.md
+skills/super-board/references/run.md
+skills/super-board/references/run-workflow.md
+skills/super-board/references/status.md
+skills/super-board/references/onboard.md
+skills/super-board/references/lint.md
+skills/super-board/references/block-template.md
+skills/super-review/SKILL.md
+skills/super-qa/SKILL.md
+skills/super-qa/references/
+skills/super-build/
+skills/superboard-setup/
+docs/
+
+# 3. The lifecycle module is what RETIRES `Skipped` — it must name it in order
+#    to refuse it — and its contract tests assert that refusal.
+scripts/super_board_runtime/lifecycle.py
+tests/test_eligibility.py

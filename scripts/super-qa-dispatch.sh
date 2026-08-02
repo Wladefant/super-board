@@ -18,8 +18,9 @@
 # Python tests pin directly — this script is the shell surface, not a second
 # implementation.
 #
-# The runtime never merges, never enables auto-merge, and never moves a card to
-# Done. A QA failure goes to Building or Blocked; see super-qa-file-bug.sh.
+# The runtime never merges and never moves a card to Done — see
+# `super_board_runtime.review` for the enforced prohibition. A QA failure goes
+# to Building or Blocked; see super-qa-file-bug.sh.
 #
 # Usage:
 #   super-qa-dispatch.sh --config <cfg> --issue-url <url> --pull-request <url>

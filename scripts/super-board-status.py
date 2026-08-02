@@ -13,7 +13,7 @@ the layout as a single Python pass.
 What it does:
   1. Resolve config slug: arg | `.claude/super-board/active` | sole config.
   2. ONE GraphQL call for project items (number, title, labels, Status).
-  3. ONE `gh issue view` per Blocked/Skipped card for reason-tag extraction.
+  3. ONE `gh issue view` per Blocked card for reason-tag extraction.
   4. Read today's manifest and pipe everything to the locked-template
      renderer that prints the 80-col snapshot matching the spec in
      references/status.md.
@@ -58,6 +58,20 @@ except Exception:
 # ───────────────────────────── lane constants ─────────────────────────────
 # Used by dispatch parsing, kanban glyph lookup, and the workers section.
 # Source of truth — never inline these as dict literals at call sites.
+
+# The canonical seven-state lifecycle, mirroring
+# `super_board_runtime.lifecycle.LIFECYCLE_STATUSES`. Retired statuses (see that
+# module's RETIRED_STATUSES) are deliberately absent: a board still carrying one
+# must be reconciled, not rendered as though it were a status.
+LIFECYCLE_STATUSES: tuple[str, ...] = (
+    "Backlog",
+    "Ready",
+    "Building",
+    "QA",
+    "Review",
+    "Blocked",
+    "Done",
+)
 
 LANE_ORDER: tuple[str, ...] = ("build", "qa", "review")
 LANE_GLYPH = {"build": "🔨", "qa": "🔍", "review": "✏️"}
@@ -525,15 +539,15 @@ def main() -> int:
 
     by_status: dict[str, list[dict[str, Any]]] = {
         s: sorted([i for i in items if i["status"] == s], key=lambda x: -x["number"])
-        for s in ("Ready", "Building", "QA", "Review", "Done", "Blocked", "Skipped")
+        for s in LIFECYCLE_STATUSES
     }
 
-    # ── fetch reason-tag comments for Blocked + Skipped only ──
+    # ── fetch reason-tag comments for Blocked only ──
     # Skip silently on error so a stale token doesn't break the rest of the
     # snapshot. The body is capped at 4000 chars; emojis in the locked
     # vocabulary land at the top of any well-formed reason-tag comment.
     reasons: dict[int, str] = {}
-    for it in by_status["Blocked"] + by_status["Skipped"]:
+    for it in by_status["Blocked"]:
         n = it["number"]
         out = gh("issue", "view", str(n), "--json", "comments", check=False)
         if not out:
@@ -602,7 +616,14 @@ def main() -> int:
 
     # ── header ──
     proj = cfg["project"]
-    mode_label = "human-approves" if cfg.get("human_approves_merge") else "auto-merge"
+    # The runtime never merges, so there is no second mode to contrast with.
+    # What the header reports is who finishes the work: a human, by rebase.
+    # A board configured otherwise is misconfigured, and says so.
+    mode_label = (
+        "human-rebase-merge"
+        if cfg.get("human_approves_merge", True)
+        else "MISCONFIGURED — the runtime has no merge path"
+    )
     tg = cfg.get("truth_gate", "off")
     tt = cfg.get("truth_threshold", 70)
     gate_label = {"off": "off", "always": "always"}.get(tg, f"non-trivial (≥{tt})")
@@ -685,7 +706,6 @@ def main() -> int:
         return "\n".join(out)
 
     print(render_blocklane("Blocked", by_status["Blocked"]))
-    print(render_blocklane("Skipped", by_status["Skipped"]))
 
     # ── workers ──
     print()
@@ -735,7 +755,7 @@ def main() -> int:
     # ── block reasons ──
     print()
     print("▎Block reasons")
-    blockers = by_status["Blocked"] + by_status["Skipped"]
+    blockers = by_status["Blocked"]
     if not blockers:
         print("   (none)")
     else:
