@@ -77,7 +77,7 @@ Sources:
 | Concern | Authoritative owner | Agent Native role |
 |---|---|---|
 | Task definition and acceptance criteria | GitHub issue | Render, validate before launch, deep-link |
-| Workflow status | GitHub Project | Read projection; request mutations through the Superboard adapter |
+| Workflow status | GitHub Project | Read projection only. The cockpit holds no Project write credential and issues no mutation, directly or by request; lifecycle changes come from the Superboard runtime and the board's own built-in workflows |
 | Model/provider selection | Claudex | Display resolved role; never choose a provider independently |
 | Context admission and tool profile | Claudex | Display policy and approval prompts |
 | Source edits and tests | Claude Code | Session cockpit and transcript |
@@ -85,7 +85,7 @@ Sources:
 | Branch, commits, PR, checks | Git/GitHub | Aggregate full evidence URLs |
 | Preview deployment | Existing CI/Dokploy preview mechanism | Embed or link the preview |
 | QA verdict | Superboard QA lane and human where required | Present evidence; never infer pass from transcript text |
-| PR approval and merge | Human in GitHub | Deep-link only; no merge authority in the pilot |
+| PR approval and merge | Human in GitHub | Deep-link only. No merge authority — permanently, not only in the pilot. The runtime never merges and neither does the cockpit; a human rebase-merges |
 | Durable audit history | GitHub issue, PR, checks, Project history | Secondary session telemetry and visual artifacts |
 | Secrets | Runner/Dokploy secret stores and framework credential APIs | Never display values; store only when required and encrypted |
 | Product-specific agent actions | Each SaaS application | `defineAction()` becomes the shared UI/agent/API contract |
