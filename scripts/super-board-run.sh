@@ -270,6 +270,49 @@ release_claim() {
   gh issue edit "$1" --remove-assignee "$BOT_LOGIN" >/dev/null 2>&1 || true
 }
 
+report_qa_evidence() {
+  # $1 = issue number, $2 = ledger entry path, $3 = pull request URL.
+  # Read-only freshness check for a card sitting in QA or Review. Emits the
+  # `qa-evidence` manifest line the status renderer reads, so an operator can
+  # see tested-vs-current SHA instead of a bare "Review".
+  local issue="$1" ledger="$2" pr="$3" payload tested current invalid
+  [ -f "$ledger" ] || return 0
+  payload=$(sb_runtime super_board_runtime.qa merge-handoff \
+              --ledger "$(sb_native_path "$ledger")" --pull-request "$pr" \
+              --check-conclusion "${QA_CHECK_CONCLUSION:-}" 2>/dev/null) || payload=""
+  [ -n "$payload" ] || return 0
+  tested=$(echo "$payload" | jq -r '.tested_sha // empty')
+  current=$(echo "$payload" | jq -r '.current_head_sha // empty')
+  [ -n "$tested" ] && [ -n "$current" ] || return 0
+  invalid=no
+  [ "$tested" = "$current" ] || invalid=yes
+  log "qa-evidence issue=#${issue} tested=${tested} current=${current} invalidated=${invalid}"
+}
+
+merge_handoff_ready() {
+  # $1 = ledger entry path, $2 = pull request URL, $3 = required-check conclusion.
+  # The last gate before a HUMAN merges. Read-only: it rereads the head,
+  # compares it with the last successful tested SHA, and verifies the SHA-bound
+  # required check. It never merges — the runtime has no merge path at all — it
+  # only decides whether this card may be REPORTED as merge-ready.
+  local payload ready reason rc=0
+  payload=$(sb_runtime super_board_runtime.qa merge-handoff \
+              --ledger "$(sb_native_path "$1")" --pull-request "$2" \
+              --check-conclusion "$3" 2>/dev/null) || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "🛑 merge handoff refused for $2 — the head or the required check could not be read (fail closed)"
+    return 1
+  fi
+  ready=$(echo "$payload" | jq -r '.merge_ready')
+  reason=$(echo "$payload" | jq -r '.reason_code // "unknown"')
+  if [ "$ready" != "true" ]; then
+    log "🛑 not merge-ready: $2 — ${reason}. The card stays in Review; a human merges nothing yet."
+    return 1
+  fi
+  log "✅ merge handoff verified for $2 — tested SHA is still the head and ${QA_CHECK_CONTEXT:-superboard/exact-sha-qa} passed. A human rebase-merges."
+  return 0
+}
+
 dispatch_lane() {
   # $1 = lane (build|qa|review); $2 = issue number
   local lane="$1" issue="$2" prompt pid

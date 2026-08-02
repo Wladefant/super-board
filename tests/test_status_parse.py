@@ -153,6 +153,7 @@ def test_empty_manifest_returns_defaults() -> None:
     assert state == {
         "inflight": {},
         "recents": [],
+        "qa_evidence": {},
         "last_tick": None,
         "start_hms": None,
         "exited": False,
@@ -287,6 +288,43 @@ def test_paginate_items_multi_page() -> None:
     assert [n["n"] for n in nodes] == [1, 2, 3]
     assert hit_cap is False
     assert calls == [None, "cur1", "cur2"]
+
+
+def test_qa_evidence_line_reports_tested_and_current_sha() -> None:
+    """`run.sh` emits the exact-SHA QA evidence line; status must surface it.
+
+    Without tested-vs-current in the status view, an operator reading "Review"
+    cannot tell whether the evidence still describes the commit they are about
+    to merge.
+    """
+    tested = "a" * 40
+    manifest = f"[09:00:00] qa-evidence issue=#25 tested={tested} current={tested} invalidated=no\n"
+    state = sbs.parse_manifest(manifest, TODAY)
+    assert "25" in state["qa_evidence"], f"qa_evidence was {state['qa_evidence']!r}"
+    row = state["qa_evidence"]["25"]
+    assert row["tested"] == tested
+    assert row["current"] == tested
+    assert row["invalidated"] is False
+
+
+def test_qa_evidence_line_reports_invalidation() -> None:
+    """A moved head must render as invalidated, not silently as fresh."""
+    tested, current = "a" * 40, "b" * 40
+    manifest = (
+        f"[09:00:00] qa-evidence issue=#25 tested={tested} current={tested} invalidated=no\n"
+        f"[09:30:00] qa-evidence issue=#25 tested={tested} current={current} invalidated=yes\n"
+    )
+    state = sbs.parse_manifest(manifest, TODAY)
+    row = state["qa_evidence"]["25"]
+    assert row["invalidated"] is True
+    assert row["current"] == current
+    assert any(r["verb"] == "qa-invalidated" for r in state["recents"]), state["recents"]
+
+
+def test_manifest_without_qa_evidence_has_an_empty_map() -> None:
+    """The key always exists so the renderer never KeyErrors on old manifests."""
+    state = sbs.parse_manifest("[10:00:00] tick — Ready=1\n", TODAY)
+    assert state["qa_evidence"] == {}
 
 
 def test_paginate_items_respects_max_pages() -> None:

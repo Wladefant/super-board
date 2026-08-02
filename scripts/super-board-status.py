@@ -83,6 +83,13 @@ DISPATCH_RE = re.compile(r"dispatch lane=(build|qa|review) issue=#(\d+) pid=(\d+
 REAP_RE = re.compile(r"reaped stale lock\b[^#]*#(\d+) \(pid=(\d+|empty)\)")
 ZOMBIE_RE = re.compile(r"zombie [a-z]+ worker on #(\d+) \(pid=(\d+)\)(.*)$")
 ALERT_RE = re.compile(r"block-rate alert: (.+)$")
+# Exact-SHA QA evidence. The dispatcher emits one line per freshness check:
+#   `qa-evidence issue=#N tested=<sha> current=<sha> invalidated=<yes|no>`
+# Reading "Review" without these two SHAs cannot tell an operator whether the
+# evidence still describes the commit they are about to merge.
+QA_EVIDENCE_RE = re.compile(
+    r"qa-evidence issue=#(\d+) tested=([0-9a-f]{40}) current=([0-9a-f]{40}) invalidated=(yes|no)"
+)
 
 
 # ───────────────────────────── pure helpers ─────────────────────────────
@@ -123,9 +130,11 @@ def parse_manifest(text: str, today_iso: str) -> dict[str, Any]:
       start_hms: HH:MM:SS of the most recent `super-board run started`, or None
       exited: True if the run has logged `exiting cleanly`
       reaped_count: number of `reaped stale lock ...` lines seen
+      qa_evidence: {issue → {tested, current, invalidated, ts}} — exact-SHA QA
     """
     inflight: dict[str, dict[str, str]] = {}
     recents: list[dict[str, Any]] = []
+    qa_evidence: dict[str, dict[str, Any]] = {}
     last_tick: str | None = None
     start_hms: str | None = None
     exited = False
@@ -197,6 +206,23 @@ def parse_manifest(text: str, today_iso: str) -> dict[str, Any]:
                 "issue": f"#{issue}", "target": "", "detail": det.strip(" —"),
             })
             continue
+        if qm := QA_EVIDENCE_RE.search(rest):
+            issue, tested, current, invalid = qm.groups()
+            invalidated = invalid == "yes"
+            # Last line wins: the newest freshness check is the current truth.
+            qa_evidence[issue] = {
+                "tested": tested,
+                "current": current,
+                "invalidated": invalidated,
+                "ts": hms,
+            }
+            if invalidated:
+                recents.append({
+                    "epoch": ep, "verb": "qa-invalidated", "glyph": "🧪",
+                    "issue": f"#{issue}", "target": "QA",
+                    "detail": f"head moved {tested[:7]} → {current[:7]}; QA must run again",
+                })
+            continue
         if am := ALERT_RE.search(rest):
             recents.append({
                 "epoch": ep, "verb": "alert", "glyph": "⚠",
@@ -206,6 +232,7 @@ def parse_manifest(text: str, today_iso: str) -> dict[str, Any]:
     return {
         "inflight": inflight,
         "recents": recents,
+        "qa_evidence": qa_evidence,
         "last_tick": last_tick,
         "start_hms": start_hms,
         "exited": exited,
@@ -689,6 +716,21 @@ def main() -> int:
                     f"   {glyph} {role}  #{v['issue']}  attempt {attempt_str(item)} · "
                     f"{worker_dur(v['ts'])}{extra}"
                 )
+
+    # ── exact-SHA QA evidence ──
+    # Passing QA is a claim about ONE commit. Showing only "Review" hides the
+    # question that actually matters at the merge handoff: does the evidence
+    # still describe the commit about to be merged?
+    qa_evidence = state.get("qa_evidence") or {}
+    if qa_evidence:
+        print()
+        print("▎QA evidence  (exact-SHA)")
+        for issue in sorted(qa_evidence, key=int):
+            row = qa_evidence[issue]
+            mark = "⚠ invalidated" if row["invalidated"] else "✓ fresh"
+            print(
+                f"   #{issue}  tested {row['tested'][:12]} · head {row['current'][:12]}  {mark}"
+            )
 
     # ── block reasons ──
     print()

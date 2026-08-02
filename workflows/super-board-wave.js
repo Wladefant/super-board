@@ -6,7 +6,7 @@ export const meta = {
     { title: 'Classify', detail: 'haiku router: kind + complexity per Ready card' },
     { title: 'Build', detail: 'Builder lifecycle (run.md): worktree, branch, draft PR' },
     { title: 'QA', detail: 'Tester lifecycle (run.md): test plan, evidence, screenshots' },
-    { title: 'Review', detail: 'Reviewer lifecycle (run.md): gates, rerun tests, merge' },
+    { title: 'Review', detail: 'Reviewer lifecycle (run.md): gates, rerun tests, stop at the human handoff' },
   ],
 }
 
@@ -83,8 +83,37 @@ const STAGE_SCHEMA = {
     detail: { type: 'string' },
     prUrl: { type: 'string' },
     branch: { type: 'string' },
+    // Exact-SHA QA evidence travels with every stage result so the merge
+    // handoff can be validated without re-deriving anything downstream.
+    testedSha: { type: 'string' },
+    currentHeadSha: { type: 'string' },
+    checkConclusion: { type: 'string' },
   },
   required: ['status', 'column', 'detail'],
+}
+
+// The read-only merge handoff. Mirrors
+// `super_board_runtime.qa.validate_merge_handoff`: the live head must still be
+// the tested commit AND the SHA-bound required check on that commit must have
+// concluded success. It performs no writes and it never merges — the runtime
+// has no merge path. It only decides whether a card may be REPORTED as ready
+// for the human's rebase merge.
+const QA_CHECK_CONTEXT = 'superboard/exact-sha-qa'
+const validateMergeHandoff = (result) => {
+  const tested = (result && result.testedSha) || null
+  const current = (result && result.currentHeadSha) || null
+  const conclusion = (result && result.checkConclusion) || null
+  if (!tested) return { mergeReady: false, reasonCode: 'qa-evidence-missing', tested, current }
+  if (!current || current !== tested) {
+    return { mergeReady: false, reasonCode: 'head-moved', tested, current }
+  }
+  if (!conclusion || !String(conclusion).trim()) {
+    return { mergeReady: false, reasonCode: 'check-missing', tested, current }
+  }
+  if (String(conclusion).trim().toLowerCase() !== 'success') {
+    return { mergeReady: false, reasonCode: 'check-not-success', tested, current }
+  }
+  return { mergeReady: true, reasonCode: null, tested, current }
 }
 
 const LANE = {
@@ -184,7 +213,20 @@ const results = await pipeline(
     if (at === 'Review') {
       // Reviewer always on session model; serialized unless a human merges.
       const review = () => runLane('review', card, undefined, history)
-      if (input.humanApprovesMerge) { await review() } else { await withReviewLock(review) }
+      const reviewResult = input.humanApprovesMerge ? await review() : await withReviewLock(review)
+      // The Review→human transition is gated on the exact-SHA handoff. A card
+      // whose head moved, or whose SHA-bound check did not conclude success,
+      // is NOT reported as merge-ready however clean the review read.
+      const handoff = validateMergeHandoff(reviewResult)
+      history[history.length - 1].mergeReady = handoff.mergeReady
+      history[history.length - 1].handoffReason = handoff.reasonCode
+      if (!handoff.mergeReady) {
+        log(
+          `#${card.number} stops in Review — not merge-ready (${handoff.reasonCode}); ` +
+          `tested=${handoff.tested || 'none'} head=${handoff.current || 'unknown'} ` +
+          `check=${QA_CHECK_CONTEXT}`
+        )
+      }
     }
     return { number: card.number, history }
   }
@@ -199,6 +241,8 @@ const summary = results.filter(Boolean).map((r) => {
     lastLane: last.lane,
     column: last.column,
     detail: last.detail,
+    mergeReady: last.mergeReady === true,
+    handoffReason: last.handoffReason || null,
     prUrl: last.prUrl || null,
     lanesRun: r.history.map((h) => `${h.lane}:${h.status}`).join(' → ') || 'none',
   }
