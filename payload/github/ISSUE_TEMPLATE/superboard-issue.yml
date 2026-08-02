@@ -1,5 +1,5 @@
 name: "Superboard task"
-description: "Structured task with enforced Context / Steps / Acceptance criteria"
+description: "Structured task with enforced Context / Steps / Acceptance criteria / classification"
 labels: []
 
 body:
@@ -10,11 +10,12 @@ body:
       description: "One-line summary of the task"
     validations:
       required: true
+
   - type: dropdown
-    id: type
+    id: work-type
     attributes:
-      label: "Type"
-      description: "Work classification (mirror as a label after creation)"
+      label: "Work type"
+      description: "Universal work classification. Mirrored as a label by the intake normalizer."
       options:
         - build
         - docs
@@ -24,6 +25,7 @@ body:
         - risk
     validations:
       required: true
+
   - type: textarea
     id: context
     attributes:
@@ -31,6 +33,7 @@ body:
       description: "Why this task exists; background and links"
     validations:
       required: true
+
   - type: textarea
     id: steps
     attributes:
@@ -38,6 +41,7 @@ body:
       description: "Concrete steps to complete the work"
     validations:
       required: true
+
   - type: textarea
     id: acceptance
     attributes:
@@ -48,16 +52,63 @@ body:
         - [ ] Given ..., When ..., Then ...
     validations:
       required: true
+
   - type: input
-    id: milestone-phase
+    id: test-area
     attributes:
-      label: "Milestone phase (informational)"
-      description: "Informational only - the actual milestone is still set via gh CLI or the UI. Name the roadmap phase this belongs to (e.g. 'Phase 0 - Install + Smoke')."
+      label: "Test Area"
+      description: "The surface QA exercises for this card, for example runtime, board, installer, frontend. Mirrored as an `area:<value>` label."
     validations:
-      required: false
-  - type: checkboxes
+      required: true
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: "Priority"
+      description: "Mirrored as a `priority:<value>` label."
+      options:
+        - P0
+        - P1
+        - P2
+        - P3
+    validations:
+      required: true
+
+  - type: dropdown
     id: environment-constraint
     attributes:
-      label: "Environment"
+      label: "Environment constraint"
+      description: "Canonical taxonomy. `environment-constraint` means the card needs a specific machine or environment and doubles as a dispatch filter. `laptop` is the preserved legacy alias and is mapped onto `environment-constraint`."
       options:
-        - label: "Needs a specific machine/environment (add the `environment-constraint` label after creation so agents without that environment skip the card)"
+        - none
+        - environment-constraint
+        - laptop
+    validations:
+      required: true
+
+  - type: dropdown
+    id: branch-route
+    attributes:
+      label: "Branch route"
+      description: "The base branch this card targets. Exactly one value; nothing else routes anything."
+      options:
+        - staging
+        - staging-frankfurt
+    validations:
+      required: true
+
+  - type: input
+    id: milestone
+    attributes:
+      label: "Milestone"
+      description: "The repository milestone this card belongs to. The repository is its only ledger. Leave empty ONLY when the Blocked reason below is filled in."
+    validations:
+      required: false
+
+  - type: textarea
+    id: blocked-reason
+    attributes:
+      label: "Blocked reason"
+      description: "Required when no milestone is set. Name the concrete thing that must happen first. Placeholders such as TBD or n/a are refused."
+    validations:
+      required: false

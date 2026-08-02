@@ -1,0 +1,93 @@
+# Continuous Superboard intake and closure normalization.
+#
+# Intake goes stale by event: a label is removed, a milestone is cleared, a body
+# is edited after the fact, a pull request is re-pointed at another base branch.
+# So normalization runs on EVERY issue and pull-request event in the trigger
+# set, plus a bounded periodic sweep for the events GitHub drops.
+#
+# This workflow never promotes a card to Ready and never writes a completion
+# status by itself. It emits a machine-readable plan; Project card adds and
+# Project status changes stay top-level orchestration, performed against that
+# plan by an operator session with the Projects credential. The workflow job
+# therefore needs no Project write token at all.
+
+name: "Superboard normalize"
+
+on:
+  issues:
+    types:
+      - opened
+      - edited
+      - labeled
+      - unlabeled
+      - milestoned
+      - demilestoned
+      - reopened
+      - closed
+  pull_request_target:
+    # `merged` is not a delivered type: a merged pull request arrives as
+    # `closed` carrying `merged` true, and the normalizer classifies it as the
+    # merged disposition. Both are named here so the trigger set is readable.
+    types:
+      - opened
+      - edited
+      - synchronize
+      - ready_for_review
+      - converted_to_draft
+      - labeled
+      - unlabeled
+      - milestoned
+      - demilestoned
+      - reopened
+      - closed
+  schedule:
+    # The bounded periodic reconciliation sweep.
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+concurrency:
+  group: superboard-normalize-${{ github.event.issue.number || github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  normalize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the installed runtime
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Plan intake normalization
+        id: intake
+        env:
+          SUBJECT_URL: ${{ github.event.issue.html_url || github.event.pull_request.html_url }}
+          SUBJECT_EVENT: ${{ github.event.action || 'schedule' }}
+        run: |
+          if [ -z "${SUBJECT_URL}" ]; then
+            echo "periodic sweep: no single subject; the operator session runs the sweep" >&2
+            exit 0
+          fi
+          python .claude/bin/super-board-normalize.py intake \
+            --issue "${SUBJECT_URL}" \
+            --event "${SUBJECT_EVENT}" \
+            --json > intake-plan.json || status=$?
+          if [ "${status:-0}" -ne 0 ]; then
+            echo "intake normalization refused with exit ${status}; nothing was written" >&2
+          fi
+
+      - name: Publish the plan as a build artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: superboard-normalization-plan
+          path: intake-plan.json
+          if-no-files-found: ignore
