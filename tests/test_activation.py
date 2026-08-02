@@ -23,10 +23,12 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 from super_board_runtime.activation import (  # noqa: E402
+    ACTIVATION_LADDER,
     ACTIVATION_MODES,
     ActivationDecision,
     evaluate_activation,
     guard_stage,
+    validate_activation_transition,
 )
 from super_board_runtime.config import ConfigError, load_and_validate_config  # noqa: E402
 from super_board_runtime.eligibility import IssueSnapshot, evaluate_dispatch  # noqa: E402
@@ -259,6 +261,96 @@ class ReEvaluationTests(unittest.TestCase):
             decision = guard_stage(_issue(8), path, planned_mode="proof-only", stage="claim")
             self.assertFalse(decision.permitted)
             self.assertEqual(decision.reason_code, "activation-not-allowlisted")
+
+
+class ActivationLadderTests(unittest.TestCase):
+    """`off` → `proof-only` → `active`, one rung at a time.
+
+    The setup skill claimed every activation rule below it was "enforced in
+    code", and this one was not: `config.py` validates the CURRENT mode and
+    nothing else, so a board could go straight from `off` to `active` in one
+    edit and no code would notice. The half of the rule a validator genuinely
+    cannot see — that each step arrives as a human-reviewed pull request — is
+    governance, and is now labelled as governance.
+    """
+
+    def test_the_ladder_is_the_three_modes_in_order(self) -> None:
+        self.assertEqual(ACTIVATION_LADDER, ("off", "proof-only", "active"))
+        self.assertEqual(set(ACTIVATION_LADDER), set(ACTIVATION_MODES))
+
+    def test_one_rung_up_is_permitted(self) -> None:
+        for previous, following in (("off", "proof-only"), ("proof-only", "active")):
+            with self.subTest(step=(previous, following)):
+                transition = validate_activation_transition(previous, following)
+                self.assertTrue(transition.permitted)
+                self.assertIsNone(transition.reason_code)
+
+    def test_skipping_the_proof_rung_is_refused(self) -> None:
+        transition = validate_activation_transition("off", "active")
+        self.assertFalse(transition.permitted)
+        self.assertEqual(transition.reason_code, "activation-ladder-skipped")
+
+    def test_standing_still_is_not_a_transition(self) -> None:
+        for mode in ACTIVATION_LADDER:
+            with self.subTest(mode=mode):
+                self.assertTrue(validate_activation_transition(mode, mode).permitted)
+
+    def test_every_de_escalation_is_permitted(self) -> None:
+        # Turning a board down, or off, must never be something code refuses.
+        for previous, following in (
+            ("active", "proof-only"),
+            ("active", "off"),
+            ("proof-only", "off"),
+        ):
+            with self.subTest(step=(previous, following)):
+                transition = validate_activation_transition(previous, following)
+                self.assertTrue(transition.permitted, transition.reason_code)
+
+    def test_an_unknown_mode_on_either_side_is_refused(self) -> None:
+        for previous, following in (("off", "on"), ("enabled", "active"), (None, "active")):
+            with self.subTest(step=(previous, following)):
+                transition = validate_activation_transition(previous, following)
+                self.assertFalse(transition.permitted)
+                self.assertEqual(transition.reason_code, "activation-mode-invalid")
+
+    def test_the_cli_refuses_a_skipped_rung_with_exit_65(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write(Path(tmp), _payload(activation_mode="active"))
+            result = subprocess.run(
+                [
+                    sys.executable, "-B", "-m", "super_board_runtime.activation",
+                    "--config", str(path), "--previous-mode", "off",
+                ],
+                capture_output=True, text=True, cwd=str(_SCRIPTS),
+            )
+        self.assertEqual(result.returncode, 65, result.stdout)
+        self.assertIn("activation-ladder-skipped", result.stderr)
+
+    def test_the_cli_accepts_a_single_rung(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _write(Path(tmp), _payload(activation_mode="active"))
+            result = subprocess.run(
+                [
+                    sys.executable, "-B", "-m", "super_board_runtime.activation",
+                    "--config", str(path), "--previous-mode", "proof-only",
+                    "--issue-url", PROOF_URL,
+                ],
+                capture_output=True, text=True, cwd=str(_SCRIPTS),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(result.stdout)["transition_permitted"])
+
+
+class SetupSkillHonestyTests(unittest.TestCase):
+    SKILL = _REPO_ROOT / "skills" / "superboard-setup" / "SKILL.md"
+
+    def test_the_ladder_names_the_validator_that_enforces_it(self) -> None:
+        text = self.SKILL.read_text(encoding="utf-8")
+        self.assertIn("validate_activation_transition", text)
+
+    def test_the_human_review_half_is_labelled_governance(self) -> None:
+        text = self.SKILL.read_text(encoding="utf-8")
+        self.assertIn("governance", text.lower())
 
 
 class ActivationCliTests(unittest.TestCase):
