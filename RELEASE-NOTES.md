@@ -27,9 +27,12 @@ through v1.7.1 are declared explicitly untagged rather than retro-tagged.
   breadcrumb trail that `git blame` and `git bisect` depend on.
 - **`claude-p` is the default backend again.** The in-session dynamic-workflow
   backend is explicit opt-in.
-- **Three activation modes** — `off`, `proof`, `on`. A board stays at `off`
-  until every installation and repository gate passes; `proof` restricts work to
-  an explicit allowlist.
+- **Three activation modes** — `off`, `proof-only`, `active`. A board stays at
+  `off` until every installation and repository gate passes, and every transition
+  along `off` → `proof-only` → `active` takes its own human-reviewed
+  configuration pull request; `proof-only` restricts work to the single
+  allowlisted issue named by `proof_issue_url`, which is `null` in the other two
+  modes. Nothing at runtime dispatches past the mode.
 - **An immutable 1,000-point GraphQL reserve.** It cannot be configured downward,
   and a run that would break it halts with exit 75 rather than borrowing against
   it. The old 200-point threshold and the 5,000-point fallback are gone.
@@ -84,6 +87,49 @@ through v1.7.1 are declared explicitly untagged rather than retro-tagged.
 - The board-URL substitution marker is gone from the fallback workflow payload;
   the URL is a repository variable now, so a placeholder nobody rewrites can no
   longer become a live misconfiguration.
+
+### Migrating an existing board
+
+This release is backward-incompatible. Four things break on a board that was
+running v1.x, in plain terms:
+
+- **Dispatch now requires exactly `Ready`.** Nothing else is dispatchable —
+  there is no resume-from-Building, no pick-up-from-Blocked, and no
+  lane-specific eligibility — and only OPEN issue cards dispatch at all. Work
+  parked in another column waiting to be picked back up will simply sit there.
+- **Merge behaviour is human-only and rebase-only.** The runtime has no merge
+  path and no substitute for one, `human_approves_merge: false` is refused, and
+  `merge_method` must be `rebase`. Repositories must be pinned to
+  `allow_rebase_merge: true`, `allow_squash_merge: false`,
+  `allow_merge_commit: false`.
+- **The status contract is the canonical seven**, not configurable, with
+  `Skipped` removed rather than remapped.
+- **The config schema changed** — `activation_mode` and `proof_issue_url` are
+  part of the contract, `minimum_graphql_reserve` has an immutable floor,
+  `exclude_labels` is enforced instead of ignored, and `github_auth` names
+  environment variables rather than carrying values. A config holding anything
+  credential-shaped exits 65.
+
+In order:
+
+1. Reinstall the payload at the pinned release; confirm the install manifest
+   recorded a SHA-256 for every installed file.
+2. Set `activation_mode` to `"off"` and `proof_issue_url` to `null`, then run
+   `python scripts/super-board-config.py validate --config <path> --json`.
+3. Set `human_approves_merge: true` and `merge_method: "rebase"`, and pin the
+   three repository merge settings above on every linked repository.
+4. Remove any Status option outside the canonical seven and reconcile the cards
+   holding it.
+5. Fix the built-in Project workflows — in particular **Item reopened →
+   Backlog**, which earlier setup guidance wrongly pointed at Building — and
+   read all seven targets back.
+6. Add the `environment-constraint` label; leave `laptop` in place as the
+   mapped alias.
+7. Add a `Branch route:` declaration to every issue you intend to dispatch;
+   without one the card is ineligible and no branch is created.
+8. Run the reconcile sweep and the board audit, and fix what they surface.
+9. Only then open the configuration pull request moving `activation_mode` from
+   `off` to `proof-only`, naming the one issue you will watch.
 
 ### Not done here
 
