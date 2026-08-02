@@ -196,6 +196,56 @@ See `.claude/skills/super-board/references/run.md` → Reviewer. Summary of 8 su
    - **Blocker (schema, contract, money, auth, migration) or rebuild cap hit** → full §4 Block template, move card Review → Blocked.
 8. Clean up worktree.
 
+### The local Codex gate — one parallel fleet per code pull request
+
+The binding review gate is a **local** Codex fleet, run from the pull request's
+worktree. Claude writes the code, Codex reviews it from four angles in parallel,
+Claude fixes every finding. Two models, working together.
+
+Run it once, through `scripts/super-board-codex-review.py run --base <base>
+--worktree <path> --pull-request <url>`, which issues exactly these four
+commands concurrently:
+
+```bash
+codex exec review --base "$(git merge-base origin/<base> HEAD)" \
+  -m gpt-5.5 -c model_reasoning_effort="high"
+codex exec -m gpt-5.5 -c model_reasoning_effort="high" -s read-only "<correctness lens>"
+codex exec -m gpt-5.5 -c model_reasoning_effort="high" -s read-only "<security lens>"
+codex exec -m gpt-5.5 -c model_reasoning_effort="high" -s read-only "<performance and design-consistency lens>"
+```
+
+Non-negotiable, each for a concrete reason:
+
+- **`codex exec review` never receives a custom prompt.** The CLI rejects the
+  combination, so a prompt there does not "add context" — it loses the entire
+  structured diff review. Passing one is refused with
+  `codex-review-prompt-conflict`.
+- **The base is the merge base, not the base branch.** `git merge-base
+  origin/<base> HEAD` scopes the review to this branch's commits instead of
+  every unrelated change that landed on the base since the fork point.
+- **Model `gpt-5.5`, `model_reasoning_effort="high"`, on every lens.** Anything
+  weaker is a cheaper review pretending to be the gate, and fails with
+  `codex-model-invalid` / `codex-reasoning-effort-invalid`. Note the
+  `~/.codex/config.toml` default lags the newest model — override it.
+- **Every finding is resolved, including nits.** No confidence threshold, no
+  "skip the low ones". A finding is resolved only when it is fixed or disproved
+  with committed evidence, recorded as `--resolution <file:line>=<commit>`. An
+  advisory review is not a gate.
+- **One fleet per pull request.** A second automatic run costs the same usage
+  and reviews the same code; it is refused with `codex-fleet-already-run`.
+  Re-review only when the user explicitly asks (`--force-rerun`).
+- **Documentation-only diffs are exempt** (`documentation-only-exempt`): four
+  maximum-effort lenses over a Markdown change burn usage for nothing.
+- **Only sanitized summaries are published.** Raw lens output is unbounded text
+  produced by a model reading the whole worktree — exactly the shape of payload
+  that carries a secret by accident. It is written to local disk outside the Git
+  tree; the summary goes through the publication boundary.
+
+**CodeRabbit, Copilot, Greptile, and the GitHub `@codex` connector are not
+gates.** They may comment; nothing waits on them. The connector in particular
+has its own easily-exhausted review rate limit, and treating it as the gate
+produces a false "usage limit" stop while the task budget is untouched.
+
 ### The runtime never merges — the review ends at the handoff
 
 A clean review produces a **record**, not a merge. Concretely, Reviewer's best
