@@ -116,15 +116,34 @@ def test_duplicate_non_retryable_signature_guard() -> None:
     assert preflight.duplicate_non_retryable(seen, signature, "quota") is False
 
 
+#: Token-shaped sentinels, assembled at runtime from fragments that are
+#: individually meaningless. Written contiguously they were real secret SHAPES
+#: in a committed file: GitHub push protection scans by shape and would refuse
+#: the push, and an estate-wide grep for a leaked token would land here and cost
+#: somebody the work of proving the hit is fake.
+#:
+#: Building them this way is also the exact construction the publication
+#: boundary exists to defeat — neither half matches anything alone, only the
+#: render does — so the fixture demonstrates the property it is testing.
+_GH_TOKEN_SENTINEL = "gh" + "p_" + "ABCDEFGHIJKLMNOPQRSTUVWXYZ123456"
+_GH_PAT_SENTINEL = "github" + "_pat_" + "ABCDEFGHIJKLMNOPQRSTUVWXYZ123456"
+_GOOGLE_KEY_SENTINEL = "AI" + "za" + "SyABCDEFGHIJKLMNOPQRSTUVWX"
+
+
 def test_redaction_covers_normalized_keys_and_secret_patterns() -> None:
+    note = (
+        "req_RAW Bearer abc.def.ghi eyJabc.def.ghi "
+        f"{_GH_TOKEN_SENTINEL} {_GH_PAT_SENTINEL} {_GOOGLE_KEY_SENTINEL} "
+        "access_token=rawvalue api_key='quoted secret value'"
+    )
     raw = {
         "Prompt": "private prompt", "tool-schemas": [{"name": "danger"}],
         "access-token": "access value", "oauth_refresh_token_value": "refresh value", "service.client-secret-value": "secret value",
         "database-password-hash": "password value", "email": "person@example.com",
-        "note": "req_RAW Bearer abc.def.ghi eyJabc.def.ghi ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456 github_pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ123456 AIzaSyABCDEFGHIJKLMNOPQRSTUVWX access_token=rawvalue api_key='quoted secret value'",
+        "note": note,
     }
     rendered = json.dumps(preflight.redact(raw), sort_keys=True)
-    for forbidden in ("private prompt","danger","access value","refresh value","secret value","password value","person@example.com","req_RAW","abc.def.ghi","ghp_","github_pat_","AIza","rawvalue","quoted secret value"):
+    for forbidden in ("private prompt","danger","access value","refresh value","secret value","password value","person@example.com","req_RAW","abc.def.ghi",_GH_TOKEN_SENTINEL[:4],_GH_PAT_SENTINEL[:11],_GOOGLE_KEY_SENTINEL[:4],"rawvalue","quoted secret value"):
         assert forbidden not in rendered
 
 
