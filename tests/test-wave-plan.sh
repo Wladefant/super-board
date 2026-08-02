@@ -55,7 +55,7 @@ RC=0; "$PLAN" --config <(echo "$BAD") --items fixtures/wave-items.json >/dev/nul
 [ "$RC" -eq 65 ] || fail "invalid variant should exit 65, got $RC"
 
 # Scenario 8 — the planner enforces the config contract: `columns` is gone
-COLS=$(jq '.columns = ["Ready","QA","Skipped"]' fixtures/wave-config.json)
+COLS=$(jq '.columns = ["Ready","QA","Review"]' fixtures/wave-config.json)
 RC=0; "$PLAN" --config <(echo "$COLS") --items fixtures/wave-items.json >/dev/null 2>&1 || RC=$?
 [ "$RC" -eq 65 ] || fail "a config carrying 'columns' should exit 65, got $RC"
 

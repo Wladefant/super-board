@@ -222,7 +222,7 @@ gh_quota_guard() {
 
 try_claim_assignee() {
   # Atomic claim. Returns 0 if we won the claim, 1 if someone else beat us.
-  # Skipped when bot_identity is unset (solo single-user runs rely on local locks only).
+  # Not attempted when bot_identity is unset (solo single-user runs rely on local locks only).
   # We rely on the runtime's eligibility pass having already filtered out cards with
   # assignees from the cached project item-list — so we attempt the edit directly without a
   # pre-check `gh issue view`. Saves one GraphQL call per dispatch. The edit is
@@ -533,12 +533,19 @@ if [ -f "$WAVE_LOCK" ]; then
   exit 74
 fi
 
-# Production-merge guard.
+# Production-merge guard. `human_approves_merge: false` is refused outright on a
+# production base branch: the runtime has no merge path, so a board configured
+# as if it did is a board whose contract nobody has re-read.
+#
+# Exit 76, not 75. 75 is the immutable GraphQL reserve (G9), and two different
+# halts sharing one code makes the halt unreadable to every caller downstream.
 if [ "$BASE_BRANCH" = "main" ] && [ "$HUMAN_APPROVES" = "false" ]; then
   if rg -qU 'on:\s*\n?\s*push:\s*\n?\s*branches:[^a-z]*main' .github/workflows 2>/dev/null \
      || [ -f vercel.json ] || [ -f netlify.toml ]; then
-    log "🛡 refusing to start: would auto-merge to production main."
-    exit 75
+    log "🛡 refusing to start: this board targets production main with human_approves_merge=false."
+    log "    Every merge is performed by a human, by rebase. Set human_approves_merge: true,"
+    log "    or point base_branch at a staging branch. Exiting 76."
+    exit 76
   fi
 fi
 

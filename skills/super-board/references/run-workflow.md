@@ -21,7 +21,10 @@ The interactive session that runs this backend is the orchestrator. It:
 Run the same preconditions as `run.md` §Preconditions, minus PID checks:
 1. Config exists and validates against `config-schema.json`.
 2. Production-merge guard: refuse `base_branch: main` + `human_approves_merge:
-   false` when deploy markers exist (same rule as super-board-run.sh).
+   false` when deploy markers exist (same rule as super-board-run.sh), halting
+   with **exit 76**. Not 75 — that code is reserved for the immutable GraphQL
+   reserve, and two different halts sharing one code makes the halt unreadable
+   to every caller downstream.
 3. Stale-worktree scan: remove `.worktrees/*` whose branch is gone.
 4. `node --check` passes on a wrapped copy of
    `.claude/workflows/super-board-wave.js` (catches a broken script before
@@ -124,11 +127,23 @@ don't stall on prompts:
     "Bash(bash .claude/bin/super-board-wave-plan.sh:*)",
     plus your project's test runners (e.g. "Bash(npm test:*)", "Bash(npx playwright:*)").
 
-`gh pr merge` is deliberately NOT in the list — Reviewer merges remain
-gated by an interactive prompt, and by `human_approves_merge` for boards
-that require a human click. Consequence: on auto-merge boards
-(`human_approves_merge: false`) every Reviewer squash-merge pauses for one
-interactive approval, so this backend is **attended-only** by default.
-For genuinely unattended auto-merge runs you must consciously add
-`"Bash(gh pr merge:*)"` yourself — doing so removes the last human gate
-before the base branch, so pair it with a non-production `base_branch`.
+No merge command is in the list, and none may be added. **The runtime has no
+merge path.** Reviewer marks the pull request ready for review, leaves the card
+in `Review`, and stops; a human rebase-merges. There is no "unattended merge"
+configuration, no auto-merge enablement, and no substitute for a merge — the
+runtime may not close the implementation issue instead, and may not move a card
+to `Done`. `Done` is produced by the built-in workflows and the closure
+normalizer *after* a real human merge.
+
+This is enforced, not merely documented:
+`super_board_runtime.review.scan_merge_prohibitions` source-scans every
+executable runtime, workflow, skill, and reviewer path for all eight merge
+mechanisms (CLI merge subcommands, repository merge REST endpoints, GraphQL
+merge mutations, GitHub MCP merge tools, auto-merge enablement, squash and
+merge-commit instructions, runtime issue closure, and runtime transitions to
+`Done`). Any active occurrence fails the release gate. Adding a merge command to
+the allowlist above would fail that gate on the next run.
+
+Required configuration: `human_approves_merge: true`, `merge_method: "rebase"`.
+Required repository settings: `allow_rebase_merge: true`,
+`allow_squash_merge: false`, `allow_merge_commit: false`.

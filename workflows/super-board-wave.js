@@ -163,7 +163,9 @@ const lanePrompt = (lane, card) => [
   `Issue node: ${card.issueNodeId || card.issue_node_id || 'unknown'}.`,
   ``,
   `Report your exit via structured output:`,
-  `- status=advanced  → card moved forward (Building→QA, QA→Review, Review→Done/merged)`,
+  `- status=advanced  → card moved forward (Building→QA, QA→Review, Review→human handoff)`,
+  `  Review is where you STOP. Never merge, never close the issue, never write the Done status.`,
+  `  On a clean review, carry testedSha/currentHeadSha/checkConclusion back so the handoff can be validated.`,
   `- status=bounced   → card moved backward (QA fail → Ready, Reviewer bounce → Ready/QA)`,
   `- status=blocked or human-gate → you wrote the Block template and moved the card to Blocked`,
   `- status=failed    → you could not complete the lifecycle (say why in detail)`,
@@ -242,6 +244,11 @@ const results = await pipeline(
       const handoff = validateMergeHandoff(reviewResult)
       history[history.length - 1].mergeReady = handoff.mergeReady
       history[history.length - 1].handoffReason = handoff.reasonCode
+      // The wave ends at Review on every path. There is no branch of this
+      // workflow that merges, closes the issue, or writes Done — Done is
+      // produced by the closure normalizer after a real human merge.
+      history[history.length - 1].column = 'Review'
+      history[history.length - 1].awaiting = 'human-rebase-merge'
       if (!handoff.mergeReady) {
         log(
           `#${card.number} stops in Review — not merge-ready (${handoff.reasonCode}); ` +

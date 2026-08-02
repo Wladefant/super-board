@@ -104,7 +104,7 @@ RC=0; "$DISPATCH" --config "$CFG" --dry-run >/dev/null 2>&1 || RC=$?
 
 # Scenario 7 — an invalid config stops before any resolution (exit 65).
 BADCFG="$TMP/bad-config.json"
-jq '.columns = ["Ready","Skipped"]' "$CFG" > "$BADCFG"
+jq '.columns = ["Ready","QA"]' "$CFG" > "$BADCFG"
 RC=0
 "$DISPATCH" --config "$BADCFG" \
   --issue-url https://github.com/test-owner/test-repo/issues/123 \
