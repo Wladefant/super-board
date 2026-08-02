@@ -322,14 +322,22 @@ def rebuild_suffix(item: dict[str, Any]) -> str:
     return f"↻ {min(k + 1, 3)}/3" if k else ""
 
 
+#: Block-reason glyphs, in match order. The lifecycle has seven statuses and the
+#: retired eighth is not one of them, so it gets no glyph, no lane, no counter
+#: and no key here — a renderer that still offers it teaches the board a status
+#: the runtime refuses to canonicalize.
 REASON_TABLE: list[tuple[str, str]] = [
     ("🛡", "dependency gate"),
     ("🔐", "missing creds"),
     ("💳", "quota / billing"),
     ("❓", "ambiguous AC"),
     ("⚙",  "infra / tooling"),
-    ("⏭", "skipped"),
 ]
+
+#: How the Done lane describes how its cards got there. The runtime never
+#: merges and the repository allows exactly one strategy: a human performs a
+#: rebase merge, so every commit survives on the trunk with its own message.
+DONE_COLLAPSE_LABEL = "   (rebase-merged by a human, collapsed)"
 
 
 def reason_for(body: str) -> tuple[str, str]:
@@ -676,7 +684,7 @@ def main() -> int:
         print(box_line("(empty)"))
     else:
         nums = [f"#{x['number']}" for x in done]
-        tail = "   (squash-merged, collapsed)"
+        tail = DONE_COLLAPSE_LABEL
         full = " ".join(nums) + tail
         if visual_width(full) <= 76:
             print(box_line(full))

@@ -32,7 +32,10 @@ python .claude/bin/super-board-status.py <config-slug>  # multi-project repo
 - **Do not** collapse empty lanes onto one line (e.g. don't merge
   `Building [0]`, `QA [0]`, `Review [0]` into one row). Each lane is its
   own multi-line box; preserve every line and every newline as-is.
-- **Do not** merge `Blocked` and `Skipped` into one combined box.
+- **Do not** fold `Blocked` into another box, and do not add a lane for a
+  status outside the canonical seven (`Backlog`, `Ready`, `Building`, `QA`,
+  `Review`, `Blocked`, `Done` — see
+  [`scripts/super_board_runtime/lifecycle.py`](https://github.com/Wladefant/super-board/blob/main/scripts/super_board_runtime/lifecycle.py)).
 - **Do not** strip the `▎Workers` / `▎Block reasons` / `▎Recent` / `▎Health`
   section headers, or fold them into the kanban box stack.
 - **Do not** re-render the box-drawing characters, "fix" alignment, or
@@ -96,7 +99,7 @@ strings. Do **not** improvise.
 📊 super-board · <Project Title> (#<number>)
 ────────────────────────────────────────────────────────────────────────────────
 config: <slug>   variant: <full|qa-only>   base: <base_branch>
-mode:   <auto-merge|human-approves>        truth gate: <off|non-trivial (≥N)|always>
+mode:   human-rebase-merge     truth gate: <off|non-trivial (≥N)|always>
 
 ┌─ Ready    [N] ───────────────────────────────────────────────────────────────┐
 │ <card lines, one per issue — see §C>                                         │
@@ -114,9 +117,6 @@ mode:   <auto-merge|human-approves>        truth gate: <off|non-trivial (≥N)|a
 │ <collapsed line — see §D>                                                    │
 └──────────────────────────────────────────────────────────────────────────────┘
 ┌─ Blocked  [N] ───────────────────────────────────────────────────────────────┐
-│ <card lines with reason glyph>                                               │
-└──────────────────────────────────────────────────────────────────────────────┘
-┌─ Skipped  [N] ───────────────────────────────────────────────────────────────┐
 │ <card lines with reason glyph>                                               │
 └──────────────────────────────────────────────────────────────────────────────┘
 
@@ -139,7 +139,7 @@ mode:   <auto-merge|human-approves>        truth gate: <off|non-trivial (≥N)|a
 📊 super-board · NSAdashboard Super-Board (#1)
 ────────────────────────────────────────────────────────────────────────────────
 config: nsadashboard-super-board   variant: full   base: staging
-mode:   auto-merge                 truth gate: non-trivial (≥70)
+mode:   human-rebase-merge     truth gate: non-trivial (≥70)
 
 ┌─ Ready    [1] ───────────────────────────────────────────────────────────────┐
 │ 🔨 #26  Strip nav + editor groups from command palette            ↻ 2/3      │
@@ -155,13 +155,10 @@ mode:   auto-merge                 truth gate: non-trivial (≥70)
 │ (empty)                                                                      │
 └──────────────────────────────────────────────────────────────────────────────┘
 ┌─ Done     [9] ───────────────────────────────────────────────────────────────┐
-│ #20 #18 #7 #6 #5 #4 #3 #2 #1   (squash-merged, collapsed)                    │
+│ #20 #18 #7 #6 #5 #4 #3 #2 #1   (rebase-merged by a human, collapsed)         │
 └──────────────────────────────────────────────────────────────────────────────┘
 ┌─ Blocked  [1] ───────────────────────────────────────────────────────────────┐
 │ 🛡 #25  Add Controle page — gated on #24                                     │
-└──────────────────────────────────────────────────────────────────────────────┘
-┌─ Skipped  [0] ───────────────────────────────────────────────────────────────┐
-│ (empty)                                                                      │
 └──────────────────────────────────────────────────────────────────────────────┘
 
 ▎Workers  (claim: LucariusWest · 2/3 active)
@@ -197,7 +194,7 @@ mode:   auto-merge                 truth gate: non-trivial (≥70)
 1. Header line (project + `#number`)
 2. Separator (80 × `─`)
 3. Config strip (2 lines: `config/variant/base`, `mode/truth-gate`)
-4. Kanban — 7 boxes, **fixed order**: Ready → Building → QA → Review → Done → Blocked → Skipped
+4. Kanban — 6 boxes, **fixed order**: Ready → Building → QA → Review → Done → Blocked
 5. `▎Workers`
 6. `▎Block reasons`
 7. `▎Recent`
@@ -228,14 +225,16 @@ Inside a Kanban box, one line per issue:
 - **suffix** (right-justified):
   - In-flight rebuild: `↻ N/3` (from `loop:rebuild-N` label)
   - Blocked: `— <reason glyph> <short reason>` or `— gated on #N`
-  - Skipped: `— ⏭ <short reason>`
   - Otherwise: empty
 
 ### §D — Done column collapsing
 
 Done is **always one line** of issue numbers, newest first, no titles, tagged
-`(squash-merged, collapsed)`. Never expand Done card-by-card. If Done has more
-than ~12 issues at 80-col width, truncate with `… +N more` at the end.
+`(rebase-merged by a human, collapsed)`. The runtime never merges and the
+repository allows no other strategy, so that label is the only one the renderer
+can honestly print — history is never collapsed into a single commit. Never
+expand Done card-by-card. If Done has more than ~12 issues at 80-col width,
+truncate with `… +N more` at the end.
 
 ### §E — Workers section format
 
@@ -251,7 +250,7 @@ issue in the run manifest". `<extra-labels>` lists any other meaningful
 
 ### §F — Block-reasons section format
 
-Group `Blocked` and `Skipped` cards by reason-tag emoji, sorted by count desc:
+Group `Blocked` cards by reason-tag emoji, sorted by count desc:
 
 ```
    <glyph> ×<count>  <short reason>    <#N> → <detail> [, <#N> → <detail>…]
@@ -273,13 +272,13 @@ Tail the last 5 state-transition lines from the most recent run manifest
 Where:
 
 - `T-<N>m` if event was < 60 minutes ago, `T-<N>h` if < 24h, `T-<N>d` otherwise.
-- `<verb>`: `dispatch`, `pass`, `block`, `skip`, `reap`, `alert`, `zombie`, `merge`.
+- `<verb>`: `dispatch`, `pass`, `block`, `reap`, `alert`, `zombie`, `handoff`.
 - `<glyph>`: the lane glyph for `dispatch`, else the action glyph from §I.
 - `<Target>`: target lane/column for the transition (or omit for `reap`).
 - Pad columns so verbs align visually.
 
 A "state-transition line" is any manifest line containing `dispatch`,
-`reaped`, `→ Done`, `→ Blocked`, `→ Skipped`, `→ QA`, `→ Review`,
+`reaped`, `→ Done`, `→ Blocked`, `→ QA`, `→ Review`,
 `block-rate alert`, or `zombie`. Tick-only lines (`tick — Ready=…`) are
 **not** state transitions; skip them.
 
@@ -314,14 +313,13 @@ Pick from this set only. If a runtime situation doesn't match, fall back to
 | Glyph | Meaning                                  |
 | ----- | ---------------------------------------- |
 | ↻     | rebuild iteration (`attempt N/3`)        |
-| ✅    | pass / merged / lane-complete            |
+| ✅    | pass / lane-complete                     |
 | ⛔    | blocked transition (Ready → Blocked)     |
-| ⏭    | skipped transition (Ready → Skipped)     |
 | ♻     | reap stale lock + assignee swept         |
 | ⚠     | block-rate / rebuild-cap / generic alert |
 | 💀    | zombie worker killed                     |
 
-**Block / skip reason tags (Blocked + Skipped column suffixes, ▎Block reasons):**
+**Block reason tags (Blocked column suffixes, ▎Block reasons):**
 
 | Glyph | Meaning                                   |
 | ----- | ----------------------------------------- |
@@ -381,7 +379,7 @@ the script is missing.
   Deliberately avoids `gh project item-list --format json` (≈100 KB — it
   slurps every issue body) and any separate `gh issue list --assignee` call.
   Do **not** call `gh project item-edit` or any mutation in this verb.
-- **Block-reason parsing:** for each issue in `Blocked` or `Skipped`, read the
+- **Block-reason parsing:** for each issue in `Blocked`, read the
   latest §4 reason-tag comment via `gh issue view <N> --json comments` and
   match the leading emoji against §I. Cache results during the snapshot — do
   not re-read mid-render.
