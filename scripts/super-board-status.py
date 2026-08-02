@@ -55,6 +55,7 @@ if str(_SCRIPTS_DIR) not in sys.path:
     # both. The status renderer reads the runtime; it never writes through it.
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
+from super_board_runtime.config import DEFAULT_REBUILD_CAP  # noqa: E402
 from super_board_runtime.publication import redact_for_display  # noqa: E402
 
 #: The kanban box is 76 columns wide, so a title longer than this could never
@@ -334,14 +335,24 @@ def rebuild_count(item: dict[str, Any] | None) -> int:
     return 0
 
 
-def attempt_str(item: dict[str, Any] | None) -> str:
-    """`attempt N/3` derived from the issue's current `loop:rebuild-N` label."""
-    return f"{min(rebuild_count(item) + 1, 3)}/3"
+def attempt_str(
+    item: dict[str, Any] | None, rebuild_cap: int = DEFAULT_REBUILD_CAP
+) -> str:
+    """`attempt N/<cap+1>`, from the issue's current `loop:rebuild-N` label.
+
+    The denominator is the CONFIGURED cap plus the first attempt, not a literal
+    3. It was hardcoded — and clamped — to 3, so a board running `rebuild_cap: 4`
+    read `3/3` on the third attempt and `3/3` again on the fifth. This line is
+    what an operator reads to decide whether a card still has attempts left; it
+    cannot invent the number.
+    """
+    attempts = max(int(rebuild_cap), 0) + 1
+    return f"{min(rebuild_count(item) + 1, attempts)}/{attempts}"
 
 
-def rebuild_suffix(item: dict[str, Any]) -> str:
+def rebuild_suffix(item: dict[str, Any], rebuild_cap: int = DEFAULT_REBUILD_CAP) -> str:
     k = rebuild_count(item)
-    return f"↻ {min(k + 1, 3)}/3" if k else ""
+    return f"↻ {attempt_str(item, rebuild_cap)}" if k else ""
 
 
 #: Block-reason glyphs, in match order. The lifecycle has seven statuses and the
@@ -663,6 +674,9 @@ def main() -> int:
         or "?"
     )
     max_workers = cfg.get("max_workers", 3)
+    # The attempt denominator is a CONFIG value, read once here and passed to
+    # every renderer below rather than assumed by any of them.
+    rebuild_cap = cfg.get("rebuild_cap", DEFAULT_REBUILD_CAP)
 
     print(f"📊 super-board · {proj['title']} (#{proj['number']})")
     print("─" * 80)
@@ -680,7 +694,7 @@ def main() -> int:
                 n = it["number"]
                 glyph = glyph_for_issue(n)
                 left = f"{glyph} #{n}  {it['title']}"
-                suffix = rebuild_suffix(it)
+                suffix = rebuild_suffix(it, rebuild_cap)
                 if suffix:
                     budget = 76 - visual_width(suffix) - 1
                     if visual_width(left) > budget:
@@ -763,7 +777,7 @@ def main() -> int:
                     ]
                 extra = (" · " + ", ".join(extras)) if extras else ""
                 print(
-                    f"   {glyph} {role}  #{v['issue']}  attempt {attempt_str(item)} · "
+                    f"   {glyph} {role}  #{v['issue']}  attempt {attempt_str(item, rebuild_cap)} · "
                     f"{worker_dur(v['ts'])}{extra}"
                 )
 
@@ -814,7 +828,7 @@ def main() -> int:
             detail = r["detail"]
             if r["verb"] == "dispatch" and not detail:
                 issue_num = int(r["issue"].lstrip("#"))
-                detail = f"attempt {attempt_str(item_by_number(issue_num))}"
+                detail = f"attempt {attempt_str(item_by_number(issue_num), rebuild_cap)}"
             if r["target"]:
                 print(
                     f"   {t:<7} {r['glyph']} {r['verb']:<9} {r['issue']:<4} → "

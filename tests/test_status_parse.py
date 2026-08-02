@@ -181,6 +181,29 @@ def test_real_live_manifest_lines() -> None:
     assert state["recents"][1]["verb"] == "reap"
 
 
+def test_attempt_str_reads_the_configured_rebuild_cap() -> None:
+    """The denominator is `rebuild_cap + 1`, and `rebuild_cap` is configurable.
+
+    It was hardcoded to 3 — and clamped to 3 — so a board configured with
+    `rebuild_cap: 4` showed `3/3` on a worker's third attempt and again on its
+    fifth. The status view is the thing an operator reads to decide whether a
+    card is out of attempts; it cannot invent the cap.
+    """
+    assert sbs.attempt_str({"labels": ["loop:rebuild-3"]}, rebuild_cap=4) == "4/5"
+    assert sbs.attempt_str({"labels": ["loop:rebuild-4"]}, rebuild_cap=4) == "5/5"
+    assert sbs.attempt_str({"labels": ["loop:rebuild-9"]}, rebuild_cap=4) == "5/5"
+    assert sbs.attempt_str(None, rebuild_cap=4) == "1/5"
+    # A board that forbids rebuilds entirely gets exactly one attempt.
+    assert sbs.attempt_str({"labels": ["loop:rebuild-1"]}, rebuild_cap=0) == "1/1"
+    assert sbs.rebuild_suffix({"labels": ["loop:rebuild-1"]}, rebuild_cap=4) == "↻ 2/5"
+
+
+def test_the_default_rebuild_cap_matches_the_config_layer() -> None:
+    from super_board_runtime.config import DEFAULT_REBUILD_CAP
+
+    assert sbs.DEFAULT_REBUILD_CAP == DEFAULT_REBUILD_CAP
+
+
 def test_attempt_str_from_rebuild_label() -> None:
     """`attempt N/3` is derived from the issue's `loop:rebuild-N` label."""
     assert sbs.attempt_str(None) == "1/3"

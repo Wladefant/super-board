@@ -241,8 +241,15 @@ truncate with `… +N more` at the end.
 One line per in-flight worker, sorted by lane (Builder, Tester, Reviewer):
 
 ```
-   <glyph> <Role-padded-to-8>  #<NNN>  attempt <a>/3 · <Nm> · <extra-labels>
+   <glyph> <Role-padded-to-8>  #<NNN>  attempt <a>/<A> · <Nm> · <extra-labels>
 ```
+
+Where `<A>` is the number of attempts the BOARD allows — `rebuild_cap + 1`,
+read from the config, defaulting to 3 because `rebuild_cap` defaults to 2. It
+is not a literal: a board running `rebuild_cap: 4` shows `4/5`, and a board
+running `rebuild_cap: 0` shows `1/1` on the only attempt it permits. This line
+is what an operator reads to decide whether a card still has attempts left, so
+it may not invent the number.
 
 Where `<Nm>` is "minutes since the most recent `dispatch lane=…` line for that
 issue in the run manifest". `<extra-labels>` lists any other meaningful
@@ -312,7 +319,7 @@ Pick from this set only. If a runtime situation doesn't match, fall back to
 
 | Glyph | Meaning                                  |
 | ----- | ---------------------------------------- |
-| ↻     | rebuild iteration (`attempt N/3`)        |
+| ↻     | rebuild iteration (`attempt N/<cap+1>`)  |
 | ✅    | pass / lane-complete                     |
 | ⛔    | blocked transition (Ready → Blocked)     |
 | ♻     | reap stale lock + assignee swept         |
