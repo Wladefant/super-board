@@ -335,6 +335,11 @@ body, and nothing else routes anything (`scripts/super_board_runtime/routing.py`
 Branch route: staging
 ```
 
+That declaration is the Issue Form's `branch-route` field, it is parsed into the
+`branch_route` value on the normalized intake form, and the config's `branch_routes` table
+maps route labels onto branches. All three name the same decision; none of them is optional
+for a card you intend to dispatch.
+
 Ineligible, before a branch is created:
 
 | Reason code | What it means |
