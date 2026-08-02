@@ -20,10 +20,26 @@
 # a live misconfiguration):
 #   vars.SUPERBOARD_PROJECT_URL   the board URL
 #   vars.ENABLE_ADD_TO_PROJECT    must be exactly the string "true"
-#   secrets.ADD_TO_PROJECT_PAT    a fine-grained PAT with Projects read/write
-#                                 for the board OWNER. A GitHub App cannot be
-#                                 used here: GitHub Apps cannot access
-#                                 user-owned (personal) Projects v2 at all.
+#   secrets.ADD_TO_PROJECT_PAT    a machine-account CLASSIC PAT carrying the
+#                                 `repo`, `project` and `read:org` scopes for
+#                                 the board OWNER — the SAME credential class
+#                                 `super_board_runtime.auth` accepts for every
+#                                 other unattended path, and the one the
+#                                 identity preflight this job runs will accept.
+#
+#                                 This entry used to say "fine-grained PAT",
+#                                 which `auth.py` refuses outright
+#                                 (`token-class-not-classic`, exit 69). Two
+#                                 credential contracts for one pipeline is one
+#                                 contract nobody can state, and the failure
+#                                 lands at the moment the fallback is finally
+#                                 needed — the day the built-in auto-add broke.
+#
+#                                 A GitHub App cannot be used here either:
+#                                 GitHub Apps cannot access user-owned
+#                                 (personal) Projects v2 at all, which is why
+#                                 `auth.py` refuses an installation token rather
+#                                 than probing it.
 # No token value ever belongs in this file.
 
 name: "Auto-add issues to Superboard (fallback, disabled)"
@@ -84,7 +100,8 @@ jobs:
           # drift from it. Identity and quota preflight run inside, and only
           # after membership has come back a definite "absent".
           PYTHONPATH=.claude/bin python - <<'PY' >> "$GITHUB_OUTPUT"
-          import json, os, subprocess
+          import json, os, subprocess, sys
+          from super_board_runtime.auth import classify_token, token_class_explanation
           from super_board_runtime.project import ProjectSnapshot, evaluate_fallback_auto_add
 
           raw = json.load(open("inventory.json", encoding="utf-8"))
@@ -106,6 +123,20 @@ jobs:
           )
 
           def identity():
+              # The SAME credential contract as every other unattended path: a
+              # machine-account CLASSIC PAT. `classify_token` reads the prefix
+              # and nothing echoes the value. Checked here rather than left to
+              # the prose above, because a comment cannot refuse a token — and
+              # this workflow is the one that runs on the day the built-in
+              # auto-add finally broke, which is the worst moment to discover
+              # the secret was the wrong class all along.
+              token_class = classify_token(os.environ.get("GH_TOKEN"))
+              if token_class != "classic":
+                  print(
+                      f"fallback auto-add: {token_class_explanation(token_class)}",
+                      file=sys.stderr,
+                  )
+                  return False
               probe = subprocess.run(
                   ["gh", "api", "user", "--jq", ".login"],
                   capture_output=True, text=True, timeout=60,
