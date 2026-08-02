@@ -28,7 +28,11 @@ Estimate before you execute. `sb_gh_guard_check` refuses a cost it cannot afford
 
 ## 3. One quota inventory per cycle — never re-fetch per operation
 
-The runtime reads the quota **once** per cycle (`QuotaCycle.begin_cycle()`), and every check inside that cycle reuses the single reading. Workers do the same: source the guard, take one reading, spend against it. Polling the quota before every call turns the guard into the thing that drains the bucket.
+The runtime reads the quota **once** per cycle (`QuotaCycle.begin_cycle()`), and every check inside that cycle reuses the single reading. Workers do the same, and now actually do: `sb_gh_guard_begin_cycle` takes the reading and caches it in the run's private temp directory, and every `sb_gh_guard_check` inside that cycle is answered from it. A worker that never calls `begin_cycle` gets its reading on the first check. An explicit `--payload` still outranks the cache, so a fixture-driven check stays a fixture-driven check.
+
+Polling the quota before every call turns the guard into the thing that drains the bucket — which is exactly what the worker guard used to do, one `gh api rate_limit` per check, in the component this section was written for.
+
+Caching does not soften a refusal: the cached reading is evaluated exactly as a live one would be. Per-call accounting is the worker-local budget (`sb_gh_budget_spend`), never a re-read.
 
 When the reading says the next burst does not fit, that is the answer for the whole cycle. Do not re-read hoping for a different number.
 

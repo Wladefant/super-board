@@ -45,11 +45,11 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Sequence
 
 try:  # normal package import
-    from . import EXIT_CONFIG, EXIT_OK, EXIT_QUOTA, EXIT_USAGE
+    from . import EXIT_CONFIG, EXIT_OK, EXIT_QUOTA, EXIT_USAGE, gh_binary
     from .config import MINIMUM_GRAPHQL_RESERVE, ConfigError, load_and_validate_config
 except ImportError:  # executed as a plain file path
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    from super_board_runtime import EXIT_CONFIG, EXIT_OK, EXIT_QUOTA, EXIT_USAGE
+    from super_board_runtime import EXIT_CONFIG, EXIT_OK, EXIT_QUOTA, EXIT_USAGE, gh_binary
     from super_board_runtime.config import (
         MINIMUM_GRAPHQL_RESERVE,
         ConfigError,
@@ -143,8 +143,10 @@ def snapshot_from_payload(payload: Any) -> QuotaSnapshot:
 
 
 def _gh_rate_limit() -> Any:
+    # `gh_binary()`, not a literal — the same override every other GitHub call in
+    # this runtime honours, so the quota read is exercisable without an account.
     result = subprocess.run(
-        ["gh", "api", "rate_limit"], capture_output=True, text=True, timeout=30
+        [gh_binary(), "api", "rate_limit"], capture_output=True, text=True, timeout=30
     )
     if result.returncode != 0:
         return None

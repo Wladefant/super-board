@@ -212,4 +212,66 @@ REMAINING=$(find "$SPACED" -mindepth 1 | wc -l | tr -d ' ')
 [ "$REMAINING" -eq 0 ] \
   || fail "a temp file created in a subshell under a spaced path survived cleanup ($REMAINING left in $SPACED)"
 
-echo "PASS: test-gh-guard-summary.sh (9 scenarios)"
+# ── Scenario 10 — one cached quota inventory per cycle, not one per check ──
+# `rate-limit-etiquette.md` §3 and `quota.py` both say the quota is read ONCE per
+# cycle and every check inside it reuses that reading, because a guard that polls
+# before every call becomes the thing that drains the bucket. The worker guard
+# shelled out to the runtime on every `sb_gh_guard_check`, and the runtime ran
+# `gh api rate_limit` every time.
+FAKE_BIN="$PWD/$TMP/fake-gh"
+cat > "$FAKE_BIN" <<EOF
+#!/usr/bin/env bash
+echo call >> "$PWD/$TMP/gh-calls.txt"
+cat "$PWD/$TMP/rate-limit.json"
+EOF
+chmod +x "$FAKE_BIN"
+: > "$TMP/gh-calls.txt"
+
+cat > "$TMP/one-inventory.sh" <<EOF
+set -euo pipefail
+export SUPERBOARD_GH="$FAKE_BIN"
+. "$PWD/$GUARD"
+trap sb_tmp_cleanup EXIT
+sb_gh_guard_begin_cycle
+sb_gh_guard_check 100
+sb_gh_guard_check 100
+sb_gh_guard_check 100
+EOF
+bash "$TMP/one-inventory.sh" >/dev/null 2>&1 \
+  || fail "three affordable checks in one cycle must all pass"
+CALLS=$(wc -l < "$TMP/gh-calls.txt" | tr -d ' ')
+[ "$CALLS" -eq 1 ] \
+  || fail "three checks in one cycle read the quota $CALLS times; the contract is one"
+
+# A new cycle takes a new reading — the cache is per cycle, not forever.
+: > "$TMP/gh-calls.txt"
+cat > "$TMP/two-cycles.sh" <<EOF
+set -euo pipefail
+export SUPERBOARD_GH="$FAKE_BIN"
+. "$PWD/$GUARD"
+trap sb_tmp_cleanup EXIT
+sb_gh_guard_begin_cycle; sb_gh_guard_check 100
+sb_gh_guard_begin_cycle; sb_gh_guard_check 100
+EOF
+bash "$TMP/two-cycles.sh" >/dev/null 2>&1 || fail "two cycles of affordable checks must pass"
+CYCLE_CALLS=$(wc -l < "$TMP/gh-calls.txt" | tr -d ' ')
+[ "$CYCLE_CALLS" -eq 2 ] \
+  || fail "two cycles must take two readings, got $CYCLE_CALLS"
+
+# The cache never softens a refusal, and an explicit --payload still wins.
+cat > "$TMP/cached-refusal.sh" <<EOF
+set -euo pipefail
+export SUPERBOARD_GH="$FAKE_BIN"
+. "$PWD/$GUARD"
+trap sb_tmp_cleanup EXIT
+sb_gh_guard_begin_cycle
+sb_gh_guard_check 100 --payload "\$(sb_native_path "$PWD/$TMP/exhausted.json")"
+EOF
+set +e
+bash "$TMP/cached-refusal.sh" >/dev/null 2>&1
+CACHED_RC=$?
+set -e
+[ "$CACHED_RC" -eq 75 ] \
+  || fail "an explicit --payload must outrank the cycle cache, expected 75, got $CACHED_RC"
+
+echo "PASS: test-gh-guard-summary.sh (10 scenarios)"

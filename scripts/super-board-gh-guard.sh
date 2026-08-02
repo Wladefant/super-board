@@ -22,6 +22,7 @@
 #
 # Usage from a worker:
 #   source scripts/super-board-gh-guard.sh
+#   sb_gh_guard_begin_cycle          # take THE reading for this cycle (see §3)
 #   sb_gh_guard_check 103 [config]   # refuse the burst if it would break the reserve
 #   sb_gh_budget_spend 5             # decrement worker-local call budget; 75 if 0
 #   sb_gh_guard_summary [config]     # print the gh-quota-on-exit line on stderr
@@ -52,15 +53,57 @@ sb_gh_guard_ensure_state_file() {
   chmod 600 "$SB_GH_GUARD_STATE_FILE" 2>/dev/null || true
 }
 
+# ───────────────────────────── one inventory per cycle ───────────────────────
+#
+# `rate-limit-etiquette.md` §3 and `quota.py` both state the rule: the quota is
+# read ONCE per cycle and every check inside that cycle reuses that reading,
+# because a guard that polls before every call becomes the thing that drains the
+# bucket. `QuotaCycle` implements it on the Python side; the worker guard did
+# not, so every `sb_gh_guard_check` shelled out to the runtime and the runtime
+# ran `gh api rate_limit` again — the documented contract, contradicted by the
+# component the document was written for.
+#
+# The cycle's reading is cached in the private 0700 run directory. A worker that
+# never calls `sb_gh_guard_begin_cycle` gets one on its first check, which is
+# what "source the guard, take one reading, spend against it" describes.
+#
+# The cache never softens a refusal — `require_graphql_budget` reads it exactly
+# as it would read a live response, and a reading that says the burst does not
+# fit is the answer for the whole cycle. Per-call accounting is the worker-local
+# budget (`sb_gh_budget_spend`), not a re-read.
+SB_GH_GUARD_QUOTA_CACHE="${SB_GH_GUARD_QUOTA_CACHE:-$(sb_tmp_dir)/gh-quota.json}"
+
+sb_gh_guard_begin_cycle() {
+  # Start a new cycle: discard the previous reading and take one now. Call at
+  # the top of a dispatcher tick or at worker start.
+  rm -f "$SB_GH_GUARD_QUOTA_CACHE"
+  sb_gh_guard_cache_quota
+}
+
+sb_gh_guard_cache_quota() {
+  # Ensure this cycle has a cached inventory. Returns non-zero when the quota
+  # could not be read at all, which leaves the cache absent so the check below
+  # falls through to a live read — and a live read that also fails is exhausted,
+  # never a fabricated balance.
+  [ -s "$SB_GH_GUARD_QUOTA_CACHE" ] && return 0
+  local raw
+  raw=$("${SUPERBOARD_GH:-gh}" api rate_limit 2>/dev/null) || return 1
+  [ -n "$raw" ] || return 1
+  printf '%s' "$raw" > "$SB_GH_GUARD_QUOTA_CACHE" || return 1
+  chmod 600 "$SB_GH_GUARD_QUOTA_CACHE" 2>/dev/null || true
+  return 0
+}
+
 sb_gh_guard_check() {
   # Refuse a burst that would break the immutable reserve.
   #   sb_gh_guard_check <cost> [config]
   #   sb_gh_guard_check <cost> [--config PATH] [--payload PATH]
   # `--payload` reads a `gh api rate_limit` document instead of calling GitHub,
-  # so the reserve check is exercisable without a token or a network.
+  # so the reserve check is exercisable without a token or a network. An
+  # explicit `--payload` always outranks this cycle's cached inventory.
   # Returns 0 when affordable, 75 when the reserve is reached or the quota is
   # unreadable. The CALLER halts — this function never sleeps and never retries.
-  local cost="${1:-$SB_GH_GUARD_DEFAULT_COST}" rc=0
+  local cost="${1:-$SB_GH_GUARD_DEFAULT_COST}" rc=0 payload_given=0
   [ $# -gt 0 ] && shift
   local args=(check --estimated-cost "$cost")
   # A bare second positional is the config path (the original signature).
@@ -71,12 +114,15 @@ sb_gh_guard_check() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --config)  args+=(--config "$(sb_native_path "${2:-}")"); shift 2 ;;
-      --payload) args+=(--payload "$(sb_native_path "${2:-}")"); shift 2 ;;
+      --payload) args+=(--payload "$(sb_native_path "${2:-}")"); payload_given=1; shift 2 ;;
       *)
         echo "[gh-guard] unknown option: $1" >&2
         return 64 ;;
     esac
   done
+  if [ "$payload_given" -eq 0 ] && sb_gh_guard_cache_quota; then
+    args+=(--payload "$(sb_native_path "$SB_GH_GUARD_QUOTA_CACHE")")
+  fi
   sb_runtime super_board_runtime.quota "${args[@]}" >/dev/null || rc=$?
   if [ "$rc" -ne 0 ]; then
     echo "[gh-guard] halting: the next burst (~${cost} points) would break the GraphQL reserve, or the quota could not be read" >&2
