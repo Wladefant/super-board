@@ -99,7 +99,7 @@ An issue is flagged if any of these apply. An issue can fail multiple criteria; 
 | 8 | Ambiguous scope (`etc.`, `TODO`, `TBD`) | "Tabs, dropdowns, modals, etc." | Enumerate or split |
 | 9 | Multiple unrelated features bundled (>3 disconnected ACs) | Auth + billing + UI polish in one ticket | Recommend splitting |
 | 10 | Title ↔ body mismatch | Title says login, body says signup | Ask which is correct |
-| 11 | Out-of-scope vs PROJECT.md | Backend AC for a URL-only QA project | Move to Skipped or rewrite |
+| 11 | Out-of-scope vs PROJECT.md | Backend AC for a URL-only QA project | Block with 🤷 out-of-scope, or rewrite |
 | 12 | Sub-agent ambiguity flag | "this could mean ≥2 different things" | Surface both interpretations |
 
 ---
@@ -166,7 +166,7 @@ Per-issue interaction example:
    2. Page doesn't jump while reply is streaming
    3. Long messages don't break the layout
 
-[a] approve   [e] edit   [b] block   [k] skip   [s] leave as-is
+[a] approve   [e] edit   [b] block   [s] leave as-is
 > _
 ```
 
@@ -204,8 +204,7 @@ Saved to `docs/super-board/pre-flight.md`. Each `[ ]` is a halt gate for `super-
 ✅ Lint complete:
    • 23 already clear
    • 3 ACs added (approved)
-   • 1 moved to Blocked
-   • 0 moved to Skipped
+   • 1 moved to Blocked (0 of them 🤷 out-of-scope)
 
 💾 All changes saved to GitHub (no local commits needed).
 🔄 Reset this session, then run `super-board run` to start the loop.
@@ -217,7 +216,7 @@ Saved to `docs/super-board/pre-flight.md`. Each `[ ]` is a halt gate for `super-
 
 - **Idempotent** — re-running on already-clear issues is silent.
 - **Resumable** — Ctrl-C anywhere is safe; re-run lint to continue.
-- **Walks active-pipeline columns only** — Ready + (Building) + QA + Review. Skips Done/Blocked/Skipped.
+- **Walks active-pipeline columns only** — Ready + (Building) + QA + Review. Passes over Backlog, Done, and Blocked.
 - **No local file writes** during Phase 4 — all state lives on GitHub issues. Session-reset is safe.
 
 ---
@@ -229,7 +228,7 @@ Before declaring lint complete, the worker MUST verify all three:
 - [ ] `docs/super-board/pre-flight.md` exists and lists every credential / tool / env signal encountered while scanning issues + PROJECT.md.
 - [ ] Every issue in active-pipeline columns (Ready, Building if present, QA, Review) either:
   - has a populated `## Acceptance Criteria` section that passes all 12 criteria, OR
-  - carries a `🤷 Skipped` comment explaining why it was deferred, OR
+  - carries a `🤷 Blocked` comment explaining why it is out of scope for this loop, OR
   - carries a `🛡 Blocked` comment naming the human-gated blocker.
 - [ ] No issue is left in an in-between state (flagged but not resolved, partially edited, or awaiting user input that never came).
 
