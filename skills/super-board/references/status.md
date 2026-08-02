@@ -365,9 +365,10 @@ the script is missing.
   `.claude/super-board/configs/<slug>.json` for the resolved project slug.
   Header fields come straight from the JSON.
 - **Claim assignee resolution:** the in-flight worker scan must match the
-  identity recorded in the config under `notifications.bot_identity`. This may
-  be a GitHub App bot account (e.g. `super-board-bot[bot]`) **or** the user's
-  own login when running in user-account mode. If `notifications.bot_identity`
+  identity recorded in the config under `notifications.bot_identity`. That is
+  always a real user login — the machine account for unattended runs, or the
+  user's own login in user-account mode — never a GitHub App, which could not
+  reach personal Projects v2 in the first place. If `notifications.bot_identity`
   is absent, fall back to scanning for any assignee that matches the
   configured identity (e.g. `claim.assignee_login`).
 - **Project items (column counts + in-flight workers, both from ONE call):**

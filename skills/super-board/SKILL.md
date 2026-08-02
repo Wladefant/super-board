@@ -54,6 +54,26 @@ The contract lives in `scripts/super_board_runtime/lifecycle.py`; anything offer
 `Skipped` where a lifecycle value is expected is rejected (exit 65) rather than mapped
 onto something else. Dispatch requires status **exactly `Ready`**.
 
+## Identity — who Superboard acts as
+
+Two modes, verified by `scripts/super-board-auth.py preflight` before any scan or
+mutation:
+
+| Mode | Credential | Notes |
+|---|---|---|
+| `interactive` | the signed-in session identity | no environment credential is read or required |
+| `unattended` | a machine-account **classic** PAT | read only from `SUPERBOARD_GITHUB_TOKEN`, login must equal `SUPERBOARD_GITHUB_LOGIN`, scopes `repo`, `project`, `read:org` |
+
+Everything fails closed with exit 69: missing variable, wrong login, fine-grained
+token, GitHub App token, absent or unparseable OAuth scope header, missing scope,
+or any repository/Project capability that cannot be confirmed.
+
+**GitHub Apps cannot access personal Projects v2 at all**, so an app installation
+token is refused outright rather than probed — no capability check can rescue it,
+and there is no `super-board-bot[bot]` identity. The claim mutex is always a real
+user login. Token values never appear in output, logs, or evidence; environment
+variables are referenced by NAME.
+
 ## Routing
 
 | If user says | Load |

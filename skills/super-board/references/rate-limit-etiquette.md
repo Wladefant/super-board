@@ -1,6 +1,6 @@
 # Worker rate-limit etiquette
 
-The dispatcher's `gh_rate_guard` only protects the dispatcher's own ticks. Workers (Builder / Tester / Reviewer) run as independent `claude -p` sessions and **share the same gh-auth token bucket** — 5000 GraphQL points/hr for a PAT, 15000/hr for a GitHub App. The #381 worker storm (2026-05-21) drained the bucket because nothing in the worker contract told workers to watch the quota.
+The dispatcher's quota guard only protects the dispatcher's own ticks. Workers (Builder / Tester / Reviewer) run as independent `claude -p` sessions and **share the same token bucket** — one machine-account classic PAT. (A GitHub App would have a larger bucket and is still not an option: apps cannot access personal Projects v2.) The #381 worker storm (2026-05-21) drained the bucket because nothing in the worker contract told workers to watch the quota.
 
 This file is the worker-side contract. Every worker MUST follow it.
 

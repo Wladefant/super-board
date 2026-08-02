@@ -44,7 +44,7 @@ Progress: ✅ onboard  →  ✅ lint  →  🤖 run (you are here)
 |---|---|
 | Active config exists | Halt: "Run `super-board onboard` first." |
 | Project + required columns exist | Halt: "Project / columns missing. Run `super-board onboard` to repair." |
-| `gh auth` valid with required scopes | Halt: "Re-auth: `gh auth refresh -s project,read:project,repo`." |
+| Identity preflight passes | `super-board-auth.py preflight --config <cfg> --mode <interactive|unattended>` must exit 0 before any scan or mutation. Halt on 69: re-auth interactively with `gh auth refresh -s repo,project,read:org`, or fix the machine account's classic PAT named by `SUPERBOARD_GITHUB_TOKEN`. Fine-grained PATs and GitHub App tokens are refused — apps cannot access personal Projects v2. |
 | `pre-flight.md` all items `[✓]` | Halt: "Pre-flight incomplete — fix these: [list]." |
 | No issues missing ACs in active columns | Halt: "N issues need clarification. Run `super-board lint`." |
 | Full variant: clean git working tree on base branch | Halt: "Working tree dirty. Stash or commit before running." |
@@ -367,7 +367,7 @@ Claim uses a **GitHub Issue assignee mutex** — atomic compare-and-set via `gh 
 
 ```
 1. ATTEMPT CLAIM (atomic):
-   ├─ `gh issue edit <N> --add-assignee super-board-bot[bot]`
+   ├─ `gh issue edit <N> --add-assignee <notifications.bot_identity>`
    │      (if a different assignee is already set → 422; treat as "already claimed")
    ├─ On 422 / conflict → another worker has it; skip this dispatch.
    └─ On success → continue. Apply descriptive label
@@ -380,10 +380,10 @@ Claim uses a **GitHub Issue assignee mutex** — atomic compare-and-set via `gh 
 3. Do the lane's work (build / QA / review).
 4. Comment evidence on issue + PR (structured handoff).
 5. Move card to next column (or Blocked with the full §4 template).
-6. RELEASE CLAIM (`gh issue edit --remove-assignee super-board-bot[bot]`) and remove descriptive label.
+6. RELEASE CLAIM (`gh issue edit --remove-assignee <notifications.bot_identity>`) and remove descriptive label.
 ```
 
-The `super-board-bot[bot]` identity is either (a) a GitHub App installed on the repo, or (b) the user's own account on solo projects — onboard step 2 picks which. The assignee mutex is reliable because GitHub serializes assignee writes per issue.
+The claim identity in `notifications.bot_identity` is a real user login — the machine account for unattended runs, or the user's own account on solo projects. It is never a GitHub App: apps cannot access personal Projects v2, so an app identity could not move the card it just claimed. The assignee mutex is reliable because GitHub serializes assignee writes per issue.
 
 ### Anti-zombie addendum (added 2026-05-22 after #381 worker storm)
 
