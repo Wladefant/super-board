@@ -12,44 +12,86 @@ description: >-
 
 ## Preconditions — check these FIRST, before touching anything
 
-This skill drives two dispatcher scripts. **They are not present in this
-repository** (see
-[missing upstream dependencies](https://github.com/Wladefant/super-board/blob/main/docs/reference/MISSING-UPSTREAM-DEPENDENCIES.md)).
-Everything below this section assumes they exist.
-
-Run this before any other step:
+This skill drives two executable dispatcher scripts. Both exist:
 
 ```bash
 ls scripts/super-qa-dispatch.sh scripts/super-qa-file-bug.sh
 ```
 
-**If either path is missing, STOP. Do not start the loop.** Report exactly:
-
-```
-super-qa HALTED — missing dependency, nothing was run.
-
-Absent: scripts/super-qa-dispatch.sh, scripts/super-qa-file-bug.sh
-These were never carried across from the upstream fork. The loop dispatches
-every iteration through the first and files every bug through the second, so
-starting would fail partway: a crawled app, evidence on disk, and findings
-that were never filed.
-
-Do not write replacements. The spec that defined their interface
-(docs/superpowers/specs/2026-05-21-super-board-design.md) is also missing, so
-a reconstruction would be a guess that looks official.
-See docs/reference/MISSING-UPSTREAM-DEPENDENCIES.md.
-```
-
-Halting here costs one message. Halting at iteration 4 costs a dirty tree, an
-inconsistent QA board, and bugs found but never recorded.
+**If either path is missing, STOP — do not start the loop and do not write
+replacements.** Their behaviour is pinned by `tests/test_exact_sha_qa.py` and
+`tests/test-super-qa-dispatch.sh`; a hand-rolled substitute would attest to
+commits nobody tested. Report that the installation is incomplete and re-run
+the installer.
 
 **Manual substitution is not a workaround.** Running the crawl by hand and
-filing issues with `gh issue create` skips the body validation, label
-resolution, and project-column placement that `super-qa-file-bug.sh` owned —
-which produces exactly the weak tickets the rest of this skill forbids.
+filing issues with `gh issue create` skips the exact-SHA binding, the body
+validation, the label resolution, and the project-column placement that
+`super-qa-file-bug.sh` owns — which produces exactly the weak tickets the rest
+of this skill forbids.
 
-If the scripts are present (someone recovered them from a real upstream
-source), continue normally — the rest of this file is unchanged and correct.
+## The exact-SHA contract — what QA is actually allowed to claim
+
+QA attests to **one commit**, never to a branch. The policy lives in
+`scripts/super_board_runtime/qa.py`; never re-derive it in a prompt.
+
+1. **Resolve first, run second.** `super-qa-dispatch.sh` resolves the linked
+   pull request and records `headRefOid` **before any command runs**. A
+   missing, non-SHA, ambiguous, or already-changed head refuses with exit 65.
+   There is no fallback to "whatever is checked out" and no fallback to the
+   branch tip.
+2. **Exactly one linked pull request.** Zero links is `qa-linkage-missing`;
+   more than one is `qa-linkage-ambiguous`. Reconcile the linkage; do not pick.
+3. **Detached, locked worktree.** The tested SHA is fetched into a per-item
+   locked worktree created with `git worktree add --detach`. A mutable branch
+   checkout is refused with `qa-mutable-checkout-refused` — a branch can move
+   under a running suite, and the evidence would name a commit that was never
+   tested.
+4. **Reread, then publish.** After the suite finishes the head is reread. The
+   SHA-bound status `superboard/exact-sha-qa` is published **on the tested
+   commit** and only when the reread SHA is unchanged. A head that moved
+   mid-run marks the ledger entry `result: "discarded"`, `invalidated: true`,
+   and publishes nothing.
+5. **No inheritance.** A later commit inherits no passing result, ever. Each
+   head needs its own run.
+6. **Always released.** The worktree and the lock are released on every
+   terminal path: success, failure, exception, stale head, and signal.
+7. **`--dry-run` issues zero GitHub writes.** Use it to prove the wiring
+   without touching the repository.
+
+```bash
+scripts/super-qa-dispatch.sh \
+  --config .claude/super-board/configs/<slug>.json \
+  --issue-url  https://github.com/<owner>/<repo>/issues/<n> \
+  --pull-request https://github.com/<owner>/<repo>/pull/<m> \
+  -- npm test
+```
+
+## The three QA failure dispositions
+
+A failed QA run **never merges, never closes the implementation issue, and
+never moves a card to Done.** `super-qa-file-bug.sh` applies exactly one of:
+
+| Failure kind | Next status | Follow-up issue |
+|---|---|---|
+| `repairable` — the current worker can fix it inside this issue's scope | `Building` | none |
+| `external-input` — a human, a third party, or a credential is needed | `Blocked` | none |
+| `outside-acceptance` — real, but outside this issue's acceptance criteria | `Blocked` | **exactly one** structured follow-up |
+
+An unrecognised or absent kind fails closed: `Blocked`, no follow-up, reason
+`qa-failure-kind-unknown`.
+
+```bash
+scripts/super-qa-file-bug.sh \
+  --config .claude/super-board/configs/<slug>.json \
+  --issue-url  https://github.com/<owner>/<repo>/issues/<n> \
+  --pull-request https://github.com/<owner>/<repo>/pull/<m> \
+  --tested-sha <40-char sha> --failure-kind outside-acceptance
+```
+
+Everything published from either script goes through the sanitizing
+publication boundary, so raw logs, command output, and environment values
+never reach GitHub.
 
 ## Auth bootstrap — auto-discover, never ask
 
