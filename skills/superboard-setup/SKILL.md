@@ -222,16 +222,40 @@ ADDITIVE keys (leave every existing key exactly as Step 1 wrote it):
 
 ```json
 {
-  "design_skill": "<slug>-design",
-  "agent_native": {
-    "design": true,
-    "plan": false,
-    "analytics": false,
-    "clips": false
+  "design_skill": {
+    "enabled": true,
+    "label": "design",
+    "skill": "<slug>-design"
   },
-  "deploy": { "target": "dokploy", "domain": "<app>.wladefant.de" }
+  "agent_native": {
+    "enabled": true,
+    "projection_only": true
+  },
+  "deploy": {
+    "provider": "dokploy",
+    "auto_deploy": false,
+    "domain": "<app>.wladefant.de"
+  }
 }
 ```
+
+⚠ **These three keys are MAPPINGS, not strings or flag bags. Corrected in 2.0 —
+earlier revisions of this file were wrong and produced a config the runtime
+refuses.** `design_skill` written as the bare string `"<slug>-design"` fails
+validation with `design-skill-invalid` and exit 65; the executable contract is
+`scripts/super_board_runtime/config.py` (`_normalize_design_skill`,
+`_normalize_agent_native`, `_normalize_deploy`), and per
+[DOCS-SYSTEM.md](https://github.com/Wladefant/super-board/blob/main/DOCS-SYSTEM.md)
+the code wins whenever this file disagrees. Read the keys back from a
+`super-board-config.py validate --json` run rather than trusting this snippet.
+
+`agent_native.projection_only` may only ever be `true`; setting it `false` raises
+`agent-native-must-be-projection-only`. The per-surface switches (design, plan,
+analytics, clips) are **not** config keys — the real capability declaration lives
+in the runtime's `payload/agent-native/super-board.json`. `deploy` reads
+`provider` and `auto_deploy`; `domain` is carried for humans and is not consumed
+by the validator. `minimum_graphql_reserve` is a TOP-LEVEL key, not nested inside
+`github_auth`.
 
 Set each surface from what the project will actually use — do not switch them all
 on. Which surface is allowed to own what is not a per-project choice: it is the
@@ -264,7 +288,7 @@ token file and the real running UI in the same session, then commit. See
 [`polysim-design`](https://github.com/Wladefant/super-board/blob/main/skills/polysim-design/SKILL.md)
 for what filled-in looks like.
 
-If the project has no UI, skip 4b and set `"design_skill": null`.
+If the project has no UI, skip 4b and set `"design_skill": {"enabled": false}`. A bare `null` is accepted (it normalizes to the disabled default) but the explicit mapping documents the intent.
 
 ## Step 5 — Deploy path (last, never first)
 
