@@ -184,6 +184,41 @@ class InvalidRouteTests(unittest.TestCase):
                 self.assertEqual(route.reason_code, "route-declaration-unknown")
                 self.assertIsNone(route.base_branch)
 
+    def test_the_configured_branch_value_is_never_the_base(self) -> None:
+        """`branch_routes` VALIDATES labels; it does not choose the branch.
+
+        The schema used to say a card carrying a route label "is branched from
+        (and targets) that branch instead of `base_branch`", which is a table
+        that decides routes. `resolve_branch_route` does not read it that way and
+        never has: the declaration in the issue body is the route, and the only
+        two declarations that resolve are `staging` and `staging-frankfurt`. A
+        table that silently retargeted work from a config value would be a second
+        routing authority, and the more permissive of two authorities is the one
+        that acts.
+        """
+        config = _config(branch_routes={FRANKFURT_LABEL: "some-other-branch"})
+        route = resolve_branch_route(
+            _issue("Branch route: staging-frankfurt\n", (FRANKFURT_LABEL,)), config
+        )
+        self.assertTrue(route.valid)
+        self.assertEqual(route.declaration, "staging-frankfurt")
+        self.assertEqual(
+            route.base_branch,
+            "staging-frankfurt",
+            "the declaration is the base branch; the config value is not consulted",
+        )
+
+    def test_the_schema_does_not_promise_a_routing_table(self) -> None:
+        schema = (
+            _REPO_ROOT / "skills" / "super-board" / "references" / "config-schema.json"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn(
+            "instead of `base_branch`",
+            schema,
+            "the schema promises a behaviour `resolve_branch_route` does not implement",
+        )
+        self.assertIn("validation table", schema)
+
     def test_two_conflicting_route_labels(self) -> None:
         config = _config(
             branch_routes={FRANKFURT_LABEL: "staging-frankfurt", "branch:staging": "staging"}

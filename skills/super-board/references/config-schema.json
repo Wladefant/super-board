@@ -69,21 +69,32 @@
   // PolySimulator shape below runs on a `staging` default.
   "base_branch": "staging",
 
-  // Optional label → branch routing table. A card carrying a route label is
-  // branched from (and targets) that branch instead of `base_branch`. Two route
-  // labels naming different branches is a routing error, not a coin toss.
+  // Optional label → branch VALIDATION TABLE. It does not choose a branch, and
+  // this entry used to claim it did ("branched from that branch instead of
+  // `base_branch`") — a promise `resolve_branch_route` has never kept and must
+  // not keep, because a table that silently retargets work would be a second
+  // routing authority beside the declaration, and the more permissive of two
+  // authorities is the one that acts.
   //
-  // A route is only real when the issue body declares it — `Branch route:
-  // staging` or `Branch route: staging-frankfurt`, exactly once. The label is
-  // the second half of the same statement: the Frankfurt route is a separate
-  // deploying branch, so it must be stated in the body AND carried on the card
-  // (`branch:staging-frankfurt`) before a branch is created.
+  // The ROUTE is what the issue body declares — `Branch route: staging` or
+  // `Branch route: staging-frankfurt`, exactly once — and the declaration IS
+  // the base branch. Those two are the only declarations that resolve.
   //
-  // A repository's default branch (`main` / `master`) and any design branch
-  // (`designstaging`) can NEVER be dispatch routes, however they are spelled.
-  // Declaring one fails closed as `route-declaration-unknown`, so listing it
-  // here buys a label that can never resolve. See
-  // `scripts/super_board_runtime/routing.py` (`NON_DISPATCH_BRANCHES`).
+  // What this table is for, and all it is for:
+  //
+  //   1. Redundancy. The Frankfurt route is a separate deploying branch, so it
+  //      must be stated in the body AND carried on the card
+  //      (`branch:staging-frankfurt`) before a branch is created. The label
+  //      listed here is the half of that statement the card carries.
+  //   2. Conflict detection. Two route labels naming different branches is a
+  //      routing error (`route-label-conflict`), not a coin toss.
+  //   3. Refusal. A label mapped onto a branch that can never dispatch —
+  //      a repository default (`main` / `master`) or a design branch
+  //      (`designstaging`) — makes the card ineligible with
+  //      `route-declaration-unknown`, however the branch is spelled. Listing
+  //      one here therefore buys a label that can never resolve.
+  //
+  // See `scripts/super_board_runtime/routing.py`, which is the authority.
   "branch_routes": {
     "branch:staging-frankfurt": "staging-frankfurt"
   },
