@@ -72,4 +72,20 @@ if [ "$RC" -ne 0 ]; then
   exit "$RC"
 fi
 
+# The follow-up issue is published through the ONE sanitizer. Nothing here
+# writes to GitHub directly: `super-board-publish.py` renders the complete
+# payload, redacts, rescans the redacted result, and exits 78 before any write
+# if anything sensitive survived.
+if echo "$OUT" | jq -e '.follow_up != null' >/dev/null 2>&1; then
+  PAYLOAD=$(echo "$OUT" | jq '.follow_up | {surface, text}' | sb_config_file)
+  PUB_RC=0
+  PUB=$("$(sb_python)" -B "$SB_SCRIPTS_DIR/super-board-publish.py" \
+          publish --input "$PAYLOAD" --json) || PUB_RC=$?
+  if [ "$PUB_RC" -ne 0 ]; then
+    echo "🛑 super-qa-file-bug: the follow-up payload was rejected at the publication boundary — nothing was filed." >&2
+    exit "$PUB_RC"
+  fi
+  OUT=$(echo "$OUT" | jq --argjson pub "$PUB" '.follow_up.sanitized = $pub.text | .follow_up.redactions = $pub.redactions')
+fi
+
 printf '%s\n' "$OUT"

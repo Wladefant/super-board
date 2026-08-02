@@ -1,0 +1,12 @@
+{
+  "artifacts": [],
+  "environment": {
+    "DEPLOY_SECRET": "NNNNNN"
+  },
+  "surface": "qa-comment",
+  "template_fragments": [
+    "QA excerpt: gh",
+    "p_NNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNNN",
+    " \u2014 and the deploy step printed NNNNNN to stdout"
+  ]
+}

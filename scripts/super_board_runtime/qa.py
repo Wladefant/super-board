@@ -859,6 +859,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "tested_sha": args.tested_sha,
         }
     )
+    # The follow-up is emitted as a payload, never written from here: every
+    # GitHub-bound byte leaves through `super-board-publish.py` so exactly one
+    # sanitizer sees it.
+    if disposition.follow_up_issue_required:
+        follow_up = build_follow_up_issue(result, config)
+        body["follow_up"] = {
+            "surface": "bug-report",
+            "text": f"# {follow_up['title']}\n\n{follow_up['body']}",
+            "title": follow_up["title"],
+        }
     print(json.dumps(body, sort_keys=True))
     return EXIT_OK
 
