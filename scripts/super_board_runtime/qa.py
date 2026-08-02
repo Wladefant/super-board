@@ -113,10 +113,20 @@ class PullRequestHead:
         return dict(asdict(self))
 
 
+def _gh_binary() -> str:
+    """The `gh` executable. `SUPERBOARD_GH` overrides it with an absolute path.
+
+    Mirrors `SUPER_BOARD_PYTHON` in `super-board-python.sh`. It exists so the
+    GitHub boundary can be exercised by a test without a network, an account,
+    or a repository — the alternative is a write path no test ever executes.
+    """
+    return os.environ.get("SUPERBOARD_GH") or "gh"
+
+
 def _gh_pull_request_view(url: str) -> Any:
     result = subprocess.run(
         [
-            "gh",
+            _gh_binary(),
             "pr",
             "view",
             url,
@@ -802,6 +812,22 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"conclusion of the {QA_CHECK_CONTEXT} status on the tested SHA",
     )
 
+    status = sub.add_parser(
+        "publish-status", help="publish the SHA-bound status for a successful run"
+    )
+    status.add_argument("--config", required=True)
+    status.add_argument("--issue-url", required=True)
+    status.add_argument("--pull-request", required=True)
+    status.add_argument("--tested-sha", required=True)
+    status.add_argument(
+        "--current-head-sha",
+        default=None,
+        help="the head reread AFTER the run; a moved head refuses to publish",
+    )
+    status.add_argument("--base-ref", default=None)
+    status.add_argument("--evidence-url", default=None, help="the sanitized evidence URL")
+    status.add_argument("--dry-run", action="store_true")
+
     disposition = sub.add_parser("disposition", help="where a failed QA run sends the card")
     disposition.add_argument("--config", required=True)
     disposition.add_argument("--issue-url", required=True)
@@ -810,6 +836,54 @@ def build_parser() -> argparse.ArgumentParser:
     disposition.add_argument("--failure-kind", default=None)
     disposition.add_argument("--dry-run", action="store_true")
     return parser
+
+
+def _gh_commit_status_writer(
+    repo_remote: Optional[str], sha: str
+) -> Callable[[Mapping[str, Any]], Any]:
+    """Write the sanitized commit status with `gh`, on the tested commit only.
+
+    The payload is handed over on stdin, never on a command line: a command
+    line is visible in the process table.
+    """
+
+    def write(payload: Mapping[str, Any]) -> Any:
+        if not repo_remote:
+            raise QaError(
+                "qa-repo-remote-missing",
+                "publishing a commit status needs the configured repo remote",
+            )
+        body = {
+            key: value
+            for key, value in payload.items()
+            if key in ("state", "context", "description", "target_url") and value is not None
+        }
+        result = subprocess.run(
+            [
+                _gh_binary(),
+                "api",
+                "--method",
+                "POST",
+                f"repos/{repo_remote}/statuses/{sha}",
+                "--input",
+                "-",
+            ],
+            input=json.dumps(body),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode != 0:
+            raise QaError(
+                "qa-status-write-failed",
+                "the SHA-bound QA status could not be written",
+            )
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError:
+            return {}
+
+    return write
 
 
 def _load_config_or_exit(path: str) -> NormalizedConfig:
@@ -885,6 +959,51 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return EXIT_CONFIG
         decision = validate_merge_handoff(entry, head, args.check_conclusion)
         print(json.dumps({**decision.to_dict(), "ok": True}, sort_keys=True))
+        return EXIT_OK
+
+    if args.command == "publish-status":
+        config = _load_config_or_exit(args.config)
+        now = utc_now()
+        try:
+            entry = record_qa_result(
+                QaResult(
+                    issue_url=args.issue_url,
+                    issue_node_id=None,
+                    pull_request_url=args.pull_request,
+                    pull_request_node_id=None,
+                    tested_sha=args.tested_sha,
+                    current_head_sha=args.current_head_sha or args.tested_sha,
+                    selected_base_branch=args.base_ref or config.base_branch,
+                    branch_declaration=args.base_ref or config.base_branch,
+                    result="success",
+                    failure_kind=None,
+                    started_at=now,
+                    completed_at=now,
+                    sanitized_evidence_url=args.evidence_url,
+                )
+            )
+            published = publish_qa_status(
+                entry,
+                writer=_gh_commit_status_writer(config.repo_remote, entry.tested_sha),
+                dry_run=args.dry_run,
+            )
+        except (QaError, UnsafePublication) as exc:
+            print(f"super-board-qa: {exc}", file=sys.stderr)
+            print(json.dumps({"ok": False, "reason": exc.reason}, sort_keys=True), file=sys.stderr)
+            return exc.exit_code
+        print(
+            json.dumps(
+                {
+                    "check_context": entry.check_context,
+                    "dry_run": published["dry_run"],
+                    "github_writes": published["github_writes"],
+                    "ok": True,
+                    "published": published["published"],
+                    "tested_sha": entry.tested_sha,
+                },
+                sort_keys=True,
+            )
+        )
         return EXIT_OK
 
     config = _load_config_or_exit(args.config)

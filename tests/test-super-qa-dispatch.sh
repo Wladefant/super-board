@@ -139,4 +139,78 @@ for kind in repairable external-input outside-acceptance; do
     || fail "QA failure must never move a card to Done ($kind), got: $OUTK"
 done
 
-echo "PASS: test-super-qa-dispatch.sh (9 scenarios)"
+# ── Stubs for the scenarios that run the full pipeline. No real git, no real gh.
+# `git` is intercepted on PATH; `gh` is intercepted through SUPERBOARD_GH,
+# because the runtime spawns it from Python and a native interpreter will not
+# resolve an extensionless script on Windows.
+mkdir -p "$TMP/bin"
+CALLS="$PWD/$TMP/gh-calls.txt"
+STDIN_LOG="$PWD/$TMP/gh-stdin.txt"
+cat > "$TMP/bin/git" <<'STUB'
+#!/usr/bin/env bash
+if [ "$1" = worktree ] && [ "$2" = add ]; then mkdir -p "$4"; exit 0; fi
+exit 0
+STUB
+cat > "$TMP/bin/gh" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$CALLS"
+cat >> "$STDIN_LOG" 2>/dev/null || true
+printf '%s' '{"url":"https://github.com/test-owner/test-repo/commit/x"}'
+STUB
+chmod +x "$TMP/bin/git" "$TMP/bin/gh"
+
+if command -v cygpath >/dev/null 2>&1; then
+  # A native python.exe runs an absolute .cmd, but never an extensionless script.
+  printf '@echo off\r\nbash "%s" %%*\r\n' "$(cygpath -m "$PWD/$TMP/bin/gh")" > "$TMP/bin/gh.cmd"
+  export SUPERBOARD_GH="$(cygpath -w "$PWD/$TMP/bin/gh.cmd")"
+else
+  export SUPERBOARD_GH="$PWD/$TMP/bin/gh"
+fi
+
+# Scenario 10 — a successful run publishes the SHA-bound status on the tested
+# commit. Without it a passing pull request can never become merge-ready: the
+# merge handoff requires that exact check on that exact SHA.
+: > "$TMP/gh-calls.txt"; : > "$TMP/gh-stdin.txt"
+OUT10=$(PATH="$PWD/$TMP/bin:$PATH" "$DISPATCH" --config "$CFG" \
+        --issue-url https://github.com/test-owner/test-repo/issues/123 \
+        --pull-request https://github.com/test-owner/test-repo/pull/456 \
+        --pr-payload "$TMP/pr-head.json" \
+        --worktree-root "$TMP/wt" -- true)
+echo "$OUT10" | jq -e '.result == "success"' >/dev/null \
+  || fail "a passing QA command should report success, got: $OUT10"
+echo "$OUT10" | jq -e '.github_writes == 1' >/dev/null \
+  || fail "a successful run publishes exactly one SHA-bound status, got: $OUT10"
+grep -q "statuses/$SHA_A" "$TMP/gh-calls.txt" \
+  || fail "the status must be written on the tested commit, got: $(cat "$TMP/gh-calls.txt")"
+grep -q "superboard/exact-sha-qa" "$TMP/gh-stdin.txt" \
+  || fail "the published status must carry the SHA-bound context, got: $(cat "$TMP/gh-stdin.txt")"
+
+# Scenario 11 — a failing QA command publishes nothing.
+: > "$TMP/gh-calls.txt"
+OUT11=$(PATH="$PWD/$TMP/bin:$PATH" "$DISPATCH" --config "$CFG" \
+        --issue-url https://github.com/test-owner/test-repo/issues/123 \
+        --pull-request https://github.com/test-owner/test-repo/pull/456 \
+        --pr-payload "$TMP/pr-head.json" \
+        --worktree-root "$TMP/wt" -- false)
+echo "$OUT11" | jq -e '.result == "failure" and .github_writes == 0' >/dev/null \
+  || fail "a failed QA run publishes no passing status, got: $OUT11"
+[ ! -s "$TMP/gh-calls.txt" ] || fail "a failed QA run must issue zero writes, got: $(cat "$TMP/gh-calls.txt")"
+
+# Scenario 12 — SIGTERM cleans up AND exits. A trap that only cleans up lets
+# execution continue after the worktree and the lock have been deleted.
+PATH="$PWD/$TMP/bin:$PATH" "$DISPATCH" --config "$CFG" \
+  --issue-url https://github.com/test-owner/test-repo/issues/123 \
+  --pull-request https://github.com/test-owner/test-repo/pull/456 \
+  --pr-payload "$TMP/pr-head.json" \
+  --worktree-root "$TMP/wt-signal" -- sleep 20 >/dev/null 2>&1 &
+SIG_PID=$!
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  [ -d "$TMP/wt-signal/locks" ] && break
+  sleep 0.5
+done
+kill -TERM "$SIG_PID" 2>/dev/null || true
+SIG_RC=0; wait "$SIG_PID" || SIG_RC=$?
+[ "$SIG_RC" -eq 143 ] || fail "a TERM during QA should exit 143, got $SIG_RC"
+[ -z "$(ls -A "$TMP/wt-signal/locks" 2>/dev/null)" ] || fail "the QA lock survived a TERM"
+
+echo "PASS: test-super-qa-dispatch.sh (12 scenarios)"

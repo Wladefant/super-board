@@ -136,7 +136,14 @@ cleanup_worktree() {
   rm -f "$LOCK"
   sb_tmp_cleanup
 }
-trap cleanup_worktree EXIT INT TERM
+# A signal trap that only cleans up does NOT stop the script: bash resumes at
+# the next statement, so the run would carry on with its worktree and its lock
+# already deleted — and could publish a status for a run that was cancelled.
+# Clean up, then leave with the conventional 128+signal status.
+on_signal() { cleanup_worktree; trap - EXIT; exit "$1"; }
+trap cleanup_worktree EXIT
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
 
 git fetch origin "$TESTED_SHA" >/dev/null 2>&1 || {
   echo "🛑 super-qa-dispatch: could not fetch ${TESTED_SHA}." >&2
@@ -167,4 +174,25 @@ if [ "$QA_RC" -ne 0 ]; then
   exit 0
 fi
 
-emit success 0 0
+# ── Step 5: publish the SHA-bound status on the tested commit.
+# Without this write a passing pull request can never become merge-ready: the
+# merge handoff requires exactly this check, on exactly this SHA, to have
+# concluded success. The payload goes through the publication boundary inside
+# `super_board_runtime.qa`; nothing is written from here.
+PUBLISH_ARGS=(publish-status
+              --config "$CONFIG_NATIVE"
+              --issue-url "$ISSUE_URL"
+              --pull-request "$PR_URL"
+              --tested-sha "$TESTED_SHA"
+              --current-head-sha "$TESTED_SHA")
+[ -n "$BASE_REF" ] && PUBLISH_ARGS+=(--base-ref "$BASE_REF")
+
+RC=0
+sb_runtime super_board_runtime.qa "${PUBLISH_ARGS[@]}" >/dev/null || RC=$?
+if [ "$RC" -ne 0 ]; then
+  echo "🛑 super-qa-dispatch: QA passed on ${TESTED_SHA} but the SHA-bound status could not be published." >&2
+  emit unpublished 0 0
+  exit "$RC"
+fi
+
+emit success 0 1
