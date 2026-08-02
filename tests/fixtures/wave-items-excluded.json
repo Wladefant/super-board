@@ -1,0 +1,88 @@
+{
+  "items": [
+    {
+      "status": "Ready",
+      "labels": ["design", "P1"],
+      "content": {
+        "type": "Issue",
+        "number": 40,
+        "title": "design card — human-designer-owned, never dispatchable",
+        "url": "https://github.com/Bavariance/polysimulator/issues/40",
+        "assignees": [],
+        "state": "OPEN"
+      }
+    },
+    {
+      "status": "Ready",
+      "labels": ["  History  "],
+      "content": {
+        "type": "Issue",
+        "number": 41,
+        "title": "history card — archive, not work (label needs trimming + folding)",
+        "url": "https://github.com/Bavariance/polysimulator/issues/41",
+        "assignees": [],
+        "state": "OPEN"
+      }
+    },
+    {
+      "status": "Ready",
+      "labels": ["bug"],
+      "content": {
+        "type": "Issue",
+        "number": 42,
+        "title": "the first genuinely dispatchable card",
+        "url": "https://github.com/Bavariance/polysimulator/issues/42",
+        "assignees": [],
+        "state": "OPEN"
+      }
+    },
+    {
+      "status": "Ready",
+      "labels": ["design", "history"],
+      "content": {
+        "type": "Issue",
+        "number": 43,
+        "title": "both exclusions at once",
+        "url": "https://github.com/Bavariance/polysimulator/issues/43",
+        "assignees": [],
+        "state": "OPEN"
+      }
+    },
+    {
+      "status": "Ready",
+      "labels": [],
+      "content": {
+        "type": "PullRequest",
+        "number": 44,
+        "title": "a pull-request card can never dispatch",
+        "url": "https://github.com/Bavariance/polysimulator/pull/44",
+        "assignees": [],
+        "state": "OPEN"
+      }
+    },
+    {
+      "status": "Building",
+      "labels": [],
+      "content": {
+        "type": "Issue",
+        "number": 45,
+        "title": "already in flight — not Ready, so not dispatchable",
+        "url": "https://github.com/Bavariance/polysimulator/issues/45",
+        "assignees": [],
+        "state": "OPEN"
+      }
+    },
+    {
+      "status": "Review",
+      "labels": [],
+      "content": {
+        "type": "Issue",
+        "number": 46,
+        "title": "awaiting a human rebase-merge — not dispatchable",
+        "url": "https://github.com/Bavariance/polysimulator/issues/46",
+        "assignees": [],
+        "state": "OPEN"
+      }
+    }
+  ]
+}

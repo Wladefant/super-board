@@ -13,8 +13,8 @@ export const meta = {
 // args = {
 //   configPath: '.claude/super-board/configs/<slug>.json',
 //   variant: 'full' | 'qa-only',
-//   cards: [{ number, status, title }],     // output of super-board-wave-plan.sh
-//   humanApprovesMerge: boolean (optional, default false),
+//   cards: [...],                           // `.cards` from super-board-wave-plan.sh
+//   humanApprovesMerge: boolean (optional, default true — the runtime never merges),
 //   tier: 'low' | 'medium' | 'high' (optional, default 'medium'),  // run model ladder
 // }
 // The harness can deliver `args` as a JSON-encoded string (the tool param is
@@ -24,10 +24,28 @@ const input = (() => {
   try { return JSON.parse(args) } catch { return args }
 })()
 if (!input || !Array.isArray(input.cards) || !input.configPath || !input.variant) {
-  throw new Error('super-board-wave needs args {configPath, variant, cards:[{number,status,title}]}')
+  throw new Error('super-board-wave needs args {configPath, variant, cards:[…]} from super-board-wave-plan.sh')
 }
 if (input.tier && !['low', 'medium', 'high'].includes(input.tier)) {
   throw new Error(`super-board-wave: unknown tier "${input.tier}" — use low | medium | high`)
+}
+
+// Eligibility is NOT re-derived here. `super-board-wave-plan.sh` already ran the
+// shared runtime (super_board_runtime.eligibility), which is the only place the
+// rules live: issue cards only, never `design`/`history`, status EXACTLY `Ready`,
+// unclaimed, OPEN, unambiguous branch route, activation permitting. This workflow
+// consumes that decision verbatim and refuses anything that does not carry it —
+// re-deriving the rules here is exactly how the three paths drifted apart before.
+for (const card of input.cards) {
+  if (!card || typeof card.number !== 'number') {
+    throw new Error('super-board-wave: every card needs a numeric issue number from the planner')
+  }
+  if (card.status !== 'Ready') {
+    throw new Error(
+      `super-board-wave: card #${card.number} arrived with status "${card.status}" — only ` +
+      `status "Ready" is dispatchable. Re-run super-board-wave-plan.sh; do not hand-assemble cards.`
+    )
+  }
 }
 
 const CLASSIFY_SCHEMA = {
@@ -57,11 +75,11 @@ const LANE = {
   review: { skill: 'super-review', section: 'Reviewer', phase: 'Review' },
 }
 
-// Merge-race guard, execution side: on auto-merge boards (humanApprovesMerge
-// false) Reviewer agents squash-merge into the same base branch, so Review
-// lanes must run one at a time even when card chains reach Review in the
-// same wave. Promise-chain mutex; the catch keeps one failed review from
-// poisoning the chain.
+// Review serialization guard, execution side: Reviewer agents contend for the
+// same base branch and the same PR-ready handoff, so Review lanes run one at a
+// time unless a human is explicitly the merge gate. The runtime itself never
+// merges. Promise-chain mutex; the catch keeps one failed review from poisoning
+// the chain.
 let reviewLock = Promise.resolve()
 const withReviewLock = (fn) => {
   const run = reviewLock.then(fn)

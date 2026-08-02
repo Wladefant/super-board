@@ -1,18 +1,32 @@
 #!/usr/bin/env bash
-# super-board-wave-plan.sh — compute the next workflow-backend wave from board state.
-# Read-only: no gh writes, no locks. Mirrors run.md's lane-allocation model:
-# base picks are one card per non-empty eligible column, downstream-first
-# (Review → QA → Ready); remaining max_workers slots fill with extra cards
-# from the most backlogged column first. Cards with assignees are skipped
-# (assignee is the cross-machine mutex, claimed by the orchestrator before
-# launch). Extra Review cards beyond the base pick are gated behind
-# config.human_approves_merge (merge-race guard).
+# super-board-wave-plan.sh — compute the next wave from board state.
+#
+# Read-only: no gh writes, no locks. Selection is NOT decided here — it is
+# delegated to the shared runtime (`super_board_runtime.eligibility`), which the
+# headless dispatcher and the dynamic workflow also use, so a card cannot be
+# eligible in one path and ineligible in another.
+#
+# The contract that runtime enforces, in full:
+#   • only issue cards (pull-request and draft cards never dispatch),
+#   • never a `design` or `history` card, nor anything in config.exclude_labels,
+#   • status EXACTLY `Ready` — Backlog, Building, QA, Review, Blocked, and Done
+#     are all rejected with `status-not-ready`,
+#   • no assignee (the assignee is the cross-machine claim mutex),
+#   • the issue must be OPEN; a failed state lookup is ineligible, never
+#     permissive,
+#   • unambiguous branch route,
+#   • activation must permit it.
 #
 # Usage:
 #   super-board-wave-plan.sh --config <config.json> [--items <project-items.json>]
 # Without --items, fetches live board state via `gh project item-list`.
-# Stdout: {"cards":[{"number":10,"status":"Review","title":"..."}]}
+# Stdout: {"activation_mode":…,"cards":[…],"decisions":[…],"exclude_labels":[…],…}
+# Exit: 0 ok · 64 bad invocation · 65 bad config/items · 66 config not found
 set -euo pipefail
+
+# shellcheck source=scripts/super-board-python.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/super-board-python.sh"
+trap sb_tmp_cleanup EXIT
 
 CONFIG=""; ITEMS_FILE=""
 while [ $# -gt 0 ]; do
@@ -27,10 +41,16 @@ done
 # Read the config ONCE — $CONFIG may be a process substitution (test mode),
 # which is a FIFO and cannot be read twice.
 CONFIG_JSON=$(cat "$CONFIG")
-VARIANT=$(echo "$CONFIG_JSON" | jq -r '.variant')
-MAX_WORKERS=$(echo "$CONFIG_JSON" | jq -r '.max_workers // 3')
+VARIANT=$(echo "$CONFIG_JSON" | jq -r '.variant // "full"')
 OWNER=$(echo "$CONFIG_JSON" | jq -r '.project.owner')
 NUMBER=$(echo "$CONFIG_JSON" | jq -r '.project.number')
+
+# Validate loudly: a typo (or missing key → literal "null") must not silently
+# change which lanes exist. The variant selects lanes, never statuses.
+case "$VARIANT" in
+  full|qa-only) ;;
+  *) echo "invalid variant in config: ${VARIANT} (expected full|qa-only)" >&2; exit 65 ;;
+esac
 
 if [ -n "$ITEMS_FILE" ]; then
   ITEMS=$(cat "$ITEMS_FILE")
@@ -38,35 +58,8 @@ else
   ITEMS=$(gh project item-list "$NUMBER" --owner "$OWNER" --format json --limit 500)
 fi
 
-# Validate loudly: a typo (or missing key → literal "null") must not silently
-# drop the QA column from selection and strand cards there.
-case "$VARIANT" in
-  full)    COLUMNS='["Review","QA","Ready"]' ;;
-  qa-only) COLUMNS='["Review","Ready"]' ;;
-  *) echo "invalid variant in config: ${VARIANT} (expected full|qa-only)" >&2; exit 65 ;;
-esac
+# A process substitution is not openable by a native interpreter; materialize.
+CONFIG_NATIVE=$(printf '%s' "$CONFIG_JSON" | sb_config_file)
 
-# Merge-race guard: concurrent auto-merges into the same base branch can
-# race, so extra Review cards (beyond the base 1) are only eligible when a
-# human approves merges (config.human_approves_merge = true).
-ALLOW_REVIEW_EXTRAS=$(echo "$CONFIG_JSON" | jq -r '.human_approves_merge // false')
-
-echo "$ITEMS" | jq --argjson cols "$COLUMNS" --argjson cap "$MAX_WORKERS" --argjson revx "$ALLOW_REVIEW_EXTRAS" '
-  [ $cols[] as $col
-    | { col: $col,
-        cands: [ .items[]
-                 | select(.status == $col and .content.type == "Issue")
-                 | select((.content.assignees // []) | length == 0)
-                 | { number: .content.number, status: $col, title: .content.title } ] }
-  ] as $bycol
-  | [ $bycol[] | select((.cands | length) > 0) | .cands[0] ] as $base
-  | ( [ $bycol[]
-        | select(.col != "Review" or $revx)
-        | { backlog: ((.cands | length) - 1), rest: .cands[1:] }
-        | select(.backlog > 0)
-      ]
-      | sort_by(-.backlog)
-      | map(.rest)
-      | add // []
-    ) as $extras
-  | { cards: (($base + $extras) | .[:$cap]) }'
+printf '%s' "$ITEMS" | sb_runtime super_board_runtime.eligibility \
+  --items - --config "$CONFIG_NATIVE"
