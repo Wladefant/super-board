@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "variant": "full",
+  "activation_mode": "active",
+  "base_branch": "staging",
+  "project": { "owner": "test-owner", "number": 99 },
+  "repo": { "remote": "test-owner/test-repo" }
+}
