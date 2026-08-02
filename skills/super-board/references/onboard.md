@@ -203,3 +203,59 @@ If any of these four checks fail, do NOT print the step-12 summary. Instead, sur
 the specific failed check and tell the user to re-run `super-board onboard`. A
 partial config is worse than no config — the lint and run verbs depend on these
 invariants.
+
+---
+
+## The fallback auto-add workflow, and the gate on re-enabling it
+
+`.github/workflows/auto-add-to-project.yml` is installed **disabled** and stays
+disabled while GitHub's built-in Projects auto-add works. It exists as a
+redundant backup for the day the built-in path breaks, and it is not armed in
+advance "just in case", because a redundant backup running unattended is a
+duplicate-card generator: it fires on `issues.opened`, the built-in workflow
+fires on the same event, and the board ends up with two cards for one issue that
+then disagree about status.
+
+While it is disabled the job is inert. Nothing about installing, upgrading,
+proving, or activating the board changes that.
+
+### What arms it
+
+Exactly two repository-level settings, both set by a human:
+
+- `vars.ENABLE_ADD_TO_PROJECT` set to the exact string `true`;
+- `secrets.ADD_TO_PROJECT_PAT`, a fine-grained PAT with Projects read/write for
+  the board **owner**.
+
+A GitHub App cannot stand in for that PAT. GitHub Apps cannot access user-owned
+(personal) Projects v2 at all — only organization-owned ones — so on a personal
+board the App path does not exist, whatever an older runbook says.
+
+There is no substitution marker in the workflow file. The board URL comes from
+`vars.SUPERBOARD_PROJECT_URL`, because a `__PLACEHOLDER__` that somebody forgets
+to rewrite becomes a live misconfiguration instead of a loud one.
+
+### The re-enable gate
+
+The fallback may be enabled **only** through a separate configuration-only issue
+plus a user-reviewed pull request that links, as evidence:
+
+1. a documented **built-in auto-add** failure — the board event, the missing
+   card, and the time window in which the built-in path did not fire;
+2. proof that membership is checked by immutable **content node ID**, not by
+   issue number or title, so a transferred or recreated issue is not merged
+   into an existing card;
+3. proof of **identity verification** before any insertion;
+4. proof of **quota preflight** before any insertion, so an insertion cannot
+   break the immutable GraphQL reserve;
+5. a stated **rollback**: unsetting `ENABLE_ADD_TO_PROJECT` returns the workflow
+   to inert, and any card the fallback inserted is named so it can be removed;
+6. proof of **no-op** behaviour for an issue already on the board, for a
+   page-capped inventory, and for an ambiguous duplicate — all three insert
+   nothing.
+
+**Neither the installer, nor the proof run, nor the active-mode change
+authorizes re-enabling it.** Running `install.sh` does not arm it. Producing the
+proof above does not arm it. Moving the board's `activation_mode` from `off` to
+`proof` or `on` does not arm it. Only the merged configuration-only pull request
+above does, and only for the repository it names.

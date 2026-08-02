@@ -41,6 +41,11 @@ except ImportError:  # executed as a plain file path
 #: No paginated Project read may request more pages than this.
 MAX_PROJECT_PAGES = 20
 
+#: The repository variable that arms the fallback auto-add workflow, and the
+#: exact value it must hold. Anything else leaves the workflow inert.
+FALLBACK_ENABLE_VARIABLE = "ENABLE_ADD_TO_PROJECT"
+FALLBACK_ENABLE_VALUE = "true"
+
 
 class MutationConflict(Exception):
     """State moved under us, or could not be read whole. Exit code 3."""
@@ -277,14 +282,112 @@ def apply_project_mutation(
     }
 
 
+# ───────────────────────────── fallback auto-add guard ─────────────────────────────
+
+
+@dataclass(frozen=True)
+class FallbackDecision:
+    """Whether the redundant auto-add workflow may insert a card, and why not."""
+
+    insert: bool
+    reason_code: str
+    membership_key: str = "content_node_id"
+    preflight: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "insert": self.insert,
+            "membership_key": self.membership_key,
+            "preflight": list(self.preflight),
+            "reason_code": self.reason_code,
+        }
+
+
+def _membership(project: Any, issue_node_id: str) -> Optional[bool]:
+    """True member, False absent, None undecidable. Never guesses."""
+    if project is None or getattr(project, "hit_cap", False):
+        # A page-capped snapshot is not the board. "Not found in the pages we
+        # managed to read" is not the same as "not on the board".
+        return None
+    try:
+        items = tuple(project.items)
+    except Exception:
+        return None
+    matches = 0
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        content = item.get("content_node_id") or item.get("contentNodeId")
+        if not content and isinstance(item.get("content"), Mapping):
+            content = item["content"].get("id")
+        if content == issue_node_id:
+            matches += 1
+    if matches > 1:
+        # Two cards for one issue is the failure this guard exists to prevent.
+        # Adding a third is not the fix.
+        return None
+    return matches == 1
+
+
+def evaluate_fallback_auto_add(
+    issue_node_id: Any,
+    project: Any,
+    enabled: bool,
+    *,
+    identity_check: Optional[Callable[[], Any]] = None,
+    quota_check: Optional[Callable[[], Any]] = None,
+) -> FallbackDecision:
+    """Decide whether the fallback may insert one card.
+
+    Every uncertain answer resolves to "do not insert". The workflow is a
+    redundant backup for a built-in feature; the cost of not inserting is one
+    card an operator adds by hand, and the cost of inserting wrongly is a
+    duplicate card that two workflows then fight over.
+    """
+    if not enabled:
+        return FallbackDecision(False, "fallback-disabled")
+    if not isinstance(issue_node_id, str) or not issue_node_id.strip():
+        return FallbackDecision(False, "issue-node-id-invalid")
+
+    member = _membership(project, issue_node_id)
+    if member is None:
+        return FallbackDecision(False, "membership-unknown")
+    if member:
+        return FallbackDecision(False, "already-member")
+
+    # Only now, with an insertion actually in prospect, does the preflight run.
+    consulted: list[str] = []
+    consulted.append("identity")
+    try:
+        verified = bool(identity_check()) if identity_check is not None else False
+    except Exception:
+        verified = False
+    if not verified:
+        return FallbackDecision(False, "identity-unverified", preflight=tuple(consulted))
+
+    consulted.append("quota")
+    if quota_check is None:
+        return FallbackDecision(False, "quota-unavailable", preflight=tuple(consulted))
+    try:
+        quota_check()
+    except Exception:
+        return FallbackDecision(False, "quota-unavailable", preflight=tuple(consulted))
+
+    return FallbackDecision(True, "insert-authorized", preflight=tuple(consulted))
+
+
 __all__ = [
+    "FALLBACK_ENABLE_VALUE",
+    "FALLBACK_ENABLE_VARIABLE",
     "MAX_PROJECT_PAGES",
     "CurrentState",
     "ExpectedState",
+    "FallbackDecision",
     "MutationConflict",
     "MutationDecision",
     "ProjectSnapshot",
     "apply_project_mutation",
     "compare_project_mutation",
+    "evaluate_fallback_auto_add",
     "snapshot_project",
 ]
