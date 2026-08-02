@@ -33,9 +33,11 @@ from super_board_runtime import EXIT_UNSAFE  # noqa: E402
 from super_board_runtime.publication import (  # noqa: E402
     ARTIFACT_CLASSIFICATIONS,
     PUBLICATION_SURFACES,
+    UNSAFE_DISPLAY_MARKER,
     PublicationError,
     UnsafePublication,
     publish,
+    redact_for_display,
     render_payload,
     sanitize_and_validate_publication,
 )
@@ -459,6 +461,53 @@ class PublishCliTests(unittest.TestCase):
             code, _, err = self._run(["publish", "--input", str(path), "--json"])
         self.assertEqual(code, 65)
         self.assertIn("publication-surface-unknown", err)
+
+
+class DisplayRedactionTests(unittest.TestCase):
+    """GitHub-controlled text reaching a plan, a log, or a terminal.
+
+    Not a publication boundary — nothing is written to GitHub — but a raw issue
+    title carries whatever a human pasted into it, and it is copied into agent
+    prompts, run manifests, and the status kanban. The same sanitizer answers
+    for it, because a second one is a second place to forget a category.
+    """
+
+    def test_ordinary_text_survives_intact(self) -> None:
+        self.assertEqual(redact_for_display("fix the leaderboard tail cache"),
+                         "fix the leaderboard tail cache")
+
+    def test_a_pasted_token_is_redacted(self) -> None:
+        token = "ghp_" + "A" * 36
+        cleaned = redact_for_display(f"rotate {token} before Friday")
+        self.assertNotIn(token, cleaned)
+        self.assertIn("redacted", cleaned)
+
+    def test_control_characters_cannot_redraw_a_terminal(self) -> None:
+        self.assertEqual(redact_for_display("wipe\x1b[2K\rthe frame"), "wipe[2Kthe frame")
+
+    def test_a_credential_named_environment_value_is_removed(self) -> None:
+        secret = "S" * 40
+        cleaned = redact_for_display(f"see {secret}", {"DEPLOY_TOKEN": secret})
+        self.assertNotIn(secret, cleaned)
+
+    def test_a_survivor_collapses_the_whole_string(self) -> None:
+        # Too short to substring-redact safely, still a credential. The display
+        # path cannot raise, so it drops the text entirely rather than print it.
+        secret = "abc123"
+        self.assertEqual(
+            redact_for_display(f"token {secret}", {"API_KEY": secret}),
+            UNSAFE_DISPLAY_MARKER,
+        )
+
+    def test_a_non_string_is_empty_not_an_exception(self) -> None:
+        for value in (None, 12, {"title": "x"}):
+            with self.subTest(value=value):
+                self.assertEqual(redact_for_display(value), "")
+
+    def test_a_limit_truncates_with_an_ellipsis(self) -> None:
+        cleaned = redact_for_display("x" * 200, limit=20)
+        self.assertEqual(len(cleaned), 20)
+        self.assertTrue(cleaned.endswith("…"))
 
 
 if __name__ == "__main__":

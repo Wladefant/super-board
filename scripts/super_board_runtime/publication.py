@@ -170,6 +170,15 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 #: payload carries bytes we cannot interpret as text.
 _BINARY_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
+#: Every C0 control character plus DEL. A one-line display has no legitimate use
+#: for any of them, and `\x1b[2K\r` inside an issue title redraws the terminal.
+_DISPLAY_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+#: What a display string becomes when something survived redaction. The display
+#: path has no way to refuse — a status renderer cannot raise at a card — so it
+#: drops the text instead of printing it.
+UNSAFE_DISPLAY_MARKER = "[redacted: unsafe text]"
+
 
 class PublicationError(ValueError):
     """Invalid publication input or an unknown surface. Maps to exit code 65."""
@@ -304,6 +313,38 @@ def scan_for_secrets(
     return findings
 
 
+def redact_for_display(
+    text: Any,
+    environment: Optional[Mapping[str, str]] = None,
+    *,
+    limit: Optional[int] = None,
+) -> str:
+    """Make GitHub-controlled text safe to put in a plan, a log, or a terminal.
+
+    This is NOT a publication boundary: nothing here is written to GitHub, so
+    `PUBLICATION_SURFACES` does not apply and nothing is raised. It is the same
+    redactor and the same detector, reused — because an issue title carries
+    whatever a human pasted into it, and titles are copied into dispatch plans,
+    agent prompts, run manifests, and the status kanban. A second sanitizer for
+    those paths would be a second place to forget a category.
+
+    Control characters go first: `\\x1b[2K\\r` in a title redraws the terminal
+    frame the status renderer just drew. Anything that survives redaction
+    collapses the whole string to `UNSAFE_DISPLAY_MARKER` — a value too short to
+    substring-replace safely is still a credential, and printing it is not one
+    of the available answers.
+    """
+    if not isinstance(text, str):
+        return ""
+    cleaned = _DISPLAY_CONTROL_RE.sub("", text)
+    cleaned, _records = _redact(cleaned, environment or {}, "display")
+    if scan_for_secrets(cleaned, environment or {}, "display"):
+        return UNSAFE_DISPLAY_MARKER
+    if limit is not None and limit > 0 and len(cleaned) > limit:
+        cleaned = cleaned[: limit - 1] + "…"
+    return cleaned
+
+
 def _require_text_only(text: str, surface: str) -> None:
     match = _BINARY_RE.search(text)
     if match is not None:
@@ -414,12 +455,14 @@ __all__ = [
     "ARTIFACT_CLASSIFICATIONS",
     "MIN_REDACTABLE_ENV_VALUE_LEN",
     "PUBLICATION_SURFACES",
+    "UNSAFE_DISPLAY_MARKER",
     "PublicationError",
     "RedactionRecord",
     "SanitizedPayload",
     "SecretFinding",
     "UnsafePublication",
     "publish",
+    "redact_for_display",
     "render_payload",
     "sanitize_and_validate_publication",
     "scan_for_secrets",

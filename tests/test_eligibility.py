@@ -24,6 +24,7 @@ if str(_SCRIPTS) not in sys.path:
 
 from super_board_runtime.config import load_and_validate_config  # noqa: E402
 from super_board_runtime.eligibility import (  # noqa: E402
+    PLAN_TITLE_LIMIT,
     IssueSnapshot,
     evaluate_dispatch,
     plan_dispatch,
@@ -181,6 +182,33 @@ class StatusGateTests(unittest.TestCase):
         items = [_item(40, "ready"), _item(41, " Ready "), _item(42, "Ready")]
         plan = plan_dispatch(items, _config())
         self.assertEqual([card["number"] for card in plan.cards], [42])
+
+
+class PlanTitleTests(unittest.TestCase):
+    """The plan's title is copied into prompts, manifests, and logs.
+
+    It is GitHub-controlled text, so it is carried sanitized or not at all —
+    a classifier needs to read it, and nothing downstream re-checks it.
+    """
+
+    def test_a_credential_pasted_into_a_title_never_reaches_the_plan(self) -> None:
+        token = "ghp_" + "C" * 36
+        plan = plan_dispatch([_item(50, "Ready", title=f"rotate {token} today")], _config())
+        self.assertEqual(len(plan.cards), 1)
+        self.assertNotIn(token, plan.cards[0]["title"])
+        self.assertNotIn(token, json.dumps(list(plan.cards)))
+
+    def test_control_characters_never_reach_the_plan(self) -> None:
+        plan = plan_dispatch([_item(51, "Ready", title="wipe\x1b[2K\rframe")], _config())
+        self.assertNotIn("\x1b", plan.cards[0]["title"])
+
+    def test_an_ordinary_title_is_carried_verbatim(self) -> None:
+        plan = plan_dispatch([_item(52, "Ready", title="fix the tail cache")], _config())
+        self.assertEqual(plan.cards[0]["title"], "fix the tail cache")
+
+    def test_a_pasted_wall_of_text_is_bounded(self) -> None:
+        plan = plan_dispatch([_item(53, "Ready", title="z" * 4000)], _config())
+        self.assertEqual(len(plan.cards[0]["title"]), PLAN_TITLE_LIMIT)
 
 
 class LabelExclusionTests(unittest.TestCase):

@@ -238,6 +238,23 @@ def test_sanitize_title_strips_c0_and_del() -> None:
     assert sbs.sanitize_title("漢字 + 🔨 build") == "漢字 + 🔨 build"
 
 
+def test_sanitize_title_redacts_a_credential_pasted_into_a_title() -> None:
+    """A title is GitHub-controlled text, and every lane prints it.
+
+    The kanban is routinely captured into a log and pasted back into an issue,
+    so a token somebody put in a title would travel with it. One sanitizer
+    answers for both the control characters and the credential.
+    """
+    token = "ghp_" + "B" * 36
+    cleaned = sbs.sanitize_title(f"rotate {token} before the deploy")
+    assert token not in cleaned
+    assert "redacted" in cleaned
+
+
+def test_sanitize_title_bounds_a_pasted_wall_of_text() -> None:
+    assert len(sbs.sanitize_title("y" * 5000)) == sbs.TITLE_DISPLAY_LIMIT
+
+
 # ───────────────────────────── I2: pagination ─────────────────────────────
 
 
