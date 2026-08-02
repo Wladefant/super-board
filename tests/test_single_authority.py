@@ -79,6 +79,36 @@ class WaveWorkflowSingleAuthorityTests(unittest.TestCase):
             "the workflow must call the `qa merge-handoff` authority for the gate",
         )
 
+    def test_the_workflow_carries_one_lifecycle_model(self) -> None:
+        """No `enter at QA` / `enter at Review` branches survive.
+
+        The guard at the top refuses every card whose status is not exactly
+        `Ready` — that is the invariant, and the planner enforces it upstream —
+        yet the lane chain still branched on `card.status` as though a card could
+        arrive already in QA or Review. Dead code that describes a DIFFERENT
+        lifecycle is worse than dead: the next reader has to work out which of
+        the two models is the real one, and the answer is not local.
+        """
+        chain = self.source.split("const results = await pipeline(", 1)
+        self.assertEqual(len(chain), 2, "the lane pipeline is gone")
+        # Prose about the retired model is not the retired model.
+        body = "\n".join(
+            line for line in chain[1].splitlines() if not line.lstrip().startswith("//")
+        )
+        self.assertNotIn(
+            "card.status",
+            body,
+            "the lane chain branches on a card status that can only ever be `Ready`",
+        )
+        for entry in ("at === 'QA'", "at === 'Review'", "at = card.status"):
+            with self.subTest(entry=entry):
+                self.assertNotIn(entry, body)
+
+    def test_the_only_dispatchable_status_is_still_refused_at_the_gate(self) -> None:
+        # Removing the downstream branches must not remove the invariant that
+        # made them dead.
+        self.assertIn("card.status !== 'Ready'", self.source)
+
     def test_the_qa_check_context_is_not_a_second_literal(self) -> None:
         # The context may be NAMED in a prompt or a log line, but it must be the
         # same string the runtime publishes.

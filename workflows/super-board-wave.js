@@ -206,8 +206,8 @@ const lanePrompt = (lane, card) => [
 
 // Run-tier model ladders. Card complexity indexes into the active ladder;
 // undefined = inherit the session model (the strongest available — e.g.
-// Fable/Opus). Cards entering past Ready (cls null, never classified)
-// always inherit the session model.
+// Fable/Opus). A card the classifier could not read (cls null) inherits the
+// session model too, which is the strongest answer, never the cheapest.
 //   low    (run --low):  haiku / sonnet / opus
 //   medium (default):    sonnet / opus / session
 //   high   (run --high): opus / session / session
@@ -235,9 +235,9 @@ const runLane = async (lane, card, model, history) => {
 
 const results = await pipeline(
   input.cards,
-  // Stage 1: classify cards entering at Ready (router for model tiering)
+  // Stage 1: classify (router for model tiering). Every card is at Ready — the
+  // guard above threw on anything else — so there is no unclassified path.
   async (card) => {
-    if (card.status !== 'Ready') return { card, cls: null }
     const cls = await agent(
       `Read GitHub issue #${card.number} ("${card.title}") — body and all comments — using gh issue view. ` +
       `Classify it: kind (feature|bug|docs|chore) and complexity (low|medium|high) judged by the scope of code change required.`,
@@ -245,49 +245,49 @@ const results = await pipeline(
     )
     return { card, cls }
   },
-  // Stage 2: lane chain — entry point depends on the card's current column.
-  // A non-'advanced' exit ends the chain; the next wave re-selects the card
-  // from wherever it landed (the board is the loop state, not this script).
+  // Stage 2: lane chain. It always starts at the top: every card arrived at
+  // exactly `Ready`, because the planner selects nothing else and the guard
+  // above throws on anything else. This used to branch on `card.status` as
+  // though a card could enter already in QA or Review — a second lifecycle
+  // model, dead but readable, leaving the next reader to work out which of the
+  // two the runtime actually obeys. A card that lands somewhere else is picked
+  // up by the NEXT wave from wherever it landed; the board is the loop state,
+  // not this script.
+  //
+  // A non-'advanced' exit ends the chain.
   async (prev, card) => {
     const history = []
     const model = tierFor(prev && prev.cls)
-    let at = card.status
 
-    if (at === 'Ready' && input.variant === 'full') {
+    // By design: qa-only boards have no Builder lane — Ready cards go straight
+    // to the Tester (run.md "Lane mapping by variant").
+    if (input.variant === 'full') {
       const b = await runLane('build', card, model, history)
       if (b.status !== 'advanced') return { number: card.number, history }
-      at = 'QA'
     }
-    // By design: qa-only boards have no Builder lane — Ready cards go
-    // straight to the Tester (run.md "Lane mapping by variant").
-    if (at === 'Ready' && input.variant === 'qa-only') at = 'QA'
-    if (at === 'QA') {
-      const q = await runLane('qa', card, model, history)
-      if (q.status !== 'advanced') return { number: card.number, history }
-      at = 'Review'
-    }
-    if (at === 'Review') {
-      // Reviewer always on session model; serialized unless a human merges.
-      const review = () => runLane('review', card, undefined, history)
-      const reviewResult = input.humanApprovesMerge ? await review() : await withReviewLock(review)
-      // The Review→human transition is gated on the exact-SHA handoff. A card
-      // whose head moved, or whose SHA-bound check did not conclude success,
-      // is NOT reported as merge-ready however clean the review read.
-      const handoff = await requestMergeHandoff(card, reviewResult)
-      history[history.length - 1].mergeReady = handoff.merge_ready === true
-      history[history.length - 1].handoffReason = handoff.reason_code || null
-      // The wave ends at Review on every path. There is no branch of this
-      // workflow that merges, closes the issue, or writes Done — Done is
-      // produced by the closure normalizer after a real human merge.
-      history[history.length - 1].column = 'Review'
-      history[history.length - 1].awaiting = 'human-rebase-merge'
-      if (handoff.merge_ready !== true) {
-        log(
-          `#${card.number} stops in Review — not merge-ready (${handoff.reason_code || 'refused'}); ` +
-          `tested=${handoff.tested_sha || 'none'} head=${handoff.current_head_sha || 'unknown'} ` +
-          `check=${handoff.check_context || 'the SHA-bound QA check'}`
-        )
-      }
+    const q = await runLane('qa', card, model, history)
+    if (q.status !== 'advanced') return { number: card.number, history }
+
+    // Reviewer always on session model; serialized unless a human merges.
+    const review = () => runLane('review', card, undefined, history)
+    const reviewResult = input.humanApprovesMerge ? await review() : await withReviewLock(review)
+    // The Review→human transition is gated on the exact-SHA handoff. A card
+    // whose head moved, or whose SHA-bound check did not conclude success, is
+    // NOT reported as merge-ready however clean the review read.
+    const handoff = await requestMergeHandoff(card, reviewResult)
+    history[history.length - 1].mergeReady = handoff.merge_ready === true
+    history[history.length - 1].handoffReason = handoff.reason_code || null
+    // The wave ends at Review on every path. There is no branch of this
+    // workflow that merges, closes the issue, or writes Done — Done is produced
+    // by the closure normalizer after a real human merge.
+    history[history.length - 1].column = 'Review'
+    history[history.length - 1].awaiting = 'human-rebase-merge'
+    if (handoff.merge_ready !== true) {
+      log(
+        `#${card.number} stops in Review — not merge-ready (${handoff.reason_code || 'refused'}); ` +
+        `tested=${handoff.tested_sha || 'none'} head=${handoff.current_head_sha || 'unknown'} ` +
+        `check=${handoff.check_context || 'the SHA-bound QA check'}`
+      )
     }
     return { number: card.number, history }
   }
