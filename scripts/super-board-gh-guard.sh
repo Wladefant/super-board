@@ -24,7 +24,7 @@
 #   source scripts/super-board-gh-guard.sh
 #   sb_gh_guard_check 103 [config]   # refuse the burst if it would break the reserve
 #   sb_gh_budget_spend 5             # decrement worker-local call budget; halt if 0
-#   sb_gh_guard_summary              # log the safe quota fields; cheap to call
+#   sb_gh_guard_summary [config]     # print the gh-quota-on-exit line on stderr
 
 # shellcheck source=scripts/super-board-python.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/super-board-python.sh"
@@ -56,9 +56,37 @@ sb_gh_guard_check() {
 }
 
 sb_gh_guard_summary() {
-  # One-line snapshot for worker exit messages. Emits only the four safe fields:
-  # remaining points, estimated cost, effective floor, reset time.
-  sb_runtime super_board_runtime.quota check --estimated-cost 1 >/dev/null 2>&1 && return 0
+  # The worker exit line `rate-limit-etiquette.md` §8 and `run.md` require:
+  #
+  #   gh-quota-on-exit: graphql=<remaining> floor=<effective-floor> reset=<time>
+  #
+  # Printed on STDERR, where the guard's other diagnostics go. Capture it for a
+  # PR handoff comment with `sb_gh_guard_summary 2>&1`.
+  #
+  # Arg 1: optional config path supplying a raised floor.
+  #
+  # Only those three safe fields ever appear — never a token, header, cookie or
+  # raw payload, and never the runtime's stderr, which is why the call below
+  # discards its own error stream rather than forwarding it.
+  #
+  # NON-FATAL by construction. A summary is a worker's last act; it must not be
+  # able to change the status that worker exits with. Every failure path — no
+  # Python, no `gh`, an unreadable or malformed quota — lands on the unavailable
+  # marker and returns 0. Silence is the one outcome that is not allowed: this
+  # function used to send both streams to /dev/null and emit nothing at all,
+  # which made the documented line impossible to produce.
+  local config="${1:-}" line=""
+  if [ -n "$config" ]; then
+    line=$(sb_runtime super_board_runtime.quota summary \
+      --config "$(sb_native_path "$config")" 2>/dev/null) || line=""
+  else
+    line=$(sb_runtime super_board_runtime.quota summary 2>/dev/null) || line=""
+  fi
+  case "$line" in
+    "gh-quota-on-exit:"*) ;;
+    *) line="gh-quota-on-exit: unavailable (quota could not be read)" ;;
+  esac
+  printf '%s\n' "$line" >&2
   return 0
 }
 

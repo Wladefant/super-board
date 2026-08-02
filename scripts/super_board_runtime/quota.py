@@ -25,9 +25,12 @@ The rules:
 CLI:
 
     python -m super_board_runtime.quota check --estimated-cost 103 [--config <cfg>]
+    python -m super_board_runtime.quota summary [--config <cfg>]
 
-Exit 0 within budget, 64 invalid invocation, 65 invalid configuration,
-75 quota unavailable or reserve reached.
+`check` exits 0 within budget, 64 invalid invocation, 65 invalid configuration,
+75 quota unavailable or reserve reached. `summary` only reports — it prints the
+worker exit line documented in `references/rate-limit-etiquette.md` and always
+exits 0, so a worker's last act cannot change the status it exits with.
 """
 
 from __future__ import annotations
@@ -185,6 +188,33 @@ def require_graphql_budget(
         )
 
 
+#: The prefix every worker's exit summary carries, so the run manifest can find
+#: the line without parsing the rest of a handoff comment.
+QUOTA_SUMMARY_PREFIX = "gh-quota-on-exit:"
+
+#: What a worker reports when the quota could not be read. It is a marker, not a
+#: number: an exit line that quietly omitted the balance would read like a run
+#: that never touched the API.
+QUOTA_SUMMARY_UNAVAILABLE = f"{QUOTA_SUMMARY_PREFIX} unavailable (quota could not be read)"
+
+
+def quota_summary_line(snapshot: QuotaSnapshot, configured_floor: Optional[int]) -> str:
+    """The worker exit line documented in `references/rate-limit-etiquette.md`.
+
+    Three safe fields and nothing else — remaining points, the floor actually
+    enforced, and the reset time. No token, no header, no cookie, no raw
+    payload, and no estimated cost, because an exit summary is not spending
+    anything. An unreadable quota renders the unavailable marker rather than a
+    fabricated balance.
+    """
+    if not snapshot.available or snapshot.remaining is None:
+        return QUOTA_SUMMARY_UNAVAILABLE
+    return (
+        f"{QUOTA_SUMMARY_PREFIX} graphql={snapshot.remaining} "
+        f"floor={effective_floor(configured_floor)} reset={snapshot.reset_at or 'unknown'}"
+    )
+
+
 def quota_log_line(
     snapshot: QuotaSnapshot, estimated_cost: int, configured_floor: Optional[int]
 ) -> str:
@@ -257,13 +287,46 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument(
         "--payload", default=None, help="read a rate_limit payload from this file instead of gh"
     )
+    summary = sub.add_parser(
+        "summary", help="print the worker exit line; never fails, never spends"
+    )
+    summary.add_argument("--config", default=None, help="config supplying a raised floor")
+    summary.add_argument(
+        "--payload", default=None, help="read a rate_limit payload from this file instead of gh"
+    )
     return parser
+
+
+def _payload_fetch(payload: Optional[str]) -> Optional[Callable[[], Any]]:
+    if not payload:
+        return None
+    payload_path = Path(payload)
+
+    def fetch() -> Any:
+        return json.loads(payload_path.read_text(encoding="utf-8"))
+
+    return fetch
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
 
-    floor: Optional[int] = None
+    if args.command == "summary":
+        # A worker calls this on its way out. It reports; it never decides, and
+        # it never changes the caller's exit status — a config it cannot read
+        # means it cannot state the enforced floor honestly, so it says so.
+        floor: Optional[int] = None
+        readable = True
+        if args.config:
+            try:
+                floor = load_and_validate_config(Path(args.config)).minimum_graphql_reserve
+            except ConfigError:
+                readable = False
+        snapshot = read_graphql_quota(_payload_fetch(args.payload)) if readable else UNAVAILABLE
+        print(quota_summary_line(snapshot, floor))
+        return EXIT_OK
+
+    floor = None
     if args.config:
         try:
             floor = load_and_validate_config(Path(args.config)).minimum_graphql_reserve
@@ -272,14 +335,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(json.dumps({"ok": False, "reason": exc.reason}, sort_keys=True), file=sys.stderr)
             return EXIT_CONFIG
 
-    fetch = None
-    if args.payload:
-        payload_path = Path(args.payload)
-
-        def fetch():  # noqa: F811 - deliberate local rebinding
-            return json.loads(payload_path.read_text(encoding="utf-8"))
-
-    snapshot = read_graphql_quota(fetch)
+    snapshot = read_graphql_quota(_payload_fetch(args.payload))
     body = {
         "effective_floor": effective_floor(floor),
         "estimated_cost": args.estimated_cost,

@@ -33,7 +33,9 @@ from super_board_runtime.quota import (  # noqa: E402
     QuotaSnapshot,
     bounded_batches,
     effective_floor,
+    QUOTA_SUMMARY_PREFIX,
     quota_log_line,
+    quota_summary_line,
     read_graphql_quota,
     require_graphql_budget,
 )
@@ -172,6 +174,84 @@ class LogLineTests(unittest.TestCase):
         line = quota_log_line(read_graphql_quota(fetch=lambda: None), 103, 1000)
         self.assertIn("remaining=unknown", line)
         self.assertIn("effective_floor=1000", line)
+
+
+class ExitSummaryTests(unittest.TestCase):
+    """The `gh-quota-on-exit:` line every worker's handoff comment must carry.
+
+    `sb_gh_guard_summary` used to run the quota check with both streams sent to
+    /dev/null and then return 0, so the line the references promise could never
+    be produced. Its shape is pinned here and its wiring in
+    `tests/test-gh-guard-summary.sh`.
+    """
+
+    def test_the_summary_carries_only_the_three_safe_fields(self) -> None:
+        line = quota_summary_line(_snapshot(4213), 1000)
+        self.assertTrue(line.startswith(QUOTA_SUMMARY_PREFIX), line)
+        fields = dict(re.findall(r"(\w+)=(\S+)", line))
+        self.assertEqual(sorted(fields), ["floor", "graphql", "reset"])
+        self.assertEqual(fields["graphql"], "4213")
+        self.assertEqual(fields["floor"], "1000")
+
+    def test_the_summary_never_carries_a_token_header_or_raw_payload(self) -> None:
+        line = quota_summary_line(_snapshot(4213), 1000)
+        for forbidden in (
+            "token", "Authorization", "authorization", "Bearer", "cookie", "resources", "limit"
+        ):
+            self.assertNotIn(forbidden, line)
+
+    def test_the_summary_reports_the_raised_floor_not_the_minimum(self) -> None:
+        self.assertIn("floor=4000", quota_summary_line(_snapshot(4213), 4000))
+
+    def test_an_unreadable_quota_is_a_marker_not_a_fabricated_balance(self) -> None:
+        line = quota_summary_line(read_graphql_quota(fetch=lambda: None), 1000)
+        self.assertTrue(line.startswith(QUOTA_SUMMARY_PREFIX), line)
+        self.assertIn("unavailable", line)
+        self.assertNotIn("graphql=", line)
+
+    def test_the_summary_cli_always_exits_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = Path(tmp) / "rate-limit.json"
+            payload.write_text(json.dumps(_payload(4213)), encoding="utf-8")
+            broken = Path(tmp) / "broken.json"
+            broken.write_text('{"resources": {}}', encoding="utf-8")
+            missing = Path(tmp) / "absent.json"
+            for path, expected in (
+                (payload, "graphql=4213"),
+                (broken, "unavailable"),
+                (missing, "unavailable"),
+            ):
+                with self.subTest(payload=path.name):
+                    result = subprocess.run(
+                        [
+                            sys.executable, "-B", "-m", "super_board_runtime.quota",
+                            "summary", "--payload", str(path),
+                        ],
+                        capture_output=True,
+                        text=True,
+                        cwd=str(_SCRIPTS),
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn(QUOTA_SUMMARY_PREFIX, result.stdout)
+                    self.assertIn(expected, result.stdout)
+
+    def test_an_unreadable_config_cannot_fail_the_summary(self) -> None:
+        # A worker's last act must not be able to change the status it exits
+        # with — and a floor it cannot read is a floor it must not claim.
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.json"
+            config.write_text("{not json", encoding="utf-8")
+            result = subprocess.run(
+                [
+                    sys.executable, "-B", "-m", "super_board_runtime.quota",
+                    "summary", "--config", str(config),
+                ],
+                capture_output=True,
+                text=True,
+                cwd=str(_SCRIPTS),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("unavailable", result.stdout)
 
 
 class BoundedWorkTests(unittest.TestCase):

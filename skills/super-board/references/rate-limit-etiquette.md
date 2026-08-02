@@ -19,7 +19,7 @@ This file is the worker-side contract. Every worker MUST follow it. The executab
 source scripts/super-board-gh-guard.sh
 sb_gh_budget_init 150      # per-worker soft cap on gh calls
 sb_gh_guard_check 103      # ESTIMATED COST of the coming burst, in GraphQL points
-sb_gh_guard_summary        # log the safe quota fields for the run manifest
+sb_gh_guard_summary        # print the gh-quota-on-exit line (stderr) — see §8
 ```
 
 **The numeric argument changed meaning — read old call sites with care.** It used to be a threshold: *pause while the remaining balance sits under this number.* It is now the **estimated cost of the burst you are about to run**. A call site that still passes `200` keeps working, but it is no longer asking what its author meant: it now asks whether an estimated cost of that size still clears the floor. A ProjectsV2 item scan is ~103; that is the number to reach for when you are unsure, not a leftover threshold.
@@ -67,7 +67,11 @@ Every worker's PR handoff comment MUST end with:
 gh-quota-on-exit: graphql=<remaining> floor=<effective-floor> reset=<time>
 ```
 
-This gives the run manifest visibility into which lane is the heaviest consumer over time. It carries no capacity claim beyond what was actually read.
+`sb_gh_guard_summary [config]` prints that line **on stderr**, where the guard's other diagnostics go. Capture it for the comment with `sb_gh_guard_summary 2>&1`. It reports three of the four fields — an exit summary is not about to spend anything, so it carries no estimated cost.
+
+The call is deliberately **non-fatal**: it is a worker's last act and must never change the status that worker exits with. If the quota cannot be read at all, it prints `gh-quota-on-exit: unavailable (quota could not be read)` and still returns 0. An unavailable marker is the honest reading — the line carries no capacity claim beyond what was actually read, and never a fabricated balance.
+
+This gives the run manifest visibility into which lane is the heaviest consumer over time.
 
 ## 9. Per-worker hard cap
 
