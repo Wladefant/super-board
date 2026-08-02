@@ -160,6 +160,28 @@ class StatusGateTests(unittest.TestCase):
                 self.assertFalse(decision.eligible)
                 self.assertEqual(decision.reason_codes, ("status-not-ready",))
 
+    def test_only_the_exact_spelling_dispatches(self) -> None:
+        """`Ready` means `Ready`. Not `ready`, not ` Ready `, not `READY`.
+
+        Canonicalization belongs to schema/alias validation. Applying it to the
+        dispatch gate turns the exactly-`Ready` invariant into a
+        case-and-whitespace-insensitive match, so a board whose column was
+        renamed or whose payload carries stray whitespace dispatches anyway.
+        """
+        for status in ("ready", " Ready ", "READY", "\tReady\n", "rEaDy"):
+            with self.subTest(status=status):
+                decision = evaluate_dispatch(_issue(status=status), _config())
+                self.assertFalse(
+                    decision.eligible,
+                    f"{status!r} is not the exact dispatchable status",
+                )
+                self.assertEqual(decision.reason_codes, ("status-not-ready",))
+
+    def test_plan_dispatch_refuses_near_miss_spellings(self) -> None:
+        items = [_item(40, "ready"), _item(41, " Ready "), _item(42, "Ready")]
+        plan = plan_dispatch(items, _config())
+        self.assertEqual([card["number"] for card in plan.cards], [42])
+
 
 class LabelExclusionTests(unittest.TestCase):
     def test_design_card_is_skipped_and_the_next_card_is_chosen(self) -> None:

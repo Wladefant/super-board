@@ -45,14 +45,14 @@ try:  # normal package import
     from . import EXIT_CONFIG, EXIT_OK, EXIT_USAGE
     from .activation import evaluate_activation
     from .config import ConfigError, NormalizedConfig, load_and_validate_config
-    from .lifecycle import DISPATCHABLE_STATUS, is_dispatchable_status
+    from .lifecycle import DISPATCHABLE_STATUS
     from .routing import resolve_branch_route
 except ImportError:  # executed as a plain file path
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from super_board_runtime import EXIT_CONFIG, EXIT_OK, EXIT_USAGE
     from super_board_runtime.activation import evaluate_activation
     from super_board_runtime.config import ConfigError, NormalizedConfig, load_and_validate_config
-    from super_board_runtime.lifecycle import DISPATCHABLE_STATUS, is_dispatchable_status
+    from super_board_runtime.lifecycle import DISPATCHABLE_STATUS
     from super_board_runtime.routing import resolve_branch_route
 
 StateLookup = Callable[["IssueSnapshot"], Optional[str]]
@@ -237,7 +237,12 @@ def evaluate_dispatch(
     if any(label.strip().casefold() in excluded for label in issue.labels):
         return _decision(issue, config, ("excluded-label",), branch)
 
-    if not is_dispatchable_status(issue.status):
+    # Exactly `Ready`, compared byte for byte. `canonicalize_status` exists for
+    # schema and alias validation — where a human-authored config or a board
+    # option is being checked against the lifecycle — and folding it into this
+    # gate silently widened the invariant: `ready`, ` Ready `, and `READY` all
+    # dispatched. The dispatch gate is the one place that must not be lenient.
+    if issue.status != DISPATCHABLE_STATUS:
         return _decision(issue, config, ("status-not-ready",), branch)
 
     if issue.assignees:
