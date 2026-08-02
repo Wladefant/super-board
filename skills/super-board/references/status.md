@@ -438,8 +438,11 @@ Forbidden in `status`:
 - `gh issue ... add-label` / `gh issue ... remove-label`
 - `gh issue ... add-assignee` / `gh issue ... remove-assignee`
 - `gh api graphql` invocations with mutations such as `resolveReviewThread`,
-  `addProjectV2ItemById`, `updateProjectV2ItemFieldValue`, `closeIssue`,
-  `mergePullRequest`, etc.
+  `addProjectV2ItemById`, `updateProjectV2ItemFieldValue`, `closeIssue`, the
+  pull-request merge mutation, etc. (that last one is named only descriptively:
+  the release gate `scan_merge_prohibitions` fails on the literal in any
+  executable path, and a skill document IS an executable path — the model obeys
+  it. This file is not on the scan's allowlist, and should not need to be.)
 
 Allowed in `status` (read-only):
 

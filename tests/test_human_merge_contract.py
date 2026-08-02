@@ -179,6 +179,43 @@ class ConfigContractTests(unittest.TestCase):
         self.assertEqual(ctx.exception.reason, "repository-setting-invalid:allow_squash_merge")
 
 
+class AllowlistHygieneTests(unittest.TestCase):
+    """Every exclusion must be load-bearing.
+
+    An entry that excludes a file carrying no scanned literal is dead weight
+    that still excludes the file — so on the day somebody adds a real merge path
+    to it, the gate stays green and nobody is told. That is exactly the failure
+    the "no path heuristic" rule at the top of the allowlist exists to prevent,
+    reached one stale line at a time instead of all at once.
+    """
+
+    def test_no_allowlist_entry_is_stale(self) -> None:
+        entries = list(load_allowlist(_REPO_ROOT))
+        self.assertTrue(entries, "the allowlist is empty")
+        stale: list[str] = []
+        for entry in entries:
+            others = [other for other in entries if other != entry]
+            hits = [
+                occurrence.path
+                for report in (
+                    scan_merge_prohibitions(_REPO_ROOT, allowlist=others),
+                    scan_retired_status(_REPO_ROOT, allowlist=others),
+                )
+                for occurrence in report.occurrences
+            ]
+            covered = any(
+                path == entry.rstrip("/") or path.startswith(entry) for path in hits
+            )
+            if not covered:
+                stale.append(entry)
+        self.assertEqual(
+            stale,
+            [],
+            "these exclusions no longer exclude anything and must be deleted:\n"
+            + "\n".join(stale),
+        )
+
+
 class ExitCodeCollisionTests(unittest.TestCase):
     """The production-merge guard needs its own code.
 
