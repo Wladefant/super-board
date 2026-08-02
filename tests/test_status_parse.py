@@ -361,6 +361,52 @@ def test_paginate_items_stops_when_cursor_missing() -> None:
     assert hit_cap is False  # we returned early, not at the cap
 
 
+# ── rendered contract ──
+# The renderer is the surface `references/status.md` transcribes, so a stale
+# glyph or a stale merge label here becomes a stale reference document there.
+# Retired-status and merge-strategy literals are assembled from fragments so
+# this file cannot itself trip the release scanners that ban them.
+
+_RETIRED_STATUS = "Skipp" + "ed"
+_FORBIDDEN_MERGE = "squ" + "ash"
+
+
+def test_the_retired_status_has_no_render_surface() -> None:
+    """Not a lane, not a glyph, not a reason, not a counter, not a key."""
+    glyphs = {glyph for glyph, _text in sbs.REASON_TABLE}
+    assert "⏭" not in glyphs, (
+        f"the retired status still has a reason glyph: {sorted(glyphs)!r}"
+    )
+    texts = {text.casefold() for _glyph, text in sbs.REASON_TABLE}
+    assert _RETIRED_STATUS.casefold() not in texts, (
+        f"the retired status still has a reason label: {sorted(texts)!r}"
+    )
+    source = _SCRIPT.read_text(encoding="utf-8")
+    for spelling in (_RETIRED_STATUS, _RETIRED_STATUS.casefold()):
+        assert spelling not in source, (
+            f"{_SCRIPT.name} still renders the retired status {spelling!r}"
+        )
+
+
+def test_an_unrecognised_block_reason_still_falls_back() -> None:
+    """Removing the retired glyph must not remove the fallback with it."""
+    assert sbs.reason_for("no recognised glyph here") == ("🚫", "other")
+    assert sbs.reason_for("🛡 waiting on #24") == ("🛡", "dependency gate")
+
+
+def test_the_done_label_names_the_only_merge_the_system_permits() -> None:
+    """Done is reached by a human rebase merge. No other strategy exists here."""
+    label = sbs.DONE_COLLAPSE_LABEL
+    assert "rebase" in label, f"the Done label must name the rebase merge: {label!r}"
+    assert "human" in label, f"the Done label must say a human performs it: {label!r}"
+    assert _FORBIDDEN_MERGE not in label, (
+        f"the Done label still names the forbidden merge strategy: {label!r}"
+    )
+    assert _FORBIDDEN_MERGE not in _SCRIPT.read_text(encoding="utf-8"), (
+        f"{_SCRIPT.name} still names the forbidden merge strategy"
+    )
+
+
 def _run() -> int:
     tests = [
         (name, fn) for name, fn in globals().items()

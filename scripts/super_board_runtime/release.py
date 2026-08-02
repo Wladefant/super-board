@@ -73,21 +73,20 @@ ACTIVE_REFERENCE_FILES: tuple[str, ...] = (
     "skills/super-board/references/rate-limit-etiquette.md",
     "skills/super-board/references/run-workflow.md",
     "skills/super-board/references/run.md",
+    "skills/super-board/references/status.md",
     "skills/super-board/references/stop.md",
 )
 
 #: Reference documents deliberately left out of the scan, listed so that the
 #: omission is a decision somebody made rather than a gap nobody noticed.
 #:
-#: `references/status.md` transcribes what `scripts/super-board-status.py`
-#: actually prints, down to the glyph table and the Done-column label. Its
-#: retired-status glyph and its merge label are accurate transcriptions of
-#: shipped output: correcting the document alone would make it a false record
-#: of what the renderer does. The renderer has to change first, and that is a
-#: runtime change rather than a documentation one.
-UNSCANNED_REFERENCE_FILES: tuple[str, ...] = (
-    "skills/super-board/references/status.md",
-)
+#: There are none. `references/status.md` was the last entry: it transcribes
+#: what `scripts/super-board-status.py` prints, and the renderer still printed a
+#: retired-status glyph row and a collapsed-history merge label, so the document
+#: was a true record of a wrong renderer. The renderer was corrected, so the
+#: transcription is correctable too, and the exemption has nothing left to
+#: excuse.
+UNSCANNED_REFERENCE_FILES: tuple[str, ...] = ()
 
 #: Documents that carry ACTIVE guidance. Historical release-notes sections are
 #: a record of what past releases did and are not rewritten; everything here is
