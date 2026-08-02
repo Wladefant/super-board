@@ -460,17 +460,18 @@ Records: config used, variant, columns, target, per-card history (claim → comp
 Workers share the dispatcher's gh-auth token bucket. The dispatcher's `gh_rate_guard` does NOT protect worker traffic. Every worker MUST follow `rate-limit-etiquette.md` (in this directory):
 
 - Source `scripts/super-board-gh-guard.sh` at worker start.
-- Call `sb_gh_guard_check <estimated-cost>` before any burst of gh calls (thread reads, sub-agent spawn, exit verification). It stops the worker with exit 75 when the call would break the immutable reserve, or when the quota cannot be read at all.
+- Call `sb_gh_guard_check <estimated-cost>` before any burst of gh calls (thread reads, sub-agent spawn, exit verification). The argument is the ESTIMATED COST of the burst in GraphQL points, not a threshold. It stops the worker with exit 75 when the call would break the immutable 1,000-point reserve, or when the quota cannot be read at all.
+- Take one quota reading per cycle and spend against it. Re-reading before every call makes the guard the thing that drains the bucket.
 - Adversarial sub-agents are capped at 50 gh calls each — prefer `git blame` (local) over `gh api graphql`.
-- Final PR handoff comment MUST include `gh-quota-on-exit: graphql=<remaining> floor=<effective-floor> reset=<time>` (use `sb_gh_guard_summary`).
-- On 403 / secondary-rate-limit: sleep 60s, re-check at threshold 500, then resume.
+- Final PR handoff comment MUST include `gh-quota-on-exit: graphql=<remaining> floor=<effective-floor> reset=<time>` (use `sb_gh_guard_summary`). Those four fields are the only ones that may be logged.
+- On 403 / secondary-rate-limit: halt exactly as for exit 75 — write the halt comment, release the claim, exit. The runtime never waits out a reset and never retry-spins.
 
 ## Worker self-check (mandatory on exit, every lane)
 
 Before releasing the claim assignee and exiting, every worker MUST verify:
 
 - [ ] Issue comment AND PR comment both written (per "Commenting cadence" above).
-- [ ] Card column move's mutation returned success. **Do NOT re-query `gh project item-list` for verification** — trust the mutation exit code (the 500-item GraphQL refetch was the per-worker quota tax; see `rate-limit-etiquette.md` §3). If the mutation returned non-zero, call `sb_gh_guard_check`, retry the move ONCE, and if it still fails, leave the assignee in place and write a halt comment.
+- [ ] Card column move's mutation returned success. **Do NOT re-query `gh project item-list` for verification** — trust the mutation exit code (the 500-item GraphQL refetch was the per-worker quota tax; see `rate-limit-etiquette.md` §5). If the mutation returned non-zero, call `sb_gh_guard_check` with the retry's estimated cost, retry the move ONCE, and if it still fails, leave the assignee in place and write a halt comment.
 - [ ] Claim assignee released (`gh issue edit --remove-assignee <bot_identity>`) and the descriptive `loop:in-*` label removed.
 - [ ] On failure handoff: `root-cause-hash:` line is present in the PR handoff comment (per "Root-cause hash" above).
 - [ ] On Block exit: the full template from `block-template.md` is populated on BOTH the issue and the PR (if a PR exists); the reason emoji is one of the nine in the vocabulary table (🔐 💳 🔑 ❓ 🛡 🧑 🤷 📦 🎨).

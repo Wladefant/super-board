@@ -32,10 +32,12 @@ If a problem surfaces during the run, the orchestrator's reply is: "I saw X. Wan
 Workers (`super-build`, `super-qa`, `super-review`) share the dispatcher's `gh` token bucket. They MUST:
 
 - Source `scripts/super-board-gh-guard.sh` at worker start.
-- Call `sb_gh_guard_check 200` before any burst of `gh` calls.
-- Prefer local `git blame` / `git log` over `gh api graphql` for any sub-agent that doesn't need fresh state.
+- Call `sb_gh_guard_check <estimated-cost>` before any burst of `gh` calls. The argument is the estimated cost of the burst in GraphQL points, not a threshold; a ProjectsV2 item scan is ~103.
+- Hold the immutable reserve of 1,000 points. Reaching it — or failing to read the quota at all — halts the worker with exit 75. Never sleep through a reset, never retry-spin.
+- Take one quota reading per cycle and spend against it, rather than re-reading before every call.
+- Prefer local `git blame` / `git log` over `gh api graphql` for any sub-agent that doesn't need fresh state, and prefer GitHub's built-in Project workflows (server-side, zero API cost) over API item-adds.
 - Cap adversarial sub-agents at 50 gh calls each. If a sub-agent runs out, it returns `confidence: insufficient_data` rather than burning the shared quota.
-- Append `gh-quota-on-exit: graphql=<n>/5000 rest=<n>/5000` to the PR handoff comment.
+- Append `gh-quota-on-exit: graphql=<remaining> floor=<effective-floor> reset=<time>` to the PR handoff comment. Those four fields are the only quota fields that may be logged — never a token, header, cookie, or raw payload.
 
 See `skills/super-board/references/rate-limit-etiquette.md` for the full discipline.
 
