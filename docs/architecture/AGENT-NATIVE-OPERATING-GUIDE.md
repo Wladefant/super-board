@@ -15,7 +15,7 @@ owns evidence, Agent Native owns the view and the design surface.**
 | Backlog priority, milestones, labels | **Superboard** | |
 | Model and provider selection, routing | **Claudex** | Agent Native displays the resolved role; it never picks one. |
 | Context admission, tool profile, permission mode, escalation | **Claudex** | |
-| Reading and changing repositories, running tests | **Claude Code** | The coding runtime. Agent Native drives it; it does not replace it. |
+| Reading and changing repositories, running tests | **Claude Code** | The coding runtime. Agent Native renders and links to it; it never drives it and never replaces it. |
 | Cockpit, run list, live session transcript | **Agent Native** | Projection only — rebuildable, never authoritative. |
 | Plans before building, visual recaps after | **Agent Native** | |
 | Preview embedding, follow-ups, approvals presentation | **Agent Native** | Presentation. The approval decision itself happens in GitHub. |
@@ -55,6 +55,16 @@ The public Agent Native web container has:
 - no runner filesystem mount
 - no repository checkout
 - no trusted shell
+- **no Project write credential and no GitHub write token** — the cockpit is a
+  read-only projection, so it carries no credential-shaped field at all, not even an
+  empty slot (an empty credential slot today is a filled one tomorrow)
+
+Unavailability is proved with **synthetic non-resolving targets**: a Project item ID that
+does not exist and a repository command that does not exist. A probe handed a real item ID
+or a real command is refused before it runs — proving that a mutation is unavailable must
+never be done by attempting a mutation that could succeed. A probe that *fails* is the
+positive evidence; a probe that is accepted is the finding. See
+[`references/agent-native.md`](https://github.com/Wladefant/super-board/blob/main/skills/super-board/references/agent-native.md).
 
 Repository code and build commands run **only** inside the private runner's ephemeral
 container or VM, which has no public inbound shell or command endpoint and reaches the
