@@ -8,9 +8,11 @@
 #   1. Orphan scan on startup — refuses to start if super-board claude workers already running.
 #   2. Issue-level lock files in .claude/super-board/inflight/<N> — survives runner restart.
 #   3. Atomic GitHub assignee claim BEFORE spawning worker (closes 10-30s claude -p cold-start race).
-#   4. Rate-limit guard — sleeps until reset when GraphQL remaining < 200.
+#   4. Quota guard — refuses a tick that would break the immutable GraphQL reserve
+#      (1000 points, raisable by config) and exits 75. Never sleeps through a reset.
 #   5. Per-tick project-items cache — one gh call per tick, not per column lookup.
-#   6. Tick interval bumped from 30s → 120s (GraphQL ProjectsV2 query is ~103 pts; 120s keeps usage <3.1k/hr vs 5k budget).
+#   6. Tick interval bumped from 30s → 120s (GraphQL ProjectsV2 query is ~103 pts; 120s keeps
+#      hourly usage well inside the account bucket while leaving the reserve untouched).
 #   7. Lane-zombie watchdog (added 2026-05-24 after fitbox-v4 first-run hang) — kills lane PIDs whose
 #      claimed issue has already moved out of the lane's expected source column. The worker's logical
 #      work is done; if the claude -p process lingers, lane appears busy forever and downstream cards
@@ -198,18 +200,23 @@ lane_idle() {
   [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null
 }
 
-gh_rate_guard() {
-  # Sleep until rate limit resets if GraphQL remaining < 200.
-  local payload remaining reset now wait
-  payload=$(gh api rate_limit 2>/dev/null || echo '{"resources":{"graphql":{"remaining":5000,"reset":0}}}')
-  remaining=$(echo "$payload" | jq -r '.resources.graphql.remaining // 5000')
-  if [ "$remaining" -lt 200 ]; then
-    reset=$(echo "$payload" | jq -r '.resources.graphql.reset // 0')
-    now=$(date +%s)
-    wait=$((reset - now + 10))
-    [ "$wait" -lt 60 ] && wait=60
-    log "⚠ GraphQL rate limit low (${remaining} left) — sleeping ${wait}s until reset"
-    sleep "$wait"
+# One ProjectsV2 item scan plus the tick's incidental calls. Estimated BEFORE
+# spending, per the reserve contract.
+TICK_ESTIMATED_COST=${TICK_ESTIMATED_COST:-120}
+
+gh_quota_guard() {
+  # Refuse the tick if it would break the immutable GraphQL reserve, or if the
+  # quota cannot be read at all. Stops cleanly with exit 75: no sleep through the
+  # reset, no retry spin, and no fabricated fallback capacity.
+  local rc=0 line
+  line=$(sb_runtime super_board_runtime.quota check \
+           --estimated-cost "$TICK_ESTIMATED_COST" --config "$CONFIG_NATIVE" 2>&1 >/dev/null) || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "🛑 halting — the GraphQL reserve is protected and this tick cannot be afforded."
+    log "    $(echo "$line" | grep -o '\[quota\].*' | head -1)"
+    log "    Draining in-flight workers, then exiting with 75."
+    drain_in_flight
+    exit 75
   fi
 }
 
@@ -461,7 +468,7 @@ fi
 reap_finished_locks
 
 # ───────────────────────────── main loop ─────────────────────────────
-gh_rate_guard
+gh_quota_guard
 fetch_project_items
 INITIAL_READY=$(column_count "Ready")
 log "initial Ready count: $INITIAL_READY"
@@ -529,7 +536,7 @@ while true; do
   fi
 
   # ── Expensive-tick path: we have capacity, fetch real state.
-  gh_rate_guard
+  gh_quota_guard
   fetch_project_items
   refresh_eligible_cards
 
