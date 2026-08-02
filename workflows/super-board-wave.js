@@ -30,6 +30,9 @@ if (input.tier && !['low', 'medium', 'high'].includes(input.tier)) {
   throw new Error(`super-board-wave: unknown tier "${input.tier}" — use low | medium | high`)
 }
 
+// Mirrors `super_board_runtime.routing.NON_DISPATCH_BRANCHES`.
+const NON_DISPATCH_BRANCHES = ['designstaging', 'main', 'master', 'default']
+
 // Eligibility is NOT re-derived here. `super-board-wave-plan.sh` already ran the
 // shared runtime (super_board_runtime.eligibility), which is the only place the
 // rules live: issue cards only, never `design`/`history`, status EXACTLY `Ready`,
@@ -52,6 +55,23 @@ for (const card of input.cards) {
     throw new Error(
       `super-board-wave: card #${card.number} carries activation mode ` +
       `"${card.activationMode || card.activation_mode}" — dispatch is not activated for this board.`
+    )
+  }
+  // The route travels with the card too, decided by
+  // `super_board_runtime.routing`. This workflow never infers a branch from a
+  // Test Area, from geography in the prose, or from the current checkout — and
+  // `designstaging` is never a dispatch route.
+  const base = card.selectedBaseBranch || card.selected_base_branch
+  if (!base) {
+    throw new Error(
+      `super-board-wave: card #${card.number} carries no resolved base branch — the planner ` +
+      `refused its branch route. Re-run super-board-wave-plan.sh; do not hand-assemble cards.`
+    )
+  }
+  if (NON_DISPATCH_BRANCHES.includes(base)) {
+    throw new Error(
+      `super-board-wave: card #${card.number} resolved to "${base}", which is never a dispatch ` +
+      `route. Refusing the wave.`
     )
   }
 }
@@ -139,6 +159,8 @@ const lanePrompt = (lane, card) => [
   `Read .claude/skills/super-board/references/run.md → "${LANE[lane].section}" lifecycle and follow it EXACTLY:`,
   `create your own worktree under .worktrees/, work on the issue branch, post the required PR/issue comments,`,
   `move the project card yourself, clean up the worktree on exit. Config: ${input.configPath}.`,
+  `Base branch: ${card.selectedBaseBranch || card.selected_base_branch} (declared route — never infer another one).`,
+  `Issue node: ${card.issueNodeId || card.issue_node_id || 'unknown'}.`,
   ``,
   `Report your exit via structured output:`,
   `- status=advanced  → card moved forward (Building→QA, QA→Review, Review→Done/merged)`,

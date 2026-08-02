@@ -46,12 +46,14 @@ try:  # normal package import
     from .activation import evaluate_activation
     from .config import ConfigError, NormalizedConfig, load_and_validate_config
     from .lifecycle import DISPATCHABLE_STATUS, is_dispatchable_status
+    from .routing import resolve_branch_route
 except ImportError:  # executed as a plain file path
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from super_board_runtime import EXIT_CONFIG, EXIT_OK, EXIT_USAGE
     from super_board_runtime.activation import evaluate_activation
     from super_board_runtime.config import ConfigError, NormalizedConfig, load_and_validate_config
     from super_board_runtime.lifecycle import DISPATCHABLE_STATUS, is_dispatchable_status
+    from super_board_runtime.routing import resolve_branch_route
 
 StateLookup = Callable[["IssueSnapshot"], Optional[str]]
 
@@ -167,19 +169,37 @@ def snapshot_from_project_item(item: Any) -> IssueSnapshot:
 # ───────────────────────────── the decision ─────────────────────────────
 
 
-def _resolve_branch(issue: IssueSnapshot, config: NormalizedConfig) -> tuple[Optional[str], bool]:
-    """Return (branch, ambiguous). Two route labels naming different branches is
-    a routing error, not a coin toss."""
+def _resolve_branch(
+    issue: IssueSnapshot, config: NormalizedConfig
+) -> tuple[Optional[str], Optional[str]]:
+    """Return (branch, reason_code). A reason code means the card is ineligible.
+
+    When the board sets `require_branch_route_declaration`, routing is delegated
+    entirely to `routing.resolve_branch_route`: the issue must carry exactly one
+    explicit, normalized `Branch route:` declaration whose redundant label
+    agrees with it. Missing, `default`, unknown, duplicated, and conflicting
+    declarations are ineligible and fail here — before any branch is created.
+
+    Boards that have not opted in keep the label-routing contract: a single
+    route label selects its branch, two labels naming different branches is a
+    routing error, and no label falls back to the configured base branch.
+    """
+    if config.require_branch_route_declaration:
+        route = resolve_branch_route(issue, config)
+        if not route.valid:
+            return None, route.reason_code or "route-declaration-missing"
+        return route.base_branch, None
+
     declared = {
         config.branch_routes[key]
         for key in config.branch_routes
         if key.strip().casefold() in {label.strip().casefold() for label in issue.labels}
     }
     if len(declared) > 1:
-        return None, True
+        return None, "branch-route-ambiguous"
     if declared:
-        return declared.pop(), False
-    return config.base_branch, False
+        return declared.pop(), None
+    return config.base_branch, None
 
 
 def _decision(
@@ -207,7 +227,7 @@ def evaluate_dispatch(
     state_lookup: Optional[StateLookup] = None,
 ) -> EligibilityDecision:
     """Decide whether one card may be dispatched. Fails closed, always."""
-    branch, ambiguous = _resolve_branch(issue, config)
+    branch, route_reason = _resolve_branch(issue, config)
 
     # Activation is consulted first so its mode is on every decision record and
     # every run-evidence row. Its reason code is only *reported* once the card
@@ -241,8 +261,8 @@ def evaluate_dispatch(
     if state.strip().upper() != "OPEN":
         return _decision(issue, config, ("issue-not-open",), branch)
 
-    if ambiguous:
-        return _decision(issue, config, ("branch-route-ambiguous",), branch)
+    if route_reason is not None:
+        return _decision(issue, config, (route_reason,), branch)
 
     if not activation.permitted:
         return _decision(

@@ -365,10 +365,25 @@ dispatch_lane() {
     release_claim "$issue"
     return 0
   fi
+  # The declared route travels with the card. A worker never infers a branch
+  # from a Test Area, from geography in the prose, or from the current checkout.
+  local route
+  route=$(echo "$ELIGIBLE_CARDS_JSON" | jq -r --argjson n "$issue" \
+            '.[] | select(.number == $n) | .selected_base_branch // empty' | head -1)
+  if [ -z "$route" ]; then
+    log "🛑 refusing to dispatch #${issue} — no declared branch route survived eligibility (fail closed)"
+    return 0
+  fi
+  case "$route" in
+    designstaging|main|master|default)
+      log "🛑 refusing to dispatch #${issue} — '${route}' is never a dispatch route"
+      return 0 ;;
+  esac
+  local route_note="Base branch: ${route} (declared route — never infer another one)."
   case "$lane" in
-    build)  prompt="Run super-build on issue #${issue} for super-board run. Read .claude/skills/super-board/references/run.md → Builder lifecycle. Config: ${CONFIG_PATH}." ;;
-    qa)     prompt="Run super-qa on issue #${issue} for super-board run. Read .claude/skills/super-board/references/run.md → Tester lifecycle. Config: ${CONFIG_PATH}." ;;
-    review) prompt="Run super-review on issue #${issue} for super-board run. Read .claude/skills/super-board/references/run.md → Reviewer lifecycle. Config: ${CONFIG_PATH}." ;;
+    build)  prompt="Run super-build on issue #${issue} for super-board run. Read .claude/skills/super-board/references/run.md → Builder lifecycle. ${route_note} Config: ${CONFIG_PATH}." ;;
+    qa)     prompt="Run super-qa on issue #${issue} for super-board run. Read .claude/skills/super-board/references/run.md → Tester lifecycle. ${route_note} Config: ${CONFIG_PATH}." ;;
+    review) prompt="Run super-review on issue #${issue} for super-board run. Read .claude/skills/super-board/references/run.md → Reviewer lifecycle. ${route_note} Config: ${CONFIG_PATH}." ;;
     *) log "unknown lane: $lane"; return 1 ;;
   esac
   nohup claude -p "$prompt" >/dev/null 2>&1 &

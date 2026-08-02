@@ -73,6 +73,7 @@ class NormalizedConfig:
     repo_remote: Optional[str]
     base_branch: str
     branch_routes: Mapping[str, str]
+    require_branch_route_declaration: bool
     worker_backend: str
     human_approves_merge: bool
     merge_method: str
@@ -487,6 +488,12 @@ def load_and_validate_config(
     repo_remote = _normalize_repo_remote(raw)
     base_branch = _string(raw, "base_branch", "main", "base-branch-invalid") or "main"
     branch_routes = _normalize_branch_routes(raw)
+    # Boards that deploy more than one branch must say which one each issue
+    # targets — see `routing.py`. Default off so a single-branch board is not
+    # forced to write a declaration that could only ever say one thing.
+    require_branch_route_declaration = _bool(
+        raw, "require_branch_route_declaration", False, "branch-routes-invalid"
+    )
 
     worker_backend = _enum(
         _string(raw, "worker_backend", "claude-p", "worker-backend-invalid") or "claude-p",
@@ -540,6 +547,7 @@ def load_and_validate_config(
         repo_remote=repo_remote,
         base_branch=base_branch,
         branch_routes=branch_routes,
+        require_branch_route_declaration=require_branch_route_declaration,
         worker_backend=worker_backend,
         human_approves_merge=human_approves_merge,
         merge_method=merge_method,

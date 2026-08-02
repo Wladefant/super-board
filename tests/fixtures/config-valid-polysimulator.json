@@ -6,10 +6,9 @@
   "repo": { "path": ".", "remote": "Bavariance/polysimulator" },
   "base_branch": "staging",
   "branch_routes": {
-    "route:staging": "staging",
-    "route:staging-frankfurt": "staging-frankfurt",
-    "route:designstaging": "designstaging"
+    "branch:staging-frankfurt": "staging-frankfurt"
   },
+  "require_branch_route_declaration": true,
   "worker_backend": "claude-p",
   "human_approves_merge": true,
   "merge_method": "rebase",
