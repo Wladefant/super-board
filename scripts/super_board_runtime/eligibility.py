@@ -43,11 +43,13 @@ from typing import Any, Callable, Iterable, Optional, Sequence
 
 try:  # normal package import
     from . import EXIT_CONFIG, EXIT_OK, EXIT_USAGE
+    from .activation import evaluate_activation
     from .config import ConfigError, NormalizedConfig, load_and_validate_config
     from .lifecycle import DISPATCHABLE_STATUS, is_dispatchable_status
 except ImportError:  # executed as a plain file path
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from super_board_runtime import EXIT_CONFIG, EXIT_OK, EXIT_USAGE
+    from super_board_runtime.activation import evaluate_activation
     from super_board_runtime.config import ConfigError, NormalizedConfig, load_and_validate_config
     from super_board_runtime.lifecycle import DISPATCHABLE_STATUS, is_dispatchable_status
 
@@ -207,6 +209,13 @@ def evaluate_dispatch(
     """Decide whether one card may be dispatched. Fails closed, always."""
     branch, ambiguous = _resolve_branch(issue, config)
 
+    # Activation is consulted first so its mode is on every decision record and
+    # every run-evidence row. Its reason code is only *reported* once the card
+    # has cleared the card-intrinsic gates below, so a Backlog card reads
+    # ("status-not-ready",) rather than blaming activation for a card that was
+    # never dispatchable in the first place.
+    activation = evaluate_activation(issue, config)
+
     content_type = (issue.content_type or "").strip().casefold()
     if content_type != "issue":
         return _decision(issue, config, ("content-type-not-issue",), branch)
@@ -234,6 +243,11 @@ def evaluate_dispatch(
 
     if ambiguous:
         return _decision(issue, config, ("branch-route-ambiguous",), branch)
+
+    if not activation.permitted:
+        return _decision(
+            issue, config, (activation.reason_code or "activation-refused",), branch
+        )
 
     return _decision(issue, config, (), branch)
 

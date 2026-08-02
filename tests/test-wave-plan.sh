@@ -63,4 +63,27 @@ RC=0; "$PLAN" --config <(echo "$COLS") --items fixtures/wave-items.json >/dev/nu
 OUT9=$("$PLAN" --config fixtures/wave-config.json --items <(echo '{"items":[]}'))
 echo "$OUT9" | jq -e '.cards == []' >/dev/null || fail "empty board should yield cards:[], got: $OUT9"
 
-echo "PASS: test-wave-plan.sh (9 scenarios)"
+# Scenario 10 — activation off dispatches nothing, however perfect the board is
+OFF=$(jq '.activation_mode = "off"' fixtures/wave-config.json)
+OUT10=$("$PLAN" --config <(echo "$OFF") --items fixtures/wave-items.json)
+echo "$OUT10" | jq -e '.cards == []' >/dev/null || fail "activation off must plan nothing, got: $OUT10"
+echo "$OUT10" | jq -e '[.decisions[] | select(.issue_number == 12) | .reason_codes[]] == ["activation-off"]' >/dev/null \
+  || fail "an otherwise-eligible card should be refused with activation-off, got: $OUT10"
+
+# Scenario 11 — proof-only plans at most the single allowlisted issue
+PROOF=$(jq '.activation_mode = "proof-only"
+            | .repo = {"remote":"test-owner/test-repo"}
+            | .proof_issue_url = "https://github.com/test-owner/test-repo/issues/14"' fixtures/wave-config.json)
+OUT11=$("$PLAN" --config <(echo "$PROOF") --items fixtures/wave-items.json)
+echo "$OUT11" | jq -e '[.cards[].number] == [14]' >/dev/null || fail "proof-only should plan only #14, got: $OUT11"
+echo "$OUT11" | jq -e '[.decisions[] | select(.issue_number == 12) | .reason_codes[]] == ["activation-not-allowlisted"]' >/dev/null \
+  || fail "#12 is not allowlisted and should say so, got: $OUT11"
+
+# Scenario 12 — proof-only with a URL outside the configured repository is a config error
+BADPROOF=$(jq '.activation_mode = "proof-only"
+               | .repo = {"remote":"test-owner/test-repo"}
+               | .proof_issue_url = "https://github.com/someone-else/other/issues/14"' fixtures/wave-config.json)
+RC=0; "$PLAN" --config <(echo "$BADPROOF") --items fixtures/wave-items.json >/dev/null 2>&1 || RC=$?
+[ "$RC" -eq 65 ] || fail "a proof URL outside the configured repo should exit 65, got $RC"
+
+echo "PASS: test-wave-plan.sh (12 scenarios)"

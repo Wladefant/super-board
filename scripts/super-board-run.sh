@@ -229,6 +229,40 @@ try_claim_assignee() {
   return 0
 }
 
+card_issue_url() {
+  echo "$ELIGIBLE_CARDS_JSON" | jq -r --argjson n "$1" '.[] | select(.number == $n) | .issue_url // empty' | head -1
+}
+
+activation_permits() {
+  # $1 = issue number, $2 = stage (claim|launch).
+  # Activation is re-read from disk at BOTH mutation boundaries, so an operator
+  # who flips the board off mid-run aborts the very next claim. Fails closed on
+  # any error: no decision means no dispatch.
+  local issue="$1" stage="$2" url payload permitted reason mode rc=0
+  url=$(card_issue_url "$issue")
+  payload=$(sb_runtime super_board_runtime.activation \
+      --config "$CONFIG_NATIVE" --issue-number "$issue" \
+      ${url:+--issue-url "$url"} \
+      --planned-mode "$PLANNED_ACTIVATION_MODE" --stage "$stage" 2>/dev/null) || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "🛑 activation re-check failed for #${issue} at ${stage} (exit ${rc}) — aborting (fail closed)"
+    return 1
+  fi
+  permitted=$(echo "$payload" | jq -r '.permitted')
+  reason=$(echo "$payload" | jq -r '.reason_code // "unknown"')
+  mode=$(echo "$payload" | jq -r '.activation_mode')
+  if [ "$permitted" != "true" ]; then
+    log "🛑 activation refused #${issue} at ${stage} — mode=${mode} reason=${reason}; no claim, no launch"
+    return 1
+  fi
+  return 0
+}
+
+release_claim() {
+  [ -n "$BOT_LOGIN" ] || return 0
+  gh issue edit "$1" --remove-assignee "$BOT_LOGIN" >/dev/null 2>&1 || true
+}
+
 dispatch_lane() {
   # $1 = lane (build|qa|review); $2 = issue number
   local lane="$1" issue="$2" prompt pid
@@ -236,7 +270,17 @@ dispatch_lane() {
     log "skip dispatch lane=${lane} issue=#${issue} — already locked"
     return 0
   fi
+  # Boundary 1: immediately before the claim.
+  if ! activation_permits "$issue" claim; then
+    return 0
+  fi
   if ! try_claim_assignee "$issue"; then
+    return 0
+  fi
+  # Boundary 2: immediately before the launch. A mode flip during the claim
+  # window releases the claim again rather than launching a worker.
+  if ! activation_permits "$issue" launch; then
+    release_claim "$issue"
     return 0
   fi
   case "$lane" in
@@ -257,7 +301,7 @@ dispatch_lane() {
     review) REVIEW_PID="$pid"; REVIEW_ISSUE="$issue" ;;
   esac
   TOTAL_DISPATCHES=$((TOTAL_DISPATCHES + 1))
-  log "dispatch lane=${lane} issue=#${issue} pid=${pid} claim=${BOT_LOGIN:-local-only}"
+  log "dispatch lane=${lane} issue=#${issue} pid=${pid} claim=${BOT_LOGIN:-local-only} activation=${PLANNED_ACTIVATION_MODE}"
 }
 
 issue_status() {
@@ -413,6 +457,7 @@ fetch_project_items
 INITIAL_READY=$(column_count "Ready")
 log "initial Ready count: $INITIAL_READY"
 
+PLANNED_ACTIVATION_MODE="$ACTIVATION_MODE"
 NO_PROGRESS_TICKS=0
 NOMERGE_TICKS=0
 PREV_DONE_COUNT=$(column_count "Done")
@@ -498,7 +543,7 @@ while true; do
   BLOCKED=$(column_count "Blocked")
   DONE=$(column_count "Done")
 
-  log "tick — Ready=$READY Building=$BUILDING QA=$QA Review=$REVIEW Blocked=$BLOCKED Done=$DONE lanes: b_idle=$BUILD_IDLE(#${BUILD_ISSUE:-_}) q_idle=$QA_IDLE(#${QA_ISSUE:-_}) r_idle=$REVIEW_IDLE(#${REVIEW_ISSUE:-_})"
+  log "tick — activation=${PLANNED_ACTIVATION_MODE} Ready=$READY Building=$BUILDING QA=$QA Review=$REVIEW Blocked=$BLOCKED Done=$DONE lanes: b_idle=$BUILD_IDLE(#${BUILD_ISSUE:-_}) q_idle=$QA_IDLE(#${QA_ISSUE:-_}) r_idle=$REVIEW_IDLE(#${REVIEW_ISSUE:-_})"
 
   # Done-count progress gate (issue #8): fires independent of lane occupancy.
   # Catches zero-merge token runaways (issue #8).
