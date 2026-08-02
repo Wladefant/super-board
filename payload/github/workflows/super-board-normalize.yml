@@ -9,7 +9,23 @@
 # status by itself. It emits a machine-readable plan; Project card adds and
 # Project status changes stay top-level orchestration, performed against that
 # plan by an operator session with the Projects credential. The workflow job
-# therefore needs no Project write token at all.
+# therefore needs no Project WRITE token — but it does need a Projects READ
+# credential, because the normalizer refuses to plan against a board it has not
+# seen in full, and an undecidable membership is not an absent card.
+#
+# Configuration (repository level; no token value ever belongs in this file):
+#   vars.ENABLE_SUPERBOARD_NORMALIZE       must be exactly "true"
+#   vars.SUPERBOARD_PROJECT_OWNER          the board owner (user or org login)
+#   vars.SUPERBOARD_PROJECT_NUMBER         the board number
+#   vars.SUPERBOARD_ACTIVATION_BOUNDARY    RFC3339; closures before it are historical
+#   secrets.SUPERBOARD_PROJECT_READ_TOKEN  Projects READ for the board owner
+#
+# The job is gated on the enable flag rather than degraded when it is unset. It
+# used to invoke the normalizer with no `--payload` at all — so every delivered
+# event exited on `normalize-project-snapshot-required` before producing a plan
+# — and then only *logged* the non-zero status, leaving the job green. A
+# pipeline that cannot fail is a pipeline nobody notices has stopped. Every step
+# below runs under `set -euo pipefail`: a refusal fails the job.
 
 name: "Superboard normalize"
 
@@ -57,6 +73,7 @@ concurrency:
 jobs:
   normalize:
     runs-on: ubuntu-latest
+    if: ${{ vars.ENABLE_SUPERBOARD_NORMALIZE == 'true' }}
     steps:
       - name: Check out the installed runtime
         uses: actions/checkout@v4
@@ -66,44 +83,126 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Decide whether this event has a single subject
+        id: subject
+        env:
+          SUBJECT_URL: ${{ github.event.issue.html_url || github.event.pull_request.html_url }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SUBJECT_URL}" ]; then
+            echo "periodic sweep: no single subject; the operator session runs the sweep" >&2
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Read the complete Project inventory
+        id: inventory
+        if: steps.subject.outputs.present == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.SUPERBOARD_PROJECT_READ_TOKEN }}
+          PROJECT_OWNER: ${{ vars.SUPERBOARD_PROJECT_OWNER }}
+          PROJECT_NUMBER: ${{ vars.SUPERBOARD_PROJECT_NUMBER }}
+        run: |
+          set -euo pipefail
+          # Every page, in the shape `snapshot_project` walks. `--paginate`
+          # follows the cursor itself; `--slurp` collects the pages into the
+          # array the runtime expects. A failed or partial read fails the step
+          # rather than becoming a smaller board.
+          gh api graphql --paginate --slurp \
+            -F owner="${PROJECT_OWNER}" -F number="${PROJECT_NUMBER}" -f query='
+            query($owner: String!, $number: Int!, $endCursor: String) {
+              user(login: $owner) {
+                projectV2(number: $number) {
+                  items(first: 100, after: $endCursor) {
+                    nodes {
+                      id
+                      updatedAt
+                      content { ... on Issue { id url } ... on PullRequest { id url } }
+                    }
+                    pageInfo { hasNextPage endCursor }
+                  }
+                }
+              }
+            }' > raw-pages.json
+          python - <<'PY' > project-pages.json
+          import json
+          raw = json.load(open("raw-pages.json", encoding="utf-8"))
+          pages = []
+          for page in raw if isinstance(raw, list) else [raw]:
+              items = (
+                  ((page.get("data") or {}).get("user") or {}).get("projectV2") or {}
+              ).get("items") or {}
+              pages.append(
+                  {
+                      "items": [
+                          {
+                              "item_node_id": node.get("id"),
+                              "content_node_id": (node.get("content") or {}).get("id"),
+                              "content_url": (node.get("content") or {}).get("url"),
+                              "updated_at": node.get("updatedAt"),
+                          }
+                          for node in (items.get("nodes") or [])
+                      ],
+                      "fields": {},
+                      "pageInfo": items.get("pageInfo") or {"hasNextPage": False},
+                  }
+              )
+          json.dump(pages, open("project-pages.json", "w", encoding="utf-8"))
+          PY
+
+      - name: Assemble the normalization payload
+        id: payload
+        if: steps.subject.outputs.present == 'true'
+        env:
+          PROJECT_OWNER: ${{ vars.SUPERBOARD_PROJECT_OWNER }}
+          PROJECT_NUMBER: ${{ vars.SUPERBOARD_PROJECT_NUMBER }}
+        run: |
+          set -euo pipefail
+          # The subject comes from the delivered event and nothing else, so a
+          # plan can never claim evidence the event did not carry.
+          python .claude/bin/super-board-normalize.py payload \
+            --event-payload "${GITHUB_EVENT_PATH}" \
+            --owner "${PROJECT_OWNER}" \
+            --number "${PROJECT_NUMBER}" \
+            --project-pages project-pages.json > normalize-payload.json
+
       - name: Plan intake normalization
         id: intake
+        if: steps.subject.outputs.present == 'true'
         env:
           SUBJECT_URL: ${{ github.event.issue.html_url || github.event.pull_request.html_url }}
           SUBJECT_EVENT: ${{ github.event.action || 'schedule' }}
         run: |
-          if [ -z "${SUBJECT_URL}" ]; then
-            echo "periodic sweep: no single subject; the operator session runs the sweep" >&2
-            exit 0
-          fi
+          set -euo pipefail
+          # The exit status is NOT captured and logged. A refusal is the whole
+          # point of a fail-closed normalizer, and a job that reports it in the
+          # log and then exits 0 has hidden it.
           python .claude/bin/super-board-normalize.py intake \
             --issue "${SUBJECT_URL}" \
             --event "${SUBJECT_EVENT}" \
-            --json > intake-plan.json || status=$?
-          if [ "${status:-0}" -ne 0 ]; then
-            echo "intake normalization refused with exit ${status}; nothing was written" >&2
-          fi
+            --payload normalize-payload.json \
+            --json > intake-plan.json
 
       - name: Plan closure normalization
         id: closure
-        if: github.event.action == 'closed' || github.event.action == 'reopened'
+        if: steps.subject.outputs.present == 'true' && (github.event.action == 'closed' || github.event.action == 'reopened')
         env:
           SUBJECT_URL: ${{ github.event.issue.html_url || github.event.pull_request.html_url }}
           SUBJECT_EVENT: ${{ github.event.action }}
           # The instant before which closures are historical. Their board status
           # is corrected; their original evidence is left exactly as it was.
           ACTIVATION_BOUNDARY: ${{ vars.SUPERBOARD_ACTIVATION_BOUNDARY }}
-          # Deliberately no Project write credential: the plan is applied by an
+          # Deliberately no Project WRITE credential: the plan is applied by an
           # operator session, not by this job.
         run: |
+          set -euo pipefail
           python .claude/bin/super-board-normalize.py closure \
             --subject "${SUBJECT_URL}" \
             --event "${SUBJECT_EVENT}" \
             --activation-boundary "${ACTIVATION_BOUNDARY}" \
-            --json > closure-plan.json || status=$?
-          if [ "${status:-0}" -ne 0 ]; then
-            echo "closure normalization refused with exit ${status}; nothing was written" >&2
-          fi
+            --payload normalize-payload.json \
+            --json > closure-plan.json
 
       - name: Publish the plans as build artifacts
         if: always()

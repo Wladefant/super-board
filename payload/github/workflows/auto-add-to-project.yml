@@ -113,8 +113,13 @@ jobs:
               return probe.returncode == 0 and bool(probe.stdout.strip())
 
           def quota():
+              # The guard's REAL entrypoint, with the cost of the insertion this
+              # step is about to authorize. Invoking the file without a command
+              # used to run a library that only defines functions and exits 0,
+              # so the 1,000-point reserve was reported as respected without
+              # ever being consulted. check=True keeps a refusal (exit 75) fatal.
               subprocess.run(
-                  ["bash", ".claude/bin/super-board-gh-guard.sh", "check"],
+                  ["bash", ".claude/bin/super-board-gh-guard.sh", "check", "110"],
                   check=True, capture_output=True, timeout=60,
               )
 

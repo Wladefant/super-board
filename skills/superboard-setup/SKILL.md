@@ -141,6 +141,15 @@ cp "$SB_SRC/payload/github/workflows/auto-add-to-project.yml"   .github/workflow
 cp "$SB_SRC/payload/github/workflows/super-board-normalize.yml" .github/workflows/
 # The board URL is a repository variable, not a placeholder in the file:
 gh variable set SUPERBOARD_PROJECT_URL --body "https://github.com/users/Wladefant/projects/<N>"
+
+# The normalizer plans against a COMPLETE board snapshot or it refuses, so it
+# needs the board coordinates and a Projects READ credential. Until all four are
+# set the workflow stays inert (the enable flag gates the job) rather than
+# running and producing nothing:
+gh variable set SUPERBOARD_PROJECT_OWNER  --body "<owner-login>"
+gh variable set SUPERBOARD_PROJECT_NUMBER --body "<N>"
+gh secret   set SUPERBOARD_PROJECT_READ_TOKEN   # Projects READ for that owner
+gh variable set ENABLE_SUPERBOARD_NORMALIZE --body "true"
 ```
   (`$SB_SRC` = the super-board clone, `~/.claude/super-board-src`.) This installs the structured Issue Form (enforced Context / Steps / Acceptance criteria / Test Area / Priority / Work type / Environment constraint / Branch route / Milestone), the continuous intake-and-closure normalizer, and the fallback auto-add workflow. That fallback stays OFF - it is armed only through the re-enable gate documented in `references/onboard.md`, never by setup, install, or activation. GitHub's built-in project auto-add (Step 2) is the primary path.
 - Commit ONLY the `.claude/` additions AND the `.github/` board payload, then push.
