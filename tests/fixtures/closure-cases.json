@@ -1,0 +1,213 @@
+{
+  "activation_boundary": "2026-08-01T00:00:00Z",
+  "cases": [
+    {
+      "name": "merged-pull-request",
+      "why": "A merge is the one disposition GitHub itself attests to.",
+      "subject": {
+        "kind": "pull_request",
+        "event": "closed",
+        "number": 202,
+        "url": "https://github.com/Bavariance/polysimulator/pull/202",
+        "node_id": "PR_kwNOTAREALPULLNODE",
+        "state": "closed",
+        "closed_at": "2026-08-02T12:00:00Z",
+        "merged_at": "2026-08-02T12:00:00Z",
+        "merge_commit_sha": "dddddddddddddddddddddddddddddddddddddddd"
+      },
+      "item": { "status": "Review" },
+      "expect": {
+        "desired_status": "Done",
+        "disposition": "merged",
+        "reopen": false,
+        "comment": false,
+        "blocked_reason": null
+      }
+    },
+    {
+      "name": "closed-issue-with-completion-evidence",
+      "why": "Accepted evidence, linked and typed, is the only completion path.",
+      "subject": {
+        "kind": "issue",
+        "event": "closed",
+        "state": "closed",
+        "closed_at": "2026-08-02T12:00:00Z",
+        "closing_state": "completed",
+        "completion_evidence": {
+          "type": "merged-pull-request",
+          "url": "https://github.com/Bavariance/polysimulator/pull/202"
+        }
+      },
+      "item": { "status": "Review" },
+      "expect": {
+        "desired_status": "Done",
+        "disposition": "completed",
+        "reopen": false,
+        "comment": false,
+        "blocked_reason": null
+      }
+    },
+    {
+      "name": "closed-issue-with-linked-duplicate",
+      "why": "A duplicate is a disposition, but only when it names the survivor.",
+      "subject": {
+        "kind": "issue",
+        "event": "closed",
+        "state": "closed",
+        "closed_at": "2026-08-02T12:00:00Z",
+        "closing_state": "not_planned",
+        "duplicate_of": "https://github.com/Bavariance/polysimulator/issues/99"
+      },
+      "item": { "status": "Backlog" },
+      "expect": {
+        "desired_status": "Done",
+        "disposition": "duplicate",
+        "reopen": false,
+        "comment": false,
+        "blocked_reason": null
+      }
+    },
+    {
+      "name": "closed-issue-not-planned",
+      "why": "Not planned is a decision; it has to say what the decision was.",
+      "subject": {
+        "kind": "issue",
+        "event": "closed",
+        "state": "closed",
+        "closed_at": "2026-08-02T12:00:00Z",
+        "closing_state": "not_planned",
+        "not_planned_reason": "Superseded by the shared runtime contract; no product work remains."
+      },
+      "item": { "status": "Backlog" },
+      "expect": {
+        "desired_status": "Done",
+        "disposition": "not-planned",
+        "reopen": false,
+        "comment": false,
+        "blocked_reason": null
+      }
+    },
+    {
+      "name": "closed-issue-without-any-disposition",
+      "why": "The failure this task exists for: a silent close reading as completed work.",
+      "subject": {
+        "kind": "issue",
+        "event": "closed",
+        "state": "closed",
+        "closed_at": "2026-08-02T12:00:00Z",
+        "closing_state": "completed"
+      },
+      "item": { "status": "Building" },
+      "expect": {
+        "desired_status": "Blocked",
+        "disposition": null,
+        "reopen": true,
+        "comment": true,
+        "blocked_reason": "closure-disposition-missing"
+      }
+    },
+    {
+      "name": "closed-unmerged-pull-request-with-supersession",
+      "why": "An abandoned branch is done work only when something else carried it.",
+      "subject": {
+        "kind": "pull_request",
+        "event": "closed",
+        "number": 203,
+        "url": "https://github.com/Bavariance/polysimulator/pull/203",
+        "node_id": "PR_kwNOTAREALSUPERSEDED",
+        "state": "closed",
+        "closed_at": "2026-08-02T12:00:00Z",
+        "supersession_evidence": {
+          "type": "superseded-by",
+          "url": "https://github.com/Bavariance/polysimulator/pull/204"
+        }
+      },
+      "item": { "status": "Review" },
+      "expect": {
+        "desired_status": "Done",
+        "disposition": "superseded",
+        "reopen": false,
+        "comment": false,
+        "blocked_reason": null
+      }
+    },
+    {
+      "name": "closed-unmerged-pull-request-without-evidence",
+      "why": "No merge, no successor, no abandonment note: not finished work.",
+      "subject": {
+        "kind": "pull_request",
+        "event": "closed",
+        "number": 205,
+        "url": "https://github.com/Bavariance/polysimulator/pull/205",
+        "node_id": "PR_kwNOTAREALORPHANED",
+        "state": "closed",
+        "closed_at": "2026-08-02T12:00:00Z"
+      },
+      "item": { "status": "Review" },
+      "expect": {
+        "desired_status": "Blocked",
+        "disposition": null,
+        "reopen": false,
+        "comment": true,
+        "blocked_reason": "pull-request-disposition-missing"
+      }
+    },
+    {
+      "name": "reopened-issue",
+      "why": "Reopening is the board saying the work is not finished.",
+      "subject": {
+        "kind": "issue",
+        "event": "reopened",
+        "state": "open"
+      },
+      "item": { "status": "Done" },
+      "expect": {
+        "desired_status": "Backlog",
+        "disposition": "reopened",
+        "reopen": false,
+        "comment": false,
+        "blocked_reason": null
+      }
+    },
+    {
+      "name": "open-issue-currently-in-done",
+      "why": "An open card in the completion column is a board error, not a state.",
+      "subject": {
+        "kind": "issue",
+        "event": "schedule",
+        "state": "open"
+      },
+      "item": { "status": "Done" },
+      "expect": {
+        "desired_status": "Backlog",
+        "disposition": "open-in-completion-column",
+        "reopen": false,
+        "comment": false,
+        "blocked_reason": null
+      }
+    },
+    {
+      "name": "closed-issue-currently-outside-done",
+      "why": "Evidence-backed closure corrects the column, whatever column it was in.",
+      "subject": {
+        "kind": "issue",
+        "event": "schedule",
+        "state": "closed",
+        "closed_at": "2026-08-02T12:00:00Z",
+        "closing_state": "completed",
+        "completion_evidence": {
+          "type": "qa-evidence",
+          "url": "https://github.com/Bavariance/polysimulator/pull/202#issuecomment-1"
+        }
+      },
+      "item": { "status": "QA" },
+      "expect": {
+        "desired_status": "Done",
+        "disposition": "completed",
+        "reopen": false,
+        "comment": false,
+        "blocked_reason": null
+      }
+    }
+  ]
+}
