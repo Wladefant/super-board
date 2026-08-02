@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""super-board-normalize.py — continuous intake normalization.
+"""super-board-normalize.py — continuous intake and closure normalization.
 
-    intake   plan the normalization of one issue or pull-request event
+    intake    plan the normalization of one issue or pull-request event
+    closure   decide, from evidence, where a closed subject belongs
 
 The plan is machine-readable and is never applied here. Project card adds and
 Project status changes are top-level orchestration: an operator session holds
@@ -11,8 +12,15 @@ paginated Project snapshot would decide membership from nothing, and an
 undecidable membership is not an absent card.
 
 Usage:
-    super-board-normalize.py intake --issue URL [--event EVENT]
-                                    --payload FILE [--json]
+    super-board-normalize.py intake  --issue URL   [--event EVENT]
+                                     --payload FILE [--json]
+    super-board-normalize.py closure --subject URL [--event EVENT]
+                                     [--activation-boundary RFC3339]
+                                     --payload FILE [--json]
+
+`closure` never manufactures evidence. A subject closed before the declared
+activation boundary keeps its original evidence untouched; only its board
+status is corrected.
 
 `--payload` carries a pre-fetched `{"subject": {...}, "project": {...}}`
 document: the subject as the event delivered it, and a complete Project
@@ -28,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -40,6 +49,7 @@ from super_board_runtime import EXIT_CONFIG, EXIT_CONFLICT, EXIT_OK, EXIT_USAGE 
 from super_board_runtime.normalize import (  # noqa: E402
     IssueOrPullRequestSnapshot,
     NormalizationError,
+    normalize_closure,
     normalize_intake,
 )
 from super_board_runtime.project import ProjectSnapshot  # noqa: E402
@@ -61,9 +71,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     intake = sub.add_parser("intake", help="plan the normalization of one event")
     intake.add_argument("--issue", required=True, help="the issue or pull-request URL")
-    intake.add_argument("--event", default=None, help="the delivered event action")
-    intake.add_argument("--payload", default=None, help="pre-fetched subject and Project snapshot")
-    intake.add_argument("--json", action="store_true", help="accepted for symmetry; output is always JSON")
+
+    closure = sub.add_parser("closure", help="decide where a closed subject belongs")
+    closure.add_argument("--subject", required=True, help="the issue or pull-request URL")
+    closure.add_argument(
+        "--activation-boundary",
+        default=None,
+        help="RFC3339 instant before which closures are historical and evidence is preserved",
+    )
+
+    for command in (intake, closure):
+        command.add_argument("--event", default=None, help="the delivered event action")
+        command.add_argument(
+            "--payload", default=None, help="pre-fetched subject and Project snapshot"
+        )
+        command.add_argument(
+            "--json", action="store_true", help="accepted for symmetry; output is always JSON"
+        )
     return parser
 
 
@@ -108,6 +132,7 @@ def _project(raw: Any) -> ProjectSnapshot:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
+    requested = args.issue if args.command == "intake" else args.subject
 
     try:
         if args.payload is None:
@@ -124,12 +149,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         subject = _subject(document.get("subject"))
         if args.event:
             subject = type(subject)(**{**subject.__dict__, "event": args.event})
-        if subject.url and args.issue and subject.url != args.issue:
+        if subject.url and requested and subject.url != requested:
             raise NormalizationError(
                 "normalize-subject-mismatch",
-                "--issue names a different subject than the payload carries",
+                "the named subject is not the one the payload carries",
             )
-        plan = normalize_intake(subject, _project(document.get("project")))
+        project = _project(document.get("project"))
+        if args.command == "intake":
+            plan = normalize_intake(subject, project)
+        else:
+            plan = normalize_closure(
+                subject,
+                project,
+                activation_boundary=args.activation_boundary,
+                environment=os.environ,
+            )
     except NormalizationError as exc:
         print(f"super-board-normalize: {exc}", file=sys.stderr)
         print(json.dumps({"ok": False, "reason": exc.reason}, sort_keys=True), file=sys.stderr)

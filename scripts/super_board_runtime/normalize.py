@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timezone
 from typing import Any, Mapping, Optional, Sequence
 
 try:  # normal package import
@@ -45,6 +46,11 @@ try:  # normal package import
         MutationDecision,
         ProjectSnapshot,
         compare_project_mutation,
+    )
+    from .publication import (
+        UnsafePublication,
+        render_payload,
+        sanitize_and_validate_publication,
     )
     from .routing import resolve_branch_route
 except ImportError:  # executed as a plain file path
@@ -60,6 +66,11 @@ except ImportError:  # executed as a plain file path
         MutationDecision,
         ProjectSnapshot,
         compare_project_mutation,
+    )
+    from super_board_runtime.publication import (
+        UnsafePublication,
+        render_payload,
+        sanitize_and_validate_publication,
     )
     from super_board_runtime.routing import resolve_branch_route
 
@@ -167,6 +178,33 @@ REQUIRED_PULL_REQUEST_CLASSIFICATION_FIELDS: tuple[str, ...] = (
     "close_evidence",
 )
 
+#: The only evidence kinds that close an issue as completed work. Each one is a
+#: thing somebody can open and read; "it looked done" is not on the list.
+ACCEPTED_COMPLETION_EVIDENCE_TYPES: tuple[str, ...] = (
+    "merged-pull-request",
+    "qa-evidence",
+    "review-evidence",
+    "operator-acceptance",
+)
+
+#: Every disposition a closure can resolve to. Anything not on this list leaves
+#: the card out of the completion column.
+CLOSURE_DISPOSITIONS: tuple[str, ...] = (
+    "merged",
+    "completed",
+    "duplicate",
+    "not-planned",
+    "superseded",
+    "abandoned",
+    "reopened",
+    "open-in-completion-column",
+    "pre-activation-historical",
+)
+
+#: The completion column. Only the closure normalizer writes it — see
+#: `review.DONE_WRITER`.
+COMPLETION_STATUS = "Done"
+
 _SECTION_RE = re.compile(r"(?m)^[ \t]{0,3}#{2,4}[ \t]+(.+?)[ \t]*$")
 
 #: GitHub renders an unanswered optional form field as this exact string.
@@ -217,6 +255,7 @@ class IssueOrPullRequestSnapshot:
     mergeable: Optional[str] = None
     linked_issues: tuple["IssueOrPullRequestSnapshot", ...] = ()
     closing_state: Optional[str] = None
+    closed_at: Optional[str] = None
     merged_at: Optional[str] = None
     merge_commit_sha: Optional[str] = None
     supersession_evidence: Optional[Mapping[str, Any]] = None
@@ -852,7 +891,235 @@ def _holding(
     return replace(base, operations=(), blocked_reason=reason, desired_status=None)
 
 
+# ───────────────────────────── closure ─────────────────────────────
+
+
+def _timestamp(value: Optional[str]) -> Optional[datetime]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _linked(evidence: Any) -> bool:
+    """Evidence somebody can open. A mapping with no link is a claim, not a link."""
+    return isinstance(evidence, Mapping) and _clean(evidence.get("url")) is not None
+
+
+def accepted_completion_evidence(evidence: Any) -> bool:
+    """True only for typed, linked completion evidence."""
+    if not _linked(evidence):
+        return False
+    return evidence.get("type") in ACCEPTED_COMPLETION_EVIDENCE_TYPES
+
+
+def _issue_disposition(subject: IssueOrPullRequestSnapshot) -> Optional[str]:
+    if accepted_completion_evidence(subject.completion_evidence):
+        return "completed"
+    if _clean(subject.duplicate_of):
+        return "duplicate"
+    if _is_concrete_reason(subject.not_planned_reason):
+        return "not-planned"
+    return None
+
+
+def _pull_request_disposition(subject: IssueOrPullRequestSnapshot) -> Optional[str]:
+    # A merge is the one disposition GitHub itself attests to — but only once
+    # the readback carries the timestamp. A merge commit SHA on its own can be
+    # a stale field on a pull request that was closed instead.
+    if _clean(subject.merged_at):
+        return "merged"
+    if _linked(subject.supersession_evidence):
+        return "superseded"
+    if _linked(subject.abandonment_evidence):
+        return "abandoned"
+    return None
+
+
+_ISSUE_CORRECTIVE_COMMENT = (
+    "This issue was closed without an accepted disposition, so Superboard "
+    "reopened it and moved it to Blocked rather than counting it as finished "
+    "work.\n\n"
+    "Subject: {url}\n"
+    "Title: {title}\n\n"
+    "Close it again with exactly one of:\n\n"
+    "- accepted completion evidence — a linked, typed record "
+    "({evidence_types});\n"
+    "- a linked duplicate — the issue that survives;\n"
+    "- a not planned decision that states, concretely, what was decided.\n\n"
+    "Until one of those exists there is no way to tell this card apart from "
+    "work that was actually built, tested, reviewed, and merged."
+)
+
+_PULL_REQUEST_CORRECTIVE_COMMENT = (
+    "This pull request was closed without being merged and without a linked "
+    "disposition, so Superboard moved its card to Blocked rather than counting "
+    "it as finished work.\n\n"
+    "Subject: {url}\n"
+    "Title: {title}\n\n"
+    "Record one of:\n\n"
+    "- linked supersession evidence — the pull request that carried this work;\n"
+    "- linked abandonment evidence — the issue or decision that dropped it.\n\n"
+    "A closed branch with neither is unfinished work, not completed work."
+)
+
+
+def _corrective_comment(
+    subject: IssueOrPullRequestSnapshot, environment: Mapping[str, str]
+) -> Optional[str]:
+    """Render the comment, then sanitize it. Never the other way round."""
+    template = (
+        _PULL_REQUEST_CORRECTIVE_COMMENT
+        if subject.is_pull_request
+        else _ISSUE_CORRECTIVE_COMMENT
+    )
+    rendered = render_payload(
+        [
+            template.format(
+                url=subject.url or "(unknown subject)",
+                title=subject.title or "(untitled)",
+                evidence_types=", ".join(ACCEPTED_COMPLETION_EVIDENCE_TYPES),
+            )
+        ]
+    )
+    try:
+        return sanitize_and_validate_publication(
+            rendered, environment, surface="closure-comment"
+        ).text
+    except UnsafePublication:
+        # Nothing is published, and nothing quotes the value that failed.
+        return None
+
+
+def normalize_closure(
+    subject: IssueOrPullRequestSnapshot,
+    project: ProjectSnapshot,
+    *,
+    activation_boundary: Optional[str] = None,
+    environment: Optional[Mapping[str, str]] = None,
+) -> NormalizationPlan:
+    """Decide, from evidence, whether a closed subject belongs in the completion column."""
+    kind = "pull_request" if subject.is_pull_request else "issue"
+    event = subject.event or ""
+    base = NormalizationPlan(
+        subject_url=subject.url,
+        subject_kind=kind,
+        event=event,
+        normalized=True,
+        classification=classify_pull_request(subject) if kind == "pull_request" else None,
+    )
+
+    if getattr(project, "hit_cap", False):
+        return replace(base, blocked_reason="project-membership-unknown")
+
+    items = tuple(project.items)
+    item = find_project_item(items, subject.node_id)
+    base = replace(base, membership_lookups=1, is_member=item is not None)
+    if item is None:
+        return replace(base, blocked_reason="closure-card-not-on-board")
+
+    expected, current = _states(item, subject)
+
+    closed = (subject.state or "").strip().casefold() == "closed"
+    boundary = _timestamp(activation_boundary)
+    closed_at = _timestamp(subject.closed_at)
+    pre_activation = bool(closed and boundary and closed_at and closed_at < boundary)
+
+    disposition: Optional[str] = None
+    desired_status: Optional[str] = None
+    blocked_reason: Optional[str] = None
+    reopen = False
+    comment: Optional[str] = None
+
+    if event == "reopened" or (not closed and event == "reopened"):
+        disposition = "reopened"
+        desired_status = "Backlog"
+    elif not closed:
+        if current.status == COMPLETION_STATUS:
+            # An open card in the completion column is a board error, not a state.
+            disposition = "open-in-completion-column"
+            desired_status = "Backlog"
+    elif pre_activation:
+        # Its board status is corrected. Its evidence is not touched: writing
+        # modern acceptance evidence onto a historical closure would be
+        # manufacturing a record of a review that never happened.
+        disposition = "pre-activation-historical"
+        desired_status = COMPLETION_STATUS
+    else:
+        disposition = (
+            _pull_request_disposition(subject)
+            if kind == "pull_request"
+            else _issue_disposition(subject)
+        )
+        if disposition is not None:
+            desired_status = COMPLETION_STATUS
+        else:
+            desired_status = "Blocked"
+            blocked_reason = (
+                "pull-request-disposition-missing"
+                if kind == "pull_request"
+                else "closure-disposition-missing"
+            )
+            # A closed pull request is never reopened by the runtime: the branch
+            # is the author's, and reopening it would re-enter a review nobody
+            # asked for. An issue is reopened, because the work is not done.
+            reopen = kind == "issue"
+            comment = _corrective_comment(subject, environment or {})
+            if comment is None:
+                blocked_reason = "closure-comment-unsafe"
+
+    operations: list[PlannedOperation] = []
+    if reopen:
+        operations.append(
+            _operation("reopen", expected, current, {"state": "open"}, comparable=True)
+        )
+    if desired_status and current.status != desired_status:
+        operations.append(
+            _operation(
+                "status",
+                expected,
+                current,
+                {"status": desired_status},
+                comparable=True,
+                desired_status=desired_status,
+            )
+        )
+    if comment is not None:
+        operations.append(
+            _operation(
+                "closure-comment",
+                expected,
+                current,
+                {"body": comment, "surface": "closure-comment"},
+                comparable=True,
+            )
+        )
+
+    return _finalize(
+        replace(
+            base,
+            operations=tuple(operations),
+            desired_status=desired_status,
+            blocked_reason=blocked_reason,
+            disposition=disposition,
+            reopen=reopen,
+            comment=comment,
+            pre_activation=pre_activation,
+            evidence_preserved=True,
+        )
+    )
+
+
 __all__ = [
+    "ACCEPTED_COMPLETION_EVIDENCE_TYPES",
+    "CLOSURE_DISPOSITIONS",
+    "COMPLETION_STATUS",
     "ENVIRONMENT_CONSTRAINT_LABEL",
     "HOLDING_STATUSES",
     "INTAKE_ISSUE_EVENTS",
@@ -872,10 +1139,12 @@ __all__ = [
     "NormalizationPlan",
     "PlannedOperation",
     "PullRequestClassification",
+    "accepted_completion_evidence",
     "canonical_environment_label",
     "classify_pull_request",
     "find_project_item",
     "handles_event",
+    "normalize_closure",
     "normalize_intake",
     "parse_intake_form",
 ]

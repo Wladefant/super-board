@@ -84,10 +84,33 @@ jobs:
             echo "intake normalization refused with exit ${status}; nothing was written" >&2
           fi
 
-      - name: Publish the plan as a build artifact
+      - name: Plan closure normalization
+        id: closure
+        if: github.event.action == 'closed' || github.event.action == 'reopened'
+        env:
+          SUBJECT_URL: ${{ github.event.issue.html_url || github.event.pull_request.html_url }}
+          SUBJECT_EVENT: ${{ github.event.action }}
+          # The instant before which closures are historical. Their board status
+          # is corrected; their original evidence is left exactly as it was.
+          ACTIVATION_BOUNDARY: ${{ vars.SUPERBOARD_ACTIVATION_BOUNDARY }}
+          # Deliberately no Project write credential: the plan is applied by an
+          # operator session, not by this job.
+        run: |
+          python .claude/bin/super-board-normalize.py closure \
+            --subject "${SUBJECT_URL}" \
+            --event "${SUBJECT_EVENT}" \
+            --activation-boundary "${ACTIVATION_BOUNDARY}" \
+            --json > closure-plan.json || status=$?
+          if [ "${status:-0}" -ne 0 ]; then
+            echo "closure normalization refused with exit ${status}; nothing was written" >&2
+          fi
+
+      - name: Publish the plans as build artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: superboard-normalization-plan
-          path: intake-plan.json
+          path: |
+            intake-plan.json
+            closure-plan.json
           if-no-files-found: ignore
