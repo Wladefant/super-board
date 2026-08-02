@@ -1,0 +1,37 @@
+{
+  "capabilities": {
+    "analytics": false,
+    "clips": false,
+    "design_presentation": true,
+    "plan": false,
+    "project_projection": true
+  },
+  "credentials": [],
+  "description": "Read-only projection of the Superboard: the board as it is, and the design work attached to it. It renders; it never decides.",
+  "environment": {
+    "AGENT_PROD_CODE_EXECUTION": "off"
+  },
+  "ledgers": [],
+  "mode": "read-only-projection",
+  "name": "super-board",
+  "negative_capabilities": [
+    "no-docker-socket",
+    "no-github-write-token",
+    "no-project-write-credential",
+    "no-repository-checkout",
+    "no-runner-filesystem-mount",
+    "no-second-completion-ledger",
+    "no-trusted-shell"
+  ],
+  "output": {
+    "sanitizer": "sanitize_and_validate_publication",
+    "source": "read-only-snapshot",
+    "surface": "project-text-field"
+  },
+  "reads": [
+    "project-item-snapshot",
+    "design-prototype-gallery"
+  ],
+  "writes": [],
+  "version": 1
+}
