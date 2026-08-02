@@ -111,9 +111,26 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
             r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)", re.S
         ),
     ),
+    # Headers reach this boundary far more often as JSON or YAML than as a bare
+    # header line — captured requests, `gh api` output, and structured tool
+    # results are all mappings — so every shape of the same header is matched,
+    # not just the one a terminal happens to print.
     ("authorization-header", re.compile(r"(?im)^[^\S\n]*authorization[^\S\n]*:[^\n]*$")),
-    ("authorization-header", re.compile(r"\bBearer[ \t]+[A-Za-z0-9._~+/=\-]{16,}")),
+    (
+        "authorization-header",
+        re.compile(r"""(?i)["']?authorization["']?[^\S\n]*[:=][^\S\n]*["']?[^\s,}\]"']+"""),
+    ),
     ("cookie", re.compile(r"(?im)^[^\S\n]*(?:set-)?cookie[^\S\n]*:[^\n]*$")),
+    (
+        "cookie",
+        re.compile(r"""(?i)["']?(?:set-)?cookie["']?[^\S\n]*[:=][^\S\n]*["']?[^\s,}\]"']+"""),
+    ),
+    # `curl -b '<jar>'` / `--cookie <jar>`: a cookie with no `Cookie` word near
+    # it. The `=` is required so an unrelated `-b` flag is not mangled.
+    (
+        "cookie",
+        re.compile(r"""(?i)(?:^|[\s'"])(?:--cookie|-b)[= \t]+(?:"[^"]*=[^"]*"|'[^']*=[^']*'|\S*=\S*)"""),
+    ),
     ("github-token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}\b")),
     ("github-token", re.compile(r"\bgithub_pat_[A-Za-z0-9_]{16,}\b")),
     ("dokploy-key", re.compile(r"\bpolysim_mcp[A-Za-z0-9_-]{8,}\b")),
@@ -122,6 +139,15 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("cloud-key", re.compile(r"\bAIza[0-9A-Za-z_\-]{35}\b")),
     ("cloud-key", re.compile(r"\bsk-[A-Za-z0-9_\-]{20,}\b")),
     ("cloud-key", re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b")),
+    # Any auth scheme carrying a credential, wherever it appears — `Basic` and
+    # `token` are as common as `Bearer` and were not matched at all. Runs after
+    # the provider patterns so a recognizable token keeps its own category.
+    (
+        "authorization-header",
+        re.compile(
+            r"(?i)(?<![-\w])(?:Bearer|Basic|Digest|OAuth|Token)[ \t]+[A-Za-z0-9._~+/=\-]{16,}"
+        ),
+    ),
     # Credentials embedded in a URL: scheme://user:password@host
     ("credentialed-url", re.compile(r"\b[a-zA-Z][a-zA-Z0-9+.\-]*://[^\s/@:]+:[^\s/@]+@\S+")),
     # Credential-bearing command arguments, both `--flag value` and `--flag=value`.

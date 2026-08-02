@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -53,6 +54,8 @@ DOKPLOY_KEY = "polysim" + "_mcp" + ("N" * 32)
 AWS_KEY = "AKIA" + ("N" * 16)
 GOOGLE_KEY = "AIza" + ("N" * 35)
 BEARER = "Bearer " + ("N" * 40)
+BASIC_AUTH = "Basic " + ("N" * 40)
+TOKEN_AUTH = "token " + ("N" * 40)
 COOKIE_VALUE = "session=" + ("N" * 40)
 PRIVATE_KEY = (
     "-----BEGIN RSA PRIVATE KEY" + "-----\n" + ("N" * 64) + "\n-----END RSA PRIVATE KEY" + "-----"
@@ -188,10 +191,48 @@ class RedactionTests(unittest.TestCase):
             BEARER,
         )
 
+    def test_authorization_in_structured_output(self) -> None:
+        """A header is a header whether it arrives as a line or as a mapping.
+
+        Tool output and captured requests reach the boundary as JSON and YAML
+        far more often than as a bare header line, and the scheme is frequently
+        Basic or token rather than Bearer.
+        """
+        for text, secret in (
+            (f'{{"Authorization": "{BASIC_AUTH}"}}', BASIC_AUTH),
+            (f"headers:\n  authorization: {TOKEN_AUTH}\n", TOKEN_AUTH),
+            (f'"authorization" : "{BEARER}"', BEARER),
+            (f"curl -H 'Authorization: {BASIC_AUTH}' https://example.invalid", BASIC_AUTH),
+            (f"authorization={TOKEN_AUTH}", TOKEN_AUTH),
+        ):
+            with self.subTest(text=text[:40]):
+                self._assert_redacted(text, "authorization-header", secret)
+
+    def test_an_authorization_value_with_no_recognizable_scheme(self) -> None:
+        opaque = "N" * 44
+        self._assert_redacted(
+            f'{{"authorization": "{opaque}"}}', "authorization-header", opaque
+        )
+
+    def test_basic_and_token_schemes_anywhere_in_the_payload(self) -> None:
+        self._assert_redacted(f"it retried with {BASIC_AUTH} and failed", "authorization-header", BASIC_AUTH)
+        self._assert_redacted(f"it retried with {TOKEN_AUTH} and failed", "authorization-header", TOKEN_AUTH)
+
     def test_cookies(self) -> None:
         self._assert_redacted(
             f"response headers:\nSet-Cookie: {COOKIE_VALUE}; Path=/", "cookie", COOKIE_VALUE
         )
+
+    def test_cookies_in_structured_output(self) -> None:
+        for text, secret in (
+            (f'{{"cookie": "{COOKIE_VALUE}"}}', COOKIE_VALUE),
+            (f'{{"Set-Cookie": "{COOKIE_VALUE}; Path=/"}}', COOKIE_VALUE),
+            (f"headers:\n  set-cookie: {COOKIE_VALUE}\n", COOKIE_VALUE),
+            (f"replayed with cookie={COOKIE_VALUE} and got 200", COOKIE_VALUE),
+            (f"curl -b '{COOKIE_VALUE}' https://example.invalid", COOKIE_VALUE),
+        ):
+            with self.subTest(text=text[:40]):
+                self._assert_redacted(text, "cookie", secret)
 
     def test_private_key_markers(self) -> None:
         self._assert_redacted(f"deploy key:\n{PRIVATE_KEY}\n", "private-key", "N" * 64)
@@ -338,6 +379,78 @@ class PublishCliTests(unittest.TestCase):
         body = json.loads(out)
         self.assertNotIn(GITHUB_TOKEN, body["text"])
         self.assertIn("github-token", [r["category"] for r in body["redactions"]])
+
+    def test_the_process_environment_is_scanned_even_when_the_payload_omits_it(self) -> None:
+        """Shell callers publish `{surface, text}` and nothing else.
+
+        The credential they are most likely to echo is the one that is already
+        exported in the process they are running in, and a value that matches no
+        provider pattern only ever gets caught by being a known value.
+        """
+        secret = "N" * 41
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "payload.json"
+            path.write_text(
+                json.dumps({"surface": "qa-comment", "text": f"the runner echoed {secret}"}),
+                encoding="utf-8",
+            )
+            previous = os.environ.get("SUPERBOARD_TEST_TOKEN")
+            os.environ["SUPERBOARD_TEST_TOKEN"] = secret
+            try:
+                code, out, _ = self._run(["publish", "--input", str(path), "--json"])
+            finally:
+                if previous is None:
+                    os.environ.pop("SUPERBOARD_TEST_TOKEN", None)
+                else:
+                    os.environ["SUPERBOARD_TEST_TOKEN"] = previous
+        self.assertEqual(code, 0)
+        body = json.loads(out)
+        self.assertNotIn(secret, body["text"])
+        self.assertIn("env-value", [r["category"] for r in body["redactions"]])
+
+    def test_a_trivial_ambient_value_does_not_refuse_every_payload(self) -> None:
+        """`SESSIONNAME=Console` is a credential NAME holding a non-credential.
+
+        Admitting those would refuse any payload containing the character `1` —
+        a boundary nobody can publish through is not a boundary that fails
+        closed. A DECLARED short value still refuses; see FailClosedTests.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "payload.json"
+            path.write_text(
+                json.dumps({"surface": "qa-comment", "text": "1 test, 0 failures."}),
+                encoding="utf-8",
+            )
+            previous = os.environ.get("SUPERBOARD_TEST_SESSION")
+            os.environ["SUPERBOARD_TEST_SESSION"] = "1"
+            try:
+                code, out, _ = self._run(["publish", "--input", str(path), "--json"])
+            finally:
+                if previous is None:
+                    os.environ.pop("SUPERBOARD_TEST_SESSION", None)
+                else:
+                    os.environ["SUPERBOARD_TEST_SESSION"] = previous
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["text"], "1 test, 0 failures.")
+
+    def test_an_explicit_payload_environment_still_applies(self) -> None:
+        secret = "N" * 39
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "payload.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "surface": "qa-comment",
+                        "text": f"the runner echoed {secret}",
+                        "environment": {"DEPLOY_TOKEN": secret},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            code, out, _ = self._run(["publish", "--input", str(path), "--json"])
+        self.assertEqual(code, 0)
+        body = json.loads(out)
+        self.assertNotIn(secret, body["text"])
 
     def test_an_unknown_surface_exits_65(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
