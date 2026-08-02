@@ -73,6 +73,10 @@ QA_CHECK_CONTEXT = "superboard/exact-sha-qa"
 #: The three dispositions a QA failure may carry. Anything else fails closed.
 QA_FAILURE_KINDS: tuple[str, ...] = ("repairable", "external-input", "outside-acceptance")
 
+#: The statuses whose recorded `tested_sha` is rechecked against the live head
+#: on every pass. A card parked anywhere else is not claiming passing evidence.
+QA_FRESHNESS_STATUSES: tuple[str, ...] = ("QA", "Review")
+
 #: The only statuses a QA failure may produce. `Done` is structurally absent:
 #: the runtime never merges and never completes work.
 QA_FAILURE_STATUSES: tuple[str, ...] = ("Building", "Blocked")
@@ -459,6 +463,164 @@ def inherited_check_state(entry: QaLedgerEntry, head_sha: Any) -> Optional[str]:
     return "success" if candidate == entry.tested_sha else None
 
 
+# ───────────────────────────── freshness ─────────────────────────────
+
+
+@dataclass(frozen=True)
+class QaFreshness:
+    fresh: bool
+    invalidated: bool
+    tested_sha: str
+    current_head_sha: Optional[str]
+    next_status: Optional[str]
+    pending_status_sha: Optional[str]
+    reason_code: Optional[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return dict(asdict(self))
+
+
+def requires_freshness_check(status: Any) -> bool:
+    """True for the statuses that claim passing QA evidence."""
+    return isinstance(status, str) and status.strip() in QA_FRESHNESS_STATUSES
+
+
+def pending_check_for_head(head_sha: Any) -> dict[str, Any]:
+    """The pending status a newly-arrived head carries until it is tested itself."""
+    sha = _normalize_sha(head_sha, "qa-head-invalid")
+    return {
+        "context": QA_CHECK_CONTEXT,
+        "description": "exact-SHA QA required for this commit",
+        "sha": sha,
+        "state": "pending",
+    }
+
+
+def validate_qa_freshness(entry: QaLedgerEntry, current_head_sha: Any) -> QaFreshness:
+    """Compare a recorded `tested_sha` with the live head.
+
+    A changed head is not a warning: the evidence describes a commit that is no
+    longer the head, so the card goes back to QA and the new head starts
+    pending. An unreadable head fails closed the same way — never fresh.
+    """
+    try:
+        current = _normalize_sha(current_head_sha, "qa-head-invalid")
+    except QaError:
+        return QaFreshness(
+            fresh=False,
+            invalidated=True,
+            tested_sha=entry.tested_sha,
+            current_head_sha=None,
+            next_status="QA",
+            pending_status_sha=None,
+            reason_code="qa-head-unreadable",
+        )
+    if entry.invalidated or entry.result != "success":
+        return QaFreshness(
+            fresh=False,
+            invalidated=True,
+            tested_sha=entry.tested_sha,
+            current_head_sha=current,
+            next_status="QA",
+            pending_status_sha=current,
+            reason_code="qa-evidence-not-success",
+        )
+    if current != entry.tested_sha:
+        return QaFreshness(
+            fresh=False,
+            invalidated=True,
+            tested_sha=entry.tested_sha,
+            current_head_sha=current,
+            next_status="QA",
+            pending_status_sha=current,
+            reason_code="qa-head-moved",
+        )
+    return QaFreshness(
+        fresh=True,
+        invalidated=False,
+        tested_sha=entry.tested_sha,
+        current_head_sha=current,
+        next_status=None,
+        pending_status_sha=None,
+        reason_code=None,
+    )
+
+
+def invalidate_qa_entry(entry: QaLedgerEntry, current_head_sha: Any) -> QaLedgerEntry:
+    """Return a NEW entry marking the evidence invalidated.
+
+    The original is left exactly as it was recorded. "What did we test, and
+    when" has to stay answerable after the head moves, so the ledger appends an
+    invalidation rather than rewriting history.
+    """
+    current = _normalize_sha(current_head_sha, "qa-head-invalid")
+    return QaLedgerEntry(
+        schema_version=entry.schema_version,
+        issue_url=entry.issue_url,
+        issue_node_id=entry.issue_node_id,
+        pull_request_url=entry.pull_request_url,
+        pull_request_node_id=entry.pull_request_node_id,
+        tested_sha=entry.tested_sha,
+        current_head_sha=current,
+        selected_base_branch=entry.selected_base_branch,
+        branch_declaration=entry.branch_declaration,
+        check_context=entry.check_context,
+        check_url=entry.check_url,
+        sanitized_evidence_url=entry.sanitized_evidence_url,
+        result="invalidated",
+        invalidated=True,
+        started_at=entry.started_at,
+        completed_at=entry.completed_at,
+    )
+
+
+# ───────────────────────────── merge handoff ─────────────────────────────
+
+
+@dataclass(frozen=True)
+class MergeHandoffDecision:
+    merge_ready: bool
+    reason_code: Optional[str]
+    tested_sha: str
+    current_head_sha: Optional[str]
+    check_context: str = QA_CHECK_CONTEXT
+
+    def to_dict(self) -> dict[str, Any]:
+        return dict(asdict(self))
+
+
+def validate_merge_handoff(
+    entry: QaLedgerEntry, head: PullRequestHead, check_conclusion: Any
+) -> MergeHandoffDecision:
+    """The last gate before a human merges. Read-only, and never fails open.
+
+    Rereads nothing itself — the caller supplies the freshly-read head and the
+    conclusion of the SHA-bound required check — so this function issues zero
+    writes and zero API calls. `merge_ready` is true only when the live head is
+    the tested commit AND the required check on that commit concluded success.
+    """
+    current = head.head_sha if isinstance(head, PullRequestHead) else None
+
+    def refuse(reason: str) -> MergeHandoffDecision:
+        return MergeHandoffDecision(False, reason, entry.tested_sha, current)
+
+    if entry.invalidated or entry.result == "discarded" or entry.result == "invalidated":
+        return refuse("qa-evidence-invalidated")
+    if entry.result != "success":
+        return refuse("qa-evidence-not-success")
+    try:
+        current = _normalize_sha(current, "qa-head-invalid")
+    except QaError:
+        return refuse("head-moved")
+    if current != entry.tested_sha:
+        return refuse("head-moved")
+    if not isinstance(check_conclusion, str) or not check_conclusion.strip():
+        return refuse("check-missing")
+    if check_conclusion.strip().lower() != "success":
+        return refuse("check-not-success")
+    return MergeHandoffDecision(True, None, entry.tested_sha, current)
+
+
 # ───────────────────────────── failure disposition ─────────────────────────────
 
 
@@ -567,6 +729,18 @@ def build_parser() -> argparse.ArgumentParser:
     resolve.add_argument("--expected-sha", default=None, help="reread: refuse a changed head")
     resolve.add_argument("--checkout", default="detached", help="QA authority checkout mode")
 
+    handoff = sub.add_parser(
+        "merge-handoff", help="read-only: may this item be reported merge-ready?"
+    )
+    handoff.add_argument("--ledger", required=True, help="the QA ledger entry JSON file")
+    handoff.add_argument("--pull-request", required=True)
+    handoff.add_argument("--payload", default=None, help="read the PR payload from a file, not gh")
+    handoff.add_argument(
+        "--check-conclusion",
+        default=None,
+        help=f"conclusion of the {QA_CHECK_CONTEXT} status on the tested SHA",
+    )
+
     disposition = sub.add_parser("disposition", help="where a failed QA run sends the card")
     disposition.add_argument("--config", required=True)
     disposition.add_argument("--issue-url", required=True)
@@ -623,6 +797,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(json.dumps(body, sort_keys=True))
         return EXIT_OK
 
+    if args.command == "merge-handoff":
+        fetch = None
+        if args.payload:
+            payload_path = Path(args.payload)
+
+            def fetch(_url):  # noqa: F811 - deliberate local rebinding
+                return json.loads(payload_path.read_text(encoding="utf-8"))
+
+        try:
+            raw = json.loads(Path(args.ledger).read_text(encoding="utf-8"))
+            entry = QaLedgerEntry(**raw)
+            head = resolve_pull_request_head(args.pull_request, fetch=fetch)
+        except QaError as exc:
+            # An unreadable head is not merge-ready; report it, never fail open.
+            body = MergeHandoffDecision(False, exc.reason, str(raw.get("tested_sha", "")), None)
+            print(json.dumps({**body.to_dict(), "ok": False}, sort_keys=True), file=sys.stderr)
+            print(f"super-board-qa: {exc}", file=sys.stderr)
+            return exc.exit_code
+        except (OSError, TypeError, ValueError) as exc:
+            print(f"super-board-qa: unreadable QA ledger entry: {exc}", file=sys.stderr)
+            print(
+                json.dumps({"ok": False, "reason": "qa-ledger-invalid"}, sort_keys=True),
+                file=sys.stderr,
+            )
+            return EXIT_CONFIG
+        decision = validate_merge_handoff(entry, head, args.check_conclusion)
+        print(json.dumps({**decision.to_dict(), "ok": True}, sort_keys=True))
+        return EXIT_OK
+
     config = _load_config_or_exit(args.config)
     result = QaResult(
         issue_url=args.issue_url,
@@ -668,9 +871,12 @@ __all__ = [
     "QA_CHECK_CONTEXT",
     "QA_FAILURE_KINDS",
     "QA_FAILURE_STATUSES",
+    "QA_FRESHNESS_STATUSES",
+    "MergeHandoffDecision",
     "PullRequestHead",
     "QaError",
     "QaFailureDisposition",
+    "QaFreshness",
     "QaLedgerEntry",
     "QaResult",
     "QaWorktree",
@@ -678,10 +884,15 @@ __all__ = [
     "disposition_qa_failure",
     "file_qa_failure",
     "inherited_check_state",
+    "invalidate_qa_entry",
     "locked_qa_worktree",
+    "pending_check_for_head",
     "publish_qa_status",
     "record_qa_result",
+    "requires_freshness_check",
     "resolve_linked_pull_request",
     "resolve_pull_request_head",
     "utc_now",
+    "validate_merge_handoff",
+    "validate_qa_freshness",
 ]
