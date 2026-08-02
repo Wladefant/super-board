@@ -255,7 +255,9 @@ Four config keys carry most of the safety, and none of them used to be documente
   `null` in `off`, an exact issue URL in `proof-only`, and `null` again in `active`. Nothing at
   runtime — no flag, no command, no environment variable — dispatches past the mode, and in
   `proof-only` only the exact allowlisted issue may be selected.
-- **The `Branch route:` declaration** — every dispatchable issue declares exactly one explicit
+- **The `Branch route:` declaration** — the Issue Form's `branch-route` field, carried as
+  `branch_route` on the normalized intake form and resolved against the config's
+  `branch_routes` table. Every dispatchable issue declares exactly one explicit
   route in its body. Missing, omitted, `default`, unknown, duplicated or conflicting
   declarations are INELIGIBLE and fail **before** a branch is created. A Test Area never
   implies a route. A design branch is never a dispatch route.
