@@ -33,7 +33,24 @@
 SB_GH_GUARD_DEFAULT_COST=100       # a ProjectsV2 item scan is ~103 points
 SB_GH_GUARD_BUDGET_DEFAULT=150     # per-worker soft cap on gh calls
 SB_GH_GUARD_SUBAGENT_BUDGET=50     # per adversarial-mode sub-agent cap
-SB_GH_GUARD_STATE_FILE="${SB_GH_GUARD_STATE_FILE:-${TMPDIR:-/tmp}/super-board-gh-budget-$$}"
+
+# The worker-local budget file. Deliberately NOT a name derived from the PID:
+# `${TMPDIR:-/tmp}/super-board-gh-budget-$$` is guessable, so anyone else on the
+# machine could create it first — as a symlink to a file this script then
+# truncates and overwrites — and could read a worker's budget whenever they
+# liked. It now lives inside the private 0700 directory `super-board-python.sh`
+# creates for this run, which is unguessable and is removed by `sb_tmp_cleanup`,
+# so the file cannot outlive the worker either.
+#
+# A caller may still pin the path by exporting `SB_GH_GUARD_STATE_FILE`. That
+# path is chmod'ed but NOT removed at exit: the caller chose it, so the caller
+# owns its lifetime.
+SB_GH_GUARD_STATE_FILE="${SB_GH_GUARD_STATE_FILE:-$(sb_tmp_dir)/gh-budget}"
+
+sb_gh_guard_ensure_state_file() {
+  [ -f "$SB_GH_GUARD_STATE_FILE" ] || : > "$SB_GH_GUARD_STATE_FILE" || return 65
+  chmod 600 "$SB_GH_GUARD_STATE_FILE" 2>/dev/null || true
+}
 
 sb_gh_guard_check() {
   # Refuse a burst that would break the immutable reserve.
@@ -106,6 +123,7 @@ sb_gh_guard_summary() {
 sb_gh_budget_init() {
   # Initialize per-worker budget. Call once at worker start.
   local budget="${1:-$SB_GH_GUARD_BUDGET_DEFAULT}"
+  sb_gh_guard_ensure_state_file || return 65
   echo "$budget" > "$SB_GH_GUARD_STATE_FILE"
 }
 
@@ -118,7 +136,9 @@ sb_gh_budget_spend() {
   # this runtime's exit-code contract does not define at all, so the halt was
   # unreadable to every caller downstream.
   local cost="${1:-1}" remaining
-  [ -f "$SB_GH_GUARD_STATE_FILE" ] || sb_gh_budget_init
+  sb_gh_guard_ensure_state_file || return 65
+  # `-s`, not `-f`: `mktemp` leaves the file existing but empty.
+  [ -s "$SB_GH_GUARD_STATE_FILE" ] || sb_gh_budget_init
   remaining=$(cat "$SB_GH_GUARD_STATE_FILE")
   remaining=$((remaining - cost))
   echo "$remaining" > "$SB_GH_GUARD_STATE_FILE"
@@ -129,7 +149,8 @@ sb_gh_budget_spend() {
 }
 
 sb_gh_budget_remaining() {
-  [ -f "$SB_GH_GUARD_STATE_FILE" ] || sb_gh_budget_init
+  sb_gh_guard_ensure_state_file || return 65
+  [ -s "$SB_GH_GUARD_STATE_FILE" ] || sb_gh_budget_init
   cat "$SB_GH_GUARD_STATE_FILE"
 }
 
@@ -144,6 +165,9 @@ sb_gh_budget_remaining() {
 # Exit codes are the functions' own: 0 affordable · 75 the reserve is reached or
 # the quota is unreadable · 64 invalid invocation.
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  # Executed, so nobody else owns the cleanup: a budget file created here would
+  # otherwise outlive the process that made it.
+  trap sb_tmp_cleanup EXIT
   sb_gh_guard_main() {
     case "${1:-}" in
       check)

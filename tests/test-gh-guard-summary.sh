@@ -150,4 +150,66 @@ echo "$INVOCATION" | grep -q '"check"' \
 echo "$INVOCATION" | grep -Eq '"[0-9]+"' \
   || fail "the workflow must pass an estimated cost to the guard, got: $INVOCATION"
 
-echo "PASS: test-gh-guard-summary.sh (7 scenarios)"
+# ── Scenario 8 — the worker budget file is not a guessable shared-temp path ──
+# It used to be `${TMPDIR:-/tmp}/super-board-gh-budget-$$`. A PID is guessable,
+# so anyone else on the machine can create that name first — as a symlink to
+# something this script then truncates — and can read a worker's state at will.
+cat > "$TMP/state-path.sh" <<EOF
+set -euo pipefail
+. "$PWD/$GUARD"
+sb_gh_budget_init 12
+printf '%s\n' "\$SB_GH_GUARD_STATE_FILE"
+EOF
+STATE_PATH=$(bash "$TMP/state-path.sh")
+[ -n "$STATE_PATH" ] || fail "the guard reports no budget state file at all"
+case "$STATE_PATH" in
+  *super-board-gh-budget-[0-9]*) fail "the budget file is still a PID-predictable path: $STATE_PATH" ;;
+esac
+
+# Created 0600, and gone once the worker exits.
+cat > "$TMP/state-mode.sh" <<EOF
+set -euo pipefail
+trap sb_tmp_cleanup EXIT
+. "$PWD/$GUARD"
+trap sb_tmp_cleanup EXIT
+sb_gh_budget_init 12
+ls -l "\$SB_GH_GUARD_STATE_FILE" | cut -c1-10
+printf '%s\n' "\$SB_GH_GUARD_STATE_FILE"
+EOF
+MODE_OUT=$(bash "$TMP/state-mode.sh")
+MODE=$(echo "$MODE_OUT" | head -1)
+LEFTOVER=$(echo "$MODE_OUT" | tail -1)
+case "$MODE" in
+  -rw-------*) ;;
+  *) echo "note: filesystem does not report POSIX modes ($MODE); skipping the 0600 assertion" >&2 ;;
+esac
+[ -e "$LEFTOVER" ] && fail "the budget file survived the worker's exit: $LEFTOVER"
+
+# ── Scenario 9 — a rendered config is actually removed, spaces and all ──
+# Two bugs in one line. `sb_tmp_cleanup` iterated an unquoted space-delimited
+# STRING, so a path under `dir with spaces/` split into three nonexistent paths
+# and `rm -f` removed none of them. And every real caller runs `sb_config_file`
+# inside a pipeline AND a command substitution — `payload=$(jq … |
+# sb_config_file)` — both subshells, so the registration died with the subshell
+# and nothing was ever cleaned up at all. What was left behind is a rendered
+# publication payload, which carries the caller's environment.
+#
+# The invocation below is the real one: a pipeline, under a TMPDIR with a space.
+SPACED="$PWD/$TMP/dir with spaces"
+mkdir -p "$SPACED"
+cat > "$TMP/spaced.sh" <<EOF
+set -euo pipefail
+export TMPDIR="$SPACED"
+. "$PWD/../scripts/super-board-python.sh"
+PAYLOAD=\$(printf 'secret-bearing config\n' | sb_config_file)
+[ -n "\$PAYLOAD" ] || { echo "sb_config_file produced no path" >&2; exit 1; }
+find "$SPACED" -type f | wc -l | tr -d ' '
+sb_tmp_cleanup
+EOF
+CREATED=$(bash "$TMP/spaced.sh")
+[ "$CREATED" -ge 1 ] || fail "the scenario never created a temp file to clean up"
+REMAINING=$(find "$SPACED" -mindepth 1 | wc -l | tr -d ' ')
+[ "$REMAINING" -eq 0 ] \
+  || fail "a temp file created in a subshell under a spaced path survived cleanup ($REMAINING left in $SPACED)"
+
+echo "PASS: test-gh-guard-summary.sh (9 scenarios)"
