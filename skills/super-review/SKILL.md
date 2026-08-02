@@ -208,11 +208,46 @@ commands concurrently:
 
 ```bash
 codex exec review --base "$(git merge-base origin/<base> HEAD)" \
-  -m gpt-5.5 -c model_reasoning_effort="high"
-codex exec -m gpt-5.5 -c model_reasoning_effort="high" -s read-only "<correctness lens>"
-codex exec -m gpt-5.5 -c model_reasoning_effort="high" -s read-only "<security lens>"
-codex exec -m gpt-5.5 -c model_reasoning_effort="high" -s read-only "<performance and design-consistency lens>"
+  -m gpt-5.5 -c model_reasoning_effort="high" < /dev/null > structured.txt 2>&1
+codex exec -m gpt-5.5 -c model_reasoning_effort="high" -s read-only "<correctness lens>" \
+  < /dev/null > correctness.txt 2>&1
+codex exec -m gpt-5.5 -c model_reasoning_effort="high" -s read-only "<security lens>" \
+  < /dev/null > security.txt 2>&1
+codex exec -m gpt-5.5 -c model_reasoning_effort="high" -s read-only "<perf and design-consistency lens>" \
+  < /dev/null > perf.txt 2>&1
 ```
+
+#### ALWAYS redirect stdin. `codex exec "<prompt>"` deadlocks without it
+
+`codex exec` with a prompt argument reads stdin when no terminal is attached —
+backgrounded, in CI, or inside a subagent — and **blocks forever**. It emits
+exactly one line first:
+
+```
+Reading additional input from stdin...
+```
+
+and then nothing at all: no error, no timeout, no exit. `< /dev/null` turns that
+into an immediate EOF. `super_board_runtime.review` passes `stdin=DEVNULL` in
+code for the same reason, and a test pins it.
+
+**`codex exec review` is NOT affected**, because it takes no prompt argument.
+That asymmetry is what makes the failure so easy to miss: the structured lens
+returns a normal-looking review while the three prompted lenses sit frozen, and
+a fleet reports a quarter of its coverage as if it were all of it. It happened
+on this release's own review gate — three of four lenses silently did nothing
+while appearing to run.
+
+**How to detect it:** check output byte counts about 60 seconds after launch.
+
+```bash
+wc -c *.txt     # a file frozen at ~39 bytes is deadlocked, not thinking
+```
+
+A lens that is genuinely working grows. A lens holding exactly the length of
+that one line has not started and never will. Kill the fleet, add the
+redirection, and run it again — a partial fleet is not a gate, and it is
+indistinguishable from a passing one unless somebody counts the bytes.
 
 Non-negotiable, each for a concrete reason:
 

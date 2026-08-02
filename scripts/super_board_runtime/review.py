@@ -591,8 +591,25 @@ def resolve_findings(
 
 
 def _default_runner(command: Sequence[str], cwd: Path) -> Mapping[str, Any]:
+    """Spawn one lens.
+
+    `stdin=DEVNULL` is load-bearing, not hygiene. `codex exec "<prompt>"` reads
+    stdin when no terminal is attached — backgrounded, in CI, or inside a
+    subagent — and BLOCKS FOREVER. It emits exactly one line first,
+    `Reading additional input from stdin...`, then nothing: no error, no
+    timeout, no exit. A fleet spawned that way reports four lenses running and
+    delivers one, because `codex exec review` takes no prompt argument and is
+    unaffected — so the structured lens produces a normal review while the three
+    prompted lenses sit silent at ~39 bytes. This happened on this release's own
+    review gate. Closing stdin turns the hang into an immediate EOF.
+    """
     result = subprocess.run(
-        list(command), cwd=str(cwd), capture_output=True, text=True, timeout=3600
+        list(command),
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+        timeout=3600,
+        stdin=subprocess.DEVNULL,
     )
     return {"exit_code": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
 
