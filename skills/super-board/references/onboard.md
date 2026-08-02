@@ -49,10 +49,17 @@ Progress: 🛠 onboard (you are here)  →  🧹 lint  →  🤖 run
    └─ D) Use an existing config
            → list configs with descriptions → pick → skip to step 9
 
-2. VERIFY GITHUB AUTH (always)
-   ├─ `gh auth status`  — must be authenticated
-   ├─ Scope check: `project`, `read:project`, `repo`
-   ├─ If missing → `gh auth refresh -s project,read:project,repo`
+2. VERIFY GITHUB IDENTITY (always)
+   ├─ Run the preflight — it is the contract, not `gh auth status` alone:
+   │     python scripts/super-board-auth.py preflight --config <cfg> --mode interactive --json
+   ├─ Interactive mode uses the signed-in session identity and needs no
+   │  environment credential.
+   ├─ Unattended mutation accepts ONLY a machine-account CLASSIC PAT, read
+   │  from the environment variable SUPERBOARD_GITHUB_TOKEN, whose login must
+   │  equal SUPERBOARD_GITHUB_LOGIN, carrying scopes `repo`, `project`,
+   │  `read:org`. Fine-grained PATs and GitHub App tokens are refused:
+   │  GitHub Apps cannot access personal Projects v2 at all.
+   ├─ Missing interactive scopes → `gh auth refresh -s repo,project,read:org`
    └─ Tell user WHY: "needed to move cards on your board and create
        projects on your behalf"
 
@@ -130,10 +137,11 @@ Progress: 🛠 onboard (you are here)  →  🧹 lint  →  🤖 run
 
 11. WRITE CONFIG + ACTIVE POINTER
     ├─ Generate `description` (short, scannable)
-    ├─ Record notifications.bot_identity — either `super-board-bot[bot]`
-    │  (when a GitHub App is installed on the repo) or the user's own
-    │  GitHub login (solo projects). Pick during step 2 based on what
-    │  `gh auth status` returned.
+    ├─ Record notifications.bot_identity — the machine-account login used
+    │  for unattended runs, or the user's own GitHub login (solo projects).
+    │  It is always a real user login: there is no bot identity, because
+    │  GitHub Apps cannot access personal Projects v2. Take it from the
+    │  `login` the step-2 preflight returned.
     ├─ Write .claude/super-board/configs/<slug>.json (committed)
     └─ Write .claude/super-board/active ← <slug> (gitignored)
 
@@ -153,7 +161,7 @@ Every onboard step that touches GitHub or the filesystem has a defined recovery 
 | Step | Failure mode | What the user sees |
 |---|---|---|
 | 2. gh auth | Not logged in | `🔑 You're not signed in to GitHub. Run: \`gh auth login\` — then re-run super-board onboard.` |
-| 2. gh auth | Scope refused (user said no on browser) | `🔑 GitHub asked for project,read:project,repo scopes and you said no. Without them I can't read or move project cards. Re-run: \`gh auth refresh -s project,read:project,repo\`.` |
+| 2. GitHub identity | Scope refused (user said no on browser) | `🔑 GitHub asked for repo,project,read:org scopes and you said no. Without them I can't read or move project cards. Re-run: \`gh auth refresh -s repo,project,read:org\`.` |
 | 3. git init | User declined | Halt with: `🛑 super-board needs a git repo. Re-run when ready.` |
 | 4. gh repo create | Quota/perm denied | `📦 GitHub refused to create the repo (org admin required, or you hit your free-repo quota). Options: (a) pick an existing repo, (b) create one in the web UI then re-run, (c) skip repo and run URL-only.` |
 | 5. gh project create | Org project denied | `🔑 You don't have permission to create projects under <org>. Either ask an org admin, or pick your personal account: \`gh project create --owner @me\`.` |

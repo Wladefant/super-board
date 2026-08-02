@@ -409,6 +409,15 @@ drain_in_flight() {
 # ───────────────────────────── preconditions ─────────────────────────────
 log "super-board run started — config=${CONFIG_SLUG} variant=${VARIANT} base=${BASE_BRANCH} activation=${ACTIVATION_MODE} tick=${TICK_SECONDS}s max_workers=${MAX_WORKERS} noprogress_halt_ticks=${NOPROGRESS_HALT_TICKS} max_dispatches=${MAX_DISPATCHES} max_hours=${MAX_HOURS}"
 
+# ── Identity preflight: prove who we are BEFORE any scan or mutation.
+# Nothing fails open — a token we cannot classify, pin, or scope is a stop.
+AUTH_MODE=$(cfg '.github_auth.mode')
+if ! AUTH_REPORT=$("$(sb_python)" -B "$SB_SCRIPTS_DIR/super-board-auth.py"       preflight --config "$CONFIG_NATIVE" --mode "$AUTH_MODE" --json); then
+  log "🛑 refusing to start: GitHub identity preflight failed (mode=${AUTH_MODE}) — see the diagnostics above."
+  exit 69
+fi
+log "identity verified — mode=${AUTH_MODE} login=$(echo "$AUTH_REPORT" | jq -r '.login') token_class=$(echo "$AUTH_REPORT" | jq -r '.token_class')"
+
 # Orphan-worker guard. `|| true` defends against pipefail when pgrep finds nothing.
 ORPHANS=$(pgrep -f 'claude -p .*super-board run' 2>/dev/null | grep -v "^$$\$" | wc -l | tr -d ' ' || true)
 ORPHANS=${ORPHANS:-0}
