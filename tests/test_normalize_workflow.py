@@ -36,6 +36,18 @@ assert _spec is not None and _spec.loader is not None
 normalize_cli = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(normalize_cli)
 
+_PROJECT_CLI = _SCRIPTS / "super-board-project.py"
+_project_spec = importlib.util.spec_from_file_location("super_board_project_cli", _PROJECT_CLI)
+assert _project_spec is not None and _project_spec.loader is not None
+project_cli = importlib.util.module_from_spec(_project_spec)
+_project_spec.loader.exec_module(project_cli)
+
+from super_board_runtime.project import (  # noqa: E402
+    PROJECT_ITEMS_QUERY,
+    MutationConflict,
+    project_pages_from_graphql,
+)
+
 WORKFLOW = _REPO_ROOT / "payload" / "github" / "workflows" / "super-board-normalize.yml"
 
 ISSUE_EVENT = {
@@ -194,9 +206,127 @@ class PayloadAssemblyTests(unittest.TestCase):
         self.assertIn("normalize-project-snapshot-required", err)
 
 
+def _raw_page(owner_typename: str | None, *, project: object = "default") -> dict:
+    """One `gh api graphql` response, shaped as the board owner returns it."""
+    if owner_typename is None:
+        return {"data": {"repositoryOwner": None}}
+    if project == "default":
+        project = {
+            "items": {
+                "nodes": [
+                    {
+                        "id": "PVTI_1",
+                        "updatedAt": "2026-08-02T09:00:00Z",
+                        "content": {
+                            "id": "I_kwNOTAREALNODEID",
+                            "url": "https://github.com/test-owner/test-repo/issues/12",
+                        },
+                    }
+                ],
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+            }
+        }
+    return {
+        "data": {"repositoryOwner": {"__typename": owner_typename, "projectV2": project}}
+    }
+
+
+class ProjectOwnerResolutionTests(unittest.TestCase):
+    """The shared runtime serves BOTH board owner types.
+
+    https://github.com/users/Wladefant/projects/5 is user-owned;
+    https://github.com/orgs/Bavariance/projects/1 is organization-owned. A
+    `user(login:)` query returns null for the org board, and a null Project read
+    as "no items" is an empty snapshot that continuous intake silently plans
+    nothing against. Neither owner type may resolve to an empty board.
+    """
+
+    def test_the_query_asks_the_owner_not_the_user(self) -> None:
+        self.assertNotIn("user(login:", PROJECT_ITEMS_QUERY.replace(" ", ""))
+        self.assertIn("repositoryOwner(login: $owner)", PROJECT_ITEMS_QUERY)
+        self.assertIn("... on User", PROJECT_ITEMS_QUERY)
+        self.assertIn("... on Organization", PROJECT_ITEMS_QUERY)
+
+    def test_an_organization_owned_board_resolves(self) -> None:
+        pages = project_pages_from_graphql([_raw_page("Organization")])
+        self.assertEqual(len(pages), 1)
+        self.assertEqual(pages[0]["items"][0]["item_node_id"], "PVTI_1")
+        self.assertEqual(pages[0]["items"][0]["content_node_id"], "I_kwNOTAREALNODEID")
+
+    def test_a_user_owned_board_resolves(self) -> None:
+        pages = project_pages_from_graphql([_raw_page("User")])
+        self.assertEqual(len(pages), 1)
+        self.assertEqual(pages[0]["items"][0]["item_node_id"], "PVTI_1")
+
+    def test_both_owner_types_produce_the_same_snapshot(self) -> None:
+        self.assertEqual(
+            project_pages_from_graphql([_raw_page("User")]),
+            project_pages_from_graphql([_raw_page("Organization")]),
+        )
+
+    def test_an_unresolvable_owner_halts(self) -> None:
+        with self.assertRaises(MutationConflict) as ctx:
+            project_pages_from_graphql([_raw_page(None)])
+        self.assertEqual(ctx.exception.reason, "project-owner-unresolved")
+
+    def test_a_null_project_halts_rather_than_reading_as_empty(self) -> None:
+        with self.assertRaises(MutationConflict) as ctx:
+            project_pages_from_graphql([_raw_page("Organization", project=None)])
+        self.assertEqual(ctx.exception.reason, "project-not-found")
+
+    def test_a_graphql_error_response_halts(self) -> None:
+        with self.assertRaises(MutationConflict) as ctx:
+            project_pages_from_graphql([{"errors": [{"message": "Could not resolve"}]}])
+        self.assertEqual(ctx.exception.reason, "project-snapshot-incomplete")
+
+    def test_a_single_unslurped_response_is_accepted(self) -> None:
+        pages = project_pages_from_graphql(_raw_page("Organization"))
+        self.assertEqual(len(pages), 1)
+
+
+class ProjectPagesCommandTests(unittest.TestCase):
+    """The workflow shells out to these, so they carry the fail-closed contract."""
+
+    def _run(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = project_cli.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_the_query_command_prints_the_one_query(self) -> None:
+        code, out, err = self._run(["query"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("repositoryOwner(login: $owner)", out)
+
+    def test_pages_converts_both_owner_types(self) -> None:
+        for typename in ("User", "Organization"):
+            with self.subTest(owner=typename), tempfile.TemporaryDirectory() as tmp:
+                raw = _write(Path(tmp), "raw.json", [_raw_page(typename)])
+                code, out, err = self._run(["pages", "--raw", raw])
+                self.assertEqual(code, 0, err)
+                self.assertEqual(json.loads(out)[0]["items"][0]["item_node_id"], "PVTI_1")
+
+    def test_pages_fails_closed_on_an_unresolvable_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            raw = _write(Path(tmp), "raw.json", [_raw_page(None)])
+            code, out, err = self._run(["pages", "--raw", raw])
+        self.assertNotEqual(code, 0)
+        self.assertEqual(out, "", "an unresolvable board must emit no snapshot at all")
+        self.assertIn("project-owner-unresolved", err)
+
+
 class WorkflowContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self.source = WORKFLOW.read_text(encoding="utf-8")
+
+    def test_the_inventory_step_serves_both_owner_types(self) -> None:
+        self.assertNotIn(
+            "user(login: $owner)",
+            self.source,
+            "a user-scoped query returns null for an organization-owned board",
+        )
+        self.assertIn("super-board-project.py query", self.source)
+        self.assertIn("super-board-project.py pages", self.source)
 
     def test_both_normalization_steps_pass_a_payload(self) -> None:
         for command in ("normalize.py intake", "normalize.py closure"):

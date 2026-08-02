@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """super-board-project.py — Project snapshot, compare, apply, and reconcile.
 
-Four subcommands, one rule: **compare before mutate**. A mutation is authorized
+Six subcommands, one rule: **compare before mutate**. A mutation is authorized
 by state reread at decision time, never by state captured during preflight.
 
+    query      print the ONE board-items GraphQL query (both owner types)
+    pages      convert a raw `gh api graphql` read into walkable pages
     snapshot   walk every page of the Project and write a complete inventory
     compare    decide `apply` or `quarantine` for one planned mutation
     apply      write a decision that says `apply`, then read it back
     reconcile  compare a whole manifest and report what quarantined
+
+`query` and `pages` exist so no caller keeps its own copy of the board read. A
+board is owned by a user OR by an organization, and a `user(login:)` query
+returns null for an organization-owned board — which then reads as a board with
+no items. `pages` refuses that: an owner or Project that did not resolve halts
+with exit 65 and writes no snapshot at all.
 
 Between preflight and apply a human can move a card, a workflow can rename the
 Status field, and GitHub can hand out new option IDs. Writing anyway silently
@@ -15,6 +23,8 @@ overwrites whoever was right — so anything that moved quarantines with exit 3
 and zero writes.
 
 Usage:
+    super-board-project.py query
+    super-board-project.py pages     --raw FILE
     super-board-project.py snapshot  --owner OWNER --number N --payload FILE [--json]
     super-board-project.py compare   --expected FILE --current FILE [--desired-status S]
     super-board-project.py apply     --expected FILE --current FILE --desired-status S
@@ -43,11 +53,13 @@ if str(_SCRIPTS) not in sys.path:
 
 from super_board_runtime import EXIT_CONFIG, EXIT_CONFLICT, EXIT_OK, EXIT_USAGE  # noqa: E402
 from super_board_runtime.project import (  # noqa: E402
+    PROJECT_ITEMS_QUERY,
     CurrentState,
     ExpectedState,
     MutationConflict,
     apply_project_mutation,
     compare_project_mutation,
+    project_pages_from_graphql,
     snapshot_project,
 )
 
@@ -62,6 +74,13 @@ class _Parser(argparse.ArgumentParser):
 def build_parser() -> argparse.ArgumentParser:
     parser = _Parser(prog="super-board-project.py", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("query", help="print the board-items query (user- and org-owned)")
+
+    pages = sub.add_parser("pages", help="convert a raw graphql read into walkable pages")
+    pages.add_argument(
+        "--raw", required=True, help="`gh api graphql --paginate --slurp` output (JSON)"
+    )
 
     snap = sub.add_parser("snapshot", help="paginated, complete Project inventory")
     snap.add_argument("--owner", required=True)
@@ -112,6 +131,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
 
     try:
+        if args.command == "query":
+            print(PROJECT_ITEMS_QUERY.rstrip("\n"))
+            return EXIT_OK
+
+        if args.command == "pages":
+            # Nothing is printed before the conversion succeeds: a refusal must
+            # leave stdout empty so a caller redirecting it cannot end up with
+            # half a board on disk. An unreadable board is an input-contract
+            # failure (65), not a compare-before-mutate conflict (3) — nothing
+            # was being mutated.
+            try:
+                pages = project_pages_from_graphql(_read(args.raw))
+            except MutationConflict as exc:
+                print(f"super-board-project: {exc}", file=sys.stderr)
+                print(
+                    json.dumps({"ok": False, "reason": exc.reason}, sort_keys=True),
+                    file=sys.stderr,
+                )
+                return EXIT_CONFIG
+            print(json.dumps(pages, sort_keys=True))
+            return EXIT_OK
+
         if args.command == "snapshot":
             pages = _read(args.payload)
             if not isinstance(pages, list):

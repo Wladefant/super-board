@@ -41,6 +41,43 @@ except ImportError:  # executed as a plain file path
 #: No paginated Project read may request more pages than this.
 MAX_PROJECT_PAGES = 20
 
+#: The ONE query every caller uses to read a board's items.
+#:
+#: A Superboard is owned by a user OR by an organization — the Master board at
+#: https://github.com/users/Wladefant/projects/5 is user-owned and the product
+#: board at https://github.com/orgs/Bavariance/projects/1 is organization-owned
+#: — and `user(login:)` resolves to null for the second one. A null owner reads
+#: as a board with no items, which is indistinguishable from a board that lost
+#: every card, so continuous intake would plan nothing against exactly the board
+#: it exists to run on and report success doing it.
+#:
+#: `repositoryOwner` resolves either kind, and `projectV2` is selected through an
+#: inline fragment per concrete type: `projectV2` lives on `User` and on
+#: `Organization`, not on the `RepositoryOwner` interface. No owner-type input
+#: is asked for, because an input is a value an operator can get wrong and this
+#: needs no value at all.
+PROJECT_ITEMS_QUERY = """query($owner: String!, $number: Int!, $endCursor: String) {
+  repositoryOwner(login: $owner) {
+    __typename
+    ... on User { ...superboardItems }
+    ... on Organization { ...superboardItems }
+  }
+}
+fragment superboardItems on ProjectV2Owner {
+  projectV2(number: $number) {
+    id
+    items(first: 100, after: $endCursor) {
+      nodes {
+        id
+        updatedAt
+        content { ... on Issue { id url } ... on PullRequest { id url } }
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}
+"""
+
 #: The repository variable that arms the fallback auto-add workflow, and the
 #: exact value it must hold. Anything else leaves the workflow inert.
 FALLBACK_ENABLE_VARIABLE = "ENABLE_ADD_TO_PROJECT"
@@ -124,6 +161,71 @@ class ProjectSnapshot:
 
 
 # ───────────────────────────── inventory ─────────────────────────────
+
+
+def project_pages_from_graphql(raw: Any) -> list[dict[str, Any]]:
+    """Turn `gh api graphql --paginate --slurp` output into walkable pages.
+
+    Every refusal here is the same refusal: we could not read the board, and an
+    unreadable board is never an empty one. A null `repositoryOwner`, a null
+    `projectV2`, or a GraphQL `errors` array all halt instead of yielding a
+    smaller snapshot — the failure this exists to prevent is a board that reads
+    as drained because the query asked the wrong owner type.
+    """
+    responses = raw if isinstance(raw, list) else [raw]
+    pages: list[dict[str, Any]] = []
+    for response in responses:
+        if not isinstance(response, Mapping):
+            raise MutationConflict(
+                "project-snapshot-incomplete", "the Project inventory response was unreadable"
+            )
+        if response.get("errors"):
+            raise MutationConflict(
+                "project-snapshot-incomplete",
+                "the Project inventory query returned errors; refusing to act on a partial "
+                "snapshot",
+            )
+        owner = (response.get("data") or {}).get("repositoryOwner")
+        if not isinstance(owner, Mapping):
+            raise MutationConflict(
+                "project-owner-unresolved",
+                "the board owner did not resolve — check the owner login, and note that a "
+                "board may be owned by a user OR by an organization",
+            )
+        project = owner.get("projectV2")
+        if not isinstance(project, Mapping):
+            raise MutationConflict(
+                "project-not-found",
+                f"owner {owner.get('__typename') or 'unknown'} resolved but carries no such "
+                "Project; an absent board is not an empty one",
+            )
+        items = project.get("items") or {}
+        nodes = items.get("nodes") if isinstance(items, Mapping) else None
+        pages.append(
+            {
+                "items": [
+                    {
+                        "item_node_id": node.get("id"),
+                        "content_node_id": (node.get("content") or {}).get("id"),
+                        "content_url": (node.get("content") or {}).get("url"),
+                        "updated_at": node.get("updatedAt"),
+                    }
+                    for node in (nodes or [])
+                    if isinstance(node, Mapping)
+                ],
+                "fields": {},
+                "pageInfo": (
+                    items.get("pageInfo")
+                    if isinstance(items, Mapping) and isinstance(items.get("pageInfo"), Mapping)
+                    else {"hasNextPage": False}
+                ),
+            }
+        )
+    if not pages:
+        raise MutationConflict(
+            "project-snapshot-incomplete", "the Project inventory response carried no pages"
+        )
+    return pages
 
 
 def snapshot_project(
@@ -380,6 +482,7 @@ __all__ = [
     "FALLBACK_ENABLE_VALUE",
     "FALLBACK_ENABLE_VARIABLE",
     "MAX_PROJECT_PAGES",
+    "PROJECT_ITEMS_QUERY",
     "CurrentState",
     "ExpectedState",
     "FallbackDecision",
@@ -389,5 +492,6 @@ __all__ = [
     "apply_project_mutation",
     "compare_project_mutation",
     "evaluate_fallback_auto_add",
+    "project_pages_from_graphql",
     "snapshot_project",
 ]
