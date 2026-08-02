@@ -32,6 +32,10 @@
 
 set -euo pipefail
 
+# shellcheck source=scripts/super-board-python.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/super-board-python.sh"
+trap sb_tmp_cleanup EXIT
+
 # ───────────────────────────── args + paths ─────────────────────────────
 CONFIG_SLUG="${1:-}"
 if [ -z "$CONFIG_SLUG" ]; then
@@ -92,8 +96,24 @@ last_commit_on_branch() {
   git log -1 --format='%h %s' "$branch" 2>/dev/null || echo "(branch found but no commits)"
 }
 
+sanitize_stop_comment() {
+  # Render the COMPLETE comment, then hand it to the one publication boundary.
+  # Echoes the sanitized text on success; returns non-zero and echoes nothing if
+  # the boundary refused it.
+  #
+  # The body embeds a commit subject, which is text a contributor wrote and this
+  # runtime has never inspected — a subject like "fix: drop the leaked <token>"
+  # was previously written to GitHub verbatim, on the issue AND on the PR.
+  local body="$1" payload rc=0 out
+  payload=$(jq -n --arg t "$body" '{surface:"pull-request-comment", text:$t}' | sb_config_file)
+  out=$("$(sb_python)" -B "$SB_SCRIPTS_DIR/super-board-publish.py" \
+          publish --input "$payload" --json 2>/dev/null) || rc=$?
+  [ "$rc" -eq 0 ] || return "$rc"
+  printf '%s' "$out" | jq -r '.text'
+}
+
 post_stop_comment() {
-  local issue="$1" lane="$2" pid="$3" pr commit body
+  local issue="$1" lane="$2" pid="$3" pr commit body safe rc=0
   commit=$(last_commit_on_branch "$issue")
   pr=$(pr_for_issue "$issue" || echo "")
 
@@ -113,12 +133,22 @@ point.
 card will be re-claimed and the ${lane:-target} lane will start over from the
 last pushed commit. AC review / test rerun is idempotent."
 
-  gh issue comment "$issue" --body "$body" >/dev/null 2>&1 \
+  # Sanitized ONCE, before EITHER write. Sanitizing per-write would let the
+  # issue comment land and the PR comment be refused, which is a partial
+  # publication of a payload we just decided was unsafe.
+  safe=$(sanitize_stop_comment "$body") || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "  🛑 the stop comment was rejected at the publication boundary (exit ${rc}) — NO comment was posted on #${issue} or its PR."
+    log "     The claim is still released and the worker is still stopped; only the comment is withheld."
+    return 0
+  fi
+
+  gh issue comment "$issue" --body "$safe" >/dev/null 2>&1 \
     && log "  💬 issue comment posted on #${issue}" \
     || log "  ⚠ failed to comment on issue #${issue} (continuing)"
 
   if [ -n "$pr" ]; then
-    gh pr comment "$pr" --body "$body" >/dev/null 2>&1 \
+    gh pr comment "$pr" --body "$safe" >/dev/null 2>&1 \
       && log "  💬 PR comment posted on #${pr}" \
       || log "  ⚠ failed to comment on PR #${pr} (continuing)"
   fi
@@ -156,11 +186,20 @@ echo "  super-board stop · ${CONFIG_SLUG}"
 echo "════════════════════════════════════════════════════════"
 
 # 1. Inventory in-flight workers BEFORE killing anything.
+#    ISSUE locks only. Every file here used to be treated as one, so the
+#    workflow backend's `workflow-wave.lock` was commented on as if it were an
+#    issue number, killed as a bogus worker, and deleted — dissolving the mutual
+#    exclusion between the two backends in the middle of a live wave. A lock
+#    whose name is not an issue number is not this dispatcher's to touch.
 WORKERS=()
+FOREIGN_LOCKS=()
 if [ -d "$INFLIGHT_DIR" ]; then
   for lock in "$INFLIGHT_DIR"/*; do
     [ -e "$lock" ] || continue
     issue=$(basename "$lock")
+    case "$issue" in
+      ''|*[!0-9]*) FOREIGN_LOCKS+=("$issue"); continue ;;
+    esac
     read_lock "$issue"
     WORKERS+=("${issue}|${LANE:-unknown}|${PID:-}")
   done
@@ -206,11 +245,23 @@ if [ -n "$DISPATCHER_PIDS" ]; then
   done
 fi
 
-# 5. Clear in-flight locks (PIDs are dead now).
-if [ -d "$INFLIGHT_DIR" ] && [ -n "$(ls -A "$INFLIGHT_DIR" 2>/dev/null)" ]; then
-  rm -f "$INFLIGHT_DIR"/*
+# 5. Clear the ISSUE locks we just wrapped up (their PIDs are dead now).
+#    Never `rm -f "$INFLIGHT_DIR"/*` — that takes locks belonging to the other
+#    backend with it.
+if [ "${#WORKERS[@]}" -gt 0 ]; then
+  for entry in "${WORKERS[@]}"; do
+    IFS='|' read -r issue _lane _pid <<< "$entry"
+    rm -f "${INFLIGHT_DIR:?}/${issue}"
+  done
   log ""
-  log "🧽 cleared $INFLIGHT_DIR"
+  log "🧽 cleared ${#WORKERS[@]} issue lock(s) from $INFLIGHT_DIR"
+fi
+
+if [ "${#FOREIGN_LOCKS[@]}" -gt 0 ]; then
+  log ""
+  log "🔒 left ${#FOREIGN_LOCKS[@]} lock(s) that are not issue locks: ${FOREIGN_LOCKS[*]}"
+  log "   These belong to another backend. `workflow-wave.lock` is removed by that"
+  log "   backend's own stop path (references/run-workflow.md §Stop / resume)."
 fi
 
 # 6. Summary.
