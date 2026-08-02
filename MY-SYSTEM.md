@@ -256,11 +256,15 @@ Four config keys carry most of the safety, and none of them used to be documente
   runtime — no flag, no command, no environment variable — dispatches past the mode, and in
   `proof-only` only the exact allowlisted issue may be selected.
 - **The `Branch route:` declaration** — the Issue Form's `branch-route` field, carried as
-  `branch_route` on the normalized intake form and resolved against the config's
-  `branch_routes` table. Every dispatchable issue declares exactly one explicit
-  route in its body. Missing, omitted, `default`, unknown, duplicated or conflicting
-  declarations are INELIGIBLE and fail **before** a branch is created. A Test Area never
-  implies a route. A design branch is never a dispatch route.
+  `branch_route` on the normalized intake form. Every dispatchable issue declares exactly one
+  explicit route in its body, and **the declaration IS the base branch**. Missing, omitted,
+  `default`, unknown, duplicated or conflicting declarations are INELIGIBLE and fail
+  **before** a branch is created. A Test Area never implies a route. A design branch is never
+  a dispatch route. The config's `branch_routes` is a **validation table, not a routing
+  table**: it names the label the Frankfurt route must also carry, turns two labels naming
+  different branches into a conflict, and refuses a label pointed at a branch that can never
+  dispatch. It never selects the branch — a table that did would be a second routing
+  authority, and the more permissive of two authorities is the one that acts.
 - **`minimum_graphql_reserve`** — an immutable 1,000-point floor. Configuration may RAISE it,
   never lower it. One cached inventory per runtime cycle; estimate the cost before executing;
   bounded batches; stop at the reserve (exit 75). **Never retry-spin, never sleep through a

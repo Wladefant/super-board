@@ -20,6 +20,14 @@ Fail-closed reason codes:
   route-declaration-duplicate   two declarations, even two identical ones
   route-label-conflict          the declaration and the labels disagree
 
+The config's `branch_routes` is a **validation table, not a routing table**. It
+never chooses a branch: the declaration is the base branch. What the table does
+is validate — it names the label that must accompany the Frankfurt route, it
+makes two labels naming different branches a `route-label-conflict`, and it lets
+a label mapped onto a non-dispatch branch refuse the card. A table that chose
+the branch would be a second routing authority beside the declaration, and the
+more permissive of two authorities is the one that acts.
+
 The redundancy rule is deliberate and asymmetric:
 
   * a `staging` declaration must **not** carry `branch:staging-frankfurt`;
