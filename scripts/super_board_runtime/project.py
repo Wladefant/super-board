@@ -268,8 +268,15 @@ def snapshot_project(
         if not info.get("hasNextPage"):
             break
         if not cursor:
-            # `after=None` would refetch page one forever.
-            break
+            # There is another page and no cursor to reach it with. `after=None`
+            # would refetch page one forever, and stopping here would hand back
+            # a partial snapshot flagged complete — which is the one thing this
+            # walk exists to never do. Refuse.
+            raise MutationConflict(
+                "project-snapshot-incomplete",
+                f"page {page + 1} reports a next page but carries no cursor; refusing to "
+                f"act on a partial snapshot",
+            )
     else:
         hit_cap = True
     return ProjectSnapshot(
