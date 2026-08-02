@@ -463,7 +463,7 @@ Workers share the dispatcher's gh-auth token bucket. The dispatcher's `gh_rate_g
 - Call `sb_gh_guard_check <estimated-cost>` before any burst of gh calls (thread reads, sub-agent spawn, exit verification). The argument is the ESTIMATED COST of the burst in GraphQL points, not a threshold. It stops the worker with exit 75 when the call would break the immutable 1,000-point reserve, or when the quota cannot be read at all.
 - Take one quota reading per cycle and spend against it. Re-reading before every call makes the guard the thing that drains the bucket.
 - Adversarial sub-agents are capped at 50 gh calls each — prefer `git blame` (local) over `gh api graphql`.
-- Final PR handoff comment MUST include `gh-quota-on-exit: graphql=<remaining> floor=<effective-floor> reset=<time>` (use `sb_gh_guard_summary`). Those four fields are the only ones that may be logged.
+- Final PR handoff comment MUST include `gh-quota-on-exit: graphql=<remaining> floor=<effective-floor> reset=<time>` — capture it with `sb_gh_guard_summary 2>&1`, which prints it on stderr and always returns 0 so a worker's last act cannot change its exit status. Those four fields are the only ones that may be logged; a quota that cannot be read prints the `unavailable` marker rather than a number.
 - On 403 / secondary-rate-limit: halt exactly as for exit 75 — write the halt comment, release the claim, exit. The runtime never waits out a reset and never retry-spins.
 
 ## Worker self-check (mandatory on exit, every lane)

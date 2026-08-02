@@ -144,6 +144,11 @@ jobs:
       - name: wave-plan — fixture tests
         run: bash tests/test-wave-plan.sh
 
+      # Worker quota etiquette: the gh-quota-on-exit line the references
+      # promise is actually emitted, and the call never fails a worker.
+      - name: gh-guard summary — worker exit line
+        run: bash tests/test-gh-guard-summary.sh
+
       # Syntax-check the dynamic workflow script the same way the
       # orchestrator's precondition 4 does (run-workflow.md).
       - name: wave workflow — node --check
