@@ -3,8 +3,8 @@
 
 Exactly ONE parallel maximum-level Codex fleet per code pull request:
 
-    codex exec review --base "$(git merge-base origin/<base> HEAD)" \
-        -m gpt-5.5 -c model_reasoning_effort="high"
+    codex exec review --base <merge-base sha> -m gpt-5.5 \
+        -c model_reasoning_effort="high"
     codex exec -m gpt-5.5 -c model_reasoning_effort="high" -s read-only "<correctness lens>"
     codex exec -m gpt-5.5 -c model_reasoning_effort="high" -s read-only "<security lens>"
     codex exec -m gpt-5.5 -c model_reasoning_effort="high" -s read-only "<performance and design-consistency lens>"
@@ -27,9 +27,13 @@ Usage:
     super-board-codex-review.py run --base REF --worktree PATH [--json]
                                    [--pull-request URL] [--changed-file PATH ...]
                                    [--resolution LOCATION=EVIDENCE ...]
-                                   [--plan-only] [--force-rerun]
+                                   [--merge-base SHA] [--plan-only] [--force-rerun]
 
-`--plan-only` prints the four commands without invoking Codex.
+`--plan-only` prints the four commands without invoking Codex. The structured
+lens reviews the merge base, resolved with `git merge-base origin/<base> HEAD`
+in `--worktree` unless `--merge-base` supplies the SHA. The commands are spawned
+as argv with no shell, so an unresolved `$(...)` there is a literal ref that no
+repository has — an unresolvable merge base blocks the gate instead.
 
 Exit: 0 gate passed · 1 gate blocked · 64 invalid invocation · 65 contract violation.
 """
@@ -89,6 +93,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="committed evidence resolving one finding; repeat",
     )
     run.add_argument("--ledger", default=None, help="path to the one-fleet-per-PR ledger")
+    run.add_argument(
+        "--merge-base",
+        default=None,
+        help="a pre-resolved merge-base commit SHA; omit to resolve it with git in --worktree",
+    )
     run.add_argument("--plan-only", action="store_true", help="print the commands, run nothing")
     run.add_argument(
         "--force-rerun",
@@ -110,6 +119,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     ledger = Path(args.ledger) if args.ledger else raw_output_dir() / "fleet-ledger.json"
 
+    # `codex exec review --base` is spawned as argv with no shell, so the base
+    # has to be a commit SHA that already exists. Either the caller resolved it
+    # or the runtime resolves it with git — never a `$(...)` string that codex
+    # would take literally and review nothing against.
+    supplied = (args.merge_base or "").strip()
+    resolver = (lambda base_ref, worktree: supplied) if supplied else None
+
     try:
         report = run_codex_fleet(
             args.base,
@@ -120,6 +136,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             force_rerun=args.force_rerun,
             resolutions=resolutions,
             plan_only=args.plan_only,
+            merge_base_resolver=resolver,
         )
     except CodexGateError as exc:
         print(f"🛑 super-board-codex-review: {exc}", file=sys.stderr)

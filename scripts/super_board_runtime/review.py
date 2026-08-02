@@ -466,14 +466,65 @@ def raw_output_dir() -> Path:
     return Path(tempfile.gettempdir()) / "super-board-codex"
 
 
+#: A resolved commit object name. Abbreviated names are accepted; anything that
+#: is not hexadecimal is not a commit and is refused.
+_COMMIT_SHA_RE = re.compile(r"\A[0-9a-fA-F]{7,64}\Z")
+
+
+def resolve_merge_base(
+    base_ref: str, worktree: Path, *, runner: Optional[Any] = None
+) -> str:
+    """Resolve `git merge-base origin/<base_ref> HEAD` to a real commit SHA.
+
+    The fleet spawns argv directly with no shell, so a `$(...)` substitution in
+    an argument is passed through to `codex` verbatim and reviews a ref that
+    cannot exist. The expansion has to happen here, in Python, or not at all.
+
+    Fails closed: a non-zero `git`, an unusable worktree, or anything on stdout
+    that is not a commit object name raises rather than returning a value the
+    caller would hand to the gate.
+    """
+    command = ("git", "merge-base", f"origin/{base_ref}", "HEAD")
+    run = _default_runner if runner is None else runner
+    try:
+        result = run(command, Path(worktree))
+    except Exception as exc:  # a merge base we could not compute is not a base
+        raise CodexGateError(
+            "codex-merge-base-unresolved",
+            f"could not run `git merge-base origin/{base_ref} HEAD`: {exc}",
+        ) from exc
+    if int(result.get("exit_code", 1)) != 0:
+        raise CodexGateError(
+            "codex-merge-base-unresolved",
+            f"`git merge-base origin/{base_ref} HEAD` failed; the structured lens has no "
+            "diff to review and the gate must not report a pass it never performed",
+        )
+    sha = str(result.get("stdout") or "").strip().splitlines()
+    candidate = sha[0].strip() if sha else ""
+    if not _COMMIT_SHA_RE.match(candidate):
+        raise CodexGateError(
+            "codex-merge-base-unresolved",
+            f"`git merge-base origin/{base_ref} HEAD` did not name a commit",
+        )
+    return candidate
+
+
 def build_lens_command(
-    lens: str, base_ref: str, *, prompt: Optional[str] = None
+    lens: str,
+    base_ref: str,
+    *,
+    prompt: Optional[str] = None,
+    merge_base: Optional[str] = None,
 ) -> tuple[str, ...]:
     """The exact command one lens issues.
 
     `codex exec review` and a custom prompt are mutually exclusive — the CLI
     rejects the combination — so passing one here would silently lose the entire
     structured review. That is refused rather than dropped.
+
+    `merge_base` must already be a resolved commit SHA. This command is spawned
+    as argv without a shell, so a `$(...)` string here is not a substitution, it
+    is a literal ref name that no repository has.
     """
     if lens not in CODEX_LENSES:
         raise CodexGateError("codex-lens-unknown", f"{lens!r} is not one of the four lenses")
@@ -485,14 +536,14 @@ def build_lens_command(
                 "`codex exec review` never receives a custom prompt: the CLI rejects the "
                 "combination and the structured review would be lost",
             )
-        return (
-            "codex",
-            "exec",
-            "review",
-            "--base",
-            f'"$(git merge-base origin/{base_ref} HEAD)"',
-            *common,
-        )
+        candidate = (merge_base or "").strip()
+        if not _COMMIT_SHA_RE.match(candidate):
+            raise CodexGateError(
+                "codex-merge-base-unresolved",
+                "`codex exec review --base` needs a resolved commit SHA; "
+                f"{merge_base!r} is not one",
+            )
+        return ("codex", "exec", "review", "--base", candidate, *common)
     return ("codex", "exec", *common, "-s", "read-only", prompt or CODEX_LENS_PROMPTS[lens])
 
 
@@ -570,6 +621,7 @@ def run_codex_fleet(
     model: str = CODEX_MODEL,
     reasoning_effort: str = CODEX_REASONING_EFFORT,
     plan_only: bool = False,
+    merge_base_resolver: Optional[Any] = None,
 ) -> CodexFleetReport:
     """Run the four lenses in parallel and decide whether the gate passes."""
     if model != CODEX_MODEL:
@@ -606,8 +658,16 @@ def run_codex_fleet(
             "reviews the same code; re-review only on an explicit request",
         )
 
+    # Resolved before any lens is spawned: an unresolvable merge base means the
+    # structured lens would review nothing, and a fleet that reviews nothing
+    # must not be able to report a pass.
+    resolve = resolve_merge_base if merge_base_resolver is None else merge_base_resolver
+    merge_base = resolve(base_ref, Path(worktree))
+
     commands = {
-        lens: build_lens_command(lens, base_ref, prompt=prompts.get(lens))
+        lens: build_lens_command(
+            lens, base_ref, prompt=prompts.get(lens), merge_base=merge_base
+        )
         for lens in CODEX_LENSES
     }
     if plan_only:
@@ -708,6 +768,7 @@ __all__ = [
     "parse_findings",
     "raw_output_dir",
     "resolve_findings",
+    "resolve_merge_base",
     "review_handoff",
     "run_codex_fleet",
     "scan_merge_prohibitions",
