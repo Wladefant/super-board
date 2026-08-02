@@ -1,6 +1,6 @@
 # super-board
 
-An autonomous GitHub Project board executor for Claude Code. Drag a card into the `Ready` column, walk away, come back to merged PRs.
+An autonomous GitHub Project board executor for Claude Code. Drag a card into the `Ready` column, walk away, come back to reviewed pull requests waiting for you to rebase-merge them.
 
 Super Board watches your GitHub Project, dispatches agents to Build / QA / Review the cards, and moves each card across the board as it goes. The default backend is `claude-p` (headless workers); the in-session dynamic-workflow backend is explicit opt-in. **The runtime never merges** - a successful Review hands off, and a human rebase-merges.
 
@@ -22,7 +22,8 @@ Super Board watches your GitHub Project, dispatches agents to Build / QA / Revie
    ```
 3. Wire up a GitHub Project board with a `Status` field whose columns are exactly the seven-state lifecycle: `Backlog`, `Ready`, `Building`, `QA`, `Review`, `Blocked`, `Done`.
 4. Drop a config at `.claude/super-board/configs/<slug>.json` pointing at your board.
-5. From inside Claude Code, type `/super-board run <slug>`. The orchestrator plans a wave, launches the `super-board-wave` dynamic workflow, reconciles results, and repeats until the board is drained.
+5. Walk the activation ladder. A new config is `"activation_mode": "off"` and dispatches nothing, deliberately — move it to `"proof-only"` (naming one issue in `proof_issue_url`) and then to `"active"`, each step through a configuration pull request a human reviewed.
+6. From inside Claude Code, type `/super-board run <slug>`. The orchestrator plans a wave, launches the workers, reconciles results, and repeats until the board is drained.
 
 That's it. Move cards into `Ready`, watch them flow through the board.
 
@@ -118,8 +119,9 @@ produced a specific failure.
 | Contract | What it means |
 |---|---|
 | **Seven-state lifecycle** | `Backlog · Ready · Building · QA · Review · Blocked · Done`. Not configurable. `Skipped` is refused where a lifecycle value is expected rather than quietly mapped onto something else. |
+| **`Ready` is the only dispatchable status** | No other status dispatches, and only OPEN issue cards do — pull-request cards never dispatch. `exclude_labels` is enforced in every dispatcher path, with `design` and `history` permanently non-dispatchable. |
 | **`claude-p` default backend** | Headless workers by default; the in-session dynamic-workflow backend is explicit opt-in. |
-| **Three activation modes** | `off`, `proof`, `on`. A board stays at `off` until every installation and repository gate passes; `proof` restricts work to an explicit allowlist. |
+| **Three activation modes** | `off`, `proof-only`, `active`. A board stays at `off` until every installation and repository gate passes, and each transition takes a human-reviewed configuration pull request; `proof-only` restricts work to the single allowlisted issue named by `proof_issue_url`. |
 | **Immutable 1,000-point GraphQL reserve** | Cannot be configured downward. A run that would break it halts (exit 75) rather than borrowing against it. |
 | **Exact-SHA QA and invalidation** | Evidence is bound to the commit it was produced on. A pull-request head that moves discards the result instead of letting it attest to a commit nobody tested. |
 | **Fail-closed branch routing** | An issue declares its route exactly once — `staging` or `staging-frankfurt`. Anything else refuses to create a branch. |
