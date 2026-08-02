@@ -217,7 +217,7 @@ class InvalidRouteTests(unittest.TestCase):
             schema,
             "the schema promises a behaviour `resolve_branch_route` does not implement",
         )
-        self.assertIn("validation table", schema)
+        self.assertIn("validation table", schema.lower())
 
     def test_two_conflicting_route_labels(self) -> None:
         config = _config(
