@@ -1,22 +1,23 @@
-# Block & Skip exit template
+# Block exit template
 
 > **Source of truth: this file.** It used to defer to spec
 > `docs/superpowers/specs/2026-05-21-super-board-design.md` §4 "Cross-cutting:
 > Block & Skip exits", which is missing from this fork — the §4 pointer is dead.
 > See `SKILL.md` for what that changes.
 
-`Blocked` and `Skipped` sit AFTER `Done` on the board — they're not workflow steps, they're exit ramps.
+`Blocked` sits AFTER `Done` on the board — it is not a workflow step, it is the exit ramp.
+
+There is exactly one exit ramp. The lifecycle is fixed at seven statuses — Backlog · Ready · Building · QA · Review · Blocked · Done — and the parked status that used to sit beside `Blocked` was retired with the 2.0 lifecycle: `scripts/super_board_runtime/lifecycle.py` refuses it, and a config that names it as a lifecycle value exits 65. A card that is not actionable in this loop is therefore blocked with the 🤷 out-of-scope reason tag, not parked in a status that no longer exists.
 
 ## When / who moves cards there
 
-| Column  | When                                       | Who moves cards there                        |
-|---------|--------------------------------------------|----------------------------------------------|
-| Blocked | Card needs human action                    | Any lane, from any workflow column           |
-| Skipped | Card isn't actionable in this loop         | Any lane, from any workflow column           |
+| Column  | When                                                        | Who moves cards there              |
+|---------|-------------------------------------------------------------|------------------------------------|
+| Blocked | Card needs human action, or is not actionable in this loop   | Any lane, from any workflow column |
 
 Once moved, the card is out of the loop. Human drags it back to `Ready` when unblocked.
 
-## Required Block/Skip comment template (mandatory on every transition into Blocked or Skipped)
+## Required Block comment template (mandatory on every transition into Blocked)
 
 The bot must write a structured comment on **both the issue and the PR** (if a PR exists) explaining *why* it moved the card and *what it couldn't safely decide*. Format:
 
@@ -39,7 +40,7 @@ To unblock:  <concrete action the human can take, in their own checklist form>
 Move back:   drag this card to Ready after the steps above are done
 ```
 
-Skipped comments use the same template with `🤷 super-board · <lane> · SKIPPED` and replace `Why blocked` with `Why parked`, `What blocks` with `Why out-of-scope for this loop`.
+An out-of-scope exit uses the same template and the same `BLOCKED` headline, carries the 🤷 reason tag, and answers `Why blocked` with why the card is out of scope for this loop and `What blocks` with the decision that would bring it back in.
 
 ## Reason emoji vocabulary
 
@@ -57,4 +58,4 @@ Skipped comments use the same template with `🤷 super-board · <lane> · SKIPP
 
 ## Hard rule
 
-**The bot is forbidden from moving any card to Blocked/Skipped *without* this full template populated. A 1-line "needs creds" comment is a contract violation and fails Reviewer's thread gate.**
+**The bot is forbidden from moving any card to Blocked *without* this full template populated. A 1-line "needs creds" comment is a contract violation and fails Reviewer's thread gate.**

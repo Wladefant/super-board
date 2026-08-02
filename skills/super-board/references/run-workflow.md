@@ -1,12 +1,17 @@
 # super-board run — workflow backend contract
 
-The DEFAULT backend (v1.6.0+): used when the active config sets
-`"worker_backend": "workflow"` or omits the key. The legacy bash dispatcher
-(`.claude/bin/super-board-run.sh`, see `run.md`) runs only on explicit
-`"worker_backend": "claude-p"`; this file ONLY changes who dispatches
-workers. Lane lifecycles, branch/PR model, comment cadence, Block
-templates, halt gates, and done conditions are all inherited from `run.md`
-unchanged.
+This backend is opt-in, and it is not what a config gets by omitting the key.
+The shipped default is `claude-p` — the headless dispatcher
+`.claude/bin/super-board-run.sh`, documented in `run.md` — and a config that
+names no backend runs on it. This file's backend runs only when the active
+config explicitly asks for the in-session wave runner (`worker_backend` set to
+`workflow`), which additionally requires dynamic workflows enabled in
+`/config`. The executable contract is
+`scripts/super_board_runtime/config.py`.
+
+Choosing this backend ONLY changes who dispatches workers. Lane lifecycles,
+branch/PR model, comment cadence, Block templates, halt gates, and done
+conditions are all inherited from `run.md` unchanged.
 
 ## Orchestrator delegation contract (NON-NEGOTIABLE, adapted)
 
@@ -71,8 +76,8 @@ Repeat until a done condition or halt gate fires:
    proceed only if the list is exactly `[<bot_identity>]`. Adding an assignee
    does NOT fail when someone else already claimed (issues accept up to 10
    assignees), so the add alone is not a mutex — on any other assignee set,
-   remove own assignee and skip the card (race lost). Skipped when
-   bot_identity is unset — accepted single-orchestrator risk: without it
+   remove own assignee and skip the card (race lost). The whole claim step is
+   passed over when bot_identity is unset — accepted single-orchestrator risk: without it
    there is no cross-session claim at all, so never run two orchestrators
    (or /loop re-entries) against the same board without bot_identity.
 4. **Launch** — Workflow tool with
