@@ -44,8 +44,11 @@ from super_board_runtime.review import (  # noqa: E402
     parse_findings,
     raw_output_dir,
     resolve_findings,
+    resolve_merge_base,
     run_codex_fleet,
 )
+
+MERGE_BASE_SHA = "9f4c1b7e2a6d8053c1f4b9a70e2d5c83a6b1042f"
 
 _CLI = _SCRIPTS / "super-board-codex-review.py"
 _spec = importlib.util.spec_from_file_location("super_board_codex_review_cli", _CLI)
@@ -89,6 +92,7 @@ def _fleet(**kwargs):
         "documentation_only": False,
         "runner": RecordingRunner(),
         "pull_request_url": "https://github.com/Bavariance/polysimulator/pull/456",
+        "merge_base_resolver": lambda base_ref, worktree: MERGE_BASE_SHA,
     }
     defaults.update(kwargs)
     with tempfile.TemporaryDirectory() as tmp:
@@ -138,7 +142,35 @@ class LensCommandTests(unittest.TestCase):
         joined = " ".join(command)
         self.assertIn("codex exec review", joined)
         self.assertIn("--base", joined)
-        self.assertIn("git merge-base origin/staging HEAD", joined)
+        self.assertIn(MERGE_BASE_SHA, command)
+
+    def test_the_base_argument_is_a_resolved_sha_not_a_shell_substitution(self) -> None:
+        """The fleet runs argv directly — there is no shell to expand `$(...)`.
+
+        Handing `codex` the literal string `"$(git merge-base origin/x HEAD)"`
+        makes it review against a ref that does not exist, so the structured
+        lens reviews nothing and the gate reports a pass it never performed.
+        """
+        runner = RecordingRunner()
+        _fleet(runner=runner)
+        command = self._command_for("structured-diff", runner.commands)
+        base = command[command.index("--base") + 1]
+        self.assertEqual(base, MERGE_BASE_SHA)
+        for token in command:
+            self.assertNotIn("$(", token)
+            self.assertNotIn("merge-base", token)
+
+    def test_building_a_structured_diff_command_requires_a_resolved_sha(self) -> None:
+        with self.assertRaises(CodexGateError) as ctx:
+            build_lens_command("structured-diff", "staging", merge_base=None)
+        self.assertEqual(ctx.exception.reason, "codex-merge-base-unresolved")
+
+        for bogus in ("", "   ", "origin/staging", "$(git merge-base origin/staging HEAD)"):
+            with self.subTest(merge_base=bogus):
+                with self.assertRaises(CodexGateError) as ctx:
+                    build_lens_command("structured-diff", "staging", merge_base=bogus)
+                self.assertEqual(ctx.exception.reason, "codex-merge-base-unresolved")
+
 
     def test_structured_diff_never_carries_a_custom_prompt(self) -> None:
         runner = RecordingRunner()
@@ -193,6 +225,50 @@ class LensCommandTests(unittest.TestCase):
                 with self.assertRaises(CodexGateError) as ctx:
                     _fleet(**kwargs)
                 self.assertEqual(ctx.exception.reason, reason)
+
+
+class MergeBaseResolutionTests(unittest.TestCase):
+    def test_the_resolver_runs_git_merge_base_and_returns_the_sha(self) -> None:
+        seen: list[tuple[str, ...]] = []
+
+        def runner(command, cwd):
+            seen.append(tuple(command))
+            return {"exit_code": 0, "stdout": MERGE_BASE_SHA + "\n", "stderr": ""}
+
+        sha = resolve_merge_base("staging", _REPO_ROOT, runner=runner)
+        self.assertEqual(sha, MERGE_BASE_SHA)
+        self.assertEqual(seen, [("git", "merge-base", "origin/staging", "HEAD")])
+
+    def test_an_unresolvable_merge_base_fails_closed(self) -> None:
+        def failing(command, cwd):
+            return {"exit_code": 128, "stdout": "", "stderr": "not a valid object name"}
+
+        with self.assertRaises(CodexGateError) as ctx:
+            resolve_merge_base("staging", _REPO_ROOT, runner=failing)
+        self.assertEqual(ctx.exception.reason, "codex-merge-base-unresolved")
+
+    def test_garbage_on_stdout_is_not_accepted_as_a_sha(self) -> None:
+        def chatty(command, cwd):
+            return {"exit_code": 0, "stdout": "fatal: your branch is behind\n", "stderr": ""}
+
+        with self.assertRaises(CodexGateError) as ctx:
+            resolve_merge_base("staging", _REPO_ROOT, runner=chatty)
+        self.assertEqual(ctx.exception.reason, "codex-merge-base-unresolved")
+
+    def test_the_fleet_refuses_to_run_when_the_merge_base_cannot_be_resolved(self) -> None:
+        def unresolvable(base_ref, worktree):
+            raise CodexGateError("codex-merge-base-unresolved", "no merge base")
+
+        runner = RecordingRunner()
+        with self.assertRaises(CodexGateError) as ctx:
+            _fleet(runner=runner, merge_base_resolver=unresolvable)
+        self.assertEqual(ctx.exception.reason, "codex-merge-base-unresolved")
+        self.assertEqual(runner.commands, [], "no lens may run without a real base")
+
+    def test_plan_only_also_carries_the_resolved_sha(self) -> None:
+        report = _fleet(plan_only=True)
+        structured = next(l for l in report.lenses if l.name == "structured-diff")
+        self.assertIn(MERGE_BASE_SHA, structured.command)
 
 
 class FindingTests(unittest.TestCase):
@@ -307,7 +383,17 @@ class CliTests(unittest.TestCase):
 
     def test_the_cli_reports_the_planned_fleet_without_running_codex(self) -> None:
         code, out, _ = self._run(
-            ["run", "--base", "staging", "--worktree", str(_REPO_ROOT), "--plan-only", "--json"]
+            [
+                "run",
+                "--base",
+                "staging",
+                "--worktree",
+                str(_REPO_ROOT),
+                "--merge-base",
+                MERGE_BASE_SHA,
+                "--plan-only",
+                "--json",
+            ]
         )
         self.assertEqual(code, 0)
         body = json.loads(out)
@@ -315,6 +401,25 @@ class CliTests(unittest.TestCase):
         for lens in body["lenses"]:
             self.assertEqual(lens["model"], CODEX_MODEL)
             self.assertEqual(lens["reasoning_effort"], CODEX_REASONING_EFFORT)
+        structured = next(l for l in body["lenses"] if l["name"] == "structured-diff")
+        self.assertIn(MERGE_BASE_SHA, structured["command"])
+
+    def test_the_cli_refuses_a_merge_base_that_is_not_a_commit(self) -> None:
+        code, _, err = self._run(
+            [
+                "run",
+                "--base",
+                "staging",
+                "--worktree",
+                str(_REPO_ROOT),
+                "--merge-base",
+                "origin/staging",
+                "--plan-only",
+                "--json",
+            ]
+        )
+        self.assertEqual(code, 65)
+        self.assertIn("codex-merge-base-unresolved", err)
 
     def test_the_cli_reports_the_documentation_exemption(self) -> None:
         code, out, _ = self._run(
@@ -328,6 +433,8 @@ class CliTests(unittest.TestCase):
                 "docs/a.md",
                 "--changed-file",
                 "README.md",
+                "--merge-base",
+                MERGE_BASE_SHA,
                 "--plan-only",
                 "--json",
             ]
