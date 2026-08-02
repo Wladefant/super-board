@@ -510,6 +510,18 @@ structured diff review plus three lenses — correctness, security, and performa
 design-consistency — run concurrently. **Every finding must be resolved, including nits.**
 No confidence-threshold filtering, no "skip the low ones".
 
+**Every lens redirects stdin: `codex exec … "<lens prompt>" < /dev/null > "$OUT" 2>&1`.**
+`codex exec` with a prompt argument reads stdin when no terminal is attached — backgrounded,
+in CI, or inside a subagent — and blocks forever, emitting exactly one line
+(`Reading additional input from stdin...`) and then nothing: no error, no timeout, no exit.
+**`codex exec review` is not affected**, because it takes no prompt argument, and that
+asymmetry is what makes the failure easy to miss — the structured lens returns a normal
+review while the prompted lenses sit frozen, so the fleet reports a quarter of its coverage
+as if it were complete. It happened on this release's own review gate. To detect it, check
+output byte counts about 60 seconds after launch (`wc -c *.txt`): a file frozen at ~39 bytes
+is deadlocked, not thinking. `super_board_runtime.review` passes `stdin=DEVNULL` in code, and
+a test pins it.
+
 **No second fleet unless the operator asks.** CodeRabbit, Copilot, Greptile and the GitHub
 `@codex` connector are non-binding and are **not** gates — the connector in particular
 carries its own easily-exhausted review rate limit that has produced false "usage limit"
