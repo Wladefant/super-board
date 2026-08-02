@@ -204,10 +204,19 @@ class ExitCodeCollisionTests(unittest.TestCase):
         import re
 
         codes = re.findall(r"^\s*exit (\d+)$", self.run_sh, re.MULTILINE)
-        # 74 is the workflow-wave mutual-exclusion halt, raised at startup and
-        # again mid-run for the same reason; every other code appears once.
+        # A code may repeat only when both halts mean the SAME thing — the rule
+        # exists so a supervisor can read the code, not so codes are unique:
+        #   74  workflow-wave mutual exclusion, at startup and again mid-run;
+        #   65  the runtime's input contract could not be satisfied — an invalid
+        #       config, or a project board that could not be read. An unreadable
+        #       board is deliberately NOT its own code: it is the same "we do not
+        #       have usable input" halt, and it must never be confused with the
+        #       empty board it used to be silently converted into.
+        allowed_repeats = {"74", "65"}
         repeated = {code for code in codes if codes.count(code) > 1}
-        self.assertEqual(repeated, {"74"}, f"colliding exit codes: {sorted(repeated)}")
+        self.assertEqual(
+            repeated, allowed_repeats, f"colliding exit codes: {sorted(repeated)}"
+        )
 
 
 class HandoffTests(unittest.TestCase):

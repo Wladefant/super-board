@@ -363,13 +363,20 @@ Block/Skip exit comments use the 🛡 / 🤷 emojis with a 1-line reason and ref
 
 ## Worker contract (every lane on claim)
 
-Claim uses a **GitHub Issue assignee mutex** — atomic compare-and-set via `gh issue edit --add-assignee`. Labels are descriptive only; the assignee is the lock.
+Claim is **add-then-verify** on the GitHub Issue assignee. It is NOT a
+compare-and-set: a GitHub issue accepts up to ten assignees, so
+`gh issue edit --add-assignee` succeeds whether or not someone else already
+claimed the card, and two dispatchers both saw exit 0. The claim is the
+read-back. Labels are descriptive only.
 
 ```
-1. ATTEMPT CLAIM (atomic):
+1. ATTEMPT CLAIM (add, then verify):
    ├─ `gh issue edit <N> --add-assignee <notifications.bot_identity>`
-   │      (if a different assignee is already set → 422; treat as "already claimed")
-   ├─ On 422 / conflict → another worker has it; skip this dispatch.
+   ├─ `gh issue view <N> --json assignees` → require EXACTLY
+   │      [<notifications.bot_identity>]
+   ├─ Any other assignee set → race lost: remove own assignee again
+   │      (`gh issue edit --remove-assignee`) and skip this dispatch.
+   ├─ Verification read fails → treat as lost: remove own assignee and skip.
    └─ On success → continue. Apply descriptive label
        (loop:in-build / loop:in-qa / loop:in-review) for UI clarity only.
 2. SANITY CHECK: issue body has `## Acceptance Criteria` with ≥1 bullet
@@ -383,7 +390,7 @@ Claim uses a **GitHub Issue assignee mutex** — atomic compare-and-set via `gh 
 6. RELEASE CLAIM (`gh issue edit --remove-assignee <notifications.bot_identity>`) and remove descriptive label.
 ```
 
-The claim identity in `notifications.bot_identity` is a real user login — the machine account for unattended runs, or the user's own account on solo projects. It is never a GitHub App: apps cannot access personal Projects v2, so an app identity could not move the card it just claimed. The assignee mutex is reliable because GitHub serializes assignee writes per issue.
+The claim identity in `notifications.bot_identity` is a real user login — the machine account for unattended runs, or the user's own account on solo projects. It is never a GitHub App: apps cannot access personal Projects v2, so an app identity could not move the card it just claimed. GitHub serializes assignee writes per issue, which is what makes the read-back conclusive: both racers end up seeing the same list, and only one of them sees itself alone.
 
 ### Anti-zombie addendum (added 2026-05-22 after #381 worker storm)
 
@@ -391,14 +398,29 @@ Worker-side assignee claim alone is **not sufficient** — `claude -p` cold-star
 
 The dispatcher MUST also:
 
-1. **Claim BEFORE spawning the worker** — `try_claim_assignee` runs in the dispatcher and only proceeds to `nohup claude -p` if it wins the assignee write. Closes the cold-start race.
-2. **Write a local in-flight lock** — `.claude/super-board/inflight/<issue-N>` contains the worker PID. `top_card_in_column` skips any issue with a live lock even if the assignee write hasn't propagated yet.
-3. **Cap one worker per lane** — track `BUILD_PID` / `QA_PID` / `REVIEW_PID`; do not dispatch to a lane whose prior PID is still alive.
-4. **Reap stale locks each tick** — `reap_finished_locks` removes any lock whose PID no longer exists.
-5. **Orphan-scan on startup** — refuse to start if any `claude -p .*super-board run` worker is already running from a prior crashed dispatcher.
-6. **Cache `gh project item-list` per tick** — one API call per tick, not per column lookup. Cuts rate consumption ~7×.
+1. **Lock, claim, THEN spawn — in that order** — the dispatcher creates
+   `.claude/super-board/inflight/<issue-N>` atomically (`set -o noclobber`)
+   before it claims the assignee and before it spawns anything, and drops the
+   lock again on every refusal. Writing the lock after the spawn left two open
+   windows: a concurrent dispatcher could pass its own lock check and launch a
+   duplicate worker, and a crash between spawn and write left a live worker
+   nothing tracked, reaped, or stopped.
+2. **Then claim the assignee** — `try_claim_assignee` adds and verifies (above);
+   only a verified claim proceeds to `nohup claude -p`. Closes the cold-start race.
+3. **Record the PID into the lock** — the lock holds `PID=` empty until the
+   worker exists, then carries it. A lock with no PID is honoured for
+   `spawn_grace_seconds` (default 120) and reaped after, so a crash in the
+   claim→spawn window cannot wedge the card forever.
+4. **Cap one worker per lane** — track `BUILD_PID` / `QA_PID` / `REVIEW_PID`; do not dispatch to a lane whose prior PID is still alive.
+5. **Reap stale locks each tick** — `reap_finished_locks` removes any lock whose PID no longer exists.
+6. **Orphan-scan on startup** — refuse to start if any `claude -p .*super-board run` worker is already running from a prior crashed dispatcher.
+7. **Cache `gh project item-list` per tick** — one API call per tick, not per column lookup. Cuts rate consumption ~7×.
+8. **Release everything on INT/TERM** — a stop signal stops the in-flight
+   workers, removes their locks, and removes their assignee claims. A signal
+   handler that only cleans temp files leaves cards claimed by processes that no
+   longer exist, and the planner skips those cards forever.
 
-The three locks (assignee, in-flight file, lane PID) are defense in depth: any one of them alone has a race window; together they make a duplicate dispatch effectively impossible.
+The three locks (assignee read-back, in-flight file, lane PID) are defense in depth: any one of them alone has a race window; together they make a duplicate dispatch effectively impossible.
 
 ## Halt gates
 

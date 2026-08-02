@@ -106,7 +106,7 @@ Worker storms are the failure mode that bit early users. Super Board prevents th
 
 1. **Orphan scan** on startup — refuses to run if any `super-board` workers are already alive from a prior crashed run.
 2. **In-flight lockfiles** at `.claude/super-board/inflight/<issue-N>` — survive runner restart and gate `top_card_in_column` even when GitHub state hasn't propagated.
-3. **Atomic assignee claim BEFORE worker spawn** — closes the 10–30s `claude -p` cold-start race.
+3. **Verified assignee claim BEFORE worker spawn** — the dispatcher adds itself, then re-reads the assignee list and requires it to be exactly itself; a lost race removes what it added and skips the card. The add alone is not a mutex (an issue accepts several assignees), so verification is the claim. Closes the 10–30s `claude -p` cold-start race.
 4. **One worker per lane** — at most one Builder, one Tester, one Reviewer at a time. A 30-card `Ready` backlog does NOT start 30 Builders.
 5. **Immutable GraphQL reserve** — a 1,000-point floor the pipeline will not spend. It is not configurable downward; a run that would break it halts (exit 75) rather than borrowing against it.
 6. **120-second tick** — keeps ProjectsV2 query cost (~103 GraphQL pts/tick) at ~3.1k/hr, well under the 5k budget. Bump in your config if you have more headroom.
