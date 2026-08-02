@@ -15,7 +15,12 @@
 #
 # Configuration (repository level; no token value ever belongs in this file):
 #   vars.ENABLE_SUPERBOARD_NORMALIZE       must be exactly "true"
-#   vars.SUPERBOARD_PROJECT_OWNER          the board owner (user or org login)
+#   vars.SUPERBOARD_PROJECT_OWNER          the board owner login — a USER or an
+#                                          ORGANIZATION. There is deliberately
+#                                          no owner-TYPE variable: the query
+#                                          resolves either kind, and a value an
+#                                          operator can set wrong is a value the
+#                                          board can be read wrong through.
 #   vars.SUPERBOARD_PROJECT_NUMBER         the board number
 #   vars.SUPERBOARD_ACTIVATION_BOUNDARY    RFC3339; closures before it are historical
 #   secrets.SUPERBOARD_PROJECT_READ_TOKEN  Projects READ for the board owner
@@ -105,51 +110,25 @@ jobs:
           PROJECT_NUMBER: ${{ vars.SUPERBOARD_PROJECT_NUMBER }}
         run: |
           set -euo pipefail
-          # Every page, in the shape `snapshot_project` walks. `--paginate`
-          # follows the cursor itself; `--slurp` collects the pages into the
-          # array the runtime expects. A failed or partial read fails the step
-          # rather than becoming a smaller board.
+          # The query is the runtime's, not this workflow's. It asks
+          # `repositoryOwner`, with an inline fragment per concrete owner type,
+          # so it resolves a user-owned board AND an organization-owned one —
+          # this release installs against
+          # https://github.com/orgs/Bavariance/projects/1, which the previous
+          # `user(login:)` query resolved to null. A null owner reads as a board
+          # with no items, so the normalizer would have planned nothing, every
+          # time, on exactly the board it exists to run on.
+          python .claude/bin/super-board-project.py query > project-items.graphql
+          # `--paginate` follows the cursor itself; `--slurp` collects the pages
+          # into the array the runtime expects. A failed or partial read fails
+          # the step rather than becoming a smaller board.
           gh api graphql --paginate --slurp \
-            -F owner="${PROJECT_OWNER}" -F number="${PROJECT_NUMBER}" -f query='
-            query($owner: String!, $number: Int!, $endCursor: String) {
-              user(login: $owner) {
-                projectV2(number: $number) {
-                  items(first: 100, after: $endCursor) {
-                    nodes {
-                      id
-                      updatedAt
-                      content { ... on Issue { id url } ... on PullRequest { id url } }
-                    }
-                    pageInfo { hasNextPage endCursor }
-                  }
-                }
-              }
-            }' > raw-pages.json
-          python - <<'PY' > project-pages.json
-          import json
-          raw = json.load(open("raw-pages.json", encoding="utf-8"))
-          pages = []
-          for page in raw if isinstance(raw, list) else [raw]:
-              items = (
-                  ((page.get("data") or {}).get("user") or {}).get("projectV2") or {}
-              ).get("items") or {}
-              pages.append(
-                  {
-                      "items": [
-                          {
-                              "item_node_id": node.get("id"),
-                              "content_node_id": (node.get("content") or {}).get("id"),
-                              "content_url": (node.get("content") or {}).get("url"),
-                              "updated_at": node.get("updatedAt"),
-                          }
-                          for node in (items.get("nodes") or [])
-                      ],
-                      "fields": {},
-                      "pageInfo": items.get("pageInfo") or {"hasNextPage": False},
-                  }
-              )
-          json.dump(pages, open("project-pages.json", "w", encoding="utf-8"))
-          PY
+            -F owner="${PROJECT_OWNER}" -F number="${PROJECT_NUMBER}" \
+            -f query="$(cat project-items.graphql)" > raw-pages.json
+          # Fails closed on an unresolved owner or an absent Project, and writes
+          # nothing at all when it does: an unreadable board is never an empty
+          # one, and `set -e` turns the refusal into a failed job.
+          python .claude/bin/super-board-project.py pages --raw raw-pages.json > project-pages.json
 
       - name: Assemble the normalization payload
         id: payload

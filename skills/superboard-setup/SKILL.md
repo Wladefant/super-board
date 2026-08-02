@@ -151,6 +151,19 @@ gh variable set SUPERBOARD_PROJECT_NUMBER --body "<N>"
 gh secret   set SUPERBOARD_PROJECT_READ_TOKEN   # Projects READ for that owner
 gh variable set ENABLE_SUPERBOARD_NORMALIZE --body "true"
 ```
+  **`SUPERBOARD_PROJECT_OWNER` is the owner LOGIN, and it may be a user or an
+  organization.** Both shapes are live: the Master board
+  <https://github.com/users/Wladefant/projects/5> is user-owned, and the product board
+  <https://github.com/orgs/Bavariance/projects/1> is organization-owned. There is
+  **no owner-type variable to set** — the board read is `repositoryOwner(login:)` with an
+  inline fragment per concrete owner type (`super-board-project.py query`, the single
+  authority for that query), so either kind resolves without being declared. That is
+  deliberate: an owner-type input is one more value an operator can set wrong, and getting
+  it wrong is invisible. A `user(login:)` query against an org board resolves to `null`,
+  `null` reads as a board with no items, and the normalizer plans nothing while the job
+  reports success. `super-board-project.py pages` refuses that shape outright — an
+  unresolved owner (`project-owner-unresolved`) or an absent Project (`project-not-found`)
+  exits 65 and writes no snapshot, and `set -euo pipefail` turns it into a failed job.
   (`$SB_SRC` = the super-board clone, `~/.claude/super-board-src`.) This installs the structured Issue Form (enforced Context / Steps / Acceptance criteria / Test Area / Priority / Work type / Environment constraint / Branch route / Milestone), the continuous intake-and-closure normalizer, and the fallback auto-add workflow. That fallback stays OFF - it is armed only through the re-enable gate documented in `references/onboard.md`, never by setup, install, or activation. GitHub's built-in project auto-add (Step 2) is the primary path.
 - Commit ONLY the `.claude/` additions AND the `.github/` board payload, then push.
 
