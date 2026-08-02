@@ -23,7 +23,7 @@
 # Usage from a worker:
 #   source scripts/super-board-gh-guard.sh
 #   sb_gh_guard_check 103 [config]   # refuse the burst if it would break the reserve
-#   sb_gh_budget_spend 5             # decrement worker-local call budget; halt if 0
+#   sb_gh_budget_spend 5             # decrement worker-local call budget; 75 if 0
 #   sb_gh_guard_summary [config]     # print the gh-quota-on-exit line on stderr
 
 # shellcheck source=scripts/super-board-python.sh
@@ -111,6 +111,12 @@ sb_gh_budget_init() {
 
 sb_gh_budget_spend() {
   # Decrement budget by N (default 1). If exhausted, halt the worker.
+  #
+  # Returns 75, the quota code — the same one `sb_gh_guard_check` returns when
+  # the GraphQL reserve is reached. Both mean "stop spending shared quota", and
+  # a worker's supervisor acts on them identically. It used to return 73, which
+  # this runtime's exit-code contract does not define at all, so the halt was
+  # unreadable to every caller downstream.
   local cost="${1:-1}" remaining
   [ -f "$SB_GH_GUARD_STATE_FILE" ] || sb_gh_budget_init
   remaining=$(cat "$SB_GH_GUARD_STATE_FILE")
@@ -118,7 +124,7 @@ sb_gh_budget_spend() {
   echo "$remaining" > "$SB_GH_GUARD_STATE_FILE"
   if [ "$remaining" -le 0 ]; then
     echo "[gh-guard] worker gh-call budget exhausted — halting to protect shared quota" >&2
-    return 73
+    return 75
   fi
 }
 

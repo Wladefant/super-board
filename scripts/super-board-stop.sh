@@ -28,7 +28,7 @@
 # Exit codes:
 #   0  clean stop (or nothing to stop)
 #   64 missing arg + no .claude/super-board/active
-#   66 config not found
+#   65 config not found, or otherwise unusable input
 
 set -euo pipefail
 
@@ -49,8 +49,11 @@ fi
 
 CONFIG_PATH=".claude/super-board/configs/${CONFIG_SLUG}.json"
 if [ ! -f "$CONFIG_PATH" ]; then
-  echo "config not found: $CONFIG_PATH" >&2
-  exit 66
+  # 65: the input contract could not be satisfied. 66 is not a code this
+  # runtime defines anywhere, so a supervisor reading it has nothing to
+  # look it up in.
+  echo "config not found: $CONFIG_PATH — exiting 65" >&2
+  exit 65
 fi
 
 # ───────────────────────────── config read ─────────────────────────────

@@ -36,7 +36,10 @@ while [ $# -gt 0 ]; do
     *) echo "unknown arg: $1" >&2; exit 64 ;;
   esac
 done
-[ -n "$CONFIG" ] && [ -e "$CONFIG" ] || { echo "config not found: ${CONFIG:-<unset>}" >&2; exit 66; }
+# 65, matching every other entry point: a config that is not there is the
+# same unusable input as a config that does not validate. 66 is not a code
+# this runtime defines.
+[ -n "$CONFIG" ] && [ -e "$CONFIG" ] || { echo "config not found: ${CONFIG:-<unset>} — exiting 65" >&2; exit 65; }
 
 # Read the config ONCE — $CONFIG may be a process substitution (test mode),
 # which is a FIFO and cannot be read twice.
