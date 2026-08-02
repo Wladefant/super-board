@@ -81,6 +81,9 @@ NOPROGRESS_HALT_TICKS=$(jq -r '.noprogress_halt_ticks // 10' "$CONFIG_PATH")
 MAX_DISPATCHES=$(jq -r '.max_dispatches // 20' "$CONFIG_PATH")
 MAX_HOURS=$(jq -r '.max_hours // 3' "$CONFIG_PATH")
 STALE_LOCK_SECONDS=$(jq -r '.stale_lock_seconds // 900' "$CONFIG_PATH")
+# How long a lock may hold a card with no worker PID recorded yet — the window
+# between claiming the lock and the worker being spawned.
+SPAWN_GRACE_SECONDS=$(jq -r '.spawn_grace_seconds // 120' "$CONFIG_PATH")
 
 # This dispatcher is the "claude-p" backend. A board configured for the
 # in-session workflow backend must not be drained here.
@@ -112,7 +115,31 @@ sb_is_windows() {
 PROJECT_ITEMS_JSON=""
 fetch_project_items() {
   # One gh call per tick; all column lookups read from this cache.
-  PROJECT_ITEMS_JSON=$(gh project item-list "$PROJECT_NUMBER" --owner "$PROJECT_OWNER" --format json --limit 500 2>/dev/null || echo '{"items":[]}')
+  #
+  # Fails CLOSED. A failed read used to become `{"items":[]}`, and an empty
+  # board is indistinguishable from a drained one: every column counted zero,
+  # the done condition fired, and the runner exited reporting success while the
+  # board it could not read was full of work. An unreadable board is an error,
+  # never a state.
+  local raw rc=0
+  raw=$(gh project item-list "$PROJECT_NUMBER" --owner "$PROJECT_OWNER" \
+          --format json --limit 500 2>/dev/null) || rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$raw" ] \
+     || ! printf '%s' "$raw" | jq -e '(.items | type) == "array"' >/dev/null 2>&1; then
+    PROJECT_ITEMS_JSON=""
+    return 1
+  fi
+  PROJECT_ITEMS_JSON="$raw"
+  return 0
+}
+
+halt_unreadable_board() {
+  # The project snapshot is this runtime's input. An input contract that cannot
+  # be satisfied is exit 65 — the same code an unreadable config produces.
+  log "🛑 halting — the project board could not be read, and an unreadable board is NOT an empty one."
+  log "    Nothing is dispatched and no done condition is inferred. Draining in-flight workers, then exiting with 65."
+  drain_in_flight
+  exit 65
 }
 
 column_count() {
@@ -171,12 +198,29 @@ read_lock() {
   return 0
 }
 
+lock_age_seconds() {
+  local mtime
+  mtime=$(date -r "$1" +%s 2>/dev/null || echo 0)
+  echo $(( $(date +%s) - mtime ))
+}
+
 issue_locked() {
   # Returns 0 if the issue has a live in-flight lock; cleans stale locks.
   # On Windows/MSYS, unverifiable PIDs are treated as alive until stale_lock_seconds.
   local issue="$1" lock="$INFLIGHT_DIR/$1"
   [ -f "$lock" ] || return 1
   read_lock "$issue"
+  if [ -z "${PID:-}" ]; then
+    # Claimed, worker not spawned yet. The lock is written before the claim so
+    # a second dispatcher cannot start a duplicate worker in that window; it is
+    # held only briefly so a crash between claim and spawn cannot wedge the card.
+    if [ "$(lock_age_seconds "$lock")" -lt "$SPAWN_GRACE_SECONDS" ]; then
+      return 0
+    fi
+    log "reaped a claim lock for #${issue} that never produced a worker"
+    rm -f "$lock"
+    return 1
+  fi
   if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
     return 0
   fi
@@ -221,18 +265,35 @@ gh_quota_guard() {
 }
 
 try_claim_assignee() {
-  # Atomic claim. Returns 0 if we won the claim, 1 if someone else beat us.
-  # Not attempted when bot_identity is unset (solo single-user runs rely on local locks only).
-  # We rely on the runtime's eligibility pass having already filtered out cards with
-  # assignees from the cached project item-list — so we attempt the edit directly without a
-  # pre-check `gh issue view`. Saves one GraphQL call per dispatch. The edit is
-  # idempotent for self-assign; on race-loss, gh returns non-zero and we skip.
-  local issue="$1"
+  # Add-then-VERIFY claim. Returns 0 only when this dispatcher owns the card.
+  # Not attempted when bot_identity is unset (solo single-user runs rely on
+  # local locks only).
+  #
+  # `gh issue edit --add-assignee` is NOT a mutex. A GitHub issue accepts up to
+  # ten assignees, so the add succeeds whether or not someone else has already
+  # claimed the card — two orchestrators both saw exit 0 and both dispatched a
+  # worker onto the same issue. The add is only half a claim; the other half is
+  # reading the assignee list back and requiring it to be exactly us. On any
+  # other set, the assignee we just added is removed again and the card is
+  # skipped: losing a race must not leave a claim behind.
+  local issue="$1" assignees
   [ -z "$BOT_LOGIN" ] && return 0
   gh issue edit "$issue" --add-assignee "$BOT_LOGIN" >/dev/null 2>&1 || {
     log "claim failed on #${issue} (race or gh api error) — skipping this tick"
     return 1
   }
+  assignees=$(gh issue view "$issue" --json assignees \
+                -q '[.assignees[].login] | join(",")' 2>/dev/null) || {
+    log "claim on #${issue} could not be verified — releasing it and skipping (fail closed)"
+    release_claim "$issue"
+    return 1
+  }
+  assignees=$(printf '%s' "$assignees" | tr -d '[:space:]')
+  if [ "$assignees" != "$BOT_LOGIN" ]; then
+    log "claim race lost on #${issue} (assignees: ${assignees:-none}) — releasing ours and skipping"
+    release_claim "$issue"
+    return 1
+  fi
   return 0
 }
 
@@ -345,6 +406,30 @@ merge_handoff_ready() {
   return 0
 }
 
+take_issue_lock() {
+  # Create the in-flight lock ATOMICALLY, before anything is claimed or spawned.
+  # `set -o noclobber` makes the create-or-fail one operation, so two
+  # dispatchers racing for the same card cannot both proceed. The PID is not
+  # known yet and is recorded by `record_worker_pid` once it is.
+  local issue="$1" lane="$2"
+  (set -o noclobber
+   printf 'PID=\nLANE=%s\nSTARTED=%s\n' "$lane" "$(date -u +%FT%TZ)" \
+     > "$INFLIGHT_DIR/$issue") 2>/dev/null
+}
+
+record_worker_pid() {
+  # v1.3.0+ lock format: bash-assignment style so `super-board stop` can source
+  # it to recover lane + dispatch time. issue_locked()/reap_finished_locks()
+  # still work because PID= is the first line.
+  local issue="$1" lane="$2" pid="$3"
+  printf 'PID=%s\nLANE=%s\nSTARTED=%s\n' "$pid" "$lane" "$(date -u +%FT%TZ)" \
+    > "$INFLIGHT_DIR/$issue"
+}
+
+drop_issue_lock() {
+  rm -f "$INFLIGHT_DIR/$1"
+}
+
 dispatch_lane() {
   # $1 = lane (build|qa|review); $2 = issue number
   local lane="$1" issue="$2" prompt pid
@@ -352,17 +437,30 @@ dispatch_lane() {
     log "skip dispatch lane=${lane} issue=#${issue} — already locked"
     return 0
   fi
+  # The lock comes FIRST — before the claim, before the worker. It used to be
+  # written after the spawn, which left two windows open: a concurrent
+  # dispatcher could pass its own `issue_locked` check and launch a second
+  # worker onto the same card, and a crash between the spawn and the write left
+  # a live worker that nothing tracked, reaped, or stopped. Every refusal below
+  # drops the lock again.
+  if ! take_issue_lock "$issue" "$lane"; then
+    log "skip dispatch lane=${lane} issue=#${issue} — another dispatcher took the lock first"
+    return 0
+  fi
   # Boundary 1: immediately before the claim.
   if ! activation_permits "$issue" claim; then
+    drop_issue_lock "$issue"
     return 0
   fi
   if ! try_claim_assignee "$issue"; then
+    drop_issue_lock "$issue"
     return 0
   fi
   # Boundary 2: immediately before the launch. A mode flip during the claim
   # window releases the claim again rather than launching a worker.
   if ! activation_permits "$issue" launch; then
     release_claim "$issue"
+    drop_issue_lock "$issue"
     return 0
   fi
   # The declared route travels with the card. A worker never infers a branch
@@ -372,11 +470,15 @@ dispatch_lane() {
             '.[] | select(.number == $n) | .selected_base_branch // empty' | head -1)
   if [ -z "$route" ]; then
     log "🛑 refusing to dispatch #${issue} — no declared branch route survived eligibility (fail closed)"
+    release_claim "$issue"
+    drop_issue_lock "$issue"
     return 0
   fi
   case "$route" in
     designstaging|main|master|default)
       log "🛑 refusing to dispatch #${issue} — '${route}' is never a dispatch route"
+      release_claim "$issue"
+      drop_issue_lock "$issue"
       return 0 ;;
   esac
   local route_note="Base branch: ${route} (declared route — never infer another one)."
@@ -384,14 +486,22 @@ dispatch_lane() {
     build)  prompt="Run super-build on issue #${issue} for super-board run. Read .claude/skills/super-board/references/run.md → Builder lifecycle. ${route_note} Config: ${CONFIG_PATH}." ;;
     qa)     prompt="Run super-qa on issue #${issue} for super-board run. Read .claude/skills/super-board/references/run.md → Tester lifecycle. ${route_note} Config: ${CONFIG_PATH}." ;;
     review) prompt="Run super-review on issue #${issue} for super-board run. Read .claude/skills/super-board/references/run.md → Reviewer lifecycle. ${route_note} Config: ${CONFIG_PATH}." ;;
-    *) log "unknown lane: $lane"; return 1 ;;
+    *)
+      log "unknown lane: $lane"
+      release_claim "$issue"
+      drop_issue_lock "$issue"
+      return 1 ;;
   esac
+  pid=""
   nohup claude -p "$prompt" >/dev/null 2>&1 &
   pid=$!
-  # v1.3.0+ lock format: bash-assignment style so `super-board stop` can source it
-  # to recover lane + dispatch time. issue_locked()/reap_finished_locks() still work
-  # because PID= is the first line.
-  printf 'PID=%s\nLANE=%s\nSTARTED=%s\n' "$pid" "$lane" "$(date -u +%FT%TZ)" > "$INFLIGHT_DIR/$issue"
+  if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+    log "🛑 the worker for #${issue} did not start — releasing the claim and the lock"
+    release_claim "$issue"
+    drop_issue_lock "$issue"
+    return 0
+  fi
+  record_worker_pid "$issue" "$lane" "$pid"
   case "$lane" in
     build) BUILD_PID="$pid"; BUILD_ISSUE="$issue" ;;
     qa) QA_PID="$pid"; QA_ISSUE="$issue" ;;
@@ -463,6 +573,18 @@ reap_finished_locks() {
     # would dissolve the backend mutual exclusion mid-run.
     case "$issue" in *[!0-9]*|'') continue ;; esac
     read_lock "$issue"
+    if [ -z "${PID:-}" ]; then
+      # A lock taken but not yet spawned into. Held for the spawn grace window,
+      # then reaped so a crash in that window cannot wedge the card forever.
+      if [ "$(lock_age_seconds "$lock")" -lt "$SPAWN_GRACE_SECONDS" ]; then
+        continue
+      fi
+      log "reaped a claim lock for #${issue} that never produced a worker"
+      rm -f "$lock"
+      TOTAL_REAPS=$((TOTAL_REAPS + 1))
+      [ -n "$BOT_LOGIN" ] && gh issue edit "$issue" --remove-assignee "$BOT_LOGIN" >/dev/null 2>&1 || true
+      continue
+    fi
     if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
       continue
     fi
@@ -502,6 +624,66 @@ drain_in_flight() {
   done
   log "⚠ drain timed out after ${max_drain_ticks} ticks — exiting anyway"
 }
+
+stop_and_release_in_flight() {
+  # Stop every worker this dispatcher owns and give back everything it holds:
+  # the GitHub assignee claim and the local lock, per issue. Used on INT/TERM,
+  # where waiting out a full drain (up to max_drain_ticks × tick_seconds) is not
+  # an option — an operator who pressed Ctrl-C is not going to wait an hour, and
+  # walking away leaves cards claimed by a process that no longer exists, which
+  # the planner then skips forever.
+  local lock issue
+  for lock in "$INFLIGHT_DIR"/*; do
+    [ -f "$lock" ] || continue
+    issue=$(basename "$lock")
+    # Issue locks only. The workflow backend's workflow-wave.lock is not ours;
+    # deleting it would dissolve the backend mutual exclusion mid-run.
+    case "$issue" in *[!0-9]*|'') continue ;; esac
+    read_lock "$issue"
+    if [ -n "${PID:-}" ] && kill -0 "$PID" 2>/dev/null; then
+      kill "$PID" 2>/dev/null || true
+      sleep 1
+      kill -9 "$PID" 2>/dev/null || true
+    fi
+    release_claim "$issue"
+    rm -f "$lock"
+    log "released #${issue} on stop (pid=${PID:-none})"
+  done
+  BUILD_PID=""; BUILD_ISSUE=""
+  QA_PID=""; QA_ISSUE=""
+  REVIEW_PID=""; REVIEW_ISSUE=""
+}
+
+on_terminate() {
+  # A signal used to run `sb_tmp_cleanup` and nothing else, so INT/TERM removed
+  # a few temp files and left every worker running, every assignee claimed, and
+  # every lock in place — the board looked busy to the next dispatcher forever.
+  local code="$1"
+  trap - EXIT INT TERM
+  log "🛑 stop signal received — stopping in-flight workers and releasing claims."
+  stop_and_release_in_flight
+  sb_tmp_cleanup
+  exit "$code"
+}
+
+BUILD_PID=""; BUILD_ISSUE=""
+QA_PID=""; QA_ISSUE=""
+REVIEW_PID=""; REVIEW_ISSUE=""
+# The mode the run was launched with. Both mutation boundaries re-read the mode
+# from disk and compare it against this, so a board flipped off mid-run aborts
+# the very next claim.
+PLANNED_ACTIVATION_MODE="$ACTIVATION_MODE"
+
+# Signals are handled from here on: everything above only defines behaviour.
+trap 'on_terminate 130' INT
+trap 'on_terminate 143' TERM
+
+# Library mode: define every function, then stop. The tests source this file to
+# exercise one guarantee at a time instead of only as an emergent property of a
+# two-minute loop. Nothing below this line runs when it is set.
+if [ -n "${SB_RUN_LIB_ONLY:-}" ]; then
+  return 0 2>/dev/null || exit 0
+fi
 
 # ───────────────────────────── preconditions ─────────────────────────────
 log "super-board run started — config=${CONFIG_SLUG} variant=${VARIANT} base=${BASE_BRANCH} activation=${ACTIVATION_MODE} tick=${TICK_SECONDS}s max_workers=${MAX_WORKERS} noprogress_halt_ticks=${NOPROGRESS_HALT_TICKS} max_dispatches=${MAX_DISPATCHES} max_hours=${MAX_HOURS}"
@@ -566,18 +748,14 @@ reap_finished_locks
 
 # ───────────────────────────── main loop ─────────────────────────────
 gh_quota_guard
-fetch_project_items
+fetch_project_items || halt_unreadable_board
 INITIAL_READY=$(column_count "Ready")
 log "initial Ready count: $INITIAL_READY"
 
-PLANNED_ACTIVATION_MODE="$ACTIVATION_MODE"
 NO_PROGRESS_TICKS=0
 NOMERGE_TICKS=0
 PREV_DONE_COUNT=$(column_count "Done")
 RUN_START_EPOCH=$(date +%s)
-BUILD_PID=""; BUILD_ISSUE=""
-QA_PID=""; QA_ISSUE=""
-REVIEW_PID=""; REVIEW_ISSUE=""
 
 while true; do
   # Workflow-backend mutual exclusion, re-checked every tick: the startup
@@ -634,7 +812,7 @@ while true; do
 
   # ── Expensive-tick path: we have capacity, fetch real state.
   gh_quota_guard
-  fetch_project_items
+  fetch_project_items || halt_unreadable_board
   refresh_eligible_cards
 
   # Re-sweep zombies against fresh cache; the previous sweep used stale data.
