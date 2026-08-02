@@ -90,10 +90,11 @@ mkdir -p .github/ISSUE_TEMPLATE .github/workflows
 cp "$SB_SRC/payload/github/ISSUE_TEMPLATE/superboard-issue.yml" .github/ISSUE_TEMPLATE/
 cp "$SB_SRC/payload/github/ISSUE_TEMPLATE/config.yml"           .github/ISSUE_TEMPLATE/
 cp "$SB_SRC/payload/github/workflows/auto-add-to-project.yml"   .github/workflows/
-# sed THIS board's URL into the guarded workflow's placeholder:
-sed -i "s#__PROJECT_URL__#https://github.com/users/Wladefant/projects/<N>#" .github/workflows/auto-add-to-project.yml
+cp "$SB_SRC/payload/github/workflows/super-board-normalize.yml" .github/workflows/
+# The board URL is a repository variable, not a placeholder in the file:
+gh variable set SUPERBOARD_PROJECT_URL --body "https://github.com/users/Wladefant/projects/<N>"
 ```
-  (`$SB_SRC` = the super-board clone, `~/.claude/super-board-src`.) This installs the structured Issue Form (enforced Context/Steps/Acceptance + Type dropdown + `environment-constraint` checkbox) and the guarded auto-add workflow. The workflow stays OFF until the operator sets `ENABLE_ADD_TO_PROJECT=true` + the `ADD_TO_PROJECT_PAT` secret (instructions are in the file header) - GitHub's built-in project auto-add (Step 2) is the primary path; this Action is the redundant backup.
+  (`$SB_SRC` = the super-board clone, `~/.claude/super-board-src`.) This installs the structured Issue Form (enforced Context / Steps / Acceptance criteria / Test Area / Priority / Work type / Environment constraint / Branch route / Milestone), the continuous intake-and-closure normalizer, and the fallback auto-add workflow. That fallback stays OFF - it is armed only through the re-enable gate documented in `references/onboard.md`, never by setup, install, or activation. GitHub's built-in project auto-add (Step 2) is the primary path.
 - Commit ONLY the `.claude/` additions AND the `.github/` board payload, then push.
 
 ## Step 2 — Browser part (route to an Opus claude-in-chrome lane; the API cannot do this)

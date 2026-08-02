@@ -1,31 +1,141 @@
-# Guarded auto-add: a REDUNDANT / robust layer on top of GitHub's built-in Projects
-# auto-add workflow (which already covers `is:issue is:open` once you enable it in the
-# project UI). This Action is a belt-and-suspenders backup and is DISABLED BY DEFAULT.
+# Fallback auto-add — INSTALLED DISABLED, and it stays that way.
 #
-# SETUP (superboard-setup Step 1 does the sed; do the secret/variable by hand once):
-#   1. Replace __PROJECT_URL__ below with this project's board URL
-#      (e.g. https://github.com/users/<owner>/projects/<N>).
-#      superboard-setup does this automatically:  sed -i "s#__PROJECT_URL__#<url>#" .github/workflows/auto-add-to-project.yml
-#   2. Create a fine-grained PAT with read/write access to the owner's Projects, then:
-#        gh secret set ADD_TO_PROJECT_PAT       # paste the token
-#   3. Turn the guard on:
-#        gh variable set ENABLE_ADD_TO_PROJECT --body true
-#   Without the variable set to the string "true" the job is SKIPPED, so nothing errors.
-#   Do NOT store any token in this file.
+# GitHub's built-in Projects auto-add already covers `is:issue is:open` once it
+# is enabled in the project UI. This Action is a redundant backup for the day
+# that breaks. A redundant backup running unattended is a duplicate-card
+# generator: it fires on `issues.opened`, the built-in workflow fires on the
+# same event, and the board ends up with two cards for one issue that then
+# disagree about status. So this job is inert unless a repository variable says
+# otherwise, and even then it refuses to insert unless it can prove the card is
+# absent.
+#
+# RE-ENABLE GATE — read `skills/super-board/references/onboard.md` before
+# touching anything here. Enabling this workflow requires a separate
+# configuration-only issue and a user-reviewed pull request that links evidence
+# of a built-in auto-add failure. Neither the installer, nor a proof run, nor an
+# activation-mode change authorizes it.
+#
+# Configuration (all repository-level; this file carries no substitution marker
+# for an installer to rewrite, because a marker that is never rewritten becomes
+# a live misconfiguration):
+#   vars.SUPERBOARD_PROJECT_URL   the board URL
+#   vars.ENABLE_ADD_TO_PROJECT    must be exactly the string "true"
+#   secrets.ADD_TO_PROJECT_PAT    a fine-grained PAT with Projects read/write
+#                                 for the board OWNER. A GitHub App cannot be
+#                                 used here: GitHub Apps cannot access
+#                                 user-owned (personal) Projects v2 at all.
+# No token value ever belongs in this file.
 
-name: "Auto-add issues to Superboard"
+name: "Auto-add issues to Superboard (fallback, disabled)"
+
 on:
   issues:
     types: [opened]
+
 permissions:
   contents: read
+  issues: read
+
+concurrency:
+  group: superboard-fallback-add-${{ github.event.issue.node_id }}
+  cancel-in-progress: false
+
 jobs:
   add-to-project:
     runs-on: ubuntu-latest
     if: ${{ vars.ENABLE_ADD_TO_PROJECT == 'true' }}
     steps:
+      - name: Check out the installed runtime
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Read the board by immutable content node ID
+        id: inventory
+        env:
+          GH_TOKEN: ${{ secrets.ADD_TO_PROJECT_PAT }}
+          PROJECT_URL: ${{ vars.SUPERBOARD_PROJECT_URL }}
+        run: |
+          # One paginated read. A partial answer is reported as partial, never
+          # as "the issue is not on the board".
+          gh api graphql -F url="${PROJECT_URL}" -f query='
+            query($url: URI!) {
+              resource(url: $url) {
+                ... on ProjectV2 {
+                  items(first: 100) {
+                    nodes { id content { ... on Issue { id } } }
+                    pageInfo { hasNextPage }
+                  }
+                }
+              }
+            }' > inventory.json
+
+      - name: Decide whether an insertion is authorized
+        id: guard
+        env:
+          ISSUE_NODE_ID: ${{ github.event.issue.node_id }}
+          ENABLE_ADD_TO_PROJECT: ${{ vars.ENABLE_ADD_TO_PROJECT }}
+          GH_TOKEN: ${{ secrets.ADD_TO_PROJECT_PAT }}
+        run: |
+          # The decision lives in the shared runtime so this workflow cannot
+          # drift from it. Identity and quota preflight run inside, and only
+          # after membership has come back a definite "absent".
+          PYTHONPATH=.claude/bin python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, subprocess
+          from super_board_runtime.project import ProjectSnapshot, evaluate_fallback_auto_add
+
+          raw = json.load(open("inventory.json", encoding="utf-8"))
+          board = (raw.get("data") or {}).get("resource") or {}
+          page = board.get("items") or {}
+          items = [
+              {
+                  "item_node_id": node.get("id"),
+                  "content_node_id": (node.get("content") or {}).get("id"),
+              }
+              for node in (page.get("nodes") or [])
+          ]
+          snapshot = ProjectSnapshot(
+              project_owner="",
+              project_number=0,
+              items=tuple(items),
+              fields={},
+              hit_cap=bool((page.get("pageInfo") or {}).get("hasNextPage")),
+          )
+
+          def identity():
+              probe = subprocess.run(
+                  ["gh", "api", "user", "--jq", ".login"],
+                  capture_output=True, text=True, timeout=60,
+              )
+              return probe.returncode == 0 and bool(probe.stdout.strip())
+
+          def quota():
+              subprocess.run(
+                  ["bash", ".claude/bin/super-board-gh-guard.sh", "check"],
+                  check=True, capture_output=True, timeout=60,
+              )
+
+          decision = evaluate_fallback_auto_add(
+              os.environ.get("ISSUE_NODE_ID"),
+              snapshot,
+              os.environ.get("ENABLE_ADD_TO_PROJECT") == "true",
+              identity_check=identity,
+              quota_check=quota,
+          )
+          print(f"insert={str(decision.insert).lower()}")
+          print(f"reason={decision.reason_code}")
+          PY
+
+      - name: Report a refusal
+        if: steps.guard.outputs.insert != 'true'
+        run: echo "fallback auto-add declined - ${{ steps.guard.outputs.reason }}"
+
       - name: Add issue to project
+        if: steps.guard.outputs.insert == 'true'
         uses: actions/add-to-project@v1
         with:
-          project-url: __PROJECT_URL__
+          project-url: ${{ vars.SUPERBOARD_PROJECT_URL }}
           github-token: ${{ secrets.ADD_TO_PROJECT_PAT }}
