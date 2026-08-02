@@ -64,16 +64,28 @@
   "repo": null,
 
   // The branch all per-issue branches are cut from and rebase-merged back into
-  // BY A HUMAN. Default `"main"`. Onboard warns and suggests `"staging"` or
-  // `"develop"` if `main` appears to be production.
-  "base_branch": "main",
+  // BY A HUMAN. Defaults to `"main"`; onboard warns and suggests `"staging"` or
+  // `"develop"` when `main` appears to be production, which is why the shipped
+  // PolySimulator shape below runs on a `staging` default.
+  "base_branch": "staging",
 
   // Optional label → branch routing table. A card carrying a route label is
   // branched from (and targets) that branch instead of `base_branch`. Two route
   // labels naming different branches is a routing error, not a coin toss.
+  //
+  // A route is only real when the issue body declares it — `Branch route:
+  // staging` or `Branch route: staging-frankfurt`, exactly once. The label is
+  // the second half of the same statement: the Frankfurt route is a separate
+  // deploying branch, so it must be stated in the body AND carried on the card
+  // (`branch:staging-frankfurt`) before a branch is created.
+  //
+  // A repository's default branch (`main` / `master`) and any design branch
+  // (`designstaging`) can NEVER be dispatch routes, however they are spelled.
+  // Declaring one fails closed as `route-declaration-unknown`, so listing it
+  // here buys a label that can never resolve. See
+  // `scripts/super_board_runtime/routing.py` (`NON_DISPATCH_BRANCHES`).
   "branch_routes": {
-    "route:staging": "staging",
-    "route:main": "main"
+    "branch:staging-frankfurt": "staging-frankfurt"
   },
 
   "paths": {
