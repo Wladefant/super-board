@@ -22,7 +22,13 @@ circular import.
 CLI:
 
     python -m super_board_runtime.activation --config <cfg> --issue-url <url> \\
-        [--planned-mode active] [--stage claim|launch]
+        [--planned-mode active] [--stage claim|launch] [--previous-mode off]
+
+`--previous-mode` validates the LADDER STEP: the board climbs
+`off` → `proof-only` → `active` one rung at a time, and skipping the proof rung
+exits 65. Descending is always permitted — the ladder slows arming, not
+disarming. The other half of the rule, that each step arrives as a pull request
+a human read, is governance: a config file does not know how it was changed.
 
 Machine-readable JSON on stdout, diagnostics on stderr. Exit 0 when the decision
 was reached (read `permitted`), 64 invalid invocation, 65 invalid configuration.
@@ -52,6 +58,16 @@ except ImportError:  # executed as a plain file path
 
 STAGES: tuple[str, ...] = ("plan", "claim", "launch")
 
+#: The activation ladder, in order. A board climbs it one rung at a time:
+#: `off` → `proof-only` → `active`. `off` → `active` skips the rung whose entire
+#: purpose is to prove the installation on one real card before the board is
+#: allowed to select any card.
+#:
+#: Descending is always permitted, to any depth. Turning a board down — or off —
+#: must never be something code refuses; the ladder exists to slow arming down,
+#: not disarming.
+ACTIVATION_LADDER: tuple[str, ...] = ("off", "proof-only", "active")
+
 
 @dataclass(frozen=True)
 class ActivationDecision:
@@ -65,6 +81,59 @@ class ActivationDecision:
             "activation_mode": self.activation_mode,
             "reason_code": self.reason_code,
         }
+
+
+@dataclass(frozen=True)
+class ActivationTransition:
+    """Whether one activation-mode change is a legal step on the ladder."""
+
+    permitted: bool
+    previous_mode: Optional[str]
+    next_mode: Optional[str]
+    reason_code: Optional[str]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "next_mode": self.next_mode,
+            "previous_mode": self.previous_mode,
+            "reason_code": self.reason_code,
+            "transition_permitted": self.permitted,
+        }
+
+
+def validate_activation_transition(
+    previous_mode: Any, next_mode: Any
+) -> ActivationTransition:
+    """Enforce the one-step ladder. Fails closed on anything it cannot read.
+
+    `config.py` validates the mode a config CURRENTLY declares; it has no view of
+    the mode the config declared before, so nothing stopped a board going from
+    `off` straight to `active` in a single edit. This is the missing half, and it
+    is the half a validator can actually see.
+
+    The other half of the rule — that each step arrives as a pull request a human
+    read — is not expressible here at all: a config file does not know how it was
+    changed. That part is governance, and the setup skill now says so rather than
+    claiming code enforces it.
+    """
+    if previous_mode not in ACTIVATION_LADDER or next_mode not in ACTIVATION_LADDER:
+        return ActivationTransition(
+            False,
+            previous_mode if isinstance(previous_mode, str) else None,
+            next_mode if isinstance(next_mode, str) else None,
+            "activation-mode-invalid",
+        )
+    current = ACTIVATION_LADDER.index(previous_mode)
+    following = ACTIVATION_LADDER.index(next_mode)
+    if following - current > 1:
+        return ActivationTransition(
+            False,
+            previous_mode,
+            next_mode,
+            "activation-ladder-skipped",
+        )
+    # Standing still, one rung up, or any descent.
+    return ActivationTransition(True, previous_mode, next_mode, None)
 
 
 def normalize_issue_url(url: Optional[str]) -> Optional[str]:
@@ -161,17 +230,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="the mode observed at plan time; a change aborts the stage",
     )
     parser.add_argument("--stage", default="claim", choices=STAGES, help="the mutation boundary")
+    parser.add_argument(
+        "--previous-mode",
+        default=None,
+        choices=ACTIVATION_MODES,
+        help="the mode this config declared BEFORE the change; validates the ladder step",
+    )
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        load_and_validate_config(Path(args.config))
+        config = load_and_validate_config(Path(args.config))
     except ConfigError as exc:
         print(f"super-board-activation: invalid config: {exc}", file=sys.stderr)
         print(json.dumps({"ok": False, "reason": exc.reason}, sort_keys=True), file=sys.stderr)
         return EXIT_CONFIG
+
+    transition: Optional[ActivationTransition] = None
+    if args.previous_mode is not None:
+        transition = validate_activation_transition(
+            args.previous_mode, config.activation_mode
+        )
+        if not transition.permitted:
+            print(
+                "super-board-activation: refusing the activation change — "
+                f"{args.previous_mode!r} → {config.activation_mode!r} is not one step "
+                f"on {' → '.join(ACTIVATION_LADDER)}",
+                file=sys.stderr,
+            )
+            print(
+                json.dumps(
+                    {"ok": False, "reason": transition.reason_code, **transition.to_dict()},
+                    sort_keys=True,
+                ),
+                file=sys.stderr,
+            )
+            return EXIT_CONFIG
 
     decision = guard_stage(
         _UrlOnlyIssue(args.issue_url, args.issue_number),
@@ -183,6 +279,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     payload["stage"] = args.stage
     payload["issue_url"] = args.issue_url
     payload["issue_number"] = args.issue_number
+    if transition is not None:
+        payload.update(transition.to_dict())
     print(json.dumps(payload, sort_keys=True))
     return EXIT_OK
 

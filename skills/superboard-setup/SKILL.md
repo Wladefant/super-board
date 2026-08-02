@@ -290,11 +290,19 @@ Deploying is not completion. The card moves on evidence in GitHub.
 
 Setting up a board is not only creating columns — it is opting the project into a runtime
 whose safety properties are non-negotiable and mostly invisible until they fire. Every one
-of the rules below is enforced in code as of
-[v2.0.0](https://github.com/Wladefant/super-board/blob/main/RELEASE-NOTES.md), and every one
 of them exists because its absence produced a real failure. Read this section before
 provisioning; a board configured against these rules will refuse to run, and the refusal
 will look like a bug.
+
+Two kinds of rule appear below, and the difference matters:
+
+- **Enforced** — a named function refuses it, as of
+  [v2.0.0](https://github.com/Wladefant/super-board/blob/main/RELEASE-NOTES.md). Nothing at
+  runtime gets past it.
+- **Governance** — a rule about how humans change the configuration, which no validator can
+  see, because a config file does not know how it was edited or who reviewed it. Marked as
+  governance wherever it appears. Calling one of these "enforced in code" is worse than
+  saying nothing: it invites somebody to rely on a check that does not exist.
 
 ### Activation — a new board is OFF, and only a reviewed pull request moves it
 
@@ -307,11 +315,23 @@ will look like a bug.
 | `proof-only` | Exactly one allowlisted issue. Every other card is refused with `activation-not-allowlisted`. | must be an exact issue URL inside `repo.remote`, and that issue must be OPEN |
 | `active` | Normal dispatch; every eligibility rule below still applies. | must be `null` again |
 
-The transition is one-way through the ladder — `off` → `proof-only` → `active` — and **each
-transition needs its own human-reviewed configuration pull request.** Not a chat approval,
-not a local edit, not a flag on the run command: a diff somebody read. A new board is
-written at `off` and stays there until the installation and repository gates have actually
-been walked on that project.
+**Enforced.** The climb is one rung at a time — `off` → `proof-only` → `active` — and
+`validate_activation_transition` in the same module refuses a skipped rung with
+`activation-ladder-skipped` (exit 65). Pass the mode the config declared BEFORE the change:
+
+```
+python -m super_board_runtime.activation --config <cfg> --previous-mode <old-mode>
+```
+
+Descending is always permitted, to any depth. The ladder slows a board being armed, never a
+board being turned off.
+
+**Governance, not enforced.** Each step should arrive as its own human-reviewed
+configuration pull request — not a chat approval, not a local edit, not a flag on the run
+command: a diff somebody read. No validator can check this, because a config file does not
+know how it was edited. This section used to claim every rule under it was enforced in code;
+this one never was. A new board is written at `off` and stays there until the installation
+and repository gates have actually been walked on that project.
 
 The mode is re-read from disk immediately before a claim and immediately before a launch, so
 flipping a board back to `off` mid-run aborts the very next claim rather than the run after
