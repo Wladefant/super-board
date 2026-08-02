@@ -10,6 +10,8 @@ Builder and QA lanes route through the `grok` CLI (xAI quota) and the `codex` CL
 
 This follows the **fable-advisor orchestration doctrine**: the orchestrating session delegates mechanical / expensive work to cheaper or differently-metered agents and keeps the expensive model for synthesis and judgment calls.
 
+The Reviewer's *judgment* is Claude's; the Reviewer's *binding gate* is a parallel maximum-level local Codex fleet whose every finding must be resolved. Two model families, working the same diff — that is the point of the split, not a cost accident.
+
 ### 2. Idea → auto-decomposed issues
 
 Write **one** short core idea. The system expands it into multiple lint-passing, detailed GitHub issues with explicit acceptance criteria (via `super-board lint` readiness checks) before any card reaches `Ready`.
@@ -20,7 +22,9 @@ Epics and milestones stay visible on the **same** GitHub Project the run loop dr
 
 ### 4. One board per project, plus a life-level Master Board
 
-Every project gets its own GitHub Project + its own `.claude/super-board/configs/<slug>.json`. Same system, same verbs, everywhere. Above them sits a single **Master Board** ([#6](https://github.com/users/Wladefant/projects/6)) for the cross-project life view. The Master Board holds **only** (a) personal/life task cards and (b) one abstract epic card per project, each linking to that project's own per-project board. Granular dev issues live **exclusively** on their per-project boards — never bulk-add dev issues to the Master Board (#6).
+Every project gets its own GitHub Project + its own `.claude/super-board/configs/<slug>.json`. Same system, same verbs, everywhere. **A product's repos share ONE board** — a frontend repo and a backend repo are one product, so both are linked to the same Project rather than getting a board each. Above them sits a single **Master Board** ([#6](https://github.com/users/Wladefant/projects/6)) for the cross-project life view. The Master Board holds **only** (a) personal/life task cards and (b) one abstract per-project program epic, each linking to that project's own per-project board. Granular product cards live **exclusively** on their per-project boards — never bulk-add dev issues to the Master Board (#6).
+
+**Board moves are direct orchestration.** Adding a card, changing its Project status, or verifying one is done by the top-level session itself — GitHub MCP where it exposes Projects v2 mutations, otherwise targeted `gh api graphql` (`addProjectV2ItemById`, `updateProjectV2ItemFieldValue`), reading the returned item ID back. **Never spawn a subagent for a card move, a card add, or a status check.** A subagent's report is a claim; the returned item ID is the mutation.
 
 ### 5. Design collaboration
 
@@ -56,7 +60,7 @@ Domain labels (per-project examples; adapt names to the project, keep the patter
 - governance (D4C5F9): Governance, compliance, BIA track
 
 Process labels:
-- laptop / environment-constraint (E99695): Requires a specific machine/environment; doubles as a dispatch filter
+- environment-constraint (E99695): Requires a specific machine/environment; doubles as a dispatch filter. **Canonical name.** `laptop` is a PRESERVED LEGACY ALIAS that maps onto it (`canonical_environment_label` in `scripts/super_board_runtime/normalize.py`), so boards created before v2.0.0 keep working without relabelling a backlog. New boards create `environment-constraint` and nothing else.
 - meeting-prep (BFDADC): Preparation for a stakeholder meeting
 - decision (F9D0C4): Blocked on or records a human decision
 - risk (B60205): Documented open risk needing a policy call
@@ -64,7 +68,7 @@ Process labels:
 Plus the two system labels design and history created by the base setup.
 
 - Note that type labels are universal; domain labels are project-specific examples to rename/adapt.
-- Discipline: every issue gets >=1 type label + relevant domain labels at creation; labels are updated when scope changes. Environment-constraint labels like `laptop` double as dispatch filters - an agent session must not pick up a card labeled with an environment it does not have.
+- Discipline: every issue gets >=1 type label + relevant domain labels at creation; labels are updated when scope changes. `environment-constraint` doubles as a dispatch filter - an agent session must not pick up a card labeled with an environment it does not have.
 
 **Single source of truth for the doctrine.** Any change to the milestones/labels doctrine or the setup flow lands in ONE place: `skills/superboard-setup/SKILL.md` in this repo. Do not fork-edit local copies. Installed payload copies in each project refresh by re-running `install.sh` (or `git pull` on a junctioned clone); the local `~/.claude/skills/superboard-setup` is a directory junction into a clone of this repo, so editing the canonical file and pushing is the only supported way to evolve the taxonomy.
 
@@ -190,15 +194,122 @@ thing to true reactivity that does not require an always-running session.
 | [#10](https://github.com/EricTechPro/super-board/issues/10) | Draft-PR ready + merge path | Reviewer marks draft PRs ready before merge; never moves a card to Done while its PR is unmerged. |
 | [#13](https://github.com/EricTechPro/super-board/issues/13) | Windows-safe locks + run ceilings | `stale_lock_seconds` on Windows/MSYS when `kill -0` can't verify PIDs; hard `max_dispatches` / `max_hours` ceilings with drain. |
 
-Config keys (all optional, defaults in parentheses): `noprogress_halt_ticks` (10), `max_dispatches` (20), `max_hours` (3), `stale_lock_seconds` (900). See `skills/super-board/references/config-schema.json`.
+Config keys (all optional, defaults in parentheses): `noprogress_halt_ticks` (10), `max_dispatches` (20), `max_hours` (3), `stale_lock_seconds` (900). See [`config-schema.json`](https://github.com/Wladefant/super-board/blob/main/skills/super-board/references/config-schema.json).
 
-**Known hazard:** label-filtering is not yet implemented in the dispatchers — a `history` or `design` card dragged into `Ready` would be dispatched as buildable work. Tracked in [soundcore-work-workflow#26](https://github.com/Wladefant/soundcore-work-workflow/issues/26).
+**Hazard closed in v2.0.0:** label-filtering used to be missing from the dispatchers — a `history` or `design` card dragged into `Ready` was dispatched as buildable work ([soundcore-work-workflow#26](https://github.com/Wladefant/soundcore-work-workflow/issues/26)). `exclude_labels` is now part of the config schema and is enforced in EVERY dispatcher path — the read-only planner, the headless dispatcher and the dynamic workflow share one implementation — and `design` + `history` are permanently non-dispatchable whether or not they are listed.
+
+## v2.0.0 is backward-incompatible — what breaks, and what an existing board must do
+
+This release changes documented contracts in ways an existing board will notice. Full detail
+in [RELEASE-NOTES.md](./RELEASE-NOTES.md); the provisioning mechanics and the reasoning behind
+each rule are in
+[`skills/superboard-setup/SKILL.md`](https://github.com/Wladefant/super-board/blob/main/skills/superboard-setup/SKILL.md).
+
+**What breaks:**
+
+1. **Dispatch now requires exactly `Ready`.** No other status is dispatchable — there is no
+   "resume from Building", no picking a card up out of Blocked, and no lane-specific
+   eligibility. Only OPEN issue cards dispatch; pull-request cards never do. Boards that
+   parked work in Building expecting it to be picked back up will find it stranded.
+2. **Merge behaviour is human-only and rebase-only.** The runtime never merges, never enables
+   an automatic merge setting, never closes an implementation issue instead of merging it, and
+   never writes the completion column before a real human merge. `human_approves_merge` must
+   be `true` and `merge_method` must be `rebase`; anything else exits 65. Repositories must be
+   set to `allow_rebase_merge: true`, `allow_squash_merge: false`, `allow_merge_commit: false`.
+   A tree-wide scanner enforces this and fails the release gate on any active merge mechanism.
+3. **The status contract is the canonical seven** — `Backlog · Ready · Building · QA · Review ·
+   Blocked · Done` — and is not configurable. The retired eighth option is refused wherever a
+   lifecycle value is expected, rather than being quietly mapped onto something else.
+4. **The config schema changed.** `activation_mode` is required in practice (a board with no
+   activation decision is `off`), `human_approves_merge`/`merge_method` are constrained,
+   `minimum_graphql_reserve` has an immutable floor, `exclude_labels` is now enforced instead
+   of ignored, and `github_auth` names environment variables rather than carrying values. A
+   config containing anything credential-shaped exits 65.
+
+**Migration checklist for an existing board, in order:**
+
+1. Reinstall the payload at the pinned release and confirm the install manifest wrote a
+   SHA-256 for every file.
+2. Set `activation_mode` to `"off"` and `proof_issue_url` to `null`, then validate:
+   `python scripts/super-board-config.py validate --config <path> --json`.
+3. Set `human_approves_merge: true` and `merge_method: "rebase"`, and pin the three repository
+   merge settings above on every linked repo.
+4. Remove any Status option that is not one of the canonical seven — the retired eighth in
+   particular — and reconcile the cards holding it onto a real status.
+5. Fix the built-in workflows — in particular **Item reopened → Backlog**, which earlier
+   revisions of the setup doctrine wrongly set to Building — and read all seven targets back.
+6. Add `environment-constraint` to the label set. Leave `laptop` in place; it is an alias now,
+   not a duplicate.
+7. Add a `Branch route:` declaration to every issue you intend to dispatch. Without one the
+   card is ineligible and no branch is created.
+8. Run the reconcile sweep and the board audit below, and fix what they surface.
+9. Only then open the configuration pull request that moves `activation_mode` from `off` to
+   `proof-only`, naming the one issue you will watch.
+
+## The contract every board inherits — the short version
+
+Four config keys carry most of the safety, and none of them used to be documented here:
+
+- **`activation_mode`** — `off` → `proof-only` → `active`. A new board is `off`. Each
+  transition needs its own human-reviewed configuration pull request. `proof_issue_url` is
+  `null` in `off`, an exact issue URL in `proof-only`, and `null` again in `active`. Nothing at
+  runtime — no flag, no command, no environment variable — dispatches past the mode, and in
+  `proof-only` only the exact allowlisted issue may be selected.
+- **The `Branch route:` declaration** — every dispatchable issue declares exactly one explicit
+  route in its body. Missing, omitted, `default`, unknown, duplicated or conflicting
+  declarations are INELIGIBLE and fail **before** a branch is created. A Test Area never
+  implies a route. A design branch is never a dispatch route.
+- **`minimum_graphql_reserve`** — an immutable 1,000-point floor. Configuration may RAISE it,
+  never lower it. One cached inventory per runtime cycle; estimate the cost before executing;
+  bounded batches; stop at the reserve (exit 75). **Never retry-spin, never sleep through a
+  reset** — and prefer the built-in Project workflows over scripted API item-adds. This
+  supersedes the old 200-point threshold and the old sleep-until-reset advice wherever a
+  runbook still repeats them; both predate the #381 worker storm, where lanes sharing one
+  token bucket drained it because nothing told them to watch it.
+- **`exclude_labels`** — enforced in EVERY dispatcher path, with `design` and `history`
+  permanently non-dispatchable.
+
+Four more rules that are not config and are not optional:
+
+- **Identity.** Unattended Projects v2 mutation accepts only a machine-account CLASSIC PAT with
+  scopes `repo`, `project`, `read:org`, supplied via `SUPERBOARD_GITHUB_TOKEN` with the
+  expected login in `SUPERBOARD_GITHUB_LOGIN`. **GitHub Apps cannot access personal Projects v2
+  at all**; fine-grained and scope-ambiguous tokens are refused. Missing variable, wrong login,
+  missing scope, inaccessible repo or Project, unconfirmable permission — all fail closed.
+  Environment variables are referenced by NAME, never by value, anywhere.
+- **QA is bound to an exact SHA.** Record the pull request head before testing, test that SHA in
+  an isolated locked worktree, reread the head afterwards, publish a SHA-bound check, and release
+  locks and worktrees on every terminal path. Later commits inherit no passing QA; every head
+  change invalidates it; the head must equal the tested SHA before Review and again immediately
+  before a human merges.
+- **Review is one Codex fleet.** Exactly one parallel maximum-level local Codex fleet per code
+  pull request — a structured diff review plus correctness, security, and performance /
+  design-consistency lenses — and every finding including nits is resolved. No second fleet
+  unless the operator asks. CodeRabbit, Copilot, Greptile and the GitHub `@codex` connector are
+  non-binding and are not gates. Documentation-only diffs are exempt.
+- **Closed is not the same as done.** A closed issue reaches the completion column only with
+  accepted completion evidence, a linked duplicate, or a stated not-planned disposition;
+  otherwise it is reopened, moved to Blocked, and given a corrective comment. A closed-unmerged
+  pull request needs linked abandonment or supersession evidence, else Blocked. Pre-activation
+  historical evidence is never rewritten to manufacture acceptance.
+
+And two habits that keep the board honest under concurrency: **compare before mutate** — reread
+the item by immutable node ID, reread repository state, reread Project values, compare against
+the manifest preconditions, and quarantine anything that changed rather than overwriting a newer
+human or automation decision — and **capture created-OR-CHANGED deltas before every mutation
+batch**, not only at the start of a run and not only for newly created items.
+
+Everything published to GitHub passes one sanitizer immediately before the write boundary:
+render the complete payload, redact, scan the complete redacted payload, fail closed with no
+partial write, then write. It covers every GitHub-bound surface — issue and pull-request bodies,
+comments, review summaries, QA comments, checks, commit statuses, closure comments, release text,
+and Project text fields and manifests.
 
 ## Spin up a new project
 
 1. **Install** the `.claude/` payload (skills + scripts) into the project (release zip or copy from this fork).
 2. **Create a GitHub Project** with Status columns: `Backlog` / `Ready` / `Building` / `QA` / `Review` / `Done` / `Blocked`.
-3. **Write** `.claude/super-board/configs/<slug>.json` pointing at that project (and set `worker_backend` if you need the legacy `claude-p` dispatcher).
+3. **Write** `.claude/super-board/configs/<slug>.json` pointing at that project, with `activation_mode` at `"off"`. `worker_backend` defaults to `"claude-p"` (headless workers); the in-session dynamic-workflow backend is explicit opt-in.
 4. **Run verbs** (in order):
    - `onboard` — wizard / config + preconditions
    - `lint` — readiness checks on acceptance criteria
