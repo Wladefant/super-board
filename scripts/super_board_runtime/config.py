@@ -30,6 +30,12 @@ GITHUB_AUTH_MODES: tuple[str, ...] = ("interactive", "unattended")
 #: are human-designer-owned; `history` cards are an archive, not work.
 PERMANENT_EXCLUDED_LABELS: tuple[str, ...] = ("design", "history")
 
+#: How many REBUILDS a card may take beyond its first attempt. The number of
+#: attempts a card gets is therefore `rebuild_cap + 1`, which is what the status
+#: renderer shows as the denominator. One authority for the default, so a
+#: renderer cannot quietly disagree with the validator about it.
+DEFAULT_REBUILD_CAP = 2
+
 #: The GraphQL reserve floor. A config may raise it; lowering it is an error.
 MINIMUM_GRAPHQL_RESERVE = 1000
 
@@ -536,7 +542,7 @@ def load_and_validate_config(
     )
 
     max_workers = _int(raw, "max_workers", 3, "max-workers-invalid", 1)
-    rebuild_cap = _int(raw, "rebuild_cap", 2, "rebuild-cap-invalid", 0)
+    rebuild_cap = _int(raw, "rebuild_cap", DEFAULT_REBUILD_CAP, "rebuild-cap-invalid", 0)
     exclude_labels = _normalize_exclude_labels(raw)
 
     reserve = _int(
@@ -581,6 +587,7 @@ def normalized_config_to_json(config: NormalizedConfig) -> str:
 
 __all__ = [
     "ACTIVATION_MODES",
+    "DEFAULT_REBUILD_CAP",
     "GITHUB_AUTH_MODES",
     "LOGIN_ENV_VAR",
     "MERGE_METHODS",
