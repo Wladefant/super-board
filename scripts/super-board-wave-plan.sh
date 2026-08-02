@@ -21,7 +21,7 @@
 #   super-board-wave-plan.sh --config <config.json> [--items <project-items.json>]
 # Without --items, fetches live board state via `gh project item-list`.
 # Stdout: {"activation_mode":…,"cards":[…],"decisions":[…],"exclude_labels":[…],…}
-# Exit: 0 ok · 64 bad invocation · 65 bad config/items · 66 config not found
+# Exit: 0 ok · 64 bad invocation · 65 bad config/items · 66 config not found · 75 reserve reached
 set -euo pipefail
 
 # shellcheck source=scripts/super-board-python.sh
@@ -55,6 +55,16 @@ esac
 if [ -n "$ITEMS_FILE" ]; then
   ITEMS=$(cat "$ITEMS_FILE")
 else
+  # A live board read costs real GraphQL points, so it is estimated against the
+  # immutable reserve BEFORE it is spent. Reaching the reserve — or being unable
+  # to read the quota — stops here with exit 75 rather than issuing the query.
+  PLAN_ESTIMATED_COST=${PLAN_ESTIMATED_COST:-110}
+  CONFIG_FOR_QUOTA=$(printf '%s' "$CONFIG_JSON" | sb_config_file)
+  if ! sb_runtime super_board_runtime.quota check \
+        --estimated-cost "$PLAN_ESTIMATED_COST" --config "$CONFIG_FOR_QUOTA" >/dev/null; then
+    echo "super-board-wave-plan: refusing to scan the board — the GraphQL reserve is protected." >&2
+    exit 75
+  fi
   ITEMS=$(gh project item-list "$NUMBER" --owner "$OWNER" --format json --limit 500)
 fi
 
