@@ -35,8 +35,11 @@ _SCRIPTS = _REPO_ROOT / "scripts"
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
+from super_board_runtime.routing import NON_DISPATCH_BRANCHES  # noqa: E402
 from super_board_runtime.release import (  # noqa: E402
     ACTIVE_GUIDANCE_FILES,
+    ACTIVE_REFERENCE_FILES,
+    UNSCANNED_REFERENCE_FILES,
     RECONCILIATION_DOCUMENT,
     RELEASE_CONTRACT_TOPICS,
     VERSION_SOURCES,
@@ -228,7 +231,10 @@ class RetiredClaimTests(unittest.TestCase):
             "retired-status-skipped": "Move the card to Skip" + "ped when it stalls.",
             "squash-merging": "The reviewer will squash-merge the branch.",
             "runtime-merging": "The reviewer merges once checks are green.",
-            "200-point-reserve": "Sleeps until reset when remaining quota dips under 200.",
+            "200-point-reserve": "The pipeline preserves a 200-point GraphQL reserve.",
+            "quota-threshold-guard": "Halt while the GraphQL balance is under 750.",
+            "sleep-to-reset-remedy": "When the bucket runs dry, sleep until the reset.",
+            "impossible-branch-route": "Declare `Branch route: main` on the card.",
             "workflow-default-backend": 'Set "worker_backend": "workflow" to use the default.',
         }
         with tempfile.TemporaryDirectory() as tmp:
@@ -238,6 +244,125 @@ class RetiredClaimTests(unittest.TestCase):
                     (root / "guide.md").write_text(f"# Guide\n\n{line}\n", encoding="utf-8")
                     findings = scan_retired_release_claims(root, files=("guide.md",))
                     self.assertEqual([f["claim"] for f in findings], [claim])
+
+    def test_the_scanned_surfaces_include_the_references_workers_are_told_to_read(self) -> None:
+        # `references/run.md` routes every worker to `rate-limit-etiquette.md`,
+        # and the config contract is documented in `config-schema.json`. Both
+        # drifted away from the shipped runtime while the scan looked past them.
+        for reference in (
+            "skills/super-board/references/rate-limit-etiquette.md",
+            "skills/super-board/references/config-schema.json",
+            "skills/super-board/references/run.md",
+        ):
+            with self.subTest(reference=reference):
+                self.assertIn(reference, ACTIVE_GUIDANCE_FILES)
+
+    def test_every_reference_document_is_scanned_or_explicitly_excused(self) -> None:
+        # A new reference document must not be able to escape the scan by
+        # simply existing. Either it is scanned, or its exemption is written
+        # down where a reviewer can see it.
+        present = {
+            path.name
+            for path in (_REPO_ROOT / "skills" / "super-board" / "references").iterdir()
+            if path.is_file()
+        }
+        accounted = {
+            Path(relative).name
+            for relative in ACTIVE_REFERENCE_FILES + UNSCANNED_REFERENCE_FILES
+        }
+        self.assertEqual(present, accounted)
+
+    def test_superseded_quota_guidance_is_caught(self) -> None:
+        # Verbatim from the reference this release corrects. The runtime holds
+        # an immutable floor and exits 75; it has no threshold and no sleep.
+        seeds = {
+            "quota-threshold-guard": (
+                "sb_gh_guard_check 200      # sleep if GraphQL remaining < 200"
+            ),
+            "sleep-to-reset-remedy": (
+                "It's a no-op if quota is healthy. It sleeps to reset only if "
+                "remaining is below the mark. Cheap to call."
+            ),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for claim, line in seeds.items():
+                with self.subTest(claim=claim):
+                    (root / "guide.md").write_text(f"# Guide\n\n{line}\n", encoding="utf-8")
+                    findings = scan_retired_release_claims(root, files=("guide.md",))
+                    self.assertIn(claim, [f["claim"] for f in findings])
+
+    def test_an_impossible_route_example_is_caught(self) -> None:
+        # `main` and `designstaging` are in NON_DISPATCH_BRANCHES, so a card
+        # declaring either fails closed as `route-declaration-unknown`. An
+        # example that offers one is a trap, not documentation.
+        seeds = (
+            '    "route:main": "main"',
+            "Branch route: designstaging",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for line in seeds:
+                with self.subTest(seed=line):
+                    (root / "guide.md").write_text(f"# Guide\n\n{line}\n", encoding="utf-8")
+                    findings = scan_retired_release_claims(root, files=("guide.md",))
+                    self.assertIn("impossible-branch-route", [f["claim"] for f in findings])
+
+    def test_prose_negation_nearby_does_not_excuse_a_route_example(self) -> None:
+        # Exactly how the schema's undispatchable route survived: the comment
+        # two lines above it ended "not a coin toss", and that stray negation
+        # excused the whole neighbourhood. An example is a line somebody
+        # copies; it does not carry the paragraph's caveats with it.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "guide.md").write_text(
+                "// Two route labels naming different branches is a routing\n"
+                "// error, not a coin toss.\n"
+                '  "branch_routes": {\n'
+                '    "route:main": "main"\n'
+                "  }\n",
+                encoding="utf-8",
+            )
+            findings = scan_retired_release_claims(root, files=("guide.md",))
+            self.assertEqual([f["claim"] for f in findings], ["impossible-branch-route"])
+
+    def test_the_impossible_routes_are_taken_from_the_routing_module(self) -> None:
+        # If routing ever retires another branch, the scanner must learn it
+        # without a second edit — two hand-maintained lists is how they drift.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for branch in NON_DISPATCH_BRANCHES:
+                with self.subTest(branch=branch):
+                    (root / "guide.md").write_text(
+                        f"# Guide\n\nBranch route: {branch}\n", encoding="utf-8"
+                    )
+                    findings = scan_retired_release_claims(root, files=("guide.md",))
+                    self.assertIn(
+                        "impossible-branch-route", [f["claim"] for f in findings]
+                    )
+
+    def test_the_incident_narrative_and_the_working_route_stay_green(self) -> None:
+        # The scanner must separate "this is what we used to do, and why it was
+        # wrong" from "do this". Narration of the worker storm, and of the
+        # routes that DO work, must not be flagged.
+        narration = (
+            "# Etiquette\n\n"
+            "The worker storm of 2026-05-21 drained the bucket, which is why this "
+            "rule exists. The first answer was a check that paused until the hour "
+            "rolled over, and pausing is exactly what let a drained bucket look "
+            "survivable.\n\n"
+            "The runtime never sleeps through a reset and never retry-spins; it "
+            "halts with exit 75 instead.\n\n"
+            "A repository's default branch can never be a dispatch route: "
+            "`Branch route: main` is refused as route-declaration-unknown.\n\n"
+            "Branch route: staging-frankfurt\n\n"
+            '"branch:staging-frankfurt": "staging-frankfurt"\n'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "guide.md").write_text(narration, encoding="utf-8")
+            findings = scan_retired_release_claims(root, files=("guide.md",))
+            self.assertEqual(findings, [], findings)
 
     def test_a_refusal_of_a_retired_claim_is_not_an_advertisement(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

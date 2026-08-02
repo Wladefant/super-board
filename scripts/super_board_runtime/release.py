@@ -38,11 +38,13 @@ from typing import Any, Callable, Iterable, Optional, Sequence
 
 try:  # normal package import
     from . import EXIT_CONFIG
+    from .routing import NON_DISPATCH_BRANCHES
 except ImportError:  # executed as a plain file path
     import sys
 
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from super_board_runtime import EXIT_CONFIG
+    from super_board_runtime.routing import NON_DISPATCH_BRANCHES
 
 #: The four sources that disagreed, named as they are named in the audit.
 VERSION_SOURCES: tuple[str, ...] = (
@@ -54,6 +56,38 @@ VERSION_SOURCES: tuple[str, ...] = (
 
 #: Where the reconciliation is written down.
 RECONCILIATION_DOCUMENT = "docs/version-reconciliation.md"
+
+#: The runtime reference documents. `skills/super-board/SKILL.md` and
+#: `references/run.md` route workers into these files mid-run, so they are read
+#: as instructions to somebody using the runtime today — the same standard as
+#: the top-level guidance below. They sat OUTSIDE this scan until now, which is
+#: how a superseded quota contract (a threshold argument and a sleep to the
+#: reset) and an undispatchable route example survived a release that retired
+#: both.
+ACTIVE_REFERENCE_FILES: tuple[str, ...] = (
+    "skills/super-board/references/agent-native.md",
+    "skills/super-board/references/block-template.md",
+    "skills/super-board/references/config-schema.json",
+    "skills/super-board/references/lint.md",
+    "skills/super-board/references/onboard.md",
+    "skills/super-board/references/rate-limit-etiquette.md",
+    "skills/super-board/references/run-workflow.md",
+    "skills/super-board/references/run.md",
+    "skills/super-board/references/stop.md",
+)
+
+#: Reference documents deliberately left out of the scan, listed so that the
+#: omission is a decision somebody made rather than a gap nobody noticed.
+#:
+#: `references/status.md` transcribes what `scripts/super-board-status.py`
+#: actually prints, down to the glyph table and the Done-column label. Its
+#: retired-status glyph and its merge label are accurate transcriptions of
+#: shipped output: correcting the document alone would make it a false record
+#: of what the renderer does. The renderer has to change first, and that is a
+#: runtime change rather than a documentation one.
+UNSCANNED_REFERENCE_FILES: tuple[str, ...] = (
+    "skills/super-board/references/status.md",
+)
 
 #: Documents that carry ACTIVE guidance. Historical release-notes sections are
 #: a record of what past releases did and are not rewritten; everything here is
@@ -67,6 +101,13 @@ ACTIVE_GUIDANCE_FILES: tuple[str, ...] = (
     "skills/super-build/SKILL.md",
     "skills/super-qa/SKILL.md",
     "skills/super-review/SKILL.md",
+) + ACTIVE_REFERENCE_FILES
+
+#: Branches that can never be dispatch routes, spelled for a regex. Taken from
+#: `routing.NON_DISPATCH_BRANCHES` rather than restated, so retiring another
+#: branch teaches the scanner in the same edit.
+_NON_DISPATCH_ALTERNATION = "|".join(
+    re.escape(branch) for branch in sorted(NON_DISPATCH_BRANCHES)
 )
 
 #: Claims this release retires. Each one was true of some earlier release and is
@@ -85,6 +126,42 @@ RETIRED_CLAIM_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "200-point-reserve",
         re.compile(r"\b200\b[^\n]{0,48}(point|quota|reserve)|(quota|reserve)[^\n]{0,48}\b200\b", re.I),
+    ),
+    (
+        # The guard's numeric argument is an estimated mutation cost, not a
+        # level to stay above. Guidance that frames it as a threshold — or that
+        # gates on the remaining balance falling under a number — is teaching
+        # the contract this release replaced.
+        "quota-threshold-guard",
+        re.compile(
+            r"(remaining|quota|graphql|balance|budget)[^\n]{0,40}(below|under|beneath|<)\s*\d{2,5}"
+            r"|(quota|graphql|rate.?limit|reserve|sb_gh_guard_check)[^\n]{0,60}\bthreshold\b"
+            r"|\bthreshold\b[^\n]{0,60}(quota|graphql|rate.?limit|reserve|sb_gh_guard_check)",
+            re.I,
+        ),
+    ),
+    (
+        # Reaching the reserve halts with exit 75. Waiting for the window to
+        # roll over holds a lane open for nothing, and retrying spends the
+        # reserve the runtime exists to protect.
+        "sleep-to-reset-remedy",
+        re.compile(
+            r"(sleep|sleeps|sleeping|wait|waits|waiting|pause|pauses|pausing|back\s?off|"
+            r"backoff)[^\n]{0,40}\b(until|through|to|till|for|out)\b[^\n]{0,24}reset"
+            r"|re-?try[^\n]{0,24}(until|when)[^\n]{0,24}(quota|reset|window)",
+            re.I,
+        ),
+    ),
+    (
+        # A route declaration naming a non-dispatch branch fails closed as
+        # `route-declaration-unknown`, so an example offering one hands the
+        # reader a label that can never resolve.
+        "impossible-branch-route",
+        re.compile(
+            rf"\"route:(?:{_NON_DISPATCH_ALTERNATION})\""
+            rf"|branch[ \t_-]*route[ \t]*:[ \t]*(?:{_NON_DISPATCH_ALTERNATION})\b",
+            re.I,
+        ),
     ),
     (
         "workflow-default-backend",
@@ -118,14 +195,24 @@ RELEASE_CONTRACT_TOPICS: tuple[str, ...] = (
 #: A retired claim that is being REFUSED is not an advertisement for it. The
 #: prohibition lists in the skills name every mechanism precisely so they can
 #: forbid it, and the lead-in that forbids them sits a few lines above the list.
+#: `no-op` is not a negation of anything — it describes what a call costs. It
+#: used to satisfy this pattern and quietly excuse the whole line, which is one
+#: reason superseded quota guidance read as clean.
 _RETIRED_NEGATION_RE = re.compile(
-    r"(never|not\b|no\b|cannot|can't|refus|reject|prohibit|forbidden|denied|false|removed|"
+    r"(never|not\b|no\b(?!-op)|cannot|can't|refus|reject|prohibit|forbidden|denied|false|removed|"
     r"retired|must not|is no longer|instead of|rather than|collapses|destroys|opt[- ]in|explicit opt|non-default)",
     re.I,
 )
 
 #: How far above a match to look for that lead-in.
 _NEGATION_LOOKBACK = 6
+
+#: Claims for which only a refusal ON THE LINE ITSELF counts. A configuration
+#: example is a thing to copy, and the copied line does not carry the
+#: surrounding paragraph's caveats with it: the schema's undispatchable route
+#: sat two lines under prose ending "not a coin toss", and that stray negation
+#: was enough to excuse it.
+_LINE_SCOPED_NEGATION_CLAIMS: frozenset[str] = frozenset({"impossible-branch-route"})
 
 _HEADING_RE = re.compile(r"(?m)^##\s+v?(\d+\.\d+\.\d+)")
 
@@ -309,9 +396,12 @@ def scan_retired_release_claims(
         for index, line in enumerate(lines):
             number = index + 1 + offset
             context = "\n".join(lines[max(0, index - _NEGATION_LOOKBACK) : index + 1])
-            if _RETIRED_NEGATION_RE.search(context):
-                continue
+            negated_context = bool(_RETIRED_NEGATION_RE.search(context))
+            negated_line = bool(_RETIRED_NEGATION_RE.search(line))
             for claim, pattern in RETIRED_CLAIM_PATTERNS:
+                excused = negated_line if claim in _LINE_SCOPED_NEGATION_CLAIMS else negated_context
+                if excused:
+                    continue
                 if pattern.search(line):
                     findings.append(
                         {
@@ -373,6 +463,8 @@ def verify_release_tag(
 
 __all__ = [
     "ACTIVE_GUIDANCE_FILES",
+    "ACTIVE_REFERENCE_FILES",
+    "UNSCANNED_REFERENCE_FILES",
     "RECONCILIATION_DOCUMENT",
     "RELEASE_CONTRACT_TOPICS",
     "RETIRED_CLAIM_PATTERNS",
