@@ -237,9 +237,28 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(len(snapshot.items), MAX_PROJECT_PAGES)
         self.assertTrue(snapshot.hit_cap)
 
-    def test_a_missing_cursor_stops_rather_than_refetching_page_one(self) -> None:
+    def test_a_missing_cursor_fails_closed_rather_than_refetching_page_one(self) -> None:
+        # `hasNextPage: true` with no cursor is a board we cannot finish reading.
+        # Stopping there and returning what we had marked a partial snapshot
+        # complete — a board missing 200 cards that reconciliation would then
+        # "fix". `after=None` would refetch page one forever, so neither
+        # continuing nor stopping quietly is available: the walk has to refuse.
+        with self.assertRaises(MutationConflict) as ctx:
+            snapshot_project(
+                "Bavariance", 1, fetch=lambda after: self._page([{"id": "PVTI_1"}], None, True)
+            )
+        self.assertEqual(ctx.exception.reason, "project-snapshot-incomplete")
+
+    def test_an_empty_cursor_string_is_also_refused(self) -> None:
+        with self.assertRaises(MutationConflict) as ctx:
+            snapshot_project(
+                "Bavariance", 1, fetch=lambda after: self._page([{"id": "PVTI_1"}], "", True)
+            )
+        self.assertEqual(ctx.exception.reason, "project-snapshot-incomplete")
+
+    def test_the_last_page_still_ends_the_walk_cleanly(self) -> None:
         snapshot = snapshot_project(
-            "Bavariance", 1, fetch=lambda after: self._page([{"id": "PVTI_1"}], None, True)
+            "Bavariance", 1, fetch=lambda after: self._page([{"id": "PVTI_1"}], None, False)
         )
         self.assertEqual(len(snapshot.items), 1)
         self.assertFalse(snapshot.hit_cap)
