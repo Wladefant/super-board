@@ -61,10 +61,25 @@ ONE_NIT = "scripts/x.py:12 — nit — rename `tmp` to something meaningful\n"
 ONE_P1 = "scripts/x.py:40 — P1 — the head is read after the tests run\n"
 
 
-class RecordingRunner:
-    """Injected Codex runner. Records commands and observed concurrency."""
+#: How long a rendezvous waits before declaring the fleet non-concurrent. It is
+#: a DEADLINE, not a duration the test spends: all four lenses release the
+#: barrier the instant the fourth arrives. Generous, because a loaded machine is
+#: slow, not sequential.
+RENDEZVOUS_TIMEOUT_S = 30.0
 
-    def __init__(self, output=CLEAN, exit_code=0, delay=0.02) -> None:
+
+class RecordingRunner:
+    """Injected Codex runner. Records commands and observed concurrency.
+
+    Concurrency is proved by RENDEZVOUS, not by timing. Sleeping 0.02s in each
+    lens and then asserting the observed peak was 4 asks whether four threads
+    happened to overlap inside a 20ms window — true on an idle machine, false
+    under load, which is how this flaked. A `threading.Barrier` sized to the
+    fleet cannot be satisfied unless all four lenses really are in flight at the
+    same moment: the fourth arrival is what releases the first three.
+    """
+
+    def __init__(self, output=CLEAN, exit_code=0, delay=0.02, rendezvous=0) -> None:
         self.output = output
         self.exit_code = exit_code
         self.delay = delay
@@ -72,13 +87,22 @@ class RecordingRunner:
         self._lock = threading.Lock()
         self._live = 0
         self.max_concurrent = 0
+        self._barrier = threading.Barrier(rendezvous) if rendezvous else None
+        self.rendezvous_reached = False
 
     def __call__(self, command, cwd):
         with self._lock:
             self.commands.append(tuple(command))
             self._live += 1
             self.max_concurrent = max(self.max_concurrent, self._live)
-        time.sleep(self.delay)
+        if self._barrier is not None:
+            # Returns only once every lens has arrived. If the fleet were
+            # sequential this raises BrokenBarrierError at the deadline, and the
+            # lens is recorded as failed — never as a slow pass.
+            self._barrier.wait(timeout=RENDEZVOUS_TIMEOUT_S)
+            self.rendezvous_reached = True
+        else:
+            time.sleep(self.delay)
         with self._lock:
             self._live -= 1
         out = self.output(command) if callable(self.output) else self.output
@@ -110,20 +134,81 @@ class FleetShapeTests(unittest.TestCase):
         )
 
     def test_all_four_lenses_run_in_parallel(self) -> None:
-        runner = RecordingRunner()
+        runner = RecordingRunner(rendezvous=len(CODEX_LENSES))
         report = _fleet(runner=runner)
         self.assertEqual(len(report.lenses), 4)
         self.assertEqual({lens.name for lens in report.lenses}, set(CODEX_LENSES))
         self.assertEqual(len(runner.commands), 4)
+        self.assertTrue(
+            runner.rendezvous_reached,
+            "the four lenses never met at the barrier — the fleet is not concurrent",
+        )
         self.assertEqual(
             runner.max_concurrent, 4, "the fleet must run its four lenses concurrently"
         )
+        self.assertTrue(report.passed, "a rendezvous that broke would fail every lens")
 
     def test_a_clean_fleet_passes(self) -> None:
         report = _fleet()
         self.assertTrue(report.passed)
         self.assertEqual(report.findings, ())
         self.assertIsNone(report.reason_code)
+
+
+class StdinDeadlockTests(unittest.TestCase):
+    """A lens must never be able to sit waiting on stdin.
+
+    `codex exec "<prompt>"` reads stdin when no terminal is attached —
+    backgrounded, in CI, or inside a subagent — and blocks forever. It prints
+    one line, `Reading additional input from stdin...`, and then nothing: no
+    error, no timeout, no exit. `codex exec review` takes no prompt argument and
+    is unaffected, which is what makes the failure so easy to miss: the
+    structured lens returns a normal review while the three prompted lenses are
+    frozen, and the fleet reports a quarter of its coverage as if it were all of
+    it. This is a real incident from this release's own review gate.
+    """
+
+    def test_the_default_runner_closes_stdin(self) -> None:
+        import subprocess as sp
+
+        seen: dict[str, object] = {}
+
+        def fake_run(command, **kwargs):
+            seen.update(kwargs)
+            seen["command"] = command
+
+            class _Result:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            return _Result()
+
+        original = sp.run
+        review_module = sys.modules[run_codex_fleet.__module__]
+        review_module.subprocess.run = fake_run
+        try:
+            review_module._default_runner(("codex", "exec", "a prompt"), Path("."))
+        finally:
+            review_module.subprocess.run = original
+
+        self.assertIs(
+            seen.get("stdin"),
+            sp.DEVNULL,
+            "a lens spawned with an inherited stdin can block forever on it",
+        )
+
+    def test_a_lens_that_hangs_is_never_reported_as_a_pass(self) -> None:
+        # The shape of the incident: three lenses produce nothing at all. A
+        # fleet must not call that a pass just because no lens errored.
+        def silent_unless_structured(command):
+            return "" if "review" not in command else ONE_NIT
+
+        report = _fleet(
+            runner=RecordingRunner(output=silent_unless_structured, exit_code=1)
+        )
+        self.assertFalse(report.passed)
+        self.assertEqual(report.reason_code, "codex-lens-failed")
 
 
 class LensCommandTests(unittest.TestCase):
