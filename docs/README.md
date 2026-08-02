@@ -8,6 +8,25 @@
 
 - [START HERE — what actually works right now](https://github.com/Wladefant/super-board/blob/main/docs/START-HERE.md) — **the front door.** What is live and verified by a real HTTP response, what is deployed but unproven, what is still pending, and the five open decisions with their tradeoffs — plus the shortest path to starting work on any product. Status is timestamped; re-check commands included.
 
+## Release and runtime contracts
+
+- [Version reconciliation](https://github.com/Wladefant/super-board/blob/main/docs/version-reconciliation.md) — what each of the four disagreeing version sources said, which one is the current release and why, why the skill mirror lagged, why v1.3.0–v1.7.1 are explicitly untagged rather than retro-tagged, and the written rule that produced the next number.
+- [Release notes](https://github.com/Wladefant/super-board/blob/main/RELEASE-NOTES.md) — every release, newest first. The newest section is the active contract; older sections are history and are not rewritten.
+- [Agent Native deployed evidence contract](https://github.com/Wladefant/super-board/blob/main/docs/architecture/AGENT-NATIVE-DEPLOYED-EVIDENCE.md) — what a deployed cockpit must record before a board is activated against it: the code-execution setting, all seven negative capabilities, and the two synthetic non-resolving probe targets.
+
+### Runtime reference (installed alongside the `super-board` skill)
+
+- [`references/onboard.md`](https://github.com/Wladefant/super-board/blob/main/skills/super-board/references/onboard.md) — the setup wizard, and the re-enable gate for the fallback auto-add workflow.
+- [`references/run.md`](https://github.com/Wladefant/super-board/blob/main/skills/super-board/references/run.md) — lane lifecycles, identity preflight, and the halt gates.
+- [`references/run-workflow.md`](https://github.com/Wladefant/super-board/blob/main/skills/super-board/references/run-workflow.md) — the opt-in in-session workflow backend. `claude-p` is the default.
+- [`references/status.md`](https://github.com/Wladefant/super-board/blob/main/skills/super-board/references/status.md) — the status renderer, including tested SHA and QA invalidation.
+- [`references/lint.md`](https://github.com/Wladefant/super-board/blob/main/skills/super-board/references/lint.md) — pre-flight readiness checks on active-pipeline issues.
+- [`references/stop.md`](https://github.com/Wladefant/super-board/blob/main/skills/super-board/references/stop.md) — graceful shutdown and resume.
+- [`references/block-template.md`](https://github.com/Wladefant/super-board/blob/main/skills/super-board/references/block-template.md) — the Blocked-card template.
+- [`references/agent-native.md`](https://github.com/Wladefant/super-board/blob/main/skills/super-board/references/agent-native.md) — the read-only projection contract for the cockpit.
+- [`references/rate-limit-etiquette.md`](https://github.com/Wladefant/super-board/blob/main/skills/super-board/references/rate-limit-etiquette.md) — GraphQL cost discipline behind the immutable reserve.
+- [`references/config-schema.json`](https://github.com/Wladefant/super-board/blob/main/skills/super-board/references/config-schema.json) — the configuration contract, documented for humans. `scripts/super_board_runtime/config.py` is the executable version and wins on disagreement.
+
 ## Architecture
 
 - [Agent Native production layer for Superboard and Claudex](https://github.com/Wladefant/super-board/blob/main/docs/architecture/AGENT-NATIVE-SUPERBOARD-PRODUCTION.md) — decision, ownership boundaries, secure VPS topology, evidence contract, and constrained real-project pilot for a reusable web/SaaS coding cockpit.

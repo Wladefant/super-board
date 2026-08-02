@@ -10,6 +10,18 @@ Every repo keeps **`docs/README.md`** as the only authoritative index:
 - One job per doc
 - If a doc has no one-line job description in the index, it does not belong in `docs/`
 
+### Runtime documents are indexed too
+
+A document that describes runtime behaviour is reachable from `docs/README.md`
+even when it does not live under `docs/` — the release notes, the version
+reconciliation, and every `skills/super-board/references/*` file. The index is
+the only place somebody has to look, so a contract that is only discoverable by
+knowing the path already failed.
+
+`tests/test_version_identity.py` asserts that every runtime reference document
+is linked from the index. A new reference file that nobody links fails the
+suite.
+
 ## Session docs are an inbox
 
 Anything a Claude Code / agent session writes mid-task lands in:

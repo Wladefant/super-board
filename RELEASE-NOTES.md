@@ -1,5 +1,96 @@
 # Release notes
 
+## v2.0.0 — 2026-08-02
+
+**Version identity reconciled.** Four sources disagreed — `VERSION` said 1.7.1,
+`skills/super-board/VERSION` said 1.6.0, the newest release-notes heading said
+v1.7.1, and the only published tag said v1.2.0. The reconciliation, the evidence
+behind it, and the rule that produced this number are written down in
+[`docs/version-reconciliation.md`](./docs/version-reconciliation.md): the
+content sources (`VERSION` + newest heading) decide the current release, the
+skill mirror and the tag never vote, and a backward-incompatible contract change
+takes the next major. 1.7.1 + backward-incompatible ⇒ 2.0.0. Releases v1.3.0
+through v1.7.1 are declared explicitly untagged rather than retro-tagged.
+
+### Backward-incompatible contracts
+
+- **Seven-state lifecycle, not configurable.** `Backlog · Ready · Building · QA ·
+  Review · Blocked · Done`. `Skipped` is refused where a lifecycle value is
+  expected instead of being quietly mapped onto something else.
+- **`Ready` is the only dispatchable status**, and an excluded label fails
+  closed.
+- **The runtime never merges.** A successful Review hands off and stops; a human
+  rebase-merges; the closure normalizer writes the completion column afterwards.
+  `human_approves_merge: false` is refused, `merge_method` must be `rebase`, and
+  a tree-wide scanner fails the build on any of the eight merge mechanisms in an
+  executable path. Squash merging is not available: it collapses the TDD
+  breadcrumb trail that `git blame` and `git bisect` depend on.
+- **`claude-p` is the default backend again.** The in-session dynamic-workflow
+  backend is explicit opt-in.
+- **Three activation modes** — `off`, `proof`, `on`. A board stays at `off`
+  until every installation and repository gate passes; `proof` restricts work to
+  an explicit allowlist.
+- **An immutable 1,000-point GraphQL reserve.** It cannot be configured downward,
+  and a run that would break it halts with exit 75 rather than borrowing against
+  it. The old 200-point threshold and the 5,000-point fallback are gone.
+- **Exact-SHA QA with invalidation.** Evidence is bound to the commit it was
+  produced on; a pull-request head that moves discards the result rather than
+  letting it attest to a commit nobody tested.
+- **Fail-closed branch routing.** An issue declares its route exactly once, as
+  `staging` or `staging-frankfurt`; anything else refuses to create a branch.
+- **The local Codex review gate.** Review runs a parallel maximum-level local
+  Codex fleet and fixes every finding, at every severity.
+
+### New
+
+- **Continuous intake normalization.** Every issue and pull-request event in the
+  trigger set, plus a bounded periodic sweep, re-normalizes the card. The
+  canonical issue form now requires Context, Steps, binary Acceptance criteria,
+  Test Area, Priority, Work type, Environment constraint (canonical
+  `environment-constraint` taxonomy, `laptop` preserved as a mapped legacy
+  alias), Branch route, and a Milestone or a concrete Blocked reason. Incomplete
+  intake is never promoted to `Ready`. The intake normalizer confirms Project
+  membership exactly once by immutable content node ID before any field update.
+- **Evidence-gated closure.** The closure normalizer moves a card to the
+  completion column only for a merged pull request, typed and linked completion
+  evidence, a linked duplicate, or a not-planned decision that says what was
+  decided. Anything else is reopened, moved to Blocked, and given a sanitized
+  corrective comment. Pre-activation closures keep their original evidence
+  untouched.
+- **A pinned, verifiable installer.** `install.sh` takes an explicit release
+  contract, refuses a source tree that is not at the pinned commit, and writes an
+  install manifest recording the release, the source SHA, the schema version, and
+  a SHA-256 for every installed file. Reinstalling at the same release is proved
+  idempotent by comparing two tree snapshots, and stale removal only ever touches
+  files the prior manifest owned.
+- **A guarded fallback auto-add.** Installed disabled, membership decided by
+  immutable content node ID, identity and quota preflight before any insertion,
+  and a documented re-enable gate that neither the installer nor an
+  activation-mode change can satisfy.
+- **Agent Native is a read-only projection.** No Project write credential, no
+  repository execution, no second completion ledger; unavailability is proved
+  against synthetic non-resolving targets.
+- **One sanitizer at one publication boundary.** Payloads are rendered whole,
+  then redacted, then rescanned, and a failure refuses the write instead of
+  publishing a partial one.
+
+### Fixed
+
+- `skills/super-board/VERSION` no longer drifts from the root version — the test
+  suite fails if the two disagree.
+- Active guidance no longer advertises `Skipped`, squash merging, runtime
+  merging, a 200-point reserve, or `workflow` as the default backend; a scanner
+  fails the suite if one comes back.
+- The board-URL substitution marker is gone from the fallback workflow payload;
+  the URL is a repository variable now, so a placeholder nobody rewrites can no
+  longer become a live misconfiguration.
+
+### Not done here
+
+Creating the `v2.0.0` tag and publishing the GitHub release are outward-facing
+and sit behind their own explicit approval. The tooling and the check exist
+(`authorize_release_publication`, `verify_release_tag`); neither has been run.
+
 ## v1.7.1 — 2026-06-11
 
 ### Fix: tolerate JSON-string `args` at wave launch
