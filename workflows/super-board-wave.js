@@ -46,6 +46,24 @@ for (const card of input.cards) {
       `status "Ready" is dispatchable. Re-run super-board-wave-plan.sh; do not hand-assemble cards.`
     )
   }
+  // Activation travels with the card. A wave cannot be launched for a board that
+  // is off, and nothing in this workflow can turn a board on.
+  if (!['proof-only', 'active'].includes(card.activationMode || card.activation_mode)) {
+    throw new Error(
+      `super-board-wave: card #${card.number} carries activation mode ` +
+      `"${card.activationMode || card.activation_mode}" — dispatch is not activated for this board.`
+    )
+  }
+}
+
+const activationMode = input.cards.length
+  ? (input.cards[0].activationMode || input.cards[0].activation_mode)
+  : 'off'
+if (activationMode === 'proof-only' && input.cards.length > 1) {
+  throw new Error(
+    `super-board-wave: proof-only activation permits exactly one card; the planner handed over ` +
+    `${input.cards.length}. Refusing the wave.`
+  )
 }
 
 const CLASSIFY_SCHEMA = {
@@ -185,6 +203,6 @@ const summary = results.filter(Boolean).map((r) => {
     lanesRun: r.history.map((h) => `${h.lane}:${h.status}`).join(' → ') || 'none',
   }
 })
-log(`wave complete: ${summary.length} cards — ` +
+log(`wave complete (activation=${activationMode}): ${summary.length} cards — ` +
     summary.map((s) => `#${s.number}=${s.finalStatus}@${s.column}`).join(', '))
-return { cards: summary }
+return { activationMode, cards: summary }
