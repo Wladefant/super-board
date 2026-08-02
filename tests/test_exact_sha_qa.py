@@ -24,6 +24,7 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 from super_board_runtime.config import load_and_validate_config  # noqa: E402
+from super_board_runtime.publication import UnsafePublication  # noqa: E402
 from super_board_runtime.qa import (  # noqa: E402
     QA_CHECK_CONTEXT,
     QA_FAILURE_KINDS,
@@ -314,6 +315,43 @@ class LedgerTests(unittest.TestCase):
         self.assertTrue(published["dry_run"])
         self.assertEqual(writer.calls, [])
 
+    def test_a_credential_bearing_target_url_never_reaches_github(self) -> None:
+        """The commit status is a GitHub write like any other.
+
+        `target_url` is copied from the evidence URL; an evidence URL that
+        carries `user:password@` would be written to GitHub verbatim unless the
+        complete status payload goes through the one sanitizer first.
+        """
+        writer = RecordingWriter()
+        password = "N" * 24
+        entry = record_qa_result(
+            _result(
+                sanitized_evidence_url=(
+                    "https://svc:" + password + "@evidence.internal.example/qa/1"
+                )
+            )
+        )
+        published = publish_qa_status(entry, writer=writer)
+        self.assertTrue(published["published"])
+        self.assertEqual(len(writer.calls), 1)
+        written = json.dumps(writer.calls[0], sort_keys=True)
+        self.assertNotIn(password, written)
+        self.assertIn("credentialed-url", written)
+        # The SHA binding survives sanitization — that is the whole evidence.
+        self.assertEqual(writer.calls[0]["sha"], TESTED_SHA)
+        self.assertEqual(writer.calls[0]["context"], QA_CHECK_CONTEXT)
+
+    def test_a_status_payload_that_fails_the_gate_writes_nothing(self) -> None:
+        """Fail closed, with no partial write — a status is a write like any other."""
+        writer = RecordingWriter()
+        short = "N" * 6  # too short to substring-redact safely; detected, never published
+        entry = record_qa_result(
+            _result(sanitized_evidence_url="https://evidence.example/qa/" + short)
+        )
+        with self.assertRaises(UnsafePublication):
+            publish_qa_status(entry, writer=writer, environment={"DEPLOY_SECRET": short})
+        self.assertEqual(writer.calls, [])
+
     def test_a_later_head_inherits_no_passing_result(self) -> None:
         entry = record_qa_result(_result())
         self.assertEqual(inherited_check_state(entry, TESTED_SHA), "success")
@@ -351,6 +389,26 @@ class FailureDispositionTests(unittest.TestCase):
         self.assertIn("title", writer.calls[0])
         self.assertIn("body", writer.calls[0])
         self.assertEqual(filed.next_status, "Blocked")
+
+    def test_the_follow_up_issue_is_sanitized_before_it_is_filed(self) -> None:
+        """`file_qa_failure` writes to GitHub, so it is a publication.
+
+        The follow-up carries a pull request URL and a base branch straight from
+        the run. Handing that to `issue_writer` directly is a GitHub write that
+        no sanitizer ever saw.
+        """
+        writer = RecordingWriter()
+        token = "gh" + "p_" + ("N" * 36)
+        result = _result(
+            result="failure",
+            failure_kind="outside-acceptance",
+            pull_request_url=PR_URL + "?token=" + token,
+        )
+        file_qa_failure(result, self.config, issue_writer=writer)
+        self.assertEqual(len(writer.calls), 1)
+        written = json.dumps(writer.calls[0], sort_keys=True)
+        self.assertNotIn(token, written)
+        self.assertIn(TESTED_SHA, written)
 
     def test_no_follow_up_is_filed_for_the_other_two_dispositions(self) -> None:
         for kind in ("repairable", "external-input"):
