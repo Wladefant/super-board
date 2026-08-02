@@ -488,12 +488,21 @@ def load_and_validate_config(
     repo_remote = _normalize_repo_remote(raw)
     base_branch = _string(raw, "base_branch", "main", "base-branch-invalid") or "main"
     branch_routes = _normalize_branch_routes(raw)
-    # Boards that deploy more than one branch must say which one each issue
-    # targets — see `routing.py`. Default off so a single-branch board is not
-    # forced to write a declaration that could only ever say one thing.
+    # Branch routing is fail-closed — see `routing.py`. Every issue says which
+    # branch it targets, in exactly one normalized declaration, or it is not
+    # dispatchable. The key survives so an existing config that states the
+    # requirement still loads, but it can only ever state it: a board that turns
+    # it off is asking for undeclared cards to dispatch on a `base_branch`
+    # fallback, and a fallback base branch is a branch nobody chose.
     require_branch_route_declaration = _bool(
-        raw, "require_branch_route_declaration", False, "branch-routes-invalid"
+        raw, "require_branch_route_declaration", True, "branch-routes-invalid"
     )
+    if not require_branch_route_declaration:
+        raise ConfigError(
+            "branch-route-declaration-required",
+            "require_branch_route_declaration may not be false: routing is fail-closed, so a "
+            "card declares its branch route or it is not dispatched",
+        )
 
     worker_backend = _enum(
         _string(raw, "worker_backend", "claude-p", "worker-backend-invalid") or "claude-p",

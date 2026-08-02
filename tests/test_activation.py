@@ -74,7 +74,8 @@ def _issue(number: int = 7, url: object = _UNSET, **overrides: object) -> IssueS
         "content_type": "Issue",
         "state": "OPEN",
         "title": "a perfectly formed card",
-        "body": "## Acceptance Criteria\n- [ ] it works",
+        # Routing is fail-closed, so a perfectly formed card declares its route.
+        "body": "## Acceptance Criteria\n- [ ] it works\n\nBranch route: staging\n",
         "labels": (),
         "assignees": (),
         "status": "Ready",

@@ -103,8 +103,31 @@ def _route_labels(config: NormalizedConfig, labels: tuple[str, ...]) -> set[str]
     return {key for key in config.branch_routes if key.strip().casefold() in folded}
 
 
+def _labels_a_non_dispatch_branch(config: NormalizedConfig, labels: tuple[str, ...]) -> bool:
+    """True when a carried route label points at a branch that never dispatches.
+
+    A config is free to map a label onto any branch name, so `route:main` is a
+    perfectly loadable config entry. It is not a perfectly dispatchable route:
+    `main` is a repository default branch. The refusal has to happen here, in
+    the routing authority, or a caller reading labels reaches a different
+    verdict from a caller reading declarations.
+    """
+    forbidden = {branch.casefold() for branch in NON_DISPATCH_BRANCHES}
+    return any(
+        config.branch_routes[key].strip().casefold() in forbidden
+        for key in _route_labels(config, labels)
+    )
+
+
 def resolve_branch_route(issue: Any, config: NormalizedConfig) -> BranchRoute:
     """Resolve the declared route, or explain exactly why there isn't one."""
+    labels = tuple(getattr(issue, "labels", ()) or ())
+    if _labels_a_non_dispatch_branch(config, labels):
+        # Checked before the declaration, because a card pointed at a
+        # non-dispatch branch is refused for that reason whether the branch was
+        # named in the body, on the card, or in both.
+        return _invalid("route-declaration-unknown")
+
     body = getattr(issue, "body", None)
     matches = _DECLARATION_RE.findall(body) if isinstance(body, str) else []
 
@@ -120,7 +143,6 @@ def resolve_branch_route(issue: Any, config: NormalizedConfig) -> BranchRoute:
     if declaration not in ROUTE_DECLARATIONS:
         return _invalid("route-declaration-unknown", declaration)
 
-    labels = tuple(getattr(issue, "labels", ()) or ())
     carried = _route_labels(config, labels)
     branches = {config.branch_routes[key] for key in carried}
     if len(branches) > 1:
