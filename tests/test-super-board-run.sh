@@ -167,4 +167,38 @@ kill -0 "$STOP_PID" 2>/dev/null && fail "the in-flight worker survived the stop"
 grep -q -- "--remove-assignee" "$TMP/gh-calls.txt" || fail "the claim was not released on stop"
 rm -f "$INFLIGHT/workflow-wave.lock"
 
-echo "PASS: test-super-board-run.sh (10 scenarios)"
+# ── Scenario 11 — the tick's six status counters come from ONE scan.
+#    Every counter used to run its own `jq` pass over the same cached board, so
+#    a 500-card board was walked six times a tick for numbers one walk produces.
+reset_state
+cat > "$TMP/gh-project-out" <<'BOARD'
+{"items":[
+ {"status":"Ready","content":{"number":1}},
+ {"status":"Ready","content":{"number":2}},
+ {"status":"Building","content":{"number":3}},
+ {"status":"QA","content":{"number":4}},
+ {"status":"Review","content":{"number":5}},
+ {"status":"Blocked","content":{"number":6}},
+ {"status":"Done","content":{"number":7}},
+ {"status":"Done","content":{"number":8}}
+]}
+BOARD
+fetch_project_items || fail "the board fixture could not be read"
+[ "$(column_count Ready)"    = "2" ] || fail "Ready counted $(column_count Ready), expected 2"
+[ "$(column_count Building)" = "1" ] || fail "Building counted $(column_count Building)"
+[ "$(column_count QA)"       = "1" ] || fail "QA counted $(column_count QA)"
+[ "$(column_count Review)"   = "1" ] || fail "Review counted $(column_count Review)"
+[ "$(column_count Blocked)"  = "1" ] || fail "Blocked counted $(column_count Blocked)"
+[ "$(column_count Done)"     = "2" ] || fail "Done counted $(column_count Done)"
+[ "$(column_count Backlog)"  = "0" ] || fail "an absent column must count 0, not empty"
+
+# The counting itself happens once, inside the fetch. `column_count` reads the
+# map — it must not be able to walk the board again.
+grep -q 'PROJECT_STATUS_COUNTS' "$RUN_SCRIPT" \
+  || fail "the per-tick status-count map is gone"
+COLUMN_BODY=$(sed -n '/^column_count() {/,/^}/p' "$RUN_SCRIPT")
+echo "$COLUMN_BODY" | grep -q 'jq' \
+  && fail "column_count still scans the board itself: $COLUMN_BODY"
+echo '{"items":[]}' > "$TMP/gh-project-out"
+
+echo "PASS: test-super-board-run.sh (11 scenarios)"

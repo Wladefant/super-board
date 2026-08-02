@@ -139,7 +139,25 @@ fetch_project_items() {
     return 1
   fi
   PROJECT_ITEMS_JSON="$raw"
+  compute_status_counts
   return 0
+}
+
+# One scan per tick, not one per column. The six counters below used to run six
+# separate `jq` passes over the same cached board for numbers a single walk
+# produces — on a 500-card board that is five walks nobody needed. Computed here,
+# inside the fetch, so the map and the payload can never describe different ticks.
+declare -A PROJECT_STATUS_COUNTS=()
+
+compute_status_counts() {
+  PROJECT_STATUS_COUNTS=()
+  local status count
+  while IFS=$'\t' read -r status count; do
+    [ -n "$status" ] || continue
+    PROJECT_STATUS_COUNTS["$status"]=$count
+  done < <(printf '%s' "$PROJECT_ITEMS_JSON" | jq -r '
+    (.items // []) | group_by(.status // "") | .[]
+    | "\(.[0].status // "")\t\(length)"' 2>/dev/null)
 }
 
 halt_unreadable_board() {
@@ -152,7 +170,9 @@ halt_unreadable_board() {
 }
 
 column_count() {
-  echo "$PROJECT_ITEMS_JSON" | jq --arg col "$1" '[.items[] | select(.status == $col)] | length'
+  # Reads the map `compute_status_counts` built for this tick. A column the
+  # board does not currently carry is 0, never empty.
+  echo "${PROJECT_STATUS_COUNTS[$1]:-0}"
 }
 
 ELIGIBLE_CARDS_JSON="[]"
