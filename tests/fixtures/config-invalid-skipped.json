@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "description": "invalid: 'Skipped' is not a Superboard lifecycle status",
+  "variant": "full",
+  "project": { "owner": "Bavariance", "number": 1 },
+  "repo": { "remote": "Bavariance/polysimulator" },
+  "base_branch": "staging",
+  "status_aliases": { "Parked": "Skipped" }
+}

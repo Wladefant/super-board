@@ -1,15 +1,24 @@
-// Source of truth: THIS FILE. It used to be
-// docs/superpowers/specs/2026-05-21-super-board-design.md §4, which is missing
-// from this fork — see skills/super-board/SKILL.md for what that changes.
+// Reference documentation for the Superboard config contract.
 //
-// This file is a REFERENCE DOC, not parsed by the skill at runtime. It uses
-// JSON5-style `//` line comments to inline field notes (originally lifted from
-// spec §4) alongside the schema. Strip comments before validating an actual
-// config file as JSON.
+// The EXECUTABLE contract is `scripts/super_board_runtime/config.py`
+// (`load_and_validate_config`). This file explains it for humans; where the two
+// ever disagree, config.py wins and this file is the bug. Validate a real
+// config with:
+//
+//     python scripts/super-board-config.py validate --config <path> --json
+//
+// This file is a REFERENCE DOC, not parsed at runtime. It uses JSON5-style `//`
+// line comments to inline field notes. Strip comments before validating an
+// actual config file as JSON.
 //
 // One config per GitHub project this repo drives, written to
 // `.claude/super-board/configs/<slug>.json` (committed). The active
 // pointer `.claude/super-board/active` is gitignored and per-machine.
+//
+// There is NO `columns` key. The lifecycle is fixed at seven statuses —
+// Backlog · Ready · Building · QA · Review · Blocked · Done — and is not
+// configurable. `Skipped` is not a status; a config that names it anywhere a
+// lifecycle value is accepted exits 65.
 
 {
   "version": 1,
@@ -25,15 +34,14 @@
     "number": 0
   },
 
-  // "full" or "qa-only".
+  // "full" or "qa-only". Selects which lanes exist, NOT which statuses exist.
   "variant": "qa-only",
 
-  // Worker dispatch backend. "workflow" (default) drains waves in-session via
-  // the super-board-wave dynamic workflow (references/run-workflow.md);
-  // requires dynamic workflows enabled in /config. "claude-p" is the legacy
-  // headless dispatcher (.claude/bin/super-board-run.sh) — explicit opt-in
-  // only; the dispatcher refuses to run (exit 78) unless set here.
-  "worker_backend": "workflow",
+  // Worker dispatch backend. Default "claude-p" — the headless dispatcher
+  // `.claude/bin/super-board-run.sh`. "workflow" drains waves in-session via
+  // the super-board-wave dynamic workflow (references/run-workflow.md) and
+  // requires dynamic workflows enabled in /config.
+  "worker_backend": "claude-p",
 
   // Default model ladder for lane workers, indexed by card complexity from
   // the classify router. Overridden per run by `super-board run --low|--high`.
@@ -49,21 +57,24 @@
     "url": "<https://your-target-url.example.com>"
   },
 
-  // `null` for URL-only; `{path, remote}` otherwise. `remote` can be `null`
-  // for local-only.
+  // `null` for URL-only; `{path, remote}` otherwise. `remote` is `owner/name`
+  // (a github.com URL is accepted and normalized) or `null` for local-only.
+  // Required when `activation_mode` is "proof-only", because the allowlisted
+  // issue must be proven to live inside this repository.
   "repo": null,
 
-  // The branch all per-issue branches are cut from and squash-merged back into.
-  // Default `"main"`. Onboard warns and suggests `"staging"` or `"develop"` if
-  // `main` appears to be production.
+  // The branch all per-issue branches are cut from and rebase-merged back into
+  // BY A HUMAN. Default `"main"`. Onboard warns and suggests `"staging"` or
+  // `"develop"` if `main` appears to be production.
   "base_branch": "main",
 
-  // Names of the Status options on the project. Aliases tolerated;
-  // canonicalized at read time.
-  //
-  // Full variant (7):    Ready · Building · QA · Review · Done · Blocked · Skipped
-  // QA-only variant (6): Ready ·            QA · Review · Done · Blocked · Skipped
-  "columns": ["Ready", "QA", "Review", "Done", "Blocked", "Skipped"],
+  // Optional label → branch routing table. A card carrying a route label is
+  // branched from (and targets) that branch instead of `base_branch`. Two route
+  // labels naming different branches is a routing error, not a coin toss.
+  "branch_routes": {
+    "route:staging": "staging",
+    "route:main": "main"
+  },
 
   "paths": {
     // `null` when no PROJECT.md exists (URL-only flows).
@@ -72,11 +83,70 @@
     "runs_dir": "docs/super-board/runs"
   },
 
-  // When `true`, Reviewer marks the PR ready but does NOT squash-merge; a
-  // human must click merge. Card auto-moves to Done when the PR is merged
-  // externally. Default `false`. Onboard FORCES this to `true` when
-  // `base_branch` is `main` AND the repo has a deploy workflow detected.
-  "human_approves_merge": false,
+  // The runtime NEVER merges. Reviewer marks the PR ready; a human merges it.
+  // Default `true`, and there is no supported way to make the runtime merge.
+  "human_approves_merge": true,
+
+  // How the human merges. Only "rebase" is accepted: every commit must survive
+  // on trunk so the TDD breadcrumb trail stays intact. "squash" and "merge"
+  // exit 65.
+  "merge_method": "rebase",
+
+  // Dispatch activation. Exactly three modes, and nothing at runtime can
+  // bypass them:
+  //   "off"        — nothing is ever dispatched. `proof_issue_url` MUST be null.
+  //   "proof-only" — only the single allowlisted issue may be selected.
+  //                  `proof_issue_url` MUST be an exact issue URL inside `repo.remote`,
+  //                  and that issue must be OPEN.
+  //   "active"     — normal dispatch; eligibility rules still apply.
+  //                  `proof_issue_url` MUST be null.
+  "activation_mode": "off",
+  "proof_issue_url": null,
+
+  // Labels that can never be dispatched. `design` (human-designer-owned) and
+  // `history` (archive, not work) are ALWAYS excluded whether listed here or
+  // not; anything listed here is added to them. Comparison is case-insensitive
+  // after trimming, and it is enforced in every dispatcher path — the planner,
+  // the shell dispatcher, and the dynamic workflow.
+  "exclude_labels": ["design", "history"],
+
+  // GitHub identity contract. Values are NEVER stored here — only env var
+  // NAMES. A config carrying anything that looks like credential material
+  // exits 65.
+  //   mode: "interactive" (the signed-in session identity) or "unattended".
+  //   Unattended mutation accepts ONLY a machine-account CLASSIC PAT read from
+  //   SUPERBOARD_GITHUB_TOKEN, whose login must equal SUPERBOARD_GITHUB_LOGIN,
+  //   carrying scopes repo, project, read:org.
+  //   Fine-grained PATs and GitHub App installation tokens are rejected:
+  //   GitHub Apps cannot access personal Projects v2 at all.
+  "github_auth": {
+    "mode": "interactive",
+    "token_env_var": "SUPERBOARD_GITHUB_TOKEN",
+    "login_env_var": "SUPERBOARD_GITHUB_LOGIN",
+    "expected_login": null,
+    "required_scopes": ["repo", "project", "read:org"],
+    // Extra Projects v2 boards the identity must be able to read, each checked
+    // as its own capability.
+    "required_projects": []
+  },
+
+  // The design skill's card contract. `design` cards are human-designer-owned;
+  // agents never dispatch or edit them.
+  "design_skill": { "enabled": true, "label": "design" },
+
+  // Agent Native is projection only — it owns no work state, holds no mutation
+  // credential, and executes no repository code. `projection_only: false`
+  // exits 65.
+  "agent_native": { "enabled": false, "projection_only": true },
+
+  // Deployment context surfaced to workers. The runtime never deploys.
+  "deploy": { "provider": null, "auto_deploy": false },
+
+  // Immutable GraphQL reserve, in points. May be RAISED above 1000; lowering it
+  // exits 65. When `remaining - estimated_cost` would fall below it, the
+  // operation stops (exit 75) — no sleep-through-reset, no retry loop, no
+  // fabricated fallback capacity.
+  "minimum_graphql_reserve": 1000,
 
   // Controls Reviewer's adversarial mode (folded-in super-truth pattern).
   //   "off"          — never adversarial.
@@ -88,12 +158,11 @@
 
   // Minimum aggregated sub-agent confidence (0-100) required to approve.
   // Default `70`. Below threshold, Reviewer must NOT approve; card moves to
-  // Blocked with `🛡 truth-check failed (confidence X/100)`. See §7.
+  // Blocked with `🛡 truth-check failed (confidence X/100)`.
   "truth_threshold": 70,
 
   // Max consecutive failures in the same lane on the same root-cause hash
-  // before the card auto-moves to Blocked. Default `2`. Root-cause hash
-  // defined in §7 Halt gates.
+  // before the card auto-moves to Blocked. Default `2`.
   "rebuild_cap": 2,
 
   // Consecutive expensive ticks with zero Done-count increase before halt.
@@ -108,6 +177,9 @@
   // Hard per-run ceiling: wall-clock hours before graceful halt + drain.
   // Default `3`.
   "max_hours": 3,
+
+  // Max concurrent lane workers. Default `3`.
+  "max_workers": 3,
 
   // Windows/MSYS only: when a lock PID is unverifiable via kill -0, treat the
   // lock as alive until this many seconds of age, then reap on elapsed time.
@@ -125,10 +197,9 @@
     "chat_id": "auto",
 
     // The assignee identity used as the claim mutex. Read by
-    // `super-board status` and `super-board run`. Recorded during onboard
-    // step 11 as either `super-board-bot[bot]` (when a GitHub App is
-    // installed on the repo) or the user's own GitHub login (solo projects).
-    // Pick during step 2 based on what `gh auth status` returned.
+    // `super-board status` and `super-board run`. Recorded during onboard as
+    // the machine account's login (unattended) or the user's own GitHub login
+    // (solo projects).
     "bot_identity": "auto"
   }
 }
