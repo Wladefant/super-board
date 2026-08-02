@@ -13,6 +13,12 @@
 # has to make and a reviewer can see.
 #
 # A trailing slash excludes a whole subtree.
+#
+# Every entry must be LOAD-BEARING: removing it must make the scan fail. An
+# entry that excludes a file carrying no scanned literal is dead weight that
+# still excludes the file — so the day somebody adds a real merge path to it,
+# the gate stays green. `tests/test_human_merge_contract.py` fails on a stale
+# entry for exactly that reason.
 
 # 1. The scanner itself and its contract test.
 scripts/super_board_runtime/review.py
@@ -31,15 +37,10 @@ README.md
 skills/super-board/SKILL.md
 skills/super-board/references/run.md
 skills/super-board/references/run-workflow.md
-skills/super-board/references/status.md
 skills/super-board/references/onboard.md
-skills/super-board/references/lint.md
-skills/super-board/references/block-template.md
 skills/super-review/SKILL.md
-skills/super-qa/SKILL.md
 skills/super-qa/references/
 skills/super-build/
-skills/superboard-setup/
 docs/
 
 # 3. The lifecycle module is what RETIRES `Skipped` — it must name it in order
