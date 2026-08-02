@@ -108,4 +108,46 @@ set -e
 echo "$BROKEN" | grep -q 'gh-quota-on-exit: unavailable' \
   || fail "a malformed payload must read as unavailable, got: $BROKEN"
 
-echo "PASS: test-gh-guard-summary.sh (5 scenarios)"
+# ── Scenario 6 — the guard has a real `check` entrypoint when EXECUTED ──
+# `payload/github/workflows/auto-add-to-project.yml` runs
+# `bash .claude/bin/super-board-gh-guard.sh check` from Python with check=True.
+# A script that only defines functions exits 0 on any argument, so the reserve
+# was reported as respected without ever being consulted.
+cat > "$TMP/affordable.json" <<'EOF'
+{ "resources": { "graphql": { "limit": 5000, "remaining": 4200, "reset": 1780000000 } } }
+EOF
+cat > "$TMP/exhausted.json" <<'EOF'
+{ "resources": { "graphql": { "limit": 5000, "remaining": 900, "reset": 1780000000 } } }
+EOF
+
+set +e
+bash "$GUARD" check 100 --payload "$(sb_native_path "$PWD/$TMP/affordable.json")" >/dev/null 2>&1
+AFFORD_RC=$?
+set -e
+[ "$AFFORD_RC" -eq 0 ] || fail "an affordable burst must pass the executed guard, got $AFFORD_RC"
+
+set +e
+bash "$GUARD" check 100 --payload "$(sb_native_path "$PWD/$TMP/exhausted.json")" >/dev/null 2>&1
+EXHAUST_RC=$?
+set -e
+[ "$EXHAUST_RC" -eq 75 ] || fail "a burst that breaks the reserve must exit 75, got $EXHAUST_RC"
+
+set +e
+bash "$GUARD" >/dev/null 2>&1; NOARG_RC=$?
+bash "$GUARD" definitely-not-a-command >/dev/null 2>&1; UNKNOWN_RC=$?
+set -e
+[ "$NOARG_RC" -eq 64 ] || fail "the executed guard needs a command, expected 64, got $NOARG_RC"
+[ "$UNKNOWN_RC" -eq 64 ] || fail "an unknown command is an invalid invocation (64), got $UNKNOWN_RC"
+
+# ── Scenario 7 — the workflow's own invocation reaches that entrypoint ──
+# The unit test for `evaluate_fallback_auto_add` injects a Python callback, so
+# it cannot see a workflow that shells out to a command that does not exist.
+WORKFLOW="../payload/github/workflows/auto-add-to-project.yml"
+INVOCATION=$(grep -o '"bash", "[^"]*super-board-gh-guard.sh"[^]]*' "$WORKFLOW" || true)
+[ -n "$INVOCATION" ] || fail "the fallback workflow no longer invokes the gh guard at all"
+echo "$INVOCATION" | grep -q '"check"' \
+  || fail "the workflow must call the guard's real check entrypoint, got: $INVOCATION"
+echo "$INVOCATION" | grep -Eq '"[0-9]+"' \
+  || fail "the workflow must pass an estimated cost to the guard, got: $INVOCATION"
+
+echo "PASS: test-gh-guard-summary.sh (7 scenarios)"

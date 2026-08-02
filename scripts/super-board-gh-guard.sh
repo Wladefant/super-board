@@ -37,17 +37,30 @@ SB_GH_GUARD_STATE_FILE="${SB_GH_GUARD_STATE_FILE:-${TMPDIR:-/tmp}/super-board-gh
 
 sb_gh_guard_check() {
   # Refuse a burst that would break the immutable reserve.
-  # Arg 1: estimated cost in GraphQL points (default 100).
-  # Arg 2: optional config path supplying a raised floor.
+  #   sb_gh_guard_check <cost> [config]
+  #   sb_gh_guard_check <cost> [--config PATH] [--payload PATH]
+  # `--payload` reads a `gh api rate_limit` document instead of calling GitHub,
+  # so the reserve check is exercisable without a token or a network.
   # Returns 0 when affordable, 75 when the reserve is reached or the quota is
   # unreadable. The CALLER halts — this function never sleeps and never retries.
-  local cost="${1:-$SB_GH_GUARD_DEFAULT_COST}" config="${2:-}" rc=0
-  if [ -n "$config" ]; then
-    sb_runtime super_board_runtime.quota check \
-      --estimated-cost "$cost" --config "$(sb_native_path "$config")" >/dev/null || rc=$?
-  else
-    sb_runtime super_board_runtime.quota check --estimated-cost "$cost" >/dev/null || rc=$?
+  local cost="${1:-$SB_GH_GUARD_DEFAULT_COST}" rc=0
+  [ $# -gt 0 ] && shift
+  local args=(check --estimated-cost "$cost")
+  # A bare second positional is the config path (the original signature).
+  if [ $# -gt 0 ] && [ -n "$1" ] && [ "${1#-}" = "$1" ]; then
+    args+=(--config "$(sb_native_path "$1")")
+    shift
   fi
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --config)  args+=(--config "$(sb_native_path "${2:-}")"); shift 2 ;;
+      --payload) args+=(--payload "$(sb_native_path "${2:-}")"); shift 2 ;;
+      *)
+        echo "[gh-guard] unknown option: $1" >&2
+        return 64 ;;
+    esac
+  done
+  sb_runtime super_board_runtime.quota "${args[@]}" >/dev/null || rc=$?
   if [ "$rc" -ne 0 ]; then
     echo "[gh-guard] halting: the next burst (~${cost} points) would break the GraphQL reserve, or the quota could not be read" >&2
     return 75
@@ -113,3 +126,37 @@ sb_gh_budget_remaining() {
   [ -f "$SB_GH_GUARD_STATE_FILE" ] || sb_gh_budget_init
   cat "$SB_GH_GUARD_STATE_FILE"
 }
+
+# ───────────────────────────── executed as a command ─────────────────────────
+#
+# Sourcing is the primary use, but not every caller can source a shell library:
+# a GitHub Actions step and a Python `subprocess.run` both invoke this file as a
+# program. Without a CLI they invoked a file that defines functions and exits 0,
+# so `super-board-gh-guard.sh check` reported the reserve as respected without
+# ever consulting it — a preflight that always passes.
+#
+# Exit codes are the functions' own: 0 affordable · 75 the reserve is reached or
+# the quota is unreadable · 64 invalid invocation.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  sb_gh_guard_main() {
+    case "${1:-}" in
+      check)
+        shift
+        sb_gh_guard_check "$@"
+        ;;
+      summary)
+        shift
+        sb_gh_guard_summary "$@"
+        ;;
+      budget-remaining)
+        sb_gh_budget_remaining
+        ;;
+      *)
+        echo "usage: super-board-gh-guard.sh <check|summary|budget-remaining> [args]" >&2
+        return 64
+        ;;
+    esac
+  }
+  sb_gh_guard_main "$@"
+  exit $?
+fi

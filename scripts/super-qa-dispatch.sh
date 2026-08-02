@@ -124,17 +124,18 @@ ITEM_KEY=$(echo "$ISSUE_URL" | tr -c 'A-Za-z0-9._-' '-')
 LOCK="$LOCK_DIR/${ITEM_KEY}.lock"
 WORKTREE="$WORKTREE_ROOT/worktrees/${ITEM_KEY}-${TESTED_SHA:0:12}"
 
-if ! (set -o noclobber; printf '%s\n' "$TESTED_SHA" > "$LOCK") 2>/dev/null; then
-  echo "🛑 super-qa-dispatch: another QA run holds the lock for ${ISSUE_URL}." >&2
-  exit 65
-fi
-
 # Released on EVERY terminal path: success, failure, and signals.
+# Installed BEFORE the lock is taken — a signal arriving between the lock write
+# and the trap install would otherwise leak exactly the lock this releases.
+# `LOCK_HELD` keeps the cleanup honest: a run that lost the race must not delete
+# the winner's lock on its way out.
+LOCK_HELD=0
 cleanup_worktree() {
   git worktree remove --force "$WORKTREE" >/dev/null 2>&1 || true
   rm -rf "$WORKTREE"
-  rm -f "$LOCK"
+  [ "$LOCK_HELD" -eq 1 ] && rm -f "$LOCK"
   sb_tmp_cleanup
+  return 0
 }
 # A signal trap that only cleans up does NOT stop the script: bash resumes at
 # the next statement, so the run would carry on with its worktree and its lock
@@ -144,6 +145,12 @@ on_signal() { cleanup_worktree; trap - EXIT; exit "$1"; }
 trap cleanup_worktree EXIT
 trap 'on_signal 130' INT
 trap 'on_signal 143' TERM
+
+if ! (set -o noclobber; printf '%s\n' "$TESTED_SHA" > "$LOCK") 2>/dev/null; then
+  echo "🛑 super-qa-dispatch: another QA run holds the lock for ${ISSUE_URL}." >&2
+  exit 65
+fi
+LOCK_HELD=1
 
 git fetch origin "$TESTED_SHA" >/dev/null 2>&1 || {
   echo "🛑 super-qa-dispatch: could not fetch ${TESTED_SHA}." >&2
