@@ -61,8 +61,13 @@ Run the same preconditions as `run.md` §Preconditions, minus PID checks:
 
 Repeat until a done condition or halt gate fires:
 
-1. **Rate guard** — `gh api rate_limit`; if GraphQL remaining < 200, wait for
-   reset (same thresholds as run.md).
+1. **Rate guard** — read the GraphQL quota once for this wave, estimate the
+   wave's mutation cost, and require `remaining - estimated_cost >=
+   effective_floor`, where the floor is the immutable 1,000-point reserve (a
+   config may raise it, never lower it). Reaching the reserve — or being
+   unable to read the quota at all — halts the wave with exit 75; the runtime
+   never waits for a reset and never retry-spins. Same accounting as run.md,
+   through `super_board_runtime.quota`.
 2. **Plan the wave** —
    `bash .claude/bin/super-board-wave-plan.sh --config <config-path>` →
    `{cards: [...]}`. Selection is backlog-aware: one card per non-empty
