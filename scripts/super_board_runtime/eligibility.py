@@ -46,6 +46,7 @@ try:  # normal package import
     from .activation import evaluate_activation
     from .config import ConfigError, NormalizedConfig, load_and_validate_config
     from .lifecycle import DISPATCHABLE_STATUS
+    from .publication import redact_for_display
     from .routing import resolve_branch_route
 except ImportError:  # executed as a plain file path
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -53,9 +54,14 @@ except ImportError:  # executed as a plain file path
     from super_board_runtime.activation import evaluate_activation
     from super_board_runtime.config import ConfigError, NormalizedConfig, load_and_validate_config
     from super_board_runtime.lifecycle import DISPATCHABLE_STATUS
+    from super_board_runtime.publication import redact_for_display
     from super_board_runtime.routing import resolve_branch_route
 
 StateLookup = Callable[["IssueSnapshot"], Optional[str]]
+
+#: How much of an issue title a dispatch plan carries. Enough to classify a
+#: card by; not enough for a pasted wall of text to become the plan.
+PLAN_TITLE_LIMIT = 160
 
 
 @dataclass(frozen=True)
@@ -295,7 +301,11 @@ def plan_dispatch(
                 {
                     "number": snapshot.number,
                     "status": DISPATCHABLE_STATUS,
-                    "title": snapshot.title,
+                    # The title is GitHub-controlled text, and this plan is
+                    # serialized into run manifests, dispatcher logs, and the
+                    # workflow's agent prompts. It is carried — a classifier
+                    # reads it — but never raw.
+                    "title": redact_for_display(snapshot.title, limit=PLAN_TITLE_LIMIT),
                     "issue_url": decision.issue_url,
                     "issue_node_id": decision.issue_node_id,
                     "selected_base_branch": decision.selected_base_branch,

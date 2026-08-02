@@ -48,6 +48,20 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Callable
 
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    # Correct in the repository checkout (`scripts/`) and in an installed
+    # `.claude/bin/`, because `super_board_runtime/` sits beside this file in
+    # both. The status renderer reads the runtime; it never writes through it.
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+
+from super_board_runtime.publication import redact_for_display  # noqa: E402
+
+#: The kanban box is 76 columns wide, so a title longer than this could never
+#: be shown whole anyway. Bounding it here keeps a pasted wall of text from
+#: being scanned line after line on every render.
+TITLE_DISPLAY_LIMIT = 200
+
 # Make box-drawing chars render on Windows consoles too.
 try:
     sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
@@ -108,16 +122,24 @@ QA_EVIDENCE_RE = re.compile(
 
 # ───────────────────────────── pure helpers ─────────────────────────────
 
-# Control chars (C0 + DEL) sourced from GitHub-controlled issue titles would
-# otherwise reach the terminal verbatim and could redraw the kanban frame
-# (e.g. a title containing `\x1b[2K\r`). Strip them at ingestion. Tabs, LF,
-# and CR are all in this range — none have a legitimate place in a one-line
-# title display anyway.
-_CTRL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
-
 
 def sanitize_title(s: str) -> str:
-    return _CTRL_CHARS_RE.sub("", s)
+    """The ONE sanitizer, applied to GitHub-controlled text at ingestion.
+
+    Control chars (C0 + DEL) in an issue title reach the terminal verbatim and
+    can redraw the kanban frame this renderer just drew (`\\x1b[2K\\r`). That was
+    the original reason this existed — but a title also carries whatever a human
+    pasted into it, and every lane below prints it, into a terminal that is
+    routinely captured into a log and pasted into an issue. So the redaction is
+    the runtime's, not a second copy living here: `redact_for_display` strips the
+    control characters AND runs the same secret patterns the publication
+    boundary runs, collapsing anything that survives.
+
+    Applied once, at ingestion (`fetch_items`), so every lane — Ready, Building,
+    QA, Review, Done, Blocked — renders from sanitized text by construction
+    rather than by each call site remembering.
+    """
+    return redact_for_display(s, limit=TITLE_DISPLAY_LIMIT)
 
 
 def hms_to_epoch(today_iso: str, hms: str) -> int:
