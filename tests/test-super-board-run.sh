@@ -100,6 +100,29 @@ RC=0; fetch_project_items || RC=$?
 [ "$RC" -eq 0 ] || fail "a readable board must succeed, got $RC"
 [ "$PROJECT_ITEMS_JSON" = '{"items":[]}' ] || fail "the readable board payload was not cached"
 
+# ── Scenario 3b — a board read that came back exactly at the cap SAYS SO.
+#    The per-tick read stays capped on purpose (a second query per tick is the
+#    quota tax rate-limit-etiquette.md §5 removed), so the cap has to be
+#    announced: cards past it are not being considered, and silence about that
+#    reads as a scan over the whole board.
+PROJECT_ITEM_LIMIT=3
+printf '{"items":[{"id":"a"},{"id":"b"},{"id":"c"}]}\n' > "$TMP/gh-project-out"
+# Redirected, never `$(...)`: a command substitution runs in a subshell and the
+# flag this scenario reads would die with it.
+fetch_project_items > "$TMP/cap.log" 2>&1 || fail "a full page is still a readable board"
+[ "$PROJECT_ITEMS_TRUNCATED" -eq 1 ] || fail "a page at the cap must be flagged truncated"
+grep -q "TRUNCATED" "$TMP/cap.log" \
+  || fail "the cap must be announced in the run log, got: $(cat "$TMP/cap.log")"
+
+printf '{"items":[{"id":"a"},{"id":"b"}]}\n' > "$TMP/gh-project-out"
+fetch_project_items > "$TMP/under.log" 2>&1 || fail "a short page is a readable board"
+[ "$PROJECT_ITEMS_TRUNCATED" -eq 0 ] || fail "a page under the cap is not truncated"
+grep -q "TRUNCATED" "$TMP/under.log" \
+  && fail "a complete read must not claim truncation"
+PROJECT_ITEM_LIMIT=500
+echo '{"items":[]}' > "$TMP/gh-project-out"
+fetch_project_items || fail "board read must still work after the cap scenarios"
+
 # ── Scenario 4 — the claim is VERIFIED. GitHub issues accept several assignees,
 #    so `--add-assignee` succeeding proves nothing about who owns the card.
 reset_state
@@ -201,4 +224,4 @@ echo "$COLUMN_BODY" | grep -q 'jq' \
   && fail "column_count still scans the board itself: $COLUMN_BODY"
 echo '{"items":[]}' > "$TMP/gh-project-out"
 
-echo "PASS: test-super-board-run.sh (11 scenarios)"
+echo "PASS: test-super-board-run.sh (12 scenarios)"

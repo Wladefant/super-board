@@ -122,6 +122,13 @@ sb_is_windows() {
 }
 
 PROJECT_ITEMS_JSON=""
+# The per-tick board read stays capped. Sizing it to the board would mean a
+# second GraphQL query on every tick, which is exactly the per-worker quota tax
+# `rate-limit-etiquette.md` §5 removed. The read-only planner
+# (`super-board-wave-plan.sh`) runs once and can afford the extra query, so it
+# scans to completeness; this one keeps the cap and SAYS SO when it hits it.
+PROJECT_ITEM_LIMIT=${PROJECT_ITEM_LIMIT:-500}
+PROJECT_ITEMS_TRUNCATED=0
 fetch_project_items() {
   # One gh call per tick; all column lookups read from this cache.
   #
@@ -130,15 +137,26 @@ fetch_project_items() {
   # the done condition fired, and the runner exited reporting success while the
   # board it could not read was full of work. An unreadable board is an error,
   # never a state.
-  local raw rc=0
+  local raw rc=0 seen
   raw=$(gh project item-list "$PROJECT_NUMBER" --owner "$PROJECT_OWNER" \
-          --format json --limit 500 2>/dev/null) || rc=$?
+          --format json --limit "$PROJECT_ITEM_LIMIT" 2>/dev/null) || rc=$?
   if [ "$rc" -ne 0 ] || [ -z "$raw" ] \
      || ! printf '%s' "$raw" | jq -e '(.items | type) == "array"' >/dev/null 2>&1; then
     PROJECT_ITEMS_JSON=""
     return 1
   fi
   PROJECT_ITEMS_JSON="$raw"
+  # A page that came back exactly full is the only evidence of truncation this
+  # read can produce without spending a second query. Announce it every tick it
+  # holds: the tail of the board is not being considered, and a plan nobody was
+  # told was bounded reads as a plan over the whole board.
+  seen=$(printf '%s' "$raw" | jq -r '(.items // []) | length' 2>/dev/null || echo 0)
+  if [ "${seen:-0}" -ge "$PROJECT_ITEM_LIMIT" ]; then
+    PROJECT_ITEMS_TRUNCATED=1
+    log "⚠ BOARD SCAN TRUNCATED — read $seen items at the --limit $PROJECT_ITEM_LIMIT cap; cards beyond it are NOT being considered this tick."
+  else
+    PROJECT_ITEMS_TRUNCATED=0
+  fi
   compute_status_counts
   return 0
 }

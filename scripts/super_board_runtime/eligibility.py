@@ -111,6 +111,54 @@ class DispatchPlan:
     decisions: tuple[EligibilityDecision, ...]
 
 
+@dataclass(frozen=True)
+class BoardCoverage:
+    """How much of the board this plan actually looked at.
+
+    A plan is a statement about a board, and a statement about a board nobody
+    finished reading is worth exactly as much as the part that was read. The
+    live planner used to fetch `gh project item-list --limit 500` and say
+    nothing: on a 591-card board it reported 500 decisions, and the 91 cards it
+    never evaluated were indistinguishable from 91 cards it evaluated and
+    rejected. Erring conservative is not the same as erring silently — a board
+    that grows past the cap stops dispatching its tail and no output says so.
+
+    `items_total` is `None` when the board's declared size could not be read. In
+    that case a page that came back exactly full is the only evidence available
+    and is reported as truncated, because assuming otherwise is the failure this
+    record exists to prevent.
+    """
+
+    items_seen: int
+    items_total: Optional[int]
+    truncated: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "items_seen": self.items_seen,
+            "items_total": self.items_total,
+            "truncated": self.truncated,
+        }
+
+
+def board_coverage(
+    items_seen: int,
+    *,
+    items_total: Optional[int] = None,
+    items_limit: Optional[int] = None,
+) -> BoardCoverage:
+    """Decide whether the scan was complete, and never guess that it was."""
+    seen = max(int(items_seen), 0)
+    if items_total is not None:
+        total = max(int(items_total), 0)
+        return BoardCoverage(seen, total, seen < total)
+    if items_limit is not None:
+        return BoardCoverage(seen, None, seen >= max(int(items_limit), 0))
+    # No cap was applied and no total was declared: the caller handed over the
+    # whole payload it had, which is all this layer can know.
+    return BoardCoverage(seen, seen, False)
+
+
 # ───────────────────────────── snapshot parsing ─────────────────────────────
 
 
@@ -359,6 +407,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--limit", type=int, default=None, help="override config.max_workers")
     parser.add_argument(
+        "--items-total",
+        type=int,
+        default=None,
+        help="the board's declared item count, when the caller could read it",
+    )
+    parser.add_argument(
+        "--items-limit",
+        type=int,
+        default=None,
+        help="the cap the items payload was fetched with, when one was applied",
+    )
+    parser.add_argument(
         "--state-lookup",
         choices=("gh", "none"),
         default="gh",
@@ -389,6 +449,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(json.dumps({"ok": False, "reason": "items-invalid"}, sort_keys=True), file=sys.stderr)
         return EXIT_CONFIG
 
+    coverage = board_coverage(
+        len(items), items_total=args.items_total, items_limit=args.items_limit
+    )
+    if coverage.truncated:
+        # Loud, on stderr, in the same run that produced the plan. A bounded
+        # scan that is not announced is a plan nobody can size.
+        missing = (
+            f"{coverage.items_total - coverage.items_seen} card(s) were never evaluated"
+            if coverage.items_total is not None
+            else "an unknown number of cards were never evaluated"
+        )
+        total = coverage.items_total if coverage.items_total is not None else "unknown"
+        print(
+            f"super-board-eligibility: BOARD SCAN TRUNCATED — {coverage.items_seen} of "
+            f"{total} items considered; {missing}.",
+            file=sys.stderr,
+        )
+
     lookup = gh_issue_state_lookup(config) if args.state_lookup == "gh" else None
     plan = plan_dispatch(items, config, state_lookup=lookup, limit=args.limit)
     print(
@@ -397,6 +475,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "activation_mode": config.activation_mode,
                 "base_branch": config.base_branch,
                 "cards": list(plan.cards),
+                "coverage": coverage.to_dict(),
                 "decisions": [decision.to_dict() for decision in plan.decisions],
                 "exclude_labels": list(config.exclude_labels),
                 "max_workers": config.max_workers,

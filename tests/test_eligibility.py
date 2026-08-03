@@ -26,6 +26,7 @@ from super_board_runtime.config import load_and_validate_config  # noqa: E402
 from super_board_runtime.eligibility import (  # noqa: E402
     PLAN_TITLE_LIMIT,
     IssueSnapshot,
+    board_coverage,
     evaluate_dispatch,
     plan_dispatch,
     snapshot_from_project_item,
@@ -507,6 +508,45 @@ class PlanShapeAndCliTests(unittest.TestCase):
         broken_items = run(good_config, "{not json")
         self.assertEqual(broken_items.returncode, 65)
         self.assertEqual(broken_items.stdout.strip(), "")
+
+
+class BoardCoverageTests(unittest.TestCase):
+    """A bounded scan has to say so.
+
+    The live planner fetched `--limit 500` against a 591-card board and reported
+    `decisions total: 500`. It errs conservative — fewer cards considered — but
+    91 unread cards looked exactly like 91 rejected ones, and a board that grows
+    past the cap stops dispatching its tail with nothing in the output to show
+    for it.
+    """
+
+    def test_a_complete_scan_is_reported_complete(self) -> None:
+        self.assertEqual(
+            board_coverage(591, items_total=591).to_dict(),
+            {"items_seen": 591, "items_total": 591, "truncated": False},
+        )
+
+    def test_a_short_read_against_a_known_total_is_truncated(self) -> None:
+        coverage = board_coverage(500, items_total=591)
+        self.assertTrue(coverage.truncated)
+        self.assertEqual(coverage.items_total, 591)
+
+    def test_a_full_page_with_no_known_total_is_assumed_truncated(self) -> None:
+        coverage = board_coverage(500, items_limit=500)
+        self.assertTrue(coverage.truncated, "a page that came back full is the only evidence there is")
+        self.assertIsNone(coverage.items_total)
+
+    def test_a_partial_page_with_no_known_total_is_complete(self) -> None:
+        self.assertFalse(board_coverage(7, items_limit=500).truncated)
+
+    def test_a_caller_supplied_payload_declares_what_it_carried(self) -> None:
+        self.assertEqual(
+            board_coverage(12).to_dict(),
+            {"items_seen": 12, "items_total": 12, "truncated": False},
+        )
+
+    def test_a_board_that_grew_between_the_two_reads_is_not_reported_short(self) -> None:
+        self.assertFalse(board_coverage(592, items_total=591).truncated)
 
 
 if __name__ == "__main__":
