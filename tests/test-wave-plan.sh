@@ -86,4 +86,95 @@ BADPROOF=$(jq '.activation_mode = "proof-only"
 RC=0; "$PLAN" --config <(echo "$BADPROOF") --items fixtures/wave-items.json >/dev/null 2>&1 || RC=$?
 [ "$RC" -eq 65 ] || fail "a proof URL outside the configured repo should exit 65, got $RC"
 
-echo "PASS: test-wave-plan.sh (12 scenarios)"
+# ── Live-board scenarios. A stubbed `gh` on PATH — no network, no account.
+#
+# The board that produced this defect holds 591 items and the planner reported
+# `decisions total: 500`, because the fetch was hard-capped at
+# `--limit 500` and the truncation was never declared anywhere. A board that
+# grows past the cap silently stops dispatching its tail.
+TMP="$(pwd)/.tmp-wave-plan"
+rm -rf "$TMP"; mkdir -p "$TMP/bin"
+trap 'rm -rf "$TMP"' EXIT
+
+# A board of $BOARD_SIZE cards. Only the LAST one is Ready and dispatchable, so
+# a planner that stops early cannot accidentally pass by finding it anyway.
+cat > "$TMP/bin/gh" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$TMP/gh-calls.txt"
+SIZE=\$(cat "$TMP/board-size")
+if [ "\$1" = api ] && [ "\$2" = rate_limit ]; then
+  printf '%s' '{"resources":{"graphql":{"limit":5000,"remaining":5000,"used":0,"reset":4102444800}}}'
+  exit 0
+fi
+if [ "\$1" = project ] && [ "\$2" = view ]; then
+  if [ -s "$TMP/view-rc" ] && [ "\$(cat "$TMP/view-rc")" != 0 ]; then exit 1; fi
+  printf '{"items":{"totalCount":%s}}' "\$SIZE"
+  exit 0
+fi
+if [ "\$1" = project ] && [ "\$2" = item-list ]; then
+  LIMIT=500
+  while [ \$# -gt 0 ]; do
+    if [ "\$1" = --limit ]; then LIMIT="\$2"; fi
+    shift
+  done
+  "\${SB_TEST_PY:-python}" -c "
+import json, sys
+size, limit = int(sys.argv[1]), int(sys.argv[2])
+items = []
+for n in range(1, size + 1):
+    ready = n == size
+    items.append({
+        'id': 'PVTI_%d' % n,
+        'type': 'Issue',
+        'status': 'Ready' if ready else 'Backlog',
+        'content': {
+            'type': 'Issue', 'number': n, 'state': 'OPEN',
+            'title': 'card %d' % n, 'url': 'https://github.com/test-owner/test-repo/issues/%d' % n,
+            'body': 'Branch route: staging' if ready else '',
+        },
+    })
+print(json.dumps({'items': items[:limit]}))
+" "\$SIZE" "\$LIMIT"
+  exit 0
+fi
+exit 0
+STUB
+chmod +x "$TMP/bin/gh"
+export PATH="$TMP/bin:$PATH"
+export SB_TEST_PY="${SUPER_BOARD_PYTHON:-python}"
+
+LIVE_CONFIG=$(jq '.project = {"owner":"test-owner","number":99}
+                  | .repo = {"remote":"test-owner/test-repo"}' fixtures/wave-config.json)
+
+# Scenario 13 — a board larger than the historic 500 cap is scanned to completeness
+echo 591 > "$TMP/board-size"; echo 0 > "$TMP/view-rc"; : > "$TMP/gh-calls.txt"
+OUT13=$("$PLAN" --config <(echo "$LIVE_CONFIG"))
+echo "$OUT13" | jq -e '(.decisions | length) == 591' >/dev/null \
+  || fail "a 591-card board must yield 591 decisions, got: $(echo "$OUT13" | jq -c '.coverage, (.decisions|length)')"
+echo "$OUT13" | jq -e '.coverage.items_seen == 591 and .coverage.items_total == 591 and .coverage.truncated == false' >/dev/null \
+  || fail "coverage must declare a complete scan, got: $(echo "$OUT13" | jq -c '.coverage')"
+echo "$OUT13" | jq -e '[.cards[].number] == [591]' >/dev/null \
+  || fail "the only Ready card is the last one on the board and must be planned, got: $(echo "$OUT13" | jq -c '.cards')"
+FETCHED_LIMIT=$(sed -n 's/.*--limit \([0-9]*\).*/\1/p' "$TMP/gh-calls.txt" | tail -1)
+[ -n "$FETCHED_LIMIT" ] && [ "$FETCHED_LIMIT" -ge 591 ] \
+  || fail "the fetch must be sized to the board (>=591), calls were: $(cat "$TMP/gh-calls.txt")"
+grep -q "project view 99" "$TMP/gh-calls.txt" \
+  || fail "the planner must read the board's declared size first, calls were: $(cat "$TMP/gh-calls.txt")"
+
+# Scenario 14 — when the board total cannot be read, the fallback cap is DECLARED
+echo 591 > "$TMP/board-size"; echo 1 > "$TMP/view-rc"; : > "$TMP/gh-calls.txt"
+ERR14="$TMP/err14"
+OUT14=$("$PLAN" --config <(echo "$LIVE_CONFIG") 2>"$ERR14")
+echo "$OUT14" | jq -e '.coverage.truncated == true' >/dev/null \
+  || fail "an unreadable total plus a full page must declare truncation, got: $(echo "$OUT14" | jq -c '.coverage')"
+echo "$OUT14" | jq -e '.coverage.items_seen == 500 and .coverage.items_total == null' >/dev/null \
+  || fail "coverage must state what it saw and admit it does not know the total, got: $(echo "$OUT14" | jq -c '.coverage')"
+grep -qi "truncat" "$ERR14" || fail "truncation must be announced on stderr, got: $(cat "$ERR14")"
+
+# Scenario 15 — a board under the cap with a readable total is complete, not truncated
+echo 7 > "$TMP/board-size"; echo 0 > "$TMP/view-rc"; : > "$TMP/gh-calls.txt"
+OUT15=$("$PLAN" --config <(echo "$LIVE_CONFIG"))
+echo "$OUT15" | jq -e '.coverage == {"items_seen":7,"items_total":7,"truncated":false}' >/dev/null \
+  || fail "a small board must report complete coverage, got: $(echo "$OUT15" | jq -c '.coverage')"
+
+echo "PASS: test-wave-plan.sh (15 scenarios)"

@@ -19,8 +19,12 @@
 #
 # Usage:
 #   super-board-wave-plan.sh --config <config.json> [--items <project-items.json>]
-# Without --items, fetches live board state via `gh project item-list`.
-# Stdout: {"activation_mode":…,"cards":[…],"decisions":[…],"exclude_labels":[…],…}
+# Without --items, reads the board's declared item count with `gh project view`
+# and sizes `gh project item-list` to it, so the scan is complete rather than
+# capped. When that count cannot be read the fetch falls back to
+# `--limit ${PLAN_ITEM_LIMIT:-500}` and the bound is DECLARED — `coverage` on
+# stdout and a warning on stderr — never applied silently.
+# Stdout: {"activation_mode":…,"cards":[…],"coverage":{…},"decisions":[…],…}
 # Exit: 0 ok · 64 bad invocation · 65 bad config/items · 66 config not found · 75 reserve reached
 set -euo pipefail
 
@@ -55,6 +59,10 @@ case "$VARIANT" in
   *) echo "invalid variant in config: ${VARIANT} (expected full|qa-only)" >&2; exit 65 ;;
 esac
 
+# Coverage arguments handed to the eligibility layer, which turns them into the
+# `coverage` block on stdout and the truncation warning on stderr.
+COVERAGE_ARGS=()
+
 if [ -n "$ITEMS_FILE" ]; then
   ITEMS=$(cat "$ITEMS_FILE")
 else
@@ -68,11 +76,40 @@ else
     echo "super-board-wave-plan: refusing to scan the board — the GraphQL reserve is protected." >&2
     exit 75
   fi
-  ITEMS=$(gh project item-list "$NUMBER" --owner "$OWNER" --format json --limit 500)
+
+  # Read the board's declared size first, then size the fetch to it. The scan
+  # used to be hard-capped at `--limit 500` with no mention of the cap
+  # anywhere: on a 591-card board the planner reported 500 decisions, and the
+  # 91 cards it never looked at were indistinguishable from 91 it looked at and
+  # rejected. `gh project view` is a single cheap query and it is what turns a
+  # bounded scan into a complete one.
+  BOARD_TOTAL=$(gh project view "$NUMBER" --owner "$OWNER" --format json 2>/dev/null \
+                  | jq -r '.items.totalCount // empty' 2>/dev/null || true)
+  case "$BOARD_TOTAL" in
+    ''|*[!0-9]*) BOARD_TOTAL="" ;;
+  esac
+
+  if [ -n "$BOARD_TOTAL" ]; then
+    # +1 so a card added between the two reads is still fetched, and the
+    # coverage comparison below reports the shortfall honestly if more arrive.
+    FETCH_LIMIT=$((BOARD_TOTAL + 1))
+    [ "$FETCH_LIMIT" -ge 1 ] || FETCH_LIMIT=1
+    COVERAGE_ARGS=(--items-total "$BOARD_TOTAL")
+  else
+    # The total could not be read. Fall back to a cap and DECLARE it: a full
+    # page is the only evidence of truncation available, and assuming a full
+    # page means a complete board is the failure this whole block exists to
+    # prevent.
+    FETCH_LIMIT=${PLAN_ITEM_LIMIT:-500}
+    echo "super-board-wave-plan: could not read the board's item count; falling back to --limit ${FETCH_LIMIT}." >&2
+    COVERAGE_ARGS=(--items-limit "$FETCH_LIMIT")
+  fi
+
+  ITEMS=$(gh project item-list "$NUMBER" --owner "$OWNER" --format json --limit "$FETCH_LIMIT")
 fi
 
 # A process substitution is not openable by a native interpreter; materialize.
 CONFIG_NATIVE=$(printf '%s' "$CONFIG_JSON" | sb_config_file)
 
 printf '%s' "$ITEMS" | sb_runtime super_board_runtime.eligibility \
-  --items - --config "$CONFIG_NATIVE"
+  --items - --config "$CONFIG_NATIVE" ${COVERAGE_ARGS+"${COVERAGE_ARGS[@]}"}
