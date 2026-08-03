@@ -128,9 +128,10 @@ Progress: 🛠 onboard (you are here)  →  🧹 lint  →  🤖 run
    ├─ Writes config.human_approves_merge = true and config.merge_method = "rebase".
    │   Any other combination exits 65 at validation time.
    └─ HARD RULE: if base_branch was production-detected (step 8) AND user
-       did NOT switch to staging/develop, force human_approves_merge = true
-       and tell the user: "Auto-merge to production is disabled. Approved
-       PRs will be marked ready for review; you click merge."
+       did NOT switch to staging/develop, keep human_approves_merge = true
+       and tell the user: "This runtime has no merge path at all — to
+       production or anywhere else. Approved PRs are marked ready for review
+       and left in Review; you click merge."
 
 10. RECORD NOTIFICATION CHANNEL
     └─ Auto-detect from the current session; allow override.
