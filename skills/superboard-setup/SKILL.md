@@ -522,10 +522,13 @@ merge commit hides it. Rebase keeps every commit. `human_approves_merge` must be
 This is not a convention — `scan_merge_prohibitions`
 (`scripts/super_board_runtime/review.py`) is a tree-wide scanner and a **release gate**: it
 source-scans every executable runtime, workflow, skill, and reviewer path for all eight ways
-a merge can happen, and any active occurrence fails the release. Exclusions come from an
-explicit allowlist file listing paths by name — never a path heuristic, because "skip
-anything under docs/" is exactly how a real merge path hides in a file called
-`docs/deploy-helper.sh`.
+a merge can happen, and any active occurrence fails the release. Run it against the installed
+tree — `scan_merge_prohibitions(Path(".claude"))` — as well as against the source repository;
+it excludes its own module intrinsically and distinguishes a prohibition statement from an
+active instruction on its own, so it needs no file that installation leaves behind. The source
+repository keeps a small allowlist for its own test fixtures, listing paths by name — never a
+path heuristic, because "skip anything under docs/" is exactly how a real merge path hides in
+a file called `docs/deploy-helper.sh`.
 
 ### The review gate — one parallel Codex fleet, every finding fixed
 

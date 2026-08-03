@@ -25,9 +25,38 @@ because closing an issue and writing `Done` are legitimate elsewhere — for the
 closure normalizer, which is the only actor allowed to produce `Done`, and only
 after a confirmed external merge.
 
-Exclusions come from an explicit allowlist FILE at the repository root, listing
-paths one per line. Never a path heuristic: "skip anything under docs/" is
-exactly how a real merge path hides in a file named `docs/deploy-helper.sh`.
+**The gate has to be runnable where the runtime runs.** It is not a repository
+lint; it is the proof that an *installed* tree has no merge path. Two things
+follow, and both used to be wrong:
+
+  * *Self-exclusion is intrinsic.* The scanner is built out of the literals it
+    hunts, so scanning itself always produced twelve hits. That used to be
+    handled by a line in `merge-scan-allowlist.txt` — a repository-root file
+    that is not part of the payload and therefore does not exist on an
+    installed tree, where the gate could consequently never report clean. The
+    scanner now recognises its own module by the package-relative path it was
+    imported from (`super_board_runtime/review.py`) plus its own definition
+    line, so the exclusion travels with the code instead of beside it. The
+    scanner's own source is policed by `tests/test_human_merge_contract.py`,
+    which is the right place for it: a scanner cannot audit itself.
+  * *A prohibition statement is not an active mechanism.* "the runtime never
+    enables auto-merge" and "enable auto-merge once CI is green" carry the same
+    literal and mean opposite things. Every document that stated the rule
+    therefore had to be named in the allowlist, which is how five dead
+    exclusions accumulated — and a dead exclusion still excludes, so the day a
+    real merge path lands in one of those files the gate stays green.
+    `_is_prohibition_statement` makes the distinction directly: a match is
+    prose only when it sits on a prose line (any non-fenced line of a Markdown
+    document, or a comment line anywhere else) AND its own statement scope —
+    the paragraph or list it belongs to, plus that list's introduction —
+    carries a negation. A match inside a fenced code block is NEVER prose: a
+    command cannot be excused by the paragraph above it.
+
+`merge-scan-allowlist.txt` survives for the repository-only surfaces that
+neither rule reaches — the seeded fixtures, the contract tests that must name
+the patterns, the release notes. It is a supplement, not the mechanism. Never a
+path heuristic: "skip anything under docs/" is exactly how a real merge path
+hides in a file named `docs/deploy-helper.sh`.
 """
 
 from __future__ import annotations
@@ -83,8 +112,15 @@ _MECHANISM_PATTERNS: tuple[tuple[str, re.Pattern[str], bool], ...] = (
     ("mcp-merge-tool", re.compile(r"merge_pull_request"), False),
     ("auto-merge-enablement", re.compile(r"auto[-_]merge"), False),
     (
+        # The value has to be the LITERAL `squash` or `merge`. `merge_method=
+        # merge_method,` passes a validated, rebase-only value into a dataclass
+        # and merges nothing — but `merge` is a prefix of the identifier
+        # `merge_method`, so without the trailing word boundary every such
+        # assignment read as a merge invocation. The optional quotes around the
+        # key catch the dict/JSON form `{"merge_method": "squash"}`, which the
+        # bare-identifier pattern missed entirely.
         "squash-or-merge-commit",
-        re.compile(r"""merge_method\s*[:=]\s*["']?(squash|merge)|--squash\b"""),
+        re.compile(r"""["']?merge_method["']?\s*[:=]\s*["']?(squash|merge)\b|--squash\b"""),
         False,
     ),
     # Scoped to dispatcher / reviewer paths — see the module docstring.
@@ -111,6 +147,110 @@ _SCANNED_SUFFIXES: frozenset[str] = frozenset(
 _ALWAYS_SKIPPED_DIRS: frozenset[str] = frozenset({".git", "node_modules", "__pycache__", ".venv"})
 
 _RETIRED_STATUS_RE = re.compile(r"\bSkipped\b")
+
+#: Suffixes whose whole body is prose unless it is fenced.
+_PROSE_DOCUMENT_SUFFIXES: frozenset[str] = frozenset({".md"})
+
+#: A fenced block opener or closer in Markdown. Up to three leading spaces are
+#: still a fence; four make it an indented code block, which is also not prose.
+_FENCE_RE = re.compile(r"^\s{0,3}(?:`{3,}|~{3,})")
+
+#: A comment. In a file that is not a prose document, this is the only kind of
+#: line that can carry a statement rather than an instruction.
+_COMMENT_RE = re.compile(r"^\s*(?:#|//|--|\*|<!--)")
+
+_LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]\s|\d+[.)]\s)")
+
+#: Negation. A statement that carries one is asserting the rule, not performing
+#: the thing it names. Deliberately generous — `no` and `not` are how the rule
+#: is actually written — and deliberately unavailable inside a code fence,
+#: which is what keeps it from becoming a way to excuse a real command.
+_PROHIBITION_RE = re.compile(
+    r"\bn[o']t\b|n't\b|"
+    r"\b(?:never|no|nor|neither|none|nothing|without|cannot|"
+    r"forbid\w*|prohibit\w*|disallow\w*|refus\w*|reject\w*|disabled?|instead\s+of)\b",
+    re.IGNORECASE,
+)
+
+#: How far back a statement scope may reach. A paragraph or list longer than
+#: this is not one statement.
+_SCOPE_LINE_LIMIT = 24
+
+#: This module, identified the way it will still be identifiable after the
+#: installer copies it to `.claude/bin/super_board_runtime/review.py`: by the
+#: package-relative path it was imported from, not by an absolute location.
+_SELF_MODULE_PATH: tuple[str, ...] = tuple(Path(__file__).resolve().parts[-2:])
+
+#: Occupying the scanner's path is not being the scanner. The definition line
+#: has to be there too.
+_SELF_DEFINITION = "def scan_merge_prohibitions("
+
+
+def _is_scanner_source(path: Path, text: str) -> bool:
+    """True when this file IS this module — wherever it has been installed."""
+    return tuple(Path(path).parts[-2:]) == _SELF_MODULE_PATH and _SELF_DEFINITION in text
+
+
+def _fenced_flags(lines: Sequence[str], *, prose_document: bool) -> tuple[bool, ...]:
+    """Mark every line that is a fence delimiter or sits inside a fenced block.
+
+    Only Markdown has fences. In every other file type the answer is "all of
+    it": source is code, and only its comments are read as prose.
+    """
+    if not prose_document:
+        return tuple(not _COMMENT_RE.match(line) for line in lines)
+    flags: list[bool] = []
+    inside = False
+    for line in lines:
+        if _FENCE_RE.match(line):
+            flags.append(True)  # the delimiter itself is a boundary, not prose
+            inside = not inside
+            continue
+        flags.append(inside)
+    return tuple(flags)
+
+
+def _statement_scope(lines: Sequence[str], index: int, fenced: Sequence[bool]) -> str:
+    """The text a match's own statement spans.
+
+    Its paragraph (or list block), walked back to a blank line or a fence
+    boundary — plus, when the block is a list, the introduction the list hangs
+    off. `Reviewer may not, on any path:` is where the negation lives for every
+    bullet under it, and a bullet read on its own says the opposite.
+    """
+    start = index
+    while start > 0 and index - start < _SCOPE_LINE_LIMIT:
+        previous = lines[start - 1]
+        if not previous.strip() or fenced[start - 1]:
+            break
+        start -= 1
+    block = list(lines[start : index + 1])
+
+    if any(_LIST_ITEM_RE.match(line) for line in block):
+        cursor = start - 1
+        while cursor >= 0 and not lines[cursor].strip():
+            cursor -= 1
+        if cursor >= 0 and not fenced[cursor] and lines[cursor].rstrip().endswith(":"):
+            intro_start = cursor
+            while (
+                intro_start > 0
+                and lines[intro_start - 1].strip()
+                and not fenced[intro_start - 1]
+                and cursor - intro_start < _SCOPE_LINE_LIMIT
+            ):
+                intro_start -= 1
+            block = list(lines[intro_start : cursor + 1]) + block
+
+    return "\n".join(block)
+
+
+def _is_prohibition_statement(
+    lines: Sequence[str], index: int, fenced: Sequence[bool]
+) -> bool:
+    """True when this line states the rule rather than performing it."""
+    if fenced[index]:
+        return False
+    return bool(_PROHIBITION_RE.search(_statement_scope(lines, index, fenced)))
 
 
 class MergeContractError(ValueError):
@@ -199,16 +339,29 @@ def scan_merge_prohibitions(
         if relative == ALLOWLIST_FILENAME or _allowlisted(relative, entries):
             continue
         try:
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            body = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
+        if _is_scanner_source(path, body):
+            continue
+        lines = body.splitlines()
+        fenced = _fenced_flags(
+            lines, prose_document=path.suffix.lower() in _PROSE_DOCUMENT_SUFFIXES
+        )
         scoped = bool(_SCOPED_PATH_RE.search(relative))
         for number, text in enumerate(lines, start=1):
-            for mechanism, pattern, scope_limited in _MECHANISM_PATTERNS:
-                if scope_limited and not scoped:
-                    continue
-                if pattern.search(text):
-                    occurrences.append(MergeOccurrence(relative, number, mechanism))
+            matched = [
+                mechanism
+                for mechanism, pattern, scope_limited in _MECHANISM_PATTERNS
+                if (scoped or not scope_limited) and pattern.search(text)
+            ]
+            if not matched:
+                continue
+            if _is_prohibition_statement(lines, number - 1, fenced):
+                continue
+            occurrences.extend(
+                MergeOccurrence(relative, number, mechanism) for mechanism in matched
+            )
 
     return MergeScanReport(tuple(occurrences), not occurrences)
 

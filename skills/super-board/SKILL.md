@@ -70,8 +70,17 @@ for a merge, or move a card to `Done`.
 This is a release gate, not a convention:
 `super_board_runtime.review.scan_merge_prohibitions` source-scans every
 executable runtime, workflow, skill, and reviewer path for all eight mechanisms,
-and any active occurrence fails. Exclusions live in the explicit
-`merge-scan-allowlist.txt` at the repository root — never a path heuristic.
+and any active occurrence fails.
+
+It is runnable on an **installed** tree — point it at `.claude` — because it
+needs nothing that only exists in the source repository: it recognises its own
+module intrinsically, and it tells a prohibition statement ("the runtime never
+enables auto-merge") from an active instruction ("enable auto-merge once CI is
+green") by looking for a negation in the statement's own paragraph or list. A
+match inside a fenced code block is never treated as prose, so a command cannot
+be excused by the paragraph above it. The repository keeps a
+`merge-scan-allowlist.txt` for its own test fixtures only — never a path
+heuristic, and nothing in the payload depends on it.
 
 Required configuration: `human_approves_merge: true`, `merge_method: "rebase"`.
 Required repository settings: `allow_rebase_merge: true`,

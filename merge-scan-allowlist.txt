@@ -1,49 +1,50 @@
-# merge-scan-allowlist.txt — explicit exclusions for the merge-prohibition gate.
+# merge-scan-allowlist.txt — REPOSITORY-ONLY exclusions for the release gates.
 #
-# `super_board_runtime.review.scan_merge_prohibitions` fails the release gate on
-# ANY occurrence of a merge mechanism in an executable path. Two kinds of file
-# legitimately contain those strings:
+# This file is deliberately NOT part of the payload, and the gate no longer
+# depends on it. `scan_merge_prohibitions` excludes its own module intrinsically
+# and tells a prohibition statement from an active merge mechanism on its own,
+# so it runs — and can report clean — on an installed tree, where this file does
+# not exist. That was the whole defect: a safety gate that only worked in the
+# repository it shipped from.
 #
-#   1. the scanner and its contract tests, which must name the patterns;
-#   2. documentation and fixtures that describe or seed the prohibition.
+# What is left here is the handful of REPOSITORY-ONLY surfaces neither rule can
+# reach, listed BY NAME:
 #
-# Both are listed here BY NAME. There is deliberately no path heuristic — a rule
-# like "skip anything under docs/" is exactly how a real merge path hides in a
-# file called docs/deploy-helper.sh. Adding a line here is a decision somebody
-# has to make and a reviewer can see.
+#   1. the contract tests and seeded fixtures, which must carry real merge
+#      literals in order to prove the scanner still detects them;
+#   2. the files that name the retired `Skipped` status for `scan_retired_status`
+#      — the module that refuses it, the docs that record its retirement, and
+#      the tests that assert both.
+#
+# There is deliberately no path heuristic — a rule like "skip anything under
+# docs/" is exactly how a real merge path hides in a file called
+# docs/deploy-helper.sh. Adding a line here is a decision somebody has to make
+# and a reviewer can see.
 #
 # A trailing slash excludes a whole subtree.
 #
-# Every entry must be LOAD-BEARING: removing it must make the scan fail. An
-# entry that excludes a file carrying no scanned literal is dead weight that
-# still excludes the file — so the day somebody adds a real merge path to it,
-# the gate stays green. `tests/test_human_merge_contract.py` fails on a stale
-# entry for exactly that reason.
+# Every entry must be LOAD-BEARING: removing it must make a scan fail. An entry
+# that excludes a file carrying no scanned literal is dead weight that still
+# excludes the file — so the day somebody adds a real merge path to it, the gate
+# stays green. `tests/test_human_merge_contract.py` fails on a stale entry for
+# exactly that reason, and it is what pruned this list when the scanner stopped
+# needing most of it.
 
-# 1. The scanner itself and its contract test.
-scripts/super_board_runtime/review.py
+# 1. The contract tests and the seeded fixtures. These carry real merge
+#    literals on purpose; nothing here executes.
 tests/test_human_merge_contract.py
+tests/test_config_contract.py
 tests/fixtures/merge-prohibition-seed/
 
-# The config layer enumerates the merge methods in order to REFUSE all but
-# rebase, and its tests assert that refusal.
-scripts/super_board_runtime/config.py
-tests/test_config_contract.py
-
-# 2. Documentation that states the prohibition. These describe what the runtime
-#    must never do; they contain no executable merge path.
+# 2. The retired `Skipped` status. `lifecycle.py` names it in order to refuse
+#    it; the rest record or assert that refusal.
+scripts/super_board_runtime/review.py
+scripts/super_board_runtime/lifecycle.py
+tests/test_eligibility.py
 RELEASE-NOTES.md
 README.md
 skills/super-board/SKILL.md
-skills/super-board/references/run.md
-skills/super-board/references/run-workflow.md
 skills/super-board/references/onboard.md
-skills/super-review/SKILL.md
 skills/super-qa/references/
 skills/super-build/
 docs/
-
-# 3. The lifecycle module is what RETIRES `Skipped` — it must name it in order
-#    to refuse it — and its contract tests assert that refusal.
-scripts/super_board_runtime/lifecycle.py
-tests/test_eligibility.py

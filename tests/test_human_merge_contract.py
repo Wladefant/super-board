@@ -100,6 +100,182 @@ class RealTreeTests(unittest.TestCase):
         self.assertTrue(report.clean, f"`Skipped` still on an active surface:\n{detail}")
 
 
+class InstalledTreeTests(unittest.TestCase):
+    """The gate has to be runnable where the runtime actually runs.
+
+    `merge-scan-allowlist.txt` lives at the REPOSITORY root and is not part of
+    the payload, so on an installed tree it does not exist. With no allowlist
+    the scanner flagged its own source — twelve occurrences of the patterns it
+    is built out of — and could never report clean. A safety gate that exists in
+    the repository and evaporates on installation is the exact inverse of a
+    safety gate.
+
+    These two tests are the pair that matters: the first proves the gate can
+    pass on an installed tree, the second proves it still bites there.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls._tmp = tempfile.TemporaryDirectory()
+        cls.tree = Path(cls._tmp.name)
+        for item in plan_install_payload(_REPO_ROOT):
+            destination = cls.tree / item.target
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes((_REPO_ROOT / item.source).read_bytes())
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._tmp.cleanup()
+
+    def test_the_installed_payload_scans_clean_with_no_repository_root(self) -> None:
+        self.assertFalse(
+            (self.tree / ALLOWLIST_FILENAME).exists(),
+            "an installed tree has no repository-root allowlist; the fixture must not fake one",
+        )
+        report = scan_merge_prohibitions(self.tree / ".claude")
+        detail = "\n".join(f"  {o.path}:{o.line} — {o.mechanism}" for o in report.occurrences)
+        self.assertTrue(report.clean, f"active merge paths on an installed tree:\n{detail}")
+
+    def test_an_active_merge_mechanism_in_the_installed_tree_is_caught(self) -> None:
+        rogue = self.tree / ".claude" / "bin" / "rogue-lane.sh"
+        rogue.write_text("#!/usr/bin/env bash\ngh pr merge \"$1\" --rebase\n", encoding="utf-8")
+        try:
+            report = scan_merge_prohibitions(self.tree / ".claude")
+            self.assertFalse(report.clean, "the gate stopped biting on an installed tree")
+            self.assertEqual(
+                [(o.path, o.mechanism) for o in report.occurrences],
+                [("bin/rogue-lane.sh", "cli-merge-subcommand")],
+            )
+        finally:
+            rogue.unlink()
+
+
+class SelfExclusionTests(unittest.TestCase):
+    """The scanner must not flag its own implementation — intrinsically.
+
+    Self-exclusion used to come from a line in an external file. That file is
+    not shipped, so the exclusion did not exist where the scan was run. The
+    scanner now recognises its own module by the package-relative path it was
+    imported from, which travels with the code instead of beside it.
+    """
+
+    def test_the_scanner_does_not_flag_its_own_source(self) -> None:
+        report = scan_merge_prohibitions(_REPO_ROOT / "scripts", allowlist=())
+        flagged = {o.path for o in report.occurrences}
+        self.assertNotIn("super_board_runtime/review.py", flagged)
+
+    def test_self_exclusion_follows_the_module_to_an_installed_location(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package = root / "bin" / "super_board_runtime"
+            package.mkdir(parents=True)
+            (package / "review.py").write_bytes(
+                (_REPO_ROOT / "scripts" / "super_board_runtime" / "review.py").read_bytes()
+            )
+            self.assertTrue(scan_merge_prohibitions(root, allowlist=()).clean)
+
+    def test_an_impostor_at_the_scanner_path_is_still_scanned(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            package = root / "super_board_runtime"
+            package.mkdir(parents=True)
+            (package / "review.py").write_text(
+                "#!/usr/bin/env python3\nrun('gh pr merge 42 --rebase')\n", encoding="utf-8"
+            )
+            report = scan_merge_prohibitions(root, allowlist=())
+            self.assertFalse(
+                report.clean,
+                "a file that merely occupies the scanner's path is not the scanner",
+            )
+
+
+class ProhibitionStatementTests(unittest.TestCase):
+    """A statement of the rule is not an instance of the thing it forbids.
+
+    The pattern heuristic could not tell prose asserting "the runtime never
+    enables auto-merge" from an instruction to enable it, so every document
+    that stated the rule had to be named in the allowlist. That is how five
+    dead exclusions accumulated, and how a real merge path in an allowlisted
+    file would have gone unseen.
+
+    The distinction is negation in the statement's own scope, and it is
+    deliberately NOT available inside a fenced code block — a command cannot be
+    excused by the paragraph above it.
+    """
+
+    def _scan(self, name: str, body: str):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / name
+            path.write_text(body, encoding="utf-8")
+            return scan_merge_prohibitions(Path(tmp), allowlist=())
+
+    def test_a_negated_sentence_is_a_prohibition(self) -> None:
+        report = self._scan("rule.md", "The runtime never enables auto-merge.\n")
+        self.assertTrue(report.clean)
+
+    def test_a_list_inherits_the_negation_from_its_introduction(self) -> None:
+        body = "Reviewer may not, on any path:\n\n- enable auto-merge;\n- squash.\n"
+        self.assertTrue(self._scan("rule.md", body).clean)
+
+    def test_an_unnegated_instruction_is_still_an_active_mechanism(self) -> None:
+        report = self._scan("lane.md", "When CI is green, enable auto-merge on the PR.\n")
+        self.assertFalse(report.clean)
+        self.assertEqual(report.occurrences[0].mechanism, "auto-merge-enablement")
+
+    def test_a_fenced_command_is_never_excused_by_surrounding_prose(self) -> None:
+        body = "The runtime never merges and never enables auto-merge:\n\n```bash\ngh pr merge 42 --rebase\n```\n"
+        report = self._scan("rule.md", body)
+        self.assertFalse(report.clean, "a fenced command is an instruction, not prose")
+        self.assertEqual(
+            [o.mechanism for o in report.occurrences], ["cli-merge-subcommand"]
+        )
+
+    def test_prose_relief_does_not_apply_to_executable_lines(self) -> None:
+        body = "# the runtime never merges; this is not allowed\ngh pr merge 42 --rebase\n"
+        report = self._scan("lane.sh", body)
+        self.assertFalse(report.clean)
+        self.assertEqual([o.line for o in report.occurrences], [2])
+
+    def test_a_negated_comment_in_source_is_a_prohibition(self) -> None:
+        report = self._scan("lane.sh", "# never call `gh pr merge` from a lane\ntrue\n")
+        self.assertTrue(report.clean)
+
+    def test_an_unrelated_earlier_paragraph_does_not_excuse_a_later_one(self) -> None:
+        body = "Nothing here is permitted.\n\nEnable auto-merge once CI is green.\n"
+        self.assertFalse(self._scan("lane.md", body).clean)
+
+
+class ConfigAssignmentTests(unittest.TestCase):
+    """Assigning a config value is not a merge invocation.
+
+    `merge_method=merge_method,` in `config.py` matched `merge_method\\s*[:=]\\s*
+    ["']?(squash|merge)` because `merge` is a prefix of the identifier
+    `merge_method`. The line passes a validated, rebase-only value into a
+    dataclass; it merges nothing.
+    """
+
+    def _scan(self, body: str):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.py"
+            path.write_text(body, encoding="utf-8")
+            return scan_merge_prohibitions(Path(tmp), allowlist=())
+
+    def test_passing_a_variable_through_is_not_a_merge_method_literal(self) -> None:
+        self.assertTrue(self._scan("    merge_method=merge_method,\n").clean)
+        self.assertTrue(self._scan("    merge_method = merge_method_default\n").clean)
+
+    def test_a_literal_squash_or_merge_value_is_still_caught(self) -> None:
+        for body in (
+            'PAYLOAD = {"merge_method": "squash"}\n',
+            'PAYLOAD = {"merge_method": "merge"}\n',
+            "merge_method=squash\n",
+        ):
+            with self.subTest(body=body.strip()):
+                report = self._scan(body)
+                self.assertFalse(report.clean, body)
+                self.assertEqual(report.occurrences[0].mechanism, "squash-or-merge-commit")
+
+
 class AllowlistTests(unittest.TestCase):
     def test_the_allowlist_is_an_explicit_file(self) -> None:
         path = _REPO_ROOT / ALLOWLIST_FILENAME
@@ -130,7 +306,11 @@ class AllowlistTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "docs").mkdir()
-            (root / "docs" / "why.md").write_text("never call gh pr merge\n", encoding="utf-8")
+            # An unnegated instruction — the subtree exclusion has to be what
+            # suppresses this, not the prohibition-statement rule.
+            (root / "docs" / "why.md").write_text(
+                "Finish the release with `gh pr merge`.\n", encoding="utf-8"
+            )
             self.assertTrue(scan_merge_prohibitions(root, allowlist=("docs/",)).clean)
             self.assertFalse(scan_merge_prohibitions(root, allowlist=()).clean)
 
