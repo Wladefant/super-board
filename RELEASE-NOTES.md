@@ -1,5 +1,118 @@
 # Release notes
 
+## v2.0.1 — 2026-08-03
+
+Three defects, all of them found by running v2.0.0's own safety proofs against a
+real installation rather than against the repository they shipped from. Nothing
+new: this release restores properties v2.0.0 already promised. No contract
+changes, no configuration changes, no migration.
+
+### The payload shipped an auto-merge concept it forbids
+
+`skills/super-qa/references/iteration-preamble.md` is installed on every board,
+and it instructed workers to classify a pull request as "auto-merge eligible if
+PR is small + green", stamp a literal `auto-merge-candidate` label on it with
+`gh pr create --label`, and then run a merge-on-green gate. None of that is
+permitted and none of it survives here. It stopped short of the merge itself,
+and nothing consumed the label — but the shipped contract is
+`human_approves_merge: true`, `merge_method: rebase`, and every pull request
+stopping at Review for a human. An instruction that builds the label and the
+gate is the whole mechanism minus the final call, and the next person to wire
+anything to that label would have created a real merge path without touching a
+line that looks like one.
+
+The preamble now describes what actually happens. QA still classifies the
+failure signal — objective versus subjective — but that classification only
+decides how much of a fix the worker may attempt, and it is recorded in the
+iteration file and the pull-request body instead of in a label. Every pull
+request is handed to Review and waits for a human rebase-merge. `super-qa` is
+the only label the example applies.
+
+`skills/super-board/references/onboard.md` no longer tells operators "Auto-merge
+to production is disabled", which implied the feature exists and is merely
+switched off somewhere. It says the runtime has no merge path at all.
+
+A payload-wide test now fails the suite if any shipped file establishes an
+auto-merge label, gate, or merge-eligibility classification. Every remaining
+`auto-merge` string in the payload is prohibition prose or the scanner's own
+pattern table.
+
+### The merge-prohibition gate could not pass on an installed tree
+
+`scan_merge_prohibitions` is the release gate that proves no merge mechanism
+exists. Run against an installed `.claude` it reported 24 active merge
+mechanisms and could never report clean. Twelve of those were the scanner
+matching its own source, one was a false positive on a config assignment, six
+were prose explaining the prohibition, and five were the super-qa findings
+above.
+
+The cause was that the only exclusion mechanism was `merge-scan-allowlist.txt`
+at the repository root — a file that is not part of the payload and therefore
+does not exist where the runtime runs. The gate existed in the repository and
+evaporated on installation, which is the inverse of what a safety gate should
+do. Excluding the prose one document at a time is also what had produced five
+dead allowlist entries, and a dead entry still excludes: the day a real merge
+path lands in one of those files, the gate stays green.
+
+- **Self-exclusion is intrinsic.** The scanner recognises its own module by the
+  package-relative path it was imported from plus its own definition line, so
+  the exclusion follows the code into `.claude/bin/`. A file that merely
+  occupies that path without being the scanner is still scanned.
+- **A prohibition statement is distinguished from an active mechanism.** A match
+  is prose only when it sits on a prose line — any non-fenced line of a Markdown
+  document, or a comment line anywhere else — and its own paragraph or list
+  carries a negation, including the introduction the list hangs off. A match
+  inside a fenced code block is never prose, so a command can never be excused
+  by the paragraph above it.
+- **`merge_method=merge_method,` is no longer read as a merge invocation.** The
+  value has to be the literal `squash` or `merge`. Fixing that exposed that the
+  quoted form `{"merge_method": "squash"}` had never been detected at all; it is
+  now.
+
+The payload consequently needs no exclusion data, which is asserted directly:
+the shipped payload scans clean with no repository root present, and a rogue
+lane dropped into `.claude/bin` flips it straight back to failing. The
+repository allowlist survives for its own fixtures and the retired-`Skipped`
+scan, four entries lighter.
+
+### The planner silently truncated the board scan
+
+A live run reported `decisions total: 500` against a board holding 591 items.
+The scan was capped by `gh project item-list --limit 500` and the cap was never
+declared. It errs conservative, but 91 cards nobody read looked exactly like 91
+cards that were read and rejected, and a board that grows past the cap silently
+stops dispatching its tail.
+
+`super-board-wave-plan.sh` now reads the board's declared item count and sizes
+the fetch to it, so the scan is complete. Every plan carries a `coverage` block
+— `items_seen`, `items_total`, `truncated` — and a truncated scan is also
+announced on stderr. When the board size cannot be read, the planner falls back
+to `--limit ${PLAN_ITEM_LIMIT:-500}` and reports a full page as truncated rather
+than assuming it was the whole board.
+
+The per-tick dispatcher read in `super-board-run.sh` keeps its cap on purpose —
+sizing it to the board would mean a second GraphQL query every tick, the exact
+per-worker quota tax `rate-limit-etiquette.md` §5 removed — but it now logs
+`BOARD SCAN TRUNCATED` with the count on every tick the cap is hit.
+
+### Versioning
+
+`derive_next_release` gained a patch branch. A release that only restores
+behaviour a previous release already promised has no new contract and no new
+surface to adopt, so numbering it a minor would advertise something to read that
+is not there. The two flags are mutually exclusive: a change that breaks a
+documented contract is not a defect fix however it was found. Reconciled current
+release 2.0.0 + defect-fixes-only ⇒ **2.0.1**.
+
+The contract inventory the release notes must carry is asserted against the
+newest major or minor section, not the newest section outright — a patch release
+restating fourteen contracts it never touched is a copy-paste ritual, and an
+inventory copied forward without being read stops being a check.
+
+**Tagging: not done here.** Creating the tag and publishing stay behind
+`authorize_release_publication` and its explicit operator approval, exactly as
+for 2.0.0, which also remains untagged.
+
 ## v2.0.0 — 2026-08-02
 
 **Version identity reconciled.** Four sources disagreed — `VERSION` said 1.7.1,

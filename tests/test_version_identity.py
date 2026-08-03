@@ -46,6 +46,7 @@ from super_board_runtime.release import (  # noqa: E402
     ReleaseError,
     authorize_release_publication,
     derive_next_release,
+    newest_contract_release_section,
     newest_release_notes_section,
     newest_release_notes_version,
     normalize_version,
@@ -173,9 +174,29 @@ class DerivationRuleTests(unittest.TestCase):
     def test_a_compatible_release_takes_the_next_minor(self) -> None:
         self.assertEqual(derive_next_release("1.7.1", backward_incompatible=False), "1.8.0")
 
+    def test_a_release_that_only_fixes_defects_takes_the_next_patch(self) -> None:
+        self.assertEqual(
+            derive_next_release("2.0.0", backward_incompatible=False, defect_fix_only=True),
+            "2.0.1",
+        )
+        self.assertEqual(
+            derive_next_release("1.7.1", backward_incompatible=False, defect_fix_only=True),
+            "1.7.2",
+        )
+
+    def test_a_defect_fix_that_breaks_a_contract_is_not_a_defect_fix(self) -> None:
+        with self.assertRaises(ReleaseError) as ctx:
+            derive_next_release("2.0.0", backward_incompatible=True, defect_fix_only=True)
+        self.assertEqual(ctx.exception.reason, "release-bump-contradictory")
+
     def test_this_release_is_what_the_rule_produces(self) -> None:
-        current, _reasoning = reconcile_current_release("1.7.1", "1.6.0", "v1.7.1", "v1.2.0")
-        derived = derive_next_release(current, backward_incompatible=True)
+        # 2.0.0 shipped and was never tagged, so the tag still says v1.2.0 and
+        # still does not vote. This release restores three shipped safety
+        # properties and adds no contract, so it is the patch branch.
+        current, _reasoning = reconcile_current_release("2.0.0", "2.0.0", "v2.0.0", "v1.2.0")
+        derived = derive_next_release(
+            current, backward_incompatible=False, defect_fix_only=True
+        )
         shipped = normalize_version((_REPO_ROOT / "VERSION").read_text(encoding="utf-8"))
         self.assertEqual(shipped, derived)
 
@@ -185,14 +206,27 @@ class DerivationRuleTests(unittest.TestCase):
 
 class ReleaseDocumentationTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.notes = newest_release_notes_section(NOTES.read_text(encoding="utf-8"))
+        body = NOTES.read_text(encoding="utf-8")
+        self.notes = newest_release_notes_section(body)
+        # The contract inventory belongs to the release that could have changed
+        # a contract. A patch release cannot — `derive_next_release` refuses to
+        # number a backward-incompatible change as one — so requiring it to
+        # restate fourteen contracts it never touched would make the inventory
+        # a copy-paste ritual instead of a check.
+        self.contract_notes = newest_contract_release_section(body)
         self.readme = README.read_text(encoding="utf-8")
 
-    def test_the_newest_release_notes_section_documents_every_contract(self) -> None:
-        lowered = self.notes.casefold()
+    def test_the_newest_contract_release_documents_every_contract(self) -> None:
+        lowered = self.contract_notes.casefold()
         for topic in RELEASE_CONTRACT_TOPICS:
             with self.subTest(topic=topic):
                 self.assertIn(topic.casefold(), lowered)
+
+    def test_a_patch_release_is_not_the_contract_bearing_section(self) -> None:
+        notes = "# Release notes\n\n## v2.0.1 — x\n\npatch\n\n## v2.0.0 — y\n\ncontracts\n"
+        self.assertIn("v2.0.1", newest_release_notes_section(notes))
+        self.assertIn("v2.0.0", newest_contract_release_section(notes))
+        self.assertNotIn("v2.0.1", newest_contract_release_section(notes))
 
     def test_the_readme_documents_every_contract(self) -> None:
         lowered = self.readme.casefold()

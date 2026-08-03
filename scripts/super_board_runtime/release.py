@@ -288,6 +288,31 @@ def newest_release_notes_section(text: str) -> str:
     return text[start:end]
 
 
+def newest_contract_release_section(text: str) -> str:
+    """The newest section for a release that could have changed a contract.
+
+    A patch release cannot change one: `derive_next_release` refuses to number a
+    backward-incompatible change as a patch. So the contract inventory is
+    asserted against the newest major or minor section, and a defect-only
+    release is not required to restate contracts it never touched. Requiring it
+    to would turn the inventory into a copy-paste ritual — and an inventory
+    everybody copies forward without reading stops being a check the moment one
+    of its entries goes stale.
+
+    Falls back to the newest section when no major/minor heading exists at all,
+    so a repository whose whole history is patches still has something checked.
+    """
+    body = text or ""
+    matches = list(_HEADING_RE.finditer(body))
+    if not matches:
+        return ""
+    for index, match in enumerate(matches):
+        if match.group(1).endswith(".0"):
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(body)
+            return body[match.start() : end]
+    return newest_release_notes_section(body)
+
+
 def read_version_sources(root: Path) -> dict[str, Optional[str]]:
     """The three in-tree sources. The git tag is read separately, by the caller."""
     root = Path(root)
@@ -371,11 +396,32 @@ def reconcile_current_release(
     return root, tuple(reasoning)
 
 
-def derive_next_release(current: str, *, backward_incompatible: bool) -> str:
-    """Major bump for a backward-incompatible contract change, minor otherwise."""
-    major, minor, _patch = _parts(normalize_version(current) or "")
+def derive_next_release(
+    current: str, *, backward_incompatible: bool, defect_fix_only: bool = False
+) -> str:
+    """Major for a broken contract, patch for defects only, minor otherwise.
+
+    The patch branch exists because a release that only restores behaviour the
+    previous release already promised has nothing to announce: no new contract,
+    no new surface, nothing for an operator to adopt. Numbering it a minor would
+    say there is something new to read, and the next genuinely new capability
+    would then be indistinguishable from it.
+
+    The two flags cannot both be true. A change that breaks a documented
+    contract is not a defect fix however it was discovered, and letting the
+    combination through would silently take the smaller bump.
+    """
+    if backward_incompatible and defect_fix_only:
+        raise ReleaseError(
+            "release-bump-contradictory",
+            "a release cannot be both a defect-only fix and a backward-incompatible "
+            "contract change; decide which it is before numbering it",
+        )
+    major, minor, patch = _parts(normalize_version(current) or "")
     if backward_incompatible:
         return f"{major + 1}.0.0"
+    if defect_fix_only:
+        return f"{major}.{minor}.{patch + 1}"
     return f"{major}.{minor + 1}.0"
 
 
@@ -474,6 +520,7 @@ __all__ = [
     "VersionObservation",
     "authorize_release_publication",
     "derive_next_release",
+    "newest_contract_release_section",
     "newest_release_notes_section",
     "newest_release_notes_version",
     "normalize_version",

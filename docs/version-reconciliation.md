@@ -66,11 +66,16 @@ Tagging resumes with this release, under its own approval gate.
 ## The rule that produced the next number
 
 > The next release is a **major** bump above the reconciled current release when
-> it changes a documented contract in a backward-incompatible way, and a minor
+> it changes a documented contract in a backward-incompatible way, a **patch**
+> bump when it only fixes defects — restoring behaviour an earlier release
+> already promised, with no new contract and no new surface — and a **minor**
 > bump otherwise.
 
-Executable as `derive_next_release(current, backward_incompatible=...)`; both
-branches are tested.
+Executable as
+`derive_next_release(current, backward_incompatible=..., defect_fix_only=...)`;
+all three branches are tested. The two flags cannot both be true: a change that
+breaks a documented contract is not a defect fix however it was discovered, and
+allowing the combination would silently take the smaller bump.
 
 This release is backward-incompatible in four separate ways:
 
@@ -88,6 +93,38 @@ This release is backward-incompatible in four separate ways:
    defaults no longer validate.
 
 Reconciled current release `1.7.1` + backward-incompatible ⇒ **`2.0.0`**.
+
+## The release after that: `2.0.1`
+
+`2.0.0` shipped. Its own safety proofs were then run against a real installation
+rather than against the repository they shipped from, and three defects came
+back:
+
+1. The installed payload instructed QA workers to build a merge-eligibility
+   label and a merge-on-green gate — a concept the same payload forbids.
+2. `scan_merge_prohibitions` could not report clean on an installed tree,
+   because its only exclusion mechanism was a repository-root file that is not
+   part of the payload. The gate existed in the repository and evaporated on
+   installation.
+3. The planner capped its board scan at 500 items and never said so, on a board
+   holding 591.
+
+All three restore behaviour `2.0.0` already promised. No documented contract
+changes, nothing new to adopt, no migration. Reading the sources the same way:
+
+| Source | Declared value |
+| --- | --- |
+| `VERSION` | `2.0.0` |
+| `skills/super-board/VERSION` | `2.0.0` (pinned since the reconciliation, and asserted equal) |
+| `RELEASE-NOTES.md` newest heading | `v2.0.0` |
+| Only published Git tag | `v1.2.0` — `2.0.0` was never tagged, so the tag still does not vote |
+
+The content sources agree, so the reconciled current release is `2.0.0`.
+
+Reconciled current release `2.0.0` + defect-fixes-only ⇒ **`2.0.1`**.
+
+`2.0.1` is likewise not tagged here; publication stays behind
+`authorize_release_publication`.
 
 ## What is now enforced
 
