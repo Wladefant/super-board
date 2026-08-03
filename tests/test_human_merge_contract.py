@@ -18,6 +18,7 @@ Or through discovery:
 from __future__ import annotations
 
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -29,6 +30,7 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 from super_board_runtime.config import ConfigError, load_and_validate_config  # noqa: E402
+from super_board_runtime.install_manifest import plan_install_payload  # noqa: E402
 from super_board_runtime.review import (  # noqa: E402
     ALLOWLIST_FILENAME,
     DONE_WRITER,
@@ -131,6 +133,89 @@ class AllowlistTests(unittest.TestCase):
             (root / "docs" / "why.md").write_text("never call gh pr merge\n", encoding="utf-8")
             self.assertTrue(scan_merge_prohibitions(root, allowlist=("docs/",)).clean)
             self.assertFalse(scan_merge_prohibitions(root, allowlist=()).clean)
+
+
+class ShippedPayloadAutoMergeTests(unittest.TestCase):
+    """The payload may STATE the merge prohibition. It may not build the concept.
+
+    A worker instruction that classifies a pull request as "auto-merge eligible",
+    stamps a literal `auto-merge-candidate` label on it, and then runs an
+    "Auto-merge gate" has established an auto-merge mechanism in everything but
+    the final call. Nothing consuming the label today is not a defence — it is
+    the reason the next person to wire something to it creates a real merge path
+    without ever editing a line that looks like a merge.
+
+    The shipped contract is `human_approves_merge: true`, `merge_method: rebase`,
+    and every pull request stopping at `Review` for a human. There is no
+    auto-merge eligibility, no auto-merge label, and no auto-merge gate anywhere
+    in it.
+    """
+
+    #: Literals that only exist if somebody built the concept. Assembled from
+    #: fragments so this file's own assertions are not themselves the string a
+    #: future grep of the payload trips over.
+    _LABEL = "auto-merge" + "-candidate"
+
+    FORBIDDEN = (
+        ("auto-merge label", re.compile(re.escape(_LABEL), re.IGNORECASE)),
+        ("auto-merge gate", re.compile(r"auto[-_ ]merge\s+gate", re.IGNORECASE)),
+        (
+            "auto-merge eligibility",
+            re.compile(r"auto[-_ ]merge\s+(?:elig|candidat)", re.IGNORECASE),
+        ),
+        (
+            "merge-eligibility classification",
+            re.compile(r"merge[-_ ]elig\w*", re.IGNORECASE),
+        ),
+    )
+
+    def _payload_sources(self) -> list[Path]:
+        return [
+            _REPO_ROOT / item.source
+            for item in plan_install_payload(_REPO_ROOT)
+            if Path(item.source).suffix.lower()
+            in {".md", ".sh", ".py", ".js", ".mjs", ".yml", ".yaml"}
+        ]
+
+    def test_the_payload_establishes_no_auto_merge_concept(self) -> None:
+        offences: list[str] = []
+        for path in self._payload_sources():
+            relative = path.relative_to(_REPO_ROOT).as_posix()
+            for number, line in enumerate(
+                path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1
+            ):
+                for name, pattern in self.FORBIDDEN:
+                    if pattern.search(line):
+                        offences.append(f"  {relative}:{number} — {name}")
+        self.assertEqual(
+            offences,
+            [],
+            "the shipped payload establishes an auto-merge concept it forbids:\n"
+            + "\n".join(offences),
+        )
+
+    def test_the_qa_iteration_preamble_hands_a_passing_pull_request_to_review(self) -> None:
+        text = (
+            _REPO_ROOT / "skills" / "super-qa" / "references" / "iteration-preamble.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("Review", text)
+        self.assertRegex(
+            text,
+            r"human[^.\n]{0,40}rebase[- ]merge",
+            "the preamble must say a human rebase-merges",
+        )
+
+    def test_the_qa_iteration_preamble_creates_no_label_on_the_command_line(self) -> None:
+        text = (
+            _REPO_ROOT / "skills" / "super-qa" / "references" / "iteration-preamble.md"
+        ).read_text(encoding="utf-8")
+        for line in text.splitlines():
+            if "--label" in line:
+                self.assertNotRegex(
+                    line,
+                    r"auto[-_ ]merge",
+                    f"a merge-eligibility label is still applied: {line.strip()}",
+                )
 
 
 class ConfigContractTests(unittest.TestCase):

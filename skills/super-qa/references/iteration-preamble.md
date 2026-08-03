@@ -264,13 +264,24 @@ acceptable; a fix can silently disable a feature to make a wrong spec pass.
 
 **For every fix attempted (regression OR explore `[b]`):**
 
-1. **Classify the failure signal** before opening a fix branch:
-   - **Objective fail signals** (auto-merge eligible if PR is small + green):
-     `pageerror`, `console.error` (level=error), HTTP 5xx, TypeScript
-     compile error, lint error, hard infra failure.
-   - **Subjective fail signals** (NEVER auto-merge — human must approve):
-     assertion mismatch ("expected X, got Y" where Y might be intentional),
-     missing element by selector, copy/text mismatch, layout/UX issue.
+1. **Classify the failure signal** before opening a fix branch. The
+   classification decides how much of the fix you may attempt and what the
+   reviewer is told to look at. It decides **nothing** about merging — see the
+   handoff step below: every pull request stops at `Review` for a human,
+   whatever the signal was.
+   - **Objective fail signals** — the machine states the failure and the
+     correct behaviour is not in dispute: `pageerror`, `console.error`
+     (level=error), HTTP 5xx, TypeScript compile error, lint error, hard infra
+     failure. Attempt the minimal root-cause fix.
+   - **Subjective fail signals** — the "failure" may be the intended
+     behaviour and only a human can say: assertion mismatch ("expected X, got
+     Y" where Y might be intentional), missing element by selector, copy/text
+     mismatch, layout/UX issue. Do NOT attempt a fix; file the issue, say in
+     the body which product decision is open, and move on.
+
+   Record the classification in `iteration-N.md` and in the PR body. Do not
+   turn it into a label: a label is a machine-readable handle, and a handle on
+   "this one is safe" is the first half of an automatic merge.
 
 2. **Open a fix branch off the active branch:**
    ```bash
@@ -289,13 +300,15 @@ acceptable; a fix can silently disable a feature to make a wrong spec pass.
    gh pr create \
      --title "fix(super-qa): <one-line bug summary>" \
      --label super-qa \
-     --label "$([[ "$SIGNAL" = "objective" ]] && echo auto-merge-candidate || echo needs-human-review)" \
      --body-file /tmp/super-qa-pr-body-${N}-${slug}.md
    ```
 
+   `super-qa` is the only label this command applies. There is no label that
+   marks a pull request as safe to merge, because nothing merges it.
+
    PR body must include:
    - Link to the GH issue (`Fixes #${ISSUE_N}`)
-   - The exact failing assertion / signal type
+   - The exact failing assertion / signal type (objective or subjective)
    - Forensics excerpt (top-5 console errors / pageerrors / failing requests)
    - Files changed + why (1-2 sentences per file)
    - Reviewer checklist (auto-rendered by `/review` skill below)
@@ -315,18 +328,25 @@ acceptable; a fix can silently disable a feature to make a wrong spec pass.
    rather than leaving the reader to assume the PR passed a review it never
    received. A PR that skipped every reviewer gets `needs-human-review`.
 
-6. **Auto-merge gate** (CI must enforce — orchestrator should NOT merge
-   itself):
-   - Label `auto-merge-candidate` AND
-   - All reviewers green AND
-   - CI green AND
-   - PR < 200 LOC changed
-   - Otherwise: leave open for human merge.
+6. **Hand off — every pull request stops at `Review`.** There is no gate that
+   can promote one further, because there is nothing past `Review` that this
+   loop is allowed to do.
+   - Move the linked card to `Review` and leave it there.
+   - A **human** rebase-merges. `merge_method` is `rebase` on every path:
+     squash collapses the TDD breadcrumb trail and a merge commit hides it.
+   - Do not merge, do not enable any merge-on-green mechanism, do not close
+     the implementation issue as a substitute for a merge, and do not move a
+     card to `Done`. `Done` is written by the closure normalizer, after a
+     confirmed external merge.
+   - If a reviewer flagged a blocking issue, or the fix was left incomplete,
+     the pull request keeps `needs-human-review` and the card goes to
+     `Blocked` instead of `Review`, with the reason stated in the comment.
 
 7. **Reference the PR everywhere:**
    - In `queue.md`: `[b] /foo → BUG-N.M → #${ISSUE_N} → PR #${PR_N} (iter:N)`
    - In `iteration-N.md` Section 4 (Fixes attempted): record GH issue +
-     PR number + reviewer verdicts + auto-merge eligibility.
+     PR number + reviewer verdicts + the card's handoff status (`Review`
+     awaiting a human rebase-merge, or `Blocked` with the reason).
 
 **On the active branch (the loop's working branch), only commit:**
 - The forensics fixture extension (iter 2 onwards, separate commit)
