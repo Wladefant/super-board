@@ -121,7 +121,12 @@ Builder writes this when opening the PR. Each lane updates the relevant section 
 
 ```markdown
 ## Issue
-Resolves #<N> — <title>
+Part of https://github.com/<owner>/<repo>/issues/<N> — <title>
+
+Use a closing keyword (`Closes` / `Fixes` / `Resolves #<N>`) only when the
+diff satisfies every acceptance-criterion checkbox on that issue. A partial
+PR that says `Closes #N` still closes the issue on merge. See
+`references/github-ops.md`.
 
 ## Acceptance Criteria
 - [ ] AC1: <text>

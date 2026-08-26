@@ -126,6 +126,30 @@ Reconciled current release `2.0.0` + defect-fixes-only ⇒ **`2.0.1`**.
 `2.0.1` is likewise not tagged here; publication stays behind
 `authorize_release_publication`.
 
+## The release after that: `2.1.0`
+
+`2.0.1` shipped. A live day against
+[Bavariance/polysimulator](https://github.com/Bavariance/polysimulator)
+produced an operator contract the runtime did not yet name: three GitHub
+comment surfaces, the self-approval 422, the closing-keyword trap, SHA
+re-resolution, nested-spawn death, and Done-column evidence. That is a new
+surface for agents to follow, not a defect restore and not a break of a 2.0
+runtime contract.
+
+| Source | Declared value |
+| --- | --- |
+| `VERSION` | `2.0.1` |
+| `skills/super-board/VERSION` | `2.0.1` |
+| `RELEASE-NOTES.md` newest heading | `v2.0.1` |
+| Only published Git tag | `v1.2.0` — still does not vote |
+
+The content sources agree, so the reconciled current release is `2.0.1`.
+
+Reconciled current release `2.0.1` + compatible new contract ⇒ **`2.1.0`**.
+
+`2.1.0` is likewise not tagged here; publication stays behind
+`authorize_release_publication`.
+
 ## What is now enforced
 
 - `VERSION`, `skills/super-board/VERSION`, and the newest `RELEASE-NOTES.md`

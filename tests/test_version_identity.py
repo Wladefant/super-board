@@ -190,12 +190,13 @@ class DerivationRuleTests(unittest.TestCase):
         self.assertEqual(ctx.exception.reason, "release-bump-contradictory")
 
     def test_this_release_is_what_the_rule_produces(self) -> None:
-        # 2.0.0 shipped and was never tagged, so the tag still says v1.2.0 and
-        # still does not vote. This release restores three shipped safety
-        # properties and adds no contract, so it is the patch branch.
-        current, _reasoning = reconcile_current_release("2.0.0", "2.0.0", "v2.0.0", "v1.2.0")
+        # 2.0.1 shipped and was never tagged, so the tag still says v1.2.0 and
+        # still does not vote. This release adds an operator contract (three
+        # harvest surfaces, self-approval, closing keywords, lane isolation)
+        # without breaking a 2.0 runtime contract, so it is the minor branch.
+        current, _reasoning = reconcile_current_release("2.0.1", "2.0.1", "v2.0.1", "v1.2.0")
         derived = derive_next_release(
-            current, backward_incompatible=False, defect_fix_only=True
+            current, backward_incompatible=False, defect_fix_only=False
         )
         shipped = normalize_version((_REPO_ROOT / "VERSION").read_text(encoding="utf-8"))
         self.assertEqual(shipped, derived)

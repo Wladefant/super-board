@@ -1,5 +1,97 @@
 # Release notes
 
+
+## v2.1.0 — 2026-08-26
+
+Hard-won GitHub-ops lessons from a live
+[Bavariance/polysimulator](https://github.com/Bavariance/polysimulator) day —
+bot harvest, self-approval, closing keywords, SHA identity, verification
+probes, nested lanes, and Done-column evidence — written into the runtime
+the same way every other operator contract lives: one reference file, and
+the scripts that still encoded the old assumption.
+
+### Three comment surfaces, not two
+
+Codex posts as
+[`chatgpt-codex-connector[bot]`](https://github.com/apps/chatgpt-codex-connector)
+and Copilot as
+[`copilot-pull-request-reviewer[bot]`](https://github.com/apps/copilot-pull-request-reviewer),
+typically 5–15 minutes after a push. Findings arrive as PR review objects
+*and* inline review comments *and* issue comments. Fetching only issue
+comments is how
+[PR #3099](https://github.com/Bavariance/polysimulator/pull/3099) merged
+with unaddressed findings.
+
+`scripts/super-board-sweep-comments.mjs` now hits the third endpoint
+(`GET /repos/{owner}/{repo}/pulls/{n}/reviews`) as well as
+`issues/comments` and `pulls/comments`. Bot findings are implemented first.
+A merged PR's unaddressed findings are live trunk defects. Silence from an
+exhausted bot — Copilot "reached their quota limit", Codex "usage limits
+for code reviews", CodeRabbit skipping a non-default base — is not
+approval. The local Codex fleet remains the binding gate.
+
+### Self-approval is impossible
+
+GitHub returns HTTP 422 `Can not approve your own pull request` and also
+refuses `REQUEST_CHANGES` on a PR you opened. Reviews are posted as
+`COMMENT` with the verdict in the body; a non-author must click Approve.
+Before any approval or tested-SHA claim, re-resolve the authoritative head
+over REST — a SHA carried forward in a summary can turn out not to be a
+commit at all.
+
+### Closing keywords close the issue
+
+`Closes` / `Fixes` / `Resolves #N` fire on merge even when the PR
+implements only part of the issue. The Builder PR template no longer
+defaults to `Resolves #<N>`; it defaults to `Part of` plus the full issue
+URL, and a closing keyword is allowed only when every acceptance criterion
+is met.
+
+### Lanes and the board
+
+Nested spawning is disabled: a subagent that tries to delegate dies with a
+preamble and no work. That is now in every worker prompt (wave script,
+build, QA, review). Announce file ownership over IRC; one worktree per
+writer; push early. Never move a card to `Done` on inference — require the
+merged PR or closed-issue evidence. A card stuck in `Building` with no live
+branch and no open PR is a triage signal. A verification that cannot fail
+is worthless; prove a probe fails on today's broken state before trusting a
+future green.
+
+### Where it lives
+
+Canonical contract:
+[`skills/super-board/references/github-ops.md`](./skills/super-board/references/github-ops.md).
+Routed from `skills/super-board/SKILL.md`. Indexed in `docs/README.md`.
+Pointed at from `MY-SYSTEM.md`, `super-review`, `super-build`, `super-qa`,
+`superboard-setup`, and `workflows/super-board-wave.js`. Added to
+`ACTIVE_REFERENCE_FILES` so a retired claim cannot hide there.
+
+### Unchanged 2.0 contracts (still in force)
+
+This minor adds an operator contract. It does not reopen the 2.0.0 break:
+
+- seven-state lifecycle (`Backlog · Ready · Building · QA · Review · Blocked · Done`)
+- `claude-p` remains the default backend
+- three activation modes (`off`, `proof-only`, `active`)
+- immutable 1,000-point GraphQL reserve
+- exact-SHA QA with invalidation
+- fail-closed branch routing
+- local Codex review gate
+- human rebase-merge only; the runtime never merges
+- intake normalizer and closure normalizer still own Ready promotion and Done
+- guarded fallback auto-add
+- Agent Native remains a read-only projection
+- pinned installer still writes an install manifest
+
+### Versioning
+
+Reconciled current release 2.0.1 + new operator contract (not a defect
+restore, not a backward-incompatible runtime break) ⇒ **2.1.0**.
+
+**Tagging: not done here.** Creating the tag and publishing stay behind
+`authorize_release_publication` and its explicit operator approval.
+
 ## v2.0.1 — 2026-08-03
 
 Three defects, all of them found by running v2.0.0's own safety proofs against a

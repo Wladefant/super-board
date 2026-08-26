@@ -234,10 +234,11 @@ If the user invokes `/super-build` after a partial run:
 
 When invoked by super-board (env `SUPER_BOARD_RUN=1` set by the runner, or invocation contains "super-board run"), follow these rules instead of the standalone defaults:
 
-### State protocol
-- Read context from: issue body + ALL issue comments + linked PR description + PR comments + PR review threads. NEVER from local state files for inter-lane coordination.
+- Read context from: issue body + ALL issue comments + linked PR description + PR conversation comments + inline review comments + PR review objects. Three REST surfaces. NEVER from local state files for inter-lane coordination. See `references/github-ops.md`.
 - Respect the worktree path super-board hands you (typically `.worktrees/issue-<N>-build/`). Don't create your own.
 - Respect the single branch super-board hands you (`issue-<N>-<slug>`). Don't create alternate branches.
+- Nested spawning is disabled: do not `task` / `spawn_subagent`. Announce file ownership over IRC before editing a shared file. Push early — a cancelled lane loses finished-but-unrecorded work.
+- Closing keywords (`Closes` / `Fixes` / `Resolves #N`) only when the diff satisfies every AC. Otherwise `Part of` plus the full issue URL.
 
 ### Lifecycle (Builder, first pass)
 Follow spec `.claude/skills/super-board/references/run.md` → Builder (first pass). Summary:

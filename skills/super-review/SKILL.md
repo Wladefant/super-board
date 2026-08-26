@@ -165,9 +165,10 @@ Super Review is done when one of these is true:
 
 When invoked by super-board (env `SUPER_BOARD_RUN=1` or invocation contains "super-board run"):
 
-### State protocol
-- Read from issue + PR comments + PR review threads.
+- Read from issue comments + PR conversation comments + inline review comments + PR review objects. Three REST surfaces, not one — see `references/github-ops.md`. Fetching only issue comments misses Codex/Copilot findings.
+- Implement bot findings FIRST (Codex as `chatgpt-codex-connector[bot]`, Copilot as `copilot-pull-request-reviewer[bot]`), before any independent review. Silence from an exhausted bot is not approval.
 - Respect handed-down worktree at `.worktrees/issue-<N>-review/` and branch `issue-<N>-<slug>`.
+- Nested spawning is disabled: do not `task` / `spawn_subagent`. Run adversarial checks yourself. State that in every prompt you write.
 
 ### Two variant modes
 - **Full variant:** review the diff (code + tests).
@@ -304,6 +305,21 @@ Reviewer may not, on any path:
 `Done` is written by the closure normalizer, and only after a confirmed external
 merge. `merge_ready: true` means "a human may now merge this", never "this was
 merged".
+
+### Self-approval is impossible
+
+GitHub returns HTTP 422 `Can not approve your own pull request` and also
+refuses `REQUEST_CHANGES` on a PR you opened. Post the review as `COMMENT`
+and put the verdict in the body. Tell the operator a non-author must click
+Approve. Before recording any approval or tested SHA, re-resolve the
+authoritative head: `gh api repos/{owner}/{repo}/pulls/{n} --jq .head.sha`.
+A SHA carried forward in a summary can turn out not to be a commit.
+
+### Verification instruments can lie
+
+A probe that cannot fail is worthless; one that passes for the wrong reason
+is worse. Prove the probe fails on today's broken state before trusting a
+future green. Absence of a search hit is not success.
 
 This is enforced, not merely stated:
 `super_board_runtime.review.scan_merge_prohibitions` source-scans every

@@ -160,9 +160,17 @@ node scripts/super-board-sweep-comments.mjs --repo owner/name   # any board
 
 Why it is part of the standard, not a convenience script:
 
-- **Nothing is missed.** It sweeps issue comments *and* pull-request review comments — two
-  different endpoints, and the second is the one people forget. A watermark per project means
-  a repeat run shows only what is new; `--peek` inspects without consuming.
+- **Nothing is missed.** It sweeps three surfaces: issue comments, inline
+  pull-request review comments, *and* PR review objects (`GET
+  /pulls/{n}/reviews`). The third is where Codex
+  (`chatgpt-codex-connector[bot]`) and Copilot
+  (`copilot-pull-request-reviewer[bot]`) post their verdict; fetching only
+  issue comments is how
+  [PR #3099](https://github.com/Bavariance/polysimulator/pull/3099) merged
+  with unaddressed findings. A watermark per project means a repeat run
+  shows only what is new; `--peek` inspects without consuming. The harvest
+  contract is
+  [`references/github-ops.md`](./skills/super-board/references/github-ops.md).
 - **It surfaces other people.** `--mine` filters to what collaborators said. On the ing board
   its first run immediately surfaced a teammate's open PR and two upstream defects that no
   session had noticed.

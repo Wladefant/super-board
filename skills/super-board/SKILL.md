@@ -120,6 +120,7 @@ variables are referenced by NAME.
 | `super-board stop ...` / "stop the run" / "pause the loop" / "kill super-board" | `references/stop.md` |
 | "resume" / "pick up where I left off" / "restart after stop" | `references/stop.md` (resume = run; no separate verb) |
 | Anything about Block/Skip exits | `references/block-template.md` |
+| Harvesting bot findings, posting a review, closing keywords, lane isolation, or Done-column evidence | `references/github-ops.md` |
 | Config structure questions | `references/config-schema.json` (the executable contract is `scripts/super_board_runtime/config.py`; validate with `python scripts/super-board-config.py validate --config <path> --json`) |
 | Worker gh-call discipline / rate-limit recovery | `references/rate-limit-etiquette.md` (+ `scripts/super-board-gh-guard.sh`) |
 

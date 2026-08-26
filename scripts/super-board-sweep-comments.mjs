@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Superboard: sweep every comment on a repo's issues and pull requests, newest first.
+ * Superboard: sweep every inbound surface on a repo's issues and pull requests, newest first.
  *
  * This is the **inbound channel** of the board. Comments are how a human talks to the
  * system between sessions — leave them on any card whenever you like, then say "check
@@ -76,22 +76,40 @@ else { since = loadWatermark(); mode = since ? 'new' : 'all'; }
 
 const q = since ? `?since=${encodeURIComponent(since)}&per_page=100` : '?per_page=100';
 
-// Issue comments cover both issues and PR conversations; review comments are a separate
-// endpoint and are easy to miss, so both are swept.
+// Three surfaces, not two. Issue comments cover issue + PR conversation
+// chatter. Inline review comments (`pulls/comments`) are a separate endpoint.
+// PR review *objects* (`pulls/{n}/reviews`) are a third: Codex and Copilot
+// post their verdict there, and fetching only the first two is how
+// https://github.com/Bavariance/polysimulator/pull/3099 merged with
+// unaddressed findings. See skills/super-board/references/github-ops.md.
 const comments = [
   ...gh(`repos/${REPO}/issues/comments${q}`).map((c) => ({ ...c, kind: 'comment' })),
-  ...gh(`repos/${REPO}/pulls/comments${q}`).map((c) => ({ ...c, kind: 'review' })),
+  ...gh(`repos/${REPO}/pulls/comments${q}`).map((c) => ({ ...c, kind: 'inline-review' })),
 ];
+
+const listed = gh(`repos/${REPO}/pulls?state=all&per_page=100`);
+for (const pr of listed) {
+  const reviews = gh(`repos/${REPO}/pulls/${pr.number}/reviews${q}`);
+  for (const r of reviews) {
+    comments.push({
+      ...r,
+      kind: 'review',
+      pull_request_url: r.pull_request_url || `https://api.github.com/repos/${REPO}/pulls/${pr.number}`,
+      html_url: r.html_url || `https://github.com/${REPO}/pull/${pr.number}#pullrequestreview-${r.id}`,
+    });
+  }
+}
 
 // ---------------------------------------------------------------- filter + sort
 let rows = comments.map((c) => ({
-  at: c.created_at,
-  edited: c.updated_at !== c.created_at,
+  at: c.submitted_at || c.created_at,
+  edited: Boolean(c.updated_at && c.created_at && c.updated_at !== c.created_at),
   who: c.user?.login ?? '?',
   num: Number((c.issue_url ?? c.pull_request_url ?? '').split('/').pop()),
   url: c.html_url,
   kind: c.kind,
   path: c.path ?? null,
+  state: c.state ?? null,
   body: (c.body ?? '').trim(),
 }));
 
@@ -133,9 +151,10 @@ if (rows.length === 0) {
 
   for (const r of rows) {
     const where = r.path ? ` · ${r.path}` : '';
+    const verdict = r.state ? ` ${r.state}` : '';
     emit('─'.repeat(78));
     emit(`#${r.num} ${titles.get(r.num) ?? ''}   <${states.get(r.num) ?? '?'}>`);
-    emit(`${r.at}  ${r.who}  [${r.kind}${r.edited ? ', edited' : ''}]${where}`);
+    emit(`${r.at}  ${r.who}  [${r.kind}${verdict}${r.edited ? ', edited' : ''}]${where}`);
     emit(r.url);
     emit('');
     const body = r.body.length > BODY_LIMIT ? r.body.slice(0, BODY_LIMIT) + `\n… (${r.body.length - BODY_LIMIT} more chars, use --full)` : r.body;

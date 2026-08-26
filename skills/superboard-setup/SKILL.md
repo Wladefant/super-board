@@ -708,6 +708,11 @@ EOF
   dragging a card there is the act of releasing it to a worker.
 - Token safety: Opus claude lanes do implementation (grok is reserved for X research and explicitly-requested jobs only); the session model is only for judgment + verification.
 - Verify each phase with real `gh project view` / `gh project item-list` output — NEVER trust reports.
+- **Harvest all three GitHub surfaces** (user-set 2026-08-26). Issue comments, inline review comments, and PR review objects. Codex is `chatgpt-codex-connector[bot]`; Copilot is `copilot-pull-request-reviewer[bot]`. Silence from an exhausted bot is not approval. Contract: [`references/github-ops.md`](https://github.com/Wladefant/super-board/blob/main/skills/super-board/references/github-ops.md).
+- **Never self-approve.** GitHub 422s `APPROVE` and `REQUEST_CHANGES` on your own PR. Post `COMMENT` and tell the operator a non-author must click Approve. Re-resolve the full head SHA over REST before recording any approval.
+- **Closing keywords close the issue.** `Closes` / `Fixes` / `Resolves #N` fire on merge even for a partial PR. Use `Part of` plus the full issue URL unless every acceptance criterion is met.
+- **Nested spawning is disabled.** A subagent that tries to delegate dies with a preamble and no work. State that in every prompt. Announce file ownership over IRC; one worktree per writer; push early.
+- **Never move a card to Done on inference.** Require the merged PR or closed-issue evidence. A card stuck in Building with no live branch and no open PR is a triage signal. Cross-check branches and open PRs before calling an issue unclaimed.
 
 ## Milestones & Labels
 

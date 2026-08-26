@@ -668,8 +668,9 @@ shipped code.
 When invoked by super-board (env `SUPER_BOARD_RUN=1` or invocation contains "super-board run"):
 
 ### State protocol (same as super-build)
-- Read from issue + PR comments + PR review threads.
-- Respect handed-down worktree + branch.
+- Read from issue comments + PR conversation comments + inline review comments + PR review objects. Three REST surfaces — see `references/github-ops.md`.
+- Respect handed-down worktree + branch. Nested spawning is disabled: do not `task` / `spawn_subagent`.
+- A probe that cannot fail is worthless. Prove it fails on today's broken state before trusting a future green. Absence of a search hit is not success.
 
 ### Variants
 - **Repo-backed:** worktree at `.worktrees/issue-<N>-qa/` checked out at Builder's branch tip.

@@ -25,6 +25,7 @@
 - [`references/block-template.md`](https://github.com/Wladefant/super-board/blob/main/skills/super-board/references/block-template.md) — the Blocked-card template.
 - [`references/agent-native.md`](https://github.com/Wladefant/super-board/blob/main/skills/super-board/references/agent-native.md) — the read-only projection contract for the cockpit.
 - [`references/rate-limit-etiquette.md`](https://github.com/Wladefant/super-board/blob/main/skills/super-board/references/rate-limit-etiquette.md) — GraphQL cost discipline behind the immutable reserve.
+- [`references/github-ops.md`](https://github.com/Wladefant/super-board/blob/main/skills/super-board/references/github-ops.md) — harvest bot findings (three surfaces), post a review without self-approving, closing-keyword trap, lane isolation, Done-column evidence.
 - [`references/config-schema.json`](https://github.com/Wladefant/super-board/blob/main/skills/super-board/references/config-schema.json) — the configuration contract, documented for humans. `scripts/super_board_runtime/config.py` is the executable version and wins on disagreement.
 
 ## Architecture
