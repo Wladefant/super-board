@@ -169,6 +169,7 @@ When invoked by super-board (env `SUPER_BOARD_RUN=1` or invocation contains "sup
 - Implement bot findings FIRST (Codex as `chatgpt-codex-connector[bot]`, Copilot as `copilot-pull-request-reviewer[bot]`), before any independent review. Silence from an exhausted bot is not approval.
 - Respect handed-down worktree at `.worktrees/issue-<N>-review/` and branch `issue-<N>-<slug>`.
 - Nested spawning is disabled: do not `task` / `spawn_subagent`. Run adversarial checks yourself. State that in every prompt you write.
+- Attack the fix's NEW shape, not only the old bug. Treat a PR-body claim as a hypothesis. See `references/bug-hunting.md`.
 
 ### Two variant modes
 - **Full variant:** review the diff (code + tests).

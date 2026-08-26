@@ -9,6 +9,10 @@ a closing keyword, dispatch a nested worker, or move a card. The executable
 comment-sweep is `scripts/super-board-sweep-comments.mjs`; if that script and
 this file ever disagree, the script is the bug.
 
+How to FIND bugs — named classes, decisive checks, hunt-the-class — is
+[`bug-hunting.md`](https://github.com/Wladefant/super-board/blob/main/skills/super-board/references/bug-hunting.md).
+This file is process; that one is the search.
+
 ## Harvesting bot findings
 
 Codex posts as [`chatgpt-codex-connector[bot]`](https://github.com/apps/chatgpt-codex-connector).

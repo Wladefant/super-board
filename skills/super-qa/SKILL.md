@@ -671,6 +671,7 @@ When invoked by super-board (env `SUPER_BOARD_RUN=1` or invocation contains "sup
 - Read from issue comments + PR conversation comments + inline review comments + PR review objects. Three REST surfaces — see `references/github-ops.md`.
 - Respect handed-down worktree + branch. Nested spawning is disabled: do not `task` / `spawn_subagent`.
 - A probe that cannot fail is worthless. Prove it fails on today's broken state before trusting a future green. Absence of a search hit is not success.
+- Name the bug class and hunt siblings; a test that is green on the pre-fix head is class 5. See `references/bug-hunting.md`. Ask what a green result would look like if the code were still broken.
 
 ### Variants
 - **Repo-backed:** worktree at `.worktrees/issue-<N>-qa/` checked out at Builder's branch tip.

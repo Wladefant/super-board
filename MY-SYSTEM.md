@@ -193,6 +193,16 @@ outside; GitHub cannot wake an agent. Three tiers, in increasing durability:
 Tier 3 plus a marker convention (`@claude` in the comment, or an `agent` label) is the closest
 thing to true reactivity that does not require an always-running session.
 
+## Hunt the class, not the ticket
+
+When a defect lands, name its shape and sweep the tree for siblings
+before moving on. Ten classes, each with a search signature and a
+decisive check, live in
+[`references/bug-hunting.md`](./skills/super-board/references/bug-hunting.md).
+Process (harvest, close, lane) stays in `github-ops.md`; finding bugs
+is the complement. One fix is a fix; one class swept is a real
+improvement.
+
 ## Production hardening (ported from ops)
 
 | Issue | Fix | What it does |

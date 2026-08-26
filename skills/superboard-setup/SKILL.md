@@ -713,6 +713,7 @@ EOF
 - **Closing keywords close the issue.** `Closes` / `Fixes` / `Resolves #N` fire on merge even for a partial PR. Use `Part of` plus the full issue URL unless every acceptance criterion is met.
 - **Nested spawning is disabled.** A subagent that tries to delegate dies with a preamble and no work. State that in every prompt. Announce file ownership over IRC; one worktree per writer; push early.
 - **Never move a card to Done on inference.** Require the merged PR or closed-issue evidence. A card stuck in Building with no live branch and no open PR is a triage signal. Cross-check branches and open PRs before calling an issue unclaimed.
+- **Hunt the class, not the ticket.** After a fix, name the shape and sweep siblings. Ten classes with decisive checks: [`references/bug-hunting.md`](https://github.com/Wladefant/super-board/blob/main/skills/super-board/references/bug-hunting.md). Attack the fix's NEW shape; a green result that would still be green if the code were broken is not evidence.
 
 ## Milestones & Labels
 

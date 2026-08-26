@@ -1,6 +1,73 @@
 # Release notes
 
 
+## v2.2.0 — 2026-08-26
+
+Hard-won bug-hunting lessons from the same live
+[Bavariance/polysimulator](https://github.com/Bavariance/polysimulator) day
+that produced 2.1.0. That release taught agents how to harvest, review,
+close, and lane. This one teaches them how to FIND bugs: ten named
+classes, each with a search signature, a why, an observable
+consequence, a decisive check, and a real example. Complement, not
+replacement.
+
+### Name the class, then hunt it
+
+When you fix a bug, name its class and hunt the class before moving
+on. One fix is a fix; one class swept is a real improvement. Today's
+defects were not ten unrelated accidents — they were ten shapes, and
+each shape almost certainly had more instances in the same tree.
+
+### Ten classes, each with a decisive check
+
+The check is the valuable part. Class 1: quantify the block against
+the real pool and statement timeouts. Class 5: break the behaviour and
+see if the test still passes. Class 6: name both instants and prove
+they are the same one. A grep is a candidate; the check is the bug.
+
+### Review heuristics that actually caught things
+
+Attack the fix's NEW shape rather than only confirming the old bug is
+gone — three separate fixes today each traded one hole for another.
+Ask what a green result would look like if the code were still broken.
+Treat a claim in a PR body as a hypothesis to verify, not a fact.
+
+### Where it lives
+
+Canonical playbook:
+[`skills/super-board/references/bug-hunting.md`](./skills/super-board/references/bug-hunting.md).
+Routed from `skills/super-board/SKILL.md`. Indexed in `docs/README.md`.
+Pointed at from `MY-SYSTEM.md`, `super-review`, `super-build`, `super-qa`,
+`superboard-setup`, and `workflows/super-board-wave.js`. Added to
+`ACTIVE_REFERENCE_FILES` so a retired claim cannot hide there. Process
+discipline remains
+[`github-ops.md`](./skills/super-board/references/github-ops.md).
+
+### Unchanged 2.0 contracts (still in force)
+
+This minor adds an operator contract. It does not reopen the 2.0.0 break:
+
+- seven-state lifecycle (`Backlog · Ready · Building · QA · Review · Blocked · Done`)
+- `claude-p` remains the default backend
+- three activation modes (`off`, `proof-only`, `active`)
+- immutable 1,000-point GraphQL reserve
+- exact-SHA QA with invalidation
+- fail-closed branch routing
+- local Codex review gate
+- human rebase-merge only; the runtime never merges
+- intake normalizer and closure normalizer still own Ready promotion and Done
+- guarded fallback auto-add
+- Agent Native remains a read-only projection
+- pinned installer still writes an install manifest
+
+### Versioning
+
+Reconciled current release 2.1.0 + new operator contract (not a defect
+restore, not a backward-incompatible runtime break) ⇒ **2.2.0**.
+
+**Tagging: not done here.** Creating the tag and publishing stay behind
+`authorize_release_publication` and its explicit operator approval.
+
 ## v2.1.0 — 2026-08-26
 
 Hard-won GitHub-ops lessons from a live

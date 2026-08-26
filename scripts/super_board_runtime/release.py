@@ -71,6 +71,7 @@ ACTIVE_REFERENCE_FILES: tuple[str, ...] = (
     "skills/super-board/references/lint.md",
     "skills/super-board/references/onboard.md",
     "skills/super-board/references/github-ops.md",
+    "skills/super-board/references/bug-hunting.md",
     "skills/super-board/references/rate-limit-etiquette.md",
     "skills/super-board/references/run-workflow.md",
     "skills/super-board/references/run.md",

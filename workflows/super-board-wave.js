@@ -196,6 +196,7 @@ const lanePrompt = (lane, card) => [
   `Harvest bot findings from all three surfaces (issue comments, inline review comments, PR review objects) before independent review.`,
   `Never use Closes/Fixes/Resolves unless every acceptance criterion is met; otherwise Part of plus the full issue URL.`,
   `Never move a card to Done on inference. Push early. Own your worktree.`,
+  `After a fix: name the bug class and hunt siblings (references/bug-hunting.md). Attack the fix's NEW shape; a test green on the pre-fix head is not evidence.`,
   ``,
   `Report your exit via structured output:`,
   `- status=advanced  → card moved forward (Building→QA, QA→Review, Review→human handoff)`,
