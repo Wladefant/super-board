@@ -175,6 +175,31 @@ Reconciled current release `2.1.0` + compatible new contract ⇒ **`2.2.0`**.
 `2.2.0` is likewise not tagged here; publication stays behind
 `authorize_release_publication`.
 
+## The release after that: `2.3.0`
+
+`2.2.0` shipped. A review of
+[PR #3250](https://github.com/Bavariance/polysimulator/pull/3250)
+found that a documented skeleton rule, taken literally, would have
+caused the CLS regression it exists to prevent. That is an eleventh
+named class — inferring visual height from an accessibility
+attribute — not a defect restore and not a break of a 2.0 runtime
+contract. The playbook already existed; this release adds the class
+and the two worked examples that make the check usable.
+
+| Source | Declared value |
+| --- | --- |
+| `VERSION` | `2.2.0` |
+| `skills/super-board/VERSION` | `2.2.0` |
+| `RELEASE-NOTES.md` newest heading | `v2.2.0` |
+| Only published Git tag | `v1.2.0` — still does not vote |
+
+The content sources agree, so the reconciled current release is `2.2.0`.
+
+Reconciled current release `2.2.0` + compatible new contract ⇒ **`2.3.0`**.
+
+`2.3.0` is likewise not tagged here; publication stays behind
+`authorize_release_publication`.
+
 ## What is now enforced
 
 - `VERSION`, `skills/super-board/VERSION`, and the newest `RELEASE-NOTES.md`

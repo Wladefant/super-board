@@ -26,7 +26,7 @@
 - [`references/agent-native.md`](https://github.com/Wladefant/super-board/blob/main/skills/super-board/references/agent-native.md) — the read-only projection contract for the cockpit.
 - [`references/rate-limit-etiquette.md`](https://github.com/Wladefant/super-board/blob/main/skills/super-board/references/rate-limit-etiquette.md) — GraphQL cost discipline behind the immutable reserve.
 - [`references/github-ops.md`](https://github.com/Wladefant/super-board/blob/main/skills/super-board/references/github-ops.md) — harvest bot findings (three surfaces), post a review without self-approving, closing-keyword trap, lane isolation, Done-column evidence.
-- [`references/bug-hunting.md`](https://github.com/Wladefant/super-board/blob/main/skills/super-board/references/bug-hunting.md) — name the class then hunt it: ten bug shapes with signatures, decisive checks, and 2026-08-26 examples.
+- [`references/bug-hunting.md`](https://github.com/Wladefant/super-board/blob/main/skills/super-board/references/bug-hunting.md) — name the class then hunt it: eleven bug shapes with signatures, decisive checks, and live examples.
 - [`references/config-schema.json`](https://github.com/Wladefant/super-board/blob/main/skills/super-board/references/config-schema.json) — the configuration contract, documented for humans. `scripts/super_board_runtime/config.py` is the executable version and wins on disagreement.
 
 ## Architecture

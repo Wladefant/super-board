@@ -196,7 +196,7 @@ thing to true reactivity that does not require an always-running session.
 ## Hunt the class, not the ticket
 
 When a defect lands, name its shape and sweep the tree for siblings
-before moving on. Ten classes, each with a search signature and a
+before moving on. Eleven classes, each with a search signature and a
 decisive check, live in
 [`references/bug-hunting.md`](./skills/super-board/references/bug-hunting.md).
 Process (harvest, close, lane) stays in `github-ops.md`; finding bugs

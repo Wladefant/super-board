@@ -1,6 +1,62 @@
 # Release notes
 
 
+## v2.3.0 — 2026-08-27
+
+The 2.2.0 playbook named ten classes. A review of
+[PR #3250](https://github.com/Bavariance/polysimulator/pull/3250)
+found an eleventh: a documented rule taken literally would have
+caused the CLS regression it exists to prevent. `aria-hidden` is an
+accessibility signal, not a height signal. One example alone teaches
+the wrong lesson, so the playbook now carries both.
+
+### Class 11 — do not infer height from an attribute
+
+[#241](https://github.com/Bavariance/polysimulator/issues/241)
+`AISummaryBlock` was `aria-hidden` **and** visually hidden (zero
+user-visible height) — a placeholder was wrong.
+[PR #3250](https://github.com/Bavariance/polysimulator/pull/3250)
+`SubscriptionBadge` is `aria-hidden` but paints a 28px chip — a
+placeholder is right. The decisive check is to read the render path
+and ask whether it paints visible pixels.
+
+The same over-literal shape ("if attribute X then always Y") applies
+to `sr-only` and `hidden`: those classes *usually* collapse paint,
+but a class in the source is not the painted node. Still read the
+path.
+
+### Where it lives
+
+Same playbook:
+[`skills/super-board/references/bug-hunting.md`](./skills/super-board/references/bug-hunting.md)
+class 11. Index line and hunt-the-class pointers updated from ten
+to eleven. No new reference file.
+
+### Unchanged 2.0 contracts (still in force)
+
+This minor adds an operator contract. It does not reopen the 2.0.0 break:
+
+- seven-state lifecycle (`Backlog · Ready · Building · QA · Review · Blocked · Done`)
+- `claude-p` remains the default backend
+- three activation modes (`off`, `proof-only`, `active`)
+- immutable 1,000-point GraphQL reserve
+- exact-SHA QA with invalidation
+- fail-closed branch routing
+- local Codex review gate
+- human rebase-merge only; the runtime never merges
+- intake normalizer and closure normalizer still own Ready promotion and Done
+- guarded fallback auto-add
+- Agent Native remains a read-only projection
+- pinned installer still writes an install manifest
+
+### Versioning
+
+Reconciled current release 2.2.0 + new operator contract (not a defect
+restore, not a backward-incompatible runtime break) ⇒ **2.3.0**.
+
+**Tagging: not done here.** Creating the tag and publishing stay behind
+`authorize_release_publication` and its explicit operator approval.
+
 ## v2.2.0 — 2026-08-26
 
 Hard-won bug-hunting lessons from the same live

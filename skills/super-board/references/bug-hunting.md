@@ -17,7 +17,7 @@ real code before it is called a bug.
 
 When you fix a bug, **name its class and hunt the class before moving
 on.** One fix is a fix; one class swept is a real improvement. Today's
-defects were not ten unrelated accidents — they were ten shapes, and
+defects were not eleven unrelated accidents — they were eleven shapes, and
 each shape almost certainly had more instances in the same tree. An
 agent that closes the ticket it was handed and walks away leaves the
 siblings live.
@@ -49,11 +49,12 @@ one hole for another, and how a green result hid a still-broken path.
    can turn out not to be a commit at all; a sentence in a PR body can
    turn out not to describe the diff.
 
-## The ten classes
+## The eleven classes
 
 For each class: the one-line signature an agent can search for, why it
 happens, the observable consequence, the decisive check that confirms or
-refutes an instance, and a real example from 2026-08-26.
+refutes an instance, and a real example. Classes 1–10 are from
+2026-08-26; class 11 is the review that followed.
 
 ### 1. Blocking work on the async event loop
 
@@ -308,9 +309,56 @@ before merge. Process contract:
 from the same day; the Superboard PR template historically used
 `Resolves #<N>`.
 
+### 11. Inferring visual height from an accessibility attribute
+
+**Signature.** A skeleton / first-paint placeholder is added or stripped
+because the component's JSX contains `aria-hidden` (or `sr-only`, or
+`hidden`), without reading whether the painted node has user-visible
+height.
+
+**Why.** `aria-hidden` is an accessibility signal, not a height signal.
+A documented rule taken literally — "if it renders `aria-hidden`,
+`sr-only`, or hidden, visual height is zero — add NO placeholder" —
+treats the attribute as a layout measurement. That is true of some
+nodes and false of others. The same over-literal shape ("if attribute
+X then always Y") is the bug even when X is `sr-only` or `hidden`:
+those CSS classes *usually* collapse paint, but a class in the source
+is not the same as a class on the painted node. Still read the path.
+
+**Consequence.** The CLS defect
+([#241](https://github.com/Bavariance/polysimulator/issues/241))
+from the other direction. A genuinely hidden SEO block gets a tall
+blank rectangle; a 28px chip that happens to be `aria-hidden` loses
+its placeholder and the identity row collapses on load.
+
+**Decisive check.** Read the component's render path. Ask whether it
+paints pixels the user can see. Never infer height from an attribute.
+A node that is `aria-hidden` and also `sr-only` / `display:none` /
+zero-height is confirmed no-placeholder. A node that is `aria-hidden`
+and still has real visual height (flex, `h-7`, a painted chip) is
+confirmed placeholder-required. One example alone teaches the wrong
+lesson — keep both.
+
+**Example.** Both:
+
+- [#241](https://github.com/Bavariance/polysimulator/issues/241)
+  `AISummaryBlock` was `aria-hidden` **and** visually hidden, an
+  SEO-only block with genuinely zero user-visible height. An
+  `h-[400px]` skeleton was wrong: blank rectangle flash.
+- [PR #3250](https://github.com/Bavariance/polysimulator/pull/3250)
+  `SubscriptionBadge.tsx:31-40` returns, while unhydrated, `<span
+  aria-hidden className="inline-flex h-7 items-center … px-3">`
+  containing an 8px dot and a 10×64 bar. `EntitlementsContext` starts
+  `hydrated: false`, so that chip **always paints** until
+  `/me/entitlements` settles, and the hydrated Free chip occupies the
+  same row. Here `aria-hidden` exists only to stop assistive tech
+  announcing a fake plan before the real one loads. A placeholder is
+  right; stripping it collapses the identity row — the same CLS
+  defect, arrived at from the other direction.
+
 ## How to run a hunt
 
-1. Name the class in the PR or the issue comment — one of the ten, or
+1. Name the class in the PR or the issue comment — one of the eleven, or
    a new named shape if none fit. A nameless fix is how siblings
    survive.
 2. Write the signature as a search you can actually run (a call shape,
