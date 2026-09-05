@@ -415,15 +415,57 @@ class TestProjectAdapterLifecycle(unittest.TestCase):
         cfg = create_polysimulator_config()
         self.assertTrue(hasattr(cfg, "update_lifecycle"))
 
+        def mock_runner(query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
+            if "projectV2" in query:
+                return {
+                    "data": {
+                        "repositoryOwner": {
+                            "projectV2": {
+                                "id": "PVT_1",
+                                "title": "Test",
+                                "fields": {
+                                    "nodes": [
+                                        {
+                                            "id": "STATUS_FIELD_1",
+                                            "name": "Status",
+                                            "options": [{"id": "OPT_QA_1", "name": "QA"}],
+                                        }
+                                    ]
+                                },
+                            }
+                        }
+                    }
+                }
+            if "projectItems" in query:
+                return {
+                    "data": {
+                        "repository": {
+                            "issue": {
+                                "id": "ISS_1",
+                                "projectItems": {
+                                    "nodes": [
+                                        {
+                                            "id": "ITEM_1",
+                                            "project": {"id": "PVT_1", "number": 1},
+                                            "fieldValueByName": {"name": "Building", "optionId": "OPT_BUILD_1"},
+                                        }
+                                    ]
+                                },
+                            }
+                        }
+                    }
+                }
+            return {}
+
         # Test call on config object
-        outcome = cfg.update_lifecycle("req-4543", "QA", dry_run=True)
+        outcome = cfg.update_lifecycle("req-4543", "QA", dry_run=True, graphql_runner=mock_runner)
         self.assertIsInstance(outcome, SuperboardLifecycleOutcome)
         self.assertTrue(hasattr(outcome, "ok"))
         self.assertTrue(hasattr(outcome, "blocked_reason"))
         self.assertTrue(hasattr(outcome, "board_url"))
         self.assertTrue(outcome.ok)
         self.assertTrue(outcome.dry_run)
-
+        self.assertEqual(outcome.github_writes, 0)
     def test_15_baseline_adapter_validations_unaffected(self):
         """Ensure all baseline project adapter safety functions remain intact."""
         cfg = create_polysimulator_config()
