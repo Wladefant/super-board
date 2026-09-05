@@ -15,8 +15,14 @@ Verifies:
   9. Expiry on security finding: Review invalidated if a new security alert is flagged after approval.
   10. Review reuse: Head-bound review is safely reused when head SHA and CI are unchanged (zero LLM churn).
   11. Real gh CLI smoke: Evaluates live CLI execution against real repository.
+  12. Base SHA absence: `gh pr view --json` exposes no base SHA field; REST-shaped base.sha is read.
+  13. Pinned head binding: a caller-pinned head that differs from the live head is a hard block.
+  14. Base invalidation: base movement (or an unresolvable base) invalidates a base-bound review.
+  15. Approval pinning: an approval with no commit OID, or one pinned elsewhere, never approves.
+  16. CLI reference parsing: PR number, PR URL, and invalid reference handling.
 """
 
+import argparse
 import copy
 import json
 import os
@@ -31,6 +37,7 @@ from github_pr_gate import (
     PRGateEvaluation,
     evaluate_pr_gate,
     fetch_pr_json,
+    parse_pr_ref,
 )
 
 
@@ -285,6 +292,125 @@ class TestGitHubPRGate(unittest.TestCase):
         print(f"  [PASS] Review successfully reused: {result.verdict_reason}")
 
     # -------------------------------------------------------------------------
+    # TEST 12: `gh pr view --json` exposes no base SHA field
+    # -------------------------------------------------------------------------
+    def test_base_sha_absent_from_raw_pr_view_payload(self):
+        print("\n--- TEST 12: Raw gh pr view Payload Carries No Base SHA ---")
+        # Faithful `gh pr view --json ...` output: baseRefName only, never baseRefOid.
+        pr = copy.deepcopy(self.mock_pr)
+        del pr["baseRefOid"]
+        pr["baseRefName"] = "main"
+
+        result = evaluate_pr_gate(pr)
+        self.assertEqual(result.base_sha, "")
+        self.assertEqual(result.gate_verdict, "PASSED")
+        print("  [PASS] Raw view payload yields empty base_sha (must be resolved separately)")
+
+        # REST-shaped nested base is accepted without a separate injection step.
+        pr_rest = copy.deepcopy(pr)
+        pr_rest["base"] = {"sha": self.base_sha}
+        self.assertEqual(evaluate_pr_gate(pr_rest).base_sha, self.base_sha)
+        print(f"  [PASS] Nested base.sha resolved: {self.base_sha[:8]}")
+
+    # -------------------------------------------------------------------------
+    # TEST 13: Pinned head must match the live head
+    # -------------------------------------------------------------------------
+    def test_expected_head_mismatch_blocks(self):
+        print("\n--- TEST 13: Pinned Head Mismatch Is A Hard Block ---")
+        pr = copy.deepcopy(self.mock_pr)
+        stale = "0" * 40
+
+        result = evaluate_pr_gate(pr, expected_head_sha=stale)
+        self.assertEqual(result.gate_verdict, "BLOCKED")
+        self.assertTrue(result.review_invalidated)
+        self.assertIn("head mismatch", result.verdict_reason.lower())
+        print(f"  [PASS] Stale pinned head blocked: {result.verdict_reason}")
+
+        # Pinning the true head must not disturb an otherwise passing gate.
+        matched = evaluate_pr_gate(pr, expected_head_sha=self.head_sha)
+        self.assertEqual(matched.gate_verdict, "PASSED")
+        print("  [PASS] Correct pinned head still PASSES")
+
+    # -------------------------------------------------------------------------
+    # TEST 14: Base movement invalidates a reused review
+    # -------------------------------------------------------------------------
+    def test_base_change_invalidates_reused_review(self):
+        print("\n--- TEST 14: Base Change Invalidates Prior Approval ---")
+        pr = copy.deepcopy(self.mock_pr)
+        pr["reviews"] = []
+        prior_review = {
+            "status": "approved",
+            "commit_sha": self.head_sha,
+            "base_sha": "9" * 40,
+            "submitted_at": "2026-09-05T08:15:00Z",
+            "approved_by": "independent-reviewer",
+        }
+
+        result = evaluate_pr_gate(pr, prior_review_record=prior_review)
+        self.assertEqual(result.gate_verdict, "BLOCKED")
+        self.assertTrue(result.review_invalidated)
+        self.assertFalse(result.review_reused)
+        self.assertIn("base changed", (result.invalidation_reason or "").lower())
+        print(f"  [PASS] Base movement invalidated review: {result.invalidation_reason}")
+
+        # Unresolvable base cannot prove "base unchanged" for a base-bound review.
+        pr_no_base = copy.deepcopy(pr)
+        del pr_no_base["baseRefOid"]
+        unresolved = evaluate_pr_gate(pr_no_base, prior_review_record=prior_review)
+        self.assertEqual(unresolved.gate_verdict, "BLOCKED")
+        self.assertTrue(unresolved.review_invalidated)
+        print("  [PASS] Unresolved base blocks base-bound review reuse")
+
+        # Matching base still reuses.
+        prior_ok = dict(prior_review, base_sha=self.base_sha)
+        reused = evaluate_pr_gate(pr, prior_review_record=prior_ok)
+        self.assertEqual(reused.gate_verdict, "PASSED")
+        self.assertTrue(reused.review_reused)
+        print("  [PASS] Unchanged base reuses review")
+
+    # -------------------------------------------------------------------------
+    # TEST 15: An approval with no commit OID is not head-bound evidence
+    # -------------------------------------------------------------------------
+    def test_approval_without_commit_oid_is_not_head_bound(self):
+        print("\n--- TEST 15: Approval Lacking Commit OID Never Approves ---")
+        pr = copy.deepcopy(self.mock_pr)
+        pr["reviews"] = [
+            {
+                "author": {"login": "independent-reviewer"},
+                "state": "APPROVED",
+                "submittedAt": "2026-09-05T08:15:00Z",
+                "commit": None,
+            }
+        ]
+
+        result = evaluate_pr_gate(pr)
+        self.assertEqual(result.approval_verdict, "UNAPPROVED")
+        self.assertEqual(result.gate_verdict, "BLOCKED")
+        self.assertIsNone(result.approved_by)
+        print(f"  [PASS] Unpinned approval rejected: {result.verdict_reason}")
+
+        # An approval pinned to some other commit is equally worthless for this head.
+        pr_other = copy.deepcopy(pr)
+        pr_other["reviews"][0]["commit"] = {"oid": "7" * 40}
+        other = evaluate_pr_gate(pr_other)
+        self.assertEqual(other.approval_verdict, "UNAPPROVED")
+        print("  [PASS] Approval pinned to a foreign commit rejected")
+
+    # -------------------------------------------------------------------------
+    # TEST 16: PR reference parsing for the documented CLI contract
+    # -------------------------------------------------------------------------
+    def test_parse_pr_ref_accepts_number_and_url(self):
+        print("\n--- TEST 16: CLI PR Reference Parsing ---")
+        self.assertEqual(parse_pr_ref("74"), (74, None))
+        self.assertEqual(
+            parse_pr_ref("https://github.com/Wladefant/super-board/pull/74"),
+            (74, "Wladefant/super-board"),
+        )
+        with self.assertRaises(argparse.ArgumentTypeError):
+            parse_pr_ref("not-a-pr")
+        print("  [PASS] Number, URL, and invalid reference all handled")
+
+    # -------------------------------------------------------------------------
     # TEST 11: Real Live gh CLI Invocation Smoke
     # -------------------------------------------------------------------------
     def test_live_gh_cli_smoke(self):
@@ -313,12 +439,12 @@ def main():
     result = runner.run(suite)
     if result.wasSuccessful():
         print("\n" + "=" * 70)
-        print("ALL 11 PR GATE TESTS PASSED PERFECTLY")
+        print(f"ALL {result.testsRun} PR GATE TESTS PASSED")
         print("=" * 70)
         sys.exit(0)
     else:
         print("\n" + "=" * 70)
-        print("TESTS FAILED")
+        print(f"TESTS FAILED: {len(result.failures)} failed, {len(result.errors)} errored")
         print("=" * 70)
         sys.exit(1)
 

@@ -19,6 +19,7 @@ import argparse
 import datetime
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
@@ -81,8 +82,35 @@ class PRGateEvaluation:
             f"- **Verdict:** **{self.gate_verdict}** — {self.verdict_reason}\n"
         )
 
+def _run_gh(cmd: List[str], timeout_sec: int) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout_sec,
+        shell=True if sys.platform == "win32" else False,
+    )
+
+
+def fetch_base_sha(pr_number: int, repo: str, timeout_sec: int = 25) -> str:
+    """
+    Resolve the PR base commit SHA.
+
+    `gh pr view --json` exposes no base SHA field at all (only `baseRefName`), so the
+    base OID must come from the REST endpoint. Returns "" when it cannot be resolved,
+    which the evaluator reports rather than silently treating as "base unchanged".
+    """
+    res = _run_gh(
+        ["gh", "api", f"repos/{repo}/pulls/{pr_number}", "--jq", ".base.sha"],
+        timeout_sec,
+    )
+    if res.returncode != 0:
+        return ""
+    return res.stdout.strip()
+
+
 def fetch_pr_json(pr_number: int, repo: str = "Bavariance/polysimulator", timeout_sec: int = 25) -> Dict[str, Any]:
-    """Fetch PR details from GitHub CLI."""
+    """Fetch PR details from GitHub CLI, including the base SHA the JSON view cannot supply."""
     cmd = [
         "gh",
         "pr",
@@ -94,26 +122,26 @@ def fetch_pr_json(pr_number: int, repo: str = "Bavariance/polysimulator", timeou
         "number,state,isDraft,headRefOid,baseRefName,reviews,statusCheckRollup,author",
     ]
 
-    res = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=timeout_sec,
-        shell=True if sys.platform == "win32" else False,
-    )
+    res = _run_gh(cmd, timeout_sec)
     if res.returncode != 0:
         raise RuntimeError(f"gh pr view failed (exit {res.returncode}): {res.stderr.strip()}")
 
-    return json.loads(res.stdout)
+    data = json.loads(res.stdout)
+    data["baseRefOid"] = fetch_base_sha(pr_number, repo, timeout_sec)
+    return data
 
 def evaluate_pr_gate(
     pr_data: Dict[str, Any],
     repo: str = "Bavariance/polysimulator",
     prior_review_record: Optional[Dict[str, Any]] = None,
     security_alerts: Optional[List[Dict[str, Any]]] = None,
+    expected_head_sha: Optional[str] = None,
 ) -> PRGateEvaluation:
     """
     Deterministically evaluates GitHub PR status gate without LLM churn.
+
+    When `expected_head_sha` is supplied, the live head must equal it; a mismatch is a
+    hard BLOCK, because every QA and review artifact is bound to one exact head SHA.
     """
     now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -121,8 +149,40 @@ def evaluate_pr_gate(
     state = str(pr_data.get("state") or "UNKNOWN").upper()
     is_draft = bool(pr_data.get("isDraft", False))
     head_sha = str(pr_data.get("headRefOid") or "")
-    base_sha = str(pr_data.get("baseRefOid") or "")
+    base_sha = str(
+        pr_data.get("baseRefOid")
+        or (pr_data.get("base") or {}).get("sha")
+        or pr_data.get("base_sha")
+        or ""
+    )
     pr_author = (pr_data.get("author") or {}).get("login", "")
+
+    # 0. Exact-head binding: refuse to evaluate a head other than the one asked about.
+    if expected_head_sha and head_sha and expected_head_sha != head_sha:
+        return PRGateEvaluation(
+            pr_number=pr_number,
+            repo=repo,
+            state=state,
+            is_draft=is_draft,
+            head_sha=head_sha,
+            base_sha=base_sha,
+            ci_verdict="FAILURE",
+            failing_checks=[],
+            pending_checks=[],
+            approval_verdict="UNAPPROVED",
+            approved_by=None,
+            review_reused=False,
+            review_invalidated=True,
+            invalidation_reason=(
+                f"Expected head {expected_head_sha[:8]} but PR head is {head_sha[:8]}"
+            ),
+            gate_verdict="BLOCKED",
+            verdict_reason=(
+                f"Head mismatch: caller pinned {expected_head_sha[:8]}, live PR head is "
+                f"{head_sha[:8]}. All prior QA/review evidence is invalidated by the new push."
+            ),
+            checked_at_utc=now_utc,
+        )
 
     # 1. Draft Check
     if is_draft:
@@ -216,7 +276,9 @@ def evaluate_pr_gate(
             continue
 
         if r_state == "APPROVED":
-            if r_commit == head_sha or not r_commit:  # Pinned to current head
+            # Strict head binding: an approval whose commit OID is unknown or points at any
+            # other commit is NOT evidence for this head and must never count as approval.
+            if r_commit and r_commit == head_sha:
                 valid_approvers.append(r_author)
                 if r_time and (latest_approval_time is None or r_time > latest_approval_time):
                     latest_approval_time = r_time
@@ -228,6 +290,7 @@ def evaluate_pr_gate(
     # Check prior review record for reuse / invalidation
     if prior_review_record:
         prior_head = prior_review_record.get("commit_sha")
+        prior_base = prior_review_record.get("base_sha")
         prior_status = str(prior_review_record.get("status") or "").lower()
         prior_approved = prior_status in ("approved", "pass", "passed")
         prior_time = prior_review_record.get("submitted_at")
@@ -241,6 +304,19 @@ def evaluate_pr_gate(
             elif prior_head != head_sha:
                 review_invalidated = True
                 invalidation_reason = f"PR head changed from {prior_head[:8] if prior_head else 'none'} to {head_sha[:8]}"
+            elif prior_base and prior_base != base_sha:
+                # Base moved under the review: the merge result is no longer what was approved.
+                review_invalidated = True
+                invalidation_reason = (
+                    f"Base changed from {prior_base[:8]} to "
+                    f"{base_sha[:8] if base_sha else 'unresolved'}"
+                )
+            elif prior_base and not base_sha:
+                review_invalidated = True
+                invalidation_reason = (
+                    f"Prior review was bound to base {prior_base[:8]} but the current base SHA "
+                    "could not be resolved, so base-unchanged cannot be proven"
+                )
             elif latest_ci_failure_time and prior_time and latest_ci_failure_time > prior_time:
                 review_invalidated = True
                 invalidation_reason = f"New CI failure occurred after prior review approval ({latest_ci_failure_time} > {prior_time})"
@@ -310,16 +386,68 @@ def evaluate_pr_gate(
     )
 
 
+def parse_pr_ref(value: str) -> Tuple[int, Optional[str]]:
+    """
+    Accept either a bare PR number or a full GitHub PR URL.
+
+    Returns (pr_number, repo_or_None). A URL also yields its owner/repo so the
+    caller does not have to restate --repo for a cross-repository PR.
+    """
+    raw = str(value).strip()
+    if raw.isdigit():
+        return int(raw), None
+
+    match = re.search(r"github\.com/([^/]+)/([^/]+)/pull/(\d+)", raw)
+    if match:
+        return int(match.group(3)), f"{match.group(1)}/{match.group(2)}"
+
+    raise argparse.ArgumentTypeError(
+        f"Invalid PR reference '{value}': expected a PR number or a github.com/<owner>/<repo>/pull/<n> URL."
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Deterministic GitHub PR Status & Review Gate CLI")
-    parser.add_argument("pr", type=int, help="GitHub PR number")
+    parser.add_argument(
+        "pr_positional",
+        nargs="?",
+        default=None,
+        metavar="PR",
+        help="GitHub PR number or PR URL",
+    )
+    parser.add_argument(
+        "--pr",
+        dest="pr_flag",
+        default=None,
+        help="GitHub PR number or PR URL (equivalent to the positional form)",
+    )
     parser.add_argument("--repo", default="Bavariance/polysimulator", help="GitHub repository (owner/repo)")
+    parser.add_argument(
+        "--head-sha",
+        default=None,
+        help="Pin evaluation to this exact 40-char head SHA; a live head mismatch is a hard BLOCK",
+    )
     parser.add_argument("--json", action="store_true", help="Output evaluation as JSON")
     args = parser.parse_args()
 
+    pr_ref = args.pr_flag if args.pr_flag is not None else args.pr_positional
+    if pr_ref is None:
+        parser.error("a PR is required: pass it positionally or with --pr")
+
     try:
-        pr_data = fetch_pr_json(pr_number=args.pr, repo=args.repo)
-        eval_result = evaluate_pr_gate(pr_data=pr_data, repo=args.repo)
+        pr_number, url_repo = parse_pr_ref(pr_ref)
+    except argparse.ArgumentTypeError as e:
+        parser.error(str(e))
+
+    repo = url_repo or args.repo
+
+    try:
+        pr_data = fetch_pr_json(pr_number=pr_number, repo=repo)
+        eval_result = evaluate_pr_gate(
+            pr_data=pr_data,
+            repo=repo,
+            expected_head_sha=args.head_sha,
+        )
     except Exception as e:
         sys.stderr.write(f"PR Gate evaluation failed: {e}\n")
         sys.exit(1)
