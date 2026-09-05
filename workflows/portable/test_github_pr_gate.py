@@ -20,13 +20,18 @@ Verifies:
   14. Base invalidation: base movement (or an unresolvable base) invalidates a base-bound review.
   15. Approval pinning: an approval with no commit OID, or one pinned elsewhere, never approves.
   16. CLI reference parsing: PR number, PR URL, and invalid reference handling.
+  17. Approval policy: resolved per repo/base; production-protected bases cannot be relaxed.
+  18. Waived GitHub approval still requires head-bound independent review evidence.
+  19. Advisory vs blocking checks; absent native required-check data never drops CI.
 """
 
 import argparse
 import copy
 import json
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -34,10 +39,12 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 from github_pr_gate import (
+    GateApprovalPolicy,
     PRGateEvaluation,
     evaluate_pr_gate,
     fetch_pr_json,
     parse_pr_ref,
+    resolve_gate_policy,
 )
 
 
@@ -409,6 +416,175 @@ class TestGitHubPRGate(unittest.TestCase):
         with self.assertRaises(argparse.ArgumentTypeError):
             parse_pr_ref("not-a-pr")
         print("  [PASS] Number, URL, and invalid reference all handled")
+
+    # -------------------------------------------------------------------------
+    # TEST 17: Approval policy is per repo/base, and production cannot be relaxed
+    # -------------------------------------------------------------------------
+    def test_approval_policy_resolution_and_production_guard(self):
+        print("\n--- TEST 17: Configurable Approval Policy & Production Guard ---")
+        self.assertFalse(
+            resolve_gate_policy("Bavariance/polysimulator", "staging").require_github_approval
+        )
+        self.assertFalse(resolve_gate_policy("Wladefant/super-board", "main").require_github_approval)
+        # Production base and unknown repositories stay strict.
+        self.assertTrue(resolve_gate_policy("Bavariance/polysimulator", "main").require_github_approval)
+        self.assertTrue(resolve_gate_policy("some/other-repo", "staging").require_github_approval)
+        # Waiving the button never waives review evidence.
+        self.assertTrue(
+            resolve_gate_policy("Bavariance/polysimulator", "staging").require_head_bound_review_evidence
+        )
+        print("  [PASS] Policy resolves per repo/base; defaults stay strict")
+
+        # A config file may not relax a production-protected base.
+        tmp_dir = tempfile.mkdtemp(prefix="gate_policy_")
+        try:
+            cfg = os.path.join(tmp_dir, "policy.json")
+            with open(cfg, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "policies": [
+                            {
+                                "repo": "Bavariance/polysimulator",
+                                "base_ref": "main",
+                                "require_github_approval": False,
+                            }
+                        ]
+                    },
+                    f,
+                )
+            forced = resolve_gate_policy("Bavariance/polysimulator", "main", config_path=cfg)
+            self.assertTrue(forced.require_github_approval)
+            self.assertIn("Refused to waive approval", forced.rationale)
+            print(f"  [PASS] Production relaxation refused: {forced.rationale[:60]}...")
+
+            # A non-production base may be configured freely.
+            cfg2 = os.path.join(tmp_dir, "policy2.json")
+            with open(cfg2, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "policies": [
+                            {
+                                "repo": "some/other-repo",
+                                "base_ref": "staging",
+                                "require_github_approval": False,
+                            }
+                        ]
+                    },
+                    f,
+                )
+            self.assertFalse(
+                resolve_gate_policy("some/other-repo", "staging", config_path=cfg2).require_github_approval
+            )
+            print("  [PASS] Non-production base configurable via policy file")
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    # -------------------------------------------------------------------------
+    # TEST 18: Waived GitHub approval still demands head-bound review evidence
+    # -------------------------------------------------------------------------
+    def test_waived_approval_still_requires_head_bound_review_evidence(self):
+        print("\n--- TEST 18: Waived GitHub Approval Is Not A Free Pass ---")
+        waived = GateApprovalPolicy(
+            repo="Bavariance/polysimulator",
+            base_ref="staging",
+            require_github_approval=False,
+            require_head_bound_review_evidence=True,
+        )
+
+        # No review of any kind: must still BLOCK.
+        bare = copy.deepcopy(self.mock_pr)
+        bare["reviews"] = []
+        bare["baseRefName"] = "staging"
+        blocked = evaluate_pr_gate(bare, policy=waived)
+        self.assertEqual(blocked.gate_verdict, "BLOCKED")
+        self.assertFalse(blocked.github_approval_required)
+        self.assertIn("no", blocked.verdict_reason.lower())
+        self.assertIn("independent head-bound review evidence", blocked.verdict_reason)
+        print(f"  [PASS] No review evidence still blocked: {blocked.verdict_reason[:70]}...")
+
+        # Author's own review must never satisfy it.
+        selfrev = copy.deepcopy(self.mock_pr)
+        selfrev["baseRefName"] = "staging"
+        selfrev["reviews"] = [
+            {
+                "author": {"login": "feature-developer"},
+                "state": "APPROVED",
+                "submittedAt": "2026-09-05T08:15:00Z",
+                "commit": {"oid": self.head_sha},
+            }
+        ]
+        self_only = evaluate_pr_gate(selfrev, policy=waived)
+        self.assertEqual(self_only.gate_verdict, "BLOCKED")
+        self.assertEqual(self_only.approval_verdict, "SELF_APPROVED_ONLY")
+        print("  [PASS] Self-approval rejected even with approval waived")
+
+        # Head-bound independent review evidence clears the gate.
+        ok = copy.deepcopy(self.mock_pr)
+        ok["baseRefName"] = "staging"
+        passed = evaluate_pr_gate(ok, policy=waived)
+        self.assertEqual(passed.gate_verdict, "PASSED")
+        self.assertIn("GitHub approval not required", passed.verdict_reason)
+        print("  [PASS] Head-bound independent review evidence clears the waived gate")
+
+        # The same PR with no reviews under the strict default is blocked for approval.
+        strict = evaluate_pr_gate(bare, policy=GateApprovalPolicy())
+        self.assertEqual(strict.gate_verdict, "BLOCKED")
+        self.assertTrue(strict.github_approval_required)
+        print("  [PASS] Strict default unchanged")
+
+    # -------------------------------------------------------------------------
+    # TEST 19: Advisory vs blocking checks; absent native data never drops CI
+    # -------------------------------------------------------------------------
+    def test_advisory_checks_versus_native_required_contexts(self):
+        print("\n--- TEST 19: Advisory Checks Never Become A Blanket CI Drop ---")
+        pr = copy.deepcopy(self.mock_pr)
+        pr["baseRefName"] = "main"
+        pr["statusCheckRollup"] = [
+            {"name": "unit-tests", "status": "COMPLETED", "conclusion": "SUCCESS"},
+            {"name": "claudex PowerShell fixtures", "status": "COMPLETED", "conclusion": "FAILURE",
+             "completedAt": "2026-09-05T08:00:00Z"},
+        ]
+
+        # No policy exemption and no native data: the failure blocks.
+        strict = evaluate_pr_gate(pr, policy=GateApprovalPolicy(require_github_approval=False))
+        self.assertEqual(strict.ci_verdict, "FAILURE")
+        self.assertIn("claudex PowerShell fixtures", strict.failing_checks)
+        self.assertEqual(strict.advisory_failing_checks, [])
+        print("  [PASS] Absent native required-check data blocks, never drops")
+
+        # Explicitly declaring it advisory makes it non-blocking but still reported.
+        advisory_policy = GateApprovalPolicy(
+            require_github_approval=False,
+            advisory_checks=["claudex *"],
+        )
+        advisory = evaluate_pr_gate(pr, policy=advisory_policy)
+        self.assertEqual(advisory.ci_verdict, "SUCCESS")
+        self.assertEqual(advisory.failing_checks, [])
+        self.assertIn("claudex PowerShell fixtures", advisory.advisory_failing_checks)
+        self.assertEqual(advisory.gate_verdict, "PASSED")
+        self.assertIn("Advisory (non-blocking) failures", advisory.verdict_reason)
+        print("  [PASS] Declared-advisory failure reported but non-blocking")
+
+        # Native required contexts win: a failure outside them is advisory.
+        native = evaluate_pr_gate(
+            pr,
+            policy=GateApprovalPolicy(require_github_approval=False),
+            native_required_contexts=["unit-tests"],
+        )
+        self.assertEqual(native.failing_checks, [])
+        self.assertIn("claudex PowerShell fixtures", native.advisory_failing_checks)
+        self.assertEqual(native.native_required_contexts, ["unit-tests"])
+        print("  [PASS] Native required contexts govern when GitHub supplies them")
+
+        # A failure that IS a native required context still blocks.
+        required = evaluate_pr_gate(
+            pr,
+            policy=GateApprovalPolicy(require_github_approval=False),
+            native_required_contexts=["unit-tests", "claudex PowerShell fixtures"],
+        )
+        self.assertEqual(required.ci_verdict, "FAILURE")
+        self.assertEqual(required.gate_verdict, "BLOCKED")
+        print("  [PASS] Native required failure still blocks")
 
     # -------------------------------------------------------------------------
     # TEST 11: Real Live gh CLI Invocation Smoke
