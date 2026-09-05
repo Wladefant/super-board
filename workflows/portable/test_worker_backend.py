@@ -251,12 +251,13 @@ class TestNativeDispatch(_Fixture):
             state_dir=self.state,
         )
         with mock.patch.object(worker_backend.subprocess, "run", side_effect=git_only):
-            ticket = backend.prepare_native(self._request())
+            ticket = backend.prepare_native(self._request(stage="build"))
 
         self.assertTrue(ticket.ready, ticket.blocked_reason)
         self.assertEqual(ticket.state, "prepared")
         self.assertIsNone(ticket.task_handle)
         self.assertIn("req-test", ticket.prompt)
+        self.assertIn("do not create an artificial edit or commit", ticket.prompt)
         self.assertIn("verdict", ticket.result_schema["properties"])
         record_path = os.path.join(
             self.state, "worker_runs", ticket.run_id, "dispatch.json",

@@ -729,10 +729,11 @@ def _extract_last_json_object(text: str) -> Optional[Any]:
 
 STAGE_BRIEFS = {
     "build": (
-        "You are the BUILD worker. Implement the request in the repository at {repo_root}. "
-        "Create or modify real files, then commit them. Report every file you touched under "
-        "\"artifacts\" as a path relative to the repository root, and report the commands you ran "
-        "under \"checks\" with their real exit codes."
+        "You are the BUILD worker. Inspect the repository at {repo_root} first. Implement any "
+        "missing request work. If the current head already implements the request, do not create "
+        "an artificial edit or commit: verify it and report the relevant existing files under "
+        "\"artifacts\" with role \"verified_existing\". Commit only real changes. Report commands "
+        "actually run under \"checks\" with their real exit codes."
     ),
     "qa": (
         "You are the QA worker, independent of whoever built this. Do NOT modify the tree and do "

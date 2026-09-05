@@ -851,7 +851,7 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
             session="test-session-routing",
             project="SuperboardCore",
             acceptance_criteria=[
-                {"criterion": "Invariant holds under concurrent execution", "status": "pending", "evidence": ""}
+                {"description": "Invariant holds under concurrent execution", "status": "pending", "evidence": ""}
             ],
             owner="RiskLane",
             state="implementation",
@@ -874,6 +874,10 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
         self.assertEqual(result.status, "advanced")
         self.assertEqual(backend.calls[0]["routing_task_type"], TaskType.DEEP_REASONING.value)
         self.assertEqual(backend.calls[0]["risk_level"], RiskLevel.HIGH.value)
+        self.assertEqual(
+            backend.calls[0]["criteria"],
+            ["AC-1: Invariant holds under concurrent execution"],
+        )
         self.assertEqual(
             backend.calls[0]["model"],
             (result.dispatch_packet or {})["recommendation"]["model"],

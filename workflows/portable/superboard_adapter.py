@@ -629,6 +629,30 @@ class SuperboardExecutionAdapter:
         criteria = getattr(req, "pending_criteria", None) or (
             req.get("pending_criteria") if isinstance(req, dict) else []
         )
+        pending_ids = {str(item) for item in (criteria or [])}
+        full_request = req if isinstance(req, dict) else None
+        if full_request is None and hasattr(self.coordinator, "ledger"):
+            try:
+                full_request = self.coordinator.ledger.get_request(req_id)
+            except (KeyError, OSError, ValueError):
+                full_request = None
+        described_criteria: List[str] = []
+        for criterion in (full_request or {}).get("acceptance_criteria", []):
+            if not isinstance(criterion, dict) or criterion.get("status") == "verified":
+                continue
+            criterion_id = str(criterion.get("id") or "").strip()
+            description = str(
+                criterion.get("criterion") or criterion.get("description") or ""
+            ).strip()
+            if pending_ids and criterion_id not in pending_ids:
+                continue
+            if criterion_id and description:
+                described_criteria.append(f"{criterion_id}: {description}")
+            elif description:
+                described_criteria.append(description)
+            elif criterion_id:
+                described_criteria.append(criterion_id)
+        criteria = described_criteria or list(criteria or [])
         expected_sha = target_sha or req_head
 
         recommendation = dispatch.recommendation if isinstance(dispatch.recommendation, dict) else {}
