@@ -367,7 +367,7 @@ graph TD
     A[1. Eligible Next Request] --> B[2. Connected-Service Preflight Gate]
     B -->|Passed| C[3. Capable Model & Role Dispatch Packet]
     B -->|Blocked| H[Emit Blocker Telegram Event]
-    C --> D[4. Worker Command Dispatch: Real, Probe, or Fake]
+    C --> D[4. Worker Command Dispatch: Real Agent CLI via worker_backend]
     D --> E[5. Evidence, QA & Review Gate Eligibility]
     E --> F[6. Concise Telegram Event]
     E --> G[7. Strict Pause: Awaiting Human Merge Authorization]
@@ -376,10 +376,11 @@ graph TD
 1. **Eligible Request Intake:** Reads from `RequestLedger` (`ledger.py`), verifying request state is dispatchable (`pending` or `implementation`), OPEN, and unclaimed.
 2. **Preflight Gate:** Evaluates staging infrastructure (Dokploy staging compose ID, Supabase staging ref); strictly rejects production references (`zaraprptkegxqpvnsubu`, `vpyL-7TDEUREH6Uo_y1sb`).
 3. **Explicit Capable Model & Role Dispatch Packet:** Uses `ResetAwareModelSelector` to generate a `HarnessDispatchPacket` with catalog-verified context sizes (no fabricated sizes), explicit agent role (`codex-worker`, `thinker`, `codex-reviewer`, `qa-verifier`), and compact evidence packet (< 1.5 KB).
-4. **Existing Worker Command Dispatch:**
-   * **Bounded Dry-Run / Smoke:** Invokes fake executor producing labeled fixture results (`[FIXTURE_EXECUTION_RESULT]`) to safely prove gates without modifying external systems.
-   * **Real Safe Worker Probe:** Runs non-mutating commands (e.g. `scripts/super-board-config.py validate` or `git status`) to verify actual subprocess dispatch and exit-code handling.
+4. **Worker Command Dispatch (`worker_backend.py`):**
+   * **Real Configured Agent CLI:** The adapter is constructed with `worker_backend=WorkerBackend(...)`, which builds a configured argv (`shell=False`) and runs one real agent CLI (`claude`, `codex`, `veyyon`, or any user-declared harness), returning a structured head-bound evidence record. Fails closed on a missing command, non-zero exit, absent or unparseable structured result, unmapped routing model, head mismatch, missing artifact, or a `pass` verdict with no executed check. **There is no fixture fallback.**
+   * **Explicitly Labelled Fixture:** Only with `fake_executor=True`. Fixture and probe output can no longer advance request state.
    * **QA Lane Dispatch:** Dispatches to `scripts/super-qa-dispatch.sh` in detached locked worktrees.
+   * See `WORKER_EXECUTION.md` for the evidence contract, backend configuration, and recorded verification.
 5. **Evidence, QA & Review Gate Verification:**
    * Enforces exact-SHA commit binding: tested commit must match current head; any head move invalidates review and resets state to `implementation`.
    * Evaluates deterministic CI checks and independent (non-author) review approvals via `github_pr_gate.py`. Self-authored approvals (`COMMENTED` or author-signed) are strictly rejected.
@@ -457,8 +458,8 @@ python /opt/portable-workflow/superboard_adapter.py \
 | **Request Intake & Eligibility** | ✅ Fully Automated | Evaluated via `RequestLedger` and `super_board_runtime.eligibility`. |
 | **Connected-Service Preflight** | ✅ Fully Automated | Evaluated via `preflight.py`; staging compose & DB ref checked; production strictly blocked. |
 | **Model & Role Routing** | ✅ Fully Automated | Reset-aware selector generates `HarnessDispatchPacket` with verified context windows. |
-| **Worker Command Dispatch** | ✅ Fully Automated | Programmatically dispatches `super-qa-dispatch.sh`, safe probes, or fake executors. |
-| **Exact-SHA QA & Review Gate** | ✅ Fully Automated | Pinned to exact commit SHA; evaluated deterministically via `github_pr_gate.py`. |
+| **Worker Command Dispatch** | ✅ Fully Automated | Real agent CLI via `worker_backend.py` with head-bound structured evidence; fails closed, no fixture fallback. Fixtures require explicit `fake_executor=True` and cannot advance state. |
+| **Continuous Stage Progression** | ✅ Fully Automated | `continuation_driver.py` wraps `run_step` over explicitly authorized request ids; reloads state per step, parks on blocked/error/decision/no-progress, and never repeats a journalled stage after restart. |
 | **Telegram Status Notification** | ✅ Fully Automated | Rate-limited single-sentence notification with canonical links via `telegram_notifier.py`. |
 | **Decision Resolution (`DEC-*`)** | 🔒 Human Operator | Pauses at `wait`; requires human reply via issue comment or `decision_workflow.py reply`. |
 | **Bug 'No-Repro' Disposition** | 🔒 Human Operator | A bug with unverified reproduction cannot close without explicit user disposition. |

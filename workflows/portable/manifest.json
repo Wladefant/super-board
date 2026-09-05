@@ -21,96 +21,199 @@
       "role": "Project configuration and environment adapter isolating generic workflow core from repository identities, Superboard numbers, and staging coordinates",
       "owner": "PackagePortableCoordinator",
       "cli_command": "python -c 'from project_adapter import get_current_project_config; print(get_current_project_config())'",
-      "inputs": ["project_adapter.json", "Superboard configs (.claude/super-board/configs/<slug>.json)"],
-      "outputs": ["ProjectConfig dataclass with staging and safety rules"]
+      "inputs": [
+        "project_adapter.json",
+        "Superboard configs (.claude/super-board/configs/<slug>.json)"
+      ],
+      "outputs": [
+        "ProjectConfig dataclass with staging and safety rules"
+      ]
     },
     "coordinator.py": {
       "role": "Single bounded coordinator entrypoint combining state, decision sync, preflight gating, normalized usage, and model routing",
       "owner": "PortableWorkflowCoordinator",
       "cli_command": "python coordinator.py [--state-dir <dir>] [--json] [--summary] [--no-sync-decisions] [--usage-adapter auto|file|veyyon|direct] [--balance-file <file>]",
-      "inputs": ["ledger.json", "decisions.json", "preflight_evidence/", "usage_fixture.json"],
-      "outputs": ["CoordinatorPacket (JSON or formatted summary)"]
+      "inputs": [
+        "ledger.json",
+        "decisions.json",
+        "preflight_evidence/",
+        "usage_fixture.json"
+      ],
+      "outputs": [
+        "CoordinatorPacket (JSON or formatted summary)"
+      ]
     },
     "ledger.py": {
       "role": "Durable request ledger utility, atomic crash-resilient recovery cache, and transition graph invariant enforcer",
       "owner": "ImplementRequestLedger / FixLedgerInvariants",
       "cli_command": "python ledger.py [add | update | check | next | list | show | recover] [--ledger <path>]",
-      "inputs": ["ledger.json"],
-      "outputs": ["Request state transitions, invariant verification, recovery queues"]
+      "inputs": [
+        "ledger.json"
+      ],
+      "outputs": [
+        "Request state transitions, invariant verification, recovery queues"
+      ]
     },
     "decision_workflow.py": {
       "role": "Issue-based asynchronous human decision contract, strict provenance validation, and authored-comment exclusion registry",
       "owner": "IntegrateDecisionWorkflow / HardenDecisionProvenance",
       "cli_command": "python decision_workflow.py [ask | ingest | reply | sync | show | list] [--decisions <path>] [--ledger <path>]",
-      "inputs": ["decisions.json", "GitHub issue comments via gh CLI"],
-      "outputs": ["Resolved human decisions, unblocked ledger requests, clarification prompts"]
+      "inputs": [
+        "decisions.json",
+        "GitHub issue comments via gh CLI"
+      ],
+      "outputs": [
+        "Resolved human decisions, unblocked ledger requests, clarification prompts"
+      ]
     },
     "preflight.py": {
       "role": "Manifest-driven staging integration preflight gating (Dokploy staging compose, Supabase staging ref, Stripe test mode)",
       "owner": "ImplementIntegrationPreflight",
       "cli_command": "python preflight.py [check | probe | record-evidence | inventory] [--evidence-dir <dir>] [--json]",
-      "inputs": ["Task manifests, environment probes, service evidence JSON"],
-      "outputs": ["PreflightResult (passed, blocked, not_applicable), probe status inventory"]
+      "inputs": [
+        "Task manifests, environment probes, service evidence JSON"
+      ],
+      "outputs": [
+        "PreflightResult (passed, blocked, not_applicable), probe status inventory"
+      ]
     },
     "balance_loader.py": {
       "role": "Sanitized, read-only subscription usage snapshot loader, multi-window constraint evaluation, and provider quota tracking",
       "owner": "ImplementSubscriptionRouter / ReviewHarnessStrongModel",
       "cli_command": "python balance_loader.py [--normalized] [--adapter veyyon|file|direct] [--balance-file <file>] [--json]",
-      "inputs": ["usage_snapshot_cache.json", "usage_fixture.json", "veyyon usage CLI"],
-      "outputs": ["NormalizedBalanceSnapshot (JSON)"]
+      "inputs": [
+        "usage_snapshot_cache.json",
+        "usage_fixture.json",
+        "veyyon usage CLI"
+      ],
+      "outputs": [
+        "NormalizedBalanceSnapshot (JSON)"
+      ]
     },
     "model_routing.py": {
       "role": "Reset-aware and quota-aware model selector, near-reset Codex promotion, and compact EvidencePacket generator",
       "owner": "ImplementHarnessRouting / ImplementSubscriptionRouter",
       "cli_command": "python model_routing.py [--task-type <type>] [--risk-level <level>] [--emit-dispatch] [--adapter veyyon|file|direct] [--balance-file <file>]",
-      "inputs": ["NormalizedBalanceSnapshot from balance_loader"],
-      "outputs": ["HarnessDispatchPacket (JSON)"]
+      "inputs": [
+        "NormalizedBalanceSnapshot from balance_loader"
+      ],
+      "outputs": [
+        "HarnessDispatchPacket (JSON)"
+      ]
     },
     "github_plan_renderer.py": {
       "role": "GitHub markdown plan, visual architecture, and evidence recap renderer for issue and PR comments",
       "owner": "IntegrateVisualPlanWorkflow",
       "cli_command": "python github_plan_renderer.py [--spec <file>] [--type plan|recap]",
-      "inputs": ["Plan spec JSON", "Recap spec JSON"],
-      "outputs": ["Formatted GitHub Markdown with badges and tables"]
+      "inputs": [
+        "Plan spec JSON",
+        "Recap spec JSON"
+      ],
+      "outputs": [
+        "Formatted GitHub Markdown with badges and tables"
+      ]
     },
     "superboard_adapter.py": {
       "role": "Superboard execution adapter bridging portable coordinator with existing loop tooling (super-qa-dispatch.sh, super-board-run.sh, and super_board_runtime)",
       "owner": "PackagePortableCoordinator",
       "cli_command": "python superboard_adapter.py [--config <file>] [--state-dir <dir>] [--fake-executor] [--real-worker] [--notify-telegram] [--json] [--summary]",
-      "inputs": ["ledger.json", "preflight_evidence/", "Superboard project config", "HarnessDispatchPacket"],
-      "outputs": ["AdapterExecutionResult with exact-SHA binding, gate verification, and Telegram milestone"]
+      "inputs": [
+        "ledger.json",
+        "preflight_evidence/",
+        "Superboard project config",
+        "HarnessDispatchPacket"
+      ],
+      "outputs": [
+        "AdapterExecutionResult with exact-SHA binding, gate verification, and Telegram milestone"
+      ]
     },
     "github_pr_gate.py": {
       "role": "Deterministic GitHub PR status & review gate helper verifying CI checks, independent non-author approval, and exact-head review reuse",
       "owner": "FinalizeExecutableRouting",
       "cli_command": "python github_pr_gate.py --pr <pr_url_or_number> [--head-sha <sha>] [--required-checks <checks>] [--json]",
-      "inputs": ["GitHub PR via gh CLI or API payload", "Required check contexts", "Prior review approval record"],
-      "outputs": ["PRGateEvaluation (PASSED, BLOCKED, PENDING) with detailed gate reasons"]
+      "inputs": [
+        "GitHub PR via gh CLI or API payload",
+        "Required check contexts",
+        "Prior review approval record"
+      ],
+      "outputs": [
+        "PRGateEvaluation (PASSED, BLOCKED, PENDING) with detailed gate reasons"
+      ]
     },
     "telegram_notifier.py": {
       "role": "Portable Telegram workflow status notification adapter with strict deduplication, cooldowns, and one-sentence event reporting",
       "owner": "IntegrateTelegramStatus",
       "cli_command": "python telegram_notifier.py [--packet <file>] [--event-type milestone|blocker|decision|completion] [--project <name>] [--send] [--dry-run] [--test-connection] [--json]",
-      "inputs": ["CoordinatorPacket JSON, NotificationEvent CLI arguments, channel access/env"],
-      "outputs": ["DeliveryReceipt (JSON or terminal summary), deduplicated Telegram messages"]
+      "inputs": [
+        "CoordinatorPacket JSON, NotificationEvent CLI arguments, channel access/env"
+      ],
+      "outputs": [
+        "DeliveryReceipt (JSON or terminal summary), deduplicated Telegram messages"
+      ]
+    },
+    "worker_backend.py": {
+      "role": "Real configured agent-CLI worker execution: takes a structured request/dispatch packet, builds a configured argv (shell=False), runs one agent CLI, and returns a structured head-bound evidence record. Fails closed on a missing command, a non-zero exit, an absent or unparseable structured result, an unmapped routing model, a head mismatch, a missing artifact, or a pass verdict with no executed check. There is no fixture fallback.",
+      "owner": "ImplementContinuousExecution",
+      "cli_command": "python worker_backend.py [--list-backends | --print-schema | --request-id <id> --stage build|qa|review --repo-root <dir> [--head-sha <sha>] [--model <m>] [--backend <name>] [--config <json>] [--state-dir <dir>] [--task-type <t>] [--prompt <text>] [--criterion <text>]... [--timeout <s>] [--dry-run] [--json]]",
+      "inputs": [
+        "worker_backends.json (or PORTABLE_WORKER_CONFIG, or project_config.metadata.portable_worker)",
+        "structured worker request (dataclass, object, or mapping)"
+      ],
+      "outputs": [
+        "WorkerOutcome (ok, stage, exit_code, command, head_sha, evidence, artifacts, blocked_reason, backend_name)",
+        "worker_runs/<request>__<stage>__<ts>/ (schema and result artifacts)"
+      ],
+      "backends": [
+        "claude (build)",
+        "claude-verify (qa, review)",
+        "codex",
+        "veyyon (optional)",
+        "any user-declared harness via config"
+      ]
+    },
+    "continuation_driver.py": {
+      "role": "Minimal continuation driver wrapping the existing adapter run_step over an explicit list of authorized request ids. Reloads ledger state every step, measures real progress, parks on blocked/error/decision/no-progress/awaiting-authorization, journals completed stages so a restart never repeats one, holds a fail-fast single-driver lock, and handles SIGINT/SIGTERM. Never merges and never deploys.",
+      "owner": "ImplementContinuousExecution",
+      "cli_command": "python continuation_driver.py --request-id <id> [--request-id <id>]... [--state-dir <dir>] [--config <json>] [--worker-config <json>] [--model <m>] [--backend <name>] [--max-steps <n>] [--decision-sync-attempts <n>] [--decision-sync-interval <s>] [--no-real-worker] [--show-parked] [--unpark <id>]... [--json]",
+      "inputs": [
+        "ledger.json",
+        "decisions.json",
+        "continuation_journal.json (completed stages and parked requests)"
+      ],
+      "outputs": [
+        "DriverOutcome (steps, parked, skipped_completed, stop_reason, boundaries)",
+        "continuation_journal.json",
+        "continuation_driver.lock"
+      ]
     }
   },
   "adapters": {
     "file": {
       "description": "Standalone file fixture adapter requiring zero external dependencies, no Veyyon CLI, and no network access.",
       "default_fixture": "usage_fixture.json",
-      "required_tools": ["python3"]
+      "required_tools": [
+        "python3"
+      ]
     },
     "veyyon": {
       "description": "Native Veyyon harness adapter reading live subscription metrics from host daemon.",
-      "required_tools": ["python3", "veyyon"]
+      "required_tools": [
+        "python3",
+        "veyyon"
+      ]
     },
     "generic_cli": {
       "description": "Generic adapter for external orchestrators (OpenAI Codex, Anthropic Claude, Claude Code, GitHub Actions, custom runners).",
-      "required_tools": ["python3", "optional: gh"]
+      "required_tools": [
+        "python3",
+        "optional: gh"
+      ]
     },
     "telegram_notify": {
-      "required_tools": ["python3", "optional: telegram transport"]
+      "required_tools": [
+        "python3",
+        "optional: telegram transport"
+      ]
     },
     "polysimulator": {
       "description": "Explicit project adapter preserving PolySimulator staging DB ref (hgzyqmaanndcimnclxtv), Dokploy compose ID (TU7b_dY9l9_nCas6YBNwj), and strict production/main DB prohibitions.",
@@ -141,7 +244,10 @@
       "telegram_notifier.py",
       "cross_repo_smoke_test.py",
       "fixtures/alternate_repo_config.json",
-      "fixtures/unknown_env_config.json"
+      "fixtures/unknown_env_config.json",
+      "worker_backend.py",
+      "continuation_driver.py",
+      "WORKER_EXECUTION.md"
     ],
     "optional_files": [
       "usage_snapshot_cache.json",
@@ -150,7 +256,9 @@
       "test_github_pr_gate.py",
       "test_telegram_notifier.py",
       "routing_smoke_test.py",
-      "decisions.json"
+      "decisions.json",
+      "test_worker_backend.py",
+      "test_continuation_driver.py"
     ]
   }
 }

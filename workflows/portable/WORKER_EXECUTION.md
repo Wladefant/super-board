@@ -1,0 +1,445 @@
+# Real worker execution and continuous stage progression
+
+Two modules: `worker_backend.py` runs one real agent-CLI worker stage and returns
+head-bound structured evidence; `continuation_driver.py` drives the existing
+adapter's `run_step` repeatedly over an explicit list of authorized requests.
+Neither replaces the coordinator or the adapter, and neither merges or deploys.
+
+---
+
+## 1. The problem these close
+
+The portable core could evaluate a step but not actually execute one. Its
+dispatch path fell through to a labelled fixture whenever a real command was not
+wired up, so a step that never ran anything still reported
+`simulated successful build` and the gate advanced the request. Between exit
+status `0` and the phrase `proven absent`, a request could travel
+`implementation → QA → review` without a single command having been run.
+
+Separately, nothing drove the adapter more than once. "Autonomous start to
+finish" meant a human re-invoking a one-shot command once per stage.
+
+So: real execution with evidence that cannot be faked, and a loop that stops for
+the right reasons.
+
+---
+
+## 2. `worker_backend.py`
+
+### Contract
+
+```python
+from worker_backend import WorkerBackend, WorkerRequest
+
+backend = WorkerBackend(state_dir=state_dir, default_model="sonnet")
+outcome = backend.execute(WorkerRequest(
+    request_id="req-1234",
+    stage="build",                 # build | qa | review
+    repo_root="/path/to/repo",
+    head_sha="<40 hex>",
+    model="anthropic/claude-opus-5:high",
+    agent_role="thinker",
+    prompt="...",
+    criteria=["..."],
+    task_type="bug",
+))
+```
+
+The request is duck-typed. A dataclass, a plain object, or a mapping all work,
+so the adapter builds its own packet and imports nothing from this module. The
+fields read are `request_id`, `stage`, `head_sha`, `model`, `agent_role`,
+`repo_root`, `issue_url`, `pr_url`, `prompt`, `criteria`, `task_type`, `backend`.
+
+`WorkerOutcome` field names are a published contract:
+
+| field | meaning |
+| --- | --- |
+| `ok` | the only success signal; false whenever anything below refuses |
+| `stage` | stage that was dispatched |
+| `exit_code` | the CLI's real exit status, or `None` if it never ran |
+| `command` | the exact argv that was executed |
+| `head_sha` | the **observed** git HEAD after the run, never the claimed one |
+| `evidence` | structured record, described below |
+| `artifacts` | repo-relative paths that were verified to exist |
+| `blocked_reason` | why it refused, in operator-actionable terms |
+| `backend_name` | which configured backend ran |
+
+`evidence` always carries `backend`, `stage`, `request_id`, `head_sha`,
+`head_before`, `head_after`, `model_requested`, `model`, `structured_result`,
+`verdict`, `artifact_digests` (sha256 per artifact), `command`, `run_dir`,
+`exit_code`, `stdout_tail`, `stderr_tail`, and `auto_merge_allowed` /
+`auto_deploy_allowed`, both always false.
+
+### Fail-closed rules
+
+Every one of these produces `ok=False` with a populated `blocked_reason`, and
+never a synthetic success:
+
+1. Malformed request — no `stage`, no `request_id`, no usable `repo_root`, or a
+   `head_sha` that is not a full 40-character SHA. A bad packet blocks; it does
+   not raise into the caller's step loop.
+2. Unknown backend, or a backend with no configured `argv`.
+3. Backend executable absent from `PATH`.
+4. An unmapped harness-qualified routing model (see §3).
+5. The tree is not on the requested commit *before* the run — the command is
+   never executed.
+6. Non-zero exit.
+7. Timeout.
+8. No structured result, or one that is not a JSON object.
+9. `is_error: true` in the CLI envelope, even alongside exit `0`.
+10. Any required result field missing.
+11. A verdict outside `pass | fail | blocked`. An honest `fail` or `blocked` is
+    reported as-is and does not advance anything.
+12. A result whose `stage` or `request_id` does not match what was dispatched.
+13. `verdict: "pass"` with an empty `checks` list, or a check with no command,
+    no integer exit code, or nothing observed. **Exit status alone is never
+    evidence.**
+14. A claimed `head_sha` that differs from the observed HEAD. The observed
+    commit always wins, and is what the outcome reports.
+15. For `qa` and `review`: HEAD moved during the run, or the tested commit is not
+    the dispatched one. A verification stage must not mutate the tree it judges.
+16. For `build`: a `pass` that produced neither a new commit nor any artifact.
+17. A declared artifact that does not exist on disk.
+18. For a bug at `qa`: no `reproduction` record, or one lacking a real command,
+    a real integer exit code, a real observation, a scenario string, or with
+    `still_reproduces` not literally `false`.
+
+### Bug reproduction is re-executed, not asserted
+
+`evidence.reproduction.verdict` is **derived** here, never taken from the model.
+It only becomes `"absent"` after the re-executed scenario has already passed
+validation: a real command, a real exit code, a real observation, and
+`still_reproduces: false`. A worker writing `"verdict": "absent"` or the words
+`proven absent` into its own answer cannot reach that value.
+
+### Head binding
+
+`head_sha` in the outcome is read with `git rev-parse HEAD` in the directory the
+command actually ran in, after the run. It is not the request's expectation and
+not the worker's claim. Both are cross-checked against it and refused on
+disagreement. A build legitimately advances the head and the new commit becomes
+the reported one; `qa` and `review` must leave it exactly where they found it.
+
+---
+
+## 3. Model translation
+
+The routing layer in `model_routing.py` names models in a harness-qualified
+vocabulary (`google-antigravity/gemini-3.8-flash:high`,
+`anthropic/claude-opus-5:high`, `openai-codex/gpt-6-astra:high`). Each CLI has a
+different one. Passing a routing id straight through is a real failure, not a
+cosmetic one: the Claude CLI answers `[claude-code:unrecognized_model]` and exits
+1, which is exactly how the first end-to-end attempt failed.
+
+Each backend therefore declares a `model_map`. Resolution is:
+
+- request names no model → the backend's `model_default`
+- id present in `model_map` → the mapped CLI name, recorded in
+  `evidence.model_note`
+- a bare name with no `/` and no `:` → already a CLI name, passed through
+- a harness-qualified id that is unmapped → **blocked**, naming the exact
+  `model_map` entry to add
+
+The refusal is deliberate. Silently substituting a different model would make the
+model recorded in the evidence a fiction. A backend that genuinely resolves names
+itself sets `strict_model: false`; `veyyon` does, because its `--model` flag
+documents fuzzy matching.
+
+---
+
+## 4. Backends
+
+Flags below come from each installed CLI's own `--help`.
+
+| backend | invocation | structured result |
+| --- | --- | --- |
+| `claude` | `claude -p <prompt> --output-format json --json-schema <inline> --model <m> --add-dir <repo> --permission-mode <mode> --allowedTools <tools>` | stdout, under `structured_output` |
+| `claude-verify` | same, with `--allowedTools "Bash Read"` | stdout, under `structured_output` |
+| `codex` | `codex exec -m <m> -C <repo> -s <sandbox> --output-schema <file> -o <file> <prompt>` | the last-message file |
+| `veyyon` | `veyyon -p --mode=json --model <m> <prompt>` | stdout |
+
+Veyyon is one optional backend among several. This module imports nothing from
+Veyyon and works with it absent; the core does not depend on it.
+
+By default `build` routes to `claude` and `qa` / `review` route to
+`claude-verify`. That default applies only when the operator has declared no
+`stage_backends` and is still on the built-in default backend — choosing another
+backend means owning the stage map too, rather than being silently redirected.
+
+### Permission modes, as measured
+
+Neither documented Claude Code mode is sufficient alone, and both failures were
+observed rather than assumed:
+
+- `acceptEdits` alone — file writes permitted, **every Bash call denied**. A
+  build worker writes the code and can substantiate nothing.
+- `dontAsk` alone — Bash permitted, **every file write denied**. A build worker
+  produces nothing.
+
+`acceptEdits` together with an explicit `--allowedTools` list permits both, with
+zero permission denials, and is the least privilege that actually works.
+
+For verification stages, Bash is granted **in full** rather than narrowed to
+patterns. A narrowed list was tried and rejected: `Bash(python*)` denies the
+compound commands a tester naturally writes, such as
+`python tests.py; echo EXIT:$?`, and denies PowerShell outright, so the worker
+ends up asking a human for approval and returning `blocked` instead of verifying
+anything. A tool allowlist is in any case the wrong place to enforce
+immutability, because anything with a shell can write a file. The real guarantee
+is enforced on the observable outcome: a `qa` or `review` result whose observed
+HEAD moved is refused, which holds no matter how the tree was touched.
+
+---
+
+## 5. Configuring another harness
+
+No code change is needed. Resolution order, first hit wins:
+
+1. explicit dict or JSON path passed to `WorkerBackend(config=...)`
+2. `PORTABLE_WORKER_CONFIG` environment variable
+3. `<state_dir>/worker_backends.json`
+4. `project_config.metadata["portable_worker"]`
+5. the built-in defaults
+
+User backends merge **over** the defaults, so declaring one harness does not
+hide `claude`, `codex` or `veyyon`.
+
+```json
+{
+  "default_backend": "my-harness",
+  "stage_backends": { "review": "codex" },
+  "backends": {
+    "my-harness": {
+      "argv": ["my-agent", "run", "--model", "{model}",
+               "--schema", "{schema_path}", "--out", "{result_path}", "{prompt}"],
+      "result_source": "file",
+      "result_path_template": "{work_dir}/result.json",
+      "schema_mode": "file",
+      "model_map": { "anthropic/claude-opus-5:high": "my-big-model" },
+      "model_default": "my-small-model",
+      "timeout_seconds": 900,
+      "env": { "MY_AGENT_QUIET": "1" }
+    }
+  }
+}
+```
+
+Placeholders, each substituted as a **whole argv token**: `{prompt}` `{model}`
+`{agent_role}` `{stage}` `{request_id}` `{head_sha}` `{repo_root}`
+`{schema_path}` `{schema_inline}` `{result_path}` `{work_dir}`
+`{permission_mode}` `{allowed_tools}` `{sandbox_mode}` `{issue_url}` `{pr_url}`.
+
+Substitution never splits or re-parses a token, which is why `shell=False` is
+safe here: a prompt containing spaces, quotes or newlines travels as exactly one
+argv entry and cannot become an extra argument.
+
+The agent's required result shape is `python worker_backend.py --print-schema`.
+It is handed to the CLI as `--json-schema` (Claude) or written out for
+`--output-schema` (Codex), so the constraint is enforced by the CLI as well as
+re-validated here.
+
+---
+
+## 6. `continuation_driver.py`
+
+```python
+adapter = SuperboardExecutionAdapter(
+    state_dir=state_dir,
+    fake_executor=False,
+    worker_backend=WorkerBackend(state_dir=state_dir),
+    repo_root=repo_root,
+)
+outcome = ContinuationDriver(
+    adapter=adapter,
+    authorized_ids=["req-1234"],
+    state_dir=state_dir,
+).run()
+```
+
+The adapter is duck-typed: anything exposing
+`run_step(request_id=..., real_worker=...)` and returning `status`,
+`status_reason`, `worker_result`, `boundaries` will drive. The driver imports
+nothing from the adapter, so load order does not matter and there is no circular
+dependency.
+
+### What it owns, and what it does not
+
+It owns the loop, the journal, the lock, the signal handling, and the decision
+gate. It owns **no** eligibility logic, routing, preflight, gating, or state
+transition — all of those already live in the coordinator and the adapter, and
+re-deriving any of them would make this a competing scheduler.
+
+### Guarantees
+
+**Authorized ids only.** Constructed with an explicit list; an empty list is an
+error, not an invitation to find work. It never scans the ledger for candidates
+and never invents a task when it runs out.
+
+**State reloaded every step.** The request is re-read from the ledger before each
+dispatch, so an external edit between steps is observed rather than overwritten
+from a stale copy.
+
+**Real progress or stop.** Progress is measured as a fingerprint of
+`(state, head, evidence count, updated_at, blocker)` taken before and after each
+step. A step that reports success and changes nothing parks the request after
+exactly one attempt. The loop cannot spin.
+
+**Park, never poll.** Blocked, errored, awaiting-authorization,
+decision-blocked, unroutable and no-progress requests are parked with a reason
+and left alone. One request parking does not stop the others.
+
+**Restart resumes and never repeats.** Completed stages are journalled with the
+commit they were entered at. A restart refuses to re-dispatch a stage already
+recorded complete at that same commit — a guard that does not consult the ledger,
+so it still holds if a ledger write was lost or reverted. A request parked by an
+earlier run stays parked; resuming it is a human act
+(`--unpark <id>`), not a restart side effect.
+
+**One driver at a time.** Two layers, each covering what the other cannot: an
+in-process registry of held paths, because the shared `FileLock` is thread-local
+re-entrant and two drivers on one thread would otherwise both "acquire" it; and
+the OS advisory lock, which the kernel releases if the process dies, so a crash
+never wedges the next run. A second driver fails immediately naming the holder's
+pid and run id.
+
+**Signals are handled.** `SIGINT` and `SIGTERM` request a stop. The in-flight
+step is allowed to finish so a worker is never orphaned mid-write, then the
+journal is flushed, the lock released, and the original handlers restored.
+
+**Merge and deploy are refused.** `awaiting authorization` is a terminal parking
+state. If an adapter result ever reports `auto_merge_allowed` or
+`auto_deploy_allowed` as true, the run aborts rather than continuing under a
+boundary the driver does not recognise.
+
+### Decision gating
+
+Decisions are checked **before** dispatch, so a worker is not spent on a request
+whose direction is unresolved. A decision blocks unless it is answered by a
+genuine authorized human operator: status `answered`, an answer payload,
+`provenance: "human_operator"`, `is_test` falsy, a non-empty interpretation, and
+a responder on the decision's own `authorized_responders`. Synthetic,
+agent-authored and unauthorized replies all keep it blocking, which is what the
+decision workflow exists to enforce.
+
+Bounded re-check is **off by default**. With `--decision-sync-attempts N` the
+driver performs at most N re-checks, each preceded by a wait of at least 15
+seconds (a floor no caller can lower), each doing one bounded sync through the
+coordinator's own one-shot sync, and resumes only when a real authorized answer
+is observed. The attempt count is finite, so it can never become an endless
+poll, and a stop signal ends the wait immediately.
+
+---
+
+## 7. Recorded verification
+
+Every claim below was executed, not modelled. Fixtures were used only where
+named.
+
+### Real agent CLI, isolated temporary repository
+
+`/tmp/portable-e2e`, a local toy repo with no remote, no GitHub issue, no
+Superboard card, and no staging or production access. Ledger and driver state in
+`/tmp/portable-e2e-state`. Execution path: `ContinuationDriver.run()` →
+`SuperboardExecutionAdapter.run_step` → `WorkerBackend.execute` →
+`claude -p ... --output-format json --json-schema ...` (real subprocess,
+`shell=False`).
+
+Seed commit `327befcd1078c737dc2335eb44ca0d761d46e80c`, a `stringkit.py` with
+`slugify` and no `titlecase`.
+
+| step | stage | backend | transition | head |
+| --- | --- | --- | --- | --- |
+| 1 | build | `claude-build` | `implementation → QA` | `327befcd → 2335b1f0` |
+| 2 | qa | `claude-verify` | `QA → review` | `2335b1f0` unchanged |
+| 3 | review | `claude-verify` | `review → awaiting authorization` | `2335b1f0` unchanged |
+
+Build produced a real commit `2335b1f0767b88cbb5231a132d7509ca8db96230` adding
+`titlecase` plus `test_stringkit.py`, both digested by sha256, with checks
+`python test_stringkit.py` (exit 0, "All tests passed.") and `git commit`
+(exit 0). The routing model `google-antigravity/gemini-3.8-flash:high` was mapped
+to `sonnet` and the mapping recorded in `evidence.model_note`.
+
+QA ran independently against the exact build head with seven executed checks
+including `git rev-parse HEAD`, `python test_stringkit.py`, and a
+`git diff 327befc 2335b1f`. Review ran five, including `git show HEAD` and both
+`python -m pytest` and plain `python`. Both left the head untouched.
+
+The driver then **parked at `awaiting_authorization`** and merged nothing.
+
+### Restart does not duplicate a completed stage
+
+Run 1 was capped at one step and completed `build`. Run 2 reported
+`resumed_from_journal=True` and its first step was `qa`; `build` did not appear.
+A third run executed **0 steps** and re-parked at the human gate.
+
+The journal guard was separately proven independent of the ledger: after a
+completed stage was recorded and the ledger state then externally reverted to
+`implementation` at the same commit, the driver dispatched nothing and reported
+`already_completed`.
+
+### Invalid worker output fails closed
+
+Driven through the full stack against `/tmp/portable-liar`, using a scripted
+backend that exits `0` and claims `verdict: "pass"` with the words
+"original reproduction proven absent":
+
+- fabricated head `000…0` → *"Head binding refused: worker claims commit 000… but
+  the observed HEAD … is c952cf74…. The observed commit always wins."*
+- truthful head, empty `checks` → *"Worker returned verdict 'pass' for stage
+  'build' with no executed checks. Exit status alone is never evidence."*
+
+In both cases the request stayed at `implementation`, the driver parked, and the
+ledger was not advanced.
+
+### Real backend failures, also fail-closed
+
+Observed during this work rather than constructed:
+
+- `codex` returned exit 1 with *"You've hit your usage limit … try again at
+  Sep 7th"*. Blocked, no fallback. **This is a live external blocker: the Codex
+  backend's own end-to-end path could not be exercised on this host.** Its
+  `result_source: "file"` path is covered by `TestFileResultBackend`, which
+  drives a real subprocess writing a real result file and asserts the schema was
+  delivered to the worker, but the codex CLI itself was not reachable.
+- `claude` returned exit 1 with `[claude-code:unrecognized_model]` when handed a
+  routing id. Blocked; this is what produced the model translation in §3.
+- An agent honestly reporting `verdict: "blocked"` because its permissions denied
+  the commands it needed was blocked rather than credited.
+
+### Suites
+
+`test_worker_backend.py` 48 tests, `test_continuation_driver.py` 42 tests, both
+green. Pre-existing suites re-run green with these modules in place:
+`test_superboard_adapter.py`, `test_github_pr_gate.py`,
+`test_telegram_notifier.py`, `coordinator_smoke_test.py`,
+`routing_smoke_test.py`, `cross_repo_smoke_test.py`.
+
+---
+
+## 8. Quick reference
+
+```bash
+# What backends exist, and is each command installed?
+python worker_backend.py --list-backends
+
+# The result shape an agent worker must return
+python worker_backend.py --print-schema
+
+# Build the argv and validate it without running anything
+python worker_backend.py --request-id req-1 --stage build --repo-root . --dry-run
+
+# One real stage
+python worker_backend.py --request-id req-1 --stage qa --repo-root . \
+  --head-sha <40-hex> --model sonnet --prompt "verify X" --json
+
+# Drive authorized requests continuously
+python continuation_driver.py --request-id req-1 --state-dir <dir> --max-steps 12
+
+# Bounded decision re-check: at most 3 tries, 60s apart, 15s floor
+python continuation_driver.py --request-id req-1 --state-dir <dir> \
+  --decision-sync-attempts 3 --decision-sync-interval 60
+
+# Inspect and clear parking
+python continuation_driver.py --state-dir <dir> --show-parked
+python continuation_driver.py --state-dir <dir> --unpark req-1 --show-parked
+```
