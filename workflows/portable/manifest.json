@@ -114,7 +114,7 @@
       ]
     },
     "superboard_adapter.py": {
-      "role": "Superboard execution adapter bridging portable coordinator with existing loop tooling (super-qa-dispatch.sh, super-board-run.sh, and super_board_runtime)",
+      "role": "Superboard execution adapter bridging the portable coordinator to an injected native host worker backend by default, with explicit fixture/probe paths and unchanged lifecycle gates",
       "owner": "PackagePortableCoordinator",
       "cli_command": "python superboard_adapter.py [--config <file>] [--state-dir <dir>] [--fake-executor] [--real-worker] [--notify-telegram] [--json] [--summary]",
       "inputs": [
@@ -152,29 +152,31 @@
       ]
     },
     "worker_backend.py": {
-      "role": "Real configured agent-CLI worker execution: takes a structured request/dispatch packet, builds a configured argv (shell=False), runs one agent CLI, and returns a structured head-bound evidence record. Fails closed on a missing command, a non-zero exit, an absent or unparseable structured result, an unmapped routing model, a head mismatch, a missing artifact, or a pass verdict with no executed check. There is no fixture fallback.",
+      "role": "Native host-dispatched worker execution by default: validates the exact repository/head before calling an injected synchronous dispatcher with WorkerRequest, compact stage prompt, and result schema; then applies one shared structured-result, exact-head, artifact, executed-check, and bug-reproduction validation path. Explicitly configured agent CLI backends remain opt-in. Missing native dispatch blocks with no CLI fallback.",
       "owner": "ImplementContinuousExecution",
-      "cli_command": "python worker_backend.py [--list-backends | --print-schema | --request-id <id> --stage build|qa|review --repo-root <dir> [--head-sha <sha>] [--model <m>] [--backend <name>] [--config <json>] [--state-dir <dir>] [--task-type <t>] [--prompt <text>] [--criterion <text>]... [--timeout <s>] [--dry-run] [--json]]",
+      "cli_command": "python worker_backend.py [--list-backends | --print-schema | --request-id <id> --stage build|qa|review --repo-root <dir> [--head-sha <sha>] [--model <m>] [--backend <explicit-cli-name>] [--config <json>] [--state-dir <dir>] [--task-type <t>] [--prompt <text>] [--criterion <text>]... [--timeout <s>] [--dry-run] [--json]]",
       "inputs": [
-        "worker_backends.json (or PORTABLE_WORKER_CONFIG, or project_config.metadata.portable_worker)",
-        "structured worker request (dataclass, object, or mapping)"
+        "host-injected native_dispatcher callable (implicit native execution)",
+        "worker_backends.json (only for explicit CLI selection)",
+        "structured worker request (WorkerRequest, object, or mapping)"
       ],
       "outputs": [
         "WorkerOutcome (ok, stage, exit_code, command, head_sha, evidence, artifacts, blocked_reason, backend_name)",
-        "worker_runs/<request>__<stage>__<ts>/ (schema and result artifacts)"
+        "worker_runs/<request>__<stage>__<ts>/ (explicit file-schema CLI backends only)"
       ],
       "backends": [
-        "claude (build)",
-        "claude-verify (qa, review)",
-        "codex",
-        "veyyon (optional)",
-        "any user-declared harness via config"
+        "native (implicit default; injected callback; no agent subprocess)",
+        "claude (explicit opt-in)",
+        "claude-verify (explicit opt-in)",
+        "codex (explicit opt-in)",
+        "veyyon (explicit opt-in)",
+        "any user-declared CLI harness via explicit config"
       ]
     },
     "continuation_driver.py": {
       "role": "Minimal continuation driver wrapping the existing adapter run_step over an explicit list of authorized request ids. Reloads ledger state every step, measures real progress, parks on blocked/error/decision/no-progress/awaiting-authorization, journals completed stages so a restart never repeats one, holds a fail-fast single-driver lock, and handles SIGINT/SIGTERM. Never merges and never deploys.",
       "owner": "ImplementContinuousExecution",
-      "cli_command": "python continuation_driver.py --request-id <id> [--request-id <id>]... [--state-dir <dir>] [--config <json>] [--worker-config <json>] [--model <m>] [--backend <name>] [--max-steps <n>] [--decision-sync-attempts <n>] [--decision-sync-interval <s>] [--no-real-worker] [--show-parked] [--unpark <id>]... [--json]",
+      "cli_command": "python continuation_driver.py --request-id <id> [--request-id <id>]... --repo-root <dir> [--state-dir <dir>] [--config <json>] [--worker-config <json>] [--model <m>] [--backend <explicit-cli-name>] [--max-steps <n>] [--decision-sync-attempts <n>] [--decision-sync-interval <s>] [--no-real-worker] [--show-parked] [--unpark <id>]... [--json]",
       "inputs": [
         "ledger.json",
         "decisions.json",

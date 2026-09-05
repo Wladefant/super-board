@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-worker_backend.py - Real, configured agent-CLI worker execution for the portable workflow core.
+worker_backend.py - Native host-dispatched and explicitly configured CLI worker execution.
 
 WHY THIS EXISTS
 ---------------
 The portable coordinator could previously only *simulate* worker execution. Its
-dispatch path fell through to a labelled fixture whenever a real command was not
-wired up, so a step that never ran anything still reported "simulated successful
-build" and the gate advanced the request. Exit code 0 and the phrase
-"proven absent" were, between them, sufficient to advance a request through
-build -> QA -> review. That is the hole this module closes.
+dispatch path fell through to a labelled fixture whenever real execution was not
+wired up, so a step that never ran anything still reported success. This module
+closes that hole while keeping the portable core independent of any harness.
 
 WHAT IT DOES
 ------------
-Takes a structured request/dispatch packet, builds a *configured* argv vector
-(never a shell string, never a shell=True invocation), runs exactly one real
-agent CLI, and returns a structured, head-bound evidence record.
+Takes a structured request/dispatch packet and, by default, calls a synchronous
+dispatcher injected by the host. The dispatcher receives a ``WorkerRequest``,
+the complete stage prompt, and the result JSON Schema, and returns the same
+structured result used by configured CLI backends. CLI execution remains
+available only through an explicitly selected backend.
 
 It is a backend, not a scheduler. It runs one stage for one request and returns.
 The existing SuperboardExecutionAdapter.run_step remains the only step engine;
@@ -27,37 +27,30 @@ Every one of the following produces ok=False with a populated blocked_reason,
 and never a synthetic success:
 
   1.  Malformed request (no stage, no request_id, no usable repo_root).
-  2.  Unknown backend name, or a backend with no configured argv.
-  3.  Backend executable absent from PATH.
-  4.  Non-zero exit status from the agent CLI.
-  5.  Timeout.
-  6.  No structured result emitted, or a result that is not a JSON object.
+  2.  Native execution selected without a host dispatcher.
+  3.  Unknown explicit CLI backend, or a backend with no configured argv.
+  4.  Explicit CLI backend executable absent from PATH.
+  5.  Non-zero exit status from an explicitly selected agent CLI.
+  6.  No structured result, or a result that is not a mapping/JSON object.
   7.  Structured result missing any required field.
   8.  A verdict outside the allowed vocabulary.
   9.  verdict == "pass" with no executed check carrying a command and an
-      exit code. Exit 0 from the agent alone is NEVER evidence.
+      exit code. Exit 0 from the executor alone is NEVER evidence.
  10.  A declared artifact that does not exist on disk.
  11.  Observed git HEAD disagreeing with the requested head, or with the head
-      the agent claims. The reported head_sha is always the *observed* one.
+      the worker claims. The reported head_sha is always the *observed* one.
  12.  A build stage that produced neither a commit nor an artifact.
  13.  A bug-QA reproduction claim that is a bare boolean or a keyword rather
       than a re-executed scenario with a command, exit code and observation.
 
 BACKENDS
 --------
-Three real backends are configured out of the box, each using flags taken from
-the installed CLI's own help output:
+Implicit execution uses the ``native`` host dispatcher and invokes no agent
+subprocess. ``claude``, ``codex`` and ``veyyon`` remain built-in CLI
+configurations, but each must be explicitly selected through ``default_backend``,
+``stage_backends`` or ``WorkerRequest.backend``.
 
-  claude   claude -p <prompt> --output-format json --json-schema <inline schema>
-           Structured result arrives on stdout under "structured_output".
-  codex    codex exec -m <model> -C <repo> --output-schema <file> -o <file>
-           Structured result is written to the last-message file.
-  veyyon   veyyon -p --mode=json --model <model> <prompt>
-           Optional. Veyyon is one backend among several, never a dependency of
-           the core: this module imports nothing from Veyyon and works with it
-           absent.
-
-Any other harness is reachable without touching this file, by declaring a
+Any other CLI harness is reachable without touching this file by declaring a
 custom backend in user config. See BACKEND CONFIGURATION below.
 
 BACKEND CONFIGURATION
@@ -114,7 +107,7 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
@@ -137,6 +130,8 @@ MAX_CAPTURED_OUTPUT = 20000
 MAX_JSON_SCAN_ATTEMPTS = 4096
 DEFAULT_TIMEOUT_SECONDS = 1800
 
+NATIVE_BACKEND_NAME = "native"
+
 
 # ---------------------------------------------------------------------------
 # Structured agent result schema
@@ -146,9 +141,8 @@ def agent_result_schema() -> Dict[str, Any]:
     """
     JSON Schema handed to the agent CLI so its final answer is machine-readable.
 
-    This is passed to `claude --json-schema` and written out for
-    `codex exec --output-schema`, both of which are documented flags of the
-    installed CLIs. The same shape is required of a custom harness.
+    This is handed to the injected native dispatcher and to explicitly selected
+    CLI backends. Every returned result is validated again by this module.
     """
     check = {
         "type": "object",
@@ -463,15 +457,11 @@ DEFAULT_BACKENDS: Dict[str, Dict[str, Any]] = {
     },
 }
 
-DEFAULT_BACKEND_NAME = "claude"
+DEFAULT_BACKEND_NAME = NATIVE_BACKEND_NAME
 
-#: Out of the box, verification stages route to the edit-free variant so the
-#: shipped configuration is correct for all three stages without the operator
-#: having to discover that a build worker and a QA worker need different tool
-#: grants. Applied ONLY when the operator has declared no stage_backends and is
-#: still on the built-in default backend; choosing another backend means owning
-#: the stage map too, rather than being silently redirected to claude.
-DEFAULT_STAGE_BACKENDS = {"qa": "claude-verify", "review": "claude-verify"}
+# Native host dispatch is the implicit choice for every stage. External CLI
+# backends remain available, but selecting one is always an explicit opt-in.
+DEFAULT_STAGE_BACKENDS: Dict[str, str] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -541,8 +531,6 @@ def load_backend_config(
     resolved_stage_backends = {str(k): str(v) for k, v in stage_backends.items()}
 
     default_backend = str(raw.get("default_backend") or DEFAULT_BACKEND_NAME)
-    if not resolved_stage_backends and default_backend == DEFAULT_BACKEND_NAME:
-        resolved_stage_backends = dict(DEFAULT_STAGE_BACKENDS)
 
     return {
         "source": source,
@@ -805,11 +793,11 @@ class WorkerBackendError(Exception):
 
 class WorkerBackend:
     """
-    Executes one real agent-CLI worker stage and returns structured, head-bound
-    evidence.
+    Executes one native host callback or one explicitly selected agent CLI and
+    returns structured, head-bound evidence.
 
     Usage:
-        backend = WorkerBackend(state_dir=..., default_model="sonnet")
+        backend = WorkerBackend(native_dispatcher=host_dispatch)
         outcome = backend.execute(request)
 
     A failed run is a WorkerOutcome with ok=False, not an exception. The only
@@ -826,6 +814,7 @@ class WorkerBackend:
         work_dir: Optional[str] = None,
         dry_run: bool = False,
         timeout_seconds: Optional[int] = None,
+        native_dispatcher: Optional[Callable[[WorkerRequest, str, Mapping[str, Any]], Mapping[str, Any]]] = None,
     ):
         self.state_dir = os.path.abspath(state_dir) if state_dir else SCRIPT_DIR
         self.resolved_config = load_backend_config(
@@ -836,12 +825,15 @@ class WorkerBackend:
         self.work_dir = os.path.abspath(work_dir) if work_dir else os.path.join(self.state_dir, "worker_runs")
         self.dry_run = dry_run
         self.timeout_override = timeout_seconds
+        self.native_dispatcher = native_dispatcher
 
     # -- configuration ----------------------------------------------------
 
     def available_backends(self) -> Dict[str, bool]:
-        """Map backend name -> whether its executable is on PATH right now."""
-        out: Dict[str, bool] = {}
+        """Map backend name to whether it can execute right now."""
+        out: Dict[str, bool] = {
+            NATIVE_BACKEND_NAME: self.native_dispatcher is not None,
+        }
         for name, raw in self.resolved_config["backends"].items():
             argv = raw.get("argv") or []
             out[name] = bool(argv) and shutil.which(str(argv[0])) is not None
@@ -1021,6 +1013,86 @@ class WorkerBackend:
                 f"a worker never runs against whatever happens to be present.",
                 head=head_before,
                 extra={"head_before": head_before},
+            )
+
+        selected_backend = (
+            backend_name
+            or self.resolved_config["stage_backends"].get(stage)
+            or self.default_backend
+        )
+        if selected_backend == NATIVE_BACKEND_NAME:
+            base_evidence["backend"] = NATIVE_BACKEND_NAME
+            base_evidence["model"] = _field(request, "model") or None
+            base_evidence["model_requested"] = _field(request, "model") or None
+            base_evidence["head_before"] = head_before
+            base_evidence["command"] = []
+            base_evidence["dispatch_kind"] = "native_callback"
+
+            if self.native_dispatcher is None:
+                return blocked(
+                    "Native worker execution requires a host-injected dispatcher. "
+                    "Construct WorkerBackend(native_dispatcher=<callable>) or explicitly "
+                    "select a configured CLI backend; no agent CLI is spawned implicitly.",
+                    head=head_before,
+                )
+            if self.dry_run:
+                return blocked(
+                    "Dry run: native dispatcher was validated but not invoked.",
+                    head=head_before,
+                    extra={"dry_run": True},
+                )
+
+            schema = agent_result_schema()
+            prompt = build_stage_prompt(request, schema)
+            native_request = WorkerRequest(
+                request_id=request_id,
+                stage=stage,
+                repo_root=repo_root,
+                head_sha=str(requested_head),
+                model=_field(request, "model") or None,
+                agent_role=_field(request, "agent_role") or None,
+                issue_url=_field(request, "issue_url") or None,
+                pr_url=_field(request, "pr_url") or None,
+                prompt=_field(request, "prompt") or None,
+                criteria=list(_field(request, "criteria", []) or []),
+                task_type=_field(request, "task_type") or None,
+                backend=NATIVE_BACKEND_NAME,
+            )
+            try:
+                native_result = self.native_dispatcher(native_request, prompt, schema)
+            except Exception as e:
+                return blocked(
+                    f"Native worker dispatcher raised for stage '{stage}' of request "
+                    f"'{request_id}': {e}",
+                    head=_git_head(repo_root) or head_before,
+                )
+            if not isinstance(native_result, Mapping):
+                return blocked(
+                    "Native worker dispatcher must return the structured result as a mapping; "
+                    f"got {type(native_result).__name__}.",
+                    exit_code=0,
+                    head=_git_head(repo_root) or head_before,
+                )
+
+            structured = dict(native_result)
+            head_after = _git_head(repo_root)
+            base_evidence["exit_code"] = 0
+            base_evidence["head_after"] = head_after
+            base_evidence["structured_result"] = structured
+            return self._finish_structured_result(
+                structured=structured,
+                stage=stage,
+                request_id=request_id,
+                request=request,
+                repo_root=repo_root,
+                head_before=head_before,
+                head_after=head_after,
+                requested_head=requested_head,
+                exit_code=0,
+                command=[],
+                backend_name=NATIVE_BACKEND_NAME,
+                base_evidence=base_evidence,
+                blocked=blocked,
             )
 
         # 2. Backend resolution.
@@ -1209,7 +1281,40 @@ class WorkerBackend:
             )
         base_evidence["structured_result"] = structured
 
-        # 9. Validate the result against the contract.
+        return self._finish_structured_result(
+            structured=structured,
+            stage=stage,
+            request_id=request_id,
+            request=request,
+            repo_root=repo_root,
+            head_before=head_before,
+            head_after=head_after,
+            requested_head=requested_head,
+            exit_code=proc.returncode,
+            command=argv,
+            backend_name=spec.name,
+            base_evidence=base_evidence,
+            blocked=blocked,
+        )
+
+    def _finish_structured_result(
+        self,
+        *,
+        structured: Mapping[str, Any],
+        stage: str,
+        request_id: str,
+        request: Any,
+        repo_root: str,
+        head_before: Optional[str],
+        head_after: Optional[str],
+        requested_head: Optional[str],
+        exit_code: int,
+        command: List[str],
+        backend_name: str,
+        base_evidence: Dict[str, Any],
+        blocked: Callable[..., WorkerOutcome],
+    ) -> WorkerOutcome:
+        """Apply the single shared validation and artifact pipeline to any executor."""
         valid, reason, verdict = self._validate_result(
             structured=structured,
             stage=stage,
@@ -1227,11 +1332,10 @@ class WorkerBackend:
         if not valid:
             return blocked(
                 reason or "Worker result failed validation.",
-                exit_code=proc.returncode, command=argv, head=observed_head,
+                exit_code=exit_code, command=command, head=observed_head,
                 extra={"verdict": verdict},
             )
 
-        # 10. Artifacts: every declared path must exist, and is digested.
         artifacts: List[str] = []
         digests: Dict[str, str] = {}
         for entry in structured.get("artifacts") or []:
@@ -1244,7 +1348,7 @@ class WorkerBackend:
                 return blocked(
                     f"Worker declared artifact '{rel}' but it does not exist at {abs_path}. "
                     f"A claimed artifact that is absent is not evidence.",
-                    exit_code=proc.returncode, command=argv, head=observed_head,
+                    exit_code=exit_code, command=command, head=observed_head,
                     extra={"verdict": verdict},
                 )
             artifacts.append(rel)
@@ -1258,12 +1362,6 @@ class WorkerBackend:
         base_evidence["summary"] = structured.get("summary") or ""
         repro = structured.get("reproduction")
         if isinstance(repro, Mapping):
-            # `verdict` is DERIVED here, never taken from the agent. It is only
-            # ever set to "absent" once the re-executed scenario has already
-            # passed _validate_result: a real command, a real integer exit code,
-            # a real observation, and still_reproduces is literally False. A
-            # model writing "verdict": "absent" or the words "proven absent"
-            # into its answer cannot reach this value on its own.
             derived = dict(repro)
             derived["verdict"] = "absent" if repro.get("still_reproduces") is False else "present"
             derived["derived_by"] = "worker_backend._validate_result"
@@ -1275,13 +1373,13 @@ class WorkerBackend:
         return WorkerOutcome(
             ok=True,
             stage=stage,
-            exit_code=proc.returncode,
-            command=argv,
+            exit_code=exit_code,
+            command=command,
             head_sha=observed_head,
             evidence=base_evidence,
             artifacts=artifacts,
             blocked_reason=None,
-            backend_name=spec.name,
+            backend_name=backend_name,
         )
 
     # -- validation --------------------------------------------------------
@@ -1472,10 +1570,10 @@ def build_parser():
     import argparse
 
     p = argparse.ArgumentParser(
-        description="Real configured agent-CLI worker backend for the portable workflow core."
+        description="Native host-dispatched or explicitly configured CLI worker backend."
     )
     p.add_argument("--list-backends", action="store_true",
-                   help="Show configured backends and whether each command is on PATH.")
+                   help="Show native dispatcher and configured CLI backend availability.")
     p.add_argument("--print-schema", action="store_true",
                    help="Print the JSON Schema required of an agent worker result.")
     p.add_argument("--request-id", help="Request id to execute a stage for.")
@@ -1522,9 +1620,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         if stage_map:
             print(f"stage overrides: {stage_map}")
         for name in sorted(avail):
-            spec = backend.resolved_config["backends"][name]
-            state = "on PATH" if avail[name] else "NOT FOUND"
-            print(f"  {name:12s} {state:10s} {(spec.get('argv') or [''])[0]}")
+            state = "available" if avail[name] else "UNAVAILABLE"
+            if name == NATIVE_BACKEND_NAME:
+                detail = "host-injected synchronous dispatcher"
+            else:
+                spec = backend.resolved_config["backends"][name]
+                detail = (spec.get("argv") or [""])[0]
+            print(f"  {name:12s} {state:11s} {detail}")
         return 0
 
     if not (args.request_id and args.stage and args.repo_root):

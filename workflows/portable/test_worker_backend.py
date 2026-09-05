@@ -7,13 +7,10 @@ a request without having proven anything. That is the exact regression this
 module exists to prevent, so the tests are written against observable outcomes
 (ok, blocked_reason, head_sha, artifacts) and never against source text.
 
-The backend under test shells out to real commands. To keep these tests
-deterministic, hermetic and free of model calls, most of them configure a
-*custom backend* whose argv is a short python script. That is not a mock of the
-backend: it is the module's documented user-configuration path, exercised for
-real, with a real subprocess, a real exit code and a real structured result.
-The live agent-CLI path is proven separately by an end-to-end run, which is
-recorded in PORTABLE.md.
+External CLI tests configure a *custom backend* whose argv is a short Python
+script. That is the documented explicit CLI opt-in path. Native tests inject a
+synchronous host callback directly and assert that no non-git subprocess is
+launched.
 """
 
 from __future__ import annotations
@@ -25,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
@@ -37,6 +35,7 @@ from worker_backend import (  # noqa: E402
     agent_result_schema,
     load_backend_config,
 )
+import worker_backend  # noqa: E402
 
 PY = sys.executable
 
@@ -209,6 +208,134 @@ class TestRequestValidation(_Fixture):
         self.assertFalse(out.ok)
         self.assertIn("not found on PATH", out.blocked_reason)
         self.assertIn("no fixture fallback", out.blocked_reason)
+
+
+class TestNativeDispatch(_Fixture):
+
+    def _result(self, request, **over):
+        result = {
+            "stage": request.stage,
+            "request_id": request.request_id,
+            "head_sha": _git(request.repo_root, "rev-parse", "HEAD").stdout.strip(),
+            "verdict": "pass",
+            "summary": "native callback verified",
+            "checks": [{
+                "name": "read seed",
+                "command": ["git", "show", "HEAD:seed.txt"],
+                "exit_code": 0,
+                "observed": "seed",
+            }],
+            "artifacts": [],
+        }
+        result.update(over)
+        return result
+
+    def test_native_callback_is_default_and_launches_no_agent_subprocess(self):
+        calls = []
+
+        def dispatch(request, prompt, result_schema):
+            calls.append((request, prompt, result_schema))
+            return self._result(request)
+
+        real_run = worker_backend.subprocess.run
+
+        def git_only(argv, *args, **kwargs):
+            if not argv or not os.path.basename(argv[0]).lower().startswith("git"):
+                raise AssertionError(f"agent subprocess launched: {argv!r}")
+            return real_run(argv, *args, **kwargs)
+
+        backend = WorkerBackend(
+            config={"backends": {"ghost-cli": {"argv": ["ghost-agent"]}}},
+            state_dir=self.state,
+            native_dispatcher=dispatch,
+        )
+        with mock.patch.object(worker_backend.subprocess, "run", side_effect=git_only):
+            out = backend.execute(self._request())
+
+        self.assertTrue(out.ok, out.blocked_reason)
+        self.assertEqual(out.backend_name, "native")
+        self.assertEqual(out.command, [])
+        self.assertEqual(len(calls), 1)
+        native_request, prompt, schema = calls[0]
+        self.assertIsInstance(native_request, WorkerRequest)
+        self.assertIn("req-test", prompt)
+        self.assertIn("verdict", schema["properties"])
+
+    def test_missing_native_dispatcher_blocks_without_cli_fallback(self):
+        backend = WorkerBackend(state_dir=self.state)
+        out = backend.execute(self._request())
+        self.assertFalse(out.ok)
+        self.assertEqual(out.backend_name, "native")
+        self.assertEqual(out.command, [])
+        self.assertIn("host-injected dispatcher", out.blocked_reason)
+        self.assertIn("no agent CLI is spawned implicitly", out.blocked_reason)
+
+    def test_invalid_repo_and_head_block_before_native_callback(self):
+        calls = []
+
+        def dispatch(request, prompt, result_schema):
+            calls.append(request)
+            return self._result(request)
+
+        backend = WorkerBackend(state_dir=self.state, native_dispatcher=dispatch)
+        invalid_repo = os.path.join(self.tmp, "not-a-repo")
+        os.makedirs(invalid_repo)
+        for request, needle in (
+            (self._request(repo_root=invalid_repo), "not a git repository"),
+            (self._request(head_sha="f" * 40), "does not resolve to a commit"),
+        ):
+            out = backend.execute(request)
+            self.assertFalse(out.ok)
+            self.assertIn(needle, out.blocked_reason)
+        self.assertEqual(calls, [])
+
+    def test_native_result_uses_existing_structured_validation(self):
+        backend = WorkerBackend(
+            state_dir=self.state,
+            native_dispatcher=lambda request, prompt, schema: self._result(request, checks=[]),
+        )
+        out = backend.execute(self._request())
+        self.assertFalse(out.ok)
+        self.assertIn("no executed checks", out.blocked_reason)
+
+    def _stale_verification_result(self, request, prompt, result_schema):
+        with open(os.path.join(request.repo_root, "mutation.txt"), "w", encoding="utf-8") as fh:
+            fh.write(request.stage)
+        _git(request.repo_root, "add", "-A")
+        _git(request.repo_root, "commit", "-q", "-m", f"mutate during {request.stage}")
+        return self._result(request)
+
+    def test_stale_qa_result_is_rejected(self):
+        backend = WorkerBackend(
+            state_dir=self.state,
+            native_dispatcher=self._stale_verification_result,
+        )
+        out = backend.execute(self._request(stage="qa"))
+        self.assertFalse(out.ok)
+        self.assertIn("QA evidence is invalid: HEAD moved", out.blocked_reason)
+
+    def test_stale_review_result_is_rejected(self):
+        backend = WorkerBackend(
+            state_dir=self.state,
+            native_dispatcher=self._stale_verification_result,
+        )
+        out = backend.execute(self._request(stage="review"))
+        self.assertFalse(out.ok)
+        self.assertIn("REVIEW evidence is invalid: HEAD moved", out.blocked_reason)
+
+    def test_external_cli_backend_requires_explicit_selection(self):
+        cfg = self._script_backend(PASS_RESULT, name="explicit-cli")
+        cfg.pop("default_backend")
+        backend = WorkerBackend(config=cfg, state_dir=self.state)
+
+        implicit = backend.execute(self._request())
+        explicit = backend.execute(self._request(backend="explicit-cli"))
+
+        self.assertFalse(implicit.ok)
+        self.assertIn("host-injected dispatcher", implicit.blocked_reason)
+        self.assertTrue(explicit.ok, explicit.blocked_reason)
+        self.assertEqual(explicit.backend_name, "explicit-cli")
+        self.assertTrue(explicit.command)
 
 
 class TestConfiguration(_Fixture):

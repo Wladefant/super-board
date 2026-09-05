@@ -1,8 +1,9 @@
 # Real worker execution and continuous stage progression
 
-Two modules: `worker_backend.py` runs one real agent-CLI worker stage and returns
-head-bound structured evidence; `continuation_driver.py` drives the existing
-adapter's `run_step` repeatedly over an explicit list of authorized requests.
+Two modules: `worker_backend.py` runs one native host callback (the default) or
+one explicitly selected agent CLI and returns head-bound structured evidence;
+`continuation_driver.py` drives the existing adapter's `run_step` repeatedly
+over an explicit list of authorized requests.
 Neither replaces the coordinator or the adapter, and neither merges or deploys.
 
 ---
@@ -31,14 +32,25 @@ the right reasons.
 ```python
 from worker_backend import WorkerBackend, WorkerRequest
 
-backend = WorkerBackend(state_dir=state_dir, default_model="sonnet")
+def dispatch_native(
+    request: WorkerRequest,
+    prompt: str,
+    result_schema: dict,
+) -> dict:
+    # `agent` is supplied by the Veyyon host, not imported by the portable core.
+    return agent(prompt, agent=request.agent_role or "codex-worker", schema=result_schema)
+
+backend = WorkerBackend(
+    state_dir=state_dir,
+    native_dispatcher=dispatch_native,
+)
 outcome = backend.execute(WorkerRequest(
     request_id="req-1234",
-    stage="build",                 # build | qa | review
+    stage="qa",                    # build | qa | review
     repo_root="/path/to/repo",
     head_sha="<40 hex>",
-    model="anthropic/claude-opus-5:high",
-    agent_role="thinker",
+    model="openai-codex/gpt-5.6-sol:high",
+    agent_role="codex-worker",
     prompt="...",
     criteria=["..."],
     task_type="bug",
@@ -50,25 +62,62 @@ so the adapter builds its own packet and imports nothing from this module. The
 fields read are `request_id`, `stage`, `head_sha`, `model`, `agent_role`,
 `repo_root`, `issue_url`, `pr_url`, `prompt`, `criteria`, `task_type`, `backend`.
 
+`native_dispatcher` is the exact host API:
+
+```python
+Callable[[WorkerRequest, str, Mapping[str, Any]], Mapping[str, Any]]
+```
+
+It is synchronous. The arguments are the normalized request, the compact
+stage-specific prompt from `build_stage_prompt`, and `agent_result_schema()`.
+It returns the structured agent result itself (not a `WorkerOutcome` and not a
+CLI envelope). The portable core invokes no agent command in this path. A
+missing dispatcher blocks; it never falls back to Claude or another CLI.
+
+The host helper must return these required fields. `checks` must describe
+commands the native agent actually executed; the host must not synthesize them.
+
+```python
+{
+    "stage": request.stage,
+    "request_id": request.request_id,
+    "head_sha": "<git rev-parse HEAD observed by the agent>",
+    "verdict": "pass",             # pass | fail | blocked
+    "summary": "what was observed",
+    "checks": [{
+        "name": "focused check",
+        "command": ["python", "path/to/focused_test.py"],
+        "exit_code": 0,
+        "observed": "observable result",
+    }],
+    "artifacts": [],               # [{"path": "relative/path", "role": "created"}]
+}
+```
+
+Bug QA additionally requires `reproduction` with `scenario`, non-empty
+`command`, integer `exit_code`, non-empty `observed`, and
+`still_reproduces: false`.
+
 `WorkerOutcome` field names are a published contract:
 
 | field | meaning |
 | --- | --- |
 | `ok` | the only success signal; false whenever anything below refuses |
 | `stage` | stage that was dispatched |
-| `exit_code` | the CLI's real exit status, or `None` if it never ran |
-| `command` | the exact argv that was executed |
+| `exit_code` | `0` after a native callback returns, the explicit CLI's exit status, or `None` if execution never ran |
+| `command` | exact explicit CLI argv, or `[]` for native callback execution |
 | `head_sha` | the **observed** git HEAD after the run, never the claimed one |
 | `evidence` | structured record, described below |
 | `artifacts` | repo-relative paths that were verified to exist |
 | `blocked_reason` | why it refused, in operator-actionable terms |
 | `backend_name` | which configured backend ran |
 
-`evidence` always carries `backend`, `stage`, `request_id`, `head_sha`,
-`head_before`, `head_after`, `model_requested`, `model`, `structured_result`,
-`verdict`, `artifact_digests` (sha256 per artifact), `command`, `run_dir`,
-`exit_code`, `stdout_tail`, `stderr_tail`, and `auto_merge_allowed` /
-`auto_deploy_allowed`, both always false.
+`evidence` carries the executor name, stage, request id, observed heads,
+routing model, structured result, verdict, artifact digests, executed checks,
+and `auto_merge_allowed` / `auto_deploy_allowed`, both always false. Native
+evidence additionally carries `dispatch_kind: "native_callback"` and an empty
+`command`; the checks inside the structured result remain the worker's actual
+commands and observations and are never fabricated by the callback plumbing.
 
 ### Fail-closed rules
 
@@ -82,27 +131,28 @@ never a synthetic success:
    requested commit does not resolve in that repository, or the checkout is not
    exactly on that commit. These checks happen before backend resolution, run
    directory creation, or worker dispatch.
-3. Unknown backend, or a backend with no configured `argv`.
-4. Backend executable absent from `PATH`.
-5. An unmapped harness-qualified routing model on a strict backend (see §3).
-6. Non-zero exit.
-7. Timeout.
-8. No structured result, or one that is not a JSON object.
-9. `is_error: true` in the CLI envelope, even alongside exit `0`.
-10. Any required result field missing.
-11. A verdict outside `pass | fail | blocked`. An honest `fail` or `blocked` is
+3. Implicit native execution has no injected dispatcher.
+4. An explicitly selected CLI backend is unknown, misconfigured, or absent
+   from `PATH`.
+5. An unmapped harness-qualified routing model on a strict explicit CLI backend
+   (see §3).
+6. A selected CLI exits non-zero or times out, or a native dispatcher raises.
+7. No structured result, or one that is not a mapping/JSON object.
+8. `is_error: true` in an explicit CLI envelope, even alongside exit `0`.
+9. Any required result field missing.
+10. A verdict outside `pass | fail | blocked`. An honest `fail` or `blocked` is
     reported as-is and does not advance anything.
-12. A result whose `stage` or `request_id` does not match what was dispatched.
-13. `verdict: "pass"` with an empty `checks` list, or a check with no command,
+11. A result whose `stage` or `request_id` does not match what was dispatched.
+12. `verdict: "pass"` with an empty `checks` list, or a check with no command,
     no integer exit code, or nothing observed. **Exit status alone is never
     evidence.**
-14. A claimed `head_sha` that differs from the observed HEAD. The observed
+13. A claimed `head_sha` that differs from the observed HEAD. The observed
     commit always wins, and is what the outcome reports.
-15. For `qa` and `review`: HEAD moved during the run, or the tested commit is not
+14. For `qa` and `review`: HEAD moved during the run, or the tested commit is not
     the dispatched one. A verification stage must not mutate the tree it judges.
-16. For `build`: a `pass` that produced neither a new commit nor any artifact.
-17. A declared artifact that does not exist on disk.
-18. For a bug at `qa`: no `reproduction` record, or one lacking a real command,
+15. For `build`: a `pass` that produced neither a new commit nor any artifact.
+16. A declared artifact that does not exist on disk.
+17. For a bug at `qa`: no `reproduction` record, or one lacking a real command,
     a real integer exit code, a real observation, a scenario string, or with
     `still_reproduces` not literally `false`.
 
@@ -125,52 +175,41 @@ legitimately advances the head and the new commit becomes the reported one;
 
 ---
 
-## 3. Model translation
+## 3. Native default and explicit CLI model translation
 
-The routing layer in `model_routing.py` names models in a harness-qualified
-vocabulary (`google-antigravity/gemini-3.8-flash:high`,
-`anthropic/claude-opus-5:high`, `openai-codex/gpt-6-astra:high`). Each CLI has a
-different one. Passing a routing id straight through is a real failure, not a
-cosmetic one: the Claude CLI answers `[claude-code:unrecognized_model]` and exits
-1, which is exactly how the first end-to-end attempt failed.
+Native execution is the default for `build`, `qa`, and `review`. It receives the
+routing model unchanged in `WorkerRequest.model`; the host owns native model
+selection. The portable core does not import Veyyon and does not spawn a CLI.
 
-Each backend therefore declares a `model_map`. Resolution is:
+Model translation applies only after an external backend is explicitly selected
+with `WorkerRequest.backend`, `WorkerBackend(default_backend=...)`, or config
+`default_backend` / `stage_backends`.
+
+Each CLI backend declares a `model_map`. Resolution is:
 
 - request names no model → the backend's `model_default`
-- id present in `model_map` → the explicit mapped CLI name, recorded in
-  `evidence.model_note` (this wins for strict and non-strict backends)
-- a bare name with no `/` and no `:` → already a CLI name, passed through
-- a harness-qualified id absent from a strict backend's map → **blocked**,
-  naming the exact `model_map` entry to add
+- id present in `model_map` → the explicit mapped CLI name
+- a bare name with no `/` and no `:` → passed through
+- a harness-qualified id absent from a strict backend's map → **blocked**
 - a harness-qualified id absent from a non-strict backend's map → passed
-  through unchanged and recorded as such; it is never silently replaced by
-  `model_default`
-
-The strict refusal is deliberate. Silently substituting a different model would
-make the model recorded in evidence a fiction. A backend that genuinely resolves
-names itself sets `strict_model: false`; `veyyon` does, because its `--model`
-flag documents fuzzy matching.
+  through unchanged and recorded
 
 ---
 
-## 4. Backends
+## 4. Executors
 
-Flags below come from each installed CLI's own `--help`.
-
-| backend | invocation | structured result |
+| executor | selection | invocation |
 | --- | --- | --- |
-| `claude` | `claude -p <prompt> --output-format json --json-schema <inline> --model <m> --add-dir <repo> --permission-mode <mode> --allowedTools <tools>` | stdout, under `structured_output` |
-| `claude-verify` | same, with `--allowedTools "Bash Read"` | stdout, under `structured_output` |
-| `codex` | `codex exec -m <m> -C <repo> -s <sandbox> --output-schema <file> -o <file> <prompt>` | the last-message file |
-| `veyyon` | `veyyon -p --mode=json --model <m> <prompt>` | stdout |
+| `native` | implicit default | injected synchronous callback; no subprocess |
+| `claude` | explicit | `claude -p ... --json-schema ...` |
+| `claude-verify` | explicit | same CLI with verification tool grants |
+| `codex` | explicit | `codex exec ... --output-schema ...` |
+| `veyyon` | explicit | `veyyon -p --mode=json ...` |
 
-Veyyon is one optional backend among several. This module imports nothing from
-Veyyon and works with it absent; the core does not depend on it.
-
-By default `build` routes to `claude` and `qa` / `review` route to
-`claude-verify`. That default applies only when the operator has declared no
-`stage_backends` and is still on the built-in default backend — choosing another
-backend means owning the stage map too, rather than being silently redirected.
+The built-in external definitions are conveniences, not defaults. Select one
+explicitly in configuration or on `WorkerRequest.backend`. Choosing a CLI never
+changes the shared result validation, head binding, artifact verification, or
+bug-reproduction rules.
 
 ### Permission modes, as measured
 
@@ -199,16 +238,16 @@ HEAD moved is refused, which holds no matter how the tree was touched.
 
 ## 5. Configuring another harness
 
-No code change is needed. Resolution order, first hit wins:
+No code change is needed for another CLI. Resolution order, first hit wins:
 
 1. explicit dict or JSON path passed to `WorkerBackend(config=...)`
 2. `PORTABLE_WORKER_CONFIG` environment variable
 3. `<state_dir>/worker_backends.json`
 4. `project_config.metadata["portable_worker"]`
-5. the built-in defaults
+5. built-in CLI definitions, with `native` still the implicit default
 
-User backends merge **over** the defaults, so declaring one harness does not
-hide `claude`, `codex` or `veyyon`.
+User backends merge **over** the built-ins. To execute one, explicitly set
+`default_backend`, a stage entry in `stage_backends`, or the request's `backend`.
 
 ```json
 {
@@ -249,10 +288,11 @@ re-validated here.
 ## 6. `continuation_driver.py`
 
 ```python
+backend = WorkerBackend(native_dispatcher=dispatch_native, state_dir=state_dir)
 adapter = SuperboardExecutionAdapter(
     state_dir=state_dir,
     fake_executor=False,
-    worker_backend=WorkerBackend(state_dir=state_dir),
+    worker_backend=backend,
     repo_root=repo_root,
 )
 outcome = ContinuationDriver(
