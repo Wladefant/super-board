@@ -36,10 +36,12 @@ from continuation_driver import (  # noqa: E402
     DriverJournal,
     DriverLockError,
     DriverRunLock,
+    build_parser,
 )
 from continuation_driver import ParkRecord, main as continuation_main  # noqa: E402
 from worker_backend import WorkerBackend  # noqa: E402
 from ledger import RequestLedger  # noqa: E402
+from unittest.mock import MagicMock, patch  # noqa: E402
 
 SAFE_BOUNDARIES = {"auto_merge_allowed": False, "auto_deploy_allowed": False}
 
@@ -971,6 +973,220 @@ class TestNativeBackgroundPending(_Fixture):
         reloaded = DriverJournal(os.path.join(self.tmp, JOURNAL_FILENAME))
         self.assertIsNone(reloaded.parked_record("req-retry"))
         self.assertNotIn("req-retry", reloaded.data["inflight"])
+
+
+class TestContinuationDriverTelegramNotifications(_Fixture):
+    """Behavioral regression exercising parser/driver -> adapter notification path.
+
+    Defends:
+      1. Same CLI switches and safe default semantics as superboard_adapter:
+         --notify-telegram, --telegram-send, --telegram-dry-run.
+      2. Forwarding booleans via adapter_kwargs to SuperboardExecutionAdapter.
+      3. No-default-send: default CLI execution or --notify-telegram alone does NOT dispatch to network.
+      4. Explicit send enables existing sender: --notify-telegram --telegram-send dispatches via transport.
+      5. Dry-run overrides send: --telegram-dry-run suppresses network dispatch even if --telegram-send is present.
+      6. Safe defaults: enabling live requires explicit notification + send; send alone does not notify.
+    """
+
+    def _setup_git_repo(self) -> str:
+        repo = os.path.join(self.tmp, "repo")
+        os.makedirs(repo, exist_ok=True)
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "t@localhost"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True)
+        with open(os.path.join(repo, "seed.txt"), "w", encoding="utf-8") as f:
+            f.write("seed\n")
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=repo, check=True)
+        return repo
+
+    def _add_request(self, req_id: str, state: str = "implementation", issue_number: int = 100):
+        return self.ledger.add_request(
+            req_id=req_id,
+            prompt=f"prompt for {req_id}",
+            session="test",
+            project="polysimulator",
+            acceptance_criteria=[{"criterion": "works", "status": "pending", "evidence": ""}],
+            owner="Tester",
+            state=state,
+            head="a" * 40,
+            task_type="deployable",
+            issue_number=issue_number,
+        )
+
+    def test_cli_telegram_flags_parsing(self):
+        """Verify build_parser preserves safe dry-run by default unless explicit --telegram-send."""
+        parser = build_parser()
+
+        # 1. Default (no telegram flags)
+        args_default = parser.parse_args([])
+        self.assertFalse(args_default.notify_telegram)
+        self.assertIsNone(args_default.telegram_dry_run)
+        self.assertFalse(args_default.telegram_send)
+
+        # 2. Notify enabled (dry-run default preserved)
+        args_notify = parser.parse_args(["--notify-telegram"])
+        self.assertTrue(args_notify.notify_telegram)
+        self.assertIsNone(args_notify.telegram_dry_run)
+        self.assertFalse(args_notify.telegram_send)
+
+        # 3. Explicit send
+        args_send = parser.parse_args(["--notify-telegram", "--telegram-send"])
+        self.assertTrue(args_send.notify_telegram)
+        self.assertIsNone(args_send.telegram_dry_run)
+        self.assertTrue(args_send.telegram_send)
+
+        # 4. Explicit dry run
+        args_dry = parser.parse_args(["--notify-telegram", "--telegram-dry-run"])
+        self.assertTrue(args_dry.notify_telegram)
+        self.assertTrue(args_dry.telegram_dry_run)
+        self.assertFalse(args_dry.telegram_send)
+
+        # 5. Both flags present
+        args_both = parser.parse_args(["--notify-telegram", "--telegram-dry-run", "--telegram-send"])
+        self.assertTrue(args_both.notify_telegram)
+        self.assertTrue(args_both.telegram_dry_run)
+        self.assertTrue(args_both.telegram_send)
+
+    def test_adapter_kwargs_forwarding_booleans(self):
+        """Verify continuation_main resolves and forwards booleans via adapter_kwargs."""
+        repo = self._setup_git_repo()
+
+        scenarios = [
+            (
+                ["--request-id", "req-kwargs-test", "--state-dir", self.tmp, "--repo-root", repo, "--no-real-worker", "--max-steps", "1"],
+                {"notify_telegram": False, "telegram_dry_run": True, "telegram_send": False},
+            ),
+            (
+                ["--request-id", "req-kwargs-test", "--state-dir", self.tmp, "--repo-root", repo, "--no-real-worker", "--max-steps", "1", "--notify-telegram"],
+                {"notify_telegram": True, "telegram_dry_run": True, "telegram_send": False},
+            ),
+            (
+                ["--request-id", "req-kwargs-test", "--state-dir", self.tmp, "--repo-root", repo, "--no-real-worker", "--max-steps", "1", "--notify-telegram", "--telegram-send"],
+                {"notify_telegram": True, "telegram_dry_run": False, "telegram_send": True},
+            ),
+            (
+                ["--request-id", "req-kwargs-test", "--state-dir", self.tmp, "--repo-root", repo, "--no-real-worker", "--max-steps", "1", "--notify-telegram", "--telegram-dry-run"],
+                {"notify_telegram": True, "telegram_dry_run": True, "telegram_send": False},
+            ),
+            (
+                ["--request-id", "req-kwargs-test", "--state-dir", self.tmp, "--repo-root", repo, "--no-real-worker", "--max-steps", "1", "--notify-telegram", "--telegram-dry-run", "--telegram-send"],
+                {"notify_telegram": True, "telegram_dry_run": True, "telegram_send": False},
+            ),
+            (
+                ["--request-id", "req-kwargs-test", "--state-dir", self.tmp, "--repo-root", repo, "--no-real-worker", "--max-steps", "1", "--telegram-send"],
+                {"notify_telegram": False, "telegram_dry_run": False, "telegram_send": True},
+            ),
+        ]
+
+        for i, (argv_template, expected) in enumerate(scenarios):
+            req_id = f"req-kwargs-{i}"
+            self._add_request(req_id, state="implementation")
+            argv = [req_id if arg == "req-kwargs-test" else arg for arg in argv_template]
+
+            with patch("superboard_adapter.SuperboardExecutionAdapter") as mock_adapter_cls:
+                mock_inst = MagicMock()
+                mock_inst.state_dir = self.tmp
+                mock_inst.ledger = self.ledger
+                mock_inst.coordinator.ledger = self.ledger
+                mock_inst.run_step.return_value = FakeResult(status="done")
+                mock_adapter_cls.return_value = mock_inst
+
+                continuation_main(argv)
+
+                kwargs = mock_adapter_cls.call_args.kwargs
+                self.assertIsInstance(kwargs.get("notify_telegram"), bool)
+                self.assertIsInstance(kwargs.get("telegram_dry_run"), bool)
+                self.assertIsInstance(kwargs.get("telegram_send"), bool)
+                self.assertEqual(kwargs.get("notify_telegram"), expected["notify_telegram"])
+                self.assertEqual(kwargs.get("telegram_dry_run"), expected["telegram_dry_run"])
+                self.assertEqual(kwargs.get("telegram_send"), expected["telegram_send"])
+
+    def test_no_default_send_leaves_transport_untouched(self):
+        """Safe default: Running without --notify-telegram or with safe defaults never calls network."""
+        repo = self._setup_git_repo()
+        self._add_request("req-no-send", state="implementation", issue_number=101)
+
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            exit_code = continuation_main([
+                "--request-id", "req-no-send",
+                "--state-dir", self.tmp,
+                "--repo-root", repo,
+                "--no-real-worker",
+                "--max-steps", "1",
+            ])
+            self.assertEqual(mock_urlopen.call_count, 0, "Default run must never contact Telegram API")
+
+    def test_notify_dry_run_prevents_live_network(self):
+        """Dry-run prevents live network dispatch while activating adapter notifications."""
+        repo = self._setup_git_repo()
+        self._add_request("req-dry-run", state="implementation", issue_number=102)
+
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            exit_code = continuation_main([
+                "--request-id", "req-dry-run",
+                "--state-dir", self.tmp,
+                "--repo-root", repo,
+                "--no-real-worker",
+                "--max-steps", "1",
+                "--notify-telegram",
+                "--telegram-dry-run",
+            ])
+            self.assertEqual(mock_urlopen.call_count, 0, "Dry-run must strictly prevent live network calls")
+
+    def test_dry_run_overrides_send_flag(self):
+        """When both --telegram-dry-run and --telegram-send are passed, dry-run overrides send."""
+        repo = self._setup_git_repo()
+        self._add_request("req-forced-dry", state="implementation", issue_number=103)
+
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            exit_code = continuation_main([
+                "--request-id", "req-forced-dry",
+                "--state-dir", self.tmp,
+                "--repo-root", repo,
+                "--no-real-worker",
+                "--max-steps", "1",
+                "--notify-telegram",
+                "--telegram-dry-run",
+                "--telegram-send",
+            ])
+            self.assertEqual(mock_urlopen.call_count, 0, "Explicit dry-run must override send and prevent network")
+
+    def test_explicit_send_enables_existing_sender_via_transport(self):
+        """Explicit --notify-telegram and --telegram-send enables the existing sender to dispatch to network."""
+        repo = self._setup_git_repo()
+        self._add_request("req-explicit-send", state="implementation", issue_number=104)
+
+        with patch("telegram_notifier.DeduplicationLedger.check_eligible", return_value=(True, "eligible", "ok")), \
+             patch("urllib.request.urlopen") as mock_urlopen:
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = json.dumps({
+                "ok": True,
+                "result": {"message_id": 99991, "from": {"id": 8566730274, "is_bot": True}},
+            }).encode("utf-8")
+            mock_urlopen.return_value.__enter__.return_value = mock_resp
+
+            exit_code = continuation_main([
+                "--request-id", "req-explicit-send",
+                "--state-dir", self.tmp,
+                "--repo-root", repo,
+                "--no-real-worker",
+                "--max-steps", "1",
+                "--notify-telegram",
+                "--telegram-send",
+            ])
+
+            self.assertGreaterEqual(mock_urlopen.call_count, 1, "Live send must dispatch via urllib.request.urlopen")
+            req = mock_urlopen.call_args_list[0][0][0]
+            self.assertEqual(req.get_method(), "POST")
+            self.assertIn("api.telegram.org", req.full_url)
+            self.assertIn("/sendMessage", req.full_url)
+
+            payload = json.loads(req.data.decode("utf-8"))
+            self.assertIn("chat_id", payload)
+            self.assertIn("text", payload)
+            self.assertIn("req-explicit-send", payload["text"])
+            self.assertIn("https://github.com/", payload["text"])
 
 
 if __name__ == "__main__":

@@ -1065,6 +1065,12 @@ def build_parser() -> argparse.ArgumentParser:
                         f"(floor {MIN_DECISION_SYNC_INTERVAL:.0f}s).")
     p.add_argument("--no-real-worker", action="store_true",
                    help="Pass real_worker=False to the adapter.")
+    p.add_argument("--notify-telegram", action="store_true",
+                   help="Enable Telegram notifications")
+    p.add_argument("--telegram-dry-run", dest="telegram_dry_run", action="store_true", default=None,
+                   help="Dry-run Telegram notification (default: True unless --telegram-send)")
+    p.add_argument("--telegram-send", dest="telegram_send", action="store_true", default=False,
+                   help="Send live Telegram notification")
     p.add_argument("--show-parked", action="store_true",
                    help="Print the journal's parked requests and exit.")
     p.add_argument("--unpark", action="append", default=[], dest="unpark",
@@ -1199,11 +1205,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"continuation_driver could not import the Superboard adapter: {e}", file=sys.stderr)
         return 70
 
+    telegram_dry_run = (
+        args.telegram_dry_run
+        if args.telegram_dry_run is not None
+        else (not args.telegram_send)
+    )
     adapter_kwargs: Dict[str, Any] = {
         "state_dir": state_dir,
         "config_path": args.config,
         "fake_executor": False,
         "repo_root": repo_root,
+        "notify_telegram": bool(args.notify_telegram),
+        "telegram_dry_run": bool(telegram_dry_run),
+        "telegram_send": bool(args.telegram_send and not args.telegram_dry_run),
     }
 
     if not args.no_real_worker:
