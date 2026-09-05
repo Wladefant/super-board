@@ -39,8 +39,26 @@ A harness-agnostic, pure Python standard library multi-agent coordination core l
 | **`github_plan_renderer.py`** | `IntegrateVisualPlanWorkflow` | Visual plan and evidence recap markdown renderer with badges, timelines, and progress metrics for GitHub issue/PR comments. | `python github_plan_renderer.py [--spec <file>] [--type plan\|recap]` | Plan or recap JSON specification | Formatted GitHub Markdown comment text |
 | **`telegram_notifier.py`** | `IntegrateTelegramStatus` | Portable Telegram workflow status notification adapter with strict deduplication, cooldowns, single-sentence formatting, and multi-repo destination resolution. | `python telegram_notifier.py [--packet <file>] [--event-type milestone\|blocker\|decision\|completion] [--project <name>] [--send] [--dry-run] [--test-connection] [--json]` | `CoordinatorPacket` JSON, CLI event arguments, manifest/channel config | `DeliveryReceipt` (JSON or terminal summary), deduplicated Telegram messages |
 | **`superboard_adapter.py`** | `PackagePortableCoordinator` | Execution adapter bridging portable coordinator with existing Superboard loop tooling (`super-qa-dispatch.sh`, `super-board-run.sh`, `super_board_runtime`). | `python superboard_adapter.py [--config <file>] [--state-dir <dir>] [--fake-executor] [--real-worker] [--notify-telegram] [--json] [--summary]` | `ledger.json`, `preflight_evidence/`, Superboard project config, `HarnessDispatchPacket` | `AdapterExecutionResult`, exact-SHA QA evidence, Telegram status events |
-| **`github_pr_gate.py`** | `FinalizeExecutableRouting` | Deterministic GitHub PR status & review gate helper verifying CI checks, independent non-author approval, and exact-head review reuse without LLM churn. | `python github_pr_gate.py --pr <pr_url_or_number> [--head-sha <sha>] [--required-checks <checks>] [--json]` | GitHub PR via `gh` CLI or API payload, required check contexts, prior review approval records | `PRGateEvaluation` (`PASSED`, `BLOCKED`, `PENDING`) with detailed gate breakdown |
+| **`github_pr_gate.py`** | `FinalizeExecutableRouting` | Deterministic GitHub PR status and review gate verifying CI, GitHub approvals, or source-backed independent automated review artifacts on named non-production branches. | `python github_pr_gate.py --pr <pr_url_or_number> [--head-sha <sha>] [--review-record <artifact.json>] [--policy-config <policy.json>] [--json]` | Live GitHub PR via `gh`, native required-check contexts, optional `portable-review/v1` artifact | `PRGateEvaluation` (`PASSED`, `BLOCKED`, `PENDING`) with detailed gate breakdown |
 | **`diagnostics.py`** | `PackagePortableCoordinator` | Unified aggregate system, service, provider, request and host resource diagnostics. Exposes where problems lie, what is missing, distinguishes access from health and stale from failed, and asks user only when true authorization/preference/credential needed with deduplicatable question IDs. | `python diagnostics.py [--state-dir <dir>] [--strict] [--json] [--summary]` (or `python coordinator.py --diagnostics`) | `ledger.json`, `decisions.json`, `preflight_evidence/`, usage snapshots | `DiagnosticReport` (JSON or terminal summary), `human_inputs`, `agent_actions` |
+
+### Automated review artifact contract
+
+`--review-record` reads an independently-produced `portable-review/v1` JSON artifact. It
+must bind the repository, PR number, full head SHA, full base SHA, and live PR author. The
+reviewer must be a distinct automation actor, and `source` must name that same actor through
+an `agent://` or `history://` transcript URI with a SHA-256 digest. Outcomes are exactly
+`approved` or `changes_requested`; the latter always blocks. A valid artifact can replace
+the GitHub Approve button only where the resolved named policy sets
+`require_github_approval` to false. Production-protected bases retain mandatory independent
+GitHub `APPROVED` review.
+
+This local gate treats the artifact as advisory trusted-workflow evidence. Schema,
+provenance shape, actor separation, and exact-head/base bindings are validated, but this is
+not a cryptographic identity guarantee; the supplying workflow must authenticate and retain
+the referenced transcript. An author `COMMENTED` review is never represented as GitHub
+approval.
+
 ---
 
 ## 3. Single Bounded Coordinator Command

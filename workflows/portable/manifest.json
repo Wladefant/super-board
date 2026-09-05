@@ -128,13 +128,13 @@
       ]
     },
     "github_pr_gate.py": {
-      "role": "Deterministic GitHub PR status & review gate helper verifying CI checks, independent non-author approval, and exact-head review reuse",
+      "role": "Deterministic GitHub PR status and review gate verifying CI, independent GitHub approval, or source-backed automated review evidence on named non-production branches",
       "owner": "FinalizeExecutableRouting",
-      "cli_command": "python github_pr_gate.py --pr <pr_url_or_number> [--head-sha <sha>] [--required-checks <checks>] [--json]",
+      "cli_command": "python github_pr_gate.py --pr <pr_url_or_number> [--head-sha <sha>] [--review-record <artifact.json>] [--policy-config <policy.json>] [--json]",
       "inputs": [
-        "GitHub PR via gh CLI or API payload",
-        "Required check contexts",
-        "Prior review approval record"
+        "Live GitHub PR via gh CLI",
+        "Native required check contexts or explicitly named advisory CI policy",
+        "Optional portable-review/v1 independent automated review artifact"
       ],
       "outputs": [
         "PRGateEvaluation (PASSED, BLOCKED, PENDING) with detailed gate reasons"

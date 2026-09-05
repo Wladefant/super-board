@@ -5,9 +5,9 @@ Location: ~/.veyyon/workflows/github_pr_gate.py
 
 Provides a deterministic status gate helper to replace non-deterministic LLM final gates:
   1. Deterministic CI status rollup verification (all required checks must succeed).
-  2. Independent review approval verification (pinned to PR head commit, no self-approvals).
+  2. Independent GitHub approval or independently-produced automated review artifact
+     verification, pinned to the PR head and base with no self-approvals.
   3. Head/base/contract-bound review reuse:
-     - Reuses verified review when head commit SHA and base are unchanged.
      - Automatically expires/invalidates review if:
          * PR head commit changed (new push).
          * New CI or security check failure occurred after review approval.
@@ -187,12 +187,102 @@ def fetch_required_contexts(repo: str, base_ref: str, timeout_sec: int = 25) -> 
         return None
 
 
-@dataclass
-class ReviewRecord:
-    author: str
-    state: str        # APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED
-    submitted_at: str
-    commit_sha: str
+
+
+REVIEW_ARTIFACT_SCHEMA = "portable-review/v1"
+REVIEW_ARTIFACT_TYPE = "independent_automated_code_review"
+SHA40_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+SOURCE_URI_RE = re.compile(r"^(agent|history)://([A-Za-z0-9][A-Za-z0-9_.:-]*)$")
+
+
+def validate_review_artifact(
+    record: Dict[str, Any],
+    *,
+    repo: str,
+    pr_number: int,
+    head_sha: str,
+    base_sha: str,
+    pr_author: str,
+) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
+    """
+    Validate a trusted-workflow automated review artifact.
+
+    This establishes an explicit, source-backed contract and exact subject bindings. It is
+    advisory local workflow evidence, not a cryptographic identity proof: the workflow
+    supplying the JSON remains responsible for authenticating and retaining the source.
+    """
+    if not isinstance(record, dict):
+        return None, "Review artifact must be a JSON object"
+    if record.get("schema") != REVIEW_ARTIFACT_SCHEMA:
+        return None, f"Review artifact schema must be '{REVIEW_ARTIFACT_SCHEMA}'"
+    if record.get("artifact_type") != REVIEW_ARTIFACT_TYPE:
+        return None, f"Review artifact type must be '{REVIEW_ARTIFACT_TYPE}'"
+    if record.get("repository") != repo or record.get("pull_request") != pr_number:
+        return None, "Review artifact repository or pull request does not match the live PR"
+
+    artifact_head = record.get("head_sha")
+    artifact_base = record.get("base_sha")
+    if not isinstance(artifact_head, str) or not SHA40_RE.fullmatch(artifact_head):
+        return None, "Review artifact head_sha must be a full 40-character hexadecimal SHA"
+    if not isinstance(artifact_base, str) or not SHA40_RE.fullmatch(artifact_base):
+        return None, "Review artifact base_sha must be a full 40-character hexadecimal SHA"
+    if artifact_head.lower() != head_sha.lower():
+        return None, f"Review artifact head {artifact_head[:8]} does not match live head {head_sha[:8]}"
+    if not base_sha or artifact_base.lower() != base_sha.lower():
+        return None, (
+            f"Review artifact base {artifact_base[:8]} does not match live base "
+            f"{base_sha[:8] if base_sha else 'unresolved'}"
+        )
+
+    subject = record.get("subject")
+    reviewer = record.get("reviewer")
+    source = record.get("source")
+    if not isinstance(subject, dict) or subject.get("author_login") != pr_author:
+        return None, "Review artifact subject.author_login must match the live PR author"
+    if not isinstance(reviewer, dict):
+        return None, "Review artifact reviewer must be an object"
+    actor_id = reviewer.get("actor_id")
+    if (
+        not isinstance(actor_id, str)
+        or not actor_id.strip()
+        or reviewer.get("actor_type") != "automation"
+    ):
+        return None, "Review artifact requires a non-empty automation reviewer.actor_id"
+    if actor_id.casefold() == pr_author.casefold():
+        return None, "Review artifact reviewer is the PR author; independent review is required"
+
+    if not isinstance(source, dict) or source.get("kind") != "agent_transcript":
+        return None, "Review artifact source.kind must be 'agent_transcript'"
+    source_uri = source.get("uri")
+    source_match = SOURCE_URI_RE.fullmatch(source_uri) if isinstance(source_uri, str) else None
+    if not source_match:
+        return None, "Review artifact source.uri must be an agent:// or history:// transcript URI"
+    producer_id = source.get("producer_id")
+    if producer_id != actor_id or source_match.group(2) != actor_id:
+        return None, "Review artifact source producer and transcript actor must match reviewer.actor_id"
+    source_digest = source.get("sha256")
+    if not isinstance(source_digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", source_digest):
+        return None, "Review artifact source.sha256 must be a 64-character hexadecimal digest"
+
+    submitted_at = record.get("submitted_at")
+    if not isinstance(submitted_at, str):
+        return None, "Review artifact submitted_at must be an RFC3339 timestamp"
+    try:
+        parsed_time = datetime.datetime.fromisoformat(submitted_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None, "Review artifact submitted_at must be an RFC3339 timestamp"
+    if parsed_time.tzinfo is None:
+        return None, "Review artifact submitted_at must include a timezone"
+
+    outcome = str(record.get("outcome") or "").lower()
+    if outcome not in ("approved", "changes_requested"):
+        return None, "Review artifact outcome must be 'approved' or 'changes_requested'"
+    return {
+        "actor_id": actor_id,
+        "outcome": outcome,
+        "submitted_at": submitted_at,
+        "source_uri": source_uri,
+    }, None
 
 
 @dataclass
@@ -206,7 +296,7 @@ class PRGateEvaluation:
     ci_verdict: str                # SUCCESS, FAILURE, PENDING
     failing_checks: List[str]
     pending_checks: List[str]
-    approval_verdict: str          # APPROVED, UNAPPROVED, SELF_APPROVED_ONLY
+    approval_verdict: str          # APPROVED, AUTOMATED_REVIEW_APPROVED, UNAPPROVED
     approved_by: Optional[str]
     review_reused: bool
     review_invalidated: bool
@@ -290,7 +380,7 @@ def fetch_pr_json(pr_number: int, repo: str = "Bavariance/polysimulator", timeou
 def evaluate_pr_gate(
     pr_data: Dict[str, Any],
     repo: str = "Bavariance/polysimulator",
-    prior_review_record: Optional[Dict[str, Any]] = None,
+    review_artifact: Optional[Dict[str, Any]] = None,
     security_alerts: Optional[List[Dict[str, Any]]] = None,
     expected_head_sha: Optional[str] = None,
     policy: Optional[GateApprovalPolicy] = None,
@@ -303,8 +393,9 @@ def evaluate_pr_gate(
     hard BLOCK, because every QA and review artifact is bound to one exact head SHA.
 
     `policy` decides whether a non-author GitHub APPROVED review is mandatory for this
-    repo/base. Waiving it never waives review: head-bound independent review evidence is
-    still required and self-approval still never counts.
+    repo/base. On a named automated branch, a valid `portable-review/v1` artifact may
+    satisfy independent review without being represented as GitHub approval. The artifact
+    is advisory trusted-workflow evidence, not a cryptographic identity proof.
     """
     now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     base_ref = str(pr_data.get("baseRefName") or (pr_data.get("base") or {}).get("ref") or "")
@@ -442,95 +533,89 @@ def evaluate_pr_gate(
     else:
         ci_verdict = "SUCCESS"
 
-    # 4. Review & Approval Verification (with Head-Binding and Reuse Invalidation)
+    # 4. GitHub approval and independent automated review artifact verification.
     reviews_list = pr_data.get("reviews") or []
-    valid_approvers = []
-    self_approvers = []
-    latest_approval_time = None
-    approval_commit_sha = None
+    valid_github_approvers: List[str] = []
+    self_approvers: List[str] = []
+    changes_requesters: List[str] = []
 
-    for r in reviews_list:
-        r_author = (r.get("author") or {}).get("login", "")
-        r_state = str(r.get("state") or "").upper()
-        r_commit = (r.get("commit") or {}).get("oid") or r.get("commitRefOid") or ""
-        r_time = r.get("submittedAt")
+    for review in reviews_list:
+        review_author = (review.get("author") or {}).get("login", "")
+        review_state = str(review.get("state") or "").upper()
+        review_commit = (
+            (review.get("commit") or {}).get("oid") or review.get("commitRefOid") or ""
+        )
 
-        if r_author == pr_author:
-            # PR author review: whether APPROVED, COMMENTED, or DISMISSED, it can NEVER approve the PR!
-            if r_state in ("APPROVED", "COMMENTED"):
-                self_approvers.append(r_author)
+        if review_author == pr_author:
+            if review_state in ("APPROVED", "COMMENTED"):
+                self_approvers.append(review_author)
             continue
+        if review_commit != head_sha:
+            continue
+        if review_state == "APPROVED":
+            valid_github_approvers.append(review_author)
+        elif review_state == "CHANGES_REQUESTED":
+            changes_requesters.append(review_author)
 
-        if r_state == "APPROVED":
-            # Strict head binding: an approval whose commit OID is unknown or points at any
-            # other commit is NOT evidence for this head and must never count as approval.
-            if r_commit and r_commit == head_sha:
-                valid_approvers.append(r_author)
-                if r_time and (latest_approval_time is None or r_time > latest_approval_time):
-                    latest_approval_time = r_time
-                    approval_commit_sha = r_commit
-    review_reused = False
+    artifact_evidence: Optional[Dict[str, str]] = None
     review_invalidated = False
     invalidation_reason = None
-
-    # Check prior review record for reuse / invalidation
-    if prior_review_record:
-        prior_head = prior_review_record.get("commit_sha")
-        prior_base = prior_review_record.get("base_sha")
-        prior_status = str(prior_review_record.get("status") or "").lower()
-        prior_approved = prior_status in ("approved", "pass", "passed")
-        prior_time = prior_review_record.get("submitted_at")
-        prior_reviewer = prior_review_record.get("approved_by")
-
-        if prior_approved:
-            if prior_reviewer and prior_reviewer == pr_author:
-                self_approvers.append(prior_reviewer)
-                review_invalidated = True
-                invalidation_reason = f"Prior review was a self-approval submitted by PR author ({pr_author}); independent review approval required"
-            elif prior_head != head_sha:
-                review_invalidated = True
-                invalidation_reason = f"PR head changed from {prior_head[:8] if prior_head else 'none'} to {head_sha[:8]}"
-            elif prior_base and prior_base != base_sha:
-                # Base moved under the review: the merge result is no longer what was approved.
+    review_reused = False
+    if review_artifact is not None:
+        artifact_evidence, artifact_error = validate_review_artifact(
+            review_artifact,
+            repo=repo,
+            pr_number=pr_number,
+            head_sha=head_sha,
+            base_sha=base_sha,
+            pr_author=pr_author,
+        )
+        if artifact_error:
+            review_invalidated = True
+            invalidation_reason = artifact_error
+        elif artifact_evidence:
+            artifact_time = artifact_evidence["submitted_at"]
+            if latest_ci_failure_time and latest_ci_failure_time > artifact_time:
                 review_invalidated = True
                 invalidation_reason = (
-                    f"Base changed from {prior_base[:8]} to "
-                    f"{base_sha[:8] if base_sha else 'unresolved'}"
+                    "New CI failure occurred after automated review "
+                    f"({latest_ci_failure_time} > {artifact_time})"
                 )
-            elif prior_base and not base_sha:
-                review_invalidated = True
-                invalidation_reason = (
-                    f"Prior review was bound to base {prior_base[:8]} but the current base SHA "
-                    "could not be resolved, so base-unchanged cannot be proven"
-                )
-            elif latest_ci_failure_time and prior_time and latest_ci_failure_time > prior_time:
-                review_invalidated = True
-                invalidation_reason = f"New CI failure occurred after prior review approval ({latest_ci_failure_time} > {prior_time})"
             elif security_alerts:
-                # Check for active security alerts created after approval
-                new_alerts = [a for a in security_alerts if a.get("created_at", "") > (prior_time or "")]
+                new_alerts = [
+                    alert
+                    for alert in security_alerts
+                    if alert.get("created_at", "") > artifact_time
+                ]
                 if new_alerts:
                     review_invalidated = True
-                    invalidation_reason = f"{len(new_alerts)} new security alert(s) detected after review approval"
-            else:
-                # Reuse verified prior review!
+                    invalidation_reason = (
+                        f"{len(new_alerts)} new security alert(s) detected after automated review"
+                    )
+            if not review_invalidated:
                 review_reused = True
-                if not valid_approvers and prior_reviewer and prior_reviewer != pr_author:
-                    valid_approvers.append(prior_reviewer)
+                if artifact_evidence["outcome"] == "changes_requested":
+                    changes_requesters.append(artifact_evidence["actor_id"])
 
-    if valid_approvers:
+    artifact_approved = bool(
+        artifact_evidence
+        and artifact_evidence["outcome"] == "approved"
+        and not review_invalidated
+    )
+    if valid_github_approvers:
         approval_verdict = "APPROVED"
-        approved_by = valid_approvers[-1]
-    elif self_approvers and not valid_approvers:
+        approved_by = valid_github_approvers[-1]
+    elif artifact_approved:
+        approval_verdict = "AUTOMATED_REVIEW_APPROVED"
+        approved_by = artifact_evidence["actor_id"] if artifact_evidence else None
+    elif self_approvers:
         approval_verdict = "SELF_APPROVED_ONLY"
         approved_by = None
     else:
         approval_verdict = "UNAPPROVED"
         approved_by = None
 
-    # Head-bound independent review evidence, independent of GitHub's approve button. This
-    # is what still has to hold when the GitHub approval requirement is waived.
-    has_head_bound_review_evidence = bool(valid_approvers) and not review_invalidated
+    has_head_bound_review_evidence = bool(valid_github_approvers) or artifact_approved
 
     # 5. Final Gate Verdict
     if ci_verdict == "FAILURE":
@@ -539,16 +624,21 @@ def evaluate_pr_gate(
     elif ci_verdict == "PENDING":
         gate_verdict = "PENDING"
         verdict_reason = f"CI check(s) currently pending/in-progress: {', '.join(pending_checks)}"
+    elif changes_requesters:
+        gate_verdict = "BLOCKED"
+        verdict_reason = (
+            "Changes requested for the current head by independent reviewer(s): "
+            f"{', '.join(changes_requesters)}."
+        )
     elif review_invalidated:
         gate_verdict = "BLOCKED"
-        verdict_reason = f"Prior review invalidated: {invalidation_reason}"
+        verdict_reason = f"Automated review artifact rejected: {invalidation_reason}"
     elif approval_verdict == "SELF_APPROVED_ONLY":
-        # Never policy-dependent: an author approving their own work is not review.
         gate_verdict = "BLOCKED"
         verdict_reason = f"Self-approval rejected (PR author {pr_author}); independent review required."
-    elif policy.require_github_approval and approval_verdict == "UNAPPROVED":
+    elif policy.require_github_approval and not valid_github_approvers:
         gate_verdict = "BLOCKED"
-        verdict_reason = f"No head-bound review approval found for commit {head_sha[:8]}."
+        verdict_reason = f"No GitHub APPROVED review pinned to commit {head_sha[:8]}."
     elif (
         not policy.require_github_approval
         and policy.require_head_bound_review_evidence
@@ -563,15 +653,17 @@ def evaluate_pr_gate(
         gate_verdict = "PASSED"
         if policy.require_github_approval:
             verdict_reason = (
-                f"All required CI checks succeeded and independent review approval verified for head "
-                f"{head_sha[:8]} (approved by {approved_by}{', review reused' if review_reused else ''})."
+                f"All required CI checks succeeded and independent GitHub approval verified for head "
+                f"{head_sha[:8]} (approved by {approved_by})."
             )
         else:
+            evidence_kind = (
+                "GitHub approval" if valid_github_approvers else "automated review artifact"
+            )
             verdict_reason = (
-                f"All required CI checks succeeded and independent head-bound review evidence verified "
-                f"for head {head_sha[:8]} (reviewer {approved_by}"
-                f"{', review reused' if review_reused else ''}); GitHub approval not required for "
-                f"{repo}@{base_ref or 'unknown'}."
+                f"All required CI checks succeeded and independent head/base-bound {evidence_kind} "
+                f"verified for head {head_sha[:8]} (reviewer {approved_by}); GitHub approval not "
+                f"required for {repo}@{base_ref or 'unknown'}."
             )
         if advisory_failing_checks:
             verdict_reason += f" Advisory (non-blocking) failures: {', '.join(advisory_failing_checks)}."
@@ -648,6 +740,14 @@ def main():
         default=None,
         help="Path to a JSON gate policy file whose entries override the built-in table",
     )
+    parser.add_argument(
+        "--review-record",
+        default=None,
+        help=(
+            "Path to a portable-review/v1 independent automated review artifact. "
+            "Trusted workflow evidence only; not a cryptographic identity assertion."
+        ),
+    )
     parser.add_argument("--json", action="store_true", help="Output evaluation as JSON")
     args = parser.parse_args()
 
@@ -666,10 +766,15 @@ def main():
         pr_data = fetch_pr_json(pr_number=pr_number, repo=repo)
         base_ref = str(pr_data.get("baseRefName") or "")
         policy = resolve_gate_policy(repo, base_ref, config_path=args.policy_config)
+        review_artifact = None
+        if args.review_record:
+            with open(args.review_record, "r", encoding="utf-8") as review_file:
+                review_artifact = json.load(review_file)
         eval_result = evaluate_pr_gate(
             pr_data=pr_data,
             repo=repo,
             expected_head_sha=args.head_sha,
+            review_artifact=review_artifact,
             policy=policy,
             native_required_contexts=fetch_required_contexts(repo, base_ref) if base_ref else None,
         )

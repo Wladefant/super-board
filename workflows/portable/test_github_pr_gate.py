@@ -31,6 +31,7 @@ import json
 import os
 import shutil
 import sys
+import subprocess
 import tempfile
 import unittest
 
@@ -89,6 +90,46 @@ class TestGitHubPRGate(unittest.TestCase):
                 }
             ],
         }
+
+    def make_review_artifact(
+        self,
+        *,
+        head_sha=None,
+        base_sha=None,
+        reviewer="independent-review-agent",
+        outcome="approved",
+        repository="Bavariance/polysimulator",
+        pull_request=4545,
+        author="feature-developer",
+        source_uri=None,
+    ):
+        source_uri = source_uri or f"agent://{reviewer}"
+        return {
+            "schema": "portable-review/v1",
+            "artifact_type": "independent_automated_code_review",
+            "repository": repository,
+            "pull_request": pull_request,
+            "head_sha": head_sha or self.head_sha,
+            "base_sha": base_sha or self.base_sha,
+            "outcome": outcome,
+            "submitted_at": "2026-09-05T08:15:00Z",
+            "subject": {"author_login": author},
+            "reviewer": {"actor_id": reviewer, "actor_type": "automation"},
+            "source": {
+                "kind": "agent_transcript",
+                "uri": source_uri,
+                "producer_id": reviewer,
+                "sha256": "a" * 64,
+            },
+        }
+
+    def waived_policy(self):
+        return GateApprovalPolicy(
+            repo="Bavariance/polysimulator",
+            base_ref="staging",
+            require_github_approval=False,
+            require_head_bound_review_evidence=True,
+        )
 
     # -------------------------------------------------------------------------
     # TEST 1: Valid Passing PR
@@ -157,7 +198,7 @@ class TestGitHubPRGate(unittest.TestCase):
         result = evaluate_pr_gate(pr)
         self.assertEqual(result.gate_verdict, "BLOCKED")
         self.assertEqual(result.approval_verdict, "UNAPPROVED")
-        self.assertIn("no head-bound review approval", result.verdict_reason.lower())
+        self.assertIn("no github approved review", result.verdict_reason.lower())
         print(f"  [PASS] Unapproved PR correctly blocked: {result.verdict_reason}")
 
     # -------------------------------------------------------------------------
@@ -192,41 +233,32 @@ class TestGitHubPRGate(unittest.TestCase):
         self.assertIn("self-approval", result.verdict_reason.lower())
         print(f"  [PASS] COMMENTED self-review correctly blocked: {result.verdict_reason}")
 
-        # Author in prior_review_record with status "approved" or "commented" is also blocked
-        prior_self_review = {
-            "status": "approved",
-            "commit_sha": self.head_sha,
-            "submitted_at": "2026-09-05T08:15:00Z",
-            "approved_by": "feature-developer",
-        }
+        # A source-backed artifact produced by the PR author is also blocked.
+        prior_self_review = self.make_review_artifact(reviewer="feature-developer")
         pr_no_reviews = copy.deepcopy(self.mock_pr)
         pr_no_reviews["reviews"] = []
-        result2 = evaluate_pr_gate(pr_no_reviews, prior_review_record=prior_self_review)
+        result2 = evaluate_pr_gate(pr_no_reviews, review_artifact=prior_self_review)
         self.assertEqual(result2.gate_verdict, "BLOCKED")
         self.assertTrue(result2.review_invalidated)
-        self.assertIn("self-approval", result2.invalidation_reason.lower())
+        self.assertIn("pr author", result2.invalidation_reason.lower())
         print(f"  [PASS] Prior self-review record correctly invalidated: {result2.invalidation_reason}")
     # -------------------------------------------------------------------------
     # TEST 7: Head Change Invalidates Prior Review
     # -------------------------------------------------------------------------
     def test_head_change_invalidates_review(self):
         print("\n--- TEST 7: Head Change Invalidates Review ---")
-        # PR has new head commit 'new_head_123456789'
+        # PR has a new head while the artifact remains pinned to the old head.
         pr = copy.deepcopy(self.mock_pr)
-        pr["headRefOid"] = "new_head_123456789"
-        pr["reviews"] = []  # No review on the new head
+        pr["headRefOid"] = "b" * 40
+        pr["reviews"] = []
+        prior_review = self.make_review_artifact()
 
-        prior_review = {
-            "status": "approved",
-            "commit_sha": self.head_sha,
-            "submitted_at": "2026-09-05T08:15:00Z",
-            "approved_by": "independent-reviewer",
-        }
-
-        result = evaluate_pr_gate(pr, prior_review_record=prior_review)
+        result = evaluate_pr_gate(
+            pr, review_artifact=prior_review, policy=self.waived_policy()
+        )
         self.assertEqual(result.gate_verdict, "BLOCKED")
         self.assertTrue(result.review_invalidated)
-        self.assertIn("head changed", result.invalidation_reason.lower())
+        self.assertIn("does not match live head", result.invalidation_reason.lower())
         print(f"  [PASS] Head change correctly invalidated review: {result.invalidation_reason}")
 
     # -------------------------------------------------------------------------
@@ -240,17 +272,14 @@ class TestGitHubPRGate(unittest.TestCase):
         pr["statusCheckRollup"][0]["conclusion"] = "FAILURE"
         pr["statusCheckRollup"][0]["completedAt"] = "2026-09-05T08:20:00Z"
 
-        prior_review = {
-            "status": "approved",
-            "commit_sha": self.head_sha,
-            "submitted_at": "2026-09-05T08:15:00Z",
-            "approved_by": "independent-reviewer",
-        }
+        prior_review = self.make_review_artifact()
 
-        result = evaluate_pr_gate(pr, prior_review_record=prior_review)
+        result = evaluate_pr_gate(
+            pr, review_artifact=prior_review, policy=self.waived_policy()
+        )
         self.assertEqual(result.gate_verdict, "BLOCKED")
         self.assertTrue(result.review_invalidated)
-        self.assertIn("new ci failure occurred after prior review", result.invalidation_reason.lower())
+        self.assertIn("new ci failure occurred after automated review", result.invalidation_reason.lower())
         print(f"  [PASS] Post-review CI failure invalidated approval: {result.invalidation_reason}")
 
     # -------------------------------------------------------------------------
@@ -259,16 +288,16 @@ class TestGitHubPRGate(unittest.TestCase):
     def test_new_security_alert_invalidates_review(self):
         print("\n--- TEST 9: New Security Alert Invalidates Review ---")
         pr = copy.deepcopy(self.mock_pr)
-        prior_review = {
-            "status": "approved",
-            "commit_sha": self.head_sha,
-            "submitted_at": "2026-09-05T08:15:00Z",
-            "approved_by": "independent-reviewer",
-        }
+        prior_review = self.make_review_artifact()
         # Security alert flagged at 08:30:00Z
         alerts = [{"id": "sec-001", "created_at": "2026-09-05T08:30:00Z", "severity": "high"}]
 
-        result = evaluate_pr_gate(pr, prior_review_record=prior_review, security_alerts=alerts)
+        result = evaluate_pr_gate(
+            pr,
+            review_artifact=prior_review,
+            security_alerts=alerts,
+            policy=self.waived_policy(),
+        )
         self.assertEqual(result.gate_verdict, "BLOCKED")
         self.assertTrue(result.review_invalidated)
         self.assertIn("security alert", result.invalidation_reason.lower())
@@ -283,19 +312,16 @@ class TestGitHubPRGate(unittest.TestCase):
         pr = copy.deepcopy(self.mock_pr)
         pr["reviews"] = []
 
-        prior_review = {
-            "status": "approved",
-            "commit_sha": self.head_sha,
-            "submitted_at": "2026-09-05T08:15:00Z",
-            "approved_by": "independent-reviewer",
-        }
+        prior_review = self.make_review_artifact()
 
-        result = evaluate_pr_gate(pr, prior_review_record=prior_review)
+        result = evaluate_pr_gate(
+            pr, review_artifact=prior_review, policy=self.waived_policy()
+        )
         self.assertEqual(result.gate_verdict, "PASSED")
         self.assertTrue(result.review_reused)
         self.assertFalse(result.review_invalidated)
-        self.assertEqual(result.approved_by, "independent-reviewer")
-        self.assertIn("review reused", result.verdict_reason.lower())
+        self.assertEqual(result.approved_by, "independent-review-agent")
+        self.assertIn("automated review artifact", result.verdict_reason.lower())
         print(f"  [PASS] Review successfully reused: {result.verdict_reason}")
 
     # -------------------------------------------------------------------------
@@ -345,32 +371,32 @@ class TestGitHubPRGate(unittest.TestCase):
         print("\n--- TEST 14: Base Change Invalidates Prior Approval ---")
         pr = copy.deepcopy(self.mock_pr)
         pr["reviews"] = []
-        prior_review = {
-            "status": "approved",
-            "commit_sha": self.head_sha,
-            "base_sha": "9" * 40,
-            "submitted_at": "2026-09-05T08:15:00Z",
-            "approved_by": "independent-reviewer",
-        }
+        prior_review = self.make_review_artifact(base_sha="9" * 40)
 
-        result = evaluate_pr_gate(pr, prior_review_record=prior_review)
+        result = evaluate_pr_gate(
+            pr, review_artifact=prior_review, policy=self.waived_policy()
+        )
         self.assertEqual(result.gate_verdict, "BLOCKED")
         self.assertTrue(result.review_invalidated)
         self.assertFalse(result.review_reused)
-        self.assertIn("base changed", (result.invalidation_reason or "").lower())
+        self.assertIn("does not match live base", (result.invalidation_reason or "").lower())
         print(f"  [PASS] Base movement invalidated review: {result.invalidation_reason}")
 
         # Unresolvable base cannot prove "base unchanged" for a base-bound review.
         pr_no_base = copy.deepcopy(pr)
         del pr_no_base["baseRefOid"]
-        unresolved = evaluate_pr_gate(pr_no_base, prior_review_record=prior_review)
+        unresolved = evaluate_pr_gate(
+            pr_no_base, review_artifact=prior_review, policy=self.waived_policy()
+        )
         self.assertEqual(unresolved.gate_verdict, "BLOCKED")
         self.assertTrue(unresolved.review_invalidated)
         print("  [PASS] Unresolved base blocks base-bound review reuse")
 
         # Matching base still reuses.
-        prior_ok = dict(prior_review, base_sha=self.base_sha)
-        reused = evaluate_pr_gate(pr, prior_review_record=prior_ok)
+        prior_ok = self.make_review_artifact()
+        reused = evaluate_pr_gate(
+            pr, review_artifact=prior_ok, policy=self.waived_policy()
+        )
         self.assertEqual(reused.gate_verdict, "PASSED")
         self.assertTrue(reused.review_reused)
         print("  [PASS] Unchanged base reuses review")
@@ -518,19 +544,60 @@ class TestGitHubPRGate(unittest.TestCase):
         self.assertEqual(self_only.approval_verdict, "SELF_APPROVED_ONLY")
         print("  [PASS] Self-approval rejected even with approval waived")
 
-        # Head-bound independent review evidence clears the gate.
-        ok = copy.deepcopy(self.mock_pr)
-        ok["baseRefName"] = "staging"
-        passed = evaluate_pr_gate(ok, policy=waived)
+        # A source-backed artifact clears the waived gate without pretending to be a
+        # GitHub APPROVED event.
+        ok = copy.deepcopy(bare)
+        artifact = self.make_review_artifact()
+        passed = evaluate_pr_gate(ok, policy=waived, review_artifact=artifact)
         self.assertEqual(passed.gate_verdict, "PASSED")
-        self.assertIn("GitHub approval not required", passed.verdict_reason)
-        print("  [PASS] Head-bound independent review evidence clears the waived gate")
+        self.assertEqual(passed.approval_verdict, "AUTOMATED_REVIEW_APPROVED")
+        self.assertIn("automated review artifact", passed.verdict_reason)
+        print("  [PASS] Source-backed automated review artifact clears the waived gate")
 
         # The same PR with no reviews under the strict default is blocked for approval.
         strict = evaluate_pr_gate(bare, policy=GateApprovalPolicy())
         self.assertEqual(strict.gate_verdict, "BLOCKED")
         self.assertTrue(strict.github_approval_required)
         print("  [PASS] Strict default unchanged")
+
+    def test_review_artifact_rejects_malformed_stale_author_and_changes_requested(self):
+        pr = copy.deepcopy(self.mock_pr)
+        pr["reviews"] = []
+        pr["baseRefName"] = "staging"
+        waived = self.waived_policy()
+
+        invalid_records = [
+            {"status": "approved", "approved_by": "somebody"},
+            dict(self.make_review_artifact(), source=None),
+            self.make_review_artifact(head_sha="b" * 40),
+            self.make_review_artifact(base_sha="b" * 40),
+            self.make_review_artifact(reviewer="feature-developer"),
+            self.make_review_artifact(source_uri="https://example.invalid/review"),
+        ]
+        for record in invalid_records:
+            with self.subTest(record=record):
+                result = evaluate_pr_gate(pr, policy=waived, review_artifact=record)
+                self.assertEqual(result.gate_verdict, "BLOCKED")
+                self.assertTrue(result.review_invalidated)
+
+        changes_requested = self.make_review_artifact(outcome="changes_requested")
+        result = evaluate_pr_gate(pr, policy=waived, review_artifact=changes_requested)
+        self.assertEqual(result.gate_verdict, "BLOCKED")
+        self.assertIn("changes requested", result.verdict_reason.lower())
+
+        github_changes = copy.deepcopy(pr)
+        github_changes["reviews"] = [
+            {
+                "author": {"login": "independent-reviewer"},
+                "state": "CHANGES_REQUESTED",
+                "submittedAt": "2026-09-05T08:15:00Z",
+                "commit": {"oid": self.head_sha},
+            }
+        ]
+        result = evaluate_pr_gate(github_changes, policy=waived)
+        self.assertEqual(result.gate_verdict, "BLOCKED")
+        self.assertIn("changes requested", result.verdict_reason.lower())
+        self.assertNotEqual(result.approval_verdict, "APPROVED")
 
     # -------------------------------------------------------------------------
     # TEST 19: Advisory vs blocking checks; absent native data never drops CI
@@ -585,6 +652,114 @@ class TestGitHubPRGate(unittest.TestCase):
         self.assertEqual(required.ci_verdict, "FAILURE")
         self.assertEqual(required.gate_verdict, "BLOCKED")
         print("  [PASS] Native required failure still blocks")
+
+    def test_executable_cli_review_record_boundary(self):
+        """Exercise --review-record through a real process and a labelled gh fixture."""
+        head_sha = "1" * 40
+        base_sha = "2" * 40
+        fixture_pr = {
+            "number": 74,
+            "state": "OPEN",
+            "isDraft": False,
+            "headRefOid": head_sha,
+            "baseRefName": "main",
+            "author": {"login": "fixture-change-author"},
+            "statusCheckRollup": [
+                {"name": "fixture-ci", "status": "COMPLETED", "conclusion": "SUCCESS"}
+            ],
+            "reviews": [],
+        }
+        script_path = os.path.abspath(os.path.join(SCRIPT_DIR, "github_pr_gate.py"))
+
+        with tempfile.TemporaryDirectory(prefix="gate_cli_fixture_") as tmp_dir:
+            pr_path = os.path.join(tmp_dir, "pr.json")
+            with open(pr_path, "w", encoding="utf-8") as fixture_file:
+                json.dump(fixture_pr, fixture_file)
+
+            gh_fixture = os.path.join(tmp_dir, "gh_fixture.py")
+            with open(gh_fixture, "w", encoding="utf-8") as fixture_file:
+                fixture_file.write(
+                    "import json, os, sys\n"
+                    "args = sys.argv[1:]\n"
+                    "if args[:2] == ['pr', 'view']:\n"
+                    "    print(open(os.environ['GATE_FIXTURE_PR'], encoding='utf-8').read())\n"
+                    "    raise SystemExit(0)\n"
+                    "if args and args[0] == 'api' and '/pulls/74' in args[1]:\n"
+                    "    print(os.environ['GATE_FIXTURE_BASE'])\n"
+                    "    raise SystemExit(0)\n"
+                    "raise SystemExit(1)\n"
+                )
+
+            if sys.platform == "win32":
+                gh_path = os.path.join(tmp_dir, "gh.cmd")
+                with open(gh_path, "w", encoding="utf-8") as gh_file:
+                    gh_file.write(
+                        f'@echo off\r\n"{sys.executable}" "{gh_fixture}" %*\r\n'
+                    )
+            else:
+                gh_path = os.path.join(tmp_dir, "gh")
+                with open(gh_path, "w", encoding="utf-8") as gh_file:
+                    gh_file.write(f'#!/bin/sh\nexec "{sys.executable}" "{gh_fixture}" "$@"\n')
+                os.chmod(gh_path, 0o755)
+
+            env = os.environ.copy()
+            env["PATH"] = tmp_dir + os.pathsep + env.get("PATH", "")
+            env["GATE_FIXTURE_PR"] = pr_path
+            env["GATE_FIXTURE_BASE"] = base_sha
+            record_path = os.path.join(tmp_dir, "review.json")
+
+            def run_cli(record):
+                with open(record_path, "w", encoding="utf-8") as record_file:
+                    json.dump(record, record_file)
+                return subprocess.run(
+                    [
+                        sys.executable,
+                        script_path,
+                        "--pr",
+                        "https://github.com/Wladefant/super-board/pull/74",
+                        "--head-sha",
+                        head_sha,
+                        "--review-record",
+                        record_path,
+                        "--json",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    timeout=20,
+                )
+
+            valid = self.make_review_artifact(
+                head_sha=head_sha,
+                base_sha=base_sha,
+                repository="Wladefant/super-board",
+                pull_request=74,
+                author="fixture-change-author",
+                reviewer="fixture-independent-reviewer",
+            )
+            completed = run_cli(valid)
+            self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+            output = json.loads(completed.stdout)
+            self.assertEqual(output["approval_verdict"], "AUTOMATED_REVIEW_APPROVED")
+
+            invalid_records = [
+                {"status": "approved", "approved_by": "fabricated"},
+                dict(valid, source=None),
+                dict(valid, head_sha="3" * 40),
+                dict(valid, base_sha="3" * 40),
+                self.make_review_artifact(
+                    head_sha=head_sha,
+                    base_sha=base_sha,
+                    repository="Wladefant/super-board",
+                    pull_request=74,
+                    author="fixture-change-author",
+                    reviewer="fixture-change-author",
+                ),
+            ]
+            for record in invalid_records:
+                rejected = run_cli(record)
+                self.assertEqual(rejected.returncode, 2, rejected.stderr or rejected.stdout)
+                self.assertEqual(json.loads(rejected.stdout)["gate_verdict"], "BLOCKED")
 
     # -------------------------------------------------------------------------
     # TEST 11: Real Live gh CLI Invocation Smoke
