@@ -570,9 +570,13 @@ class SuperboardExecutionAdapter:
         expected_sha = target_sha or req_head
 
         recommendation = dispatch.recommendation if isinstance(dispatch.recommendation, dict) else {}
+        req_task_type = getattr(req, "task_type", None) or (
+            req.get("task_type") if isinstance(req, dict) else None
+        )
         worker_request = {
             "request_id": req_id,
             "stage": stage,
+            "task_type": req_task_type,
             "head_sha": expected_sha,
             "model": recommendation.get("selected_model"),
             "agent_role": recommendation.get("agent_role"),
@@ -617,18 +621,33 @@ class SuperboardExecutionAdapter:
                 command=command,
             )
 
-        # The backend observes the head it actually ran against; disagreement means the
-        # evidence does not describe the commit under evaluation.
-        if expected_sha and observed_sha and expected_sha != observed_sha:
-            return self._blocked_result(
-                stage,
-                (
-                    f"Worker backend executed against head {observed_sha} but stage '{stage}' "
-                    f"was dispatched for {expected_sha}; evidence is not head-bound"
-                ),
-                head_sha=observed_sha,
-                command=command,
-            )
+        # Head expectations differ by stage. A build produces work, so its observed head is
+        # necessarily a NEW commit and becomes the authoritative head. QA and review must
+        # verify the exact commit they were dispatched for, so any movement there voids the
+        # evidence.
+        if stage in ("qa", "review"):
+            if expected_sha and observed_sha and expected_sha != observed_sha:
+                return self._blocked_result(
+                    stage,
+                    (
+                        f"Worker backend executed against head {observed_sha} but stage '{stage}' "
+                        f"was dispatched for {expected_sha}; evidence is not head-bound"
+                    ),
+                    head_sha=observed_sha,
+                    command=command,
+                )
+        elif stage == "build":
+            # A build that moved nothing and produced nothing has not proved any work.
+            if expected_sha and observed_sha == expected_sha and not artifacts:
+                return self._blocked_result(
+                    stage,
+                    (
+                        f"Build left head at {expected_sha} and produced no artifacts; "
+                        "no work was performed"
+                    ),
+                    head_sha=observed_sha,
+                    command=command,
+                )
 
         if not evidence:
             return self._blocked_result(
@@ -878,8 +897,15 @@ class SuperboardExecutionAdapter:
                 gate_result,
             )
 
-        # Head binding: evidence must describe the commit the ledger is tracking.
-        if req_head and worker_res.head_sha and req_head != worker_res.head_sha:
+        # Head binding applies to the verification stages. QA and review must describe the
+        # exact commit the ledger tracks; a build legitimately produces a new head, which is
+        # recorded below as the request's new authoritative head.
+        if (
+            stage in ("qa", "review")
+            and req_head
+            and worker_res.head_sha
+            and req_head != worker_res.head_sha
+        ):
             gate_result["head_bound"] = False
             gate_result["advance_refused"] = "head mismatch"
             return (

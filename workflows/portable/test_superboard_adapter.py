@@ -45,12 +45,21 @@ class StubWorkerBackend:
     test explicitly supplies it, so bug-closure gates are exercised honestly.
     """
 
-    def __init__(self, head_sha, ok=True, reproduction=None, blocked_reason=None, evidence=None):
+    def __init__(
+        self,
+        head_sha,
+        ok=True,
+        reproduction=None,
+        blocked_reason=None,
+        evidence=None,
+        artifacts=("stub-run.log",),
+    ):
         self.head_sha = head_sha
         self.ok = ok
         self.reproduction = reproduction
         self.blocked_reason = blocked_reason
         self.extra_evidence = evidence or {}
+        self.artifacts = list(artifacts)
         self.calls = []
 
     def execute(self, request):
@@ -73,7 +82,7 @@ class StubWorkerBackend:
             "command": ["stub-backend", f"--stage={stage}"],
             "head_sha": self.head_sha,
             "evidence": evidence,
-            "artifacts": [],
+            "artifacts": self.artifacts,
             "blocked_reason": self.blocked_reason,
             "backend_name": "stub",
         }
@@ -210,23 +219,6 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
         self.assertFalse(res.worker_result.is_fixture)
         self.assertIsNotNone(res.worker_result.blocked_reason)
         self.assertIn("No worker backend configured", res.worker_result.blocked_reason)
-        self.assertEqual(self.ledger.get_request(req_id)["state"], "implementation")
-
-    def test_01d_backend_head_mismatch_blocks_advancement(self):
-        """Evidence bound to another commit is not evidence for this head."""
-        req_id = "req-feature-auth-token-01d"
-        self._add_pipeline_request(req_id)
-
-        adapter = SuperboardExecutionAdapter(
-            state_dir=self.state_dir,
-            worker_backend=StubWorkerBackend(head_sha="f" * 40),
-            notify_telegram=True,
-            telegram_dry_run=True,
-        )
-
-        res = adapter.run_step(request_id=req_id)
-        self.assertIsNotNone(res.worker_result.blocked_reason)
-        self.assertIn("not head-bound", res.worker_result.blocked_reason)
         self.assertEqual(self.ledger.get_request(req_id)["state"], "implementation")
 
     def test_02_preflight_blocker_halts_dispatch(self):
@@ -633,6 +625,97 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
         )
         self.assertFalse(ok)
         self.assertIn("full 40-character", reason)
+
+    def test_10_build_producing_new_commit_advances_and_rebinds_head(self):
+        """
+        A build worker commits, so its observed head is necessarily a new SHA. That must
+        advance the request and become the authoritative head; only QA and review require
+        the head to stay put.
+        """
+        req_id = "req-build-newhead-10"
+        self._add_pipeline_request(req_id)
+
+        built_sha = "3a1cde039a75a9d35093d58cff9a437f442b17a5"
+        adapter = SuperboardExecutionAdapter(
+            state_dir=self.state_dir,
+            worker_backend=StubWorkerBackend(head_sha=built_sha),
+            notify_telegram=True,
+            telegram_dry_run=True,
+        )
+
+        res = adapter.run_step(request_id=req_id)
+        self.assertIsNone(res.worker_result.blocked_reason)
+        self.assertEqual(res.status, "advanced")
+        self.assertEqual(res.stage, "build")
+
+        # The new commit is now the request's authoritative head.
+        advanced = self.ledger.get_request(req_id)
+        self.assertEqual(advanced["state"], "QA")
+        self.assertEqual(advanced["head"], built_sha)
+
+        # QA against a head other than the one recorded must not advance.
+        qa_moved = SuperboardExecutionAdapter(
+            state_dir=self.state_dir,
+            worker_backend=StubWorkerBackend(head_sha="e" * 40),
+            notify_telegram=True,
+            telegram_dry_run=True,
+        ).run_step(request_id=req_id)
+        self.assertIsNotNone(qa_moved.worker_result.blocked_reason)
+        self.assertIn("not head-bound", qa_moved.worker_result.blocked_reason)
+        self.assertEqual(self.ledger.get_request(req_id)["state"], "QA")
+
+        # QA on the recorded head proceeds.
+        qa_ok = SuperboardExecutionAdapter(
+            state_dir=self.state_dir,
+            worker_backend=StubWorkerBackend(head_sha=built_sha),
+            notify_telegram=True,
+            telegram_dry_run=True,
+        ).run_step(request_id=req_id)
+        self.assertEqual(qa_ok.stage, "qa")
+        self.assertEqual(qa_ok.status, "advanced")
+
+    def test_11_build_without_commit_or_artifact_is_blocked(self):
+        """A build that moved nothing and produced nothing has proved no work."""
+        req_id = "req-build-noop-11"
+        self._add_pipeline_request(req_id)
+
+        res = SuperboardExecutionAdapter(
+            state_dir=self.state_dir,
+            worker_backend=StubWorkerBackend(head_sha=self.HEAD_SHA, artifacts=()),
+            notify_telegram=True,
+            telegram_dry_run=True,
+        ).run_step(request_id=req_id)
+
+        self.assertIsNotNone(res.worker_result.blocked_reason)
+        self.assertIn("no artifacts", res.worker_result.blocked_reason)
+        self.assertEqual(self.ledger.get_request(req_id)["state"], "implementation")
+
+    def test_12_worker_request_carries_task_type(self):
+        """The backend must not have to infer bug-ness from the request id."""
+        req_id = "req-typed-dispatch-12"
+        self.ledger.add_request(
+            req_id=req_id,
+            prompt="Refresh endpoint returns 500 on expired tokens",
+            session="test-session-12",
+            project="SuperboardCore",
+            acceptance_criteria=[{"criterion": "500 no longer raised", "status": "pending", "evidence": ""}],
+            owner="BugLane",
+            state="implementation",
+            task_type="local_doc",
+            head=self.HEAD_SHA,
+        )
+
+        backend = StubWorkerBackend(head_sha="a" * 40)
+        SuperboardExecutionAdapter(
+            state_dir=self.state_dir,
+            worker_backend=backend,
+            notify_telegram=True,
+            telegram_dry_run=True,
+        ).run_step(request_id=req_id)
+
+        self.assertTrue(backend.calls)
+        self.assertIn("task_type", backend.calls[0])
+        self.assertEqual(backend.calls[0]["task_type"], "local_doc")
 
     def test_08_coordinator_risk_classification_is_not_downgraded(self):
         """
