@@ -164,6 +164,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
         python: ["3.12"]
+    env:
+      TELEGRAM_NOTIFY_CHAT_ID: "1247617658"
+      TELEGRAM_BOT_TOKEN: "dummy_token_for_dry_run"
 
     steps:
       - uses: actions/checkout@v4
