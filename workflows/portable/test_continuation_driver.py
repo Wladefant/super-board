@@ -20,6 +20,7 @@ import json
 import os
 import shutil
 import sys
+import subprocess
 import tempfile
 import unittest
 
@@ -103,6 +104,29 @@ class ScriptedAdapter:
             return FakeResult("advanced", f"nothing scripted for state {state}",
                               boundaries=self.boundaries)
         next_state, status = entry
+        if next_state in ("review", "awaiting authorization"):
+            stage_name = "qa" if next_state == "review" else "review"
+            current = self.ledger.get_request(request_id)
+            for criterion in current.get("acceptance_criteria", []):
+                self.ledger.update_request(
+                    request_id,
+                    criterion_update={
+                        "id": criterion["id"],
+                        "status": "verified",
+                        "evidence": f"{stage_name} verified scripted driver contract",
+                    },
+                    actor="ScriptedAdapter",
+                )
+            self.ledger.update_request(
+                request_id,
+                add_evidence={
+                    "type": f"{stage_name}_verification",
+                    "summary": f"{stage_name} stage passed",
+                    "details": f"scripted adapter verified {stage_name} on {current['head']}",
+                    "head": current["head"],
+                },
+                actor="ScriptedAdapter",
+            )
         self.ledger.update_request(
             request_id,
             state=next_state,
@@ -123,7 +147,7 @@ class _Fixture(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _add(self, req_id, state="implementation", head=None, task_type="local_doc"):
+    def _add(self, req_id, state="implementation", head="a" * 40, task_type="local_doc"):
         return self.ledger.add_request(
             req_id=req_id,
             prompt=f"prompt for {req_id}",
@@ -275,8 +299,8 @@ class TestStopsForTheRightReasons(_Fixture):
     def test_request_already_at_the_merge_gate_is_never_dispatched(self):
         """A driver must not spend a worker on something waiting for a human."""
         self._add("req-waiting", state="review")
-        self.ledger.update_request("req-waiting", state="awaiting authorization",
-                                   actor="test")
+        setup_adapter = self._adapter()
+        setup_adapter.run_step(request_id="req-waiting")
         adapter = self._adapter()
         outcome = self._driver(adapter, ["req-waiting"]).run()
         self.assertEqual(adapter.calls, [])
@@ -285,8 +309,9 @@ class TestStopsForTheRightReasons(_Fixture):
 
     def test_done_request_is_not_dispatched(self):
         self._add("req-done", state="implementation")
-        for nxt in ("QA", "review", "awaiting authorization"):
-            self.ledger.update_request("req-done", state=nxt, actor="test")
+        setup_adapter = self._adapter()
+        for _ in range(3):
+            setup_adapter.run_step(request_id="req-done")
         adapter = self._adapter()
         outcome = self._driver(adapter, ["req-done"]).run()
         self.assertEqual(adapter.calls, [])
@@ -312,6 +337,22 @@ class TestStopsForTheRightReasons(_Fixture):
         outcome = self._driver(adapter, ["req-blocked"]).run()
         self.assertEqual(outcome.parked[0]["reason_code"], "blocked")
         self.assertIn("staging unreachable", outcome.parked[0]["reason"])
+        with open(os.path.join(self.tmp, JOURNAL_FILENAME), encoding="utf-8") as fh:
+            journal = json.load(fh)
+        self.assertNotIn(
+            "req-blocked",
+            journal["completed_stages"],
+            "a blocker write must not masquerade as completed stage work",
+        )
+        attempts = journal["stage_attempts"]["req-blocked"]
+        self.assertEqual(attempts[-1]["outcome"], "blocked")
+
+        # Restart remains idempotent while parked; the failed attempt is not
+        # dispatched again unless an operator explicitly unparks it.
+        restarted_adapter = self._adapter()
+        restarted = self._driver(restarted_adapter, ["req-blocked"]).run()
+        self.assertEqual(restarted.steps_executed, 0)
+        self.assertEqual(restarted_adapter.calls, [])
 
     def test_one_request_parking_does_not_stop_the_other(self):
         self._add("req-ok")
@@ -693,6 +734,130 @@ class TestSignalHandling(_Fixture):
         self._driver(self._adapter(), ["req-sig"],
                     install_signal_handlers=True, max_steps=1).run()
         self.assertIs(signal_mod.getsignal(signal_mod.SIGINT), before)
+
+
+class TestInstalledDriverCliRepoRoot(_Fixture):
+    """Exercise the documented CLI boundary, including a real child worker."""
+
+    def _make_repo(self) -> tuple[str, str]:
+        repo = os.path.join(self.tmp, "repo")
+        os.makedirs(repo)
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "t@localhost"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True)
+        with open(os.path.join(repo, "seed.txt"), "w", encoding="utf-8") as fh:
+            fh.write("seed\n")
+        subprocess.run(["git", "add", "seed.txt"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=repo, check=True)
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        return repo, head
+
+    def _worker_config(self, sentinel: str) -> str:
+        worker = os.path.join(self.tmp, "cli_worker.py")
+        with open(worker, "w", encoding="utf-8") as fh:
+            fh.write(
+                "import json, pathlib, subprocess, sys\n"
+                "request_id, stage, repo_root, sentinel = sys.argv[1:5]\n"
+                "pathlib.Path(sentinel).write_text('executed', encoding='utf-8')\n"
+                "head = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=repo_root, "
+                "check=True, capture_output=True, text=True).stdout.strip()\n"
+                "result = {'stage': stage, 'request_id': request_id, 'head_sha': head, "
+                "'verdict': 'pass', 'summary': 'CLI worker verified exact HEAD', "
+                "'checks': [{'command': ['git', 'rev-parse', 'HEAD'], 'exit_code': 0, "
+                "'observed': head}], 'artifacts': []}\n"
+                "print(json.dumps({'structured_output': result}))\n"
+            )
+        config = os.path.join(self.tmp, "worker_config.json")
+        with open(config, "w", encoding="utf-8") as fh:
+            json.dump({
+                "default_backend": "scripted-cli",
+                "backends": {
+                    "scripted-cli": {
+                        "argv": [
+                            sys.executable, worker, "{request_id}", "{stage}",
+                            "{repo_root}", sentinel,
+                        ],
+                        "result_source": "stdout_json",
+                        "stdout_result_keys": ["structured_output"],
+                        "schema_mode": "none",
+                        "strict_model": False,
+                    },
+                },
+            }, fh)
+        return config
+
+    def _run_cli(self, request_id: str, repo_root: str, config: str):
+        return subprocess.run(
+            [
+                sys.executable, os.path.join(SCRIPT_DIR, "continuation_driver.py"),
+                "--request-id", request_id,
+                "--state-dir", self.tmp,
+                "--repo-root", repo_root,
+                "--worker-config", config,
+                "--backend", "scripted-cli",
+                "--max-steps", "1",
+                "--json",
+            ],
+            cwd=SCRIPT_DIR,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            shell=False,
+        )
+
+    def test_cli_runs_worker_in_explicit_real_repository(self):
+        repo, head = self._make_repo()
+        sentinel = os.path.join(self.tmp, "legitimate-worker-ran")
+        config = self._worker_config(sentinel)
+        self._add("req-cli-valid", state="QA", head=head)
+
+        proc = self._run_cli("req-cli-valid", repo, config)
+        self.assertEqual(proc.returncode, 0, proc.stderr or proc.stdout)
+        result = json.loads(proc.stdout)
+        self.assertEqual(result["steps_executed"], 1)
+        self.assertTrue(os.path.exists(sentinel))
+        self.assertEqual(self.ledger.get_request("req-cli-valid")["state"], "review")
+
+    def test_cli_requires_explicit_repo_root(self):
+        proc = subprocess.run(
+            [
+                sys.executable, os.path.join(SCRIPT_DIR, "continuation_driver.py"),
+                "--request-id", "req-no-root",
+                "--state-dir", self.tmp,
+            ],
+            cwd=SCRIPT_DIR,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            shell=False,
+        )
+        self.assertEqual(proc.returncode, 64)
+        self.assertIn("--repo-root is required", proc.stderr)
+
+    def test_cli_invalid_directory_never_executes_sentinel_worker(self):
+        repo, head = self._make_repo()
+        invalid_repo = os.path.join(self.tmp, "not-a-repo")
+        os.makedirs(invalid_repo)
+        sentinel = os.path.join(self.tmp, "invalid-worker-ran")
+        config = self._worker_config(sentinel)
+        self._add("req-cli-invalid", state="QA", head=head)
+
+        proc = self._run_cli("req-cli-invalid", invalid_repo, config)
+        self.assertEqual(proc.returncode, 1, proc.stderr or proc.stdout)
+        result = json.loads(proc.stdout)
+        self.assertEqual(result["steps_executed"], 1)
+        self.assertFalse(os.path.exists(sentinel), "invalid repo dispatched the worker")
+        self.assertEqual(result["parked"][0]["reason_code"], "error")
+        with open(os.path.join(self.tmp, JOURNAL_FILENAME), encoding="utf-8") as fh:
+            journal = json.load(fh)
+        self.assertNotIn("req-cli-invalid", journal["completed_stages"])
+        self.assertEqual(
+            journal["stage_attempts"]["req-cli-invalid"][-1]["outcome"], "failed",
+        )
+
 
 
 if __name__ == "__main__":

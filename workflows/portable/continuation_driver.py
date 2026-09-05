@@ -40,9 +40,10 @@ Park, never poll
     a tight loop waiting for the world to change.
 
 Restart resumes, and never repeats a completed stage
-    Completed stages are journalled with the commit they were entered at.
-    A restart re-reads the journal and refuses to re-dispatch a stage already
-    recorded complete at the same commit, independently of the ledger.
+    Every dispatch attempt is journalled with its outcome. Only a stage that
+    actually completed is added to the completed-stage guard; blocked and
+    failed attempts remain retryable only after their parked request is
+    explicitly unparked.
 
 One driver at a time
     A run holds an OS-level advisory lock for its state directory. A second
@@ -111,7 +112,7 @@ except ImportError as e:  # pragma: no cover - packaging error, not a runtime pa
 
 JOURNAL_FILENAME = "continuation_journal.json"
 LOCK_FILENAME = "continuation_driver.lock"
-JOURNAL_SCHEMA_VERSION = "1.0"
+JOURNAL_SCHEMA_VERSION = "1.1"
 
 #: Stages this driver dispatches. Anything else is the adapter's business.
 DRIVABLE_STAGES = ("build", "qa", "review")
@@ -233,6 +234,7 @@ class DriverJournal:
         self.data: Dict[str, Any] = {
             "schema_version": JOURNAL_SCHEMA_VERSION,
             "completed_stages": {},   # request_id -> [ {stage, entry_head, result_head, at} ]
+            "stage_attempts": {},     # request_id -> [ {stage, outcome, ...} ]
             "parked": {},             # request_id -> ParkRecord dict
             "runs": [],               # run summaries, newest last
         }
@@ -251,7 +253,7 @@ class DriverJournal:
             self.data["journal_recovered_from_corruption_at"] = _now()
             return
         if isinstance(loaded, dict):
-            for key in ("completed_stages", "parked", "runs"):
+            for key in ("completed_stages", "stage_attempts", "parked", "runs"):
                 if key in loaded:
                     self.data[key] = loaded[key]
             self.existed = True
@@ -297,6 +299,19 @@ class DriverJournal:
             "stage": stage,
             "entry_head": entry_head,
             "result_head": result_head,
+            "at": _now(),
+        })
+
+    def record_attempt(self, request_id: str, stage: str, entry_head: Optional[str],
+                       result_head: Optional[str], status: str, outcome: str) -> None:
+        """Record a dispatch outcome without conflating failure with completion."""
+        bucket = self.data["stage_attempts"].setdefault(request_id, [])
+        bucket.append({
+            "stage": stage,
+            "entry_head": entry_head,
+            "result_head": result_head,
+            "status": status,
+            "outcome": outcome,
             "at": _now(),
         })
 
@@ -844,6 +859,9 @@ class ContinuationDriver:
                             result_head=None, exit_state=state, progressed=False,
                             worker_ok=False, worker_backend=None,
                         ).to_dict())
+                        self.journal.record_attempt(
+                            rid, stage, entry_head, None, "error", "failed",
+                        )
                         continue
 
                     self._assert_boundaries(result, rid)
@@ -873,10 +891,20 @@ class ContinuationDriver:
                         artifacts=[str(a) for a in worker_artifacts],
                     ).to_dict())
 
-                    if progressed:
+                    result_head = (after_req or {}).get("head")
+                    if status in ("blocked", "error"):
+                        attempt_outcome = "blocked" if status == "blocked" else "failed"
+                    elif progressed:
+                        attempt_outcome = "completed"
+                    else:
+                        attempt_outcome = "no_progress"
+                    self.journal.record_attempt(
+                        rid, stage, entry_head, result_head, status, attempt_outcome,
+                    )
+
+                    if attempt_outcome == "completed":
                         self.journal.record_completed(
-                            rid, stage, entry_head,
-                            (after_req or {}).get("head"),
+                            rid, stage, entry_head, result_head,
                         )
                         progressed_this_pass = True
                         self.journal.save()
@@ -978,6 +1006,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "selects work on its own.")
     p.add_argument("--state-dir", default=None, help="Directory holding ledger.json and driver state.")
     p.add_argument("--config", default=None, help="Superboard project config JSON.")
+    p.add_argument("--repo-root", default=None,
+                   help="Explicit git repository root workers execute in. Required for dispatch; "
+                        "the installed workflows directory is never treated as the project.")
     p.add_argument("--worker-config", default=None, help="Worker backend config JSON.")
     p.add_argument("--model", default=None, help="Default model for the worker backend.")
     p.add_argument("--backend", default=None, help="Force a specific worker backend.")
@@ -1088,6 +1119,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("--request-id is required at least once; the driver never selects work on its own.",
               file=sys.stderr)
         return 64
+    if not args.repo_root:
+        print(
+            "--repo-root is required for dispatch; refusing to infer a project from the installed "
+            "workflow location.",
+            file=sys.stderr,
+        )
+        return 64
+
+    repo_root = os.path.abspath(args.repo_root)
 
     try:
         from superboard_adapter import SuperboardExecutionAdapter
@@ -1099,6 +1139,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "state_dir": state_dir,
         "config_path": args.config,
         "fake_executor": False,
+        "repo_root": repo_root,
     }
 
     if not args.no_real_worker:
@@ -1145,7 +1186,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         print(format_outcome(outcome))
 
-    return 1 if outcome.error else 0
+    failed_attempt = any(
+        parked.get("reason_code") in ("blocked", "error")
+        for parked in outcome.parked
+    )
+    return 1 if outcome.error or failed_attempt else 0
 
 
 if __name__ == "__main__":

@@ -151,6 +151,47 @@ class TestRequestValidation(_Fixture):
         self.assertFalse(out.ok)
         self.assertIn("does not exist", out.blocked_reason)
 
+    def test_existing_non_git_directory_blocks_before_sentinel_worker_launch(self):
+        """The original invalid-repo reproduction must never reach the worker process."""
+        invalid_repo = os.path.join(self.tmp, "not-a-repo")
+        os.makedirs(invalid_repo)
+        sentinel = os.path.join(self.tmp, "worker-was-launched")
+        body = (
+            "from pathlib import Path\n"
+            f"Path({sentinel!r}).write_text('launched', encoding='utf-8')\n"
+        )
+        backend = self._backend(self._script_backend(body))
+        out = backend.execute(self._request(repo_root=invalid_repo))
+        self.assertFalse(out.ok)
+        self.assertIn("not a git repository", out.blocked_reason)
+        self.assertFalse(os.path.exists(sentinel), "invalid target launched the worker")
+        self.assertEqual(out.command, [])
+        self.assertFalse(os.path.exists(os.path.join(self.state, "worker_runs")))
+
+    def test_missing_expected_head_blocks_before_worker_launch(self):
+        sentinel = os.path.join(self.tmp, "worker-was-launched")
+        body = (
+            "from pathlib import Path\n"
+            f"Path({sentinel!r}).write_text('launched', encoding='utf-8')\n"
+        )
+        backend = self._backend(self._script_backend(body))
+        out = backend.execute(self._request(head_sha=None))
+        self.assertFalse(out.ok)
+        self.assertIn("'head_sha' is required", out.blocked_reason)
+        self.assertFalse(os.path.exists(sentinel))
+
+    def test_unresolvable_expected_head_blocks_before_worker_launch(self):
+        sentinel = os.path.join(self.tmp, "worker-was-launched")
+        body = (
+            "from pathlib import Path\n"
+            f"Path({sentinel!r}).write_text('launched', encoding='utf-8')\n"
+        )
+        backend = self._backend(self._script_backend(body))
+        out = backend.execute(self._request(head_sha="f" * 40))
+        self.assertFalse(out.ok)
+        self.assertIn("does not resolve to a commit", out.blocked_reason)
+        self.assertFalse(os.path.exists(sentinel))
+
     def test_unknown_backend_names_the_configured_ones(self):
         backend = self._backend(self._script_backend("import sys\n"))
         out = backend.execute(self._request(backend="not-a-backend"))
@@ -237,6 +278,33 @@ class TestConfiguration(_Fixture):
         self.assertEqual(len(argv), 4)
         self.assertEqual(argv[2], 'a b "c"\nd; rm -rf /')
         self.assertEqual(argv[3], "--tail")
+
+    def test_non_strict_unmapped_model_passes_through_without_substitution(self):
+        backend = self._backend(self._script_backend(
+            "import sys\n", strict_model=False, model_default="quiet-default",
+        ))
+        spec, err = backend.resolve_backend("qa")
+        self.assertIsNone(err)
+        requested = "vendor/model:high"
+        resolved, note, model_err = backend.resolve_model(spec, requested)
+        self.assertIsNone(model_err)
+        self.assertEqual(resolved, requested)
+        self.assertIn("passed through unchanged", note)
+        self.assertNotIn("quiet-default", note)
+
+    def test_explicit_mapping_is_retained_for_non_strict_backend(self):
+        backend = self._backend(self._script_backend(
+            "import sys\n",
+            strict_model=False,
+            model_default="quiet-default",
+            model_map={"vendor/model:high": "exact-cli-name"},
+        ))
+        spec, err = backend.resolve_backend("qa")
+        self.assertIsNone(err)
+        resolved, note, model_err = backend.resolve_model(spec, "vendor/model:high")
+        self.assertIsNone(model_err)
+        self.assertEqual(resolved, "exact-cli-name")
+        self.assertIn("mapped to 'exact-cli-name'", note)
 
 
 # ---------------------------------------------------------------------------

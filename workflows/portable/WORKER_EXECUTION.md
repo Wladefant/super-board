@@ -75,14 +75,16 @@ fields read are `request_id`, `stage`, `head_sha`, `model`, `agent_role`,
 Every one of these produces `ok=False` with a populated `blocked_reason`, and
 never a synthetic success:
 
-1. Malformed request — no `stage`, no `request_id`, no usable `repo_root`, or a
-   `head_sha` that is not a full 40-character SHA. A bad packet blocks; it does
-   not raise into the caller's step loop.
-2. Unknown backend, or a backend with no configured `argv`.
-3. Backend executable absent from `PATH`.
-4. An unmapped harness-qualified routing model (see §3).
-5. The tree is not on the requested commit *before* the run — the command is
-   never executed.
+1. Malformed request — no `stage`, no `request_id`, no usable `repo_root`, or no
+   full 40-character `head_sha`. A bad packet blocks; it does not raise into the
+   caller's step loop.
+2. `repo_root` is not an existing Git repository with a resolvable `HEAD`, the
+   requested commit does not resolve in that repository, or the checkout is not
+   exactly on that commit. These checks happen before backend resolution, run
+   directory creation, or worker dispatch.
+3. Unknown backend, or a backend with no configured `argv`.
+4. Backend executable absent from `PATH`.
+5. An unmapped harness-qualified routing model on a strict backend (see §3).
 6. Non-zero exit.
 7. Timeout.
 8. No structured result, or one that is not a JSON object.
@@ -114,11 +116,12 @@ validation: a real command, a real exit code, a real observation, and
 
 ### Head binding
 
-`head_sha` in the outcome is read with `git rev-parse HEAD` in the directory the
-command actually ran in, after the run. It is not the request's expectation and
-not the worker's claim. Both are cross-checked against it and refused on
-disagreement. A build legitimately advances the head and the new commit becomes
-the reported one; `qa` and `review` must leave it exactly where they found it.
+Before dispatch, `repo_root` must be a Git repository whose `HEAD` and resolved
+requested commit both equal the required full `head_sha`. `head_sha` in the
+outcome is then observed again with `git rev-parse HEAD` in the directory the
+command actually ran in; it is never copied from the worker's claim. A build
+legitimately advances the head and the new commit becomes the reported one;
+`qa` and `review` must leave it exactly where they found it.
 
 ---
 
@@ -134,16 +137,19 @@ cosmetic one: the Claude CLI answers `[claude-code:unrecognized_model]` and exit
 Each backend therefore declares a `model_map`. Resolution is:
 
 - request names no model → the backend's `model_default`
-- id present in `model_map` → the mapped CLI name, recorded in
-  `evidence.model_note`
+- id present in `model_map` → the explicit mapped CLI name, recorded in
+  `evidence.model_note` (this wins for strict and non-strict backends)
 - a bare name with no `/` and no `:` → already a CLI name, passed through
-- a harness-qualified id that is unmapped → **blocked**, naming the exact
-  `model_map` entry to add
+- a harness-qualified id absent from a strict backend's map → **blocked**,
+  naming the exact `model_map` entry to add
+- a harness-qualified id absent from a non-strict backend's map → passed
+  through unchanged and recorded as such; it is never silently replaced by
+  `model_default`
 
-The refusal is deliberate. Silently substituting a different model would make the
-model recorded in the evidence a fiction. A backend that genuinely resolves names
-itself sets `strict_model: false`; `veyyon` does, because its `--model` flag
-documents fuzzy matching.
+The strict refusal is deliberate. Silently substituting a different model would
+make the model recorded in evidence a fiction. A backend that genuinely resolves
+names itself sets `strict_model: false`; `veyyon` does, because its `--model`
+flag documents fuzzy matching.
 
 ---
 
@@ -288,12 +294,13 @@ exactly one attempt. The loop cannot spin.
 decision-blocked, unroutable and no-progress requests are parked with a reason
 and left alone. One request parking does not stop the others.
 
-**Restart resumes and never repeats.** Completed stages are journalled with the
-commit they were entered at. A restart refuses to re-dispatch a stage already
-recorded complete at that same commit — a guard that does not consult the ledger,
-so it still holds if a ledger write was lost or reverted. A request parked by an
-earlier run stays parked; resuming it is a human act
-(`--unpark <id>`), not a restart side effect.
+**Restart resumes and never repeats.** Every dispatch is recorded in
+`stage_attempts` as `completed`, `blocked`, `failed`, or `no_progress`. Only an
+actually completed stage is added to `completed_stages` with the commit it
+entered at; a blocker write that changes the ledger fingerprint is not
+completion. A restart refuses to re-dispatch a completed stage at the same
+commit. Failed and blocked attempts remain parked across restart and retry only
+after the explicit human action `--unpark <id>`.
 
 **One driver at a time.** Two layers, each covering what the other cannot: an
 in-process registry of held paths, because the shared `FileLock` is thread-local
@@ -377,6 +384,16 @@ completed stage was recorded and the ledger state then externally reverted to
 `implementation` at the same commit, the driver dispatched nothing and reported
 `already_completed`.
 
+### Installed driver CLI repository boundary
+
+The documented `continuation_driver.py` CLI was invoked as a subprocess against
+a temporary real Git repository with an exact 40-character ledger head and a
+configured child worker. With explicit `--repo-root`, the child executed and QA
+advanced to review. The same CLI against an existing non-Git directory exited
+non-zero, parked the attempt as failed, created no completed-stage record, and
+the sentinel child worker was never executed. Omitting `--repo-root` exits 64
+before adapter construction.
+
 ### Invalid worker output fails closed
 
 Driven through the full stack against `/tmp/portable-liar`, using a scripted
@@ -408,7 +425,7 @@ Observed during this work rather than constructed:
 
 ### Suites
 
-`test_worker_backend.py` 48 tests, `test_continuation_driver.py` 42 tests, both
+`test_worker_backend.py` 53 tests, `test_continuation_driver.py` 45 tests, both
 green. Pre-existing suites re-run green with these modules in place:
 `test_superboard_adapter.py`, `test_github_pr_gate.py`,
 `test_telegram_notifier.py`, `coordinator_smoke_test.py`,
@@ -426,17 +443,20 @@ python worker_backend.py --list-backends
 python worker_backend.py --print-schema
 
 # Build the argv and validate it without running anything
-python worker_backend.py --request-id req-1 --stage build --repo-root . --dry-run
+python worker_backend.py --request-id req-1 --stage build --repo-root . \
+  --head-sha <40-hex> --dry-run
 
 # One real stage
 python worker_backend.py --request-id req-1 --stage qa --repo-root . \
   --head-sha <40-hex> --model sonnet --prompt "verify X" --json
 
 # Drive authorized requests continuously
-python continuation_driver.py --request-id req-1 --state-dir <dir> --max-steps 12
+python continuation_driver.py --request-id req-1 --state-dir <dir> \
+  --repo-root <git-repository> --max-steps 12
 
 # Bounded decision re-check: at most 3 tries, 60s apart, 15s floor
 python continuation_driver.py --request-id req-1 --state-dir <dir> \
+  --repo-root <git-repository> \
   --decision-sync-attempts 3 --decision-sync-interval 60
 
 # Inspect and clear parking

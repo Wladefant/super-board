@@ -305,9 +305,9 @@ class BackendSpec:
     #: Model used when the request names none.
     model_default: Optional[str] = None
     #: With strict_model set, an unmapped harness-qualified id BLOCKS and names
-    #: the mapping to add. Unset, it falls back to model_default and records the
-    #: substitution in the evidence. Strict is the default because a silent
-    #: downgrade makes the model in the evidence a fiction.
+    #: the mapping to add. Unset, the requested id passes through unchanged
+    #: because that backend promises to resolve routing ids itself. An implicit
+    #: model_default substitution would make the recorded model a fiction.
     strict_model: bool = True
 
     @classmethod
@@ -600,6 +600,27 @@ def _git_head(repo_root: str) -> Optional[str]:
     sha = res.stdout.strip()
     return sha if SHA_RE.match(sha) else None
 
+def _git_commit(repo_root: str, commit: str) -> Optional[str]:
+    """Resolve ``commit`` to an exact commit object in ``repo_root``."""
+    git = shutil.which("git")
+    if not git:
+        return None
+    try:
+        res = subprocess.run(
+            [git, "rev-parse", "--verify", f"{commit}^{{commit}}"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            shell=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if res.returncode != 0:
+        return None
+    sha = res.stdout.strip()
+    return sha if SHA_RE.fullmatch(sha) else None
+
 
 def _sha256_file(path: str) -> Optional[str]:
     try:
@@ -848,12 +869,14 @@ class WorkerBackend:
         """
         Translate a routing model id into a name this backend's CLI accepts.
 
-        Returns (model, note, error). Exactly one of model or error is set; note
-        records a substitution worth carrying into the evidence.
+        Returns (model, note, error). Exactly one of model or error is set.
+        ``note`` records an explicit map or non-strict pass-through worth
+        carrying into the evidence.
 
         A harness-qualified id ("provider/model" or "model:effort") belongs to
-        the routing layer's vocabulary, not to any one CLI, so it must be mapped.
-        A bare name is already a CLI name and passes through untouched.
+        the routing layer's vocabulary. Strict backends require a mapping;
+        non-strict backends explicitly promise to resolve it unchanged. A bare
+        name is already a CLI name and passes through untouched.
         """
         fallback = spec.model_default or self.default_model
         requested = (requested or "").strip()
@@ -880,9 +903,10 @@ class WorkerBackend:
                 f"config, or route this stage to a backend that serves it."
             )
 
-        return fallback, (
-            f"routing model '{requested}' is unmapped for backend '{spec.name}'; fell back to "
-            f"'{fallback}' because this backend is configured with strict_model disabled"
+        return requested, (
+            f"routing model '{requested}' is unmapped for backend '{spec.name}'; "
+            "passed through unchanged because this backend is configured with "
+            "strict_model disabled"
         ), None
 
     # -- argv construction -------------------------------------------------
@@ -967,6 +991,37 @@ class WorkerBackend:
             return blocked(
                 f"Malformed worker request: head_sha must be a full 40-character SHA, got {requested_head!r}."
             )
+        if requested_head is None:
+            return blocked(
+                "Malformed worker request: 'head_sha' is required and must identify the exact "
+                "commit checked out at repo_root."
+            )
+
+        # Validate the repository and exact requested commit before resolving a
+        # worker command, preparing run files, or dispatching the worker. A
+        # directory is not a safe execution target merely because it exists.
+        head_before = _git_head(repo_root)
+        if head_before is None:
+            return blocked(
+                f"Worker repo_root is not a git repository with a resolvable HEAD: {repo_root}",
+                extra={"head_before": None},
+            )
+        resolved_head = _git_commit(repo_root, str(requested_head))
+        if resolved_head is None:
+            return blocked(
+                f"Head binding refused before execution: requested commit {requested_head} "
+                f"does not resolve to a commit in repository {repo_root}.",
+                head=head_before,
+                extra={"head_before": head_before},
+            )
+        if resolved_head != str(requested_head) or head_before != str(requested_head):
+            return blocked(
+                f"Head binding refused before execution: request targets {requested_head} but the "
+                f"tree at {repo_root} is on {head_before}. Check out the requested commit first; "
+                f"a worker never runs against whatever happens to be present.",
+                head=head_before,
+                extra={"head_before": head_before},
+            )
 
         # 2. Backend resolution.
         spec, err = self.resolve_backend(stage, backend_name)
@@ -1038,18 +1093,9 @@ class WorkerBackend:
         argv = self._substitute(spec.argv, values)
         argv[0] = executable
 
-        # 5. Observed head before the run. QA and review are bound to a commit
-        #    that must not move; build may advance it.
-        head_before = _git_head(repo_root)
-        if requested_head and head_before and head_before != str(requested_head):
-            return blocked(
-                f"Head binding refused before execution: request targets {requested_head} but the "
-                f"tree at {repo_root} is on {head_before}. Check out the requested commit first; "
-                f"a worker never runs against whatever happens to be present.",
-                command=argv,
-                head=head_before,
-                extra={"head_before": head_before},
-            )
+        # 5. The repository and exact requested commit were resolved before any
+        #    worker preparation or dispatch. Carry that immutable observation
+        #    into the command evidence; build may advance it, QA/review may not.
         base_evidence["head_before"] = head_before
         base_evidence["command"] = argv
         base_evidence["run_dir"] = run_dir
