@@ -37,3 +37,6 @@ __pycache__/
 # cannot open an MSYS /tmp path). Removed by each test's EXIT trap; ignored so a
 # test killed mid-run cannot leave artifacts in a commit.
 tests/.tmp-*/
+# Workflow ephemeral state
+workflows/portable/usage_snapshot_cache.json
+telegram_notify_state.json

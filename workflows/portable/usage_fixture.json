@@ -1,0 +1,159 @@
+{
+  "schema_version": "1.0",
+  "generated_at_utc": "2026-09-05T09:00:00Z",
+  "providers": {
+    "google-antigravity": {
+      "provider": "google-antigravity",
+      "status": "ok",
+      "is_active": true,
+      "effective_remaining_fraction": 0.92,
+      "cycle_seconds_to_reset": 16500.0,
+      "cycle_hours_to_reset": 4.58,
+      "bottleneck_window_id": "Usage (Google)",
+      "windows": [
+        {
+          "id": "google-antigravity:google:default:daily",
+          "label": "Usage (Google)",
+          "duration_seconds": 86400.0,
+          "resets_at_utc": "2026-09-05T13:43:10Z",
+          "seconds_to_reset": 16500.0,
+          "remaining_fraction": 0.92,
+          "used_fraction": 0.08,
+          "unit": "percent",
+          "status": "ok",
+          "is_cooldown": false,
+          "remaining_units": 92.0,
+          "total_limit": 100.0
+        },
+        {
+          "id": "google-antigravity:openai:default:daily",
+          "label": "Usage (OpenAI)",
+          "duration_seconds": 86400.0,
+          "resets_at_utc": "2026-09-05T13:55:58Z",
+          "seconds_to_reset": 17300.0,
+          "remaining_fraction": 0.99,
+          "used_fraction": 0.01,
+          "unit": "percent",
+          "status": "ok",
+          "is_cooldown": false,
+          "remaining_units": 99.0,
+          "total_limit": 100.0
+        },
+        {
+          "id": "google-antigravity:anthropic:default:daily",
+          "label": "Usage (Anthropic)",
+          "duration_seconds": 86400.0,
+          "resets_at_utc": "2026-09-05T13:55:58Z",
+          "seconds_to_reset": 17300.0,
+          "remaining_fraction": 0.99,
+          "used_fraction": 0.01,
+          "unit": "percent",
+          "status": "ok",
+          "is_cooldown": false,
+          "remaining_units": 99.0,
+          "total_limit": 100.0
+        }
+      ],
+      "metadata": {}
+    },
+    "anthropic": {
+      "provider": "anthropic",
+      "status": "ok",
+      "is_active": true,
+      "effective_remaining_fraction": 0.99,
+      "cycle_seconds_to_reset": 521500.0,
+      "cycle_hours_to_reset": 144.8,
+      "bottleneck_window_id": "Claude 5 Hour",
+      "windows": [
+        {
+          "id": "anthropic:5h",
+          "label": "Claude 5 Hour",
+          "duration_seconds": 18000.0,
+          "resets_at_utc": "2026-09-05T13:50:00Z",
+          "seconds_to_reset": 16950.0,
+          "remaining_fraction": 0.99,
+          "used_fraction": 0.01,
+          "unit": "percent",
+          "status": "ok",
+          "is_cooldown": false,
+          "remaining_units": 99.0,
+          "total_limit": 100.0
+        },
+        {
+          "id": "anthropic:7d",
+          "label": "Claude 7 Day",
+          "duration_seconds": 604800.0,
+          "resets_at_utc": "2026-09-11T10:00:00Z",
+          "seconds_to_reset": 521500.0,
+          "remaining_fraction": 1.0,
+          "used_fraction": 0.0,
+          "unit": "percent",
+          "status": "ok",
+          "is_cooldown": false,
+          "remaining_units": 100.0,
+          "total_limit": 100.0
+        }
+      ],
+      "metadata": {}
+    },
+    "openai-codex": {
+      "provider": "openai-codex",
+      "status": "ok",
+      "is_active": true,
+      "effective_remaining_fraction": 0.95,
+      "cycle_seconds_to_reset": 521800.0,
+      "cycle_hours_to_reset": 144.9,
+      "bottleneck_window_id": "7 days",
+      "windows": [
+        {
+          "id": "openai-codex:primary",
+          "label": "7 days",
+          "duration_seconds": 604800.0,
+          "resets_at_utc": "2026-09-11T10:05:37Z",
+          "seconds_to_reset": 521800.0,
+          "remaining_fraction": 0.95,
+          "used_fraction": 0.05,
+          "unit": "percent",
+          "status": "ok",
+          "is_cooldown": false,
+          "remaining_units": 95.0,
+          "total_limit": 100.0
+        },
+        {
+          "id": "openai-codex:spark:primary",
+          "label": "5 hours (Spark)",
+          "duration_seconds": 18000.0,
+          "resets_at_utc": "2026-09-05T14:05:05Z",
+          "seconds_to_reset": 17800.0,
+          "remaining_fraction": 1.0,
+          "used_fraction": 0.0,
+          "unit": "percent",
+          "status": "ok",
+          "is_cooldown": false,
+          "remaining_units": 100.0,
+          "total_limit": 100.0
+        }
+      ],
+      "metadata": {}
+    },
+    "xai-oauth": {
+      "provider": "xai-oauth",
+      "status": "dormant",
+      "is_active": false,
+      "effective_remaining_fraction": 0.0,
+      "cycle_seconds_to_reset": 0.0,
+      "cycle_hours_to_reset": 0.0,
+      "bottleneck_window_id": "dormant",
+      "windows": [],
+      "metadata": {}
+    }
+  },
+  "active_providers": [
+    "anthropic",
+    "google-antigravity",
+    "openai-codex"
+  ],
+  "dormant_providers": [
+    "xai-oauth"
+  ]
+}

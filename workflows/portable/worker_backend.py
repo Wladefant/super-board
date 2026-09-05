@@ -1,0 +1,2090 @@
+#!/usr/bin/env python3
+"""
+worker_backend.py - Native host-dispatched and explicitly configured CLI worker execution.
+
+WHY THIS EXISTS
+---------------
+The portable coordinator could previously only *simulate* worker execution. Its
+dispatch path fell through to a labelled fixture whenever real execution was not
+wired up, so a step that never ran anything still reported success. This module
+closes that hole while keeping the portable core independent of any harness.
+
+WHAT IT DOES
+------------
+Takes a structured request/dispatch packet and, by default, validates and
+persists a compact native background-task ticket. The host launches that ticket
+with its normal non-blocking task tool, records the actual task handle, and
+delivers the structured result for shared validation. CLI execution remains
+available only through an explicitly selected backend.
+
+It is a backend, not a scheduler. It runs one stage for one request and returns.
+The existing SuperboardExecutionAdapter.run_step remains the only step engine;
+this module is what that engine dispatches *into*.
+
+FAIL-CLOSED CONTRACT
+--------------------
+Every one of the following produces ok=False with a populated blocked_reason,
+and never a synthetic success:
+
+  1.  Malformed request (no stage, no request_id, no usable repo_root).
+  2.  Native record/handle state mismatch or changed-result replay.
+  3.  Unknown explicit CLI backend, missing executable, or non-zero CLI exit.
+  4.  No structured result, or a result that is not a mapping/JSON object.
+  5.  Structured result missing any required field or using an invalid verdict.
+  6.  verdict == "pass" with no executed check carrying a command and an
+      exit code. Exit 0 from the executor alone is NEVER evidence.
+  7.  A declared artifact that does not exist on disk.
+  8.  Observed git HEAD disagreeing with the requested head, or with the head
+      the worker claims. The reported head_sha is always the *observed* one.
+  9.  A build stage that produced neither a commit nor an artifact.
+ 10.  A bug-QA reproduction claim that is a bare boolean or a keyword rather
+      than a re-executed scenario with a command, exit code and observation.
+
+BACKENDS
+--------
+Implicit execution uses a durable ``native`` prepare/record/complete handoff and
+invokes no agent subprocess. ``claude``, ``codex`` and ``veyyon`` remain built-in
+CLI configurations, but each must be explicitly selected through
+``default_backend``, ``stage_backends`` or ``WorkerRequest.backend``.
+
+Any other CLI harness is reachable without touching this file by declaring a
+custom backend in user config. See BACKEND CONFIGURATION below.
+
+BACKEND CONFIGURATION
+---------------------
+Resolution order, first hit wins:
+
+  1. Explicit dict or JSON path passed to WorkerBackend(config=...).
+  2. Environment variable PORTABLE_WORKER_CONFIG (path to JSON).
+  3. <state_dir>/worker_backends.json.
+  4. project_config.metadata["portable_worker"], when a ProjectConfig-like
+     object is supplied.
+  5. The built-in defaults in DEFAULT_BACKENDS.
+
+A user config is a JSON object shaped like:
+
+  {
+    "default_backend": "my-harness",
+    "stage_backends": {"review": "codex"},
+    "backends": {
+      "my-harness": {
+        "argv": ["my-agent", "run", "--model", "{model}", "--schema",
+                 "{schema_path}", "--out", "{result_path}", "{prompt}"],
+        "result_source": "file",
+        "result_path_template": "{work_dir}/result.json",
+        "timeout_seconds": 900,
+        "env": {"MY_AGENT_QUIET": "1"}
+      }
+    }
+  }
+
+Every argv element is substituted as a whole token against the placeholder set
+{prompt} {model} {agent_role} {stage} {request_id} {head_sha} {repo_root}
+{schema_path} {schema_inline} {result_path} {work_dir} {permission_mode}
+{allowed_tools} {sandbox_mode} {issue_url} {pr_url}. Substitution never
+splits or re-parses a token, so a prompt containing spaces, quotes or newlines
+travels as exactly one argv entry.
+
+BOUNDARIES
+----------
+This module never merges, never pushes, never deploys, and never resolves a
+human authorization gate. It runs one command and reports what happened.
+"""
+
+from __future__ import annotations
+
+import copy
+import datetime
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import asdict, dataclass, field
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+from ledger import FileLock
+
+SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+VALID_STAGES = ("build", "qa", "review")
+VALID_VERDICTS = ("pass", "fail", "blocked")
+
+#: Stages where the tested tree must not move underneath the worker. QA and
+#: review evidence is bound to one commit; a head that advances mid-run
+#: invalidates the result rather than producing a passing one.
+IMMUTABLE_HEAD_STAGES = ("qa", "review")
+
+MAX_CAPTURED_OUTPUT = 20000
+#: Upper bound on "{" positions tried when recovering a result from noisy
+#: output. A real envelope appears within a handful; the cap stops adversarial
+#: or runaway output from turning recovery into a quadratic scan.
+MAX_JSON_SCAN_ATTEMPTS = 4096
+DEFAULT_TIMEOUT_SECONDS = 1800
+
+NATIVE_BACKEND_NAME = "native"
+
+
+# ---------------------------------------------------------------------------
+# Structured agent result schema
+# ---------------------------------------------------------------------------
+
+def agent_result_schema() -> Dict[str, Any]:
+    """
+    JSON Schema handed to the native background host task or explicitly selected
+    agent CLI. Every delivered result is validated again by this module.
+    """
+    check = {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "command": {"type": "array", "items": {"type": "string"}},
+            "exit_code": {"type": "integer"},
+            "observed": {"type": "string"},
+        },
+        "required": ["name", "command", "exit_code", "observed"],
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "stage": {"type": "string", "enum": list(VALID_STAGES)},
+            "request_id": {"type": "string"},
+            "head_sha": {
+                "type": "string",
+                "description": "Full 40-character git HEAD of the tree you worked in, read with `git rev-parse HEAD`. Never invent it.",
+            },
+            "verdict": {"type": "string", "enum": list(VALID_VERDICTS)},
+            "summary": {"type": "string"},
+            "checks": {
+                "type": "array",
+                "description": "Commands you actually executed, with their real exit codes and observed output. A pass verdict with no checks is rejected.",
+                "items": check,
+            },
+            "artifacts": {
+                "type": "array",
+                "description": "Files you created or changed, as paths relative to the repository root. They must exist on disk.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "role": {"type": "string"},
+                    },
+                    "required": ["path", "role"],
+                },
+            },
+            "reproduction": {
+                "type": "object",
+                "description": "Required when QA-ing a bug: the original failing scenario, re-executed.",
+                "properties": {
+                    "scenario": {"type": "string"},
+                    "command": {"type": "array", "items": {"type": "string"}},
+                    "exit_code": {"type": "integer"},
+                    "observed": {"type": "string"},
+                    "still_reproduces": {"type": "boolean"},
+                },
+                "required": ["scenario", "command", "exit_code", "observed", "still_reproduces"],
+            },
+        },
+        "required": ["stage", "request_id", "head_sha", "verdict", "summary", "checks", "artifacts"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Request / outcome data models
+# ---------------------------------------------------------------------------
+
+@dataclass
+class WorkerRequest:
+    """
+    Structured request/dispatch packet handed to a backend.
+
+    Callers are not obliged to use this class. WorkerBackend.execute accepts any
+    object or mapping exposing these names, so the adapter can build its own
+    packet without importing this module.
+    """
+    request_id: str
+    stage: str
+    repo_root: str
+    head_sha: Optional[str] = None
+    model: Optional[str] = None
+    agent_role: Optional[str] = None
+    issue_url: Optional[str] = None
+    pr_url: Optional[str] = None
+    prompt: Optional[str] = None
+    criteria: List[str] = field(default_factory=list)
+    task_type: Optional[str] = None
+    backend: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class WorkerOutcome:
+    """
+    Structured, head-bound result of one real worker execution.
+
+    Field names are a published contract consumed by SuperboardExecutionAdapter
+    and by ContinuationDriver. They do not change without coordination.
+    """
+    ok: bool
+    stage: str
+    exit_code: Optional[int]
+    command: List[str]
+    head_sha: Optional[str]
+    evidence: Dict[str, Any]
+    artifacts: List[str] = field(default_factory=list)
+    blocked_reason: Optional[str] = None
+    backend_name: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    def to_json(self, indent: int = 2) -> str:
+        return json.dumps(self.to_dict(), indent=indent, default=str)
+
+@dataclass
+class NativeDispatchTicket:
+    """Durable handoff from deterministic preparation to the native host."""
+    run_id: str
+    state: str
+    request: Dict[str, Any]
+    prompt: str
+    result_schema: Dict[str, Any]
+    head_sha: Optional[str]
+    task_handle: Optional[str] = None
+    blocked_reason: Optional[str] = None
+
+    @property
+    def ready(self) -> bool:
+        return self.blocked_reason is None and self.state in ("prepared", "background_dispatched")
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = asdict(self)
+        data["ready"] = self.ready
+        return data
+
+    def to_json(self, indent: int = 2) -> str:
+        return json.dumps(self.to_dict(), indent=indent, default=str)
+
+
+@dataclass
+class BackendSpec:
+    """One configured agent CLI invocation."""
+    name: str
+    argv: List[str]
+    result_source: str = "stdout_json"   # stdout_json | file
+    result_path_template: Optional[str] = None
+    stdout_result_keys: List[str] = field(default_factory=lambda: ["structured_output"])
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS
+    env: Dict[str, str] = field(default_factory=dict)
+    schema_mode: str = "inline"          # inline | file | none
+    description: str = ""
+    #: Substituted for {permission_mode} and {allowed_tools}.
+    #:
+    #: Measured against the installed Claude Code CLI, neither documented mode
+    #: is sufficient on its own for a worker that must both write code and
+    #: prove it works:
+    #:   acceptEdits alone  -> file writes permitted, every Bash call denied,
+    #:                         so a build worker can write code and substantiate
+    #:                         nothing.
+    #:   dontAsk alone      -> Bash reads permitted, every file write denied,
+    #:                         so a build worker cannot produce anything.
+    #: acceptEdits together with an explicit allowed-tools list permits both,
+    #: with zero permission denials, and is the least privilege that actually
+    #: works. It grants file and shell access inside the target repo and
+    #: nothing wider; merge, push and deploy remain refused by the workflow
+    #: gates regardless of what a worker is permitted to run.
+    permission_mode: str = "acceptEdits"
+    allowed_tools: str = "Bash Write Edit Read"
+    #: Substituted for {sandbox_mode}. Codex-style backends take a sandbox
+    #: policy; "workspace-write" lets a build worker produce something, and a
+    #: verification stage should be pinned to "read-only" via its own backend
+    #: entry so it cannot mutate the tree it is judging.
+    sandbox_mode: str = "workspace-write"
+    #: Translation from the routing layer's harness-qualified model ids
+    #: ("provider/model:effort") to a name THIS CLI accepts.
+    #:
+    #: The routing layer picks a model for the whole fleet and names it in its
+    #: own vocabulary; each CLI has a different one. Passing a routing id
+    #: straight through is a real failure, not a cosmetic one: the claude CLI
+    #: answers "[claude-code:unrecognized_model]" and exits 1.
+    model_map: Dict[str, str] = field(default_factory=dict)
+    #: Model used when the request names none.
+    model_default: Optional[str] = None
+    #: With strict_model set, an unmapped harness-qualified id BLOCKS and names
+    #: the mapping to add. Unset, the requested id passes through unchanged
+    #: because that backend promises to resolve routing ids itself. An implicit
+    #: model_default substitution would make the recorded model a fiction.
+    strict_model: bool = True
+
+    @classmethod
+    def from_dict(cls, name: str, data: Mapping[str, Any]) -> "BackendSpec":
+        argv = data.get("argv")
+        if not isinstance(argv, (list, tuple)) or not argv:
+            raise ValueError(f"backend '{name}': 'argv' must be a non-empty list of strings")
+        argv = [str(a) for a in argv]
+        result_source = str(data.get("result_source", "stdout_json"))
+        if result_source not in ("stdout_json", "file"):
+            raise ValueError(
+                f"backend '{name}': result_source must be 'stdout_json' or 'file', got {result_source!r}"
+            )
+        keys = data.get("stdout_result_keys") or ["structured_output"]
+        if not isinstance(keys, (list, tuple)):
+            raise ValueError(f"backend '{name}': stdout_result_keys must be a list")
+        return cls(
+            name=name,
+            argv=argv,
+            result_source=result_source,
+            result_path_template=data.get("result_path_template"),
+            stdout_result_keys=[str(k) for k in keys],
+            timeout_seconds=int(data.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)),
+            env={str(k): str(v) for k, v in (data.get("env") or {}).items()},
+            schema_mode=str(data.get("schema_mode", "inline")),
+            description=str(data.get("description", "")),
+            permission_mode=str(data.get("permission_mode", "acceptEdits")),
+            allowed_tools=str(data.get("allowed_tools", "Bash Write Edit Read")),
+            sandbox_mode=str(data.get("sandbox_mode", "workspace-write")),
+            model_map={str(k): str(v) for k, v in (data.get("model_map") or {}).items()},
+            model_default=(str(data["model_default"]) if data.get("model_default") else None),
+            strict_model=bool(data.get("strict_model", True)),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Built-in backends, using flags taken from each installed CLI's own help
+# ---------------------------------------------------------------------------
+
+#: The routing layer in model_routing.py names models in a harness-qualified
+#: vocabulary. These maps translate the ids it actually emits into names each
+#: installed CLI accepts. An id absent from a backend's map is one that backend
+#: cannot serve, and is refused rather than guessed at.
+_ANTHROPIC_MODEL_MAP = {
+    "anthropic/claude-opus-5:high": "opus",
+    "anthropic/claude-fable-5-1": "sonnet",
+    # A routing choice pointing at another vendor is deliberately absent: this
+    # backend cannot run a Gemini or a Codex model, and saying so is the honest
+    # answer. Map it explicitly in user config to redirect it here.
+}
+_CODEX_MODEL_MAP = {
+    "openai-codex/gpt-5.6-sol:high": "gpt-5.6-sol",
+    "openai-codex/gpt-6-astra:high": "gpt-6-astra",
+    "openai-codex/gpt-5.3-codex": "gpt-5.3-codex",
+}
+#: Veyyon resolves fuzzy model names itself ("opus", "gpt-5.2",
+#: "openai/gpt-5.2" all work per its --model help), so it can take the routing
+#: id unchanged and is not strict about unmapped ones.
+_VEYYON_MODEL_MAP: Dict[str, str] = {}
+
+DEFAULT_BACKENDS: Dict[str, Dict[str, Any]] = {
+    # claude --help: -p/--print, --output-format json, --json-schema <schema>,
+    # --model, --add-dir, --permission-mode, --allowedTools. The structured
+    # answer lands on stdout under "structured_output".
+    "claude": {
+        "argv": [
+            "claude", "-p", "{prompt}",
+            "--output-format", "json",
+            "--json-schema", "{schema_inline}",
+            "--model", "{model}",
+            "--add-dir", "{repo_root}",
+            "--permission-mode", "{permission_mode}",
+            "--allowedTools", "{allowed_tools}",
+        ],
+        "result_source": "stdout_json",
+        "stdout_result_keys": ["structured_output"],
+        "schema_mode": "inline",
+        "model_map": _ANTHROPIC_MODEL_MAP,
+        "model_default": "sonnet",
+        "description": "Claude Code headless, JSON schema constrained.",
+    },
+    # The same CLI, configured for a verification stage: no Write and no Edit
+    # tool, so it cannot casually rewrite the tree it is judging.
+    #
+    # Bash is granted in full rather than narrowed to patterns. A narrowed list
+    # was measured and rejected: "Bash(python*)" denies the compound commands a
+    # tester naturally writes, such as `python tests.py; echo EXIT:$?`, and
+    # denies PowerShell outright, so the worker ends up asking a human for
+    # approval and returning "blocked" instead of verifying anything. A tool
+    # allowlist is in any case the wrong place to enforce immutability, because
+    # anything with a shell can write a file. The real guarantee is enforced on
+    # the observable outcome: a qa or review result whose observed git HEAD
+    # moved is refused, which holds no matter how the tree was touched.
+    "claude-verify": {
+        "argv": [
+            "claude", "-p", "{prompt}",
+            "--output-format", "json",
+            "--json-schema", "{schema_inline}",
+            "--model", "{model}",
+            "--add-dir", "{repo_root}",
+            "--permission-mode", "{permission_mode}",
+            "--allowedTools", "{allowed_tools}",
+        ],
+        "result_source": "stdout_json",
+        "stdout_result_keys": ["structured_output"],
+        "schema_mode": "inline",
+        "model_map": _ANTHROPIC_MODEL_MAP,
+        "model_default": "sonnet",
+        "allowed_tools": "Bash Read",
+        "description": "Claude Code headless for qa and review: runs checks, cannot edit.",
+    },
+    # codex exec --help: -m/--model, -C/--cd <DIR>, -s/--sandbox <MODE>,
+    # --output-schema <FILE>, -o/--output-last-message <FILE>. The final
+    # structured message is written to the last-message file.
+    #
+    # Codex defaults to a read-only sandbox, which is correct for qa and review
+    # and useless for build, so the mode is explicit here rather than inherited.
+    # Declare a read-only variant as a separate stage backend to pin verification
+    # stages shut.
+    "codex": {
+        "argv": [
+            "codex", "exec",
+            "-m", "{model}",
+            "-C", "{repo_root}",
+            "-s", "{sandbox_mode}",
+            "--output-schema", "{schema_path}",
+            "-o", "{result_path}",
+            "{prompt}",
+        ],
+        "result_source": "file",
+        "result_path_template": "{work_dir}/codex_last_message.json",
+        "schema_mode": "file",
+        "model_map": _CODEX_MODEL_MAP,
+        "model_default": "gpt-5.6-sol",
+        "description": "Codex headless exec, output-schema constrained.",
+    },
+    # veyyon --help: -p/--print, --mode=json, --model. Optional backend.
+    "veyyon": {
+        "argv": [
+            "veyyon", "-p",
+            "--mode=json",
+            "--model", "{model}",
+            "{prompt}",
+        ],
+        "result_source": "stdout_json",
+        "stdout_result_keys": ["structured_output", "result", "output"],
+        "schema_mode": "none",
+        "model_map": _VEYYON_MODEL_MAP,
+        "model_default": "opus",
+        "strict_model": False,
+        "description": "Veyyon headless print mode. Resolves model names itself, so routing "
+                       "ids pass through. Optional; never required by the core.",
+    },
+}
+
+DEFAULT_BACKEND_NAME = NATIVE_BACKEND_NAME
+
+# Native host dispatch is the implicit choice for every stage. External CLI
+# backends remain available, but selecting one is always an explicit opt-in.
+DEFAULT_STAGE_BACKENDS: Dict[str, str] = {}
+
+
+# ---------------------------------------------------------------------------
+# Config loading
+# ---------------------------------------------------------------------------
+
+def _read_json_file(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        raise ValueError(f"worker backend config at {path} must be a JSON object")
+    return data
+
+
+def load_backend_config(
+    config: Optional[Union[str, Mapping[str, Any]]] = None,
+    state_dir: Optional[str] = None,
+    project_config: Any = None,
+) -> Dict[str, Any]:
+    """
+    Resolve worker backend configuration. See BACKEND CONFIGURATION in the
+    module docstring for the precedence order.
+
+    User backends are merged over the built-in defaults, so declaring one custom
+    harness does not hide `claude`, `codex` or `veyyon`.
+    """
+    raw: Optional[Dict[str, Any]] = None
+    source = "builtin-defaults"
+
+    if isinstance(config, Mapping):
+        raw = dict(config)
+        source = "explicit-dict"
+    elif isinstance(config, str) and config.strip():
+        raw = _read_json_file(config)
+        source = f"explicit-path:{config}"
+    else:
+        env_path = os.environ.get("PORTABLE_WORKER_CONFIG", "").strip()
+        if env_path and os.path.exists(env_path):
+            raw = _read_json_file(env_path)
+            source = f"env:PORTABLE_WORKER_CONFIG:{env_path}"
+        elif state_dir:
+            candidate = os.path.join(state_dir, "worker_backends.json")
+            if os.path.exists(candidate):
+                raw = _read_json_file(candidate)
+                source = f"state-dir:{candidate}"
+
+    if raw is None and project_config is not None:
+        meta = getattr(project_config, "metadata", None)
+        if isinstance(meta, Mapping) and isinstance(meta.get("portable_worker"), Mapping):
+            raw = dict(meta["portable_worker"])
+            source = "project-config-metadata"
+
+    raw = raw or {}
+
+    backends: Dict[str, Dict[str, Any]] = copy.deepcopy(DEFAULT_BACKENDS)
+    user_backends = raw.get("backends") or {}
+    if not isinstance(user_backends, Mapping):
+        raise ValueError("worker backend config: 'backends' must be an object")
+    for name, spec in user_backends.items():
+        if not isinstance(spec, Mapping):
+            raise ValueError(f"worker backend config: backend '{name}' must be an object")
+        backends[str(name)] = dict(spec)
+
+    stage_backends = raw.get("stage_backends") or {}
+    if not isinstance(stage_backends, Mapping):
+        raise ValueError("worker backend config: 'stage_backends' must be an object")
+    resolved_stage_backends = {str(k): str(v) for k, v in stage_backends.items()}
+
+    default_backend = str(raw.get("default_backend") or DEFAULT_BACKEND_NAME)
+
+    return {
+        "source": source,
+        "default_backend": default_backend,
+        "stage_backends": resolved_stage_backends,
+        "backends": backends,
+        "default_model": raw.get("default_model"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+def _now() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _field(req: Any, name: str, default: Any = None) -> Any:
+    """Read a field from a dataclass, plain object, or mapping. Duck-typed by design."""
+    if isinstance(req, Mapping):
+        value = req.get(name, default)
+    else:
+        value = getattr(req, name, default)
+    return default if value is None else value
+
+
+def _clip(text: str, limit: int = MAX_CAPTURED_OUTPUT) -> str:
+    if text is None:
+        return ""
+    text = str(text)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n...[clipped {len(text) - limit} chars]"
+
+
+def _git_head(repo_root: str) -> Optional[str]:
+    """Observed git HEAD of repo_root, or None when it is not a usable repo."""
+    git = shutil.which("git")
+    if not git:
+        return None
+    try:
+        res = subprocess.run(
+            [git, "rev-parse", "HEAD"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            shell=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if res.returncode != 0:
+        return None
+    sha = res.stdout.strip()
+    return sha if SHA_RE.match(sha) else None
+
+def _git_commit(repo_root: str, commit: str) -> Optional[str]:
+    """Resolve ``commit`` to an exact commit object in ``repo_root``."""
+    git = shutil.which("git")
+    if not git:
+        return None
+    try:
+        res = subprocess.run(
+            [git, "rev-parse", "--verify", f"{commit}^{{commit}}"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            shell=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if res.returncode != 0:
+        return None
+    sha = res.stdout.strip()
+    return sha if SHA_RE.fullmatch(sha) else None
+
+
+def _sha256_file(path: str) -> Optional[str]:
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def _coerce_result_object(payload: Any, keys: Sequence[str]) -> Optional[Dict[str, Any]]:
+    """
+    Pull the agent's structured answer out of a CLI envelope.
+
+    Handles the shapes the real CLIs emit: a bare result object, an envelope
+    carrying it under a known key, and an envelope carrying it as a JSON string
+    that still needs parsing.
+    """
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (ValueError, TypeError):
+            return None
+    if not isinstance(payload, dict):
+        return None
+
+    # Already the result object itself.
+    if "verdict" in payload and "stage" in payload:
+        return payload
+
+    for key in keys:
+        if key not in payload:
+            continue
+        candidate = payload[key]
+        if isinstance(candidate, str):
+            try:
+                candidate = json.loads(candidate)
+            except (ValueError, TypeError):
+                continue
+        if isinstance(candidate, dict):
+            return candidate
+    return None
+
+
+def _extract_last_json_object(text: str) -> Optional[Any]:
+    """
+    Recover the JSON result from output that also carries log noise.
+
+    Real CLIs interleave hook warnings, OAuth errors and progress banners with
+    their JSON, and that noise can itself contain an unbalanced brace. So this
+    walks every "{" and lets the JSON decoder decide where an object ends,
+    keeping the LAST top-level object that parses, because a CLI prints its
+    result after its chatter.
+
+    Two things it deliberately does not do: it does not scan backwards from the
+    final brace, which would return whichever innermost nested object happens to
+    parse alone and throw away the envelope; and it does not stop at the first
+    unbalanced brace, which would let one malformed log line hide a perfectly
+    good result printed after it.
+    """
+    if not text:
+        return None
+    try:
+        return json.loads(text.strip())
+    except (ValueError, TypeError):
+        pass
+
+    decoder = json.JSONDecoder()
+    candidates: List[Any] = []
+    index = 0
+    attempts = 0
+    length = len(text)
+    while index < length and attempts < MAX_JSON_SCAN_ATTEMPTS:
+        index = text.find("{", index)
+        if index < 0:
+            break
+        attempts += 1
+        try:
+            obj, end = decoder.raw_decode(text, index)
+        except ValueError:
+            index += 1
+            continue
+        if isinstance(obj, dict):
+            candidates.append(obj)
+        # Skip past what was consumed, so a successfully parsed envelope is
+        # never re-entered to harvest its own nested objects.
+        index = max(end, index + 1)
+
+    return candidates[-1] if candidates else None
+
+
+# ---------------------------------------------------------------------------
+# Prompt construction
+# ---------------------------------------------------------------------------
+
+STAGE_BRIEFS = {
+    "build": (
+        "You are the BUILD worker. Inspect the repository at {repo_root} first. Implement any "
+        "missing request work. If the current head already implements the request, do not create "
+        "an artificial edit or commit: verify it and report the relevant existing files under "
+        "\"artifacts\" with role \"verified_existing\". Commit only real changes. Report commands "
+        "actually run under \"checks\" with their real exit codes."
+    ),
+    "qa": (
+        "You are the QA worker, independent of whoever built this. Do NOT modify the tree and do "
+        "NOT commit. Verify the request against the repository at {repo_root} by executing real "
+        "commands, and report each one under \"checks\" with its real exit code and observed output. "
+        "Return verdict \"fail\" if verification does not hold."
+    ),
+    "review": (
+        "You are the REVIEW worker, independent of whoever built this. Do NOT modify the tree and "
+        "do NOT commit. Review the change on the current commit, execute the commands you need to "
+        "substantiate your reading, and report them under \"checks\". Return verdict \"fail\" if the "
+        "change is not sound."
+    ),
+}
+
+
+def build_stage_prompt(req: Any, schema: Dict[str, Any]) -> str:
+    """
+    Compose the stage prompt. An explicit prompt on the request is used verbatim
+    as the task statement; the stage brief and result contract are always added
+    so a backend cannot be talked out of returning structured evidence.
+    """
+    stage = str(_field(req, "stage", "build"))
+    repo_root = str(_field(req, "repo_root", ""))
+    request_id = str(_field(req, "request_id", ""))
+    head_sha = _field(req, "head_sha") or "(unset)"
+    task = str(_field(req, "prompt", "")).strip()
+    criteria = _field(req, "criteria", []) or []
+    task_type = _field(req, "task_type") or "unspecified"
+
+    brief = STAGE_BRIEFS.get(stage, STAGE_BRIEFS["build"]).format(repo_root=repo_root)
+
+    lines = [
+        brief,
+        "",
+        f"Request id: {request_id}",
+        f"Stage: {stage}",
+        f"Task type: {task_type}",
+        f"Repository root: {repo_root}",
+        f"Expected head commit: {head_sha}",
+    ]
+    if task:
+        lines += ["", "TASK", task]
+    if criteria:
+        lines += ["", "ACCEPTANCE CRITERIA"]
+        for c in criteria:
+            if isinstance(c, Mapping):
+                c = c.get("criterion", "")
+            lines.append(f"- {c}")
+
+    lines += [
+        "",
+        "RESULT CONTRACT",
+        "Your final answer must be a single JSON object matching this schema exactly:",
+        json.dumps(schema, indent=2),
+        "",
+        "Rules that are enforced after you exit, so satisfy them or you will be rejected:",
+        "- \"head_sha\" must be the full 40-character output of `git rev-parse HEAD` in the "
+        "repository you worked in. It is cross-checked against the real HEAD.",
+        "- \"checks\" must describe commands you actually executed. A \"pass\" verdict with an "
+        "empty checks list is rejected.",
+        "- Every \"artifacts\" path must exist on disk when you exit.",
+        "- Do not claim a reproduction is gone with a phrase. If this is a bug, fill in "
+        "\"reproduction\" with the scenario re-executed, its command, its real exit code and what "
+        "you observed.",
+        "- Never merge, never push, never deploy. Committing locally is allowed for the build "
+        "stage only.",
+    ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# The backend
+# ---------------------------------------------------------------------------
+
+class WorkerBackendError(Exception):
+    """Raised only for programmer error, never for a failed worker run."""
+
+
+class WorkerBackend:
+    """
+    Prepares durable native background work or executes one explicitly selected
+    agent CLI, then returns structured, head-bound evidence.
+
+    Native usage:
+        ticket = backend.prepare_native(request)
+        # Host launches a background task from ticket.prompt/result_schema.
+        backend.record_native_dispatch(ticket.run_id, task_handle)
+        outcome = backend.complete_native(ticket.run_id, task_handle, result)
+
+    A failed run is a WorkerOutcome with ok=False, not an exception. The only
+    exceptions raised are configuration errors surfaced at construction time.
+    """
+
+    def __init__(
+        self,
+        config: Optional[Union[str, Mapping[str, Any]]] = None,
+        state_dir: Optional[str] = None,
+        project_config: Any = None,
+        default_model: Optional[str] = None,
+        default_backend: Optional[str] = None,
+        work_dir: Optional[str] = None,
+        dry_run: bool = False,
+        timeout_seconds: Optional[int] = None,
+    ):
+        self.state_dir = os.path.abspath(state_dir) if state_dir else SCRIPT_DIR
+        self.resolved_config = load_backend_config(
+            config=config, state_dir=self.state_dir, project_config=project_config
+        )
+        self.default_backend = default_backend or self.resolved_config["default_backend"]
+        self.default_model = default_model or self.resolved_config.get("default_model") or "sonnet"
+        self.work_dir = os.path.abspath(work_dir) if work_dir else os.path.join(self.state_dir, "worker_runs")
+        self.dry_run = dry_run
+        self.timeout_override = timeout_seconds
+
+    # -- configuration ----------------------------------------------------
+
+    def available_backends(self) -> Dict[str, bool]:
+        """Map backend name to whether its preparation/executable is available."""
+        out: Dict[str, bool] = {NATIVE_BACKEND_NAME: True}
+        for name, raw in self.resolved_config["backends"].items():
+            argv = raw.get("argv") or []
+            out[name] = bool(argv) and shutil.which(str(argv[0])) is not None
+        return out
+
+    def resolve_backend(self, stage: str, requested: Optional[str] = None) -> Tuple[Optional[BackendSpec], Optional[str]]:
+        """Pick the backend for this stage. Returns (spec, error)."""
+        name = requested or self.resolved_config["stage_backends"].get(stage) or self.default_backend
+        raw = self.resolved_config["backends"].get(name)
+        if raw is None:
+            known = ", ".join(sorted(self.resolved_config["backends"])) or "(none)"
+            return None, (
+                f"No worker backend named '{name}' is configured. Configured backends: {known}. "
+                f"Config source: {self.resolved_config['source']}."
+            )
+        try:
+            spec = BackendSpec.from_dict(name, raw)
+        except ValueError as e:
+            return None, f"Worker backend '{name}' is misconfigured: {e}"
+        if self.timeout_override:
+            spec.timeout_seconds = int(self.timeout_override)
+        return spec, None
+
+    def resolve_model(self, spec: BackendSpec, requested: Optional[str]) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        """
+        Translate a routing model id into a name this backend's CLI accepts.
+
+        Returns (model, note, error). Exactly one of model or error is set.
+        ``note`` records an explicit map or non-strict pass-through worth
+        carrying into the evidence.
+
+        A harness-qualified id ("provider/model" or "model:effort") belongs to
+        the routing layer's vocabulary. Strict backends require a mapping;
+        non-strict backends explicitly promise to resolve it unchanged. A bare
+        name is already a CLI name and passes through untouched.
+        """
+        fallback = spec.model_default or self.default_model
+        requested = (requested or "").strip()
+        if not requested:
+            return fallback, None, None
+
+        if requested in spec.model_map:
+            mapped = spec.model_map[requested]
+            if mapped == requested:
+                return mapped, None, None
+            return mapped, f"routing model '{requested}' mapped to '{mapped}' for backend '{spec.name}'", None
+
+        is_qualified = "/" in requested or ":" in requested
+        if not is_qualified:
+            return requested, None, None
+
+        if spec.strict_model:
+            known = ", ".join(sorted(spec.model_map)) or "(none)"
+            return None, None, (
+                f"Backend '{spec.name}' has no mapping for routing model '{requested}', so it "
+                f"cannot run that model. Refusing rather than passing an id its CLI will reject "
+                f"or silently substituting a different model. Mapped ids: {known}. Add "
+                f"\"model_map\": {{\"{requested}\": \"<cli-model-name>\"}} to this backend's "
+                f"config, or route this stage to a backend that serves it."
+            )
+
+        return requested, (
+            f"routing model '{requested}' is unmapped for backend '{spec.name}'; "
+            "passed through unchanged because this backend is configured with "
+            "strict_model disabled"
+        ), None
+
+    # -- argv construction -------------------------------------------------
+
+    def _substitute(self, argv: Sequence[str], values: Mapping[str, str]) -> List[str]:
+        """
+        Whole-token placeholder substitution. Each argv element is rendered
+        independently and stays a single element, so no value can inject an
+        extra argument regardless of its content.
+        """
+        out: List[str] = []
+        for token in argv:
+            rendered = token
+            for key, val in values.items():
+                needle = "{" + key + "}"
+                if needle in rendered:
+                    rendered = rendered.replace(needle, val)
+            out.append(rendered)
+        return out
+
+    # -- durable native background dispatch -------------------------------
+
+    def _request_context(self, request: Any) -> Tuple[Dict[str, Any], Optional[str]]:
+        """Single request/repository/head validator shared by native and CLI paths."""
+        context = {
+            "stage": str(_field(request, "stage", "") or "").strip(),
+            "request_id": str(_field(request, "request_id", "") or "").strip(),
+            "repo_root": str(_field(request, "repo_root", "") or "").strip(),
+            "requested_head": _field(request, "head_sha") or None,
+            "head_before": None,
+        }
+        if not context["request_id"]:
+            return context, "Malformed worker request: 'request_id' is required."
+        if context["stage"] not in VALID_STAGES:
+            return context, (
+                f"Malformed worker request: stage must be one of {VALID_STAGES}, "
+                f"got {context['stage']!r}."
+            )
+        if not context["repo_root"]:
+            return context, "Malformed worker request: 'repo_root' is required."
+        context["repo_root"] = os.path.abspath(context["repo_root"])
+        if not os.path.isdir(context["repo_root"]):
+            return context, (
+                f"Worker repo_root does not exist or is not a directory: "
+                f"{context['repo_root']}"
+            )
+        requested_head = context["requested_head"]
+        if requested_head is None:
+            return context, (
+                "Malformed worker request: 'head_sha' is required and must identify the exact "
+                "commit checked out at repo_root."
+            )
+        if not SHA_RE.match(str(requested_head)):
+            return context, (
+                "Malformed worker request: head_sha must be a full 40-character SHA, "
+                f"got {requested_head!r}."
+            )
+        head_before = _git_head(context["repo_root"])
+        context["head_before"] = head_before
+        if head_before is None:
+            return context, (
+                f"Worker repo_root is not a git repository with a resolvable HEAD: "
+                f"{context['repo_root']}"
+            )
+        resolved_head = _git_commit(context["repo_root"], str(requested_head))
+        if resolved_head is None:
+            return context, (
+                f"Head binding refused before execution: requested commit {requested_head} "
+                f"does not resolve to a commit in repository {context['repo_root']}."
+            )
+        if resolved_head != str(requested_head) or head_before != str(requested_head):
+            return context, (
+                f"Head binding refused before execution: request targets {requested_head} but "
+                f"the tree at {context['repo_root']} is on {head_before}. Check out the requested "
+                "commit first; a worker never runs against whatever happens to be present."
+            )
+        return context, None
+
+    def _normalized_request(self, request: Any, context: Mapping[str, Any]) -> WorkerRequest:
+        return WorkerRequest(
+            request_id=context["request_id"],
+            stage=context["stage"],
+            repo_root=context["repo_root"],
+            head_sha=str(context["requested_head"]),
+            model=_field(request, "model") or None,
+            agent_role=_field(request, "agent_role") or None,
+            issue_url=_field(request, "issue_url") or None,
+            pr_url=_field(request, "pr_url") or None,
+            prompt=_field(request, "prompt") or None,
+            criteria=list(_field(request, "criteria", []) or []),
+            task_type=_field(request, "task_type") or None,
+            backend=NATIVE_BACKEND_NAME,
+        )
+
+    def _native_run_dir(self, run_id: str) -> str:
+        if not re.match(r"^native_[0-9a-f]{24}$", run_id):
+            raise WorkerBackendError(f"Invalid native run id: {run_id!r}")
+        return os.path.join(self.work_dir, run_id)
+
+    def _read_native_record(self, run_id: str) -> Dict[str, Any]:
+        path = os.path.join(self._native_run_dir(run_id), "dispatch.json")
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError) as e:
+            raise WorkerBackendError(f"Native dispatch record {run_id!r} is unavailable: {e}")
+        if not isinstance(data, dict) or data.get("run_id") != run_id:
+            raise WorkerBackendError(f"Native dispatch record {run_id!r} is malformed.")
+        return data
+
+    def _write_native_record(self, record: Mapping[str, Any]) -> None:
+        run_dir = self._native_run_dir(str(record["run_id"]))
+        os.makedirs(run_dir, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".dispatch_", suffix=".json", dir=run_dir, text=True)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(dict(record), fh, indent=2, default=str)
+                fh.write("\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, os.path.join(run_dir, "dispatch.json"))
+        except Exception:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+
+    def _read_native_index(self) -> Dict[str, str]:
+        path = os.path.join(self.work_dir, "native_attempts.json")
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError) as e:
+            raise WorkerBackendError(f"Native attempt index is unavailable: {e}")
+        if not isinstance(data, dict):
+            raise WorkerBackendError("Native attempt index must be a JSON object.")
+        return {str(key): str(value) for key, value in data.items()}
+
+    def _write_native_index(self, index: Mapping[str, str]) -> None:
+        os.makedirs(self.work_dir, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(
+            prefix=".native_attempts_", suffix=".json", dir=self.work_dir, text=True,
+        )
+        path = os.path.join(self.work_dir, "native_attempts.json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(dict(index), fh, indent=2, sort_keys=True)
+                fh.write("\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        except Exception:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+
+    def _native_identity_sha(self, request: Any) -> Optional[str]:
+        request_id = str(_field(request, "request_id", "") or "").strip()
+        stage = str(_field(request, "stage", "") or "").strip()
+        repo_root = str(_field(request, "repo_root", "") or "").strip()
+        head_sha = str(_field(request, "head_sha", "") or "").strip()
+        if not (request_id and stage in VALID_STAGES and repo_root and SHA_RE.match(head_sha)):
+            return None
+        identity = "|".join((os.path.abspath(repo_root), request_id, stage, head_sha))
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
+    def _ticket(self, record: Mapping[str, Any], blocked_reason: Optional[str] = None) -> NativeDispatchTicket:
+        return NativeDispatchTicket(
+            run_id=str(record.get("run_id") or ""),
+            state=str(record.get("state") or "blocked"),
+            request=dict(record.get("request") or {}),
+            prompt=str(record.get("prompt") or ""),
+            result_schema=dict(record.get("result_schema") or {}),
+            head_sha=record.get("head_before"),
+            task_handle=record.get("task_handle"),
+            blocked_reason=blocked_reason or record.get("blocked_reason"),
+        )
+
+    def prepare_native(self, request: Any) -> NativeDispatchTicket:
+        """Preflight and durably prepare work without launching or retrying anything."""
+        identity_sha = self._native_identity_sha(request)
+        lock_path = os.path.join(self.work_dir, ".native-dispatch.lock")
+        if identity_sha:
+            with FileLock(lock_path):
+                index = self._read_native_index()
+                run_id = index.get(identity_sha) or ("native_" + identity_sha[:24])
+                record_path = os.path.join(
+                    self._native_run_dir(run_id), "dispatch.json",
+                )
+                if os.path.exists(record_path):
+                    if identity_sha not in index:
+                        index[identity_sha] = run_id
+                        self._write_native_index(index)
+                    return self._ticket(self._read_native_record(run_id))
+
+        context, error = self._request_context(request)
+        if error:
+            return NativeDispatchTicket(
+                run_id="", state="blocked", request={}, prompt="", result_schema={},
+                head_sha=context.get("head_before"), blocked_reason=error,
+            )
+        normalized = self._normalized_request(request, context)
+        identity_sha = self._native_identity_sha(normalized)
+        assert identity_sha is not None
+        run_id = "native_" + identity_sha[:24]
+        schema = agent_result_schema()
+        prompt = build_stage_prompt(normalized, schema)
+        with FileLock(lock_path):
+            index = self._read_native_index()
+            indexed_run = index.get(identity_sha)
+            if indexed_run:
+                return self._ticket(self._read_native_record(indexed_run))
+            record_path = os.path.join(self._native_run_dir(run_id), "dispatch.json")
+            if os.path.exists(record_path):
+                index[identity_sha] = run_id
+                self._write_native_index(index)
+                return self._ticket(self._read_native_record(run_id))
+            record = {
+                "version": 1,
+                "run_id": run_id,
+                "identity_sha256": identity_sha,
+                "attempt": 1,
+                "state": "prepared",
+                "request": normalized.to_dict(),
+                "repo_root": normalized.repo_root,
+                "head_before": context["head_before"],
+                "prompt": prompt,
+                "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                "result_schema": schema,
+                "schema_sha256": hashlib.sha256(
+                    json.dumps(schema, sort_keys=True).encode("utf-8")
+                ).hexdigest(),
+                "prepared_at": _now(),
+                "task_handle": None,
+            }
+            self._write_native_record(record)
+            index[identity_sha] = run_id
+            self._write_native_index(index)
+            return self._ticket(record)
+
+    def retry_native(self, run_id: str) -> NativeDispatchTicket:
+        """Create one fresh prepared attempt only after an explicit terminal failure retry."""
+        lock_path = os.path.join(self.work_dir, ".native-dispatch.lock")
+        with FileLock(lock_path):
+            record = self._read_native_record(run_id)
+            identity_sha = record.get("identity_sha256") or self._native_identity_sha(
+                record.get("request") or {}
+            )
+            if not identity_sha:
+                raise WorkerBackendError(
+                    f"Native dispatch {run_id} has no recoverable request identity."
+                )
+            index = self._read_native_index()
+            current_run = index.get(identity_sha, run_id)
+            if current_run != run_id:
+                current = self._read_native_record(current_run)
+                if current.get("state") == "prepared":
+                    return self._ticket(current)
+                raise WorkerBackendError(
+                    f"Native dispatch {run_id} already has current attempt {current_run} "
+                    f"in state {current.get('state')!r}; refusing another retry."
+                )
+            outcome = record.get("outcome") or {}
+            if record.get("state") != "blocked" or outcome.get("ok") is not False:
+                raise WorkerBackendError(
+                    f"Native dispatch {run_id} is {record.get('state')!r}; only an explicitly "
+                    "unparked terminal blocked/failed outcome may be retried."
+                )
+            _, retry_error = self._request_context(record.get("request") or {})
+            if retry_error:
+                raise WorkerBackendError(
+                    f"Native dispatch {run_id} cannot retry on its bound head: {retry_error}"
+                )
+            nonce = f"{run_id}|{record.get('attempt', 1)}|{_now()}"
+            next_run_id = "native_" + hashlib.sha256(nonce.encode("utf-8")).hexdigest()[:24]
+            next_record = {
+                "version": 1,
+                "run_id": next_run_id,
+                "identity_sha256": identity_sha,
+                "attempt": int(record.get("attempt") or 1) + 1,
+                "retry_of": run_id,
+                "state": "prepared",
+                "request": dict(record["request"]),
+                "repo_root": record["repo_root"],
+                "head_before": record["head_before"],
+                "prompt": record["prompt"],
+                "prompt_sha256": record["prompt_sha256"],
+                "result_schema": dict(record["result_schema"]),
+                "schema_sha256": record["schema_sha256"],
+                "prepared_at": _now(),
+                "task_handle": None,
+            }
+            self._write_native_record(next_record)
+            index[identity_sha] = next_run_id
+            self._write_native_index(index)
+            return self._ticket(next_record)
+
+    def get_native_dispatch(self, run_id: str) -> NativeDispatchTicket:
+        return self._ticket(self._read_native_record(run_id))
+
+    def get_native_outcome(self, run_id: str) -> Optional[WorkerOutcome]:
+        record = self._read_native_record(run_id)
+        if record.get("state") not in ("finalized", "blocked"):
+            return None
+        outcome = record.get("outcome")
+        return WorkerOutcome(**outcome) if isinstance(outcome, dict) else None
+
+    def record_native_dispatch(self, run_id: str, task_handle: str) -> NativeDispatchTicket:
+        """Bind a prepared record to the actual recoverable background task handle."""
+        if not isinstance(task_handle, str) or not task_handle.startswith("agent://"):
+            raise WorkerBackendError("Native task handle must be a non-empty agent:// URI.")
+        run_dir = self._native_run_dir(run_id)
+        with FileLock(os.path.join(run_dir, ".lock")):
+            record = self._read_native_record(run_id)
+            if record["state"] == "background_dispatched":
+                if record.get("task_handle") == task_handle:
+                    return self._ticket(record)
+                raise WorkerBackendError(
+                    f"Native dispatch {run_id} is already bound to "
+                    f"{record.get('task_handle')!r}; refusing handle replacement."
+                )
+            request = WorkerRequest(**record["request"])
+            context, error = self._request_context(request)
+            if error:
+                raise WorkerBackendError(
+                    f"Native dispatch {run_id} cannot be registered: {error}"
+                )
+            if record["state"] != "prepared":
+                raise WorkerBackendError(
+                    f"Native dispatch {run_id} is {record['state']!r}, not prepared."
+                )
+            record["state"] = "background_dispatched"
+            record["task_handle"] = task_handle
+            record["dispatched_at"] = _now()
+            record["dispatch_head"] = context["head_before"]
+            self._write_native_record(record)
+            return self._ticket(record)
+
+    def _native_refusal(
+        self, record: Mapping[str, Any], reason: str, head: Optional[str] = None
+    ) -> WorkerOutcome:
+        request = record.get("request") or {}
+        evidence = {
+            "backend": NATIVE_BACKEND_NAME,
+            "dispatch_kind": "native_background",
+            "stage": request.get("stage") or "unknown",
+            "request_id": request.get("request_id") or "",
+            "head_before": record.get("head_before"),
+            "head_after": head,
+            "head_sha": head,
+            "started_at": record.get("prepared_at"),
+            "dispatched_at": record.get("dispatched_at"),
+            "finished_at": _now(),
+            "blocked_reason": reason,
+            "auto_merge_allowed": False,
+            "auto_deploy_allowed": False,
+        }
+        return WorkerOutcome(
+            ok=False,
+            stage=evidence["stage"],
+            exit_code=None,
+            command=[],
+            head_sha=head,
+            evidence=evidence,
+            artifacts=[],
+            blocked_reason=reason,
+            backend_name=NATIVE_BACKEND_NAME,
+        )
+
+    def complete_native(
+        self, run_id: str, task_handle: str, structured_result: Mapping[str, Any]
+    ) -> WorkerOutcome:
+        """Finalize one bound background task exactly once through shared validation."""
+        run_dir = self._native_run_dir(run_id)
+        with FileLock(os.path.join(run_dir, ".lock")):
+            record = self._read_native_record(run_id)
+            try:
+                result_digest = hashlib.sha256(
+                    json.dumps(structured_result, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest()
+            except (TypeError, ValueError):
+                return self._native_refusal(
+                    record, "Native structured result must be a JSON-serializable mapping.",
+                    _git_head(str(record.get("repo_root") or "")),
+                )
+            if record.get("state") in ("finalized", "blocked"):
+                if (
+                    record.get("task_handle") == task_handle
+                    and record.get("result_sha256") == result_digest
+                    and isinstance(record.get("outcome"), dict)
+                ):
+                    return WorkerOutcome(**record["outcome"])
+                return self._native_refusal(
+                    record,
+                    f"Native dispatch {run_id} is already terminal; changed handle/result replay refused.",
+                    _git_head(str(record.get("repo_root") or "")),
+                )
+            if record.get("state") != "background_dispatched":
+                return self._native_refusal(
+                    record,
+                    f"Native dispatch {run_id} is {record.get('state')!r}; completion requires "
+                    "a bound background_dispatched record.",
+                    _git_head(str(record.get("repo_root") or "")),
+                )
+            if task_handle != record.get("task_handle"):
+                return self._native_refusal(
+                    record,
+                    f"Native completion handle {task_handle!r} does not match bound handle "
+                    f"{record.get('task_handle')!r}.",
+                    _git_head(str(record.get("repo_root") or "")),
+                )
+            if not isinstance(structured_result, Mapping):
+                return self._native_refusal(
+                    record, "Native structured result must be a mapping.",
+                    _git_head(str(record.get("repo_root") or "")),
+                )
+
+            request = WorkerRequest(**record["request"])
+            repo_root = request.repo_root
+            head_after = _git_head(repo_root)
+            base_evidence: Dict[str, Any] = {
+                "backend": NATIVE_BACKEND_NAME,
+                "dispatch_kind": "native_background",
+                "stage": request.stage,
+                "request_id": request.request_id,
+                "head_sha": head_after,
+                "head_before": record.get("head_before"),
+                "head_after": head_after,
+                "structured_result": dict(structured_result),
+                "verdict": None,
+                "artifact_digests": {},
+                "started_at": record.get("prepared_at"),
+                "dispatched_at": record.get("dispatched_at"),
+                "model": request.model,
+                "model_requested": request.model,
+                "command": [],
+                "task_handle": record.get("task_handle"),
+                "config_source": self.resolved_config["source"],
+                "exit_code": 0,
+            }
+
+            def blocked(reason: str, *, exit_code: Optional[int] = None,
+                        command: Optional[List[str]] = None,
+                        extra: Optional[Dict[str, Any]] = None,
+                        head: Optional[str] = None) -> WorkerOutcome:
+                outcome = self._native_refusal(record, reason, head)
+                outcome.exit_code = exit_code
+                if extra:
+                    outcome.evidence.update(extra)
+                return outcome
+
+            outcome = self._finish_structured_result(
+                structured=dict(structured_result),
+                stage=request.stage,
+                request_id=request.request_id,
+                request=request,
+                repo_root=repo_root,
+                head_before=record.get("head_before"),
+                head_after=head_after,
+                requested_head=request.head_sha,
+                exit_code=0,
+                command=[],
+                backend_name=NATIVE_BACKEND_NAME,
+                base_evidence=base_evidence,
+                blocked=blocked,
+            )
+            record["result_sha256"] = result_digest
+            record["structured_result"] = dict(structured_result)
+            record["finished_at"] = _now()
+            record["state"] = "finalized" if outcome.ok else "blocked"
+            record["outcome"] = outcome.to_dict()
+            self._write_native_record(record)
+            return outcome
+
+    # -- execution ---------------------------------------------------------
+
+    def execute(self, request: Any) -> WorkerOutcome:
+        """
+        Execute one explicitly selected CLI stage. Native background execution
+        uses prepare_native/record_native_dispatch/complete_native instead.
+        """
+        stage = str(_field(request, "stage", "") or "").strip()
+        request_id = str(_field(request, "request_id", "") or "").strip()
+        repo_root = str(_field(request, "repo_root", "") or "").strip()
+        requested_head = _field(request, "head_sha") or None
+        backend_name = _field(request, "backend") or None
+
+        base_evidence: Dict[str, Any] = {
+            "backend": None,
+            "stage": stage or "unknown",
+            "request_id": request_id,
+            "head_sha": None,
+            "structured_result": None,
+            "verdict": None,
+            "artifact_digests": {},
+            "started_at": _now(),
+            "config_source": self.resolved_config["source"],
+        }
+
+        def blocked(reason: str, *, exit_code: Optional[int] = None,
+                    command: Optional[List[str]] = None,
+                    extra: Optional[Dict[str, Any]] = None,
+                    head: Optional[str] = None) -> WorkerOutcome:
+            ev = dict(base_evidence)
+            ev["finished_at"] = _now()
+            ev["blocked_reason"] = reason
+            ev["head_sha"] = head
+            if extra:
+                ev.update(extra)
+            return WorkerOutcome(
+                ok=False,
+                stage=stage or "unknown",
+                exit_code=exit_code,
+                command=command or [],
+                head_sha=head,
+                evidence=ev,
+                artifacts=[],
+                blocked_reason=reason,
+                backend_name=base_evidence.get("backend"),
+            )
+
+        context, request_error = self._request_context(request)
+        stage = context["stage"]
+        request_id = context["request_id"]
+        repo_root = context["repo_root"]
+        requested_head = context["requested_head"]
+        head_before = context["head_before"]
+        if request_error:
+            return blocked(
+                request_error,
+                head=head_before,
+                extra={"head_before": head_before},
+            )
+
+        selected_backend = (
+            backend_name
+            or self.resolved_config["stage_backends"].get(stage)
+            or self.default_backend
+        )
+        if selected_backend == NATIVE_BACKEND_NAME:
+            base_evidence["backend"] = NATIVE_BACKEND_NAME
+            return blocked(
+                "Native execution is background-only. Call prepare_native(request), launch the "
+                "returned prompt/result schema with the host task tool, bind its agent:// handle "
+                "with record_native_dispatch, then call complete_native.",
+                head=head_before,
+            )
+
+        # 2. Backend resolution.
+        spec, err = self.resolve_backend(stage, backend_name)
+        if err or spec is None:
+            return blocked(err or "Worker backend could not be resolved.")
+        base_evidence["backend"] = spec.name
+
+        # 2b. Model translation. The routing layer names models in its own
+        #     vocabulary; this backend's CLI has a different one.
+        resolved_model, model_note, model_err = self.resolve_model(
+            spec, _field(request, "model")
+        )
+        if model_err:
+            return blocked(model_err)
+        base_evidence["model"] = resolved_model
+        base_evidence["model_requested"] = _field(request, "model") or None
+        if model_note:
+            base_evidence["model_note"] = model_note
+
+        # 3. Executable presence. A missing command blocks, it does not fall
+        #    back to a fixture.
+        executable = shutil.which(spec.argv[0])
+        if not executable:
+            return blocked(
+                f"Worker backend '{spec.name}' command '{spec.argv[0]}' was not found on PATH. "
+                f"Install it or configure a different backend; there is no fixture fallback."
+            )
+
+        # 4. Prepare the run directory, schema and prompt.
+        schema = agent_result_schema()
+        run_dir = os.path.join(self.work_dir, f"{request_id}__{stage}__{datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}")
+        try:
+            os.makedirs(run_dir, exist_ok=True)
+        except OSError as e:
+            return blocked(f"Could not create worker run directory {run_dir}: {e}")
+
+        schema_path = os.path.join(run_dir, "result_schema.json")
+        if spec.schema_mode == "file":
+            try:
+                with open(schema_path, "w", encoding="utf-8") as fh:
+                    json.dump(schema, fh, indent=2)
+            except OSError as e:
+                return blocked(f"Could not write result schema to {schema_path}: {e}")
+
+        prompt = build_stage_prompt(request, schema)
+        result_path = ""
+        if spec.result_source == "file":
+            template = spec.result_path_template or "{work_dir}/result.json"
+            result_path = template.replace("{work_dir}", run_dir).replace("{repo_root}", repo_root)
+
+        values = {
+            "prompt": prompt,
+            "model": str(resolved_model),
+            "agent_role": str(_field(request, "agent_role") or "worker"),
+            "stage": stage,
+            "request_id": request_id,
+            "head_sha": str(requested_head or ""),
+            "repo_root": repo_root,
+            "schema_path": schema_path,
+            "schema_inline": json.dumps(schema),
+            "permission_mode": spec.permission_mode,
+            "allowed_tools": spec.allowed_tools,
+            "sandbox_mode": spec.sandbox_mode,
+            "result_path": result_path,
+            "work_dir": run_dir,
+            "issue_url": str(_field(request, "issue_url") or ""),
+            "pr_url": str(_field(request, "pr_url") or ""),
+        }
+        argv = self._substitute(spec.argv, values)
+        argv[0] = executable
+
+        # 5. The repository and exact requested commit were resolved before any
+        #    worker preparation or dispatch. Carry that immutable observation
+        #    into the command evidence; build may advance it, QA/review may not.
+        base_evidence["head_before"] = head_before
+        base_evidence["command"] = argv
+        base_evidence["run_dir"] = run_dir
+
+        if self.dry_run:
+            ev = dict(base_evidence)
+            ev["finished_at"] = _now()
+            ev["dry_run"] = True
+            ev["blocked_reason"] = "Dry run: the configured command was built and validated but not executed."
+            return WorkerOutcome(
+                ok=False,
+                stage=stage,
+                exit_code=None,
+                command=argv,
+                head_sha=head_before,
+                evidence=ev,
+                artifacts=[],
+                blocked_reason="Dry run: command built and validated, nothing executed.",
+                backend_name=spec.name,
+            )
+
+        # 6. Run it. shell=False, explicit argv, no interpolation into a shell.
+        env = dict(os.environ)
+        env.update(spec.env)
+        try:
+            proc = subprocess.run(
+                argv,
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+                timeout=spec.timeout_seconds,
+                shell=False,
+                env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return blocked(
+                f"Worker backend '{spec.name}' exceeded its {spec.timeout_seconds}s timeout for "
+                f"stage '{stage}' of request '{request_id}'.",
+                command=argv,
+                head=head_before,
+            )
+        except OSError as e:
+            return blocked(
+                f"Worker backend '{spec.name}' could not be executed: {e}",
+                command=argv,
+                head=head_before,
+            )
+
+        stdout = proc.stdout or ""
+        stderr = proc.stderr or ""
+        base_evidence["exit_code"] = proc.returncode
+        base_evidence["stdout_tail"] = _clip(stdout)
+        base_evidence["stderr_tail"] = _clip(stderr)
+
+        head_after = _git_head(repo_root)
+        base_evidence["head_after"] = head_after
+
+        # 7. Non-zero exit blocks.
+        if proc.returncode != 0:
+            return blocked(
+                f"Worker backend '{spec.name}' exited {proc.returncode} for stage '{stage}' of "
+                f"request '{request_id}'.",
+                exit_code=proc.returncode,
+                command=argv,
+                head=head_after or head_before,
+            )
+
+        # 8. Recover the structured result. Absence blocks; exit 0 is not a result.
+        structured: Optional[Dict[str, Any]] = None
+        if spec.result_source == "file":
+            if not result_path or not os.path.exists(result_path):
+                return blocked(
+                    f"Worker backend '{spec.name}' exited 0 but wrote no structured result to "
+                    f"{result_path or '(unset)'}. Exit status alone is not evidence.",
+                    exit_code=proc.returncode,
+                    command=argv,
+                    head=head_after or head_before,
+                )
+            try:
+                with open(result_path, "r", encoding="utf-8") as fh:
+                    raw_text = fh.read()
+            except OSError as e:
+                return blocked(
+                    f"Worker backend '{spec.name}' result file {result_path} could not be read: {e}",
+                    exit_code=proc.returncode, command=argv, head=head_after or head_before,
+                )
+            payload = _extract_last_json_object(raw_text)
+            structured = _coerce_result_object(payload, spec.stdout_result_keys)
+        else:
+            payload = _extract_last_json_object(stdout)
+            if payload is None:
+                return blocked(
+                    f"Worker backend '{spec.name}' exited 0 but emitted no parseable JSON on stdout. "
+                    f"Exit status alone is not evidence.",
+                    exit_code=proc.returncode, command=argv, head=head_after or head_before,
+                )
+            if isinstance(payload, dict) and payload.get("is_error") is True:
+                return blocked(
+                    f"Worker backend '{spec.name}' reported is_error=true "
+                    f"(subtype={payload.get('subtype')!r}) despite exit 0.",
+                    exit_code=proc.returncode, command=argv, head=head_after or head_before,
+                )
+            structured = _coerce_result_object(payload, spec.stdout_result_keys)
+
+        if structured is None:
+            return blocked(
+                f"Worker backend '{spec.name}' produced output that is not a structured worker "
+                f"result. Expected a JSON object with the required stage/verdict fields "
+                f"(looked under {spec.stdout_result_keys}).",
+                exit_code=proc.returncode, command=argv, head=head_after or head_before,
+            )
+        base_evidence["structured_result"] = structured
+
+        return self._finish_structured_result(
+            structured=structured,
+            stage=stage,
+            request_id=request_id,
+            request=request,
+            repo_root=repo_root,
+            head_before=head_before,
+            head_after=head_after,
+            requested_head=requested_head,
+            exit_code=proc.returncode,
+            command=argv,
+            backend_name=spec.name,
+            base_evidence=base_evidence,
+            blocked=blocked,
+        )
+
+    def _finish_structured_result(
+        self,
+        *,
+        structured: Mapping[str, Any],
+        stage: str,
+        request_id: str,
+        request: Any,
+        repo_root: str,
+        head_before: Optional[str],
+        head_after: Optional[str],
+        requested_head: Optional[str],
+        exit_code: int,
+        command: List[str],
+        backend_name: str,
+        base_evidence: Dict[str, Any],
+        blocked: Callable[..., WorkerOutcome],
+    ) -> WorkerOutcome:
+        """Apply the single shared validation and artifact pipeline to any executor."""
+        valid, reason, verdict = self._validate_result(
+            structured=structured,
+            stage=stage,
+            request_id=request_id,
+            request=request,
+            repo_root=repo_root,
+            head_before=head_before,
+            head_after=head_after,
+            requested_head=requested_head,
+        )
+        base_evidence["verdict"] = verdict
+        observed_head = head_after or head_before
+        base_evidence["head_sha"] = observed_head
+
+        if not valid:
+            return blocked(
+                reason or "Worker result failed validation.",
+                exit_code=exit_code, command=command, head=observed_head,
+                extra={"verdict": verdict},
+            )
+
+        artifacts: List[str] = []
+        digests: Dict[str, str] = {}
+        for entry in structured.get("artifacts") or []:
+            rel = entry.get("path") if isinstance(entry, Mapping) else entry
+            if not rel:
+                continue
+            rel = str(rel)
+            abs_path = rel if os.path.isabs(rel) else os.path.join(repo_root, rel)
+            if not os.path.exists(abs_path):
+                return blocked(
+                    f"Worker declared artifact '{rel}' but it does not exist at {abs_path}. "
+                    f"A claimed artifact that is absent is not evidence.",
+                    exit_code=exit_code, command=command, head=observed_head,
+                    extra={"verdict": verdict},
+                )
+            artifacts.append(rel)
+            digest = _sha256_file(abs_path) if os.path.isfile(abs_path) else None
+            if digest:
+                digests[rel] = digest
+
+        base_evidence["artifact_digests"] = digests
+        base_evidence["artifacts"] = artifacts
+        base_evidence["checks"] = structured.get("checks") or []
+        base_evidence["summary"] = structured.get("summary") or ""
+        repro = structured.get("reproduction")
+        if isinstance(repro, Mapping):
+            derived = dict(repro)
+            derived["verdict"] = "absent" if repro.get("still_reproduces") is False else "present"
+            derived["derived_by"] = "worker_backend._validate_result"
+            base_evidence["reproduction"] = derived
+        base_evidence["finished_at"] = _now()
+        base_evidence["auto_merge_allowed"] = False
+        base_evidence["auto_deploy_allowed"] = False
+
+        return WorkerOutcome(
+            ok=True,
+            stage=stage,
+            exit_code=exit_code,
+            command=command,
+            head_sha=observed_head,
+            evidence=base_evidence,
+            artifacts=artifacts,
+            blocked_reason=None,
+            backend_name=backend_name,
+        )
+
+    # -- validation --------------------------------------------------------
+
+    def _validate_result(
+        self,
+        structured: Mapping[str, Any],
+        stage: str,
+        request_id: str,
+        request: Any,
+        repo_root: str,
+        head_before: Optional[str],
+        head_after: Optional[str],
+        requested_head: Optional[str],
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
+        """
+        Enforce the evidence contract on a parsed agent result.
+
+        Returns (valid, reason, verdict). This is where "exit 0" and
+        "proven absent" stop being acceptable.
+        """
+        required = ("stage", "request_id", "head_sha", "verdict", "summary", "checks", "artifacts")
+        missing = [k for k in required if k not in structured]
+        if missing:
+            return False, (
+                f"Worker result is missing required field(s): {', '.join(missing)}. "
+                f"A partial result is not evidence."
+            ), structured.get("verdict")
+
+        verdict = structured.get("verdict")
+        if verdict not in VALID_VERDICTS:
+            return False, (
+                f"Worker result verdict {verdict!r} is not one of {VALID_VERDICTS}."
+            ), verdict
+
+        if str(structured.get("stage")) != stage:
+            return False, (
+                f"Worker result is for stage {structured.get('stage')!r} but stage {stage!r} was "
+                f"dispatched. Refusing to credit a result to the wrong stage."
+            ), verdict
+
+        if str(structured.get("request_id")) != request_id:
+            return False, (
+                f"Worker result is for request {structured.get('request_id')!r} but request "
+                f"{request_id!r} was dispatched."
+            ), verdict
+
+        # A non-pass verdict is a legitimate, honest outcome, but it does not
+        # advance the request. Report it as blocked with the worker's reason.
+        if verdict != "pass":
+            return False, (
+                f"Worker returned verdict '{verdict}' for stage '{stage}': "
+                f"{structured.get('summary') or '(no summary)'}"
+            ), verdict
+
+        # --- head binding -------------------------------------------------
+        claimed = structured.get("head_sha")
+        if not isinstance(claimed, str) or not SHA_RE.match(claimed.strip()):
+            return False, (
+                f"Worker claimed head_sha {claimed!r}, which is not a full 40-character SHA. "
+                f"Evidence must be bound to a real commit."
+            ), verdict
+        claimed = claimed.strip()
+
+        observed = head_after
+        if observed is None:
+            return False, (
+                f"Could not read git HEAD in {repo_root} after execution, so the worker's "
+                f"evidence cannot be bound to a commit."
+            ), verdict
+        if claimed != observed:
+            return False, (
+                f"Head binding refused: worker claims commit {claimed} but the observed HEAD in "
+                f"{repo_root} after execution is {observed}. The observed commit always wins."
+            ), verdict
+
+        if stage in IMMUTABLE_HEAD_STAGES:
+            if head_before and head_before != observed:
+                return False, (
+                    f"{stage.upper()} evidence is invalid: HEAD moved from {head_before} to "
+                    f"{observed} during the run. A verification stage must not mutate the tree it "
+                    f"is verifying."
+                ), verdict
+            if requested_head and observed != str(requested_head):
+                return False, (
+                    f"{stage.upper()} evidence is invalid: request targets {requested_head} but the "
+                    f"tested commit is {observed}."
+                ), verdict
+
+        # --- executed checks ---------------------------------------------
+        checks = structured.get("checks")
+        if not isinstance(checks, list) or not checks:
+            return False, (
+                f"Worker returned verdict 'pass' for stage '{stage}' with no executed checks. "
+                f"Exit status alone is never evidence."
+            ), verdict
+
+        good_checks = 0
+        for idx, chk in enumerate(checks):
+            if not isinstance(chk, Mapping):
+                return False, f"Worker check #{idx} is not an object.", verdict
+            cmd = chk.get("command")
+            if not isinstance(cmd, list) or not cmd or not all(str(c).strip() for c in cmd):
+                return False, (
+                    f"Worker check #{idx} ({chk.get('name')!r}) carries no executed command. "
+                    f"A pass verdict needs commands that actually ran."
+                ), verdict
+            if not isinstance(chk.get("exit_code"), int):
+                return False, (
+                    f"Worker check #{idx} ({chk.get('name')!r}) has no integer exit_code."
+                ), verdict
+            if not str(chk.get("observed") or "").strip():
+                return False, (
+                    f"Worker check #{idx} ({chk.get('name')!r}) reports nothing observed."
+                ), verdict
+            good_checks += 1
+
+        if good_checks == 0:
+            return False, "Worker returned no substantiated check.", verdict
+
+        # --- build must have produced something --------------------------
+        artifacts = structured.get("artifacts")
+        if not isinstance(artifacts, list):
+            return False, "Worker result 'artifacts' must be a list.", verdict
+
+        if stage == "build":
+            advanced = bool(head_before and head_after and head_before != head_after)
+            if not advanced and not artifacts:
+                return False, (
+                    "Build stage returned 'pass' but produced neither a new commit nor any "
+                    "artifact. A build that changed nothing has proven nothing."
+                ), verdict
+
+        # --- bug reproduction must be re-executed, not asserted ----------
+        # The adapter supplies task_type, so it is authoritative when present.
+        # The id heuristic survives only for a caller that omits it entirely
+        # (the standalone CLI), and would otherwise demand a reproduction record
+        # from any request whose id merely contains the word.
+        task_type = str(_field(request, "task_type", "") or "").strip().lower()
+        if task_type:
+            is_bug = task_type == "bug"
+        else:
+            is_bug = "bug" in request_id.lower()
+        if is_bug and stage == "qa":
+            repro = structured.get("reproduction")
+            if not isinstance(repro, Mapping):
+                return False, (
+                    f"Bug QA for '{request_id}' returned 'pass' without a 'reproduction' record. "
+                    f"A bug is closed by re-running the original failing scenario, not by asserting "
+                    f"it is gone."
+                ), verdict
+            for key in ("scenario", "command", "exit_code", "observed", "still_reproduces"):
+                if key not in repro:
+                    return False, (
+                        f"Bug QA reproduction record for '{request_id}' is missing '{key}'."
+                    ), verdict
+            if not isinstance(repro.get("command"), list) or not repro["command"]:
+                return False, (
+                    f"Bug QA reproduction for '{request_id}' names no command, so the scenario was "
+                    f"not re-executed."
+                ), verdict
+            if not isinstance(repro.get("exit_code"), int):
+                return False, (
+                    f"Bug QA reproduction for '{request_id}' has no integer exit_code."
+                ), verdict
+            if not str(repro.get("observed") or "").strip():
+                return False, (
+                    f"Bug QA reproduction for '{request_id}' records nothing observed."
+                ), verdict
+            if repro.get("still_reproduces") is not False:
+                return False, (
+                    f"Bug QA for '{request_id}': the original scenario still reproduces on "
+                    f"{observed}. Reopening rather than advancing."
+                ), verdict
+            if not str(repro.get("scenario") or "").strip():
+                return False, (
+                    f"Bug QA reproduction for '{request_id}' does not state the scenario."
+                ), verdict
+
+        return True, None, verdict
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def build_parser():
+    import argparse
+
+    p = argparse.ArgumentParser(
+        description="Native host-dispatched or explicitly configured CLI worker backend."
+    )
+    p.add_argument("--list-backends", action="store_true",
+                   help="Show native preparation and configured CLI backend availability.")
+    p.add_argument("--print-schema", action="store_true",
+                   help="Print the JSON Schema required of an agent worker result.")
+    native = p.add_mutually_exclusive_group()
+    native.add_argument("--prepare-native", action="store_true",
+                        help="Preflight and persist a native background task ticket.")
+    native.add_argument("--record-native", action="store_true",
+                        help="Bind a prepared native ticket to an actual agent:// handle.")
+    native.add_argument("--complete-native", action="store_true",
+                        help="Finalize a bound native task result through shared validation.")
+    p.add_argument("--run-id", help="Opaque native run id from --prepare-native.")
+    p.add_argument("--task-handle", help="Actual agent:// handle returned by the host task tool.")
+    p.add_argument("--result-file", help="JSON structured result for --complete-native.")
+    p.add_argument("--request-id", help="Request id to execute a stage for.")
+    p.add_argument("--stage", choices=list(VALID_STAGES), help="Worker stage to run.")
+    p.add_argument("--repo-root", help="Repository the worker runs in.")
+    p.add_argument("--head-sha", help="Full 40-character commit the stage is bound to.")
+    p.add_argument("--model", help="Model to pass to the backend.")
+    p.add_argument("--agent-role", default="worker", help="Role label carried into the prompt.")
+    p.add_argument("--task-type", help="Ledger task type, e.g. 'bug'.")
+    p.add_argument("--prompt", help="Task statement for the worker.")
+    p.add_argument("--criterion", action="append", default=[], dest="criteria",
+                   help="Acceptance criterion (repeatable).")
+    p.add_argument("--backend", help="Force a specific configured backend.")
+    p.add_argument("--config", help="Path to a worker backend config JSON.")
+    p.add_argument("--state-dir", help="State directory used for config and run artifacts.")
+    p.add_argument("--timeout", type=int, help="Override the backend timeout, in seconds.")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Build and validate the argv without executing it.")
+    p.add_argument("--json", action="store_true", help="Emit the outcome as JSON.")
+    return p
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    if args.print_schema:
+        print(json.dumps(agent_result_schema(), indent=2))
+        return 0
+
+    backend = WorkerBackend(
+        config=args.config,
+        state_dir=args.state_dir,
+        default_model=args.model,
+        default_backend=args.backend,
+        dry_run=args.dry_run,
+        timeout_seconds=args.timeout,
+    )
+
+    if args.list_backends:
+        avail = backend.available_backends()
+        print(f"config source: {backend.resolved_config['source']}")
+        print(f"default backend: {backend.default_backend}")
+        stage_map = backend.resolved_config["stage_backends"]
+        if stage_map:
+            print(f"stage overrides: {stage_map}")
+        for name in sorted(avail):
+            state = "available" if avail[name] else "UNAVAILABLE"
+            if name == NATIVE_BACKEND_NAME:
+                detail = "durable prepare/record/complete handoff"
+            else:
+                spec = backend.resolved_config["backends"][name]
+                detail = (spec.get("argv") or [""])[0]
+            print(f"  {name:12s} {state:11s} {detail}")
+        return 0
+
+    if args.record_native:
+        if not (args.run_id and args.task_handle):
+            print("--record-native requires --run-id and --task-handle.", file=sys.stderr)
+            return 64
+        try:
+            ticket = backend.record_native_dispatch(args.run_id, args.task_handle)
+        except WorkerBackendError as e:
+            print(str(e), file=sys.stderr)
+            return 1
+        print(ticket.to_json() if args.json else f"{ticket.run_id} {ticket.state} {ticket.task_handle}")
+        return 0
+
+    if args.complete_native:
+        if not (args.run_id and args.task_handle and args.result_file):
+            print(
+                "--complete-native requires --run-id, --task-handle and --result-file.",
+                file=sys.stderr,
+            )
+            return 64
+        try:
+            result = _read_json_file(args.result_file)
+            outcome = backend.complete_native(args.run_id, args.task_handle, result)
+        except (WorkerBackendError, OSError, ValueError) as e:
+            print(str(e), file=sys.stderr)
+            return 1
+        print(outcome.to_json() if args.json else (
+            f"ok={outcome.ok} run_id={args.run_id} head={outcome.head_sha} "
+            f"blocked={outcome.blocked_reason or ''}"
+        ))
+        return 0 if outcome.ok else 1
+
+    if not (args.request_id and args.stage and args.repo_root):
+        print("--request-id, --stage and --repo-root are required.", file=sys.stderr)
+        return 64
+
+    req = WorkerRequest(
+        request_id=args.request_id,
+        stage=args.stage,
+        repo_root=args.repo_root,
+        head_sha=args.head_sha,
+        model=args.model,
+        agent_role=args.agent_role,
+        prompt=args.prompt,
+        criteria=list(args.criteria or []),
+        task_type=args.task_type,
+        backend=args.backend,
+    )
+    if args.prepare_native:
+        ticket = backend.prepare_native(req)
+        print(ticket.to_json() if args.json else (
+            f"{ticket.run_id or '(none)'} {ticket.state} "
+            f"{ticket.blocked_reason or ''}"
+        ))
+        return 0 if ticket.ready else 1
+
+    outcome = backend.execute(req)
+
+    if args.json:
+        print(outcome.to_json())
+    else:
+        print(f"ok            : {outcome.ok}")
+        print(f"backend       : {outcome.backend_name}")
+        print(f"stage         : {outcome.stage}")
+        print(f"exit_code     : {outcome.exit_code}")
+        print(f"head_sha      : {outcome.head_sha}")
+        print(f"artifacts     : {outcome.artifacts}")
+        if outcome.blocked_reason:
+            print(f"blocked_reason: {outcome.blocked_reason}")
+        if outcome.evidence.get("summary"):
+            print(f"summary       : {outcome.evidence['summary']}")
+
+    return 0 if outcome.ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

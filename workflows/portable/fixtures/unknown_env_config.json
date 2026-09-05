@@ -1,0 +1,24 @@
+{
+  "project_name": "UnknownProject",
+  "repo": "isolated/unknown-project",
+  "project_number": 99,
+  "base_branch": "main",
+  "staging": {
+    "dokploy_compose_id": null,
+    "dokploy_app_name": null,
+    "supabase_project_ref": null,
+    "stripe_mode": "test",
+    "services": []
+  },
+  "safety": {
+    "forbidden_patterns": [],
+    "prohibit_production": true,
+    "prohibit_main_db": true,
+    "prohibit_live_keys": true,
+    "forbidden_compose_ids": [],
+    "forbidden_supabase_refs": []
+  },
+  "metadata": {
+    "environment": "isolated_unknown"
+  }
+}

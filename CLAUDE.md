@@ -18,11 +18,18 @@ This repo tracks five skills under `skills/`:
    - `"claude-p"` (legacy, explicit opt-in only) — spawn the headless runner `nohup scripts/super-board-run.sh <slug> &`, report PID + log path, exit. The runner refuses to start (exit 78) unless the config sets this value.
 3. Report back to the user (dispatch confirmation, or one status line per wave).
 
+For the portable core, use the native background protocol documented in
+`workflows/portable/WORKER_EXECUTION.md`: scripts prepare and validate a task,
+the host launches a background agent, and scripts reconcile its completion.
+Keep routing, gates, durable state, and notification deduplication in scripts;
+skills and host instructions should be thin entrypoints. External agent CLIs
+remain explicit standalone options, not requirements for native host execution.
+
 The orchestrator MUST NOT:
 
-- Build, test, review, or fix issues itself. All product work is delegated to `claude -p` workers.
+- Build, test, review, or fix issues itself during a dispatched run. Product work belongs to the configured background workers; `claude -p` is only the explicit legacy option.
 - Patch the dispatcher script or skill files mid-run, even if it sees a problem. Capture the symptom and tell the user; wait for explicit approval.
-- Wait for workers. They write their evidence back to the GitHub issue + PR. The orchestrator's user-facing output is the dispatch confirmation, not the run result.
+- Block the interactive session with inline worker execution. Launch background workers and reconcile their completion events while remaining available to the operator.
 - Hold context for multi-card progress. State lives on the GitHub Project board + the inflight lockfiles, not in the orchestrator's session.
 
 If a problem surfaces during the run, the orchestrator's reply is: "I saw X. Want me to dig in or stop the runner?" — not "I went ahead and fixed it."

@@ -155,3 +155,43 @@ jobs:
         run: |
           { echo '(async function(){'; sed 's/^export const meta/const meta/' workflows/super-board-wave.js; echo '})'; } | node --check --input-type=module
           echo "OK: workflows/super-board-wave.js parses"
+
+  portable-contracts:
+    name: portable-contracts (${{ matrix.os }} / py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: portable ledger smoke
+        run: python -B workflows/portable/test_ledger_gates.py
+
+      - name: coordinator smoke
+        run: python -B workflows/portable/coordinator_smoke_test.py
+
+      - name: worker backend
+        run: python -B workflows/portable/test_worker_backend.py
+
+      - name: continuation driver
+        run: python -B workflows/portable/test_continuation_driver.py
+
+      - name: superboard adapter
+        run: python -B workflows/portable/test_superboard_adapter.py
+
+      - name: project v2 adapter
+        run: python -B workflows/portable/test_project_adapter.py
+
+      - name: github pr gate
+        run: python -B workflows/portable/test_github_pr_gate.py
+
+      - name: telegram notifier
+        run: python -B workflows/portable/test_telegram_notifier.py
