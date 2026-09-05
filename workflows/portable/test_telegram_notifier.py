@@ -548,36 +548,76 @@ class TestTelegramNotificationAdapter(unittest.TestCase):
         self.assertEqual(dec["decision_id"], "DEC-TEST-01")
         self.assertEqual(dec["question"], "Test question?")
 
-    def test_decision_refusal_retired_and_resolved(self):
-        """Verify retired, rejected, resolved, and answered decisions are strictly refused."""
+    def test_retired_typed_status_refusal_with_neutral_id(self):
+        """Verify decisions with neutral IDs are refused based strictly on authoritative typed status."""
         for bad_status in ("rejected", "resolved", "answered", "closed", "retired", "done"):
             dec = {
-                "decision_id": "DEC-100",
-                "request_id": "req-100",
+                "decision_id": "DEC-NEUTRAL-42",
+                "request_id": "req-neutral-42",
                 "status": bad_status,
-                "question": "Some question?",
+                "question": "Neutral architectural choice?",
             }
             is_valid, reason = TelegramNotificationAdapter.is_decision_notifiable(dec)
-            self.assertFalse(is_valid, f"Status '{bad_status}' should be refused")
+            self.assertFalse(is_valid, f"Neutral ID with typed status '{bad_status}' should be refused")
             self.assertIn("non-actionable", reason)
             self.assertIsNone(TelegramNotificationAdapter.from_decision(dec))
 
     def test_decision_refusal_synthetic_and_demo(self):
-        """Verify synthetic test probes and demo decisions are strictly refused."""
+        """Verify explicit synthetic test probes and synthetic provenance are strictly refused."""
         synthetic_decisions = [
-            {"decision_id": "DEC-4543-01", "request_id": "req-synthetic-decision-demo-4543", "status": "pending", "question": "Q?"},
-            {"decision_id": "DEC-SYNTHETIC-99", "request_id": "req-real-01", "status": "pending", "question": "Q?"},
-            {"decision_id": "DEC-DEMO-01", "request_id": "req-real-01", "status": "pending", "question": "Q?"},
-            {"decision_id": "DEC-RETIRED-01", "request_id": "req-real-01", "status": "pending", "question": "Q?"},
-            {"decision_id": "DEC-REAL-01", "request_id": "req-real-01", "status": "pending", "is_synthetic": True, "question": "Q?"},
-            {"decision_id": "DEC-REAL-02", "request_id": "req-real-02", "status": "pending", "provenance": "synthetic_test", "question": "Q?"},
-            {"decision_id": "DEC-REAL-03", "request_id": "req-real-03", "status": "pending", "provenance": "agent_authored", "question": "Q?"},
+            {"decision_id": "DEC-TEST-01", "request_id": "req-test-01", "status": "pending", "is_synthetic": True, "question": "Q?"},
+            {"decision_id": "DEC-TEST-02", "request_id": "req-test-02", "status": "pending", "is_test": True, "question": "Q?"},
+            {"decision_id": "DEC-TEST-03", "request_id": "req-test-03", "status": "pending", "provenance": "synthetic_test", "question": "Q?"},
+            {
+                "decision_id": "DEC-TEST-04",
+                "request_id": "req-test-04",
+                "status": "pending",
+                "question": "Q?",
+                "audit_trail": [{"provenance": "synthetic_test", "status": "rejected", "comment_id": "999"}],
+            },
         ]
         for dec in synthetic_decisions:
             is_valid, reason = TelegramNotificationAdapter.is_decision_notifiable(dec)
-            self.assertFalse(is_valid, f"Synthetic decision '{dec['decision_id']}' should be refused")
+            self.assertFalse(is_valid, f"Synthetic decision '{dec['decision_id']}' should be refused: got valid")
             self.assertIsNone(TelegramNotificationAdapter.from_decision(dec))
 
+    def test_valid_demo_feature_and_retiring_api_decisions_accepted(self):
+        """Regression: Legitimate questions discussing demo features or retiring APIs must be accepted."""
+        demo_feature_dec = {
+            "decision_id": "DEC-DEMO-FEATURE-01",
+            "request_id": "req-feature-demo-mode",
+            "prompt": "Implement interactive demo feature for product showcase",
+            "question": "Should the interactive demo feature be embedded in the hero or linked to modal?",
+            "options": [{"id": "A", "label": "Hero embed"}, {"id": "B", "label": "Modal link"}],
+            "recommendation": "Option A",
+            "status": "pending",
+            "provenance": "agent_authored",  # Agent-authored questions are normal and valid
+            "issue_url": "https://github.com/Bavariance/polysimulator/issues/4543",
+        }
+        is_valid, reason = TelegramNotificationAdapter.is_decision_notifiable(demo_feature_dec)
+        self.assertTrue(is_valid, f"Legitimate demo feature question was incorrectly refused: {reason}")
+        ev = TelegramNotificationAdapter.from_decision(demo_feature_dec)
+        self.assertIsNotNone(ev)
+        formatted = TelegramNotificationAdapter.format_message(ev)
+        self.assertIn("interactive demo feature", formatted)
+
+        retire_api_dec = {
+            "decision_id": "DEC-RETIRE-API-02",
+            "request_id": "req-retire-v1-endpoints",
+            "prompt": "Retire legacy v1 endpoints in favor of unified v2 schema",
+            "question": "Should we retire legacy v1 endpoints immediately or retain 30-day deprecation shim?",
+            "options": [{"id": "A", "label": "Immediate retirement"}, {"id": "B", "label": "30-day shim"}],
+            "recommendation": "Option B",
+            "status": "pending",
+            "provenance": "human_operator",
+            "issue_url": "https://github.com/Bavariance/polysimulator/issues/4543",
+        }
+        is_valid2, reason2 = TelegramNotificationAdapter.is_decision_notifiable(retire_api_dec)
+        self.assertTrue(is_valid2, f"Legitimate API retirement question was incorrectly refused: {reason2}")
+        ev2 = TelegramNotificationAdapter.from_decision(retire_api_dec)
+        self.assertIsNotNone(ev2)
+        formatted2 = TelegramNotificationAdapter.format_message(ev2)
+        self.assertIn("retire legacy v1 endpoints", formatted2)
     def test_decision_refusal_completed_ledger_request(self):
         """Verify decisions on completed/done requests are refused."""
         dec = {

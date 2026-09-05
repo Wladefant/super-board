@@ -678,14 +678,53 @@ class TelegramNotificationAdapter:
         return None
 
     @classmethod
+    def lookup_ledger_request(
+        cls,
+        req_id: str,
+        ledger: Optional[Any] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Look up request state in ledger object or candidate ledger.json files."""
+        if not req_id:
+            return None
+        if ledger and hasattr(ledger, "get_request"):
+            try:
+                return ledger.get_request(req_id)
+            except Exception:
+                pass
+        # Candidate ledger files
+        candidate_files = [
+            Path.cwd() / "ledger.json",
+            Path.cwd() / "request_ledger.json",
+            Path(__file__).resolve().parent / "ledger.json",
+            Path.home() / ".veyyon" / "workflows" / "ledger.json",
+        ]
+        for cpath in candidate_files:
+            if cpath.exists():
+                try:
+                    data = json.loads(cpath.read_text(encoding="utf-8"))
+                    requests = data.get("requests", {})
+                    if isinstance(requests, dict) and req_id in requests:
+                        return requests[req_id]
+                    elif isinstance(requests, list):
+                        for r in requests:
+                            if isinstance(r, dict) and r.get("id") == req_id:
+                                return r
+                except Exception:
+                    pass
+        return None
+
+    @classmethod
     def is_decision_notifiable(
         cls,
         decision: Any,
         ledger_request: Optional[Dict[str, Any]] = None,
+        ledger: Optional[Any] = None,
     ) -> Tuple[bool, str]:
         """Validates that a decision contract represents a genuine, active, non-synthetic,
         uncompleted decision awaiting human operator action.
-        Refuses retired, resolved, synthetic, demo, and completed-request notifications.
+        Uses typed decision status, explicit synthetic provenance/flags, and actual ledger
+        request state. Substring checks on prompt/IDs are strictly avoided to allow legitimate
+        questions about demo features or retiring APIs.
         """
         if hasattr(decision, "__dataclass_fields__"):
             d_dict = asdict(decision)
@@ -699,39 +738,35 @@ class TelegramNotificationAdapter:
         dec_id = str(d_dict.get("decision_id") or "").strip()
         req_id = str(d_dict.get("request_id") or "").strip()
         status = str(d_dict.get("status") or "pending").strip().lower()
-        prompt = str(d_dict.get("prompt") or "").strip().lower()
         provenance = str(d_dict.get("provenance") or "").strip().lower()
 
-        # 1. Refuse non-pending status (rejected, answered, resolved, closed, retired, done)
+        # 1. Authoritative Typed Status Check:
+        # Actionable decision states awaiting human operator response
         if status not in ("pending", "clarification_requested"):
-            return False, f"Decision '{dec_id}' has non-actionable status '{status}'; only active pending decisions may notify operator."
+            return False, f"Decision '{dec_id}' has non-actionable typed status '{status}'; only active pending decisions may notify operator."
 
-        # 2. Refuse synthetic, test, or demo provenance
-        if d_dict.get("is_synthetic") or d_dict.get("is_test"):
-            return False, f"Decision '{dec_id}' is explicitly flagged as synthetic/test; human notification refused."
+        # 2. Explicit Synthetic Provenance & Flags Check:
+        if d_dict.get("is_synthetic") is True or d_dict.get("is_test") is True:
+            return False, f"Decision '{dec_id}' has explicit synthetic/test flag set; human notification refused."
 
-        if provenance in ("synthetic_test", "agent_authored"):
-            return False, f"Decision '{dec_id}' has provenance '{provenance}'; human notification refused."
+        if provenance == "synthetic_test":
+            return False, f"Decision '{dec_id}' has explicit synthetic_test provenance; human notification refused."
 
-        # Check for synthetic/demo keywords in IDs and prompt
-        combined_identifiers = f"{dec_id.lower()} {req_id.lower()} {prompt}"
-        for marker in ("synthetic", "demo", "retired"):
-            if marker in combined_identifiers:
-                return False, f"Decision '{dec_id}' matches synthetic/demo/retired marker '{marker}'; human notification refused."
-
-        # Check audit trail for synthetic test probes
+        # Check audit trail for synthetic test probes answering/invalidating this decision
         audit_trail = d_dict.get("audit_trail", [])
         if isinstance(audit_trail, list):
             for entry in audit_trail:
-                if isinstance(entry, dict) and entry.get("provenance") in ("synthetic_test", "agent_authored"):
-                    if status != "pending":
-                        return False, f"Decision '{dec_id}' audit trail contains synthetic test probe; human notification refused."
+                if isinstance(entry, dict) and entry.get("provenance") == "synthetic_test" and entry.get("status") in ("rejected", "resolved", "answered"):
+                    return False, f"Decision '{dec_id}' was processed by a synthetic test probe; human notification refused."
 
-        # 3. Refuse if underlying ledger request is already completed/done
-        if ledger_request and isinstance(ledger_request, dict):
-            req_state = str(ledger_request.get("state") or "").strip().lower()
+        # 3. Linked Ledger Request State Check:
+        resolved_ledger_req = ledger_request or cls.lookup_ledger_request(req_id, ledger=ledger)
+        if resolved_ledger_req and isinstance(resolved_ledger_req, dict):
+            req_state = str(resolved_ledger_req.get("state") or "").strip().lower()
             if req_state in ("done", "completed", "closed"):
                 return False, f"Underlying request '{req_id}' is already in terminal state '{req_state}'; decision is obsolete."
+            if resolved_ledger_req.get("task_type") == "synthetic" or resolved_ledger_req.get("is_synthetic") is True:
+                return False, f"Underlying request '{req_id}' is marked as synthetic in ledger; human notification refused."
 
         return True, "Eligible for notification"
 
@@ -741,12 +776,17 @@ class TelegramNotificationAdapter:
         decision: Any,
         project_override: Optional[str] = None,
         ledger_request: Optional[Dict[str, Any]] = None,
+        ledger: Optional[Any] = None,
         strict: bool = False,
     ) -> Optional[NotificationEvent]:
         """Translates a DecisionContract or decision dictionary into a NotificationEvent.
-        Strictly refuses retired, resolved, synthetic/demo, or completed requests.
+        Strictly refuses retired, resolved, synthetic, or completed requests.
         """
-        is_eligible, refusal_reason = cls.is_decision_notifiable(decision, ledger_request=ledger_request)
+        is_eligible, refusal_reason = cls.is_decision_notifiable(
+            decision,
+            ledger_request=ledger_request,
+            ledger=ledger,
+        )
         if not is_eligible:
             if strict:
                 raise ValueError(f"Decision notification refused: {refusal_reason}")
@@ -872,7 +912,20 @@ def main() -> int:
         if not dec_dict:
             print(f"ERROR: Decision '{args.decision_id}' not found in decisions.json", file=sys.stderr)
             return 1
+        # from_decision automatically performs typed validation and ledger check
         event = TelegramNotificationAdapter.from_decision(dec_dict, project_override=args.project)
+        if not event:
+            is_valid, reason = TelegramNotificationAdapter.is_decision_notifiable(dec_dict)
+            if args.json:
+                print(json.dumps({
+                    "delivered": False,
+                    "status": "refused",
+                    "reason": f"Decision notification refused: {reason}",
+                    "chat_id": "[REDACTED_DESTINATION]",
+                }, indent=2))
+            else:
+                print(f"[REFUSED] Decision notification refused: {reason}")
+            return 1
         if args.links:
             event.metadata.setdefault("links", []).extend(args.links)
     elif args.packet:
