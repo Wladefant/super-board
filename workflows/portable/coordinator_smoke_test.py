@@ -19,6 +19,7 @@ Validates:
   6. Protection of primary ledger: main ledger requests are NEVER marked done.
 """
 
+import datetime
 import json
 import os
 import shutil
@@ -336,7 +337,10 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
     assert_true("preflight" in p5["status_reason"].lower(), "Status reason mentions preflight")
     print("  [PASS] Preflight gate successfully BLOCKED deployable task lacking staging probe.")
 
-    # B2: Record valid staging probe evidence for dokploy_staging
+    # B2: Record valid staging probe evidence for dokploy_staging.
+    # Timestamps are generated relative to now: a hardcoded time silently turns this suite
+    # red once it drifts past ttl_seconds, which is a clock failure, not a code failure.
+    probe_now = datetime.datetime.now(datetime.timezone.utc)
     evidence_file = os.path.join(evidence_dir, "dokploy_evidence_payload.json")
     evidence_payload = {
         "service": "dokploy_staging",
@@ -347,13 +351,13 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
         },
         "read_only": True,
         "access_status": "success",
-        "timestamp": "2026-09-05T09:15:00+00:00",
+        "timestamp": probe_now.isoformat(),
         "ttl_seconds": 3600,
         "issue": "4556",
         "bounded_utc_logs": {
             "count": 5,
-            "first_timestamp": "2026-09-05T09:00:00Z",
-            "last_timestamp": "2026-09-05T09:15:00Z",
+            "first_timestamp": (probe_now - datetime.timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "last_timestamp": probe_now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         },
         "baseline_behavior": {
             "container_running": True,
@@ -377,15 +381,30 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
     assert_true(p6["status"] == "ready", f"Deployable task with preflight probe is 'ready' (got {p6['status']})")
     assert_true(p6["preflight"]["passed"] is True, "Preflight passed with recorded staging probe")
 
-    # B4: Advance to 'awaiting authorization' -> Coordinator WAIT (No auto-merge)
-    to_auth_cmd = [
-        PYTHON_EXE, ledger_py,
-        "--ledger", ledger_json,
-        "update", deploy_req_id,
-        "--state", "awaiting authorization",
-    ]
-    res = subprocess.run(to_auth_cmd, capture_output=True, text=True)
-    assert_true(res.returncode == 0, f"Transitioned to awaiting authorization: {res.stderr}")
+    # B4: A deployable request cannot jump to 'awaiting authorization' from 'implementation':
+    # that state asserts QA and review are complete.
+    def set_state(state):
+        return subprocess.run(
+            [
+                PYTHON_EXE, ledger_py,
+                "--ledger", ledger_json,
+                "update", deploy_req_id,
+                "--state", state,
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+    illegal = set_state("awaiting authorization")
+    assert_true(
+        illegal.returncode != 0,
+        "Deployable task must not reach 'awaiting authorization' straight from 'implementation'",
+    )
+    print("  [PASS] Authorization gate refuses to skip QA and review.")
+
+    for stage_state in ("QA", "review", "awaiting authorization"):
+        res = set_state(stage_state)
+        assert_true(res.returncode == 0, f"Transitioned to {stage_state}: {res.stderr}")
 
     p7 = run_coord(deploy_req_id)
     assert_true(p7["status"] == "wait", f"Coordinator emits 'wait' for awaiting authorization (got {p7['status']})")

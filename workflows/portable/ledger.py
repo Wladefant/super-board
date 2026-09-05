@@ -49,13 +49,25 @@ VALID_STATES = [
 
 DEPLOYMENT_STATES = ["integration", "live verification"]
 
+# States that assert QA and review already completed. From here on, an unverified, missing
+# or stale acceptance criterion is a contradiction of the state itself, not a pending note.
+VERIFICATION_COMPLETE_STATES = [
+    "awaiting authorization",
+    "integration",
+    "live verification",
+    "done",
+]
+
 TASK_TYPES = ["deployable", "local_doc", "local", "doc", "harness"]
 
-# Strict state transition graph for deployable tasks (full 8-state model)
+# Strict state transition graph for deployable tasks (full 8-state model).
+# 'awaiting authorization' asserts that implementation, QA and review are complete, so it is
+# reachable only from 'review'. Allowing it directly from 'implementation' or 'QA' let a
+# request reach the pre-merge gate having never been verified.
 ALLOWED_TRANSITIONS_DEPLOYABLE: Dict[str, List[str]] = {
     "pending": ["implementation"],
-    "implementation": ["QA", "review", "awaiting authorization"],
-    "QA": ["review", "implementation", "awaiting authorization"],
+    "implementation": ["QA", "review"],
+    "QA": ["review", "implementation"],
     "review": ["awaiting authorization", "QA", "implementation"],
     "awaiting authorization": ["integration", "implementation"],
     "integration": ["live verification", "implementation"],
@@ -1131,17 +1143,23 @@ class RequestLedger:
                 if curr_head and c.get("verified_head") and c.get("verified_head") != curr_head:
                     stale_crit.append(f"{c['id']} (verified on {c.get('verified_head')})")
 
-            if req.get("state") == "done":
+            req_state_now = req.get("state")
+            if req_state_now in VERIFICATION_COMPLETE_STATES:
+                # These states all assert that QA and review already succeeded, so an
+                # unverified or stale criterion is a contradiction, not a note. Reporting it
+                # as a warning is how a request sat at the merge gate looking HEALTHY with
+                # every criterion still pending.
                 if unverified_crit:
-                    issues.append(f"State is 'done' but criteria unverified: {unverified_crit}")
+                    issues.append(f"State is '{req_state_now}' but criteria unverified: {unverified_crit}")
                 if no_evidence_crit:
-                    issues.append(f"State is 'done' but criteria missing evidence: {no_evidence_crit}")
+                    issues.append(f"State is '{req_state_now}' but criteria missing evidence: {no_evidence_crit}")
                 if stale_crit:
-                    issues.append(f"State is 'done' but criteria have stale evidence: {stale_crit}")
-                gh = req.get("github", {})
-                expected_repo = gh.get("repo") or DEFAULT_REPO
-                if not (gh.get("proof_verified") and validate_github_url(gh.get("proof_url"), expected_repo=expected_repo)):
-                    issues.append(f"State is 'done' but missing verified well-formed GitHub proof URL for '{expected_repo}'.")
+                    issues.append(f"State is '{req_state_now}' but criteria have stale evidence: {stale_crit}")
+                if req_state_now == "done":
+                    gh = req.get("github", {})
+                    expected_repo = gh.get("repo") or DEFAULT_REPO
+                    if not (gh.get("proof_verified") and validate_github_url(gh.get("proof_url"), expected_repo=expected_repo)):
+                        issues.append(f"State is 'done' but missing verified well-formed GitHub proof URL for '{expected_repo}'.")
             else:
                 if unverified_crit:
                     warnings.append(f"Pending criteria ({len(unverified_crit)}/{len(req.get('acceptance_criteria', []))}): {unverified_crit}")
