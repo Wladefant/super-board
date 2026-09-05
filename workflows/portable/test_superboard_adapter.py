@@ -503,7 +503,6 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
         self.assertEqual(missing_status.status, "blocked")
         self.assertEqual(missing_status.preflight_passed, False)
         self.assertIsNone(missing_status.notification_receipt)
-
         eligible, reason = TelegramNotificationAdapter.is_decision_notifiable(
             {
                 "decision_id": "DEC-MISSING-STATUS",
