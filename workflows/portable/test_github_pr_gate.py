@@ -27,6 +27,7 @@ Verifies:
 
 import argparse
 import copy
+import datetime
 import json
 import os
 import shutil
@@ -598,6 +599,37 @@ class TestGitHubPRGate(unittest.TestCase):
         self.assertEqual(result.gate_verdict, "BLOCKED")
         self.assertIn("changes requested", result.verdict_reason.lower())
         self.assertNotEqual(result.approval_verdict, "APPROVED")
+
+    def test_review_artifact_rejects_future_timestamp_and_accepts_current_or_past(self):
+        pr = copy.deepcopy(self.mock_pr)
+        pr["reviews"] = []
+        pr["baseRefName"] = "staging"
+        now = datetime.datetime.now(datetime.timezone.utc)
+
+        current = self.make_review_artifact()
+        current["submitted_at"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        current_result = evaluate_pr_gate(
+            pr, policy=self.waived_policy(), review_artifact=current
+        )
+        self.assertEqual(current_result.gate_verdict, "PASSED")
+
+        past_result = evaluate_pr_gate(
+            pr,
+            policy=self.waived_policy(),
+            review_artifact=self.make_review_artifact(),
+        )
+        self.assertEqual(past_result.gate_verdict, "PASSED")
+
+        future = self.make_review_artifact()
+        future["submitted_at"] = (
+            now + datetime.timedelta(minutes=5)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        future_result = evaluate_pr_gate(
+            pr, policy=self.waived_policy(), review_artifact=future
+        )
+        self.assertEqual(future_result.gate_verdict, "BLOCKED")
+        self.assertTrue(future_result.review_invalidated)
+        self.assertIn("is in the future", future_result.verdict_reason)
 
     # -------------------------------------------------------------------------
     # TEST 19: Advisory vs blocking checks; absent native data never drops CI

@@ -193,6 +193,7 @@ REVIEW_ARTIFACT_SCHEMA = "portable-review/v1"
 REVIEW_ARTIFACT_TYPE = "independent_automated_code_review"
 SHA40_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 SOURCE_URI_RE = re.compile(r"^(agent|history)://([A-Za-z0-9][A-Za-z0-9_.:-]*)$")
+MAX_REVIEW_FUTURE_SKEW_SECONDS = 60
 
 
 def validate_review_artifact(
@@ -203,6 +204,7 @@ def validate_review_artifact(
     head_sha: str,
     base_sha: str,
     pr_author: str,
+    checked_at_utc: str,
 ) -> Tuple[Optional[Dict[str, str]], Optional[str]]:
     """
     Validate a trusted-workflow automated review artifact.
@@ -273,6 +275,15 @@ def validate_review_artifact(
         return None, "Review artifact submitted_at must be an RFC3339 timestamp"
     if parsed_time.tzinfo is None:
         return None, "Review artifact submitted_at must include a timezone"
+    checked_time = datetime.datetime.fromisoformat(checked_at_utc.replace("Z", "+00:00"))
+    if parsed_time > checked_time + datetime.timedelta(
+        seconds=MAX_REVIEW_FUTURE_SKEW_SECONDS
+    ):
+        return None, (
+            f"Review artifact submitted_at {submitted_at} is in the future relative to "
+            f"gate time {checked_at_utc} beyond the "
+            f"{MAX_REVIEW_FUTURE_SKEW_SECONDS}-second clock-skew allowance"
+        )
 
     outcome = str(record.get("outcome") or "").lower()
     if outcome not in ("approved", "changes_requested"):
@@ -569,6 +580,7 @@ def evaluate_pr_gate(
             head_sha=head_sha,
             base_sha=base_sha,
             pr_author=pr_author,
+            checked_at_utc=now_utc,
         )
         if artifact_error:
             review_invalidated = True
