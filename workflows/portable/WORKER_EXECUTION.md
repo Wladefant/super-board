@@ -376,6 +376,15 @@ coordinator's own one-shot sync, and resumes only when a real authorized answer
 is observed. The attempt count is finite, so it can never become an endless
 poll, and a stop signal ends the wait immediately.
 
+### Telegram status notifications
+
+The driver exposes the same notification flags and semantics as the underlying `SuperboardExecutionAdapter`:
+* `--notify-telegram`: Enable Telegram milestone and blocker notifications during continuous driving.
+* `--telegram-dry-run`: Dry-run evaluate status notifications without network transmission (default: True unless `--telegram-send`).
+* `--telegram-send`: Send live outbound Telegram status notifications.
+
+Safe defaults remain no network transmission. Enabling live notification requires both `--notify-telegram` and `--telegram-send`. Dry-run overrides send if both are specified.
+
 ---
 
 ## 7. Recorded verification
@@ -483,17 +492,41 @@ python worker_backend.py --list-backends
 # The result shape an agent worker must return
 python worker_backend.py --print-schema
 
-# Build the argv and validate it without running anything
-python worker_backend.py --request-id req-1 --stage build --repo-root . \
-  --head-sha <40-hex> --dry-run
+# Canonical native background execution recipe (see Section 2 for contract)
+# 1. Prepare: validates repository and HEAD, persists dispatch ticket
+python worker_backend.py --prepare-native --request-id req-1 --stage qa \
+  --repo-root <git-repository> --head-sha <40-hex> --agent-role qa-verifier --json
 
-# One real stage
-python worker_backend.py --request-id req-1 --stage qa --repo-root . \
-  --head-sha <40-hex> --model sonnet --prompt "verify X" --json
+# 2. Host launches returned prompt/schema as a background task, obtaining task handle
 
-# Drive authorized requests continuously
+# 3. Record: binds actual agent:// handle to the prepared ticket
+python worker_backend.py --record-native --run-id <run-id> \
+  --task-handle agent://<actual-handle> --json
+
+# 4. Complete: shared validation over delivered structured result
+python worker_backend.py --complete-native --run-id <run-id> \
+  --task-handle agent://<actual-handle> --result-file result.json --json
+
+# Explicitly selected CLI stage (opt-in only; requires explicit --backend)
+python worker_backend.py --backend claude-verify --request-id req-1 --stage qa \
+  --repo-root <git-repository> --head-sha <40-hex> --model sonnet --prompt "verify X" --json
+
+# Dry-run validation of explicit CLI argv without executing
+python worker_backend.py --backend claude-verify --request-id req-1 --stage build \
+  --repo-root <git-repository> --head-sha <40-hex> --dry-run
+
+# Drive authorized requests continuously (requires explicit --state-dir, --repo-root, and authorized --request-id)
 python continuation_driver.py --request-id req-1 --state-dir <dir> \
   --repo-root <git-repository> --max-steps 12
+
+# Optional Telegram status notifications during continuation (same adapter semantics)
+# Default is safe dry-run:
+python continuation_driver.py --request-id req-1 --state-dir <dir> \
+  --repo-root <git-repository> --notify-telegram --telegram-dry-run
+
+# Live Telegram delivery requires explicit --notify-telegram AND --telegram-send:
+python continuation_driver.py --request-id req-1 --state-dir <dir> \
+  --repo-root <git-repository> --notify-telegram --telegram-send
 
 # Bounded decision re-check: at most 3 tries, 60s apart, 15s floor
 python continuation_driver.py --request-id req-1 --state-dir <dir> \

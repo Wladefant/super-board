@@ -116,7 +116,7 @@
     "superboard_adapter.py": {
       "role": "Superboard execution adapter bridging the portable coordinator to durable native prepared/background_dispatched/finalized states by default, with explicit fixture/probe paths and unchanged lifecycle gates",
       "owner": "PackagePortableCoordinator",
-      "cli_command": "python superboard_adapter.py [--config <file>] [--state-dir <dir>] [--fake-executor] [--real-worker] [--notify-telegram] [--json] [--summary]",
+      "cli_command": "python superboard_adapter.py [--config <file>] [--state-dir <dir>] [--fake-executor] [--real-worker] [--notify-telegram] [--telegram-dry-run] [--telegram-send] [--json] [--summary]",
       "inputs": [
         "ledger.json",
         "preflight_evidence/",
@@ -176,7 +176,7 @@
     "continuation_driver.py": {
       "role": "Minimal continuation driver over explicit authorized request ids. It records durable native prepared/background_dispatched states as in-flight without advancing or parking, resumes reconciliation on later invocations, and journals only validated final outcomes as completed. Never merges and never deploys.",
       "owner": "ImplementContinuousExecution",
-      "cli_command": "python continuation_driver.py --request-id <id> [--request-id <id>]... --repo-root <dir> [--state-dir <dir>] [--config <json>] [--worker-config <json>] [--model <m>] [--backend <explicit-cli-name>] [--max-steps <n>] [--decision-sync-attempts <n>] [--decision-sync-interval <s>] [--no-real-worker] [--show-parked] [--unpark <id>]... [--json]",
+      "cli_command": "python continuation_driver.py --request-id <id> [--request-id <id>]... --repo-root <dir> [--state-dir <dir>] [--config <json>] [--worker-config <json>] [--model <m>] [--backend <explicit-cli-name>] [--max-steps <n>] [--decision-sync-attempts <n>] [--decision-sync-interval <s>] [--no-real-worker] [--notify-telegram] [--telegram-dry-run] [--telegram-send] [--show-parked] [--unpark <id>]... [--json]",
       "inputs": [
         "ledger.json",
         "decisions.json",

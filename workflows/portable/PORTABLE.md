@@ -1,6 +1,6 @@
 # Portable Workflow Core & Module Integration Guide
 
-A harness-agnostic, pure Python standard library multi-agent coordination core located under `workflows/`.
+A harness-agnostic, pure Python standard library multi-agent coordination core located under `workflows/portable/`.
 
 ---
 
@@ -217,7 +217,7 @@ python diagnostics.py --state-dir /path/to/state --summary
    * `unknown_cause`: Failures lacking diagnostic evidence, preventing fabricated conclusions.
 4. **Human Input vs. Agent Action:**
    * `human_input_needed = True` ONLY for true authorization gates (`awaiting authorization` merge approval), architectural preferences/tradeoffs (pending `DEC-*` items), or secure credential setup (`sk_test_` missing).
-   * Every human input item carries a unique, deduplicatable `question_id` (e.g. `credential:stripe_test:sk_test_key`, `authorization:req-001:merge`, `decision:DEC-4543-01`).
+   * Every human input item carries a unique, deduplicatable `question_id` (e.g. `credential:stripe_test:sk_test_key`, `authorization:req-001:merge`, `decision:DEC-001`).
    * **Missing implementation, unwritten tests, and failing tests are strictly AGENT-OWNED actions, never punts to the operator.**
    * **Zero Secret Exposure:** Diagnostics never request or display secret values; they provide secure workstation environment or vault configuration instructions.
 5. **Host Resource Telemetry:**
@@ -244,7 +244,7 @@ The package runs anywhere with standard Python 3.9+ and optionally the GitHub CL
 When running under Veyyon (with orchestrators like GPT-5.6 Sol or Astra):
 
 1. **Step Evaluation:**
-   The interactive orchestrator invokes `python workflows/coordinator.py --json`.
+   The interactive orchestrator invokes `python workflows/portable/coordinator.py --json`.
 2. **Packet Processing:**
    * Parse returned JSON packet.
    * If `status == "wait"`:
@@ -268,49 +268,31 @@ When running under Veyyon (with orchestrators like GPT-5.6 Sol or Astra):
 
 ### Adapter B: OpenAI Codex / Anthropic Claude / Custom Runners
 
-Generic external orchestrators (Codex, Claude, Claude Code, GitHub Actions, custom shell scripts) use the coordinator as an idempotent oracle:
+Generic external orchestrators (Codex, Claude, Claude Code, GitHub Actions, custom runners) use the coordinator as an idempotent oracle for step evaluation:
 
-```python
-#!/usr/bin/env python3
-"""Example driver script for external orchestrators."""
-import json
-import subprocess
-import sys
-
-def run_step():
-    # 1. Evaluate single bounded step
-    cmd = [
-        sys.executable, "workflows/coordinator.py",
-        "--usage-adapter", "file",
-        "--balance-file", "workflows/usage_fixture.json",
-        "--json"
-    ]
-    res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    packet = json.loads(res.stdout)
-
-    status = packet["status"]
-    print(f"Coordinator Status: {status}")
-    print(f"Next Action: {packet['next_action']}")
-
-    if status == "ready":
-        # Dispatch execution in your harness
-        model = packet["routing"]["recommended_model"]
-        print(f"Dispatching task to model {model}...")
-    elif status == "wait":
-        print("Execution paused: human decision or authorization required.")
-    elif status == "block":
-        print(f"Execution blocked: {packet['status_reason']}")
-    elif status == "done":
-        print("All workflow tasks complete.")
-
-if __name__ == "__main__":
-    run_step()
-```
+1. **Step Evaluation:**
+   Invoke `python workflows/portable/coordinator.py --usage-adapter file --balance-file workflows/portable/usage_fixture.json --json`.
+2. **Canonical Worker Execution:**
+   Do not implement custom host execution loops that bypass preflight or forge execution results. Instead, follow the canonical native background prepare/record/complete recipe documented in `WORKER_EXECUTION.md` (§2):
+   * Call `python workflows/portable/worker_backend.py --prepare-native ...` to preflight and persist a dispatch ticket.
+   * Launch the returned prompt and schema using your host's non-blocking background task facility.
+   * Bind the resulting task handle with `--record-native`.
+   * Finalize the task with `--complete-native` using the delivered structured result.
+3. **Continuous Multi-Stage Progression:**
+   To drive multi-stage workflows across authorized requests continuously without writing custom loops, invoke the verified driver with explicit state directory and repository root:
+   ```bash
+   python workflows/portable/continuation_driver.py \
+     --request-id <authorized-id> \
+     --state-dir <dir> \
+     --repo-root <git-repository> \
+     --max-steps 12
+   ```
 
 ### Adapter C: Optional Telegram Notification Adapter
 
 For real-time human updates, an external notification adapter (`telegram_notifier.py`, owned by `IntegrateTelegramStatus`) consumes coordinator packets or ledger state changes and emits one-sentence deduped updates without polling spam or parallel state tracking:
-* **Canonical System of Record:** Status is always anchored to GitHub Issues and Superboard; Telegram is strictly a read-only push channel.
+* **Canonical System of Record:** Status is always anchored to GitHub Issues and Superboard; Telegram is strictly an outbound, read-only push channel for status notifications. There is no inbound Telegram message or command processing.
+* **Active Typed Decisions:** Decision requests (`DEC-*`) and questions are answered via GitHub issue comments (or `decision_workflow.py reply`). Status messages provide canonical GitHub links directing operators to the discussion.
 * **Deduped Event Types:** Emits events exclusively on major milestones (`milestone`), active blockers (`blocker`), decision requests (`decision`), or closure (`completion`), referencing the canonical issue URL.
 * **Generic Multi-Repo Transport:** Resolves per-project slot destinations dynamically via manifest/affinity matching (`Bavariance/polysimulator`, `Wladefant/super-board`, `soundcore`, `dubai-holding`, `heylolo`, `heyloweb`).
 * **Credential Redaction:** Tokens, bearer headers, and user paths are sanitized before dispatch. Bot tokens are held in-memory only.
@@ -320,13 +302,13 @@ For real-time human updates, an external notification adapter (`telegram_notifie
 # Check bot connectivity and allowlisted destinations (read-only getMe)
 python telegram_notifier.py --project Bavariance/polysimulator --test-connection --json
 
-# Dry-run evaluate an event without network transmission
+# Dry-run evaluate a milestone status event without network transmission
 python telegram_notifier.py \
-  --event-type decision \
+  --event-type milestone \
   --project "Bavariance/polysimulator" \
-  --request-id "req-4543" \
-  --summary "Request paused awaiting human decision on DEC-4543-01." \
-  --link "https://github.com/Bavariance/polysimulator/issues/4543#issuecomment-5550731410" \
+  --request-id "req-001" \
+  --summary "Request transitioned to QA on commit 693de377." \
+  --link "https://github.com/Bavariance/polysimulator/issues/4543" \
   --dry-run \
   --json
 
@@ -337,42 +319,46 @@ python telegram_notifier.py --packet coordinator_output.json --send
 
 ## 6. Export Procedure & Verification
 
-To export the portable workflow package to an isolated directory:
+To export the portable workflow package to an isolated directory using the canonical standard library export recipe:
 
 ```bash
 # Export destination
 EXPORT_DIR="/tmp/portable_workflow"
-mkdir -p "$EXPORT_DIR"
+python -c "
+import json, os, shutil
 
-# Copy core files
-cp workflows/coordinator.py "$EXPORT_DIR/"
-cp workflows/ledger.py "$EXPORT_DIR/"
-cp workflows/decision_workflow.py "$EXPORT_DIR/"
-cp workflows/preflight.py "$EXPORT_DIR/"
-cp workflows/balance_loader.py "$EXPORT_DIR/"
-cp workflows/model_routing.py "$EXPORT_DIR/"
-cp workflows/github_plan_renderer.py "$EXPORT_DIR/"
-cp workflows/github_plan_templates.py "$EXPORT_DIR/"
-cp workflows/usage_fixture.json "$EXPORT_DIR/"
-cp workflows/manifest.json "$EXPORT_DIR/"
-cp workflows/PORTABLE.md "$EXPORT_DIR/"
+src_dir = 'workflows/portable'
+dst_dir = '${EXPORT_DIR}'
+manifest_path = os.path.join(src_dir, 'manifest.json')
+with open(manifest_path, 'r', encoding='utf-8') as f:
+    manifest = json.load(f)
 
-# Run standalone verification in export directory
+required_files = manifest.get('export', {}).get('required_files', [])
+os.makedirs(dst_dir, exist_ok=True)
+for rel_path in required_files:
+    src_file = os.path.join(src_dir, rel_path)
+    dst_file = os.path.join(dst_dir, rel_path)
+    os.makedirs(os.path.dirname(dst_file), exist_ok=True)
+    shutil.copy2(src_file, dst_file)
+print(f'Exported {len(required_files)} required files to {dst_dir}')
+"
+
+# Run standalone verification in export directory (separate state, no remote sync)
 cd "$EXPORT_DIR"
-python coordinator.py --summary
+python coordinator.py --summary --no-sync-decisions
 ```
 ---
 
 ## 7. Multi-Repository Portability & Project Adapters
 
-The workflow core is strictly decoupled from any single product or environment through `workflows/project_adapter.py`.
+The workflow core is strictly decoupled from any single product or environment through `workflows/portable/project_adapter.py`.
 
 ### 7.1 Generic Core vs Project Adapter Architecture
 
 ```mermaid
 graph TD
-    A[External Invocation / Superboard / CLI] --> B[workflows/coordinator.py]
-    B --> C[workflows/project_adapter.py]
+    A[External Invocation / Superboard / CLI] --> B[workflows/portable/coordinator.py]
+    B --> C[workflows/portable/project_adapter.py]
     C --> D[Explicit PolysimulatorAdapter]
     C --> E[Alternate Repo Adapter: acme/demo-service]
     C --> F[Generic / Safe Unknown Environment]
@@ -384,7 +370,7 @@ graph TD
    * Encapsulates authoritative staging compose ID (`TU7b_dY9l9_nCas6YBNwj`) and staging DB ref (`hgzyqmaanndcimnclxtv`).
    * Inviolable invariant: **ZERO production or main DB access**. Main DB (`zaraprptkegxqpvnsubu`) and production compose ID (`vpyL-7TDEUREH6Uo_y1sb`) are strictly rejected.
 3. **Alternate Repository Fixture (`acme/demo-service`):**
-   * Configured via `workflows/fixtures/alternate_repo_config.json` (project #42, `main` base branch).
+   * Configured via `workflows/portable/fixtures/alternate_repo_config.json` (project #42, `main` base branch).
    * Proves zero PolySimulator defaults leak into packet summaries or boundaries.
 4. **Safe Unknown Environment (`isolated/unknown-project`):**
    * Unconfigured staging environment safely exempts local_doc / harness tasks as `not_applicable`.
@@ -401,7 +387,7 @@ The user's authoritative Superboard repository was discovered:
 
 Run the cross-repository smoke test to verify isolation across all 3 tiers:
 ```bash
-python workflows/cross_repo_smoke_test.py
+python workflows/portable/cross_repo_smoke_test.py
 ```
 Verifies PolySimulator staging preservation, alternate repo fixture execution with zero leakage, and safe unknown environment handling (100% success).
 
@@ -470,34 +456,50 @@ In the active Veyyon session:
 # 1. Verify portable coordinator status and next eligible task
 python workflows/portable/coordinator.py --summary
 
-# 2. Execute bounded single-step dispatch with fake executor (safe proof)
-python workflows/portable/coordinator.py --dispatch --fake-executor --summary
+# 2. Run aggregate system and service diagnostics
+python workflows/portable/diagnostics.py --summary
 
-# 3. Execute real safe worker probe (verifies real process execution)
-python workflows/portable/coordinator.py --dispatch --real-worker --summary
+# 3. Drive authorized requests continuously via continuation driver
+python workflows/portable/continuation_driver.py \
+  --request-id <authorized-id> \
+  --state-dir <state-dir> \
+  --repo-root <git-repository>
 
-# 4. Run standalone Superboard execution adapter with Telegram dry-run
+# 4. Standalone adapter invocation with safe Telegram dry-run
 python workflows/portable/superboard_adapter.py --notify-telegram --telegram-dry-run --summary
 
-# 5. Run full test suites
+# 5. Run targeted test suites
 python workflows/portable/test_superboard_adapter.py
 python workflows/portable/coordinator_smoke_test.py
 python workflows/portable/test_github_pr_gate.py
 python workflows/portable/routing_smoke_test.py
+python workflows/portable/test_worker_backend.py
+python workflows/portable/test_continuation_driver.py
+python workflows/portable/test_diagnostics.py
 ```
 
 ### 9.2 Generic External Harness Activation (Claude Code, GitHub Actions, Custom Runners)
 The package is 100% harness-agnostic with zero external package dependencies (pure Python standard library):
 ```bash
-# 1. Export the portable workflow package to any target system
+# 1. Export required files using manifest.required_files (preserves local state)
 python -c "
-import shutil, os
+import json, os, shutil
 src = 'workflows/portable'
 dst = '/opt/portable-workflow'
-shutil.copytree(src, dst, dirs_exist_ok=True)
+manifest_path = os.path.join(src, 'manifest.json')
+with open(manifest_path, 'r', encoding='utf-8') as f:
+    manifest = json.load(f)
+required_files = manifest.get('export', {}).get('required_files', [])
+os.makedirs(dst, exist_ok=True)
+for rel in required_files:
+    s = os.path.join(src, rel)
+    d = os.path.join(dst, rel)
+    os.makedirs(os.path.dirname(d), exist_ok=True)
+    shutil.copy2(s, d)
+print(f'Exported {len(required_files)} required files to {dst}')
 "
 
-# 2. Run coordinator in standalone file mode (no Veyyon CLI, no network needed)
+# 2. Run coordinator in standalone file mode with isolated state directory
 python /opt/portable-workflow/coordinator.py \
   --state-dir /opt/portable-workflow/state \
   --usage-adapter file \
@@ -505,11 +507,12 @@ python /opt/portable-workflow/coordinator.py \
   --no-sync-decisions \
   --json
 
-# 3. Dispatch worker step via Superboard adapter
-python /opt/portable-workflow/superboard_adapter.py \
+# 3. Drive authorized requests continuously via continuation driver
+python /opt/portable-workflow/continuation_driver.py \
+  --request-id <authorized-id> \
   --state-dir /opt/portable-workflow/state \
-  --fake-executor \
-  --json
+  --repo-root /path/to/target/repo \
+  --max-steps 12
 ```
 
 ---
@@ -518,14 +521,14 @@ python /opt/portable-workflow/superboard_adapter.py \
 
 | Capability / Action | Status | Authority / Enforcement |
 | :--- | :--- | :--- |
-| **Request Intake & Eligibility** | ✅ Fully Automated | Evaluated via `RequestLedger` and `super_board_runtime.eligibility`. |
-| **Connected-Service Preflight** | ✅ Fully Automated | Evaluated via `preflight.py`; staging compose & DB ref checked; production strictly blocked. |
-| **Model & Role Routing** | ✅ Fully Automated | Reset-aware selector generates `HarnessDispatchPacket` with verified context windows. |
-| **Worker Command Dispatch** | ✅ Fully Automated | Real agent CLI via `worker_backend.py` with head-bound structured evidence; fails closed, no fixture fallback. Fixtures require explicit `fake_executor=True` and cannot advance state. |
-| **Continuous Stage Progression** | ✅ Fully Automated | `continuation_driver.py` wraps `run_step` over explicitly authorized request ids; reloads state per step, parks on blocked/error/decision/no-progress, and never repeats a journalled stage after restart. |
-| **Telegram Status Notification** | ✅ Fully Automated | Rate-limited single-sentence notification with canonical links via `telegram_notifier.py`. |
-| **Decision Resolution (`DEC-*`)** | 🔒 Human Operator | Pauses at `wait`; requires human reply via issue comment or `decision_workflow.py reply`. |
-| **Bug 'No-Repro' Disposition** | 🔒 Human Operator | A bug with unverified reproduction cannot close without explicit user disposition. |
-| **PR Merge Commits (`--no-ff`)**| 🔒 Human Operator | Automated merge is strictly prohibited. Request halts at `awaiting authorization`. |
-| **Staging Deploy Promotion** | 🔒 Human Operator | Staging container deploy promotion requires authorized human operator action. |
-| **Production Access / Deploy** | 🚫 Strictly Prohibited | Inviolable invariant: zero production access across all adapters and environments. |
+| **Request Intake & Eligibility** | Script-Enforced Gates | Evaluated deterministically via `RequestLedger` (`ledger.py`) and `super_board_runtime.eligibility`. |
+| **Connected-Service Preflight** | Script-Enforced Gates | Evaluated via `preflight.py`; staging compose and DB ref verified; production targets strictly blocked. |
+| **Model & Role Routing** | Script-Enforced Gates | Reset-aware selector generates `HarnessDispatchPacket` with catalog-verified context windows. |
+| **Worker Command Dispatch** | Host Background Tasks | Native background execution is the default: `worker_backend.py` durably prepares tickets, the host launches non-blocking background tasks, and shared scripts enforce exact-head/check gates. External agent CLIs are explicit opt-ins only; no default CLI or Claudex fallback. |
+| **Continuous Stage Progression** | Script-Enforced Gates | `continuation_driver.py` drives the execution adapter across explicitly authorized request IDs, journals validated stages, and stops on blocked states, decisions, or completion. |
+| **Telegram Status Notification** | Optional Explicit Adapter | Outbound one-sentence status events via `telegram_notifier.py`. Safe dry-run by default; live transmission requires explicit `--notify-telegram` and `--telegram-send`. No inbound handling. |
+| **Decision Resolution (`DEC-*`)** | Human Operator Required | Pauses at `wait`; requires human response via GitHub issue comment or `decision_workflow.py reply`. |
+| **Bug 'No-Repro' Disposition** | Human Operator Required | A bug with unverified reproduction cannot close without explicit operator disposition. |
+| **PR Merge Commits (`--no-ff`)** | Human Operator Required | Automated merge is strictly prohibited. Requests halt at `awaiting authorization`. |
+| **Staging Deploy Promotion** | Human Operator Required | Staging container deployment promotion requires authorized operator action. |
+| **Production Access / Deploy** | Strictly Prohibited | Inviolable invariant: zero production access across all adapters, scripts, and environments. |
