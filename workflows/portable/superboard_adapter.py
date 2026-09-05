@@ -1094,7 +1094,7 @@ class SuperboardExecutionAdapter:
             metadata=metadata,
         )
 
-        adapter = TelegramNotificationAdapter()
+        adapter = TelegramNotificationAdapter(state_dir_override=Path(self.state_dir))
         # Preserve safe dry-run by default unless configured opt-in; explicit --telegram-send must actually send, never combine silently with dry-run
         if self.telegram_dry_run is True and not self.telegram_send:
             dry_run_mode = True
@@ -1122,7 +1122,7 @@ class SuperboardExecutionAdapter:
                     ledger_req = self.coordinator.ledger.get_request(req_id)
                 except (KeyError, Exception):
                     ledger_req = None
-        adapter = TelegramNotificationAdapter()
+        adapter = TelegramNotificationAdapter(state_dir_override=Path(self.state_dir))
         event = adapter.from_decision(
             decision,
             project_override=self.project_config.project_name or self.project_config.repo,

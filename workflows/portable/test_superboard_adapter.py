@@ -18,6 +18,7 @@ import os
 import shutil
 import sys
 import tempfile
+from unittest.mock import patch
 import unittest
 from pathlib import Path
 
@@ -151,6 +152,62 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
             issue_number=75,
             head=self.HEAD_SHA,
         )
+
+    def test_telegram_state_directory_survives_working_directory_changes(self):
+        """Both notification hooks persist deduplication in the configured state directory."""
+        req_id = "req-notification-state"
+        self._add_pipeline_request(req_id)
+        original_cwd = os.getcwd()
+        for kind in ("status", "decision"):
+            with self.subTest(kind=kind), patch.dict(os.environ, {
+                "TELEGRAM_NOTIFY_CHAT_ID": "1247617658",
+                "TELEGRAM_BOT_TOKEN": "dummy_token_for_dry_run",
+            }), patch("urllib.request.urlopen") as transport:
+                state_dir = Path(self.test_dir) / kind / "state"
+                state_dir.mkdir(parents=True)
+                shutil.copyfile(self.ledger_path, state_dir / "ledger.json")
+                working_dirs = [
+                    Path(self.test_dir) / kind / "first-cwd",
+                    Path(self.test_dir) / kind / "second-cwd",
+                ]
+                for working_dir in working_dirs:
+                    working_dir.mkdir()
+                transport.return_value.__enter__.return_value.read.return_value = json.dumps({
+                    "ok": True,
+                    "result": {"message_id": 12345, "from": {"id": 54321}},
+                }).encode("utf-8")
+                adapter = SuperboardExecutionAdapter(
+                    state_dir=str(state_dir),
+                    notify_telegram=True,
+                    telegram_dry_run=False,
+                    telegram_send=True,
+                )
+                try:
+                    for index, working_dir in enumerate(working_dirs):
+                        os.chdir(working_dir)
+                        if kind == "status":
+                            receipt = adapter.emit_telegram_event(
+                                {"id": req_id, "issue_number": 75},
+                                status="advanced",
+                                stage="qa",
+                                summary="Verified state-directory notification fixture",
+                            )
+                        else:
+                            receipt = adapter.emit_telegram_decision_event({
+                                "decision_id": "DEC-NOTIFICATION-STATE",
+                                "request_id": req_id,
+                                "status": "pending",
+                                "question": "Choose a supported execution path",
+                                "options": [{"id": "A", "label": "First"}, {"id": "B", "label": "Second"}],
+                                "recommendation": "A",
+                                "issue_url": "https://github.com/Bavariance/polysimulator/issues/75",
+                            })
+                        self.assertEqual(receipt["status"], "sent" if index == 0 else "deduped")
+                        self.assertTrue((state_dir / "telegram_notify_state.json").is_file())
+                        self.assertFalse((working_dir / "telegram_notify_state.json").exists())
+                    self.assertEqual(transport.call_count, 1)
+                finally:
+                    os.chdir(original_cwd)
 
     def test_01_fixture_execution_never_advances_request_state(self):
         """A labelled fixture proves dispatch plumbing and must never advance real state."""
