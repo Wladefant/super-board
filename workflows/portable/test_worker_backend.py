@@ -340,6 +340,43 @@ class TestNativeDispatch(_Fixture):
         repeated = backend.complete_native(ticket.run_id, ticket.task_handle, result)
         self.assertEqual(repeated.to_dict(), out.to_dict())
 
+    def test_explicit_retry_preserves_blocked_audit_and_can_succeed(self):
+        backend, first = self._dispatched()
+        invalid = self._result(first, checks=[])
+        blocked = backend.complete_native(first.run_id, first.task_handle, invalid)
+        self.assertFalse(blocked.ok)
+
+        retry = backend.retry_native(first.run_id)
+        self.assertEqual(retry.state, "prepared")
+        self.assertNotEqual(retry.run_id, first.run_id)
+        self.assertEqual(
+            backend.get_native_outcome(first.run_id).to_dict(),
+            blocked.to_dict(),
+        )
+        current = backend.prepare_native(self._request())
+        self.assertEqual(current.run_id, retry.run_id)
+
+        dispatched = backend.record_native_dispatch(retry.run_id, "agent://retry-child")
+        succeeded = backend.complete_native(
+            retry.run_id, dispatched.task_handle, self._result(retry),
+        )
+        self.assertTrue(succeeded.ok, succeeded.blocked_reason)
+
+    def test_retry_refuses_prepared_live_and_completed_attempts(self):
+        backend = WorkerBackend(state_dir=self.state)
+        prepared = backend.prepare_native(self._request())
+        with self.assertRaisesRegex(Exception, "only an explicitly unparked"):
+            backend.retry_native(prepared.run_id)
+        live = backend.record_native_dispatch(prepared.run_id, "agent://live")
+        with self.assertRaisesRegex(Exception, "only an explicitly unparked"):
+            backend.retry_native(live.run_id)
+        completed = backend.complete_native(
+            live.run_id, live.task_handle, self._result(live),
+        )
+        self.assertTrue(completed.ok)
+        with self.assertRaisesRegex(Exception, "only an explicitly unparked"):
+            backend.retry_native(live.run_id)
+
     def _move_head(self, ticket):
         repo = ticket.request["repo_root"]
         with open(os.path.join(repo, "mutation.txt"), "w", encoding="utf-8") as fh:

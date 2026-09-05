@@ -64,6 +64,7 @@ complete_native(
     task_handle: str,
     structured_result: Mapping[str, Any],
 ) -> WorkerOutcome
+retry_native(run_id: str) -> NativeDispatchTicket
 get_native_dispatch(run_id: str) -> NativeDispatchTicket
 get_native_outcome(run_id: str) -> Optional[WorkerOutcome]
 ```
@@ -76,6 +77,11 @@ durably records the actual `agent://` handle. `complete` requires that same
 handle, rereads HEAD, and uses the one shared result validator. Identical
 completion retries return the persisted outcome; changed-result or changed-
 handle replays are rejected.
+`retry_native` is never automatic: `continuation_driver.py --unpark <request>`
+may call it only for a persisted terminal blocked/failed outcome. It creates a
+new prepared run id while retaining the old result and handle as immutable
+audit. Prepared, background-dispatched, and successful completed attempts cannot
+be retried.
 
 Runnable host command sequence:
 
@@ -330,12 +336,12 @@ decision-blocked, unroutable and no-progress requests are parked with a reason
 and left alone. One request parking does not stop the others.
 
 **Restart resumes and never repeats.** Every dispatch is recorded in
-`stage_attempts` as `completed`, `blocked`, `failed`, or `no_progress`. Only an
-actually completed stage is added to `completed_stages` with the commit it
-entered at; a blocker write that changes the ledger fingerprint is not
-completion. A restart refuses to re-dispatch a completed stage at the same
-commit. Failed and blocked attempts remain parked across restart and retry only
-after the explicit human action `--unpark <id>`.
+`stage_attempts`; only an actually completed stage enters `completed_stages`.
+A restart refuses to re-dispatch a completed stage at the same commit. Prepared
+or background-dispatched native work remains in-flight and requires host
+reconciliation. A terminal blocked native attempt remains parked until explicit
+`--unpark <id>`, which creates one fresh prepared ticket and preserves the old
+ticket/result/handle audit. Unpark refuses live or successful completed work.
 
 **One driver at a time.** Two layers, each covering what the other cannot: an
 in-process registry of held paths, because the shared `FileLock` is thread-local

@@ -37,6 +37,8 @@ from continuation_driver import (  # noqa: E402
     DriverLockError,
     DriverRunLock,
 )
+from continuation_driver import ParkRecord, main as continuation_main  # noqa: E402
+from worker_backend import WorkerBackend  # noqa: E402
 from ledger import RequestLedger  # noqa: E402
 
 SAFE_BOUNDARIES = {"auto_merge_allowed": False, "auto_deploy_allowed": False}
@@ -890,6 +892,85 @@ class TestNativeBackgroundPending(_Fixture):
             journal = json.load(fh)
         self.assertEqual(journal["inflight"]["req-native"]["state"], "prepared")
         self.assertNotIn("req-native", journal["completed_stages"])
+
+    def test_cli_unpark_creates_fresh_attempt_only_for_terminal_blocked_native(self):
+        repo = os.path.join(self.tmp, "repo")
+        os.makedirs(repo)
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "t@localhost"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True)
+        with open(os.path.join(repo, "seed.txt"), "w", encoding="utf-8") as fh:
+            fh.write("seed\n")
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=repo, check=True)
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+        backend = WorkerBackend(state_dir=self.tmp)
+        request = {
+            "request_id": "req-retry",
+            "stage": "qa",
+            "repo_root": repo,
+            "head_sha": head,
+        }
+        first = backend.prepare_native(request)
+        first = backend.record_native_dispatch(first.run_id, "agent://first-child")
+        invalid = {
+            "stage": "qa",
+            "request_id": "req-retry",
+            "head_sha": head,
+            "verdict": "pass",
+            "summary": "missing evidence",
+            "checks": [],
+            "artifacts": [],
+        }
+        self.assertFalse(
+            backend.complete_native(first.run_id, first.task_handle, invalid).ok
+        )
+        journal = DriverJournal(os.path.join(self.tmp, JOURNAL_FILENAME))
+        journal.record_inflight(
+            "req-retry", "qa", head, first.run_id, "background_dispatched",
+        )
+        journal.park(ParkRecord("req-retry", "blocked", "bad result", "qa", head))
+        journal.save()
+
+        exit_code = continuation_main([
+            "--unpark", "req-retry",
+            "--state-dir", self.tmp,
+        ])
+
+        self.assertEqual(exit_code, 0)
+        retry = backend.prepare_native(request)
+        self.assertNotEqual(retry.run_id, first.run_id)
+        self.assertEqual(retry.state, "prepared")
+        retry = backend.record_native_dispatch(retry.run_id, "agent://retry-child")
+        check = subprocess.run(
+            ["git", "show", "HEAD:seed.txt"], cwd=repo,
+            capture_output=True, text=True,
+        )
+        valid = {
+            "stage": "qa",
+            "request_id": "req-retry",
+            "head_sha": head,
+            "verdict": "pass",
+            "summary": "retry child verified repository",
+            "checks": [{
+                "name": "read seed",
+                "command": ["git", "show", "HEAD:seed.txt"],
+                "exit_code": check.returncode,
+                "observed": check.stdout.strip(),
+            }],
+            "artifacts": [],
+        }
+        succeeded = backend.complete_native(
+            retry.run_id, retry.task_handle, valid,
+        )
+        self.assertTrue(succeeded.ok, succeeded.blocked_reason)
+        self.assertFalse(backend.get_native_outcome(first.run_id).ok)
+        reloaded = DriverJournal(os.path.join(self.tmp, JOURNAL_FILENAME))
+        self.assertIsNone(reloaded.parked_record("req-retry"))
+        self.assertNotIn("req-retry", reloaded.data["inflight"])
 
 
 if __name__ == "__main__":

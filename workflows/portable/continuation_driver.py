@@ -1147,8 +1147,28 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.show_parked or args.unpark:
         journal = DriverJournal(os.path.join(state_dir, JOURNAL_FILENAME))
         for rid in args.unpark:
+            inflight = journal.data.get("inflight", {}).get(rid) or {}
+            native_run_id = inflight.get("run_id")
+            if native_run_id:
+                try:
+                    from worker_backend import WorkerBackend
+                    ticket = WorkerBackend(
+                        config=args.worker_config,
+                        state_dir=state_dir,
+                        default_model=args.model,
+                        default_backend=args.backend,
+                    ).retry_native(native_run_id)
+                except Exception as e:
+                    print(
+                        f"cannot unpark {rid}: native retry refused: {e}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                journal.clear_inflight(rid)
+                print(f"unparked: {rid} -> prepared native retry {ticket.run_id}")
+            else:
+                print(f"unparked: {rid}")
             journal.unpark(rid)
-            print(f"unparked: {rid}")
         if args.unpark:
             journal.save()
         if args.show_parked:

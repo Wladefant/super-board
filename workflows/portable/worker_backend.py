@@ -1045,6 +1045,47 @@ class WorkerBackend:
                 os.unlink(tmp)
             raise
 
+    def _read_native_index(self) -> Dict[str, str]:
+        path = os.path.join(self.work_dir, "native_attempts.json")
+        if not os.path.exists(path):
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError) as e:
+            raise WorkerBackendError(f"Native attempt index is unavailable: {e}")
+        if not isinstance(data, dict):
+            raise WorkerBackendError("Native attempt index must be a JSON object.")
+        return {str(key): str(value) for key, value in data.items()}
+
+    def _write_native_index(self, index: Mapping[str, str]) -> None:
+        os.makedirs(self.work_dir, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(
+            prefix=".native_attempts_", suffix=".json", dir=self.work_dir, text=True,
+        )
+        path = os.path.join(self.work_dir, "native_attempts.json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(dict(index), fh, indent=2, sort_keys=True)
+                fh.write("\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        except Exception:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+
+    def _native_identity_sha(self, request: Any) -> Optional[str]:
+        request_id = str(_field(request, "request_id", "") or "").strip()
+        stage = str(_field(request, "stage", "") or "").strip()
+        repo_root = str(_field(request, "repo_root", "") or "").strip()
+        head_sha = str(_field(request, "head_sha", "") or "").strip()
+        if not (request_id and stage in VALID_STAGES and repo_root and SHA_RE.match(head_sha)):
+            return None
+        identity = "|".join((os.path.abspath(repo_root), request_id, stage, head_sha))
+        return hashlib.sha256(identity.encode("utf-8")).hexdigest()
+
     def _ticket(self, record: Mapping[str, Any], blocked_reason: Optional[str] = None) -> NativeDispatchTicket:
         return NativeDispatchTicket(
             run_id=str(record.get("run_id") or ""),
@@ -1058,25 +1099,22 @@ class WorkerBackend:
         )
 
     def prepare_native(self, request: Any) -> NativeDispatchTicket:
-        """Preflight and durably prepare work without launching anything."""
-        raw_request_id = str(_field(request, "request_id", "") or "").strip()
-        raw_stage = str(_field(request, "stage", "") or "").strip()
-        raw_repo = str(_field(request, "repo_root", "") or "").strip()
-        raw_head = str(_field(request, "head_sha", "") or "").strip()
-        if raw_request_id and raw_stage in VALID_STAGES and raw_repo and SHA_RE.match(raw_head):
-            identity = "|".join((
-                os.path.abspath(raw_repo), raw_request_id, raw_stage, raw_head,
-            ))
-            existing_run_id = (
-                "native_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
-            )
-            existing_path = os.path.join(
-                self._native_run_dir(existing_run_id), "dispatch.json",
-            )
-            if os.path.exists(existing_path):
-                # Recovery never creates or redispatches work. It returns the
-                # already-bound durable state even when a build advanced HEAD.
-                return self._ticket(self._read_native_record(existing_run_id))
+        """Preflight and durably prepare work without launching or retrying anything."""
+        identity_sha = self._native_identity_sha(request)
+        lock_path = os.path.join(self.work_dir, ".native-dispatch.lock")
+        if identity_sha:
+            with FileLock(lock_path):
+                index = self._read_native_index()
+                run_id = index.get(identity_sha) or ("native_" + identity_sha[:24])
+                record_path = os.path.join(
+                    self._native_run_dir(run_id), "dispatch.json",
+                )
+                if os.path.exists(record_path):
+                    if identity_sha not in index:
+                        index[identity_sha] = run_id
+                        self._write_native_index(index)
+                    return self._ticket(self._read_native_record(run_id))
+
         context, error = self._request_context(request)
         if error:
             return NativeDispatchTicket(
@@ -1084,22 +1122,26 @@ class WorkerBackend:
                 head_sha=context.get("head_before"), blocked_reason=error,
             )
         normalized = self._normalized_request(request, context)
+        identity_sha = self._native_identity_sha(normalized)
+        assert identity_sha is not None
+        run_id = "native_" + identity_sha[:24]
         schema = agent_result_schema()
         prompt = build_stage_prompt(normalized, schema)
-        identity = "|".join((
-            normalized.repo_root, normalized.request_id, normalized.stage,
-            str(normalized.head_sha),
-        ))
-        run_id = "native_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
-        run_dir = self._native_run_dir(run_id)
-        lock_path = os.path.join(self.work_dir, ".native-dispatch.lock")
         with FileLock(lock_path):
-            record_path = os.path.join(run_dir, "dispatch.json")
+            index = self._read_native_index()
+            indexed_run = index.get(identity_sha)
+            if indexed_run:
+                return self._ticket(self._read_native_record(indexed_run))
+            record_path = os.path.join(self._native_run_dir(run_id), "dispatch.json")
             if os.path.exists(record_path):
+                index[identity_sha] = run_id
+                self._write_native_index(index)
                 return self._ticket(self._read_native_record(run_id))
             record = {
                 "version": 1,
                 "run_id": run_id,
+                "identity_sha256": identity_sha,
+                "attempt": 1,
                 "state": "prepared",
                 "request": normalized.to_dict(),
                 "repo_root": normalized.repo_root,
@@ -1114,7 +1156,66 @@ class WorkerBackend:
                 "task_handle": None,
             }
             self._write_native_record(record)
+            index[identity_sha] = run_id
+            self._write_native_index(index)
             return self._ticket(record)
+
+    def retry_native(self, run_id: str) -> NativeDispatchTicket:
+        """Create one fresh prepared attempt only after an explicit terminal failure retry."""
+        lock_path = os.path.join(self.work_dir, ".native-dispatch.lock")
+        with FileLock(lock_path):
+            record = self._read_native_record(run_id)
+            identity_sha = record.get("identity_sha256") or self._native_identity_sha(
+                record.get("request") or {}
+            )
+            if not identity_sha:
+                raise WorkerBackendError(
+                    f"Native dispatch {run_id} has no recoverable request identity."
+                )
+            index = self._read_native_index()
+            current_run = index.get(identity_sha, run_id)
+            if current_run != run_id:
+                current = self._read_native_record(current_run)
+                if current.get("state") == "prepared":
+                    return self._ticket(current)
+                raise WorkerBackendError(
+                    f"Native dispatch {run_id} already has current attempt {current_run} "
+                    f"in state {current.get('state')!r}; refusing another retry."
+                )
+            outcome = record.get("outcome") or {}
+            if record.get("state") != "blocked" or outcome.get("ok") is not False:
+                raise WorkerBackendError(
+                    f"Native dispatch {run_id} is {record.get('state')!r}; only an explicitly "
+                    "unparked terminal blocked/failed outcome may be retried."
+                )
+            _, retry_error = self._request_context(record.get("request") or {})
+            if retry_error:
+                raise WorkerBackendError(
+                    f"Native dispatch {run_id} cannot retry on its bound head: {retry_error}"
+                )
+            nonce = f"{run_id}|{record.get('attempt', 1)}|{_now()}"
+            next_run_id = "native_" + hashlib.sha256(nonce.encode("utf-8")).hexdigest()[:24]
+            next_record = {
+                "version": 1,
+                "run_id": next_run_id,
+                "identity_sha256": identity_sha,
+                "attempt": int(record.get("attempt") or 1) + 1,
+                "retry_of": run_id,
+                "state": "prepared",
+                "request": dict(record["request"]),
+                "repo_root": record["repo_root"],
+                "head_before": record["head_before"],
+                "prompt": record["prompt"],
+                "prompt_sha256": record["prompt_sha256"],
+                "result_schema": dict(record["result_schema"]),
+                "schema_sha256": record["schema_sha256"],
+                "prepared_at": _now(),
+                "task_handle": None,
+            }
+            self._write_native_record(next_record)
+            index[identity_sha] = next_run_id
+            self._write_native_index(index)
+            return self._ticket(next_record)
 
     def get_native_dispatch(self, run_id: str) -> NativeDispatchTicket:
         return self._ticket(self._read_native_record(run_id))
