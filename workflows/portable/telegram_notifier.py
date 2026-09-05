@@ -737,7 +737,10 @@ class TelegramNotificationAdapter:
 
         dec_id = str(d_dict.get("decision_id") or "").strip()
         req_id = str(d_dict.get("request_id") or "").strip()
-        status = str(d_dict.get("status") or "pending").strip().lower()
+        raw_status = d_dict.get("status")
+        if raw_status is None or not str(raw_status).strip():
+            return False, f"Decision '{dec_id}' is missing required typed status; notification refused."
+        status = str(raw_status).strip().lower()
         provenance = str(d_dict.get("provenance") or "").strip().lower()
 
         # 1. Authoritative Typed Status Check:

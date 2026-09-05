@@ -32,10 +32,12 @@ from superboard_adapter import (
     WorkerExecutionResult,
 )
 from coordinator import Coordinator, RoutingStatus
-from ledger import RequestLedger
+from ledger import FileLock, RequestLedger
 from model_routing import TaskType, RiskLevel
 from project_adapter import SuperboardLifecycleOutcome
 import project_adapter
+from decision_workflow import DecisionContract
+from telegram_notifier import TelegramNotificationAdapter
 
 
 class StubWorkerBackend:
@@ -421,6 +423,81 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
         self.assertIsNotNone(receipt_completed)
         self.assertEqual(receipt_completed.get("status"), "refused")
         self.assertIn("terminal state", receipt_completed.get("reason", ""))
+
+    def test_04f_run_step_uses_typed_decision_guard(self):
+        """Real Coordinator DecisionStatus routes registry decisions through one typed guard."""
+        retired_req = "req-synthetic-decision-demo-4543"
+        self._add_pipeline_request(retired_req)
+        retired_adapter = SuperboardExecutionAdapter(
+            state_dir=self.state_dir,
+            notify_telegram=True,
+            telegram_dry_run=True,
+        )
+        retired_manager = retired_adapter.coordinator.decision_mgr
+        retired_manager.register_question(
+            DecisionContract(
+                decision_id="DEC-4543-01",
+                request_id=retired_req,
+                prompt="p",
+                question="How to proceed?",
+                options=[{"id": "A", "label": "Park"}, {"id": "B", "label": "Branch"}],
+                recommendation="A",
+                blocking_dependencies=[retired_req],
+                authorized_responders=["wladefant"],
+            )
+        )
+        packet = retired_adapter.coordinator.evaluate_step(request_id=retired_req)
+        self.assertEqual(type(packet.decision_status).__name__, "DecisionStatus")
+        self.assertTrue(packet.decision_status.blocking_this_request)
+
+        with FileLock(retired_manager.lock_path):
+            data = retired_manager._load_data_unlocked()
+            data["decisions"]["DEC-4543-01"]["status"] = "rejected"
+            data["decisions"]["DEC-4543-01"]["provenance"] = "synthetic_test"
+            retired_manager._save_data_unlocked(data)
+
+        retired = retired_adapter.run_step(request_id=retired_req)
+        self.assertEqual(retired.stage, "decision")
+        self.assertEqual(retired.status, "blocked")
+        self.assertEqual(retired.notification_receipt["status"], "refused")
+        self.assertNotIn("[Blocker]", retired.notification_receipt["reason"])
+
+        pending_req = "req-real-pending-decision"
+        self._add_pipeline_request(pending_req)
+        pending_adapter = SuperboardExecutionAdapter(
+            state_dir=self.state_dir,
+            notify_telegram=True,
+            telegram_dry_run=True,
+        )
+        pending_adapter.coordinator.decision_mgr.register_question(
+            DecisionContract(
+                decision_id="DEC-PENDING-01",
+                request_id=pending_req,
+                prompt="p",
+                question="Choose the supported execution path?",
+                options=[{"id": "A", "label": "First"}, {"id": "B", "label": "Second"}],
+                recommendation="A",
+                blocking_dependencies=[pending_req],
+                authorized_responders=["wladefant"],
+            )
+        )
+        pending = pending_adapter.run_step(request_id=pending_req)
+        self.assertEqual(pending.stage, "decision")
+        self.assertEqual(pending.status, "blocked")
+        self.assertEqual(pending.notification_receipt["status"], "dry_run")
+        self.assertIn("[Decision Needed]", pending.notification_receipt["reason"])
+        self.assertNotIn("[Blocker]", pending.notification_receipt["reason"])
+
+        eligible, reason = TelegramNotificationAdapter.is_decision_notifiable(
+            {
+                "decision_id": "DEC-MISSING-STATUS",
+                "request_id": pending_req,
+                "question": "Missing typed state",
+            },
+            ledger_request=self.ledger.get_request(pending_req),
+        )
+        self.assertFalse(eligible)
+        self.assertIn("missing required typed status", reason)
     def test_04d_cli_telegram_flags_parsing(self):
         """Verify build_parser preserves safe dry-run by default unless explicit --telegram-send."""
         from superboard_adapter import build_parser
