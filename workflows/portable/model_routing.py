@@ -72,6 +72,18 @@ MODEL_CODEX_ASTRA = "openai-codex/gpt-6-astra:high"
 
 MODEL_GROK_DORMANT = "xai-oauth/grok-4.6:high"
 
+# Catalog-verified model context windows (models.db authoritative, no fabricated context sizes)
+VERIFIED_CONTEXT_WINDOWS: Dict[str, int] = {
+    MODEL_GEMINI_FLASH: 1048576,
+    MODEL_GEMINI_LITE: 1048576,
+    MODEL_GEMINI_PRO: 1048576,
+    MODEL_CLAUDE_FABLE: 1000000,
+    MODEL_CLAUDE_OPUS: 1000000,
+    MODEL_CODEX_FAST: 400000,
+    MODEL_CODEX_SOL: 372000,
+    MODEL_CODEX_ASTRA: 272000,
+}
+
 
 @dataclass
 class HarnessDispatchPacket:
@@ -98,7 +110,7 @@ def model_to_agent_role(model_id: str, task_type: TaskType, risk_level: RiskLeve
     if "flash-lite" in model_id:
         return "compactor"
     if "flash" in model_id:
-        return "task"
+        return "qa-verifier" if task_type == TaskType.STRONG_REVIEW and risk_level == RiskLevel.LOW else "task"
     if "pro" in model_id:
         return "task"
     if "fable" in model_id:
@@ -106,13 +118,12 @@ def model_to_agent_role(model_id: str, task_type: TaskType, risk_level: RiskLeve
     if "opus" in model_id:
         return "thinker" if task_type == TaskType.DEEP_REASONING else "reviewer"
     if "sol" in model_id:
-        return "reviewer" if task_type == TaskType.STRONG_REVIEW else "thinker"
+        return "codex-reviewer" if task_type == TaskType.STRONG_REVIEW else "codex-worker"
     if "astra" in model_id:
-        return "orchestrator"
+        return "orchestrator" if task_type not in (TaskType.STRONG_REVIEW, TaskType.ROUTINE_EXECUTION) else ("codex-reviewer" if task_type == TaskType.STRONG_REVIEW else "codex-worker")
     if "codex" in model_id:
-        return "task"
+        return "codex-reviewer" if task_type == TaskType.STRONG_REVIEW else "codex-worker"
     return "task"
-
 
 def model_to_provider(model_id: str) -> str:
     """Map model ID to canonical provider name."""
@@ -343,11 +354,11 @@ class ResetAwareModelSelector:
             if google_meta["is_available"]:
                 selected_model = MODEL_GEMINI_PRO
                 fallback_model = MODEL_CLAUDE_OPUS if anthropic_meta["is_available"] else MODEL_GEMINI_FLASH
-                reasoning = f"Context size {context_tokens} tokens routed to Gemini 3.1 Pro 2M window."
+                reasoning = f"Context size {context_tokens} tokens routed to Gemini 3.1 Pro ({VERIFIED_CONTEXT_WINDOWS.get(MODEL_GEMINI_PRO, '1M')} token window)."
             elif anthropic_meta["is_available"]:
                 selected_model = MODEL_CLAUDE_OPUS
                 fallback_model = MODEL_CLAUDE_FABLE
-                reasoning = f"Context size {context_tokens} tokens routed to Claude Opus 200k window."
+                reasoning = f"Context size {context_tokens} tokens routed to Claude Opus ({VERIFIED_CONTEXT_WINDOWS.get(MODEL_CLAUDE_OPUS, '1M')} token window)."
             else:
                 selected_model = MODEL_GEMINI_FLASH
                 fallback_model = MODEL_GEMINI_LITE
@@ -480,9 +491,13 @@ class ResetAwareModelSelector:
                     fallback_model = MODEL_CLAUDE_FABLE
                     reasoning = "High-risk implementation first pass: routed to Claude Opus 5 to prevent rework."
                 else:
-                    selected_model = MODEL_GEMINI_FLASH
+                    selected_model = MODEL_GEMINI_PRO
                     fallback_model = MODEL_GEMINI_PRO
-                    reasoning = "High-risk implementation: strong models unavailable, fallback to Gemini Flash."
+                    cooldown_fallback = True
+                    reasoning = (
+                        "High-risk implementation / structural retry: all strong models (Sol/Astra/Opus/Fable) "
+                        "unavailable or in cooldown; emergency fallback to Gemini Pro (Flash strictly barred from structural failure retry)."
+                    )
             elif codex_near_reset_surplus and risk_level != RiskLevel.LOW:
                 # Promote Codex Fast for capable implementation when Codex capacity is expiring
                 selected_model = MODEL_CODEX_FAST

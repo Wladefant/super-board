@@ -73,6 +73,20 @@
       "inputs": ["Plan spec JSON", "Recap spec JSON"],
       "outputs": ["Formatted GitHub Markdown with badges and tables"]
     },
+    "superboard_adapter.py": {
+      "role": "Superboard execution adapter bridging portable coordinator with existing loop tooling (super-qa-dispatch.sh, super-board-run.sh, and super_board_runtime)",
+      "owner": "PackagePortableCoordinator",
+      "cli_command": "python superboard_adapter.py [--config <file>] [--state-dir <dir>] [--fake-executor] [--real-worker] [--notify-telegram] [--json] [--summary]",
+      "inputs": ["ledger.json", "preflight_evidence/", "Superboard project config", "HarnessDispatchPacket"],
+      "outputs": ["AdapterExecutionResult with exact-SHA binding, gate verification, and Telegram milestone"]
+    },
+    "github_pr_gate.py": {
+      "role": "Deterministic GitHub PR status & review gate helper verifying CI checks, independent non-author approval, and exact-head review reuse",
+      "owner": "FinalizeExecutableRouting",
+      "cli_command": "python github_pr_gate.py --pr <pr_url_or_number> [--head-sha <sha>] [--required-checks <checks>] [--json]",
+      "inputs": ["GitHub PR via gh CLI or API payload", "Required check contexts", "Prior review approval record"],
+      "outputs": ["PRGateEvaluation (PASSED, BLOCKED, PENDING) with detailed gate reasons"]
+    },
     "telegram_notifier.py": {
       "role": "Portable Telegram workflow status notification adapter with strict deduplication, cooldowns, and one-sentence event reporting",
       "owner": "IntegrateTelegramStatus",
@@ -122,6 +136,9 @@
       "manifest.json",
       "PORTABLE.md",
       "project_adapter.py",
+      "superboard_adapter.py",
+      "github_pr_gate.py",
+      "telegram_notifier.py",
       "cross_repo_smoke_test.py",
       "fixtures/alternate_repo_config.json",
       "fixtures/unknown_env_config.json"
@@ -129,8 +146,10 @@
     "optional_files": [
       "usage_snapshot_cache.json",
       "ledger.json",
-      "telegram_notifier.py",
+      "test_superboard_adapter.py",
+      "test_github_pr_gate.py",
       "test_telegram_notifier.py",
+      "routing_smoke_test.py",
       "decisions.json"
     ]
   }

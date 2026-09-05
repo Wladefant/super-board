@@ -43,6 +43,9 @@ EXPORT_FILES = [
     "manifest.json",
     "PORTABLE.md",
     "project_adapter.py",
+    "superboard_adapter.py",
+    "github_pr_gate.py",
+    "telegram_notifier.py",
 ]
 
 
@@ -141,8 +144,14 @@ def test_missing_optional_tools(export_dir: str):
 
 def test_isolated_synthetic_request_lifecycle(export_dir: str):
     log_test("Full isolated synthetic request lifecycle (local_doc & deployable tasks)")
-    state_dir = os.path.join(export_dir, f"synthetic_state_{os.getpid()}")
-    os.makedirs(state_dir, exist_ok=True)
+    state_dir = tempfile.mkdtemp(prefix="synthetic_state_", dir=export_dir)
+    try:
+        _run_isolated_synthetic_request_lifecycle(export_dir, state_dir)
+    finally:
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
 
     ledger_py = os.path.join(export_dir, "ledger.py")
     decisions_py = os.path.join(export_dir, "decision_workflow.py")
@@ -227,19 +236,7 @@ def test_isolated_synthetic_request_lifecycle(export_dir: str):
     assert_true(p2["status"] == "wait", f"Coordinator emits 'wait' on decision blocker (got {p2['status']})")
     assert_true(p2["decision_status"]["blocking_this_request"] is True, "Decision blocking flag is True")
 
-    # A3: Resolve decision: record operator answer in ledger and process reply in decision_workflow
-    res_ledger_cmd = [
-        PYTHON_EXE, ledger_py,
-        "--ledger", ledger_json,
-        "update", local_req_id,
-        "--resolve-decision", dec_id,
-        "--decision-answer", "A: Single file",
-        "--actor", "Wladefant",
-        "--decision-comment-id", "999888777",
-    ]
-    res = subprocess.run(res_ledger_cmd, capture_output=True, text=True)
-    assert_true(res.returncode == 0, f"Recorded decision resolution in ledger: {res.stderr}")
-
+    # A3: Resolve decision: reply directly via decision_workflow (which resolves ledger directly)
     reply_cmd = [
         PYTHON_EXE, decisions_py,
         "--decisions", decisions_json,
@@ -473,11 +470,7 @@ def main():
     print("\n" + "#" * 70)
     print("STARTING PORTABLE WORKFLOW COORDINATOR SMOKE TEST SUITE")
     print("#" * 70)
-
-    temp_export_dir = os.path.join(tempfile.gettempdir(), f"portable_workflow_smoke_test_{os.getpid()}")
-    if os.path.exists(temp_export_dir):
-        shutil.rmtree(temp_export_dir, ignore_errors=True)
-
+    temp_export_dir = tempfile.mkdtemp(prefix="portable_workflow_smoke_test_")
     try:
         test_export_package(temp_export_dir)
         test_standalone_coordinator_execution(temp_export_dir)
@@ -490,7 +483,7 @@ def main():
         print(f"Export Directory Verified: {temp_export_dir}")
         print("#" * 70)
     finally:
-        pass
+        shutil.rmtree(temp_export_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

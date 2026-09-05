@@ -328,7 +328,7 @@ class SanitizedUsageSnapshot:
             btn = first.bottleneck_window
             prim = first.primary_window or btn
             rem = btn.amount.remaining_fraction if btn else 0.0
-            hrs = prim.hours_to_reset if prim else 0.0
+            hrs = btn.hours_to_reset if btn else (prim.hours_to_reset if prim else 0.0)
             lbl = btn.label if btn else "all_failed"
             return (rem, hrs, lbl, first.status)
 

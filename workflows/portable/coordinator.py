@@ -874,6 +874,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Execute live network delivery to Telegram (requires explicit opt-in)",
     )
+    parser.add_argument(
+        "--dispatch",
+        action="store_true",
+        help="Dispatch eligible step via SuperboardExecutionAdapter (executes worker and advances ledger)",
+    )
+    parser.add_argument(
+        "--fake-executor",
+        action="store_true",
+        default=True,
+        help="Use fake executor with labeled fixture output for bounded integration testing",
+    )
+    parser.add_argument(
+        "--real-worker",
+        action="store_true",
+        help="Execute safe harmless real worker command (config validation or git status)",
+    )
     parser.add_argument("--json", action="store_true", help="Output machine-readable JSON packet")
     parser.add_argument("--summary", action="store_true", help="Output concise terminal summary")
     return parser
@@ -965,12 +981,34 @@ def main():
         adapter_name=args.adapter,
     )
 
+    if args.dispatch:
+        try:
+            from superboard_adapter import SuperboardExecutionAdapter, format_adapter_summary
+            adapter = SuperboardExecutionAdapter(
+                coordinator=coordinator,
+                state_dir=args.state_dir,
+                config_path=args.project_config,
+                fake_executor=args.fake_executor and not args.real_worker,
+                notify_telegram=args.notify_telegram,
+                telegram_project=args.telegram_project,
+                telegram_dry_run=args.telegram_dry_run,
+                telegram_send=args.telegram_send,
+            )
+            res = adapter.run_step(request_id=args.request_id, real_worker=args.real_worker)
+            if args.json or not args.summary:
+                print(res.to_json())
+            else:
+                print(format_adapter_summary(res))
+            return
+        except Exception as e:
+            sys.stderr.write(f"Adapter execution error: {e}\n")
+            sys.exit(1)
+
     try:
         packet = coordinator.evaluate_step(request_id=args.request_id)
     except Exception as e:
         sys.stderr.write(f"Coordinator execution error: {e}\n")
         sys.exit(1)
-
     if args.json or not args.summary:
         # Default to JSON output for programmatic consumers
         print(packet.to_json())

@@ -38,6 +38,8 @@ A harness-agnostic, pure Python standard library multi-agent coordination core l
 | **`model_routing.py`** | `ImplementHarnessRouting` / `ImplementSubscriptionRouter` | Capability-first, reset-aware model selection, near-reset Codex promotion, and compact EvidencePacket generation (< 1.5 KB). | `python model_routing.py [--task-type <type>] [--risk-level <level>] [--emit-dispatch] [--adapter veyyon\|file\|direct] [--balance-file <file>]` | `NormalizedBalanceSnapshot` | `HarnessDispatchPacket` (JSON) |
 | **`github_plan_renderer.py`** | `IntegrateVisualPlanWorkflow` | Visual plan and evidence recap markdown renderer with badges, timelines, and progress metrics for GitHub issue/PR comments. | `python github_plan_renderer.py [--spec <file>] [--type plan\|recap]` | Plan or recap JSON specification | Formatted GitHub Markdown comment text |
 | **`telegram_notifier.py`** | `IntegrateTelegramStatus` | Portable Telegram workflow status notification adapter with strict deduplication, cooldowns, single-sentence formatting, and multi-repo destination resolution. | `python telegram_notifier.py [--packet <file>] [--event-type milestone\|blocker\|decision\|completion] [--project <name>] [--send] [--dry-run] [--test-connection] [--json]` | `CoordinatorPacket` JSON, CLI event arguments, manifest/channel config | `DeliveryReceipt` (JSON or terminal summary), deduplicated Telegram messages |
+| **`superboard_adapter.py`** | `PackagePortableCoordinator` | Execution adapter bridging portable coordinator with existing Superboard loop tooling (`super-qa-dispatch.sh`, `super-board-run.sh`, `super_board_runtime`). | `python superboard_adapter.py [--config <file>] [--state-dir <dir>] [--fake-executor] [--real-worker] [--notify-telegram] [--json] [--summary]` | `ledger.json`, `preflight_evidence/`, Superboard project config, `HarnessDispatchPacket` | `AdapterExecutionResult`, exact-SHA QA evidence, Telegram status events |
+| **`github_pr_gate.py`** | `FinalizeExecutableRouting` | Deterministic GitHub PR status & review gate helper verifying CI checks, independent non-author approval, and exact-head review reuse without LLM churn. | `python github_pr_gate.py --pr <pr_url_or_number> [--head-sha <sha>] [--required-checks <checks>] [--json]` | GitHub PR via `gh` CLI or API payload, required check contexts, prior review approval records | `PRGateEvaluation` (`PASSED`, `BLOCKED`, `PENDING`) with detailed gate breakdown |
 ---
 
 ## 3. Single Bounded Coordinator Command
@@ -341,3 +343,125 @@ python workflows/cross_repo_smoke_test.py
 ```
 Verifies PolySimulator staging preservation, alternate repo fixture execution with zero leakage, and safe unknown environment handling (100% success).
 
+---
+
+## 8. Superboard Execution Adapter & Build/QA/Review Loop Integration
+
+### 8.1 Prompt Instructions vs. Executable Tooling
+A key architectural finding in the existing `Wladefant/super-board` repository:
+* **Interactive Skill Files (`skills/super-build/SKILL.md`, `skills/super-qa/SKILL.md`, `skills/super-review/SKILL.md`):** These are interactive markdown instructions designed for human/Claude prompt orchestration. They are not autonomous daemon binaries, as `super-build/SKILL.md` explicitly states: *"The mode was designed to be triggered by a super-orchestrator skill that would chain QA and Build automatically. That skill does not exist in this repo and never did... Nothing chains the loop: a human sets BUILD_LOOP_QA_MODE=1, invokes /super-build, and decides when to run the next QA wave."*
+* **Executable CLI & Runtime Tooling:** The repository's real automation consists of verified CLI utilities:
+  +- `scripts/super-qa-dispatch.sh`: Exact-SHA detached worktree QA runner and status publisher.
+  +- `scripts/super-qa-file-bug.sh`: Product-readable bug ticket filing with project column placement.
+  +- `scripts/super-board-wave-plan.sh`: Backlog wave planner delegating to `super_board_runtime.eligibility`.
+  +- `scripts/super-board-run.sh`: Legacy headless runner tick loop.
+  +- `scripts/super_board_runtime/qa.py`: Exact-SHA merge handoff verification.
+  +- `scripts/super_board_runtime/config.py`: Project config validation.
+  +- `workflows/portable/github_pr_gate.py`: Deterministic CI status & review gate helper.
+
+### 8.2 Sequential Adapter Execution Pipeline (No Duplicate Scheduler)
+The `SuperboardExecutionAdapter` (`workflows/portable/superboard_adapter.py`) bridges the portable coordinator with these executable tools in a single bounded step:
+
+```mermaid
+graph TD
+    A[1. Eligible Next Request] --> B[2. Connected-Service Preflight Gate]
+    B -->|Passed| C[3. Capable Model & Role Dispatch Packet]
+    B -->|Blocked| H[Emit Blocker Telegram Event]
+    C --> D[4. Worker Command Dispatch: Real, Probe, or Fake]
+    D --> E[5. Evidence, QA & Review Gate Eligibility]
+    E --> F[6. Concise Telegram Event]
+    E --> G[7. Strict Pause: Awaiting Human Merge Authorization]
+```
+
+1. **Eligible Request Intake:** Reads from `RequestLedger` (`ledger.py`), verifying request state is dispatchable (`pending` or `implementation`), OPEN, and unclaimed.
+2. **Preflight Gate:** Evaluates staging infrastructure (Dokploy staging compose ID, Supabase staging ref); strictly rejects production references (`zaraprptkegxqpvnsubu`, `vpyL-7TDEUREH6Uo_y1sb`).
+3. **Explicit Capable Model & Role Dispatch Packet:** Uses `ResetAwareModelSelector` to generate a `HarnessDispatchPacket` with catalog-verified context sizes (no fabricated sizes), explicit agent role (`codex-worker`, `thinker`, `codex-reviewer`, `qa-verifier`), and compact evidence packet (< 1.5 KB).
+4. **Existing Worker Command Dispatch:**
+   * **Bounded Dry-Run / Smoke:** Invokes fake executor producing labeled fixture results (`[FIXTURE_EXECUTION_RESULT]`) to safely prove gates without modifying external systems.
+   * **Real Safe Worker Probe:** Runs non-mutating commands (e.g. `scripts/super-board-config.py validate` or `git status`) to verify actual subprocess dispatch and exit-code handling.
+   * **QA Lane Dispatch:** Dispatches to `scripts/super-qa-dispatch.sh` in detached locked worktrees.
+5. **Evidence, QA & Review Gate Verification:**
+   * Enforces exact-SHA commit binding: tested commit must match current head; any head move invalidates review and resets state to `implementation`.
+   * Evaluates deterministic CI checks and independent (non-author) review approvals via `github_pr_gate.py`. Self-authored approvals (`COMMENTED` or author-signed) are strictly rejected.
+6. **Concise Telegram Event:** Emits exactly one concise sentence with canonical GitHub link via `TelegramNotificationAdapter` (deduplicated within 24h window).
+7. **Strict Separation of Merge & Deploy Authorization:**
+   * When review passes, request transitions strictly to `awaiting authorization`.
+   * `auto_merge_allowed = False` and `auto_deploy_allowed = False` are strictly enforced. Auto-merge is prohibited.
+
+### 8.3 Bug Retention & Reproduction Absence Invariant
+To ensure no reported bugs are prematurely closed or lost:
+* **Durable Intake Upsert:** Every reported important bug must be durably upserted into the authoritative ledger before any worker dispatch occurs, preserving the original prompt, reproduction scenario, and severity. New prompts, context compaction, or session restarts cannot delete or overwrite an unresolved bug.
+* **Reproduction Absence Requirement:** A bug cannot close merely because "a generic test suite passed", "a related PR merged", or "no-repro was found" without explicit human user disposition.
+* **Closure Binding:** Bug closure strictly binds the exact original reproduction scenario proven absent on the reviewed head commit + non-empty regression evidence logs + signed-in QA where applicable.
+* **Reopen Invariant:** If QA fails to prove the original reproduction absent, the bug resets/reopens to `implementation`.
+* **Empirical Claims:** Claims are strictly empirical ("specific reproduction scenario failed to trigger on reviewed head commit"); no mathematical proof of global bug absence is claimed.
+
+---
+
+## 9. Installation & Activation Guide
+
+### 9.1 Veyyon Current Session Activation
+In the active Veyyon session:
+```bash
+# 1. Verify portable coordinator status and next eligible task
+python workflows/portable/coordinator.py --summary
+
+# 2. Execute bounded single-step dispatch with fake executor (safe proof)
+python workflows/portable/coordinator.py --dispatch --fake-executor --summary
+
+# 3. Execute real safe worker probe (verifies real process execution)
+python workflows/portable/coordinator.py --dispatch --real-worker --summary
+
+# 4. Run standalone Superboard execution adapter with Telegram dry-run
+python workflows/portable/superboard_adapter.py --notify-telegram --telegram-dry-run --summary
+
+# 5. Run full test suites
+python workflows/portable/test_superboard_adapter.py
+python workflows/portable/coordinator_smoke_test.py
+python workflows/portable/test_github_pr_gate.py
+python workflows/portable/routing_smoke_test.py
+```
+
+### 9.2 Generic External Harness Activation (Claude Code, GitHub Actions, Custom Runners)
+The package is 100% harness-agnostic with zero external package dependencies (pure Python standard library):
+```bash
+# 1. Export the portable workflow package to any target system
+python -c "
+import shutil, os
+src = 'workflows/portable'
+dst = '/opt/portable-workflow'
+shutil.copytree(src, dst, dirs_exist_ok=True)
+"
+
+# 2. Run coordinator in standalone file mode (no Veyyon CLI, no network needed)
+python /opt/portable-workflow/coordinator.py \
+  --state-dir /opt/portable-workflow/state \
+  --usage-adapter file \
+  --balance-file /opt/portable-workflow/usage_fixture.json \
+  --no-sync-decisions \
+  --json
+
+# 3. Dispatch worker step via Superboard adapter
+python /opt/portable-workflow/superboard_adapter.py \
+  --state-dir /opt/portable-workflow/state \
+  --fake-executor \
+  --json
+```
+
+---
+
+## 10. Exact Remaining Activation & Permission Boundaries
+
+| Capability / Action | Status | Authority / Enforcement |
+| :--- | :--- | :--- |
+| **Request Intake & Eligibility** | ✅ Fully Automated | Evaluated via `RequestLedger` and `super_board_runtime.eligibility`. |
+| **Connected-Service Preflight** | ✅ Fully Automated | Evaluated via `preflight.py`; staging compose & DB ref checked; production strictly blocked. |
+| **Model & Role Routing** | ✅ Fully Automated | Reset-aware selector generates `HarnessDispatchPacket` with verified context windows. |
+| **Worker Command Dispatch** | ✅ Fully Automated | Programmatically dispatches `super-qa-dispatch.sh`, safe probes, or fake executors. |
+| **Exact-SHA QA & Review Gate** | ✅ Fully Automated | Pinned to exact commit SHA; evaluated deterministically via `github_pr_gate.py`. |
+| **Telegram Status Notification** | ✅ Fully Automated | Rate-limited single-sentence notification with canonical links via `telegram_notifier.py`. |
+| **Decision Resolution (`DEC-*`)** | 🔒 Human Operator | Pauses at `wait`; requires human reply via issue comment or `decision_workflow.py reply`. |
+| **Bug 'No-Repro' Disposition** | 🔒 Human Operator | A bug with unverified reproduction cannot close without explicit user disposition. |
+| **PR Merge Commits (`--no-ff`)**| 🔒 Human Operator | Automated merge is strictly prohibited. Request halts at `awaiting authorization`. |
+| **Staging Deploy Promotion** | 🔒 Human Operator | Staging container deploy promotion requires authorized human operator action. |
+| **Production Access / Deploy** | 🚫 Strictly Prohibited | Inviolable invariant: zero production access across all adapters and environments. |

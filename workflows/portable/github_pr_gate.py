@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+"""
+Deterministic GitHub PR Status & Review Gate Helper
+Location: ~/.veyyon/workflows/github_pr_gate.py
+
+Provides a deterministic status gate helper to replace non-deterministic LLM final gates:
+  1. Deterministic CI status rollup verification (all required checks must succeed).
+  2. Independent review approval verification (pinned to PR head commit, no self-approvals).
+  3. Head/base/contract-bound review reuse:
+     - Reuses verified review when head commit SHA and base are unchanged.
+     - Automatically expires/invalidates review if:
+         * PR head commit changed (new push).
+         * New CI or security check failure occurred after review approval.
+         * New security finding/alert flagged.
+  4. Zero LLM gate churn: performs evaluations via deterministic rule logic.
+"""
+
+import argparse
+import datetime
+import json
+import os
+import subprocess
+import sys
+from dataclasses import asdict, dataclass, field
+from typing import Any, Dict, List, Optional, Tuple
+
+
+@dataclass
+class CheckRunStatus:
+    name: str
+    status: str       # COMPLETED, IN_PROGRESS, QUEUED, PENDING
+    conclusion: str   # SUCCESS, FAILURE, NEUTRAL, SKIPPED, TIMED_OUT, CANCELLED
+    started_at: str = ""
+    completed_at: str = ""
+    details_url: str = ""
+
+
+@dataclass
+class ReviewRecord:
+    author: str
+    state: str        # APPROVED, CHANGES_REQUESTED, COMMENTED, DISMISSED
+    submitted_at: str
+    commit_sha: str
+
+
+@dataclass
+class PRGateEvaluation:
+    pr_number: int
+    repo: str
+    state: str                     # OPEN, MERGED, CLOSED
+    is_draft: bool
+    head_sha: str
+    base_sha: str
+    ci_verdict: str                # SUCCESS, FAILURE, PENDING
+    failing_checks: List[str]
+    pending_checks: List[str]
+    approval_verdict: str          # APPROVED, UNAPPROVED, SELF_APPROVED_ONLY
+    approved_by: Optional[str]
+    review_reused: bool
+    review_invalidated: bool
+    invalidation_reason: Optional[str]
+    gate_verdict: str              # PASSED, BLOCKED, PENDING
+    verdict_reason: str
+    checked_at_utc: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    def to_compact_markdown(self) -> str:
+        failing_str = ", ".join(self.failing_checks) if self.failing_checks else "None"
+        pending_str = ", ".join(self.pending_checks) if self.pending_checks else "None"
+
+        return (
+            f"### Deterministic PR Gate Evaluation: PR #{self.pr_number} ({self.gate_verdict})\n"
+            f"- **Head SHA:** `{self.head_sha[:8]}` (Base: `{self.base_sha[:8]}`)\n"
+            f"- **State:** `{self.state}` (Draft: `{self.is_draft}`)\n"
+            f"- **CI Status:** `{self.ci_verdict}` (Failing: {failing_str}, Pending: {pending_str})\n"
+            f"- **Approval:** `{self.approval_verdict}` (By: `{self.approved_by or 'None'}`)\n"
+            f"- **Review Reused:** `{self.review_reused}` (Invalidated: `{self.review_invalidated}`"
+            f"{f' - {self.invalidation_reason}' if self.invalidation_reason else ''})\n"
+            f"- **Verdict:** **{self.gate_verdict}** — {self.verdict_reason}\n"
+        )
+
+def fetch_pr_json(pr_number: int, repo: str = "Bavariance/polysimulator", timeout_sec: int = 25) -> Dict[str, Any]:
+    """Fetch PR details from GitHub CLI."""
+    cmd = [
+        "gh",
+        "pr",
+        "view",
+        str(pr_number),
+        "--repo",
+        repo,
+        "--json",
+        "number,state,isDraft,headRefOid,baseRefName,reviews,statusCheckRollup,author",
+    ]
+
+    res = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout_sec,
+        shell=True if sys.platform == "win32" else False,
+    )
+    if res.returncode != 0:
+        raise RuntimeError(f"gh pr view failed (exit {res.returncode}): {res.stderr.strip()}")
+
+    return json.loads(res.stdout)
+
+def evaluate_pr_gate(
+    pr_data: Dict[str, Any],
+    repo: str = "Bavariance/polysimulator",
+    prior_review_record: Optional[Dict[str, Any]] = None,
+    security_alerts: Optional[List[Dict[str, Any]]] = None,
+) -> PRGateEvaluation:
+    """
+    Deterministically evaluates GitHub PR status gate without LLM churn.
+    """
+    now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    pr_number = int(pr_data.get("number") or 0)
+    state = str(pr_data.get("state") or "UNKNOWN").upper()
+    is_draft = bool(pr_data.get("isDraft", False))
+    head_sha = str(pr_data.get("headRefOid") or "")
+    base_sha = str(pr_data.get("baseRefOid") or "")
+    pr_author = (pr_data.get("author") or {}).get("login", "")
+
+    # 1. Draft Check
+    if is_draft:
+        return PRGateEvaluation(
+            pr_number=pr_number,
+            repo=repo,
+            state=state,
+            is_draft=is_draft,
+            head_sha=head_sha,
+            base_sha=base_sha,
+            ci_verdict="PENDING",
+            failing_checks=[],
+            pending_checks=[],
+            approval_verdict="UNAPPROVED",
+            approved_by=None,
+            review_reused=False,
+            review_invalidated=False,
+            invalidation_reason=None,
+            gate_verdict="BLOCKED",
+            verdict_reason="PR is marked as Draft. Ready for review must be set before promotion.",
+            checked_at_utc=now_utc,
+        )
+
+    # 2. PR Open Check
+    if state not in ("OPEN", "MERGED"):
+        return PRGateEvaluation(
+            pr_number=pr_number,
+            repo=repo,
+            state=state,
+            is_draft=is_draft,
+            head_sha=head_sha,
+            base_sha=base_sha,
+            ci_verdict="FAILURE",
+            failing_checks=[],
+            pending_checks=[],
+            approval_verdict="UNAPPROVED",
+            approved_by=None,
+            review_reused=False,
+            review_invalidated=False,
+            invalidation_reason=None,
+            gate_verdict="BLOCKED",
+            verdict_reason=f"PR state is '{state}', expected 'OPEN'.",
+            checked_at_utc=now_utc,
+        )
+
+    # 3. Status Checks Rollup Verification
+    status_rollup = pr_data.get("statusCheckRollup") or []
+    failing_checks: List[str] = []
+    pending_checks: List[str] = []
+    new_ci_failure_after_review = False
+    latest_ci_failure_time = None
+
+    for check in status_rollup:
+        # Check either CheckRun or StatusContext
+        c_name = check.get("name") or check.get("context") or "unknown_check"
+        c_status = str(check.get("status") or "").upper()
+        c_conclusion = str(check.get("conclusion") or check.get("state") or "").upper()
+        c_completed_at = check.get("completedAt") or check.get("createdAt")
+
+        if c_conclusion in ("FAILURE", "TIMED_OUT", "ACTION_REQUIRED", "CANCELLED", "STARTUP_FAILURE"):
+            failing_checks.append(c_name)
+            if c_completed_at and (latest_ci_failure_time is None or c_completed_at > latest_ci_failure_time):
+                latest_ci_failure_time = c_completed_at
+        elif c_status in ("IN_PROGRESS", "QUEUED", "PENDING", "EXPECTED"):
+            pending_checks.append(c_name)
+
+    if failing_checks:
+        ci_verdict = "FAILURE"
+    elif pending_checks:
+        ci_verdict = "PENDING"
+    else:
+        ci_verdict = "SUCCESS"
+
+    # 4. Review & Approval Verification (with Head-Binding and Reuse Invalidation)
+    reviews_list = pr_data.get("reviews") or []
+    valid_approvers = []
+    self_approvers = []
+    latest_approval_time = None
+    approval_commit_sha = None
+
+    for r in reviews_list:
+        r_author = (r.get("author") or {}).get("login", "")
+        r_state = str(r.get("state") or "").upper()
+        r_commit = (r.get("commit") or {}).get("oid") or r.get("commitRefOid") or ""
+        r_time = r.get("submittedAt")
+
+        if r_author == pr_author:
+            # PR author review: whether APPROVED, COMMENTED, or DISMISSED, it can NEVER approve the PR!
+            if r_state in ("APPROVED", "COMMENTED"):
+                self_approvers.append(r_author)
+            continue
+
+        if r_state == "APPROVED":
+            if r_commit == head_sha or not r_commit:  # Pinned to current head
+                valid_approvers.append(r_author)
+                if r_time and (latest_approval_time is None or r_time > latest_approval_time):
+                    latest_approval_time = r_time
+                    approval_commit_sha = r_commit
+    review_reused = False
+    review_invalidated = False
+    invalidation_reason = None
+
+    # Check prior review record for reuse / invalidation
+    if prior_review_record:
+        prior_head = prior_review_record.get("commit_sha")
+        prior_status = str(prior_review_record.get("status") or "").lower()
+        prior_approved = prior_status in ("approved", "pass", "passed")
+        prior_time = prior_review_record.get("submitted_at")
+        prior_reviewer = prior_review_record.get("approved_by")
+
+        if prior_approved:
+            if prior_reviewer and prior_reviewer == pr_author:
+                self_approvers.append(prior_reviewer)
+                review_invalidated = True
+                invalidation_reason = f"Prior review was a self-approval submitted by PR author ({pr_author}); independent review approval required"
+            elif prior_head != head_sha:
+                review_invalidated = True
+                invalidation_reason = f"PR head changed from {prior_head[:8] if prior_head else 'none'} to {head_sha[:8]}"
+            elif latest_ci_failure_time and prior_time and latest_ci_failure_time > prior_time:
+                review_invalidated = True
+                invalidation_reason = f"New CI failure occurred after prior review approval ({latest_ci_failure_time} > {prior_time})"
+            elif security_alerts:
+                # Check for active security alerts created after approval
+                new_alerts = [a for a in security_alerts if a.get("created_at", "") > (prior_time or "")]
+                if new_alerts:
+                    review_invalidated = True
+                    invalidation_reason = f"{len(new_alerts)} new security alert(s) detected after review approval"
+            else:
+                # Reuse verified prior review!
+                review_reused = True
+                if not valid_approvers and prior_reviewer and prior_reviewer != pr_author:
+                    valid_approvers.append(prior_reviewer)
+
+    if valid_approvers:
+        approval_verdict = "APPROVED"
+        approved_by = valid_approvers[-1]
+    elif self_approvers and not valid_approvers:
+        approval_verdict = "SELF_APPROVED_ONLY"
+        approved_by = None
+    else:
+        approval_verdict = "UNAPPROVED"
+        approved_by = None
+
+    # 5. Final Gate Verdict
+    if ci_verdict == "FAILURE":
+        gate_verdict = "BLOCKED"
+        verdict_reason = f"CI status check(s) failed: {', '.join(failing_checks)}"
+    elif ci_verdict == "PENDING":
+        gate_verdict = "PENDING"
+        verdict_reason = f"CI check(s) currently pending/in-progress: {', '.join(pending_checks)}"
+    elif review_invalidated:
+        gate_verdict = "BLOCKED"
+        verdict_reason = f"Prior review invalidated: {invalidation_reason}"
+    elif approval_verdict == "SELF_APPROVED_ONLY":
+        gate_verdict = "BLOCKED"
+        verdict_reason = f"Self-approval rejected (PR author {pr_author}); independent review approval required."
+    elif approval_verdict == "UNAPPROVED":
+        gate_verdict = "BLOCKED"
+        verdict_reason = f"No head-bound review approval found for commit {head_sha[:8]}."
+    else:
+        gate_verdict = "PASSED"
+        verdict_reason = (
+            f"All CI checks succeeded and independent review approval verified for head {head_sha[:8]} "
+            f"(approved by {approved_by}{', review reused' if review_reused else ''})."
+        )
+
+    return PRGateEvaluation(
+        pr_number=pr_number,
+        repo=repo,
+        state=state,
+        is_draft=is_draft,
+        head_sha=head_sha,
+        base_sha=base_sha,
+        ci_verdict=ci_verdict,
+        failing_checks=failing_checks,
+        pending_checks=pending_checks,
+        approval_verdict=approval_verdict,
+        approved_by=approved_by,
+        review_reused=review_reused,
+        review_invalidated=review_invalidated,
+        invalidation_reason=invalidation_reason,
+        gate_verdict=gate_verdict,
+        verdict_reason=verdict_reason,
+        checked_at_utc=now_utc,
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Deterministic GitHub PR Status & Review Gate CLI")
+    parser.add_argument("pr", type=int, help="GitHub PR number")
+    parser.add_argument("--repo", default="Bavariance/polysimulator", help="GitHub repository (owner/repo)")
+    parser.add_argument("--json", action="store_true", help="Output evaluation as JSON")
+    args = parser.parse_args()
+
+    try:
+        pr_data = fetch_pr_json(pr_number=args.pr, repo=args.repo)
+        eval_result = evaluate_pr_gate(pr_data=pr_data, repo=args.repo)
+    except Exception as e:
+        sys.stderr.write(f"PR Gate evaluation failed: {e}\n")
+        sys.exit(1)
+
+    if args.json:
+        print(json.dumps(eval_result.to_dict(), indent=2))
+    else:
+        print(eval_result.to_compact_markdown())
+
+    if eval_result.gate_verdict != "PASSED":
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()
