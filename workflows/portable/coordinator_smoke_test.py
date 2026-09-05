@@ -188,6 +188,7 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
     # Part A: local_doc Task Lifecycle (Exempt Preflight, Decision Block, QA)
     # =========================================================================
     local_req_id = "req-synthetic-localdoc-001"
+    synthetic_head = "0123456789abcdef0123456789abcdef01234567"
     add_local_cmd = [
         PYTHON_EXE, ledger_py,
         "--ledger", ledger_json,
@@ -200,6 +201,7 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
         "--owner", "SmokeDocWorker",
         "--criteria", "AC-1: Local doc verification,AC-2: Coordinator contract smoke",
         "--state", "implementation",
+        "--head", synthetic_head,
         "--labels", "area:harness,local_doc",
         "--next-action", "Draft documentation updates",
         "--issue-number", "4555",
@@ -294,6 +296,10 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
         "--ledger", ledger_json,
         "update", local_req_id,
         "--state", "review",
+        "--add-evidence",
+        "--evidence-type", "qa_verification",
+        "--evidence-summary", "Synthetic QA stage completed",
+        "--evidence-details", "Isolated coordinator smoke command exited 0",
     ]
     subprocess.run(rev_cmd, check=True)
 
@@ -304,6 +310,10 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
         "--github-proof", "https://github.com/Bavariance/polysimulator/pull/4555",
         "--verify-github-proof",
         "--state", "done",
+        "--add-evidence",
+        "--evidence-type", "review_verification",
+        "--evidence-summary", "Synthetic review stage completed",
+        "--evidence-details", "Isolated coordinator review smoke command exited 0",
     ]
     res = subprocess.run(proof_cmd, capture_output=True, text=True)
     assert_true(res.returncode == 0, f"Completed local_doc to done: {res.stderr}")
@@ -325,6 +335,7 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
         "--criteria", "AC-1: Staging container verified,AC-2: Integration signoff",
         "--state", "implementation",
         "--labels", "runtime,ui",
+        "--head", synthetic_head,
         "--next-action", "Run staging smoke verification",
         "--issue-number", "4556",
         "--issue-url", "https://github.com/Bavariance/polysimulator/issues/4556",
@@ -385,16 +396,27 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
     # B4: A deployable request cannot jump to 'awaiting authorization' from 'implementation':
     # that state asserts QA and review are complete.
     def set_state(state):
-        return subprocess.run(
-            [
-                PYTHON_EXE, ledger_py,
-                "--ledger", ledger_json,
-                "update", deploy_req_id,
-                "--state", state,
-            ],
-            capture_output=True,
-            text=True,
-        )
+        command = [
+            PYTHON_EXE, ledger_py,
+            "--ledger", ledger_json,
+            "update", deploy_req_id,
+            "--state", state,
+        ]
+        if state == "review":
+            command.extend([
+                "--add-evidence",
+                "--evidence-type", "qa_verification",
+                "--evidence-summary", "Synthetic deployable QA completed",
+                "--evidence-details", "Isolated QA command exited 0",
+            ])
+        elif state == "awaiting authorization":
+            command.extend([
+                "--add-evidence",
+                "--evidence-type", "review_verification",
+                "--evidence-summary", "Synthetic deployable review completed",
+                "--evidence-details", "Isolated review command exited 0",
+            ])
+        return subprocess.run(command, capture_output=True, text=True)
 
     illegal = set_state("awaiting authorization")
     assert_true(
@@ -402,6 +424,24 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
         "Deployable task must not reach 'awaiting authorization' straight from 'implementation'",
     )
     print("  [PASS] Authorization gate refuses to skip QA and review.")
+
+    for criterion_id in ("AC-1", "AC-2"):
+        criterion_result = subprocess.run(
+            [
+                PYTHON_EXE, ledger_py,
+                "--ledger", ledger_json,
+                "update", deploy_req_id,
+                "--criterion-id", criterion_id,
+                "--criterion-status", "verified",
+                "--criterion-evidence", f"Synthetic exact-head QA evidence for {criterion_id}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert_true(
+            criterion_result.returncode == 0,
+            f"Recorded current-head criterion evidence for {criterion_id}: {criterion_result.stderr}",
+        )
 
     for stage_state in ("QA", "review", "awaiting authorization"):
         res = set_state(stage_state)

@@ -124,7 +124,7 @@ class ProjectConfig:
         *,
         issue_number: Optional[int] = None,
         dry_run: bool = False,
-        closure_verified: bool = False,
+        ledger_record: Optional[Dict[str, Any]] = None,
         graphql_runner: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None,
     ) -> "SuperboardLifecycleOutcome":
         """
@@ -141,7 +141,7 @@ class ProjectConfig:
             evidence_url=evidence_url,
             issue_number=issue_number,
             dry_run=dry_run,
-            closure_verified=closure_verified,
+            ledger_record=ledger_record,
         )
 
 
@@ -817,7 +817,7 @@ class SuperboardProjectUpdater:
         *,
         issue_number: Optional[int] = None,
         dry_run: bool = False,
-        closure_verified: bool = False,
+        ledger_record: Optional[Dict[str, Any]] = None,
     ) -> SuperboardLifecycleOutcome:
         """
         Public duck-typed lifecycle update method conforming to the frozen contract:
@@ -860,20 +860,37 @@ class SuperboardProjectUpdater:
                 github_writes=0,
             )
 
-        # 4. Inviolable Done-closure gate: fail closed on unverified Done or missing head
+        # 4. Inviolable Done-closure gate: the updater consumes the ledger's
+        # verified closure record, never a caller assertion.
         if canonical_status == "Done":
-            if not closure_verified:
-                return SuperboardLifecycleOutcome(
-                    ok=False,
-                    blocked_reason="Done status requires verified live closure; unverified transitions to Done are prohibited",
-                    board_url=board_url,
-                    dry_run=dry_run,
-                    github_writes=0,
+            full_head = str(head_sha or "").strip().lower()
+            record = ledger_record if isinstance(ledger_record, dict) else {}
+            record_head = str(record.get("head") or "").strip().lower()
+            criteria = record.get("acceptance_criteria") or []
+            github = record.get("github") or {}
+            closure_ok = (
+                record.get("state") == "done"
+                and bool(re.fullmatch(r"[0-9a-f]{40}", full_head))
+                and record_head == full_head
+                and bool(criteria)
+                and all(
+                    criterion.get("status") == "verified"
+                    and str(criterion.get("evidence") or "").strip()
+                    and not str(criterion.get("evidence") or "").startswith("[STALE")
+                    and str(criterion.get("verified_head") or "").strip().lower() == full_head
+                    for criterion in criteria
                 )
-            if not head_sha or len(head_sha.strip()) < 7:
+                and github.get("proof_verified") is True
+                and bool(str(github.get("proof_url") or "").strip())
+            )
+            if not closure_ok:
                 return SuperboardLifecycleOutcome(
                     ok=False,
-                    blocked_reason="Done status requires an authoritative head_sha",
+                    blocked_reason=(
+                        "Done status requires an actual ledger-verified closure record: state=done, "
+                        "matching full 40-character head, fresh current-head criterion evidence, "
+                        "and verified GitHub proof"
+                    ),
                     board_url=board_url,
                     dry_run=dry_run,
                     github_writes=0,
@@ -1035,7 +1052,7 @@ def update_project_lifecycle(
     config: Optional[ProjectConfig] = None,
     issue_number: Optional[int] = None,
     dry_run: bool = False,
-    closure_verified: bool = False,
+    ledger_record: Optional[Dict[str, Any]] = None,
     graphql_runner: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None,
 ) -> SuperboardLifecycleOutcome:
     """Convenience functional wrapper around SuperboardProjectUpdater."""
@@ -1047,7 +1064,7 @@ def update_project_lifecycle(
         evidence_url=evidence_url,
         issue_number=issue_number,
         dry_run=dry_run,
-        closure_verified=closure_verified,
+        ledger_record=ledger_record,
         graphql_runner=graphql_runner,
     )
 
@@ -1070,7 +1087,7 @@ def main():
     up_p.add_argument("--head-sha", default=None, help="Authoritative commit SHA")
     up_p.add_argument("--evidence-url", default=None, help="Evidence URL or proof link")
     up_p.add_argument("--dry-run", action="store_true", help="Dry run mode: do not mutate GitHub")
-    up_p.add_argument("--verified", action="store_true", help="Assert verified live closure (required for Done)")
+    up_p.add_argument("--ledger-record", default=None, help="Path to the ledger request JSON required for Done")
     up_p.add_argument("--json", action="store_true", help="Output outcome as JSON")
 
     # status
@@ -1090,6 +1107,14 @@ def main():
         sys.exit(0)
 
     elif args.command == "update-lifecycle":
+        ledger_record = None
+        if args.ledger_record:
+            with open(args.ledger_record, "r", encoding="utf-8") as record_file:
+                ledger_record = json.load(record_file)
+            if "requests" in ledger_record:
+                ledger_record = (ledger_record.get("requests") or {}).get(
+                    args.request_id or f"issue-{args.issue}"
+                )
         updater = SuperboardProjectUpdater(cfg)
         outcome = updater.update_lifecycle(
             request_id=args.request_id or f"issue-{args.issue}",
@@ -1098,7 +1123,7 @@ def main():
             evidence_url=args.evidence_url,
             issue_number=args.issue,
             dry_run=args.dry_run,
-            closure_verified=args.verified,
+            ledger_record=ledger_record,
         )
         if args.json:
             print(json.dumps(outcome.to_dict(), indent=2))

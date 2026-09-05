@@ -66,7 +66,7 @@ TASK_TYPES = ["deployable", "local_doc", "local", "doc", "harness"]
 # request reach the pre-merge gate having never been verified.
 ALLOWED_TRANSITIONS_DEPLOYABLE: Dict[str, List[str]] = {
     "pending": ["implementation"],
-    "implementation": ["QA", "review"],
+    "implementation": ["QA"],
     "QA": ["review", "implementation"],
     "review": ["awaiting authorization", "QA", "implementation"],
     "awaiting authorization": ["integration", "implementation"],
@@ -79,8 +79,8 @@ ALLOWED_TRANSITIONS_DEPLOYABLE: Dict[str, List[str]] = {
 # Deployment stages ('integration', 'live verification') are explicitly NOT applicable.
 ALLOWED_TRANSITIONS_LOCAL_DOC: Dict[str, List[str]] = {
     "pending": ["implementation"],
-    "implementation": ["QA", "review"],
-    "QA": ["review", "implementation", "done"],
+    "implementation": ["QA"],
+    "QA": ["review", "implementation"],
     "review": ["done", "QA", "implementation", "awaiting authorization"],
     "awaiting authorization": ["done", "implementation"],
     "done": [],  # Terminal state
@@ -881,6 +881,45 @@ class RequestLedger:
             if next_action is not None:
                 req["next_action"] = next_action
 
+            def require_current_head_stage_evidence(stage_name: str) -> None:
+                current_head = str(req.get("head") or "").strip().lower()
+                if not re.fullmatch(r"[0-9a-f]{40}", current_head):
+                    raise ValueError(
+                        f"Cannot advance from '{stage_name}': a full current 40-character head SHA is required."
+                    )
+
+                stage_type = f"{stage_name.lower()}_verification"
+                stage_evidence = [
+                    ev for ev in req.get("evidence", [])
+                    if not ev.get("stale")
+                    and str(ev.get("head") or "").strip().lower() == current_head
+                    and ev.get("type") == stage_type
+                    and str(ev.get("summary") or "").strip()
+                    and str(ev.get("details") or "").strip()
+                ]
+                if not stage_evidence:
+                    raise ValueError(
+                        f"Cannot advance from '{stage_name}': genuine current-head evidence "
+                        f"of type '{stage_type}' is required for {current_head}."
+                    )
+
+                criteria = req.get("acceptance_criteria", [])
+                if not criteria:
+                    raise ValueError(
+                        f"Cannot advance from '{stage_name}': no acceptance criteria are defined."
+                    )
+                for criterion in criteria:
+                    if (
+                        criterion.get("status") != "verified"
+                        or not str(criterion.get("evidence") or "").strip()
+                        or str(criterion.get("evidence") or "").startswith("[STALE")
+                        or str(criterion.get("verified_head") or "").strip().lower() != current_head
+                    ):
+                        raise ValueError(
+                            f"Cannot advance from '{stage_name}': acceptance criterion "
+                            f"'{criterion.get('id')}' lacks fresh verified evidence on {current_head}."
+                        )
+
             # 11. State Transition & Strict Invariants
             target_state = state or prev_state
             if target_state != prev_state:
@@ -906,6 +945,11 @@ class RequestLedger:
                         f"Illegal state transition from '{prev_state}' to '{target_state}' for {task_t} task. "
                         f"Allowed transitions from '{prev_state}': {allowed_next}"
                     )
+
+                if target_state == "review":
+                    require_current_head_stage_evidence("QA")
+                elif target_state == "awaiting authorization":
+                    require_current_head_stage_evidence("review")
 
                 # Check dependencies
                 for dep_id in req.get("dependencies", []):

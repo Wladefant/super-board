@@ -310,22 +310,39 @@ class TestProjectAdapterLifecycle(unittest.TestCase):
         self.assertEqual(len(mutations), 0)
         self.assertIn("already in status", outcome.details.get("message", ""))
 
-    def test_11_done_closure_gate_enforces_live_verified_closure(self):
-        """USER INVIOLABLE SAFETY GATE: Transitions to 'Done' strictly require verified closure and valid head SHA."""
+    def test_11_done_closure_gate_consumes_verified_ledger_record(self):
+        """Done requires the ledger's verified closure, not a caller-provided boolean."""
         cfg = create_polysimulator_config()
         updater = SuperboardProjectUpdater(cfg)
+        head = "a" * 40
 
-        # 1. Unverified closure rejected
-        outcome_unverified = updater.update_lifecycle("req-4543", "Done", closure_verified=False)
-        self.assertFalse(outcome_unverified.ok)
-        self.assertIn("verified live closure", outcome_unverified.blocked_reason or "")
-        self.assertEqual(outcome_unverified.github_writes, 0)
+        outcome_missing = updater.update_lifecycle("req-4543", "Done", head_sha=head)
+        self.assertFalse(outcome_missing.ok)
+        self.assertIn("actual ledger-verified closure record", outcome_missing.blocked_reason or "")
+        self.assertEqual(outcome_missing.github_writes, 0)
 
-        # 2. Verified closure but missing head SHA rejected
-        outcome_no_head = updater.update_lifecycle("req-4543", "Done", head_sha=None, closure_verified=True)
-        self.assertFalse(outcome_no_head.ok)
-        self.assertIn("authoritative head_sha", outcome_no_head.blocked_reason or "")
-        self.assertEqual(outcome_no_head.github_writes, 0)
+        asserted_but_not_done = {
+            "state": "review",
+            "head": head,
+            "acceptance_criteria": [{
+                "id": "AC-1",
+                "status": "verified",
+                "evidence": "observed pass",
+                "verified_head": head,
+            }],
+            "github": {
+                "proof_verified": True,
+                "proof_url": "https://github.com/Bavariance/polysimulator/issues/4543",
+            },
+        }
+        outcome_not_closed = updater.update_lifecycle(
+            "req-4543",
+            "Done",
+            head_sha=head,
+            ledger_record=asserted_but_not_done,
+        )
+        self.assertFalse(outcome_not_closed.ok)
+        self.assertIn("state=done", outcome_not_closed.blocked_reason or "")
 
     def test_12_readback_verification_detects_mismatch(self):
         """Verify readback verification: if GitHub readback status does not match desired status, fails closed."""

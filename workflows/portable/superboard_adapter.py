@@ -416,6 +416,50 @@ class SuperboardExecutionAdapter:
                 pass
         return RiskLevel.LOW
 
+    def _sync_project_lifecycle(self, req_id: str, state: str) -> Dict[str, Any]:
+        """
+        Mirror a completed ledger transition to its configured GitHub Project V2 card.
+
+        An isolated/local request without a card is explicitly not applicable. It is
+        never reported as though an external card was updated.
+        """
+        record = self.coordinator.ledger.get_request(req_id) or {}
+        board = record.get("superboard") or {}
+        github = record.get("github") or {}
+        item_id = board.get("item_id")
+        issue_number = github.get("issue_number")
+        if not item_id or not issue_number:
+            return {
+                "status": "not_applicable",
+                "reason": "request has no configured Superboard card contract",
+                "github_writes": 0,
+            }
+
+        outcome = self.project_config.update_lifecycle(
+            request_id=req_id,
+            state=state,
+            head_sha=record.get("head"),
+            evidence_url=github.get("proof_url"),
+            issue_number=issue_number,
+            dry_run=self.dry_run,
+            ledger_record=record,
+        )
+        result = asdict(outcome)
+        if not outcome.ok:
+            result["status"] = "blocked"
+            return result
+        result["status"] = "dry_run" if outcome.dry_run else (
+            "idempotent" if outcome.github_writes == 0 else "updated"
+        )
+        if outcome.new_status:
+            self.coordinator.ledger.update_request(
+                req_id,
+                superboard_update={"status": outcome.new_status, "item_id": outcome.item_id},
+                actor="SuperboardAdapter:ProjectV2",
+                reason=f"Superboard lifecycle synchronized to {outcome.new_status}",
+            )
+        return result
+
     def _determine_stage_for_request(self, req: Union[RequestSummary, Dict[str, Any]]) -> str:
         """Map ledger request state to existing Superboard worker lifecycle stage."""
         state = getattr(req, "state", None) or (req.get("state") if isinstance(req, dict) else "")
@@ -578,8 +622,10 @@ class SuperboardExecutionAdapter:
             "stage": stage,
             "task_type": req_task_type,
             "head_sha": expected_sha,
-            "model": recommendation.get("selected_model"),
+            "model": recommendation.get("model"),
             "agent_role": recommendation.get("agent_role"),
+            "routing_task_type": dispatch.task.get("task_type"),
+            "risk_level": dispatch.task.get("risk_level"),
             "repo_root": self.repo_root,
             "issue_url": (
                 f"https://github.com/{self.project_config.repo}/issues/{req_issue}" if req_issue else None
@@ -669,76 +715,6 @@ class SuperboardExecutionAdapter:
             evidence=evidence,
         )
 
-    def dispatch_qa_script(
-        self,
-        req: Union[RequestSummary, Dict[str, Any]],
-        stage: str,
-        target_sha: Optional[str] = None,
-    ) -> Optional[WorkerExecutionResult]:
-        """
-        Dispatch the existing Superboard QA script for the QA stage.
-
-        Returns None when the script is not present, so the caller can continue down the
-        precedence chain. A dry run is marked as a probe: it proves dispatch works and
-        nothing about the acceptance criteria.
-        """
-        qa_script = os.path.join(self.repo_root, "scripts", "super-qa-dispatch.sh")
-        if not os.path.exists(qa_script):
-            return None
-
-        req_issue = getattr(req, "issue_number", None) or (req.get("issue_number") if isinstance(req, dict) else None)
-        req_head = getattr(req, "head", None) or (req.get("head") if isinstance(req, dict) else None)
-        expected_sha = target_sha or req_head
-
-        cmd = [
-            "bash",
-            qa_script,
-            "--config", self.config_path or ".claude/super-board/configs/default.json",
-            "--issue-url", f"https://github.com/{self.project_config.repo}/issues/{req_issue or 1}",
-        ]
-        if req_issue:
-            cmd.extend(["--pull-request", f"https://github.com/{self.project_config.repo}/pull/{req_issue}"])
-        if self.dry_run:
-            cmd.append("--dry-run")
-        if expected_sha:
-            cmd.extend(["--expected-sha", expected_sha])
-
-        try:
-            res = subprocess.run(cmd, cwd=self.repo_root, capture_output=True, text=True, timeout=60)
-        except Exception as e:
-            return self._blocked_result(
-                stage,
-                f"Error dispatching {qa_script}: {e}",
-                head_sha=expected_sha,
-                command=cmd,
-            )
-
-        output = res.stdout + ("\n" + res.stderr if res.stderr else "")
-        if res.returncode != 0:
-            return self._blocked_result(
-                stage,
-                f"QA script exited {res.returncode}",
-                head_sha=expected_sha,
-                command=cmd,
-            )
-
-        return WorkerExecutionResult(
-            stage=stage,
-            exit_code=0,
-            output=output,
-            head_sha=expected_sha,
-            command=cmd,
-            is_fixture=False,
-            is_probe=self.dry_run,
-            backend_name="super-qa-dispatch.sh",
-            evidence={} if self.dry_run else {
-                "backend": "super-qa-dispatch.sh",
-                "stage": stage,
-                "head_sha": expected_sha,
-                "exit_code": 0,
-                "output_tail": output[-2000:],
-            },
-        )
 
     def dispatch_worker(
         self,
@@ -767,10 +743,6 @@ class SuperboardExecutionAdapter:
         if self.worker_backend is not None:
             return self.dispatch_via_backend(req, stage, dispatch, target_sha=target_sha)
 
-        if stage == "qa":
-            qa_result = self.dispatch_qa_script(req, stage, target_sha=target_sha)
-            if qa_result is not None:
-                return qa_result
 
         if real_worker:
             return self.execute_real_safe_worker(req, stage, dispatch)
@@ -827,57 +799,68 @@ class SuperboardExecutionAdapter:
         # Bug retention: a defect whose reproduction is not proven absent must reopen, so
         # this is evaluated before the generic provenance gate. Reopening only ever moves a
         # request backwards, so it can never manufacture a false completion.
+        request_labels = getattr(req, "labels", None) or (
+            req.get("labels") if isinstance(req, dict) else []
+        ) or []
         is_bug = (
             getattr(req, "task_type", None) == "bug"
             or (isinstance(req, dict) and req.get("task_type") == "bug")
             or "bug" in req_id.lower()
+            or any(str(label).lower() == "type:bug" for label in request_labels)
         )
-        if is_bug and stage in ("qa", "review"):
-            # Closure requires a structured, explicit reproduction verdict from the backend.
-            # Prose in the output and fixture provenance are both worthless here:
-            # keyword-matching "simulated successful" is how simulated runs closed real defects.
+        if is_bug and stage == "qa":
             evidence = worker_res.evidence or {}
             repro = evidence.get("reproduction") if isinstance(evidence.get("reproduction"), dict) else {}
             verdict = str(repro.get("verdict") or evidence.get("reproduction_verdict") or "").strip().lower()
             scenario = str(repro.get("scenario") or evidence.get("reproduction_scenario") or "").strip()
+            closure = evidence.get("bug_closure") if isinstance(evidence.get("bug_closure"), dict) else {}
+            labels = request_labels
+            is_ui_bug = bool(
+                closure.get("bug_type") in ("ui", "both")
+                or any(str(label).lower() in ("type:ui", "area:ui", "ui") for label in labels)
+            )
+            checks = evidence.get("checks") or []
+            regression_evidence = str(closure.get("regression_evidence") or "").strip()
+            if not regression_evidence and checks:
+                regression_evidence = json.dumps(checks, sort_keys=True, default=str)
 
-            if not (verdict == "absent" and scenario):
-                if not verdict:
-                    why = (
-                        "no structured reproduction verdict "
-                        "(evidence.reproduction.verdict) was returned"
-                    )
-                elif verdict != "absent":
-                    why = f"reproduction verdict is '{verdict}', not 'absent'"
-                else:
-                    why = "reproduction verdict lacks the original scenario it was run against"
-
+            closure_ok, closure_reason = self.verify_bug_closure(
+                req_id=req_id,
+                tested_sha=worker_res.head_sha or "",
+                reproduction_verified_absent=verdict == "absent" and bool(scenario),
+                regression_evidence=regression_evidence,
+                bug_type="ui" if is_ui_bug else "functional",
+                desktop_after_url=closure.get("desktop_after_url"),
+                mobile_after_url=closure.get("mobile_after_url"),
+                desktop_before_url=closure.get("desktop_before_url"),
+                mobile_before_url=closure.get("mobile_before_url"),
+                before_unavailable_reason=closure.get("before_unavailable_reason"),
+                render_verified=closure.get("render_verified") is True,
+                environment=str(closure.get("environment") or "staging"),
+                user_explicit_disposition=closure.get("user_explicit_disposition"),
+                generic_suite_only=closure.get("generic_suite_only") is True,
+                no_repro_claimed=closure.get("no_repro_claimed") is True,
+                deployed_signed_in_qa=closure.get("deployed_signed_in_qa") is True,
+            )
+            if not closure_ok:
                 self.coordinator.ledger.update_request(
                     req_id,
                     state="implementation",
                     actor="SuperboardAdapter:Reopen",
                     add_evidence={
-                        "summary": (
-                            f"QA failed to prove original reproduction absent on "
-                            f"{worker_res.head_sha or 'unknown'}: {why}; reopened to implementation"
-                        ),
+                        "type": "qa_reproduction_failure",
+                        "summary": f"{closure_reason}; reopened to implementation",
                         "details": worker_res.output,
                         "head": worker_res.head_sha,
                     },
                 )
                 gate_result["verified"] = False
                 gate_result["reopened"] = True
-                gate_result["repro_refused"] = why
-                return (
-                    "implementation",
-                    (
-                        f"Original reproduction scenario not proven absent on "
-                        f"{worker_res.head_sha}: {why}; reopened to implementation"
-                    ),
-                    gate_result,
-                )
+                gate_result["repro_refused"] = closure_reason
+                return "implementation", f"{closure_reason}; reopened to implementation", gate_result
 
             gate_result["reproduction_scenario"] = scenario
+            gate_result["bug_closure"] = closure_reason
 
         # Provenance gate: simulated or probe output is not evidence about this request.
         if not worker_res.is_verifiable_evidence:
@@ -930,24 +913,50 @@ class SuperboardExecutionAdapter:
                 state=new_state,
                 head=worker_res.head_sha or req_head,
                 actor="SuperboardAdapter:Build",
-                add_evidence={"summary": evidence_note, "details": worker_res.output, "head": worker_res.head_sha},
+                add_evidence={
+                    "type": "implementation_verification",
+                    "summary": evidence_note,
+                    "details": worker_res.output,
+                    "head": worker_res.head_sha,
+                },
             )
             gate_result["verified"] = True
             gate_result["new_state"] = new_state
+            gate_result["board_update"] = self._sync_project_lifecycle(req_id, new_state)
             return new_state, f"Build completed successfully; advanced to {new_state}", gate_result
 
         elif stage == "qa":
-            # Advance: QA -> review
+            # A successful real QA run was dispatched with every pending acceptance
+            # criterion. Bind each criterion's verification to this exact result/head
+            # before the ledger enforces the QA -> review boundary.
+            current = self.coordinator.ledger.get_request(req_id) or {}
+            for criterion in current.get("acceptance_criteria", []):
+                self.coordinator.ledger.update_request(
+                    req_id,
+                    actor="SuperboardAdapter:QA",
+                    criterion_update={
+                        "id": criterion.get("id"),
+                        "status": "verified",
+                        "evidence": evidence_note,
+                    },
+                    reason=f"QA verified acceptance criterion '{criterion.get('id')}'",
+                )
             new_state = "review"
             self.coordinator.ledger.update_request(
                 req_id,
                 state=new_state,
                 head=worker_res.head_sha or req_head,
                 actor="SuperboardAdapter:QA",
-                add_evidence={"summary": evidence_note, "details": worker_res.output, "head": worker_res.head_sha},
+                add_evidence={
+                    "type": "qa_verification",
+                    "summary": evidence_note,
+                    "details": worker_res.output,
+                    "head": worker_res.head_sha,
+                },
             )
             gate_result["verified"] = True
             gate_result["new_state"] = new_state
+            gate_result["board_update"] = self._sync_project_lifecycle(req_id, new_state)
             return new_state, f"Exact-SHA QA verified; advanced to {new_state}", gate_result
 
         elif stage == "review":
@@ -958,12 +967,18 @@ class SuperboardExecutionAdapter:
                 state=new_state,
                 head=worker_res.head_sha or req_head,
                 actor="SuperboardAdapter:Review",
-                add_evidence={"summary": evidence_note, "details": worker_res.output, "head": worker_res.head_sha},
+                add_evidence={
+                    "type": "review_verification",
+                    "summary": evidence_note,
+                    "details": worker_res.output,
+                    "head": worker_res.head_sha,
+                },
             )
             gate_result["verified"] = True
             gate_result["new_state"] = new_state
             gate_result["human_authorization_required"] = True
-            return new_state, f"Independent review verified; request is awaiting human authorization to merge", gate_result
+            gate_result["board_update"] = self._sync_project_lifecycle(req_id, new_state)
+            return new_state, "Independent review verified; request is awaiting human authorization to merge", gate_result
 
         return req_state, f"Stage {stage} concluded with state {req_state}", gate_result
 
@@ -1112,9 +1127,9 @@ class SuperboardExecutionAdapter:
                 if isinstance(dispatch_packet.recommendation, dict)
                 else {}
             )
-            if recommendation.get("selected_model") != routing.recommended_model:
-                recommendation["adapter_reselected_model"] = recommendation.get("selected_model")
-                recommendation["selected_model"] = routing.recommended_model
+            if recommendation.get("model") != routing.recommended_model:
+                recommendation["adapter_reselected_model"] = recommendation.get("model")
+                recommendation["model"] = routing.recommended_model
                 recommendation["model_authority"] = "coordinator"
                 if routing.recommended_role:
                     recommendation["agent_role"] = routing.recommended_role
@@ -1148,7 +1163,14 @@ class SuperboardExecutionAdapter:
         boundaries["self_spawn_loop"] = False
 
         status = "advanced"
-        if new_state == "awaiting authorization":
+        board_update = (gate_result or {}).get("board_update") or {}
+        if board_update.get("status") == "blocked":
+            status = "blocked"
+            transition_reason = (
+                f"{transition_reason}; Project V2 lifecycle synchronization blocked: "
+                f"{board_update.get('blocked_reason') or 'unknown board error'}"
+            )
+        elif new_state == "awaiting authorization":
             status = "awaiting_authorization"
         elif worker_res.exit_code != 0:
             status = "error"

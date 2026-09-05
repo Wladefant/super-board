@@ -54,6 +54,31 @@ class TestLedgerLifecycleGates(unittest.TestCase):
             task_type=task_type,
             head=self.HEAD,
         )
+    def _verify_criteria(self, req_id):
+        for criterion in self.ledger.get_request(req_id)["acceptance_criteria"]:
+            self.ledger.update_request(
+                req_id,
+                actor="real-stage-runner",
+                criterion_update={
+                    "id": criterion["id"],
+                    "status": "verified",
+                    "evidence": f"Observed criterion {criterion['id']} pass on {self.HEAD}",
+                },
+            )
+
+    def _advance_after_stage(self, req_id, stage, target):
+        self.ledger.update_request(
+            req_id,
+            state=target,
+            actor=f"real-{stage}-runner",
+            add_evidence={
+                "type": f"{stage.lower()}_verification",
+                "summary": f"{stage} passed on exact head",
+                "details": f"command exited 0 and observed expected behavior on {self.HEAD}",
+                "head": self.HEAD,
+            },
+        )
+
 
     def test_authorization_unreachable_without_review(self):
         """A deployable task must pass through review before the authorization gate."""
@@ -64,65 +89,52 @@ class TestLedgerLifecycleGates(unittest.TestCase):
         req_id = "req-gate-01"
         self._add(req_id)
 
-        with self.assertRaises(Exception):
+        with self.assertRaisesRegex(ValueError, "Illegal state transition"):
+            self.ledger.update_request(req_id, state="review", actor="test")
+        with self.assertRaisesRegex(ValueError, "Illegal state transition"):
             self.ledger.update_request(req_id, state="awaiting authorization", actor="test")
         self.assertEqual(self.ledger.get_request(req_id)["state"], "implementation")
 
-        # QA is also not a shortcut.
         self.ledger.update_request(req_id, state="QA", actor="test")
-        with self.assertRaises(Exception):
+        with self.assertRaisesRegex(ValueError, "Illegal state transition"):
             self.ledger.update_request(req_id, state="awaiting authorization", actor="test")
+        with self.assertRaisesRegex(ValueError, "acceptance criterion"):
+            self._advance_after_stage(req_id, "QA", "review")
         self.assertEqual(self.ledger.get_request(req_id)["state"], "QA")
 
-        # The legitimate route succeeds.
-        self.ledger.update_request(req_id, state="review", actor="test")
-        self.ledger.update_request(req_id, state="awaiting authorization", actor="test")
+        self._verify_criteria(req_id)
+        self._advance_after_stage(req_id, "QA", "review")
+        self._advance_after_stage(req_id, "review", "awaiting authorization")
         self.assertEqual(self.ledger.get_request(req_id)["state"], "awaiting authorization")
 
-    def test_pending_criteria_block_at_authorization_gate(self):
-        """Unverified criteria at the merge gate must report BLOCKED, never HEALTHY."""
+        local_id = "req-local-no-review-skip"
+        self._add(local_id, task_type="local_doc")
+        self.ledger.update_request(local_id, state="QA", actor="test")
+        with self.assertRaisesRegex(ValueError, "Illegal state transition"):
+            self.ledger.update_request(local_id, state="done", actor="test")
+
+    def test_pending_criteria_rejected_at_update_boundary(self):
+        """Pending criteria cannot enter review; a later health warning is not the gate."""
         req_id = "req-gate-02"
         self._add(req_id)
+        self.ledger.update_request(req_id, state="QA", actor="test")
 
-        # While still being implemented, pending criteria are an expected warning.
-        early = self.ledger.check_request(req_id)
-        self.assertEqual(early["status"], "HEALTHY")
-        self.assertTrue(any("Pending criteria" in w for w in early["warnings"]))
+        with self.assertRaisesRegex(ValueError, "acceptance criterion"):
+            self._advance_after_stage(req_id, "QA", "review")
 
-        for state in ("QA", "review", "awaiting authorization"):
-            self.ledger.update_request(req_id, state=state, actor="test")
-
-        gated = self.ledger.check_request(req_id)
-        self.assertEqual(gated["status"], "BLOCKED")
-        self.assertTrue(
-            any("criteria unverified" in i for i in gated["issues"]),
-            f"expected an unverified-criteria issue, got {gated['issues']}",
-        )
-        self.assertTrue(
-            any("criteria missing evidence" in i for i in gated["issues"]),
-            f"expected a missing-evidence issue, got {gated['issues']}",
-        )
+        current = self.ledger.get_request(req_id)
+        self.assertEqual(current["state"], "QA")
+        self.assertTrue(all(c["status"] == "pending" for c in current["acceptance_criteria"]))
 
     def test_verified_criteria_clear_the_authorization_gate(self):
         """With every criterion verified on the current head, the gate reports HEALTHY."""
         req_id = "req-gate-03"
         self._add(req_id)
 
-        for state in ("QA", "review"):
-            self.ledger.update_request(req_id, state=state, actor="test")
-
-        for criterion in self.ledger.get_request(req_id)["acceptance_criteria"]:
-            self.ledger.update_request(
-                req_id,
-                actor="test",
-                criterion_update={
-                    "id": criterion["id"],
-                    "status": "verified",
-                    "evidence": "https://github.com/Wladefant/super-board/pull/74",
-                },
-            )
-
-        self.ledger.update_request(req_id, state="awaiting authorization", actor="test")
+        self.ledger.update_request(req_id, state="QA", actor="test")
+        self._verify_criteria(req_id)
+        self._advance_after_stage(req_id, "QA", "review")
+        self._advance_after_stage(req_id, "review", "awaiting authorization")
         result = self.ledger.check_request(req_id)
         self.assertEqual(result["status"], "HEALTHY", f"unexpected issues: {result['issues']}")
         self.assertTrue(

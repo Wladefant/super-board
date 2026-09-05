@@ -141,6 +141,8 @@ class RoutingStatus:
     evaluated: bool
     recommended_model: Optional[str] = None
     recommended_role: Optional[str] = None
+    task_type: Optional[str] = None
+    risk_level: Optional[str] = None
     fallback_model: Optional[str] = None
     promotion_applied: bool = False
     cooldown_fallback: bool = False
@@ -791,6 +793,8 @@ class Coordinator:
         routing_info = RoutingStatus(
             evaluated=True,
             recommended_model=rec.selected_model,
+            task_type=task_type.value,
+            risk_level=risk_level.value,
             recommended_role=model_to_agent_role(rec.selected_model, task_type, risk_level),
             fallback_model=rec.fallback_model,
             promotion_applied=rec.promotion_applied,

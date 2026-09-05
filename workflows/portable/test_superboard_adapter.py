@@ -31,9 +31,11 @@ from superboard_adapter import (
     SuperboardExecutionAdapter,
     WorkerExecutionResult,
 )
-from coordinator import Coordinator
+from coordinator import Coordinator, RoutingStatus
 from ledger import RequestLedger
-from model_routing import HarnessDispatchPacket, TaskType, RiskLevel
+from model_routing import TaskType, RiskLevel
+from project_adapter import SuperboardLifecycleOutcome
+import project_adapter
 
 
 class StubWorkerBackend:
@@ -717,58 +719,41 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
         self.assertIn("task_type", backend.calls[0])
         self.assertEqual(backend.calls[0]["task_type"], "local_doc")
 
-    def test_08_coordinator_risk_classification_is_not_downgraded(self):
-        """
-        USER CRITICAL INVARIANT TEST:
-        The coordinator is the routing authority. The adapter must not re-derive a weaker
-        classification, which previously forced every non-review stage to
-        routine_execution/low and silently discarded a HIGH-risk decision.
-        """
-        class Routing:
-            def __init__(self, task_type=None, risk_level=None, model=None, role=None):
-                self.evaluated = True
-                self.task_type = task_type
-                self.risk_level = risk_level
-                self.recommended_model = model
-                self.recommended_role = role
-
-        # The coordinator's classification wins over the stage-derived default.
-        routing = Routing(task_type="deep_reasoning", risk_level="high")
-        self.assertEqual(
-            SuperboardExecutionAdapter._resolve_task_type(routing, "build"),
-            TaskType.DEEP_REASONING,
+    def test_08_coordinator_risk_classification_reaches_backend(self):
+        """The actual Coordinator DTO carries its real HIGH/DEEP classification to dispatch."""
+        req_id = "req-routing-high-risk-08"
+        self.ledger.add_request(
+            req_id=req_id,
+            prompt="Repair critical security architecture invariant under concurrency",
+            session="test-session-routing",
+            project="SuperboardCore",
+            acceptance_criteria=[
+                {"criterion": "Invariant holds under concurrent execution", "status": "pending", "evidence": ""}
+            ],
+            owner="RiskLane",
+            state="implementation",
+            task_type="local",
+            head=self.HEAD_SHA,
         )
-        self.assertEqual(
-            SuperboardExecutionAdapter._resolve_risk_level(routing, {}),
-            RiskLevel.HIGH,
+        backend = StubWorkerBackend(head_sha=self.HEAD_SHA)
+        adapter = SuperboardExecutionAdapter(
+            state_dir=self.state_dir,
+            worker_backend=backend,
+            notify_telegram=False,
         )
 
-        # Without a coordinator classification, an explicit request risk is still honoured.
-        bare = Routing()
-        self.assertEqual(
-            SuperboardExecutionAdapter._resolve_risk_level(bare, {"risk_level": "high"}),
-            RiskLevel.HIGH,
-        )
+        coordinator_packet = adapter.coordinator.evaluate_step(request_id=req_id)
+        self.assertIsInstance(coordinator_packet.routing, RoutingStatus)
+        self.assertEqual(coordinator_packet.routing.task_type, TaskType.DEEP_REASONING.value)
+        self.assertEqual(coordinator_packet.routing.risk_level, RiskLevel.HIGH.value)
 
-        # Review still routes to strong review when nothing else is declared.
+        result = adapter.run_step(request_id=req_id)
+        self.assertEqual(result.status, "advanced")
+        self.assertEqual(backend.calls[0]["routing_task_type"], TaskType.DEEP_REASONING.value)
+        self.assertEqual(backend.calls[0]["risk_level"], RiskLevel.HIGH.value)
         self.assertEqual(
-            SuperboardExecutionAdapter._resolve_task_type(bare, "review"),
-            TaskType.STRONG_REVIEW,
-        )
-        self.assertEqual(
-            SuperboardExecutionAdapter._resolve_risk_level(bare, {}),
-            RiskLevel.LOW,
-        )
-
-        # An unparseable value must not crash the step; it falls back rather than raising.
-        junk = Routing(task_type="not_a_task_type", risk_level="not_a_risk")
-        self.assertEqual(
-            SuperboardExecutionAdapter._resolve_task_type(junk, "build"),
-            TaskType.ROUTINE_EXECUTION,
-        )
-        self.assertEqual(
-            SuperboardExecutionAdapter._resolve_risk_level(junk, {}),
-            RiskLevel.LOW,
+            backend.calls[0]["model"],
+            (result.dispatch_packet or {})["recommendation"]["model"],
         )
 
     def test_09_coordinator_model_choice_overrides_adapter_reselection(self):
@@ -788,11 +773,112 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
         recommendation = (res.dispatch_packet or {}).get("recommendation") or {}
         coordinator_model = adapter.coordinator.evaluate_step(request_id=req_id).routing.recommended_model
 
-        # Whatever the selector re-derives, the dispatched model is the coordinator's.
+        # Whatever the selector re-derives, the canonical dispatch key carries the
+        # coordinator's exact model to the backend.
         if coordinator_model:
-            self.assertEqual(recommendation.get("selected_model"), coordinator_model)
+            self.assertEqual(recommendation.get("model"), coordinator_model)
             self.assertEqual(backend.calls[0]["model"], coordinator_model)
+            self.assertNotIn("selected_model", recommendation)
 
+
+    def test_13_configured_card_uses_native_project_v2_transition_hook(self):
+        """A real ledger transition invokes the native updater for its configured card."""
+        req_id = "req-native-board-13"
+        self._add_pipeline_request(req_id)
+        self.ledger.update_request(
+            req_id,
+            superboard_update={"item_id": "ITEM_1", "status": "Building"},
+            actor="test-setup",
+        )
+        observed_status = {"name": "Building"}
+        mutations = []
+
+        def graphql_runner(query, variables):
+            if "updateProjectV2ItemFieldValue" in query:
+                mutations.append(dict(variables))
+                observed_status["name"] = "QA"
+                return {"data": {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": "ITEM_1"}}}}
+            if "projectV2" in query:
+                return {
+                    "data": {"repositoryOwner": {"projectV2": {
+                        "id": "PVT_1",
+                        "title": "Superboard",
+                        "fields": {"nodes": [{
+                            "id": "STATUS_FIELD",
+                            "name": "Status",
+                            "options": [{"id": "OPT_QA", "name": "QA"}],
+                        }]},
+                    }}}
+                }
+            if "projectItems" in query:
+                return {
+                    "data": {"repository": {"issue": {"projectItems": {"nodes": [{
+                        "id": "ITEM_1",
+                        "project": {"id": "PVT_1", "number": 1, "title": "Superboard"},
+                        "fieldValueByName": {"name": observed_status["name"]},
+                    }]}}}}
+                }
+            return {}
+
+        original_runner = project_adapter.default_graphql_runner
+        project_adapter.default_graphql_runner = graphql_runner
+        try:
+            result = SuperboardExecutionAdapter(
+                state_dir=self.state_dir,
+                worker_backend=StubWorkerBackend(head_sha=self.HEAD_SHA),
+                notify_telegram=False,
+            ).run_step(request_id=req_id)
+        finally:
+            project_adapter.default_graphql_runner = original_runner
+
+        self.assertEqual(result.status, "advanced")
+        self.assertEqual(result.gate_result["board_update"]["status"], "updated")
+        self.assertEqual(len(mutations), 1)
+        self.assertEqual(self.ledger.get_request(req_id)["superboard"]["status"], "QA")
+
+    def test_14_ui_bug_qa_execution_path_enforces_closure_assets(self):
+        """UI bug QA cannot advance without signed-in visual/original-scenario closure proof."""
+        req_id = "bug-ui-slider-14"
+        self.ledger.add_request(
+            req_id=req_id,
+            prompt="Slider overlaps the chart for signed-in users",
+            session="test-ui-bug",
+            project="SuperboardCore",
+            acceptance_criteria=[
+                {"criterion": "Original overlap is absent", "status": "pending", "evidence": ""}
+            ],
+            owner="UILane",
+            state="QA",
+            task_type="local_doc",
+            head=self.HEAD_SHA,
+            labels=["type:bug", "area:ui"],
+        )
+        backend = StubWorkerBackend(
+            head_sha=self.HEAD_SHA,
+            reproduction={
+                "verdict": "absent",
+                "scenario": "Open the signed-in dashboard at 390px and inspect slider overlap",
+            },
+            evidence={
+                "checks": [{
+                    "name": "original scenario",
+                    "command": ["browser", "open-dashboard"],
+                    "exit_code": 0,
+                    "observed": "no overlap",
+                }]
+            },
+        )
+
+        result = SuperboardExecutionAdapter(
+            state_dir=self.state_dir,
+            worker_backend=backend,
+            notify_telegram=False,
+        ).run_step(request_id=req_id)
+
+        self.assertEqual(result.status, "advanced")
+        self.assertTrue(result.gate_result["reopened"])
+        self.assertIn("Desktop after-fix visual asset", result.gate_result["repro_refused"])
+        self.assertEqual(self.ledger.get_request(req_id)["state"], "implementation")
 
 def run_tests():
     print("=" * 70)
