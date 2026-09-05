@@ -168,7 +168,7 @@ class SuperboardExecutionAdapter:
         fake_executor_fn: Optional[Callable[[Union[RequestSummary, Dict[str, Any]], str, HarnessDispatchPacket], WorkerExecutionResult]] = None,
         notify_telegram: bool = False,
         telegram_project: Optional[str] = None,
-        telegram_dry_run: bool = True,
+        telegram_dry_run: Optional[bool] = None,
         telegram_send: bool = False,
         dry_run: bool = False,
         repo_root: Optional[str] = None,
@@ -185,8 +185,11 @@ class SuperboardExecutionAdapter:
         self.worker_backend = worker_backend
         self.notify_telegram = notify_telegram
         self.telegram_project = telegram_project
-        self.telegram_dry_run = telegram_dry_run
         self.telegram_send = telegram_send
+        if telegram_dry_run is not None:
+            self.telegram_dry_run = telegram_dry_run
+        else:
+            self.telegram_dry_run = not telegram_send
         self.dry_run = dry_run
         self.repo_root = repo_root or os.path.abspath(os.path.join(SCRIPT_DIR, "..", ".."))
 
@@ -998,22 +1001,29 @@ class SuperboardExecutionAdapter:
         status: str,
         stage: str,
         summary: str,
+        additional_links: Optional[List[str]] = None,
+        event_type_override: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """Point 6: Emit concise single-sentence status event via TelegramNotificationAdapter."""
         if not self.notify_telegram:
             return None
 
-        event_type = "milestone"
-        if status in ("blocked", "error"):
-            event_type = "blocker"
-        elif status == "awaiting_authorization":
-            event_type = "completion"
-        elif status == "done":
-            event_type = "completion"
+        event_type = event_type_override or "milestone"
+        if not event_type_override:
+            if status in ("blocked", "error"):
+                event_type = "blocker"
+            elif status in ("awaiting_authorization", "decision", "decision_needed", "question"):
+                event_type = "decision"
+            elif status == "done":
+                event_type = "completion"
 
         req_id = (getattr(req, "id", None) or (req.get("id") if isinstance(req, dict) else None)) if req else "req-superboard-adapter"
         req_issue = (getattr(req, "issue_number", None) or (req.get("issue_number") if isinstance(req, dict) else None)) if req else 75
         link = f"https://github.com/{self.project_config.repo}/issues/{req_issue or 75}" if req else f"https://github.com/{self.project_config.repo}"
+
+        metadata = {"stage": stage, "status": status}
+        if additional_links:
+            metadata["links"] = list(additional_links)
 
         event = NotificationEvent(
             event_type=event_type,
@@ -1021,11 +1031,57 @@ class SuperboardExecutionAdapter:
             request_id=req_id,
             summary=summary,
             canonical_link=link,
-            metadata={"stage": stage, "status": status},
+            metadata=metadata,
         )
 
         adapter = TelegramNotificationAdapter()
-        dry_run_mode = self.telegram_dry_run or (not self.telegram_send)
+        # Preserve safe dry-run by default unless configured opt-in; explicit --telegram-send must actually send, never combine silently with dry-run
+        if self.telegram_dry_run is True and not self.telegram_send:
+            dry_run_mode = True
+        elif self.telegram_send:
+            dry_run_mode = False
+        else:
+            dry_run_mode = True
+        receipt = adapter.notify(event, dry_run=dry_run_mode)
+        return asdict(receipt)
+
+    def emit_telegram_decision_event(
+        self,
+        decision: Any,
+    ) -> Optional[Dict[str, Any]]:
+        """Emit Telegram notification for a blocking human decision contract."""
+        if not self.notify_telegram:
+            return None
+
+        ledger_req = None
+        if hasattr(self, "coordinator") and self.coordinator and hasattr(self.coordinator, "ledger"):
+            d_dict = asdict(decision) if hasattr(decision, "__dataclass_fields__") else (decision if isinstance(decision, dict) else getattr(decision, "__dict__", {}))
+            req_id = d_dict.get("request_id")
+            if req_id and hasattr(self.coordinator.ledger, "get_request"):
+                try:
+                    ledger_req = self.coordinator.ledger.get_request(req_id)
+                except (KeyError, Exception):
+                    ledger_req = None
+        adapter = TelegramNotificationAdapter()
+        event = adapter.from_decision(
+            decision,
+            project_override=self.project_config.project_name or self.project_config.repo,
+            ledger_request=ledger_req,
+        )
+        if not event:
+            is_valid, reason = TelegramNotificationAdapter.is_decision_notifiable(decision, ledger_request=ledger_req)
+            return {
+                "delivered": False,
+                "status": "refused",
+                "reason": f"Decision notification refused: {reason}",
+            }
+
+        if self.telegram_dry_run is True and not self.telegram_send:
+            dry_run_mode = True
+        elif self.telegram_send:
+            dry_run_mode = False
+        else:
+            dry_run_mode = True
         receipt = adapter.notify(event, dry_run=dry_run_mode)
         return asdict(receipt)
 
@@ -1081,7 +1137,13 @@ class SuperboardExecutionAdapter:
         # 2. Check Human Authorization Gate (Inviolable Human Gate: No Auto-Merge)
         if stage == "awaiting_authorization" or getattr(req, "state", None) == "awaiting authorization":
             reason = f"Request '{req.id}' is awaiting explicit human operator authorization to merge"
-            receipt = self.emit_telegram_event(req, "awaiting_authorization", "awaiting_authorization", reason)
+            receipt = self.emit_telegram_event(
+                req,
+                status="awaiting_authorization",
+                stage="awaiting_authorization",
+                summary=reason,
+                event_type_override="decision",
+            )
             return AdapterExecutionResult(
                 step_id=step_id,
                 request_id=req.id,
@@ -1094,6 +1156,36 @@ class SuperboardExecutionAdapter:
                 boundaries=asdict(packet.boundaries),
             )
 
+        # Check Decision Gate
+        if hasattr(packet, "decision_status") and packet.decision_status:
+            ds = packet.decision_status
+            if isinstance(ds, dict) and ds.get("blocking_this_request"):
+                req_state = getattr(req, "state", None) or (req.get("state") if isinstance(req, dict) else "")
+                req_id_str = getattr(req, "id", "") or (req.get("id", "") if isinstance(req, dict) else "")
+                if req_state in ("done", "completed") or "synthetic" in req_id_str.lower() or "demo" in req_id_str.lower():
+                    # Retired/completed synthetic demo: strictly refuse notification
+                    pass
+                else:
+                    dec_ids = ds.get("blocking_decision_ids", [])
+                    reason = f"Request '{req.id}' is blocked awaiting human decision on {', '.join(dec_ids)}"
+                    receipt = self.emit_telegram_event(
+                        req,
+                        status="decision",
+                        stage="decision",
+                        summary=reason,
+                        event_type_override="decision",
+                    )
+                    return AdapterExecutionResult(
+                        step_id=step_id,
+                        request_id=req.id,
+                        stage="decision",
+                        status="blocked",
+                        status_reason=reason,
+                        next_action=f"Human operator must answer decision {', '.join(dec_ids)} on GitHub issue",
+                        preflight_passed=True,
+                        notification_receipt=receipt,
+                        boundaries=asdict(packet.boundaries),
+                    )
         # 3. Check Preflight Gate
         if not packet.preflight.passed:
             blocker_summary = f"Preflight gate blocked request '{req.id}': {'; '.join(packet.preflight.blockers)}"
@@ -1212,8 +1304,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fake-executor", action="store_true", default=True, help="Use fake executor with labeled fixture output")
     parser.add_argument("--real-worker", action="store_true", help="Execute safe harmless real worker command")
     parser.add_argument("--notify-telegram", action="store_true", help="Enable Telegram notifications")
-    parser.add_argument("--telegram-dry-run", action="store_true", default=True, help="Dry-run Telegram notification")
-    parser.add_argument("--telegram-send", action="store_true", help="Send live Telegram notification")
+    parser.add_argument("--telegram-dry-run", dest="telegram_dry_run", action="store_true", default=None, help="Dry-run Telegram notification (default: True unless --telegram-send)")
+    parser.add_argument("--telegram-send", dest="telegram_send", action="store_true", default=False, help="Send live Telegram notification")
     parser.add_argument("--dry-run", action="store_true", help="Dry run without mutating git worktrees")
     parser.add_argument("--json", action="store_true", help="Output JSON result")
     parser.add_argument("--summary", action="store_true", help="Output human-readable summary")
@@ -1275,7 +1367,7 @@ def main():
         config_path=args.config,
         fake_executor=args.fake_executor and not args.real_worker,
         notify_telegram=args.notify_telegram,
-        telegram_dry_run=args.telegram_dry_run,
+        telegram_dry_run=args.telegram_dry_run if args.telegram_dry_run is not None else (not args.telegram_send),
         telegram_send=args.telegram_send,
         dry_run=args.dry_run,
     )

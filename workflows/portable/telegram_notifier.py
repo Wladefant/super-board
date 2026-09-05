@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 # Supported event classes
-VALID_EVENT_TYPES = {"milestone", "blocker", "decision", "completion"}
+VALID_EVENT_TYPES = {"milestone", "blocker", "decision", "completion", "question", "status"}
 
 # Default timing intervals (in seconds)
 DEFAULT_DEDUP_WINDOW_SECONDS = 86400  # 24 hours
@@ -53,6 +53,8 @@ DEFAULT_HTTP_TIMEOUT = 10            # 10 seconds timeout for Telegram Bot API
 # Default paths
 DEFAULT_MANIFEST_PATHS = [
     Path(__file__).resolve().parent.parent / "telegram" / "manifest.json",
+    Path(__file__).resolve().parent / "manifest.json",
+    Path.home() / ".veyyon" / "workflows" / "telegram" / "manifest.json",
     Path.home() / ".veyyon" / "telegram" / "manifest.json",
 ]
 DEFAULT_CHANNELS_BASE = Path.home() / ".claude" / "channels"
@@ -102,6 +104,8 @@ class SecretSanitizer:
         (re.compile(r"\bBearer\s+[A-Za-z0-9._~+/-]{15,}\b", re.IGNORECASE), "Bearer [REDACTED]"),
         (re.compile(r"(?:TELEGRAM_BOT_TOKEN\s*=\s*)[^\s\n]+", re.IGNORECASE), "TELEGRAM_BOT_TOKEN=[REDACTED]"),
         (re.compile(r"(?:password|secret|key|token)\s*[:=]\s*['\"][^'\"]+['\"]", re.IGNORECASE), "[REDACTED_SECRET]"),
+        (re.compile(r"\b1247617658\b"), "[REDACTED_DESTINATION]"),
+        (re.compile(r"(?:chat_id|destination|chat)\s*[:=]\s*['\"]?\d{8,}['\"]?", re.IGNORECASE), "chat_id=[REDACTED_DESTINATION]"),
         (re.compile(r"[A-Za-z]:\\[Uu]sers\\[^\\]+\\", re.IGNORECASE), r"C:\\Users\\<user>\\"),
         (re.compile(r"/home/[^/]+/", re.IGNORECASE), "/home/<user>/"),
     ]
@@ -332,8 +336,8 @@ class DeduplicationLedger:
             elapsed = int(now - last_sent)
             return False, "deduped", f"Identical event signature dispatched {elapsed}s ago (within {int(self.dedup_window)}s window)"
 
-        # 2. Per-request cooldown (unless blocker)
-        if event.event_type != "blocker":
+        # 2. Per-request cooldown (unless blocker, decision, or question)
+        if event.event_type not in ("blocker", "decision", "question"):
             req_cooldowns = data.get("request_cooldowns", {})
             last_req_time = req_cooldowns.get(event.request_id)
             if last_req_time and (now - last_req_time < self.cooldown_window):
@@ -395,18 +399,29 @@ class TelegramNotificationAdapter:
             "milestone": "Milestone",
             "blocker": "Blocker",
             "decision": "Decision Needed",
+            "question": "Question",
+            "status": "Status Update",
             "completion": "Completed",
         }
         label = type_labels.get(event.event_type, event.event_type.capitalize())
 
-        # Clean summary to exactly one sentence
+        # Clean summary to concise sentences
         clean_summary = SecretSanitizer.sanitize(event.summary.strip().replace("\n", " "))
         # Ensure single sentence punctuation
         if not clean_summary.endswith((".", "!", "?")):
             clean_summary += "."
 
+        # Collect canonical links: event.canonical_link plus any metadata links
+        raw_links = event.canonical_link.strip().split()
+        if "links" in event.metadata and isinstance(event.metadata["links"], list):
+            for lk in event.metadata["links"]:
+                lk_str = str(lk).strip()
+                if lk_str and lk_str not in raw_links:
+                    raw_links.append(lk_str)
+        links_str = " ".join(raw_links)
+
         # Build message
-        msg = f"[{label}] {event.project} {event.request_id}: {clean_summary} {event.canonical_link.strip()}"
+        msg = f"[{label}] {event.project} {event.request_id}: {clean_summary} {links_str}"
         return msg
 
     def test_connection(self, project: str = "polysimulator", slot_id: Optional[str] = None) -> Dict[str, Any]:
@@ -440,7 +455,7 @@ class TelegramNotificationAdapter:
                     "bot_id": str(result.get("id")),
                     "bot_username": result.get("username"),
                     "bot_name": result.get("first_name"),
-                    "configured_destinations": destinations,
+                    "configured_destinations": ["[CONFIGURED_DESTINATION]" for _ in destinations],
                 }
         except urllib.error.HTTPError as e:
             return {
@@ -492,9 +507,9 @@ class TelegramNotificationAdapter:
             return DeliveryReceipt(
                 delivered=False,
                 status="blocked",
-                reason=f"Target chat ID '{target_chat}' is not in allowlist {allowed_chats} for slot '{slot_info['slotId']}'",
+                reason=f"Target destination is not in allowlist for slot '{slot_info['slotId']}'",
                 event_signature=sig,
-                chat_id=str(target_chat),
+                chat_id="[REDACTED_DESTINATION]",
             )
 
         if not token:
@@ -503,7 +518,7 @@ class TelegramNotificationAdapter:
                 status="blocked",
                 reason=f"Telegram bot token missing for slot '{slot_info['slotId']}' in {state_dir}",
                 event_signature=sig,
-                chat_id=str(target_chat),
+                chat_id="[REDACTED_DESTINATION]",
             )
 
         # 2. Check deduplication & cooldown unless forced
@@ -515,7 +530,7 @@ class TelegramNotificationAdapter:
                     status=status,
                     reason=reason,
                     event_signature=sig,
-                    chat_id=str(target_chat),
+                    chat_id="[REDACTED_DESTINATION]",
                 )
 
         # 3. Format message
@@ -526,9 +541,9 @@ class TelegramNotificationAdapter:
             return DeliveryReceipt(
                 delivered=True,
                 status="dry_run",
-                reason=f"[DRY-RUN] Would send message to chat {target_chat} via slot {slot_info['slotId']}: {message_text}",
+                reason=f"[DRY-RUN] Would send message to slot '{slot_info['slotId']}': {message_text}",
                 event_signature=sig,
-                chat_id=str(target_chat),
+                chat_id="[REDACTED_DESTINATION]",
             )
 
         # 5. Network dispatch
@@ -559,10 +574,10 @@ class TelegramNotificationAdapter:
                     return DeliveryReceipt(
                         delivered=True,
                         status="sent",
-                        reason=f"Notification delivered to chat {target_chat} (message_id: {msg_id})",
+                        reason=f"Notification delivered to channel slot '{slot_info['slotId']}' (message_id: {msg_id})",
                         event_signature=sig,
                         message_id=msg_id,
-                        chat_id=str(target_chat),
+                        chat_id="[REDACTED_DESTINATION]",
                         bot_id=bot_id,
                     )
                 else:
@@ -571,7 +586,7 @@ class TelegramNotificationAdapter:
                         status="failed",
                         reason=f"Telegram API error: {resp_data.get('description', 'Unknown error')}",
                         event_signature=sig,
-                        chat_id=str(target_chat),
+                        chat_id="[REDACTED_DESTINATION]",
                     )
         except urllib.error.HTTPError as e:
             try:
@@ -585,7 +600,7 @@ class TelegramNotificationAdapter:
                 status="failed",
                 reason=f"HTTP {e.code} delivery failure: {desc}",
                 event_signature=sig,
-                chat_id=str(target_chat),
+                chat_id="[REDACTED_DESTINATION]",
             )
         except Exception as e:
             return DeliveryReceipt(
@@ -593,7 +608,7 @@ class TelegramNotificationAdapter:
                 status="failed",
                 reason=f"Network delivery exception: {type(e).__name__}: {e}",
                 event_signature=sig,
-                chat_id=str(target_chat),
+                chat_id="[REDACTED_DESTINATION]",
             )
 
     @classmethod
@@ -662,16 +677,171 @@ class TelegramNotificationAdapter:
         # Routine chatter (implementation, discovery, etc.) is dropped
         return None
 
+    @classmethod
+    def is_decision_notifiable(
+        cls,
+        decision: Any,
+        ledger_request: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[bool, str]:
+        """Validates that a decision contract represents a genuine, active, non-synthetic,
+        uncompleted decision awaiting human operator action.
+        Refuses retired, resolved, synthetic, demo, and completed-request notifications.
+        """
+        if hasattr(decision, "__dataclass_fields__"):
+            d_dict = asdict(decision)
+        elif hasattr(decision, "__dict__"):
+            d_dict = decision.__dict__
+        elif isinstance(decision, dict):
+            d_dict = decision
+        else:
+            return False, f"Unsupported decision object type: {type(decision)}"
+
+        dec_id = str(d_dict.get("decision_id") or "").strip()
+        req_id = str(d_dict.get("request_id") or "").strip()
+        status = str(d_dict.get("status") or "pending").strip().lower()
+        prompt = str(d_dict.get("prompt") or "").strip().lower()
+        provenance = str(d_dict.get("provenance") or "").strip().lower()
+
+        # 1. Refuse non-pending status (rejected, answered, resolved, closed, retired, done)
+        if status not in ("pending", "clarification_requested"):
+            return False, f"Decision '{dec_id}' has non-actionable status '{status}'; only active pending decisions may notify operator."
+
+        # 2. Refuse synthetic, test, or demo provenance
+        if d_dict.get("is_synthetic") or d_dict.get("is_test"):
+            return False, f"Decision '{dec_id}' is explicitly flagged as synthetic/test; human notification refused."
+
+        if provenance in ("synthetic_test", "agent_authored"):
+            return False, f"Decision '{dec_id}' has provenance '{provenance}'; human notification refused."
+
+        # Check for synthetic/demo keywords in IDs and prompt
+        combined_identifiers = f"{dec_id.lower()} {req_id.lower()} {prompt}"
+        for marker in ("synthetic", "demo", "retired"):
+            if marker in combined_identifiers:
+                return False, f"Decision '{dec_id}' matches synthetic/demo/retired marker '{marker}'; human notification refused."
+
+        # Check audit trail for synthetic test probes
+        audit_trail = d_dict.get("audit_trail", [])
+        if isinstance(audit_trail, list):
+            for entry in audit_trail:
+                if isinstance(entry, dict) and entry.get("provenance") in ("synthetic_test", "agent_authored"):
+                    if status != "pending":
+                        return False, f"Decision '{dec_id}' audit trail contains synthetic test probe; human notification refused."
+
+        # 3. Refuse if underlying ledger request is already completed/done
+        if ledger_request and isinstance(ledger_request, dict):
+            req_state = str(ledger_request.get("state") or "").strip().lower()
+            if req_state in ("done", "completed", "closed"):
+                return False, f"Underlying request '{req_id}' is already in terminal state '{req_state}'; decision is obsolete."
+
+        return True, "Eligible for notification"
+
+    @classmethod
+    def from_decision(
+        cls,
+        decision: Any,
+        project_override: Optional[str] = None,
+        ledger_request: Optional[Dict[str, Any]] = None,
+        strict: bool = False,
+    ) -> Optional[NotificationEvent]:
+        """Translates a DecisionContract or decision dictionary into a NotificationEvent.
+        Strictly refuses retired, resolved, synthetic/demo, or completed requests.
+        """
+        is_eligible, refusal_reason = cls.is_decision_notifiable(decision, ledger_request=ledger_request)
+        if not is_eligible:
+            if strict:
+                raise ValueError(f"Decision notification refused: {refusal_reason}")
+            return None
+
+        if hasattr(decision, "__dataclass_fields__"):
+            d_dict = asdict(decision)
+        elif hasattr(decision, "__dict__"):
+            d_dict = decision.__dict__
+        elif isinstance(decision, dict):
+            d_dict = decision
+        else:
+            raise ValueError(f"Unsupported decision object type: {type(decision)}")
+
+        dec_id = d_dict.get("decision_id") or "DEC-unknown"
+        req_id_raw = d_dict.get("request_id")
+        if req_id_raw and dec_id and req_id_raw != dec_id:
+            req_id = f"{req_id_raw} ({dec_id})"
+        else:
+            req_id = req_id_raw or dec_id
+        question = d_dict.get("question") or "Human decision required"
+        options = d_dict.get("options") or []
+        recommendation = d_dict.get("recommendation") or ""
+        issue_url = (
+            d_dict.get("issue_url")
+            or d_dict.get("canonical_issue_url")
+            or "https://github.com/Bavariance/polysimulator/issues/4543"
+        )
+        project = project_override or "Bavariance/polysimulator"
+
+        opt_summaries = []
+        for opt in options:
+            if isinstance(opt, dict):
+                opt_id = opt.get("id", "")
+                opt_lbl = opt.get("label") or opt.get("description", "")
+                opt_summaries.append(f"{opt_id}: {opt_lbl}" if opt_id else opt_lbl)
+            else:
+                opt_summaries.append(str(opt))
+        opts_str = f" Options: {'; '.join(opt_summaries)}." if opt_summaries else ""
+        rec_str = f" Recommended: {recommendation}." if recommendation else ""
+
+        summary = f"{question.rstrip('.')}.{opts_str}{rec_str}".strip()
+        return NotificationEvent(
+            event_type="decision",
+            project=project,
+            request_id=req_id,
+            summary=summary,
+            canonical_link=issue_url,
+            metadata={
+                "decision_id": dec_id,
+                "options": options,
+                "recommendation": recommendation,
+            },
+        )
+    @classmethod
+    def load_decision_from_file(
+        cls,
+        decision_id: str,
+        decisions_file: Optional[Path] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Load a decision dict by ID from a decisions.json file."""
+        paths = [
+            decisions_file,
+            Path.cwd() / "decisions.json",
+            Path(__file__).resolve().parent / "decisions.json",
+            Path.home() / ".veyyon" / "workflows" / "decisions.json",
+        ]
+        for p in paths:
+            if p and p.exists():
+                try:
+                    data = json.loads(p.read_text(encoding="utf-8"))
+                    decs = data.get("decisions", {})
+                    if isinstance(decs, dict) and decision_id in decs:
+                        return decs[decision_id]
+                    elif isinstance(decs, list):
+                        for d in decs:
+                            if d.get("decision_id") == decision_id:
+                                return d
+                except Exception:
+                    pass
+        return None
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Portable Telegram Notification Adapter")
     parser.add_argument("--project", default="polysimulator", help="Target project or repo name")
     parser.add_argument("--slot", default=None, help="Explicit slot identifier (e.g. telegram-polysim)")
     parser.add_argument("--chat-id", default=None, help="Explicit destination chat ID")
-    parser.add_argument("--event-type", choices=sorted(VALID_EVENT_TYPES), help="Event type: milestone, blocker, decision, completion")
+    parser.add_argument("--event-type", choices=sorted(VALID_EVENT_TYPES), help="Event type: milestone, blocker, decision, completion, question, status")
     parser.add_argument("--request-id", default="req-manual", help="Request ID (e.g. req-4543)")
     parser.add_argument("--summary", default="", help="One-sentence status summary")
     parser.add_argument("--link", default="", help="Canonical issue or PR URL")
+    parser.add_argument("--links", nargs="*", default=[], help="Additional canonical URLs (e.g. PRs, issues)")
+    parser.add_argument("--decision-id", default=None, help="Decision ID from decisions.json to notify")
+    parser.add_argument("--decisions-file", default=None, help="Path to decisions.json file")
     parser.add_argument("--packet", default=None, help="Path to CoordinatorPacket JSON file")
     parser.add_argument("--test-connection", action="store_true", help="Perform read-only API check (getMe)")
     parser.add_argument("--dry-run", action="store_true", help="Format and check dedup without network send")
@@ -696,7 +866,16 @@ def main() -> int:
 
     event: Optional[NotificationEvent] = None
 
-    if args.packet:
+    if args.decision_id:
+        dec_file = Path(args.decisions_file) if args.decisions_file else None
+        dec_dict = TelegramNotificationAdapter.load_decision_from_file(args.decision_id, decisions_file=dec_file)
+        if not dec_dict:
+            print(f"ERROR: Decision '{args.decision_id}' not found in decisions.json", file=sys.stderr)
+            return 1
+        event = TelegramNotificationAdapter.from_decision(dec_dict, project_override=args.project)
+        if args.links:
+            event.metadata.setdefault("links", []).extend(args.links)
+    elif args.packet:
         packet_path = Path(args.packet)
         if not packet_path.exists():
             print(f"ERROR: Packet file not found: {packet_path}", file=sys.stderr)
@@ -709,13 +888,17 @@ def main() -> int:
             else:
                 print("[INFO] Packet contains routine execution chatter; dropped per event filter rules.")
             return 0
-    elif args.event_type and args.summary and args.link:
+        if args.links:
+            event.metadata.setdefault("links", []).extend(args.links)
+    elif args.event_type and args.summary and (args.link or args.links):
+        primary_link = args.link or (args.links[0] if args.links else "")
         event = NotificationEvent(
             event_type=args.event_type,
             project=args.project,
             request_id=args.request_id,
             summary=args.summary,
-            canonical_link=args.link,
+            canonical_link=primary_link,
+            metadata={"links": args.links} if args.links else {},
         )
     else:
         parser.print_help()

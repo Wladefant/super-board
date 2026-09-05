@@ -326,6 +326,123 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
         self.assertIn("https://github.com/", reason)
         self.assertIn("/issues/75", reason)
         self.assertIn(req_id, reason)
+
+    def test_04b_telegram_safe_dry_run_defaults_and_explicit_send(self):
+        """Verify safe dry-run by default unless configured opt-in; explicit telegram_send actually sends."""
+        # 1. Default: safe dry-run
+        adapter_default = SuperboardExecutionAdapter(
+            state_dir=self.state_dir,
+            notify_telegram=True,
+        )
+        self.assertTrue(adapter_default.telegram_dry_run)
+        self.assertFalse(adapter_default.telegram_send)
+
+        # 2. Explicit send: dry_run is False
+        adapter_send = SuperboardExecutionAdapter(
+            state_dir=self.state_dir,
+            notify_telegram=True,
+            telegram_send=True,
+        )
+        self.assertFalse(adapter_send.telegram_dry_run)
+        self.assertTrue(adapter_send.telegram_send)
+
+        # 3. Explicit dry-run overrides send if both set
+        adapter_forced_dry = SuperboardExecutionAdapter(
+            state_dir=self.state_dir,
+            notify_telegram=True,
+            telegram_dry_run=True,
+            telegram_send=True,
+        )
+        self.assertTrue(adapter_forced_dry.telegram_dry_run)
+        self.assertTrue(adapter_forced_dry.telegram_send)
+
+    def test_04c_telegram_decision_event_hook(self):
+        """Verify emit_telegram_decision_event emits a real decision notification."""
+        adapter = SuperboardExecutionAdapter(
+            state_dir=self.state_dir,
+            notify_telegram=True,
+            telegram_dry_run=True,
+        )
+        decision_data = {
+            "decision_id": "DEC-ARCH-01",
+            "request_id": "req-arch-01",
+            "question": "How should background execution proceed on blocking decisions?",
+            "options": [
+                {"id": "A", "label": "Park and Idle Wait"},
+                {"id": "B", "label": "Speculative Feature Branching"},
+            ],
+            "recommendation": "Option A: Park and Idle Wait",
+            "issue_url": "https://github.com/Bavariance/polysimulator/issues/4543",
+            "status": "pending",
+        }
+        receipt = adapter.emit_telegram_decision_event(decision_data)
+        self.assertIsNotNone(receipt)
+        self.assertEqual(receipt.get("status"), "dry_run")
+        self.assertIn("Park and Idle Wait", receipt.get("reason", ""))
+        self.assertIn("DEC-ARCH-01", receipt.get("reason", ""))
+
+    def test_04e_telegram_decision_refusal_retired_and_synthetic(self):
+        """Regression: Verify retired/synthetic/completed decisions are strictly refused by adapter hook."""
+        adapter = SuperboardExecutionAdapter(
+            state_dir=self.state_dir,
+            notify_telegram=True,
+            telegram_dry_run=True,
+        )
+        # 1. Retired synthetic demo DEC-4543-01
+        retired_demo = {
+            "decision_id": "DEC-4543-01",
+            "request_id": "req-synthetic-decision-demo-4543",
+            "question": "When agent swarm encounters blocking decision, how to proceed?",
+            "status": "rejected",
+            "provenance": "synthetic_test",
+        }
+        receipt_retired = adapter.emit_telegram_decision_event(retired_demo)
+        self.assertIsNotNone(receipt_retired)
+        self.assertEqual(receipt_retired.get("status"), "refused")
+        self.assertIn("refused", receipt_retired.get("reason", "").lower())
+
+        # 2. Decision on completed ledger request
+        self.ledger.add_request(
+            req_id="req-done-item",
+            prompt="Done prompt",
+            session="test",
+            project="SuperboardCore",
+            acceptance_criteria=[],
+            owner="TestLane",
+            state="done",
+        )
+        completed_dec = {
+            "decision_id": "DEC-NEW-99",
+            "request_id": "req-done-item",
+            "question": "Obsolete question on done request?",
+            "status": "pending",
+        }
+        receipt_completed = adapter.emit_telegram_decision_event(completed_dec)
+        self.assertIsNotNone(receipt_completed)
+        self.assertEqual(receipt_completed.get("status"), "refused")
+        self.assertIn("terminal state", receipt_completed.get("reason", ""))
+    def test_04d_cli_telegram_flags_parsing(self):
+        """Verify build_parser preserves safe dry-run by default unless explicit --telegram-send."""
+        from superboard_adapter import build_parser
+        parser = build_parser()
+
+        # Default CLI args
+        args_default = parser.parse_args([])
+        self.assertFalse(args_default.notify_telegram)
+        self.assertIsNone(args_default.telegram_dry_run)
+        self.assertFalse(args_default.telegram_send)
+
+        # Explicit send
+        args_send = parser.parse_args(["--notify-telegram", "--telegram-send"])
+        self.assertTrue(args_send.notify_telegram)
+        self.assertIsNone(args_send.telegram_dry_run)
+        self.assertTrue(args_send.telegram_send)
+
+        # Explicit dry run
+        args_dry = parser.parse_args(["--notify-telegram", "--telegram-dry-run"])
+        self.assertTrue(args_dry.notify_telegram)
+        self.assertTrue(args_dry.telegram_dry_run)
+        self.assertFalse(args_dry.telegram_send)
     def test_05_no_parallel_scheduler_invariant(self):
         """Test sequential, single-step execution contract without daemon loops."""
         adapter = SuperboardExecutionAdapter(

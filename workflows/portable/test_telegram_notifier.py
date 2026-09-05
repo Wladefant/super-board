@@ -123,6 +123,51 @@ class TestMessageFormatting(unittest.TestCase):
         msg = TelegramNotificationAdapter.format_message(ev)
         self.assertTrue(msg.startswith("[Decision Needed]"))
 
+    def test_format_status_and_question_events(self):
+        status_ev = NotificationEvent(
+            event_type="status",
+            project="Bavariance/polysimulator",
+            request_id="req-harness-continuous-orchestration",
+            summary="Workflow in progress at 1a28d9d8ad1976160db7223a0d5df57df421f862, adapter unfinished",
+            canonical_link="https://github.com/Wladefant/super-board/pull/74",
+        )
+        msg = TelegramNotificationAdapter.format_message(status_ev)
+        self.assertTrue(msg.startswith("[Status Update] Bavariance/polysimulator req-harness-continuous-orchestration:"))
+        self.assertIn("1a28d9d8ad1976160db7223a0d5df57df421f862", msg)
+        self.assertTrue(msg.endswith("https://github.com/Wladefant/super-board/pull/74"))
+
+        question_ev = NotificationEvent(
+            event_type="question",
+            project="Bavariance/polysimulator",
+            request_id="DEC-4543-01",
+            summary="How should background execution proceed? Options: A (Park), B (Speculate)",
+            canonical_link="https://github.com/Bavariance/polysimulator/issues/4543",
+        )
+        q_msg = TelegramNotificationAdapter.format_message(question_ev)
+        self.assertTrue(q_msg.startswith("[Question] Bavariance/polysimulator DEC-4543-01:"))
+
+    def test_format_multiple_links_and_deduplication(self):
+        ev = NotificationEvent(
+            event_type="status",
+            project="Bavariance/polysimulator",
+            request_id="req-multi-link",
+            summary="Workflow active across multiple tracking endpoints",
+            canonical_link="https://github.com/Wladefant/super-board/pull/74",
+            metadata={
+                "links": [
+                    "https://github.com/Bavariance/polysimulator/pull/4545",
+                    "https://github.com/Bavariance/polysimulator/issues/4543",
+                    "https://github.com/Wladefant/super-board/pull/74",  # Duplicate link
+                ]
+            },
+        )
+        msg = TelegramNotificationAdapter.format_message(ev)
+        self.assertIn("https://github.com/Wladefant/super-board/pull/74", msg)
+        self.assertIn("https://github.com/Bavariance/polysimulator/pull/4545", msg)
+        self.assertIn("https://github.com/Bavariance/polysimulator/issues/4543", msg)
+        # Verify deduplication: PR74 should appear exactly once
+        self.assertEqual(msg.count("https://github.com/Wladefant/super-board/pull/74"), 1)
+
 
 class TestCoordinatorPacketIngestion(unittest.TestCase):
     def test_decision_packet_translation(self):
@@ -277,6 +322,28 @@ class TestDeduplicationAndCooldown(unittest.TestCase):
         eligible, status, reason = self.ledger.check_eligible(blocker, now=now + 15.0)
         self.assertTrue(eligible)
 
+    def test_decision_bypasses_per_request_cooldown(self):
+        ev1 = NotificationEvent(
+            event_type="milestone",
+            project="polysimulator",
+            request_id="req-4543",
+            summary="Milestone passed.",
+            canonical_link="http://link/1",
+        )
+        decision_ev = NotificationEvent(
+            event_type="decision",
+            project="polysimulator",
+            request_id="req-4543",
+            summary="Operator architectural choice required.",
+            canonical_link="http://link/dec",
+        )
+        now = 1000.0
+        self.ledger.record_dispatch(ev1, now=now)
+
+        # Decision should bypass per-request cooldown (after global min interval)
+        eligible, status, reason = self.ledger.check_eligible(decision_ev, now=now + 15.0)
+        self.assertTrue(eligible)
+
 
 class TestProjectSlotResolver(unittest.TestCase):
     def setUp(self):
@@ -387,7 +454,8 @@ class TestTelegramNotificationAdapter(unittest.TestCase):
         self.assertTrue(receipt.delivered)
         self.assertEqual(receipt.status, "dry_run")
         self.assertIn("[DRY-RUN]", receipt.reason)
-        self.assertEqual(receipt.chat_id, "1247617658")
+        self.assertEqual(receipt.chat_id, "[REDACTED_DESTINATION]")
+        self.assertNotIn("1247617658", receipt.reason)
 
     @patch("urllib.request.urlopen")
     def test_live_send_mocked_success(self, mock_urlopen):
@@ -412,7 +480,8 @@ class TestTelegramNotificationAdapter(unittest.TestCase):
         self.assertTrue(receipt.delivered)
         self.assertEqual(receipt.status, "sent")
         self.assertEqual(receipt.message_id, 999123)
-        self.assertEqual(receipt.chat_id, "1247617658")
+        self.assertEqual(receipt.chat_id, "[REDACTED_DESTINATION]")
+        self.assertNotIn("1247617658", receipt.reason)
         self.assertEqual(receipt.bot_id, "8566730274")
 
     def test_unallowlisted_chat_blocked(self):
@@ -428,6 +497,132 @@ class TestTelegramNotificationAdapter(unittest.TestCase):
         self.assertFalse(receipt.delivered)
         self.assertEqual(receipt.status, "blocked")
         self.assertIn("not in allowlist", receipt.reason)
+
+    def test_from_decision_contract_translation(self):
+        decision_data = {
+            "decision_id": "DEC-ARCH-01",
+            "request_id": "req-arch-01",
+            "question": "When the agent swarm encounters a blocking human decision, how should background execution proceed?",
+            "options": [
+                {"id": "A", "label": "Park and Idle Wait"},
+                {"id": "B", "label": "Speculative Feature Branching"},
+            ],
+            "recommendation": "Option A: Park and Idle Wait ensures strict invariant compliance",
+            "issue_url": "https://github.com/Bavariance/polysimulator/issues/4543",
+            "status": "pending",
+        }
+        ev = TelegramNotificationAdapter.from_decision(decision_data, project_override="Bavariance/polysimulator")
+        self.assertIsNotNone(ev)
+        self.assertEqual(ev.event_type, "decision")
+        self.assertEqual(ev.request_id, "req-arch-01 (DEC-ARCH-01)")
+        self.assertEqual(ev.canonical_link, "https://github.com/Bavariance/polysimulator/issues/4543")
+        self.assertIn("Park and Idle Wait", ev.summary)
+        self.assertIn("A: Park and Idle Wait", ev.summary)
+        self.assertIn("B: Speculative Feature Branching", ev.summary)
+        self.assertIn("Option A: Park and Idle Wait", ev.summary)
+
+        formatted = TelegramNotificationAdapter.format_message(ev)
+        self.assertTrue(formatted.startswith("[Decision Needed] Bavariance/polysimulator req-arch-01 (DEC-ARCH-01):"))
+        self.assertIn("Options: A: Park and Idle Wait; B: Speculative Feature Branching", formatted)
+        self.assertIn("Recommended: Option A", formatted)
+        self.assertTrue(formatted.endswith("https://github.com/Bavariance/polysimulator/issues/4543"))
+
+    def test_load_decision_from_file(self):
+        temp_dec_file = Path(self.temp_dir.name) / "test_decisions.json"
+        test_data = {
+            "version": 2,
+            "decisions": {
+                "DEC-TEST-01": {
+                    "decision_id": "DEC-TEST-01",
+                    "request_id": "req-test-01",
+                    "question": "Test question?",
+                    "options": [{"id": "A", "label": "Option A"}],
+                    "recommendation": "Option A",
+                    "issue_url": "https://github.com/Bavariance/polysimulator/issues/999",
+                }
+            },
+        }
+        temp_dec_file.write_text(json.dumps(test_data), encoding="utf-8")
+        dec = TelegramNotificationAdapter.load_decision_from_file("DEC-TEST-01", decisions_file=temp_dec_file)
+        self.assertIsNotNone(dec)
+        self.assertEqual(dec["decision_id"], "DEC-TEST-01")
+        self.assertEqual(dec["question"], "Test question?")
+
+    def test_decision_refusal_retired_and_resolved(self):
+        """Verify retired, rejected, resolved, and answered decisions are strictly refused."""
+        for bad_status in ("rejected", "resolved", "answered", "closed", "retired", "done"):
+            dec = {
+                "decision_id": "DEC-100",
+                "request_id": "req-100",
+                "status": bad_status,
+                "question": "Some question?",
+            }
+            is_valid, reason = TelegramNotificationAdapter.is_decision_notifiable(dec)
+            self.assertFalse(is_valid, f"Status '{bad_status}' should be refused")
+            self.assertIn("non-actionable", reason)
+            self.assertIsNone(TelegramNotificationAdapter.from_decision(dec))
+
+    def test_decision_refusal_synthetic_and_demo(self):
+        """Verify synthetic test probes and demo decisions are strictly refused."""
+        synthetic_decisions = [
+            {"decision_id": "DEC-4543-01", "request_id": "req-synthetic-decision-demo-4543", "status": "pending", "question": "Q?"},
+            {"decision_id": "DEC-SYNTHETIC-99", "request_id": "req-real-01", "status": "pending", "question": "Q?"},
+            {"decision_id": "DEC-DEMO-01", "request_id": "req-real-01", "status": "pending", "question": "Q?"},
+            {"decision_id": "DEC-RETIRED-01", "request_id": "req-real-01", "status": "pending", "question": "Q?"},
+            {"decision_id": "DEC-REAL-01", "request_id": "req-real-01", "status": "pending", "is_synthetic": True, "question": "Q?"},
+            {"decision_id": "DEC-REAL-02", "request_id": "req-real-02", "status": "pending", "provenance": "synthetic_test", "question": "Q?"},
+            {"decision_id": "DEC-REAL-03", "request_id": "req-real-03", "status": "pending", "provenance": "agent_authored", "question": "Q?"},
+        ]
+        for dec in synthetic_decisions:
+            is_valid, reason = TelegramNotificationAdapter.is_decision_notifiable(dec)
+            self.assertFalse(is_valid, f"Synthetic decision '{dec['decision_id']}' should be refused")
+            self.assertIsNone(TelegramNotificationAdapter.from_decision(dec))
+
+    def test_decision_refusal_completed_ledger_request(self):
+        """Verify decisions on completed/done requests are refused."""
+        dec = {
+            "decision_id": "DEC-GENUINE-01",
+            "request_id": "req-completed-01",
+            "status": "pending",
+            "question": "Genuine question?",
+        }
+        completed_ledger_req = {"id": "req-completed-01", "state": "done"}
+        is_valid, reason = TelegramNotificationAdapter.is_decision_notifiable(dec, ledger_request=completed_ledger_req)
+        self.assertFalse(is_valid)
+        self.assertIn("terminal state", reason)
+        self.assertIsNone(TelegramNotificationAdapter.from_decision(dec, ledger_request=completed_ledger_req))
+
+    @patch("urllib.request.urlopen")
+    def test_destination_identifiers_strictly_redacted(self, mock_urlopen):
+        """Verify destination chat IDs are completely redacted across receipts, sanitizers, and connection tests."""
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps({
+            "ok": True,
+            "result": {"id": 8566730274, "username": "testbot", "first_name": "TestBot"},
+        }).encode("utf-8")
+        mock_urlopen.return_value.__enter__.return_value = mock_resp
+        ev = NotificationEvent(
+            event_type="milestone",
+            project="polysimulator",
+            request_id="req-clean",
+            summary="Summary text.",
+            canonical_link="http://link",
+        )
+        receipt = self.adapter.notify(ev, dry_run=True)
+        self.assertEqual(receipt.chat_id, "[REDACTED_DESTINATION]")
+        self.assertNotIn("1247617658", receipt.reason)
+
+        # Test sanitizer
+        leak_text = "Sending alert to chat_id: 1247617658 for user"
+        sanitized = SecretSanitizer.sanitize(leak_text)
+        self.assertNotIn("1247617658", sanitized)
+        self.assertIn("[REDACTED_DESTINATION]", sanitized)
+
+        # Test connection result masking
+        conn = self.adapter.test_connection()
+        for dest in conn.get("configured_destinations", []):
+            self.assertNotIn("1247617658", dest)
+            self.assertEqual(dest, "[CONFIGURED_DESTINATION]")
 
 
 if __name__ == "__main__":
