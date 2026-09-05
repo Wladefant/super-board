@@ -132,6 +132,42 @@ class TestGitHubPRGate(unittest.TestCase):
             require_head_bound_review_evidence=True,
         )
 
+    def test_unresolvable_live_head_never_approves(self):
+        for head in ("", "short", "g" * 40):
+            for expected in (None, self.head_sha):
+                with self.subTest(head=head, expected=expected):
+                    pr = copy.deepcopy(self.mock_pr)
+                    pr["headRefOid"] = head
+                    pr["reviews"][0]["commit"] = {"oid": head}
+                    result = evaluate_pr_gate(pr, expected_head_sha=expected)
+                    self.assertEqual(result.gate_verdict, "BLOCKED")
+                    self.assertTrue(result.review_invalidated)
+
+    def test_protected_policy_cannot_make_failed_checks_advisory(self):
+        with tempfile.TemporaryDirectory(prefix="gate_strict_ci_") as directory:
+            path = os.path.join(directory, "policy.json")
+            for require_approval in (False, True):
+                with self.subTest(require_approval=require_approval):
+                    with open(path, "w", encoding="utf-8") as config_file:
+                        json.dump({"policies": [{
+                            "repo": "Bavariance/polysimulator",
+                            "base_ref": "main",
+                            "require_github_approval": require_approval,
+                            "require_head_bound_review_evidence": False,
+                            "advisory_checks": ["*"],
+                        }]}, config_file)
+                    policy = resolve_gate_policy(
+                        "Bavariance/polysimulator", "main", config_path=path
+                    )
+                    pr = copy.deepcopy(self.mock_pr)
+                    pr["baseRefName"] = "main"
+                    pr["statusCheckRollup"][0]["conclusion"] = "FAILURE"
+                    result = evaluate_pr_gate(pr, policy=policy)
+                    self.assertEqual(result.gate_verdict, "BLOCKED")
+                    self.assertEqual(result.failing_checks, ["test-suite"])
+                    self.assertEqual(policy.advisory_checks, [])
+                    self.assertTrue(policy.require_head_bound_review_evidence)
+
     # -------------------------------------------------------------------------
     # TEST 1: Valid Passing PR
     # -------------------------------------------------------------------------

@@ -148,16 +148,16 @@ def resolve_gate_policy(
     policy = sorted(candidates, key=specificity, reverse=True)[0]
 
     protected = PRODUCTION_PROTECTED_BASES.get(repo, [])
-    if base_ref in protected and not policy.require_github_approval:
+    if base_ref in protected:
         return GateApprovalPolicy(
             repo=repo,
             base_ref=base_ref,
             require_github_approval=True,
             require_head_bound_review_evidence=True,
-            advisory_checks=policy.advisory_checks,
+            advisory_checks=[],
             rationale=(
-                f"Refused to waive approval on production-protected base '{base_ref}' of "
-                f"{repo}; forced back to requiring independent human approval."
+                f"Refused to waive approval or CI checks on production-protected base '{base_ref}' of "
+                f"{repo}; independent human approval and all CI checks remain required."
             ),
         )
     return policy
@@ -425,8 +425,9 @@ def evaluate_pr_gate(
     )
     pr_author = (pr_data.get("author") or {}).get("login", "")
 
-    # 0. Exact-head binding: refuse to evaluate a head other than the one asked about.
-    if expected_head_sha and head_sha and expected_head_sha != head_sha:
+    # 0. Exact-head binding requires a resolvable full SHA even without a caller pin.
+    invalid_live_head = not SHA40_RE.fullmatch(head_sha)
+    if invalid_live_head or (expected_head_sha and expected_head_sha != head_sha):
         return PRGateEvaluation(
             pr_number=pr_number,
             repo=repo,
@@ -442,12 +443,18 @@ def evaluate_pr_gate(
             review_reused=False,
             review_invalidated=True,
             invalidation_reason=(
-                f"Expected head {expected_head_sha[:8]} but PR head is {head_sha[:8]}"
+                "Live PR head is not a full 40-character hexadecimal commit SHA."
+                if invalid_live_head
+                else f"Expected head {expected_head_sha[:8]} but PR head is {head_sha[:8]}"
             ),
             gate_verdict="BLOCKED",
             verdict_reason=(
-                f"Head mismatch: caller pinned {expected_head_sha[:8]}, live PR head is "
-                f"{head_sha[:8]}. All prior QA/review evidence is invalidated by the new push."
+                "Live PR head is not a full 40-character hexadecimal commit SHA; review cannot be bound."
+                if invalid_live_head
+                else (
+                    f"Head mismatch: caller pinned {expected_head_sha[:8]}, live PR head is "
+                    f"{head_sha[:8]}. All prior QA/review evidence is invalidated by the new push."
+                )
             ),
             checked_at_utc=now_utc,
         )
