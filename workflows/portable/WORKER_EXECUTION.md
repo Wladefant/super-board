@@ -1,9 +1,9 @@
 # Real worker execution and continuous stage progression
 
-Two modules: `worker_backend.py` runs one native host callback (the default) or
-one explicitly selected agent CLI and returns head-bound structured evidence;
-`continuation_driver.py` drives the existing adapter's `run_step` repeatedly
-over an explicit list of authorized requests.
+Two modules: `worker_backend.py` durably prepares and finalizes native background
+tasks (the default), or runs one explicitly selected agent CLI;
+`continuation_driver.py` drives the existing adapter over explicit authorized
+requests and stops cleanly while native work is in flight.
 Neither replaces the coordinator or the adapter, and neither merges or deploys.
 
 ---
@@ -32,71 +32,68 @@ the right reasons.
 ```python
 from worker_backend import WorkerBackend, WorkerRequest
 
-def dispatch_native(
-    request: WorkerRequest,
-    prompt: str,
-    result_schema: dict,
-) -> dict:
-    # `agent` is supplied by the Veyyon host, not imported by the portable core.
-    return agent(prompt, agent=request.agent_role or "codex-worker", schema=result_schema)
-
-backend = WorkerBackend(
-    state_dir=state_dir,
-    native_dispatcher=dispatch_native,
-)
-outcome = backend.execute(WorkerRequest(
+backend = WorkerBackend(state_dir=state_dir)
+request = WorkerRequest(
     request_id="req-1234",
     stage="qa",                    # build | qa | review
     repo_root="/path/to/repo",
     head_sha="<40 hex>",
     model="openai-codex/gpt-5.6-sol:high",
-    agent_role="codex-worker",
+    agent_role="qa-verifier",
     prompt="...",
     criteria=["..."],
     task_type="bug",
-))
+)
+ticket = backend.prepare_native(request)
+# The host launches ticket.prompt with ticket.result_schema as a BACKGROUND task.
+ticket = backend.record_native_dispatch(ticket.run_id, "agent://actual-handle")
+outcome = backend.complete_native(
+    ticket.run_id,
+    "agent://actual-handle",
+    structured_result,
+)
 ```
 
-The request is duck-typed. A dataclass, a plain object, or a mapping all work,
-so the adapter builds its own packet and imports nothing from this module. The
-fields read are `request_id`, `stage`, `head_sha`, `model`, `agent_role`,
-`repo_root`, `issue_url`, `pr_url`, `prompt`, `criteria`, `task_type`, `backend`.
-
-`native_dispatcher` is the exact host API:
+The exact native API is:
 
 ```python
-Callable[[WorkerRequest, str, Mapping[str, Any]], Mapping[str, Any]]
+prepare_native(request) -> NativeDispatchTicket
+record_native_dispatch(run_id: str, task_handle: str) -> NativeDispatchTicket
+complete_native(
+    run_id: str,
+    task_handle: str,
+    structured_result: Mapping[str, Any],
+) -> WorkerOutcome
+get_native_dispatch(run_id: str) -> NativeDispatchTicket
+get_native_outcome(run_id: str) -> Optional[WorkerOutcome]
 ```
 
-It is synchronous. The arguments are the normalized request, the compact
-stage-specific prompt from `build_stage_prompt`, and `agent_result_schema()`.
-It returns the structured agent result itself (not a `WorkerOutcome` and not a
-CLI envelope). The portable core invokes no agent command in this path. A
-missing dispatcher blocks; it never falls back to Claude or another CLI.
+Preparation validates the request, repository, and exact checked-out head before
+persisting a ticket. It does not launch work and is not successful execution.
+The host uses its normal non-blocking task tool between `prepare` and `record`;
+the portable core never invokes an agent CLI. `record` rechecks the binding and
+durably records the actual `agent://` handle. `complete` requires that same
+handle, rereads HEAD, and uses the one shared result validator. Identical
+completion retries return the persisted outcome; changed-result or changed-
+handle replays are rejected.
 
-The host helper must return these required fields. `checks` must describe
-commands the native agent actually executed; the host must not synthesize them.
+Runnable host command sequence:
 
-```python
-{
-    "stage": request.stage,
-    "request_id": request.request_id,
-    "head_sha": "<git rev-parse HEAD observed by the agent>",
-    "verdict": "pass",             # pass | fail | blocked
-    "summary": "what was observed",
-    "checks": [{
-        "name": "focused check",
-        "command": ["python", "path/to/focused_test.py"],
-        "exit_code": 0,
-        "observed": "observable result",
-    }],
-    "artifacts": [],               # [{"path": "relative/path", "role": "created"}]
-}
+```bash
+python worker_backend.py --prepare-native --request-id req-1234 --stage qa \
+  --repo-root /path/to/repo --head-sha <40-hex> --agent-role qa-verifier --json
+# Launch the returned prompt/schema with the native BACKGROUND task tool.
+python worker_backend.py --record-native --run-id <run-id> \
+  --task-handle agent://<actual-handle> --json
+# After automatic task delivery, save its actual structured result as result.json.
+python worker_backend.py --complete-native --run-id <run-id> \
+  --task-handle agent://<actual-handle> --result-file result.json --json
 ```
 
-Bug QA additionally requires `reproduction` with `scenario`, non-empty
-`command`, integer `exit_code`, non-empty `observed`, and
-`still_reproduces: false`.
+The result must contain `stage`, `request_id`, observed full `head_sha`,
+`verdict`, `summary`, actual non-empty executed `checks`, and `artifacts`. Bug QA
+also requires the re-executed `reproduction` record. The host must never
+synthesize checks or timestamps.
 
 `WorkerOutcome` field names are a published contract:
 
@@ -104,20 +101,19 @@ Bug QA additionally requires `reproduction` with `scenario`, non-empty
 | --- | --- |
 | `ok` | the only success signal; false whenever anything below refuses |
 | `stage` | stage that was dispatched |
-| `exit_code` | `0` after a native callback returns, the explicit CLI's exit status, or `None` if execution never ran |
-| `command` | exact explicit CLI argv, or `[]` for native callback execution |
+| `exit_code` | `0` after validated native completion, the explicit CLI's exit status, or `None` before/after refused execution |
+| `command` | exact explicit CLI argv, or `[]` for native background execution |
 | `head_sha` | the **observed** git HEAD after the run, never the claimed one |
 | `evidence` | structured record, described below |
 | `artifacts` | repo-relative paths that were verified to exist |
 | `blocked_reason` | why it refused, in operator-actionable terms |
 | `backend_name` | which configured backend ran |
 
-`evidence` carries the executor name, stage, request id, observed heads,
-routing model, structured result, verdict, artifact digests, executed checks,
-and `auto_merge_allowed` / `auto_deploy_allowed`, both always false. Native
-evidence additionally carries `dispatch_kind: "native_callback"` and an empty
-`command`; the checks inside the structured result remain the worker's actual
-commands and observations and are never fabricated by the callback plumbing.
+`evidence` carries backend-generated runtime timestamps, executor name, bound
+task handle, stage, request id, observed heads, routing model, structured result,
+verdict, artifact digests, executed checks, and merge/deploy denial. Native
+evidence uses `dispatch_kind: "native_background"`; task-supplied metadata
+cannot replace these observations.
 
 ### Fail-closed rules
 
@@ -131,28 +127,27 @@ never a synthetic success:
    requested commit does not resolve in that repository, or the checkout is not
    exactly on that commit. These checks happen before backend resolution, run
    directory creation, or worker dispatch.
-3. Implicit native execution has no injected dispatcher.
-4. An explicitly selected CLI backend is unknown, misconfigured, or absent
-   from `PATH`.
-5. An unmapped harness-qualified routing model on a strict explicit CLI backend
-   (see §3).
-6. A selected CLI exits non-zero or times out, or a native dispatcher raises.
-7. No structured result, or one that is not a mapping/JSON object.
-8. `is_error: true` in an explicit CLI envelope, even alongside exit `0`.
-9. Any required result field missing.
-10. A verdict outside `pass | fail | blocked`. An honest `fail` or `blocked` is
-    reported as-is and does not advance anything.
-11. A result whose `stage` or `request_id` does not match what was dispatched.
-12. `verdict: "pass"` with an empty `checks` list, or a check with no command,
+3. A native record is missing/corrupt, is not in the required transition state,
+   has a changed task handle, or is replayed with a changed result.
+4. Repository/head binding changes before dispatch registration.
+5. An explicitly selected CLI backend is unknown, misconfigured, absent from
+   `PATH`, exits non-zero, or times out.
+6. No structured result, or one that is not a mapping/JSON object.
+7. `is_error: true` in an explicit CLI envelope, even alongside exit `0`.
+8. Any required result field missing.
+9. A verdict outside `pass | fail | blocked`. An honest `fail` or `blocked` is
+   reported as-is and does not advance anything.
+10. A result whose `stage` or `request_id` does not match what was dispatched.
+11. `verdict: "pass"` with an empty `checks` list, or a check with no command,
     no integer exit code, or nothing observed. **Exit status alone is never
     evidence.**
-13. A claimed `head_sha` that differs from the observed HEAD. The observed
+12. A claimed `head_sha` that differs from the observed HEAD. The observed
     commit always wins, and is what the outcome reports.
-14. For `qa` and `review`: HEAD moved during the run, or the tested commit is not
+13. For `qa` and `review`: HEAD moved during the run, or the tested commit is not
     the dispatched one. A verification stage must not mutate the tree it judges.
-15. For `build`: a `pass` that produced neither a new commit nor any artifact.
-16. A declared artifact that does not exist on disk.
-17. For a bug at `qa`: no `reproduction` record, or one lacking a real command,
+14. For `build`: a `pass` that produced neither a new commit nor any artifact.
+15. A declared artifact that does not exist on disk.
+16. For a bug at `qa`: no `reproduction` record, or one lacking a real command,
     a real integer exit code, a real observation, a scenario string, or with
     `still_reproduces` not literally `false`.
 
@@ -200,7 +195,7 @@ Each CLI backend declares a `model_map`. Resolution is:
 
 | executor | selection | invocation |
 | --- | --- | --- |
-| `native` | implicit default | injected synchronous callback; no subprocess |
+| `native` | implicit default | durable prepare → host background task → record handle → complete |
 | `claude` | explicit | `claude -p ... --json-schema ...` |
 | `claude-verify` | explicit | same CLI with verification tool grants |
 | `codex` | explicit | `codex exec ... --output-schema ...` |
@@ -288,7 +283,7 @@ re-validated here.
 ## 6. `continuation_driver.py`
 
 ```python
-backend = WorkerBackend(native_dispatcher=dispatch_native, state_dir=state_dir)
+backend = WorkerBackend(state_dir=state_dir)
 adapter = SuperboardExecutionAdapter(
     state_dir=state_dir,
     fake_executor=False,

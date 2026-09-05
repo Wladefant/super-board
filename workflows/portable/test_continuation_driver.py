@@ -860,5 +860,37 @@ class TestInstalledDriverCliRepoRoot(_Fixture):
 
 
 
+class TestNativeBackgroundPending(_Fixture):
+
+    def test_prepared_native_work_stops_cleanly_without_advancing_or_parking(self):
+        self._add("req-native")
+        adapter = self._adapter(script={})
+
+        def pending_step(request_id=None, target_sha=None, real_worker=False):
+            worker = type("PendingWorker", (), {
+                "ok": False,
+                "backend_name": "native",
+                "artifacts": [],
+                "native_run_id": "native_" + "a" * 24,
+            })()
+            return FakeResult(
+                "prepared",
+                "native task prepared; no lifecycle state advanced",
+                worker=worker,
+            )
+
+        adapter.run_step = pending_step
+        outcome = self._driver(adapter, ["req-native"]).run()
+        self.assertEqual(outcome.steps_executed, 1)
+        self.assertEqual(outcome.parked, [])
+        self.assertEqual(outcome.inflight[0]["state"], "prepared")
+        self.assertEqual(outcome.stop_reason, "native background work is in flight")
+        self.assertEqual(self.ledger.get_request("req-native")["state"], "implementation")
+        with open(os.path.join(self.tmp, JOURNAL_FILENAME), encoding="utf-8") as fh:
+            journal = json.load(fh)
+        self.assertEqual(journal["inflight"]["req-native"]["state"], "prepared")
+        self.assertNotIn("req-native", journal["completed_stages"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1003,6 +1003,45 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
         self.assertIn("Desktop after-fix visual asset", result.gate_result["repro_refused"])
         self.assertEqual(self.ledger.get_request(req_id)["state"], "implementation")
 
+    def test_15_native_preparation_is_pending_and_never_advances_state(self):
+        req_id = "req-native-background"
+        self._add_pipeline_request(req_id)
+
+        class Ticket:
+            state = "prepared"
+            run_id = "native_" + "a" * 24
+            head_sha = self.HEAD_SHA
+            task_handle = None
+            blocked_reason = None
+
+            def to_dict(self):
+                return {
+                    "state": self.state,
+                    "run_id": self.run_id,
+                    "head_sha": self.head_sha,
+                    "task_handle": self.task_handle,
+                }
+
+        class NativeBackend:
+            default_backend = "native"
+
+            def prepare_native(self, request):
+                return Ticket()
+
+        result = SuperboardExecutionAdapter(
+            state_dir=self.state_dir,
+            worker_backend=NativeBackend(),
+            notify_telegram=False,
+        ).run_step(request_id=req_id)
+
+        self.assertEqual(result.status, "prepared")
+        self.assertTrue(result.worker_result.is_pending)
+        self.assertFalse(result.worker_result.is_verifiable_evidence)
+        self.assertEqual(result.worker_result.native_run_id, Ticket.run_id)
+        self.assertFalse(result.gate_result["verified"])
+        self.assertFalse(result.boundaries["execution_dispatched"])
+        self.assertEqual(self.ledger.get_request(req_id)["state"], "implementation")
+
 def run_tests():
     print("=" * 70)
     print("RUNNING SUPERBOARD EXECUTION ADAPTER SMOKE & INTEGRATION TEST SUITE")

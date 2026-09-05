@@ -8,9 +8,9 @@ module exists to prevent, so the tests are written against observable outcomes
 (ok, blocked_reason, head_sha, artifacts) and never against source text.
 
 External CLI tests configure a *custom backend* whose argv is a short Python
-script. That is the documented explicit CLI opt-in path. Native tests inject a
-synchronous host callback directly and assert that no non-git subprocess is
-launched.
+script. That is the documented explicit CLI opt-in path. Native tests exercise
+the durable prepare/record/complete handoff and assert no agent subprocess is
+launched by the portable core.
 """
 
 from __future__ import annotations
@@ -212,13 +212,13 @@ class TestRequestValidation(_Fixture):
 
 class TestNativeDispatch(_Fixture):
 
-    def _result(self, request, **over):
+    def _result(self, ticket, **over):
         result = {
-            "stage": request.stage,
-            "request_id": request.request_id,
-            "head_sha": _git(request.repo_root, "rev-parse", "HEAD").stdout.strip(),
+            "stage": ticket.request["stage"],
+            "request_id": ticket.request["request_id"],
+            "head_sha": _git(ticket.request["repo_root"], "rev-parse", "HEAD").stdout.strip(),
             "verdict": "pass",
-            "summary": "native callback verified",
+            "summary": "native background task verified",
             "checks": [{
                 "name": "read seed",
                 "command": ["git", "show", "HEAD:seed.txt"],
@@ -230,13 +230,15 @@ class TestNativeDispatch(_Fixture):
         result.update(over)
         return result
 
-    def test_native_callback_is_default_and_launches_no_agent_subprocess(self):
-        calls = []
+    def _dispatched(self, stage="qa"):
+        backend = WorkerBackend(state_dir=self.state)
+        ticket = backend.prepare_native(self._request(stage=stage))
+        self.assertTrue(ticket.ready, ticket.blocked_reason)
+        ticket = backend.record_native_dispatch(ticket.run_id, "agent://native-test")
+        self.assertEqual(ticket.state, "background_dispatched")
+        return backend, ticket
 
-        def dispatch(request, prompt, result_schema):
-            calls.append((request, prompt, result_schema))
-            return self._result(request)
-
+    def test_prepare_is_default_durable_and_launches_no_agent_subprocess(self):
         real_run = worker_backend.subprocess.run
 
         def git_only(argv, *args, **kwargs):
@@ -247,92 +249,138 @@ class TestNativeDispatch(_Fixture):
         backend = WorkerBackend(
             config={"backends": {"ghost-cli": {"argv": ["ghost-agent"]}}},
             state_dir=self.state,
-            native_dispatcher=dispatch,
         )
         with mock.patch.object(worker_backend.subprocess, "run", side_effect=git_only):
-            out = backend.execute(self._request())
+            ticket = backend.prepare_native(self._request())
 
-        self.assertTrue(out.ok, out.blocked_reason)
-        self.assertEqual(out.backend_name, "native")
-        self.assertEqual(out.command, [])
-        self.assertEqual(len(calls), 1)
-        native_request, prompt, schema = calls[0]
-        self.assertIsInstance(native_request, WorkerRequest)
-        self.assertIn("req-test", prompt)
-        self.assertIn("verdict", schema["properties"])
+        self.assertTrue(ticket.ready, ticket.blocked_reason)
+        self.assertEqual(ticket.state, "prepared")
+        self.assertIsNone(ticket.task_handle)
+        self.assertIn("req-test", ticket.prompt)
+        self.assertIn("verdict", ticket.result_schema["properties"])
+        record_path = os.path.join(
+            self.state, "worker_runs", ticket.run_id, "dispatch.json",
+        )
+        self.assertTrue(os.path.exists(record_path))
 
-    def test_missing_native_dispatcher_blocks_without_cli_fallback(self):
-        backend = WorkerBackend(state_dir=self.state)
-        out = backend.execute(self._request())
+    def test_execute_native_blocks_and_never_claims_preparation_as_execution(self):
+        out = WorkerBackend(state_dir=self.state).execute(self._request())
         self.assertFalse(out.ok)
         self.assertEqual(out.backend_name, "native")
-        self.assertEqual(out.command, [])
-        self.assertIn("host-injected dispatcher", out.blocked_reason)
-        self.assertIn("no agent CLI is spawned implicitly", out.blocked_reason)
+        self.assertIn("background-only", out.blocked_reason)
 
-    def test_invalid_repo_and_head_block_before_native_callback(self):
-        calls = []
-
-        def dispatch(request, prompt, result_schema):
-            calls.append(request)
-            return self._result(request)
-
-        backend = WorkerBackend(state_dir=self.state, native_dispatcher=dispatch)
+    def test_invalid_repo_and_head_block_before_prepare(self):
+        backend = WorkerBackend(state_dir=self.state)
         invalid_repo = os.path.join(self.tmp, "not-a-repo")
         os.makedirs(invalid_repo)
         for request, needle in (
             (self._request(repo_root=invalid_repo), "not a git repository"),
             (self._request(head_sha="f" * 40), "does not resolve to a commit"),
         ):
-            out = backend.execute(request)
-            self.assertFalse(out.ok)
-            self.assertIn(needle, out.blocked_reason)
-        self.assertEqual(calls, [])
+            ticket = backend.prepare_native(request)
+            self.assertFalse(ticket.ready)
+            self.assertIn(needle, ticket.blocked_reason)
+            self.assertEqual(ticket.run_id, "")
 
-    def test_native_result_uses_existing_structured_validation(self):
-        backend = WorkerBackend(
-            state_dir=self.state,
-            native_dispatcher=lambda request, prompt, schema: self._result(request, checks=[]),
-        )
-        out = backend.execute(self._request())
+    def test_same_pending_request_is_not_redispatched(self):
+        backend = WorkerBackend(state_dir=self.state)
+        first = backend.prepare_native(self._request())
+        second = backend.prepare_native(self._request())
+        self.assertEqual(second.run_id, first.run_id)
+        self.assertEqual(second.state, "prepared")
+        backend.record_native_dispatch(first.run_id, "agent://one")
+        recovered = backend.prepare_native(self._request())
+        self.assertEqual(recovered.state, "background_dispatched")
+        self.assertEqual(recovered.task_handle, "agent://one")
+
+    def test_dispatch_registration_rechecks_head_and_binds_handle(self):
+        backend = WorkerBackend(state_dir=self.state)
+        ticket = backend.prepare_native(self._request())
+        with open(os.path.join(self.repo, "moved.txt"), "w", encoding="utf-8") as fh:
+            fh.write("moved")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "move before registration")
+        with self.assertRaisesRegex(Exception, "cannot be registered"):
+            backend.record_native_dispatch(ticket.run_id, "agent://late")
+
+    def test_bound_handle_cannot_be_replaced(self):
+        backend, ticket = self._dispatched()
+        same = backend.record_native_dispatch(ticket.run_id, "agent://native-test")
+        self.assertEqual(same.task_handle, "agent://native-test")
+        with self.assertRaisesRegex(Exception, "refusing handle replacement"):
+            backend.record_native_dispatch(ticket.run_id, "agent://other")
+
+    def test_native_completion_uses_shared_validation_and_is_idempotent(self):
+        backend, ticket = self._dispatched()
+        result = self._result(ticket)
+        first = backend.complete_native(ticket.run_id, ticket.task_handle, result)
+        second = backend.complete_native(ticket.run_id, ticket.task_handle, result)
+        self.assertTrue(first.ok, first.blocked_reason)
+        self.assertEqual(second.to_dict(), first.to_dict())
+        self.assertEqual(first.backend_name, "native")
+        self.assertEqual(first.command, [])
+        changed = dict(result, summary="changed replay")
+        replay = backend.complete_native(ticket.run_id, ticket.task_handle, changed)
+        self.assertFalse(replay.ok)
+        self.assertIn("changed handle/result replay refused", replay.blocked_reason)
+
+    def test_wrong_completion_handle_blocks(self):
+        backend, ticket = self._dispatched()
+        out = backend.complete_native(ticket.run_id, "agent://other", self._result(ticket))
+        self.assertFalse(out.ok)
+        self.assertIn("does not match bound handle", out.blocked_reason)
+
+    def test_invalid_native_result_is_persistently_blocked(self):
+        backend, ticket = self._dispatched()
+        result = self._result(ticket, checks=[])
+        out = backend.complete_native(ticket.run_id, ticket.task_handle, result)
         self.assertFalse(out.ok)
         self.assertIn("no executed checks", out.blocked_reason)
+        repeated = backend.complete_native(ticket.run_id, ticket.task_handle, result)
+        self.assertEqual(repeated.to_dict(), out.to_dict())
 
-    def _stale_verification_result(self, request, prompt, result_schema):
-        with open(os.path.join(request.repo_root, "mutation.txt"), "w", encoding="utf-8") as fh:
-            fh.write(request.stage)
-        _git(request.repo_root, "add", "-A")
-        _git(request.repo_root, "commit", "-q", "-m", f"mutate during {request.stage}")
-        return self._result(request)
+    def _move_head(self, ticket):
+        repo = ticket.request["repo_root"]
+        with open(os.path.join(repo, "mutation.txt"), "w", encoding="utf-8") as fh:
+            fh.write(ticket.request["stage"])
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-q", "-m", f"mutate during {ticket.request['stage']}")
 
     def test_stale_qa_result_is_rejected(self):
-        backend = WorkerBackend(
-            state_dir=self.state,
-            native_dispatcher=self._stale_verification_result,
-        )
-        out = backend.execute(self._request(stage="qa"))
+        backend, ticket = self._dispatched("qa")
+        self._move_head(ticket)
+        out = backend.complete_native(ticket.run_id, ticket.task_handle, self._result(ticket))
         self.assertFalse(out.ok)
         self.assertIn("QA evidence is invalid: HEAD moved", out.blocked_reason)
 
     def test_stale_review_result_is_rejected(self):
-        backend = WorkerBackend(
-            state_dir=self.state,
-            native_dispatcher=self._stale_verification_result,
-        )
-        out = backend.execute(self._request(stage="review"))
+        backend, ticket = self._dispatched("review")
+        self._move_head(ticket)
+        out = backend.complete_native(ticket.run_id, ticket.task_handle, self._result(ticket))
         self.assertFalse(out.ok)
         self.assertIn("REVIEW evidence is invalid: HEAD moved", out.blocked_reason)
+
+    def test_completed_build_is_recoverable_after_head_advances(self):
+        backend, ticket = self._dispatched("build")
+        self._move_head(ticket)
+        result = self._result(
+            ticket,
+            artifacts=[{"path": "mutation.txt", "role": "created"}],
+        )
+        out = backend.complete_native(ticket.run_id, ticket.task_handle, result)
+        self.assertTrue(out.ok, out.blocked_reason)
+        recovered = backend.prepare_native(self._request(stage="build"))
+        self.assertEqual(recovered.run_id, ticket.run_id)
+        self.assertEqual(recovered.state, "finalized")
 
     def test_external_cli_backend_requires_explicit_selection(self):
         cfg = self._script_backend(PASS_RESULT, name="explicit-cli")
         cfg.pop("default_backend")
         backend = WorkerBackend(config=cfg, state_dir=self.state)
-
         implicit = backend.execute(self._request())
         explicit = backend.execute(self._request(backend="explicit-cli"))
-
         self.assertFalse(implicit.ok)
-        self.assertIn("host-injected dispatcher", implicit.blocked_reason)
+        self.assertIn("background-only", implicit.blocked_reason)
         self.assertTrue(explicit.ok, explicit.blocked_reason)
         self.assertEqual(explicit.backend_name, "explicit-cli")
         self.assertTrue(explicit.command)

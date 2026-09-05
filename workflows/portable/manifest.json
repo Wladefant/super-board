@@ -114,7 +114,7 @@
       ]
     },
     "superboard_adapter.py": {
-      "role": "Superboard execution adapter bridging the portable coordinator to an injected native host worker backend by default, with explicit fixture/probe paths and unchanged lifecycle gates",
+      "role": "Superboard execution adapter bridging the portable coordinator to durable native prepared/background_dispatched/finalized states by default, with explicit fixture/probe paths and unchanged lifecycle gates",
       "owner": "PackagePortableCoordinator",
       "cli_command": "python superboard_adapter.py [--config <file>] [--state-dir <dir>] [--fake-executor] [--real-worker] [--notify-telegram] [--json] [--summary]",
       "inputs": [
@@ -152,20 +152,20 @@
       ]
     },
     "worker_backend.py": {
-      "role": "Native host-dispatched worker execution by default: validates the exact repository/head before calling an injected synchronous dispatcher with WorkerRequest, compact stage prompt, and result schema; then applies one shared structured-result, exact-head, artifact, executed-check, and bug-reproduction validation path. Explicitly configured agent CLI backends remain opt-in. Missing native dispatch blocks with no CLI fallback.",
+      "role": "Durable native background worker execution by default: validates the exact repository/head before persisting a compact prompt/schema ticket, binds the actual agent task handle, and finalizes the delivered result through one shared exact-head, artifact, executed-check, and bug-reproduction validation path. Explicit agent CLI backends remain opt-in; preparation never advances lifecycle state.",
       "owner": "ImplementContinuousExecution",
-      "cli_command": "python worker_backend.py [--list-backends | --print-schema | --request-id <id> --stage build|qa|review --repo-root <dir> [--head-sha <sha>] [--model <m>] [--backend <explicit-cli-name>] [--config <json>] [--state-dir <dir>] [--task-type <t>] [--prompt <text>] [--criterion <text>]... [--timeout <s>] [--dry-run] [--json]]",
+      "cli_command": "python worker_backend.py [--prepare-native --request-id <id> --stage build|qa|review --repo-root <dir> --head-sha <sha> | --record-native --run-id <id> --task-handle agent://<handle> | --complete-native --run-id <id> --task-handle agent://<handle> --result-file <json> | --backend <explicit-cli-name> --request-id <id> --stage build|qa|review --repo-root <dir> --head-sha <sha> | --list-backends | --print-schema] [--json]",
       "inputs": [
-        "host-injected native_dispatcher callable (implicit native execution)",
+        "durable native prepare/record/complete handoff (implicit native execution)",
         "worker_backends.json (only for explicit CLI selection)",
         "structured worker request (WorkerRequest, object, or mapping)"
       ],
       "outputs": [
         "WorkerOutcome (ok, stage, exit_code, command, head_sha, evidence, artifacts, blocked_reason, backend_name)",
-        "worker_runs/<request>__<stage>__<ts>/ (explicit file-schema CLI backends only)"
+        "worker_runs/native_<bound-id>/dispatch.json and explicit CLI schema/result artifacts"
       ],
       "backends": [
-        "native (implicit default; injected callback; no agent subprocess)",
+        "native (implicit default; durable background task handoff; no agent CLI)",
         "claude (explicit opt-in)",
         "claude-verify (explicit opt-in)",
         "codex (explicit opt-in)",
@@ -174,16 +174,16 @@
       ]
     },
     "continuation_driver.py": {
-      "role": "Minimal continuation driver wrapping the existing adapter run_step over an explicit list of authorized request ids. Reloads ledger state every step, measures real progress, parks on blocked/error/decision/no-progress/awaiting-authorization, journals completed stages so a restart never repeats one, holds a fail-fast single-driver lock, and handles SIGINT/SIGTERM. Never merges and never deploys.",
+      "role": "Minimal continuation driver over explicit authorized request ids. It records durable native prepared/background_dispatched states as in-flight without advancing or parking, resumes reconciliation on later invocations, and journals only validated final outcomes as completed. Never merges and never deploys.",
       "owner": "ImplementContinuousExecution",
       "cli_command": "python continuation_driver.py --request-id <id> [--request-id <id>]... --repo-root <dir> [--state-dir <dir>] [--config <json>] [--worker-config <json>] [--model <m>] [--backend <explicit-cli-name>] [--max-steps <n>] [--decision-sync-attempts <n>] [--decision-sync-interval <s>] [--no-real-worker] [--show-parked] [--unpark <id>]... [--json]",
       "inputs": [
         "ledger.json",
         "decisions.json",
-        "continuation_journal.json (completed stages and parked requests)"
+        "continuation_journal.json (completed stages, in-flight native dispatches, and parked requests)"
       ],
       "outputs": [
-        "DriverOutcome (steps, parked, skipped_completed, stop_reason, boundaries)",
+        "DriverOutcome (steps, inflight, parked, skipped_completed, stop_reason, boundaries)",
         "continuation_journal.json",
         "continuation_driver.lock"
       ]

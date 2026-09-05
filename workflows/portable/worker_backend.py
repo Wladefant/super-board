@@ -11,10 +11,10 @@ closes that hole while keeping the portable core independent of any harness.
 
 WHAT IT DOES
 ------------
-Takes a structured request/dispatch packet and, by default, calls a synchronous
-dispatcher injected by the host. The dispatcher receives a ``WorkerRequest``,
-the complete stage prompt, and the result JSON Schema, and returns the same
-structured result used by configured CLI backends. CLI execution remains
+Takes a structured request/dispatch packet and, by default, validates and
+persists a compact native background-task ticket. The host launches that ticket
+with its normal non-blocking task tool, records the actual task handle, and
+delivers the structured result for shared validation. CLI execution remains
 available only through an explicitly selected backend.
 
 It is a backend, not a scheduler. It runs one stage for one request and returns.
@@ -27,28 +27,25 @@ Every one of the following produces ok=False with a populated blocked_reason,
 and never a synthetic success:
 
   1.  Malformed request (no stage, no request_id, no usable repo_root).
-  2.  Native execution selected without a host dispatcher.
-  3.  Unknown explicit CLI backend, or a backend with no configured argv.
-  4.  Explicit CLI backend executable absent from PATH.
-  5.  Non-zero exit status from an explicitly selected agent CLI.
-  6.  No structured result, or a result that is not a mapping/JSON object.
-  7.  Structured result missing any required field.
-  8.  A verdict outside the allowed vocabulary.
-  9.  verdict == "pass" with no executed check carrying a command and an
+  2.  Native record/handle state mismatch or changed-result replay.
+  3.  Unknown explicit CLI backend, missing executable, or non-zero CLI exit.
+  4.  No structured result, or a result that is not a mapping/JSON object.
+  5.  Structured result missing any required field or using an invalid verdict.
+  6.  verdict == "pass" with no executed check carrying a command and an
       exit code. Exit 0 from the executor alone is NEVER evidence.
- 10.  A declared artifact that does not exist on disk.
- 11.  Observed git HEAD disagreeing with the requested head, or with the head
+  7.  A declared artifact that does not exist on disk.
+  8.  Observed git HEAD disagreeing with the requested head, or with the head
       the worker claims. The reported head_sha is always the *observed* one.
- 12.  A build stage that produced neither a commit nor an artifact.
- 13.  A bug-QA reproduction claim that is a bare boolean or a keyword rather
+  9.  A build stage that produced neither a commit nor an artifact.
+ 10.  A bug-QA reproduction claim that is a bare boolean or a keyword rather
       than a re-executed scenario with a command, exit code and observation.
 
 BACKENDS
 --------
-Implicit execution uses the ``native`` host dispatcher and invokes no agent
-subprocess. ``claude``, ``codex`` and ``veyyon`` remain built-in CLI
-configurations, but each must be explicitly selected through ``default_backend``,
-``stage_backends`` or ``WorkerRequest.backend``.
+Implicit execution uses a durable ``native`` prepare/record/complete handoff and
+invokes no agent subprocess. ``claude``, ``codex`` and ``veyyon`` remain built-in
+CLI configurations, but each must be explicitly selected through
+``default_backend``, ``stage_backends`` or ``WorkerRequest.backend``.
 
 Any other CLI harness is reachable without touching this file by declaring a
 custom backend in user config. See BACKEND CONFIGURATION below.
@@ -113,6 +110,8 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
+from ledger import FileLock
+
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 VALID_STAGES = ("build", "qa", "review")
@@ -139,10 +138,8 @@ NATIVE_BACKEND_NAME = "native"
 
 def agent_result_schema() -> Dict[str, Any]:
     """
-    JSON Schema handed to the agent CLI so its final answer is machine-readable.
-
-    This is handed to the injected native dispatcher and to explicitly selected
-    CLI backends. Every returned result is validated again by this module.
+    JSON Schema handed to the native background host task or explicitly selected
+    agent CLI. Every delivered result is validated again by this module.
     """
     check = {
         "type": "object",
@@ -249,6 +246,30 @@ class WorkerOutcome:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+    def to_json(self, indent: int = 2) -> str:
+        return json.dumps(self.to_dict(), indent=indent, default=str)
+
+@dataclass
+class NativeDispatchTicket:
+    """Durable handoff from deterministic preparation to the native host."""
+    run_id: str
+    state: str
+    request: Dict[str, Any]
+    prompt: str
+    result_schema: Dict[str, Any]
+    head_sha: Optional[str]
+    task_handle: Optional[str] = None
+    blocked_reason: Optional[str] = None
+
+    @property
+    def ready(self) -> bool:
+        return self.blocked_reason is None and self.state in ("prepared", "background_dispatched")
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = asdict(self)
+        data["ready"] = self.ready
+        return data
 
     def to_json(self, indent: int = 2) -> str:
         return json.dumps(self.to_dict(), indent=indent, default=str)
@@ -793,12 +814,14 @@ class WorkerBackendError(Exception):
 
 class WorkerBackend:
     """
-    Executes one native host callback or one explicitly selected agent CLI and
-    returns structured, head-bound evidence.
+    Prepares durable native background work or executes one explicitly selected
+    agent CLI, then returns structured, head-bound evidence.
 
-    Usage:
-        backend = WorkerBackend(native_dispatcher=host_dispatch)
-        outcome = backend.execute(request)
+    Native usage:
+        ticket = backend.prepare_native(request)
+        # Host launches a background task from ticket.prompt/result_schema.
+        backend.record_native_dispatch(ticket.run_id, task_handle)
+        outcome = backend.complete_native(ticket.run_id, task_handle, result)
 
     A failed run is a WorkerOutcome with ok=False, not an exception. The only
     exceptions raised are configuration errors surfaced at construction time.
@@ -814,7 +837,6 @@ class WorkerBackend:
         work_dir: Optional[str] = None,
         dry_run: bool = False,
         timeout_seconds: Optional[int] = None,
-        native_dispatcher: Optional[Callable[[WorkerRequest, str, Mapping[str, Any]], Mapping[str, Any]]] = None,
     ):
         self.state_dir = os.path.abspath(state_dir) if state_dir else SCRIPT_DIR
         self.resolved_config = load_backend_config(
@@ -825,15 +847,12 @@ class WorkerBackend:
         self.work_dir = os.path.abspath(work_dir) if work_dir else os.path.join(self.state_dir, "worker_runs")
         self.dry_run = dry_run
         self.timeout_override = timeout_seconds
-        self.native_dispatcher = native_dispatcher
 
     # -- configuration ----------------------------------------------------
 
     def available_backends(self) -> Dict[str, bool]:
-        """Map backend name to whether it can execute right now."""
-        out: Dict[str, bool] = {
-            NATIVE_BACKEND_NAME: self.native_dispatcher is not None,
-        }
+        """Map backend name to whether its preparation/executable is available."""
+        out: Dict[str, bool] = {NATIVE_BACKEND_NAME: True}
         for name, raw in self.resolved_config["backends"].items():
             argv = raw.get("argv") or []
             out[name] = bool(argv) and shutil.which(str(argv[0])) is not None
@@ -919,12 +938,366 @@ class WorkerBackend:
             out.append(rendered)
         return out
 
+    # -- durable native background dispatch -------------------------------
+
+    def _request_context(self, request: Any) -> Tuple[Dict[str, Any], Optional[str]]:
+        """Single request/repository/head validator shared by native and CLI paths."""
+        context = {
+            "stage": str(_field(request, "stage", "") or "").strip(),
+            "request_id": str(_field(request, "request_id", "") or "").strip(),
+            "repo_root": str(_field(request, "repo_root", "") or "").strip(),
+            "requested_head": _field(request, "head_sha") or None,
+            "head_before": None,
+        }
+        if not context["request_id"]:
+            return context, "Malformed worker request: 'request_id' is required."
+        if context["stage"] not in VALID_STAGES:
+            return context, (
+                f"Malformed worker request: stage must be one of {VALID_STAGES}, "
+                f"got {context['stage']!r}."
+            )
+        if not context["repo_root"]:
+            return context, "Malformed worker request: 'repo_root' is required."
+        context["repo_root"] = os.path.abspath(context["repo_root"])
+        if not os.path.isdir(context["repo_root"]):
+            return context, (
+                f"Worker repo_root does not exist or is not a directory: "
+                f"{context['repo_root']}"
+            )
+        requested_head = context["requested_head"]
+        if requested_head is None:
+            return context, (
+                "Malformed worker request: 'head_sha' is required and must identify the exact "
+                "commit checked out at repo_root."
+            )
+        if not SHA_RE.match(str(requested_head)):
+            return context, (
+                "Malformed worker request: head_sha must be a full 40-character SHA, "
+                f"got {requested_head!r}."
+            )
+        head_before = _git_head(context["repo_root"])
+        context["head_before"] = head_before
+        if head_before is None:
+            return context, (
+                f"Worker repo_root is not a git repository with a resolvable HEAD: "
+                f"{context['repo_root']}"
+            )
+        resolved_head = _git_commit(context["repo_root"], str(requested_head))
+        if resolved_head is None:
+            return context, (
+                f"Head binding refused before execution: requested commit {requested_head} "
+                f"does not resolve to a commit in repository {context['repo_root']}."
+            )
+        if resolved_head != str(requested_head) or head_before != str(requested_head):
+            return context, (
+                f"Head binding refused before execution: request targets {requested_head} but "
+                f"the tree at {context['repo_root']} is on {head_before}. Check out the requested "
+                "commit first; a worker never runs against whatever happens to be present."
+            )
+        return context, None
+
+    def _normalized_request(self, request: Any, context: Mapping[str, Any]) -> WorkerRequest:
+        return WorkerRequest(
+            request_id=context["request_id"],
+            stage=context["stage"],
+            repo_root=context["repo_root"],
+            head_sha=str(context["requested_head"]),
+            model=_field(request, "model") or None,
+            agent_role=_field(request, "agent_role") or None,
+            issue_url=_field(request, "issue_url") or None,
+            pr_url=_field(request, "pr_url") or None,
+            prompt=_field(request, "prompt") or None,
+            criteria=list(_field(request, "criteria", []) or []),
+            task_type=_field(request, "task_type") or None,
+            backend=NATIVE_BACKEND_NAME,
+        )
+
+    def _native_run_dir(self, run_id: str) -> str:
+        if not re.match(r"^native_[0-9a-f]{24}$", run_id):
+            raise WorkerBackendError(f"Invalid native run id: {run_id!r}")
+        return os.path.join(self.work_dir, run_id)
+
+    def _read_native_record(self, run_id: str) -> Dict[str, Any]:
+        path = os.path.join(self._native_run_dir(run_id), "dispatch.json")
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError) as e:
+            raise WorkerBackendError(f"Native dispatch record {run_id!r} is unavailable: {e}")
+        if not isinstance(data, dict) or data.get("run_id") != run_id:
+            raise WorkerBackendError(f"Native dispatch record {run_id!r} is malformed.")
+        return data
+
+    def _write_native_record(self, record: Mapping[str, Any]) -> None:
+        run_dir = self._native_run_dir(str(record["run_id"]))
+        os.makedirs(run_dir, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".dispatch_", suffix=".json", dir=run_dir, text=True)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(dict(record), fh, indent=2, default=str)
+                fh.write("\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, os.path.join(run_dir, "dispatch.json"))
+        except Exception:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+
+    def _ticket(self, record: Mapping[str, Any], blocked_reason: Optional[str] = None) -> NativeDispatchTicket:
+        return NativeDispatchTicket(
+            run_id=str(record.get("run_id") or ""),
+            state=str(record.get("state") or "blocked"),
+            request=dict(record.get("request") or {}),
+            prompt=str(record.get("prompt") or ""),
+            result_schema=dict(record.get("result_schema") or {}),
+            head_sha=record.get("head_before"),
+            task_handle=record.get("task_handle"),
+            blocked_reason=blocked_reason or record.get("blocked_reason"),
+        )
+
+    def prepare_native(self, request: Any) -> NativeDispatchTicket:
+        """Preflight and durably prepare work without launching anything."""
+        raw_request_id = str(_field(request, "request_id", "") or "").strip()
+        raw_stage = str(_field(request, "stage", "") or "").strip()
+        raw_repo = str(_field(request, "repo_root", "") or "").strip()
+        raw_head = str(_field(request, "head_sha", "") or "").strip()
+        if raw_request_id and raw_stage in VALID_STAGES and raw_repo and SHA_RE.match(raw_head):
+            identity = "|".join((
+                os.path.abspath(raw_repo), raw_request_id, raw_stage, raw_head,
+            ))
+            existing_run_id = (
+                "native_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+            )
+            existing_path = os.path.join(
+                self._native_run_dir(existing_run_id), "dispatch.json",
+            )
+            if os.path.exists(existing_path):
+                # Recovery never creates or redispatches work. It returns the
+                # already-bound durable state even when a build advanced HEAD.
+                return self._ticket(self._read_native_record(existing_run_id))
+        context, error = self._request_context(request)
+        if error:
+            return NativeDispatchTicket(
+                run_id="", state="blocked", request={}, prompt="", result_schema={},
+                head_sha=context.get("head_before"), blocked_reason=error,
+            )
+        normalized = self._normalized_request(request, context)
+        schema = agent_result_schema()
+        prompt = build_stage_prompt(normalized, schema)
+        identity = "|".join((
+            normalized.repo_root, normalized.request_id, normalized.stage,
+            str(normalized.head_sha),
+        ))
+        run_id = "native_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+        run_dir = self._native_run_dir(run_id)
+        lock_path = os.path.join(self.work_dir, ".native-dispatch.lock")
+        with FileLock(lock_path):
+            record_path = os.path.join(run_dir, "dispatch.json")
+            if os.path.exists(record_path):
+                return self._ticket(self._read_native_record(run_id))
+            record = {
+                "version": 1,
+                "run_id": run_id,
+                "state": "prepared",
+                "request": normalized.to_dict(),
+                "repo_root": normalized.repo_root,
+                "head_before": context["head_before"],
+                "prompt": prompt,
+                "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                "result_schema": schema,
+                "schema_sha256": hashlib.sha256(
+                    json.dumps(schema, sort_keys=True).encode("utf-8")
+                ).hexdigest(),
+                "prepared_at": _now(),
+                "task_handle": None,
+            }
+            self._write_native_record(record)
+            return self._ticket(record)
+
+    def get_native_dispatch(self, run_id: str) -> NativeDispatchTicket:
+        return self._ticket(self._read_native_record(run_id))
+
+    def get_native_outcome(self, run_id: str) -> Optional[WorkerOutcome]:
+        record = self._read_native_record(run_id)
+        if record.get("state") not in ("finalized", "blocked"):
+            return None
+        outcome = record.get("outcome")
+        return WorkerOutcome(**outcome) if isinstance(outcome, dict) else None
+
+    def record_native_dispatch(self, run_id: str, task_handle: str) -> NativeDispatchTicket:
+        """Bind a prepared record to the actual recoverable background task handle."""
+        if not isinstance(task_handle, str) or not task_handle.startswith("agent://"):
+            raise WorkerBackendError("Native task handle must be a non-empty agent:// URI.")
+        run_dir = self._native_run_dir(run_id)
+        with FileLock(os.path.join(run_dir, ".lock")):
+            record = self._read_native_record(run_id)
+            if record["state"] == "background_dispatched":
+                if record.get("task_handle") == task_handle:
+                    return self._ticket(record)
+                raise WorkerBackendError(
+                    f"Native dispatch {run_id} is already bound to "
+                    f"{record.get('task_handle')!r}; refusing handle replacement."
+                )
+            request = WorkerRequest(**record["request"])
+            context, error = self._request_context(request)
+            if error:
+                raise WorkerBackendError(
+                    f"Native dispatch {run_id} cannot be registered: {error}"
+                )
+            if record["state"] != "prepared":
+                raise WorkerBackendError(
+                    f"Native dispatch {run_id} is {record['state']!r}, not prepared."
+                )
+            record["state"] = "background_dispatched"
+            record["task_handle"] = task_handle
+            record["dispatched_at"] = _now()
+            record["dispatch_head"] = context["head_before"]
+            self._write_native_record(record)
+            return self._ticket(record)
+
+    def _native_refusal(
+        self, record: Mapping[str, Any], reason: str, head: Optional[str] = None
+    ) -> WorkerOutcome:
+        request = record.get("request") or {}
+        evidence = {
+            "backend": NATIVE_BACKEND_NAME,
+            "dispatch_kind": "native_background",
+            "stage": request.get("stage") or "unknown",
+            "request_id": request.get("request_id") or "",
+            "head_before": record.get("head_before"),
+            "head_after": head,
+            "head_sha": head,
+            "started_at": record.get("prepared_at"),
+            "dispatched_at": record.get("dispatched_at"),
+            "finished_at": _now(),
+            "blocked_reason": reason,
+            "auto_merge_allowed": False,
+            "auto_deploy_allowed": False,
+        }
+        return WorkerOutcome(
+            ok=False,
+            stage=evidence["stage"],
+            exit_code=None,
+            command=[],
+            head_sha=head,
+            evidence=evidence,
+            artifacts=[],
+            blocked_reason=reason,
+            backend_name=NATIVE_BACKEND_NAME,
+        )
+
+    def complete_native(
+        self, run_id: str, task_handle: str, structured_result: Mapping[str, Any]
+    ) -> WorkerOutcome:
+        """Finalize one bound background task exactly once through shared validation."""
+        run_dir = self._native_run_dir(run_id)
+        with FileLock(os.path.join(run_dir, ".lock")):
+            record = self._read_native_record(run_id)
+            try:
+                result_digest = hashlib.sha256(
+                    json.dumps(structured_result, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest()
+            except (TypeError, ValueError):
+                return self._native_refusal(
+                    record, "Native structured result must be a JSON-serializable mapping.",
+                    _git_head(str(record.get("repo_root") or "")),
+                )
+            if record.get("state") in ("finalized", "blocked"):
+                if (
+                    record.get("task_handle") == task_handle
+                    and record.get("result_sha256") == result_digest
+                    and isinstance(record.get("outcome"), dict)
+                ):
+                    return WorkerOutcome(**record["outcome"])
+                return self._native_refusal(
+                    record,
+                    f"Native dispatch {run_id} is already terminal; changed handle/result replay refused.",
+                    _git_head(str(record.get("repo_root") or "")),
+                )
+            if record.get("state") != "background_dispatched":
+                return self._native_refusal(
+                    record,
+                    f"Native dispatch {run_id} is {record.get('state')!r}; completion requires "
+                    "a bound background_dispatched record.",
+                    _git_head(str(record.get("repo_root") or "")),
+                )
+            if task_handle != record.get("task_handle"):
+                return self._native_refusal(
+                    record,
+                    f"Native completion handle {task_handle!r} does not match bound handle "
+                    f"{record.get('task_handle')!r}.",
+                    _git_head(str(record.get("repo_root") or "")),
+                )
+            if not isinstance(structured_result, Mapping):
+                return self._native_refusal(
+                    record, "Native structured result must be a mapping.",
+                    _git_head(str(record.get("repo_root") or "")),
+                )
+
+            request = WorkerRequest(**record["request"])
+            repo_root = request.repo_root
+            head_after = _git_head(repo_root)
+            base_evidence: Dict[str, Any] = {
+                "backend": NATIVE_BACKEND_NAME,
+                "dispatch_kind": "native_background",
+                "stage": request.stage,
+                "request_id": request.request_id,
+                "head_sha": head_after,
+                "head_before": record.get("head_before"),
+                "head_after": head_after,
+                "structured_result": dict(structured_result),
+                "verdict": None,
+                "artifact_digests": {},
+                "started_at": record.get("prepared_at"),
+                "dispatched_at": record.get("dispatched_at"),
+                "model": request.model,
+                "model_requested": request.model,
+                "command": [],
+                "task_handle": record.get("task_handle"),
+                "config_source": self.resolved_config["source"],
+                "exit_code": 0,
+            }
+
+            def blocked(reason: str, *, exit_code: Optional[int] = None,
+                        command: Optional[List[str]] = None,
+                        extra: Optional[Dict[str, Any]] = None,
+                        head: Optional[str] = None) -> WorkerOutcome:
+                outcome = self._native_refusal(record, reason, head)
+                outcome.exit_code = exit_code
+                if extra:
+                    outcome.evidence.update(extra)
+                return outcome
+
+            outcome = self._finish_structured_result(
+                structured=dict(structured_result),
+                stage=request.stage,
+                request_id=request.request_id,
+                request=request,
+                repo_root=repo_root,
+                head_before=record.get("head_before"),
+                head_after=head_after,
+                requested_head=request.head_sha,
+                exit_code=0,
+                command=[],
+                backend_name=NATIVE_BACKEND_NAME,
+                base_evidence=base_evidence,
+                blocked=blocked,
+            )
+            record["result_sha256"] = result_digest
+            record["structured_result"] = dict(structured_result)
+            record["finished_at"] = _now()
+            record["state"] = "finalized" if outcome.ok else "blocked"
+            record["outcome"] = outcome.to_dict()
+            self._write_native_record(record)
+            return outcome
+
     # -- execution ---------------------------------------------------------
 
     def execute(self, request: Any) -> WorkerOutcome:
         """
-        Run one real worker stage. Never raises for a failed run; always returns
-        a WorkerOutcome whose ok flag is the verdict.
+        Execute one explicitly selected CLI stage. Native background execution
+        uses prepare_native/record_native_dispatch/complete_native instead.
         """
         stage = str(_field(request, "stage", "") or "").strip()
         request_id = str(_field(request, "request_id", "") or "").strip()
@@ -966,51 +1339,15 @@ class WorkerBackend:
                 backend_name=base_evidence.get("backend"),
             )
 
-        # 1. Request validation. A malformed packet blocks; it never crashes the
-        #    caller's step loop.
-        if not request_id:
-            return blocked("Malformed worker request: 'request_id' is required.")
-        if stage not in VALID_STAGES:
+        context, request_error = self._request_context(request)
+        stage = context["stage"]
+        request_id = context["request_id"]
+        repo_root = context["repo_root"]
+        requested_head = context["requested_head"]
+        head_before = context["head_before"]
+        if request_error:
             return blocked(
-                f"Malformed worker request: stage must be one of {VALID_STAGES}, got {stage!r}."
-            )
-        if not repo_root:
-            return blocked("Malformed worker request: 'repo_root' is required.")
-        repo_root = os.path.abspath(repo_root)
-        if not os.path.isdir(repo_root):
-            return blocked(f"Worker repo_root does not exist or is not a directory: {repo_root}")
-        if requested_head is not None and not SHA_RE.match(str(requested_head)):
-            return blocked(
-                f"Malformed worker request: head_sha must be a full 40-character SHA, got {requested_head!r}."
-            )
-        if requested_head is None:
-            return blocked(
-                "Malformed worker request: 'head_sha' is required and must identify the exact "
-                "commit checked out at repo_root."
-            )
-
-        # Validate the repository and exact requested commit before resolving a
-        # worker command, preparing run files, or dispatching the worker. A
-        # directory is not a safe execution target merely because it exists.
-        head_before = _git_head(repo_root)
-        if head_before is None:
-            return blocked(
-                f"Worker repo_root is not a git repository with a resolvable HEAD: {repo_root}",
-                extra={"head_before": None},
-            )
-        resolved_head = _git_commit(repo_root, str(requested_head))
-        if resolved_head is None:
-            return blocked(
-                f"Head binding refused before execution: requested commit {requested_head} "
-                f"does not resolve to a commit in repository {repo_root}.",
-                head=head_before,
-                extra={"head_before": head_before},
-            )
-        if resolved_head != str(requested_head) or head_before != str(requested_head):
-            return blocked(
-                f"Head binding refused before execution: request targets {requested_head} but the "
-                f"tree at {repo_root} is on {head_before}. Check out the requested commit first; "
-                f"a worker never runs against whatever happens to be present.",
+                request_error,
                 head=head_before,
                 extra={"head_before": head_before},
             )
@@ -1022,77 +1359,11 @@ class WorkerBackend:
         )
         if selected_backend == NATIVE_BACKEND_NAME:
             base_evidence["backend"] = NATIVE_BACKEND_NAME
-            base_evidence["model"] = _field(request, "model") or None
-            base_evidence["model_requested"] = _field(request, "model") or None
-            base_evidence["head_before"] = head_before
-            base_evidence["command"] = []
-            base_evidence["dispatch_kind"] = "native_callback"
-
-            if self.native_dispatcher is None:
-                return blocked(
-                    "Native worker execution requires a host-injected dispatcher. "
-                    "Construct WorkerBackend(native_dispatcher=<callable>) or explicitly "
-                    "select a configured CLI backend; no agent CLI is spawned implicitly.",
-                    head=head_before,
-                )
-            if self.dry_run:
-                return blocked(
-                    "Dry run: native dispatcher was validated but not invoked.",
-                    head=head_before,
-                    extra={"dry_run": True},
-                )
-
-            schema = agent_result_schema()
-            prompt = build_stage_prompt(request, schema)
-            native_request = WorkerRequest(
-                request_id=request_id,
-                stage=stage,
-                repo_root=repo_root,
-                head_sha=str(requested_head),
-                model=_field(request, "model") or None,
-                agent_role=_field(request, "agent_role") or None,
-                issue_url=_field(request, "issue_url") or None,
-                pr_url=_field(request, "pr_url") or None,
-                prompt=_field(request, "prompt") or None,
-                criteria=list(_field(request, "criteria", []) or []),
-                task_type=_field(request, "task_type") or None,
-                backend=NATIVE_BACKEND_NAME,
-            )
-            try:
-                native_result = self.native_dispatcher(native_request, prompt, schema)
-            except Exception as e:
-                return blocked(
-                    f"Native worker dispatcher raised for stage '{stage}' of request "
-                    f"'{request_id}': {e}",
-                    head=_git_head(repo_root) or head_before,
-                )
-            if not isinstance(native_result, Mapping):
-                return blocked(
-                    "Native worker dispatcher must return the structured result as a mapping; "
-                    f"got {type(native_result).__name__}.",
-                    exit_code=0,
-                    head=_git_head(repo_root) or head_before,
-                )
-
-            structured = dict(native_result)
-            head_after = _git_head(repo_root)
-            base_evidence["exit_code"] = 0
-            base_evidence["head_after"] = head_after
-            base_evidence["structured_result"] = structured
-            return self._finish_structured_result(
-                structured=structured,
-                stage=stage,
-                request_id=request_id,
-                request=request,
-                repo_root=repo_root,
-                head_before=head_before,
-                head_after=head_after,
-                requested_head=requested_head,
-                exit_code=0,
-                command=[],
-                backend_name=NATIVE_BACKEND_NAME,
-                base_evidence=base_evidence,
-                blocked=blocked,
+            return blocked(
+                "Native execution is background-only. Call prepare_native(request), launch the "
+                "returned prompt/result schema with the host task tool, bind its agent:// handle "
+                "with record_native_dispatch, then call complete_native.",
+                head=head_before,
             )
 
         # 2. Backend resolution.
@@ -1573,9 +1844,19 @@ def build_parser():
         description="Native host-dispatched or explicitly configured CLI worker backend."
     )
     p.add_argument("--list-backends", action="store_true",
-                   help="Show native dispatcher and configured CLI backend availability.")
+                   help="Show native preparation and configured CLI backend availability.")
     p.add_argument("--print-schema", action="store_true",
                    help="Print the JSON Schema required of an agent worker result.")
+    native = p.add_mutually_exclusive_group()
+    native.add_argument("--prepare-native", action="store_true",
+                        help="Preflight and persist a native background task ticket.")
+    native.add_argument("--record-native", action="store_true",
+                        help="Bind a prepared native ticket to an actual agent:// handle.")
+    native.add_argument("--complete-native", action="store_true",
+                        help="Finalize a bound native task result through shared validation.")
+    p.add_argument("--run-id", help="Opaque native run id from --prepare-native.")
+    p.add_argument("--task-handle", help="Actual agent:// handle returned by the host task tool.")
+    p.add_argument("--result-file", help="JSON structured result for --complete-native.")
     p.add_argument("--request-id", help="Request id to execute a stage for.")
     p.add_argument("--stage", choices=list(VALID_STAGES), help="Worker stage to run.")
     p.add_argument("--repo-root", help="Repository the worker runs in.")
@@ -1622,16 +1903,46 @@ def main(argv: Optional[List[str]] = None) -> int:
         for name in sorted(avail):
             state = "available" if avail[name] else "UNAVAILABLE"
             if name == NATIVE_BACKEND_NAME:
-                detail = "host-injected synchronous dispatcher"
+                detail = "durable prepare/record/complete handoff"
             else:
                 spec = backend.resolved_config["backends"][name]
                 detail = (spec.get("argv") or [""])[0]
             print(f"  {name:12s} {state:11s} {detail}")
         return 0
 
+    if args.record_native:
+        if not (args.run_id and args.task_handle):
+            print("--record-native requires --run-id and --task-handle.", file=sys.stderr)
+            return 64
+        try:
+            ticket = backend.record_native_dispatch(args.run_id, args.task_handle)
+        except WorkerBackendError as e:
+            print(str(e), file=sys.stderr)
+            return 1
+        print(ticket.to_json() if args.json else f"{ticket.run_id} {ticket.state} {ticket.task_handle}")
+        return 0
+
+    if args.complete_native:
+        if not (args.run_id and args.task_handle and args.result_file):
+            print(
+                "--complete-native requires --run-id, --task-handle and --result-file.",
+                file=sys.stderr,
+            )
+            return 64
+        try:
+            result = _read_json_file(args.result_file)
+            outcome = backend.complete_native(args.run_id, args.task_handle, result)
+        except (WorkerBackendError, OSError, ValueError) as e:
+            print(str(e), file=sys.stderr)
+            return 1
+        print(outcome.to_json() if args.json else (
+            f"ok={outcome.ok} run_id={args.run_id} head={outcome.head_sha} "
+            f"blocked={outcome.blocked_reason or ''}"
+        ))
+        return 0 if outcome.ok else 1
+
     if not (args.request_id and args.stage and args.repo_root):
-        print("--request-id, --stage and --repo-root are required to execute a stage.",
-              file=sys.stderr)
+        print("--request-id, --stage and --repo-root are required.", file=sys.stderr)
         return 64
 
     req = WorkerRequest(
@@ -1646,6 +1957,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         task_type=args.task_type,
         backend=args.backend,
     )
+    if args.prepare_native:
+        ticket = backend.prepare_native(req)
+        print(ticket.to_json() if args.json else (
+            f"{ticket.run_id or '(none)'} {ticket.state} "
+            f"{ticket.blocked_reason or ''}"
+        ))
+        return 0 if ticket.ready else 1
+
     outcome = backend.execute(req)
 
     if args.json:

@@ -91,6 +91,10 @@ class WorkerExecutionResult:
     # Provenance of the result. A probe proves the dispatch plumbing works; it proves
     # nothing about the request's acceptance criteria, so it may never advance state.
     is_probe: bool = False
+    # Durable native preparation/background dispatch is not completed evidence.
+    is_pending: bool = False
+    pending_state: Optional[str] = None
+    native_run_id: Optional[str] = None
     blocked_reason: Optional[str] = None
     backend_name: Optional[str] = None
     evidence: Dict[str, Any] = field(default_factory=dict)
@@ -116,6 +120,7 @@ class WorkerExecutionResult:
         return (
             not self.is_fixture
             and not self.is_probe
+            and not self.is_pending
             and self.blocked_reason is None
             and self.exit_code == 0
             and checks_are_genuine
@@ -648,6 +653,42 @@ class SuperboardExecutionAdapter:
             "criteria": list(criteria or []),
         }
 
+        selected_backend = (
+            getattr(self.worker_backend, "default_backend", None)
+            if not worker_request.get("backend")
+            else worker_request["backend"]
+        )
+        if selected_backend == "native" and hasattr(self.worker_backend, "prepare_native"):
+            try:
+                ticket = self.worker_backend.prepare_native(worker_request)
+            except Exception as e:
+                return self._blocked_result(
+                    stage, f"Native preparation failed for stage '{stage}': {e}",
+                    head_sha=expected_sha,
+                )
+            if ticket.blocked_reason:
+                return self._blocked_result(
+                    stage, ticket.blocked_reason, head_sha=ticket.head_sha or expected_sha,
+                )
+            if ticket.state in ("finalized", "blocked") and hasattr(
+                self.worker_backend, "get_native_outcome"
+            ):
+                outcome = self.worker_backend.get_native_outcome(ticket.run_id)
+                if outcome is not None:
+                    return self._worker_result_from_outcome(outcome, stage, expected_sha)
+            return WorkerExecutionResult(
+                stage=stage,
+                exit_code=0,
+                output=json.dumps(ticket.to_dict(), default=str),
+                head_sha=ticket.head_sha,
+                command=[],
+                is_pending=True,
+                pending_state=ticket.state,
+                native_run_id=ticket.run_id,
+                backend_name="native",
+                evidence={"native_dispatch": ticket.to_dict()},
+            )
+
         try:
             outcome = self.worker_backend.execute(worker_request)
         except Exception as e:
@@ -656,7 +697,12 @@ class SuperboardExecutionAdapter:
                 f"Worker backend raised while executing stage '{stage}': {e}",
                 head_sha=expected_sha,
             )
+        return self._worker_result_from_outcome(outcome, stage, expected_sha)
 
+    def _worker_result_from_outcome(
+        self, outcome: Any, stage: str, expected_sha: Optional[str]
+    ) -> WorkerExecutionResult:
+        """Translate a validated backend outcome without replacing backend validation."""
         def field_of(name: str, default: Any = None) -> Any:
             if isinstance(outcome, dict):
                 return outcome.get(name, default)
@@ -671,7 +717,6 @@ class SuperboardExecutionAdapter:
         exit_code = field_of("exit_code")
         exit_code = int(exit_code) if isinstance(exit_code, int) else (0 if ok else 1)
         artifacts = list(field_of("artifacts") or [])
-
         if not ok:
             return self._blocked_result(
                 stage,
@@ -679,35 +724,21 @@ class SuperboardExecutionAdapter:
                 head_sha=observed_sha,
                 command=command,
             )
-
-        # Head expectations differ by stage. A build produces work, so its observed head is
-        # necessarily a NEW commit and becomes the authoritative head. QA and review must
-        # verify the exact commit they were dispatched for, so any movement there voids the
-        # evidence.
-        if stage in ("qa", "review"):
-            if expected_sha and observed_sha and expected_sha != observed_sha:
-                return self._blocked_result(
-                    stage,
-                    (
-                        f"Worker backend executed against head {observed_sha} but stage '{stage}' "
-                        f"was dispatched for {expected_sha}; evidence is not head-bound"
-                    ),
-                    head_sha=observed_sha,
-                    command=command,
-                )
-        elif stage == "build":
-            # A build that moved nothing and produced nothing has not proved any work.
-            if expected_sha and observed_sha == expected_sha and not artifacts:
-                return self._blocked_result(
-                    stage,
-                    (
-                        f"Build left head at {expected_sha} and produced no artifacts; "
-                        "no work was performed"
-                    ),
-                    head_sha=observed_sha,
-                    command=command,
-                )
-
+        if stage in ("qa", "review") and expected_sha and observed_sha != expected_sha:
+            return self._blocked_result(
+                stage,
+                f"Worker backend executed against head {observed_sha} but stage '{stage}' "
+                f"was dispatched for {expected_sha}; evidence is not head-bound",
+                head_sha=observed_sha,
+                command=command,
+            )
+        if stage == "build" and expected_sha and observed_sha == expected_sha and not artifacts:
+            return self._blocked_result(
+                stage,
+                f"Build left head at {expected_sha} and produced no artifacts; no work was performed",
+                head_sha=observed_sha,
+                command=command,
+            )
         if not evidence:
             return self._blocked_result(
                 stage,
@@ -715,15 +746,12 @@ class SuperboardExecutionAdapter:
                 head_sha=observed_sha,
                 command=command,
             )
-
         return WorkerExecutionResult(
             stage=stage,
             exit_code=exit_code,
             output=json.dumps({"backend": backend_name, "evidence": evidence, "artifacts": artifacts}, default=str),
             head_sha=observed_sha,
             command=command,
-            is_fixture=False,
-            is_probe=False,
             backend_name=backend_name,
             evidence=evidence,
         )
@@ -800,6 +828,14 @@ class SuperboardExecutionAdapter:
             or ("fixture" if worker_res.is_fixture else "unknown"),
         }
 
+        if worker_res.is_pending:
+            gate_result["pending_state"] = worker_res.pending_state
+            gate_result["native_run_id"] = worker_res.native_run_id
+            return (
+                req_state,
+                f"Native stage '{stage}' is {worker_res.pending_state}; no lifecycle state advanced",
+                gate_result,
+            )
         if worker_res.blocked_reason:
             gate_result["blocked_reason"] = worker_res.blocked_reason
             return req_state, f"Stage '{stage}' blocked: {worker_res.blocked_reason}", gate_result
@@ -1257,13 +1293,35 @@ class SuperboardExecutionAdapter:
         telegram_summary = f"Superboard request '{req.id}' {transition_reason}"
         receipt = self.emit_telegram_event(req, new_state, stage, telegram_summary)
 
-        # 7. Explicit Boundaries with execution_dispatched=True
+        # 7. Preparation alone is not execution; a bound background handle is.
         boundaries = asdict(packet.boundaries)
-        boundaries["execution_dispatched"] = True
+        boundaries["execution_dispatched"] = (
+            not worker_res.is_pending
+            or worker_res.pending_state == "background_dispatched"
+        )
         boundaries["auto_merge_allowed"] = False
         boundaries["auto_deploy_allowed"] = False
         boundaries["self_spawn_loop"] = False
 
+        if worker_res.is_pending:
+            return AdapterExecutionResult(
+                step_id=step_id,
+                request_id=req.id,
+                stage=stage,
+                status=worker_res.pending_state or "prepared",
+                status_reason=transition_reason,
+                next_action=(
+                    f"Launch native background task for run {worker_res.native_run_id}"
+                    if worker_res.pending_state == "prepared"
+                    else f"Reconcile native background task {worker_res.native_run_id}"
+                ),
+                preflight_passed=True,
+                dispatch_packet=dispatch_packet.to_dict(),
+                worker_result=worker_res,
+                gate_result=gate_result,
+                notification_receipt=receipt,
+                boundaries=boundaries,
+            )
         status = "advanced"
         board_update = (gate_result or {}).get("board_update") or {}
         if board_update.get("status") == "blocked":

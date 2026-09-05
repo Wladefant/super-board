@@ -196,6 +196,7 @@ class DriverOutcome:
     stop_reason: str
     steps: List[Dict[str, Any]] = field(default_factory=list)
     parked: List[Dict[str, Any]] = field(default_factory=list)
+    inflight: List[Dict[str, Any]] = field(default_factory=list)
     skipped_completed: List[Dict[str, Any]] = field(default_factory=list)
     resumed_from_journal: bool = False
     boundaries: Dict[str, Any] = field(default_factory=dict)
@@ -235,6 +236,7 @@ class DriverJournal:
             "schema_version": JOURNAL_SCHEMA_VERSION,
             "completed_stages": {},   # request_id -> [ {stage, entry_head, result_head, at} ]
             "stage_attempts": {},     # request_id -> [ {stage, outcome, ...} ]
+            "inflight": {},           # request_id -> durable native dispatch record
             "parked": {},             # request_id -> ParkRecord dict
             "runs": [],               # run summaries, newest last
         }
@@ -253,7 +255,7 @@ class DriverJournal:
             self.data["journal_recovered_from_corruption_at"] = _now()
             return
         if isinstance(loaded, dict):
-            for key in ("completed_stages", "stage_attempts", "parked", "runs"):
+            for key in ("completed_stages", "stage_attempts", "inflight", "parked", "runs"):
                 if key in loaded:
                     self.data[key] = loaded[key]
             self.existed = True
@@ -314,6 +316,22 @@ class DriverJournal:
             "outcome": outcome,
             "at": _now(),
         })
+
+    def record_inflight(
+        self, request_id: str, stage: str, entry_head: Optional[str],
+        run_id: str, state: str,
+    ) -> None:
+        self.data["inflight"][request_id] = {
+            "request_id": request_id,
+            "stage": stage,
+            "entry_head": entry_head,
+            "run_id": run_id,
+            "state": state,
+            "at": _now(),
+        }
+
+    def clear_inflight(self, request_id: str) -> None:
+        self.data["inflight"].pop(request_id, None)
 
     # -- parking ----------------------------------------------------------
 
@@ -732,6 +750,7 @@ class ContinuationDriver:
         steps: List[Dict[str, Any]] = []
         parked: List[Dict[str, Any]] = []
         skipped: List[Dict[str, Any]] = []
+        inflight: List[Dict[str, Any]] = []
         stop_reason = "completed"
         error: Optional[str] = None
 
@@ -891,6 +910,26 @@ class ContinuationDriver:
                         artifacts=[str(a) for a in worker_artifacts],
                     ).to_dict())
 
+                    if status in ("prepared", "background_dispatched"):
+                        pending = {
+                            "request_id": rid,
+                            "stage": stage,
+                            "entry_head": entry_head,
+                            "run_id": str(_attr(worker, "native_run_id", "") or ""),
+                            "state": status,
+                        }
+                        self.journal.record_inflight(
+                            rid, stage, entry_head, pending["run_id"], status,
+                        )
+                        self.journal.record_attempt(
+                            rid, stage, entry_head, (after_req or {}).get("head"),
+                            status, status,
+                        )
+                        self.journal.save()
+                        inflight.append(pending)
+                        active.remove(rid)
+                        continue
+
                     result_head = (after_req or {}).get("head")
                     if status in ("blocked", "error"):
                         attempt_outcome = "blocked" if status == "blocked" else "failed"
@@ -906,6 +945,7 @@ class ContinuationDriver:
                         self.journal.record_completed(
                             rid, stage, entry_head, result_head,
                         )
+                        self.journal.clear_inflight(rid)
                         progressed_this_pass = True
                         self.journal.save()
 
@@ -953,7 +993,10 @@ class ContinuationDriver:
 
             else:
                 if not active:
-                    stop_reason = "every authorized request is parked or terminal"
+                    stop_reason = (
+                        "native background work is in flight"
+                        if inflight else "every authorized request is parked or terminal"
+                    )
                 elif step_index >= self.max_steps:
                     stop_reason = f"step ceiling reached ({self.max_steps})"
 
@@ -971,6 +1014,7 @@ class ContinuationDriver:
                 steps=steps,
                 parked=parked,
                 skipped_completed=skipped,
+                inflight=inflight,
                 resumed_from_journal=resumed,
                 boundaries={
                     "auto_merge_allowed": False,

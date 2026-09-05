@@ -429,7 +429,7 @@ graph TD
     A[1. Eligible Next Request] --> B[2. Connected-Service Preflight Gate]
     B -->|Passed| C[3. Capable Model & Role Dispatch Packet]
     B -->|Blocked| H[Emit Blocker Telegram Event]
-    C --> D[4. Worker Dispatch: Native Host Callback by Default]
+    C --> D[4. Worker Dispatch: Durable Native Background Task by Default]
     D --> E[5. Shared Evidence, QA & Review Validation]
     E --> F[6. Concise Telegram Event]
     E --> G[7. Strict Pause: Awaiting Human Merge Authorization]
@@ -439,11 +439,11 @@ graph TD
 2. **Preflight Gate:** Evaluates staging infrastructure (Dokploy staging compose ID, Supabase staging ref); strictly rejects production references (`zaraprptkegxqpvnsubu`, `vpyL-7TDEUREH6Uo_y1sb`).
 3. **Explicit Capable Model & Role Dispatch Packet:** Uses `ResetAwareModelSelector` to generate a `HarnessDispatchPacket` with catalog-verified context sizes (no fabricated sizes), explicit agent role (`codex-worker`, `thinker`, `codex-reviewer`, `qa-verifier`), and compact evidence packet (< 1.5 KB).
 4. **Worker Dispatch (`worker_backend.py`):**
-   * **Native by default:** The host constructs `WorkerBackend(native_dispatcher=...)` and passes it through the adapter's existing `worker_backend` extension. The synchronous callback receives `(WorkerRequest, compact_stage_prompt, result_schema)` and returns the structured agent result. The portable core invokes no agent CLI.
+   * **Native background by default:** `WorkerBackend.prepare_native(...)` validates and persists a compact prompt/schema ticket. The host launches it with the normal non-blocking task tool, binds the actual `agent://` handle with `record_native_dispatch`, and delivers the result to `complete_native`.
    * **External CLIs are explicit opt-ins:** `claude`, `claude-verify`, `codex`, `veyyon`, and user-declared CLI backends remain configurable through `default_backend`, `stage_backends`, or `WorkerRequest.backend`; none is an implicit fallback.
-   * **One validation path:** Native and CLI results share exact-head, structured evidence, artifact, executed-check, and bug-reproduction validation. A missing native dispatcher blocks closed.
+   * **One validation path:** Native completion and CLI results share exact-head, structured evidence, artifact, executed-check, and bug-reproduction validation. Preparation never advances lifecycle state.
    * **Explicitly Labelled Fixture:** Only with `fake_executor=True`. Fixture and probe output can no longer advance request state.
-   * See `WORKER_EXECUTION.md` for the exact callback API, runnable host injection recipe, and result contract.
+   * See `WORKER_EXECUTION.md` for the exact prepare/record/complete API and runnable host command sequence.
 5. **Evidence, QA & Review Gate Verification:**
    * Enforces exact-SHA commit binding: tested commit must match current head; any head move invalidates review and resets state to `implementation`.
    * Evaluates deterministic CI checks and independent (non-author) review approvals via `github_pr_gate.py`. Self-authored approvals (`COMMENTED` or author-signed) are strictly rejected.
