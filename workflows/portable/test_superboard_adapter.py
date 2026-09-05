@@ -4,7 +4,8 @@ workflows/portable/test_superboard_adapter.py — Smoke & Integration Tests for 
 
 Verifies the integration between the portable workflow core and the Superboard
 execution tooling:
-  1. Full pipeline lifecycle with fake executor producing labeled fixture results.
+  1. Fixture results never advance real request state; only a real backend can.
+  1b. Full lifecycle advancement driven by a backend implementing the published contract.
   2. Bounded gates: preflight gating, reset-aware role routing, exact-SHA QA, review handoff.
   3. Inviolable human authorization gate: halts at 'awaiting authorization'; zero auto-merge.
   4. Real harmless worker task dispatch: exercises actual subprocess execution and exit-code capture.
@@ -35,7 +36,52 @@ from ledger import RequestLedger
 from model_routing import HarnessDispatchPacket, TaskType, RiskLevel
 
 
+class StubWorkerBackend:
+    """
+    Test double implementing the published worker-backend contract.
+
+    Unlike a fixture, this stands in for a real backend at the documented extension point
+    and returns structured, head-bound evidence. `reproduction` is only populated when a
+    test explicitly supplies it, so bug-closure gates are exercised honestly.
+    """
+
+    def __init__(self, head_sha, ok=True, reproduction=None, blocked_reason=None, evidence=None):
+        self.head_sha = head_sha
+        self.ok = ok
+        self.reproduction = reproduction
+        self.blocked_reason = blocked_reason
+        self.extra_evidence = evidence or {}
+        self.calls = []
+
+    def execute(self, request):
+        stage = request["stage"]
+        self.calls.append(dict(request))
+        evidence = {
+            "backend": "stub",
+            "stage": stage,
+            "head_sha": self.head_sha,
+            "structured_result": {"passed": self.ok},
+            "verdict": "pass" if self.ok else "fail",
+        }
+        evidence.update(self.extra_evidence)
+        if self.reproduction is not None:
+            evidence["reproduction"] = self.reproduction
+        return {
+            "ok": self.ok,
+            "stage": stage,
+            "exit_code": 0 if self.ok else 1,
+            "command": ["stub-backend", f"--stage={stage}"],
+            "head_sha": self.head_sha,
+            "evidence": evidence,
+            "artifacts": [],
+            "blocked_reason": self.blocked_reason,
+            "backend_name": "stub",
+        }
+
+
 class TestSuperboardExecutionAdapter(unittest.TestCase):
+
+    HEAD_SHA = "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3"
 
     def setUp(self):
         self.test_dir = tempfile.mkdtemp(prefix="test_sb_adapter_")
@@ -53,10 +99,7 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
-    def test_01_full_pipeline_with_fake_executor_and_labeled_fixture(self):
-        """Test complete workflow with fake executor producing labeled fixture output."""
-        # 1. Add eligible request in 'implementation'
-        req_id = "req-feature-auth-token-01"
+    def _add_pipeline_request(self, req_id):
         self.ledger.add_request(
             req_id=req_id,
             prompt="Implement secure auth token refreshing for staging API",
@@ -70,8 +113,13 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
             state="implementation",
             task_type="local_doc",
             issue_number=75,
-            head="d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3",
+            head=self.HEAD_SHA,
         )
+
+    def test_01_fixture_execution_never_advances_request_state(self):
+        """A labelled fixture proves dispatch plumbing and must never advance real state."""
+        req_id = "req-feature-auth-token-01"
+        self._add_pipeline_request(req_id)
 
         adapter = SuperboardExecutionAdapter(
             state_dir=self.state_dir,
@@ -80,47 +128,106 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
             telegram_dry_run=True,
         )
 
-        # Step 1: Execute Build stage
+        res = adapter.run_step(request_id=req_id)
+        self.assertEqual(res.stage, "build")
+        self.assertTrue(res.worker_result.is_fixture)
+        self.assertIn("[FIXTURE_EXECUTION_RESULT]", res.worker_result.fixture_label)
+        self.assertFalse(res.worker_result.is_verifiable_evidence)
+
+        # The refusal must be explicit, not a silent no-op.
+        self.assertFalse(res.gate_result["verified"])
+        self.assertIn("fixture", res.gate_result["advance_refused"])
+        self.assertIn("did not advance", res.status_reason)
+
+        # Ledger state is untouched, however many fixture steps run.
+        self.assertEqual(self.ledger.get_request(req_id)["state"], "implementation")
+        adapter.run_step(request_id=req_id)
+        self.assertEqual(self.ledger.get_request(req_id)["state"], "implementation")
+
+    def test_01b_real_backend_advances_pipeline_to_awaiting_authorization(self):
+        """A backend returning structured head-bound evidence drives the full lifecycle."""
+        req_id = "req-feature-auth-token-01b"
+        self._add_pipeline_request(req_id)
+
+        backend = StubWorkerBackend(head_sha=self.HEAD_SHA)
+        adapter = SuperboardExecutionAdapter(
+            state_dir=self.state_dir,
+            worker_backend=backend,
+            notify_telegram=True,
+            telegram_dry_run=True,
+        )
+
+        # Build: implementation -> QA
         res1 = adapter.run_step(request_id=req_id)
         self.assertEqual(res1.stage, "build")
         self.assertEqual(res1.status, "advanced")
         self.assertTrue(res1.preflight_passed)
-        self.assertIsNotNone(res1.worker_result)
-        self.assertTrue(res1.worker_result.is_fixture)
-        self.assertIn("[FIXTURE_EXECUTION_RESULT]", res1.worker_result.fixture_label)
+        self.assertFalse(res1.worker_result.is_fixture)
+        self.assertTrue(res1.worker_result.is_verifiable_evidence)
+        self.assertEqual(res1.worker_result.backend_name, "stub")
         self.assertEqual(res1.boundaries["execution_dispatched"], True)
         self.assertEqual(res1.boundaries["auto_merge_allowed"], False)
         self.assertEqual(res1.boundaries["auto_deploy_allowed"], False)
+        self.assertEqual(self.ledger.get_request(req_id)["state"], "QA")
 
-        # Verify ledger transitioned to QA
-        req_after_1 = self.ledger.get_request(req_id)
-        self.assertEqual(req_after_1["state"], "QA")
-
-        # Step 2: Execute QA stage
+        # QA: QA -> review
         res2 = adapter.run_step(request_id=req_id)
         self.assertEqual(res2.stage, "qa")
         self.assertEqual(res2.status, "advanced")
         self.assertTrue(res2.gate_result["verified"])
         self.assertEqual(res2.gate_result["new_state"], "review")
+        self.assertEqual(self.ledger.get_request(req_id)["state"], "review")
 
-        # Verify ledger transitioned to Review
-        req_after_2 = self.ledger.get_request(req_id)
-        self.assertEqual(req_after_2["state"], "review")
-
-        # Step 3: Execute Review stage -> must halt at 'awaiting authorization'
+        # Review: halts at awaiting authorization, never merges.
         res3 = adapter.run_step(request_id=req_id)
         self.assertEqual(res3.stage, "review")
         self.assertEqual(res3.status, "awaiting_authorization")
         self.assertTrue(res3.gate_result["human_authorization_required"])
+        self.assertEqual(self.ledger.get_request(req_id)["state"], "awaiting authorization")
 
-        # Inviolable Invariant Check: State is strictly 'awaiting authorization', NOT merged or done!
-        req_after_3 = self.ledger.get_request(req_id)
-        self.assertEqual(req_after_3["state"], "awaiting authorization")
-
-        # Step 4: Next step must respect human authorization gate
+        # The authorization gate holds on subsequent steps.
         res4 = adapter.run_step(request_id=req_id)
         self.assertEqual(res4.status, "awaiting_authorization")
         self.assertIn("awaiting explicit human operator authorization", res4.status_reason)
+
+        # Every dispatch carried the request identity and stage the backend contract requires.
+        self.assertEqual([c["stage"] for c in backend.calls], ["build", "qa", "review"])
+        self.assertTrue(all(c["request_id"] == req_id for c in backend.calls))
+        self.assertTrue(all(c["head_sha"] == self.HEAD_SHA for c in backend.calls))
+
+    def test_01c_missing_backend_blocks_instead_of_substituting_fixture(self):
+        """With no backend and no explicit fixture flag, dispatch must block."""
+        req_id = "req-feature-auth-token-01c"
+        self._add_pipeline_request(req_id)
+
+        adapter = SuperboardExecutionAdapter(
+            state_dir=self.state_dir,
+            notify_telegram=True,
+            telegram_dry_run=True,
+        )
+
+        res = adapter.run_step(request_id=req_id)
+        self.assertFalse(res.worker_result.is_fixture)
+        self.assertIsNotNone(res.worker_result.blocked_reason)
+        self.assertIn("No worker backend configured", res.worker_result.blocked_reason)
+        self.assertEqual(self.ledger.get_request(req_id)["state"], "implementation")
+
+    def test_01d_backend_head_mismatch_blocks_advancement(self):
+        """Evidence bound to another commit is not evidence for this head."""
+        req_id = "req-feature-auth-token-01d"
+        self._add_pipeline_request(req_id)
+
+        adapter = SuperboardExecutionAdapter(
+            state_dir=self.state_dir,
+            worker_backend=StubWorkerBackend(head_sha="f" * 40),
+            notify_telegram=True,
+            telegram_dry_run=True,
+        )
+
+        res = adapter.run_step(request_id=req_id)
+        self.assertIsNotNone(res.worker_result.blocked_reason)
+        self.assertIn("not head-bound", res.worker_result.blocked_reason)
+        self.assertEqual(self.ledger.get_request(req_id)["state"], "implementation")
 
     def test_02_preflight_blocker_halts_dispatch(self):
         """Test that a failing preflight probe halts worker dispatch and reports blocker."""
@@ -277,8 +384,16 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
         self.assertEqual(persisted_bug["prompt"], original_prompt)
         self.assertEqual(persisted_bug["state"], "implementation")
 
-        # 3. Advance to QA
-        res_build = adapter.run_step(request_id=bug_id)
+        # 3. Advance to QA through a real backend; a fixture is not allowed to advance state.
+        bug_head = self.ledger.get_request(bug_id).get("head") or self.HEAD_SHA
+        self.ledger.update_request(bug_id, head=bug_head, actor="test-setup")
+        build_adapter = SuperboardExecutionAdapter(
+            state_dir=self.state_dir,
+            worker_backend=StubWorkerBackend(head_sha=bug_head),
+            notify_telegram=True,
+            telegram_dry_run=True,
+        )
+        res_build = build_adapter.run_step(request_id=bug_id)
         self.assertEqual(res_build.stage, "build")
         self.assertEqual(res_build.status, "advanced")
         bug_in_qa = self.ledger.get_request(bug_id)
@@ -307,7 +422,11 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
         self.assertEqual(reopened_bug["state"], "implementation")
         self.assertIn("reopened to implementation", reopened_bug["evidence"][-1]["summary"])
 
-        # 5. Strict Bug Closure Gate Verification
+        # 5. Strict Bug Closure Gate Verification.
+        # The fix commit becomes the authoritative head that closure evidence must be bound to.
+        fix_sha = "c1c2c3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0"
+        self.ledger.update_request(bug_id, head=fix_sha, actor="test-setup")
+
         # 5a. Generic suite alone is rejected
         ok, reason = adapter.verify_bug_closure(
             req_id=bug_id,
@@ -341,6 +460,16 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("Reproduction scenario specifically proven absent", evidence_str)
         self.assertIn("no mathematical proof of global absence claimed", evidence_str)
+
+        # 5d. Closure bound to a commit other than the ledger head is rejected
+        ok, reason = adapter.verify_bug_closure(
+            req_id=bug_id,
+            tested_sha="b" * 40,
+            reproduction_verified_absent=True,
+            regression_evidence="curl returned HTTP 401; 500 no longer triggers",
+        )
+        self.assertFalse(ok)
+        self.assertIn("authoritative head", reason)
 
     def test_07_ui_bug_screenshot_gates_and_behavioral_proof_invariant(self):
         """
@@ -446,6 +575,7 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
             before_unavailable_reason="Before screenshot unavailable due to fatal JavaScript crash on unpatched commit",
             render_verified=True,
             environment="staging",
+            deployed_signed_in_qa=True,
         )
         self.assertTrue(ok)
         self.assertIn("Before Asset Limitation: Before screenshot unavailable due to fatal JavaScript crash", evidence_limitation)
@@ -465,6 +595,7 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
             mobile_after_url="https://github.com/Bavariance/polysimulator/releases/download/v0.8.0/slider_after_390.png",
             render_verified=True,
             environment="staging",
+            deployed_signed_in_qa=True,
         )
         self.assertTrue(ok)
         self.assertIn("Desktop Before:", evidence_full)
@@ -472,6 +603,114 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
         self.assertIn("Mobile After (320px/390px):", evidence_full)
         self.assertIn("Behavioral Evidence: Chromium automated evaluation", evidence_full)
         self.assertIn("no mathematical proof of global absence claimed", evidence_full)
+        self.assertIn("Signed-in QA: verified", evidence_full)
+
+        # 8. Staging closure without persistent signed-in QA must be refused
+        ok, reason = adapter.verify_bug_closure(
+            req_id=ui_bug_id,
+            tested_sha=head_sha,
+            reproduction_verified_absent=True,
+            regression_evidence="Chromium automated evaluation: no intersection",
+            bug_type="ui",
+            desktop_before_url="https://github.com/Bavariance/polysimulator/releases/download/v0.8.0/slider_before_1440.png",
+            desktop_after_url="https://github.com/Bavariance/polysimulator/releases/download/v0.8.0/slider_after_1440.png",
+            mobile_after_url="https://github.com/Bavariance/polysimulator/releases/download/v0.8.0/slider_after_390.png",
+            render_verified=True,
+            environment="staging",
+            deployed_signed_in_qa=False,
+        )
+        self.assertFalse(ok)
+        self.assertIn("Persistent signed-in QA", reason)
+
+        # 9. A truncated SHA is not an authoritative head
+        ok, reason = adapter.verify_bug_closure(
+            req_id=ui_bug_id,
+            tested_sha=head_sha[:8],
+            reproduction_verified_absent=True,
+            regression_evidence="Chromium automated evaluation: no intersection",
+            bug_type="functional",
+            environment="local",
+        )
+        self.assertFalse(ok)
+        self.assertIn("full 40-character", reason)
+
+    def test_08_coordinator_risk_classification_is_not_downgraded(self):
+        """
+        USER CRITICAL INVARIANT TEST:
+        The coordinator is the routing authority. The adapter must not re-derive a weaker
+        classification, which previously forced every non-review stage to
+        routine_execution/low and silently discarded a HIGH-risk decision.
+        """
+        class Routing:
+            def __init__(self, task_type=None, risk_level=None, model=None, role=None):
+                self.evaluated = True
+                self.task_type = task_type
+                self.risk_level = risk_level
+                self.recommended_model = model
+                self.recommended_role = role
+
+        # The coordinator's classification wins over the stage-derived default.
+        routing = Routing(task_type="deep_reasoning", risk_level="high")
+        self.assertEqual(
+            SuperboardExecutionAdapter._resolve_task_type(routing, "build"),
+            TaskType.DEEP_REASONING,
+        )
+        self.assertEqual(
+            SuperboardExecutionAdapter._resolve_risk_level(routing, {}),
+            RiskLevel.HIGH,
+        )
+
+        # Without a coordinator classification, an explicit request risk is still honoured.
+        bare = Routing()
+        self.assertEqual(
+            SuperboardExecutionAdapter._resolve_risk_level(bare, {"risk_level": "high"}),
+            RiskLevel.HIGH,
+        )
+
+        # Review still routes to strong review when nothing else is declared.
+        self.assertEqual(
+            SuperboardExecutionAdapter._resolve_task_type(bare, "review"),
+            TaskType.STRONG_REVIEW,
+        )
+        self.assertEqual(
+            SuperboardExecutionAdapter._resolve_risk_level(bare, {}),
+            RiskLevel.LOW,
+        )
+
+        # An unparseable value must not crash the step; it falls back rather than raising.
+        junk = Routing(task_type="not_a_task_type", risk_level="not_a_risk")
+        self.assertEqual(
+            SuperboardExecutionAdapter._resolve_task_type(junk, "build"),
+            TaskType.ROUTINE_EXECUTION,
+        )
+        self.assertEqual(
+            SuperboardExecutionAdapter._resolve_risk_level(junk, {}),
+            RiskLevel.LOW,
+        )
+
+    def test_09_coordinator_model_choice_overrides_adapter_reselection(self):
+        """The worker must never receive a weaker model than the coordinator authorised."""
+        req_id = "req-routing-authority-09"
+        self._add_pipeline_request(req_id)
+
+        backend = StubWorkerBackend(head_sha=self.HEAD_SHA)
+        adapter = SuperboardExecutionAdapter(
+            state_dir=self.state_dir,
+            worker_backend=backend,
+            notify_telegram=True,
+            telegram_dry_run=True,
+        )
+
+        res = adapter.run_step(request_id=req_id)
+        recommendation = (res.dispatch_packet or {}).get("recommendation") or {}
+        coordinator_model = adapter.coordinator.evaluate_step(request_id=req_id).routing.recommended_model
+
+        # Whatever the selector re-derives, the dispatched model is the coordinator's.
+        if coordinator_model:
+            self.assertEqual(recommendation.get("selected_model"), coordinator_model)
+            self.assertEqual(backend.calls[0]["model"], coordinator_model)
+
+
 def run_tests():
     print("=" * 70)
     print("RUNNING SUPERBOARD EXECUTION ADAPTER SMOKE & INTEGRATION TEST SUITE")

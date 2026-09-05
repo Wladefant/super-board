@@ -46,6 +46,7 @@ import argparse
 import datetime
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -78,7 +79,7 @@ except ImportError as e:
 
 @dataclass
 class WorkerExecutionResult:
-    """Result of worker command dispatch (real, safe-probe, or fake fixture)."""
+    """Result of worker command dispatch (real backend, safe probe, or fake fixture)."""
     stage: str                          # "build", "qa", "review", "probe"
     exit_code: int
     output: str
@@ -87,9 +88,33 @@ class WorkerExecutionResult:
     command: List[str] = field(default_factory=list)
     is_fixture: bool = False
     fixture_label: Optional[str] = None
+    # Provenance of the result. A probe proves the dispatch plumbing works; it proves
+    # nothing about the request's acceptance criteria, so it may never advance state.
+    is_probe: bool = False
+    blocked_reason: Optional[str] = None
+    backend_name: Optional[str] = None
+    evidence: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def is_verifiable_evidence(self) -> bool:
+        """
+        True only for a successful real-backend execution carrying structured evidence.
+
+        Fixtures and probes are excluded by construction: no amount of fixture output
+        may be read as proof that real work happened.
+        """
+        return (
+            not self.is_fixture
+            and not self.is_probe
+            and self.blocked_reason is None
+            and self.exit_code == 0
+            and bool(self.evidence)
+        )
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        d["is_verifiable_evidence"] = self.is_verifiable_evidence
+        return d
 
 
 @dataclass
@@ -137,11 +162,17 @@ class SuperboardExecutionAdapter:
         telegram_send: bool = False,
         dry_run: bool = False,
         repo_root: Optional[str] = None,
+        worker_backend: Optional[Any] = None,
     ):
         self.state_dir = os.path.abspath(state_dir) if state_dir else SCRIPT_DIR
         self.config_path = config_path
         self.fake_executor = fake_executor
         self.fake_executor_fn = fake_executor_fn
+        # Real execution backend, duck-typed: .execute(request) -> outcome exposing
+        # ok, stage, exit_code, command, head_sha, evidence, artifacts, blocked_reason,
+        # backend_name. Kept deliberately separate from fake_executor_fn so a fixture
+        # and a real run can never share a code path.
+        self.worker_backend = worker_backend
         self.notify_telegram = notify_telegram
         self.telegram_project = telegram_project
         self.telegram_dry_run = telegram_dry_run
@@ -274,8 +305,20 @@ class SuperboardExecutionAdapter:
         if not regression_evidence or not regression_evidence.strip():
             return False, f"Cannot close bug '{req_id}': Specific behavioral reproduction regression proof (logs, traces, or test exit code) is required; screenshot alone is insufficient."
 
-        if not tested_sha or len(tested_sha) < 8:
-            return False, f"Cannot close bug '{req_id}': Valid reviewed head commit SHA required."
+        # Closure must name the full authoritative commit, not a prefix, and it must be the
+        # head the ledger is actually tracking — otherwise the proof describes another commit.
+        if not tested_sha or not re.fullmatch(r"[0-9a-f]{40}", tested_sha.strip().lower()):
+            return False, f"Cannot close bug '{req_id}': A full 40-character reviewed head commit SHA is required (got '{tested_sha}')."
+
+        try:
+            ledger_head = (self.coordinator.ledger.get_request(req_id) or {}).get("head")
+        except Exception:
+            ledger_head = None
+        if ledger_head and ledger_head.strip().lower() != tested_sha.strip().lower():
+            return False, (
+                f"Cannot close bug '{req_id}': Closure evidence is bound to {tested_sha} but the "
+                f"ledger's authoritative head is {ledger_head}; re-verify on the current head."
+            )
 
         # 2. UI Bug Specific Visual Assets & Viewport Verification
         ui_evidence_parts = []
@@ -309,15 +352,70 @@ class SuperboardExecutionAdapter:
             ui_evidence_parts.append(f"Mobile After (320px/390px): {mobile_after_url.strip()}")
             ui_evidence_parts.append(f"Render Verified: YES ({environment})")
 
+        # A user-facing flow on a deployed environment must be proven under a real signed-in
+        # session; an unauthenticated pass never reaches the flow. Backend-only defects are
+        # excluded: their proof is the behavioral regression evidence already required above.
+        # Checked after the asset gates so the more specific evidence gap is reported first.
+        if (
+            bug_type in ("ui", "both")
+            and environment not in ("local", "harness")
+            and not deployed_signed_in_qa
+        ):
+            return False, (
+                f"Cannot close bug '{req_id}': Persistent signed-in QA on '{environment}' is required "
+                "for a user-facing flow; an unauthenticated pass does not exercise it."
+            )
+
         ui_section = f" UI Assets: [{', '.join(ui_evidence_parts)}]." if ui_evidence_parts else ""
         evidence_str = (
             f"Reproduction scenario specifically proven absent on reviewed head {tested_sha} ({environment}). "
             f"Behavioral Evidence: {regression_evidence.strip()}."
             f"{ui_section} "
-            f"Signed-in QA: {'verified' if deployed_signed_in_qa else 'n/a'}. "
+            f"Signed-in QA: {'verified' if deployed_signed_in_qa else 'not required for ' + environment}. "
             f"[Empirical observation: specific reproduction scenario failed to trigger on reviewed head {tested_sha}; no mathematical proof of global absence claimed.]"
         )
         return True, evidence_str
+
+    @staticmethod
+    def _resolve_task_type(routing: Any, stage: str) -> TaskType:
+        """
+        Task type as classified by the coordinator, falling back to the stage.
+
+        The coordinator surfaces `task_type` on its routing status when it has classified
+        the request (including DEEP_REASONING, which the stage alone cannot express).
+        """
+        declared = getattr(routing, "task_type", None) if routing is not None else None
+        if declared:
+            if isinstance(declared, TaskType):
+                return declared
+            try:
+                return TaskType(str(declared))
+            except ValueError:
+                pass
+        return TaskType.STRONG_REVIEW if stage == "review" else TaskType.ROUTINE_EXECUTION
+
+    @staticmethod
+    def _resolve_risk_level(routing: Any, req: Union[RequestSummary, Dict[str, Any]]) -> RiskLevel:
+        """
+        Risk as classified by the coordinator, then the request, and only then LOW.
+
+        Defaulting straight to LOW is what dropped HIGH-risk classifications, so an
+        explicit signal from either source is always preferred.
+        """
+        declared = getattr(routing, "risk_level", None) if routing is not None else None
+        if not declared:
+            declared = getattr(req, "risk_level", None) or (
+                req.get("risk_level") if isinstance(req, dict) else None
+            )
+        if declared:
+            if isinstance(declared, RiskLevel):
+                return declared
+            try:
+                return RiskLevel(str(declared).lower())
+            except ValueError:
+                pass
+        return RiskLevel.LOW
+
     def _determine_stage_for_request(self, req: Union[RequestSummary, Dict[str, Any]]) -> str:
         """Map ledger request state to existing Superboard worker lifecycle stage."""
         state = getattr(req, "state", None) or (req.get("state") if isinstance(req, dict) else "")
@@ -412,9 +510,11 @@ class SuperboardExecutionAdapter:
                 exit_code=res.returncode,
                 output=output,
                 head_sha=sha,
-                pr_url=f"https://github.com/{self.project_config.repo}/pull/{req_issue or 74}",
+                pr_url=f"https://github.com/{self.project_config.repo}/pull/{req_issue}" if req_issue else None,
                 command=cmd,
                 is_fixture=False,
+                is_probe=True,
+                backend_name="safe-probe",
             )
         except Exception as e:
             return WorkerExecutionResult(
@@ -423,7 +523,203 @@ class SuperboardExecutionAdapter:
                 output=f"[REAL_WORKER_ERROR] Failed to execute {cmd}: {e}",
                 command=cmd,
                 is_fixture=False,
+                is_probe=True,
+                backend_name="safe-probe",
+                blocked_reason=f"Safe probe failed to execute {cmd}: {e}",
             )
+
+    def _blocked_result(
+        self,
+        stage: str,
+        reason: str,
+        head_sha: Optional[str] = None,
+        command: Optional[List[str]] = None,
+    ) -> WorkerExecutionResult:
+        """A dispatch that could not really run. Never carries advanceable evidence."""
+        return WorkerExecutionResult(
+            stage=stage,
+            exit_code=1,
+            output=f"[DISPATCH_BLOCKED] {reason}",
+            head_sha=head_sha,
+            command=command or [],
+            is_fixture=False,
+            blocked_reason=reason,
+        )
+
+    def dispatch_via_backend(
+        self,
+        req: Union[RequestSummary, Dict[str, Any]],
+        stage: str,
+        dispatch: HarnessDispatchPacket,
+        target_sha: Optional[str] = None,
+    ) -> WorkerExecutionResult:
+        """
+        Execute the stage through the configured real worker backend.
+
+        The backend is duck-typed; only the published outcome field names are read, so no
+        import of the backend module is required. Any failure, missing structured evidence,
+        or head mismatch surfaces as a blocked result rather than a passable one.
+        """
+        req_id = getattr(req, "id", None) or (req.get("id") if isinstance(req, dict) else "req-unknown")
+        req_head = getattr(req, "head", None) or (req.get("head") if isinstance(req, dict) else None)
+        req_issue = getattr(req, "issue_number", None) or (req.get("issue_number") if isinstance(req, dict) else None)
+        req_prompt = getattr(req, "prompt", None) or (req.get("prompt") if isinstance(req, dict) else "")
+        criteria = getattr(req, "pending_criteria", None) or (
+            req.get("pending_criteria") if isinstance(req, dict) else []
+        )
+        expected_sha = target_sha or req_head
+
+        recommendation = dispatch.recommendation if isinstance(dispatch.recommendation, dict) else {}
+        worker_request = {
+            "request_id": req_id,
+            "stage": stage,
+            "head_sha": expected_sha,
+            "model": recommendation.get("selected_model"),
+            "agent_role": recommendation.get("agent_role"),
+            "repo_root": self.repo_root,
+            "issue_url": (
+                f"https://github.com/{self.project_config.repo}/issues/{req_issue}" if req_issue else None
+            ),
+            "pr_url": None,
+            "prompt": req_prompt,
+            "criteria": list(criteria or []),
+        }
+
+        try:
+            outcome = self.worker_backend.execute(worker_request)
+        except Exception as e:
+            return self._blocked_result(
+                stage,
+                f"Worker backend raised while executing stage '{stage}': {e}",
+                head_sha=expected_sha,
+            )
+
+        def field_of(name: str, default: Any = None) -> Any:
+            if isinstance(outcome, dict):
+                return outcome.get(name, default)
+            return getattr(outcome, name, default)
+
+        blocked_reason = field_of("blocked_reason")
+        ok = bool(field_of("ok", False))
+        observed_sha = field_of("head_sha") or expected_sha
+        command = list(field_of("command") or [])
+        evidence = field_of("evidence") or {}
+        backend_name = field_of("backend_name") or type(outcome).__name__
+        exit_code = field_of("exit_code")
+        exit_code = int(exit_code) if isinstance(exit_code, int) else (0 if ok else 1)
+        artifacts = list(field_of("artifacts") or [])
+
+        if not ok:
+            return self._blocked_result(
+                stage,
+                blocked_reason or f"Worker backend '{backend_name}' reported failure for stage '{stage}'",
+                head_sha=observed_sha,
+                command=command,
+            )
+
+        # The backend observes the head it actually ran against; disagreement means the
+        # evidence does not describe the commit under evaluation.
+        if expected_sha and observed_sha and expected_sha != observed_sha:
+            return self._blocked_result(
+                stage,
+                (
+                    f"Worker backend executed against head {observed_sha} but stage '{stage}' "
+                    f"was dispatched for {expected_sha}; evidence is not head-bound"
+                ),
+                head_sha=observed_sha,
+                command=command,
+            )
+
+        if not evidence:
+            return self._blocked_result(
+                stage,
+                f"Worker backend '{backend_name}' returned no structured evidence for stage '{stage}'",
+                head_sha=observed_sha,
+                command=command,
+            )
+
+        return WorkerExecutionResult(
+            stage=stage,
+            exit_code=exit_code,
+            output=json.dumps({"backend": backend_name, "evidence": evidence, "artifacts": artifacts}, default=str),
+            head_sha=observed_sha,
+            command=command,
+            is_fixture=False,
+            is_probe=False,
+            backend_name=backend_name,
+            evidence=evidence,
+        )
+
+    def dispatch_qa_script(
+        self,
+        req: Union[RequestSummary, Dict[str, Any]],
+        stage: str,
+        target_sha: Optional[str] = None,
+    ) -> Optional[WorkerExecutionResult]:
+        """
+        Dispatch the existing Superboard QA script for the QA stage.
+
+        Returns None when the script is not present, so the caller can continue down the
+        precedence chain. A dry run is marked as a probe: it proves dispatch works and
+        nothing about the acceptance criteria.
+        """
+        qa_script = os.path.join(self.repo_root, "scripts", "super-qa-dispatch.sh")
+        if not os.path.exists(qa_script):
+            return None
+
+        req_issue = getattr(req, "issue_number", None) or (req.get("issue_number") if isinstance(req, dict) else None)
+        req_head = getattr(req, "head", None) or (req.get("head") if isinstance(req, dict) else None)
+        expected_sha = target_sha or req_head
+
+        cmd = [
+            "bash",
+            qa_script,
+            "--config", self.config_path or ".claude/super-board/configs/default.json",
+            "--issue-url", f"https://github.com/{self.project_config.repo}/issues/{req_issue or 1}",
+        ]
+        if req_issue:
+            cmd.extend(["--pull-request", f"https://github.com/{self.project_config.repo}/pull/{req_issue}"])
+        if self.dry_run:
+            cmd.append("--dry-run")
+        if expected_sha:
+            cmd.extend(["--expected-sha", expected_sha])
+
+        try:
+            res = subprocess.run(cmd, cwd=self.repo_root, capture_output=True, text=True, timeout=60)
+        except Exception as e:
+            return self._blocked_result(
+                stage,
+                f"Error dispatching {qa_script}: {e}",
+                head_sha=expected_sha,
+                command=cmd,
+            )
+
+        output = res.stdout + ("\n" + res.stderr if res.stderr else "")
+        if res.returncode != 0:
+            return self._blocked_result(
+                stage,
+                f"QA script exited {res.returncode}",
+                head_sha=expected_sha,
+                command=cmd,
+            )
+
+        return WorkerExecutionResult(
+            stage=stage,
+            exit_code=0,
+            output=output,
+            head_sha=expected_sha,
+            command=cmd,
+            is_fixture=False,
+            is_probe=self.dry_run,
+            backend_name="super-qa-dispatch.sh",
+            evidence={} if self.dry_run else {
+                "backend": "super-qa-dispatch.sh",
+                "stage": stage,
+                "head_sha": expected_sha,
+                "exit_code": 0,
+                "output_tail": output[-2000:],
+            },
+        )
 
     def dispatch_worker(
         self,
@@ -434,57 +730,42 @@ class SuperboardExecutionAdapter:
         real_worker: bool = False,
     ) -> WorkerExecutionResult:
         """
-        Dispatch worker command according to configured mode:
-        1. Custom fake executor if provided
-        2. Default fake executor if fake_executor=True
-        3. Real safe worker if real_worker=True
-        4. Standard Superboard CLI command dispatch (super-qa-dispatch.sh or dry-run)
+        Dispatch the stage, in strict precedence:
+          1. Explicit fixture executor (`fake_executor_fn` / `fake_executor`) — test fixtures only.
+          2. Configured real worker backend.
+          3. Explicit `real_worker` safe probe — plumbing proof only, never advanceable.
+          4. Otherwise BLOCKED.
+
+        There is deliberately no implicit fixture fallback: a missing backend is reported as a
+        blocker, because silently substituting a fixture is what let simulated output be read
+        as real proof.
         """
         if self.fake_executor_fn:
             return self.fake_executor_fn(req, stage, dispatch)
         if self.fake_executor:
             return self.default_fake_executor(req, stage, dispatch, target_sha=target_sha)
+
+        if self.worker_backend is not None:
+            return self.dispatch_via_backend(req, stage, dispatch, target_sha=target_sha)
+
+        if stage == "qa":
+            qa_result = self.dispatch_qa_script(req, stage, target_sha=target_sha)
+            if qa_result is not None:
+                return qa_result
+
         if real_worker:
             return self.execute_real_safe_worker(req, stage, dispatch)
 
-        req_issue = getattr(req, "issue_number", None) or (req.get("issue_number") if isinstance(req, dict) else 1)
         req_head = getattr(req, "head", None) or (req.get("head") if isinstance(req, dict) else None)
-
-        # Standard command execution: for QA, dispatch to super-qa-dispatch.sh
-        if stage == "qa":
-            qa_script = os.path.join(self.repo_root, "scripts", "super-qa-dispatch.sh")
-            if os.path.exists(qa_script):
-                cmd = [
-                    "bash",
-                    qa_script,
-                    "--config", self.config_path or ".claude/super-board/configs/default.json",
-                    "--issue-url", f"https://github.com/{self.project_config.repo}/issues/{req_issue or 1}",
-                    "--pull-request", f"https://github.com/{self.project_config.repo}/pull/{req_issue or 74}",
-                ]
-                if self.dry_run:
-                    cmd.append("--dry-run")
-                if target_sha or req_head:
-                    cmd.extend(["--expected-sha", target_sha or req_head])
-
-                try:
-                    res = subprocess.run(cmd, cwd=self.repo_root, capture_output=True, text=True, timeout=60)
-                    return WorkerExecutionResult(
-                        stage=stage,
-                        exit_code=res.returncode,
-                        output=res.stdout + ("\n" + res.stderr if res.stderr else ""),
-                        head_sha=target_sha or req_head,
-                        command=cmd,
-                    )
-                except Exception as e:
-                    return WorkerExecutionResult(
-                        stage=stage,
-                        exit_code=1,
-                        output=f"Error dispatching {qa_script}: {e}",
-                        command=cmd,
-                    )
-
-        # Fallback to safe fixture if no direct script or in dry-run
-        return self.default_fake_executor(req, stage, dispatch, target_sha=target_sha)
+        return self._blocked_result(
+            stage,
+            (
+                f"No worker backend configured for stage '{stage}'. Construct the adapter with "
+                "worker_backend=<backend> for real execution, or pass fake_executor=True to run "
+                "an explicitly labelled fixture. Refusing to substitute a fixture implicitly."
+            ),
+            head_sha=target_sha or req_head,
+        )
 
     def verify_and_advance_request(
         self,
@@ -495,10 +776,12 @@ class SuperboardExecutionAdapter:
         """
         Point 5: Evidence, QA & Review Gate Eligibility.
         Verifies execution result, enforces head-bound SHA checks, and advances request state.
-        
-        INVIOLABLE SAFETY INVARIANT:
-        When a request passes review verification, it transitions strictly to
-        'awaiting authorization'. It NEVER auto-merges or transitions to 'integration'.
+
+        INVIOLABLE SAFETY INVARIANTS:
+        1. Only a real backend execution carrying structured evidence may advance state.
+           A fixture or a probe never advances a request, whatever its output says.
+        2. When a request passes review verification, it transitions strictly to
+           'awaiting authorization'. It NEVER auto-merges or transitions to 'integration'.
         """
         req_id = getattr(req, "id", None) or (req.get("id") if isinstance(req, dict) else "req-unknown")
         req_state = getattr(req, "state", None) or (req.get("state") if isinstance(req, dict) else "unknown")
@@ -509,39 +792,110 @@ class SuperboardExecutionAdapter:
             "gate_type": stage,
             "tested_sha": worker_res.head_sha,
             "head_bound": True,
+            "evidence_source": worker_res.backend_name
+            or ("fixture" if worker_res.is_fixture else "unknown"),
         }
+
+        if worker_res.blocked_reason:
+            gate_result["blocked_reason"] = worker_res.blocked_reason
+            return req_state, f"Stage '{stage}' blocked: {worker_res.blocked_reason}", gate_result
 
         if worker_res.exit_code != 0:
             reason = f"Worker {stage} execution failed with exit code {worker_res.exit_code}"
             gate_result["error"] = worker_res.output
             return req_state, reason, gate_result
-        # Check bug retention / closure invariants
+
+        # Bug retention: a defect whose reproduction is not proven absent must reopen, so
+        # this is evaluated before the generic provenance gate. Reopening only ever moves a
+        # request backwards, so it can never manufacture a false completion.
         is_bug = (
             getattr(req, "task_type", None) == "bug"
             or (isinstance(req, dict) and req.get("task_type") == "bug")
             or "bug" in req_id.lower()
         )
         if is_bug and stage in ("qa", "review"):
-            worker_output = worker_res.output or ""
-            repro_gone = (
-                "[REPRODUCTION_FAILED_TO_DISPROVE]" not in worker_output
-                and "[GENERIC_SUITE_ONLY]" not in worker_output
-                and ("simulated successful" in worker_output or "proven absent" in worker_output or worker_res.is_fixture)
-            )
-            if not repro_gone:
-                # Reopen to implementation
+            # Closure requires a structured, explicit reproduction verdict from the backend.
+            # Prose in the output and fixture provenance are both worthless here:
+            # keyword-matching "simulated successful" is how simulated runs closed real defects.
+            evidence = worker_res.evidence or {}
+            repro = evidence.get("reproduction") if isinstance(evidence.get("reproduction"), dict) else {}
+            verdict = str(repro.get("verdict") or evidence.get("reproduction_verdict") or "").strip().lower()
+            scenario = str(repro.get("scenario") or evidence.get("reproduction_scenario") or "").strip()
+
+            if not (verdict == "absent" and scenario):
+                if not verdict:
+                    why = (
+                        "no structured reproduction verdict "
+                        "(evidence.reproduction.verdict) was returned"
+                    )
+                elif verdict != "absent":
+                    why = f"reproduction verdict is '{verdict}', not 'absent'"
+                else:
+                    why = "reproduction verdict lacks the original scenario it was run against"
+
                 self.coordinator.ledger.update_request(
                     req_id,
                     state="implementation",
                     actor="SuperboardAdapter:Reopen",
-                    add_evidence={"summary": f"QA failed to prove original reproduction absent on {worker_res.head_sha or 'unknown'}; reopened to implementation", "details": worker_res.output},
+                    add_evidence={
+                        "summary": (
+                            f"QA failed to prove original reproduction absent on "
+                            f"{worker_res.head_sha or 'unknown'}: {why}; reopened to implementation"
+                        ),
+                        "details": worker_res.output,
+                        "head": worker_res.head_sha,
+                    },
                 )
                 gate_result["verified"] = False
                 gate_result["reopened"] = True
-                return "implementation", f"Original reproduction scenario still present or unverified on {worker_res.head_sha}; reopened to implementation", gate_result
+                gate_result["repro_refused"] = why
+                return (
+                    "implementation",
+                    (
+                        f"Original reproduction scenario not proven absent on "
+                        f"{worker_res.head_sha}: {why}; reopened to implementation"
+                    ),
+                    gate_result,
+                )
+
+            gate_result["reproduction_scenario"] = scenario
+
+        # Provenance gate: simulated or probe output is not evidence about this request.
+        if not worker_res.is_verifiable_evidence:
+            if worker_res.is_fixture:
+                why = (
+                    f"fixture result '{worker_res.fixture_label or 'unlabelled'}' is not evidence "
+                    "of real execution"
+                )
+            elif worker_res.is_probe:
+                why = "safe probe proves dispatch plumbing only, not the acceptance criteria"
+            else:
+                why = "worker returned no structured evidence"
+            gate_result["advance_refused"] = why
+            return (
+                req_state,
+                f"Stage '{stage}' did not advance: {why}. Request remains in '{req_state}'.",
+                gate_result,
+            )
+
+        # Head binding: evidence must describe the commit the ledger is tracking.
+        if req_head and worker_res.head_sha and req_head != worker_res.head_sha:
+            gate_result["head_bound"] = False
+            gate_result["advance_refused"] = "head mismatch"
+            return (
+                req_state,
+                (
+                    f"Stage '{stage}' did not advance: evidence is bound to {worker_res.head_sha} "
+                    f"but the ledger head is {req_head}."
+                ),
+                gate_result,
+            )
 
         # Update evidence in ledger
-        evidence_note = f"{stage} verified via {worker_res.fixture_label or 'worker execution'} on commit {worker_res.head_sha or 'unknown'}"
+        evidence_note = (
+            f"{stage} verified via {worker_res.backend_name or 'worker execution'} "
+            f"on commit {worker_res.head_sha or 'unknown'}"
+        )
         if stage == "build":
             # Advance: implementation -> QA
             new_state = "QA"
@@ -705,19 +1059,40 @@ class SuperboardExecutionAdapter:
                 boundaries=asdict(packet.boundaries),
             )
 
-        # Build explicit HarnessDispatchPacket
+        # Build the HarnessDispatchPacket from the coordinator's classification. The
+        # coordinator is the single routing authority: it already classified task type and
+        # risk from the request's prompt, labels and state. Re-deriving them here used to
+        # silently downgrade every non-review stage to routine_execution/low and discard a
+        # HIGH-risk decision, so the classification is read from the coordinator's routing
+        # and only falls back when that routing was not evaluated.
         selector = ResetAwareModelSelector(
             snapshot=self.coordinator.resolve_balance_adapter(),
         )
-        task_type = TaskType.STRONG_REVIEW if stage == "review" else TaskType.ROUTINE_EXECUTION
-        req_risk = getattr(req, "risk_level", None) or (req.get("risk_level", "low") if isinstance(req, dict) else "low")
-        risk_level = RiskLevel.HIGH if req_risk.lower() == "high" else RiskLevel.LOW
+        routing = packet.routing
+        task_type = self._resolve_task_type(routing, stage)
+        risk_level = self._resolve_risk_level(routing, req)
         dispatch_packet = selector.dispatch(
             task_type=task_type,
             risk_level=risk_level,
             context_tokens=4000,
             head_sha=getattr(req, "head", None) or (req.get("head") if isinstance(req, dict) else None),
         )
+
+        # The coordinator's model choice wins over a re-selection, so a divergence can never
+        # quietly hand the worker a weaker model than the one the coordinator authorised.
+        if routing and getattr(routing, "evaluated", False) and routing.recommended_model:
+            recommendation = (
+                dispatch_packet.recommendation
+                if isinstance(dispatch_packet.recommendation, dict)
+                else {}
+            )
+            if recommendation.get("selected_model") != routing.recommended_model:
+                recommendation["adapter_reselected_model"] = recommendation.get("selected_model")
+                recommendation["selected_model"] = routing.recommended_model
+                recommendation["model_authority"] = "coordinator"
+                if routing.recommended_role:
+                    recommendation["agent_role"] = routing.recommended_role
+                dispatch_packet.recommendation = recommendation
 
         # 4. Dispatch Worker Command (Fake, Safe-Probe, or Real)
         worker_res = self.dispatch_worker(
