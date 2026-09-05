@@ -1,0 +1,137 @@
+{
+  "name": "portable-workflow-core",
+  "version": "1.0.0",
+  "description": "Harness-agnostic automated multi-agent workflow core and module integration package",
+  "authority": {
+    "shared_system_of_record": "GitHub Issues and Superboard for configured project (e.g. Project #1 for Bavariance/polysimulator or custom project adapter)",
+    "local_recovery_cache": "ledger.json and decisions.json (machine-local crash-resilient restart recovery cache)",
+    "preflight_inventory": "preflight_evidence/ (manifest-based staging probe inventory and TTL tracker)"
+  },
+  "invariants": {
+    "no_auto_merge": "Transition to integration requires an explicit authorization record with verified provenance. Self-authorization and CLI default operator trust are strictly rejected.",
+    "no_auto_deploy": "Deployment to production, main merges, or staging promotions cannot be authorized through issue comments or autonomous routines.",
+    "no_self_spawn_loop": "Coordinator runs as a single bounded evaluation step. It emits recommendations and state transitions without self-spawning recursive execution loops.",
+    "no_credential_leakage": "Balance and probe modules strictly redact email addresses, project IDs, account numbers, and API tokens.",
+    "head_bound_evidence": "Git HEAD changes invalidate all head-bound QA evidence, criteria statuses, and proofs, resetting state to implementation.",
+    "explicit_per_criterion_evidence": "Every criterion in acceptance_criteria must have status 'verified' and non-empty evidence before transitioning to 'done'.",
+    "github_proof_required": "Requests cannot close to 'done' without a verified GitHub proof URL (PR, issue comment, commit SHA, or asset) matching repository."
+  },
+  "modules": {
+    "project_adapter.py": {
+      "role": "Project configuration and environment adapter isolating generic workflow core from repository identities, Superboard numbers, and staging coordinates",
+      "owner": "PackagePortableCoordinator",
+      "cli_command": "python -c 'from project_adapter import get_current_project_config; print(get_current_project_config())'",
+      "inputs": ["project_adapter.json", "Superboard configs (.claude/super-board/configs/<slug>.json)"],
+      "outputs": ["ProjectConfig dataclass with staging and safety rules"]
+    },
+    "coordinator.py": {
+      "role": "Single bounded coordinator entrypoint combining state, decision sync, preflight gating, normalized usage, and model routing",
+      "owner": "PortableWorkflowCoordinator",
+      "cli_command": "python coordinator.py [--state-dir <dir>] [--json] [--summary] [--no-sync-decisions] [--usage-adapter auto|file|veyyon|direct] [--balance-file <file>]",
+      "inputs": ["ledger.json", "decisions.json", "preflight_evidence/", "usage_fixture.json"],
+      "outputs": ["CoordinatorPacket (JSON or formatted summary)"]
+    },
+    "ledger.py": {
+      "role": "Durable request ledger utility, atomic crash-resilient recovery cache, and transition graph invariant enforcer",
+      "owner": "ImplementRequestLedger / FixLedgerInvariants",
+      "cli_command": "python ledger.py [add | update | check | next | list | show | recover] [--ledger <path>]",
+      "inputs": ["ledger.json"],
+      "outputs": ["Request state transitions, invariant verification, recovery queues"]
+    },
+    "decision_workflow.py": {
+      "role": "Issue-based asynchronous human decision contract, strict provenance validation, and authored-comment exclusion registry",
+      "owner": "IntegrateDecisionWorkflow / HardenDecisionProvenance",
+      "cli_command": "python decision_workflow.py [ask | ingest | reply | sync | show | list] [--decisions <path>] [--ledger <path>]",
+      "inputs": ["decisions.json", "GitHub issue comments via gh CLI"],
+      "outputs": ["Resolved human decisions, unblocked ledger requests, clarification prompts"]
+    },
+    "preflight.py": {
+      "role": "Manifest-driven staging integration preflight gating (Dokploy staging compose, Supabase staging ref, Stripe test mode)",
+      "owner": "ImplementIntegrationPreflight",
+      "cli_command": "python preflight.py [check | probe | record-evidence | inventory] [--evidence-dir <dir>] [--json]",
+      "inputs": ["Task manifests, environment probes, service evidence JSON"],
+      "outputs": ["PreflightResult (passed, blocked, not_applicable), probe status inventory"]
+    },
+    "balance_loader.py": {
+      "role": "Sanitized, read-only subscription usage snapshot loader, multi-window constraint evaluation, and provider quota tracking",
+      "owner": "ImplementSubscriptionRouter / ReviewHarnessStrongModel",
+      "cli_command": "python balance_loader.py [--normalized] [--adapter veyyon|file|direct] [--balance-file <file>] [--json]",
+      "inputs": ["usage_snapshot_cache.json", "usage_fixture.json", "veyyon usage CLI"],
+      "outputs": ["NormalizedBalanceSnapshot (JSON)"]
+    },
+    "model_routing.py": {
+      "role": "Reset-aware and quota-aware model selector, near-reset Codex promotion, and compact EvidencePacket generator",
+      "owner": "ImplementHarnessRouting / ImplementSubscriptionRouter",
+      "cli_command": "python model_routing.py [--task-type <type>] [--risk-level <level>] [--emit-dispatch] [--adapter veyyon|file|direct] [--balance-file <file>]",
+      "inputs": ["NormalizedBalanceSnapshot from balance_loader"],
+      "outputs": ["HarnessDispatchPacket (JSON)"]
+    },
+    "github_plan_renderer.py": {
+      "role": "GitHub markdown plan, visual architecture, and evidence recap renderer for issue and PR comments",
+      "owner": "IntegrateVisualPlanWorkflow",
+      "cli_command": "python github_plan_renderer.py [--spec <file>] [--type plan|recap]",
+      "inputs": ["Plan spec JSON", "Recap spec JSON"],
+      "outputs": ["Formatted GitHub Markdown with badges and tables"]
+    },
+    "telegram_notifier.py": {
+      "role": "Portable Telegram workflow status notification adapter with strict deduplication, cooldowns, and one-sentence event reporting",
+      "owner": "IntegrateTelegramStatus",
+      "cli_command": "python telegram_notifier.py [--packet <file>] [--event-type milestone|blocker|decision|completion] [--project <name>] [--send] [--dry-run] [--test-connection] [--json]",
+      "inputs": ["CoordinatorPacket JSON, NotificationEvent CLI arguments, channel access/env"],
+      "outputs": ["DeliveryReceipt (JSON or terminal summary), deduplicated Telegram messages"]
+    }
+  },
+  "adapters": {
+    "file": {
+      "description": "Standalone file fixture adapter requiring zero external dependencies, no Veyyon CLI, and no network access.",
+      "default_fixture": "usage_fixture.json",
+      "required_tools": ["python3"]
+    },
+    "veyyon": {
+      "description": "Native Veyyon harness adapter reading live subscription metrics from host daemon.",
+      "required_tools": ["python3", "veyyon"]
+    },
+    "generic_cli": {
+      "description": "Generic adapter for external orchestrators (OpenAI Codex, Anthropic Claude, Claude Code, GitHub Actions, custom runners).",
+      "required_tools": ["python3", "optional: gh"]
+    },
+    "telegram_notify": {
+      "required_tools": ["python3", "optional: telegram transport"]
+    },
+    "polysimulator": {
+      "description": "Explicit project adapter preserving PolySimulator staging DB ref (hgzyqmaanndcimnclxtv), Dokploy compose ID (TU7b_dY9l9_nCas6YBNwj), and strict production/main DB prohibitions.",
+      "repo": "Bavariance/polysimulator",
+      "superboard_project": 1
+    },
+    "generic_project": {
+      "description": "Configurable project adapter for arbitrary repositories (e.g. acme/demo-service) and safe unknown environments.",
+      "config_schema": "ProjectConfig (repo, project_name, project_number, staging, safety)"
+    }
+  },
+  "export": {
+    "required_files": [
+      "coordinator.py",
+      "ledger.py",
+      "decision_workflow.py",
+      "preflight.py",
+      "balance_loader.py",
+      "model_routing.py",
+      "github_plan_renderer.py",
+      "github_plan_templates.py",
+      "usage_fixture.json",
+      "manifest.json",
+      "PORTABLE.md",
+      "project_adapter.py",
+      "cross_repo_smoke_test.py",
+      "fixtures/alternate_repo_config.json",
+      "fixtures/unknown_env_config.json"
+    ],
+    "optional_files": [
+      "usage_snapshot_cache.json",
+      "ledger.json",
+      "telegram_notifier.py",
+      "test_telegram_notifier.py",
+      "decisions.json"
+    ]
+  }
+}

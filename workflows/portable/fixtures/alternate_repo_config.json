@@ -1,0 +1,28 @@
+{
+  "project_name": "DemoService",
+  "repo": "acme/demo-service",
+  "project_number": 42,
+  "base_branch": "main",
+  "staging": {
+    "dokploy_compose_id": "compose_staging_acme_42",
+    "dokploy_app_name": "demo-service-staging",
+    "supabase_project_ref": "sb_staging_acme_42",
+    "stripe_mode": "test",
+    "services": ["dokploy_staging", "supabase_staging", "stripe_test"]
+  },
+  "safety": {
+    "forbidden_patterns": [
+      "\\bprod_db_acme_000\\b",
+      "\\bprod\\.demo\\.acme\\.com\\b"
+    ],
+    "prohibit_production": true,
+    "prohibit_main_db": true,
+    "prohibit_live_keys": true,
+    "forbidden_compose_ids": ["compose_prod_acme_99"],
+    "forbidden_supabase_refs": ["prod_db_acme_000"]
+  },
+  "metadata": {
+    "tier": "standard",
+    "contact": "eng@acme.com"
+  }
+}
