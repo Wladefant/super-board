@@ -47,6 +47,7 @@ EXPORT_FILES = [
     "superboard_adapter.py",
     "github_pr_gate.py",
     "telegram_notifier.py",
+    "diagnostics.py",
 ]
 
 

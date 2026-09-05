@@ -185,6 +185,22 @@
         "continuation_journal.json",
         "continuation_driver.lock"
       ]
+    },
+    "diagnostics.py": {
+      "role": "Comprehensive aggregate system, service, provider, request and host resource diagnostics. Exposes where problems lie, what is missing, distinguishes access from health and stale from failed, and asks the user only when true human authorization/preference/credential is needed with a deduplicatable question identifier.",
+      "owner": "PackagePortableCoordinator",
+      "cli_command": "python diagnostics.py [--state-dir <dir>] [--ledger <path>] [--decisions <path>] [--evidence-dir <dir>] [--balance-file <file>] [--repo <repo>] [--strict] [--json] [--summary]",
+      "inputs": [
+        "ledger.json",
+        "decisions.json",
+        "preflight_evidence/",
+        "usage_snapshot_cache.json or usage_fixture.json"
+      ],
+      "outputs": [
+        "DiagnosticReport (JSON or terminal summary)",
+        "human_inputs (question_id, category, target, question, resolution_guidance)",
+        "agent_actions (target, category, missing_prerequisites, next_action)"
+      ]
     }
   },
   "adapters": {
@@ -247,7 +263,8 @@
       "fixtures/unknown_env_config.json",
       "worker_backend.py",
       "continuation_driver.py",
-      "WORKER_EXECUTION.md"
+      "WORKER_EXECUTION.md",
+      "diagnostics.py"
     ],
     "optional_files": [
       "usage_snapshot_cache.json",
@@ -258,7 +275,8 @@
       "routing_smoke_test.py",
       "decisions.json",
       "test_worker_backend.py",
-      "test_continuation_driver.py"
+      "test_continuation_driver.py",
+      "test_diagnostics.py"
     ]
   }
 }

@@ -832,6 +832,22 @@ class Coordinator:
             evidence_packet=evidence_packet,
         ))
 
+    def run_diagnostics(self) -> Any:
+        """Run comprehensive aggregate system, service, provider and request diagnostics."""
+        try:
+            from diagnostics import DiagnosticCollector
+            collector = DiagnosticCollector(
+                state_dir=self.state_dir,
+                ledger_path=self.ledger_path,
+                decisions_path=self.decisions_path,
+                evidence_dir=self.evidence_dir,
+                balance_file=self.balance_file,
+                repo=self.repo,
+            )
+            return collector.run_diagnostics()
+        except ImportError as e:
+            raise ImportError(f"Failed to import diagnostics module: {e}")
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -889,6 +905,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--real-worker",
         action="store_true",
         help="Execute safe harmless real worker command (config validation or git status)",
+    )
+    parser.add_argument(
+        "--diagnostics",
+        action="store_true",
+        help="Run aggregate system, service, provider, request and host diagnostics",
     )
     parser.add_argument("--json", action="store_true", help="Output machine-readable JSON packet")
     parser.add_argument("--summary", action="store_true", help="Output concise terminal summary")
@@ -980,6 +1001,19 @@ def main():
         project_config=args.project_config,
         adapter_name=args.adapter,
     )
+
+    if getattr(args, "diagnostics", False):
+        try:
+            from diagnostics import format_diagnostic_summary
+            report = coordinator.run_diagnostics()
+            if args.json or not args.summary:
+                print(report.to_json())
+            else:
+                print(format_diagnostic_summary(report))
+            return
+        except Exception as e:
+            sys.stderr.write(f"Diagnostics execution error: {e}\n")
+            sys.exit(1)
 
     if args.dispatch:
         try:

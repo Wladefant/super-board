@@ -40,6 +40,7 @@ A harness-agnostic, pure Python standard library multi-agent coordination core l
 | **`telegram_notifier.py`** | `IntegrateTelegramStatus` | Portable Telegram workflow status notification adapter with strict deduplication, cooldowns, single-sentence formatting, and multi-repo destination resolution. | `python telegram_notifier.py [--packet <file>] [--event-type milestone\|blocker\|decision\|completion] [--project <name>] [--send] [--dry-run] [--test-connection] [--json]` | `CoordinatorPacket` JSON, CLI event arguments, manifest/channel config | `DeliveryReceipt` (JSON or terminal summary), deduplicated Telegram messages |
 | **`superboard_adapter.py`** | `PackagePortableCoordinator` | Execution adapter bridging portable coordinator with existing Superboard loop tooling (`super-qa-dispatch.sh`, `super-board-run.sh`, `super_board_runtime`). | `python superboard_adapter.py [--config <file>] [--state-dir <dir>] [--fake-executor] [--real-worker] [--notify-telegram] [--json] [--summary]` | `ledger.json`, `preflight_evidence/`, Superboard project config, `HarnessDispatchPacket` | `AdapterExecutionResult`, exact-SHA QA evidence, Telegram status events |
 | **`github_pr_gate.py`** | `FinalizeExecutableRouting` | Deterministic GitHub PR status & review gate helper verifying CI checks, independent non-author approval, and exact-head review reuse without LLM churn. | `python github_pr_gate.py --pr <pr_url_or_number> [--head-sha <sha>] [--required-checks <checks>] [--json]` | GitHub PR via `gh` CLI or API payload, required check contexts, prior review approval records | `PRGateEvaluation` (`PASSED`, `BLOCKED`, `PENDING`) with detailed gate breakdown |
+| **`diagnostics.py`** | `PackagePortableCoordinator` | Unified aggregate system, service, provider, request and host resource diagnostics. Exposes where problems lie, what is missing, distinguishes access from health and stale from failed, and asks user only when true authorization/preference/credential needed with deduplicatable question IDs. | `python diagnostics.py [--state-dir <dir>] [--strict] [--json] [--summary]` (or `python coordinator.py --diagnostics`) | `ledger.json`, `decisions.json`, `preflight_evidence/`, usage snapshots | `DiagnosticReport` (JSON or terminal summary), `human_inputs`, `agent_actions` |
 ---
 
 ## 3. Single Bounded Coordinator Command
@@ -162,6 +163,49 @@ python coordinator.py \
 * **`done`**: All requests in ledger are in terminal `done` state or no active requests exist.
   * *Action:* No work remaining. Conclude session or await new operator prompts.
 
+### 3.1 Aggregate Diagnostics & Problem Identification Command (`diagnostics.py`)
+
+When systems stall, dependencies fail, or preflight evidence expires, the operator or orchestrator can run the read-only diagnostic command to evaluate all configured systems, requests, and services in a single bounded pass:
+
+```bash
+# 1. Standalone diagnostics with formatted terminal summary
+python diagnostics.py --summary
+
+# 2. Machine-readable JSON output
+python diagnostics.py --json
+
+# 3. Via coordinator extension point
+python coordinator.py --diagnostics --summary
+
+# 4. Via continuation driver diagnostic inspection
+python continuation_driver.py --diagnostics
+
+# 5. Diagnostic inspection with custom state directory
+python diagnostics.py --state-dir /path/to/state --summary
+```
+
+#### Diagnostic Invariants & Output Semantics
+
+1. **Access vs. Health:**
+   * `access_status`: Proves network/auth connectivity to the endpoint (`granted`, `blocked`, `unconfigured`).
+   * `health_status`: Evaluates whether the underlying container/database/service is healthy and running expected schema/revision.
+   * `live_verified`: Distinguishes active live probes from cached file attestations. **Cached credentials are never claimed as live healthy.**
+2. **Stale vs. Failed:**
+   * `is_stale`: When evidence age exceeds TTL (`now - timestamp > ttl_seconds`), the state resets to `stale`.
+   * **Unknown or stale evidence is NEVER green/healthy.**
+   * A stale probe requires a fresh probe execution (`agent_action`), not an assumption of health.
+3. **Confirmed Diagnosis vs. Unknown Root Cause:**
+   * `confirmed_diagnosis`: Diagnoses with verifiable root cause (e.g., missing test-mode key `sk_test_`, container log query error, or TTL expiration).
+   * `unknown_cause`: Failures lacking diagnostic evidence, preventing fabricated conclusions.
+4. **Human Input vs. Agent Action:**
+   * `human_input_needed = True` ONLY for true authorization gates (`awaiting authorization` merge approval), architectural preferences/tradeoffs (pending `DEC-*` items), or secure credential setup (`sk_test_` missing).
+   * Every human input item carries a unique, deduplicatable `question_id` (e.g. `credential:stripe_test:sk_test_key`, `authorization:req-001:merge`, `decision:DEC-4543-01`).
+   * **Missing implementation, unwritten tests, and failing tests are strictly AGENT-OWNED actions, never punts to the operator.**
+   * **Zero Secret Exposure:** Diagnostics never request or display secret values; they provide secure workstation environment or vault configuration instructions.
+5. **Host Resource Telemetry:**
+   * Reads host RAM usage via Python standard library (`ctypes` on Windows, `/proc/meminfo` on Linux).
+   * Never runs auto-kills or background daemons.
+   * If telemetry is unsupported or unavailable, state is strictly marked `unknown` (never assumed healthy).
 ---
 
 ## 4. Standalone Execution (Zero Veyyon Requirement)

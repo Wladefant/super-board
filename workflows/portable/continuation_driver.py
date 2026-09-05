@@ -995,6 +995,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--unpark", action="append", default=[], dest="unpark",
                    help="Clear a parked request so the next run may retry it (repeatable).")
     p.add_argument("--json", action="store_true", help="Emit the run outcome as JSON.")
+    p.add_argument("--diagnostics", action="store_true",
+                   help="Run aggregate diagnostic inspection across requests and services.")
     return p
 
 
@@ -1035,6 +1037,11 @@ def format_outcome(outcome: DriverOutcome) -> str:
         lines.append("PARKED")
         for p in outcome.parked:
             lines.append(f"  {p['request_id']} [{p['reason_code']}] {p['reason']}")
+    if outcome.parked or outcome.error:
+        lines.append("-" * 70)
+        lines.append("DIAGNOSTIC HANDOFF")
+        lines.append("  Inspect root causes, missing prerequisites and required operator inputs:")
+        lines.append("  python diagnostics.py --summary")
     lines.append("-" * 70)
     lines.append(
         "boundaries      : auto_merge=False auto_deploy=False authorized_ids_only=True"
@@ -1047,6 +1054,20 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
 
     state_dir = os.path.abspath(args.state_dir) if args.state_dir else SCRIPT_DIR
+
+    if getattr(args, "diagnostics", False):
+        try:
+            from diagnostics import DiagnosticCollector, format_diagnostic_summary
+            collector = DiagnosticCollector(state_dir=state_dir)
+            rep = collector.run_diagnostics()
+            if args.json:
+                print(rep.to_json())
+            else:
+                print(format_diagnostic_summary(rep))
+            return 0
+        except Exception as e:
+            sys.stderr.write(f"Diagnostics error: {e}\n")
+            return 1
 
     if args.show_parked or args.unpark:
         journal = DriverJournal(os.path.join(state_dir, JOURNAL_FILENAME))
