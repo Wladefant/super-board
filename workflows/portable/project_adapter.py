@@ -25,8 +25,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
+import sys
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +113,35 @@ class ProjectConfig:
             staging=staging,
             safety=safety,
             metadata=data.get("metadata", {}),
+        )
+
+    def update_lifecycle(
+        self,
+        request_id: str,
+        state: str,
+        head_sha: Optional[str] = None,
+        evidence_url: Optional[str] = None,
+        *,
+        issue_number: Optional[int] = None,
+        dry_run: bool = False,
+        closure_verified: bool = False,
+        graphql_runner: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None,
+    ) -> "SuperboardLifecycleOutcome":
+        """
+        Update GitHub Project V2 card status for this project.
+        Duck-typed callable conforming to the frozen Superboard updater contract:
+          .update_lifecycle(request_id, state, head_sha, evidence_url) -> outcome
+          exposing attributes: .ok (bool), .blocked_reason (str|None), .board_url (str|None)
+        """
+        updater = SuperboardProjectUpdater(self, graphql_runner=graphql_runner)
+        return updater.update_lifecycle(
+            request_id=request_id,
+            state=state,
+            head_sha=head_sha,
+            evidence_url=evidence_url,
+            issue_number=issue_number,
+            dry_run=dry_run,
+            closure_verified=closure_verified,
         )
 
 
@@ -451,3 +482,676 @@ def validate_supabase_project_ref(
         )
 
     return True, "valid", "Supabase project ref matches configured staging environment."
+
+
+
+# ---------------------------------------------------------------------------
+# Superboard Project V2 Lifecycle Updater & Data Models
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SuperboardLifecycleOutcome:
+    """
+    Outcome of a Superboard lifecycle update on GitHub Project V2.
+    Exposes the frozen duck-typed contract:
+      .ok: bool
+      .blocked_reason: Optional[str]
+      .board_url: Optional[str]
+    """
+    ok: bool
+    blocked_reason: Optional[str] = None
+    board_url: Optional[str] = None
+    item_id: Optional[str] = None
+    previous_status: Optional[str] = None
+    new_status: Optional[str] = None
+    dry_run: bool = False
+    github_writes: int = 0
+    details: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+CANONICAL_LIFECYCLE_STATUSES: Tuple[str, ...] = (
+    "Backlog",
+    "Ready",
+    "Building",
+    "QA",
+    "Review",
+    "Blocked",
+    "Done",
+)
+
+STATE_TO_CANONICAL_LIFECYCLE: Dict[str, str] = {
+    "backlog": "Backlog",
+    "pending": "Ready",
+    "ready": "Ready",
+    "building": "Building",
+    "build": "Building",
+    "implementation": "Building",
+    "qa": "QA",
+    "review": "Review",
+    "awaiting authorization": "Review",
+    "awaiting_authorization": "Review",
+    "blocked": "Blocked",
+    "done": "Done",
+    "completed": "Done",
+}
+
+
+def canonicalize_lifecycle_status(value: str) -> str:
+    """
+    Canonicalize a state string into the canonical 7-state Superboard lifecycle status.
+    Raises ValueError on retired ('Skipped') or unknown statuses.
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"Lifecycle status must be a string, got {type(value).__name__}")
+    trimmed = value.strip()
+    if not trimmed:
+        raise ValueError("Lifecycle status must not be empty")
+    folded = trimmed.casefold()
+    if folded in ("skipped",):
+        raise ValueError(
+            "'Skipped' is a retired status; canonical statuses are: Backlog, Ready, Building, QA, Review, Blocked, Done"
+        )
+
+    # Check if exact canonical status
+    for status in CANONICAL_LIFECYCLE_STATUSES:
+        if folded == status.casefold():
+            return status
+
+    # Check state mapping
+    mapped = STATE_TO_CANONICAL_LIFECYCLE.get(folded)
+    if mapped:
+        return mapped
+
+    raise ValueError(
+        f"Unknown lifecycle status '{trimmed}'; canonical statuses are: Backlog, Ready, Building, QA, Review, Blocked, Done"
+    )
+
+
+PROJECT_STATUS_SCHEMA_QUERY = """query($owner: String!, $number: Int!) {
+  repositoryOwner(login: $owner) {
+    ... on Organization {
+      projectV2(number: $number) {
+        id
+        title
+        fields(first: 50) {
+          nodes {
+            ... on ProjectV2SingleSelectField {
+              id
+              name
+              options {
+                id
+                name
+              }
+            }
+          }
+        }
+      }
+    }
+    ... on User {
+      projectV2(number: $number) {
+        id
+        title
+        fields(first: 50) {
+          nodes {
+            ... on ProjectV2SingleSelectField {
+              id
+              name
+              options {
+                id
+                name
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}"""
+
+
+ISSUE_PROJECT_ITEM_QUERY = """query($owner: String!, $repo: String!, $issueNumber: Int!) {
+  repository(owner: $owner, name: $repo) {
+    issue(number: $issueNumber) {
+      id
+      title
+      projectItems(first: 20) {
+        nodes {
+          id
+          project {
+            id
+            number
+            title
+            owner {
+              ... on Organization { login }
+              ... on User { login }
+            }
+          }
+          fieldValueByName(name: "Status") {
+            ... on ProjectV2ItemFieldSingleSelectValue {
+              name
+              optionId
+              field {
+                ... on ProjectV2SingleSelectField {
+                  id
+                  name
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}"""
+
+
+UPDATE_PROJECT_ITEM_STATUS_MUTATION = """mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+  updateProjectV2ItemFieldValue(
+    input: {
+      projectId: $projectId
+      itemId: $itemId
+      fieldId: $fieldId
+      value: {
+        singleSelectOptionId: $optionId
+      }
+    }
+  ) {
+    projectV2Item {
+      id
+    }
+  }
+}"""
+
+
+def default_graphql_runner(query: str, variables: Dict[str, Any]) -> Dict[str, Any]:
+    """Execute a GraphQL query or mutation via gh api graphql subprocess."""
+    cmd = ["gh", "api", "graphql"]
+    for k, v in variables.items():
+        if isinstance(v, int):
+            cmd.extend(["-F", f"{k}={v}"])
+        else:
+            cmd.extend(["-f", f"{k}={str(v)}"])
+    cmd.extend(["-f", f"query={query}"])
+
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        raise RuntimeError(f"Failed to execute gh api graphql subprocess: {e}")
+
+    if res.returncode != 0:
+        err_msg = res.stderr.strip() or res.stdout.strip() or f"gh exited with code {res.returncode}"
+        raise RuntimeError(f"GraphQL execution failed: {err_msg}")
+
+    try:
+        return json.loads(res.stdout)
+    except Exception as e:
+        raise RuntimeError(f"Invalid JSON returned by gh api graphql: {e}\nRaw output: {res.stdout}")
+
+
+class SuperboardProjectUpdater:
+    """
+    Native GitHub Project V2 lifecycle updater for Superboard.
+    Ensures:
+      - Dynamic schema discovery (no generic global fixed IDs)
+      - Fails closed on wrong-target, generic, or unconfigured projects
+      - Idempotence: 0 writes if card is already in target status
+      - Dry-run: guaranteed 0 writes
+      - Done status requires verified closure and head_sha
+      - Readback verification on all live mutations
+      - Truthful error propagation
+    """
+
+    def __init__(
+        self,
+        config: Optional[ProjectConfig] = None,
+        *,
+        graphql_runner: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None,
+    ):
+        self.config = config or get_current_project_config()
+        self.graphql_runner = graphql_runner or default_graphql_runner
+
+    def _parse_repo(self) -> Tuple[bool, str, str, Optional[str]]:
+        """Validate and parse repo into (owner, repo_name). Returns (ok, owner, repo, err)."""
+        repo = (self.config.repo or "").strip()
+        if not repo or repo.startswith("generic/") or "unconfigured" in repo.lower():
+            return False, "", "", f"Project repository '{repo}' is unconfigured or generic; failing closed"
+        if "/" not in repo:
+            return False, "", "", f"Invalid repository identifier '{repo}'; expected 'owner/repo'"
+        parts = repo.split("/", 1)
+        return True, parts[0].strip(), parts[1].strip(), None
+
+    def _resolve_issue_number(self, request_id: str, issue_number: Optional[int] = None) -> Optional[int]:
+        if issue_number and issue_number > 0:
+            return issue_number
+        if str(request_id).isdigit():
+            return int(request_id)
+        # Parse patterns like req-4543, issue-4543, #4543
+        m = re.search(r"(?:issue|req|#)[-_]?(\d+)", str(request_id), re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+        m2 = re.search(r"\b(\d+)\b", str(request_id))
+        if m2:
+            return int(m2.group(1))
+        return None
+
+    def get_board_schema(self, owner: str, project_number: int) -> Dict[str, Any]:
+        """Dynamically fetch project ID, Status field ID, and option IDs map."""
+        raw = self.graphql_runner(PROJECT_STATUS_SCHEMA_QUERY, {"owner": owner, "number": project_number})
+        data = raw.get("data", {})
+        repo_owner = data.get("repositoryOwner") or {}
+        project = repo_owner.get("projectV2")
+        if not project:
+            errors = raw.get("errors", [])
+            err_msg = errors[0].get("message") if errors else f"Project #{project_number} not found for owner '{owner}'"
+            raise RuntimeError(err_msg)
+
+        project_id = project.get("id")
+        project_title = project.get("title", "")
+        status_field_id = None
+        options_map: Dict[str, str] = {}  # canonical status name (folded) -> option_id
+
+        fields = (project.get("fields") or {}).get("nodes") or []
+        for f in fields:
+            if not isinstance(f, dict):
+                continue
+            if (f.get("name") or "").strip().casefold() == "status":
+                status_field_id = f.get("id")
+                for opt in f.get("options") or []:
+                    opt_name = opt.get("name")
+                    opt_id = opt.get("id")
+                    if opt_name and opt_id:
+                        options_map[opt_name.strip().casefold()] = opt_id
+                break
+
+        if not status_field_id:
+            raise RuntimeError(f"Status field not found on project #{project_number} for owner '{owner}'")
+
+        return {
+            "project_id": project_id,
+            "project_title": project_title,
+            "status_field_id": status_field_id,
+            "options_map": options_map,
+        }
+
+    def get_issue_project_item(
+        self, owner: str, repo: str, issue_number: int, project_number: int
+    ) -> Dict[str, Any]:
+        """Fetch project item node ID, current status name and option ID for the issue."""
+        raw = self.graphql_runner(
+            ISSUE_PROJECT_ITEM_QUERY,
+            {"owner": owner, "repo": repo, "issueNumber": issue_number},
+        )
+        data = raw.get("data", {})
+        repository = data.get("repository") or {}
+        issue = repository.get("issue")
+        if not issue:
+            errors = raw.get("errors", [])
+            err_msg = errors[0].get("message") if errors else f"Issue #{issue_number} not found in {owner}/{repo}"
+            raise RuntimeError(err_msg)
+
+        items = (issue.get("projectItems") or {}).get("nodes") or []
+        for it in items:
+            proj = it.get("project") or {}
+            if proj.get("number") == project_number:
+                status_val = it.get("fieldValueByName") or {}
+                return {
+                    "item_id": it.get("id"),
+                    "project_id": proj.get("id"),
+                    "project_number": proj.get("number"),
+                    "project_title": proj.get("title"),
+                    "status_name": status_val.get("name"),
+                    "option_id": status_val.get("optionId"),
+                }
+
+        raise RuntimeError(f"Issue #{issue_number} is not linked to project #{project_number} on {owner}")
+
+    def update_lifecycle(
+        self,
+        request_id: str,
+        state: str,
+        head_sha: Optional[str] = None,
+        evidence_url: Optional[str] = None,
+        *,
+        issue_number: Optional[int] = None,
+        dry_run: bool = False,
+        closure_verified: bool = False,
+    ) -> SuperboardLifecycleOutcome:
+        """
+        Public duck-typed lifecycle update method conforming to the frozen contract:
+          .update_lifecycle(request_id, state, head_sha, evidence_url) -> outcome
+          exposing: .ok, .blocked_reason, .board_url
+        """
+        # 1. Guard wrong-target / unconfigured repo
+        ok_repo, owner, repo_name, repo_err = self._parse_repo()
+        if not ok_repo:
+            return SuperboardLifecycleOutcome(
+                ok=False,
+                blocked_reason=repo_err,
+                dry_run=dry_run,
+                github_writes=0,
+            )
+
+        project_number = int(self.config.project_number or 1)
+        board_url = f"https://github.com/orgs/{owner}/projects/{project_number}"
+
+        # 2. Resolve issue number
+        target_issue = self._resolve_issue_number(request_id, issue_number)
+        if not target_issue:
+            return SuperboardLifecycleOutcome(
+                ok=False,
+                blocked_reason=f"Cannot resolve target issue number from request_id '{request_id}'",
+                board_url=board_url,
+                dry_run=dry_run,
+                github_writes=0,
+            )
+
+        # 3. Canonicalize desired status
+        try:
+            canonical_status = canonicalize_lifecycle_status(state)
+        except ValueError as e:
+            return SuperboardLifecycleOutcome(
+                ok=False,
+                blocked_reason=str(e),
+                board_url=board_url,
+                dry_run=dry_run,
+                github_writes=0,
+            )
+
+        # 4. Inviolable Done-closure gate: fail closed on unverified Done or missing head
+        if canonical_status == "Done":
+            if not closure_verified:
+                return SuperboardLifecycleOutcome(
+                    ok=False,
+                    blocked_reason="Done status requires verified live closure; unverified transitions to Done are prohibited",
+                    board_url=board_url,
+                    dry_run=dry_run,
+                    github_writes=0,
+                )
+            if not head_sha or len(head_sha.strip()) < 7:
+                return SuperboardLifecycleOutcome(
+                    ok=False,
+                    blocked_reason="Done status requires an authoritative head_sha",
+                    board_url=board_url,
+                    dry_run=dry_run,
+                    github_writes=0,
+                )
+
+        # 5. Dynamic schema discovery
+        try:
+            schema = self.get_board_schema(owner, project_number)
+        except Exception as e:
+            return SuperboardLifecycleOutcome(
+                ok=False,
+                blocked_reason=f"Failed to discover project schema for {owner}#{project_number}: {e}",
+                board_url=board_url,
+                dry_run=dry_run,
+                github_writes=0,
+            )
+
+        project_id = schema["project_id"]
+        status_field_id = schema["status_field_id"]
+        options_map = schema["options_map"]
+
+        target_option_id = options_map.get(canonical_status.casefold())
+        if not target_option_id:
+            return SuperboardLifecycleOutcome(
+                ok=False,
+                blocked_reason=f"Status option '{canonical_status}' not found on project #{project_number} for {owner}",
+                board_url=board_url,
+                dry_run=dry_run,
+                github_writes=0,
+            )
+
+        # 6. Find card on board
+        try:
+            card = self.get_issue_project_item(owner, repo_name, target_issue, project_number)
+        except Exception as e:
+            return SuperboardLifecycleOutcome(
+                ok=False,
+                blocked_reason=str(e),
+                board_url=board_url,
+                dry_run=dry_run,
+                github_writes=0,
+            )
+
+        item_id = card["item_id"]
+        current_status = card["status_name"]
+
+        # 7. Idempotence: if already in target status, 0 writes
+        if current_status and current_status.casefold() == canonical_status.casefold():
+            return SuperboardLifecycleOutcome(
+                ok=True,
+                board_url=board_url,
+                item_id=item_id,
+                previous_status=current_status,
+                new_status=canonical_status,
+                dry_run=dry_run,
+                github_writes=0,
+                details={
+                    "message": f"Card already in status '{canonical_status}'; mutation skipped (idempotent)",
+                    "issue_number": target_issue,
+                    "head_sha": head_sha,
+                    "evidence_url": evidence_url,
+                },
+            )
+
+        # 8. Dry-run guard: guaranteed 0 writes
+        if dry_run:
+            return SuperboardLifecycleOutcome(
+                ok=True,
+                board_url=board_url,
+                item_id=item_id,
+                previous_status=current_status,
+                new_status=canonical_status,
+                dry_run=True,
+                github_writes=0,
+                details={
+                    "message": f"Dry-run: would mutate status from '{current_status}' to '{canonical_status}'",
+                    "target_option_id": target_option_id,
+                    "status_field_id": status_field_id,
+                    "issue_number": target_issue,
+                    "head_sha": head_sha,
+                    "evidence_url": evidence_url,
+                },
+            )
+
+        # 9. Real mutation
+        try:
+            self.graphql_runner(
+                UPDATE_PROJECT_ITEM_STATUS_MUTATION,
+                {
+                    "projectId": project_id,
+                    "itemId": item_id,
+                    "fieldId": status_field_id,
+                    "optionId": target_option_id,
+                },
+            )
+        except Exception as e:
+            return SuperboardLifecycleOutcome(
+                ok=False,
+                blocked_reason=f"GraphQL mutation failed: {e}",
+                board_url=board_url,
+                item_id=item_id,
+                previous_status=current_status,
+                new_status=None,
+                dry_run=False,
+                github_writes=0,
+            )
+
+        # 10. Readback verification
+        try:
+            readback_card = self.get_issue_project_item(owner, repo_name, target_issue, project_number)
+            observed_status = readback_card["status_name"]
+            if not observed_status or observed_status.casefold() != canonical_status.casefold():
+                return SuperboardLifecycleOutcome(
+                    ok=False,
+                    blocked_reason=f"Readback mismatch: expected status '{canonical_status}', observed '{observed_status}'",
+                    board_url=board_url,
+                    item_id=item_id,
+                    previous_status=current_status,
+                    new_status=observed_status,
+                    dry_run=False,
+                    github_writes=1,
+                )
+        except Exception as e:
+            return SuperboardLifecycleOutcome(
+                ok=False,
+                blocked_reason=f"Mutation executed but readback verification failed: {e}",
+                board_url=board_url,
+                item_id=item_id,
+                previous_status=current_status,
+                new_status=None,
+                dry_run=False,
+                github_writes=1,
+            )
+
+        return SuperboardLifecycleOutcome(
+            ok=True,
+            board_url=board_url,
+            item_id=item_id,
+            previous_status=current_status,
+            new_status=canonical_status,
+            dry_run=False,
+            github_writes=1,
+            details={
+                "message": f"Successfully transitioned card status from '{current_status}' to '{canonical_status}'",
+                "readback_verified": True,
+                "issue_number": target_issue,
+                "head_sha": head_sha,
+                "evidence_url": evidence_url,
+            },
+        )
+
+
+def update_project_lifecycle(
+    request_id: str,
+    state: str,
+    head_sha: Optional[str] = None,
+    evidence_url: Optional[str] = None,
+    *,
+    config: Optional[ProjectConfig] = None,
+    issue_number: Optional[int] = None,
+    dry_run: bool = False,
+    closure_verified: bool = False,
+    graphql_runner: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None,
+) -> SuperboardLifecycleOutcome:
+    """Convenience functional wrapper around SuperboardProjectUpdater."""
+    cfg = config or get_current_project_config()
+    return cfg.update_lifecycle(
+        request_id=request_id,
+        state=state,
+        head_sha=head_sha,
+        evidence_url=evidence_url,
+        issue_number=issue_number,
+        dry_run=dry_run,
+        closure_verified=closure_verified,
+        graphql_runner=graphql_runner,
+    )
+
+
+def main():
+    """CLI interface for project adapter and Superboard lifecycle updater."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Portable Project Adapter & Superboard Lifecycle Updater")
+    subparsers = parser.add_subparsers(dest="command")
+
+    # config
+    subparsers.add_parser("config", help="Print active project configuration JSON")
+
+    # update-lifecycle
+    up_p = subparsers.add_parser("update-lifecycle", help="Update Superboard Project V2 card status")
+    up_p.add_argument("--request-id", default="", help="Request ID (e.g. req-4543)")
+    up_p.add_argument("--issue", type=int, default=None, help="Target GitHub issue number")
+    up_p.add_argument("--state", required=True, help="Target lifecycle state (Backlog, Ready, Building, QA, Review, Blocked, Done)")
+    up_p.add_argument("--head-sha", default=None, help="Authoritative commit SHA")
+    up_p.add_argument("--evidence-url", default=None, help="Evidence URL or proof link")
+    up_p.add_argument("--dry-run", action="store_true", help="Dry run mode: do not mutate GitHub")
+    up_p.add_argument("--verified", action="store_true", help="Assert verified live closure (required for Done)")
+    up_p.add_argument("--json", action="store_true", help="Output outcome as JSON")
+
+    # status
+    st_p = subparsers.add_parser("status", help="Get current Superboard card status for an issue")
+    st_p.add_argument("--issue", type=int, required=True, help="Target GitHub issue number")
+    st_p.add_argument("--json", action="store_true", help="Output status as JSON")
+
+    # board-info
+    subparsers.add_parser("board-info", help="Get project board schema (fields & options)")
+
+    args = parser.parse_args()
+
+    cfg = get_current_project_config()
+
+    if args.command == "config":
+        print(json.dumps(cfg.to_dict(), indent=2))
+        sys.exit(0)
+
+    elif args.command == "update-lifecycle":
+        updater = SuperboardProjectUpdater(cfg)
+        outcome = updater.update_lifecycle(
+            request_id=args.request_id or f"issue-{args.issue}",
+            state=args.state,
+            head_sha=args.head_sha,
+            evidence_url=args.evidence_url,
+            issue_number=args.issue,
+            dry_run=args.dry_run,
+            closure_verified=args.verified,
+        )
+        if args.json:
+            print(json.dumps(outcome.to_dict(), indent=2))
+        else:
+            status_label = "OK" if outcome.ok else "BLOCKED"
+            print(f"[{status_label}] Superboard Lifecycle Update")
+            print(f"  Board URL:        {outcome.board_url}")
+            print(f"  Item ID:          {outcome.item_id}")
+            print(f"  Previous Status:  {outcome.previous_status}")
+            print(f"  New Status:       {outcome.new_status}")
+            print(f"  Dry Run:          {outcome.dry_run}")
+            print(f"  GitHub Writes:    {outcome.github_writes}")
+            if outcome.blocked_reason:
+                print(f"  Blocked Reason:   {outcome.blocked_reason}")
+        sys.exit(0 if outcome.ok else 1)
+
+    elif args.command == "status":
+        updater = SuperboardProjectUpdater(cfg)
+        ok_repo, owner, repo_name, err = updater._parse_repo()
+        if not ok_repo:
+            print(f"Error: {err}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            item = updater.get_issue_project_item(owner, repo_name, args.issue, cfg.project_number)
+            if args.json:
+                print(json.dumps(item, indent=2))
+            else:
+                print(f"Issue #{args.issue} on Project #{cfg.project_number} ({owner}/{repo_name}):")
+                print(f"  Item ID: {item.get('item_id')}")
+                print(f"  Status:  {item.get('status_name')} (optionId: {item.get('option_id')})")
+            sys.exit(0)
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    elif args.command == "board-info":
+        updater = SuperboardProjectUpdater(cfg)
+        ok_repo, owner, repo_name, err = updater._parse_repo()
+        if not ok_repo:
+            print(f"Error: {err}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            schema = updater.get_board_schema(owner, cfg.project_number)
+            print(json.dumps(schema, indent=2))
+            sys.exit(0)
+        except Exception as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    else:
+        parser.print_help()
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
