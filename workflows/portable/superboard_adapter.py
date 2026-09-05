@@ -103,12 +103,22 @@ class WorkerExecutionResult:
         Fixtures and probes are excluded by construction: no amount of fixture output
         may be read as proof that real work happened.
         """
+        checks = self.evidence.get("checks") if isinstance(self.evidence, dict) else None
+        checks_are_genuine = bool(checks) and all(
+            isinstance(check, dict)
+            and isinstance(check.get("command"), list)
+            and bool(check.get("command"))
+            and isinstance(check.get("exit_code"), int)
+            and check.get("exit_code") == 0
+            and bool(str(check.get("observed") or "").strip())
+            for check in checks
+        )
         return (
             not self.is_fixture
             and not self.is_probe
             and self.blocked_reason is None
             and self.exit_code == 0
-            and bool(self.evidence)
+            and checks_are_genuine
         )
 
     def to_dict(self) -> Dict[str, Any]:

@@ -73,6 +73,12 @@ class StubWorkerBackend:
             "head_sha": self.head_sha,
             "structured_result": {"passed": self.ok},
             "verdict": "pass" if self.ok else "fail",
+            "checks": [{
+                "name": f"{stage} contract",
+                "command": ["stub-backend", f"--stage={stage}"],
+                "exit_code": 0 if self.ok else 1,
+                "observed": f"{stage} {'passed' if self.ok else 'failed'} at {self.head_sha}",
+            }],
         }
         evidence.update(self.extra_evidence)
         if self.reproduction is not None:
