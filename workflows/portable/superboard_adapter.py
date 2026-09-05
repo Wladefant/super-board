@@ -1216,40 +1216,53 @@ class SuperboardExecutionAdapter:
                 boundaries=asdict(packet.boundaries),
             )
 
-        # Check Decision Gate
-        if hasattr(packet, "decision_status") and packet.decision_status:
-            ds = packet.decision_status
-            if isinstance(ds, dict) and ds.get("blocking_this_request"):
-                req_state = getattr(req, "state", None) or (req.get("state") if isinstance(req, dict) else "")
-                req_id_str = getattr(req, "id", "") or (req.get("id", "") if isinstance(req, dict) else "")
-                if req_state in ("done", "completed") or "synthetic" in req_id_str.lower() or "demo" in req_id_str.lower():
-                    # Retired/completed synthetic demo: strictly refuse notification
-                    pass
-                else:
-                    dec_ids = ds.get("blocking_decision_ids", [])
-                    reason = f"Request '{req.id}' is blocked awaiting human decision on {', '.join(dec_ids)}"
-                    receipt = self.emit_telegram_event(
-                        req,
-                        status="decision",
-                        stage="decision",
-                        summary=reason,
-                        event_type_override="decision",
-                    )
-                    return AdapterExecutionResult(
-                        step_id=step_id,
-                        request_id=req.id,
-                        stage="decision",
-                        status="blocked",
-                        status_reason=reason,
-                        next_action=f"Human operator must answer decision {', '.join(dec_ids)} on GitHub issue",
-                        preflight_passed=True,
-                        notification_receipt=receipt,
-                        boundaries=asdict(packet.boundaries),
-                    )
+        # Check Decision Gate. CoordinatorPacket carries a typed DecisionStatus; resolve
+        # the authoritative registry decision before routing through the notifier's typed
+        # status/provenance guard.
+        decision_status = getattr(packet, "decision_status", None)
+        if decision_status is not None and getattr(
+            decision_status, "blocking_this_request", False
+        ):
+            decision_ids = list(
+                getattr(decision_status, "blocking_decision_ids", None) or []
+            )
+            decision_id = decision_ids[0] if decision_ids else ""
+            try:
+                decision = self.coordinator.decision_mgr.get_decision(decision_id)
+            except KeyError:
+                # Fail closed through the same typed guard when the coordinator reports a
+                # blocker whose registry record/status cannot be resolved.
+                decision = {
+                    "decision_id": decision_id,
+                    "request_id": req.id,
+                    "question": "Decision status could not be resolved",
+                }
+            reason = (
+                f"Request '{req.id}' is blocked awaiting human decision on "
+                f"{', '.join(decision_ids) or 'an unresolved decision'}"
+            )
+            receipt = self.emit_telegram_decision_event(decision)
+            return AdapterExecutionResult(
+                step_id=step_id,
+                request_id=req.id,
+                stage="decision",
+                status="blocked",
+                status_reason=reason,
+                next_action=(
+                    f"Human operator must answer decision {', '.join(decision_ids)} on GitHub issue"
+                    if decision_ids
+                    else "Resolve the missing decision registry status before continuing"
+                ),
+                preflight_passed=True,
+                notification_receipt=receipt,
+                boundaries=asdict(packet.boundaries),
+            )
         # 3. Check Preflight Gate
         if not packet.preflight.passed:
             blocker_summary = f"Preflight gate blocked request '{req.id}': {'; '.join(packet.preflight.blockers)}"
-            receipt = self.emit_telegram_event(req, "blocked", "preflight", blocker_summary)
+            receipt = None
+            if getattr(packet.preflight, "status", "") != "blocked_by_decision":
+                receipt = self.emit_telegram_event(req, "blocked", "preflight", blocker_summary)
             return AdapterExecutionResult(
                 step_id=step_id,
                 request_id=req.id,
