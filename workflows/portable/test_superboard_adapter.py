@@ -115,9 +115,26 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
         # Initialize clean test ledger
         self.ledger = RequestLedger(self.ledger_path)
 
-    def tearDown(self):
-        shutil.rmtree(self.test_dir, ignore_errors=True)
+        # Zero-quota fixture credentials for dry-run Telegram notification testing
+        self._orig_chat_id = os.environ.get("TELEGRAM_NOTIFY_CHAT_ID")
+        self._orig_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+        if not self._orig_chat_id:
+            os.environ["TELEGRAM_NOTIFY_CHAT_ID"] = "1247617658"
+        if not self._orig_token:
+            os.environ["TELEGRAM_BOT_TOKEN"] = "dummy_token_for_dry_run"
 
+    def tearDown(self):
+        if self._orig_chat_id is None:
+            os.environ.pop("TELEGRAM_NOTIFY_CHAT_ID", None)
+        else:
+            os.environ["TELEGRAM_NOTIFY_CHAT_ID"] = self._orig_chat_id
+
+        if self._orig_token is None:
+            os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+        else:
+            os.environ["TELEGRAM_BOT_TOKEN"] = self._orig_token
+
+        shutil.rmtree(self.test_dir, ignore_errors=True)
     def _add_pipeline_request(self, req_id):
         self.ledger.add_request(
             req_id=req_id,
