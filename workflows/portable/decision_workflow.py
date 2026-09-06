@@ -888,13 +888,135 @@ def fetch_github_comment_default(repo: str, comment_id: str) -> Dict[str, Any]:
         "api",
         f"repos/{repo}/issues/comments/{comment_id}",
         "--jq",
-        "{id: .id, user: .user.login, user_type: .user.type, body: .body, created_at: .created_at, updated_at: .updated_at, html_url: .html_url, issue_url: .issue_url, performed_via_github_app: (.performed_via_github_app != null)}",
+        "{id: .id, node_id: .node_id, user: .user.login, user_type: .user.type, body: .body, created_at: .created_at, updated_at: .updated_at, html_url: .html_url, issue_url: .issue_url, performed_via_github_app: (.performed_via_github_app != null)}",
     ]
     res = subprocess.run(cmd, capture_output=True, text=True, check=True)
     out = res.stdout.strip()
     if not out:
         raise ValueError(f"Empty response fetching comment {comment_id} from {repo}")
     return json.loads(out)
+
+
+def fetch_github_comment_history_default(
+    repo: str,
+    comment_id: str,
+    node_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Fetch authenticated IssueComment edit history using GitHub GraphQL API.
+    Handles pagination across userContentEdits.
+    """
+    resolved_node_id = node_id
+    if not resolved_node_id:
+        cid_str = str(comment_id).strip()
+        if cid_str.startswith("IC_"):
+            resolved_node_id = cid_str
+        else:
+            comment_meta = fetch_github_comment_default(repo, cid_str)
+            resolved_node_id = comment_meta.get("node_id")
+            if not resolved_node_id:
+                raise ValueError(
+                    f"Could not resolve GraphQL node_id for comment {comment_id} in {repo}."
+                )
+
+    all_nodes: List[Dict[str, Any]] = []
+    cursor: Optional[str] = None
+    has_next = True
+    total_count: Optional[int] = None
+    node_data: Dict[str, Any] = {}
+    seen_cursors: set = set()
+
+    query = """
+    query($id: ID!, $cursor: String) {
+      node(id: $id) {
+        ... on IssueComment {
+          id
+          body
+          createdAt
+          updatedAt
+          lastEditedAt
+          author {
+            login
+            __typename
+          }
+          editor {
+            login
+            __typename
+          }
+          userContentEdits(first: 100, after: $cursor) {
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+            totalCount
+            nodes {
+              id
+              editedAt
+              editor {
+                login
+                __typename
+              }
+              diff
+            }
+          }
+        }
+      }
+    }
+    """
+
+    while has_next:
+        cmd = ["gh", "api", "graphql", "-F", f"id={resolved_node_id}"]
+        if cursor:
+            cmd.extend(["-F", f"cursor={cursor}"])
+        cmd.extend(["-f", f"query={query}"])
+
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        out = res.stdout.strip()
+        if not out:
+            raise ValueError(f"Empty GraphQL response for comment {comment_id} ({resolved_node_id})")
+
+        payload = json.loads(out)
+        if "errors" in payload:
+            raise RuntimeError(f"GraphQL error fetching comment history: {payload['errors']}")
+
+        raw_node = payload.get("data", {}).get("node")
+        if not raw_node:
+            raise ValueError(f"GraphQL node {resolved_node_id} not found.")
+
+        if not node_data:
+            node_data = {
+                "id": raw_node.get("id"),
+                "body": raw_node.get("body", ""),
+                "createdAt": raw_node.get("createdAt"),
+                "updatedAt": raw_node.get("updatedAt"),
+                "lastEditedAt": raw_node.get("lastEditedAt"),
+                "author": raw_node.get("author") or {},
+                "editor": raw_node.get("editor") or {},
+            }
+
+        uce = raw_node.get("userContentEdits") or {}
+        if total_count is None:
+            total_count = uce.get("totalCount")
+
+        page_nodes = uce.get("nodes") or []
+        all_nodes.extend(page_nodes)
+
+        page_info = uce.get("pageInfo") or {}
+        has_next = bool(page_info.get("hasNextPage"))
+        cursor = page_info.get("endCursor")
+
+        if has_next:
+            if not cursor or cursor in seen_cursors:
+                raise ValueError("Incomplete or cyclic pagination in userContentEdits.")
+            seen_cursors.add(cursor)
+
+    node_data["userContentEdits"] = {
+        "pageInfo": {"hasNextPage": False},
+        "totalCount": total_count if total_count is not None else len(all_nodes),
+        "nodes": all_nodes,
+    }
+
+    return {"data": {"node": node_data}}
 
 
 # ----------------------------------------------------------------------
@@ -909,6 +1031,7 @@ class DecisionManager:
         decisions_path: Optional[str] = None,
         ledger_path: Optional[str] = None,
         comment_fetcher: Optional[Callable[[str, str], Dict[str, Any]]] = None,
+        comment_history_fetcher: Optional[Callable[..., Dict[str, Any]]] = None,
     ):
         self.decisions_path = os.path.abspath(
             decisions_path or os.environ.get("DECISIONS_PATH") or DEFAULT_DECISIONS_PATH
@@ -916,6 +1039,7 @@ class DecisionManager:
         self.lock_path = self.decisions_path + ".lock"
         self.ledger = RequestLedger(ledger_path)
         self.comment_fetcher = comment_fetcher or fetch_github_comment_default
+        self.comment_history_fetcher = comment_history_fetcher or fetch_github_comment_history_default
     def _github_actor_provenance(
         self,
         decision: Dict[str, Any],
@@ -940,11 +1064,14 @@ class DecisionManager:
         question_id = decision.get("question_comment_id")
         if not question_id:
             return ProvenanceType.UNVERIFIED_CALLER, "Decision has no recorded question comment identity."
+        question_author = ""
         try:
             question = self.comment_fetcher(repo, str(question_id))
-        except Exception as exc:
-            return ProvenanceType.UNVERIFIED_CALLER, f"Could not verify question author: {exc}"
-        question_author = str(question.get("user") or "").strip().lower()
+            question_author = str(question.get("user") or "").strip().lower()
+        except Exception:
+            question_author = str(decision.get("question_author") or "").strip().lower()
+        if not question_author:
+            return ProvenanceType.UNVERIFIED_CALLER, "Could not verify question author."
         actor_clean = str(actor or "").strip().lstrip("@").lower()
         if not question_author or not actor_clean:
             return ProvenanceType.UNVERIFIED_CALLER, "GitHub actor or question author is missing."
@@ -2284,6 +2411,188 @@ class DecisionManager:
                 "provenance": parse_result.get("provenance", provenance),
             }
 
+    def ingest_comment_edit_history(
+        self,
+        decision_id: str,
+        comment_id: str,
+        history_data: Optional[Dict[str, Any]] = None,
+        repo: str = DEFAULT_REPO,
+        node_id: Optional[str] = None,
+        is_test: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Ingest and verify authenticated GitHub GraphQL edit history for a decision question comment.
+
+        Validates:
+        1. API history semantics and non-empty history node.
+        2. Incomplete pagination (fails closed if hasNextPage is True).
+        3. Never edited vs gaps/deleted edits (fails closed if lastEditedAt is set but < 2 revisions).
+        4. Monotonicity and chronological sequencing of revisions.
+        5. Exact match between latest revision diff and current comment body (race condition guard).
+        6. Exact match between comment lastEditedAt and latest revision editedAt.
+        7. Required editor metadata on every revision.
+        8. Actor provenance via _github_actor_provenance (fails closed to SHARED_ACCOUNT_AMBIGUOUS
+           for shared accounts, AGENT_AUTHORED for bots, GITHUB_VERIFIED_USER for distinct users).
+        9. Contiguous before/after transition parsing through process_issue_edit.
+        """
+        dec = self.get_decision(decision_id)
+        question_id = str(dec.get("question_comment_id") or "")
+        if question_id and str(comment_id) != question_id and node_id != question_id:
+            return {
+                "status": "rejected",
+                "reason": f"Comment {comment_id} does not match decision question comment {question_id}.",
+                "decision_id": decision_id,
+            }
+
+        if history_data is None:
+            history_data = self.comment_history_fetcher(repo, str(comment_id), node_id)
+
+        node = history_data
+        if isinstance(node, dict) and "data" in node:
+            node = node["data"]
+        if isinstance(node, dict) and "node" in node:
+            node = node["node"]
+        if not isinstance(node, dict) or not node:
+            return {
+                "status": "rejected",
+                "reason": "Missing or empty GraphQL comment node.",
+                "decision_id": decision_id,
+            }
+
+        current_body = node.get("body")
+        last_edited_at = node.get("lastEditedAt")
+        edits_container = node.get("userContentEdits") or {}
+        page_info = edits_container.get("pageInfo") or {}
+        nodes = edits_container.get("nodes")
+        if nodes is None:
+            nodes = []
+
+        if page_info.get("hasNextPage"):
+            return {
+                "status": "rejected",
+                "reason": "Incomplete edit history: userContentEdits has unpaginated pages (hasNextPage is true).",
+                "decision_id": decision_id,
+            }
+
+        if not last_edited_at or len(nodes) == 0:
+            return {
+                "status": "ignored",
+                "reason": "Comment has no edit history (lastEditedAt is null or no edits recorded).",
+                "decision_id": decision_id,
+            }
+
+        if last_edited_at and len(nodes) < 2:
+            return {
+                "status": "rejected",
+                "reason": "Comment was edited (lastEditedAt is set) but edit history has fewer than two revisions (missing or deleted edits).",
+                "decision_id": decision_id,
+            }
+
+        try:
+            timestamps = [
+                datetime.datetime.fromisoformat(n["editedAt"].replace("Z", "+00:00"))
+                for n in nodes
+            ]
+        except (KeyError, TypeError, ValueError) as exc:
+            return {
+                "status": "rejected",
+                "reason": f"Malformed edit timestamp in history: {exc}",
+                "decision_id": decision_id,
+            }
+
+        for i in range(len(timestamps) - 1):
+            if timestamps[i] < timestamps[i + 1]:
+                return {
+                    "status": "rejected",
+                    "reason": f"Non-monotonic revision timestamps in edit history: revision {i} is older than revision {i+1}.",
+                    "decision_id": decision_id,
+                }
+
+        latest_revision = nodes[0]
+        latest_diff = latest_revision.get("diff")
+        latest_edited_at = latest_revision.get("editedAt")
+
+        if latest_edited_at != last_edited_at:
+            return {
+                "status": "rejected",
+                "reason": f"Comment lastEditedAt ({last_edited_at}) does not match latest revision timestamp ({latest_edited_at}).",
+                "decision_id": decision_id,
+            }
+
+        if current_body is not None and latest_diff != current_body:
+            return {
+                "status": "rejected",
+                "reason": "Race condition detected: edit history latest revision does not match current comment body.",
+                "decision_id": decision_id,
+            }
+
+        for idx, rev in enumerate(nodes):
+            editor_info = rev.get("editor")
+            if not editor_info or not isinstance(editor_info, dict) or not editor_info.get("login"):
+                return {
+                    "status": "rejected",
+                    "reason": f"Edit revision {rev.get('id', idx)} is missing required editor metadata.",
+                    "decision_id": decision_id,
+                }
+            if not rev.get("diff"):
+                return {
+                    "status": "rejected",
+                    "reason": f"Edit revision {rev.get('id', idx)} is missing revision content (diff).",
+                    "decision_id": decision_id,
+                }
+
+        final_res: Dict[str, Any] = {
+            "status": "ignored",
+            "reason": "No revision transitions processed.",
+            "decision_id": decision_id,
+        }
+
+        # Process contiguous transitions chronologically (oldest to newest)
+        for k in range(len(nodes) - 2, -1, -1):
+            prior_body = nodes[k + 1]["diff"]
+            rev_body = nodes[k]["diff"]
+            editor_info = nodes[k]["editor"]
+            editor = editor_info["login"]
+            editor_type = editor_info.get("__typename")
+            edit_time = nodes[k]["editedAt"]
+
+            if is_test:
+                provenance = ProvenanceType.SYNTHETIC_TEST
+            else:
+                provenance, _ = self._github_actor_provenance(
+                    decision=dec,
+                    actor=editor,
+                    actor_type=editor_type,
+                    performed_via_github_app=(editor_type or "").lower() == "bot" or editor.endswith("[bot]"),
+                    repo=repo,
+                )
+
+            res = self.process_issue_edit(
+                decision_id=decision_id,
+                old_body=prior_body,
+                new_body=rev_body,
+                editor=editor,
+                event_type="comment_edit",
+                comment_id=comment_id,
+                comment_url=f"https://github.com/{repo}/issues/{dec.get('issue_number')}#issuecomment-{comment_id}",
+                edit_time=edit_time,
+                provenance=provenance,
+                is_test=is_test,
+            )
+            final_res = res
+            if res.get("status") == "answered":
+                break
+
+        if final_res and final_res.get("status") in ("answered", "clarification_requested"):
+            with FileLock(self.lock_path):
+                state = self._load_data_unlocked()
+                if decision_id in state["decisions"]:
+                    state["decisions"][decision_id]["question_body_snapshot"] = nodes[0]["diff"]
+                    state["decisions"][decision_id]["question_snapshot_updated_at"] = nodes[0]["editedAt"]
+                    self._save_data_unlocked(state)
+
+        return final_res
+
     def ingest_github_event(
         self,
         event_payload: Dict[str, Any],
@@ -2480,7 +2789,7 @@ class DecisionManager:
                         "api",
                         f"repos/{repo}/issues/{issue_num}/comments",
                         "--jq",
-                        ".[] | {id: .id, user: .user.login, user_type: .user.type, body: .body, created_at: .created_at, updated_at: .updated_at, html_url: .html_url, issue_url: .issue_url, performed_via_github_app: (.performed_via_github_app != null)}",
+                        ".[] | {id: .id, node_id: .node_id, user: .user.login, user_type: .user.type, body: .body, created_at: .created_at, updated_at: .updated_at, html_url: .html_url, issue_url: .issue_url, performed_via_github_app: (.performed_via_github_app != null)}",
                     ]
                     res = subprocess.run(cmd, capture_output=True, text=True, check=True)
                     comments = []
@@ -2502,10 +2811,9 @@ class DecisionManager:
                         c_body = c.get("body", "")
                         summary["comments_evaluated"] += 1
 
-                        # Polling can observe the exact before/after revision but the
-                        # comments API exposes only the original author, not the
-                        # editor. Persist the revision and context, but fail closed
-                        # on approval because editor provenance is unavailable.
+                        # Polling checks comment edits against authenticated GraphQL history.
+                        # If GraphQL edit history is unavailable, it falls back to unverified REST
+                        # which persists revision and context but fails closed to UNVERIFIED_CALLER.
                         if c_id == str(dec.get("question_comment_id") or ""):
                             prior_body = dec.get("question_body_snapshot")
                             prior_updated_at = dec.get("question_snapshot_updated_at")
@@ -2519,26 +2827,39 @@ class DecisionManager:
                                 continue
                             if prior_body == c_body and prior_updated_at == c.get("updated_at"):
                                 continue
-                            ingest_res = self.process_issue_edit(
-                                decision_id=d_id,
-                                old_body=prior_body,
-                                new_body=c_body,
-                                editor="unverified-editor",
-                                event_type="comment_edit",
-                                comment_id=c_id,
-                                comment_url=c.get("html_url"),
-                                edit_time=c.get("updated_at"),
-                                provenance=ProvenanceType.UNVERIFIED_CALLER,
-                                is_test=False,
-                            )
-                            with FileLock(self.lock_path):
-                                state = self._load_data_unlocked()
-                                current_dec = state["decisions"][d_id]
-                                current_dec["question_body_snapshot"] = c_body
-                                current_dec["question_snapshot_updated_at"] = c.get("updated_at")
-                                self._save_data_unlocked(state)
+                            node_id = c.get("node_id")
+                            try:
+                                ingest_res = self.ingest_comment_edit_history(
+                                    decision_id=d_id,
+                                    comment_id=c_id,
+                                    repo=repo,
+                                    node_id=node_id,
+                                    is_test=False,
+                                )
+                            except Exception:
+                                ingest_res = self.process_issue_edit(
+                                    decision_id=d_id,
+                                    old_body=prior_body,
+                                    new_body=c_body,
+                                    editor="unverified-editor",
+                                    event_type="comment_edit",
+                                    comment_id=c_id,
+                                    comment_url=c.get("html_url"),
+                                    edit_time=c.get("updated_at"),
+                                    provenance=ProvenanceType.UNVERIFIED_CALLER,
+                                    is_test=False,
+                                )
+                                with FileLock(self.lock_path):
+                                    state = self._load_data_unlocked()
+                                    current_dec = state["decisions"][d_id]
+                                    current_dec["question_body_snapshot"] = c_body
+                                    current_dec["question_snapshot_updated_at"] = c.get("updated_at")
+                                    self._save_data_unlocked(state)
+                            if ingest_res.get("status") == "answered":
+                                summary["resolved_decisions"].append(d_id)
+                                summary["unblocked_requests"].extend(ingest_res.get("unblocked_requests", []))
+                                break
                             continue
-
                         response_marker = re.match(
                             r"^\s*Decision\s+([\w-]+)\s*:",
                             c_body,
@@ -3138,6 +3459,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_evt.add_argument("--repo", default=DEFAULT_REPO, help="GitHub repository name")
     p_evt.add_argument("--test", action="store_true", help="Flag as synthetic test probe (cannot unblock real tasks)")
 
+    # INGEST-HISTORY
+    p_igh = subparsers.add_parser(
+        "ingest-history",
+        help="Ingest and verify comment edit history via authenticated GitHub GraphQL",
+    )
+    p_igh.add_argument("id", help="Decision ID")
+    p_igh.add_argument("--comment-id", required=True, help="GitHub issue comment ID or GraphQL node ID")
+    p_igh.add_argument("--repo", default=DEFAULT_REPO, help="GitHub repo")
+    p_igh.add_argument("--history-path", default=None, help="Optional local JSON file of GraphQL history payload")
+    p_igh.add_argument("--test", action="store_true", help="Flag as synthetic test probe (cannot unblock real tasks)")
+
     return parser
 
 
@@ -3201,6 +3533,32 @@ def main():
                 print(f"Decision ID: {res['decision_id']}")
             if res.get("interpretation"):
                 print(f"Interpretation: {res['interpretation']}")
+            if res.get("unblocked_requests"):
+                print(f"Unblocked Requests: {', '.join(res['unblocked_requests'])}")
+            if res.get("rejection_reason"):
+                print(f"Rejection Reason: {res['rejection_reason']}")
+            if res.get("clarification_prompt"):
+                print(f"Clarification Prompt: {res['clarification_prompt']}")
+
+        elif args.command == "ingest-history":
+            history_data = None
+            if args.history_path:
+                with open(args.history_path, "r", encoding="utf-8") as f:
+                    history_data = json.load(f)
+            res = mgr.ingest_comment_edit_history(
+                decision_id=args.id,
+                comment_id=args.comment_id,
+                history_data=history_data,
+                repo=args.repo,
+                is_test=args.test,
+            )
+            print(f"Status: {res.get('status')}")
+            if res.get("decision_id"):
+                print(f"Decision ID: {res['decision_id']}")
+            if res.get("interpretation"):
+                print(f"Interpretation: {res['interpretation']}")
+            if res.get("provenance"):
+                print(f"Provenance: {res['provenance']}")
             if res.get("unblocked_requests"):
                 print(f"Unblocked Requests: {', '.join(res['unblocked_requests'])}")
             if res.get("rejection_reason"):

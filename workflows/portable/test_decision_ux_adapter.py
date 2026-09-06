@@ -23,6 +23,7 @@ from decision_workflow import (
     extract_scoped_task_list_options,
     extract_task_list_options,
     format_decision_markdown,
+    fetch_github_comment_history_default,
 )
 from continuation_driver import ContinuationDriver
 from ledger import RequestLedger
@@ -413,5 +414,403 @@ class DecisionUXProof(unittest.TestCase):
         self.assertIsNone(self.mgr.get_decision("DEC-1")["answer"]["additional_context"])
 
 
+class GraphQLDecisionHistoryProof(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="graphql_decision_ux_")
+        self.decisions_path = os.path.join(self.tmp, "decisions.json")
+        self.ledger_path = os.path.join(self.tmp, "ledger.json")
+        self.ledger = RequestLedger(self.ledger_path)
+        self.ledger.add_request(
+            req_id="REQ-1",
+            prompt="Choose audit storage",
+            session="synthetic-proof",
+            project="Wladefant/super-board",
+            owner="GraphQLDecisionHistoryProof",
+            acceptance_criteria=["A durable decision reaches the existing consumer"],
+        )
+        self.contract = DecisionContract(
+            decision_id="DEC-1",
+            request_id="REQ-1",
+            prompt="Choose audit storage",
+            question="Which safe architecture should be used?",
+            options=OPTIONS,
+            recommendation="Option A: Dedicated audit_events table",
+            blocking_dependencies=["REQ-1"],
+            authorized_responders=["Operator"],
+            decision_scope=DecisionScope.ARCHITECTURAL_PREFERENCE,
+            issue_number=77,
+        )
+        self.initial_body = format_decision_markdown(self.contract)
+        self.comments = {
+            "100": {
+                "id": "100",
+                "node_id": "IC_100",
+                "user": "Automation",
+                "user_type": "User",
+                "body": self.initial_body,
+                "created_at": "2026-09-06T11:00:00Z",
+                "updated_at": "2026-09-06T11:00:00Z",
+                "html_url": "https://github.com/Wladefant/super-board/issues/77#issuecomment-100",
+                "issue_url": "https://api.github.com/repos/Wladefant/super-board/issues/77",
+                "performed_via_github_app": False,
+            }
+        }
+        self.mgr = DecisionManager(
+            decisions_path=self.decisions_path,
+            ledger_path=self.ledger_path,
+            comment_fetcher=lambda repo, cid: dict(self.comments[str(cid)]),
+        )
+        self.mgr.register_question(self.contract)
+        with open(self.decisions_path, "r", encoding="utf-8") as f:
+            dstate = json.load(f)
+        dstate["decisions"]["DEC-1"].update({
+            "issue_number": 77,
+            "question_comment_id": "100",
+            "question_posted_at": "2026-09-06T11:00:00Z",
+            "question_body_snapshot": self.initial_body,
+            "question_snapshot_updated_at": "2026-09-06T11:00:00Z",
+            "question_author": "Automation",
+        })
+        with open(self.decisions_path, "w", encoding="utf-8") as f:
+            json.dump(dstate, f)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _checked(self, option="A", context=None):
+        body = self.initial_body.replace(
+            f"- [ ] **Option {option}**", f"- [x] **Option {option}**"
+        )
+        if context is not None:
+            body = body.replace(
+                "_Leave any supplemental notes, constraints, or alternative proposals below:_",
+                context,
+            )
+        return body
+
+    def test_graphql_distinct_verified_user_approves(self):
+        checked = self._checked("A", "Authorized choice by Operator")
+        payload = {
+            "data": {
+                "node": {
+                    "id": "IC_100",
+                    "body": checked,
+                    "lastEditedAt": "2026-09-06T12:00:00Z",
+                    "editor": {"login": "Operator", "__typename": "User"},
+                    "userContentEdits": {
+                        "pageInfo": {"hasNextPage": False},
+                        "totalCount": 2,
+                        "nodes": [
+                            {
+                                "id": "UCE_2",
+                                "editedAt": "2026-09-06T12:00:00Z",
+                                "editor": {"login": "Operator", "__typename": "User"},
+                                "diff": checked,
+                            },
+                            {
+                                "id": "UCE_1",
+                                "editedAt": "2026-09-06T11:00:00Z",
+                                "editor": {"login": "Automation", "__typename": "User"},
+                                "diff": self.initial_body,
+                            },
+                        ],
+                    },
+                }
+            }
+        }
+        res = self.mgr.ingest_comment_edit_history("DEC-1", "100", history_data=payload)
+        self.assertEqual(res["status"], "answered")
+        self.assertEqual(res["provenance"], ProvenanceType.GITHUB_VERIFIED_USER)
+        self.assertEqual(res["unblocked_requests"], ["REQ-1"])
+        self.assertIn("Authorized choice by Operator", res["interpretation"])
+
+        # Verify existing ContinuationDriver consumer accepts the record
+        dec = self.mgr.get_decision("DEC-1")
+        self.assertTrue(ContinuationDriver._decision_is_authorized_answer(dec))
+
+        # Verify ledger blocker is cleared and evidence recorded
+        req = self.ledger.get_request("REQ-1")
+        self.assertEqual(req.get("decision_blockers", []), [])
+        ev = [item for item in req["evidence"] if item.get("type") == "github_decision"][-1]
+        self.assertIn("Provenance: github_verified_user", ev["details"])
+
+    def test_graphql_shared_account_fails_closed(self):
+        with open(self.decisions_path, "r", encoding="utf-8") as f:
+            dstate = json.load(f)
+        dstate["decisions"]["DEC-1"]["question_author"] = "Operator"
+        with open(self.decisions_path, "w", encoding="utf-8") as f:
+            json.dump(dstate, f)
+        self.comments["100"]["user"] = "Operator"
+
+        checked = self._checked("A")
+        payload = {
+            "data": {
+                "node": {
+                    "id": "IC_100",
+                    "body": checked,
+                    "lastEditedAt": "2026-09-06T12:00:00Z",
+                    "editor": {"login": "Operator", "__typename": "User"},
+                    "userContentEdits": {
+                        "pageInfo": {"hasNextPage": False},
+                        "totalCount": 2,
+                        "nodes": [
+                            {"id": "UCE_2", "editedAt": "2026-09-06T12:00:00Z", "editor": {"login": "Operator", "__typename": "User"}, "diff": checked},
+                            {"id": "UCE_1", "editedAt": "2026-09-06T11:00:00Z", "editor": {"login": "Operator", "__typename": "User"}, "diff": self.initial_body},
+                        ],
+                    },
+                }
+            }
+        }
+        res = self.mgr.ingest_comment_edit_history("DEC-1", "100", history_data=payload)
+        self.assertEqual(res["status"], "clarification_requested")
+        self.assertEqual(res["provenance"], ProvenanceType.SHARED_ACCOUNT_AMBIGUOUS)
+
+        dec = self.mgr.get_decision("DEC-1")
+        self.assertFalse(ContinuationDriver._decision_is_authorized_answer(dec))
+        req = self.ledger.get_request("REQ-1")
+        self.assertIn("DEC-1", req.get("decision_blockers", []))
+
+    def test_graphql_race_condition_fails_closed(self):
+        checked = self._checked("A")
+        payload = {
+            "data": {
+                "node": {
+                    "id": "IC_100",
+                    "body": checked + "\nConcurrent in-flight change",
+                    "lastEditedAt": "2026-09-06T12:00:00Z",
+                    "editor": {"login": "Operator", "__typename": "User"},
+                    "userContentEdits": {
+                        "pageInfo": {"hasNextPage": False},
+                        "totalCount": 2,
+                        "nodes": [
+                            {"id": "UCE_2", "editedAt": "2026-09-06T12:00:00Z", "editor": {"login": "Operator", "__typename": "User"}, "diff": checked},
+                            {"id": "UCE_1", "editedAt": "2026-09-06T11:00:00Z", "editor": {"login": "Automation", "__typename": "User"}, "diff": self.initial_body},
+                        ],
+                    },
+                }
+            }
+        }
+        res = self.mgr.ingest_comment_edit_history("DEC-1", "100", history_data=payload)
+        self.assertEqual(res["status"], "rejected")
+        self.assertIn("Race condition", res["reason"])
+        req = self.ledger.get_request("REQ-1")
+        self.assertIn("DEC-1", req.get("decision_blockers", []))
+
+    def test_graphql_gaps_and_deleted_edits_fail_closed(self):
+        checked = self._checked("A")
+        payload = {
+            "data": {
+                "node": {
+                    "id": "IC_100",
+                    "body": checked,
+                    "lastEditedAt": "2026-09-06T12:00:00Z",
+                    "editor": {"login": "Operator", "__typename": "User"},
+                    "userContentEdits": {
+                        "pageInfo": {"hasNextPage": False},
+                        "totalCount": 1,
+                        "nodes": [
+                            {"id": "UCE_2", "editedAt": "2026-09-06T12:00:00Z", "editor": {"login": "Operator", "__typename": "User"}, "diff": checked},
+                        ],
+                    },
+                }
+            }
+        }
+        res = self.mgr.ingest_comment_edit_history("DEC-1", "100", history_data=payload)
+        self.assertEqual(res["status"], "rejected")
+        self.assertIn("fewer than two revisions", res["reason"])
+
+    def test_graphql_unpaginated_history_fails_closed(self):
+        checked = self._checked("A")
+        payload = {
+            "data": {
+                "node": {
+                    "id": "IC_100",
+                    "body": checked,
+                    "lastEditedAt": "2026-09-06T12:00:00Z",
+                    "editor": {"login": "Operator", "__typename": "User"},
+                    "userContentEdits": {
+                        "pageInfo": {"hasNextPage": True, "endCursor": "cursor_999"},
+                        "totalCount": 10,
+                        "nodes": [
+                            {"id": "UCE_2", "editedAt": "2026-09-06T12:00:00Z", "editor": {"login": "Operator", "__typename": "User"}, "diff": checked},
+                            {"id": "UCE_1", "editedAt": "2026-09-06T11:00:00Z", "editor": {"login": "Automation", "__typename": "User"}, "diff": self.initial_body},
+                        ],
+                    },
+                }
+            }
+        }
+        res = self.mgr.ingest_comment_edit_history("DEC-1", "100", history_data=payload)
+        self.assertEqual(res["status"], "rejected")
+        self.assertIn("unpaginated pages", res["reason"])
+
+    def test_graphql_non_monotonic_timestamps_fail_closed(self):
+        checked = self._checked("A")
+        payload = {
+            "data": {
+                "node": {
+                    "id": "IC_100",
+                    "body": checked,
+                    "lastEditedAt": "2026-09-06T10:00:00Z",
+                    "editor": {"login": "Operator", "__typename": "User"},
+                    "userContentEdits": {
+                        "pageInfo": {"hasNextPage": False},
+                        "totalCount": 2,
+                        "nodes": [
+                            {"id": "UCE_2", "editedAt": "2026-09-06T10:00:00Z", "editor": {"login": "Operator", "__typename": "User"}, "diff": checked},
+                            {"id": "UCE_1", "editedAt": "2026-09-06T11:00:00Z", "editor": {"login": "Automation", "__typename": "User"}, "diff": self.initial_body},
+                        ],
+                    },
+                }
+            }
+        }
+        res = self.mgr.ingest_comment_edit_history("DEC-1", "100", history_data=payload)
+        self.assertEqual(res["status"], "rejected")
+        self.assertIn("Non-monotonic", res["reason"])
+
+    def test_graphql_bot_editor_fails_closed(self):
+        checked = self._checked("A")
+        payload = {
+            "data": {
+                "node": {
+                    "id": "IC_100",
+                    "body": checked,
+                    "lastEditedAt": "2026-09-06T12:00:00Z",
+                    "editor": {"login": "agent[bot]", "__typename": "Bot"},
+                    "userContentEdits": {
+                        "pageInfo": {"hasNextPage": False},
+                        "totalCount": 2,
+                        "nodes": [
+                            {"id": "UCE_2", "editedAt": "2026-09-06T12:00:00Z", "editor": {"login": "agent[bot]", "__typename": "Bot"}, "diff": checked},
+                            {"id": "UCE_1", "editedAt": "2026-09-06T11:00:00Z", "editor": {"login": "Automation", "__typename": "User"}, "diff": self.initial_body},
+                        ],
+                    },
+                }
+            }
+        }
+        res = self.mgr.ingest_comment_edit_history("DEC-1", "100", history_data=payload)
+        self.assertEqual(res["status"], "rejected")
+
+    def test_graphql_missing_editor_metadata_fails_closed(self):
+        checked = self._checked("A")
+        payload = {
+            "data": {
+                "node": {
+                    "id": "IC_100",
+                    "body": checked,
+                    "lastEditedAt": "2026-09-06T12:00:00Z",
+                    "editor": {"login": "Operator", "__typename": "User"},
+                    "userContentEdits": {
+                        "pageInfo": {"hasNextPage": False},
+                        "totalCount": 2,
+                        "nodes": [
+                            {"id": "UCE_2", "editedAt": "2026-09-06T12:00:00Z", "editor": None, "diff": checked},
+                            {"id": "UCE_1", "editedAt": "2026-09-06T11:00:00Z", "editor": {"login": "Automation", "__typename": "User"}, "diff": self.initial_body},
+                        ],
+                    },
+                }
+            }
+        }
+        res = self.mgr.ingest_comment_edit_history("DEC-1", "100", history_data=payload)
+        self.assertEqual(res["status"], "rejected")
+        self.assertIn("missing required editor metadata", res["reason"])
+
+    def test_sync_decisions_with_graphql_edit_history(self):
+        checked = self._checked("A")
+        payload = {
+            "data": {
+                "node": {
+                    "id": "IC_100",
+                    "body": checked,
+                    "lastEditedAt": "2026-09-06T12:00:00Z",
+                    "editor": {"login": "Operator", "__typename": "User"},
+                    "userContentEdits": {
+                        "pageInfo": {"hasNextPage": False},
+                        "totalCount": 2,
+                        "nodes": [
+                            {"id": "UCE_2", "editedAt": "2026-09-06T12:00:00Z", "editor": {"login": "Operator", "__typename": "User"}, "diff": checked},
+                            {"id": "UCE_1", "editedAt": "2026-09-06T11:00:00Z", "editor": {"login": "Automation", "__typename": "User"}, "diff": self.initial_body},
+                        ],
+                    },
+                }
+            }
+        }
+        self.mgr.comment_history_fetcher = lambda repo, cid, nid=None: payload
+
+        self.comments["100"] = {
+            **self.comments["100"],
+            "body": checked,
+            "updated_at": "2026-09-06T12:00:00Z",
+        }
+        output = "".join(json.dumps(comment) + "\n" for comment in self.comments.values())
+        completed = subprocess.CompletedProcess([], 0, stdout=output, stderr="")
+        with patch("decision_workflow.subprocess.run", return_value=completed):
+            sync_res = self.mgr.sync_decisions(repo="Wladefant/super-board")
+
+        self.assertEqual(sync_res["resolved_decisions"], ["DEC-1"])
+        self.assertEqual(sync_res["unblocked_requests"], ["REQ-1"])
+        self.assertEqual(self.mgr.get_decision("DEC-1")["status"], "answered")
+        self.assertEqual(self.ledger.get_request("REQ-1").get("decision_blockers", []), [])
+
+    def test_sync_decisions_fallback_to_unverified_rest_fails_closed(self):
+        checked = self._checked("A")
+        def fail_history(*args, **kwargs):
+            raise RuntimeError("GraphQL unavailable")
+        self.mgr.comment_history_fetcher = fail_history
+
+        self.comments["100"] = {
+            **self.comments["100"],
+            "body": checked,
+            "updated_at": "2026-09-06T12:00:00Z",
+        }
+        output = "".join(json.dumps(comment) + "\n" for comment in self.comments.values())
+        completed = subprocess.CompletedProcess([], 0, stdout=output, stderr="")
+        with patch("decision_workflow.subprocess.run", return_value=completed):
+            sync_res = self.mgr.sync_decisions(repo="Wladefant/super-board")
+
+        self.assertEqual(sync_res["resolved_decisions"], [])
+        self.assertEqual(self.mgr.get_decision("DEC-1")["status"], "clarification_requested")
+        self.assertIn("DEC-1", self.ledger.get_request("REQ-1").get("decision_blockers", []))
+
+    def test_cli_ingest_history_command(self):
+        checked = self._checked("A")
+        payload = {
+            "data": {
+                "node": {
+                    "id": "IC_100",
+                    "body": checked,
+                    "lastEditedAt": "2026-09-06T12:00:00Z",
+                    "editor": {"login": "Operator", "__typename": "User"},
+                    "userContentEdits": {
+                        "pageInfo": {"hasNextPage": False},
+                        "totalCount": 2,
+                        "nodes": [
+                            {"id": "UCE_2", "editedAt": "2026-09-06T12:00:00Z", "editor": {"login": "Operator", "__typename": "User"}, "diff": checked},
+                            {"id": "UCE_1", "editedAt": "2026-09-06T11:00:00Z", "editor": {"login": "Automation", "__typename": "User"}, "diff": self.initial_body},
+                        ],
+                    },
+                }
+            }
+        }
+        hist_path = os.path.join(self.tmp, "history.json")
+        with open(hist_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+
+        from decision_workflow import main
+        test_args = [
+            "decision_workflow.py",
+            "--decisions", self.decisions_path,
+            "--ledger", self.ledger_path,
+            "ingest-history",
+            "DEC-1",
+            "--comment-id", "100",
+            "--history-path", hist_path,
+        ]
+        with patch("sys.argv", test_args):
+            with patch("sys.stdout"):
+                main()
+
+        dec = self.mgr.get_decision("DEC-1")
+        self.assertEqual(dec["status"], "answered")
+        self.assertEqual(dec["answer"]["selected_option_id"], "A")
 if __name__ == "__main__":
     unittest.main(verbosity=2)
