@@ -728,6 +728,50 @@ class TestHeadBinding(_Fixture):
         self.assertIn("before execution", out.blocked_reason)
         self.assertIsNone(out.exit_code, "the command must not have been executed")
 
+    def test_existing_divergent_head_refused_without_mutating_tree(self):
+        """When the request targets an existing historical or sibling commit but the worktree
+        is on a different commit, execution and native preparation are refused; the worktree
+        is never silently modified, checked out, or overwritten."""
+        with open(os.path.join(self.repo, "second.txt"), "w", encoding="utf-8") as fh:
+            fh.write("second\n")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "second")
+        second_head = _git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        first_head = self.head
+        self.assertNotEqual(first_head, second_head)
+
+        # 1. Native preparation targeting older commit while tree is on newer commit
+        backend = WorkerBackend(state_dir=self.state)
+        ticket = backend.prepare_native(self._request(head_sha=first_head))
+        self.assertFalse(ticket.ready)
+        self.assertEqual(ticket.state, "blocked")
+        self.assertEqual(ticket.run_id, "")
+        self.assertIn("Head binding refused before execution", ticket.blocked_reason)
+        self.assertIn(f"request targets {first_head}", ticket.blocked_reason)
+        self.assertIn(f"tree at {self.repo} is on {second_head}", ticket.blocked_reason)
+        self.assertIn("Check out the requested commit first", ticket.blocked_reason)
+
+        # Confirm worktree was never touched
+        observed_head = _git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        self.assertEqual(observed_head, second_head)
+        status = _git(self.repo, "status", "--porcelain").stdout.strip()
+        self.assertEqual(status, "")
+
+        # 2. Execution path targeting older commit also safely blocks without running
+        cli_backend = self._backend(self._script_backend(PASS_RESULT))
+        out = cli_backend.execute(self._request(head_sha=first_head))
+        self.assertFalse(out.ok)
+        self.assertIn("Head binding refused before execution", out.blocked_reason)
+        self.assertIn(f"request targets {first_head}", out.blocked_reason)
+        self.assertIsNone(out.exit_code)
+
+        # 3. Metadata reconciliation: when request targets verified worktree HEAD, it succeeds
+        reconciled_ticket = backend.prepare_native(self._request(head_sha=second_head))
+        self.assertTrue(reconciled_ticket.ready)
+        self.assertEqual(reconciled_ticket.state, "prepared")
+        self.assertIsNone(reconciled_ticket.blocked_reason)
+        self.assertEqual(reconciled_ticket.head_sha, second_head)
+
     def test_verification_stage_that_moves_head_is_invalid(self):
         """QA must not mutate the tree it is judging; if it does, discard the result."""
         mover = """

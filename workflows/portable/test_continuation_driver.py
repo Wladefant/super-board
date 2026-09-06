@@ -467,6 +467,52 @@ class TestRestartDoesNotDuplicateWork(_Fixture):
         self.assertEqual(len(data["runs"]), 1)
 
 
+    def test_head_binding_refusal_parks_safely_and_reconciled_unpark_progresses(self):
+        """When a request specifies an outdated historical head while the tree has progressed,
+        the driver safely parks the request on head binding refusal without mutating the tree.
+        After metadata reconciliation (updating the ledger to the verified tree head) and unparking,
+        the driver advances on the verified head."""
+        req_id = "req-head-mismatch"
+        historical_head = "1" * 40
+        verified_head = "2" * 40
+        self._add(req_id, head=historical_head)
+
+        # 1. Driver encounters head binding refusal from adapter
+        refusal_msg = (
+            f"Stage 'build' blocked: Head binding refused before execution: request targets "
+            f"{historical_head} but the tree at /repo is on {verified_head}. Check out the "
+            "requested commit first; a worker never runs against whatever happens to be present."
+        )
+        adapter = self._adapter()
+        def blocked_run_step(request_id=None, target_sha=None, real_worker=False):
+            return FakeResult("blocked", refusal_msg)
+        adapter.run_step = blocked_run_step
+
+        outcome = self._driver(adapter, [req_id]).run()
+        self.assertEqual(len(outcome.parked), 1)
+        self.assertEqual(outcome.parked[0]["reason_code"], "blocked")
+        self.assertIn("Head binding refused before execution", outcome.parked[0]["reason"])
+        self.assertIn(historical_head, outcome.parked[0]["reason"])
+
+        # 2. Driver remains safely parked across restart
+        restarted_adapter = self._adapter()
+        restarted = self._driver(restarted_adapter, [req_id]).run()
+        self.assertEqual(restarted.steps_executed, 0)
+        self.assertEqual(restarted_adapter.calls, [])
+
+        # 3. Metadata reconciliation: update ledger request to verified head and unpark
+        self.ledger.update_request(req_id, head=verified_head)
+        journal = DriverJournal(os.path.join(self.tmp, JOURNAL_FILENAME))
+        journal.unpark(req_id)
+        journal.save()
+
+        # 4. Advancing with reconciled head succeeds
+        advancing_adapter = self._adapter()
+        advanced_outcome = self._driver(advancing_adapter, [req_id], max_steps=1).run()
+        self.assertEqual(advanced_outcome.steps_executed, 1)
+        self.assertTrue(advancing_adapter.calls)
+        self.assertEqual(self.ledger.get_request(req_id)["head"], verified_head)
+
 # ---------------------------------------------------------------------------
 # Single-driver guarantee
 # ---------------------------------------------------------------------------
