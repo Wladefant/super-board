@@ -147,8 +147,17 @@ class _Fixture(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="cdrv_test_")
         self.ledger = RequestLedger(ledger_path=os.path.join(self.tmp, "ledger.json"))
+        # Correlation defaults to the installed ~/.veyyon/telegram/bot_pool.db when that
+        # file exists, which is the live index the session bridge resolves replies
+        # through. Any test here that reaches the sender must write into its own pool,
+        # never that one.
+        self._pool_db_env = patch.dict(
+            os.environ, {"VEYYON_POOL_DB": os.path.join(self.tmp, "bot_pool.db")}
+        )
+        self._pool_db_env.start()
 
     def tearDown(self):
+        self._pool_db_env.stop()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _add(self, req_id, state="implementation", head="a" * 40, task_type="local_doc"):
