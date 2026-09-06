@@ -479,31 +479,64 @@ only when all of this is true, each checked against reality rather than asserted
   whether one is required and never whether it has to be related to the failure.
   A recorded head no reachable context resolves is a *fail-closed* outcome: the
   record lands and the gate stays shut. A failure that recorded neither a head nor
-  a reachable repository has no lineage to bind to at all, and the record says so
-  (`gate_binding.lineage: "unanchored"`) instead of implying one was checked;
+  a reachable repository has nothing a proof could be related to: the record says
+  so (`gate_binding.lineage: "unanchored"`) and **binds nothing**. That is not a
+  deadlock and it invents no authorization — the refusal names the two recovery
+  paths this module already contracts, either re-observing the failure with
+  `--head-sha` (and `--repo-root`) so it has a lineage, or an operator taking its
+  counted observations out of the count with `supersede-observation --actor
+  --reason`;
 * the `--change-ref` **resolves** in that context, and names something that
   actually changed:
   * `commit:<sha>` exists there and is not one of the observed failing heads;
   * `config:<path>#<key>` and `test:<path>::<name>` are read out of the
     **committed tree of `--head-sha`** (`git show <head>:<path>`), not out of the
-    checkout, and the file's content must differ from the same path at every
-    observed failing head. So a key or a test that had been there unchanged since
-    before the failure, and one that exists only as an uncommitted edit, both
-    resolve and open nothing;
+    checkout, and the comparison is scoped to **what the reference names**: the
+    referenced key's own assignment (plus the block it opens) or the referenced
+    test's own definition (decorators included), against the same reference at
+    every observed failing head. Whole-file inequality was not enough — a
+    revision bump beside the key, a comment, or a different test added below it
+    made an untouched reference count as the change. Blank lines, whole-line
+    comments and inline comments are normalized out, so a comment-only edit is
+    not a change. A reference that does not identify **one** committed assignment
+    or definition — assigned or defined twice, or reachable only inside a flow or
+    minified line whose region would be the whole file — is refused outright
+    rather than compared against a region nobody named, and a tree where the
+    comparison is ambiguous records `change_comparison: "ambiguous"` and opens
+    nothing. So a key or a test that had been there unchanged since before the
+    failure, and one that exists only as an uncommitted edit, both resolve and
+    open nothing;
   * `decision:<id>` is recorded `answered` in the decision record beside the store
-    **and** its `answer.answered_at` is later than the last counted occurrence of
-    this signature. A decision taken while the failure was still happening is not
-    what changed, and one with no readable timestamp cannot be shown to be.
+    **and** its `answer.comment_created_at` — the API-verified instant the
+    answering comment was *posted* — is later than the last counted occurrence of
+    this signature. `answer.answered_at` is the instant the reply was *ingested*
+    and is audit only: ingestion runs at barriers, so reading it made every
+    comment posted before the failure and swept up afterwards "postdate" it.
+    There is no fallback — an answer with no readable `comment_created_at`
+    (including a legacy record, or one carrying only `answered_at` or a
+    hand-edited `updated_at`) resolves and opens nothing;
 
   A reference the context *refutes* is refused outright. A reference that cannot
   be resolved at all — a pull request, which needs a remote API this module never
   contacts, or anything in a worktree that no longer exists — is recorded
   unverified and never opens the gate;
 * `--evidence-exit-code` is **0**. A non-zero exit is the scenario still failing;
-* `--head-sha` is not one of the heads the failure was observed on, is not an
-  **ancestor** of one (`git merge-base --is-ancestor`) — a tree the failing tree
-  was built on top of predates the failure — and for a commit reference it
-  **contains** that commit, so the run that passed is a run of the changed tree.
+* `--head-sha` is the tree the correction was actually proved on. It is not one of
+  the heads the failure was observed on, is not an **ancestor** of one (`git
+  merge-base --is-ancestor`) — a tree the failing tree was built on top of
+  predates the failure — and it **descends from every counted observed failing
+  head** (`git merge-base --is-ancestor <observed> <head>`, once per head), so the
+  run that passed is a run of the failing tree with the correction on top of it.
+  Being *able to resolve* the failing head is not descent: an orphan branch in the
+  same repository, an orphan commit in any clone that merely holds the failing
+  commit, and a sibling branch cut from its parent all resolve it and none of them
+  ever carried the failure. A counted head this context cannot resolve, and an
+  ancestry query git will not answer, are fail-closed. Where the failure recorded
+  no head at all there is nothing to descend from, so the anchor is that the
+  evidence head was itself **committed after** the last counted observation (git
+  reports that to the second, and a committer date is self-reported, so it is
+  recorded as the separate, weaker fact `head_committed_after_failure`). For a
+  commit reference the head additionally **contains** that commit.
 
 `record-corrective-action` exits 0 when the record opened the gate and 3 when it
 landed with the gate still closed, and every gate decision is recomputed from the
@@ -784,13 +817,16 @@ python recurrence_guard.py --state-dir <dir> check-retry --request-id req-1
 # Record (never execute) the systemic corrective action that unblocks retry.
 # The record always lands. Exit 0 means it opened the retry gate; exit 3 means it
 # landed and the gate stayed closed, because the verification context could not be
-# related to this failure, the reference did not resolve (pr: cannot be resolved
-# offline at all) or named nothing that changed since the failure, the proof
-# exited non-zero, or the evidence head is a failing head, precedes one, or does
-# not carry the change.
+# related to this failure (a failure with no head and no reachable repository can
+# be related to nothing and binds nothing), the reference did not resolve (pr:
+# cannot be resolved offline at all) or named no change to the key or test it
+# points at, the proof exited non-zero, or the evidence head is a failing head,
+# precedes one, does not descend from every counted failing head, or does not
+# carry the change.
 # --verify-root names a reachable repository when the observed worktree is gone; it
-# still has to resolve one of the heads the failure was observed on, which a second
-# worktree of the same repository does.
+# still has to resolve every head the failure was observed on and the evidence head
+# still has to descend from them, which a second worktree of the same repository
+# and a plain clone both satisfy.
 python recurrence_guard.py --state-dir <dir> record-corrective-action \
   --signature <sig> --kind code_change --actor <lane> \
   --description "what systemically changed" \
@@ -799,8 +835,8 @@ python recurrence_guard.py --state-dir <dir> record-corrective-action \
   --evidence "what re-running it produced" \
   --evidence-command python -m pytest tests/test_it.py \
   --evidence-exit-code 0 \
-  --head-sha <40-char-sha-containing-the-change> \
-  --verify-root <git-repository-that-resolves-the-failing-head>
+  --head-sha <40-char-sha-descending-from-every-observed-failing-head> \
+  --verify-root <git-repository-that-resolves-the-failing-heads>
 
 # Retain an already-counted failure out of the count, with an audited reason
 python recurrence_guard.py --state-dir <dir> supersede-observation \

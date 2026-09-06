@@ -1048,8 +1048,8 @@ class RecurrenceGuard:
         entry["required_action"] = cls._required_action(entry)
         return entry
 
-    @staticmethod
-    def _required_action(entry: Mapping[str, Any]) -> str:
+    @classmethod
+    def _required_action(cls, entry: Mapping[str, Any]) -> str:
         status = entry.get("status")
         occurrences = int(entry.get("occurrences") or 0)
         if status == STATUS_RESOLVED:
@@ -1072,13 +1072,27 @@ class RecurrenceGuard:
             unbound = int(entry.get("corrective_actions_recorded") or 0) - int(
                 entry.get("corrective_actions_gate_bound") or 0
             )
+            recorded_root = str(entry.get("repo_root") or "").strip()
+            anchored = bool(cls._observed_heads(entry)) or bool(
+                recorded_root and os.path.isdir(recorded_root)
+            )
             return (
                 "Second distinct occurrence: unchanged retry is refused. Implement the systemic "
                 "change through the corrective work item's normal build/QA/review path, then "
                 "record it with record-corrective-action, naming a change reference that "
                 "resolves and the original scenario re-executed successfully against it "
                 "(--change-ref --scenario --evidence --evidence-command --evidence-exit-code 0 "
-                "--head-sha carrying the change, --verify-root where it can be looked up)."
+                "--head-sha descending from every head this failure was observed on, "
+                "--verify-root where they can be looked up)."
+                + (
+                    ""
+                    if anchored
+                    else " This failure recorded no head and no reachable repository, so no "
+                    "proof can be related to it and none will open this gate: re-observe it "
+                    "with --head-sha (and --repo-root) to anchor it, or have an operator take "
+                    "its counted observations out of the count with supersede-observation "
+                    "--actor --reason."
+                )
                 + (
                     f" {unbound} corrective action(s) are recorded but not bound to a verified "
                     "change, so they leave this gate closed; see each action's gate_binding "
@@ -1994,15 +2008,22 @@ class RecurrenceGuard:
         * ``observed_head`` - the context resolves a commit this failure was
           observed on. This is the normal case *and* it survives the ephemeral
           worktree flow, because a second worktree of the same repository shares
-          the object store and resolves the same head.
+          the object store and resolves the same head. Resolving one is only where
+          the lookups happen: ``_bind_evidence`` additionally requires the evidence
+          head to *descend* from every counted observed head, because a clone or an
+          orphan branch resolves them too.
         * ``recorded_repository`` - the failure recorded no head at all, and this
           context is the same repository (same object store) the failure was
-          recorded in.
+          recorded in. With no head to descend from, the evidence head has to
+          postdate the last counted observation instead.
         * ``unanchored`` - the failure recorded neither a failing head nor a
-          reachable repository. Nothing can be related to it, and refusing here
-          would not fail closed but deadlock: no reference could ever open the gate
-          and no resolution could ever close it. So the record stands on nothing
-          and says so, rather than claiming a relation nobody checked.
+          reachable repository, so nothing can be related to it. This is recorded
+          as the absence it is and binds nothing: the reviewed defect was that it
+          read as a pass, so any repository with any commit opened the gate. It is
+          not a deadlock either - an operator anchors the failure by re-observing
+          it with a head (and a repository), or takes its counted observations out
+          of the count with ``supersede-observation``, both of which this module
+          already contracts.
 
         Anything else is a lineage failure: a recorded head that this context
         cannot resolve, or a reachable recorded repository that this is not.
@@ -2179,8 +2200,20 @@ class RecurrenceGuard:
         recurred in September, "resolved" and opened the gate under the description
         "will retry later". So the answer has to postdate the last counted
         occurrence of this signature - it cannot be the change if the failure
-        happened after it - and a record whose answer carries no readable timestamp
-        resolves without opening the gate rather than being taken on trust.
+        happened after it.
+
+        *Which* timestamp says that is the second correction, and the reviewed
+        defect: ``answer.answered_at`` is the instant the decision workflow
+        *ingested* the reply, not the instant the human posted it. Ingestion runs
+        at barriers, so a comment posted before the failure and swept up by a sync
+        that ran after it was recorded as "answered after this signature last
+        failed" - the normal case, not an edge. The only timestamp read here is
+        ``answer.comment_created_at``, which the decision workflow copies verbatim
+        from the API-verified comment creation time; ``answered_at`` stays an
+        ingestion audit field and is never read as proof, and neither is
+        ``record.updated_at``, which a hand edit can set to anything. An answer
+        with no readable creation time resolves and opens nothing, because nothing
+        else in the record can stand in for it.
         """
         path = self._decisions_path()
         if not os.path.exists(path):
@@ -2217,26 +2250,29 @@ class RecurrenceGuard:
                 "to correct anything with."
             )
         answer = record.get("answer") if isinstance(record.get("answer"), Mapping) else {}
-        answered_raw = (
-            answer.get("answered_at")
-            or record.get("answered_at")
-            or record.get("updated_at")
-        )
-        answered_at = self._parse_iso(answered_raw)
+        created_raw = answer.get("comment_created_at")
+        created_at = self._parse_iso(created_raw)
+        ingested_raw = answer.get("answered_at") or record.get("answered_at")
         resolved: Dict[str, Any] = {
             "checked": True,
             "decision": decision_id,
             "decision_status": status,
             "decision_record": path,
-            "answered_at": (str(answered_raw) if answered_raw else None),
+            "comment_created_at": (str(created_raw) if created_raw else None),
+            # Recorded so the reader can see the ingestion lag this check exists
+            # to survive, and never compared against anything.
+            "answered_at_ingest_audit": (str(ingested_raw) if ingested_raw else None),
             "answered_after_failure": False,
         }
         last = self._last_counted_observation(entry)
-        if answered_at is None:
+        if created_at is None:
             resolved["reason"] = (
                 f"decision {decision_id} is answered in {path}, but its answer carries no "
-                "readable timestamp, so it cannot be shown to postdate the failure it claims "
-                "to correct"
+                "readable answer.comment_created_at, so when the answer was actually posted is "
+                "not established. answered_at"
+                + (f" ({ingested_raw})" if ingested_raw else "")
+                + " is the instant the reply was ingested, not the instant it was posted, so it "
+                "cannot stand in for it"
             )
             return resolved
         resolved["last_counted_observation_at"] = (
@@ -2248,45 +2284,241 @@ class RecurrenceGuard:
                 "answer cannot be shown to postdate the failure"
             )
             return resolved
-        if answered_at <= last["at"]:
+        if created_at <= last["at"]:
             resolved["reason"] = (
-                f"decision {decision_id} was answered at {answered_at.isoformat()}, before this "
-                f"signature last failed at {last['at'].isoformat()}, so it was already taken "
-                "while the failure was happening and is not what changed"
+                f"decision {decision_id} was answered by a comment posted at "
+                f"{created_at.isoformat()}, before this signature last failed at "
+                f"{last['at'].isoformat()}, so it was already taken while the failure was "
+                "happening and is not what changed"
             )
             return resolved
         resolved["answered_after_failure"] = True
         resolved["reason"] = (
-            f"decision {decision_id} is answered in {path} at {answered_at.isoformat()}, after "
-            f"this signature last failed at {last['at'].isoformat()}"
+            f"decision {decision_id} is answered in {path} by a comment posted at "
+            f"{created_at.isoformat()}, after this signature last failed at "
+            f"{last['at'].isoformat()}"
         )
         return resolved
 
-    @staticmethod
-    def _config_key_line(text: str, key: str) -> Optional[int]:
-        """The 1-based line where `key` is assigned in `text`, or None."""
-        leaf = str(key).strip().split(".")[-1]
-        if not leaf:
-            return None
-        pattern = re.compile(r"(?:^|[\s{,\[])[\"']?" + re.escape(leaf) + r"[\"']?\s*[:=]")
-        for number, line in enumerate(str(text or "").splitlines(), 1):
-            if pattern.search(line):
-                return number
-        return None
+    #: Whole-line comment markers dropped from a compared region, and the inline
+    #: markers stripped from one. A comment is not a change to the thing a
+    #: reference names, and a comment-only touch of the file was one of the
+    #: reviewed laundering shapes.
+    _COMMENT_PREFIXES = ("#", "//", ";")
+
+    @classmethod
+    def _strip_inline_comment(cls, line: str) -> str:
+        """
+        `line` without a trailing unquoted ``#`` comment, right-stripped.
+
+        Quote-aware, because a value may legitimately contain a ``#`` inside
+        quotes - where YAML and INI both read it as data, not as a comment - and
+        treating that as a comment would drop half of a real value change.
+        """
+        out: List[str] = []
+        quote: Optional[str] = None
+        for index, char in enumerate(line):
+            if quote:
+                out.append(char)
+                if char == quote:
+                    quote = None
+                continue
+            if char in "\"'":
+                quote = char
+                out.append(char)
+                continue
+            if char == "#" and (index == 0 or line[index - 1] in " \t"):
+                break
+            out.append(char)
+        return "".join(out).rstrip()
 
     @staticmethod
-    def _test_definition_line(text: str, name: str) -> Optional[int]:
-        """The 1-based line where test `name` is defined in `text`, or None."""
+    def _indent_of(line: str) -> int:
+        return len(line) - len(line.lstrip())
+
+    @classmethod
+    def _block_end(cls, lines: Sequence[str], start: int) -> int:
+        """The index one past the block `lines[start]` opens."""
+        indent = cls._indent_of(lines[start])
+        for index in range(start + 1, len(lines)):
+            if lines[index].strip() and cls._indent_of(lines[index]) <= indent:
+                return index
+        return len(lines)
+
+    @classmethod
+    def _region(cls, lines: Sequence[str], start: int, first: Optional[int] = None) -> str:
+        """
+        The block `lines[start]` opens, normalized for comparison across two trees.
+
+        The block is the opening line plus every following line indented deeper
+        than it: the value a config key is assigned, the body a test is defined
+        with. Comparing *that* is the whole correction - the previous comparison
+        was whole-file byte inequality, so an untouched key or test counted as the
+        change whenever anything else in the file moved.
+
+        `first` lets a caller start the region above the opening line (a test's
+        decorators, which are part of the test's definition and not of the block
+        it opens). Blank and whole-line-comment lines are dropped and inline
+        comments stripped, so a comment-only edit is not a change; indentation is
+        kept, because a reindented body is one.
+        """
+        block = list(lines[(first if first is not None else start):start + 1])
+        block += list(lines[start + 1:cls._block_end(lines, start)])
+        normalized: List[str] = []
+        for line in block:
+            stripped = line.strip()
+            if not stripped or stripped.startswith(cls._COMMENT_PREFIXES):
+                continue
+            normalized.append(cls._strip_inline_comment(line))
+        return "\n".join(normalized)
+
+    @classmethod
+    def _line_assignments(
+        cls,
+        lines: Sequence[str],
+        name: str,
+        lo: int,
+        hi: int,
+        parent_indent: Optional[int],
+    ) -> List[int]:
+        """Indices in ``[lo, hi)`` where `name` opens an assignment line."""
+        pattern = re.compile(r"^\s*[\"']?" + re.escape(name) + r"[\"']?\s*[:=]")
+        return [
+            index
+            for index in range(lo, min(hi, len(lines)))
+            if pattern.match(lines[index])
+            and (parent_indent is None or cls._indent_of(lines[index]) > parent_indent)
+        ]
+
+    @classmethod
+    def _config_key_assignment(cls, text: str, key: str) -> Dict[str, Any]:
+        """
+        The one assignment `key` names in `text`, with the value block to compare.
+
+        The reference names a key, so the key's own assignment is what has to
+        differ from the failing tree - not the file it lives in, which is what the
+        reviewed comparison actually checked.
+
+        Scoped to what a line-oriented reader can answer honestly, and refusing
+        rather than guessing everywhere else:
+
+        * the assignment has to *open* a line (optionally indented, optionally
+          quoted), which covers YAML, INI/env and pretty-printed JSON. A key that
+          appears only inside a flow mapping or a minified document is reported
+          ``unsupported``: the region would then be the whole line, which is the
+          whole-file weakness again one level down;
+        * a dotted reference resolves by nesting - one segment per level, inside
+          the block its parent opens - and only when no literal dotted key is
+          assigned outright;
+        * more than one candidate at any level is ``ambiguous``. Taking the first
+          would compare a region nobody named.
+        """
+        raw = str(key).strip()
+        lines = str(text or "").splitlines()
+        if not raw:
+            return {"found": False, "reason": "names no configuration key, so it identifies nothing in"}
+        candidates = cls._line_assignments(lines, raw, 0, len(lines), None)
+        segments = [segment for segment in raw.split(".") if segment]
+        if not candidates and len(segments) > 1:
+            lo, hi, parent_indent = 0, len(lines), None
+            index: Optional[int] = None
+            for depth, segment in enumerate(segments):
+                matches = cls._line_assignments(lines, segment, lo, hi, parent_indent)
+                if not matches:
+                    return {
+                        "found": False,
+                        "reason": (
+                            f"is not assigned anywhere at the start of a line: its segment "
+                            f"{segment!r} ({depth + 1} of {len(segments)}) is not assigned in"
+                        ),
+                    }
+                if len(matches) > 1:
+                    return {
+                        "found": False,
+                        "ambiguous": True,
+                        "reason": (
+                            f"resolves ambiguously: its segment {segment!r} is assigned on "
+                            f"{len(matches)} lines ({', '.join(str(m + 1) for m in matches[:4])}) "
+                            f"in"
+                        ),
+                    }
+                index = matches[0]
+                parent_indent = cls._indent_of(lines[index])
+                lo, hi = index + 1, cls._block_end(lines, index)
+            candidates = [index] if index is not None else []
+        if not candidates:
+            loose = re.compile(
+                r"(?:^|[\s{,\[])[\"']?" + re.escape(segments[-1] if segments else raw) + r"[\"']?\s*[:=]"
+            )
+            inline = next(
+                (number for number, line in enumerate(lines, 1) if loose.search(line)), None
+            )
+            if inline is not None:
+                return {
+                    "found": False,
+                    "unsupported": True,
+                    "reason": (
+                        f"is assigned only inside a flow or minified line (line {inline}), which "
+                        "cannot be scoped to the key itself, in"
+                    ),
+                }
+            return {"found": False, "reason": "is not assigned anywhere at the start of a line in"}
+        if len(candidates) > 1:
+            return {
+                "found": False,
+                "ambiguous": True,
+                "reason": (
+                    f"is assigned on {len(candidates)} lines "
+                    f"({', '.join(str(c + 1) for c in candidates[:4])}), so the reference "
+                    "identifies no single assignment in"
+                ),
+            }
+        start = candidates[0]
+        return {"found": True, "line": start + 1, "region": cls._region(lines, start)}
+
+    @classmethod
+    def _test_definition(cls, text: str, name: str) -> Dict[str, Any]:
+        """
+        The one definition of test `name` in `text`, with the body to compare.
+
+        Same correction as for a config key, and the same reviewed shape: a test
+        that had been there, untouched, since before the failure counted as the
+        change because a *different* test was added beside it in the same file. The
+        compared region is the test's own definition - its decorators, its
+        signature and its body - so an adjacent test cannot stand in for it, and a
+        file that defines the name twice is ambiguous rather than resolved to
+        whichever came first.
+        """
         leaf = str(name).strip()
+        lines = str(text or "").splitlines()
         if not leaf:
-            return None
+            return {"found": False, "reason": "names no test, so it identifies nothing in"}
         pattern = re.compile(
             r"^\s*(?:async\s+)?(?:def|class|it|test)\b.*\b" + re.escape(leaf) + r"\b"
         )
-        for number, line in enumerate(str(text or "").splitlines(), 1):
-            if pattern.search(line):
-                return number
-        return None
+        candidates = [index for index, line in enumerate(lines) if pattern.search(line)]
+        if not candidates:
+            return {"found": False, "reason": "is not defined in"}
+        if len(candidates) > 1:
+            return {
+                "found": False,
+                "ambiguous": True,
+                "reason": (
+                    f"is defined {len(candidates)} times "
+                    f"({', '.join(str(c + 1) for c in candidates[:4])}), so the reference "
+                    "identifies no single definition in"
+                ),
+            }
+        start = candidates[0]
+        indent = cls._indent_of(lines[start])
+        first = start
+        while first - 1 >= 0:
+            above = lines[first - 1]
+            if above.strip().startswith("@") and cls._indent_of(above) == indent:
+                first -= 1
+                continue
+            break
+        return {"found": True, "line": start + 1, "region": cls._region(lines, start, first)}
 
     @classmethod
     def _blob_at(cls, root: str, commit: str, rel_path: str) -> Optional[str]:
@@ -2413,10 +2645,10 @@ class RecurrenceGuard:
         # observed on.
         if ref_form == "config":
             rel_path, _, selector = ref_value.partition("#")
-            noun, locate = "config key", self._config_key_line
+            noun, locate = "config key", self._config_key_assignment
         else:
             rel_path, _, selector = ref_value.partition("::")
-            noun, locate = "test", self._test_definition_line
+            noun, locate = "test", self._test_definition
         base: Dict[str, Any] = {
             "form": ref_form,
             "value": ref_value,
@@ -2450,14 +2682,17 @@ class RecurrenceGuard:
                 "so the change it claims was not in the tree the proof ran on. An uncommitted "
                 "edit is not a change any head carries."
             )
-        line = locate(content, selector)
-        if line is None:
+        located = locate(content, selector)
+        if not located.get("found"):
             raise RecurrenceGuardError(
-                f"Change reference {noun} {selector!r} is not "
-                f"{'assigned anywhere in' if ref_form == 'config' else 'defined in'} "
-                f"{rel_path} at the evidence head {head[:12]}, so this reference names a "
-                "change that tree does not carry."
+                f"Change reference {noun} {selector!r} {located['reason']} "
+                f"{rel_path} at the evidence head {head[:12]}, so this reference does not "
+                "identify one committed change that tree carries. An unresolvable or "
+                "ambiguous reference is refused rather than compared against a region "
+                "nobody named."
             )
+        line = located["line"]
+        region = located["region"]
         resolved = {
             **base,
             "checked": True,
@@ -2473,9 +2708,10 @@ class RecurrenceGuard:
             # Two different absences, and only one of them may bind. A failure that
             # recorded no head at all has no tree to be compared with, so the
             # comparison is not applicable and the committed reference is as much
-            # as anything can establish. A failure that recorded heads this context
-            # cannot resolve is a context that failed its lineage check, and the
-            # comparison stays unresolvable.
+            # as anything can establish - which is why _bind_evidence additionally
+            # requires the evidence head itself to postdate the failure there. A
+            # failure that recorded heads this context cannot resolve is a context
+            # that failed its lineage check, and the comparison stays unresolvable.
             if not (context.get("observed_heads_recorded") or []):
                 resolved["changed_against_observed"] = None
                 resolved["change_comparison"] = "not_applicable"
@@ -2490,24 +2726,62 @@ class RecurrenceGuard:
                     "change cannot be shown to postdate the failure"
                 )
             return resolved
-        unchanged = [
-            sha for sha in observed if self._blob_at(root, sha, rel_path) == content
-        ]
+        # Scoped to the referenced key's assignment / the referenced test's own
+        # definition at each observed failing head. Whole-file inequality was the
+        # reviewed defect: any edit elsewhere in the file - a revision bump beside
+        # the key, a comment, a different test added below - made an untouched
+        # reference "differ" from the failing tree.
+        unchanged: List[str] = []
+        undecidable: List[str] = []
+        absent: List[str] = []
+        undecidable_reason = ""
+        for sha in observed:
+            other = self._blob_at(root, sha, rel_path)
+            if other is None:
+                absent.append(sha)
+                continue
+            there = locate(other, selector)
+            if there.get("ambiguous") or there.get("unsupported"):
+                undecidable.append(sha)
+                undecidable_reason = undecidable_reason or str(there.get("reason") or "")
+                continue
+            if not there.get("found"):
+                absent.append(sha)
+                continue
+            if there["region"] == region:
+                unchanged.append(sha)
         resolved["unchanged_at_observed"] = unchanged
+        resolved["absent_at_observed"] = absent
+        if undecidable:
+            resolved["undecidable_at_observed"] = undecidable
+            resolved["change_comparison"] = "ambiguous"
+            resolved["reason"] = (
+                f"{selector} cannot be compared with {rel_path} at {undecidable[0][:12]}, a head "
+                f"this failure was observed on, because it {undecidable_reason} {rel_path} "
+                "there. An ambiguous comparison is refused rather than resolved to whichever "
+                "region came first"
+            )
+            return resolved
         if unchanged:
             resolved["change_comparison"] = "identical"
             resolved["reason"] = (
-                f"{rel_path} is byte-identical at the evidence head {head[:12]} and at "
-                f"{unchanged[0][:12]}, a head this failure was observed on, so {selector} "
-                "names no change relative to the failure it claims to correct"
+                f"{selector} is byte-identical at {rel_path}:{line} in the evidence head "
+                f"{head[:12]} and at {unchanged[0][:12]}, a head this failure was observed on, "
+                f"so {selector} names no change relative to the failure it claims to correct - "
+                "whatever else in that file was touched"
             )
             return resolved
         resolved["changed_against_observed"] = True
         resolved["change_comparison"] = "differs"
         resolved["reason"] = (
-            f"{selector} is present at {rel_path}:{line} in {head[:12]}, whose content differs "
-            f"from {rel_path} at every head this failure was observed on "
-            f"({', '.join(sha[:12] for sha in observed[:3])})"
+            f"{selector} at {rel_path}:{line} in {head[:12]} differs from the same "
+            f"{'assignment' if ref_form == 'config' else 'definition'} at every head this "
+            f"failure was observed on ({', '.join(sha[:12] for sha in observed[:3])})"
+            + (
+                f"; it is not committed there at all in {len(absent)} of them"
+                if absent
+                else ""
+            )
         )
         return resolved
 
@@ -2539,28 +2813,52 @@ class RecurrenceGuard:
 
         * the verification context is **related to this failure** - it resolves a
           head the failure was observed on, or (when no head was recorded) it is
-          the repository the failure was recorded in. A context that can be related
-          to nothing at all is recorded as ``unanchored`` and never claims more;
+          the repository the failure was recorded in;
         * the proof succeeded - a non-zero exit code is the scenario still failing;
         * the proof did not run on a head the failure was observed on, and is not
           an **ancestor** of one either - a tree the failure's own tree was built on
           top of predates the failure, whatever the reference says about it;
+        * the evidence head **descends from every counted observed failing head**
+          (``git merge-base --is-ancestor <observed> <head>``, once per head), so
+          the tree the proof ran on is the failing tree with a correction on top of
+          it. This is the positive relation the reviewed version never asked for:
+          it related the head to the failure only negatively - not an observed
+          head, not an ancestor of one - and an orphan root in the same repository,
+          an orphan in any clone that merely *holds* the failing commit, and a
+          sibling branch that never contained it all satisfy that. Shared object
+          availability or a common merge-base is not descent. A counted head this
+          context cannot resolve, and an ancestry query git will not answer, are
+          fail-closed outcomes rather than absences;
+        * where the failure recorded **no head at all** there is nothing to descend
+          from, so the anchor is the evidence head's own commit time: it has to
+          postdate the last counted observation, or the proof ran on a tree that
+          already existed while the failure was happening. A committer date is
+          self-reported, so this is a weaker anchor than descent and is recorded as
+          the separate fact it is;
         * for a commit reference, the head the proof ran on *contains* that commit
           (``git merge-base --is-ancestor``), so the run that passed is a run of the
-          changed tree. For a ``config:``/``test:`` reference, the resolved content
-          differs from the same path at every observed failing head. For a
-          ``decision:`` reference, the answer postdates the last counted failure.
+          changed tree. For a ``config:``/``test:`` reference, the referenced key's
+          assignment or the referenced test's own definition differs from the same
+          reference at every observed failing head. For a ``decision:`` reference,
+          the answering comment was *posted* after the last counted failure.
 
-        Where a recorded relation cannot be evaluated - a recorded head no context
-        resolves, an ancestry query git will not answer, a timestamp nothing
-        carries - the binding fails closed and says which check it could not make.
+        An ``unanchored`` failure - no counted head and no reachable recorded
+        repository - binds nothing at all. There is no relation left to check, and
+        the previous contract let that absence read as a pass: any repository with
+        any commit opened the gate, which is the reviewed laundering shape one
+        level down. Refusing here does not deadlock and does not need a new
+        authorization: the two recovery paths already contracted by this module are
+        the operator's, either re-observing the failure with ``--head-sha`` (and
+        ``--repo-root``) so it has a lineage to bind to, or taking the counted
+        observations out of the count with ``supersede-observation --actor
+        --reason``, which is auditable precisely because it is an operator act.
 
         The gate itself is not stored: ``_action_gate_bound`` recomputes it from
         these facts on every load, so no stored flag can open a gate its own
         record denies.
         """
         root = context.get("root")
-        observed = cls._observed_heads(entry)
+        observed = list(dict.fromkeys(cls._observed_heads(entry)))
         resolved_observed = list(context.get("observed_heads_resolved") or [])
         binding: Dict[str, Any] = {
             "evidence_exit_code": int(evidence_exit_code),
@@ -2573,9 +2871,19 @@ class RecurrenceGuard:
             "verification_root": root,
             "lineage": context.get("lineage"),
             "lineage_reason": context.get("lineage_reason"),
+            "observed_heads_recorded": observed,
             "observed_heads_resolved": resolved_observed,
             "head_precedes_observed_failure": None,
             "ancestry_determined": None,
+            "descends_from_observed": None,
+            "containment_determined": None,
+            "observed_heads_contained": [],
+            "observed_heads_not_contained": [],
+            "observed_heads_unresolved": [],
+            "observed_heads_undetermined": [],
+            "head_committed_after_failure": None,
+            "head_committed_at": None,
+            "last_counted_observation_at": None,
         }
 
         reasons: List[str] = []
@@ -2590,7 +2898,15 @@ class RecurrenceGuard:
                 f"the evidence head {head[:12]} is one of the heads this failure was observed "
                 "on, so the proof was exercised on the unchanged tree"
             )
-        if not binding["lineage"]:
+        if binding["lineage"] == "unanchored":
+            reasons.append(
+                f"the verification context stands on nothing: {context.get('lineage_reason')}. "
+                "Anchor the failure by re-observing it with --head-sha (and --repo-root), or "
+                "have an operator take its counted observations out of the count with "
+                "supersede-observation --actor --reason; a proof related to nothing is what "
+                "this gate exists to refuse"
+            )
+        elif not binding["lineage"]:
             reasons.append(
                 "the verification context is not related to this failure: "
                 f"{context.get('lineage_reason')}"
@@ -2606,6 +2922,14 @@ class RecurrenceGuard:
             )
             binding["head_precedes_observed_failure"] = precedes
             binding["ancestry_determined"] = not undetermined
+            containment = cls._descendant_containment(root, head, observed)
+            containment_reason = containment.pop("reason", None)
+            binding.update(containment)
+            timing_reason = None
+            if not observed and binding["lineage"] == "recorded_repository":
+                timing = cls._head_postdates_failure(root, head, entry)
+                timing_reason = timing.pop("reason", None)
+                binding.update(timing)
             if undetermined:
                 reasons.append(
                     f"git would not answer whether the evidence head {head[:12]} precedes the "
@@ -2618,6 +2942,10 @@ class RecurrenceGuard:
                     "this failure was observed on, so it is a tree that already existed when "
                     "the failure happened"
                 )
+            elif containment_reason:
+                reasons.append(containment_reason)
+            elif timing_reason:
+                reasons.append(timing_reason)
             elif ref_form == "commit":
                 ancestor = cls._git(root, "merge-base", "--is-ancestor", ref_value.lower(), head)
                 carries = bool(ancestor is not None and ancestor.returncode == 0)
@@ -2657,9 +2985,15 @@ class RecurrenceGuard:
             binding["reference_resolved"]
             and binding["evidence_succeeded"]
             and not binding["head_was_observed_failing"]
-            and bool(binding["lineage"])
+            and binding["lineage"] in ("observed_head", "recorded_repository")
             and binding["ancestry_determined"] is True
             and not binding["head_precedes_observed_failure"]
+            and binding["containment_determined"] is True
+            and (
+                binding["descends_from_observed"] is True
+                if observed
+                else binding["head_committed_after_failure"] is True
+            )
             and binding["head_bound"]
         )
         binding["reason"] = (
@@ -2692,6 +3026,142 @@ class RecurrenceGuard:
                 return observed, None
         return None, None
 
+    @classmethod
+    def _descendant_containment(
+        cls, root: str, head: str, observed: Sequence[str]
+    ) -> Dict[str, Any]:
+        """
+        Whether `head` descends from every counted head this failure was observed on.
+
+        The reviewed defect this answers: the evidence head was related to the
+        failure only by what it was *not* - not an observed head, not an ancestor
+        of one. Every disconnected tree satisfies that. An orphan root commit in
+        the same repository, an orphan commit in any clone that merely holds the
+        failing commit (every clone of the project does), and a sibling branch cut
+        from the failing commit's parent all bound, because resolving the failing
+        head somewhere is availability, not descent.
+
+        So each counted observed head is asked the positive question, one
+        ``merge-base --is-ancestor <observed> <head>`` per head: is the failing
+        commit *in* the history of the tree the proof ran on. Every one of them has
+        to answer yes. A head that only shares a merge-base with the failure is a
+        sibling; a head this context cannot resolve, and a query git will not
+        answer, leave the relation unproven, and unproven is refused.
+
+        Returns the recorded facts, plus a ``reason`` key when the containment is
+        not established - the caller pops it into its refusal list.
+        """
+        contained: List[str] = []
+        missing: List[str] = []
+        unresolved: List[str] = []
+        undetermined: List[str] = []
+        for sha in dict.fromkeys(observed):
+            if not cls._commit_exists(root, sha):
+                unresolved.append(sha)
+                continue
+            probe = cls._git(root, "merge-base", "--is-ancestor", sha, head)
+            if probe is None or probe.returncode not in (0, 1):
+                undetermined.append(sha)
+                continue
+            (contained if probe.returncode == 0 else missing).append(sha)
+        facts: Dict[str, Any] = {
+            "observed_heads_contained": contained,
+            "observed_heads_not_contained": missing,
+            "observed_heads_unresolved": unresolved,
+            "observed_heads_undetermined": undetermined,
+            "containment_determined": not (unresolved or undetermined),
+            "descends_from_observed": None,
+        }
+        if not observed:
+            return facts
+        if undetermined:
+            facts["reason"] = (
+                f"git would not answer whether the evidence head {head[:12]} descends from the "
+                f"observed failing head {undetermined[0][:12]} in {root}, so the proof cannot "
+                "be shown to have run on the corrected failing tree"
+            )
+            return facts
+        if unresolved:
+            facts["reason"] = (
+                f"the observed failing head {unresolved[0][:12]} is not resolvable in {root} "
+                f"({len(unresolved)} of {len(list(dict.fromkeys(observed)))} counted head(s)), "
+                "so the evidence head cannot be shown to descend from every head this failure "
+                "was observed on"
+            )
+            return facts
+        if missing:
+            facts["reason"] = (
+                f"the evidence head {head[:12]} does not descend from the observed failing head "
+                f"{missing[0][:12]} ({len(missing)} of "
+                f"{len(list(dict.fromkeys(observed)))} counted head(s) are not in its history), "
+                "so it is a disconnected or sibling tree that never carried the failure rather "
+                "than the failing tree with the correction on top of it. Holding the failing "
+                "commit or sharing a merge-base with it is not descent"
+            )
+            return facts
+        facts["descends_from_observed"] = True
+        return facts
+
+    @classmethod
+    def _head_postdates_failure(
+        cls, root: str, head: str, entry: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Whether the evidence head was committed after this failure last happened.
+
+        Only asked where the failure recorded no head to descend from, which leaves
+        no history to relate the proof to: without this, any commit already in the
+        recorded repository - including one that predates the failure entirely -
+        bound, which is the same pre-failure tree the descent check refuses when
+        there is a head.
+
+        A committer date is self-reported, so this is deliberately the weaker
+        anchor and is recorded as its own fact rather than folded into descent. An
+        unreadable date or observation timestamp is refused, not assumed.
+
+        Git reports a commit time to the second, so the observation it is compared
+        with is truncated to the second too: a correction committed *in* the second
+        the failure was last observed cannot be ordered against it at that
+        resolution, and refusing it would be false precision that rejects real
+        corrections rather than a check. Anything committed in an earlier second is
+        refused. The descent check, where the failure recorded a head, has no such
+        tolerance and does not need one.
+        """
+        facts: Dict[str, Any] = {
+            "head_committed_after_failure": False,
+            "head_committed_at": None,
+            "last_counted_observation_at": None,
+        }
+        probe = cls._git(root, "show", "-s", "--format=%cI", head)
+        raw = ((probe.stdout or "").strip().splitlines() or [""])[0] if probe else ""
+        committed_at = cls._parse_iso(raw) if probe is not None and probe.returncode == 0 else None
+        facts["head_committed_at"] = raw or None
+        last = cls._last_counted_observation(entry)
+        facts["last_counted_observation_at"] = last["at"].isoformat() if last["at"] else None
+        if committed_at is None:
+            facts["reason"] = (
+                f"git would not report a readable commit time for the evidence head "
+                f"{head[:12]} in {root}, and this failure recorded no head to descend from, so "
+                "nothing relates the proof to the failure"
+            )
+            return facts
+        if last["at"] is None:
+            facts["reason"] = (
+                f"this failure recorded no head to descend from, and {last['reason']}, so the "
+                "evidence head cannot be shown to postdate it"
+            )
+            return facts
+        floor = last["at"].replace(microsecond=0)
+        if committed_at < floor:
+            facts["reason"] = (
+                f"the evidence head {head[:12]} was committed at {committed_at.isoformat()}, "
+                f"before this signature last failed at {last['at'].isoformat()}, so the proof "
+                "ran on a tree that already existed while the failure was happening"
+            )
+            return facts
+        facts["head_committed_after_failure"] = True
+        return facts
+
     @staticmethod
     def _bound_reason(
         ref_form: str, binding: Mapping[str, Any], verification: Mapping[str, Any]
@@ -2708,24 +3178,37 @@ class RecurrenceGuard:
         if ref_form == "commit":
             carried = "on a head that contains the change commit"
         elif ref_form in ("config", "test"):
-            noun = "configuration" if ref_form == "config" else "test"
+            noun = "configuration key" if ref_form == "config" else "test definition"
             carried = (
-                f"on a head whose committed {noun} differs from every head this failure was "
-                "observed on"
+                f"on a head whose committed {noun} differs from the same reference at every "
+                "head this failure was observed on"
                 if verification.get("change_comparison") == "differs"
                 else f"on a head that commits the referenced {noun}, with no observed failing "
                      "head to compare it against"
             )
         elif ref_form == "decision":
-            carried = "after a decision answered later than the last counted failure"
+            carried = (
+                "after a decision whose answering comment was posted later than the last "
+                "counted failure"
+            )
         else:
             carried = "against a resolved reference"
-        anchor = (
-            ""
-            if binding.get("lineage") != "unanchored"
-            else " (this failure recorded no head and no reachable repository, so the "
-                 "verification context could not be related to it)"
-        )
+        if binding.get("observed_heads_recorded"):
+            anchor = (
+                " on a head descending from every head this failure was observed on ("
+                + ", ".join(
+                    sha[:12] for sha in (binding.get("observed_heads_contained") or [])[:3]
+                )
+                + ")"
+            )
+        else:
+            anchor = (
+                " on a head committed at "
+                f"{binding.get('head_committed_at')}, after this failure last happened at "
+                f"{binding.get('last_counted_observation_at')} - this failure recorded no head "
+                "to descend from, and a committer date is self-reported, so that is the whole "
+                "of the relation"
+            )
         return (
             f"the original scenario was re-executed successfully {carried}, in a repository "
             f"related to this failure by {binding.get('lineage')}" + anchor
@@ -2765,11 +3248,19 @@ class RecurrenceGuard:
             return False
         if binding.get("head_bound") is not True:
             return False
-        if not binding.get("lineage"):
+        # `unanchored` is a recorded absence of any relation, so it is not one.
+        if binding.get("lineage") not in ("observed_head", "recorded_repository"):
             return False
         if binding.get("ancestry_determined") is not True:
             return False
         if binding.get("head_precedes_observed_failure"):
+            return False
+        if binding.get("containment_determined") is not True:
+            return False
+        if binding.get("observed_heads_recorded"):
+            if binding.get("descends_from_observed") is not True:
+                return False
+        elif binding.get("head_committed_after_failure") is not True:
             return False
         form = str(verification.get("form") or action.get("change_ref_form") or "")
         if form == "commit":
@@ -2828,26 +3319,34 @@ class RecurrenceGuard:
           it is the repository the failure was recorded in (``_lineage``). Naming
           *a* repository used to be enough, so a scratch repository holding an
           unrelated commit and a descendant of it opened the gate while the
-          repository the failure was recorded in still existed;
+          repository the failure was recorded in still existed. A failure that
+          recorded neither (``unanchored``) can be related to nothing, so nothing
+          binds to it and the record says which operator act would anchor it;
         * the reference **resolves** in that context - ``_verify_change_ref``. A
-          reference the context refutes is refused outright; one that cannot be
+          reference the context refutes, or that names no single committed
+          assignment or definition, is refused outright; one that cannot be
           resolved at all is recorded unverified and never opens the gate. A
           ``config:``/``test:`` reference is read out of the evidence head's
-          committed tree and must differ from the same path at every observed
-          failing head; a ``decision:`` reference must be answered after the last
-          counted occurrence of this failure;
+          committed tree and the referenced key's assignment (or the referenced
+          test's own definition, decorators included) must differ from the same
+          reference at every observed failing head - not merely the file it lives
+          in; a ``decision:`` reference must have been answered by a comment
+          *posted* after the last counted occurrence of this failure;
         * the exercising command **succeeded** (``evidence_exit_code == 0``);
         * ``head_sha`` is not one of the heads this failure was observed on, is not
-          an ancestor of one, and for a commit reference it **contains** that
-          commit, so the run that passed is a run of the changed tree -
+          an ancestor of one, **descends from every one of them** (or, where the
+          failure recorded no head at all, was itself committed after the last
+          counted observation), and for a commit reference it **contains** that
+          commit, so the run that passed is a run of the corrected failing tree -
           ``_bind_evidence``.
 
         ``verification_root`` names the repository to resolve against when the one
         recorded with the failure is gone, which is the normal case for an
         ephemeral worktree - a second worktree of the same repository resolves the
-        same failing head, so that flow is unaffected. It changes where the lookup
-        happens, never whether one is required, and never whether the context has
-        to be related to the failure.
+        same failing head and descends the same history, so that flow is
+        unaffected, as is a clone that holds it. It changes where the lookup
+        happens, never whether one is required, and never whether the context and
+        the head have to be related to the failure.
 
         It still records a claim and executes nothing: no change is applied, no
         acceptance criterion is touched, no merge or deployment is authorized, and
@@ -2995,6 +3494,15 @@ class RecurrenceGuard:
                     "lineage_reason": binding.get("lineage_reason"),
                     "head_precedes_observed_failure": binding.get(
                         "head_precedes_observed_failure"
+                    ),
+                    "descends_from_observed": binding.get("descends_from_observed"),
+                    "observed_heads_not_contained": binding.get(
+                        "observed_heads_not_contained"
+                    ),
+                    "observed_heads_unresolved": binding.get("observed_heads_unresolved"),
+                    "containment_determined": binding.get("containment_determined"),
+                    "head_committed_after_failure": binding.get(
+                        "head_committed_after_failure"
                     ),
                     "verification": ref_verification,
                 },
