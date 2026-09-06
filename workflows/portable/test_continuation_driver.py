@@ -983,6 +983,225 @@ class TestNativeBackgroundPending(_Fixture):
         self.assertIsNone(reloaded.parked_record("req-retry"))
         self.assertNotIn("req-retry", reloaded.data["inflight"])
 
+class TestNativeCheckExpectationReconcile(_Fixture):
+    """
+    The real prepare-record-complete-reconcile lifecycle across the check
+    expectation contract, driven through the actual SuperboardExecutionAdapter
+    rather than the scripted one.
+
+    This is the seam the defect lived in and the only place it is observable end
+    to end: worker_backend finalized a completion whose baseline check exited 1,
+    the adapter refused the same result on the next driver pass, run_step still
+    reported 'advanced', and the driver parked the request as 'no_progress' with
+    its own generic message while the ledger had never moved.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.repo = os.path.join(self.tmp, "repo")
+        os.makedirs(self.repo)
+        self._git("init", "-q", "-b", "main")
+        self._git("config", "user.email", "t@localhost")
+        self._git("config", "user.name", "T")
+        self._git("config", "commit.gpgsign", "false")
+        self.head = self._commit("seed.txt", "seed\n", "seed")
+
+    def _git(self, *args):
+        return subprocess.run(
+            ["git", *args], cwd=self.repo, capture_output=True, text=True,
+            check=False, shell=False,
+        )
+
+    def _commit(self, name, body, message):
+        with open(os.path.join(self.repo, name), "w", encoding="utf-8") as fh:
+            fh.write(body)
+        self._git("add", "-A")
+        self._git("commit", "-q", "-m", message)
+        return self._git("rev-parse", "HEAD").stdout.strip()
+
+    def _real_adapter(self, backend):
+        from superboard_adapter import SuperboardExecutionAdapter
+
+        return SuperboardExecutionAdapter(
+            state_dir=self.tmp,
+            worker_backend=backend,
+            notify_telegram=False,
+            repo_root=self.repo,
+        )
+
+    def _dispatch(self, req_id, backend, adapter):
+        """Drive the request to a bound background task, as the host would."""
+        outcome = self._driver(adapter, [req_id]).run()
+        self.assertEqual(outcome.parked, [], outcome.parked)
+        self.assertEqual(len(outcome.inflight), 1, outcome.to_dict())
+        run_id = outcome.inflight[0]["run_id"]
+        self.assertTrue(run_id, "the driver recorded no native run id")
+        handle = f"agent://child-{req_id}"
+        self.assertEqual(
+            backend.record_native_dispatch(run_id, handle).state,
+            "background_dispatched",
+        )
+        return run_id, handle
+
+    @staticmethod
+    def _result(req_id, head, checks):
+        return {
+            "stage": "build",
+            "request_id": req_id,
+            "head_sha": head,
+            "verdict": "pass",
+            "summary": "implemented and verified",
+            "checks": checks,
+            "artifacts": [{"path": "fix.txt", "role": "implementation"}],
+        }
+
+    @staticmethod
+    def _evidence_types(req):
+        return [entry.get("type") for entry in req.get("evidence", [])]
+
+    @staticmethod
+    def _lifecycle_view(req):
+        """
+        The lifecycle-bearing projection of a request.
+
+        A refused completion is a real failure, and the recurrence guard durably
+        records that it happened: an observation, a same-state history row and
+        the diagnosis it now wants. None of that is progress. What must not move
+        is the lifecycle itself, so this projects exactly the fields that carry
+        it - and any real advance changes at least one of them - instead of
+        pretending the failure went unobserved.
+        """
+        return {
+            "state": req.get("state"),
+            "head": req.get("head"),
+            "acceptance_criteria": req.get("acceptance_criteria"),
+            "authorization": req.get("authorization"),
+            "verification_evidence": [
+                entry for entry in req.get("evidence", [])
+                if entry.get("type") != "recurrence_observation"
+            ],
+            "state_path": [
+                row.get("to_state") for row in req.get("history", [])
+                if row.get("from_state") != row.get("to_state")
+            ],
+        }
+
+    def test_declared_controls_reconcile_and_advance_exactly_once(self):
+        req_id = "req-native-controls"
+        self._add(req_id, head=self.head)
+        backend = WorkerBackend(state_dir=self.tmp)
+        adapter = self._real_adapter(backend)
+        run_id, handle = self._dispatch(req_id, backend, adapter)
+
+        # The background worker really worked: it committed, reproduced the
+        # defect it was fixing, proved a guard still refuses, and ran a suite.
+        built = self._commit("fix.txt", "fix\n", "fix")
+        result = self._result(req_id, built, [
+            {"name": "baseline defect reproduction", "command": ["python", "repro.py"],
+             "exit_code": 1, "observed": "defect present before the fix",
+             "purpose": "baseline", "expected_exit_code": 1},
+            {"name": "guard refuses laundered evidence", "command": ["python", "guard.py"],
+             "exit_code": 3, "observed": "refused", "purpose": "negative_control",
+             "expected_exit_code": 3},
+            {"name": "focused suite", "command": ["python", "-m", "unittest", "-q"],
+             "exit_code": 0, "observed": "68 tests OK", "purpose": "verification"},
+        ])
+
+        completed = backend.complete_native(run_id, handle, result)
+        self.assertTrue(completed.ok, completed.blocked_reason)
+        # The observed exits survive finalization untouched.
+        self.assertEqual(
+            [c["exit_code"] for c in completed.evidence["checks"]], [1, 3, 0],
+        )
+        self.assertEqual(
+            completed.evidence["check_expectations"]["verifications_passed"], 1,
+        )
+        self.assertEqual(
+            completed.evidence["check_expectations"]["controls_retained"], 2,
+        )
+
+        reconciled = self._driver(adapter, [req_id]).run()
+        step = reconciled.steps[0]
+        self.assertEqual(step["result_status"], "advanced")
+        self.assertTrue(step["progressed"])
+        advanced = self.ledger.get_request(req_id)
+        self.assertEqual(advanced["state"], "QA")
+        self.assertEqual(advanced["head"], built)
+        self.assertEqual(
+            self._evidence_types(advanced).count("implementation_verification"), 1,
+        )
+
+        # Restart with a lost journal, and replay the completion: neither may
+        # credit the build stage a second time.
+        replay = backend.complete_native(run_id, handle, result)
+        self.assertEqual(replay.to_dict(), completed.to_dict())
+        os.remove(os.path.join(self.tmp, JOURNAL_FILENAME))
+        restarted = self._driver(self._real_adapter(backend), [req_id]).run()
+        self.assertEqual(restarted.steps[0]["stage"], "qa")
+        after = self.ledger.get_request(req_id)
+        self.assertEqual(after["state"], "QA")
+        self.assertEqual(
+            self._evidence_types(after).count("implementation_verification"), 1,
+        )
+
+    def test_unclassified_failing_check_parks_with_the_real_reason(self):
+        """The reproduced case: refused at the shared source, reported truthfully."""
+        req_id = "req-native-unclassified"
+        self._add(req_id, head=self.head)
+        backend = WorkerBackend(state_dir=self.tmp)
+        adapter = self._real_adapter(backend)
+        run_id, handle = self._dispatch(req_id, backend, adapter)
+        before = self.ledger.get_request(req_id)
+
+        built = self._commit("fix.txt", "fix\n", "fix")
+        completed = backend.complete_native(run_id, handle, self._result(req_id, built, [
+            {"name": "baseline defect reproduction", "command": ["python", "repro.py"],
+             "exit_code": 1, "observed": "defect present"},
+            {"name": "focused suite", "command": ["python", "-m", "unittest", "-q"],
+             "exit_code": 0, "observed": "68 tests OK"},
+        ]))
+        self.assertFalse(completed.ok)
+        self.assertIn("unclassified failing check", completed.blocked_reason)
+
+        reconciled = self._driver(adapter, [req_id]).run()
+        step = reconciled.steps[0]
+        self.assertNotEqual(step["result_status"], "advanced")
+        self.assertFalse(step["progressed"])
+        park = reconciled.parked[0]
+        self.assertNotEqual(park["reason_code"], "no_progress")
+        self.assertIn("unclassified failing check", park["reason"])
+        self.assertEqual(
+            self._lifecycle_view(self.ledger.get_request(req_id)),
+            self._lifecycle_view(before),
+        )
+
+    def test_controls_only_completion_is_refused_and_never_advances(self):
+        req_id = "req-native-controls-only"
+        self._add(req_id, head=self.head)
+        backend = WorkerBackend(state_dir=self.tmp)
+        adapter = self._real_adapter(backend)
+        run_id, handle = self._dispatch(req_id, backend, adapter)
+        before = self.ledger.get_request(req_id)
+
+        built = self._commit("fix.txt", "fix\n", "fix")
+        completed = backend.complete_native(run_id, handle, self._result(req_id, built, [
+            {"name": "baseline defect reproduction", "command": ["python", "repro.py"],
+             "exit_code": 1, "observed": "defect present",
+             "purpose": "baseline", "expected_exit_code": 1},
+            {"name": "guard refuses", "command": ["python", "guard.py"],
+             "exit_code": 3, "observed": "refused",
+             "purpose": "negative_control", "expected_exit_code": 3},
+        ]))
+        self.assertFalse(completed.ok)
+        self.assertIn("none is a successful 'verification' check", completed.blocked_reason)
+
+        reconciled = self._driver(adapter, [req_id]).run()
+        self.assertNotEqual(reconciled.steps[0]["result_status"], "advanced")
+        self.assertEqual(
+            self._lifecycle_view(self.ledger.get_request(req_id)),
+            self._lifecycle_view(before),
+        )
+
 
 class TestContinuationDriverTelegramNotifications(_Fixture):
     """Behavioral regression exercising parser/driver -> adapter notification path.
