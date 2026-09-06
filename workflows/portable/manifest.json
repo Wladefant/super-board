@@ -203,6 +203,23 @@
         "human_inputs (question_id, category, target, question, resolution_guidance)",
         "agent_actions (target, category, missing_prerequisites, next_action)"
       ]
+    },
+    "topic_inventory_guard.py": {
+      "role": "Deterministic topic inventory coverage and worker invariant engine. Reconciles full source inventory additively; detects dropped items; verifies active native worker coverage per runnable topic; enforces 7-15 worker floor unless RAM ceiling (>=95%) applies; rejects fake or parked statuses; generates actionable next-ready assignments.",
+      "owner": "PackagePortableCoordinator",
+      "cli_command": "python topic_inventory_guard.py [--sources <paths...>] [--roster-json <path>] [--ram-pct <pct>] [--check] [--json]",
+      "inputs": [
+        "full-topic-board-current.json",
+        "scope-additive-verification.json",
+        "open-issue-inventory.json",
+        "ledger.json",
+        "native host roster JSON"
+      ],
+      "outputs": [
+        "GuardReport (JSON or terminal summary)",
+        "CoverageViolation records (DROPPED_TASK, UNCOVERED_RUNNABLE_TOPIC, WORKER_FLOOR_DEFICIT, UNAUTHORIZED_ACTIVE_WORKER, FAKE_WORKER_REJECTED)",
+        "NextAssignment recommendations for Main"
+      ]
     }
   },
   "adapters": {

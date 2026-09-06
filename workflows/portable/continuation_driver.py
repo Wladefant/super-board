@@ -201,6 +201,8 @@ class DriverOutcome:
     resumed_from_journal: bool = False
     boundaries: Dict[str, Any] = field(default_factory=dict)
     error: Optional[str] = None
+    next_assignments: List[Dict[str, Any]] = field(default_factory=list)
+    coverage_summary: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -1004,6 +1006,20 @@ class ContinuationDriver:
             error = str(e)
             stop_reason = "aborted on boundary violation"
         finally:
+            next_assigns: List[Dict[str, Any]] = []
+            cov_summary: Optional[Dict[str, Any]] = None
+            try:
+                from topic_inventory_guard import TopicInventoryGuard
+                guard = TopicInventoryGuard()
+                ledger_path = getattr(self.ledger, "ledger_path", None)
+                cov_rep = guard.evaluate_topic_coverage(
+                    inventory=guard.parse_inventory_source(ledger_path or {}),
+                    roster=[],
+                )
+                cov_summary = {"ok": cov_rep.ok, "summary": cov_rep.summary}
+                next_assigns = [a.to_dict() for a in cov_rep.next_assignments]
+            except Exception:
+                pass
             outcome = DriverOutcome(
                 run_id=run_id,
                 started_at=started,
@@ -1024,6 +1040,8 @@ class ContinuationDriver:
                     "real_worker": self.real_worker,
                 },
                 error=error,
+                next_assignments=next_assigns,
+                coverage_summary=cov_summary,
             )
             try:
                 self.journal.add_run(outcome)
@@ -1118,6 +1136,11 @@ def format_outcome(outcome: DriverOutcome) -> str:
         lines.append("PARKED")
         for p in outcome.parked:
             lines.append(f"  {p['request_id']} [{p['reason_code']}] {p['reason']}")
+    if outcome.next_assignments:
+        lines.append("-" * 70)
+        lines.append(f"NEXT ACTIONABLE ASSIGNMENTS ({len(outcome.next_assignments)})")
+        for a in outcome.next_assignments:
+            lines.append(f"  [P{a.get('priority', 1)}] [{a.get('topic')}] {a.get('content')} (role={a.get('recommended_role')})")
     if outcome.parked or outcome.error:
         lines.append("-" * 70)
         lines.append("DIAGNOSTIC HANDOFF")
