@@ -136,6 +136,7 @@ PROTECTED_ACTION_SCOPES = [
 class ProvenanceType:
     HUMAN_OPERATOR = "human_operator"  # Legacy persisted value; never inferred from GitHub identity alone.
     GITHUB_VERIFIED_USER = "github_verified_user"
+    TELEGRAM_VERIFIED_CALLBACK = "telegram_verified_callback"
     SHARED_ACCOUNT_AMBIGUOUS = "shared_account_ambiguous"
     SYNTHETIC_TEST = "synthetic_test"
     AGENT_AUTHORED = "agent_authored"
@@ -1842,6 +1843,177 @@ class DecisionManager:
                 "provenance": parse_result.get("provenance", provenance),
             }
 
+    def resolve_telegram_callback(
+        self,
+        decision_id: str,
+        choice_id: str,
+        callback_token: str,
+        responder: str = "Wladefant",
+        session_id: Optional[str] = None,
+        context: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Resolves a decision from an authentic Telegram inline keyboard callback.
+        Enforces:
+        - Decision exists and is currently in an open state
+        - Choice matches an explicit option ID in the decision
+        - Refuses already-answered decisions
+        - Sets provenance to telegram_verified_callback
+        - Resolves decision and clears blocker in RequestLedger
+        - Preserves free-text context in audit trail and evidence
+        - Does NOT grant extra permissions (merges, deployments, or infra mutations)
+        """
+        with FileLock(self.lock_path):
+            data = self._load_data_unlocked()
+            if decision_id not in data["decisions"]:
+                return {
+                    "ok": False,
+                    "error": f"Decision '{decision_id}' not found.",
+                    "decision_id": decision_id,
+                }
+
+            dec_dict = data["decisions"][decision_id]
+
+            # Already answered check
+            if dec_dict.get("answer") or dec_dict.get("status") in TERMINAL_DECISION_STATUSES:
+                return {
+                    "ok": False,
+                    "error": "decision_already_answered",
+                    "decision_id": decision_id,
+                    "current_answer": dec_dict.get("answer"),
+                }
+
+            # Match choice ID
+            matched_opt = None
+            for opt in dec_dict.get("options", []):
+                if isinstance(opt, dict) and str(opt.get("id", "")).strip().lower() == str(choice_id).strip().lower():
+                    matched_opt = opt
+                    break
+            if not matched_opt:
+                avail = [o.get("id") if isinstance(o, dict) else str(o) for o in dec_dict.get("options", [])]
+                return {
+                    "ok": False,
+                    "error": f"Invalid choice '{choice_id}'. Available options: {avail}",
+                    "decision_id": decision_id,
+                }
+
+            # Verify responder authorization
+            auth_responders = dec_dict.get("authorized_responders", [])
+            auth_normalized = [str(a).lower().lstrip("@") for a in auth_responders]
+            clean_resp = str(responder or "Wladefant").strip().lower().lstrip("@")
+            if auth_normalized and clean_resp not in auth_normalized:
+                return {
+                    "ok": False,
+                    "error": f"Unauthorized responder '@{responder}'. Authorized responders: {auth_responders}",
+                    "decision_id": decision_id,
+                }
+
+            # Verify session binding if decision carries one
+            dec_session = dec_dict.get("session") or dec_dict.get("session_id")
+            if session_id and dec_session and dec_session != session_id:
+                return {
+                    "ok": False,
+                    "error": f"Session mismatch: callback session '{session_id}' != decision session '{dec_session}'",
+                    "decision_id": decision_id,
+                }
+
+            now = get_iso_timestamp()
+            opt_id = matched_opt["id"]
+            opt_label = matched_opt.get("label", "")
+            interpretation = f"Option {opt_id} ({opt_label})" if opt_label else f"Option {opt_id}"
+
+            ans_data = {
+                "comment_id": callback_token,
+                "comment_url": f"telegram://callback/{callback_token}",
+                "responder": responder,
+                "answered_at": now,
+                "comment_created_at": now,
+                "comment_created_at_source": "telegram_verified_callback",
+                "raw_text": f"Option {opt_id}",
+                "selected_option_id": opt_id,
+                "selected_option_label": opt_label,
+                "interpretation": interpretation,
+                "form_fields": {"choice": opt_id},
+                "provenance": ProvenanceType.TELEGRAM_VERIFIED_CALLBACK,
+                "context": context,
+                "is_test": False,
+            }
+
+            audit_entry = {
+                "timestamp": now,
+                "responder": responder,
+                "comment_id": callback_token,
+                "comment_url": f"telegram://callback/{callback_token}",
+                "reply_text": f"Option {opt_id}",
+                "status": "answered",
+                "provenance": ProvenanceType.TELEGRAM_VERIFIED_CALLBACK,
+                "interpretation": interpretation,
+                "context": context,
+                "is_test": False,
+            }
+
+            dec_dict["status"] = DecisionStatus.ANSWERED
+            dec_dict["answer"] = ans_data
+            dec_dict["rejection_reason"] = None
+            dec_dict["clarification_prompt"] = None
+            dec_dict.setdefault("audit_trail", []).append(audit_entry)
+
+            # Update dependent ledger requests and clear decision blocker
+            unblocked = []
+            clean_actor = responder.lstrip("@").strip()
+            for req_id in dec_dict.get("blocking_dependencies", []):
+                try:
+                    if hasattr(self.ledger, "resolve_decision"):
+                        self.ledger.resolve_decision(
+                            req_id=req_id,
+                            decision_id=decision_id,
+                            answer=interpretation,
+                            comment_id=callback_token,
+                            provenance_type=ProvenanceType.TELEGRAM_VERIFIED_CALLBACK,
+                            actor=clean_actor,
+                        )
+                    ev_payload = {
+                        "type": "human_decision",
+                        "summary": f"Decision [{decision_id}] answered via Telegram callback by @{clean_actor}: {interpretation}",
+                        "details": (
+                            f"Callback Token: {callback_token} | "
+                            f"Selected: {opt_id} - {opt_label} | "
+                            f"Provenance: {ProvenanceType.TELEGRAM_VERIFIED_CALLBACK} | "
+                            f"Context: {context or 'None'}"
+                        ),
+                        "recorded_by": f"telegram-callback:@{clean_actor}",
+                        "comment_id": callback_token,
+                        "responder": responder,
+                    }
+                    upd_kwargs = {
+                        "req_id": req_id,
+                        "clear_blocker": True,
+                        "actor": clean_actor,
+                        "reason": f"Decision [{decision_id}] answered by @{clean_actor}: {interpretation}",
+                        "add_evidence": ev_payload,
+                    }
+                    if hasattr(self.ledger, "clear_decision_blocker"):
+                        upd_kwargs["clear_decision_blocker"] = decision_id
+                    self.ledger.update_request(**upd_kwargs)
+                    unblocked.append(req_id)
+                except Exception:
+                    pass
+
+            self._save_data_unlocked(data)
+
+            return {
+                "ok": True,
+                "status": "answered",
+                "decision_id": decision_id,
+                "choice_id": opt_id,
+                "choice_label": opt_label,
+                "interpretation": interpretation,
+                "responder": responder,
+                "provenance": ProvenanceType.TELEGRAM_VERIFIED_CALLBACK,
+                "unblocked_requests": unblocked,
+                "context": context,
+            }
+
     def ingest_comment(
         self,
         decision_id: str,
@@ -3470,6 +3642,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_igh.add_argument("--history-path", default=None, help="Optional local JSON file of GraphQL history payload")
     p_igh.add_argument("--test", action="store_true", help="Flag as synthetic test probe (cannot unblock real tasks)")
 
+    # RESOLVE-CALLBACK
+    p_rcb = subparsers.add_parser(
+        "resolve-callback",
+        help="Resolve a decision from an authentic Telegram inline keyboard callback",
+    )
+    p_rcb.add_argument("--id", required=True, help="Decision ID")
+    p_rcb.add_argument("--choice", required=True, help="Selected choice ID (e.g. A, B)")
+    p_rcb.add_argument("--token", required=True, help="Verified callback token")
+    p_rcb.add_argument("--responder", default="Wladefant", help="Authorized responder username")
+    p_rcb.add_argument("--session", default=None, help="Session ID")
+    p_rcb.add_argument("--context", default=None, help="Optional additional free-text context")
+    p_rcb.add_argument("--json", action="store_true", help="Emit the resolution result as JSON")
+
     return parser
 
 
@@ -3672,6 +3857,24 @@ def main():
                     "     No answer was manufactured; decision blockers and authorization "
                     "are unchanged."
                 )
+        elif args.command == "resolve-callback":
+            res = mgr.resolve_telegram_callback(
+                decision_id=args.id,
+                choice_id=args.choice,
+                callback_token=args.token,
+                responder=args.responder,
+                session_id=args.session,
+                context=args.context,
+            )
+            if getattr(args, "json", False):
+                print(json.dumps(res, indent=2))
+            else:
+                if res.get("ok"):
+                    print(f"[OK] Decision '{args.id}' resolved via Telegram callback: {res['interpretation']}")
+                    print(f"     Unblocked requests: {', '.join(res.get('unblocked_requests', []))}")
+                else:
+                    print(f"[ERROR] Could not resolve decision '{args.id}': {res.get('error')}", file=sys.stderr)
+                    sys.exit(1)
 
     except DecisionRecoveryRefused as e:
         print(f"[REFUSED] {e.code}: {e.message}", file=sys.stderr)

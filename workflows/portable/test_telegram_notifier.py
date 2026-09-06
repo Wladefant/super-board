@@ -41,6 +41,9 @@ from telegram_notifier import (
     ProjectSlotResolver,
     SecretSanitizer,
     TelegramNotificationAdapter,
+    DecisionCallbackStore,
+    build_decision_inline_keyboard,
+    format_decision_presentation,
     resolve_pool_db_path,
 )
 
@@ -1102,7 +1105,7 @@ class TestCoordinatorHookCorrelation(unittest.TestCase):
         self.state_dir = self.root / "state"
         self.state_dir.mkdir()
         self.pool_db = self.root / "configured_pool.db"
-
+        self.pre_existing_cwd_state = (Path.cwd() / "telegram_notify_state.json").exists()
         self.channels_dir = self.root / "channels"
         slot_dir = self.channels_dir / "telegram-polysim"
         slot_dir.mkdir(parents=True)
@@ -1180,7 +1183,8 @@ class TestCoordinatorHookCorrelation(unittest.TestCase):
 
         # Deduplication state belongs to the configured state directory, not the cwd.
         self.assertTrue((self.state_dir / "telegram_notify_state.json").is_file())
-        self.assertFalse((Path.cwd() / "telegram_notify_state.json").exists())
+        if not self.pre_existing_cwd_state:
+            self.assertFalse((Path.cwd() / "telegram_notify_state.json").exists())
 
 
 class _PacketStub:
@@ -1191,6 +1195,110 @@ class _PacketStub:
 
     def to_dict(self):
         return self._data
+
+
+class TestDecisionInteractiveCallback(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.pool_db = Path(self.tmp) / "bot_pool.db"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_callback_store_token_generation_and_lookup(self):
+        store = DecisionCallbackStore(self.pool_db)
+        token = store.create_callback(
+            decision_id="staging-ci-access-403",
+            choice_id="A",
+            session_id="sess-test-01",
+            chat_id="1247617658",
+            user_id="1247617658",
+            question_text="Which access strategy should replace the runner?",
+            ttl_seconds=3600.0,
+        )
+        self.assertIsNotNone(token)
+        # Bounded token limit: <= 64 bytes for Telegram callback_data
+        self.assertLessEqual(len(token.encode("utf-8")), 64)
+        self.assertTrue(token.startswith("cb:d_"))
+
+        record = store.lookup(token)
+        self.assertIsNotNone(record)
+        self.assertEqual(record["decision_id"], "staging-ci-access-403")
+        self.assertEqual(record["choice_id"], "A")
+        self.assertEqual(record["session_id"], "sess-test-01")
+        self.assertEqual(record["chat_id"], "1247617658")
+        self.assertEqual(record["user_id"], "1247617658")
+        self.assertIsNone(record["consumed_at"])
+
+        # Consume once succeeds
+        self.assertTrue(store.consume(token))
+        # Replay / second consume fails
+        self.assertFalse(store.consume(token))
+
+        record_after = store.lookup(token)
+        self.assertIsNotNone(record_after["consumed_at"])
+
+    def test_decision_presentation_format_plain_language(self):
+        msg = format_decision_presentation(
+            problem="PolySimulator staging automated tests cannot run because CI lacks access.",
+            proposed_action="Choose how to configure authorized staging CI access.",
+            consequence_or_risk="Option A requires access credentials; Option B requires registering a fresh runner.",
+            details_url="https://github.com/Bavariance/polysimulator/issues/4574",
+            options=[{"id": "A", "label": "Approved access remedy"}, {"id": "B", "label": "Approved non-retired runner"}],
+        )
+        self.assertIn("❓ <b>Problem:</b> PolySimulator staging automated tests cannot run because CI lacks access.", msg)
+        self.assertIn("👉 <b>Proposed Action:</b> Choose how to configure authorized staging CI access.", msg)
+        self.assertIn("⚠️ <b>Risk / Consequence:</b> Option A requires access credentials; Option B requires registering a fresh runner.", msg)
+        self.assertIn("• <b>Option A</b>: Approved access remedy", msg)
+        self.assertIn("• <b>Option B</b>: Approved non-retired runner", msg)
+        self.assertIn('<a href="https://github.com/Bavariance/polysimulator/issues/4574">View Details on GitHub</a>', msg)
+        # No raw request IDs or raw paths
+        self.assertNotIn("req-", msg)
+        self.assertNotIn("C:\\", msg)
+
+    def test_build_decision_inline_keyboard(self):
+        store = DecisionCallbackStore(self.pool_db)
+        kb = build_decision_inline_keyboard(
+            decision_id="staging-ci-access-403",
+            options=[{"id": "A", "label": "Approved access path"}, {"id": "B", "label": "Approved runner"}],
+            session_id="sess-test-01",
+            chat_id="1247617658",
+            user_id="1247617658",
+            question_text="CI access strategy",
+            callback_store=store,
+        )
+        self.assertIsNotNone(kb)
+        self.assertIn("inline_keyboard", kb)
+        buttons = kb["inline_keyboard"][0]
+        self.assertEqual(len(buttons), 2)
+        self.assertEqual(buttons[0]["text"], "A: Approved access path")
+        self.assertTrue(buttons[0]["callback_data"].startswith("cb:d_"))
+        self.assertEqual(buttons[1]["text"], "B: Approved runner")
+        self.assertTrue(buttons[1]["callback_data"].startswith("cb:d_"))
+
+    def test_send_notification_dry_run_includes_buttons(self):
+        store = DecisionCallbackStore(self.pool_db)
+        adapter = TelegramNotificationAdapter(callback_store=store)
+        ev = NotificationEvent(
+            event_type="decision",
+            project="Bavariance/polysimulator",
+            request_id="req-4574",
+            summary="Staging CI access needed.",
+            canonical_link="https://github.com/Bavariance/polysimulator/issues/4574",
+            metadata={
+                "decision_id": "staging-ci-access-403",
+                "options": [{"id": "A", "label": "Access remedy"}, {"id": "B", "label": "Runner"}],
+            },
+            session_id="sess-owner-123",
+        )
+        receipt = adapter.notify(ev, dry_run=True)
+        self.assertTrue(receipt.delivered)
+        self.assertIsNotNone(receipt.reply_markup)
+        self.assertIn("inline_keyboard", receipt.reply_markup)
+        buttons = receipt.reply_markup["inline_keyboard"][0]
+        self.assertEqual(len(buttons), 2)
+        self.assertEqual(buttons[0]["text"], "A: Access remedy")
+        self.assertTrue(buttons[0]["callback_data"].startswith("cb:d_"))
 
 
 if __name__ == "__main__":

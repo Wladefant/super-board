@@ -752,7 +752,7 @@ class ContinuationDriver:
         answer = dec.get("answer")
         if not isinstance(answer, Mapping):
             return False
-        if answer.get("provenance") != "github_verified_user":
+        if answer.get("provenance") not in ("github_verified_user", "telegram_verified_callback"):
             return False
         if answer.get("is_test"):
             return False
