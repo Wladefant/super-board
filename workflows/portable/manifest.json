@@ -14,7 +14,8 @@
     "no_credential_leakage": "Balance and probe modules strictly redact email addresses, project IDs, account numbers, and API tokens.",
     "head_bound_evidence": "Git HEAD changes invalidate all head-bound QA evidence, criteria statuses, and proofs, resetting state to implementation.",
     "explicit_per_criterion_evidence": "Every criterion in acceptance_criteria must have status 'verified' and non-empty evidence before transitioning to 'done'.",
-    "github_proof_required": "Requests cannot close to 'done' without a verified GitHub proof URL (PR, issue comment, commit SHA, or asset) matching repository."
+    "github_proof_required": "Requests cannot close to 'done' without a verified GitHub proof URL (PR, issue comment, commit SHA, or asset) matching repository.",
+    "recurrence_changes_behaviour": "A repeated failure changes what the system does instead of being retried unchanged. The second distinct occurrence of one project+environment+operation+error signature refuses unchanged blind retry; the third escalates once per escalation epoch. Duplicate ingestion of a known observation id is never a recurrence, and an intended negative control is retained as evidence without counting. Recording a corrective action and opening the retry gate are separate outcomes: the record always lands, and the gate opens only when the change reference resolved in a reachable context, the exercising command exited 0, and the evidence head is not one of the observed failing heads and carries the change commit - recomputed from the action's own recorded facts on every load, never read from a stored verdict. A reference that cannot be resolved (a pull request, or anything in a worktree that no longer exists) is recorded unverified and never opens the gate or closes an escalation epoch. Opening the gate is all it does: it never verifies acceptance criteria, satisfies head-bound QA or review, or authorizes a merge or deployment. The refusal is not inert: it opens a durable corrective work item whose closure must name the corrective change and the original failure scenario re-executed on the corrected head."
   },
   "modules": {
     "project_adapter.py": {
@@ -188,6 +189,33 @@
         "continuation_driver.lock"
       ]
     },
+    "recurrence_guard.py": {
+      "role": "Durable failure recurrence persistence and corrective-action gates. Observed failures persist under stable project+environment+operation+error-class signatures with unique observation ids, so duplicate ingestion is not recurrence. The first occurrence retains an actionable diagnosis, owner and next action; the second refuses unchanged blind retry until a corrective action whose reference resolves and whose exercised proof is bound to it is recorded; the third escalates once per escalation epoch through the existing deduplicated notification event contract. Only observations dispositioned 'unexpected' count, so an intended negative control or superseded attempt is retained as evidence without driving a retry loop. Every string a durable write would newly persist - into the store, the request ledger or the escalation outbox - is redacted at that boundary, while values something is later looked up by keep their shape and already-durable history is not rewritten. Each observation records whether its ledger projection is pending, applied, failed, suppressed or not applicable, and keeps an immutable observation-time snapshot that a delayed projection reports from. Records only: never executes a code change, DDL, deployment or privileged action, never sends a notification, and is advisory local state on a writable checkout rather than security enforcement.",
+      "owner": "ImplementRecurrenceGuard",
+      "cli_command": "python recurrence_guard.py [--state-dir <dir>] [--store <json>] [--summary] {observe --environment <env> --operation <op> (--error <text> | --error-class <id>) [--project <id>] [--source native_worker|continuation_driver|ci|deploy|tool|manual] [--disposition unexpected|expected_negative_control|superseded_attempt] [--request-id <id>] [--head-sha <sha>] [--stage <stage>] [--attempt <id>] [--observation-id <id>] [--diagnosis <text>] [--owner <who>] [--next-action <text>] [--detail <text>] [--repo-root <dir>] [--canonical-link <url>] [--session <id>] [--no-ledger-update] | check-retry (--signature <sig> | --request-id <id> | --project <id> --environment <env> --operation <op> --error-class <id>) | record-corrective-action --signature <sig> [--verify-root <dir>] --kind <kind> --description <text> --actor <who> --change-ref commit:<40-hex>|pr:<owner>/<repo>#<n>|<github-pull-url>|config:<path>#<key>|decision:<id>|test:<path>::<name> --scenario <text> --evidence <text> --evidence-command <argv...> --evidence-exit-code <int> --head-sha <sha> [--authorization <ref>] [--request-id <id>] | supersede-observation --observation-id <id> --reason <text> --actor <who> [--disposition expected_negative_control|superseded_attempt] | resolve --signature <sig> --head-sha <sha> --evidence <text> --actor <who> | list [--status <status>] | show --signature <sig> | escalations [--ack <id> --acknowledged-by <who>] | resync-ledger [--strict] | deliver-escalations --outbox <path> --dedup-state <path> [--acknowledged-by <who>] [--dry-run]}",
+      "inputs": [
+        "recurrence.json (durable failure observation history, atomically written under ledger.FileLock)",
+        "ledger.json (request record the observation is attached to)",
+        "observed failure text from a native worker outcome, the continuation driver, CI, a deployment or a tool",
+        "decisions.json beside the store (read-only), when a corrective action names a decision reference",
+        "an explicit --verify-root git repository, when the repository the failure was observed in is gone"
+      ],
+      "outputs": [
+        "recurrence.json and recurrence.json.lock",
+        "IntakeResult (signature, observation_id, duplicate, disposition, counted, occurrences, status, retry_allowed, required_action, reopened, escalation)",
+        "RetryDecision (allowed, reason, blocking, required_action); CLI exit 3 when a retry is refused",
+        "NotificationEvent payloads plus their notification-contract dedup signatures, for the notification owner to send",
+        "ledger evidence, blocker and next_action on the affected request (never state, head, criteria or authorization)",
+        "durable corrective work item request in ledger.json (pending, local, never authorized or deployment-applicable)",
+        "durable corrective work item request in ledger.json (pending, local, labelled selection:explicit-only and scoped to its parent request, never authorized or deployment-applicable)",
+        "escalation delivery attempts and acknowledgements via deliver-escalations, through an injected sender exposing the notification contract's notify; OfflineEscalationOutbox hands off to a durable local file with no transport, credentials or bot pool"
+      ],
+      "exit_codes": {
+        "0": "operation completed / unchanged retry permitted",
+        "1": "usage or runtime error",
+        "3": "gate refusal: unchanged retry refused, a corrective action refused for an unverifiable change reference form, a reference a reachable context refutes, missing original-scenario evidence or missing authorization, or a corrective action recorded whose proof is not bound to a verified change so the retry gate stayed closed"
+      }
+    },
     "diagnostics.py": {
       "role": "Comprehensive aggregate system, service, provider, request and host resource diagnostics. Exposes where problems lie, what is missing, distinguishes access from health and stale from failed, and asks the user only when true human authorization/preference/credential is needed with a deduplicatable question identifier.",
       "owner": "PackagePortableCoordinator",
@@ -265,6 +293,7 @@
       "fixtures/unknown_env_config.json",
       "worker_backend.py",
       "continuation_driver.py",
+      "recurrence_guard.py",
       "WORKER_EXECUTION.md",
       "diagnostics.py"
     ],
@@ -278,6 +307,7 @@
       "decisions.json",
       "test_worker_backend.py",
       "test_continuation_driver.py",
+      "test_recurrence_guard.py",
       "test_diagnostics.py"
     ]
   }

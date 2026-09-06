@@ -35,7 +35,13 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 try:
-    from ledger import FileLock, RequestLedger, get_iso_timestamp
+    from ledger import (
+            EXPLICIT_SELECTION_LABEL,
+            FileLock,
+            RequestLedger,
+            get_iso_timestamp,
+            requires_explicit_selection,
+        )
 except ImportError as e:
     raise ImportError(f"Failed to import ledger module from {SCRIPT_DIR}: {e}")
 
@@ -447,7 +453,18 @@ class Coordinator:
     def select_target_request(
         self, request_id: Optional[str] = None
     ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-        """Select target request from ledger (specified ID, next runnable, or first active)."""
+        """
+        Select target request from ledger (specified ID, next runnable, or first active).
+
+        Every implicit branch skips a request labelled for explicit selection only.
+        Machine-authored work - a corrective work item the recurrence guard opened
+        when a failure recurred, for instance - is real work with a real owner, but
+        no operator scoped it, and it is pending and unblocked, which made it the
+        *first* thing "whatever is runnable next" picked up. Naming it is still
+        honoured: an explicit request id is the explicit selection the label asks
+        for, and nothing here weakens the authorization, merge or deployment gates
+        that apply once a request is selected.
+        """
         data = self.ledger._load_data_unlocked()
         requests = data.get("requests", {})
         if not requests:
@@ -459,22 +476,44 @@ class Coordinator:
                 return None, f"Request '{request_id}' not found in ledger."
             return req, None
 
+        def implicitly_selectable(candidate_id: Optional[str]) -> bool:
+            return not requires_explicit_selection(requests.get(candidate_id))
+
         # Check if any requests are runnable via ledger.next_actions()
         actions = self.ledger.next_actions()
-        runnable = [a for a in actions if not a.get("is_blocked")]
+        runnable = [
+            a for a in actions
+            if not a.get("is_blocked") and implicitly_selectable(a.get("id"))
+        ]
         if runnable:
             req_id_cand = runnable[0]["id"]
             return requests.get(req_id_cand), None
 
         # Otherwise select first candidate from next_actions (e.g. blocked or waiting)
-        if actions:
-            req_id_cand = actions[0]["id"]
+        selectable_actions = [a for a in actions if implicitly_selectable(a.get("id"))]
+        if selectable_actions:
+            req_id_cand = selectable_actions[0]["id"]
             return requests.get(req_id_cand), None
 
         # Otherwise find first non-done request
-        active = [r for r in requests.values() if r.get("state") != "done"]
+        active = [
+            r for r in requests.values()
+            if r.get("state") != "done" and not requires_explicit_selection(r)
+        ]
         if active:
             return active[0], None
+
+        explicit_only = [
+            r["id"] for r in requests.values()
+            if r.get("state") != "done" and requires_explicit_selection(r)
+        ]
+        if explicit_only:
+            return None, (
+                "No implicitly selectable request remains. "
+                f"{len(explicit_only)} request(s) are labelled "
+                f"'{EXPLICIT_SELECTION_LABEL}' and run only when named: "
+                f"{', '.join(sorted(explicit_only))}."
+            )
 
         # All requests are done
         return None, "All requests in ledger are in terminal 'done' state."
