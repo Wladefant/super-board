@@ -364,6 +364,105 @@ def rejected_input_fingerprint(body: str, comment_updated_at: Optional[str]) -> 
     return digest.hexdigest()
 
 
+def extract_task_list_options(text: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Extract task-list checkbox options from markdown text.
+    Matches lines like:
+      - [ ] **Option A**: Dedicated audit_events table
+      - [x] **Option A**: Dedicated audit_events table
+      - [X] **A**: Dedicated audit_events table
+      - [ ] [A] Dedicated table
+      - [x] Choice 1 - First option
+      * [x] Option 2: Second option
+    """
+    options: Dict[str, Dict[str, Any]] = {}
+    pattern = re.compile(
+        r"^\s*[-*]\s*\[([ xX])\]\s*(?:\*\*)?(?:Option\s+|Choice\s+)?\[?([a-zA-Z0-9_-]+)\]?(?:\*\*)?(?:\s*[:\-\.]\s*|\s+)?(.*)$",
+        re.MULTILINE,
+    )
+    for match in pattern.finditer(text or ""):
+        state = match.group(1).lower() == "x"
+        opt_id = match.group(2).strip()
+        label = (match.group(3) or "").strip()
+        label = re.sub(r"^\*\*\s*", "", label)
+        options[opt_id] = {
+            "checked": state,
+            "id": opt_id,
+            "label": label,
+            "raw_line": match.group(0).strip(),
+        }
+    return options
+
+
+def extract_additional_context(text: str) -> str:
+    """
+    Extract free-text notes / additional context from markdown context block or section.
+    Looks for:
+      <!-- decision-context: DEC-ID -->
+      ...
+      <!-- /decision-context -->
+    or under '#### Additional Context / Alternative Proposal'.
+    """
+    ctx_match = re.search(
+        r"<!--\s*decision-context(?::\s*[\w-]+)?\s*-->\s*(.*?)\s*<!--\s*/decision-context\s*-->",
+        text or "",
+        re.DOTALL | re.IGNORECASE,
+    )
+    if ctx_match:
+        content = ctx_match.group(1).strip()
+        if content.startswith("_") and content.endswith("_"):
+            return ""
+        return content
+
+    heading_match = re.search(
+        r"#{3,4}\s*(?:Additional Context|Alternative Proposal|Notes)[^\n]*\n(.*?)(?:\n#{2,4}\s|\Z)",
+        text or "",
+        re.DOTALL | re.IGNORECASE,
+    )
+    if heading_match:
+        content = heading_match.group(1).strip()
+        content = re.sub(r"<!--.*?-->", "", content, flags=re.DOTALL).strip()
+        if content.startswith("_") and content.endswith("_"):
+            return ""
+        return content
+
+    return ""
+
+
+def extract_context_from_reply(
+    reply_text: str,
+    matched_option_id: Optional[str] = None,
+    matched_label: Optional[str] = None,
+) -> str:
+    """Extract supplemental notes / free text from a plain or task-list reply comment."""
+    lines = []
+    task_re = re.compile(r"^\s*[-*]\s*\[([ xX])\]")
+    for line in (reply_text or "").splitlines():
+        if not task_re.match(line):
+            lines.append(line)
+    text_without_tasks = "\n".join(lines).strip()
+
+    if not matched_option_id:
+        return text_without_tasks
+
+    cleaned = re.sub(
+        rf"^\s*(?:i\s+choose\s+|go\s+with\s+|i\s+prefer\s+)?(?:option\s+|choice\s+)?\[?{re.escape(matched_option_id)}\]?(?:\*\*)?(?:\s*[:\-\.]\s*|\s+)",
+        "",
+        text_without_tasks,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    if matched_label and len(matched_label) > 3:
+        cleaned = re.sub(
+            rf"^\s*{re.escape(matched_label)}(?:\s*[:\-\.]\s*|\s+)?",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip()
+
+    cleaned = re.sub(r"^(?:note|notes|additional context|context)\s*:\s*", "", cleaned, flags=re.IGNORECASE).strip()
+    return cleaned
+
 def extract_form_fields(text: str) -> Dict[str, str]:
     """Extract key-value pairs from optional markdown form block or lines."""
     fields: Dict[str, str] = {}
@@ -450,7 +549,55 @@ def parse_plain_reply(
     # 4. Optional Form Extraction
     form_fields = extract_form_fields(reply_text)
 
-    # 5. Typed Option Resolution
+    # 5. Check Task-List Checkbox Options in Reply
+    task_options = extract_task_list_options(reply_text)
+    checked_task_ids = [opt_id for opt_id, info in task_options.items() if info["checked"]]
+    if len(checked_task_ids) > 1:
+        options_summary = " or ".join(f"Option {o['id']} ({o['label']})" for o in decision.options)
+        clarification = (
+            f"Multiple options were selected by @{responder}: {', '.join(checked_task_ids)}. "
+            f"Please choose only one option from {options_summary}."
+        )
+        return {
+            "status": "clarification_requested",
+            "selected_option": None,
+            "selection_method": "task_list_checkbox",
+            "additional_context": None,
+            "notes": None,
+            "interpretation": f"Ambiguous reply: Multiple options checked ({', '.join(checked_task_ids)}).",
+            "form_fields": form_fields,
+            "rejection_reason": None,
+            "clarification_prompt": clarification,
+            "provenance": provenance,
+        }
+    elif len(checked_task_ids) == 1:
+        matched_task_opt = None
+        for opt in decision.options:
+            if opt["id"].lower() == checked_task_ids[0].lower():
+                matched_task_opt = opt
+                break
+        if matched_task_opt:
+            ctx = extract_context_from_reply(
+                reply_text, matched_task_opt["id"], matched_task_opt["label"]
+            ) or form_fields.get("notes", "") or extract_additional_context(reply_text)
+            ctx = ctx.strip() if ctx else None
+            interp = f"Explicit choice via task list: Option {matched_task_opt['id']} ({matched_task_opt['label']})"
+            if ctx:
+                interp += f" (notes: {ctx})"
+            return {
+                "status": "answered",
+                "selected_option": matched_task_opt,
+                "selection_method": "task_list_checkbox",
+                "additional_context": ctx,
+                "notes": ctx,
+                "interpretation": interp,
+                "form_fields": form_fields,
+                "rejection_reason": None,
+                "clarification_prompt": None,
+                "provenance": provenance,
+            }
+
+    # 6. Typed Option Resolution from Plain / Form Text
     candidate_text = form_fields.get("choice") or form_fields.get("option") or reply_text.strip()
     candidate_lower = candidate_text.lower()
 
@@ -468,10 +615,20 @@ def parse_plain_reply(
             rec_opt = decision.options[0]
 
         if rec_opt:
+            ctx = extract_context_from_reply(
+                reply_text, rec_opt["id"], rec_opt["label"]
+            ) or form_fields.get("notes", "") or extract_additional_context(reply_text)
+            ctx = ctx.strip() if ctx else None
+            interp = f"Approved recommendation ({rec_opt['id']}: {rec_opt['label']})"
+            if ctx:
+                interp += f" (notes: {ctx})"
             return {
                 "status": "answered",
                 "selected_option": rec_opt,
-                "interpretation": f"Approved recommendation ({rec_opt['id']}: {rec_opt['label']})",
+                "selection_method": "recommendation",
+                "additional_context": ctx,
+                "notes": ctx,
+                "interpretation": interp,
                 "form_fields": form_fields,
                 "rejection_reason": None,
                 "clarification_prompt": None,
@@ -509,10 +666,20 @@ def parse_plain_reply(
 
     if len(unique_matched_ids) == 1 and not has_ambiguous_phrase:
         chosen_opt = matched_options[0][0]
+        ctx = extract_context_from_reply(
+            reply_text, chosen_opt["id"], chosen_opt["label"]
+        ) or form_fields.get("notes", "") or extract_additional_context(reply_text)
+        ctx = ctx.strip() if ctx else None
+        interp = f"Explicit choice: Option {chosen_opt['id']} ({chosen_opt['label']})"
+        if ctx:
+            interp += f" (notes: {ctx})"
         return {
             "status": "answered",
             "selected_option": chosen_opt,
-            "interpretation": f"Explicit choice: Option {chosen_opt['id']} ({chosen_opt['label']})",
+            "selection_method": "form" if form_fields.get("choice") or form_fields.get("option") else "plain_reply",
+            "additional_context": ctx,
+            "notes": ctx,
+            "interpretation": interp,
             "form_fields": form_fields,
             "rejection_reason": None,
             "clarification_prompt": None,
@@ -520,15 +687,44 @@ def parse_plain_reply(
         }
 
     options_summary = " or ".join(f"Option {o['id']} ({o['label']})" for o in decision.options)
+    clean_reply = reply_text.strip()
+
+    # If ambiguous phrase or multiple options matched
+    if has_ambiguous_phrase or len(unique_matched_ids) > 1:
+        clarification = (
+            f"Ambiguous or unrecognized reply received from @{responder}: '{reply_text}'. "
+            f"Please clarify your choice by replying with either {options_summary}, "
+            f"or simply 'Recommendation'."
+        )
+        return {
+            "status": "clarification_requested",
+            "selected_option": None,
+            "selection_method": "ambiguous_reply",
+            "additional_context": clean_reply,
+            "notes": None,
+            "interpretation": "Ambiguous reply; clarification requested from operator.",
+            "form_fields": form_fields,
+            "rejection_reason": None,
+            "clarification_prompt": clarification,
+            "provenance": provenance,
+        }
+
+    # Alternative proposal / custom free-text answer (not matching pre-defined options)
+    # Selection is optional; custom proposals are retained for review/interpretation
+    # rather than discarded or forced into a checkbox. Tasks remain blocked until resolved.
     clarification = (
-        f"Ambiguous or unrecognized reply received from @{responder}: '{reply_text}'. "
-        f"Please clarify your choice by replying with either {options_summary}, "
-        f"or simply 'Recommendation'."
+        f"Alternative proposal received from @{responder}: '{clean_reply}'. "
+        f"This response has been recorded for interpretation. To advance the blocked tasks automatically, "
+        f"please select one of the available options ({options_summary}), or clarify approval."
     )
     return {
         "status": "clarification_requested",
         "selected_option": None,
-        "interpretation": "Ambiguous reply; clarification requested from operator.",
+        "selection_method": "alternative_proposal",
+        "alternative_proposal": clean_reply,
+        "additional_context": clean_reply,
+        "notes": clean_reply,
+        "interpretation": f"Alternative proposal / custom response received from @{responder}: '{clean_reply}' (retained for interpretation; tasks remain blocked until an authorized option or scope is approved).",
         "form_fields": form_fields,
         "rejection_reason": None,
         "clarification_prompt": clarification,
@@ -536,8 +732,9 @@ def parse_plain_reply(
     }
 
 
+
 def format_decision_markdown(decision: DecisionContract) -> str:
-    """Format the decision contract as a clean, actionable GitHub issue comment."""
+    """Format the decision contract as a clean, actionable GitHub issue comment with interactive task-list options."""
     lines = [
         f"### ❓ Decision Needed: `{decision.decision_id}`",
         "",
@@ -558,6 +755,26 @@ def format_decision_markdown(decision: DecisionContract) -> str:
 
     lines.extend([
         "",
+        "#### Choose an Option (Click checkbox to select)",
+        f"<!-- decision-options: {decision.decision_id} -->",
+    ])
+
+    selected_id = None
+    if decision.answer and isinstance(decision.answer, dict):
+        selected_id = str(decision.answer.get("selected_option_id") or "").strip().lower()
+
+    for opt in decision.options:
+        is_checked = "x" if selected_id and opt["id"].lower() == selected_id else " "
+        lines.append(f"- [{is_checked}] **Option {opt['id']}**: {opt['label']} - {opt['description']}")
+
+    lines.extend([
+        f"<!-- /decision-options -->",
+        "",
+        "#### Additional Context / Alternative Proposal (Optional)",
+        f"<!-- decision-context: {decision.decision_id} -->",
+        "_Leave any supplemental notes, constraints, or alternative proposals below:_",
+        f"<!-- /decision-context -->",
+        "",
         "#### Recommendation",
         f"👉 **{decision.recommendation}**",
         "",
@@ -574,10 +791,18 @@ def format_decision_markdown(decision: DecisionContract) -> str:
         "#### How to Respond",
         f"Authorized responder(s): {authorized_mentions}",
         "",
-        "**Option 1: Plain reply (Preferred)**",
-        "- Reply to this issue with: `Option A`, `Option B`, or simply `Recommendation`.",
+        "**Option 1: Click a checkbox above (Fastest)**",
+        "- Click the checkbox next to your preferred option directly in this issue.",
         "",
-        "**Option 2: Structured Form (Optional for multi-field responses)**",
+        "**Option 2: Plain reply comment (Preferred for mobile or quick reply)**",
+        "- Reply to this issue with: `Option A`, `Option B`, or simply `Recommendation`.",
+        "- You can include additional notes or instructions in your reply (e.g. `Option A: ensure we add indices`).",
+        "",
+        "**Option 3: Alternative proposal or custom answer**",
+        "- Reply with your own alternative proposal or instructions in free text.",
+        "- Selection is optional; custom proposals are retained for review and interpretation without silent automatic approval.",
+        "",
+        "**Option 4: Structured Form (Optional for multi-field responses)**",
         "```markdown",
         f"<!-- decision-form: {decision.decision_id} -->",
         "choice: Option A",
@@ -593,6 +818,7 @@ def format_decision_markdown(decision: DecisionContract) -> str:
     ])
 
     return "\n".join(lines)
+
 
 
 # ----------------------------------------------------------------------
@@ -1177,6 +1403,10 @@ class DecisionManager:
                     "selected_option_label": opt["label"] if opt else None,
                     "interpretation": parse_result["interpretation"],
                     "form_fields": parse_result["form_fields"],
+                    "selection_method": parse_result.get("selection_method", "plain_reply"),
+                    "additional_context": parse_result.get("additional_context"),
+                    "notes": parse_result.get("notes"),
+                    "alternative_proposal": parse_result.get("alternative_proposal"),
                     "provenance": parse_result.get("provenance", provenance),
                     "is_test": is_test,
                 }
@@ -1222,6 +1452,7 @@ class DecisionManager:
                                     f"Selected: {opt['id'] if opt else 'N/A'} - {opt['label'] if opt else 'chosen option'} | "
                                     f"Provenance: {prov_type} | "
                                     f"Raw reply: '{reply_text}'"
+                                    + (f" | Context: '{parse_result.get('additional_context')}'" if parse_result.get("additional_context") else "")
                                 ),
                                 "recorded_by": f"decision-workflow:@{normalized_actor}",
                                 "comment_id": comment_id,
@@ -1252,18 +1483,32 @@ class DecisionManager:
             elif parse_result["status"] == "clarification_requested":
                 dec_dict["status"] = "clarification_requested"
                 dec_dict["clarification_prompt"] = parse_result["clarification_prompt"]
+                if parse_result.get("alternative_proposal"):
+                    dec_dict["alternative_proposal"] = parse_result["alternative_proposal"]
+                    dec_dict["last_alternative_proposal"] = parse_result["alternative_proposal"]
+                    dec_dict["alternative_responder"] = responder
+                    dec_dict["alternative_received_at"] = now
                 for req_id in self._blockable_requests(decision.blocking_dependencies):
                     try:
+                        blocker_msg = (
+                            f"BLOCKED: Alternative proposal received on decision [{decision.decision_id}] from @{responder}: '{parse_result['alternative_proposal']}'. Awaiting interpretation/clarification."
+                            if parse_result.get("alternative_proposal")
+                            else f"BLOCKED: Clarification requested on decision [{decision.decision_id}] from @{responder}"
+                        )
+                        next_act = (
+                            f"Awaiting operator choice or interpretation of alternative proposal on decision [{decision.decision_id}]"
+                            if parse_result.get("alternative_proposal")
+                            else f"Awaiting clarified response on decision [{decision.decision_id}]"
+                        )
                         self.ledger.update_request(
                             req_id=req_id,
-                            blocker=f"BLOCKED: Clarification requested on decision [{decision.decision_id}] from @{responder}",
-                            next_action=f"Awaiting clarified response on decision [{decision.decision_id}]",
+                            blocker=blocker_msg,
+                            next_action=next_act,
                             actor=f"decision-workflow:@{responder}",
-                            reason=f"Ambiguous reply to decision [{decision.decision_id}]",
+                            reason=f"Clarification or alternative proposal for decision [{decision.decision_id}]",
                         )
                     except KeyError:
                         pass
-
             elif parse_result["status"] == "rejected":
                 # A refused reply is an INPUT outcome. The question stays unresolved:
                 # writing the refusal onto `status` is exactly what poisoned
@@ -1390,6 +1635,511 @@ class DecisionManager:
             comment_updated_at=api_updated_at,
             comment_time_provenance=CommentTimeProvenance.API_VERIFIED,
         )
+    def process_issue_edit(
+        self,
+        decision_id: str,
+        old_body: str,
+        new_body: str,
+        editor: str,
+        event_type: str = "issue_edit",
+        comment_id: Optional[str] = None,
+        comment_url: Optional[str] = None,
+        edit_time: Optional[str] = None,
+        provenance: str = ProvenanceType.HUMAN_OPERATOR,
+        is_test: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Process an edit event on an issue body or question comment containing clickable task-list options.
+        Validates transition (newly selected option vs old body), actor authorization,
+        safety guardrails, decision scope, and idempotent replay/conflicting edits.
+        """
+        with FileLock(self.lock_path):
+            data = self._load_data_unlocked()
+            if decision_id not in data["decisions"]:
+                raise KeyError(f"Decision '{decision_id}' not found.")
+
+            dec_dict = data["decisions"][decision_id]
+            decision = DecisionContract(
+                decision_id=dec_dict["decision_id"],
+                request_id=dec_dict["request_id"],
+                prompt=dec_dict["prompt"],
+                question=dec_dict["question"],
+                options=dec_dict["options"],
+                recommendation=dec_dict["recommendation"],
+                blocking_dependencies=dec_dict["blocking_dependencies"],
+                authorized_responders=dec_dict["authorized_responders"],
+                decision_scope=dec_dict.get("decision_scope", DecisionScope.ARCHITECTURAL_PREFERENCE),
+                status=dec_dict.get("status", "pending"),
+                format_preference=dec_dict.get("format_preference", "plain"),
+                issue_number=dec_dict.get("issue_number"),
+                issue_url=dec_dict.get("issue_url"),
+                question_comment_id=dec_dict.get("question_comment_id"),
+                question_posted_at=dec_dict.get("question_posted_at"),
+                created_at=dec_dict.get("created_at"),
+                updated_at=dec_dict.get("updated_at"),
+                answer=dec_dict.get("answer"),
+                clarification_prompt=dec_dict.get("clarification_prompt"),
+                rejection_reason=dec_dict.get("rejection_reason"),
+                audit_trail=dec_dict.get("audit_trail", []),
+            )
+
+            # Check if decision is already terminal
+            recorded_answer = decision.answer or {}
+            if recorded_answer or decision.status in TERMINAL_DECISION_STATUSES:
+                new_options = extract_task_list_options(new_body)
+                new_checked = [opt_id for opt_id, info in new_options.items() if info["checked"]]
+                recorded_opt_id = recorded_answer.get("selected_option_id")
+                if len(new_checked) == 1 and str(new_checked[0]).lower() == str(recorded_opt_id or "").lower():
+                    return {
+                        "idempotent_replay": True,
+                        "status": decision.status,
+                        "decision_id": decision.decision_id,
+                        "answer": decision.answer,
+                        "interpretation": recorded_answer.get("interpretation"),
+                        "unblocked_requests": decision.blocking_dependencies,
+                        "provenance": recorded_answer.get("provenance", ProvenanceType.HUMAN_OPERATOR),
+                    }
+                else:
+                    mismatch = f"Conflicting edit: decision already answered with option {recorded_opt_id}"
+                    return self._refuse_reanswer_unlocked(
+                        data=data,
+                        dec_dict=dec_dict,
+                        decision_id=decision_id,
+                        recorded_answer=recorded_answer,
+                        mismatch=mismatch,
+                        reply_text=new_body,
+                        responder=editor,
+                        comment_id=comment_id,
+                        comment_url=comment_url,
+                        comment_created_at=edit_time,
+                        comment_updated_at=edit_time,
+                        comment_time_provenance=CommentTimeProvenance.API_VERIFIED if edit_time else CommentTimeProvenance.CALLER_SUPPLIED,
+                        provenance=provenance,
+                        is_test=is_test,
+                    )
+
+            # 1. Safety Guardrail Check
+            is_safe, safety_err = check_safety_guardrails(new_body)
+            if not is_safe:
+                parse_result = {
+                    "status": "rejected",
+                    "selected_option": None,
+                    "interpretation": "Safety violation detected in edited issue body.",
+                    "form_fields": {},
+                    "rejection_reason": safety_err,
+                    "clarification_prompt": None,
+                    "provenance": provenance,
+                }
+            # 2. Provenance Check: Autonomous agent-authored edits cannot answer real decisions
+            elif provenance in [ProvenanceType.AGENT_AUTHORED] or (
+                provenance == ProvenanceType.SYNTHETIC_TEST and not is_test
+            ):
+                parse_result = {
+                    "status": "rejected",
+                    "selected_option": None,
+                    "interpretation": "Agent-authored edit rejected from human decision authority.",
+                    "form_fields": {},
+                    "rejection_reason": (
+                        "Authored-comment / synthetic test exclusion: Edit was performed by "
+                        "autonomous agent or test harness, not genuine human operator. "
+                        "Agent-authored edits cannot authorize real work."
+                    ),
+                    "clarification_prompt": None,
+                    "provenance": provenance,
+                }
+            # 3. Authorization Check
+            else:
+                auth_normalized = [a.lower().lstrip("@") for a in decision.authorized_responders]
+                editor_clean = editor.lower().lstrip("@")
+                if auth_normalized and editor_clean not in auth_normalized:
+                    parse_result = {
+                        "status": "rejected",
+                        "selected_option": None,
+                        "interpretation": f"Editor '@{editor}' is not authorized to answer this decision.",
+                        "form_fields": {},
+                        "rejection_reason": (
+                            f"Unauthorized editor '@{editor}'. Authorized responders: "
+                            f"{', '.join('@' + a for a in decision.authorized_responders)}"
+                        ),
+                        "clarification_prompt": None,
+                        "provenance": ProvenanceType.UNAUTHORIZED_ACTOR,
+                    }
+                else:
+                    # 4. Transition Analysis
+                    old_options = extract_task_list_options(old_body)
+                    new_options = extract_task_list_options(new_body)
+                    currently_checked = [opt_id for opt_id, info in new_options.items() if info["checked"]]
+                    additional_context = extract_additional_context(new_body)
+                    options_summary = " or ".join(f"Option {o['id']} ({o['label']})" for o in decision.options)
+
+                    if len(currently_checked) > 1:
+                        parse_result = {
+                            "status": "clarification_requested",
+                            "selected_option": None,
+                            "selection_method": "task_list_checkbox",
+                            "additional_context": additional_context or None,
+                            "notes": None,
+                            "interpretation": f"Ambiguous edit: Multiple options checked ({', '.join(currently_checked)}).",
+                            "form_fields": {},
+                            "rejection_reason": None,
+                            "clarification_prompt": (
+                                f"Multiple options were selected in the edit by @{editor}: {', '.join(currently_checked)}. "
+                                f"Please choose only one option from {options_summary}."
+                            ),
+                            "provenance": provenance,
+                        }
+                    elif len(currently_checked) == 1:
+                        chosen_id = currently_checked[0]
+                        matched_opt = None
+                        for opt in decision.options:
+                            if opt["id"].lower() == chosen_id.lower():
+                                matched_opt = opt
+                                break
+                        if matched_opt:
+                            interp = f"Explicit choice via task list: Option {matched_opt['id']} ({matched_opt['label']})"
+                            if additional_context:
+                                interp += f" (notes: {additional_context})"
+                            parse_result = {
+                                "status": "answered",
+                                "selected_option": matched_opt,
+                                "selection_method": "task_list_checkbox",
+                                "additional_context": additional_context or None,
+                                "notes": additional_context or None,
+                                "interpretation": interp,
+                                "form_fields": {},
+                                "rejection_reason": None,
+                                "clarification_prompt": None,
+                                "provenance": provenance,
+                            }
+                        else:
+                            parse_result = {
+                                "status": "clarification_requested",
+                                "selected_option": None,
+                                "selection_method": "task_list_checkbox",
+                                "additional_context": additional_context or None,
+                                "notes": None,
+                                "interpretation": f"Unrecognized option '{chosen_id}' checked.",
+                                "form_fields": {},
+                                "rejection_reason": None,
+                                "clarification_prompt": (
+                                    f"Option '{chosen_id}' is not one of the available options. "
+                                    f"Please choose from {options_summary}."
+                                ),
+                                "provenance": provenance,
+                            }
+                    else:
+                        # Zero options checked
+                        if additional_context:
+                            parse_result = {
+                                "status": "clarification_requested",
+                                "selected_option": None,
+                                "selection_method": "alternative_proposal",
+                                "alternative_proposal": additional_context,
+                                "additional_context": additional_context,
+                                "notes": additional_context,
+                                "interpretation": f"Alternative proposal / custom response received from @{editor}: '{additional_context}' (retained for interpretation; tasks remain blocked until an authorized option or scope is approved).",
+                                "form_fields": {},
+                                "rejection_reason": None,
+                                "clarification_prompt": (
+                                    f"Alternative proposal received from @{editor}: '{additional_context}'. "
+                                    f"Recorded for interpretation; please choose an option from {options_summary} to advance automatically."
+                                ),
+                                "provenance": provenance,
+                            }
+                        else:
+                            parse_result = {
+                                "status": "clarification_requested",
+                                "selected_option": None,
+                                "selection_method": "no_selection",
+                                "additional_context": None,
+                                "notes": None,
+                                "interpretation": f"No option selected in edit by @{editor}.",
+                                "form_fields": {},
+                                "rejection_reason": None,
+                                "clarification_prompt": f"No option selected. Please choose an option from {options_summary}.",
+                                "provenance": provenance,
+                            }
+
+            now = get_iso_timestamp()
+            audit_entry = {
+                "timestamp": now,
+                "responder": editor,
+                "comment_id": comment_id,
+                "comment_url": comment_url,
+                "reply_text": new_body,
+                "status": parse_result["status"],
+                "provenance": parse_result.get("provenance", provenance),
+                "interpretation": parse_result["interpretation"],
+                "rejection_reason": parse_result["rejection_reason"],
+                "clarification_prompt": parse_result["clarification_prompt"],
+                "is_test": is_test,
+                "comment_created_at": edit_time,
+                "comment_updated_at": edit_time,
+                "comment_time_provenance": CommentTimeProvenance.API_VERIFIED if edit_time else CommentTimeProvenance.CALLER_SUPPLIED,
+                "event_type": event_type,
+            }
+            dec_dict.setdefault("audit_trail", []).append(audit_entry)
+
+            unblocked = []
+            if parse_result["status"] == "answered":
+                opt = parse_result["selected_option"]
+                proof_created_at, created_at_source = verified_comment_created_at(
+                    edit_time,
+                    CommentTimeProvenance.API_VERIFIED if edit_time else CommentTimeProvenance.CALLER_SUPPLIED,
+                )
+                ans_data = {
+                    "comment_id": comment_id,
+                    "comment_url": comment_url,
+                    "responder": editor,
+                    "answered_at": now,
+                    "comment_created_at": proof_created_at,
+                    "comment_created_at_source": created_at_source,
+                    "raw_text": new_body,
+                    "selected_option_id": opt["id"] if opt else None,
+                    "selected_option_label": opt["label"] if opt else None,
+                    "interpretation": parse_result["interpretation"],
+                    "form_fields": {},
+                    "selection_method": parse_result.get("selection_method", "task_list_checkbox"),
+                    "additional_context": parse_result.get("additional_context"),
+                    "notes": parse_result.get("notes"),
+                    "alternative_proposal": parse_result.get("alternative_proposal"),
+                    "provenance": parse_result.get("provenance", provenance),
+                    "is_test": is_test,
+                }
+
+                if is_test or parse_result.get("provenance") != ProvenanceType.HUMAN_OPERATOR:
+                    dec_dict["rejection_reason"] = (
+                        "Synthetic test verified option parsing, but real task unblock is prohibited "
+                        "for synthetic/test provenance."
+                    )
+                else:
+                    clean_editor = str(editor or "").strip().lstrip("@")
+                    prov_type = parse_result.get("provenance", provenance)
+
+                    for req_id in decision.blocking_dependencies:
+                        try:
+                            if hasattr(self.ledger, "resolve_decision"):
+                                self.ledger.resolve_decision(
+                                    req_id=req_id,
+                                    decision_id=decision.decision_id,
+                                    answer=parse_result["interpretation"],
+                                    comment_id=comment_id,
+                                    provenance_type=prov_type,
+                                    actor=clean_editor,
+                                )
+                            ev_payload = {
+                                "type": "human_decision",
+                                "summary": f"Decision [{decision.decision_id}] answered by @{clean_editor}: {parse_result['interpretation']}",
+                                "details": (
+                                    f"Event: {event_type} | URL: {comment_url} | "
+                                    f"Selected: {opt['id'] if opt else 'N/A'} - {opt['label'] if opt else 'chosen option'} | "
+                                    f"Provenance: {prov_type}"
+                                    + (f" | Context: '{parse_result.get('additional_context')}'" if parse_result.get("additional_context") else "")
+                                ),
+                                "recorded_by": f"decision-workflow:@{clean_editor}",
+                                "comment_id": comment_id,
+                                "comment_url": comment_url,
+                                "responder": editor,
+                            }
+                            upd_kwargs = {
+                                "req_id": req_id,
+                                "clear_blocker": True,
+                                "next_action": f"Proceed with implementation following decision [{decision.decision_id}]: {opt['label'] if opt else 'chosen option'}",
+                                "add_evidence": ev_payload,
+                                "actor": clean_editor,
+                                "reason": f"Human decision [{decision.decision_id}] resolved via task-list selection: {parse_result['interpretation']}",
+                            }
+                            if hasattr(self.ledger, "clear_decision_blocker"):
+                                upd_kwargs["clear_decision_blocker"] = decision.decision_id
+                            self.ledger.update_request(**upd_kwargs)
+                            unblocked.append(req_id)
+                        except KeyError:
+                            pass
+
+                    dec_dict["status"] = "answered"
+                    dec_dict["answer"] = ans_data
+                    dec_dict["clarification_prompt"] = None
+                    dec_dict["rejection_reason"] = None
+
+            elif parse_result["status"] == "clarification_requested":
+                dec_dict["status"] = "clarification_requested"
+                dec_dict["clarification_prompt"] = parse_result["clarification_prompt"]
+                if parse_result.get("alternative_proposal"):
+                    dec_dict["alternative_proposal"] = parse_result["alternative_proposal"]
+                    dec_dict["last_alternative_proposal"] = parse_result["alternative_proposal"]
+                    dec_dict["alternative_responder"] = editor
+                    dec_dict["alternative_received_at"] = now
+                for req_id in self._blockable_requests(decision.blocking_dependencies):
+                    try:
+                        blocker_msg = (
+                            f"BLOCKED: Alternative proposal received on decision [{decision.decision_id}] from @{editor}: '{parse_result['alternative_proposal']}'. Awaiting interpretation/clarification."
+                            if parse_result.get("alternative_proposal")
+                            else f"BLOCKED: Clarification requested on decision [{decision.decision_id}] from @{editor}"
+                        )
+                        next_act = (
+                            f"Awaiting operator choice or interpretation of alternative proposal on decision [{decision.decision_id}]"
+                            if parse_result.get("alternative_proposal")
+                            else f"Awaiting clarified response on decision [{decision.decision_id}]"
+                        )
+                        self.ledger.update_request(
+                            req_id=req_id,
+                            blocker=blocker_msg,
+                            next_action=next_act,
+                            actor=f"decision-workflow:@{editor}",
+                            reason=f"Clarification or alternative proposal for decision [{decision.decision_id}]",
+                        )
+                    except KeyError:
+                        pass
+
+            elif parse_result["status"] == "rejected":
+                rejected_record = {
+                    "comment_id": str(comment_id) if comment_id else None,
+                    "comment_url": comment_url,
+                    "responder": editor,
+                    "fingerprint": rejected_input_fingerprint(new_body, edit_time),
+                    "reason": parse_result["rejection_reason"],
+                    "provenance": parse_result.get("provenance", provenance),
+                    "interpretation": parse_result["interpretation"],
+                    "first_seen_at": now,
+                    "last_seen_at": now,
+                    "occurrences": 1,
+                    "event_type": event_type,
+                }
+                if comment_id:
+                    dec_dict.setdefault("rejected_inputs", {})[str(comment_id)] = rejected_record
+                dec_dict["last_rejected_input"] = dict(rejected_record)
+                dec_dict["rejection_reason"] = parse_result["rejection_reason"]
+                for req_id in self._blockable_requests(decision.blocking_dependencies):
+                    try:
+                        self.ledger.update_request(
+                            req_id=req_id,
+                            blocker=f"BLOCKED: Decision [{decision.decision_id}] edit from @{editor} was REJECTED: {parse_result['rejection_reason']}",
+                            next_action=f"Awaiting valid authorized response on decision [{decision.decision_id}]",
+                            actor=f"decision-workflow:@{editor}",
+                            reason=f"Rejected edit on decision [{decision.decision_id}]",
+                        )
+                    except KeyError:
+                        pass
+
+            self._save_data_unlocked(data)
+
+            return {
+                "idempotent_replay": False,
+                "status": parse_result["status"],
+                "decision_id": decision_id,
+                "interpretation": parse_result["interpretation"],
+                "rejection_reason": parse_result["rejection_reason"],
+                "clarification_prompt": parse_result["clarification_prompt"],
+                "unblocked_requests": unblocked,
+                "question_status": dec_dict.get("status", DecisionStatus.PENDING),
+                "provenance": parse_result.get("provenance", provenance),
+            }
+
+    def ingest_github_event(
+        self,
+        event_payload: Dict[str, Any],
+        decision_id: Optional[str] = None,
+        repo: str = DEFAULT_REPO,
+        is_test: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Ingest a GitHub webhook event payload (issues.edited, issue_comment.created, issue_comment.edited).
+        Validates event structure, sender authorization, decision scope, and transition.
+        """
+        action = event_payload.get("action", "")
+        sender_data = event_payload.get("sender", {})
+        sender = sender_data.get("login", "")
+        issue_data = event_payload.get("issue", {})
+        issue_number = issue_data.get("number")
+        comment_data = event_payload.get("comment")
+        changes = event_payload.get("changes", {})
+
+        target_text = ""
+        if comment_data:
+            target_text = comment_data.get("body", "")
+        elif issue_data:
+            target_text = issue_data.get("body", "")
+
+        resolved_decision_id = decision_id
+        if not resolved_decision_id and target_text:
+            m = re.search(
+                r"(?:decision-(?:question|options|form|context):\s*|Decision Needed:\s*`?)([\w-]+)",
+                target_text,
+                re.IGNORECASE,
+            )
+            if m:
+                resolved_decision_id = m.group(1).strip("`")
+
+        if not resolved_decision_id and issue_number:
+            open_decs = [
+                d["decision_id"]
+                for d in self.list_open_decisions()
+                if d.get("issue_number") == issue_number
+            ]
+            if len(open_decs) == 1:
+                resolved_decision_id = open_decs[0]
+
+        if not resolved_decision_id:
+            return {
+                "status": "ignored",
+                "reason": f"Could not correlate event to a known decision (issue #{issue_number}).",
+                "action": action,
+                "sender": sender,
+            }
+
+        if comment_data and action == "edited":
+            old_body = changes.get("body", {}).get("from", "")
+            new_body = comment_data.get("body", "")
+            return self.process_issue_edit(
+                decision_id=resolved_decision_id,
+                old_body=old_body,
+                new_body=new_body,
+                editor=sender,
+                event_type="comment_edit",
+                comment_id=str(comment_data.get("id")),
+                comment_url=comment_data.get("html_url"),
+                edit_time=comment_data.get("updated_at"),
+                provenance=ProvenanceType.SYNTHETIC_TEST if is_test else ProvenanceType.HUMAN_OPERATOR,
+                is_test=is_test,
+            )
+
+        elif comment_data and action == "created":
+            return self.process_reply(
+                decision_id=resolved_decision_id,
+                reply_text=comment_data.get("body", ""),
+                responder=sender,
+                comment_id=str(comment_data.get("id")),
+                comment_url=comment_data.get("html_url"),
+                provenance=ProvenanceType.SYNTHETIC_TEST if is_test else ProvenanceType.HUMAN_OPERATOR,
+                is_test=is_test,
+                comment_created_at=comment_data.get("created_at"),
+                comment_updated_at=comment_data.get("updated_at"),
+                comment_time_provenance=CommentTimeProvenance.API_VERIFIED,
+            )
+
+        elif issue_data and action == "edited" and not comment_data:
+            old_body = changes.get("body", {}).get("from", "")
+            new_body = issue_data.get("body", "")
+            return self.process_issue_edit(
+                decision_id=resolved_decision_id,
+                old_body=old_body,
+                new_body=new_body,
+                editor=sender,
+                event_type="issue_edit",
+                comment_id=None,
+                comment_url=issue_data.get("html_url"),
+                edit_time=issue_data.get("updated_at"),
+                provenance=ProvenanceType.SYNTHETIC_TEST if is_test else ProvenanceType.HUMAN_OPERATOR,
+                is_test=is_test,
+            )
+
+        return {
+            "status": "ignored",
+            "reason": f"Unhandled event action '{action}' for decision '{resolved_decision_id}'.",
+            "action": action,
+            "sender": sender,
+        }
+
 
     def sync_decisions(
         self,
@@ -1456,8 +2206,27 @@ class DecisionManager:
                         c_body = c.get("body", "")
                         summary["comments_evaluated"] += 1
 
-                        # Skip question comments
+                        # If question comment, check for task-list checkbox selection
                         if f"decision-question:{d_id}" in c_body or "### ❓ Decision Needed:" in c_body:
+                            task_opts = extract_task_list_options(c_body)
+                            checked_task_ids = [opt_id for opt_id, info in task_opts.items() if info["checked"]]
+                            if checked_task_ids:
+                                ingest_res = self.process_issue_edit(
+                                    decision_id=d_id,
+                                    old_body="",
+                                    new_body=c_body,
+                                    editor=dec.get("authorized_responders", ["Wladefant"])[0],
+                                    event_type="comment_edit",
+                                    comment_id=c_id,
+                                    comment_url=c.get("html_url"),
+                                    edit_time=c.get("updated_at"),
+                                    provenance=ProvenanceType.HUMAN_OPERATOR,
+                                    is_test=False,
+                                )
+                                if ingest_res.get("status") == "answered":
+                                    summary["resolved_decisions"].append(d_id)
+                                    summary["unblocked_requests"].extend(ingest_res.get("unblocked_requests", []))
+                                    break
                             continue
 
                         # Ingest comment through verified pipeline. The stream came
@@ -1910,6 +2679,23 @@ def post_decision_to_github_issue(
         "comment_id": comment_id,
         "decision_id": decision_id,
     }
+def ingest_github_event(
+    event_payload: Dict[str, Any],
+    decision_id: Optional[str] = None,
+    repo: str = DEFAULT_REPO,
+    is_test: bool = False,
+    decisions_path: Optional[str] = None,
+    ledger_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Ingest a GitHub webhook event payload via a fresh DecisionManager instance."""
+    mgr = DecisionManager(decisions_path=decisions_path, ledger_path=ledger_path)
+    return mgr.ingest_github_event(
+        event_payload=event_payload,
+        decision_id=decision_id,
+        repo=repo,
+        is_test=is_test,
+    )
+
 
 
 # ----------------------------------------------------------------------
@@ -2006,6 +2792,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_rcv.add_argument("--json", action="store_true", help="Emit the recovery result as JSON")
 
+    # INGEST-EVENT
+    p_evt = subparsers.add_parser(
+        "ingest-event",
+        help="Ingest GitHub webhook event payload (issues.edited, issue_comment.created, issue_comment.edited)",
+    )
+    p_evt.add_argument("--event-path", default=None, help="Path to GitHub event payload JSON file (e.g. $GITHUB_EVENT_PATH)")
+    p_evt.add_argument("--event-json", default=None, help="Inline JSON string of GitHub event payload")
+    p_evt.add_argument("--id", default=None, help="Optional decision ID (overrides payload discovery)")
+    p_evt.add_argument("--repo", default=DEFAULT_REPO, help="GitHub repository name")
+    p_evt.add_argument("--test", action="store_true", help="Flag as synthetic test probe (cannot unblock real tasks)")
+
     return parser
 
 
@@ -2046,6 +2843,35 @@ def main():
                     manager=mgr,
                 )
                 print(f"[OK] Posted decision to GitHub issue #{args.issue}: {post_res['comment_url']}")
+
+        elif args.command == "ingest-event":
+            if not args.event_path and not args.event_json:
+                print("[ERROR] Must provide either --event-path or --event-json", file=sys.stderr)
+                sys.exit(1)
+            payload = {}
+            if args.event_path:
+                with open(args.event_path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+            else:
+                payload = json.loads(args.event_json)
+
+            res = mgr.ingest_github_event(
+                event_payload=payload,
+                decision_id=args.id,
+                repo=args.repo,
+                is_test=args.test,
+            )
+            print(f"Status: {res.get('status')}")
+            if res.get("decision_id"):
+                print(f"Decision ID: {res['decision_id']}")
+            if res.get("interpretation"):
+                print(f"Interpretation: {res['interpretation']}")
+            if res.get("unblocked_requests"):
+                print(f"Unblocked Requests: {', '.join(res['unblocked_requests'])}")
+            if res.get("rejection_reason"):
+                print(f"Rejection Reason: {res['rejection_reason']}")
+            if res.get("clarification_prompt"):
+                print(f"Clarification Prompt: {res['clarification_prompt']}")
 
         elif args.command == "ingest":
             res = mgr.ingest_comment(

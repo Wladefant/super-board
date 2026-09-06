@@ -1,0 +1,43 @@
+name: Superboard Decision Event Ingestion
+
+# Authenticated issue-edit and comment event ingestion for Superboard decision workflow.
+# Executes only in authorized workflow repository hosting (Wladefant/super-board) on default branch.
+#
+# Supported events:
+#   - issues.edited: detects task-list checkbox clicks in issue descriptions
+#   - issue_comment.created: detects plain replies, form responses, or alternative proposals
+#   - issue_comment.edited: detects task-list checkbox clicks or context edits in comments
+#
+# Security:
+#   - Only authorized responders (operator GitHub logins) can advance decisions
+#   - Pure Python execution without passing untrusted input into shell commands
+#   - Strict decision scope (architectural/design preferences only, zero production access)
+
+on:
+  issues:
+    types: [edited]
+  issue_comment:
+    types: [created, edited]
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  ingest-decision-event:
+    name: Ingest Decision Event
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Ingest Decision Event
+        env:
+          EVENT_PATH: ${{ github.event_path }}
+        run: |
+          python workflows/portable/decision_workflow.py ingest-event --event-path "$EVENT_PATH"
