@@ -459,22 +459,64 @@ never manufacture one.
    implements it through the normal isolated build/QA/review path, under the same
    gates as any other request.
 3. **Third and beyond** — `escalated`, once per escalation epoch. An epoch closes
-   when a corrective action or resolution is recorded, so ten identical restarts
-   in ten minutes produce one notification event rather than eight.
+   when a resolution, or a corrective action that is *bound to a verified change*,
+   is recorded, so ten identical restarts in ten minutes produce one notification
+   event rather than eight — and recording an unresolvable reference cannot
+   silence the escalation either.
 
-A corrective action is **recorded, never executed**, and it must name a
-`--change-ref`: a commit, PR, configuration or recorded decision. A corrective
-action with no reference is "retry later", which is the behaviour this module
-exists to stop. `resolve` then requires *both* halves of closure — a current
-corrective action, whose change references it copies into the resolution, and a
-`--scenario` naming the original failing scenario that was re-executed on the
-named commit. A generic suite passing closes nothing.
+A corrective action is **recorded, never executed**, and recording it is not the
+same act as opening the retry gate. The record always lands — a proposal, or a
+reference somebody wants on the record, is worth keeping — and the gate opens
+only when all of this is true, each checked against reality rather than asserted:
 
-Recording a corrective action clears the retry gate and nothing else: it does not verify an acceptance criterion, does not satisfy
-head-bound QA or review, and does not authorize a merge or a deployment. A
-privileged kind (`ddl`, `deployment`, `privileged_operation`, `gate_change`) is
-only recordable with an explicit authorization reference naming the human who
-authorized it, because recording one asserts that they did.
+* the `--change-ref` **resolves** in a reachable context: a commit that exists in
+  the repository (`git cat-file`), a `config:<path>#<key>` whose key is really
+  assigned in that file, a `test:<path>::<name>` really defined in that module, or
+  a `decision:<id>` recorded `answered` in the decision record beside the store.
+  A reference the context *refutes* is refused outright. A reference that cannot
+  be resolved at all — a pull request, which needs a remote API this module never
+  contacts, or anything in a worktree that no longer exists — is recorded
+  unverified and never opens the gate. `--verify-root` names a reachable
+  repository when the one the failure was observed in is gone, which is the normal
+  case for an ephemeral worktree; it changes where the lookup happens, never
+  whether one is required;
+* `--evidence-exit-code` is **0**. A non-zero exit is the scenario still failing;
+* `--head-sha` is not one of the heads the failure was observed on, and for a
+  commit reference it **contains** that commit (`git merge-base --is-ancestor`),
+  so the run that passed is a run of the changed tree.
+
+`record-corrective-action` exits 0 when the record opened the gate and 3 when it
+landed with the gate still closed, and every gate decision is recomputed from the
+action's own recorded facts on load rather than read from a stored verdict. So
+`decision:later` with the description "will retry later", an exit code of 1 and
+the failing head as the evidence head is recorded and clears nothing.
+
+`resolve` then requires *both* halves of closure — a current corrective action
+that is itself gate-bound, whose change references it copies into the resolution,
+and a `--scenario` naming the original failing scenario that was re-executed on
+the named commit. A generic suite passing closes nothing.
+
+Opening the gate is all a corrective action does: it does not verify an
+acceptance criterion, does not satisfy head-bound QA or review, and does not
+authorize a merge or a deployment. A privileged kind (`ddl`, `deployment`,
+`privileged_operation`, `gate_change`) is only recordable with an explicit
+authorization reference naming the human who authorized it, because recording one
+asserts that they did.
+
+### Diagnostics are redacted at the durable write boundary
+
+Redaction is a property of the boundary, not a list of fields: every string a
+write would newly persist — into `recurrence.json`, into `ledger.json`, into the
+escalation outbox — is redacted on the way out, so a field nobody remembered to
+name cannot reach disk raw. Text that was already durable is left byte-exact,
+because rewriting it would edit recorded history rather than redact a new write.
+A value that something is later looked up by (a repository root, a commit, a
+reference, an id) keeps its shape and still has credential forms stripped, so the
+gate can still open the repository it was told to verify against. Coverage is
+pattern-level: URL userinfo, `Authorization:` headers, prefixed `key=value`
+assignments (`PGPASSWORD=`, `AWS_SECRET_ACCESS_KEY=`) and known token shapes are
+recognised; a bare secret written as an unlabelled word is not detectable and is
+not claimed to be.
 
 ### History survives, and a correction can be undone by reality
 
@@ -489,6 +531,26 @@ construction: the new observation reopens the signature and blocks retry again.
 `resolve` requires a full 40-character commit and exercised evidence, and closes
 the signature for that scenario on that commit only — it claims no universal
 absence, and a later observation reopens it.
+
+### A suppressed projection is not a gap, and a late one is not the present
+
+Each observation records what its ledger projection is owed: `pending`,
+`applied`, `failed`, `suppressed` or `not_applicable`. A replay or
+`resync-ledger` re-applies an outstanding one and adds no occurrence. A
+projection the caller suppressed with `--no-ledger-update` is honoured on replay
+and on resync — writing it anyway takes an explicit `--include-suppressed
+--unsuppressed-by`, recorded on the observation as a deliberate act — because
+reading "no row" as "a missing row" is how a resync wrote the row a caller had
+refused.
+
+Each observation also keeps an immutable observation-time snapshot of its
+occurrence, count and status, and a projection reports its evidence row from that
+snapshot. A projection recovered after later failures landed otherwise describes
+the present as if it were the past: the row for occurrence 1 read "occurrence 2 /
+corrective_action_required". Where no snapshot exists, the row carries
+projection-time numbers and says so rather than inventing a history that was
+never recorded; the request's current state stays available as
+`occurrences_at_projection` / `status_at_projection`.
 
 ### Where it is wired
 
@@ -697,9 +759,11 @@ python recurrence_guard.py --state-dir <dir> observe \
 python recurrence_guard.py --state-dir <dir> check-retry --request-id req-1
 
 # Record (never execute) the systemic corrective action that unblocks retry.
-# --change-ref must be a verifiable reference (commit:<40-hex>, pr:<owner>/<repo>#<n>,
-# a GitHub pull URL, config:<path>#<key>, decision:<id>, test:<path>::<name>), and the
-# original scenario has to be re-executed here, because this is where the gate opens.
+# The record always lands. Exit 0 means it opened the retry gate; exit 3 means it
+# landed and the gate stayed closed, because the reference did not resolve
+# (pr: cannot be resolved offline at all), the proof exited non-zero, or the
+# evidence head is a failing head or does not carry the change.
+# --verify-root names a reachable repository when the observed worktree is gone.
 python recurrence_guard.py --state-dir <dir> record-corrective-action \
   --signature <sig> --kind code_change --actor <lane> \
   --description "what systemically changed" \
@@ -708,7 +772,8 @@ python recurrence_guard.py --state-dir <dir> record-corrective-action \
   --evidence "what re-running it produced" \
   --evidence-command python -m pytest tests/test_it.py \
   --evidence-exit-code 0 \
-  --head-sha <40-char-sha>
+  --head-sha <40-char-sha-containing-the-change> \
+  --verify-root <git-repository-holding-it>
 
 # Retain an already-counted failure out of the count, with an audited reason
 python recurrence_guard.py --state-dir <dir> supersede-observation \
@@ -716,8 +781,14 @@ python recurrence_guard.py --state-dir <dir> supersede-observation \
   --reason "the probe's non-zero exit was the intended negative control"
 
 # Repair a projection that never reached the ledger (crash between the two locks).
-# Adds no occurrence; --strict exits 1 while anything is still outstanding.
+# Adds no occurrence; --strict exits 1 while anything is still outstanding. A
+# projection suppressed with --no-ledger-update is reported and left alone.
 python recurrence_guard.py --state-dir <dir> resync-ledger --strict
+
+# Deliberately project a suppressed observation after all (not a repair, and
+# recorded on the observation as an explicit act):
+python recurrence_guard.py --state-dir <dir> resync-ledger \
+  --include-suppressed --unsuppressed-by <operator>
 
 # What is known, what is owed, and what is waiting for a sender
 python recurrence_guard.py --state-dir <dir> --summary list

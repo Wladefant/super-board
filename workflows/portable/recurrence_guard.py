@@ -81,29 +81,51 @@ One attempt is one occurrence, at every seam that sees it
     request at that commit, because prose gets reworded on every attempt and a
     reworded identical fault must still close the retry gate.
 
-Diagnostics are redacted before they are persisted
-    Every free-text field an observation carries is passed through
-    ``redact_diagnostic`` *before* it reaches the store, so a credential in a
-    failure reason is not written to disk, not embedded in a corrective work
-    item's prompt, not copied into ledger evidence and not carried into an
-    escalation. Redaction happens once, at intake, rather than at each of those
-    egress points, because the store itself is the thing that outlives the
-    incident.
+Diagnostics are redacted at every durable write boundary
+    Redaction is a property of the boundary, not a list of fields. Every string a
+    write would newly persist - into the store, into the request ledger, into the
+    offline escalation outbox - goes through ``redact_diagnostic`` on the way out,
+    so a field nobody remembered to name cannot reach disk raw. Text that was
+    already durable is left byte-exact, because rewriting it would edit recorded
+    history rather than redact a new write. Coverage is pattern-level: URL
+    userinfo, ``Authorization:`` headers, prefixed ``key=value`` assignments
+    (``PGPASSWORD=``) and known token shapes are recognised; a bare secret written
+    as an unlabelled word is not detectable and is not claimed to be.
 
-The ledger projection is recoverable, not best-effort
+The ledger projection is recoverable, and a suppression is not a gap
     The store and the request ledger are two durable authorities with two locks,
-    so a crash can land between them. Each observation therefore records whether
-    its ledger projection was applied. A replay of that observation adds no
-    occurrence and re-applies the missing projection, and ``resync-ledger``
-    re-applies every outstanding one, so a failing request cannot end up blocked
-    in the store yet unmarked in the ledger with no repair path.
+    so a crash can land between them. Each observation therefore records what its
+    projection is owed - ``pending``, ``applied``, ``failed``, ``suppressed`` or
+    ``not_applicable``. A replay adds no occurrence and re-applies an outstanding
+    projection; ``resync-ledger`` re-applies every outstanding one. A projection
+    the caller suppressed is none of those: it is honoured on replay and on
+    resync, and writing it anyway takes an explicit
+    ``--include-suppressed --unsuppressed-by``.
 
-Correction must be a verifiable, exercised change
-    Clearing the retry gate requires a structured change reference, the original
-    failure scenario, and the command and exit code that exercised it on a named
-    commit. An arbitrary string is refused, so "retry later" cannot be spelled as
-    a change reference. The corrective action still verifies nothing: head-bound
-    QA, review, acceptance criteria and authorization are untouched.
+A projection reports what was true when the failure was observed
+    Each observation keeps an immutable observation-time snapshot of its
+    occurrence, count and status, and a projection - including one recovered long
+    afterwards - reports the row from that snapshot. Without it a recovered row
+    described the present as if it were the past: the evidence for occurrence 1,
+    written after occurrence 2 landed, read "occurrence 2". Where no snapshot
+    exists, the row says its numbers are projection-time rather than inventing a
+    history that was never recorded.
+
+Correction opens the gate only when it is verified and its proof is bound to it
+    Recording a corrective action and opening the retry gate are separate
+    outcomes. The record always lands, so a proposal or a reference somebody wants
+    on the record is kept. The gate opens only when the reference **resolves** in
+    a reachable context (a commit in a repository, a config key in that file, a
+    test defined in that module, an answered decision in the record beside this
+    store), the exercising command **exited 0**, and the evidence head is not one
+    of the heads the failure was observed on and, for a commit reference,
+    **contains** that commit. A reference that cannot be resolved - a pull request,
+    or anything in a worktree that no longer exists - is recorded unverified and
+    never opens the gate, so "retry later" cannot be laundered through a reference
+    shape. Every gate decision is recomputed from the action's own recorded facts
+    on load, never read from a stored verdict. The corrective action still verifies
+    nothing: head-bound QA, review, acceptance criteria and authorization are
+    untouched.
 
 Machine-authored work is not silently dispatchable
     The corrective work item the second occurrence opens is labelled for explicit
@@ -241,6 +263,25 @@ CORRECTIVE_ACTION_KINDS: Dict[str, bool] = {
 #: change reference must name a commit rather than a decision or a config key.
 COMMIT_BACKED_KINDS = ("code_change", "test_added")
 
+#: What an observation's ledger projection is currently owed, as a closed set.
+#:
+#: The distinction is load-bearing and its absence was a defect: "no ledger row
+#: for this observation" was written the same way whether the projection had not
+#: been attempted yet, had crashed between the two locks, or had been
+#: deliberately suppressed by the caller. A later ``resync-ledger`` therefore
+#: repaired a suppression into the ledger - it could not tell it from a crash -
+#: and wrote a row the caller had explicitly refused.
+PROJECTION_PENDING = "pending"
+PROJECTION_APPLIED = "applied"
+PROJECTION_FAILED = "failed"
+PROJECTION_SUPPRESSED = "suppressed"
+PROJECTION_NOT_APPLICABLE = "not_applicable"
+
+#: The projection states a repair is owed for. `suppressed` is deliberately not
+#: one of them, and `not_applicable` never becomes one: an observation with no
+#: request has nothing to project onto.
+PROJECTION_OUTSTANDING_STATES = (PROJECTION_PENDING, PROJECTION_FAILED)
+
 #: The change-reference forms a corrective action may name, as (form, pattern).
 #:
 #: This closed set is the whole point. The previous contract accepted any
@@ -300,10 +341,17 @@ _VOLATILE_PATTERNS: Sequence[Tuple[Any, str]] = (
 #: the text is later read.
 #:
 #: The patterns below are the ones this module owns because the notifier's
-#: ``SecretSanitizer`` does not cover them: URL userinfo (a Postgres DSN password)
-#: and unquoted ``key=value`` assignments. ``redact_diagnostic`` then delegates to
-#: ``SecretSanitizer`` for everything it already knows, rather than growing a
-#: second copy of that pattern set here that would drift from it.
+#: ``SecretSanitizer`` does not cover them: URL userinfo (a Postgres DSN
+#: password), ``Authorization:`` headers, and ``key=value`` assignments whose key
+#: carries a prefix or suffix - ``PGPASSWORD=``, ``AWS_SECRET_ACCESS_KEY=`` - which
+#: a word boundary anchored on the bare credential word never fires inside.
+#: ``redact_diagnostic`` then delegates to ``SecretSanitizer`` for everything it
+#: already knows, rather than growing a second copy of that pattern set here that
+#: would drift from it.
+#:
+#: Every pattern is idempotent: re-applying it to its own output changes nothing,
+#: which is what lets redaction sit on the durable write boundary and run over
+#: text that may already have passed through it.
 #:
 #: Redaction is deterministic, so it happens before normalization and the error
 #: class stays stable: the same failure text always yields the same redaction and
@@ -321,17 +369,29 @@ _SECRET_PATTERNS: Sequence[Tuple[Any, str]] = (
         re.compile(r"(?P<scheme>\b[A-Za-z][A-Za-z0-9+.\-]*://)(?P<user>[^\s:/@]+):[^\s/@]+@"),
         r"\g<scheme>\g<user>:<redacted-password>@",
     ),
-    (re.compile(r"\bBearer\s+[A-Za-z0-9._~+/\-]{8,}={0,2}", re.IGNORECASE), "Bearer <redacted>"),
-    # Named assignments, quoted or bare. The key is kept: which credential was
-    # wrong is often the diagnosis, and only its value is the secret.
+    # An Authorization header carries its credential after the scheme, and 'Basic'
+    # carries it base64-encoded, which no token-shape pattern recognises.
     (
         re.compile(
-            r"(?i)\b(pass|passwd|password|secret|token|api[_-]?key|access[_-]?key|"
-            r"secret[_-]?key|private[_-]?key|auth[_-]?token|service[_-]?role[_-]?key|"
-            r"client[_-]?secret|connection[_-]?string)\b(\s*[:=]\s*)"
+            r"(?i)\bAuthorization\s*:\s*(?P<scheme>Basic|Bearer|Token|Digest)\s+"
+            r"[A-Za-z0-9+/._~\-]{8,}={0,2}"
+        ),
+        r"Authorization: \g<scheme> <redacted>",
+    ),
+    (re.compile(r"\bBearer\s+[A-Za-z0-9._~+/\-]{8,}={0,2}", re.IGNORECASE), "Bearer <redacted>"),
+    # Named assignments, quoted or bare. The key is kept - which credential was
+    # wrong is often the diagnosis, and only its value is the secret - including
+    # the prefix and suffix around it, because the shapes that actually leak are
+    # environment variables rather than the bare word.
+    (
+        re.compile(
+            r"(?i)(?<![A-Za-z0-9_])(?P<key>[A-Za-z0-9_]*(?:pass|passwd|password|secret|token|"
+            r"api[_-]?key|access[_-]?key|private[_-]?key|auth[_-]?token|"
+            r"service[_-]?role[_-]?key|client[_-]?secret|connection[_-]?string|credential)"
+            r"[A-Za-z0-9_]*)(?P<sep>\s*[:=]\s*)"
             r"(?:\"[^\"]*\"|'[^']*'|[^\s,;&)\]}]+)"
         ),
-        r"\1\2<redacted>",
+        r"\g<key>\g<sep><redacted>",
     ),
     (re.compile(r"\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{8,}"), "<redacted-token>"),
     (re.compile(r"\bsbp_[A-Za-z0-9_\-]{8,}"), "<redacted-token>"),
@@ -374,17 +434,18 @@ class RecurrenceGuardError(RuntimeError):
 
 def redact_diagnostic(text: Any) -> str:
     """
-    Strip credentials out of one free-text diagnostic field.
-
-    Called on every text field at intake, so nothing downstream has to remember
-    to do it: the store, the corrective work item's prompt, ledger evidence and
-    the escalation summary all read text that was already redacted on the way in.
+    Strip credentials out of one free-text field.
 
     Composition rather than reimplementation: the module-owned patterns handle
-    URL userinfo and bare ``key=value`` assignments, then the notifier's
-    ``SecretSanitizer`` is applied for the shapes it already owns. A missing
-    notifier only loses that second pass; the module-owned pass always runs, so a
-    partial export still redacts.
+    URL userinfo, ``Authorization:`` headers and prefixed ``key=value``
+    assignments, then the notifier's ``SecretSanitizer`` is applied for the shapes
+    it already owns. A missing notifier only loses that second pass; the
+    module-owned pass always runs, so a partial export still redacts.
+
+    Callers do not have to remember to use this. ``redact_durable`` applies it at
+    every durable write boundary this module owns; this function is called
+    directly only where the redacted text also decides identity, so the error
+    class is computed from what is actually stored.
     """
     if text is None:
         return ""
@@ -400,6 +461,101 @@ def redact_diagnostic(text: Any) -> str:
     except ImportError:
         pass
     return out
+
+
+#: Keys whose value is an identity or a lookup handle rather than prose.
+#:
+#: The write boundary redacts every string it persists, and the notifier's
+#: ``SecretSanitizer`` deliberately anonymises home directories for outbound
+#: messages - correct for a message, destructive for a value something is later
+#: looked up by. A redacted ``repo_root`` cannot be opened, so the gate could
+#: never verify a commit again.
+#:
+#: So these keys get the module-owned credential patterns and not that second
+#: pass: a credential shape in them is still redacted, and the identity survives.
+#: This is a list, which is what the previous redaction contract got wrong - but
+#: it points the other way. A key missing from here is over-redacted, which fails
+#: loudly at the next lookup; a key missing from a list of *secret-bearing* fields
+#: leaks silently, which is the defect being corrected.
+_STRUCTURAL_KEYS = frozenset({
+    # verification contexts and lookup roots
+    "repo_root", "verification_root", "decision_record", "path", "store_path",
+    # commit identities
+    "head_sha", "evidence_head", "commit", "head",
+    # durable record identities
+    "signature", "recurrence_signature", "observation_id", "action_id",
+    "escalation_id", "resolution_id", "request_id", "req_id", "attempt",
+    "corrective_work_item", "dedup_signature", "session", "session_id",
+    "observation_index", "request_index", "request_ids", "corrective_action_ids",
+    # references somebody else resolves
+    "change_ref", "change_ref_value", "change_refs", "value", "canonical_link",
+    "issue_url", "labels", "key", "test",
+})
+
+
+def redact_identity(text: Any) -> str:
+    """Redact credential shapes out of a structural value, preserving the value."""
+    if text is None:
+        return ""
+    out = str(text)
+    if not out:
+        return ""
+    for pattern, replacement in _SECRET_PATTERNS:
+        out = pattern.sub(replacement, out)
+    return out
+
+
+def redact_durable(payload: Any, keep: Any = (), structural: bool = False) -> Any:
+    """
+    Redact every string this write would newly persist, in place.
+
+    The durable write boundary, not a list of fields. The previous contract
+    redacted named fields at named call sites, and the fields that were added
+    later - a supersede reason, a corrective action's argv, its authorization
+    reference, an acknowledgement actor - were simply not on the list, so they
+    reached disk verbatim. A field cannot be forgotten here, because nothing
+    names one: the whole payload about to be persisted is walked and every string
+    leaf is redacted.
+
+    ``keep`` is the set of strings that were already durable when this document
+    was read. They are left byte-exact, because rewriting them would edit
+    recorded history rather than redact a new write - and history that a previous
+    build wrote unredacted is still the only record that those occurrences
+    happened. Nothing new can hide behind it: a string is only skipped when that
+    exact value is already on disk.
+
+    A value under a ``_STRUCTURAL_KEYS`` key is redacted for credentials but not
+    anonymised, so a repository root stays openable and a commit stays resolvable.
+    Dictionary keys themselves are structural and are never rewritten.
+    """
+    if isinstance(payload, str):
+        if payload in keep:
+            return payload
+        return redact_identity(payload) if structural else redact_diagnostic(payload)
+    if isinstance(payload, dict):
+        for key, value in list(payload.items()):
+            payload[key] = redact_durable(
+                value, keep, structural or key in _STRUCTURAL_KEYS
+            )
+        return payload
+    if isinstance(payload, list):
+        for index, value in enumerate(payload):
+            payload[index] = redact_durable(value, keep, structural)
+        return payload
+    return payload
+
+
+def _durable_strings(payload: Any, into: set) -> set:
+    """Every string value already present in a loaded durable document."""
+    if isinstance(payload, str):
+        into.add(payload)
+    elif isinstance(payload, dict):
+        for value in payload.values():
+            _durable_strings(value, into)
+    elif isinstance(payload, list):
+        for value in payload:
+            _durable_strings(value, into)
+    return into
 
 
 def parse_change_ref(change_ref: Optional[str]) -> Tuple[str, str]:
@@ -621,6 +777,11 @@ class RecurrenceGuard:
         else:
             self.store_path = os.path.join(SCRIPT_DIR, STORE_FILENAME)
         self.lock_path = self.store_path + ".lock"
+        #: Strings that were already durable when this instance last read the
+        #: store. The write boundary redacts everything else, so a field nobody
+        #: remembered to name cannot reach disk raw, while recorded history is not
+        #: rewritten under the reader's feet.
+        self._durable_baseline: set = set()
 
     # -- persistence -------------------------------------------------------
 
@@ -641,6 +802,7 @@ class RecurrenceGuard:
 
     def _load_unlocked(self) -> Dict[str, Any]:
         if not os.path.exists(self.store_path):
+            self._durable_baseline = set()
             return self._empty()
         try:
             with open(self.store_path, "r", encoding="utf-8") as fh:
@@ -648,6 +810,7 @@ class RecurrenceGuard:
         except OSError as e:
             raise RecurrenceGuardError(f"Recurrence store at {self.store_path} is unreadable: {e}")
         if not content:
+            self._durable_baseline = set()
             return self._empty()
         try:
             data = json.loads(content)
@@ -675,9 +838,14 @@ class RecurrenceGuard:
                     f"signature {sig!r}; repair it rather than reading past it."
                 )
             self._derive(entry)
+        self._durable_baseline = _durable_strings(data, set())
         return data
 
     def _save_unlocked(self, data: Dict[str, Any]) -> None:
+        # The one durable write boundary of this store. Every string this write
+        # would newly persist is redacted here, so no call site has to remember
+        # to do it and no field added later can be omitted from a list.
+        redact_durable(data, self._durable_baseline)
         data["updated_at"] = _now()
         dir_name = os.path.dirname(self.store_path)
         os.makedirs(dir_name, exist_ok=True)
@@ -705,9 +873,16 @@ class RecurrenceGuard:
 
     @classmethod
     def _escalation_epoch_start(cls, entry: Mapping[str, Any]) -> int:
-        """The sequence number at which the current escalation epoch opened."""
+        """
+        The sequence number at which the current escalation epoch opened.
+
+        Only a corrective action whose proof is bound to a verified change closes
+        an epoch. An unbound record must not silence the escalation either: if
+        recording an unresolvable reference stopped the notifications, the gate
+        would be laundered around the operator instead of past the retry.
+        """
         return max(
-            cls._last_seq(entry.get("corrective_actions") or []),
+            cls._last_seq(cls._gate_qualifying_actions(entry)),
             cls._last_seq(entry.get("resolutions") or []),
         )
 
@@ -743,6 +918,13 @@ class RecurrenceGuard:
         control or a superseded attempt stays in `observations` as evidence of an
         executed failure, and stays out of every threshold, because a suite that is
         meant to fail is not a system that is currently broken.
+
+        Only a corrective action whose reference resolved and whose exercised proof
+        is bound to it - ``_action_gate_bound``, recomputed here from that action's
+        own facts - counts as a correction. An unresolvable reference, a proof that
+        exited non-zero, or a proof exercised on a head that does not carry the
+        change stays recorded and leaves the gate exactly where the failures put
+        it.
         """
         observations = entry.get("observations") or []
         counted = [
@@ -754,13 +936,16 @@ class RecurrenceGuard:
         entry["observations_recorded"] = len(observations)
         entry["observations_retained_uncounted"] = len(observations) - occurrences
         last_obs = cls._last_seq(counted)
-        last_action = cls._last_seq(entry.get("corrective_actions") or [])
+        qualifying = cls._gate_qualifying_actions(entry)
+        last_action = cls._last_seq(qualifying)
         last_resolution = cls._last_seq(entry.get("resolutions") or [])
 
         corrected = last_action > last_obs
         resolved = last_resolution > last_obs
 
         entry["corrective_action_current"] = corrected
+        entry["corrective_actions_recorded"] = len(entry.get("corrective_actions") or [])
+        entry["corrective_actions_gate_bound"] = len(qualifying)
         entry["retry_blocked"] = bool(
             occurrences >= CORRECTIVE_ACTION_THRESHOLD and not (corrected or resolved)
         )
@@ -805,13 +990,23 @@ class RecurrenceGuard:
                 "action with its change reference before any further retry."
             )
         if status == STATUS_CORRECTIVE_ACTION_REQUIRED:
+            unbound = int(entry.get("corrective_actions_recorded") or 0) - int(
+                entry.get("corrective_actions_gate_bound") or 0
+            )
             return (
                 "Second distinct occurrence: unchanged retry is refused. Implement the systemic "
                 "change through the corrective work item's normal build/QA/review path, then "
-                "record it with record-corrective-action, naming a verifiable change reference "
-                "and the original scenario re-executed against it (--change-ref --scenario "
-                "--evidence --evidence-command --evidence-exit-code --head-sha). An arbitrary "
-                "reference string is refused, so 'retry later' cannot clear this gate."
+                "record it with record-corrective-action, naming a change reference that "
+                "resolves and the original scenario re-executed successfully against it "
+                "(--change-ref --scenario --evidence --evidence-command --evidence-exit-code 0 "
+                "--head-sha carrying the change, --verify-root where it can be looked up)."
+                + (
+                    f" {unbound} corrective action(s) are recorded but not bound to a verified "
+                    "change, so they leave this gate closed; see each action's gate_binding "
+                    "reason."
+                    if unbound > 0
+                    else " An unresolvable reference is recorded but never opens this gate."
+                )
             )
         if not entry.get("diagnosis_complete"):
             return (
@@ -1018,6 +1213,8 @@ class RecurrenceGuard:
         duplicate_result: Optional[IntakeResult] = None
         duplicate_entry: Dict[str, Any] = {}
         duplicate_request_id: Optional[str] = None
+        duplicate_observation: Dict[str, Any] = {}
+        duplicate_projection_state: Optional[str] = None
 
         with FileLock(self.lock_path):
             data = self._load_unlocked()
@@ -1057,12 +1254,19 @@ class RecurrenceGuard:
                 # locks, so a crash between them left the store blocking retry
                 # while the failing request carried no blocker and no corrective
                 # work item, and re-ingesting the event wrote nothing because it
-                # was a duplicate. The replay now re-applies the outstanding
+                # was a duplicate. The replay re-applies an *outstanding*
                 # projection, which adds no occurrence because that is already
                 # decided above.
-                if not (stored.get("ledger_projection") or {}).get("applied"):
+                #
+                # A projection the caller suppressed is not outstanding. Replaying
+                # it must not quietly write the row that `--no-ledger-update`
+                # refused: the suppression is a durable decision, and undoing it
+                # takes an explicit `resync-ledger --include-suppressed`.
+                duplicate_projection_state = self._projection_state(stored)
+                if duplicate_projection_state in PROJECTION_OUTSTANDING_STATES:
                     duplicate_request_id = str(stored.get("request_id") or "") or None
                 duplicate_entry = dict(entry)
+                duplicate_observation = dict(stored)
 
         if duplicate_result is not None:
             if update_ledger and duplicate_request_id:
@@ -1072,7 +1276,18 @@ class RecurrenceGuard:
                     entry=duplicate_entry,
                     result=duplicate_result,
                     recovery=True,
+                    observation=duplicate_observation,
                 )
+            elif update_ledger and duplicate_projection_state == PROJECTION_SUPPRESSED:
+                duplicate_result.ledger_update = {
+                    "recorded": False,
+                    "state": PROJECTION_SUPPRESSED,
+                    "reason": (
+                        "this observation's ledger projection was explicitly suppressed when it "
+                        "was recorded; replay honours that. Use resync-ledger "
+                        "--include-suppressed to project it deliberately."
+                    ),
+                }
             return duplicate_result
 
         with FileLock(self.lock_path):
@@ -1127,31 +1342,27 @@ class RecurrenceGuard:
             if reopened:
                 entry["reopened_count"] = int(entry.get("reopened_count") or 0) + 1
 
-            entry["observations"].append(
-                {
-                    "observation_id": obs_id,
-                    "seq": seq,
-                    "observed_at": now,
-                    "source": source,
-                    "disposition": disposition,
-                    "counted": counts,
-                    "request_id": request_id or None,
-                    "head_sha": head_sha or None,
-                    "stage": stage or None,
-                    "attempt": attempt or None,
-                    "error": _clip(str(error or ""), MAX_ERROR_SAMPLE),
-                    "detail": _clip(str(detail or ""), MAX_ERROR_SAMPLE),
-                    # Whether this observation's ledger projection landed. Written
-                    # after the ledger write returns, so a crash in between leaves
-                    # `applied` false and the replay path knows there is work left.
-                    "ledger_projection": {
-                        "applied": False,
-                        "at": None,
-                        "reason": "not attempted",
-                        "attempts": 0,
-                    },
-                }
-            )
+            observation = {
+                "observation_id": obs_id,
+                "seq": seq,
+                "observed_at": now,
+                "source": source,
+                "disposition": disposition,
+                "counted": counts,
+                "request_id": request_id or None,
+                "head_sha": head_sha or None,
+                "stage": stage or None,
+                "attempt": attempt or None,
+                "error": _clip(str(error or ""), MAX_ERROR_SAMPLE),
+                "detail": _clip(str(detail or ""), MAX_ERROR_SAMPLE),
+                # What this observation's ledger projection is owed, and why. The
+                # state is decided here, before the projection is attempted, so a
+                # suppression the caller asked for is never indistinguishable from
+                # a crash between the two locks - which is what let a later
+                # resync write a row the caller had refused.
+                "ledger_projection": self._initial_projection(request_id, update_ledger),
+            }
+            entry["observations"].append(observation)
             entry["last_observed_at"] = now
 
             # First-failure triage fields are recorded once and only ever refined,
@@ -1175,6 +1386,26 @@ class RecurrenceGuard:
 
             data["observation_index"][obs_id] = signature
             self._derive(entry)
+
+            # Immutable observation-time evidence. The count and status a
+            # projection reports have to be the ones that were true when the
+            # failure was observed, or a projection recovered later reports the
+            # present as if it were the past: the row for occurrence 1, written
+            # after occurrence 2 landed, read "occurrence 2 /
+            # corrective_action_required". Written once and never revised - a
+            # later supersede changes the count from now on, not what was
+            # observed then.
+            observation["at_observation"] = {
+                "occurrence": int(entry["occurrences"]) if counts else None,
+                "occurrences": int(entry["occurrences"]),
+                "observations_recorded": int(entry["observations_recorded"]),
+                "status": str(entry["status"]),
+                "retry_allowed": not bool(entry["retry_blocked"]),
+                "required_action": str(entry["required_action"]),
+                "counted": counts,
+                "disposition": disposition,
+                "observed_at": now,
+            }
 
             entry["history"].append(
                 {
@@ -1223,7 +1454,11 @@ class RecurrenceGuard:
         # recoverable by replay or by resync rather than silently lost.
         if update_ledger and request_id:
             result.ledger_update = self._project_to_ledger(
-                ledger=ledger, request_id=str(request_id), entry=entry, result=result
+                ledger=ledger,
+                request_id=str(request_id),
+                entry=entry,
+                result=result,
+                observation=observation,
             )
         return result
 
@@ -1616,31 +1851,169 @@ class RecurrenceGuard:
             if obs.get("counted", True) and obs.get("head_sha")
         ]
 
+    @staticmethod
+    def _git(root: str, *args: str) -> Optional[subprocess.CompletedProcess]:
+        """Run one read-only git query in the verification context, or None if git cannot."""
+        try:
+            return subprocess.run(
+                ["git"] + list(args),
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+
     @classmethod
+    def _repo_context(
+        cls, entry: Mapping[str, Any], verification_root: Optional[str]
+    ) -> Dict[str, Any]:
+        """
+        The repository a reference and an evidence head can actually be looked up in.
+
+        An explicit root wins over the one recorded with the failure, because the
+        recorded one is routinely gone: lanes work in ephemeral detached
+        worktrees, so by the time a correction is recorded the tree the failure
+        was observed in may no longer exist. That is a missing verification
+        context, not a verified reference - so the caller is given a way to name a
+        reachable one instead of having the gate open on nothing.
+        """
+        for candidate in (verification_root, entry.get("repo_root")):
+            path = str(candidate or "").strip()
+            if not path or not os.path.isdir(path):
+                continue
+            root = os.path.abspath(path)
+            probe = cls._git(root, "rev-parse", "--git-dir")
+            if probe is None:
+                return {"root": None, "reason": f"git could not be run in {root}"}
+            if probe.returncode != 0:
+                return {"root": None, "reason": f"{root} is not a git repository"}
+            return {"root": root, "reason": None, "explicit": bool(verification_root)}
+        return {
+            "root": None,
+            "reason": (
+                "no reachable repository: neither an explicit verification root nor the "
+                "repository recorded with this failure exists on this host"
+            ),
+        }
+
+    def _decisions_path(self) -> str:
+        """The decision record kept beside this store, never an installed default."""
+        return os.path.join(os.path.dirname(self.store_path), "decisions.json")
+
+    def _resolve_decision(self, decision_id: str) -> Dict[str, Any]:
+        """
+        Resolve a ``decision:<id>`` reference against the decision record beside this store.
+
+        Read-only, and deliberately scoped to this state directory: resolving
+        against an installed decisions file would let state nobody named here
+        decide whether a gate opens.
+        """
+        path = self._decisions_path()
+        if not os.path.exists(path):
+            return {
+                "checked": False,
+                "reason": (
+                    f"no decision record at {path}, so decision {decision_id!r} could not "
+                    "be resolved"
+                ),
+                "decision": decision_id,
+            }
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                document = json.load(fh)
+            decisions = (document or {}).get("decisions") or {}
+        except (OSError, ValueError) as e:
+            return {
+                "checked": False,
+                "reason": f"decision record at {path} is unreadable: {type(e).__name__}: {e}",
+                "decision": decision_id,
+            }
+        record = decisions.get(decision_id)
+        if not isinstance(record, Mapping):
+            raise RecurrenceGuardError(
+                f"Decision reference {decision_id!r} is not in the decision record at {path}. "
+                "A reference to a decision nobody took asserts that one was taken, which is "
+                "the shape of correction this gate exists to refuse."
+            )
+        status = str(record.get("status") or "").strip()
+        if status != "answered":
+            raise RecurrenceGuardError(
+                f"Decision {decision_id!r} is recorded with status "
+                f"{status or 'unknown'!r}, not 'answered', so it carries no taken decision "
+                "to correct anything with."
+            )
+        return {
+            "checked": True,
+            "reason": f"decision {decision_id} is answered in {path}",
+            "decision": decision_id,
+            "decision_status": status,
+            "decision_record": path,
+        }
+
+    @staticmethod
+    def _config_key_present(path: str, key: str) -> Optional[int]:
+        """The 1-based line where `key` is assigned in `path`, or None."""
+        leaf = str(key).strip().split(".")[-1]
+        if not leaf:
+            return None
+        pattern = re.compile(r"(?:^|[\s{,\[])[\"']?" + re.escape(leaf) + r"[\"']?\s*[:=]")
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                for number, line in enumerate(fh, 1):
+                    if pattern.search(line):
+                        return number
+        except OSError:
+            return None
+        return None
+
+    @staticmethod
+    def _test_defined_in(path: str, name: str) -> Optional[int]:
+        """The 1-based line where test `name` is defined in `path`, or None."""
+        leaf = str(name).strip()
+        if not leaf:
+            return None
+        pattern = re.compile(
+            r"^\s*(?:async\s+)?(?:def|class|it|test)\b.*\b" + re.escape(leaf) + r"\b"
+        )
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                for number, line in enumerate(fh, 1):
+                    if pattern.search(line):
+                        return number
+        except OSError:
+            return None
+        return None
+
     def _verify_change_ref(
-        cls,
+        self,
         entry: Mapping[str, Any],
         kind: str,
         ref_form: str,
         ref_value: str,
+        context: Mapping[str, Any],
     ) -> Dict[str, Any]:
         """
-        Check the change reference against the failure it claims to correct.
+        Resolve the change reference against the failure it claims to correct.
 
-        Two checks, in order of how much they prove:
+        Three outcomes, and the difference between them is the whole gate:
 
-        * scope - a kind whose systemic change lives in the repository must name a
-          commit, and that commit must not be one of the heads the failures were
-          observed on. A "code change" that points at the failing commit itself is
-          the unchanged retry it is supposed to replace, and no amount of prose
-          around it makes the retried tree different.
-        * existence - when the repository the failure was observed in is reachable,
-          the commit is looked up with ``git cat-file``. A reference to an object
-          that is not there is refused rather than recorded.
-
-        A reference that cannot be checked (no recorded repository, or git absent)
-        is recorded with that stated truthfully instead of being reported as
-        verified. It still had to pass the form and scope checks to get here.
+        * **refuted** - the reference names something a reachable context says is
+          not there: a commit absent from the repository, a config key absent from
+          the file, a test absent from the module, a decision absent from the
+          record, or a "code change" pointing at one of the commits the failure was
+          observed on. Refused outright, because a fabricated reference is worse
+          than none.
+        * **resolved** (``checked: True``) - the reference was looked up and found.
+          Only this can contribute to opening the retry gate.
+        * **unresolved** (``checked: False``) - there was nothing to look it up
+          against: no reachable repository, no decision record, or a form that
+          cannot be resolved offline at all (a pull request). It is still recorded,
+          truthfully, and it never opens the gate. This is what the previous
+          contract got wrong: it recorded the same ``checked: false`` and opened
+          the gate anyway, so a fabricated PR reference, or a commit in a worktree
+          that no longer existed, cleared an unchanged-retry block.
         """
         if kind in COMMIT_BACKED_KINDS and ref_form != "commit":
             raise RecurrenceGuardError(
@@ -1648,48 +2021,264 @@ class RecurrenceGuard:
                 f"reference must name a commit (commit:<40-hex>), not a '{ref_form}' "
                 "reference. The commit is what makes the next retry a different attempt."
             )
-        if ref_form != "commit":
-            return {"checked": False, "reason": f"'{ref_form}' references are not git objects"}
-
-        sha = ref_value.lower()
-        observed = cls._observed_heads(entry)
-        if sha in observed:
-            raise RecurrenceGuardError(
-                f"Change reference commit {sha} is one of the commits this failure was "
-                "observed on, so it carries no systemic change: retrying against it is the "
-                "same unchanged attempt that already failed."
-            )
-
-        repo_root = str(entry.get("repo_root") or "").strip()
-        if not repo_root or not os.path.isdir(repo_root):
+        root = context.get("root")
+        if ref_form == "pr":
             return {
                 "checked": False,
+                "form": ref_form,
+                "value": ref_value,
                 "reason": (
-                    "no reachable repository was recorded for this signature, so the commit's "
-                    "existence could not be looked up"
+                    "a pull request can only be resolved against a remote API, which this "
+                    "module never contacts, so this reference is recorded and never treated "
+                    "as verified"
                 ),
-                "commit": sha,
             }
-        try:
-            proc = subprocess.run(
-                ["git", "cat-file", "-e", f"{sha}^{{commit}}"],
-                cwd=repo_root,
-                capture_output=True,
-                text=True,
-                timeout=20,
-            )
-        except (OSError, subprocess.SubprocessError) as e:
+        if ref_form == "decision":
+            resolved = self._resolve_decision(ref_value)
+            resolved.update({"form": ref_form, "value": ref_value})
+            return resolved
+
+        if ref_form == "commit":
+            sha = ref_value.lower()
+            if sha in self._observed_heads(entry):
+                raise RecurrenceGuardError(
+                    f"Change reference commit {sha} is one of the commits this failure was "
+                    "observed on, so it carries no systemic change: retrying against it is "
+                    "the same unchanged attempt that already failed."
+                )
+            if not root:
+                return {
+                    "checked": False,
+                    "form": ref_form,
+                    "value": ref_value,
+                    "commit": sha,
+                    "reason": (
+                        f"{context.get('reason')}, so commit {sha[:12]} could not be looked "
+                        "up; name a reachable repository that holds it with --verify-root"
+                    ),
+                }
+            probe = self._git(root, "cat-file", "-e", f"{sha}^{{commit}}")
+            if probe is None:
+                return {
+                    "checked": False,
+                    "form": ref_form,
+                    "value": ref_value,
+                    "commit": sha,
+                    "reason": f"git could not be run in {root}",
+                }
+            if probe.returncode != 0:
+                raise RecurrenceGuardError(
+                    f"Change reference commit {sha} does not exist in {root}, so it cannot "
+                    "be the systemic change that unblocks this retry."
+                )
+            return {
+                "checked": True,
+                "form": ref_form,
+                "value": ref_value,
+                "exists": True,
+                "commit": sha,
+                "repo_root": root,
+                "reason": f"commit {sha[:12]} exists in {root}",
+            }
+
+        # config: and test: name a path inside the repository, so they resolve
+        # offline against the same context a commit does.
+        if not root:
             return {
                 "checked": False,
-                "reason": f"git could not be run in {repo_root}: {type(e).__name__}: {e}",
-                "commit": sha,
+                "form": ref_form,
+                "value": ref_value,
+                "reason": (
+                    f"{context.get('reason')}, so the {ref_form} reference could not be "
+                    "looked up; name the repository that holds it with --verify-root"
+                ),
             }
-        if proc.returncode != 0:
+        if ref_form == "config":
+            rel_path, _, key = ref_value.partition("#")
+            target = os.path.join(root, rel_path.replace("/", os.sep))
+            if not os.path.isfile(target):
+                raise RecurrenceGuardError(
+                    f"Change reference config file {rel_path!r} is not in {root}, so the "
+                    "configuration change it claims cannot be there either."
+                )
+            line = self._config_key_present(target, key)
+            if line is None:
+                raise RecurrenceGuardError(
+                    f"Change reference config key {key!r} is not assigned anywhere in "
+                    f"{rel_path}, so this reference names a change the file does not carry."
+                )
+            return {
+                "checked": True,
+                "form": ref_form,
+                "value": ref_value,
+                "exists": True,
+                "path": rel_path,
+                "key": key,
+                "line": line,
+                "repo_root": root,
+                "reason": f"{key} is assigned at {rel_path}:{line}",
+            }
+
+        rel_path, _, name = ref_value.partition("::")
+        target = os.path.join(root, rel_path.replace("/", os.sep))
+        if not os.path.isfile(target):
             raise RecurrenceGuardError(
-                f"Change reference commit {sha} does not exist in {repo_root}, so it cannot "
-                "be the systemic change that unblocks this retry."
+                f"Change reference test file {rel_path!r} is not in {root}, so the test it "
+                "names cannot be there either."
             )
-        return {"checked": True, "exists": True, "commit": sha, "repo_root": repo_root}
+        line = self._test_defined_in(target, name)
+        if line is None:
+            raise RecurrenceGuardError(
+                f"Change reference test {name!r} is not defined in {rel_path}, so this "
+                "reference names a test that does not exist."
+            )
+        return {
+            "checked": True,
+            "form": ref_form,
+            "value": ref_value,
+            "exists": True,
+            "path": rel_path,
+            "test": name,
+            "line": line,
+            "repo_root": root,
+            "reason": f"{name} is defined at {rel_path}:{line}",
+        }
+
+    @classmethod
+    def _bind_evidence(
+        cls,
+        entry: Mapping[str, Any],
+        ref_form: str,
+        ref_value: str,
+        verification: Mapping[str, Any],
+        head: str,
+        evidence_exit_code: int,
+        context: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Bind the exercised proof to the verified change, and record how.
+
+        The reviewed defect was that this evidence was *collected* rather than
+        bound: the fields were required, then nothing checked what they said. So a
+        correction could carry a still-failing exit code, or name the very head
+        the failure was observed on, and the gate opened on the presence of the
+        fields alone.
+
+        Three facts are established here against reality, each recorded so a later
+        reader can see what was actually checked:
+
+        * the proof succeeded - a non-zero exit code is the scenario still failing;
+        * the proof did not run on a head the failure was observed on - that is the
+          unchanged attempt, whatever the description says;
+        * for a commit reference, the head the proof ran on *contains* that commit
+          (``git merge-base --is-ancestor``), so the run that passed is a run of
+          the changed tree. For a reference resolved inside the repository, the
+          head is at least a commit that exists there.
+
+        The gate itself is not stored: ``_action_gate_bound`` recomputes it from
+        these facts on every load, so no stored flag can open a gate its own
+        record denies.
+        """
+        root = context.get("root")
+        observed = cls._observed_heads(entry)
+        binding: Dict[str, Any] = {
+            "evidence_exit_code": int(evidence_exit_code),
+            "evidence_succeeded": int(evidence_exit_code) == 0,
+            "evidence_head": head,
+            "head_was_observed_failing": head in observed,
+            "reference_resolved": verification.get("checked") is True,
+            "head_carries_change": None,
+            "head_bound": False,
+            "verification_root": root,
+        }
+
+        reasons: List[str] = []
+        if not binding["reference_resolved"]:
+            reasons.append(f"the change reference is not resolved ({verification.get('reason')})")
+        if not binding["evidence_succeeded"]:
+            reasons.append(
+                f"the exercised scenario exited {evidence_exit_code}, so it did not pass"
+            )
+        if binding["head_was_observed_failing"]:
+            reasons.append(
+                f"the evidence head {head[:12]} is one of the heads this failure was observed "
+                "on, so the proof was exercised on the unchanged tree"
+            )
+
+        if not root:
+            reasons.append(f"the evidence head could not be resolved: {context.get('reason')}")
+        else:
+            exists = cls._git(root, "cat-file", "-e", f"{head}^{{commit}}")
+            if exists is None or exists.returncode != 0:
+                reasons.append(f"the evidence head {head[:12]} is not a commit in {root}")
+            elif ref_form == "commit":
+                ancestor = cls._git(root, "merge-base", "--is-ancestor", ref_value.lower(), head)
+                carries = bool(ancestor is not None and ancestor.returncode == 0)
+                binding["head_carries_change"] = carries
+                if carries:
+                    binding["head_bound"] = True
+                else:
+                    reasons.append(
+                        f"the evidence head {head[:12]} does not contain the change commit "
+                        f"{ref_value[:12]}, so the run that passed is not a run of the "
+                        "changed tree"
+                    )
+            else:
+                binding["head_bound"] = True
+
+        binding["bound"] = bool(
+            binding["reference_resolved"]
+            and binding["evidence_succeeded"]
+            and not binding["head_was_observed_failing"]
+            and binding["head_bound"]
+        )
+        binding["reason"] = (
+            "the original scenario was re-executed successfully on a head that carries the "
+            "verified change"
+            if binding["bound"]
+            else "; ".join(reasons) or "the exercised proof is not bound to a verified change"
+        )
+        return binding
+
+    @staticmethod
+    def _action_gate_bound(action: Mapping[str, Any]) -> bool:
+        """
+        Whether one recorded corrective action may open the retry gate.
+
+        Recomputed from the action's own durable facts on every load rather than
+        read from a stored verdict: the resolved reference, the exit code the proof
+        returned, and how its head related to the change and to the observed
+        failures. An action that misses any of them stays recorded - a proposal, or
+        a reference somebody wanted on the record, is still worth keeping - and
+        contributes nothing to the gate.
+        """
+        verification = action.get("change_ref_verification") or {}
+        if verification.get("checked") is not True:
+            return False
+        binding = action.get("gate_binding") or {}
+        if not binding:
+            return False
+        try:
+            exit_code = int(action.get("evidence_exit_code"))
+        except (TypeError, ValueError):
+            return False
+        if exit_code != 0:
+            return False
+        if binding.get("head_was_observed_failing"):
+            return False
+        if binding.get("head_bound") is not True:
+            return False
+        if str(verification.get("form") or action.get("change_ref_form") or "") == "commit":
+            return binding.get("head_carries_change") is True
+        return True
+
+    @classmethod
+    def _gate_qualifying_actions(cls, entry: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+        """The recorded corrective actions whose proof is bound to a verified change."""
+        return [
+            action for action in entry.get("corrective_actions") or []
+            if cls._action_gate_bound(action)
+        ]
 
     def record_corrective_action(
         self,
@@ -1705,28 +2294,37 @@ class RecurrenceGuard:
         head_sha: str,
         authorization: Optional[str] = None,
         request_id: Optional[str] = None,
+        verification_root: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Record - never execute - the systemic corrective action that unblocks retry.
 
-        What this demands, and why each part is load-bearing:
+        Recording and gate-opening are two different outcomes, and the reviewed
+        defect was that they were one. The previous contract required a structured
+        reference and exercised-proof fields, then opened the gate on their
+        *presence*: nothing resolved the reference, and nothing checked what the
+        proof said. So ``decision:later`` with the description "will retry later",
+        an exit code of 1 and the failing head as the evidence head cleared an
+        unchanged-retry block - the single behaviour this module exists to stop -
+        and so did a fabricated ``pr:`` or ``config:`` reference.
 
-        * ``change_ref`` must be one of ``CHANGE_REF_FORMS``. The previous contract
-          took any non-empty string, so ``--change-ref later`` with the description
-          "will retry later" moved the signature to ``corrective_action_recorded``
-          and reopened retry. "Retry later" is the exact behaviour this module
-          exists to stop, so it must not be spellable as a correction.
-        * for a kind whose change lives in the repository, the reference must name
-          a commit that is *not* one of the heads the failures were observed on,
-          and that commit is verified to exist when the observed repository is
-          reachable. A correction that points at the failing commit itself did not
-          change the thing being retried.
-        * ``scenario``, ``evidence``, ``evidence_command`` and
-          ``evidence_exit_code`` are the original failing scenario re-executed
-          against the change. Requiring them here rather than only at ``resolve``
-          is the point: the gate is cleared *here*, so this is where exercised
-          proof has to exist.
-        * ``head_sha`` is the full commit the evidence was exercised on.
+        Now the record always lands (a proposal, or a reference somebody wants on
+        the record, is worth keeping) and the gate opens only when all of the
+        following are true, each established against reality rather than asserted:
+
+        * the reference **resolves** in a reachable verification context -
+          ``_verify_change_ref``. A reference the context refutes is refused
+          outright; one that cannot be resolved at all is recorded unverified and
+          never opens the gate;
+        * the exercising command **succeeded** (``evidence_exit_code == 0``);
+        * ``head_sha`` is not one of the heads this failure was observed on, and
+          for a commit reference it **contains** that commit, so the run that
+          passed is a run of the changed tree - ``_bind_evidence``.
+
+        ``verification_root`` names the repository to resolve against when the one
+        recorded with the failure is gone, which is the normal case for an
+        ephemeral worktree. It changes where the lookup happens, never whether one
+        is required.
 
         It still records a claim and executes nothing: no change is applied, no
         acceptance criterion is touched, no merge or deployment is authorized, and
@@ -1748,9 +2346,6 @@ class RecurrenceGuard:
         if not actor or not str(actor).strip():
             raise RecurrenceGuardError("A corrective action requires an actor.")
         ref_form, ref_value = parse_change_ref(change_ref)
-        scenario = redact_diagnostic(scenario)
-        evidence = redact_diagnostic(evidence)
-        description = redact_diagnostic(description)
         if len(str(scenario).strip()) < MIN_EVIDENCE_CHARS:
             raise RecurrenceGuardError(
                 "A corrective action requires the original failure scenario it was exercised "
@@ -1796,7 +2391,14 @@ class RecurrenceGuard:
                     f"No recurrence signature '{signature}' in the store; a corrective action "
                     "must attach to an observed failure."
                 )
-            ref_verification = self._verify_change_ref(entry, kind, ref_form, ref_value)
+            context = self._repo_context(entry, verification_root)
+            ref_verification = self._verify_change_ref(
+                entry, kind, ref_form, ref_value, context
+            )
+            binding = self._bind_evidence(
+                entry, ref_form, ref_value, ref_verification, head,
+                int(evidence_exit_code), context,
+            )
             before = str(self._derive(entry)["status"])
             data["seq"] = int(data["seq"]) + 1
             seq = int(data["seq"])
@@ -1812,6 +2414,7 @@ class RecurrenceGuard:
                 "change_ref_form": ref_form,
                 "change_ref_value": ref_value,
                 "change_ref_verification": ref_verification,
+                "gate_binding": binding,
                 "scenario": str(scenario).strip(),
                 "evidence": str(evidence).strip(),
                 "evidence_command": command,
@@ -1823,9 +2426,10 @@ class RecurrenceGuard:
                 "occurrences_at_record": int(entry.get("occurrences") or 0),
                 "executed": False,
                 "verifies_nothing": (
-                    "Recorded claim only. Clears the unchanged-retry gate; does not verify "
-                    "acceptance criteria, does not satisfy head-bound QA or review, and does "
-                    "not authorize a merge or deployment."
+                    "Recorded claim only. Opens the unchanged-retry gate when its reference "
+                    "resolved and its proof is bound to it; does not verify acceptance "
+                    "criteria, does not satisfy head-bound QA or review, and does not "
+                    "authorize a merge or deployment."
                 ),
             }
             entry.setdefault("corrective_actions", []).append(record)
@@ -1834,7 +2438,10 @@ class RecurrenceGuard:
                 {
                     "seq": seq,
                     "at": now,
-                    "event": "corrective_action_recorded",
+                    "event": (
+                        "corrective_action_recorded" if binding.get("bound")
+                        else "corrective_action_recorded_unbound"
+                    ),
                     "action_id": record["action_id"],
                     "kind": kind,
                     "from_status": before,
@@ -1850,6 +2457,19 @@ class RecurrenceGuard:
                 "previous_status": before,
                 "retry_allowed": not bool(entry["retry_blocked"]),
                 "required_action": entry["required_action"],
+                # What this record did to the gate, stated separately from the fact
+                # that it was recorded. A caller that wanted the gate open has to
+                # be told it is not, rather than reading a successful write as one.
+                "recorded": True,
+                "gate": {
+                    "opened": bool(self._action_gate_bound(record)),
+                    "reason": binding.get("reason"),
+                    "reference_resolved": binding.get("reference_resolved"),
+                    "evidence_succeeded": binding.get("evidence_succeeded"),
+                    "head_bound": binding.get("head_bound"),
+                    "head_carries_change": binding.get("head_carries_change"),
+                    "verification": ref_verification,
+                },
             }
 
     def resolve(
@@ -1867,8 +2487,11 @@ class RecurrenceGuard:
         false green looks like:
 
         * the corrective change — at least one recorded corrective action must be
-          current, and its change references are copied into the resolution, so a
-          closed signature always names what actually changed;
+          current *and* bound to a verified change (a resolved reference plus a
+          successful proof exercised on a head that carries it), and its change
+          references are copied into the resolution, so a closed signature always
+          names what actually changed. Resolving is the second way the retry gate
+          opens, so it cannot accept a record the gate itself refuses;
         * the original failure scenario — `scenario` names the exact failing
           scenario that was re-executed, and `evidence` carries what running it
           produced. A generic suite passing is not proof that this failure is gone.
@@ -1894,8 +2517,6 @@ class RecurrenceGuard:
             )
         if not actor or not str(actor).strip():
             raise RecurrenceGuardError("Resolving a recurrence requires an actor.")
-        scenario = redact_diagnostic(scenario)
-        evidence = redact_diagnostic(evidence)
 
         with FileLock(self.lock_path):
             data = self._load_unlocked()
@@ -1910,14 +2531,29 @@ class RecurrenceGuard:
                 [o for o in entry.get("observations") or [] if o.get("counted", True)]
             )
             current_actions = [
-                a for a in (entry.get("corrective_actions") or [])
+                a for a in self._gate_qualifying_actions(entry)
                 if int(a.get("seq") or 0) > last_counted
             ]
             if not current_actions:
+                recorded_current = [
+                    a for a in (entry.get("corrective_actions") or [])
+                    if int(a.get("seq") or 0) > last_counted
+                ]
                 raise RecurrenceGuardError(
-                    f"Cannot resolve '{signature}': no systemic corrective action is recorded "
-                    "and current for this signature. Closure must point at the corrective "
-                    "change, not only at a scenario that happened to pass."
+                    f"Cannot resolve '{signature}': no systemic corrective action is recorded, "
+                    "current and bound to a verified change for this signature. Closure must "
+                    "point at the corrective change, not only at a scenario that happened to "
+                    "pass."
+                    + (
+                        " "
+                        + "; ".join(
+                            f"{a.get('action_id')} is unbound: "
+                            f"{(a.get('gate_binding') or {}).get('reason')}"
+                            for a in recorded_current
+                        )
+                        if recorded_current
+                        else ""
+                    )
                 )
             data["seq"] = int(data["seq"]) + 1
             seq = int(data["seq"])
@@ -2020,10 +2656,11 @@ class RecurrenceGuard:
         operation = entry.get("operation")
         environment = entry.get("environment")
         diagnosis = str(entry.get("diagnosis") or "").strip()
-        # Redacted on the way out as well as on the way in: an entry written by an
-        # older build of this module holds raw text, and this prompt is where that
-        # text would otherwise be copied into a second durable record.
-        scenario = _clip(redact_diagnostic(entry.get("error_sample")), 600)
+        # This prompt copies stored failure text into a *second* durable
+        # authority, so it goes through the same write boundary as the store: an
+        # entry written by an older build holds raw text, and the ledger must not
+        # become the place it survives.
+        scenario = _clip(str(entry.get("error_sample") or ""), 600)
         prompt = (
             f"Systemic corrective work for a recurring failure: '{operation}' in "
             f"'{environment}' has failed {entry.get('occurrences')} distinct times with "
@@ -2067,24 +2704,24 @@ class RecurrenceGuard:
             except (KeyError, OSError, ValueError):
                 owner = ""
         try:
-            ledger.add_request(
-                req_id=corrective_id,
-                prompt=prompt,
-                session="recurrence-guard-corrective-intake",
-                project=str(entry.get("project") or ""),
-                acceptance_criteria=criteria,
-                owner=owner or "unassigned",
-                state="pending",
+            payload = {
+                "req_id": corrective_id,
+                "prompt": prompt,
+                "session": "recurrence-guard-corrective-intake",
+                "project": str(entry.get("project") or ""),
+                "acceptance_criteria": criteria,
+                "owner": owner or "unassigned",
+                "state": "pending",
                 # Deliberately a local work item: opening it must not assert that a
                 # deployment or a DDL apply is in scope. A lane that needs those
                 # states retypes the request under its own authorization.
-                task_type="local",
-                next_action=(
+                "task_type": "local",
+                "next_action": (
                     "Implement the systemic corrective change on an isolated branch, then "
                     "verify it through the normal build/QA/review path."
                 ),
-                issue_url=entry.get("canonical_link") or None,
-                labels=[
+                "issue_url": entry.get("canonical_link") or None,
+                "labels": [
                     "type:corrective-action",
                     f"recurrence:{signature[:12]}",
                     f"operation:{operation}",
@@ -2094,11 +2731,78 @@ class RecurrenceGuard:
                     EXPLICIT_SELECTION_LABEL,
                     f"parent-scope:{failing_request_id or 'none'}",
                 ],
-            )
+            }
+            ledger.add_request(**redact_durable(payload))
         except (KeyError, OSError, ValueError) as e:
             return {"created": False, "request_id": corrective_id,
                     "reason": f"{type(e).__name__}: {e}"}
         return {"created": True, "request_id": corrective_id}
+
+    @staticmethod
+    def _initial_projection(request_id: Optional[str], update_ledger: bool) -> Dict[str, Any]:
+        """
+        What an observation's ledger projection is owed the moment it is recorded.
+
+        Three genuinely different situations, recorded as three different states
+        instead of one absent `applied` flag:
+
+        * ``pending`` - a projection is owed and about to be attempted. If the
+          process dies before the marker is written, this is what makes the gap
+          discoverable.
+        * ``suppressed`` - the caller asked for no ledger write. Nothing is owed,
+          and a later repair must not invent one.
+        * ``not_applicable`` - there is no request to project onto, so no ledger
+          row can exist for this observation at all.
+        """
+        if not request_id:
+            return {
+                "applied": False,
+                "state": PROJECTION_NOT_APPLICABLE,
+                "at": None,
+                "reason": (
+                    "no request id was recorded with this observation, so there is no ledger "
+                    "record to project it onto"
+                ),
+                "attempts": 0,
+            }
+        if not update_ledger:
+            return {
+                "applied": False,
+                "state": PROJECTION_SUPPRESSED,
+                "at": _now(),
+                "reason": (
+                    "the caller explicitly suppressed the ledger projection for this "
+                    "observation; no projection is owed"
+                ),
+                "attempts": 0,
+            }
+        return {
+            "applied": False,
+            "state": PROJECTION_PENDING,
+            "at": None,
+            "reason": "projection owed; not yet attempted",
+            "attempts": 0,
+        }
+
+    @staticmethod
+    def _projection_state(observation: Mapping[str, Any]) -> str:
+        """
+        The projection state of one observation, including stores written before
+        the state was recorded.
+
+        A record from an older build carries only ``applied``. An unapplied one is
+        read as ``pending``, which is the state it was actually in: those builds
+        had no way to suppress a projection, so nothing is being guessed.
+        """
+        projection = observation.get("ledger_projection") or {}
+        state = str(projection.get("state") or "").strip()
+        if state:
+            return state
+        if projection.get("applied"):
+            return PROJECTION_APPLIED
+        if not observation.get("request_id"):
+            return PROJECTION_NOT_APPLICABLE
+        return PROJECTION_PENDING
 
     @staticmethod
     def _projection_evidence_id(observation_id: str) -> str:
@@ -2112,15 +2816,19 @@ class RecurrenceGuard:
         return f"ev-recurrence-{observation_id}"
 
     def _mark_ledger_projection(
-        self, observation_id: str, applied: bool, reason: str
+        self, observation_id: str, applied: bool, reason: str, unsuppressed_by: Optional[str] = None
     ) -> None:
         """
-        Record on the observation whether its ledger projection landed.
+        Record on the observation what happened to its ledger projection.
 
         Written under the store's lock after the ledger call returned, so the
         window between the two authorities is visible in the store rather than
-        assumed away. Nothing here touches occurrence, status or the gate: the
-        marker is bookkeeping about a projection, not evidence about a failure.
+        assumed away. The state moves to ``applied`` or ``failed`` - a failed one
+        is still outstanding and still repairable - and the state it came from is
+        kept, so an explicitly unsuppressed projection stays distinguishable from
+        one that was always owed. Nothing here touches occurrence, status or the
+        gate: the marker is bookkeeping about a projection, not evidence about a
+        failure.
         """
         try:
             with FileLock(self.lock_path):
@@ -2133,12 +2841,17 @@ class RecurrenceGuard:
                     if obs.get("observation_id") != str(observation_id):
                         continue
                     previous = obs.get("ledger_projection") or {}
-                    obs["ledger_projection"] = {
+                    marker = {
                         "applied": bool(applied),
+                        "state": PROJECTION_APPLIED if applied else PROJECTION_FAILED,
                         "at": _now(),
                         "reason": reason,
                         "attempts": int(previous.get("attempts") or 0) + 1,
+                        "previous_state": self._projection_state(obs),
                     }
+                    if unsuppressed_by:
+                        marker["unsuppressed_by"] = str(unsuppressed_by)
+                    obs["ledger_projection"] = marker
                     self._save_unlocked(data)
                     return
         except (RecurrenceGuardError, OSError, ValueError):
@@ -2153,6 +2866,8 @@ class RecurrenceGuard:
         entry: Mapping[str, Any],
         result: IntakeResult,
         recovery: bool = False,
+        observation: Optional[Mapping[str, Any]] = None,
+        unsuppressed_by: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Persist the recurrence into the request's durable record, recoverably.
@@ -2174,11 +2889,14 @@ class RecurrenceGuard:
         projection stays discoverable by ``resync_ledger`` instead of being lost
         in the gap between the two locks.
         """
-        outcome = self._apply_ledger_projection(ledger, request_id, entry, result, recovery)
+        outcome = self._apply_ledger_projection(
+            ledger, request_id, entry, result, recovery, observation
+        )
         self._mark_ledger_projection(
             result.observation_id,
             bool(outcome.get("recorded")),
             str(outcome.get("reason") or ("applied" if outcome.get("recorded") else "failed")),
+            unsuppressed_by=unsuppressed_by,
         )
         return outcome
 
@@ -2189,7 +2907,26 @@ class RecurrenceGuard:
         entry: Mapping[str, Any],
         result: IntakeResult,
         recovery: bool,
+        observation: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
+        """
+        Write one observation's evidence, blocker and next_action onto its request.
+
+        The evidence row is about a *past* observation, so it reports the
+        occurrence count and status that were true when that failure was observed,
+        taken from the immutable snapshot the observation carries. A projection
+        recovered after later failures landed otherwise describes the present as if
+        it were the past: the row for occurrence 1, written after occurrence 2, read
+        "occurrence 2 / corrective_action_required".
+
+        When no snapshot exists - an observation recorded before they were kept -
+        the row carries the projection-time values and says so, rather than
+        presenting them as observation-time facts or inventing a snapshot that was
+        never taken.
+
+        The blocker and next_action are deliberately *current*: they describe what
+        the request needs now, not what it needed then.
+        """
         try:
             if ledger is None:
                 from ledger import RequestLedger
@@ -2226,12 +2963,28 @@ class RecurrenceGuard:
         elif result.counted and result.occurrences == 1 and not entry.get("diagnosis_complete"):
             next_action = str(entry.get("required_action") or "")
 
+        snapshot = (observation or {}).get("at_observation") or {}
+        occurrence_evidence = "observation_time" if snapshot else "projection_time"
+        occurrences_then = int(snapshot.get("occurrences", result.occurrences))
+        occurrence_index = snapshot.get("occurrence") if snapshot else (
+            result.occurrences if result.counted else None
+        )
+        status_then = str(snapshot.get("status", result.status))
+        retry_allowed_then = bool(snapshot.get("retry_allowed", result.retry_allowed))
+        required_action_then = str(
+            snapshot.get("required_action", entry.get("required_action") or "")
+        )
+        as_of = (
+            "when it was observed" if snapshot
+            else "at projection time; no observation-time snapshot was recorded"
+        )
+
         if result.counted:
             summary = (
                 f"Failure observation {result.observation_id} recorded: occurrence "
-                f"{result.occurrences} of signature {entry.get('signature')[:16]} "
+                f"{occurrence_index} of signature {entry.get('signature')[:16]} "
                 f"({entry.get('operation')} / {entry.get('environment')}); "
-                f"status {result.status}"
+                f"status {status_then} ({as_of})"
             )
         else:
             # The executed failure is retained as evidence and explicitly does not
@@ -2240,7 +2993,7 @@ class RecurrenceGuard:
                 f"Executed failure {result.observation_id} retained as "
                 f"'{result.disposition}' and excluded from the recurrence count "
                 f"({entry.get('operation')} / {entry.get('environment')}); "
-                f"occurrences unchanged at {result.occurrences}"
+                f"occurrences unchanged at {occurrences_then} ({as_of})"
             )
 
         evidence_id = self._projection_evidence_id(result.observation_id)
@@ -2260,16 +3013,33 @@ class RecurrenceGuard:
                         "observation_id": result.observation_id,
                         "disposition": result.disposition,
                         "counted": result.counted,
-                        "observations_recorded": entry.get("observations_recorded"),
-                        "occurrences": result.occurrences,
-                        "status": result.status,
-                        "retry_allowed": result.retry_allowed,
                         "error_class": entry.get("error_class"),
                         "diagnosis": entry.get("diagnosis"),
                         "owner": entry.get("owner"),
-                        "required_action": entry.get("required_action"),
                         "corrective_work_item": (corrective or {}).get("request_id"),
                         "projected_by_recovery": bool(recovery),
+                        # What this row asserts about counts and status, and when
+                        # those were true. Kept explicit so a reader never has to
+                        # guess whether a recovered row is history or the present.
+                        "occurrence_evidence": occurrence_evidence,
+                        "occurrence": occurrence_index,
+                        "occurrences": occurrences_then,
+                        "status": status_then,
+                        "retry_allowed": retry_allowed_then,
+                        "required_action": required_action_then,
+                        "observations_recorded": int(
+                            snapshot.get(
+                                "observations_recorded", entry.get("observations_recorded") or 0
+                            )
+                        ),
+                        "observed_at": (
+                            snapshot.get("observed_at")
+                            or (observation or {}).get("observed_at")
+                        ),
+                        # The request's state now, which a blocker written by this
+                        # same call describes.
+                        "occurrences_at_projection": int(entry.get("occurrences") or 0),
+                        "status_at_projection": str(entry.get("status") or ""),
                     },
                     default=str,
                 ),
@@ -2277,18 +3047,22 @@ class RecurrenceGuard:
             }
 
         try:
-            ledger.update_request(
-                request_id,
-                blocker=blocker,
-                next_action=next_action,
-                add_evidence=add_evidence,
-                actor="RecurrenceGuard",
-                reason=(
+            # The second durable authority, through the same write boundary as the
+            # store: everything this projection would persist into the ledger is
+            # redacted here, including text copied out of an entry an older build
+            # wrote unredacted.
+            update = redact_durable({
+                "blocker": blocker,
+                "next_action": next_action,
+                "add_evidence": add_evidence,
+                "actor": "RecurrenceGuard",
+                "reason": (
                     f"Recurrence projection recovery for observation {result.observation_id}"
                     if recovery
                     else f"Recurrence intake for observation {result.observation_id}"
                 ),
-            )
+            })
+            ledger.update_request(request_id, **update)
         except (KeyError, OSError, ValueError) as e:
             return {"recorded": False, "reason": f"{type(e).__name__}: {e}"}
         return {
@@ -2302,37 +3076,68 @@ class RecurrenceGuard:
             "reason": "applied by projection recovery" if recovery else "applied",
         }
 
-    def resync_ledger(self, ledger: Any = None) -> Dict[str, Any]:
+    def resync_ledger(
+        self,
+        ledger: Any = None,
+        include_suppressed: bool = False,
+        unsuppressed_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
-        Re-apply every ledger projection that never landed.
+        Re-apply every ledger projection that is still owed.
 
         The repair path for a crash between the store write and the ledger write.
-        Reads the store, finds each observation whose projection is still
-        unapplied and belongs to a request, and projects it again. Occurrences,
-        status and the retry gate are untouched: this replays a projection, it
-        does not re-observe a failure.
+        Reads the store, finds each observation whose projection state is
+        ``pending`` or ``failed``, and projects it again. Occurrences, status and
+        the retry gate are untouched: this replays a projection, it does not
+        re-observe a failure, and each replay reports the occurrence and status
+        that were true when that failure was observed rather than the ones that
+        are true now.
+
+        A projection the caller suppressed is **not** owed and is not repaired.
+        Reading "no ledger row" as "a row is missing" is what made a later resync
+        write the row that ``--no-ledger-update`` had refused. Projecting one
+        deliberately takes ``include_suppressed``, which is recorded on the
+        observation as an explicit act rather than a repair.
         """
         data = self.load()
-        outstanding: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+        outstanding: List[Tuple[Dict[str, Any], Dict[str, Any], str]] = []
+        skipped: List[Dict[str, Any]] = []
         for entry in data["signatures"].values():
             for obs in entry.get("observations") or []:
-                if (obs.get("ledger_projection") or {}).get("applied"):
+                state = self._projection_state(obs)
+                if state == PROJECTION_APPLIED or not obs.get("request_id"):
                     continue
-                if not obs.get("request_id"):
+                if state in PROJECTION_OUTSTANDING_STATES:
+                    outstanding.append((entry, obs, state))
                     continue
-                outstanding.append((entry, obs))
+                if state == PROJECTION_SUPPRESSED and include_suppressed:
+                    outstanding.append((entry, obs, state))
+                    continue
+                skipped.append(
+                    {
+                        "observation_id": str(obs.get("observation_id")),
+                        "request_id": str(obs.get("request_id")),
+                        "state": state,
+                        "reason": (obs.get("ledger_projection") or {}).get("reason"),
+                    }
+                )
 
         repaired: List[Dict[str, Any]] = []
-        for entry, obs in outstanding:
+        for entry, obs, state in outstanding:
+            snapshot = obs.get("at_observation") or {}
             result = IntakeResult(
                 signature=str(entry.get("signature") or ""),
                 observation_id=str(obs.get("observation_id")),
                 duplicate=True,
-                occurrences=int(entry.get("occurrences") or 0),
-                status=str(entry.get("status") or STATUS_OPEN),
-                previous_status=str(entry.get("status") or STATUS_OPEN),
-                retry_allowed=not bool(entry.get("retry_blocked")),
-                required_action=str(entry.get("required_action") or ""),
+                occurrences=int(snapshot.get("occurrences", entry.get("occurrences") or 0)),
+                status=str(snapshot.get("status", entry.get("status") or STATUS_OPEN)),
+                previous_status=str(snapshot.get("status", entry.get("status") or STATUS_OPEN)),
+                retry_allowed=bool(
+                    snapshot.get("retry_allowed", not bool(entry.get("retry_blocked")))
+                ),
+                required_action=str(
+                    snapshot.get("required_action", entry.get("required_action") or "")
+                ),
                 disposition=str(obs.get("disposition") or DEFAULT_DISPOSITION),
                 counted=bool(obs.get("counted", True)),
                 diagnosis_complete=bool(entry.get("diagnosis_complete")),
@@ -2343,12 +3148,19 @@ class RecurrenceGuard:
                 entry=entry,
                 result=result,
                 recovery=True,
+                observation=obs,
+                unsuppressed_by=(
+                    (unsuppressed_by or "resync-ledger --include-suppressed")
+                    if state == PROJECTION_SUPPRESSED
+                    else None
+                ),
             )
             repaired.append(
                 {
                     "observation_id": result.observation_id,
                     "request_id": str(obs["request_id"]),
                     "signature": result.signature,
+                    "from_state": state,
                     "recorded": bool((outcome or {}).get("recorded")),
                     "reason": (outcome or {}).get("reason"),
                     "blocker_set": bool((outcome or {}).get("blocker_set")),
@@ -2360,6 +3172,9 @@ class RecurrenceGuard:
             "recovered": sum(1 for r in repaired if r["recorded"]),
             "still_outstanding": [r for r in repaired if not r["recorded"]],
             "projections": repaired,
+            # Reported, never repaired: an operator can see exactly what was left
+            # alone and why, instead of a silent difference in the count.
+            "suppressed_skipped": skipped,
         }
 
 
@@ -2424,19 +3239,21 @@ class OfflineEscalationOutbox:
                 reason="Formatted and eligible; nothing written and nothing handed off.",
             )
         os.makedirs(os.path.dirname(self.outbox_path) or ".", exist_ok=True)
+        # The outbox file is a durable queue somebody else reads, so it gets the
+        # same write boundary as the store and the ledger. The event arrives
+        # already redacted; this covers the formatted message and an event that
+        # reached the sender from anywhere else.
+        record = redact_durable(
+            {
+                "at": _now(),
+                "message": message,
+                "event": (
+                    asdict(event) if hasattr(event, "__dataclass_fields__") else dict(event)
+                ),
+            }
+        )
         with open(self.outbox_path, "a", encoding="utf-8") as fh:
-            fh.write(
-                json.dumps(
-                    {
-                        "at": _now(),
-                        "message": message,
-                        "event": asdict(event) if hasattr(event, "__dataclass_fields__") else dict(event),
-                    },
-                    ensure_ascii=False,
-                    default=str,
-                )
-                + "\n"
-            )
+            fh.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
             fh.flush()
             os.fsync(fh.fileno())
         signature = ledger.record_dispatch(event)
@@ -2585,7 +3402,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     ca = sub.add_parser(
         "record-corrective-action",
-        help="Record (never execute) the systemic corrective action that unblocks retry.",
+        help="Record (never execute) the systemic corrective action that unblocks retry. "
+             "Exit 0 when the record opened the retry gate, 3 when it landed but the gate "
+             "stayed closed because the reference did not resolve or the proof is not bound "
+             "to it.",
     )
     ca.add_argument("--signature", required=True)
     ca.add_argument("--kind", required=True, choices=sorted(CORRECTIVE_ACTION_KINDS))
@@ -2594,10 +3414,11 @@ def build_parser() -> argparse.ArgumentParser:
     ca.add_argument(
         "--change-ref",
         required=True,
-        help="Verifiable reference to the systemic change: commit:<40-hex>, "
-             "pr:<owner>/<repo>#<n>, https://github.com/<owner>/<repo>/pull/<n>, "
-             "config:<path>#<key>, decision:<id> or test:<path>::<name>. Arbitrary text is "
-             "refused, because that is how 'retry later' cleared this gate.",
+        help="Reference to the systemic change: commit:<40-hex>, pr:<owner>/<repo>#<n>, "
+             "https://github.com/<owner>/<repo>/pull/<n>, config:<path>#<key>, decision:<id> "
+             "or test:<path>::<name>. Arbitrary text is refused. A reference that cannot be "
+             "resolved here - a pull request, or anything in an unreachable repository - is "
+             "recorded unverified and never opens the gate.",
     )
     ca.add_argument(
         "--scenario",
@@ -2619,12 +3440,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--evidence-exit-code",
         required=True,
         type=int,
-        help="The exit code that command returned.",
+        help="The exit code that command returned. Anything but 0 is the scenario still "
+             "failing, so the record lands and the gate stays closed.",
     )
     ca.add_argument(
         "--head-sha",
         required=True,
-        help="Full 40-character commit the evidence was exercised on.",
+        help="Full 40-character commit the evidence was exercised on. It must not be one of "
+             "the heads this failure was observed on, and for a commit reference it must "
+             "contain that commit.",
+    )
+    ca.add_argument(
+        "--verify-root",
+        default=None,
+        help="Repository to resolve the change reference and the evidence head against, when "
+             "the one recorded with the failure is gone (an ephemeral worktree, a rebuilt "
+             "checkout). It changes where the lookup happens, never whether one is required.",
     )
     ca.add_argument(
         "--authorization",
@@ -2674,13 +3505,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     rsy = sub.add_parser(
         "resync-ledger",
-        help="Re-apply every ledger projection that never landed (repair after a crash "
-             "between the store write and the ledger write). Adds no occurrence.",
+        help="Re-apply every ledger projection that is still owed (repair after a crash "
+             "between the store write and the ledger write). Adds no occurrence, and never "
+             "repairs a projection the caller suppressed.",
     )
     rsy.add_argument(
         "--strict",
         action="store_true",
         help="Exit 1 when a projection is still outstanding after the attempt.",
+    )
+    rsy.add_argument(
+        "--include-suppressed",
+        action="store_true",
+        help="Also project observations whose ledger write was explicitly suppressed. This "
+             "is a deliberate act, not a repair: it is recorded on each observation as "
+             "unsuppressed, with who asked for it.",
+    )
+    rsy.add_argument(
+        "--unsuppressed-by",
+        default=None,
+        help="Who is deliberately projecting a suppressed observation. Required with "
+             "--include-suppressed.",
     )
 
     dlv = sub.add_parser(
@@ -2827,22 +3672,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 head_sha=args.head_sha,
                 authorization=args.authorization,
                 request_id=args.request_id,
+                verification_root=args.verify_root,
             )
             action = out["action"]
+            gate = out["gate"]
             lines = [
                 f"signature      : {out['signature']}",
                 f"action         : {action['action_id']} ({action['kind']})",
+                f"recorded       : {out['recorded']}",
                 f"change ref     : {action['change_ref']} "
                 f"[{action['change_ref_form']}] verification={action['change_ref_verification']}",
                 f"scenario       : {action['scenario']}",
                 f"evidence       : {' '.join(action['evidence_command'])} "
                 f"-> exit {action['evidence_exit_code']} on {action['head_sha']}",
+                f"gate opened    : {gate['opened']}",
+                f"gate reason    : {gate['reason']}",
                 f"status         : {out['previous_status']} -> {out['status']}",
                 f"retry allowed  : {out['retry_allowed']}",
                 f"scope          : {action['verifies_nothing']}",
             ]
             _print(out, lines, args.summary)
-            return EXIT_OK
+            # The record landed either way. Exit 3 says the gate did not open, so a
+            # caller that was clearing a retry block is told, instead of reading a
+            # successful write as permission.
+            return EXIT_OK if gate["opened"] else EXIT_GATE_REFUSED
 
         if args.command == "resolve":
             out = guard.resolve(
@@ -2924,16 +3777,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return EXIT_OK
 
         if args.command == "resync-ledger":
-            out = guard.resync_ledger()
+            if args.include_suppressed and not str(args.unsuppressed_by or "").strip():
+                print(
+                    "--include-suppressed requires --unsuppressed-by: projecting an "
+                    "explicitly suppressed observation is a deliberate act and is recorded "
+                    "as one.",
+                    file=sys.stderr,
+                )
+                return EXIT_ERROR
+            out = guard.resync_ledger(
+                include_suppressed=args.include_suppressed,
+                unsuppressed_by=args.unsuppressed_by,
+            )
             lines = [
                 f"outstanding    : {out['outstanding']}",
                 f"recovered      : {out['recovered']}",
+                f"suppressed left: {len(out['suppressed_skipped'])}",
             ]
             for row in out["projections"]:
                 lines.append(
                     f"  {row['observation_id']} -> {row['request_id']} "
-                    f"recorded={row['recorded']} blocker_set={row['blocker_set']} "
-                    f"({row['reason']})"
+                    f"from={row['from_state']} recorded={row['recorded']} "
+                    f"blocker_set={row['blocker_set']} ({row['reason']})"
+                )
+            for row in out["suppressed_skipped"]:
+                lines.append(
+                    f"  {row['observation_id']} -> {row['request_id']} left alone "
+                    f"[{row['state']}] ({row['reason']})"
                 )
             _print(out, lines, args.summary)
             if args.strict and out["still_outstanding"]:
