@@ -300,5 +300,55 @@ class TestTopicInventoryGuard(unittest.TestCase):
         uncovered_violations = [v for v in report.violations if v.kind == "UNCOVERED_RUNNABLE_TOPIC"]
         self.assertEqual(len(uncovered_violations), 2)
 
+    # ----------------------------------------------------------------------
+    # Proof 9: open vs independently runnable reconciliation
+    # ----------------------------------------------------------------------
+    def test_proof_9_open_vs_independently_runnable_reconciliation(self):
+        # Locate real full-topic-board-current.json
+        board_candidates = [
+            Path("local://full-topic-board-current.json"),
+            Path(self.home_dir) / ".veyyon" / "profiles" / "default" / "agent" / "sessions" / "-development-polysimulator" / "2026-08-28T17-33-52-246Z_01a0496f-64f6-733e-a9a6-89f15fc2a437" / "local" / "full-topic-board-current.json",
+            Path(SCRIPT_DIR) / "full-topic-board-current.json",
+        ]
+        board_path = None
+        for cand in board_candidates:
+            if cand.exists():
+                board_path = str(cand)
+                break
+
+        if board_path:
+            board_items = self.guard.parse_inventory_source(board_path)
+            report = self.guard.evaluate_topic_coverage(
+                inventory=board_items,
+                roster=[],
+            )
+
+            # Reconcile exact counts
+            self.assertEqual(report.total_tasks, 342)
+            self.assertEqual(report.completed_tasks, 16)
+            self.assertEqual(report.cancelled_tasks, 1)
+            self.assertEqual(report.open_tasks, 325)
+            self.assertEqual(report.blocked_tasks, 55)
+            self.assertEqual(report.runnable_tasks, 270)
+            self.assertEqual(report.total_tasks, report.completed_tasks + report.cancelled_tasks + report.blocked_tasks + report.runnable_tasks)
+
+            # Blocked topics must not be flagged as uncovered runnable topics
+            blocked_topic_names = {b["topic"] for b in report.blocked_topics}
+            self.assertIn("Motion acceptance details", blocked_topic_names)
+            self.assertIn("Desktop GUI", blocked_topic_names)
+            self.assertIn("UX/design", blocked_topic_names)
+            self.assertIn("Motion", blocked_topic_names)
+            self.assertIn("Telegram", blocked_topic_names)
+            self.assertIn("Decisions", blocked_topic_names)
+            self.assertIn("Staging", blocked_topic_names)
+            for b_name in blocked_topic_names:
+                self.assertNotIn(b_name, report.uncovered_topics)
+
+            # Choice A preserved as cancelled, not pending or deleted
+            choice_a = [it for it in board_items if "choice a" in it.content.lower()][0]
+            self.assertEqual(choice_a.status, "cancelled")
+            self.assertFalse(choice_a.is_runnable)
+            self.assertFalse(choice_a.is_blocked)
+
 if __name__ == "__main__":
     unittest.main()

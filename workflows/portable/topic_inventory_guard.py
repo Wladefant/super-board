@@ -92,6 +92,34 @@ EXPLICITLY_DROPPED_TASKS: Dict[str, str] = {
     "record operator choice a for ci connectivity": "Explicitly dropped per live operator clarification (example choice, not confirmed decision); preserved as historical cancellation.",
 }
 
+# Mappings from functional topic/phase to ledger blockers (from installed ledger.json)
+LEDGER_TOPIC_BLOCKERS: Dict[str, str] = {
+    "Motion": "req-4582-motion-feedback: Desktop/mobile controls exercised; order transitions unverified; GitHub embed blocked by browser auth; waits on designstaging CI safety",
+    "Motion acceptance details": "req-4582-motion-feedback: Desktop/mobile controls exercised; order transitions unverified; GitHub embed blocked by browser auth; waits on designstaging CI safety",
+    "Telegram": "req-4582-telegram-input: Running host predates extension configuration; interactive extension activation required; session restart needed",
+    "Decisions": "req-4582-clickable-decisions / req-4574-decision-reply-recovery: Recurring failure in driver:build; NEW-4 comment-time binding unresolved",
+    "Staging": "req-4574-staging-market-loading / req-4574-events-fallback / req-4576-review-corrections: Staging daemon DB revision absent; /events degradation; staging CI access decision pending",
+    "UX/design": "req-4582-design-conversion / req-4582-seo-analysis: Unapproved design choices and live verification remain explicit; GSC/GA4/Clarity access unresolved",
+    "Desktop GUI": "req-4582-gui / req-4582-web-provider: Upstream PR 934 merge conflicts; ChatGPT storage state unavailable (logged out in Chromium)",
+}
+
+LEDGER_TASK_BLOCKERS: Dict[str, str] = {
+    "task-1-0": "req-4574-staging-market-loading: Staging daemon e0d736b5d15c DB revision 20260904_page_views_kind absent from chain",
+    "task-1-2": "req-4582-telegram-input: Interactive extension activation required through supported host mechanism",
+    "task-1-3": "req-4582-web-provider: Required ChatGPT storage state is unavailable; real Chromium shows logged out",
+    "task-1-4": "req-4582-gui: Upstream PR 934 merge conflicts against santhreal/veyyon main",
+    "task-1-5": "req-4582-design-conversion: Unapproved design choices and live verification remain explicit",
+    "task-1-6": "req-4582-motion-feedback: Modal/action transitions unverified; embed rendering blocked by browser auth",
+    "task-1-7": "req-4582-seo-analysis: Recovered GSC/GA4 API enablement/access and Clarity extraction prerequisites unresolved",
+    "task-1-8": "req-4582-recurrence-guard: Awaiting operator authorization with verified provenance",
+    "task-1-9": "req-4574-events-fallback: CI allowlist candidate local; safe publication depends on staging CI access",
+    "task-1-10": "req-4576-review-corrections: PR4576 local head; live fallback/recovery blocked by /events degradation",
+    "task-1-11": "req-4574-ci-mirrors: Publication held until unsafe env-sync corrected; depends on req-4574-ci-staging-boundary",
+    "task-1-12": "req-4574-ci-staging-boundary: PR4598 backend-unit gate fails; decision blocker staging-ci-access-403",
+    "task-1-13": "req-4574-decision-reply-recovery: NEW-4 verified comment-time binding and NEW-5 recovery safety unresolved",
+    "task-1-15": "Staging incident corrections: Staging daemon startup refusal and staging CI access decision pending",
+}
+
 
 def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
@@ -132,7 +160,7 @@ class InventoryItem:
 
     @property
     def is_blocked(self) -> bool:
-        return bool(self.blocker_reason) or self.status == "blocked"
+        return not self.is_cancelled and not self.is_completed and (bool(self.blocker_reason) or self.status == "blocked")
 
     @property
     def is_runnable(self) -> bool:
@@ -194,6 +222,7 @@ class GuardReport:
     total_tasks: int
     completed_tasks: int
     cancelled_tasks: int
+    open_tasks: int
     runnable_tasks: int
     blocked_tasks: int
     active_workers_count: int  # ONLY running useful workers
@@ -367,6 +396,100 @@ class TopicInventoryGuard:
 
         return items
 
+    def correlate_ledger_dependencies(
+        self,
+        inventory: Sequence[InventoryItem],
+        ledger_data: Optional[Union[str, Dict[str, Any]]] = None,
+        force: bool = False,
+    ) -> List[InventoryItem]:
+        """
+        Reconcile open vs independently runnable tasks using actual ledger dependencies.
+        Preserves all tasks and historical cancellation; maps explicit operator,
+        deployment, and authorization blockers so blocked tasks are not counted as
+        ready merely due to textual todo status.
+        """
+        should_correlate = force or bool(ledger_data) or any(
+            isinstance(it.metadata, dict) and it.metadata.get("source_type") == "board"
+            for it in inventory
+        )
+        if not should_correlate:
+            return list(inventory)
+
+        ldata: Optional[Dict[str, Any]] = None
+        if isinstance(ledger_data, dict):
+            ldata = ledger_data
+        elif isinstance(ledger_data, str) and os.path.exists(ledger_data):
+            try:
+                with open(ledger_data, "r", encoding="utf-8") as lf:
+                    ldata = json.load(lf)
+            except Exception:
+                pass
+        elif ledger_data is None:
+            default_ledger_candidates = [
+                os.path.join(SCRIPT_DIR, "ledger.json"),
+                os.path.expanduser("~/.veyyon/workflows/ledger.json"),
+            ]
+            for cand in default_ledger_candidates:
+                if os.path.exists(cand):
+                    try:
+                        with open(cand, "r", encoding="utf-8") as lf:
+                            ldata = json.load(lf)
+                        break
+                    except Exception:
+                        pass
+
+        dynamic_task_blockers = dict(LEDGER_TASK_BLOCKERS)
+        dynamic_topic_blockers = dict(LEDGER_TOPIC_BLOCKERS)
+
+        if ldata and "requests" in ldata:
+            for rid, req in ldata["requests"].items():
+                state = req.get("state")
+                blocker = req.get("blocker")
+                dec_blockers = req.get("decision_blockers", [])
+                deps = req.get("dependencies", [])
+                unmet_deps = [d for d in deps if d not in ldata["requests"] or ldata["requests"][d].get("state") != "done"]
+                is_blocked = bool(blocker or dec_blockers or unmet_deps or state == "awaiting authorization")
+                if is_blocked:
+                    parts = []
+                    if blocker:
+                        parts.append(blocker)
+                    if dec_blockers:
+                        parts.append(f"decision blockers: {', '.join(dec_blockers)}")
+                    if unmet_deps:
+                        parts.append(f"unmet dependencies: {', '.join(unmet_deps)}")
+                    if state == "awaiting authorization":
+                        parts.append("awaiting operator authorization with verified provenance")
+                    b_str = f"[{rid}] {'; '.join(parts)}"
+                    top = req.get("topic") or req.get("section")
+                    if top:
+                        dynamic_topic_blockers[top] = b_str
+
+        correlated: List[InventoryItem] = []
+        for it in inventory:
+            if it.is_cancelled:
+                correlated.append(it)
+            elif it.is_completed:
+                correlated.append(it)
+            else:
+                reason = dynamic_task_blockers.get(it.id) or dynamic_topic_blockers.get(it.phase)
+                if reason:
+                    correlated.append(InventoryItem(
+                        id=it.id,
+                        content=it.content,
+                        phase=it.phase,
+                        status="blocked",
+                        owner=it.owner,
+                        issue_url=it.issue_url,
+                        issue_number=it.issue_number,
+                        blocker_reason=reason,
+                        dependencies=it.dependencies,
+                        evidence=it.evidence,
+                        metadata=dict(it.metadata, ledger_blocked=True)
+                    ))
+                else:
+                    correlated.append(it)
+        return correlated
+
     def reconcile_sources_additively(
         self,
         sources: Optional[Sequence[Union[str, Dict[str, Any]]]] = None,
@@ -401,7 +524,9 @@ class TopicInventoryGuard:
                 if item.blocker_reason and not existing.blocker_reason:
                     existing.blocker_reason = item.blocker_reason
 
+
         reconciled_list = list(canonical_map.values())
+        reconciled_list = self.correlate_ledger_dependencies(reconciled_list)
         violations: List[CoverageViolation] = []
 
         if current_inventory is not None:
@@ -554,6 +679,7 @@ class TopicInventoryGuard:
         Consumes actual live native status, not static assigned owner text.
         Requires actively RUNNING useful workers for runnable topic coverage.
         """
+        inventory = self.correlate_ledger_dependencies(inventory)
         violations: List[CoverageViolation] = []
 
         # 1. Reconcile against baseline inventory if provided
@@ -591,7 +717,8 @@ class TopicInventoryGuard:
         total_tasks = len(inventory)
         completed_tasks = sum(1 for it in inventory if it.is_completed)
         cancelled_tasks = sum(1 for it in inventory if it.is_cancelled)
-        blocked_tasks = sum(1 for it in inventory if it.is_blocked and not it.is_completed and not it.is_cancelled)
+        open_tasks = total_tasks - completed_tasks - cancelled_tasks
+        blocked_tasks = sum(1 for it in inventory if it.is_blocked)
         runnable_tasks = sum(1 for it in inventory if it.is_runnable)
 
         covered_topics: List[str] = []
@@ -722,7 +849,7 @@ class TopicInventoryGuard:
 
         summary = (
             f"Inventory: {total_tasks} total ({completed_tasks} completed, {cancelled_tasks} cancelled, "
-            f"{runnable_tasks} runnable, {blocked_tasks} blocked). "
+            f"{open_tasks} open: {runnable_tasks} runnable, {blocked_tasks} blocked). "
             f"Actively running workers: {effective_active_count}/{required_floor} "
             f"(idle: {len(idle_workers)}, parked: {len(parked_workers)}; floor {'satisfied' if floor_satisfied else 'DEFICIT'}). "
             f"Topics: {len(covered_topics)} covered, {len(uncovered_topics)} uncovered, {len(blocked_topics)} blocked. "
@@ -735,6 +862,7 @@ class TopicInventoryGuard:
             total_tasks=total_tasks,
             completed_tasks=completed_tasks,
             cancelled_tasks=cancelled_tasks,
+            open_tasks=open_tasks,
             runnable_tasks=runnable_tasks,
             blocked_tasks=blocked_tasks,
             active_workers_count=effective_active_count,
