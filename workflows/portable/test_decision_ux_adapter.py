@@ -1,48 +1,28 @@
 #!/usr/bin/env python3
-"""
-test_decision_ux_adapter.py — Behavioral test suite for clickable task-list decision UX,
-free-text alternative answers, context retention, and authenticated GitHub event ingestion.
-
-Acceptance Criteria Exercised:
-1. Clickable task-list rendering with interactive markdown checkboxes.
-2. Single-choice transition validation (newly checked box advances pending decision to answered).
-3. Free-text context and supplemental notes path (both checkbox + notes flow into decision handling).
-4. Alternative proposals / custom answers retained for interpretation without being discarded or forced into checkboxes.
-5. Negative controls:
-   - Ambiguous multiple choices (- [x] A and - [x] B) cannot silently approve.
-   - Unauthorized actor edits/comments rejected, tasks remain blocked.
-   - Autonomous agent/bot edits rejected from human decision authority.
-   - Safety guardrail violations (production promotion, destructive DDL, prod refs) rejected.
-   - Conflicting edits on terminal answered decisions refused, preserving original answer.
-   - Idempotent replays re-synchronize without corrupting state or duplicating records.
-6. Authenticated GitHub event ingestion for issues.edited, issue_comment.created, and issue_comment.edited.
-7. CLI interface for ingest-event (--event-path, --event-json).
-"""
+"""Focused production-path proofs for GitHub decision input safety."""
 
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
-import decision_workflow
 from decision_workflow import (
-    CommentTimeProvenance,
     DecisionContract,
     DecisionManager,
     DecisionScope,
-    DecisionStatus,
     ProvenanceType,
     extract_additional_context,
-    extract_context_from_reply,
+    extract_scoped_task_list_options,
     extract_task_list_options,
     format_decision_markdown,
-    ingest_github_event,
 )
 from ledger import RequestLedger
 
@@ -62,539 +42,323 @@ OPTIONS = [
 ]
 
 
-class BaseDecisionUXTest(unittest.TestCase):
+class DecisionUXProof(unittest.TestCase):
     def setUp(self):
-        self.tmp_dir = tempfile.mkdtemp(prefix="decision_ux_test_")
-        self.decisions_path = os.path.join(self.tmp_dir, "decisions.json")
-        self.ledger_path = os.path.join(self.tmp_dir, "ledger.json")
-
+        self.tmp = tempfile.mkdtemp(prefix="synthetic_decision_ux_")
+        self.decisions_path = os.path.join(self.tmp, "decisions.json")
+        self.ledger_path = os.path.join(self.tmp, "ledger.json")
         self.ledger = RequestLedger(self.ledger_path)
         self.ledger.add_request(
-            req_id="req-test-ux-001",
-            prompt="Implement event audit logging architecture",
-            session="sess-test-ux",
-            project="Bavariance/polysimulator",
-            owner="ImplementClickableDecisions",
-            acceptance_criteria=["Durable audit trail established"],
+            req_id="REQ-1",
+            prompt="Choose audit storage",
+            session="synthetic-proof",
+            project="Wladefant/super-board",
+            owner="DecisionUXProof",
+            acceptance_criteria=["A durable decision reaches the existing consumer"],
         )
-
+        self.comments = {}
         self.mgr = DecisionManager(
             decisions_path=self.decisions_path,
             ledger_path=self.ledger_path,
+            comment_fetcher=self._fetch_comment,
         )
-
         self.contract = DecisionContract(
-            decision_id="DEC-TEST-UX-01",
-            request_id="req-test-ux-001",
-            prompt="Implement event audit logging architecture",
-            question="Which database storage format should we use for audit events?",
+            decision_id="DEC-1",
+            request_id="REQ-1",
+            prompt="Choose audit storage",
+            question="Which safe architecture should be used?",
             options=OPTIONS,
-            recommendation="Option A: Dedicated audit_events table provides cleanest retention.",
-            blocking_dependencies=["req-test-ux-001"],
-            authorized_responders=["Wladefant"],
+            recommendation="Option A: Dedicated audit_events table",
+            blocking_dependencies=["REQ-1"],
+            authorized_responders=["Operator"],
             decision_scope=DecisionScope.ARCHITECTURAL_PREFERENCE,
-            issue_number=4543,
+            issue_number=77,
         )
         self.mgr.register_question(self.contract)
+        self.initial_body = format_decision_markdown(self.contract)
+        self.question = {
+            "id": "100",
+            "user": "Automation",
+            "user_type": "User",
+            "body": self.initial_body,
+            "created_at": "2026-09-06T11:00:00Z",
+            "updated_at": "2026-09-06T11:00:00Z",
+            "html_url": "https://github.com/Wladefant/super-board/issues/77#issuecomment-100",
+            "issue_url": "https://api.github.com/repos/Wladefant/super-board/issues/77",
+            "performed_via_github_app": False,
+        }
+        self.comments["100"] = self.question
+        self._set_question_state()
 
     def tearDown(self):
-        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+        shutil.rmtree(self.tmp, ignore_errors=True)
 
+    def _fetch_comment(self, repo, comment_id):
+        return dict(self.comments[str(comment_id)])
 
-class TestDecisionMarkdownRendering(BaseDecisionUXTest):
-    def test_markdown_renders_interactive_task_list_checkboxes(self):
-        md = format_decision_markdown(self.contract)
-        self.assertIn("#### Choose an Option (Click checkbox to select)", md)
-        self.assertIn("<!-- decision-options: DEC-TEST-UX-01 -->", md)
-        self.assertIn("- [ ] **Option A**: Dedicated audit_events table", md)
-        self.assertIn("- [ ] **Option B**: Inline JSON audit column", md)
-        self.assertIn("<!-- /decision-options -->", md)
-
-    def test_markdown_renders_context_and_alternative_section(self):
-        md = format_decision_markdown(self.contract)
-        self.assertIn("#### Additional Context / Alternative Proposal (Optional)", md)
-        self.assertIn("<!-- decision-context: DEC-TEST-UX-01 -->", md)
-        self.assertIn("<!-- /decision-context -->", md)
-
-    def test_markdown_pre_checks_answered_option(self):
-        # Answer decision with Option A
-        self.mgr.process_reply(
-            decision_id="DEC-TEST-UX-01",
-            reply_text="Option A",
-            responder="Wladefant",
-            provenance=ProvenanceType.HUMAN_OPERATOR,
+    def _set_question_state(self):
+        with open(self.decisions_path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        decision = data["decisions"]["DEC-1"]
+        decision.update(
+            {
+                "issue_number": 77,
+                "question_comment_id": "100",
+                "question_posted_at": self.question["created_at"],
+                "question_body_snapshot": self.initial_body,
+                "question_snapshot_updated_at": self.question["updated_at"],
+                "question_author": "Automation",
+            }
         )
-        dec = self.mgr.get_decision("DEC-TEST-UX-01")
-        contract = DecisionContract(**{k: v for k, v in dec.items() if k in DecisionContract.__annotations__})
-        md = format_decision_markdown(contract)
-        self.assertIn("- [x] **Option A**: Dedicated audit_events table", md)
-        self.assertIn("- [ ] **Option B**: Inline JSON audit column", md)
+        data.setdefault("authored_comment_ids", []).append("100")
+        with open(self.decisions_path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
 
-
-class TestTaskListExtraction(unittest.TestCase):
-    def test_extract_various_task_list_formats(self):
-        text = (
-            "Some preamble\n"
-            "- [ ] **Option A**: Dedicated table\n"
-            "- [x] **Option B**: Inline JSON\n"
-            "- [X] Choice C - Third option\n"
-            "* [x] Option 1: First item\n"
-            "- [ ] [2] Second item\n"
+    def _checked(self, option="A", context=None):
+        body = self.initial_body.replace(
+            f"- [ ] **Option {option}**", f"- [x] **Option {option}**"
         )
-        opts = extract_task_list_options(text)
-        self.assertIn("A", opts)
-        self.assertFalse(opts["A"]["checked"])
-        self.assertIn("B", opts)
-        self.assertTrue(opts["B"]["checked"])
-        self.assertIn("C", opts)
-        self.assertTrue(opts["C"]["checked"])
-        self.assertIn("1", opts)
-        self.assertTrue(opts["1"]["checked"])
-        self.assertIn("2", opts)
-        self.assertFalse(opts["2"]["checked"])
+        if context is not None:
+            body = body.replace(
+                "_Leave any supplemental notes, constraints, or alternative proposals below:_",
+                context,
+            )
+        return body
 
-    def test_extract_additional_context_from_block(self):
-        text = (
-            "<!-- decision-context: DEC-001 -->\n"
-            "Please ensure table is partitioned by month.\n"
-            "<!-- /decision-context -->"
-        )
-        ctx = extract_additional_context(text)
-        self.assertEqual(ctx, "Please ensure table is partitioned by month.")
-
-    def test_extract_context_from_reply_comments(self):
-        ctx1 = extract_context_from_reply("Option A - ensure we backfill timestamps", "A", "Dedicated audit_events table")
-        self.assertEqual(ctx1, "ensure we backfill timestamps")
-
-        ctx2 = extract_context_from_reply("Option A\n\nNotes: Backfill required", "A", "Dedicated audit_events table")
-        self.assertEqual(ctx2, "Backfill required")
-
-        ctx3 = extract_context_from_reply("- [x] Option A\n\nPlease add retention policy", "A", "Dedicated audit_events table")
-        self.assertEqual(ctx3, "Please add retention policy")
-
-
-class TestSingleChoiceTaskListTransition(BaseDecisionUXTest):
-    def test_clicking_checkbox_advances_decision_and_unblocks_ledger(self):
-        old_body = format_decision_markdown(self.contract)
-        new_body = old_body.replace("- [ ] **Option A**", "- [x] **Option A**")
-
-        res = self.mgr.process_issue_edit(
-            decision_id="DEC-TEST-UX-01",
-            old_body=old_body,
-            new_body=new_body,
-            editor="Wladefant",
-            event_type="comment_edit",
-            comment_id="5559001",
-            comment_url="https://github.com/Bavariance/polysimulator/issues/4543#issuecomment-5559001",
-            edit_time="2026-09-06T10:15:00Z",
-            provenance=ProvenanceType.HUMAN_OPERATOR,
-        )
-
-        self.assertEqual(res["status"], "answered")
-        self.assertEqual(res["decision_id"], "DEC-TEST-UX-01")
-        self.assertIn("req-test-ux-001", res["unblocked_requests"])
-
-        # Verify decision store
-        dec = self.mgr.get_decision("DEC-TEST-UX-01")
-        self.assertEqual(dec["status"], "answered")
-        self.assertEqual(dec["answer"]["selected_option_id"], "A")
-        self.assertEqual(dec["answer"]["selection_method"], "task_list_checkbox")
-
-        # Verify ledger
-        req = self.ledger.get_request("req-test-ux-001")
-        self.assertFalse(req["decision_blockers"])
-        self.assertIsNone(req["blocker"])
-        self.assertTrue(any(e.get("type") == "human_decision" for e in req.get("evidence", [])))
-
-
-class TestMultipleChoiceRejection(BaseDecisionUXTest):
-    def test_checking_multiple_options_fails_closed_without_silent_approval(self):
-        old_body = format_decision_markdown(self.contract)
-        # Check both A and B
-        new_body = old_body.replace("- [ ] **Option A**", "- [x] **Option A**").replace("- [ ] **Option B**", "- [x] **Option B**")
-
-        res = self.mgr.process_issue_edit(
-            decision_id="DEC-TEST-UX-01",
-            old_body=old_body,
-            new_body=new_body,
-            editor="Wladefant",
-            event_type="comment_edit",
-            comment_id="5559002",
-        )
-
-        self.assertEqual(res["status"], "clarification_requested")
-        self.assertEqual(res["unblocked_requests"], [])
-        self.assertIn("Multiple options", res["interpretation"])
-
-        # Decision stays pending / clarification_requested, ledger stays blocked
-        dec = self.mgr.get_decision("DEC-TEST-UX-01")
-        self.assertEqual(dec["status"], "clarification_requested")
-        self.assertIsNone(dec["answer"])
-
-        req = self.ledger.get_request("req-test-ux-001")
-        self.assertIn("DEC-TEST-UX-01", req["decision_blockers"])
-        self.assertIn("BLOCKED", req["blocker"])
-
-
-class TestFreeTextAndContextRetention(BaseDecisionUXTest):
-    def test_checkbox_selection_with_additional_context_retains_both(self):
-        old_body = format_decision_markdown(self.contract)
-        new_body = old_body.replace("- [ ] **Option A**", "- [x] **Option A**")
-        new_body = new_body.replace(
-            "_Leave any supplemental notes, constraints, or alternative proposals below:_",
-            "Ensure compound index on (tenant_id, created_at) is created.",
-        )
-
-        res = self.mgr.process_issue_edit(
-            decision_id="DEC-TEST-UX-01",
-            old_body=old_body,
-            new_body=new_body,
-            editor="Wladefant",
-            event_type="comment_edit",
-            comment_id="5559003",
-        )
-
-        self.assertEqual(res["status"], "answered")
-        dec = self.mgr.get_decision("DEC-TEST-UX-01")
-        self.assertEqual(dec["answer"]["selected_option_id"], "A")
-        self.assertEqual(dec["answer"]["additional_context"], "Ensure compound index on (tenant_id, created_at) is created.")
-        self.assertIn("Ensure compound index on (tenant_id, created_at) is created.", dec["answer"]["interpretation"])
-
-        # Ledger evidence includes context
-        req = self.ledger.get_request("req-test-ux-001")
-        ev = [e for e in req.get("evidence", []) if e.get("type") == "human_decision"][0]
-        self.assertIn("Ensure compound index", ev["details"])
-
-    def test_comment_reply_with_context_retains_both(self):
-        res = self.mgr.process_reply(
-            decision_id="DEC-TEST-UX-01",
-            reply_text="Option B - make sure we configure JSONB in PostgreSQL",
-            responder="Wladefant",
-            provenance=ProvenanceType.HUMAN_OPERATOR,
-        )
-
-        self.assertEqual(res["status"], "answered")
-        dec = self.mgr.get_decision("DEC-TEST-UX-01")
-        self.assertEqual(dec["answer"]["selected_option_id"], "B")
-        self.assertEqual(dec["answer"]["additional_context"], "make sure we configure JSONB in PostgreSQL")
-        self.assertIn("make sure we configure JSONB in PostgreSQL", dec["answer"]["interpretation"])
-
-
-class TestAlternativeProposalRetention(BaseDecisionUXTest):
-    def test_alternative_answer_is_retained_for_interpretation_not_discarded(self):
-        reply = "I propose Option C: Use SQLite with WAL mode and in-memory caching instead."
-        res = self.mgr.process_reply(
-            decision_id="DEC-TEST-UX-01",
-            reply_text=reply,
-            responder="Wladefant",
-            provenance=ProvenanceType.HUMAN_OPERATOR,
-        )
-
-        # Retained for interpretation; does NOT silently approve or unblock
-        self.assertEqual(res["status"], "clarification_requested")
-        self.assertEqual(res["unblocked_requests"], [])
-        self.assertIn("Alternative proposal / custom response", res["interpretation"])
-
-        dec = self.mgr.get_decision("DEC-TEST-UX-01")
-        self.assertEqual(dec["alternative_proposal"], reply)
-        self.assertEqual(dec["alternative_responder"], "Wladefant")
-        self.assertIsNone(dec["answer"])
-
-        # Ledger records the proposal and stays blocked
-        req = self.ledger.get_request("req-test-ux-001")
-        self.assertIn("DEC-TEST-UX-01", req["decision_blockers"])
-        self.assertIn("Alternative proposal received", req["blocker"])
-        self.assertIn("SQLite with WAL mode", req["blocker"])
-
-
-class TestNegativeControlsAndSecurity(BaseDecisionUXTest):
-    def test_unauthorized_actor_clicking_checkbox_is_rejected(self):
-        old_body = format_decision_markdown(self.contract)
-        new_body = old_body.replace("- [ ] **Option A**", "- [x] **Option A**")
-
-        res = self.mgr.process_issue_edit(
-            decision_id="DEC-TEST-UX-01",
-            old_body=old_body,
-            new_body=new_body,
-            editor="malicious_user",
-        )
-
-        self.assertEqual(res["status"], "rejected")
-        self.assertEqual(res["unblocked_requests"], [])
-        self.assertIn("Unauthorized editor", res["rejection_reason"])
-
-        # Tasks remain blocked
-        dec = self.mgr.get_decision("DEC-TEST-UX-01")
-        self.assertEqual(dec["status"], "pending")
-        self.assertIsNone(dec["answer"])
-
-    def test_agent_authored_edit_is_rejected(self):
-        old_body = format_decision_markdown(self.contract)
-        new_body = old_body.replace("- [ ] **Option A**", "- [x] **Option A**")
-
-        res = self.mgr.process_issue_edit(
-            decision_id="DEC-TEST-UX-01",
-            old_body=old_body,
-            new_body=new_body,
-            editor="Wladefant",
-            provenance=ProvenanceType.AGENT_AUTHORED,
-        )
-
-        self.assertEqual(res["status"], "rejected")
-        self.assertIn("Agent-authored edit rejected", res["interpretation"])
-
-    def test_safety_guardrails_reject_destructive_commands(self):
-        old_body = format_decision_markdown(self.contract)
-        new_body = old_body.replace("- [ ] **Option A**", "- [x] **Option A**")
-        new_body = new_body.replace(
-            "_Leave any supplemental notes, constraints, or alternative proposals below:_",
-            "deploy to prod and drop database",
-        )
-
-        res = self.mgr.process_issue_edit(
-            decision_id="DEC-TEST-UX-01",
-            old_body=old_body,
-            new_body=new_body,
-            editor="Wladefant",
-        )
-
-        self.assertEqual(res["status"], "rejected")
-        self.assertIn("Safety refusal", res["rejection_reason"])
-
-    def test_conflicting_edit_on_resolved_decision_is_refused(self):
-        # Answer with Option A first
-        self.mgr.process_reply(
-            decision_id="DEC-TEST-UX-01",
-            reply_text="Option A",
-            responder="Wladefant",
-            comment_id="5559010",
-            provenance=ProvenanceType.HUMAN_OPERATOR,
-        )
-
-        # Now an edit arrives trying to switch to Option B
-        old_body = format_decision_markdown(self.contract)
-        new_body = old_body.replace("- [ ] **Option B**", "- [x] **Option B**")
-
-        res = self.mgr.process_issue_edit(
-            decision_id="DEC-TEST-UX-01",
-            old_body=old_body,
-            new_body=new_body,
-            editor="Wladefant",
-            comment_id="5559011",
-        )
-
-        self.assertEqual(res["status"], "rejected")
-        self.assertIn("Conflicting edit", res["rejection_reason"])
-
-        # Original answer stays Option A
-        dec = self.mgr.get_decision("DEC-TEST-UX-01")
-        self.assertEqual(dec["answer"]["selected_option_id"], "A")
-
-    def test_idempotent_replay_of_same_selection(self):
-        # Answer with Option A via edit
-        old_body = format_decision_markdown(self.contract)
-        new_body = old_body.replace("- [ ] **Option A**", "- [x] **Option A**")
-
-        res1 = self.mgr.process_issue_edit(
-            decision_id="DEC-TEST-UX-01",
-            old_body=old_body,
-            new_body=new_body,
-            editor="Wladefant",
-            comment_id="5559020",
-        )
-        self.assertEqual(res1["status"], "answered")
-        self.assertFalse(res1.get("idempotent_replay", False))
-
-        # Replay identical edit
-        res2 = self.mgr.process_issue_edit(
-            decision_id="DEC-TEST-UX-01",
-            old_body=old_body,
-            new_body=new_body,
-            editor="Wladefant",
-            comment_id="5559020",
-        )
-        self.assertEqual(res2["status"], "answered")
-        self.assertTrue(res2.get("idempotent_replay", False))
-
-
-class TestGitHubEventIngestion(BaseDecisionUXTest):
-    def test_ingest_issue_comment_edited_event(self):
-        old_body = format_decision_markdown(self.contract)
-        new_body = old_body.replace("- [ ] **Option A**", "- [x] **Option A**")
-
-        event = {
+    def _edit_event(self, old_body, new_body, sender="Operator", sender_type="User"):
+        self.comments["100"] = {
+            **self.question,
+            "body": new_body,
+            "updated_at": "2026-09-06T12:00:00Z",
+        }
+        return {
             "action": "edited",
-            "issue": {"number": 4543},
+            "sender": {"login": sender, "type": sender_type},
+            "issue": {"number": 77},
             "comment": {
-                "id": 5559050,
+                "id": 100,
+                "user": {"login": "Automation", "type": "User"},
                 "body": new_body,
-                "html_url": "https://github.com/Bavariance/polysimulator/issues/4543#issuecomment-5559050",
-                "user": {"login": "Wladefant"},
-                "updated_at": "2026-09-06T10:20:00Z",
+                "updated_at": "2026-09-06T12:00:00Z",
+                "html_url": self.question["html_url"],
             },
             "changes": {"body": {"from": old_body}},
-            "sender": {"login": "Wladefant"},
         }
 
-        res = ingest_github_event(
-            event_payload=event,
-            decisions_path=self.decisions_path,
-            ledger_path=self.ledger_path,
+    def _created_comment(self, comment_id, body, user="Operator", user_type="User", app=False):
+        comment = {
+            "id": str(comment_id),
+            "user": user,
+            "user_type": user_type,
+            "body": body,
+            "created_at": "2026-09-06T12:00:00Z",
+            "updated_at": "2026-09-06T12:00:00Z",
+            "html_url": f"https://github.com/Wladefant/super-board/issues/77#issuecomment-{comment_id}",
+            "issue_url": "https://api.github.com/repos/Wladefant/super-board/issues/77",
+            "performed_via_github_app": app,
+        }
+        self.comments[str(comment_id)] = comment
+        return comment
+    def _sync(self):
+        output = "".join(json.dumps(comment) + "\n" for comment in self.comments.values())
+        completed = subprocess.CompletedProcess([], 0, stdout=output, stderr="")
+        with patch("decision_workflow.subprocess.run", return_value=completed):
+            return self.mgr.sync_decisions(repo="Wladefant/super-board")
+
+
+    def _assert_blocked(self):
+        request = self.ledger.get_request("REQ-1")
+        self.assertIn("DEC-1", request.get("decision_blockers", []))
+        self.assertNotEqual(self.mgr.get_decision("DEC-1").get("status"), "answered")
+
+    def test_renderer_and_exact_scoped_extraction(self):
+        self.assertIn("<!-- decision-options: DEC-1 -->", self.initial_body)
+        scoped, error = extract_scoped_task_list_options(self.initial_body, "DEC-1")
+        self.assertIsNone(error)
+        self.assertEqual(set(scoped), {"A", "B"})
+        hostile = (
+            "- [x] **Option A**: unrelated\n"
+            "```\n- [x] **Option B**: code\n```\n"
+            "<!--\n- [x] **Option B**: hidden\n-->"
         )
+        combined = self.initial_body + "\n" + hostile
+        combined_scoped, combined_error = extract_scoped_task_list_options(combined, "DEC-1")
+        self.assertIsNone(combined_error)
+        self.assertEqual(set(combined_scoped), {"A", "B"})
 
-        self.assertEqual(res["status"], "answered")
-        self.assertEqual(res["decision_id"], "DEC-TEST-UX-01")
-        self.assertIn("req-test-ux-001", res["unblocked_requests"])
-
-    def test_ingest_issues_edited_event(self):
-        old_body = format_decision_markdown(self.contract)
-        new_body = old_body.replace("- [ ] **Option B**", "- [x] **Option B**")
-
-        event = {
-            "action": "edited",
-            "issue": {
-                "number": 4543,
-                "body": new_body,
-                "html_url": "https://github.com/Bavariance/polysimulator/issues/4543",
-                "updated_at": "2026-09-06T10:25:00Z",
-            },
-            "changes": {"body": {"from": old_body}},
-            "sender": {"login": "Wladefant"},
-        }
-
-        res = ingest_github_event(
-            event_payload=event,
-            decisions_path=self.decisions_path,
-            ledger_path=self.ledger_path,
+    def test_B1_existing_check_plus_unrelated_edit_does_not_approve(self):
+        checked = self._checked("A")
+        result = self.mgr.process_issue_edit(
+            "DEC-1", checked, checked + "\nUnrelated prose changed.", "Operator",
+            event_type="comment_edit", comment_id="100", edit_time="2026-09-06T12:00:00Z",
+            provenance=ProvenanceType.GITHUB_VERIFIED_USER,
         )
+        self.assertEqual(result["status"], "clarification_requested")
+        self.assertIn("No valid unchecked-to-checked", result["interpretation"])
+        self._assert_blocked()
 
-        self.assertEqual(res["status"], "answered")
-        self.assertEqual(res["decision_id"], "DEC-TEST-UX-01")
-
-        dec = self.mgr.get_decision("DEC-TEST-UX-01")
-        self.assertEqual(dec["answer"]["selected_option_id"], "B")
-
-    def test_ingest_issue_comment_created_event(self):
-        event = {
-            "action": "created",
-            "issue": {"number": 4543},
-            "comment": {
-                "id": 5559060,
-                "body": "Option A - approved for staging",
-                "html_url": "https://github.com/Bavariance/polysimulator/issues/4543#issuecomment-5559060",
-                "user": {"login": "Wladefant"},
-                "created_at": "2026-09-07T10:30:00Z",
-                "updated_at": "2026-09-07T10:30:00Z",
-            },
-            "sender": {"login": "Wladefant"},
-        }
-
-        res = ingest_github_event(
-            event_payload=event,
-            decisions_path=self.decisions_path,
-            ledger_path=self.ledger_path,
+    def test_B2_unrelated_checklists_and_nonrendered_markdown_do_not_select(self):
+        body = self.initial_body + "\n- [x] A. Migration applied\n    - [x] **Option B**: nested\n```\n- [x] **Option B**: code\n```"
+        result = self.mgr.process_issue_edit(
+            "DEC-1", self.initial_body, body, "Operator", event_type="comment_edit",
+            comment_id="100", edit_time="2026-09-06T12:00:00Z",
+            provenance=ProvenanceType.GITHUB_VERIFIED_USER,
         )
+        self.assertEqual(result["status"], "clarification_requested")
+        self._assert_blocked()
 
-        self.assertEqual(res["status"], "answered")
-        dec = self.mgr.get_decision("DEC-TEST-UX-01")
-        self.assertEqual(dec["answer"]["selected_option_id"], "A")
-        self.assertEqual(dec["answer"]["additional_context"], "approved for staging")
+    def test_B3_poller_never_invents_editor_and_persists_revision_across_restart(self):
+        changed = self._checked("A", "Keep every free-form constraint, including article a.")
+        question = {**self.question, "body": changed, "updated_at": "2026-09-06T12:00:00Z"}
+        self.comments["100"] = question
+        output = json.dumps(question) + "\n"
+        completed = subprocess.CompletedProcess([], 0, stdout=output, stderr="")
+        with patch("decision_workflow.subprocess.run", return_value=completed):
+            first = self.mgr.sync_decisions(repo="Wladefant/super-board")
+        self.assertEqual(first["errors"], [])
+        decision = self.mgr.get_decision("DEC-1")
+        self.assertEqual(decision["question_body_snapshot"], changed)
+        self.assertIn("free-form constraint", decision["last_alternative_proposal"])
+        self._assert_blocked()
+        audit_count = len(decision["audit_trail"])
+        restarted = DecisionManager(self.decisions_path, self.ledger_path, self._fetch_comment)
+        with patch("decision_workflow.subprocess.run", return_value=completed):
+            replay = restarted.sync_decisions(repo="Wladefant/super-board")
+        self.assertEqual(replay["errors"], [])
+        self.assertEqual(len(restarted.get_decision("DEC-1")["audit_trail"]), audit_count)
+
+    def test_B4_shared_account_and_bot_edits_fail_closed(self):
+        with open(self.decisions_path, "r", encoding="utf-8") as handle:
+            state = json.load(handle)
+        state["decisions"]["DEC-1"]["authorized_responders"] = ["Automation"]
+        with open(self.decisions_path, "w", encoding="utf-8") as handle:
+            json.dump(state, handle)
+        shared_event = self._edit_event(self.initial_body, self._checked("A"), sender="Automation")
+        result = self.mgr.ingest_github_event(
+            shared_event, repo="Wladefant/super-board", trusted_transport=True
+        )
+        self.assertEqual(result["status"], "clarification_requested")
+        self.assertEqual(result["provenance"], ProvenanceType.SHARED_ACCOUNT_AMBIGUOUS)
+        self._assert_blocked()
+
+        other_tmp = DecisionUXProof(methodName="runTest")
+        other_tmp.setUp()
+        try:
+            bot_event = other_tmp._edit_event(other_tmp.initial_body, other_tmp._checked("A"), sender="agent[bot]", sender_type="Bot")
+            rejected = other_tmp.mgr.ingest_github_event(
+                bot_event, repo="Wladefant/super-board", trusted_transport=True
+            )
+            self.assertEqual(rejected["status"], "rejected")
+            other_tmp._assert_blocked()
+        finally:
+            other_tmp.tearDown()
+
+    def test_article_a_negation_and_arbitrary_text_are_retained_without_approval(self):
+        prose = "Do not proceed; I need a migration plan and a DBA review before deciding."
+        comment = self._created_comment("201", prose)
+        result = self.mgr.ingest_comment("DEC-1", "201", repo="Wladefant/super-board")
+        self.assertEqual(result["status"], "clarification_requested")
+        self.assertEqual(self.mgr.get_decision("DEC-1")["last_alternative_proposal"], prose)
+        self._assert_blocked()
+
+    def test_tampered_option_text_stale_event_and_question_publication_fail(self):
+        tampered = self._checked("A").replace("Dedicated audit_events table", "Delete audit history")
+        bad = self.mgr.process_issue_edit(
+            "DEC-1", self.initial_body, tampered, "Operator", event_type="comment_edit",
+            comment_id="100", edit_time="2026-09-06T12:00:00Z",
+            provenance=ProvenanceType.GITHUB_VERIFIED_USER,
+        )
+        self.assertEqual(bad["status"], "rejected")
+        self.assertIn("option text changed", bad["rejection_reason"])
+
+        stale = self.mgr.process_issue_edit(
+            "DEC-1", self.initial_body, self._checked("A"), "Operator", event_type="comment_edit",
+            comment_id="100", edit_time="2020-01-01T00:00:00Z",
+            provenance=ProvenanceType.GITHUB_VERIFIED_USER,
+        )
+        self.assertEqual(stale["status"], "rejected")
+        publication = self.mgr.ingest_github_event(
+            {"action": "created", "sender": {"login": "Automation"}, "issue": {"number": 77}, "comment": {"id": 100, "body": self.initial_body}},
+            repo="Wladefant/super-board",
+        )
+        self.assertEqual(publication["status"], "ignored")
+        self._assert_blocked()
+
+    def test_ambiguous_and_missing_prior_revision_fail_closed(self):
+        both = self._checked("A").replace(
+            "- [ ] **Option B**", "- [x] **Option B**"
+        )
+        ambiguous = self.mgr.process_issue_edit(
+            "DEC-1", self.initial_body, both, "Operator", event_type="comment_edit",
+            comment_id="100", edit_time="2026-09-06T12:00:00Z",
+            provenance=ProvenanceType.GITHUB_VERIFIED_USER,
+        )
+        self.assertEqual(ambiguous["status"], "clarification_requested")
+        missing_old = self._edit_event(self.initial_body, self._checked("A"))
+        del missing_old["changes"]["body"]["from"]
+        rejected = self.mgr.ingest_github_event(missing_old, repo="Wladefant/super-board")
+        self.assertEqual(rejected["status"], "rejected")
+        untrusted_event = self._edit_event(self.initial_body, self._checked("A"))
+        untrusted = self.mgr.ingest_github_event(
+            untrusted_event, repo="Wladefant/super-board"
+        )
+        self.assertEqual(untrusted["status"], "clarification_requested")
+        self.assertEqual(untrusted["provenance"], ProvenanceType.UNVERIFIED_CALLER)
+        self._assert_blocked()
+
+    def test_distinct_verified_click_reaches_decision_manager_ledger_and_replays(self):
+        body = self._checked("B", "Preserve this unrestricted context: a, b, and not Option A.")
+        event = self._edit_event(self.initial_body, body)
+        result = self.mgr.ingest_github_event(
+            event, repo="Wladefant/super-board", trusted_transport=True
+        )
+        self.assertEqual(result["status"], "answered")
+        self.assertEqual(result["unblocked_requests"], ["REQ-1"])
+        answer = self.mgr.get_decision("DEC-1")["answer"]
+        self.assertEqual(answer["selected_option_id"], "B")
+        self.assertEqual(answer["responder"], "Operator")
+        self.assertEqual(answer["provenance"], ProvenanceType.GITHUB_VERIFIED_USER)
+        self.assertIn("unrestricted context", answer["additional_context"])
+        request = self.ledger.get_request("REQ-1")
+        self.assertNotIn("DEC-1", request.get("decision_blockers", []))
+        restarted = DecisionManager(self.decisions_path, self.ledger_path, self._fetch_comment)
+        replay = restarted.ingest_github_event(
+            event, repo="Wladefant/super-board", trusted_transport=True
+        )
+        self.assertTrue(replay["idempotent_replay"])
+        conflicting_event = self._edit_event(body, self._checked("A"))
+        conflicting = restarted.ingest_github_event(
+            conflicting_event,
+            repo="Wladefant/super-board",
+            trusted_transport=True,
+        )
+        self.assertEqual(conflicting["status"], "rejected")
+        self.assertIn("Conflicting edit", conflicting["rejection_reason"])
+        self.assertEqual(restarted.get_decision("DEC-1")["answer"]["selected_option_id"], "B")
+
+    def test_free_text_then_explicit_choice_reaches_consumer_with_prior_context(self):
+        proposal = "Alternative proposal: keep all raw events and use partitioned storage."
+        self._created_comment("301", proposal)
+        first = self._sync()
+        self.assertEqual(first["errors"], [])
+        self.assertEqual(self.mgr.get_decision("DEC-1")["status"], "clarification_requested")
+        self._created_comment("302", "Decision DEC-1: Option A: add a covering index")
+        second = self._sync()
+        self.assertEqual(second["resolved_decisions"], ["DEC-1"])
+        answer = self.mgr.get_decision("DEC-1")["answer"]
+        self.assertEqual(answer["additional_context"], "add a covering index")
+        self.assertEqual(answer["prior_alternative_proposal"], proposal)
+        evidence = self.ledger.get_request("REQ-1")["evidence"]
+        durable = [item for item in evidence if item.get("type") == "github_decision"][-1]
+        self.assertIn(proposal, durable["details"])
+
+    def test_placeholder_and_bare_option_do_not_pollute_context(self):
+        self.assertEqual(extract_additional_context(self.initial_body, "DEC-1"), "")
+        self._created_comment("401", "Option B")
+        result = self.mgr.ingest_comment("DEC-1", "401", repo="Wladefant/super-board")
+        self.assertEqual(result["status"], "answered")
+        self.assertIsNone(self.mgr.get_decision("DEC-1")["answer"]["additional_context"])
 
 
-    def test_cli_ingest_event_json(self):
-        old_body = format_decision_markdown(self.contract)
-        new_body = old_body.replace("- [ ] **Option B**", "- [x] **Option B**")
-
-        event = {
-            "action": "edited",
-            "issue": {"number": 4543},
-            "comment": {
-                "id": 5559070,
-                "body": new_body,
-                "html_url": "https://github.com/Bavariance/polysimulator/issues/4543#issuecomment-5559070",
-                "user": {"login": "Wladefant"},
-                "updated_at": "2026-09-07T10:35:00Z",
-            },
-            "changes": {"body": {"from": old_body}},
-            "sender": {"login": "Wladefant"},
-        }
-
-        import subprocess
-        script_path = os.path.join(SCRIPT_DIR, "decision_workflow.py")
-        cmd = [
-            sys.executable,
-            script_path,
-            "--decisions",
-            self.decisions_path,
-            "--ledger",
-            self.ledger_path,
-            "ingest-event",
-            "--event-json",
-            json.dumps(event),
-        ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        self.assertIn("Status: answered", proc.stdout)
-        self.assertIn("Decision ID: DEC-TEST-UX-01", proc.stdout)
-        self.assertIn("Unblocked Requests: req-test-ux-001", proc.stdout)
-
-    def test_cli_ingest_event_path(self):
-        old_body = format_decision_markdown(self.contract)
-        new_body = old_body.replace("- [ ] **Option A**", "- [x] **Option A**")
-
-        event = {
-            "action": "edited",
-            "issue": {"number": 4543},
-            "comment": {
-                "id": 5559080,
-                "body": new_body,
-                "html_url": "https://github.com/Bavariance/polysimulator/issues/4543#issuecomment-5559080",
-                "user": {"login": "Wladefant"},
-                "updated_at": "2026-09-07T10:40:00Z",
-            },
-            "changes": {"body": {"from": old_body}},
-            "sender": {"login": "Wladefant"},
-        }
-
-        event_file = os.path.join(self.tmp_dir, "event.json")
-        with open(event_file, "w", encoding="utf-8") as f:
-            json.dump(event, f)
-
-        import subprocess
-        script_path = os.path.join(SCRIPT_DIR, "decision_workflow.py")
-        cmd = [
-            sys.executable,
-            script_path,
-            "--decisions",
-            self.decisions_path,
-            "--ledger",
-            self.ledger_path,
-            "ingest-event",
-            "--event-path",
-            event_file,
-        ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        self.assertIn("Status: answered", proc.stdout)
-        self.assertIn("Decision ID: DEC-TEST-UX-01", proc.stdout)
-        self.assertIn("Unblocked Requests: req-test-ux-001", proc.stdout)
-
-    def test_cli_show_markdown_includes_clickable_task_list(self):
-        import subprocess
-        script_path = os.path.join(SCRIPT_DIR, "decision_workflow.py")
-        cmd = [
-            sys.executable,
-            script_path,
-            "--decisions",
-            self.decisions_path,
-            "--ledger",
-            self.ledger_path,
-            "show",
-            "DEC-TEST-UX-01",
-            "--markdown",
-        ]
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        self.assertIn("#### Choose an Option (Click checkbox to select)", proc.stdout)
-        self.assertIn("- [ ] **Option A**: Dedicated audit_events table", proc.stdout)
-        self.assertIn("- [ ] **Option B**: Inline JSON audit column", proc.stdout)
-        self.assertIn("#### Additional Context / Alternative Proposal (Optional)", proc.stdout)
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2)

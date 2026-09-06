@@ -163,9 +163,25 @@ class DecisionLifecycleTestBase(unittest.TestCase):
 
     def _set_question_posted(self, timestamp: str, comment_id: str = "9000"):
         raw = self._raw_store()
-        raw["decisions"][self.DEC_ID]["question_posted_at"] = timestamp
-        raw["decisions"][self.DEC_ID]["question_comment_id"] = comment_id
+        decision = raw["decisions"][self.DEC_ID]
+        decision["question_posted_at"] = timestamp
+        decision["question_comment_id"] = comment_id
+        decision["question_author"] = "DecisionAutomation"
         self._write_store(raw)
+        self.comments[str(comment_id)] = {
+            "id": str(comment_id),
+            "user": "DecisionAutomation",
+            "user_type": "User",
+            "body": "",
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "html_url": (
+                f"https://github.com/{self.REPO}/issues/{self.ISSUE_NUMBER}"
+                f"#issuecomment-{comment_id}"
+            ),
+            "issue_url": f"https://api.github.com/repos/{self.REPO}/issues/{self.ISSUE_NUMBER}",
+            "performed_via_github_app": False,
+        }
 
     def _raw_store(self):
         with open(self.decisions_path, "r", encoding="utf-8") as f:
@@ -885,23 +901,19 @@ class TestVerifiedAnswerTimeProvenance(DecisionLifecycleTestBase):
         self.assertIn("Stale reply", res["rejection_reason"])
         self.assertIsNone(self._decision()["answer"])
 
-    def test_an_api_response_without_a_creation_time_records_no_proof(self):
+    def test_an_api_response_without_a_creation_time_fails_closed(self):
         self._add_comment("7005", "Option A", created_at=None)
         res = self.mgr.ingest_comment(decision_id=self.DEC_ID, comment_id="7005", repo=self.REPO)
-        self.assertEqual(res["status"], "answered")
+        self.assertEqual(res["status"], "rejected")
+        self.assertIn("no valid API-verified creation timestamp", res["rejection_reason"])
+        self.assertIsNone(self._decision()["answer"])
 
-        ans = self._decision()["answer"]
-        self.assertIsNone(ans["comment_created_at"])
-        self.assertEqual(ans["comment_created_at_source"], CommentTimeProvenance.MISSING)
-
-    def test_a_timezone_naive_api_creation_time_records_no_proof(self):
+    def test_a_timezone_naive_api_creation_time_fails_closed(self):
         self._add_comment("7006", "Option A", created_at="2026-09-02T11:00:00")
         res = self.mgr.ingest_comment(decision_id=self.DEC_ID, comment_id="7006", repo=self.REPO)
-        self.assertEqual(res["status"], "answered")
-
-        ans = self._decision()["answer"]
-        self.assertIsNone(ans["comment_created_at"], "an unorderable instant proves nothing")
-        self.assertEqual(ans["comment_created_at_source"], CommentTimeProvenance.MALFORMED)
+        self.assertEqual(res["status"], "rejected")
+        self.assertIn("no valid API-verified creation timestamp", res["rejection_reason"])
+        self.assertIsNone(self._decision()["answer"])
 
     def test_ingest_refuses_a_caller_creation_time_the_api_contradicts(self):
         self._add_comment("7007", "Option A", created_at=AFTER_QUESTION)
