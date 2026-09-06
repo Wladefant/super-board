@@ -739,13 +739,14 @@ class ContinuationDriver:
     @staticmethod
     def _decision_is_authorized_answer(dec: Mapping[str, Any]) -> bool:
         """
-        True only for an answer from a distinct authorized GitHub user event.
+        True only for an answer from a distinct authorized GitHub user event or
+        verified Telegram callback.
 
         Requires all of: status "answered", an answer payload,
-        github_verified_user provenance, not flagged as a test, a non-empty
-        interpretation, and a responder on the decision's authorized list.
-        Legacy human_operator, synthetic, ambiguous, and unverified provenance
-        remain blocking.
+        github_verified_user or telegram_verified_callback provenance, not
+        flagged as a test, a non-empty interpretation, and a responder on the
+        decision's authorized list. Legacy human_operator, synthetic,
+        ambiguous, and unverified provenance remain blocking.
         """
         if dec.get("status") != "answered":
             return False

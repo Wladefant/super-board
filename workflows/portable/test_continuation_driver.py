@@ -626,6 +626,14 @@ class TestDecisionGating(_Fixture):
         self.assertTrue(adapter.calls, "an answered decision did not unblock the request")
         self.assertEqual(self.ledger.get_request("req-dec")["state"], "awaiting authorization")
 
+    def test_authorized_telegram_callback_answer_unblocks(self):
+        self._add("req-dec")
+        mgr = FakeDecisionManager([_answered_decision(provenance="telegram_verified_callback")])
+        adapter = self._adapter(decision_mgr=mgr)
+        self._driver(adapter, ["req-dec"]).run()
+        self.assertTrue(adapter.calls, "an answered telegram callback did not unblock the request")
+        self.assertEqual(self.ledger.get_request("req-dec")["state"], "awaiting authorization")
+
     def test_only_a_genuine_authorized_answer_counts(self):
         """
         Every weaker shape the decision workflow exists to reject must keep the
@@ -638,6 +646,11 @@ class TestDecisionGating(_Fixture):
             "unauthorized responder": _answered_decision(responder="RandomPerson"),
             "empty interpretation": _answered_decision(interpretation="   "),
             "still pending": _pending_decision(),
+            "unverified telegram callback": _answered_decision(provenance="telegram_unverified_callback"),
+            "untrusted provenance": _answered_decision(provenance="untrusted_input"),
+            "telegram callback synthetic test": _answered_decision(provenance="telegram_verified_callback", is_test=True),
+            "telegram callback unauthorized responder": _answered_decision(provenance="telegram_verified_callback", responder="RandomPerson"),
+            "telegram callback empty interpretation": _answered_decision(provenance="telegram_verified_callback", interpretation="   "),
         }
         for label, decision in cases.items():
             with self.subTest(label):
@@ -646,8 +659,17 @@ class TestDecisionGating(_Fixture):
                     f"{label} was accepted as an authorized answer",
                 )
         self.assertTrue(
-            ContinuationDriver._decision_is_authorized_answer(_answered_decision()))
-
+            ContinuationDriver._decision_is_authorized_answer(
+                _answered_decision(provenance="github_verified_user")
+            ),
+            "github_verified_user was rejected as an authorized answer",
+        )
+        self.assertTrue(
+            ContinuationDriver._decision_is_authorized_answer(
+                _answered_decision(provenance="telegram_verified_callback")
+            ),
+            "telegram_verified_callback was rejected as an authorized answer",
+        )
     def test_bounded_recheck_resumes_only_on_a_real_answer(self):
         """The re-check is finite and resumes on a genuine answer, without polling."""
         self._add("req-dec")
