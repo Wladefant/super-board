@@ -125,6 +125,14 @@ TERMINAL_STATES = ("awaiting authorization", "integration", "live verification",
 #: Adapter statuses that end a request's participation in this run.
 PARK_STATUSES = ("blocked", "error", "awaiting_authorization")
 
+#: Park codes that mean a real, operator-actionable failure rather than an
+#: expected stop. A run that ends on one of these exits non-zero.
+FAILED_PARK_CODES = ("blocked", "error", "recurrence_blocked")
+
+#: Adapter statuses whose failure is worth remembering across runs, so a second
+#: identical one stops being retried blind.
+OBSERVABLE_FAILURE_STATUSES = ("blocked", "error")
+
 #: A bounded decision re-check may never become a tight poll. Even a caller
 #: asking for a 1-second interval waits this long.
 MIN_DECISION_SYNC_INTERVAL = 15.0
@@ -537,6 +545,125 @@ class ContinuationDriver:
         except Exception:
             return None
 
+    # -- recurrence memory -------------------------------------------------
+    #
+    # Owned by recurrence_guard.py and soft-imported, so a partial export still
+    # drives. What the driver asks of it is deliberately narrow: remember a
+    # failure, and refuse a retry that already failed for the same reason twice.
+    # It adds no eligibility logic and never overrides a gate.
+
+    def _recurrence_guard(self) -> Any:
+        try:
+            from recurrence_guard import RecurrenceGuard
+        except ImportError:
+            return None
+        return RecurrenceGuard(state_dir=self.state_dir)
+
+    def _recurrence_refusal(self, request_id: str) -> Optional[str]:
+        """
+        Why this request must not be dispatched again unchanged, or None.
+
+        An unreadable recurrence history is itself a refusal: a failure record
+        that cannot be read must not be mistaken for an absence of failures.
+        """
+        guard = self._recurrence_guard()
+        if guard is None:
+            return None
+        try:
+            decision = guard.check_retry(request_id=request_id)
+        except Exception as e:
+            return (
+                f"The recurrence history governing unchanged retry is unreadable "
+                f"({type(e).__name__}: {e}). Repair it rather than dispatching blind."
+            )
+        if decision.allowed:
+            return None
+        return f"{decision.reason} {decision.required_action}".strip()
+
+    def _observe_failure(
+        self,
+        request_id: str,
+        stage: str,
+        status: str,
+        reason: str,
+        head: Optional[str],
+        run_id: str,
+        native_run_id: Optional[str] = None,
+        error_class: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Record one observed stage failure so a later run can refuse to repeat it.
+
+        Whose failure this is decides the identity, and getting that wrong is how
+        one real failure became several.
+
+        When the step reports a native background attempt, the failure *is* that
+        attempt's outcome, not a separate driver-level event: the worker already
+        recorded it. The driver therefore ingests it under the attempt's own
+        identity - the same operation, the same fault class and the same
+        observation id the worker derived from the run id - so the guard
+        recognises it as the event it already holds. That is what stops one native
+        failure from counting twice (once as `worker:<stage>`, once as
+        `driver:<stage>`, with two ledger evidence rows), and it is what stops a
+        driver whose journal was lost from turning repeated re-reads of one
+        completed ticket into fresh occurrences that close the gate and open a
+        corrective item for failures that never happened.
+
+        Without a native attempt, the failure is genuinely the driver's own - the
+        adapter raised, or reported a status with no attempt behind it - and the
+        identity has to distinguish a real second dispatch from a re-ingestion of
+        the first. `run_id` alone cannot: it is a second-resolution timestamp plus
+        a pid, so two runs inside one second in one process share it and the
+        second failure would be swallowed as a duplicate. The journal's
+        append-only attempt list gives a durable, monotonic dispatch ordinal that
+        survives restart, which is exactly the identity of "this dispatch and no
+        other".
+        """
+        guard = self._recurrence_guard()
+        if guard is None:
+            return None
+        # The request already carries the session and the authoritative issue link;
+        # both belong in an escalation so the notification owner can correlate it
+        # without re-deriving either.
+        req = self._load_request(request_id) or {}
+        observation_id = None
+        operation = f"driver:{stage}"
+        attempt = None
+        if native_run_id:
+            try:
+                from recurrence_guard import native_attempt_observation_id
+
+                observation_id = native_attempt_observation_id(native_run_id)
+                operation = f"worker:{stage}"
+                attempt = native_run_id
+            except Exception:
+                observation_id = None
+        if attempt is None:
+            ordinal = len((self.journal.data.get("stage_attempts") or {}).get(request_id) or [])
+            attempt = f"{run_id}|dispatch-{ordinal}"
+        try:
+            result = guard.observe(
+                environment="harness",
+                operation=operation,
+                error=reason or f"adapter reported '{status}' with no reason",
+                source="continuation_driver",
+                request_id=request_id,
+                head_sha=head,
+                stage=stage,
+                attempt=attempt,
+                observation_id=observation_id,
+                explicit_error_class=error_class,
+                detail=f"adapter_status={status}",
+                repo_root=getattr(self.adapter, "repo_root", None),
+                canonical_link=(req.get("github") or {}).get("issue_url"),
+                session=req.get("session"),
+                ledger=self.ledger,
+            )
+        except Exception as e:
+            # Advisory memory never converts a real failure into a different one.
+            return {"recorded": False, "reason": f"{type(e).__name__}: {e}"}
+        return result.to_dict()
+
     # -- state observation -------------------------------------------------
 
     def _load_request(self, request_id: str) -> Optional[Dict[str, Any]]:
@@ -855,6 +982,18 @@ class ContinuationDriver:
                             active.remove(rid)
                             continue
 
+                    # Recurrence gate, checked before dispatch for the same reason as
+                    # the decision gate: a step that already failed twice for one
+                    # reason would spend a worker reproducing it.
+                    recurrence_refusal = self._recurrence_refusal(rid)
+                    if recurrence_refusal:
+                        rec = ParkRecord(rid, "recurrence_blocked", recurrence_refusal,
+                                         stage=stage, head=entry_head)
+                        self.journal.park(rec)
+                        parked.append(rec.to_dict())
+                        active.remove(rid)
+                        continue
+
                     before = self._fingerprint(req)
 
                     # --- the one and only dispatch: the adapter's own step ---
@@ -868,6 +1007,10 @@ class ContinuationDriver:
                         rec = ParkRecord(rid, "error",
                                          f"adapter.run_step raised for '{rid}' at stage '{stage}': "
                                          f"{type(e).__name__}: {e}", stage=stage, head=entry_head)
+                        self._observe_failure(
+                            request_id=rid, stage=stage, status="error",
+                            reason=rec.reason, head=entry_head, run_id=run_id,
+                        )
                         self.journal.park(rec)
                         parked.append(rec.to_dict())
                         active.remove(rid)
@@ -893,6 +1036,18 @@ class ContinuationDriver:
                     worker_artifacts = _attr(worker, "artifacts", []) if worker is not None else []
                     if not isinstance(worker_artifacts, list):
                         worker_artifacts = []
+                    # The failing attempt's own identity, when the step ran one. The
+                    # journal is not consulted for it: a lost journal must not turn a
+                    # re-read of one completed attempt into a new occurrence.
+                    worker_evidence = _attr(worker, "evidence", None) if worker is not None else None
+                    if not isinstance(worker_evidence, Mapping):
+                        worker_evidence = {}
+                    native_run_id = str(
+                        (_attr(worker, "native_run_id", None) if worker is not None else None)
+                        or worker_evidence.get("native_run_id")
+                        or ""
+                    ) or None
+                    native_error_class = worker_evidence.get("failure_error_class") or None
 
                     after_req = self._load_request(rid)
                     after = self._fingerprint(after_req)
@@ -953,6 +1108,15 @@ class ContinuationDriver:
                         code = "awaiting_authorization" if status == "awaiting_authorization" else status
                         rec = ParkRecord(rid, code, reason or f"Adapter reported '{status}'.",
                                          stage=stage, head=entry_head)
+                        if status in OBSERVABLE_FAILURE_STATUSES:
+                            # A native attempt owns its own identity; only a failure
+                            # with no attempt behind it is identified by this run.
+                            self._observe_failure(
+                                request_id=rid, stage=stage, status=status,
+                                reason=rec.reason, head=entry_head, run_id=run_id,
+                                native_run_id=native_run_id,
+                                error_class=native_error_class,
+                            )
                         self.journal.park(rec)
                         parked.append(rec.to_dict())
                         active.remove(rid)
@@ -1071,6 +1235,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Dry-run Telegram notification (default: True unless --telegram-send)")
     p.add_argument("--telegram-send", dest="telegram_send", action="store_true", default=False,
                    help="Send live Telegram notification")
+    p.add_argument("--telegram-pool-db", dest="telegram_pool_db", default=None,
+                   help="Path to the shared bot_pool.db holding the outbound message correlation "
+                        "index (default: VEYYON_POOL_DB, else the installed pool when it exists)")
     p.add_argument("--show-parked", action="store_true",
                    help="Print the journal's parked requests and exit.")
     p.add_argument("--unpark", action="append", default=[], dest="unpark",
@@ -1219,6 +1386,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         "telegram_dry_run": bool(telegram_dry_run),
         "telegram_send": bool(args.telegram_send and not args.telegram_dry_run),
     }
+    # Passed only when named, so the driver still loads against an installed adapter
+    # that predates the argument; unset means the adapter resolves the pool itself.
+    if args.telegram_pool_db:
+        adapter_kwargs["telegram_pool_db"] = args.telegram_pool_db
 
     if not args.no_real_worker:
         try:
@@ -1265,7 +1436,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(format_outcome(outcome))
 
     failed_attempt = any(
-        parked.get("reason_code") in ("blocked", "error")
+        parked.get("reason_code") in FAILED_PARK_CODES
         for parked in outcome.parked
     )
     return 1 if outcome.error or failed_attempt else 0

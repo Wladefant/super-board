@@ -72,7 +72,18 @@ try:
     )
     from project_adapter import ProjectConfig, get_current_project_config, set_current_project_config
     from github_pr_gate import PRGateEvaluation, evaluate_pr_gate
-    from telegram_notifier import NotificationEvent, TelegramNotificationAdapter
+    from telegram_notifier import (
+        NotificationEvent,
+        OutboundCorrelationStore,
+        TelegramNotificationAdapter,
+    )
+    # The check-expectation contract, not a backend instance. The backend itself
+    # stays duck-typed on purpose (see self.worker_backend), but the question
+    # "are these checks advanceable evidence?" must have exactly one answer:
+    # a second local implementation of it here is what let a completion be
+    # accepted by the backend, refused by this adapter, and still reported as
+    # advanced.
+    from worker_backend import CheckExpectationVerdict, evaluate_check_expectations
 except ImportError as e:
     raise ImportError(f"superboard_adapter failed to import sibling portable modules: {e}")
 
@@ -100,6 +111,21 @@ class WorkerExecutionResult:
     evidence: Dict[str, Any] = field(default_factory=dict)
 
     @property
+    def check_expectations(self) -> CheckExpectationVerdict:
+        """
+        The shared check-expectation verdict for this result's reported checks.
+
+        Delegated to worker_backend.evaluate_check_expectations so the adapter and
+        the backend that produced the result cannot disagree about whether a
+        packet of checks is evidence. Expected-failure controls are retained with
+        their observed exit codes intact; a mismatch, an unclassified failure or a
+        packet without a successful verification check is refused here for the
+        same stated reason the backend gives.
+        """
+        checks = self.evidence.get("checks") if isinstance(self.evidence, dict) else None
+        return evaluate_check_expectations(checks)
+
+    @property
     def is_verifiable_evidence(self) -> bool:
         """
         True only for a successful real-backend execution carrying structured evidence.
@@ -107,28 +133,51 @@ class WorkerExecutionResult:
         Fixtures and probes are excluded by construction: no amount of fixture output
         may be read as proof that real work happened.
         """
-        checks = self.evidence.get("checks") if isinstance(self.evidence, dict) else None
-        checks_are_genuine = bool(checks) and all(
-            isinstance(check, dict)
-            and isinstance(check.get("command"), list)
-            and bool(check.get("command"))
-            and isinstance(check.get("exit_code"), int)
-            and check.get("exit_code") == 0
-            and bool(str(check.get("observed") or "").strip())
-            for check in checks
-        )
         return (
             not self.is_fixture
             and not self.is_probe
             and not self.is_pending
             and self.blocked_reason is None
             and self.exit_code == 0
-            and checks_are_genuine
+            and self.check_expectations.ok
         )
+
+    @property
+    def evidence_refusal(self) -> Optional[str]:
+        """
+        Why this result may not advance the request, or None when it may.
+
+        The reason is the actionable one, naming the provenance that disqualified
+        the result or the exact check-expectation rule it broke. It used to be the
+        blanket "no structured evidence", which was untrue of a result that
+        carried checks and only told the operator to look in the wrong place.
+        """
+        if self.is_fixture:
+            return (
+                f"fixture result '{self.fixture_label or 'unlabelled'}' is not evidence "
+                "of real execution"
+            )
+        if self.is_probe:
+            return "safe probe proves dispatch plumbing only, not the acceptance criteria"
+        if self.is_pending:
+            return (
+                f"native dispatch is {self.pending_state or 'pending'} and has delivered no "
+                "completion yet"
+            )
+        if self.blocked_reason is not None:
+            return self.blocked_reason
+        if self.exit_code != 0:
+            return f"worker execution exited {self.exit_code}"
+        verdict = self.check_expectations
+        if not verdict.ok:
+            return verdict.reason or "reported checks are not acceptable evidence"
+        return None
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
         d["is_verifiable_evidence"] = self.is_verifiable_evidence
+        d["check_expectations"] = self.check_expectations.to_dict()
+        d["evidence_refusal"] = self.evidence_refusal
         return d
 
 
@@ -175,6 +224,7 @@ class SuperboardExecutionAdapter:
         telegram_project: Optional[str] = None,
         telegram_dry_run: Optional[bool] = None,
         telegram_send: bool = False,
+        telegram_pool_db: Optional[str] = None,
         dry_run: bool = False,
         repo_root: Optional[str] = None,
         worker_backend: Optional[Any] = None,
@@ -191,6 +241,11 @@ class SuperboardExecutionAdapter:
         self.notify_telegram = notify_telegram
         self.telegram_project = telegram_project
         self.telegram_send = telegram_send
+        # Shared correlation index a reply to a notification is resolved through. None
+        # defers to the same resolution the session bridge uses (VEYYON_POOL_DB, else
+        # the installed pool when present), so a reply to an adapter notification is
+        # routable by default instead of requiring an opt-in nobody sets.
+        self.telegram_pool_db = telegram_pool_db
         if telegram_dry_run is not None:
             self.telegram_dry_run = telegram_dry_run
         else:
@@ -208,6 +263,7 @@ class SuperboardExecutionAdapter:
                 telegram_project=self.telegram_project,
                 telegram_dry_run=self.telegram_dry_run,
                 telegram_send=self.telegram_send,
+                telegram_pool_db=self.telegram_pool_db,
             )
 
         if self.coordinator.project_config:
@@ -596,8 +652,19 @@ class SuperboardExecutionAdapter:
         reason: str,
         head_sha: Optional[str] = None,
         command: Optional[List[str]] = None,
+        native_run_id: Optional[str] = None,
+        evidence: Optional[Dict[str, Any]] = None,
     ) -> WorkerExecutionResult:
-        """A dispatch that could not really run. Never carries advanceable evidence."""
+        """
+        A dispatch that could not really run. Never carries advanceable evidence.
+
+        It does carry the failing attempt's identity when the backend reported one.
+        Dropping it made a native failure look anonymous downstream, so the driver
+        recorded the same attempt a second time under its own run identity and a
+        re-read of the completed ticket counted as another occurrence. Identity is
+        not advanceable evidence: `blocked_reason` still refuses the step, and
+        `is_verifiable_evidence` stays false because the exit code is non-zero.
+        """
         return WorkerExecutionResult(
             stage=stage,
             exit_code=1,
@@ -605,7 +672,9 @@ class SuperboardExecutionAdapter:
             head_sha=head_sha,
             command=command or [],
             is_fixture=False,
+            native_run_id=native_run_id,
             blocked_reason=reason,
+            evidence=dict(evidence or {}),
         )
 
     def dispatch_via_backend(
@@ -693,13 +762,16 @@ class SuperboardExecutionAdapter:
             if ticket.blocked_reason:
                 return self._blocked_result(
                     stage, ticket.blocked_reason, head_sha=ticket.head_sha or expected_sha,
+                    native_run_id=ticket.run_id,
                 )
             if ticket.state in ("finalized", "blocked") and hasattr(
                 self.worker_backend, "get_native_outcome"
             ):
                 outcome = self.worker_backend.get_native_outcome(ticket.run_id)
                 if outcome is not None:
-                    return self._worker_result_from_outcome(outcome, stage, expected_sha)
+                    return self._worker_result_from_outcome(
+                        outcome, stage, expected_sha, native_run_id=ticket.run_id
+                    )
             return WorkerExecutionResult(
                 stage=stage,
                 exit_code=0,
@@ -724,7 +796,11 @@ class SuperboardExecutionAdapter:
         return self._worker_result_from_outcome(outcome, stage, expected_sha)
 
     def _worker_result_from_outcome(
-        self, outcome: Any, stage: str, expected_sha: Optional[str]
+        self,
+        outcome: Any,
+        stage: str,
+        expected_sha: Optional[str],
+        native_run_id: Optional[str] = None,
     ) -> WorkerExecutionResult:
         """Translate a validated backend outcome without replacing backend validation."""
         def field_of(name: str, default: Any = None) -> Any:
@@ -742,11 +818,18 @@ class SuperboardExecutionAdapter:
         exit_code = int(exit_code) if isinstance(exit_code, int) else (0 if ok else 1)
         artifacts = list(field_of("artifacts") or [])
         if not ok:
+            # The backend records the failing attempt's identity and fault class on
+            # the outcome, so the seams downstream of here observe the one attempt
+            # rather than inventing a second identity for it.
             return self._blocked_result(
                 stage,
                 blocked_reason or f"Worker backend '{backend_name}' reported failure for stage '{stage}'",
                 head_sha=observed_sha,
                 command=command,
+                native_run_id=native_run_id or (
+                    evidence.get("native_run_id") if isinstance(evidence, dict) else None
+                ),
+                evidence=evidence if isinstance(evidence, dict) else None,
             )
         if stage in ("qa", "review") and expected_sha and observed_sha != expected_sha:
             return self._blocked_result(
@@ -935,18 +1018,15 @@ class SuperboardExecutionAdapter:
             gate_result["reproduction_scenario"] = scenario
             gate_result["bug_closure"] = closure_reason
 
-        # Provenance gate: simulated or probe output is not evidence about this request.
+        # Provenance and check-expectation gate. Simulated or probe output is not
+        # evidence about this request, and neither is a real run whose checks do not
+        # satisfy the shared contract. The reason is the backend's own, so the
+        # operator is pointed at the check that refused rather than at a blanket
+        # claim that no evidence arrived.
         if not worker_res.is_verifiable_evidence:
-            if worker_res.is_fixture:
-                why = (
-                    f"fixture result '{worker_res.fixture_label or 'unlabelled'}' is not evidence "
-                    "of real execution"
-                )
-            elif worker_res.is_probe:
-                why = "safe probe proves dispatch plumbing only, not the acceptance criteria"
-            else:
-                why = "worker returned no structured evidence"
+            why = worker_res.evidence_refusal or "result is not advanceable evidence"
             gate_result["advance_refused"] = why
+            gate_result["check_expectations"] = worker_res.check_expectations.to_dict()
             return (
                 req_state,
                 f"Stage '{stage}' did not advance: {why}. Request remains in '{req_state}'.",
@@ -973,10 +1053,17 @@ class SuperboardExecutionAdapter:
                 gate_result,
             )
 
-        # Update evidence in ledger
+        expectations = worker_res.check_expectations
+        gate_result["check_expectations"] = expectations.to_dict()
+
+        # Update evidence in ledger. The note states what was actually credited:
+        # how many verification checks succeeded and how many expected-failure
+        # controls were retained beside them.
         evidence_note = (
             f"{stage} verified via {worker_res.backend_name or 'worker execution'} "
-            f"on commit {worker_res.head_sha or 'unknown'}"
+            f"on commit {worker_res.head_sha or 'unknown'} "
+            f"({expectations.verifications_passed} verification check(s) passed, "
+            f"{expectations.controls_retained} expected-outcome control(s) retained)"
         )
         if stage == "build":
             # Advance: implementation -> QA
@@ -1055,6 +1142,54 @@ class SuperboardExecutionAdapter:
 
         return req_state, f"Stage {stage} concluded with state {req_state}", gate_result
 
+    def _resolve_request_session(
+        self,
+        req: Optional[Union[RequestSummary, Dict[str, Any]]],
+        req_id: Optional[str],
+    ) -> Optional[str]:
+        """Originating session of a request, from the request itself or from the ledger.
+
+        This is what lets a reply to the notification reach the session that owns the
+        request. It deliberately never falls back to the session currently holding the
+        Telegram bot lease: that session may own nothing related to this request, so an
+        unresolved identity must leave the notification uncorrelated rather than hand an
+        unrelated active session someone else's reply.
+        """
+        if req is not None:
+            direct = (
+                getattr(req, "session", None)
+                or getattr(req, "session_id", None)
+                or (req.get("session") if isinstance(req, dict) else None)
+                or (req.get("session_id") if isinstance(req, dict) else None)
+            )
+            if direct:
+                return str(direct)
+
+        ledger = getattr(getattr(self, "coordinator", None), "ledger", None)
+        if req_id and ledger is not None and hasattr(ledger, "get_request"):
+            try:
+                record = ledger.get_request(req_id)
+            except Exception:
+                record = None
+            if record is not None:
+                for key in ("session", "session_id"):
+                    value = record.get(key) if isinstance(record, dict) else getattr(record, key, None)
+                    if value:
+                        return str(value)
+
+        return None
+
+    def _correlation_store(self) -> OutboundCorrelationStore:
+        """Correlation index every notification this adapter delivers is recorded in.
+
+        Without one, a reply to a Superboard notification is refused by the session
+        bridge as unknown, so this is not an optional extra: the default has to resolve
+        to the same pool the bridge reads.
+        """
+        return OutboundCorrelationStore(
+            Path(self.telegram_pool_db) if self.telegram_pool_db else None
+        )
+
     def emit_telegram_event(
         self,
         req: Optional[Union[RequestSummary, Dict[str, Any]]],
@@ -1092,9 +1227,13 @@ class SuperboardExecutionAdapter:
             summary=summary,
             canonical_link=link,
             metadata=metadata,
+            session_id=self._resolve_request_session(req, req_id),
         )
 
-        adapter = TelegramNotificationAdapter(state_dir_override=Path(self.state_dir))
+        adapter = TelegramNotificationAdapter(
+            state_dir_override=Path(self.state_dir),
+            correlation_store=self._correlation_store(),
+        )
         # Preserve safe dry-run by default unless configured opt-in; explicit --telegram-send must actually send, never combine silently with dry-run
         if self.telegram_dry_run is True and not self.telegram_send:
             dry_run_mode = True
@@ -1122,7 +1261,10 @@ class SuperboardExecutionAdapter:
                     ledger_req = self.coordinator.ledger.get_request(req_id)
                 except (KeyError, Exception):
                     ledger_req = None
-        adapter = TelegramNotificationAdapter(state_dir_override=Path(self.state_dir))
+        adapter = TelegramNotificationAdapter(
+            state_dir_override=Path(self.state_dir),
+            correlation_store=self._correlation_store(),
+        )
         event = adapter.from_decision(
             decision,
             project_override=self.project_config.project_name or self.project_config.repo,
@@ -1359,18 +1501,44 @@ class SuperboardExecutionAdapter:
                 notification_receipt=receipt,
                 boundaries=boundaries,
             )
-        status = "advanced"
+        # The status must describe what happened to the request, not merely that the
+        # dispatch process exited cleanly. A refused gate leaves the ledger where it
+        # was, so reporting "advanced" told the driver the step had made progress it
+        # had not made; the driver then parked the request as 'no_progress' with its
+        # own generic message and the real refusal never reached the operator.
         board_update = (gate_result or {}).get("board_update") or {}
+        gate_verified = bool((gate_result or {}).get("verified"))
+        refusal = next(
+            (
+                str((gate_result or {}).get(key))
+                for key in ("advance_refused", "repro_refused")
+                if (gate_result or {}).get(key)
+            ),
+            None,
+        )
         if board_update.get("status") == "blocked":
             status = "blocked"
             transition_reason = (
                 f"{transition_reason}; Project V2 lifecycle synchronization blocked: "
                 f"{board_update.get('blocked_reason') or 'unknown board error'}"
             )
-        elif new_state == "awaiting authorization":
-            status = "awaiting_authorization"
         elif worker_res.exit_code != 0:
             status = "error"
+        elif not gate_verified:
+            status = "blocked"
+        elif new_state == "awaiting authorization":
+            status = "awaiting_authorization"
+        else:
+            status = "advanced"
+
+        if status == "awaiting_authorization":
+            next_action = "Awaiting human merge authorization"
+        elif status == "advanced":
+            next_action = f"Continue execution in {new_state}"
+        elif refusal:
+            next_action = f"Resolve the refused {stage} gate: {refusal}"
+        else:
+            next_action = f"Resolve the blocked {stage} step before continuing"
 
         return AdapterExecutionResult(
             step_id=step_id,
@@ -1378,7 +1546,7 @@ class SuperboardExecutionAdapter:
             stage=stage,
             status=status,
             status_reason=transition_reason,
-            next_action=f"Continue execution in {new_state}" if status != "awaiting_authorization" else "Awaiting human merge authorization",
+            next_action=next_action,
             preflight_passed=True,
             dispatch_packet=dispatch_packet.to_dict(),
             worker_result=worker_res,
@@ -1401,6 +1569,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--notify-telegram", action="store_true", help="Enable Telegram notifications")
     parser.add_argument("--telegram-dry-run", dest="telegram_dry_run", action="store_true", default=None, help="Dry-run Telegram notification (default: True unless --telegram-send)")
     parser.add_argument("--telegram-send", dest="telegram_send", action="store_true", default=False, help="Send live Telegram notification")
+    parser.add_argument(
+        "--telegram-pool-db",
+        dest="telegram_pool_db",
+        default=None,
+        help=(
+            "Path to the shared bot_pool.db holding the outbound message correlation index. "
+            "Defaults to VEYYON_POOL_DB, else the installed pool at ~/.veyyon/telegram/bot_pool.db "
+            "when it exists; set VEYYON_POOL_DB=off to record nothing"
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true", help="Dry run without mutating git worktrees")
     parser.add_argument("--json", action="store_true", help="Output JSON result")
     parser.add_argument("--summary", action="store_true", help="Output human-readable summary")
@@ -1464,6 +1642,7 @@ def main():
         notify_telegram=args.notify_telegram,
         telegram_dry_run=args.telegram_dry_run if args.telegram_dry_run is not None else (not args.telegram_send),
         telegram_send=args.telegram_send,
+        telegram_pool_db=args.telegram_pool_db,
         dry_run=args.dry_run,
     )
 

@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 # Ensure sibling workflow modules are in sys.path
@@ -34,7 +35,13 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 try:
-    from ledger import FileLock, RequestLedger, get_iso_timestamp
+    from ledger import (
+            EXPLICIT_SELECTION_LABEL,
+            FileLock,
+            RequestLedger,
+            get_iso_timestamp,
+            requires_explicit_selection,
+        )
 except ImportError as e:
     raise ImportError(f"Failed to import ledger module from {SCRIPT_DIR}: {e}")
 
@@ -195,6 +202,7 @@ class Coordinator:
         telegram_project: Optional[str] = None,
         telegram_dry_run: bool = True,
         telegram_send: bool = False,
+        telegram_pool_db: Optional[str] = None,
         project_config: Optional[Union[Any, str, dict]] = None,
         adapter_name: Optional[str] = None,
     ):
@@ -218,6 +226,10 @@ class Coordinator:
         self.telegram_project = telegram_project
         self.telegram_dry_run = telegram_dry_run
         self.telegram_send = telegram_send
+        # Shared correlation index a reply to a notification is resolved through. None
+        # means "resolve it the way the session bridge does" (VEYYON_POOL_DB, else the
+        # installed pool when present); a path here overrides that.
+        self.telegram_pool_db = telegram_pool_db
 
         # Initialize project configuration adapter
         if project_config is not None and set_current_project_config is not None:
@@ -271,7 +283,7 @@ class Coordinator:
         if not self.notify_telegram:
             return None
         try:
-            from telegram_notifier import TelegramNotificationAdapter
+            from telegram_notifier import OutboundCorrelationStore, TelegramNotificationAdapter
         except ImportError:
             return {
                 "enabled": True,
@@ -291,7 +303,16 @@ class Coordinator:
                     "reason": "Routine transition filtered per notification policy",
                 }
 
-            adapter = TelegramNotificationAdapter()
+            adapter = TelegramNotificationAdapter(
+                # Deduplication state belongs to this coordinator's state directory, not
+                # to whatever directory the process happens to be running in: a run from
+                # a different cwd would otherwise start with an empty dedup window and
+                # re-send notifications already delivered.
+                state_dir_override=Path(self.state_dir),
+                correlation_store=OutboundCorrelationStore(
+                    Path(self.telegram_pool_db) if self.telegram_pool_db else None
+                ),
+            )
             dry_run_mode = self.telegram_dry_run or (not self.telegram_send)
             receipt = adapter.notify(event, dry_run=dry_run_mode)
             return asdict(receipt)
@@ -432,7 +453,18 @@ class Coordinator:
     def select_target_request(
         self, request_id: Optional[str] = None
     ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-        """Select target request from ledger (specified ID, next runnable, or first active)."""
+        """
+        Select target request from ledger (specified ID, next runnable, or first active).
+
+        Every implicit branch skips a request labelled for explicit selection only.
+        Machine-authored work - a corrective work item the recurrence guard opened
+        when a failure recurred, for instance - is real work with a real owner, but
+        no operator scoped it, and it is pending and unblocked, which made it the
+        *first* thing "whatever is runnable next" picked up. Naming it is still
+        honoured: an explicit request id is the explicit selection the label asks
+        for, and nothing here weakens the authorization, merge or deployment gates
+        that apply once a request is selected.
+        """
         data = self.ledger._load_data_unlocked()
         requests = data.get("requests", {})
         if not requests:
@@ -444,22 +476,44 @@ class Coordinator:
                 return None, f"Request '{request_id}' not found in ledger."
             return req, None
 
+        def implicitly_selectable(candidate_id: Optional[str]) -> bool:
+            return not requires_explicit_selection(requests.get(candidate_id))
+
         # Check if any requests are runnable via ledger.next_actions()
         actions = self.ledger.next_actions()
-        runnable = [a for a in actions if not a.get("is_blocked")]
+        runnable = [
+            a for a in actions
+            if not a.get("is_blocked") and implicitly_selectable(a.get("id"))
+        ]
         if runnable:
             req_id_cand = runnable[0]["id"]
             return requests.get(req_id_cand), None
 
         # Otherwise select first candidate from next_actions (e.g. blocked or waiting)
-        if actions:
-            req_id_cand = actions[0]["id"]
+        selectable_actions = [a for a in actions if implicitly_selectable(a.get("id"))]
+        if selectable_actions:
+            req_id_cand = selectable_actions[0]["id"]
             return requests.get(req_id_cand), None
 
         # Otherwise find first non-done request
-        active = [r for r in requests.values() if r.get("state") != "done"]
+        active = [
+            r for r in requests.values()
+            if r.get("state") != "done" and not requires_explicit_selection(r)
+        ]
         if active:
             return active[0], None
+
+        explicit_only = [
+            r["id"] for r in requests.values()
+            if r.get("state") != "done" and requires_explicit_selection(r)
+        ]
+        if explicit_only:
+            return None, (
+                "No implicitly selectable request remains. "
+                f"{len(explicit_only)} request(s) are labelled "
+                f"'{EXPLICIT_SELECTION_LABEL}' and run only when named: "
+                f"{', '.join(sorted(explicit_only))}."
+            )
 
         # All requests are done
         return None, "All requests in ledger are in terminal 'done' state."
@@ -895,6 +949,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Execute live network delivery to Telegram (requires explicit opt-in)",
     )
     parser.add_argument(
+        "--telegram-pool-db",
+        default=None,
+        help=(
+            "Path to the shared bot_pool.db holding the outbound message correlation index. "
+            "Defaults to VEYYON_POOL_DB, else the installed pool at ~/.veyyon/telegram/bot_pool.db "
+            "when it exists; set VEYYON_POOL_DB=off to record nothing"
+        ),
+    )
+    parser.add_argument(
         "--dispatch",
         action="store_true",
         help="Dispatch eligible step via SuperboardExecutionAdapter (executes worker and advances ledger)",
@@ -1002,6 +1065,7 @@ def main():
         telegram_project=args.telegram_project,
         telegram_dry_run=args.telegram_dry_run,
         telegram_send=args.telegram_send,
+        telegram_pool_db=args.telegram_pool_db,
         project_config=args.project_config,
         adapter_name=args.adapter,
     )
@@ -1031,6 +1095,7 @@ def main():
                 telegram_project=args.telegram_project,
                 telegram_dry_run=args.telegram_dry_run,
                 telegram_send=args.telegram_send,
+                telegram_pool_db=args.telegram_pool_db,
             )
             res = adapter.run_step(request_id=args.request_id, real_worker=args.real_worker)
             if args.json or not args.summary:
