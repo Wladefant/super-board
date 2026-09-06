@@ -77,6 +77,13 @@ try:
         OutboundCorrelationStore,
         TelegramNotificationAdapter,
     )
+    # The check-expectation contract, not a backend instance. The backend itself
+    # stays duck-typed on purpose (see self.worker_backend), but the question
+    # "are these checks advanceable evidence?" must have exactly one answer:
+    # a second local implementation of it here is what let a completion be
+    # accepted by the backend, refused by this adapter, and still reported as
+    # advanced.
+    from worker_backend import CheckExpectationVerdict, evaluate_check_expectations
 except ImportError as e:
     raise ImportError(f"superboard_adapter failed to import sibling portable modules: {e}")
 
@@ -104,6 +111,21 @@ class WorkerExecutionResult:
     evidence: Dict[str, Any] = field(default_factory=dict)
 
     @property
+    def check_expectations(self) -> CheckExpectationVerdict:
+        """
+        The shared check-expectation verdict for this result's reported checks.
+
+        Delegated to worker_backend.evaluate_check_expectations so the adapter and
+        the backend that produced the result cannot disagree about whether a
+        packet of checks is evidence. Expected-failure controls are retained with
+        their observed exit codes intact; a mismatch, an unclassified failure or a
+        packet without a successful verification check is refused here for the
+        same stated reason the backend gives.
+        """
+        checks = self.evidence.get("checks") if isinstance(self.evidence, dict) else None
+        return evaluate_check_expectations(checks)
+
+    @property
     def is_verifiable_evidence(self) -> bool:
         """
         True only for a successful real-backend execution carrying structured evidence.
@@ -111,28 +133,51 @@ class WorkerExecutionResult:
         Fixtures and probes are excluded by construction: no amount of fixture output
         may be read as proof that real work happened.
         """
-        checks = self.evidence.get("checks") if isinstance(self.evidence, dict) else None
-        checks_are_genuine = bool(checks) and all(
-            isinstance(check, dict)
-            and isinstance(check.get("command"), list)
-            and bool(check.get("command"))
-            and isinstance(check.get("exit_code"), int)
-            and check.get("exit_code") == 0
-            and bool(str(check.get("observed") or "").strip())
-            for check in checks
-        )
         return (
             not self.is_fixture
             and not self.is_probe
             and not self.is_pending
             and self.blocked_reason is None
             and self.exit_code == 0
-            and checks_are_genuine
+            and self.check_expectations.ok
         )
+
+    @property
+    def evidence_refusal(self) -> Optional[str]:
+        """
+        Why this result may not advance the request, or None when it may.
+
+        The reason is the actionable one, naming the provenance that disqualified
+        the result or the exact check-expectation rule it broke. It used to be the
+        blanket "no structured evidence", which was untrue of a result that
+        carried checks and only told the operator to look in the wrong place.
+        """
+        if self.is_fixture:
+            return (
+                f"fixture result '{self.fixture_label or 'unlabelled'}' is not evidence "
+                "of real execution"
+            )
+        if self.is_probe:
+            return "safe probe proves dispatch plumbing only, not the acceptance criteria"
+        if self.is_pending:
+            return (
+                f"native dispatch is {self.pending_state or 'pending'} and has delivered no "
+                "completion yet"
+            )
+        if self.blocked_reason is not None:
+            return self.blocked_reason
+        if self.exit_code != 0:
+            return f"worker execution exited {self.exit_code}"
+        verdict = self.check_expectations
+        if not verdict.ok:
+            return verdict.reason or "reported checks are not acceptable evidence"
+        return None
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
         d["is_verifiable_evidence"] = self.is_verifiable_evidence
+        d["check_expectations"] = self.check_expectations.to_dict()
+        d["evidence_refusal"] = self.evidence_refusal
         return d
 
 
@@ -973,18 +1018,15 @@ class SuperboardExecutionAdapter:
             gate_result["reproduction_scenario"] = scenario
             gate_result["bug_closure"] = closure_reason
 
-        # Provenance gate: simulated or probe output is not evidence about this request.
+        # Provenance and check-expectation gate. Simulated or probe output is not
+        # evidence about this request, and neither is a real run whose checks do not
+        # satisfy the shared contract. The reason is the backend's own, so the
+        # operator is pointed at the check that refused rather than at a blanket
+        # claim that no evidence arrived.
         if not worker_res.is_verifiable_evidence:
-            if worker_res.is_fixture:
-                why = (
-                    f"fixture result '{worker_res.fixture_label or 'unlabelled'}' is not evidence "
-                    "of real execution"
-                )
-            elif worker_res.is_probe:
-                why = "safe probe proves dispatch plumbing only, not the acceptance criteria"
-            else:
-                why = "worker returned no structured evidence"
+            why = worker_res.evidence_refusal or "result is not advanceable evidence"
             gate_result["advance_refused"] = why
+            gate_result["check_expectations"] = worker_res.check_expectations.to_dict()
             return (
                 req_state,
                 f"Stage '{stage}' did not advance: {why}. Request remains in '{req_state}'.",
@@ -1011,10 +1053,17 @@ class SuperboardExecutionAdapter:
                 gate_result,
             )
 
-        # Update evidence in ledger
+        expectations = worker_res.check_expectations
+        gate_result["check_expectations"] = expectations.to_dict()
+
+        # Update evidence in ledger. The note states what was actually credited:
+        # how many verification checks succeeded and how many expected-failure
+        # controls were retained beside them.
         evidence_note = (
             f"{stage} verified via {worker_res.backend_name or 'worker execution'} "
-            f"on commit {worker_res.head_sha or 'unknown'}"
+            f"on commit {worker_res.head_sha or 'unknown'} "
+            f"({expectations.verifications_passed} verification check(s) passed, "
+            f"{expectations.controls_retained} expected-outcome control(s) retained)"
         )
         if stage == "build":
             # Advance: implementation -> QA
@@ -1452,18 +1501,44 @@ class SuperboardExecutionAdapter:
                 notification_receipt=receipt,
                 boundaries=boundaries,
             )
-        status = "advanced"
+        # The status must describe what happened to the request, not merely that the
+        # dispatch process exited cleanly. A refused gate leaves the ledger where it
+        # was, so reporting "advanced" told the driver the step had made progress it
+        # had not made; the driver then parked the request as 'no_progress' with its
+        # own generic message and the real refusal never reached the operator.
         board_update = (gate_result or {}).get("board_update") or {}
+        gate_verified = bool((gate_result or {}).get("verified"))
+        refusal = next(
+            (
+                str((gate_result or {}).get(key))
+                for key in ("advance_refused", "repro_refused")
+                if (gate_result or {}).get(key)
+            ),
+            None,
+        )
         if board_update.get("status") == "blocked":
             status = "blocked"
             transition_reason = (
                 f"{transition_reason}; Project V2 lifecycle synchronization blocked: "
                 f"{board_update.get('blocked_reason') or 'unknown board error'}"
             )
-        elif new_state == "awaiting authorization":
-            status = "awaiting_authorization"
         elif worker_res.exit_code != 0:
             status = "error"
+        elif not gate_verified:
+            status = "blocked"
+        elif new_state == "awaiting authorization":
+            status = "awaiting_authorization"
+        else:
+            status = "advanced"
+
+        if status == "awaiting_authorization":
+            next_action = "Awaiting human merge authorization"
+        elif status == "advanced":
+            next_action = f"Continue execution in {new_state}"
+        elif refusal:
+            next_action = f"Resolve the refused {stage} gate: {refusal}"
+        else:
+            next_action = f"Resolve the blocked {stage} step before continuing"
 
         return AdapterExecutionResult(
             step_id=step_id,
@@ -1471,7 +1546,7 @@ class SuperboardExecutionAdapter:
             stage=stage,
             status=status,
             status_reason=transition_reason,
-            next_action=f"Continue execution in {new_state}" if status != "awaiting_authorization" else "Awaiting human merge authorization",
+            next_action=next_action,
             preflight_passed=True,
             dispatch_packet=dispatch_packet.to_dict(),
             worker_result=worker_res,

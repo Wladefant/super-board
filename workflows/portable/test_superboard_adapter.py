@@ -42,6 +42,7 @@ from project_adapter import SuperboardLifecycleOutcome
 import project_adapter
 from decision_workflow import DecisionContract
 from telegram_notifier import OutboundCorrelationStore, TelegramNotificationAdapter
+from worker_backend import evaluate_check_expectations
 
 
 class StubWorkerBackend:
@@ -550,12 +551,22 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
 
         # Run with real_worker=True (exercises git status or config validate subprocess)
         res = adapter.run_step(request_id=req_id, real_worker=True)
-        self.assertEqual(res.status, "advanced")
         self.assertIsNotNone(res.worker_result)
         self.assertFalse(res.worker_result.is_fixture)
         self.assertEqual(res.worker_result.exit_code, 0)
         self.assertIn("[REAL_WORKER_EXECUTION]", res.worker_result.output)
         self.assertEqual(res.boundaries["execution_dispatched"], True)
+
+        # The subprocess really ran and exited 0, but a probe substantiates the
+        # dispatch plumbing and nothing about this request. The step must say so:
+        # reporting "advanced" for a gate that refused told the driver about
+        # progress the ledger never made.
+        self.assertTrue(res.worker_result.is_probe)
+        self.assertEqual(res.status, "blocked")
+        self.assertFalse(res.gate_result["verified"])
+        self.assertIn("safe probe", res.gate_result["advance_refused"])
+        self.assertIn("safe probe", res.next_action)
+        self.assertEqual(self.ledger.get_request(req_id)["state"], "implementation")
 
     def test_04_telegram_notification_event_formatting(self):
         """Test concise, single-sentence Telegram notification formatting with canonical link."""
@@ -1356,9 +1367,12 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
             notify_telegram=False,
         ).run_step(request_id=req_id)
 
-        self.assertEqual(result.status, "advanced")
+        # The bug was reopened, which moves the request backwards. A refused gate
+        # must never be reported as an advance, whichever gate refused.
+        self.assertEqual(result.status, "blocked")
         self.assertTrue(result.gate_result["reopened"])
         self.assertIn("Desktop after-fix visual asset", result.gate_result["repro_refused"])
+        self.assertIn("Desktop after-fix visual asset", result.next_action)
         self.assertEqual(self.ledger.get_request(req_id)["state"], "implementation")
 
     def test_15_native_preparation_is_pending_and_never_advances_state(self):
@@ -1399,6 +1413,206 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
         self.assertFalse(result.gate_result["verified"])
         self.assertFalse(result.boundaries["execution_dispatched"])
         self.assertEqual(self.ledger.get_request(req_id)["state"], "implementation")
+
+    # -- the shared check-expectation contract ------------------------------
+    #
+    # The reproduced defect lived exactly here: worker_backend accepted a
+    # completion whose baseline check exited 1, this adapter refused the same
+    # result as "no structured evidence", and run_step still reported "advanced"
+    # while the ledger never moved. The driver then parked the request as
+    # 'no_progress' and the real reason never surfaced.
+
+    #: Packets the two boundaries must agree on, with the substring of the shared
+    #: refusal each one is expected to produce. None means "acceptable evidence".
+    CONTRACT_CASES = (
+        (
+            "undeclared success",
+            [{"name": "suite", "command": ["pytest"], "exit_code": 0, "observed": "ok"}],
+            None,
+        ),
+        (
+            "legacy unclassified failure",
+            [{"name": "baseline", "command": ["repro"], "exit_code": 1, "observed": "fails"},
+             {"name": "suite", "command": ["pytest"], "exit_code": 0, "observed": "ok"}],
+            "unclassified failing check",
+        ),
+        (
+            "declared controls beside a verification",
+            [{"name": "baseline", "command": ["repro"], "exit_code": 1, "observed": "fails",
+              "purpose": "baseline", "expected_exit_code": 1},
+             {"name": "guard", "command": ["guard"], "exit_code": 3, "observed": "refused",
+              "purpose": "negative_control", "expected_exit_code": 3},
+             {"name": "suite", "command": ["pytest"], "exit_code": 0, "observed": "ok"}],
+            None,
+        ),
+        (
+            "controls only",
+            [{"name": "baseline", "command": ["repro"], "exit_code": 1, "observed": "fails",
+              "purpose": "baseline", "expected_exit_code": 1}],
+            "none is a successful 'verification' check",
+        ),
+        (
+            "control that did not fail as declared",
+            [{"name": "baseline", "command": ["repro"], "exit_code": 0, "observed": "passes",
+              "purpose": "baseline", "expected_exit_code": 1},
+             {"name": "suite", "command": ["pytest"], "exit_code": 0, "observed": "ok"}],
+            "expecting exit 1 but exited 0",
+        ),
+        (
+            "unexpected verification failure",
+            [{"name": "suite", "command": ["pytest"], "exit_code": 2, "observed": "failed",
+              "purpose": "verification", "expected_exit_code": 0}],
+            "expecting exit 0 but exited 2",
+        ),
+        (
+            "malformed purpose",
+            [{"name": "suite", "command": ["pytest"], "exit_code": 0, "observed": "ok",
+              "purpose": "smoke"}],
+            "which is not one of",
+        ),
+        (
+            "malformed expected_exit_code",
+            [{"name": "suite", "command": ["pytest"], "exit_code": 0, "observed": "ok",
+              "expected_exit_code": "0"}],
+            "is not an integer",
+        ),
+        (
+            "no checks at all",
+            [],
+            "No executed checks were reported",
+        ),
+    )
+
+    def test_16_both_validators_answer_identically(self):
+        """
+        One contract, one answer. The adapter's evidence gate must be the same
+        function the backend validated with, not a second local reading of it.
+        """
+        for label, checks, expected in self.CONTRACT_CASES:
+            with self.subTest(case=label):
+                backend_verdict = evaluate_check_expectations(checks)
+                adapter_verdict = WorkerExecutionResult(
+                    stage="qa",
+                    exit_code=0,
+                    output="",
+                    head_sha=self.HEAD_SHA,
+                    backend_name="stub",
+                    evidence={"checks": checks},
+                ).check_expectations
+                self.assertEqual(adapter_verdict, backend_verdict)
+                self.assertIs(backend_verdict.ok, expected is None)
+                if expected is not None:
+                    self.assertIn(expected, backend_verdict.reason)
+
+    def test_17_declared_controls_advance_once_with_observed_exits_intact(self):
+        """
+        A packet carrying real controls and one real verification advances exactly
+        one stage, and the nonzero exits the worker observed are recorded as they
+        were observed rather than normalised to make the packet acceptable.
+        """
+        req_id = "req-typed-controls-17"
+        self._add_pipeline_request(req_id)
+        checks = [
+            {"name": "baseline defect reproduction", "command": ["python", "repro.py"],
+             "exit_code": 1, "observed": "defect present", "purpose": "baseline",
+             "expected_exit_code": 1},
+            {"name": "guard still refuses laundering", "command": ["python", "guard.py"],
+             "exit_code": 3, "observed": "refused", "purpose": "negative_control",
+             "expected_exit_code": 3},
+            {"name": "focused suite", "command": ["python", "-m", "unittest"],
+             "exit_code": 0, "observed": "68 tests OK", "purpose": "verification"},
+        ]
+        adapter = SuperboardExecutionAdapter(
+            state_dir=self.state_dir,
+            worker_backend=StubWorkerBackend(
+                head_sha=self.HEAD_SHA, evidence={"checks": checks},
+            ),
+            notify_telegram=False,
+        )
+
+        res = adapter.run_step(request_id=req_id)
+        self.assertEqual(res.status, "advanced")
+        self.assertTrue(res.gate_result["verified"])
+        self.assertNotIn("advance_refused", res.gate_result)
+        expectations = res.gate_result["check_expectations"]
+        self.assertEqual(expectations["verifications_passed"], 1)
+        self.assertEqual(expectations["controls_retained"], 2)
+        self.assertEqual(
+            [c["observed_exit_code"] for c in expectations["checks"]], [1, 3, 0],
+        )
+        self.assertEqual(self.ledger.get_request(req_id)["state"], "QA")
+
+        # Exactly once: a second step on the already-advanced request is a QA
+        # stage, not a repeat of the build advance.
+        again = adapter.run_step(request_id=req_id)
+        self.assertEqual(again.stage, "qa")
+        self.assertEqual(self.ledger.get_request(req_id)["state"], "review")
+
+    def test_18_refused_checks_report_a_truthful_status_and_leave_the_ledger_alone(self):
+        """
+        The reproduced falsehood. Every refusal must report a non-advanced status,
+        carry the actionable reason, and change nothing in the ledger.
+        """
+        refusing_cases = [
+            (label, checks, expected)
+            for label, checks, expected in self.CONTRACT_CASES
+            if expected is not None and checks
+        ]
+        self.assertTrue(refusing_cases, "no refusing contract cases to exercise")
+
+        for index, (label, checks, expected) in enumerate(refusing_cases):
+            with self.subTest(case=label):
+                req_id = f"req-refused-18-{index}"
+                self._add_pipeline_request(req_id)
+                before = self.ledger.get_request(req_id)
+
+                res = SuperboardExecutionAdapter(
+                    state_dir=self.state_dir,
+                    worker_backend=StubWorkerBackend(
+                        head_sha=self.HEAD_SHA, evidence={"checks": checks},
+                    ),
+                    notify_telegram=False,
+                ).run_step(request_id=req_id)
+
+                self.assertNotEqual(res.status, "advanced")
+                self.assertEqual(res.status, "blocked")
+                self.assertFalse(res.gate_result["verified"])
+                self.assertIn(expected, res.gate_result["advance_refused"])
+                self.assertIn(expected, res.next_action)
+                # The refusal names the failing check, never "no structured evidence".
+                self.assertNotIn("no structured evidence", res.status_reason)
+                self.assertEqual(self.ledger.get_request(req_id), before)
+
+    def test_19_refusal_never_rewrites_an_observed_exit_code(self):
+        """
+        A refused packet is reported with the exits the worker really saw. Nothing
+        may 'correct' an exit code to make a packet acceptable or a refusal tidy.
+        """
+        req_id = "req-observed-exits-19"
+        self._add_pipeline_request(req_id)
+        checks = [
+            {"name": "baseline", "command": ["python", "repro.py"], "exit_code": 7,
+             "observed": "defect present"},
+            {"name": "suite", "command": ["pytest"], "exit_code": 0, "observed": "ok"},
+        ]
+        res = SuperboardExecutionAdapter(
+            state_dir=self.state_dir,
+            worker_backend=StubWorkerBackend(
+                head_sha=self.HEAD_SHA, evidence={"checks": checks},
+            ),
+            notify_telegram=False,
+        ).run_step(request_id=req_id)
+
+        self.assertEqual(res.status, "blocked")
+        self.assertIn("exited 7", res.gate_result["advance_refused"])
+        self.assertEqual(
+            [c["exit_code"] for c in res.worker_result.evidence["checks"]], [7, 0],
+        )
+        self.assertEqual(
+            [c["observed_exit_code"]
+             for c in res.gate_result["check_expectations"]["checks"]],
+            [7, 0],
+        )
 
 def run_tests():
     print("=" * 70)
