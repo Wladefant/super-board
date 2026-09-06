@@ -582,7 +582,7 @@ def _pending_decision(req_id="req-dec", decision_id="DEC-1"):
 
 
 def _answered_decision(req_id="req-dec", decision_id="DEC-1", responder="Wladefant",
-                       provenance="human_operator", is_test=False,
+                       provenance="github_verified_user", is_test=False,
                        interpretation="Option A"):
     return {
         "decision_id": decision_id,
@@ -618,7 +618,7 @@ class TestDecisionGating(_Fixture):
         outcome = self._driver(self._adapter(decision_mgr=mgr), ["req-dec"]).run()
         self.assertIn("disabled", outcome.parked[0]["reason"])
 
-    def test_authorized_human_answer_unblocks(self):
+    def test_authorized_github_user_answer_unblocks(self):
         self._add("req-dec")
         mgr = FakeDecisionManager([_answered_decision()])
         adapter = self._adapter(decision_mgr=mgr)
@@ -633,6 +633,7 @@ class TestDecisionGating(_Fixture):
         """
         cases = {
             "synthetic test": _answered_decision(is_test=True),
+            "legacy human operator": _answered_decision(provenance="human_operator"),
             "agent authored": _answered_decision(provenance="agent_authored"),
             "unauthorized responder": _answered_decision(responder="RandomPerson"),
             "empty interpretation": _answered_decision(interpretation="   "),

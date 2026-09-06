@@ -73,6 +73,7 @@ Key Features:
 
 import argparse
 import datetime
+import difflib
 import hashlib
 import json
 import os
@@ -384,25 +385,29 @@ def _decision_block(text: str, block_name: str, decision_id: str) -> Tuple[Optio
 
 
 def extract_task_list_options(text: str) -> Dict[str, Dict[str, Any]]:
-    """
-    Extract only top-level, GitHub-renderable decision task-list lines.
-
-    This low-level helper accepts only canonical top-level lines. Production edit
-    handling first scopes the text to the exact decision-options marker block, so
-    fenced examples, HTML comments, and unrelated checklists are unreachable.
-    """
+    """Extract canonical top-level task-list lines while ignoring fenced regions."""
     options: Dict[str, Dict[str, Any]] = {}
     pattern = re.compile(
-        r"^[-*] \[([ xX])\] \*\*Option ([a-zA-Z0-9_-]+)\*\*: (.+)$",
-        re.MULTILINE,
+        r"^[-*] \[([ xX])\] \*\*Option ([a-zA-Z0-9_-]+)\*\*: (.+)$"
     )
-    for match in pattern.finditer(text or ""):
+    fence = None
+    for line in (text or "").splitlines():
+        fence_match = re.match(r"^\s*(```|~~~)", line)
+        if fence_match:
+            marker = fence_match.group(1)
+            fence = None if fence == marker else (marker if fence is None else fence)
+            continue
+        if fence:
+            continue
+        match = pattern.fullmatch(line)
+        if not match:
+            continue
         opt_id = match.group(2).strip()
         options[opt_id] = {
             "checked": match.group(1).lower() == "x",
             "id": opt_id,
             "label": match.group(3).strip(),
-            "raw_line": match.group(0),
+            "raw_line": line,
         }
     return options
 
@@ -411,10 +416,72 @@ def extract_scoped_task_list_options(
     text: str,
     decision_id: str,
 ) -> Tuple[Dict[str, Dict[str, Any]], Optional[str]]:
+    """Parse a rendered option block only when every line is one unique canonical option."""
     block, error = _decision_block(text, "decision-options", decision_id)
     if error:
         return {}, error
-    return extract_task_list_options(block or ""), None
+    options: Dict[str, Dict[str, Any]] = {}
+    pattern = re.compile(
+        r"^- \[([ xX])\] \*\*Option ([a-zA-Z0-9_-]+)\*\*: (.+)$"
+    )
+    for line in (block or "").splitlines():
+        match = pattern.fullmatch(line)
+        if not match:
+            return {}, f"Non-canonical or non-rendered content inside decision-options: {line!r}."
+        opt_id = match.group(2).strip()
+        if opt_id in options:
+            return {}, f"Duplicate option id {opt_id} inside decision-options."
+        options[opt_id] = {
+            "checked": match.group(1).lower() == "x",
+            "id": opt_id,
+            "label": match.group(3).strip(),
+            "raw_line": line,
+        }
+    return options, None
+
+
+def extract_rendered_edit_context(
+    baseline_body: str,
+    new_body: str,
+    decision_id: str,
+) -> Tuple[str, Optional[str]]:
+    """
+    Retain context both inside and outside its marker without allowing static
+    question text to be rewritten alongside an approval.
+    """
+    for block_name in ("decision-options", "decision-context"):
+        for body, revision in ((baseline_body, "baseline"), (new_body, "current")):
+            _, error = _decision_block(body, block_name, decision_id)
+            if error:
+                return "", f"Invalid {revision} {block_name} block: {error}"
+
+    def normalized(body: str) -> str:
+        result = body
+        for block_name in ("decision-options", "decision-context"):
+            marker_id = re.escape(str(decision_id))
+            pattern = re.compile(
+                rf"^[ \t]*<!--\s*{re.escape(block_name)}:\s*{marker_id}\s*-->[ \t]*\n"
+                rf".*?"
+                rf"\n[ \t]*<!--\s*/{re.escape(block_name)}\s*-->[ \t]*$",
+                re.MULTILINE | re.DOTALL,
+            )
+            result = pattern.sub(f"<!-- normalized-{block_name} -->", result)
+        return result
+
+    baseline_lines = normalized(baseline_body).splitlines()
+    current_lines = normalized(new_body).splitlines()
+    added_lines: List[str] = []
+    matcher = difflib.SequenceMatcher(a=baseline_lines, b=current_lines, autojunk=False)
+    for tag, _a1, _a2, b1, b2 in matcher.get_opcodes():
+        if tag == "equal":
+            continue
+        if tag != "insert":
+            return "", "Static rendered question text was deleted or rewritten."
+        added_lines.extend(line for line in current_lines[b1:b2] if line.strip())
+
+    scoped_context = extract_additional_context(new_body, decision_id)
+    pieces = [piece for piece in (scoped_context, "\n".join(added_lines).strip()) if piece]
+    return "\n".join(pieces), None
 
 
 def extract_additional_context(text: str, decision_id: Optional[str] = None) -> str:
@@ -1182,7 +1249,7 @@ class DecisionManager:
         responder: str,
         comment_id: Optional[str] = None,
         comment_url: Optional[str] = None,
-        provenance: str = ProvenanceType.HUMAN_OPERATOR,
+        provenance: str = ProvenanceType.UNVERIFIED_CALLER,
         is_test: bool = False,
         comment_created_at: Optional[str] = None,
         comment_updated_at: Optional[str] = None,
@@ -1398,6 +1465,7 @@ class DecisionManager:
                 and provenance in (
                     ProvenanceType.SHARED_ACCOUNT_AMBIGUOUS,
                     ProvenanceType.UNVERIFIED_CALLER,
+                    ProvenanceType.HUMAN_OPERATOR,
                 )
                 and not is_test
             ):
@@ -1503,12 +1571,9 @@ class DecisionManager:
                 }
 
                 # Only a distinct, API-verified GitHub user event may resolve new
-                # real work. Legacy human_operator remains supported only for
-                # internal callers that explicitly supply it; GitHub paths never infer it.
-                if is_test or parse_result.get("provenance") not in (
-                    ProvenanceType.GITHUB_VERIFIED_USER,
-                    ProvenanceType.HUMAN_OPERATOR,
-                ):
+                # real work. Legacy human_operator remains readable on historical
+                # answers but can never authorize a new state transition.
+                if is_test or parse_result.get("provenance") != ProvenanceType.GITHUB_VERIFIED_USER:
                     dec_dict["rejection_reason"] = (
                         "Selection was retained but did not carry distinct, verified GitHub user provenance; "
                         "real task unblock is prohibited."
@@ -1801,14 +1866,44 @@ class DecisionManager:
                     and recorded_answer.get("raw_text") == new_body
                     and recorded_answer.get("event_updated_at") == edit_time
                 ):
+                    resynchronized = []
+                    replay_actor = str(recorded_answer.get("responder") or "").lstrip("@").strip()
+                    replay_provenance = recorded_answer.get("provenance")
+                    for req_id in decision.blocking_dependencies:
+                        try:
+                            request = self.ledger.get_request(req_id)
+                            if decision.decision_id not in request.get("decision_blockers", []):
+                                continue
+                            if hasattr(self.ledger, "resolve_decision"):
+                                self.ledger.resolve_decision(
+                                    req_id=req_id,
+                                    decision_id=decision.decision_id,
+                                    answer=recorded_answer.get("interpretation") or "",
+                                    comment_id=comment_id,
+                                    provenance_type=replay_provenance,
+                                    actor=replay_actor,
+                                )
+                            update = {
+                                "req_id": req_id,
+                                "clear_blocker": True,
+                                "actor": replay_actor,
+                                "reason": f"Idempotent checkbox replay synchronized decision [{decision.decision_id}]",
+                            }
+                            if hasattr(self.ledger, "clear_decision_blocker"):
+                                update["clear_decision_blocker"] = decision.decision_id
+                            self.ledger.update_request(**update)
+                            resynchronized.append(req_id)
+                        except KeyError:
+                            continue
+
                     return {
                         "idempotent_replay": True,
                         "status": decision.status,
                         "decision_id": decision.decision_id,
                         "answer": decision.answer,
                         "interpretation": recorded_answer.get("interpretation"),
-                        "unblocked_requests": decision.blocking_dependencies,
-                        "provenance": recorded_answer.get("provenance", ProvenanceType.HUMAN_OPERATOR),
+                        "unblocked_requests": resynchronized,
+                        "provenance": recorded_answer.get("provenance"),
                     }
                 else:
                     mismatch = f"Conflicting edit: decision already answered with option {recorded_opt_id}"
@@ -1886,10 +1981,10 @@ class DecisionManager:
                 if scope_error:
                     rejection_reason = f"Invalid {revision_name} rendered decision block: {scope_error}"
                     break
-                if set(parsed) != set(expected):
+                if list(parsed) != list(expected):
                     rejection_reason = (
-                        f"Invalid {revision_name} rendered decision block: option identities do not "
-                        "match the stored decision contract."
+                        f"Invalid {revision_name} rendered decision block: option identities, "
+                        "count, or order do not match the stored decision contract."
                     )
                     break
                 mismatched = [
@@ -1902,6 +1997,16 @@ class DecisionManager:
                         f"{', '.join(mismatched)}."
                     )
                     break
+
+            additional_context, context_error = extract_rendered_edit_context(
+                dec_dict.get("question_body_original")
+                or dec_dict.get("question_body_snapshot")
+                or old_body,
+                new_body,
+                decision_id,
+            )
+            if not rejection_reason and context_error:
+                rejection_reason = context_error
 
             if rejection_reason:
                 parse_result = {
@@ -1921,7 +2026,6 @@ class DecisionManager:
                     key for key in expected
                     if old_options[key]["checked"] != new_options[key]["checked"]
                 }
-                additional_context = extract_additional_context(new_body, decision_id)
                 options_summary = " or ".join(
                     f"Option {o['id']} ({o['label']})" for o in decision.options
                 )
@@ -1978,6 +2082,7 @@ class DecisionManager:
                     and provenance in (
                         ProvenanceType.SHARED_ACCOUNT_AMBIGUOUS,
                         ProvenanceType.UNVERIFIED_CALLER,
+                        ProvenanceType.HUMAN_OPERATOR,
                     )
                     and not is_test
                 ):
@@ -2898,6 +3003,7 @@ def post_decision_to_github_issue(
         data["decisions"][decision_id]["question_comment_id"] = comment_id
         data["decisions"][decision_id]["question_posted_at"] = posted_comment.get("created_at")
         data["decisions"][decision_id]["question_body_snapshot"] = posted_comment.get("body")
+        data["decisions"][decision_id]["question_body_original"] = posted_comment.get("body")
         data["decisions"][decision_id]["question_snapshot_updated_at"] = posted_comment.get("updated_at")
         data["decisions"][decision_id]["question_author"] = posted_comment.get("user")
         mgr._save_data_unlocked(data)

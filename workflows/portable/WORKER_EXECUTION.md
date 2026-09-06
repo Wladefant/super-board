@@ -382,11 +382,11 @@ boundary the driver does not recognise.
 
 Decisions are checked **before** dispatch, so a worker is not spent on a request
 whose direction is unresolved. A decision blocks unless it is answered by a
-genuine authorized human operator: status `answered`, an answer payload,
-`provenance: "human_operator"`, `is_test` falsy, a non-empty interpretation, and
-a responder on the decision's own `authorized_responders`. Synthetic,
-agent-authored and unauthorized replies all keep it blocking, which is what the
-decision workflow exists to enforce.
+distinct authorized GitHub user event: status `answered`, an answer payload,
+`provenance: "github_verified_user"`, `is_test` falsy, a non-empty interpretation,
+and a responder on the decision's own `authorized_responders`. Legacy
+`human_operator`, synthetic, shared-account, agent-authored, unverified, and
+unauthorized provenance all keep it blocking.
 
 Bounded re-check is **off by default**. With `--decision-sync-attempts N` the
 driver performs at most N re-checks, each preceded by a wait of at least 15

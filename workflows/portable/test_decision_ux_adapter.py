@@ -24,6 +24,7 @@ from decision_workflow import (
     extract_task_list_options,
     format_decision_markdown,
 )
+from continuation_driver import ContinuationDriver
 from ledger import RequestLedger
 
 OPTIONS = [
@@ -207,6 +208,24 @@ class DecisionUXProof(unittest.TestCase):
         self.assertEqual(result["status"], "clarification_requested")
         self._assert_blocked()
 
+        canonical_b = next(
+            line for line in self.initial_body.splitlines()
+            if line.startswith("- [ ] **Option B**:")
+        )
+        fenced_inside = self.initial_body.replace(
+            "<!-- /decision-options -->",
+            f"```markdown\n{canonical_b.replace('[ ]', '[x]')}\n```\n<!-- /decision-options -->",
+        )
+        hidden = self.mgr.process_issue_edit(
+            "DEC-1", self.initial_body, fenced_inside, "Operator",
+            event_type="comment_edit", comment_id="100",
+            edit_time="2026-09-06T12:00:00Z",
+            provenance=ProvenanceType.GITHUB_VERIFIED_USER,
+        )
+        self.assertEqual(hidden["status"], "rejected")
+        self.assertIn("Non-canonical", hidden["rejection_reason"])
+        self._assert_blocked()
+
     def test_B3_poller_never_invents_editor_and_persists_revision_across_restart(self):
         changed = self._checked("A", "Keep every free-form constraint, including article a.")
         question = {**self.question, "body": changed, "updated_at": "2026-09-06T12:00:00Z"}
@@ -284,6 +303,17 @@ class DecisionUXProof(unittest.TestCase):
         self.assertEqual(publication["status"], "ignored")
         self._assert_blocked()
 
+    def test_provenance_less_reply_cannot_approve(self):
+        result = self.mgr.process_reply(
+            "DEC-1",
+            "Decision DEC-1: Option A",
+            responder="Operator",
+        )
+        self.assertEqual(result["status"], "clarification_requested")
+        self.assertEqual(result["provenance"], ProvenanceType.UNVERIFIED_CALLER)
+        self.assertIsNone(self.mgr.get_decision("DEC-1")["answer"])
+        self._assert_blocked()
+
     def test_ambiguous_and_missing_prior_revision_fail_closed(self):
         both = self._checked("A").replace(
             "- [ ] **Option B**", "- [x] **Option B**"
@@ -306,8 +336,27 @@ class DecisionUXProof(unittest.TestCase):
         self.assertEqual(untrusted["provenance"], ProvenanceType.UNVERIFIED_CALLER)
         self._assert_blocked()
 
+    def test_checkbox_replay_repairs_ledger_before_reporting_unblocked(self):
+        body = self._checked("A")
+        event = self._edit_event(self.initial_body, body)
+        with patch.object(self.mgr.ledger, "resolve_decision", side_effect=KeyError("synthetic missing write")):
+            first = self.mgr.ingest_github_event(
+                event, repo="Wladefant/super-board", trusted_transport=True
+            )
+        self.assertEqual(first["status"], "answered")
+        self.assertEqual(first["unblocked_requests"], [])
+        self.assertIn("DEC-1", self.ledger.get_request("REQ-1")["decision_blockers"])
+        replay = self.mgr.ingest_github_event(
+            event, repo="Wladefant/super-board", trusted_transport=True
+        )
+        self.assertTrue(replay["idempotent_replay"])
+        self.assertEqual(replay["unblocked_requests"], ["REQ-1"])
+        self.assertNotIn("DEC-1", self.ledger.get_request("REQ-1")["decision_blockers"])
+
     def test_distinct_verified_click_reaches_decision_manager_ledger_and_replays(self):
         body = self._checked("B", "Preserve this unrestricted context: a, b, and not Option A.")
+        outside_context = "IMPORTANT: wait for DBA sign-off and keep raw events for 90 days."
+        body += "\n" + outside_context
         event = self._edit_event(self.initial_body, body)
         result = self.mgr.ingest_github_event(
             event, repo="Wladefant/super-board", trusted_transport=True
@@ -319,8 +368,12 @@ class DecisionUXProof(unittest.TestCase):
         self.assertEqual(answer["responder"], "Operator")
         self.assertEqual(answer["provenance"], ProvenanceType.GITHUB_VERIFIED_USER)
         self.assertIn("unrestricted context", answer["additional_context"])
+        self.assertIn(outside_context, answer["additional_context"])
+        self.assertTrue(ContinuationDriver._decision_is_authorized_answer(self.mgr.get_decision("DEC-1")))
         request = self.ledger.get_request("REQ-1")
         self.assertNotIn("DEC-1", request.get("decision_blockers", []))
+        durable = [item for item in request["evidence"] if item.get("type") == "github_decision"][-1]
+        self.assertIn(outside_context, durable["details"])
         restarted = DecisionManager(self.decisions_path, self.ledger_path, self._fetch_comment)
         replay = restarted.ingest_github_event(
             event, repo="Wladefant/super-board", trusted_transport=True
