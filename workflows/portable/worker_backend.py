@@ -652,6 +652,43 @@ def _sha256_file(path: str) -> Optional[str]:
 # guard, because an unreadable failure history must not be mistaken for none.
 # ---------------------------------------------------------------------------
 
+def verdict_failure_class(
+    structured: Mapping[str, Any],
+    stage: str,
+    request_id: str,
+    head_sha: Optional[str],
+) -> Optional[str]:
+    """
+    The stable identity of a worker's own non-pass verdict, or None.
+
+    A worker that judges its stage failed says so in ``verdict`` and explains it
+    in ``summary``. The judgement is the fault; the summary is prose, and a real
+    agent rewords it on every attempt. Deriving the recurrence identity from the
+    blocked reason therefore made two attempts at the *same* defect two separate
+    first occurrences, so the retry gate never closed on the case it exists for -
+    it only closed when a byte-identical summary came back, which is a fixture
+    behaviour and not an agent one.
+
+    Identity here is the structured judgement instead: this verdict, for this
+    stage, on this request, at this commit. Every part is load-bearing.
+    ``request_id`` keeps two unrelated requests failing review from collapsing
+    into one invented recurrence, and the observed commit is what makes the gate
+    mean "unchanged": ``retry_native`` re-dispatches the same request against the
+    same bound head, so a second non-pass verdict there is the same attempt
+    repeated, while a different commit is a different attempt at the problem.
+
+    Returns None for every other failure, because those reasons are authored by
+    this module rather than by an agent: they are already stable text and the
+    guard's own normalization is the right identity for them.
+    """
+    verdict = structured.get("verdict")
+    if verdict not in VALID_VERDICTS or verdict == "pass":
+        return None
+    return (
+        f"worker_verdict:{stage}:{verdict}:{request_id}@{str(head_sha or 'unknown-head').lower()}"
+    )
+
+
 def _observe_failure(
     state_dir: str,
     stage: str,
@@ -661,10 +698,18 @@ def _observe_failure(
     run_id: Optional[str],
     head_sha: Optional[str],
     exit_code: Optional[int],
+    explicit_error_class: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Record one authentic worker failure in the durable recurrence store."""
+    """
+    Record one authentic worker failure in the durable recurrence store.
+
+    The attempt's run id supplies both identities the guard needs: the attempt
+    itself, and the single observation id every seam that later sees this attempt
+    derives from it, so one real failure is one occurrence whether it is observed
+    here, re-read by the driver, or replayed after a restart.
+    """
     try:
-        from recurrence_guard import observe_worker_failure
+        from recurrence_guard import native_attempt_observation_id, observe_worker_failure
     except ImportError as e:
         return {"recorded": False, "reason": f"recurrence_guard is not installed: {e}"}
     return observe_worker_failure(
@@ -677,6 +722,8 @@ def _observe_failure(
         head_sha=head_sha,
         exit_code=exit_code,
         source="native_worker",
+        explicit_error_class=explicit_error_class,
+        observation_id=(native_attempt_observation_id(run_id) if run_id else None),
     ) or {"recorded": False, "reason": "recurrence intake returned nothing"}
 
 
@@ -1465,8 +1512,19 @@ class WorkerBackend:
             record["outcome"] = outcome.to_dict()
             if not outcome.ok:
                 # Real, already-validated worker failure. Recorded once per attempt:
-                # the run id is the attempt identity, so a replayed completion of the
-                # same run is a duplicate observation and never a new occurrence.
+                # the run id is the attempt identity, so a replayed completion of
+                # the same run is a duplicate observation and never a new
+                # occurrence, and any other seam that later sees this attempt lands
+                # on the same observation rather than counting it again.
+                failure_class = verdict_failure_class(
+                    structured_result, request.stage, request.request_id, head_after
+                )
+                # Carried on the outcome so a seam that only receives the outcome -
+                # the adapter, and through it the driver - observes the same fault
+                # identity instead of re-deriving one from the reason's prose.
+                outcome.evidence["native_run_id"] = run_id
+                outcome.evidence["failure_error_class"] = failure_class
+                record["outcome"] = outcome.to_dict()
                 record["recurrence"] = _observe_failure(
                     state_dir=self.state_dir,
                     stage=request.stage,
@@ -1476,6 +1534,7 @@ class WorkerBackend:
                     run_id=run_id,
                     head_sha=head_after,
                     exit_code=outcome.exit_code,
+                    explicit_error_class=failure_class,
                 )
             self._write_native_record(record)
             return outcome

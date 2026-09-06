@@ -493,17 +493,38 @@ absence, and a later observation reopens it.
 ### Where it is wired
 
 * `WorkerBackend.complete_native` — an authentic failing outcome is observed once
-  per attempt, keyed on the native run id, so a replayed completion is a
-  duplicate. A `retry_native` of a signature owing a corrective action raises.
+  per attempt under the attempt's own observation identity, derived from the
+  native run id, so a replayed completion is a duplicate. For a non-pass verdict
+  the fault identity is the structured verdict on that request at that commit,
+  never the agent's summary text, so two attempts at one defect with reworded
+  summaries accumulate and the second closes the gate. A `retry_native` of a
+  signature owing a corrective action raises.
+* `SuperboardExecutionAdapter` — a blocked result derived from a native attempt
+  carries that attempt's run id and fault class, so the seams downstream observe
+  the one attempt instead of inventing a second identity for it.
 * `ContinuationDriver` — a `blocked`/`error` park and a raised `run_step` are
-  observed against the journal's dispatch ordinal; the pre-dispatch gate parks
-  `recurrence_blocked` and the run exits non-zero.
+  observed; when the step carries a native attempt the driver ingests it under
+  that attempt's identity, so one native failure is one occurrence with one
+  ledger evidence row however many restarts re-read the terminal ticket. A
+  failure with no attempt behind it is the driver's own and is identified by the
+  journal's dispatch ordinal. The pre-dispatch gate parks `recurrence_blocked`
+  and the run exits non-zero.
+* `Coordinator.select_target_request` — a request labelled
+  `selection:explicit-only`, which is how the guard opens its corrective work
+  item, is skipped by every implicit selection branch and runs only when a caller
+  names it.
 * Escalation produces the `NotificationEvent` payload plus that contract's own
-  dedup signature. This module never sends: delivery, correlation and rate
-  limiting stay with the notification owner, which consumes
-  `recurrence_guard.py escalations` and acknowledges each handoff.
+  dedup signature, and `deliver-escalations` consumes it: each pending escalation
+  is handed to an injected sender exposing the contract's `notify`, and only what
+  the sender actually took (`sent`, or `deduped` because it already holds it) is
+  acknowledged. Rate limiting, refusal and a raised transport leave the
+  escalation pending with the attempt recorded. This module still never sends and
+  never constructs a transport: delivery, credentials, destination, correlation
+  and rate limiting stay with the notification owner, and the shipped
+  `OfflineEscalationOutbox` hands off to a durable local file so consumption can
+  be exercised with no network and no bot pool.
 
-Both integrations soft-import the module, so a partial export still runs. A module
+Every integration soft-imports the module, so a partial export still runs. A module
 that is installed but whose history cannot be read is a **refusal**, not an
 absence: an unreadable failure record must not be mistaken for no failures.
 
@@ -675,15 +696,28 @@ python recurrence_guard.py --state-dir <dir> observe \
 # Gate a retry: exit 0 permitted, exit 3 refused pending a corrective action
 python recurrence_guard.py --state-dir <dir> check-retry --request-id req-1
 
-# Record (never execute) the systemic corrective action that unblocks retry
+# Record (never execute) the systemic corrective action that unblocks retry.
+# --change-ref must be a verifiable reference (commit:<40-hex>, pr:<owner>/<repo>#<n>,
+# a GitHub pull URL, config:<path>#<key>, decision:<id>, test:<path>::<name>), and the
+# original scenario has to be re-executed here, because this is where the gate opens.
 python recurrence_guard.py --state-dir <dir> record-corrective-action \
   --signature <sig> --kind code_change --actor <lane> \
-  --description "what systemically changed" --change-ref <commit-or-pr>
+  --description "what systemically changed" \
+  --change-ref commit:<40-char-sha> \
+  --scenario "the original failing scenario" \
+  --evidence "what re-running it produced" \
+  --evidence-command python -m pytest tests/test_it.py \
+  --evidence-exit-code 0 \
+  --head-sha <40-char-sha>
 
 # Retain an already-counted failure out of the count, with an audited reason
 python recurrence_guard.py --state-dir <dir> supersede-observation \
   --observation-id <obs> --actor <lane> \
   --reason "the probe's non-zero exit was the intended negative control"
+
+# Repair a projection that never reached the ledger (crash between the two locks).
+# Adds no occurrence; --strict exits 1 while anything is still outstanding.
+python recurrence_guard.py --state-dir <dir> resync-ledger --strict
 
 # What is known, what is owed, and what is waiting for a sender
 python recurrence_guard.py --state-dir <dir> --summary list
@@ -691,6 +725,13 @@ python recurrence_guard.py --state-dir <dir> --summary show --signature <sig>
 python recurrence_guard.py --state-dir <dir> escalations
 python recurrence_guard.py --state-dir <dir> escalations \
   --ack <escalation-id> --acknowledged-by <notification-owner>
+
+# Consume pending escalations into a durable offline outbox and acknowledge only
+# what it took. Live transport, credentials, destination and bot pool belong to the
+# notification owner: this command constructs none of them and sends nothing.
+python recurrence_guard.py --state-dir <dir> deliver-escalations \
+  --outbox <dir>/escalations.jsonl --dedup-state <dir>/escalations.dedup.json \
+  --acknowledged-by <notification-owner>
 
 # Close a signature against exercised evidence on one exact commit
 python recurrence_guard.py --state-dir <dir> resolve --signature <sig> \

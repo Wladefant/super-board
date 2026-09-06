@@ -596,8 +596,19 @@ class SuperboardExecutionAdapter:
         reason: str,
         head_sha: Optional[str] = None,
         command: Optional[List[str]] = None,
+        native_run_id: Optional[str] = None,
+        evidence: Optional[Dict[str, Any]] = None,
     ) -> WorkerExecutionResult:
-        """A dispatch that could not really run. Never carries advanceable evidence."""
+        """
+        A dispatch that could not really run. Never carries advanceable evidence.
+
+        It does carry the failing attempt's identity when the backend reported one.
+        Dropping it made a native failure look anonymous downstream, so the driver
+        recorded the same attempt a second time under its own run identity and a
+        re-read of the completed ticket counted as another occurrence. Identity is
+        not advanceable evidence: `blocked_reason` still refuses the step, and
+        `is_verifiable_evidence` stays false because the exit code is non-zero.
+        """
         return WorkerExecutionResult(
             stage=stage,
             exit_code=1,
@@ -605,7 +616,9 @@ class SuperboardExecutionAdapter:
             head_sha=head_sha,
             command=command or [],
             is_fixture=False,
+            native_run_id=native_run_id,
             blocked_reason=reason,
+            evidence=dict(evidence or {}),
         )
 
     def dispatch_via_backend(
@@ -693,13 +706,16 @@ class SuperboardExecutionAdapter:
             if ticket.blocked_reason:
                 return self._blocked_result(
                     stage, ticket.blocked_reason, head_sha=ticket.head_sha or expected_sha,
+                    native_run_id=ticket.run_id,
                 )
             if ticket.state in ("finalized", "blocked") and hasattr(
                 self.worker_backend, "get_native_outcome"
             ):
                 outcome = self.worker_backend.get_native_outcome(ticket.run_id)
                 if outcome is not None:
-                    return self._worker_result_from_outcome(outcome, stage, expected_sha)
+                    return self._worker_result_from_outcome(
+                        outcome, stage, expected_sha, native_run_id=ticket.run_id
+                    )
             return WorkerExecutionResult(
                 stage=stage,
                 exit_code=0,
@@ -724,7 +740,11 @@ class SuperboardExecutionAdapter:
         return self._worker_result_from_outcome(outcome, stage, expected_sha)
 
     def _worker_result_from_outcome(
-        self, outcome: Any, stage: str, expected_sha: Optional[str]
+        self,
+        outcome: Any,
+        stage: str,
+        expected_sha: Optional[str],
+        native_run_id: Optional[str] = None,
     ) -> WorkerExecutionResult:
         """Translate a validated backend outcome without replacing backend validation."""
         def field_of(name: str, default: Any = None) -> Any:
@@ -742,11 +762,18 @@ class SuperboardExecutionAdapter:
         exit_code = int(exit_code) if isinstance(exit_code, int) else (0 if ok else 1)
         artifacts = list(field_of("artifacts") or [])
         if not ok:
+            # The backend records the failing attempt's identity and fault class on
+            # the outcome, so the seams downstream of here observe the one attempt
+            # rather than inventing a second identity for it.
             return self._blocked_result(
                 stage,
                 blocked_reason or f"Worker backend '{backend_name}' reported failure for stage '{stage}'",
                 head_sha=observed_sha,
                 command=command,
+                native_run_id=native_run_id or (
+                    evidence.get("native_run_id") if isinstance(evidence, dict) else None
+                ),
+                evidence=evidence if isinstance(evidence, dict) else None,
             )
         if stage in ("qa", "review") and expected_sha and observed_sha != expected_sha:
             return self._blocked_result(

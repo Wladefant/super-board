@@ -34,7 +34,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 VALID_STATES = [
     "pending",
@@ -59,6 +59,29 @@ VERIFICATION_COMPLETE_STATES = [
 ]
 
 TASK_TYPES = ["deployable", "local_doc", "local", "doc", "harness"]
+
+#: Label marking a request that may only be worked when it is named explicitly.
+#:
+#: The ledger holds requests a human asked for and requests a machine opened on
+#: their behalf, and the difference matters at selection time. An automatically
+#: created request is real work with a real owner, but nobody scoped it, so a
+#: loop that picks "whatever is runnable next" must not pick it up on its own.
+#: Carrying that as a label rather than a new field keeps it durable, visible in
+#: every existing read path, and free for any caller to set on its own requests.
+EXPLICIT_SELECTION_LABEL = "selection:explicit-only"
+
+
+def requires_explicit_selection(request: Optional[Mapping[str, Any]]) -> bool:
+    """
+    Whether this request may only be worked when a caller names it.
+
+    Read by every implicit selector. An explicitly named request is never filtered
+    by this: naming it *is* the explicit selection the label asks for.
+    """
+    if not request:
+        return False
+    labels = ((request.get("superboard") or {}).get("labels")) or []
+    return EXPLICIT_SELECTION_LABEL in [str(l) for l in labels]
 
 # Strict state transition graph for deployable tasks (full 8-state model).
 # 'awaiting authorization' asserts that implementation, QA and review are complete, so it is
