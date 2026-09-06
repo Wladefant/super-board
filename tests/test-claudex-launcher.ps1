@@ -8,6 +8,39 @@ $Audit = Join-Path $Skill 'scripts\audit.ps1'
 
 function Assert-True([bool]$Condition, [string]$Message) { if (-not $Condition) { throw "ASSERT: $Message" } }
 function Assert-Equal($Actual, $Expected, [string]$Message) { if ($Actual -ne $Expected) { throw "ASSERT: $Message (actual='$Actual', expected='$Expected')" } }
+function Test-SddlEquivalence([string]$ActualSddl, [string]$ExpectedSddl) {
+    if ($ActualSddl -eq $ExpectedSddl) { return $true }
+    if ([string]::IsNullOrEmpty($ActualSddl) -or [string]::IsNullOrEmpty($ExpectedSddl)) { return $false }
+    try {
+        $actual = New-Object System.Security.AccessControl.RawSecurityDescriptor($ActualSddl)
+        $expected = New-Object System.Security.AccessControl.RawSecurityDescriptor($ExpectedSddl)
+    } catch {
+        return $false
+    }
+    if ($actual.Owner -ne $expected.Owner) { return $false }
+    if ($actual.Group -ne $expected.Group) { return $false }
+    $actualProtected = ($actual.ControlFlags -band [System.Security.AccessControl.ControlFlags]::DiscretionaryAclProtected) -ne 0
+    $expectedProtected = ($expected.ControlFlags -band [System.Security.AccessControl.ControlFlags]::DiscretionaryAclProtected) -ne 0
+    if ($actualProtected -ne $expectedProtected) { return $false }
+    $actualDacl = $actual.DiscretionaryAcl
+    $expectedDacl = $expected.DiscretionaryAcl
+    if ($null -eq $actualDacl -and $null -eq $expectedDacl) { return $true }
+    if ($null -eq $actualDacl -or $null -eq $expectedDacl) { return $false }
+    if ($actualDacl.Count -ne $expectedDacl.Count) { return $false }
+    for ($i = 0; $i -lt $actualDacl.Count; $i++) {
+        $a = $actualDacl[$i]; $b = $expectedDacl[$i]
+        if ($a.AceType -ne $b.AceType) { return $false }
+        if ($a.AceFlags -ne $b.AceFlags) { return $false }
+        if ($a.AccessMask -ne $b.AccessMask) { return $false }
+        if ($a.SecurityIdentifier -ne $b.SecurityIdentifier) { return $false }
+    }
+    return $true
+}
+function Assert-AclEqual([string]$Actual, [string]$Expected, [string]$Message) {
+    if (-not (Test-SddlEquivalence $Actual $Expected)) {
+        throw "ASSERT: $Message (actual='$Actual', expected='$Expected')"
+    }
+}
 function Get-EnvValue([string]$Name) { $item = Get-Item "Env:$Name" -ErrorAction SilentlyContinue; if ($null -eq $item) { return $null }; return $item.Value }
 function Get-ByteHash([byte[]]$Bytes) { $sha = [Security.Cryptography.SHA256]::Create(); try { return [BitConverter]::ToString($sha.ComputeHash($Bytes)) } finally { $sha.Dispose() } }
 
@@ -151,7 +184,7 @@ try {
     Assert-Equal $apply.ExitCode 0 "setup apply succeeds: $($apply.Output)"
     $appliedBytes = [IO.File]::ReadAllBytes($fixture.Profile)
     Assert-True ($appliedBytes[0] -eq 0xEF -and $appliedBytes[1] -eq 0xBB -and $appliedBytes[2] -eq 0xBF) 'UTF-8 BOM preserved'
-    Assert-Equal (Get-Acl -LiteralPath $fixture.Profile).Sddl $originalAcl 'ACL preserved after apply'
+    Assert-AclEqual (Get-Acl -LiteralPath $fixture.Profile).Sddl $originalAcl 'ACL preserved after apply'
     $stateJson = [IO.File]::ReadAllText((Join-Path $fixture.State 'state.json')) | ConvertFrom-Json
     Assert-True ($stateJson.backupPath.StartsWith([IO.Path]::GetFullPath($fixture.State), [StringComparison]::OrdinalIgnoreCase)) 'backup stored under fixture state'
     Assert-Equal (Get-ByteHash ([IO.File]::ReadAllBytes($stateJson.backupPath))) (Get-ByteHash $originalBytes) 'transaction backup is byte exact'
@@ -184,7 +217,7 @@ claude-codex 'space value' 'quote"inside' '' $unicode '--'
     $rollback = Invoke-SetupFixture Rollback $fixture.Profile $fixture.Junction $fixture.State $fixture.Canonical
     Assert-Equal $rollback.ExitCode 0 "rollback succeeds: $($rollback.Output)"
     Assert-Equal (Get-ByteHash ([IO.File]::ReadAllBytes($fixture.Profile))) (Get-ByteHash $originalBytes) 'rollback restores exact bytes'
-    Assert-Equal (Get-Acl -LiteralPath $fixture.Profile).Sddl $originalAcl 'rollback restores ACL'
+    Assert-AclEqual (Get-Acl -LiteralPath $fixture.Profile).Sddl $originalAcl 'rollback restores ACL'
     Assert-True (-not (Test-Path -LiteralPath $fixture.Junction)) 'rollback removes junction'
 
     $encodingCases = @(
@@ -207,12 +240,12 @@ claude-codex 'space value' 'quote"inside' '' $unicode '--'
         $preamble = $case.Encoding.GetPreamble()
         for ($i=0; $i -lt $preamble.Length; $i++) { Assert-Equal $afterBytes[$i] $preamble[$i] "$($case.Name) preamble byte $i preserved" }
         if ($preamble.Length -eq 0) { Assert-True (-not ($afterBytes.Length -ge 3 -and $afterBytes[0] -eq 0xEF -and $afterBytes[1] -eq 0xBB -and $afterBytes[2] -eq 0xBF)) "$($case.Name) remains BOM-free" }
-        Assert-Equal (Get-Acl -LiteralPath $encoded.Profile).Sddl $beforeAcl "$($case.Name) ACL preserved after apply"
+        Assert-AclEqual (Get-Acl -LiteralPath $encoded.Profile).Sddl $beforeAcl "$($case.Name) ACL preserved after apply"
         Assert-Equal (Invoke-SetupFixture Validate $encoded.Profile $encoded.Junction $encoded.State $encoded.Canonical).ExitCode 0 "$($case.Name) validate succeeds"
         Assert-Equal (@(Get-ChildItem -LiteralPath $encoded.State -Force | Where-Object { $_.Name -like '.state-*' }).Count) 0 "$($case.Name) atomic state write leaves no temp files"
         Assert-Equal (Invoke-SetupFixture Rollback $encoded.Profile $encoded.Junction $encoded.State $encoded.Canonical).ExitCode 0 "$($case.Name) rollback succeeds"
         Assert-Equal (Get-ByteHash ([IO.File]::ReadAllBytes($encoded.Profile))) (Get-ByteHash $beforeBytes) "$($case.Name) rollback restores exact bytes"
-        Assert-Equal (Get-Acl -LiteralPath $encoded.Profile).Sddl $beforeAcl "$($case.Name) rollback restores ACL"
+        Assert-AclEqual (Get-Acl -LiteralPath $encoded.Profile).Sddl $beforeAcl "$($case.Name) rollback restores ACL"
     }
     $invalidEncoding = New-FixtureCase 'invalid-bomless-encoding'
     [IO.File]::WriteAllBytes($invalidEncoding.Profile, [byte[]]@(0x23,0x20,0x80,0x0A))
@@ -228,7 +261,7 @@ claude-codex 'space value' 'quote"inside' '' $unicode '--'
     $recoverOnceResult = Invoke-SetupFixture Apply $recoverOnce.Profile $recoverOnce.Junction $recoverOnce.State $recoverOnce.Canonical 'ApplyPostReplaceAclOnce'
     Assert-True ($recoverOnceResult.ExitCode -ne 0) 'fixture injects one post-replace ACL failure'
     Assert-Equal (Get-ByteHash ([IO.File]::ReadAllBytes($recoverOnce.Profile))) (Get-ByteHash $recoverOnceBytes) 'one-shot failure restores original bytes'
-    Assert-Equal (Get-Acl -LiteralPath $recoverOnce.Profile).Sddl $recoverOnceAcl 'one-shot failure restores original ACL'
+    Assert-AclEqual (Get-Acl -LiteralPath $recoverOnce.Profile).Sddl $recoverOnceAcl 'one-shot failure restores original ACL'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $recoverOnce.State 'state.json'))) 'verified restoration removes transaction state'
     Assert-Equal (@(Get-ChildItem -LiteralPath (Split-Path -Parent $recoverOnce.Profile) -Filter '.claudex-profile-*' -Force).Count) 0 'verified restoration removes File.Replace recovery copies'
     Assert-True (-not (Test-Path -LiteralPath $recoverOnce.Junction)) 'verified restoration removes transaction-created junction'
@@ -564,7 +597,25 @@ try {
     Assert-Equal $failClosedRun.ExitCode 0 'unrecognized batch wrapper safely fails closed'
     Write-Output '  ok  npm claude.cmd wrapper safe resolution, metacharacter preservation, and fail-closed security'
 
-    Write-Output "`n9/9 PowerShell groups passed."
+    # Faithful DACL normalization fixture
+    $normSddlActual = 'O:BAG:S-1-5-21-1456194669-2875347699-3862154473-513D:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;LA)'
+    $normSddlExpected = 'O:BAG:S-1-5-21-1456194669-2875347699-3862154473-513D:(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;LA)'
+    Assert-True (Test-SddlEquivalence $normSddlActual $normSddlExpected) 'unprotected auto-inherited control bit normalizes between identical ACEs'
+    $diffOwner = 'O:SYG:S-1-5-21-1456194669-2875347699-3862154473-513D:(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;LA)'
+    Assert-True (-not (Test-SddlEquivalence $normSddlActual $diffOwner)) 'different owner is rejected'
+    $diffGroup = 'O:BAG:S-1-5-32-544D:(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;LA)'
+    Assert-True (-not (Test-SddlEquivalence $normSddlActual $diffGroup)) 'different group is rejected'
+    $protectedAcl = 'O:BAG:S-1-5-21-1456194669-2875347699-3862154473-513D:P(A;FA;;;SY)(A;FA;;;BA)(A;FA;;;LA)'
+    Assert-True (-not (Test-SddlEquivalence $normSddlActual $protectedAcl)) 'protected inheritance P is never normalized away'
+    $diffRights = 'O:BAG:S-1-5-21-1456194669-2875347699-3862154473-513D:(A;ID;FR;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;LA)'
+    Assert-True (-not (Test-SddlEquivalence $normSddlActual $diffRights)) 'different rights/mask is rejected'
+    $diffOrder = 'O:BAG:S-1-5-21-1456194669-2875347699-3862154473-513D:(A;ID;FA;;;BA)(A;ID;FA;;;SY)(A;ID;FA;;;LA)'
+    Assert-True (-not (Test-SddlEquivalence $normSddlActual $diffOrder)) 'different ACE order is rejected'
+    $diffCount = 'O:BAG:S-1-5-21-1456194669-2875347699-3862154473-513D:(A;ID;FA;;;SY)(A;ID;FA;;;BA)'
+    Assert-True (-not (Test-SddlEquivalence $normSddlActual $diffCount)) 'missing ACE is rejected'
+    Write-Output '  ok  faithful DACL normalization, owner/group preservation, and protected inheritance guards'
+
+    Write-Output "`n10/10 PowerShell groups passed."
 }
 finally {
     foreach ($process in $gatewayProcesses) { if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force -Confirm:$false } }
