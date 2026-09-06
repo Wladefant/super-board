@@ -211,15 +211,18 @@ class GuardTestCase(unittest.TestCase):
 
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def observe_daemon_cycle(self, minute, lineage=False, **kwargs):
+    def observe_daemon_cycle(self, minute, lineage=None, **kwargs):
         """
         One observed restart cycle of the staging daemon fixture.
 
-        `lineage=True` records the failure on the shared fixture repository's real
-        base commit, which is what a test needs when it is about the gate opening:
-        a correction is only bound when its verification context resolves a head
-        the failure was observed on. Without it the failure records no head and no
-        repository, which is the honestly unanchored case and is tested by name.
+        The fixture incident happened *somewhere*, so by default it is recorded on
+        the shared fixture repository's real base commit: a correction is only
+        bound when the head its proof ran on descends from every head the failure
+        was observed on, so a test about anything else still needs a failure that
+        has a lineage to descend from. A caller that names its own `head_sha` or
+        `repo_root` keeps exactly the shape it named, and `lineage=False` records
+        neither, which is the honestly unanchored case - it binds nothing and is
+        tested by name.
         """
         params = dict(
             project="fixture-org/fixture-repo",
@@ -230,6 +233,8 @@ class GuardTestCase(unittest.TestCase):
             attempt=f"fixture-restart-cycle-{minute}",
             update_ledger=False,
         )
+        if lineage is None:
+            lineage = not ({"head_sha", "repo_root"} & set(kwargs))
         if lineage:
             repo = fixture_corrective_repo()
             params.update(head_sha=repo["base"], repo_root=repo["root"])
@@ -491,10 +496,14 @@ class TestCorrectiveActionGates(GuardTestCase):
         self.assertIn("does not exist", str(ctx.exception))
         self.assertFalse(self.guard.check_retry(signature=second.signature).allowed)
 
+        # The correction itself is a real commit made *after* the failures, in the
+        # repository they were recorded in: these observations carry no head, so
+        # the head the proof ran on is bound to the failure by postdating it.
+        corrective = commit_systemic_change(repo, "revision_restored.py")
         out = self.correct(
             second.signature,
-            change_ref=f"commit:{real_head}",
-            head_sha=real_head,
+            change_ref=f"commit:{corrective}",
+            head_sha=corrective,
             verification_root=None,
         )
         self.assertTrue(out["action"]["change_ref_verification"]["checked"])
@@ -889,6 +898,10 @@ class TestPersistenceAcrossProcesses(GuardTestCase):
 
     def test_cli_escalation_and_gate_survive_separate_processes(self):
         base = ["--state-dir", self.tmp]
+        # The CLI records the failure where it happened, so the corrective action
+        # further down has a lineage to descend from - which is the only shape
+        # that opens the gate through the CLI an operator actually runs.
+        fixture = fixture_corrective_repo()
         signature = None
         for minute in range(1, ESCALATION_THRESHOLD + 1):
             proc = run_cli(base + [
@@ -899,6 +912,8 @@ class TestPersistenceAcrossProcesses(GuardTestCase):
                 "--error", DAEMON_RESTART_ERROR.format(minute=minute),
                 "--source", "deploy",
                 "--attempt", f"fixture-restart-cycle-{minute}",
+                "--head-sha", fixture["base"],
+                "--repo-root", fixture["root"],
                 "--canonical-link", "https://github.com/fixture-org/fixture-repo/issues/4574",
                 "--no-ledger-update",
             ])
@@ -916,6 +931,8 @@ class TestPersistenceAcrossProcesses(GuardTestCase):
             "--error", DAEMON_RESTART_ERROR.format(minute=2),
             "--source", "deploy",
             "--attempt", "fixture-restart-cycle-2",
+            "--head-sha", fixture["base"],
+            "--repo-root", fixture["root"],
             "--no-ledger-update",
         ])
         self.assertEqual(replay.returncode, 0, replay.stderr)
@@ -973,9 +990,9 @@ class TestPersistenceAcrossProcesses(GuardTestCase):
             run_cli(base + ["check-retry", "--signature", signature]).returncode, 3
         )
 
-        # A commit reference with nothing to resolve it against is recorded and
-        # still does not open the gate.
-        unverifiable = run_cli(base + [
+        # A commit reference the recorded repository *refutes* is refused outright
+        # through the CLI too, so a fabricated SHA never lands as a correction.
+        refuted = run_cli(base + [
             "record-corrective-action", "--signature", signature,
             "--kind", "code_change",
             "--description", "restored the missing revision file on the branch",
@@ -987,6 +1004,18 @@ class TestPersistenceAcrossProcesses(GuardTestCase):
             "--evidence-exit-code", "0",
             "--head-sha", FIXTURE_CORRECTIVE_COMMIT,
         ])
+        self.assertEqual(refuted.returncode, 3, refuted.stdout)
+        self.assertIn("does not exist", refuted.stderr)
+
+        # A reference with nothing to resolve it against - a pull request needs a
+        # remote API this module never contacts - is recorded and opens nothing.
+        unverifiable = run_cli(base + [
+            "record-corrective-action", "--signature", signature,
+            "--kind", "process_change",
+            "--description", "opened the upstream fix as a pull request",
+            "--change-ref", "pr:fixture-org/fixture-repo#4574",
+            "--actor", "DaemonMigrationRepair",
+        ] + evidence_args)
         self.assertEqual(unverifiable.returncode, 3, unverifiable.stdout)
         self.assertFalse(json.loads(unverifiable.stdout)["gate"]["opened"])
         self.assertEqual(
@@ -1116,6 +1145,10 @@ class TestIntendedFailuresAreNotRecurrence(GuardTestCase):
     """
 
     def _probe(self, run, **kwargs):
+        # Recorded on the fixture repository's real base commit: the probe ran
+        # somewhere, and a correction only binds when the head its proof ran on
+        # descends from the head the failure was observed on.
+        repo = fixture_corrective_repo()
         params = dict(
             project="fixture-org/fixture-repo",
             environment="ci",
@@ -1124,6 +1157,8 @@ class TestIntendedFailuresAreNotRecurrence(GuardTestCase):
             source="ci",
             attempt=f"fixture-probe-run-{run}",
             disposition="expected_negative_control",
+            head_sha=repo["base"],
+            repo_root=repo["root"],
             update_ledger=False,
         )
         params.update(kwargs)
@@ -1564,7 +1599,7 @@ class TestDriverRecurrenceGate(unittest.TestCase):
     #: head the proof ran on, so the file and the key have to be really committed -
     #: which is also what the fix in the observed incident actually was. It is
     #: deliberately left out of the working tree, so the only place the gate can
-    #: have read it from is `self.corrected_head`'s tree.
+    #: have read it from is the corrective commit's tree.
     REVISION_FILE = "alembic/versions/20260904_page_views_kind.py"
 
     def setUp(self):
@@ -1572,15 +1607,6 @@ class TestDriverRecurrenceGate(unittest.TestCase):
         self.addCleanup(self._cleanup)
         self.repo = os.path.join(self.tmp, "repo")
         self.head = make_repo(self.repo)
-        self.corrected_head = commit_files(
-            self.repo,
-            {
-                self.REVISION_FILE: (
-                    'revision = "20260904_page_views_kind"\ndown_revision = None\n'
-                )
-            },
-            "restore the missing alembic revision",
-        )
         self.state_dir = os.path.join(self.tmp, "state")
         os.makedirs(self.state_dir, exist_ok=True)
         self.ledger = RequestLedger(state_dir=self.state_dir)
@@ -1595,6 +1621,26 @@ class TestDriverRecurrenceGate(unittest.TestCase):
             task_type="local",
         )
         self.guard = RecurrenceGuard(state_dir=self.state_dir)
+
+    def _commit_correction(self):
+        """
+        The corrective commit, made when the correction is recorded rather than in
+        setUp.
+
+        These failures record no head (the fixture request has none), so the head
+        the proof ran on is bound to the failure by postdating it: a tree that
+        already existed while the failure was happening cannot be what corrected
+        it. Building the commit up front made the fixture assert the opposite.
+        """
+        return commit_files(
+            self.repo,
+            {
+                self.REVISION_FILE: (
+                    'revision = "20260904_page_views_kind"\ndown_revision = None\n'
+                )
+            },
+            "restore the missing alembic revision",
+        )
 
     def _cleanup(self):
         import shutil
@@ -1645,7 +1691,7 @@ class TestDriverRecurrenceGate(unittest.TestCase):
                     kind="config_change",
                     description="restored the missing revision file so the drift check passes",
                     change_ref=f"config:{self.REVISION_FILE}#revision",
-                    head_sha=self.corrected_head,
+                    head_sha=self._commit_correction(),
                     verification_root=self.repo,
                 )
         fourth, adapter_four = self._run()
@@ -1687,7 +1733,7 @@ class TestDriverRecurrenceGate(unittest.TestCase):
                     kind="config_change",
                     description="restored the missing revision file so the drift check passes",
                     change_ref=f"config:{self.REVISION_FILE}#revision",
-                    head_sha=self.corrected_head,
+                    head_sha=self._commit_correction(),
                     verification_root=self.repo,
                 )
         _, adapter = self._run()
@@ -2729,10 +2775,17 @@ class TestCorrectiveProofIsBoundToAVerifiedChange(GuardTestCase):
                     "dec-4582": {
                         "status": "answered",
                         "selected_option": "stop retrying",
-                        # The decision has to have been taken *after* the failure it
-                        # claims to correct, and this is the field decision_workflow
-                        # writes when a human answers.
-                        "answer": {"answered_at": _later_than_now()},
+                        "answer": {
+                            # The comment that answered it has to have been
+                            # *posted* after the failure it claims to correct, and
+                            # this is the API-verified creation time
+                            # decision_workflow copies from the comment.
+                            "comment_created_at": _later_than_now(),
+                            # The instant the reply was ingested. Kept as audit and
+                            # never read as proof: a sync running after the failure
+                            # would otherwise make any older comment postdate it.
+                            "answered_at": _later_than_now(120),
+                        },
                     }
                 }
             }
@@ -2926,10 +2979,22 @@ class TestCorrectiveProofIsBoundToTheFailuresLineage(GuardTestCase):
         self.assertTrue(out["gate"]["opened"], out["gate"]["reason"])
 
     def test_a_decision_answered_after_the_last_failure_opens_the_gate(self):
-        self._decisions({"dec-now": {"status": "answered",
-                                     "answer": {"answered_at": _later_than_now()}}})
+        """The authentic shape: the answering comment was posted after the failure."""
+        self._decisions(
+            {
+                "dec-now": {
+                    "status": "answered",
+                    "answer": {
+                        "comment_created_at": _later_than_now(),
+                        "answered_at": _later_than_now(120),
+                        "comment_created_at_source": "api_verified",
+                    },
+                }
+            }
+        )
         out = self.record(kind="process_change", change_ref="decision:dec-now")
         self.assertTrue(out["gate"]["opened"], out["gate"]["reason"])
+        self.assertIn("posted", out["gate"]["reason"])
 
     # -- WIR-1: the verification context has to be the failure's ----------
 
@@ -2975,24 +3040,75 @@ class TestCorrectiveProofIsBoundToTheFailuresLineage(GuardTestCase):
         self.assertIsNone(out["gate"]["lineage"])
         self.assertFalse(self.guard.check_retry(signature=orphan.signature).allowed)
 
-    def test_a_failure_that_recorded_no_lineage_says_so_instead_of_claiming_one(self):
+    def test_a_failure_that_recorded_no_lineage_binds_nothing_and_names_the_way_out(self):
         """
-        Neither a head nor a reachable repository was ever recorded, so there is
-        nothing to relate a context to. Refusing here would deadlock rather than
-        fail closed - no reference could open the gate and no resolution could
-        close it - so the record stands on nothing and states that it does.
+        NEW-3, and the reviewed regression of this very test: neither a head nor a
+        reachable repository was ever recorded, so there is nothing a proof can be
+        related to - and "related to nothing" was previously recorded honestly and
+        then read as a pass, so any repository with any commit opened the gate.
+
+        It stays closed. That is not a deadlock and needs no new authorization:
+        the refusal names the two recovery paths this module already contracts,
+        re-observing the failure with a head (and a repository) or superseding its
+        counted observations as an operator, and the second one is exercised here.
         """
-        self.observe_daemon_cycle(1, operation="deploy:migrate")
-        orphan = self.observe_daemon_cycle(2, operation="deploy:migrate")
+        self.observe_daemon_cycle(1, operation="deploy:migrate", lineage=False)
+        orphan = self.observe_daemon_cycle(2, operation="deploy:migrate", lineage=False)
         out = self.correct(
             orphan.signature,
             change_ref=f"commit:{self.unrelated_base}",
             head_sha=self.unrelated_fix,
             verification_root=self.unrelated,
         )
-        self.assertTrue(out["gate"]["opened"], out["gate"]["reason"])
+        self.assertTrue(out["recorded"], "a proposal is still worth recording")
+        self.assertFalse(out["gate"]["opened"], out["gate"]["reason"])
         self.assertEqual(out["gate"]["lineage"], "unanchored")
-        self.assertIn("could not be related to it", out["gate"]["reason"])
+        self.assertIn("stands on nothing", out["gate"]["reason"])
+        self.assertIn("--head-sha", out["gate"]["reason"])
+        self.assertIn("supersede-observation", out["gate"]["reason"])
+        self.assertFalse(self.guard.check_retry(signature=orphan.signature).allowed)
+        self.assertIn(
+            "recorded no head and no reachable repository",
+            self.guard.get(orphan.signature)["required_action"],
+        )
+
+        # The contracted operator path out, with an actor and a reason on the
+        # record: taking the counted observations out of the count unblocks retry
+        # without anybody claiming a proof that stands on nothing.
+        for observation in self.guard.get(orphan.signature)["observations"]:
+            self.guard.supersede_observation(
+                observation_id=observation["observation_id"],
+                disposition="superseded_attempt",
+                reason="operator reclassified the unanchored attempts after triage",
+                actor="operator",
+            )
+        self.assertTrue(self.guard.check_retry(signature=orphan.signature).allowed)
+
+    def test_an_unanchored_failure_reobserved_with_a_head_can_be_corrected(self):
+        """
+        The other contracted way out, and the one that keeps the gate meaningful:
+        the failure is re-observed where it happens, so a descendant correction has
+        something to descend from.
+        """
+        self.observe_daemon_cycle(1, operation="deploy:migrate", lineage=False)
+        orphan = self.observe_daemon_cycle(2, operation="deploy:migrate", lineage=False)
+        self.assertFalse(self.guard.check_retry(signature=orphan.signature).allowed)
+        anchored = self.observe_daemon_cycle(
+            3,
+            operation="deploy:migrate",
+            head_sha=self.failing_head,
+            repo_root=self.repo,
+        )
+        self.assertEqual(anchored.signature, orphan.signature)
+        out = self.correct(
+            orphan.signature,
+            change_ref=f"commit:{self.fix}",
+            head_sha=self.fix,
+            verification_root=self.repo,
+        )
+        self.assertTrue(out["gate"]["opened"], out["gate"]["reason"])
+        self.assertEqual(out["gate"]["lineage"], "observed_head")
+        self.assertTrue(self.guard.check_retry(signature=orphan.signature).allowed)
 
     # -- WIR-2: the reference has to name something that changed ----------
 
@@ -3032,7 +3148,7 @@ class TestCorrectiveProofIsBoundToTheFailuresLineage(GuardTestCase):
         )
         self.assertIn("is an ancestor of", out["gate"]["reason"])
 
-    # -- WIR-3: the decision has to postdate the failure -------------------
+    # -- WIR-3 / NEW-4: the answering comment has to postdate the failure --
 
     def _decisions(self, decisions):
         with open(os.path.join(self.tmp, "decisions.json"), "w", encoding="utf-8") as fh:
@@ -3044,7 +3160,7 @@ class TestCorrectiveProofIsBoundToTheFailuresLineage(GuardTestCase):
                 "dec-old": {
                     "status": "answered",
                     "question": "an unrelated question from January",
-                    "answer": {"answered_at": BEFORE_ANY_FAILURE},
+                    "answer": {"comment_created_at": BEFORE_ANY_FAILURE},
                 }
             }
         )
@@ -3058,28 +3174,100 @@ class TestCorrectiveProofIsBoundToTheFailuresLineage(GuardTestCase):
         self.assertFalse(verification["answered_after_failure"])
         self.assertIn("before this signature last failed", verification["reason"])
 
-    def test_an_answered_decision_with_no_readable_timestamp_opens_nothing(self):
-        """Fail-closed on a missing timestamp: it cannot be shown to postdate."""
-        self._decisions({"dec-undated": {"status": "answered"}})
-        out = self.record(kind="process_change", change_ref="decision:dec-undated")
+    def test_a_comment_posted_before_the_failure_but_ingested_after_it_opens_nothing(self):
+        """
+        The reviewed cross-lane defect (NEW-4), and the *normal* case rather than
+        an edge: `sync_decisions` is a bounded one-shot invoked at barriers, so a
+        comment posted before the failure is routinely ingested after it. Reading
+        the ingest instant made every such answer "postdate" the failure it was
+        already taken during.
+        """
+        self._decisions(
+            {
+                "dec-lag": {
+                    "status": "answered",
+                    "answer": {
+                        "comment_created_at": BEFORE_ANY_FAILURE,
+                        # Ingested a minute from now: after the failure, and not
+                        # proof of anything about when the answer was posted.
+                        "answered_at": _later_than_now(),
+                    },
+                }
+            }
+        )
+        out = self.record(kind="process_change", change_ref="decision:dec-lag")
+        self.assert_closed(out)
+        verification = out["action"]["change_ref_verification"]
+        self.assertFalse(verification["answered_after_failure"])
+        self.assertEqual(verification["comment_created_at"], BEFORE_ANY_FAILURE)
+        self.assertIn("before this signature last failed", verification["reason"])
+
+    def test_an_ingest_timestamp_alone_is_not_proof_and_opens_nothing(self):
+        """
+        No fallback. An answer whose only timestamp is the ingest instant - which
+        is what the decision workflow wrote before the producer carried the
+        comment's creation time - cannot be shown to have been posted after the
+        failure, so it resolves and binds nothing.
+        """
+        self._decisions(
+            {"dec-ingest-only": {"status": "answered",
+                                 "answer": {"answered_at": _later_than_now()}}}
+        )
+        out = self.record(kind="process_change", change_ref="decision:dec-ingest-only")
+        self.assert_closed(out)
+        verification = out["action"]["change_ref_verification"]
+        self.assertIsNone(verification["comment_created_at"])
+        self.assertIn("no readable answer.comment_created_at", verification["reason"])
+        self.assertIn("not the instant it was posted", verification["reason"])
+
+    def test_a_hand_edited_record_timestamp_is_not_a_fallback_either(self):
+        """
+        `record.updated_at` and a top-level `answered_at` are whatever wrote the
+        file last said they are. Neither may stand in for the comment's creation
+        time.
+        """
+        self._decisions(
+            {
+                "dec-hand-edited": {
+                    "status": "answered",
+                    "answered_at": _later_than_now(),
+                    "updated_at": _later_than_now(120),
+                    "answer": {"responder": "operator", "comment_id": "1"},
+                }
+            }
+        )
+        out = self.record(kind="process_change", change_ref="decision:dec-hand-edited")
         self.assert_closed(out)
         self.assertIn(
-            "no readable timestamp",
+            "no readable answer.comment_created_at",
+            out["action"]["change_ref_verification"]["reason"],
+        )
+
+    def test_an_unparseable_comment_creation_time_opens_nothing(self):
+        self._decisions(
+            {"dec-garbled": {"status": "answered",
+                             "answer": {"comment_created_at": "last tuesday"}}}
+        )
+        out = self.record(kind="process_change", change_ref="decision:dec-garbled")
+        self.assert_closed(out)
+        self.assertIn(
+            "no readable answer.comment_created_at",
             out["action"]["change_ref_verification"]["reason"],
         )
 
     def test_a_decision_answered_between_two_occurrences_opens_nothing(self):
         """It was already taken when the failure happened again, so it did not hold."""
-        # Answered one millisecond after the second occurrence was recorded, and
-        # then a third occurrence lands: the decision predates the last counted
+        # Posted one millisecond after the second occurrence was recorded, and
+        # then a third occurrence lands: the answer predates the last counted
         # failure, so it demonstrably did not hold.
         second = self.guard.get(self.signature)["observations"][1]["observed_at"]
-        answered = (
+        posted = (
             datetime.datetime.fromisoformat(second)
             + datetime.timedelta(milliseconds=1)
         ).isoformat()
         self._decisions(
-            {"dec-mid": {"status": "answered", "answer": {"answered_at": answered}}}
+            {"dec-mid": {"status": "answered",
+                         "answer": {"comment_created_at": posted}}}
         )
         self.observe_daemon_cycle(
             3, head_sha=self.failing_head, repo_root=self.repo,
@@ -3101,7 +3289,7 @@ class TestCorrectiveProofIsBoundToTheFailuresLineage(GuardTestCase):
             change_ref="config:app.yml#revision",
             head_sha=corrected,
         )
-        self.assertIn("committed configuration differs", config["gate"]["reason"])
+        self.assertIn("committed configuration key differs", config["gate"]["reason"])
         self.assertNotIn("change commit", config["gate"]["reason"])
 
         commit = self.record(change_ref=f"commit:{self.fix}", head_sha=self.fix)
@@ -3122,6 +3310,500 @@ class TestCorrectiveProofIsBoundToTheFailuresLineage(GuardTestCase):
         self.assertEqual(third.status, STATUS_ESCALATED)
         self.assertFalse(third.retry_allowed)
         self.assertEqual(third.occurrences, 3)
+
+
+class TestCorrectiveProofRunsOnTheCorrectedFailingTree(GuardTestCase):
+    """
+    NEW-1 and NEW-2: the head the proof ran on, and the region the reference names.
+
+    The layer under the lineage check. Once the verification *context* was
+    anchored, the evidence *head* was still related to the failure only by what it
+    was not - not an observed head, not an ancestor of one - which every tree that
+    never carried the failure satisfies: an orphan root in the same repository, an
+    orphan commit in any clone that merely holds the failing commit, a sibling
+    branch cut from the failing commit's parent. And "the reference names something
+    that changed" was whole-file byte inequality, so an untouched key or test
+    counted as the change whenever anything else in the file moved.
+
+    The fixture is one repository with a real shape: `before` carries the config
+    and the test, `failing_head` is the tree the failure was observed on, and
+    `fix`, `orphan` and `sibling` are the three heads a proof might claim.
+    """
+
+    def setUp(self):
+        import shutil
+
+        super().setUp()
+        self.repo = os.path.join(self.tmp, "repo")
+        make_repo(self.repo)
+        trunk = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=self.repo,
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        self.before = self._commit(
+            {
+                "app.yml": "revision: 1\nfeature: on\n",
+                "tests/test_x.py": "def test_old():\n    assert True\n",
+            },
+            "config and test as they were before the failure",
+        )
+        self.failing_head = self._commit(
+            {"src.py": "broken = True\n"}, "the head the failure was observed on"
+        )
+        self.fix = self._commit({"src.py": "broken = False\n"}, "the systemic fix")
+
+        # A sibling branch from the failing commit's parent: a real head, in the
+        # right repository, that never contained the failure.
+        git(self.repo, "checkout", "-q", "-b", "sibling", self.before)
+        self.sibling = self._commit({"other.py": "unrelated = 1\n"}, "sibling change")
+        # An orphan root in the same repository: shares no history with anything.
+        git(self.repo, "checkout", "-q", "--orphan", "orphan")
+        git(self.repo, "rm", "-rfq", "--cached", ".")
+        for name in ("src.py", "other.py", "app.yml"):
+            path = os.path.join(self.repo, name)
+            if os.path.exists(path):
+                os.remove(path)
+        shutil.rmtree(os.path.join(self.repo, "tests"), ignore_errors=True)
+        self.orphan = self._commit({"README": "orphan\n"}, "orphan root")
+        git(self.repo, "checkout", "-q", trunk)
+
+        self.observe(1)
+        blocking = self.observe(2)
+        self.signature = blocking.signature
+        self.assertFalse(blocking.retry_allowed)
+
+    def _commit(self, files, message):
+        for rel, content in files.items():
+            path = os.path.join(self.repo, *rel.split("/"))
+            if os.path.dirname(path):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(content)
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", message)
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo,
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+    def observe(self, minute, head=None, **kwargs):
+        return self.observe_daemon_cycle(
+            minute, head_sha=head or self.failing_head, repo_root=self.repo, **kwargs
+        )
+
+    def record(self, **kwargs):
+        params = dict(verification_root=self.repo, head_sha=self.fix)
+        params.update(kwargs)
+        return self.correct(self.signature, **params)
+
+    def assert_closed(self, out):
+        self.assertTrue(out["recorded"], "a proposal is still worth recording")
+        self.assertFalse(out["gate"]["opened"], out["gate"]["reason"])
+        self.assertFalse(self.guard.check_retry(signature=self.signature).allowed)
+
+    # -- NEW-1: the head has to descend from every observed failing head ---
+
+    def test_an_orphan_head_in_the_same_repository_opens_nothing(self):
+        """
+        The reviewed laundering shape one level down: the context resolves the
+        failing head, and the head the proof ran on shares no history with it.
+        """
+        out = self.record(change_ref=f"commit:{self.orphan}", head_sha=self.orphan)
+        self.assert_closed(out)
+        self.assertEqual(out["gate"]["lineage"], "observed_head")
+        self.assertTrue(
+            out["action"]["change_ref_verification"]["checked"],
+            "the reference resolves; descent is what it does not establish",
+        )
+        self.assertFalse(out["gate"]["descends_from_observed"])
+        self.assertEqual(
+            out["gate"]["observed_heads_not_contained"], [self.failing_head]
+        )
+        self.assertIn("does not descend from", out["gate"]["reason"])
+
+    def test_a_sibling_head_that_never_carried_the_failure_opens_nothing(self):
+        """
+        A common ancestor is not descent: `sibling` branched from the failing
+        commit's parent, so the failure was never in its history.
+        """
+        out = self.record(change_ref=f"commit:{self.sibling}", head_sha=self.sibling)
+        self.assert_closed(out)
+        self.assertFalse(out["gate"]["descends_from_observed"])
+        self.assertIn("sharing a merge-base with it is not descent", out["gate"]["reason"])
+
+    def test_an_orphan_head_in_a_clone_that_merely_holds_the_failure_opens_nothing(self):
+        """
+        Every clone of the project holds the failing commit, so resolving it there
+        proves availability and nothing else.
+        """
+        clone = os.path.join(self.tmp, "clone")
+        git(self.tmp, "clone", "-q", self.repo, clone)
+        git(clone, "checkout", "-q", self.orphan)
+        out = self.record(
+            change_ref=f"commit:{self.orphan}",
+            head_sha=self.orphan,
+            verification_root=clone,
+        )
+        self.assert_closed(out)
+        self.assertEqual(out["gate"]["lineage"], "observed_head")
+        self.assertFalse(out["gate"]["descends_from_observed"])
+
+    def test_a_head_descending_from_only_one_of_two_observed_heads_opens_nothing(self):
+        """
+        Both branches really failed, so a fix that only ever contained one of them
+        cannot be the correction for the signature: `sibling` is a second counted
+        failing head, and `fix` descends from the first only.
+        """
+        self.observe(3, head=self.sibling, attempt="fixture-restart-cycle-sibling")
+        out = self.record(change_ref=f"commit:{self.fix}", head_sha=self.fix)
+        self.assert_closed(out)
+        self.assertEqual(out["gate"]["observed_heads_not_contained"], [self.sibling])
+        self.assertIn("does not descend from", out["gate"]["reason"])
+
+    def test_an_unresolvable_observed_head_fails_closed_rather_than_being_skipped(self):
+        """
+        A second counted head that this context cannot resolve leaves the descent
+        unproven for that head. Unproven is refused, not ignored - otherwise a
+        fabricated second head would *weaken* the check it is subject to.
+        """
+        self.observe(4, head="b" * 40, attempt="fixture-restart-cycle-unresolvable")
+        out = self.record(change_ref=f"commit:{self.fix}", head_sha=self.fix)
+        self.assert_closed(out)
+        self.assertEqual(out["gate"]["observed_heads_unresolved"], ["b" * 40])
+        self.assertFalse(out["gate"]["containment_determined"])
+        self.assertIn("is not resolvable in", out["gate"]["reason"])
+
+    def test_the_real_descendant_fix_still_opens_the_gate(self):
+        out = self.record(change_ref=f"commit:{self.fix}", head_sha=self.fix)
+        self.assertTrue(out["gate"]["opened"], out["gate"]["reason"])
+        self.assertTrue(out["gate"]["descends_from_observed"])
+        self.assertEqual(out["gate"]["observed_heads_not_contained"], [])
+        self.assertIn("descending from every head", out["gate"]["reason"])
+        self.assertTrue(self.guard.check_retry(signature=self.signature).allowed)
+
+    def test_a_descendant_fix_verified_in_a_plain_clone_still_opens_the_gate(self):
+        """A clone legitimately holds both the failure and its descendant fix."""
+        clone = os.path.join(self.tmp, "clone-ok")
+        git(self.tmp, "clone", "-q", self.repo, clone)
+        out = self.record(
+            change_ref=f"commit:{self.fix}", head_sha=self.fix, verification_root=clone
+        )
+        self.assertTrue(out["gate"]["opened"], out["gate"]["reason"])
+        self.assertTrue(out["gate"]["descends_from_observed"])
+
+    def test_a_replacement_worktree_of_the_same_repository_still_opens_the_gate(self):
+        """The ephemeral-lane flow: the tree the failure was observed in is gone."""
+        replacement = os.path.join(self.tmp, "worktree-replacement")
+        git(self.repo, "worktree", "add", "-q", "--detach", replacement, self.fix)
+        out = self.record(
+            change_ref=f"commit:{self.fix}",
+            head_sha=self.fix,
+            verification_root=replacement,
+        )
+        self.assertTrue(out["gate"]["opened"], out["gate"]["reason"])
+        self.assertTrue(out["gate"]["descends_from_observed"])
+
+    # -- NEW-2: the reference has to name the region that changed ---------
+
+    def test_an_untouched_key_in_a_file_changed_elsewhere_opens_nothing(self):
+        """
+        `feature` has been byte-identical since before the failure; what the
+        corrective commit changed is `revision` beside it. Whole-file inequality
+        made that count as a change to `feature`.
+        """
+        corrected = commit_files(self.repo, {"app.yml": "revision: 2\nfeature: on\n"})
+        out = self.record(
+            kind="config_change",
+            change_ref="config:app.yml#feature",
+            head_sha=corrected,
+        )
+        self.assert_closed(out)
+        verification = out["action"]["change_ref_verification"]
+        self.assertEqual(verification["change_comparison"], "identical")
+        self.assertEqual(verification["unchanged_at_observed"], [self.failing_head])
+
+    def test_a_comment_only_touch_of_the_file_opens_nothing(self):
+        corrected = commit_files(
+            self.repo, {"app.yml": "revision: 1\nfeature: on\n# touched\n"}
+        )
+        out = self.record(
+            kind="config_change",
+            change_ref="config:app.yml#revision",
+            head_sha=corrected,
+        )
+        self.assert_closed(out)
+        self.assertEqual(
+            out["action"]["change_ref_verification"]["change_comparison"], "identical"
+        )
+
+    def test_an_inline_comment_beside_the_value_is_not_a_value_change(self):
+        corrected = commit_files(
+            self.repo, {"app.yml": "revision: 1  # restored by hand\nfeature: on\n"}
+        )
+        out = self.record(
+            kind="config_change",
+            change_ref="config:app.yml#revision",
+            head_sha=corrected,
+        )
+        self.assert_closed(out)
+        self.assertEqual(
+            out["action"]["change_ref_verification"]["change_comparison"], "identical"
+        )
+
+    def test_a_pre_existing_test_beside_a_newly_added_one_opens_nothing(self):
+        """
+        `test_old` is untouched; a different test was added below it. The reference
+        names `test_old`, so `test_old` is what has to have changed.
+        """
+        corrected = commit_files(
+            self.repo,
+            {
+                "tests/test_x.py": (
+                    "def test_old():\n    assert True\n\n\n"
+                    "def test_new():\n    assert True\n"
+                )
+            },
+        )
+        out = self.record(
+            kind="process_change",
+            change_ref="test:tests/test_x.py::test_old",
+            head_sha=corrected,
+        )
+        self.assert_closed(out)
+        verification = out["action"]["change_ref_verification"]
+        self.assertEqual(verification["change_comparison"], "identical")
+        self.assertEqual(verification["unchanged_at_observed"], [self.failing_head])
+
+    def test_a_key_assigned_twice_in_the_file_is_refused_outright(self):
+        """
+        Ambiguous rather than wrong: the reference does not identify one
+        assignment, so picking the first would compare a region nobody named.
+        """
+        corrected = commit_files(
+            self.repo, {"app.yml": "revision: 1\nfeature: on\nrevision: 2\n"}
+        )
+        with self.assertRaises(RecurrenceGuardError) as ctx:
+            self.record(
+                kind="config_change",
+                change_ref="config:app.yml#revision",
+                head_sha=corrected,
+            )
+        self.assertIn("is assigned on 2 lines", str(ctx.exception))
+        self.assertEqual(self.guard.get(self.signature)["corrective_actions"], [])
+
+    def test_a_key_only_inside_a_minified_document_is_refused_outright(self):
+        """
+        A flow mapping or a minified document puts the whole file on one line, so
+        the compared region would be the whole file - the defect, one level down.
+        """
+        corrected = commit_files(
+            self.repo, {"app.json": '{"revision": 2, "feature": "on"}\n'}
+        )
+        with self.assertRaises(RecurrenceGuardError) as ctx:
+            self.record(
+                kind="config_change",
+                change_ref="config:app.json#revision",
+                head_sha=corrected,
+            )
+        self.assertIn("flow or minified line", str(ctx.exception))
+
+    def test_a_test_defined_twice_in_the_module_is_refused_outright(self):
+        corrected = commit_files(
+            self.repo,
+            {
+                "tests/test_x.py": (
+                    "def test_old():\n    assert True\n\n\n"
+                    "def test_old():\n    assert False\n"
+                )
+            },
+        )
+        with self.assertRaises(RecurrenceGuardError) as ctx:
+            self.record(
+                kind="process_change",
+                change_ref="test:tests/test_x.py::test_old",
+                head_sha=corrected,
+            )
+        self.assertIn("is defined 2 times", str(ctx.exception))
+
+    def test_a_dotted_key_that_resolves_to_two_candidates_is_refused_outright(self):
+        corrected = commit_files(
+            self.repo,
+            {
+                "app.yml": (
+                    "revision: 1\nfeature: on\n"
+                    "server:\n  port: 8080\n  port: 9090\n"
+                )
+            },
+        )
+        with self.assertRaises(RecurrenceGuardError) as ctx:
+            self.record(
+                kind="config_change",
+                change_ref="config:app.yml#server.port",
+                head_sha=corrected,
+            )
+        self.assertIn("resolves ambiguously", str(ctx.exception))
+
+    # -- the scoped comparison still recognises a real change -------------
+
+    def test_a_committed_value_change_to_the_referenced_key_opens_the_gate(self):
+        corrected = commit_files(self.repo, {"app.yml": "revision: 1\nfeature: off\n"})
+        out = self.record(
+            kind="config_change",
+            change_ref="config:app.yml#feature",
+            head_sha=corrected,
+        )
+        self.assertTrue(out["gate"]["opened"], out["gate"]["reason"])
+        self.assertEqual(
+            out["action"]["change_ref_verification"]["change_comparison"], "differs"
+        )
+
+    def test_a_nested_dotted_key_change_opens_the_gate(self):
+        corrected = commit_files(
+            self.repo,
+            {"app.yml": "revision: 1\nfeature: on\nserver:\n  port: 9090\n"},
+        )
+        out = self.record(
+            kind="config_change",
+            change_ref="config:app.yml#server.port",
+            head_sha=corrected,
+        )
+        self.assertTrue(out["gate"]["opened"], out["gate"]["reason"])
+        self.assertEqual(
+            out["action"]["change_ref_verification"]["absent_at_observed"],
+            [self.failing_head],
+        )
+
+    def test_a_changed_body_of_the_referenced_test_opens_the_gate(self):
+        """The definition is what is compared, so a rewritten body is a change."""
+        corrected = commit_files(
+            self.repo,
+            {
+                "tests/test_x.py": (
+                    "def test_old():\n    assert compute() == 2\n\n\n"
+                    "def test_new():\n    assert True\n"
+                )
+            },
+        )
+        out = self.record(
+            kind="process_change",
+            change_ref="test:tests/test_x.py::test_old",
+            head_sha=corrected,
+        )
+        self.assertTrue(out["gate"]["opened"], out["gate"]["reason"])
+        self.assertEqual(
+            out["action"]["change_ref_verification"]["change_comparison"], "differs"
+        )
+
+    def test_a_new_decorator_on_the_referenced_test_opens_the_gate(self):
+        """A decorator is part of the test's definition, not of its surroundings."""
+        corrected = commit_files(
+            self.repo,
+            {
+                "tests/test_x.py": (
+                    "@pytest.mark.parametrize('n', [1, 2])\n"
+                    "def test_old():\n    assert True\n"
+                )
+            },
+        )
+        out = self.record(
+            kind="process_change",
+            change_ref="test:tests/test_x.py::test_old",
+            head_sha=corrected,
+        )
+        self.assertTrue(out["gate"]["opened"], out["gate"]["reason"])
+        self.assertEqual(
+            out["action"]["change_ref_verification"]["change_comparison"], "differs"
+        )
+
+    def test_a_record_written_before_descent_was_checked_recomputes_as_unbound(self):
+        """
+        The gate is recomputed from the action's own recorded facts, so a record
+        that predates this check carries none of them - and an absent relation is
+        an unestablished one, not a passed one.
+        """
+        out = self.record(change_ref=f"commit:{self.fix}", head_sha=self.fix)
+        self.assertTrue(out["gate"]["opened"], out["gate"]["reason"])
+        with open(self.guard.store_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        binding = data["signatures"][self.signature]["corrective_actions"][0][
+            "gate_binding"
+        ]
+        for field in (
+            "descends_from_observed",
+            "containment_determined",
+            "observed_heads_contained",
+            "observed_heads_not_contained",
+            "observed_heads_recorded",
+        ):
+            binding.pop(field, None)
+        with open(self.guard.store_path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        self.assertFalse(
+            self.guard.check_retry(signature=self.signature).allowed,
+            "descent was never established on this record, so it cannot open the gate",
+        )
+
+    # -- a headless failure has no descent, so the head must postdate it --
+
+    def _commit_dated(self, message, when):
+        """
+        A real commit whose committer date is `when`, without moving HEAD.
+
+        Wall-clock dating is not a fixture: git reports a commit time to the
+        second, so a commit made in the same second as the observation is
+        deliberately *not* ordered against it. A test about a pre-failure tree has
+        to name a date, not race one.
+        """
+        tree = subprocess.run(
+            ["git", "rev-parse", "HEAD^{tree}"], cwd=self.repo,
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        env = dict(os.environ, GIT_COMMITTER_DATE=when, GIT_AUTHOR_DATE=when)
+        return subprocess.run(
+            ["git", "commit-tree", tree, "-p", "HEAD", "-m", message],
+            cwd=self.repo, env=env, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+    def test_a_headless_failure_binds_only_a_head_committed_after_it(self):
+        """
+        A failure that recorded no head has no history to descend from, so the
+        only relation left is that the corrective tree came *after* it. Without
+        this, any commit already sitting in the recorded repository bound - the
+        same pre-failure tree the descent check refuses when there is a head.
+        """
+        self.observe_daemon_cycle(1, operation="deploy:migrate", repo_root=self.repo)
+        headless = self.observe_daemon_cycle(
+            2, operation="deploy:migrate", repo_root=self.repo
+        )
+        self.assertFalse(headless.retry_allowed)
+        before_the_failure = self._commit_dated(
+            "a tree that already existed when the failure happened",
+            "2025-01-01T00:00:00+00:00",
+        )
+        stale = self.correct(
+            headless.signature,
+            change_ref=f"commit:{before_the_failure}",
+            head_sha=before_the_failure,
+            verification_root=self.repo,
+        )
+        self.assertFalse(stale["gate"]["opened"], stale["gate"]["reason"])
+        self.assertEqual(stale["gate"]["lineage"], "recorded_repository")
+        self.assertFalse(stale["gate"]["head_committed_after_failure"])
+        self.assertIn(
+            "already existed while the failure was happening", stale["gate"]["reason"]
+        )
+        self.assertFalse(self.guard.check_retry(signature=headless.signature).allowed)
+
+        after = commit_files(self.repo, {"src.py": "broken = False\n"}, "the later fix")
+        opened = self.correct(
+            headless.signature,
+            change_ref=f"commit:{after}",
+            head_sha=after,
+            verification_root=self.repo,
+        )
+        self.assertTrue(opened["gate"]["opened"], opened["gate"]["reason"])
+        self.assertTrue(opened["gate"]["head_committed_after_failure"])
+        self.assertTrue(self.guard.check_retry(signature=headless.signature).allowed)
 
 
 class TestEveryDurableWriteRedacts(GuardTestCase):
@@ -3147,8 +3829,10 @@ class TestEveryDurableWriteRedacts(GuardTestCase):
         self.repo = os.path.join(self.tmp, "repo")
         self.base = make_repo(self.repo)
         self.fix = commit_systemic_change(self.repo, "revision_restored.py")
-        self.observe_daemon_cycle(1, repo_root=self.repo)
-        self.blocking = self.observe_daemon_cycle(2, repo_root=self.repo)
+        self.observe_daemon_cycle(1, head_sha=self.base, repo_root=self.repo)
+        self.blocking = self.observe_daemon_cycle(
+            2, head_sha=self.base, repo_root=self.repo
+        )
 
     def stored(self):
         with open(self.guard.store_path, "r", encoding="utf-8") as fh:
