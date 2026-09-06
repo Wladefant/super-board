@@ -81,12 +81,60 @@ function ConvertTo-WindowsCommandLineArgument([string]$Argument) {
     return $builder.ToString()
 }
 
+function Resolve-ClaudeInvocation([string]$CommandPath) {
+    if (-not (Test-Path -LiteralPath $CommandPath -PathType Leaf)) {
+        throw "Claude command path not found: $CommandPath"
+    }
+    if ($CommandPath -notmatch '\.(cmd|bat)$') {
+        return [pscustomobject]@{
+            Executable = [System.IO.Path]::GetFullPath($CommandPath)
+            PrefixArguments = @()
+        }
+    }
+    $cmdDir = Split-Path -Parent ([System.IO.Path]::GetFullPath($CommandPath))
+    $lines = Get-Content -LiteralPath $CommandPath -ErrorAction Stop
+    foreach ($line in $lines) {
+        if ($line -match '(?i)"(?:%dp0%|%~dp0)([^"]+\.exe)"') {
+            $relative = $matches[1].TrimStart('\', '/')
+            $resolved = [System.IO.Path]::GetFullPath((Join-Path $cmdDir $relative))
+            if (Test-Path -LiteralPath $resolved -PathType Leaf) {
+                return [pscustomobject]@{
+                    Executable = $resolved
+                    PrefixArguments = @()
+                }
+            }
+        }
+    }
+    foreach ($line in $lines) {
+        if ($line -match '(?i)"(?:%dp0%|%~dp0)([^"]+\.(?:c?js|mjs))"') {
+            $relative = $matches[1].TrimStart('\', '/')
+            $resolvedScript = [System.IO.Path]::GetFullPath((Join-Path $cmdDir $relative))
+            if (Test-Path -LiteralPath $resolvedScript -PathType Leaf) {
+                $localNode = Join-Path $cmdDir 'node.exe'
+                $nodeExe = if (Test-Path -LiteralPath $localNode -PathType Leaf) { $localNode } else {
+                    $nodeCmd = @(Get-Command node -CommandType Application -ErrorAction SilentlyContinue)[0]
+                    if ($nodeCmd) { [string]$nodeCmd.Source } else { $null }
+                }
+                if ($nodeExe -and (Test-Path -LiteralPath $nodeExe -PathType Leaf)) {
+                    return [pscustomobject]@{
+                        Executable = [System.IO.Path]::GetFullPath($nodeExe)
+                        PrefixArguments = @($resolvedScript)
+                    }
+                }
+            }
+        }
+    }
+    throw "Refusing to execute unrecognized batch wrapper without safe process target: $CommandPath"
+}
+
 function Invoke-ClaudeExact([string[]]$Arguments) {
-    $command = Get-Command claude -CommandType Application -ErrorAction Stop
+    $command = @(Get-Command claude -CommandType Application -ErrorAction Stop)[0]
+    $resolved = Resolve-ClaudeInvocation ([string]$command.Source)
+    $allArgs = @($resolved.PrefixArguments) + @($Arguments)
     $start = New-Object System.Diagnostics.ProcessStartInfo
-    $start.FileName = $command.Source
+    $start.FileName = $resolved.Executable
+    $start.Arguments = (@($allArgs | ForEach-Object { ConvertTo-WindowsCommandLineArgument ([string]$_) }) -join ' ')
     $start.UseShellExecute = $false
-    $start.Arguments = (@($Arguments | ForEach-Object { ConvertTo-WindowsCommandLineArgument ([string]$_) }) -join ' ')
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $start
     try {
@@ -98,6 +146,7 @@ function Invoke-ClaudeExact([string[]]$Arguments) {
 }
 
 if ($ProbeArgvRoundTrip) {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
     ConvertTo-Json -InputObject @($EffectiveClaudeArgs) -Compress
     exit 0
 }

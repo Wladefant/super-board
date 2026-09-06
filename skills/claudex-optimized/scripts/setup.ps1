@@ -115,9 +115,19 @@ function Set-FileAclSddl([string]$Path, [string]$Sddl) {
             throw 'Fixture-injected post-replace ACL failure.'
         }
     }
+    if ((Test-Path -LiteralPath $Path -PathType Leaf) -and (Get-Acl -LiteralPath $Path).Sddl -eq $Sddl) {
+        return
+    }
     $security = New-Object System.Security.AccessControl.FileSecurity
-    $security.SetSecurityDescriptorSddlForm($Sddl)
-    Set-Acl -LiteralPath $Path -AclObject $security
+    try {
+        $security.SetSecurityDescriptorSddlForm($Sddl)
+        Set-Acl -LiteralPath $Path -AclObject $security
+    }
+    catch {
+        $daclSecurity = New-Object System.Security.AccessControl.FileSecurity
+        $daclSecurity.SetSecurityDescriptorSddlForm($Sddl, [System.Security.AccessControl.AccessControlSections]::Access)
+        Set-Acl -LiteralPath $Path -AclObject $daclSecurity
+    }
 }
 
 function Test-FileState([string]$Path, [byte[]]$ExpectedBytes, [string]$ExpectedAclSddl, [bool]$ExpectedExists = $true) {
@@ -130,6 +140,23 @@ function Test-FileState([string]$Path, [byte[]]$ExpectedBytes, [string]$Expected
 
 function Assert-FileState([string]$Path, [byte[]]$ExpectedBytes, [string]$ExpectedAclSddl, [bool]$ExpectedExists = $true) {
     if (-not (Test-FileState $Path $ExpectedBytes $ExpectedAclSddl $ExpectedExists)) {
+        if (-not $ExpectedExists) {
+            throw "File unexpectedly exists after atomic profile operation: $(Get-RedactedPath $Path)"
+        }
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+            throw "File missing or not a leaf file after atomic profile operation: $(Get-RedactedPath $Path)"
+        }
+        $actualHash = Get-ByteHash ([System.IO.File]::ReadAllBytes($Path))
+        $expectedHash = Get-ByteHash $ExpectedBytes
+        if ($actualHash -ne $expectedHash) {
+            throw "Byte-hash verification failed after atomic profile operation: actual=$actualHash expected=$expectedHash"
+        }
+        if (-not [string]::IsNullOrEmpty($ExpectedAclSddl)) {
+            $actualAcl = (Get-Acl -LiteralPath $Path).Sddl
+            if ($actualAcl -ne $ExpectedAclSddl) {
+                throw "ACL verification failed after atomic profile operation: actual='$actualAcl' expected='$ExpectedAclSddl'"
+            }
+        }
         throw 'Byte-hash or ACL verification failed after atomic profile operation.'
     }
 }
