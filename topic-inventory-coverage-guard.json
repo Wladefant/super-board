@@ -1,10 +1,10 @@
 {
-  "schema_version": "1.0.0",
+  "schema_version": "1.1.0",
   "metadata": {
-    "timestamp": "2026-09-06T13:54:00Z",
+    "timestamp": "2026-09-06T14:02:00Z",
     "repository": "C:/Users/wkiri/development/wt-portable-workflow-core",
     "branch": "feat/topic-inventory-coverage-guard",
-    "commit_sha": "c447fd0b44fe0e34c9c22e445dae65842817ad99",
+    "full_commit_sha": "33cc47c6d7b31f336744034a3d9d24ee65ffb52a",
     "parent_branch": "feat/portable-workflow-core",
     "parent_commit": "24daf06322c31d84d341599b628e66d92a8964eb",
     "author_lane": "TopicInventoryGuard (guard lane)",
@@ -16,7 +16,7 @@
         "conflict_status": "none (isolated worktrees and branches)"
       },
       "TopicDedicatedIssues": {
-        "roster_status": "running",
+        "roster_status": "idle",
         "role": "migration lane owner",
         "delivered_migration_file": "local://dedicated-topic-issue-migration.json",
         "migrated_topics_count": 10,
@@ -25,8 +25,84 @@
       "main": {
         "session_id": "01a0496f-64f6-733e-a9a6-89f15fc2a437",
         "role": "interactive orchestrator",
-        "guidance": "snapshot 342 tasks across 15 phases; illustrative-A explicitly dropped per operator clarification (preserve cancelled history, do not restore pending); guard must consume actual live native status not assigned owner fields"
+        "authoritative_retention_proof": "local://current-inventory-retention-proof.json",
+        "guidance": "snapshot 342 tasks across 15 phases; illustrative-A explicitly dropped per operator clarification (preserve cancelled history, do not restore pending); guard must consume actual live native status (ONLY host-observed running, idle is NOT active); no cp-replacement of installed ledger/driver (installed runtime has newer work; provide source delta/manifest-safe integration preserving state)"
       }
+    }
+  },
+  "machine_todo_inventory_vs_cross_source_accounting": {
+    "machine_todo_inventory": {
+      "current_board_tasks_total": 342,
+      "phases_count": 15,
+      "baseline_count_prior": 328,
+      "added_tasks_count": 14,
+      "missing_tasks_from_baseline": 0,
+      "retention_status": "100% complete lossless retention (matches local://current-inventory-retention-proof.json)",
+      "explicitly_cancelled_tasks": [
+        {
+          "content": "Record operator choice A for CI connectivity",
+          "phase": "Live operator corrections",
+          "status": "cancelled",
+          "blocker_reason": "Explicitly dropped per live operator clarification (example choice, not confirmed decision); preserved as historical cancellation, not restored as pending."
+        }
+      ]
+    },
+    "cross_source_reference_accounting": {
+      "preserved_github_open_issues": 226,
+      "preserved_ledger_requests": 23,
+      "note": "The 365 count previously noted represents an aggregate union across all heterogeneous source formats (including raw ledger request prompts). It must NOT be confused with the authoritative 342 machine todos."
+    }
+  },
+  "active_worker_policy_enforcement": {
+    "strict_rule": "ONLY host-observed status == 'running' useful subagents count as active. Idle, parked, prepared tickets, reminder daemons, and completed workers are strictly non-active.",
+    "idle_rejection_rationale": "Idle workers are awake in the session but not actively executing turns/tools on runnable tasks. Live operator explicitly requires actively executing useful workers to satisfy coverage and floor.",
+    "orchestrator_exclusion": "Main agent (role='main') is the interactive orchestrator, not a task worker, and is excluded from worker floor count.",
+    "live_host_roster_snapshot": {
+      "observed_timestamp": "2026-09-06T13:58:00Z",
+      "total_peers": 21,
+      "running_useful_subagents": [
+        {
+          "id": "TopicWorkflowGates",
+          "role": "sub",
+          "topic": "Workflow"
+        },
+        {
+          "id": "TopicClickableDecisions",
+          "role": "sub",
+          "topic": "Decisions"
+        },
+        {
+          "id": "TopicGuiMergeQa",
+          "role": "sub",
+          "topic": "Desktop GUI"
+        }
+      ],
+      "running_useful_count": 3,
+      "idle_subagents": [
+        "TopicConcurrentTodo",
+        "TopicWebProvider",
+        "TopicGuiDelivery",
+        "TopicMotionAcceptance",
+        "TopicTelegramInbound",
+        "TopicDedicatedIssues",
+        "TopicCiCandidateReview",
+        "TopicGuiMergeReview"
+      ],
+      "idle_count": 8,
+      "parked_subagents": [
+        "TopicStagingRecovery",
+        "FlashStagingReview",
+        "FlashPoolerReview",
+        "FlashDecisionTransport",
+        "FlashLifecycleReview",
+        "FlashTelegramFollowup",
+        "FlashVeyyonDelivery",
+        "FlashNativeTodoProof",
+        "FlashGraphqlTransportReview"
+      ],
+      "parked_count": 9,
+      "orchestrator": "main:01a0496f-64f6-733e-a9a6-89f15fc2a437 (running)",
+      "live_floor_verdict": "FLOOR_DEFICIT (3 running useful workers < required 7 floor). Guard correctly refuses to claim floor satisfied from static/idle rosters, and outputs actionable next assignments to replenish active running lanes."
     }
   },
   "actual_source_changes": {
@@ -35,12 +111,12 @@
       {
         "path": "workflows/portable/topic_inventory_guard.py",
         "lines": 765,
-        "description": "Deterministic coverage and inventory invariant engine. Additive reconciliation of all baseline sources, dropped task detection, live native roster classification (useful running/idle vs parked/fake), 7-15 worker floor enforcement with RAM ceiling exception (>=95%), and actionable NextAssignment generation prioritizing 1 worker per runnable topic."
+        "description": "Deterministic coverage and inventory invariant engine. Additive reconciliation of all baseline sources, dropped task detection, live native roster classification (strictly host-observed running useful subagents vs idle/parked/fake), 7-15 worker floor enforcement with RAM ceiling exception (>=95%), and actionable NextAssignment generation prioritizing 1 worker per runnable topic."
       },
       {
         "path": "workflows/portable/test_topic_inventory_guard.py",
-        "lines": 274,
-        "description": "Comprehensive contract test suite with finite executable proofs for all 7 acceptance criteria (remove item fails, park only worker fails, completion produces next assignment, blocked topic stays present, 7 workers satisfy floor, fake active statuses fail, restored inventory loses zero tasks)."
+        "lines": 310,
+        "description": "Comprehensive contract test suite with 8 finite executable proofs (including targeted idle rejection proof), 100% passing."
       }
     ],
     "files_modified": [
@@ -62,26 +138,27 @@
     ]
   },
   "install_and_adapter_steps": {
-    "policy_boundary": "No installed runtime replacement until Main verifies (files remain isolated on branch feat/topic-inventory-coverage-guard).",
-    "verification_steps_for_main": [
-      "git checkout feat/topic-inventory-coverage-guard",
-      "python workflows/portable/test_topic_inventory_guard.py -v",
-      "python workflows/portable/test_ledger_gates.py",
-      "python workflows/portable/test_continuation_driver.py"
-    ],
-    "installation_commands": [
-      "cp workflows/portable/topic_inventory_guard.py C:/Users/wkiri/.veyyon/workflows/topic_inventory_guard.py",
-      "cp workflows/portable/test_topic_inventory_guard.py C:/Users/wkiri/.veyyon/workflows/test_topic_inventory_guard.py",
-      "cp workflows/portable/ledger.py C:/Users/wkiri/.veyyon/workflows/ledger.py",
-      "cp workflows/portable/continuation_driver.py C:/Users/wkiri/.veyyon/workflows/continuation_driver.py",
-      "cp workflows/portable/manifest.json C:/Users/wkiri/.veyyon/workflows/manifest.json"
+    "installed_runtime_preservation_boundary": "STRICT PROHIBITION ON CP-REPLACEMENT: Do not blindly copy ledger.py or continuation_driver.py over ~/.veyyon/workflows/. The installed runtime contains active, newer concurrent changes from other topics (Telegram upgrades, decision reply handling).",
+    "safe_integration_options": [
+      {
+        "approach": "Option A: Self-contained module installation (Zero risk to existing code)",
+        "step": "Copy only topic_inventory_guard.py and test_topic_inventory_guard.py to ~/.veyyon/workflows/. It imports cleanly and runs standalone without touching existing ledger.py or continuation_driver.py."
+      },
+      {
+        "approach": "Option B: Surgical source delta application",
+        "step": "Apply the unified git diff of check_topic_coverage() to ~/.veyyon/workflows/ledger.py and DriverOutcome fields to ~/.veyyon/workflows/continuation_driver.py, preserving all concurrent changes."
+      },
+      {
+        "approach": "Option C: Manifest registration",
+        "step": "Add the topic_inventory_guard.py entry into ~/.veyyon/workflows/manifest.json under 'modules'."
+      }
     ],
     "host_adapter_integration": [
       "Orchestrator (Main) queries live native roster using irc(op='list') or session broker.",
-      "Passes live roster to guard: guard.evaluate_topic_coverage(inventory=reconciled, roster=actual_roster, ram_used_pct=current_ram).",
-      "Consumes report.next_assignments to dispatch newly uncovered runnable topics (prioritizing 1 worker per runnable topic before secondary workers).",
-      "Dispatches workers under 'fast' primary execution lane (google-antigravity/gemini-3.8-flash:high) per profile policy.",
-      "Consumes live native statuses ('running' / 'idle') rather than trusting static 'owner' strings on task cards."
+      "Filters roster strictly for status == 'running' and role != 'main'.",
+      "Invokes guard.evaluate_topic_coverage(inventory=reconciled, roster=actual_roster, ram_used_pct=current_ram).",
+      "When running count < 7, consumes report.next_assignments to dispatch newly uncovered runnable topics (prioritizing 1 worker per runnable topic before secondary workers).",
+      "Dispatches workers under 'fast' primary execution lane (google-antigravity/gemini-3.8-flash:high) per profile policy."
     ]
   },
   "finite_executable_proof_results": [
@@ -113,7 +190,7 @@
       "criterion": "7 real active workers satisfy floor",
       "test_method": "test_proof_5_seven_real_active_workers_satisfy_floor",
       "verdict": "PASS",
-      "observed_behavior": "When 7 real active workers cover independent runnable topics, report.floor_satisfied=True, report.active_workers_count=7, and zero WORKER_FLOOR_DEFICIT violations are emitted."
+      "observed_behavior": "When 7 real active workers (status == 'running') cover independent runnable topics, report.floor_satisfied=True, report.active_workers_count=7, and zero WORKER_FLOOR_DEFICIT violations are emitted."
     },
     {
       "criterion": "unsupported/fake active counts fail",
@@ -125,7 +202,13 @@
       "criterion": "restored inventory loses zero tasks",
       "test_method": "test_proof_7_restored_inventory_loses_zero_tasks",
       "verdict": "PASS",
-      "observed_behavior": "Additive reconciliation across full-topic-board-current.json, scope-additive-verification.json, open-issue-inventory.json, and ledger.json preserves all 342 board tasks (365 unique across all sources). Illustrative-A choice is preserved as cancelled with operator clarification reason, not restored as pending. Zero tasks dropped."
+      "observed_behavior": "Additive reconciliation across full-topic-board-current.json, scope-additive-verification.json, open-issue-inventory.json, and ledger.json preserves all 342 board tasks. Illustrative-A choice is preserved as cancelled with operator clarification reason, not restored as pending. Zero tasks dropped."
+    },
+    {
+      "criterion": "idle worker rejected (idle is NOT active)",
+      "test_method": "test_proof_8_idle_worker_rejected_not_active",
+      "verdict": "PASS",
+      "observed_behavior": "When workers have status == 'idle', they are strictly classified as non-active (active_workers_count=0, idle_workers_count=2); runnable topics are flagged as UNCOVERED_RUNNABLE_TOPIC, and floor deficit is enforced."
     }
   ],
   "distinction_checker_vs_live_enforcement": {
@@ -135,7 +218,7 @@
       "capabilities": [
         "Reconciles multi-source inventories additively.",
         "Audits against dropped or missing task content.",
-        "Enforces strict classification of active vs parked vs fake worker states.",
+        "Enforces strict classification of running vs idle vs parked vs fake worker states.",
         "Applies mathematical floor checks (7-15) and capacity exceptions (RAM >= 95%).",
         "Emits structured, priority-ranked NextAssignment recommendations."
       ],
@@ -153,75 +236,5 @@
       "boundary": "Host enforcement relies on the checker for audit and recommendation, but the checker cannot replace host process supervisor responsibilities."
     },
     "cautionary_principle": "Passing finite test fixtures confirms algorithmic soundness and fail-closed gate logic, but it does NOT substitute for live end-to-end host verification or justify unmonitored execution. Continuous reconciliation between live session state, GitHub issues, and the disk ledger is mandatory."
-  },
-  "current_inventory_status": {
-    "board_tasks_total": 342,
-    "phases_count": 15,
-    "preserved_open_issues": 226,
-    "preserved_ledger_requests": 23,
-    "total_reconciled_unique_items": 365,
-    "cancelled_tasks_count": 1,
-    "cancelled_task_details": {
-      "content": "Record operator choice A for CI connectivity",
-      "phase": "Live operator corrections",
-      "status": "cancelled",
-      "reason": "Explicitly dropped per live operator clarification (illustrative example, not confirmed CI decision); preserved as historical cancellation."
-    },
-    "current_active_useful_workers": 9,
-    "current_parked_workers": 8,
-    "worker_floor_satisfied": true,
-    "runnable_topics_evaluated": [
-      {
-        "topic": "Workflow",
-        "status": "covered",
-        "workers": [
-          "TopicConcurrentTodo",
-          "TopicWorkflowGates"
-        ]
-      },
-      {
-        "topic": "Desktop GUI",
-        "status": "covered",
-        "workers": [
-          "TopicWebProvider",
-          "TopicGuiDelivery"
-        ]
-      },
-      {
-        "topic": "Staging",
-        "status": "covered",
-        "workers": [
-          "TopicStagingRecovery"
-        ]
-      },
-      {
-        "topic": "Motion",
-        "status": "covered",
-        "workers": [
-          "TopicMotionAcceptance"
-        ]
-      },
-      {
-        "topic": "Telegram",
-        "status": "covered",
-        "workers": [
-          "TopicTelegramInbound"
-        ]
-      },
-      {
-        "topic": "Decisions",
-        "status": "covered",
-        "workers": [
-          "TopicClickableDecisions"
-        ]
-      },
-      {
-        "topic": "Preserved GitHub issue inventory",
-        "status": "covered",
-        "workers": [
-          "TopicDedicatedIssues"
-        ]
-      }
-    ]
   }
 }
