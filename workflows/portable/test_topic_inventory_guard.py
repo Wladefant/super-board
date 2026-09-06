@@ -205,7 +205,7 @@ class TestTopicInventoryGuard(unittest.TestCase):
         # Roster with 3 real workers and 4 fake/daemon/prepared statuses
         roster = [
             {"id": "TopicReal1", "status": "running", "topic": "Topic-0", "role": "sub"},
-            {"id": "TopicReal2", "status": "idle", "topic": "Topic-1", "role": "sub"},
+            {"id": "TopicReal2", "status": "running", "topic": "Topic-1", "role": "sub"},
             {"id": "TopicReal3", "status": "running", "topic": "Topic-2", "role": "sub"},
             {"id": "TicketPrepared1", "status": "prepared", "topic": "Topic-3"},
             {"id": "DaemonReminder", "status": "reminder_daemon", "topic": "Topic-4"},
@@ -220,7 +220,7 @@ class TestTopicInventoryGuard(unittest.TestCase):
 
         self.assertFalse(report.ok)
         self.assertFalse(report.floor_satisfied)
-        self.assertEqual(report.active_workers_count, 3, "Only real running/idle subagents count as active")
+        self.assertEqual(report.active_workers_count, 3, "Only real running useful subagents count as active")
         self.assertEqual(report.fake_workers_rejected_count, 4, "4 fake/daemon statuses must be rejected")
         floor_violations = [v for v in report.violations if v.kind == "WORKER_FLOOR_DEFICIT"]
         self.assertTrue(len(floor_violations) >= 1, "Floor deficit must be flagged when fakes are rejected")
@@ -268,6 +268,37 @@ class TestTopicInventoryGuard(unittest.TestCase):
                     self.assertFalse(item.is_runnable)
                     self.assertIsNotNone(item.blocker_reason)
 
+
+    # ----------------------------------------------------------------------
+    # Proof 8: idle worker rejected (idle is NOT active)
+    # ----------------------------------------------------------------------
+    def test_proof_8_idle_worker_rejected_not_active(self):
+        topics = ["Desktop GUI", "UX/design"]
+        inventory = [
+            InventoryItem(id="t-idle-1", content="Task 1", phase="Desktop GUI", status="pending", owner="TopicGuiWorker",
+                          issue_url="https://github.com/Bavariance/polysimulator/issues/4582"),
+            InventoryItem(id="t-idle-2", content="Task 2", phase="UX/design", status="pending", owner="TopicDesignWorker",
+                          issue_url="https://github.com/Bavariance/polysimulator/issues/4582"),
+        ]
+        # Both workers are "idle" (awake in session but not actively executing)
+        roster = [
+            {"id": "TopicGuiWorker", "status": "idle", "topic": "Desktop GUI", "role": "sub"},
+            {"id": "TopicDesignWorker", "status": "idle", "topic": "UX/design", "role": "sub"},
+        ]
+
+        report = self.guard.evaluate_topic_coverage(
+            inventory=inventory,
+            roster=roster,
+        )
+
+        # Idle workers must NOT count as active running workers
+        self.assertFalse(report.ok)
+        self.assertEqual(report.active_workers_count, 0, "Idle workers must not count toward active useful count")
+        self.assertEqual(report.idle_workers_count, 2, "Idle workers must be tracked separately")
+        self.assertIn("Desktop GUI", report.uncovered_topics)
+        self.assertIn("UX/design", report.uncovered_topics)
+        uncovered_violations = [v for v in report.violations if v.kind == "UNCOVERED_RUNNABLE_TOPIC"]
+        self.assertEqual(len(uncovered_violations), 2)
 
 if __name__ == "__main__":
     unittest.main()

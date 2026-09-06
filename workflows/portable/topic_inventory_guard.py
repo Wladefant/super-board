@@ -8,15 +8,16 @@ coverage, worker floor compliance, and generation of actionable next-ready assig
 Strict invariants enforced:
 1. Lossless Additive Inventory: All baseline items across snapshot boards, scope verification,
    open issue inventory, and ledger are reconciled additively. Zero items may be silently dropped.
-2. Active Native Worker Coverage: Every unfinished, runnable topic MUST have at least one
-   ACTIVE native worker. Parked workers, prepared tickets, reminder daemons, and completed workers
+   Distinguishes 342 machine todos from cross-source references.
+2. Host-Observed Running Native Worker Coverage: Every unfinished, runnable topic MUST have at least one
+   actively RUNNING native worker. Idle, parked, prepared tickets, reminder daemons, and completed workers
    do NOT count as active. Static assigned owner text on a task does not satisfy coverage without
-   an active native worker.
-3. Worker Floor: At least 7 active useful workers (ceiling 20) when >= 7 runnable independent units
+   a host-observed running native worker.
+3. Worker Floor: At least 7 actively RUNNING useful workers (ceiling 20) when >= 7 runnable independent units
    of work exist, unless an explicit measured RAM capacity ceiling (>= 95%) or explicit capacity limit applies.
 4. Authorization Integrity: Active workers must be assigned to authorized tasks/targets; unauthorized
    tasks or forbidden targets (production/merge) are blocked.
-5. Actionable Next-Ready Assignments: Priority is given to achieving one active worker per
+5. Actionable Next-Ready Assignments: Priority is given to achieving one running worker per
    runnable topic before stacking extra workers in an already-covered topic.
 """
 
@@ -35,10 +36,11 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
-# Supported active worker statuses in native host execution
-VALID_ACTIVE_STATUSES = {"running", "idle"}
-INVALID_OR_NON_ACTIVE_STATUSES = {
-    "parked", "completed", "stopped", "terminated", "prepared",
+# ONLY host-observed "running" status counts as active per live operator policy.
+# Idle, parked, prepared, completed, or reminder daemons are strictly INACTIVE.
+VALID_ACTIVE_STATUSES = {"running"}
+INACTIVE_STATUSES = {
+    "idle", "parked", "completed", "stopped", "terminated", "prepared",
     "prepared_ticket", "reminder_daemon", "simulated_active", "fake"
 }
 
@@ -142,7 +144,7 @@ class NativeWorker:
     """A classified native actor from the host session roster."""
     id: str
     status: str
-    is_active: bool
+    is_active: bool  # True ONLY if status == "running" and useful subagent
     assigned_topic: Optional[str] = None
     assigned_task_id: Optional[str] = None
     is_authorized: bool = True
@@ -161,7 +163,7 @@ class NativeWorker:
 @dataclass
 class CoverageViolation:
     """A reported breach of topic coverage, inventory preservation, or worker policies."""
-    kind: str  # DROPPED_TASK | UNCOVERED_RUNNABLE_TOPIC | WORKER_FLOOR_DEFICIT | UNAUTHORIZED_ACTIVE_WORKER | UNLINKED_TOPIC_ISSUE | ABSENT_OWNER | FAKE_WORKER_REJECTED
+    kind: str  # DROPPED_TASK | UNCOVERED_RUNNABLE_TOPIC | WORKER_FLOOR_DEFICIT | UNAUTHORIZED_ACTIVE_WORKER | UNLINKED_TOPIC_ISSUE | ABSENT_OWNER | FAKE_WORKER_REJECTED | IDLE_WORKER_REJECTED
     message: str
     details: Dict[str, Any] = field(default_factory=dict)
 
@@ -194,7 +196,8 @@ class GuardReport:
     cancelled_tasks: int
     runnable_tasks: int
     blocked_tasks: int
-    active_workers_count: int
+    active_workers_count: int  # ONLY running useful workers
+    idle_workers_count: int
     parked_workers_count: int
     fake_workers_rejected_count: int
     required_floor: int
@@ -218,7 +221,7 @@ class GuardReport:
 class TopicInventoryGuard:
     """
     Executable coverage and inventory invariant engine.
-    Integrates directly with ledger and continuation driver.
+    Integrates cleanly with ledger and continuation driver.
     """
 
     def __init__(
@@ -234,6 +237,8 @@ class TopicInventoryGuard:
         self.max_worker_ceiling = max_worker_ceiling
         self.ram_ceiling_pct = ram_ceiling_pct
         self.topic_issues = dict(default_topic_issues or DEFAULT_TOPIC_ISSUES)
+
+        # Incorporate dedicated topic issue migration if available
         migration_candidates = [
             os.path.join(SCRIPT_DIR, "dedicated-topic-issue-migration.json"),
             os.path.expanduser("~/.veyyon/workflows/dedicated-topic-issue-migration.json"),
@@ -427,13 +432,15 @@ class TopicInventoryGuard:
         self,
         roster: Sequence[Dict[str, Any]],
         authorized_task_ids: Optional[Set[str]] = None,
-    ) -> Tuple[List[NativeWorker], List[NativeWorker], List[CoverageViolation]]:
+    ) -> Tuple[List[NativeWorker], List[NativeWorker], List[NativeWorker], List[CoverageViolation]]:
         """
-        Classify active vs parked/fake native workers.
-        Rejects fake, prepared, or reminder daemon statuses; flags unauthorized active workers.
-        Consumes actual live native status, not static assigned owner text.
+        Classify running (active) vs idle vs parked/fake native workers.
+        ONLY status == 'running' counts as active. Idle, parked, completed,
+        reminder daemons, and prepared tickets are strictly non-active.
+        Returns: (active_running, idle_workers, parked_workers, violations)
         """
         active_workers: List[NativeWorker] = []
+        idle_workers: List[NativeWorker] = []
         parked_workers: List[NativeWorker] = []
         violations: List[CoverageViolation] = []
 
@@ -459,7 +466,21 @@ class TopicInventoryGuard:
                 ))
                 continue
 
-            # Check for parked / completed
+            # Check for idle: IDLE IS NOT ACTIVE per operator instruction
+            if raw_status == "idle":
+                idle_workers.append(NativeWorker(
+                    id=w_id,
+                    status="idle",
+                    is_active=False,
+                    assigned_topic=self.map_worker_to_topic(w_id, entry.get("topic")),
+                    assigned_task_id=entry.get("task_id"),
+                    role=role,
+                    raw_status=raw_status,
+                    rejection_reason="Worker is idle, not actively executing. Operator requires actively running useful workers.",
+                ))
+                continue
+
+            # Check for parked / completed / stopped
             if raw_status in ("parked", "completed", "stopped", "terminated"):
                 parked_workers.append(NativeWorker(
                     id=w_id,
@@ -473,7 +494,7 @@ class TopicInventoryGuard:
                 ))
                 continue
 
-            # Valid active statuses
+            # Check for running: the ONLY valid active status
             if raw_status in VALID_ACTIVE_STATUSES:
                 topic = self.map_worker_to_topic(w_id, entry.get("topic"))
                 task_id = entry.get("task_id")
@@ -501,7 +522,7 @@ class TopicInventoryGuard:
 
                 active_workers.append(NativeWorker(
                     id=w_id,
-                    status=raw_status,
+                    status="running",
                     is_active=True,
                     assigned_topic=topic,
                     assigned_task_id=task_id,
@@ -510,14 +531,14 @@ class TopicInventoryGuard:
                     raw_status=raw_status,
                 ))
             else:
-                # Any unclassified status is rejected
+                # Any unclassified status is rejected as fake/unverified
                 violations.append(CoverageViolation(
                     kind="FAKE_WORKER_REJECTED",
                     message=f"Worker '{w_id}' has unverified status '{raw_status}'. Refused as active native worker.",
                     details={"worker_id": w_id, "status": raw_status},
                 ))
 
-        return active_workers, parked_workers, violations
+        return active_workers, idle_workers, parked_workers, violations
 
     def evaluate_topic_coverage(
         self,
@@ -531,6 +552,7 @@ class TopicInventoryGuard:
         Evaluate all coverage and inventory invariants.
         Produces actionable next-ready assignments for Main.
         Consumes actual live native status, not static assigned owner text.
+        Requires actively RUNNING useful workers for runnable topic coverage.
         """
         violations: List[CoverageViolation] = []
 
@@ -546,25 +568,25 @@ class TopicInventoryGuard:
                         details={"item_id": b_item.id, "content": b_item.content, "phase": b_item.phase},
                     ))
 
-        # 2. Classify live native roster
-        active_workers, parked_workers, roster_violations = self.classify_roster(
+        # 2. Classify live native roster: ONLY "running" useful subagents count
+        active_workers, idle_workers, parked_workers, roster_violations = self.classify_roster(
             roster, authorized_task_ids=authorized_task_ids
         )
         violations.extend(roster_violations)
 
-        # Useful workers exclude orchestrator (role="main")
-        useful_active_workers = [w for w in active_workers if w.is_useful_worker]
+        # Useful running workers exclude orchestrator (role="main")
+        useful_running_workers = [w for w in active_workers if w.is_useful_worker]
 
         # 3. Group inventory tasks by topic/phase
         topic_tasks: Dict[str, List[InventoryItem]] = {}
         for item in inventory:
             topic_tasks.setdefault(item.phase, []).append(item)
 
-        # Map active useful workers to topics
-        active_topic_coverage: Dict[str, List[NativeWorker]] = {}
-        for w in useful_active_workers:
+        # Map running useful workers to topics
+        running_topic_coverage: Dict[str, List[NativeWorker]] = {}
+        for w in useful_running_workers:
             if w.assigned_topic:
-                active_topic_coverage.setdefault(w.assigned_topic, []).append(w)
+                running_topic_coverage.setdefault(w.assigned_topic, []).append(w)
 
         total_tasks = len(inventory)
         completed_tasks = sum(1 for it in inventory if it.is_completed)
@@ -577,7 +599,7 @@ class TopicInventoryGuard:
         blocked_topics: List[Dict[str, Any]] = []
         next_assignments: List[NextAssignment] = []
 
-        # 4. Check each topic's status and active coverage
+        # 4. Check each topic's status and running active coverage
         for topic_name, items in topic_tasks.items():
             topic_runnable_items = [it for it in items if it.is_runnable]
             topic_blocked_items = [it for it in items if it.is_blocked and not it.is_completed and not it.is_cancelled]
@@ -614,16 +636,16 @@ class TopicInventoryGuard:
             if not topic_runnable_items and not topic_blocked_items:
                 continue
 
-            # Topic is runnable: requires an ACTIVE native worker
+            # Topic is runnable: requires an actively RUNNING native worker
             if topic_runnable_items:
-                workers = active_topic_coverage.get(topic_name, [])
-                if workers:
+                running_w = running_topic_coverage.get(topic_name, [])
+                if running_w:
                     covered_topics.append(topic_name)
                 else:
                     uncovered_topics.append(topic_name)
                     violations.append(CoverageViolation(
                         kind="UNCOVERED_RUNNABLE_TOPIC",
-                        message=f"Runnable topic '{topic_name}' has 0 active native workers ({len(topic_runnable_items)} unfinished tasks).",
+                        message=f"Runnable topic '{topic_name}' has 0 actively running native workers ({len(topic_runnable_items)} unfinished tasks).",
                         details={
                             "topic": topic_name,
                             "runnable_task_count": len(topic_runnable_items),
@@ -642,9 +664,9 @@ class TopicInventoryGuard:
                         priority=1,
                     ))
 
-        # 5. Worker floor evaluation
+        # 5. Worker floor evaluation (based ONLY on running useful workers)
         runnable_topic_count = len(covered_topics) + len(uncovered_topics)
-        effective_active_count = len(useful_active_workers)
+        effective_active_count = len(useful_running_workers)
         floor_satisfied = True
         capacity_exc = None
 
@@ -666,11 +688,13 @@ class TopicInventoryGuard:
                 violations.append(CoverageViolation(
                     kind="WORKER_FLOOR_DEFICIT",
                     message=(
-                        f"Active useful worker count {effective_active_count} is below required floor {required_floor} "
+                        f"Actively running useful worker count {effective_active_count} is below required floor {required_floor} "
                         f"while {runnable_topic_count} ready independent topics exist."
                     ),
                     details={
-                        "active_count": effective_active_count,
+                        "running_active_count": effective_active_count,
+                        "idle_workers_count": len(idle_workers),
+                        "parked_workers_count": len(parked_workers),
                         "required_floor": required_floor,
                         "runnable_topic_count": runnable_topic_count,
                     },
@@ -699,7 +723,8 @@ class TopicInventoryGuard:
         summary = (
             f"Inventory: {total_tasks} total ({completed_tasks} completed, {cancelled_tasks} cancelled, "
             f"{runnable_tasks} runnable, {blocked_tasks} blocked). "
-            f"Active useful workers: {effective_active_count}/{required_floor} (floor {'satisfied' if floor_satisfied else 'DEFICIT'}). "
+            f"Actively running workers: {effective_active_count}/{required_floor} "
+            f"(idle: {len(idle_workers)}, parked: {len(parked_workers)}; floor {'satisfied' if floor_satisfied else 'DEFICIT'}). "
             f"Topics: {len(covered_topics)} covered, {len(uncovered_topics)} uncovered, {len(blocked_topics)} blocked. "
             f"Violations: {len(violations)}."
         )
@@ -713,6 +738,7 @@ class TopicInventoryGuard:
             runnable_tasks=runnable_tasks,
             blocked_tasks=blocked_tasks,
             active_workers_count=effective_active_count,
+            idle_workers_count=len(idle_workers),
             parked_workers_count=len(parked_workers),
             fake_workers_rejected_count=sum(1 for v in violations if v.kind == "FAKE_WORKER_REJECTED"),
             required_floor=required_floor,
