@@ -469,27 +469,50 @@ same act as opening the retry gate. The record always lands — a proposal, or a
 reference somebody wants on the record, is worth keeping — and the gate opens
 only when all of this is true, each checked against reality rather than asserted:
 
-* the `--change-ref` **resolves** in a reachable context: a commit that exists in
-  the repository (`git cat-file`), a `config:<path>#<key>` whose key is really
-  assigned in that file, a `test:<path>::<name>` really defined in that module, or
-  a `decision:<id>` recorded `answered` in the decision record beside the store.
+* the verification context is **related to this failure**. It has to resolve one
+  of the heads the failure was observed on (`git cat-file -e`), which a second
+  worktree of the same repository does because it shares the object store; where
+  the failure recorded no head at all, it has to be the repository the failure was
+  recorded in (same `--git-common-dir`). `--verify-root` names a reachable
+  repository when the one the failure was observed in is gone, which is the normal
+  case for an ephemeral worktree; it changes where the lookup happens, never
+  whether one is required and never whether it has to be related to the failure.
+  A recorded head no reachable context resolves is a *fail-closed* outcome: the
+  record lands and the gate stays shut. A failure that recorded neither a head nor
+  a reachable repository has no lineage to bind to at all, and the record says so
+  (`gate_binding.lineage: "unanchored"`) instead of implying one was checked;
+* the `--change-ref` **resolves** in that context, and names something that
+  actually changed:
+  * `commit:<sha>` exists there and is not one of the observed failing heads;
+  * `config:<path>#<key>` and `test:<path>::<name>` are read out of the
+    **committed tree of `--head-sha`** (`git show <head>:<path>`), not out of the
+    checkout, and the file's content must differ from the same path at every
+    observed failing head. So a key or a test that had been there unchanged since
+    before the failure, and one that exists only as an uncommitted edit, both
+    resolve and open nothing;
+  * `decision:<id>` is recorded `answered` in the decision record beside the store
+    **and** its `answer.answered_at` is later than the last counted occurrence of
+    this signature. A decision taken while the failure was still happening is not
+    what changed, and one with no readable timestamp cannot be shown to be.
+
   A reference the context *refutes* is refused outright. A reference that cannot
   be resolved at all — a pull request, which needs a remote API this module never
   contacts, or anything in a worktree that no longer exists — is recorded
-  unverified and never opens the gate. `--verify-root` names a reachable
-  repository when the one the failure was observed in is gone, which is the normal
-  case for an ephemeral worktree; it changes where the lookup happens, never
-  whether one is required;
+  unverified and never opens the gate;
 * `--evidence-exit-code` is **0**. A non-zero exit is the scenario still failing;
-* `--head-sha` is not one of the heads the failure was observed on, and for a
-  commit reference it **contains** that commit (`git merge-base --is-ancestor`),
-  so the run that passed is a run of the changed tree.
+* `--head-sha` is not one of the heads the failure was observed on, is not an
+  **ancestor** of one (`git merge-base --is-ancestor`) — a tree the failing tree
+  was built on top of predates the failure — and for a commit reference it
+  **contains** that commit, so the run that passed is a run of the changed tree.
 
 `record-corrective-action` exits 0 when the record opened the gate and 3 when it
 landed with the gate still closed, and every gate decision is recomputed from the
 action's own recorded facts on load rather than read from a stored verdict. So
 `decision:later` with the description "will retry later", an exit code of 1 and
-the failing head as the evidence head is recorded and clears nothing.
+the failing head as the evidence head is recorded and clears nothing — and
+neither does any of the shapes above whose reference merely *resolves*. What this
+closes is that one class; it is not a claim that no laundering exists, because the
+store is cooperative local state on a writable checkout.
 
 `resolve` then requires *both* halves of closure — a current corrective action
 that is itself gate-bound, whose change references it copies into the resolution,
@@ -760,10 +783,14 @@ python recurrence_guard.py --state-dir <dir> check-retry --request-id req-1
 
 # Record (never execute) the systemic corrective action that unblocks retry.
 # The record always lands. Exit 0 means it opened the retry gate; exit 3 means it
-# landed and the gate stayed closed, because the reference did not resolve
-# (pr: cannot be resolved offline at all), the proof exited non-zero, or the
-# evidence head is a failing head or does not carry the change.
-# --verify-root names a reachable repository when the observed worktree is gone.
+# landed and the gate stayed closed, because the verification context could not be
+# related to this failure, the reference did not resolve (pr: cannot be resolved
+# offline at all) or named nothing that changed since the failure, the proof
+# exited non-zero, or the evidence head is a failing head, precedes one, or does
+# not carry the change.
+# --verify-root names a reachable repository when the observed worktree is gone; it
+# still has to resolve one of the heads the failure was observed on, which a second
+# worktree of the same repository does.
 python recurrence_guard.py --state-dir <dir> record-corrective-action \
   --signature <sig> --kind code_change --actor <lane> \
   --description "what systemically changed" \
@@ -773,7 +800,7 @@ python recurrence_guard.py --state-dir <dir> record-corrective-action \
   --evidence-command python -m pytest tests/test_it.py \
   --evidence-exit-code 0 \
   --head-sha <40-char-sha-containing-the-change> \
-  --verify-root <git-repository-holding-it>
+  --verify-root <git-repository-that-resolves-the-failing-head>
 
 # Retain an already-counted failure out of the count, with an audited reason
 python recurrence_guard.py --state-dir <dir> supersede-observation \
