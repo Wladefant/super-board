@@ -14,7 +14,8 @@
     "no_credential_leakage": "Balance and probe modules strictly redact email addresses, project IDs, account numbers, and API tokens.",
     "head_bound_evidence": "Git HEAD changes invalidate all head-bound QA evidence, criteria statuses, and proofs, resetting state to implementation.",
     "explicit_per_criterion_evidence": "Every criterion in acceptance_criteria must have status 'verified' and non-empty evidence before transitioning to 'done'.",
-    "github_proof_required": "Requests cannot close to 'done' without a verified GitHub proof URL (PR, issue comment, commit SHA, or asset) matching repository."
+    "github_proof_required": "Requests cannot close to 'done' without a verified GitHub proof URL (PR, issue comment, commit SHA, or asset) matching repository.",
+    "recurrence_changes_behaviour": "A repeated failure changes what the system does instead of being retried unchanged. The second distinct occurrence of one project+environment+operation+error signature refuses unchanged blind retry until a systemic corrective action is recorded; the third escalates once per escalation epoch. Duplicate ingestion of a known observation id is never a recurrence, an intended negative control is retained as evidence without counting, and a recorded corrective action clears only the retry gate: it never verifies acceptance criteria, satisfies head-bound QA or review, or authorizes a merge or deployment. The refusal is not inert: it opens a durable corrective work item whose closure must name the corrective change and the original failure scenario re-executed on the corrected commit."
   },
   "modules": {
     "project_adapter.py": {
@@ -188,6 +189,29 @@
         "continuation_driver.lock"
       ]
     },
+    "recurrence_guard.py": {
+      "role": "Durable failure recurrence persistence and corrective-action gates. Observed failures persist under stable project+environment+operation+error-class signatures with unique observation ids, so duplicate ingestion is not recurrence. The first occurrence retains an actionable diagnosis, owner and next action; the second refuses unchanged blind retry until a systemic corrective action is recorded; the third escalates once per escalation epoch through the existing deduplicated notification event contract. Only observations dispositioned 'unexpected' count, so an intended negative control or superseded attempt is retained as evidence without driving a retry loop. Records only: never executes a code change, DDL, deployment or privileged action, and never satisfies authorization or head-bound QA/review. The second occurrence also opens a durable corrective work item in the ledger (req-corrective-<sig12>, pending/local, idempotent per signature) whose acceptance criteria bind closure to the systemic change and the re-executed original scenario, so the existing coordinator picks up real work instead of an inert blocked flag. A corrective action must name a change reference and resolution must name both that change and the re-executed scenario; 'retry later' clears nothing.",
+      "owner": "ImplementRecurrenceGuard",
+      "cli_command": "python recurrence_guard.py [--state-dir <dir>] [--store <json>] [--summary] {observe --environment <env> --operation <op> (--error <text> | --error-class <id>) [--project <id>] [--source native_worker|continuation_driver|ci|deploy|tool|manual] [--disposition unexpected|expected_negative_control|superseded_attempt] [--request-id <id>] [--head-sha <sha>] [--stage <stage>] [--attempt <id>] [--observation-id <id>] [--diagnosis <text>] [--owner <who>] [--next-action <text>] [--detail <text>] [--repo-root <dir>] [--canonical-link <url>] [--session <id>] [--no-ledger-update] | check-retry (--signature <sig> | --request-id <id> | --project <id> --environment <env> --operation <op> --error-class <id>) | record-corrective-action --signature <sig> --kind <kind> --description <text> --actor <who> [--change-ref <ref>] [--authorization <ref>] [--request-id <id>] [--head-sha <sha>] | supersede-observation --observation-id <id> --reason <text> --actor <who> [--disposition expected_negative_control|superseded_attempt] | resolve --signature <sig> --head-sha <sha> --evidence <text> --actor <who> | list [--status <status>] | show --signature <sig> | escalations [--ack <id> --acknowledged-by <who>]}",
+      "inputs": [
+        "recurrence.json (durable failure observation history, atomically written under ledger.FileLock)",
+        "ledger.json (request record the observation is attached to)",
+        "observed failure text from a native worker outcome, the continuation driver, CI, a deployment or a tool"
+      ],
+      "outputs": [
+        "recurrence.json and recurrence.json.lock",
+        "IntakeResult (signature, observation_id, duplicate, disposition, counted, occurrences, status, retry_allowed, required_action, reopened, escalation)",
+        "RetryDecision (allowed, reason, blocking, required_action); CLI exit 3 when a retry is refused",
+        "NotificationEvent payloads plus their notification-contract dedup signatures, for the notification owner to send",
+        "ledger evidence, blocker and next_action on the affected request (never state, head, criteria or authorization)",
+        "durable corrective work item request in ledger.json (pending, local, never authorized or deployment-applicable)"
+      ],
+      "exit_codes": {
+        "0": "operation completed / unchanged retry permitted",
+        "1": "usage or runtime error",
+        "3": "gate refusal: unchanged retry refused, or a corrective action refused for missing authorization"
+      }
+    },
     "diagnostics.py": {
       "role": "Comprehensive aggregate system, service, provider, request and host resource diagnostics. Exposes where problems lie, what is missing, distinguishes access from health and stale from failed, and asks the user only when true human authorization/preference/credential is needed with a deduplicatable question identifier.",
       "owner": "PackagePortableCoordinator",
@@ -265,6 +289,7 @@
       "fixtures/unknown_env_config.json",
       "worker_backend.py",
       "continuation_driver.py",
+      "recurrence_guard.py",
       "WORKER_EXECUTION.md",
       "diagnostics.py"
     ],
@@ -278,6 +303,7 @@
       "decisions.json",
       "test_worker_backend.py",
       "test_continuation_driver.py",
+      "test_recurrence_guard.py",
       "test_diagnostics.py"
     ]
   }

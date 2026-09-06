@@ -387,7 +387,129 @@ Safe defaults remain no network transmission. Enabling live notification require
 
 ---
 
-## 7. Recorded verification
+## 7. `recurrence_guard.py` — recurrence and corrective-action gates
+
+Every other module here is single-step: it observes one failure, reports it, and
+forgets it. Nothing remembered that the same failure had already happened, so the
+honest response to a repeated failure was to retry it unchanged, forever. This
+module is that missing memory, and only that: it dispatches nothing, retries
+nothing, and decides nothing about eligibility.
+
+### The signature
+
+A failure is identified by `project | environment | operation | error_class`.
+`error_class` is a digest of the error text with the volatile parts replaced —
+paths, timestamps, uuids, hex digests, addresses, bare integers — so the same
+fault in a different temp directory under a different run id is still recognised
+as the same fault. A Python traceback is reduced to its raised final line, since
+the intermediate frames move with every refactor. A caller that knows the real
+identity passes `--error-class` and the heuristic is not consulted.
+
+Quoted strings are deliberately **not** collapsed: in an error message the quoted
+symbol is usually the discriminating part (`'str' object has no attribute 'get'`),
+and merging distinct faults into one class would invent a recurrence that never
+happened.
+
+### Duplicate ingestion is not recurrence
+
+Every observation carries a unique observation id, supplied by the caller or
+derived from the event's own durable identity. Re-ingesting a known id is
+idempotent: no occurrence, no state change, no escalation, no ledger write. What
+makes an id distinct in practice is the **attempt identity** — a native run id, a
+CI run id, the driver's journalled dispatch ordinal. Re-reading the same incident
+artifact ten times is one occurrence.
+
+### An intended failure is not a broken system
+
+`_validate_result` accepts non-zero check exits alongside a `pass` verdict, on
+purpose: a retained baseline reproduction is evidence. So intake fires only on a
+validated failing outcome, never on a passing result that carries a reproduction
+failure.
+
+For everything the worker path does not see, the disposition is explicit:
+
+| disposition | counts toward gates | meaning |
+| --- | --- | --- |
+| `unexpected` (default) | yes | something is broken now |
+| `expected_negative_control` | no | a probe or baseline that is *supposed* to fail |
+| `superseded_attempt` | no | a real failure since shown intentional or obsolete |
+
+Both retained dispositions stay in history verbatim; they stay out of every
+threshold. Piping every non-zero exit in as `unexpected` is how a guard like this
+escalates off a test suite's own output, so the classification is never inferred
+from an exit code. `supersede-observation` reclassifies an already-counted
+observation, requires an actor and a reason, is written into history, and cannot
+move one back to `unexpected` — it can retain an occurrence out of the count,
+never manufacture one.
+
+### What each occurrence does
+
+1. **First** — `open`. Retry permitted. An actionable diagnosis, an owner and a
+   next action are recorded, and their absence is reported rather than assumed.
+2. **Second distinct** — `corrective_action_required`. Unchanged blind retry is
+   refused: `WorkerBackend.retry_native` raises, and the driver parks with
+   `recurrence_blocked` **before** spending a dispatch. Refusing alone would be
+   an inert flag, so this also opens a durable **corrective work item** in the
+   ledger — `req-corrective-<sig12>`, idempotent per signature, `pending` and
+   `local`, owned by whoever owns the failing request, carrying acceptance
+   criteria that bind its closure to the systemic change and to the original
+   scenario re-executed. `ledger next` reports it as `[RUNNABLE]` while the
+   failing request is `[BLOCKED]` naming it, so the existing coordinator picks it
+   up as work. Opening a work item is not doing the work: an authorized lane
+   implements it through the normal isolated build/QA/review path, under the same
+   gates as any other request.
+3. **Third and beyond** — `escalated`, once per escalation epoch. An epoch closes
+   when a corrective action or resolution is recorded, so ten identical restarts
+   in ten minutes produce one notification event rather than eight.
+
+A corrective action is **recorded, never executed**, and it must name a
+`--change-ref`: a commit, PR, configuration or recorded decision. A corrective
+action with no reference is "retry later", which is the behaviour this module
+exists to stop. `resolve` then requires *both* halves of closure — a current
+corrective action, whose change references it copies into the resolution, and a
+`--scenario` naming the original failing scenario that was re-executed on the
+named commit. A generic suite passing closes nothing.
+
+Recording a corrective action clears the retry gate and nothing else: it does not verify an acceptance criterion, does not satisfy
+head-bound QA or review, and does not authorize a merge or a deployment. A
+privileged kind (`ddl`, `deployment`, `privileged_operation`, `gate_change`) is
+only recordable with an explicit authorization reference naming the human who
+authorized it, because recording one asserts that they did.
+
+### History survives, and a correction can be undone by reality
+
+The store is `recurrence.json` beside `ledger.json`, written atomically under the
+shared `ledger.FileLock`. Status and the retry gate are recomputed from the
+observation, corrective-action and resolution sequence on **every load**, so no
+stored flag can open a gate its own history says is closed, and a corrupt store is
+reported rather than silently replaced with an empty one.
+
+A corrective action recorded *before* a later observation is stale by
+construction: the new observation reopens the signature and blocks retry again.
+`resolve` requires a full 40-character commit and exercised evidence, and closes
+the signature for that scenario on that commit only — it claims no universal
+absence, and a later observation reopens it.
+
+### Where it is wired
+
+* `WorkerBackend.complete_native` — an authentic failing outcome is observed once
+  per attempt, keyed on the native run id, so a replayed completion is a
+  duplicate. A `retry_native` of a signature owing a corrective action raises.
+* `ContinuationDriver` — a `blocked`/`error` park and a raised `run_step` are
+  observed against the journal's dispatch ordinal; the pre-dispatch gate parks
+  `recurrence_blocked` and the run exits non-zero.
+* Escalation produces the `NotificationEvent` payload plus that contract's own
+  dedup signature. This module never sends: delivery, correlation and rate
+  limiting stay with the notification owner, which consumes
+  `recurrence_guard.py escalations` and acknowledges each handoff.
+
+Both integrations soft-import the module, so a partial export still runs. A module
+that is installed but whose history cannot be read is a **refusal**, not an
+absence: an unreadable failure record must not be mistaken for no failures.
+
+---
+
+## 8. Recorded verification
 
 Every claim below was executed, not modelled. Fixtures were used only where
 named.
@@ -483,7 +605,7 @@ green. Pre-existing suites re-run green with these modules in place:
 
 ---
 
-## 8. Quick reference
+## 9. Quick reference
 
 ```bash
 # What backends exist, and is each command installed?
@@ -536,4 +658,42 @@ python continuation_driver.py --request-id req-1 --state-dir <dir> \
 # Inspect and clear parking
 python continuation_driver.py --state-dir <dir> --show-parked
 python continuation_driver.py --state-dir <dir> --unpark req-1 --show-parked
+
+# Record an observed CI/deploy/tool failure. --attempt is what separates a real
+# new occurrence from a replay of the same event.
+python recurrence_guard.py --state-dir <dir> observe \
+  --environment staging --operation deploy:staging \
+  --error "$(cat failure.log)" --source deploy \
+  --request-id req-1 --attempt "$CI_RUN_ID" \
+  --diagnosis "..." --owner <lane> --next-action "..."
+
+# A probe that is SUPPOSED to exit non-zero is retained, not counted
+python recurrence_guard.py --state-dir <dir> observe \
+  --environment ci --operation ci:mutation-probe --error "$(cat probe.log)" \
+  --source ci --attempt "$CI_RUN_ID" --disposition expected_negative_control
+
+# Gate a retry: exit 0 permitted, exit 3 refused pending a corrective action
+python recurrence_guard.py --state-dir <dir> check-retry --request-id req-1
+
+# Record (never execute) the systemic corrective action that unblocks retry
+python recurrence_guard.py --state-dir <dir> record-corrective-action \
+  --signature <sig> --kind code_change --actor <lane> \
+  --description "what systemically changed" --change-ref <commit-or-pr>
+
+# Retain an already-counted failure out of the count, with an audited reason
+python recurrence_guard.py --state-dir <dir> supersede-observation \
+  --observation-id <obs> --actor <lane> \
+  --reason "the probe's non-zero exit was the intended negative control"
+
+# What is known, what is owed, and what is waiting for a sender
+python recurrence_guard.py --state-dir <dir> --summary list
+python recurrence_guard.py --state-dir <dir> --summary show --signature <sig>
+python recurrence_guard.py --state-dir <dir> escalations
+python recurrence_guard.py --state-dir <dir> escalations \
+  --ack <escalation-id> --acknowledged-by <notification-owner>
+
+# Close a signature against exercised evidence on one exact commit
+python recurrence_guard.py --state-dir <dir> resolve --signature <sig> \
+  --head-sha <40-char-sha> --actor <lane> \
+  --evidence "command, exit code and what was observed"
 ```

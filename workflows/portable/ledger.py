@@ -178,6 +178,67 @@ def match_decision_option(answer: str, option: str) -> bool:
     return False
 
 
+def normalize_acceptance_criteria(
+    acceptance_criteria: Any, head: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """
+    Normalize acceptance criteria into the ledger's stored criterion shape.
+
+    Accepts the shapes callers actually pass:
+      * a description string, which is what `--criteria '["a","b"]'` produces and
+        what the CLI's own help documents as valid;
+      * a mapping using either 'description' or the 'criterion' alias for the text
+        (the alias is what the durable bug intake writes);
+      * an already-stored criterion, which round-trips unchanged.
+
+    A description string used to reach a mapping-only normalizer and die with
+    "'str' object has no attribute 'get'": an internal type error surfaced as if
+    the ledger itself were broken, from documented input. Anything genuinely
+    unusable now names its position and its type instead.
+    """
+    if acceptance_criteria is None:
+        return []
+    if isinstance(acceptance_criteria, (str, bytes, dict)):
+        raise ValueError(
+            "Acceptance criteria must be a list of criteria, not a single "
+            f"{type(acceptance_criteria).__name__}."
+        )
+
+    normalized: List[Dict[str, Any]] = []
+    for i, criterion in enumerate(acceptance_criteria):
+        default_id = f"AC-{i+1}"
+        if isinstance(criterion, str):
+            text = criterion.strip()
+            if not text:
+                raise ValueError(
+                    f"Acceptance criterion {i+1} is an empty string; a criterion the request "
+                    "will be verified against needs a description."
+                )
+            criterion = {"id": default_id, "description": text}
+        elif not isinstance(criterion, dict):
+            raise ValueError(
+                f"Acceptance criterion {i+1} must be a description string or a mapping with a "
+                f"'description' (or 'criterion') field, got {type(criterion).__name__}."
+            )
+
+        description = criterion.get("description")
+        if description is None or not str(description).strip():
+            description = criterion.get("criterion")
+        status = criterion.get("status", "pending")
+        verified = status == "verified"
+        normalized.append({
+            "id": str(criterion.get("id") or criterion.get("criterion_id") or default_id),
+            "description": "" if description is None else str(description),
+            "status": status,
+            "evidence": criterion.get("evidence", ""),
+            "head": head if verified else None,
+            "verified_head": head if verified else None,
+            "verified_at": criterion.get("verified_at"),
+            "verified_by": criterion.get("verified_by"),
+        })
+    return normalized
+
+
 class FileLock:
     """
     Cross-platform re-entrant advisory file lock using msvcrt (Windows) or fcntl (POSIX).
@@ -420,6 +481,9 @@ class RequestLedger:
             self._validate_head_sha(head)
 
         deps = dependencies or []
+        # Validated before the lock: a malformed criterion is a rejected request, not a
+        # half-written store.
+        norm_criteria = normalize_acceptance_criteria(acceptance_criteria, head)
 
         with FileLock(self.lock_path):
             data = self._load_data_unlocked()
@@ -445,21 +509,6 @@ class RequestLedger:
                             f"Cannot add request '{req_id}' in state '{state}': "
                             f"Dependency '{dep}' is not 'done' (current state: '{dep_req.get('state') if dep_req else 'missing'}')."
                         )
-
-            # Normalize acceptance criteria
-            norm_criteria = []
-            for i, c in enumerate(acceptance_criteria):
-                c_id = c.get("id") or f"AC-{i+1}"
-                norm_criteria.append({
-                    "id": str(c_id),
-                    "description": str(c.get("description", "")),
-                    "status": c.get("status", "pending"),
-                    "evidence": c.get("evidence", ""),
-                    "head": head if c.get("status") == "verified" else None,
-                    "verified_head": head if c.get("status") == "verified" else None,
-                    "verified_at": c.get("verified_at"),
-                    "verified_by": c.get("verified_by"),
-                })
 
             now = get_iso_timestamp()
             repo = github_repo or DEFAULT_REPO
@@ -1380,14 +1429,33 @@ class RequestLedger:
 # CLI Interface
 # ----------------------------------------------------------------------
 
-def parse_criteria_arg(arg: str) -> List[Dict[str, Any]]:
+def parse_criteria_arg(arg: str) -> List[Any]:
+    """
+    Parse the `--criteria` argument into criteria entries.
+
+    Parsing only: entries stay in whatever documented shape the caller wrote
+    (description strings or mappings) and `normalize_acceptance_criteria` remains
+    the single normalization authority. A JSON-looking argument that is not valid
+    JSON is reported as that, rather than as a decoder error with no context.
+    """
     arg = arg.strip()
     if arg.startswith("[") or arg.startswith("{"):
-        parsed = json.loads(arg)
+        try:
+            parsed = json.loads(arg)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"--criteria starts with '{arg[0]}' so it was read as JSON, but it is not valid "
+                f"JSON: {e}. Pass a JSON array of description strings or criterion objects, or "
+                "comma-separated descriptions."
+            )
         if isinstance(parsed, list):
             return parsed
         if isinstance(parsed, dict):
             return [parsed]
+        raise ValueError(
+            f"--criteria parsed as JSON {type(parsed).__name__}; expected an array of criteria "
+            "or a single criterion object."
+        )
     lines = [line.strip() for line in arg.replace("\n", ",").split(",") if line.strip()]
     return [{"id": f"AC-{i+1}", "description": line} for i, line in enumerate(lines)]
 

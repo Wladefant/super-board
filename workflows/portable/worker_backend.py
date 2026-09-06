@@ -642,6 +642,64 @@ def _sha256_file(path: str) -> Optional[str]:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Recurrence intake and the unchanged-retry gate
+#
+# The recurrence store is durable advisory memory owned by recurrence_guard.py.
+# It is soft-imported so a partial export still runs: a missing module means the
+# feature is absent and is reported as such, never silently reinterpreted. A
+# module that IS installed but whose history cannot be read raises out of the
+# guard, because an unreadable failure history must not be mistaken for none.
+# ---------------------------------------------------------------------------
+
+def _observe_failure(
+    state_dir: str,
+    stage: str,
+    request_id: str,
+    repo_root: str,
+    reason: str,
+    run_id: Optional[str],
+    head_sha: Optional[str],
+    exit_code: Optional[int],
+) -> Dict[str, Any]:
+    """Record one authentic worker failure in the durable recurrence store."""
+    try:
+        from recurrence_guard import observe_worker_failure
+    except ImportError as e:
+        return {"recorded": False, "reason": f"recurrence_guard is not installed: {e}"}
+    return observe_worker_failure(
+        state_dir=state_dir,
+        stage=stage,
+        request_id=request_id,
+        repo_root=repo_root,
+        reason=reason,
+        run_id=run_id,
+        head_sha=head_sha,
+        exit_code=exit_code,
+        source="native_worker",
+    ) or {"recorded": False, "reason": "recurrence intake returned nothing"}
+
+
+def _recurrence_retry_refusal(state_dir: str, request_id: Optional[str]) -> Optional[str]:
+    """
+    The reason an unchanged retry is refused, or None when it is permitted.
+
+    A retry of an attempt that already failed twice for the same reason would
+    reproduce the same failure at the same cost. This is the only question asked
+    of the recurrence store here; it decides nothing else about the retry.
+    """
+    if not request_id or not str(request_id).strip():
+        return None
+    try:
+        from recurrence_guard import RecurrenceGuard
+    except ImportError:
+        return None
+    decision = RecurrenceGuard(state_dir=state_dir).check_retry(request_id=str(request_id).strip())
+    if decision.allowed:
+        return None
+    return f"{decision.reason} {decision.required_action}".strip()
+
+
 def _coerce_result_object(payload: Any, keys: Sequence[str]) -> Optional[Dict[str, Any]]:
     """
     Pull the agent's structured answer out of a CLI envelope.
@@ -1193,6 +1251,20 @@ class WorkerBackend:
                 raise WorkerBackendError(
                     f"Native dispatch {run_id} cannot retry on its bound head: {retry_error}"
                 )
+            try:
+                refusal = _recurrence_retry_refusal(
+                    self.state_dir, (record.get("request") or {}).get("request_id")
+                )
+            except Exception as e:
+                raise WorkerBackendError(
+                    f"Native dispatch {run_id} cannot be retried: the recurrence history that "
+                    f"governs unchanged retry is unreadable ({type(e).__name__}: {e}). Repair it "
+                    "rather than retrying blind."
+                )
+            if refusal:
+                raise WorkerBackendError(
+                    f"Native dispatch {run_id} will not be retried unchanged: {refusal}"
+                )
             nonce = f"{run_id}|{record.get('attempt', 1)}|{_now()}"
             next_run_id = "native_" + hashlib.sha256(nonce.encode("utf-8")).hexdigest()[:24]
             next_record = {
@@ -1391,6 +1463,20 @@ class WorkerBackend:
             record["finished_at"] = _now()
             record["state"] = "finalized" if outcome.ok else "blocked"
             record["outcome"] = outcome.to_dict()
+            if not outcome.ok:
+                # Real, already-validated worker failure. Recorded once per attempt:
+                # the run id is the attempt identity, so a replayed completion of the
+                # same run is a duplicate observation and never a new occurrence.
+                record["recurrence"] = _observe_failure(
+                    state_dir=self.state_dir,
+                    stage=request.stage,
+                    request_id=request.request_id,
+                    repo_root=repo_root,
+                    reason=str(outcome.blocked_reason or "worker reported failure"),
+                    run_id=run_id,
+                    head_sha=head_after,
+                    exit_code=outcome.exit_code,
+                )
             self._write_native_record(record)
             return outcome
 
