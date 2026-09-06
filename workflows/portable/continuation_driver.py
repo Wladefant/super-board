@@ -1071,6 +1071,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Dry-run Telegram notification (default: True unless --telegram-send)")
     p.add_argument("--telegram-send", dest="telegram_send", action="store_true", default=False,
                    help="Send live Telegram notification")
+    p.add_argument("--telegram-pool-db", dest="telegram_pool_db", default=None,
+                   help="Path to the shared bot_pool.db holding the outbound message correlation "
+                        "index (default: VEYYON_POOL_DB, else the installed pool when it exists)")
     p.add_argument("--show-parked", action="store_true",
                    help="Print the journal's parked requests and exit.")
     p.add_argument("--unpark", action="append", default=[], dest="unpark",
@@ -1219,6 +1222,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         "telegram_dry_run": bool(telegram_dry_run),
         "telegram_send": bool(args.telegram_send and not args.telegram_dry_run),
     }
+    # Passed only when named, so the driver still loads against an installed adapter
+    # that predates the argument; unset means the adapter resolves the pool itself.
+    if args.telegram_pool_db:
+        adapter_kwargs["telegram_pool_db"] = args.telegram_pool_db
 
     if not args.no_real_worker:
         try:

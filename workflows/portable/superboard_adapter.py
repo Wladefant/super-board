@@ -72,7 +72,11 @@ try:
     )
     from project_adapter import ProjectConfig, get_current_project_config, set_current_project_config
     from github_pr_gate import PRGateEvaluation, evaluate_pr_gate
-    from telegram_notifier import NotificationEvent, TelegramNotificationAdapter
+    from telegram_notifier import (
+        NotificationEvent,
+        OutboundCorrelationStore,
+        TelegramNotificationAdapter,
+    )
 except ImportError as e:
     raise ImportError(f"superboard_adapter failed to import sibling portable modules: {e}")
 
@@ -175,6 +179,7 @@ class SuperboardExecutionAdapter:
         telegram_project: Optional[str] = None,
         telegram_dry_run: Optional[bool] = None,
         telegram_send: bool = False,
+        telegram_pool_db: Optional[str] = None,
         dry_run: bool = False,
         repo_root: Optional[str] = None,
         worker_backend: Optional[Any] = None,
@@ -191,6 +196,11 @@ class SuperboardExecutionAdapter:
         self.notify_telegram = notify_telegram
         self.telegram_project = telegram_project
         self.telegram_send = telegram_send
+        # Shared correlation index a reply to a notification is resolved through. None
+        # defers to the same resolution the session bridge uses (VEYYON_POOL_DB, else
+        # the installed pool when present), so a reply to an adapter notification is
+        # routable by default instead of requiring an opt-in nobody sets.
+        self.telegram_pool_db = telegram_pool_db
         if telegram_dry_run is not None:
             self.telegram_dry_run = telegram_dry_run
         else:
@@ -208,6 +218,7 @@ class SuperboardExecutionAdapter:
                 telegram_project=self.telegram_project,
                 telegram_dry_run=self.telegram_dry_run,
                 telegram_send=self.telegram_send,
+                telegram_pool_db=self.telegram_pool_db,
             )
 
         if self.coordinator.project_config:
@@ -1092,6 +1103,17 @@ class SuperboardExecutionAdapter:
 
         return None
 
+    def _correlation_store(self) -> OutboundCorrelationStore:
+        """Correlation index every notification this adapter delivers is recorded in.
+
+        Without one, a reply to a Superboard notification is refused by the session
+        bridge as unknown, so this is not an optional extra: the default has to resolve
+        to the same pool the bridge reads.
+        """
+        return OutboundCorrelationStore(
+            Path(self.telegram_pool_db) if self.telegram_pool_db else None
+        )
+
     def emit_telegram_event(
         self,
         req: Optional[Union[RequestSummary, Dict[str, Any]]],
@@ -1132,7 +1154,10 @@ class SuperboardExecutionAdapter:
             session_id=self._resolve_request_session(req, req_id),
         )
 
-        adapter = TelegramNotificationAdapter(state_dir_override=Path(self.state_dir))
+        adapter = TelegramNotificationAdapter(
+            state_dir_override=Path(self.state_dir),
+            correlation_store=self._correlation_store(),
+        )
         # Preserve safe dry-run by default unless configured opt-in; explicit --telegram-send must actually send, never combine silently with dry-run
         if self.telegram_dry_run is True and not self.telegram_send:
             dry_run_mode = True
@@ -1160,7 +1185,10 @@ class SuperboardExecutionAdapter:
                     ledger_req = self.coordinator.ledger.get_request(req_id)
                 except (KeyError, Exception):
                     ledger_req = None
-        adapter = TelegramNotificationAdapter(state_dir_override=Path(self.state_dir))
+        adapter = TelegramNotificationAdapter(
+            state_dir_override=Path(self.state_dir),
+            correlation_store=self._correlation_store(),
+        )
         event = adapter.from_decision(
             decision,
             project_override=self.project_config.project_name or self.project_config.repo,
@@ -1439,6 +1467,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--notify-telegram", action="store_true", help="Enable Telegram notifications")
     parser.add_argument("--telegram-dry-run", dest="telegram_dry_run", action="store_true", default=None, help="Dry-run Telegram notification (default: True unless --telegram-send)")
     parser.add_argument("--telegram-send", dest="telegram_send", action="store_true", default=False, help="Send live Telegram notification")
+    parser.add_argument(
+        "--telegram-pool-db",
+        dest="telegram_pool_db",
+        default=None,
+        help=(
+            "Path to the shared bot_pool.db holding the outbound message correlation index. "
+            "Defaults to VEYYON_POOL_DB, else the installed pool at ~/.veyyon/telegram/bot_pool.db "
+            "when it exists; set VEYYON_POOL_DB=off to record nothing"
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true", help="Dry run without mutating git worktrees")
     parser.add_argument("--json", action="store_true", help="Output JSON result")
     parser.add_argument("--summary", action="store_true", help="Output human-readable summary")
@@ -1502,6 +1540,7 @@ def main():
         notify_telegram=args.notify_telegram,
         telegram_dry_run=args.telegram_dry_run if args.telegram_dry_run is not None else (not args.telegram_send),
         telegram_send=args.telegram_send,
+        telegram_pool_db=args.telegram_pool_db,
         dry_run=args.dry_run,
     )
 

@@ -41,6 +41,7 @@ from telegram_notifier import (
     ProjectSlotResolver,
     SecretSanitizer,
     TelegramNotificationAdapter,
+    resolve_pool_db_path,
 )
 
 
@@ -444,7 +445,14 @@ class TestTelegramNotificationAdapter(unittest.TestCase):
             encoding="utf-8",
         )
         self.resolver = ProjectSlotResolver(manifest_path=manifest_file, channels_dir=self.channels_dir)
-        self.adapter = TelegramNotificationAdapter(resolver=self.resolver, ledger=self.ledger)
+        # The pool database is named explicitly so this fixture can never resolve to the
+        # installed pool and write correlations into a real session bridge index.
+        self.pool_db = Path(self.temp_dir.name) / "bot_pool.db"
+        self.adapter = TelegramNotificationAdapter(
+            resolver=self.resolver,
+            ledger=self.ledger,
+            correlation_store=OutboundCorrelationStore(self.pool_db),
+        )
 
     def tearDown(self):
         self.temp_dir.cleanup()
@@ -744,7 +752,8 @@ class TestStrictProjectAffinity(unittest.TestCase):
 class TestOutboundCorrelationStore(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
-        self.pool_db = Path(self.temp_dir.name) / "bot_pool.db"
+        self.root = Path(self.temp_dir.name)
+        self.pool_db = self.root / "bot_pool.db"
         self.store = OutboundCorrelationStore(self.pool_db)
 
     def tearDown(self):
@@ -768,11 +777,53 @@ class TestOutboundCorrelationStore(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_disabled_without_named_pool_database(self):
+    def test_pool_database_resolution_order(self):
+        installed = self.root / "installed_pool.db"
+        explicit = self.root / "explicit_pool.db"
+        env_named = self.root / "env_pool.db"
+
+        # An explicit path wins outright, and is honoured before the file exists: naming
+        # it is the caller's statement that this is the pool.
+        self.assertEqual(
+            resolve_pool_db_path(explicit, default_path=installed, env={"VEYYON_POOL_DB": str(env_named)}),
+            (explicit, "explicit"),
+        )
+        # Then the environment.
+        self.assertEqual(
+            resolve_pool_db_path(None, default_path=installed, env={"VEYYON_POOL_DB": str(env_named)}),
+            (env_named, "env"),
+        )
+        # An off value is a deliberate opt-out even inside an installed pool.
+        installed.write_bytes(b"")
+        for off in ("", "off", "0", "none", "disabled", "false", " OFF "):
+            self.assertEqual(
+                resolve_pool_db_path(None, default_path=installed, env={"VEYYON_POOL_DB": off}),
+                (None, "env_disabled"),
+                msg=f"VEYYON_POOL_DB={off!r} must disable correlation",
+            )
+        # With no explicit path and no environment, an existing installed pool is used,
+        # so a real caller correlates by default instead of needing an opt-in.
+        self.assertEqual(resolve_pool_db_path(None, default_path=installed, env={}), (installed, "installed"))
+        # But a default that does not exist is never created: a pool no bridge reads
+        # would swallow correlations and make replies look routable when they are not.
+        missing = self.root / "no_such_pool.db"
+        self.assertEqual(resolve_pool_db_path(None, default_path=missing, env={}), (None, "absent"))
+
+    def test_store_reports_the_rule_that_decided_its_path(self):
+        installed = self.root / "installed_pool.db"
+        installed.write_bytes(b"")
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("VEYYON_POOL_DB", None)
-            self.assertFalse(OutboundCorrelationStore().enabled)
+            enabled_by_default = OutboundCorrelationStore(default_path=installed)
+            self.assertTrue(enabled_by_default.enabled)
+            self.assertEqual(enabled_by_default.source, "installed")
+
+            off = OutboundCorrelationStore(default_path=self.root / "absent_pool.db")
+            self.assertFalse(off.enabled)
+            self.assertEqual(off.source, "absent")
+
         self.assertTrue(self.store.enabled)
+        self.assertEqual(self.store.source, "explicit")
 
     def test_record_and_lookup_round_trip(self):
         self.assertTrue(
@@ -1035,6 +1086,111 @@ class TestCrossLanguageReplyRouting(unittest.TestCase):
 
         unknown = self._probe(555000, "sess-owner")
         self.assertEqual(unknown["decision"], "reject_unknown")
+
+
+class TestCoordinatorHookCorrelation(unittest.TestCase):
+    """The coordinator's own notification hook must correlate what it delivers.
+
+    It constructed a bare TelegramNotificationAdapter, so its notifications were the
+    one delivery path that could never be correlated regardless of configuration, and
+    the bridge refused every reply to one.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp_dir.name)
+        self.state_dir = self.root / "state"
+        self.state_dir.mkdir()
+        self.pool_db = self.root / "configured_pool.db"
+
+        self.channels_dir = self.root / "channels"
+        slot_dir = self.channels_dir / "telegram-polysim"
+        slot_dir.mkdir(parents=True)
+        (slot_dir / ".env").write_text("TELEGRAM_BOT_TOKEN=1000000000:AAsynthetic\n", encoding="utf-8")
+        (slot_dir / "access.json").write_text(
+            json.dumps({"dmPolicy": "allowlist", "allowFrom": ["1247617658"]}), encoding="utf-8"
+        )
+        self.manifest = self.root / "manifest.json"
+        self.manifest.write_text(
+            json.dumps({
+                "version": 1,
+                "slots": [{
+                    "slotId": "telegram-polysim",
+                    "stateDir": str(slot_dir),
+                    "preferredProjects": ["polysimulator"],
+                    "enabled": True,
+                }],
+            }),
+            encoding="utf-8",
+        )
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_configured_pool_reaches_the_coordinator_notification_hook(self):
+        from coordinator import Coordinator
+
+        packet = {
+            "status": "blocked",
+            "status_reason": "Prerequisite missing",
+            "request": {
+                "id": "req-coordinator-hook",
+                "state": "implementation",
+                "session": "sess-coordinator-owner",
+                "issue_url": "https://github.com/Bavariance/polysimulator/issues/75",
+            },
+            "blocker": "dokploy_staging compose unhealthy",
+        }
+
+        env = {
+            "TELEGRAM_NOTIFY_CHAT_ID": "1247617658",
+            "TELEGRAM_BOT_TOKEN": "1000000000:AAsynthetic",
+            "VEYYON_MANIFEST_PATH": str(self.manifest),
+            "VEYYON_CHANNELS_DIR": str(self.channels_dir),
+        }
+        with patch.dict(os.environ, env), patch("urllib.request.urlopen") as transport:
+            # Nothing in the environment names a pool: only the coordinator's own
+            # configuration can enable correlation here.
+            os.environ.pop("VEYYON_POOL_DB", None)
+            transport.return_value.__enter__.return_value.read.return_value = json.dumps({
+                "ok": True,
+                "result": {
+                    "message_id": 660066,
+                    "from": {"id": 54321},
+                    "chat": {"id": 1247617658},
+                },
+            }).encode("utf-8")
+
+            coordinator = Coordinator(
+                state_dir=str(self.state_dir),
+                notify_telegram=True,
+                telegram_dry_run=False,
+                telegram_send=True,
+                telegram_pool_db=str(self.pool_db),
+            )
+            receipt = coordinator.maybe_notify_telegram(_PacketStub(packet))
+
+        self.assertEqual(receipt["status"], "sent", receipt["reason"])
+        self.assertEqual(receipt["correlation_source"], "explicit")
+        self.assertTrue(receipt["correlation_recorded"], receipt["reason"])
+
+        row = OutboundCorrelationStore(self.pool_db).lookup("54321", "1247617658", 660066)
+        self.assertIsNotNone(row, "the coordinator hook recorded no correlation")
+        self.assertEqual(row["session_id"], "sess-coordinator-owner")
+
+        # Deduplication state belongs to the configured state directory, not the cwd.
+        self.assertTrue((self.state_dir / "telegram_notify_state.json").is_file())
+        self.assertFalse((Path.cwd() / "telegram_notify_state.json").exists())
+
+
+class _PacketStub:
+    """Minimal stand-in for CoordinatorPacket: the hook only calls to_dict()."""
+
+    def __init__(self, data):
+        self._data = data
+
+    def to_dict(self):
+        return self._data
 
 
 if __name__ == "__main__":

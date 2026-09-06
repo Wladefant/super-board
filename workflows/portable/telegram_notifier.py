@@ -26,9 +26,11 @@ Invariants:
    - Every delivered message is indexed by (bot_id, chat_id, message_id) against the
      originating session and request in the shared bot_pool.db, so the session bridge
      can route a reply back to its owner and refuse an unknown or stale one.
-   - Correlation requires an explicitly named pool database (constructor argument,
-     --pool-db, or VEYYON_POOL_DB); without one, messages stay uncorrelated and any
-     reply to them is refused by the bridge.
+   - The pool database resolves the same way the TypeScript bridge resolves it: an
+     explicit path (constructor argument or --pool-db), else VEYYON_POOL_DB, else the
+     installed pool at ~/.veyyon/telegram/bot_pool.db when that file exists. Outside an
+     installed pool there is nothing to correlate against, so correlation stays off
+     rather than creating a database no bridge reads.
 8. Fail-Closed Resilience: Network or API failures fail safely with structured receipts
    without halting or disrupting the coordinator execution flow.
 """
@@ -87,6 +89,47 @@ CREATE TABLE IF NOT EXISTS message_correlations (
 )
 """
 
+# Values of VEYYON_POOL_DB that mean "no correlation", so a caller inside an installed
+# pool can turn recording off without editing code.
+POOL_DB_OFF_VALUES = {"", "0", "off", "none", "disabled", "false"}
+
+
+def resolve_pool_db_path(
+    explicit: Optional[Path] = None,
+    *,
+    default_path: Optional[Path] = DEFAULT_POOL_DB_PATH,
+    env: Optional[Dict[str, str]] = None,
+) -> Tuple[Optional[Path], str]:
+    """Resolves the shared bot_pool.db to record outbound correlations in.
+
+    Returns the path and the name of whatever decided it:
+
+    ``explicit``       a caller named the path (constructor argument, --pool-db, config)
+    ``env``            VEYYON_POOL_DB named it
+    ``env_disabled``   VEYYON_POOL_DB explicitly turned correlation off
+    ``installed``      the installed pool exists at the default path
+    ``absent``         no pool database anywhere, so correlation is off
+
+    An explicit path is honoured even if the file does not exist yet: naming it is the
+    caller's statement that this is the pool. The default is honoured only when the file
+    already exists, because a bot_pool.db conjured somewhere no bridge reads would
+    silently swallow every correlation and make replies look routable when they are not.
+    """
+    if explicit:
+        return Path(explicit), "explicit"
+
+    environ = os.environ if env is None else env
+    raw = environ.get("VEYYON_POOL_DB")
+    if raw is not None:
+        if raw.strip().lower() in POOL_DB_OFF_VALUES:
+            return None, "env_disabled"
+        return Path(raw.strip()), "env"
+
+    if default_path is not None and Path(default_path).exists():
+        return Path(default_path), "installed"
+
+    return None, "absent"
+
 
 @dataclass
 class NotificationEvent:
@@ -126,6 +169,10 @@ class DeliveryReceipt:
     session_id: Optional[str] = None
     correlation_status: str = "not_attempted"
     correlation_recorded: bool = False
+    # Which rule decided the pool database: explicit, env, env_disabled, installed,
+    # absent. Without it a "disabled" status is indistinguishable from a misconfigured
+    # one at the caller.
+    correlation_source: str = "absent"
 
 
 class SecretSanitizer:
@@ -413,13 +460,17 @@ class OutboundCorrelationStore:
     happens to hold the bot lease is never substituted: it may own nothing related to
     this request, and binding to it would route someone else's reply into it.
 
-    Enabled only when a pool database is named explicitly (constructor argument or
-    VEYYON_POOL_DB), so runs outside an installed session pool never write into one.
+    Resolution order is `resolve_pool_db_path`: an explicit path wins, then
+    VEYYON_POOL_DB, then the installed pool when it exists. `source` records which of
+    those answered, so a receipt can say why correlation is on or off.
     """
 
-    def __init__(self, db_path: Optional[Path] = None):
-        raw = str(db_path) if db_path else os.environ.get("VEYYON_POOL_DB", "")
-        self.db_path: Optional[Path] = Path(raw) if raw else None
+    def __init__(
+        self,
+        db_path: Optional[Path] = None,
+        default_path: Optional[Path] = DEFAULT_POOL_DB_PATH,
+    ):
+        self.db_path, self.source = resolve_pool_db_path(db_path, default_path=default_path)
 
     @property
     def enabled(self) -> bool:
@@ -710,6 +761,7 @@ class TelegramNotificationAdapter:
                 slot_id=slot_info["slotId"],
                 session_id=bound_session,
                 correlation_status="dry_run",
+                correlation_source=self.correlation_store.source,
             )
 
         # 5. Network dispatch
@@ -734,8 +786,14 @@ class TelegramNotificationAdapter:
             with urllib.request.urlopen(req, timeout=DEFAULT_HTTP_TIMEOUT) as resp:
                 resp_data = json.loads(resp.read().decode("utf-8"))
                 if resp_data.get("ok"):
-                    msg_id = resp_data.get("result", {}).get("message_id")
-                    bot_id = str(resp_data.get("result", {}).get("from", {}).get("id", ""))
+                    result = resp_data.get("result", {})
+                    msg_id = result.get("message_id")
+                    bot_id = str(result.get("from", {}).get("id", ""))
+                    # The chat the API actually delivered to. `target_chat` may be a
+                    # channel name from the allowlist, and the session bridge looks a
+                    # reply up by the numeric chat id Telegram reports, so keying on the
+                    # requested destination would produce a row no reply can ever match.
+                    delivered_chat_id = str(result.get("chat", {}).get("id", target_chat))
                     self.ledger.record_dispatch(event)
 
                     correlation_status = "disabled" if not self.correlation_store.enabled else "unbound"
@@ -743,7 +801,7 @@ class TelegramNotificationAdapter:
                     if self.correlation_store.enabled and bound_session and msg_id is not None:
                         correlation_recorded = self.correlation_store.record(
                             bot_id=bot_id,
-                            chat_id=str(target_chat),
+                            chat_id=delivered_chat_id,
                             message_id=int(msg_id),
                             slot_id=str(slot_info["slotId"]),
                             session_id=bound_session,
@@ -765,6 +823,7 @@ class TelegramNotificationAdapter:
                         session_id=bound_session,
                         correlation_status=correlation_status,
                         correlation_recorded=correlation_recorded,
+                        correlation_source=self.correlation_store.source,
                     )
                 else:
                     return DeliveryReceipt(
@@ -1104,7 +1163,11 @@ def main() -> int:
     parser.add_argument(
         "--pool-db",
         default=None,
-        help="Path to the shared bot_pool.db holding the message correlation index (defaults to VEYYON_POOL_DB)",
+        help=(
+            "Path to the shared bot_pool.db holding the message correlation index. "
+            "Defaults to VEYYON_POOL_DB, else the installed pool at "
+            "~/.veyyon/telegram/bot_pool.db when it exists; set VEYYON_POOL_DB=off to record nothing"
+        ),
     )
 
     args = parser.parse_args()

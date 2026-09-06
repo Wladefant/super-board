@@ -184,6 +184,9 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
                     notify_telegram=True,
                     telegram_dry_run=False,
                     telegram_send=True,
+                    # Named explicitly so this fixture can never resolve to the
+                    # installed pool and write into a real session bridge index.
+                    telegram_pool_db=str(state_dir / "bot_pool.db"),
                 )
                 try:
                     for index, working_dir in enumerate(working_dirs):
@@ -229,6 +232,107 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
                 )
         finally:
             conn.close()
+
+    def test_configured_pool_database_reaches_both_notification_hooks(self):
+        """The correlation index must be reachable from the adapter's own configuration.
+
+        Before this, the store was only ever enabled by VEYYON_POOL_DB, which no
+        launcher, config, or module set, so every adapter notification went out
+        uncorrelated in the real runtime and the bridge refused every reply to one.
+        """
+        req_id = "req-configured-pool-db"
+        self._add_pipeline_request(req_id)  # ledger records session 'test-session-01'
+        configured_pool = Path(self.test_dir) / "configured" / "bot_pool.db"
+
+        env = {
+            "TELEGRAM_NOTIFY_CHAT_ID": "1247617658",
+            "TELEGRAM_BOT_TOKEN": "dummy_token_for_dry_run",
+        }
+        for hook, message_id in (("status", 991001), ("decision", 991002)):
+            with self.subTest(hook=hook), patch.dict(os.environ, env), patch(
+                "urllib.request.urlopen"
+            ) as transport:
+                # No VEYYON_POOL_DB anywhere: the configuration argument is the only
+                # thing that can enable correlation here.
+                os.environ.pop("VEYYON_POOL_DB", None)
+                transport.return_value.__enter__.return_value.read.return_value = json.dumps({
+                    "ok": True,
+                    "result": {
+                        "message_id": message_id,
+                        "from": {"id": 54321},
+                        "chat": {"id": 1247617658},
+                    },
+                }).encode("utf-8")
+
+                # A fresh dedup/rate-limit state per hook: the two hooks are independent
+                # assertions, not a burst of notifications.
+                hook_state = Path(self.test_dir) / f"pool-{hook}" / "state"
+                hook_state.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(self.ledger_path, hook_state / "ledger.json")
+
+                adapter = SuperboardExecutionAdapter(
+                    state_dir=str(hook_state),
+                    notify_telegram=True,
+                    telegram_dry_run=False,
+                    telegram_send=True,
+                    telegram_pool_db=str(configured_pool),
+                )
+                # The configuration must reach the coordinator's own hook too, not just
+                # the adapter's.
+                self.assertEqual(adapter.coordinator.telegram_pool_db, str(configured_pool))
+
+                if hook == "status":
+                    receipt = adapter.emit_telegram_event(
+                        {"id": req_id, "issue_number": 75},
+                        status="advanced",
+                        stage="qa",
+                        summary=f"Configured pool database fixture {message_id}",
+                    )
+                else:
+                    receipt = adapter.emit_telegram_decision_event({
+                        "decision_id": f"DEC-CONFIGURED-{message_id}",
+                        "request_id": req_id,
+                        "status": "pending",
+                        "question": "Choose a supported execution path",
+                        "options": [{"id": "A", "label": "First"}, {"id": "B", "label": "Second"}],
+                        "recommendation": "A",
+                        "issue_url": "https://github.com/Bavariance/polysimulator/issues/75",
+                    })
+
+                self.assertEqual(receipt["status"], "sent")
+                self.assertEqual(receipt["correlation_source"], "explicit")
+                self.assertTrue(receipt["correlation_recorded"], receipt["reason"])
+
+                row = OutboundCorrelationStore(configured_pool).lookup("54321", "1247617658", message_id)
+                self.assertIsNotNone(row, "the configured pool holds no correlation for the delivered message")
+                self.assertEqual(row["session_id"], "test-session-01")
+                # The decision hook labels its request id with the decision it carries.
+                self.assertTrue(
+                    row["request_id"].startswith(req_id),
+                    f"correlated request id {row['request_id']!r} does not name {req_id!r}",
+                )
+
+    def test_installed_pool_is_the_default_when_no_path_is_configured(self):
+        """With nothing configured, resolution matches the TypeScript bridge's default.
+
+        The default is exercised against a stand-in installed pool rather than the real
+        one: the rule under test is 'an existing installed pool is used, a missing one is
+        not created', and proving it must not write into a live session bridge index.
+        """
+        installed = Path(self.test_dir) / "installed" / "bot_pool.db"
+        installed.parent.mkdir(parents=True, exist_ok=True)
+        installed.write_bytes(b"")
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("VEYYON_POOL_DB", None)
+            store = OutboundCorrelationStore(default_path=installed)
+            self.assertTrue(store.enabled)
+            self.assertEqual(store.source, "installed")
+
+            absent = OutboundCorrelationStore(default_path=Path(self.test_dir) / "nowhere" / "bot_pool.db")
+            self.assertFalse(absent.enabled)
+            self.assertEqual(absent.source, "absent")
+            self.assertFalse((Path(self.test_dir) / "nowhere").exists())
 
     def test_telegram_notification_binds_originating_session_not_current_lease(self):
         """A notification must carry the request's own session even while an unrelated

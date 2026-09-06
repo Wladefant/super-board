@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 # Ensure sibling workflow modules are in sys.path
@@ -195,6 +196,7 @@ class Coordinator:
         telegram_project: Optional[str] = None,
         telegram_dry_run: bool = True,
         telegram_send: bool = False,
+        telegram_pool_db: Optional[str] = None,
         project_config: Optional[Union[Any, str, dict]] = None,
         adapter_name: Optional[str] = None,
     ):
@@ -218,6 +220,10 @@ class Coordinator:
         self.telegram_project = telegram_project
         self.telegram_dry_run = telegram_dry_run
         self.telegram_send = telegram_send
+        # Shared correlation index a reply to a notification is resolved through. None
+        # means "resolve it the way the session bridge does" (VEYYON_POOL_DB, else the
+        # installed pool when present); a path here overrides that.
+        self.telegram_pool_db = telegram_pool_db
 
         # Initialize project configuration adapter
         if project_config is not None and set_current_project_config is not None:
@@ -271,7 +277,7 @@ class Coordinator:
         if not self.notify_telegram:
             return None
         try:
-            from telegram_notifier import TelegramNotificationAdapter
+            from telegram_notifier import OutboundCorrelationStore, TelegramNotificationAdapter
         except ImportError:
             return {
                 "enabled": True,
@@ -291,7 +297,16 @@ class Coordinator:
                     "reason": "Routine transition filtered per notification policy",
                 }
 
-            adapter = TelegramNotificationAdapter()
+            adapter = TelegramNotificationAdapter(
+                # Deduplication state belongs to this coordinator's state directory, not
+                # to whatever directory the process happens to be running in: a run from
+                # a different cwd would otherwise start with an empty dedup window and
+                # re-send notifications already delivered.
+                state_dir_override=Path(self.state_dir),
+                correlation_store=OutboundCorrelationStore(
+                    Path(self.telegram_pool_db) if self.telegram_pool_db else None
+                ),
+            )
             dry_run_mode = self.telegram_dry_run or (not self.telegram_send)
             receipt = adapter.notify(event, dry_run=dry_run_mode)
             return asdict(receipt)
@@ -895,6 +910,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Execute live network delivery to Telegram (requires explicit opt-in)",
     )
     parser.add_argument(
+        "--telegram-pool-db",
+        default=None,
+        help=(
+            "Path to the shared bot_pool.db holding the outbound message correlation index. "
+            "Defaults to VEYYON_POOL_DB, else the installed pool at ~/.veyyon/telegram/bot_pool.db "
+            "when it exists; set VEYYON_POOL_DB=off to record nothing"
+        ),
+    )
+    parser.add_argument(
         "--dispatch",
         action="store_true",
         help="Dispatch eligible step via SuperboardExecutionAdapter (executes worker and advances ledger)",
@@ -1002,6 +1026,7 @@ def main():
         telegram_project=args.telegram_project,
         telegram_dry_run=args.telegram_dry_run,
         telegram_send=args.telegram_send,
+        telegram_pool_db=args.telegram_pool_db,
         project_config=args.project_config,
         adapter_name=args.adapter,
     )
@@ -1031,6 +1056,7 @@ def main():
                 telegram_project=args.telegram_project,
                 telegram_dry_run=args.telegram_dry_run,
                 telegram_send=args.telegram_send,
+                telegram_pool_db=args.telegram_pool_db,
             )
             res = adapter.run_step(request_id=args.request_id, real_worker=args.real_worker)
             if args.json or not args.summary:
