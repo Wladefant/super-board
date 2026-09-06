@@ -20,6 +20,8 @@ function Invoke-Process {
     $start.UseShellExecute = $false
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
+    $start.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $start.StandardErrorEncoding = [System.Text.Encoding]::UTF8
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $start
     $null = $process.Start()
@@ -161,8 +163,9 @@ try {
 
     $env:CLAUDEX_OPTIMIZED_PROBE_ARGV = '1'
     $invokeScript = Join-Path $tempRoot 'invoke-profile.ps1'
-    $invokeBody = @'
+$invokeBody = @'
 param([string]$Profile)
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 . $Profile
 $unicode = -join @([char]0x47,[char]0x72,[char]0xFC,[char]0xDF,[char]0x65,[char]0x4E16,[char]0x754C)
 claude-codex 'space value' 'quote"inside' '' $unicode '--'
@@ -481,7 +484,87 @@ ThreadingHTTPServer(('127.0.0.1',port),H).serve_forever()
     Assert-True ($verifiedAudit.Output -notmatch [regex]::Escape([Environment]::UserName)) 'audit output does not expose username paths'
     Write-Output '  ok  audit routing-state validation and path redaction'
 
-    Write-Output "`n8/8 PowerShell groups passed."
+    $shimCase = Join-Path $tempRoot 'npm-shim-test'
+    $shimBin = Join-Path $shimCase 'bin'
+    $null = New-Item -ItemType Directory -Path $shimBin -Force
+    $pkgDir = Join-Path $shimCase 'node_modules\@anthropic-ai\claude-code'
+    $null = New-Item -ItemType Directory -Path $pkgDir -Force
+    $targetScript = Join-Path $pkgDir 'cli-wrapper.cjs'
+    $captureFile = Join-Path $shimCase 'capture.json'
+    $sentinelFile = Join-Path $shimCase 'pwned.txt'
+    $escapedCapture = $captureFile.Replace('\', '\\')
+    $jsCode = "const fs = require('fs'); fs.writeFileSync('$escapedCapture', JSON.stringify(process.argv.slice(2)), 'utf8'); process.exit(0);"
+    [IO.File]::WriteAllText($targetScript, $jsCode, (New-Object Text.UTF8Encoding($false)))
+    $claudeCmd = Join-Path $shimBin 'claude.cmd'
+    $relativeScript = '..\node_modules\@anthropic-ai\claude-code\cli-wrapper.cjs'
+    $shimText = "@ECHO off`r`nGOTO start`r`n:find_dp0`r`nSET dp0=%~dp0`r`nEXIT /b`r`n:start`r`nSETLOCAL`r`nCALL :find_dp0`r`n`"%_prog%`" `"%dp0%\$relativeScript`" %*`r`n"
+    [IO.File]::WriteAllText($claudeCmd, $shimText, [Text.Encoding]::ASCII)
+    $testScript = Join-Path $shimCase 'test-invocation.ps1'
+    $testBody = @"
+param([string]`$LaunchScript, [string]`$BinPath, [string]`$SentinelPath, [string]`$CapturePath)
+`$env:PATH = `$BinPath + ';' + `$env:PATH
+. `$LaunchScript -ProbeArgvRoundTrip
+`$unicode = -join @([char]0x47,[char]0x72,[char]0xFC,[char]0xDF,[char]0x65,[char]0x4E16,[char]0x754C)
+`$pwnArg = 'foo & echo PWNED > "' + `$SentinelPath + '"'
+`$payload = @(
+    '%USERPROFILE%',
+    '%PATH%',
+    '!NOT_EXPANDED!',
+    `$pwnArg,
+    '| pipe < redirect > out ^ caret',
+    'quote"inside',
+    'space value',
+    '',
+    `$unicode
+)
+`$code = Invoke-ClaudeExact `$payload
+exit `$code
+"@
+    [IO.File]::WriteAllText($testScript, $testBody, (New-Object Text.UTF8Encoding($true)))
+    $shimRun = Invoke-Process 'powershell.exe' @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $testScript, $Launch, $shimBin, $sentinelFile, $captureFile)
+    Assert-Equal $shimRun.ExitCode 0 "npm shim invocation succeeds: $($shimRun.Output)"
+    Assert-True (-not (Test-Path -LiteralPath $sentinelFile)) 'shell metacharacters are never executed by cmd.exe'
+    Assert-True (Test-Path -LiteralPath $captureFile) 'capture file is produced by native process'
+    $capturedArgs = [IO.File]::ReadAllText($captureFile, [Text.Encoding]::UTF8) | ConvertFrom-Json
+    $expectedUnicode = -join @([char]0x47,[char]0x72,[char]0xFC,[char]0xDF,[char]0x65,[char]0x4E16,[char]0x754C)
+    $expectedPayload = @(
+        '%USERPROFILE%',
+        '%PATH%',
+        '!NOT_EXPANDED!',
+        "foo & echo PWNED > `"$sentinelFile`"",
+        '| pipe < redirect > out ^ caret',
+        'quote"inside',
+        'space value',
+        '',
+        $expectedUnicode
+    )
+    Assert-Equal $capturedArgs.Count $expectedPayload.Count 'captured argument count matches verbatim'
+    for ($i = 0; $i -lt $expectedPayload.Count; $i++) {
+        Assert-Equal $capturedArgs[$i] $expectedPayload[$i] "payload argument $i preserved verbatim without shell interpolation"
+    }
+
+    $unknownCmd = Join-Path $shimCase 'unknown.cmd'
+    [IO.File]::WriteAllText($unknownCmd, "@ECHO off`r`necho Arbitrary shell commands %*`r`n")
+    $failClosedScript = Join-Path $shimCase 'test-fail-closed.ps1'
+    $failClosedBody = @"
+param([string]`$LaunchScript, [string]`$UnknownCmd)
+. `$LaunchScript -ProbeArgvRoundTrip
+try {
+    Resolve-ClaudeInvocation `$UnknownCmd
+    exit 1
+} catch {
+    if (`$_.Exception.Message.Contains('Refusing to execute unrecognized batch wrapper')) {
+        exit 0
+    }
+    exit 2
+}
+"@
+    [IO.File]::WriteAllText($failClosedScript, $failClosedBody, (New-Object Text.UTF8Encoding($true)))
+    $failClosedRun = Invoke-Process 'powershell.exe' @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $failClosedScript, $Launch, $unknownCmd)
+    Assert-Equal $failClosedRun.ExitCode 0 'unrecognized batch wrapper safely fails closed'
+    Write-Output '  ok  npm claude.cmd wrapper safe resolution, metacharacter preservation, and fail-closed security'
+
+    Write-Output "`n9/9 PowerShell groups passed."
 }
 finally {
     foreach ($process in $gatewayProcesses) { if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force -Confirm:$false } }

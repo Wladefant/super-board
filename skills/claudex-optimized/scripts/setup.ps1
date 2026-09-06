@@ -115,6 +115,9 @@ function Set-FileAclSddl([string]$Path, [string]$Sddl) {
             throw 'Fixture-injected post-replace ACL failure.'
         }
     }
+    if ((Test-Path -LiteralPath $Path -PathType Leaf) -and (Get-Acl -LiteralPath $Path).Sddl -eq $Sddl) {
+        return
+    }
     $security = New-Object System.Security.AccessControl.FileSecurity
     $security.SetSecurityDescriptorSddlForm($Sddl)
     Set-Acl -LiteralPath $Path -AclObject $security
