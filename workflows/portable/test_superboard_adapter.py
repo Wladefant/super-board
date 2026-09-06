@@ -16,8 +16,11 @@ execution tooling:
 import json
 import os
 import shutil
+import sqlite3
+import subprocess
 import sys
 import tempfile
+import time
 from unittest.mock import patch
 import unittest
 from pathlib import Path
@@ -38,7 +41,7 @@ from model_routing import TaskType, RiskLevel
 from project_adapter import SuperboardLifecycleOutcome
 import project_adapter
 from decision_workflow import DecisionContract
-from telegram_notifier import TelegramNotificationAdapter
+from telegram_notifier import OutboundCorrelationStore, TelegramNotificationAdapter
 
 
 class StubWorkerBackend:
@@ -208,6 +211,87 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
                     self.assertEqual(transport.call_count, 1)
                 finally:
                     os.chdir(original_cwd)
+
+    def _seed_active_lease(self, pool_db: Path, slot_id: str, session_id: str) -> None:
+        conn = sqlite3.connect(str(pool_db))
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS bot_leases ("
+                    "slot_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, project_path TEXT NOT NULL, "
+                    "owner_pid INTEGER NOT NULL, owner_proc_start TEXT NOT NULL, acquired_at REAL NOT NULL, "
+                    "heartbeat_at REAL NOT NULL, ttl_seconds REAL NOT NULL DEFAULT 20.0, lease_status TEXT NOT NULL)"
+                )
+                now = time.time()
+                conn.execute(
+                    "INSERT OR REPLACE INTO bot_leases VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')",
+                    (slot_id, session_id, "C:/dev/polysimulator", 4242, "0", now, now, 20.0),
+                )
+        finally:
+            conn.close()
+
+    def test_telegram_notification_binds_originating_session_not_current_lease(self):
+        """A notification must carry the request's own session even while an unrelated
+        session holds the Telegram bot lease, and the bridge must then refuse that
+        lease-holder's reply while accepting the owning session's."""
+        req_id = "req-origin-session-binding"
+        self._add_pipeline_request(req_id)  # ledger records session 'test-session-01'
+
+        pool_db = Path(self.test_dir) / "bot_pool.db"
+        self._seed_active_lease(pool_db, "telegram-polysim", "sess-unrelated-lease")
+
+        with patch.dict(os.environ, {
+            "TELEGRAM_NOTIFY_CHAT_ID": "1247617658",
+            "TELEGRAM_BOT_TOKEN": "dummy_token_for_dry_run",
+            "VEYYON_POOL_DB": str(pool_db),
+        }), patch("urllib.request.urlopen") as transport:
+            transport.return_value.__enter__.return_value.read.return_value = json.dumps({
+                "ok": True,
+                "result": {"message_id": 778899, "from": {"id": 54321}},
+            }).encode("utf-8")
+
+            adapter = SuperboardExecutionAdapter(
+                state_dir=self.state_dir,
+                notify_telegram=True,
+                telegram_dry_run=False,
+                telegram_send=True,
+            )
+            # The real caller shape: a request dict that carries no session of its own.
+            receipt = adapter.emit_telegram_event(
+                {"id": req_id, "issue_number": 75},
+                status="blocked",
+                stage="build",
+                summary="Worker blocked awaiting a prerequisite",
+            )
+
+        self.assertEqual(receipt["status"], "sent")
+        self.assertEqual(receipt["session_id"], "test-session-01")
+        self.assertNotEqual(receipt["session_id"], "sess-unrelated-lease")
+        self.assertTrue(receipt["correlation_recorded"])
+
+        store = OutboundCorrelationStore(pool_db)
+        row = store.lookup("54321", "1247617658", 778899)
+        self.assertEqual(row["session_id"], "test-session-01")
+        self.assertEqual(row["request_id"], req_id)
+
+        probe = Path.home() / ".veyyon" / "telegram" / "tests" / "reply_probe.ts"
+        bun = shutil.which("bun")
+        if not (bun and probe.exists()):
+            self.skipTest("bridge-side leg requires bun and the installed Telegram session bridge")
+
+        def decide(session_id: str) -> dict:
+            proc = subprocess.run(
+                [bun, str(probe), str(pool_db), "54321", "1247617658", "778899", session_id],
+                cwd=str(probe.parent.parent),
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            self.assertEqual(proc.returncode, 0, f"probe failed: {proc.stderr}")
+            return json.loads(proc.stdout.strip().splitlines()[-1])
+
+        self.assertEqual(decide("test-session-01")["decision"], "deliver")
+        self.assertEqual(decide("sess-unrelated-lease")["decision"], "reject_foreign_session")
 
     def test_01_fixture_execution_never_advances_request_state(self):
         """A labelled fixture proves dispatch plumbing and must never advance real state."""

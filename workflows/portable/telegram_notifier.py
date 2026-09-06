@@ -409,6 +409,10 @@ class OutboundCorrelationStore:
     bridge, so recording here is what makes a reply to a workflow notification routable
     back to the session that owns the request.
 
+    Only the originating session of a request may be recorded here. The session that
+    happens to hold the bot lease is never substituted: it may own nothing related to
+    this request, and binding to it would route someone else's reply into it.
+
     Enabled only when a pool database is named explicitly (constructor argument or
     VEYYON_POOL_DB), so runs outside an installed session pool never write into one.
     """
@@ -425,33 +429,6 @@ class OutboundCorrelationStore:
         conn = sqlite3.connect(str(self.db_path), timeout=5.0)
         conn.execute("PRAGMA busy_timeout = 5000;")
         return conn
-
-    def resolve_active_session(self, slot_id: str, now: Optional[float] = None) -> Optional[str]:
-        """Session holding a live, non-expired lease on slot_id.
-
-        A stale lease is treated as no lease: binding a message to a session that is
-        no longer heartbeating would let a later reply land on the wrong session.
-        """
-        if not self.enabled or not slot_id or not self.db_path.exists():
-            return None
-        now = now if now is not None else time.time()
-        try:
-            with closing(self._connect()) as conn:
-                row = conn.execute(
-                    "SELECT session_id, heartbeat_at, ttl_seconds FROM bot_leases "
-                    "WHERE slot_id = ? AND lease_status = 'ACTIVE'",
-                    (slot_id,),
-                ).fetchone()
-        except sqlite3.Error:
-            return None
-
-        if not row or not row[0]:
-            return None
-        heartbeat_at = float(row[1] or 0.0)
-        ttl_seconds = float(row[2] or 0.0)
-        if now - heartbeat_at > ttl_seconds:
-            return None
-        return str(row[0])
 
     def record(
         self,
@@ -711,14 +688,13 @@ class TelegramNotificationAdapter:
                     chat_id="[REDACTED_DESTINATION]",
                 )
 
-        # The reply to this message must reach the session that owns the request, so
-        # bind it to an explicit session_id when the caller knows one and otherwise to
-        # the session currently holding a live lease on the destination slot. With no
-        # binding available the message stays uncorrelated and the session bridge
-        # refuses any reply to it rather than guessing.
-        bound_session = event.session_id or self.correlation_store.resolve_active_session(
-            slot_info["slotId"] or ""
-        )
+        # A reply to this message must reach the session that OWNS the request, so the
+        # binding comes from the event's originating session and nowhere else. It is
+        # deliberately never taken from whichever session currently holds the bot lease:
+        # that session may be unrelated to this request, and binding to it would hand it
+        # someone else's reply. With no originating identity the message stays
+        # uncorrelated and the session bridge refuses any reply to it.
+        bound_session = event.session_id or None
 
         # 3. Format message
         message_text = self.format_message(event)

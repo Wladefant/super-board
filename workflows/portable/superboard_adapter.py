@@ -1055,6 +1055,43 @@ class SuperboardExecutionAdapter:
 
         return req_state, f"Stage {stage} concluded with state {req_state}", gate_result
 
+    def _resolve_request_session(
+        self,
+        req: Optional[Union[RequestSummary, Dict[str, Any]]],
+        req_id: Optional[str],
+    ) -> Optional[str]:
+        """Originating session of a request, from the request itself or from the ledger.
+
+        This is what lets a reply to the notification reach the session that owns the
+        request. It deliberately never falls back to the session currently holding the
+        Telegram bot lease: that session may own nothing related to this request, so an
+        unresolved identity must leave the notification uncorrelated rather than hand an
+        unrelated active session someone else's reply.
+        """
+        if req is not None:
+            direct = (
+                getattr(req, "session", None)
+                or getattr(req, "session_id", None)
+                or (req.get("session") if isinstance(req, dict) else None)
+                or (req.get("session_id") if isinstance(req, dict) else None)
+            )
+            if direct:
+                return str(direct)
+
+        ledger = getattr(getattr(self, "coordinator", None), "ledger", None)
+        if req_id and ledger is not None and hasattr(ledger, "get_request"):
+            try:
+                record = ledger.get_request(req_id)
+            except Exception:
+                record = None
+            if record is not None:
+                for key in ("session", "session_id"):
+                    value = record.get(key) if isinstance(record, dict) else getattr(record, key, None)
+                    if value:
+                        return str(value)
+
+        return None
+
     def emit_telegram_event(
         self,
         req: Optional[Union[RequestSummary, Dict[str, Any]]],
@@ -1092,6 +1129,7 @@ class SuperboardExecutionAdapter:
             summary=summary,
             canonical_link=link,
             metadata=metadata,
+            session_id=self._resolve_request_session(req, req_id),
         )
 
         adapter = TelegramNotificationAdapter(state_dir_override=Path(self.state_dir))

@@ -805,13 +805,10 @@ class TestOutboundCorrelationStore(unittest.TestCase):
             )
         )
 
-    def test_active_session_resolution_ignores_stale_lease(self):
-        self._seed_lease("telegram-polysim", "sess-live", heartbeat_age=2.0)
-        self.assertEqual(self.store.resolve_active_session("telegram-polysim"), "sess-live")
-
-        self._seed_lease("telegram-polysim", "sess-dead", heartbeat_age=3600.0)
-        self.assertIsNone(self.store.resolve_active_session("telegram-polysim"))
-        self.assertIsNone(self.store.resolve_active_session("telegram-absent"))
+    def test_lease_holder_is_never_used_as_a_session_binding(self):
+        """A live lease on the destination slot must not become a message's binding."""
+        self._seed_lease("telegram-polysim", "sess-leaseholder", heartbeat_age=2.0)
+        self.assertFalse(hasattr(self.store, "resolve_active_session"))
 
     def test_schema_matches_shared_definition(self):
         self.store.record(
@@ -916,7 +913,7 @@ class TestNotifyCorrelationBinding(unittest.TestCase):
         self.assertEqual(row["request_id"], "req-4582-telegram-input")
 
     @patch("urllib.request.urlopen")
-    def test_without_session_or_lease_message_stays_uncorrelated(self, mock_urlopen):
+    def test_without_originating_session_message_stays_uncorrelated(self, mock_urlopen):
         self._mock_send(mock_urlopen, message_id=999124)
         receipt = self.adapter.notify(self._event(request_id="req-nobind"), force=True)
         self.assertTrue(receipt.delivered)
@@ -926,7 +923,8 @@ class TestNotifyCorrelationBinding(unittest.TestCase):
         self.assertIsNone(self.store.lookup("8566730274", "1247617658", 999124))
 
     @patch("urllib.request.urlopen")
-    def test_binds_to_session_holding_the_live_lease(self, mock_urlopen):
+    def test_live_lease_on_the_slot_never_binds_the_message(self, mock_urlopen):
+        """An unrelated session holding the lease must not inherit this request's reply."""
         conn = sqlite3.connect(str(self.pool_db))
         try:
             with conn:
@@ -945,11 +943,38 @@ class TestNotifyCorrelationBinding(unittest.TestCase):
             conn.close()
 
         self._mock_send(mock_urlopen, message_id=999125)
-        receipt = self.adapter.notify(self._event(request_id="req-lease-bound"), force=True)
-        self.assertEqual(receipt.session_id, "sess-leaseholder")
+        receipt = self.adapter.notify(self._event(request_id="req-no-identity"), force=True)
+        self.assertTrue(receipt.delivered)
+        self.assertIsNone(receipt.session_id)
+        self.assertFalse(receipt.correlation_recorded)
+        self.assertEqual(receipt.correlation_status, "unbound")
+        self.assertIsNone(self.store.lookup("8566730274", "1247617658", 999125))
+
+    @patch("urllib.request.urlopen")
+    def test_originating_session_wins_over_a_mismatched_lease_holder(self, mock_urlopen):
+        conn = sqlite3.connect(str(self.pool_db))
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS bot_leases ("
+                    "slot_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, project_path TEXT NOT NULL, "
+                    "owner_pid INTEGER NOT NULL, owner_proc_start TEXT NOT NULL, acquired_at REAL NOT NULL, "
+                    "heartbeat_at REAL NOT NULL, ttl_seconds REAL NOT NULL DEFAULT 20.0, lease_status TEXT NOT NULL)"
+                )
+                now = time.time()
+                conn.execute(
+                    "INSERT OR REPLACE INTO bot_leases VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')",
+                    ("telegram-polysim", "sess-current-lease", "C:/dev/polysimulator", 99, "0", now, now, 20.0),
+                )
+        finally:
+            conn.close()
+
+        self._mock_send(mock_urlopen, message_id=999126)
+        receipt = self.adapter.notify(self._event(request_id="req-owned", session_id="sess-request-owner"), force=True)
+        self.assertEqual(receipt.session_id, "sess-request-owner")
         self.assertTrue(receipt.correlation_recorded)
         self.assertEqual(
-            self.store.lookup("8566730274", "1247617658", 999125)["session_id"], "sess-leaseholder"
+            self.store.lookup("8566730274", "1247617658", 999126)["session_id"], "sess-request-owner"
         )
 
 
