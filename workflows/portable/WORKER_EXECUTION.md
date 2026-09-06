@@ -147,13 +147,32 @@ never a synthetic success:
 11. `verdict: "pass"` with an empty `checks` list, or a check with no command,
     no integer exit code, or nothing observed. **Exit status alone is never
     evidence.**
-12. A claimed `head_sha` that differs from the observed HEAD. The observed
+12. A check with an invalid `purpose` (must be one of `verification`, `baseline`,
+    or `negative_control`) or a non-integer `expected_exit_code`.
+13. A `verification` check declaring a non-zero `expected_exit_code`. Verification
+    substantiates the work on the current head and must expect exit 0; declare
+    `purpose: "baseline"` or `purpose: "negative_control"` for a check that is
+    expected to fail.
+14. An unclassified non-zero check — a check exiting non-zero that declares
+    neither `purpose` nor `expected_exit_code`. It is refused rather than assumed
+    to be an intended control: declare `purpose: "baseline"` or
+    `purpose: "negative_control"` with the matching `expected_exit_code` if the
+    failure was intended.
+15. An observed/expected exit code mismatch either way — a check whose observed
+    exit code contradicts its declared `expected_exit_code`. A baseline that was
+    expected to fail and passed is as much a broken assumption as a verification
+    that was expected to pass and failed.
+16. A controls-only packet — all reported checks are `baseline` or
+    `negative_control` diagnostics and none is a successful `verification` check
+    exiting 0. Controls record what the code used to do and what it still
+    refuses; they never substitute for proving the request works on this head.
+17. A claimed `head_sha` that differs from the observed HEAD. The observed
     commit always wins, and is what the outcome reports.
-13. For `qa` and `review`: HEAD moved during the run, or the tested commit is not
+18. For `qa` and `review`: HEAD moved during the run, or the tested commit is not
     the dispatched one. A verification stage must not mutate the tree it judges.
-14. For `build`: a `pass` that produced neither a new commit nor any artifact.
-15. A declared artifact that does not exist on disk.
-16. For a bug at `qa`: no `reproduction` record, or one lacking a real command,
+19. For `build`: a `pass` that produced neither a new commit nor any artifact.
+20. A declared artifact that does not exist on disk.
+21. For a bug at `qa`: no `reproduction` record, or one lacking a real command,
     a real integer exit code, a real observation, a scenario string, or with
     `still_reproduces` not literally `false`.
 
@@ -421,10 +440,66 @@ artifact ten times is one occurrence.
 
 ### An intended failure is not a broken system
 
-`_validate_result` accepts non-zero check exits alongside a `pass` verdict, on
-purpose: a retained baseline reproduction is evidence. So intake fires only on a
-validated failing outcome, never on a passing result that carries a reproduction
-failure.
+`_validate_result` (delegating to `evaluate_check_expectations`) accepts a
+non-zero check exit alongside a `pass` verdict only when the check explicitly
+declares `purpose: "baseline"` or `purpose: "negative_control"` with the matching
+`expected_exit_code`, and at least one `verification` check has succeeded
+(exited 0). An undeclared non-zero check defaults to `verification` expecting
+exit 0 and is refused as an unclassified failing check rather than quietly
+assumed to be an intended control, and a packet consisting only of controls
+proves nothing about the current head and is refused. So intake fires only on a
+validated failing outcome, never on a passing result that carries a retained,
+correctly classified control failure.
+
+Example of an advanceable check packet carrying a retained baseline and a passing verification:
+
+```json
+[
+  {
+    "name": "baseline defect reproduction",
+    "command": ["python", "repro.py"],
+    "exit_code": 1,
+    "observed": "fails with defect present",
+    "purpose": "baseline",
+    "expected_exit_code": 1
+  },
+  {
+    "name": "guard against bad input",
+    "command": ["python", "guard.py", "--bad-input"],
+    "exit_code": 3,
+    "observed": "refused with exit 3",
+    "purpose": "negative_control",
+    "expected_exit_code": 3
+  },
+  {
+    "name": "verification suite",
+    "command": ["python", "-m", "unittest", "tests/test_fix.py"],
+    "exit_code": 0,
+    "observed": "OK (68 tests passed)",
+    "purpose": "verification",
+    "expected_exit_code": 0
+  }
+]
+```
+
+Example of a refused packet (unclassified non-zero exit without purpose or expected_exit_code):
+
+```json
+[
+  {
+    "name": "baseline defect reproduction",
+    "command": ["python", "repro.py"],
+    "exit_code": 1,
+    "observed": "fails with defect present"
+  },
+  {
+    "name": "verification suite",
+    "command": ["python", "-m", "unittest", "tests/test_fix.py"],
+    "exit_code": 0,
+    "observed": "OK"
+  }
+]
+```
 
 For everything the worker path does not see, the disposition is explicit:
 
