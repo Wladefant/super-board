@@ -104,20 +104,86 @@ LEDGER_TOPIC_BLOCKERS: Dict[str, str] = {
 }
 
 LEDGER_TASK_BLOCKERS: Dict[str, str] = {
+    # Phase 1: Recovered authorized work
     "task-1-0": "req-4574-staging-market-loading: Staging daemon e0d736b5d15c DB revision 20260904_page_views_kind absent from chain",
-    "task-1-2": "req-4582-telegram-input: Interactive extension activation required through supported host mechanism",
-    "task-1-3": "req-4582-web-provider: Required ChatGPT storage state is unavailable; real Chromium shows logged out",
-    "task-1-4": "req-4582-gui: Upstream PR 934 merge conflicts against santhreal/veyyon main",
-    "task-1-5": "req-4582-design-conversion: Unapproved design choices and live verification remain explicit",
-    "task-1-6": "req-4582-motion-feedback: Modal/action transitions unverified; embed rendering blocked by browser auth",
-    "task-1-7": "req-4582-seo-analysis: Recovered GSC/GA4 API enablement/access and Clarity extraction prerequisites unresolved",
+    "task-1-1": "req-4576-market-loading-qa: Staging /events and /v1/markets return 404 / 503 degradation; live scenario QA blocked",
+    "task-1-2": "req-4582-telegram-input: Running host predates extension configuration; operator clean restart needed",
+    "task-1-3": "req-4582-web-provider: Required ChatGPT storage state unavailable (logged out in Chromium)",
+    "task-1-4": "req-4582-gui: Handbook conflict repair completed locally; repaired exact-head native GUI acceptance and remote publication remain pending",
+    "task-1-5": "req-4582-design-conversion: Full per-comment accounting and grounded label correction active; unapproved design choices and live verification remain explicit",
+    "task-1-6": "req-4582-motion-feedback: Desktop/mobile controls exercised; order transitions unverified; embed blocked by browser auth; waits on designstaging CI safety",
+    "task-1-7": "req-4582-seo-analysis: GSC query/rank series, GA4 access and Clarity extraction are separate missing prerequisites",
     "task-1-8": "req-4582-recurrence-guard: Awaiting operator authorization with verified provenance",
     "task-1-9": "req-4574-events-fallback: CI allowlist candidate local; safe publication depends on staging CI access",
-    "task-1-10": "req-4576-review-corrections: PR4576 local head; live fallback/recovery blocked by /events degradation",
+    "task-1-10": "req-4576-review-corrections: Local head; live fallback/recovery blocked by /events degradation",
     "task-1-11": "req-4574-ci-mirrors: Publication held until unsafe env-sync corrected; depends on req-4574-ci-staging-boundary",
     "task-1-12": "req-4574-ci-staging-boundary: PR4598 backend-unit gate fails; decision blocker staging-ci-access-403",
     "task-1-13": "req-4574-decision-reply-recovery: NEW-4 verified comment-time binding and NEW-5 recovery safety unresolved",
     "task-1-15": "Staging incident corrections: Staging daemon startup refusal and staging CI access decision pending",
+    # Phase 2: Motion acceptance details (all 5 blocked by req-4582-motion-feedback)
+    "task-2-0": "req-4582-motion-feedback: Desktop/mobile controls exercised; order transitions unverified; embed blocked by browser auth",
+    "task-2-1": "req-4582-motion-feedback: Desktop/mobile controls exercised; order transitions unverified; embed blocked by browser auth",
+    "task-2-2": "req-4582-motion-feedback: Desktop/mobile controls exercised; order transitions unverified; embed blocked by browser auth",
+    "task-2-3": "req-4582-motion-feedback: Desktop/mobile controls exercised; order transitions unverified; embed blocked by browser auth",
+    "task-2-4": "req-4582-motion-feedback: Desktop/mobile controls exercised; order transitions unverified; embed blocked by browser auth",
+    # Phase 4: Operator follow-through
+    "task-4-0": "req-4582-telegram-input: Running host predates extension configuration; operator restart needed",
+    "task-4-1": "req-4582-motion-feedback: GitHub embed rendering blocked by browser authentication",
+    "task-4-3": "req-4582-telegram-input: Running host predates extension configuration; operator restart needed",
+    "task-4-4": "req-4582-telegram-input: Running host predates extension configuration; operator restart needed",
+    "task-4-5": "req-4582-clickable-decisions: Installed decision compatibility verified; operator host restart and real callback unverified",
+    "task-4-6": "req-4582-clickable-decisions: Installed decision compatibility verified; operator host restart and real callback unverified",
+    "task-4-7": "req-4582-clickable-decisions: Installed decision compatibility verified; operator host restart and real callback unverified",
+    # Phase 6: Desktop GUI
+    "task-6-0": "req-4582-gui: Upstream PR 934 merge conflicts against santhreal/veyyon main",
+    "task-6-1": "req-4582-gui: Repaired exact-head native GUI acceptance and remote publication pending",
+    "task-6-2": "req-4582-web-provider: Required ChatGPT storage state unavailable (logged out in Chromium)",
+    "task-6-3": "req-4582-web-provider: Required ChatGPT storage state unavailable (logged out in Chromium)",
+    "task-6-4": "req-4582-gui: Upstream PR 934 merge conflicts against santhreal/veyyon main",
+    "task-6-5": "req-4582-gui: Upstream PR 934 merge conflicts against santhreal/veyyon main",
+    # Phase 7: UX/design
+    "task-7-0": "req-4582-design-conversion: Full per-comment accounting active; unapproved design choices and live verification remain explicit",
+    "task-7-1": "req-4582-design-conversion: Full per-comment accounting active; unapproved design choices and live verification remain explicit",
+    "task-7-2": "req-4582-design-conversion: Full per-comment accounting active; unapproved design choices and live verification remain explicit",
+    "task-7-3": "req-4582-design-conversion: Full per-comment accounting active; unapproved design choices and live verification remain explicit",
+    "task-7-4": "req-4582-design-conversion: Full per-comment accounting active; unapproved design choices and live verification remain explicit",
+    "task-7-5": "req-4582-design-conversion: Full per-comment accounting active; unapproved design choices and live verification remain explicit",
+    "task-7-6": "req-4582-design-conversion: Full per-comment accounting active; unapproved design choices and live verification remain explicit",
+    "task-7-7": "req-4582-design-conversion: Full per-comment accounting active; unapproved design choices and live verification remain explicit",
+    "task-7-8": "req-4582-design-conversion: Full per-comment accounting active; unapproved design choices and live verification remain explicit",
+    "task-7-9": "req-4582-design-conversion: Full per-comment accounting active; unapproved design choices and live verification remain explicit",
+    "task-7-10": "req-4582-design-conversion: Full per-comment accounting active; unapproved design choices and live verification remain explicit",
+    "task-7-11": "req-4582-design-conversion: Full per-comment accounting active; unapproved design choices and live verification remain explicit",
+    "task-7-12": "req-4582-design-conversion: Full per-comment accounting active; unapproved design choices and live verification remain explicit",
+    "task-7-13": "req-4582-seo-analysis: GSC query/rank series, GA4 access and Clarity extraction are separate missing prerequisites",
+    "task-7-14": "req-4582-seo-analysis: GSC query/rank series, GA4 access and Clarity extraction are separate missing prerequisites",
+    "task-7-15": "req-4582-seo-analysis: GSC query/rank series, GA4 access and Clarity extraction are separate missing prerequisites",
+    "task-7-16": "req-4582-seo-analysis: GSC query/rank series, GA4 access and Clarity extraction are separate missing prerequisites",
+    "task-7-17": "req-4582-seo-analysis: GSC query/rank series, GA4 access and Clarity extraction are separate missing prerequisites",
+    "task-7-18": "req-4582-seo-analysis: GSC query/rank series, GA4 access and Clarity extraction are separate missing prerequisites",
+    # Phase 8: Motion
+    "task-8-1": "req-4582-motion-feedback: Desktop/mobile controls exercised; order transitions unverified; waits on designstaging CI safety",
+    "task-8-2": "req-4582-motion-feedback: Desktop/mobile controls exercised; order transitions unverified; waits on designstaging CI safety",
+    # Phase 9: Telegram
+    "task-9-1": "req-4582-telegram-input: Running host predates extension configuration; operator clean restart needed",
+    "task-9-2": "req-4582-telegram-input: Running host predates extension configuration; operator clean restart needed",
+    # Phase 10: Decisions
+    "task-10-0": "req-4582-clickable-decisions: Installed decision compatibility verified; operator restart needed",
+    "task-10-1": "req-4582-clickable-decisions: Installed decision compatibility verified; operator restart needed",
+    "task-10-2": "req-4582-clickable-decisions: Installed decision compatibility verified; operator restart needed",
+    "task-10-4": "req-4574-decision-reply-recovery: NEW-4 verified comment-time binding and NEW-5 recovery safety unresolved",
+    "task-10-5": "req-4574-decision-reply-recovery: NEW-4 verified comment-time binding and NEW-5 recovery safety unresolved",
+    # Phase 11: Staging
+    "task-11-2": "req-4574-staging-market-loading: Staging daemon e0d736b5d15c DB revision absent from chain; /events degradation",
+    "task-11-3": "req-4574-staging-market-loading: Staging daemon e0d736b5d15c DB revision absent from chain; /events degradation",
+    # Phase 12: Workflow
+    "task-12-10": "req-4574-ci-staging-boundary: PR4598 backend-unit gate fails; decision blocker staging-ci-access-403",
+    "task-12-11": "req-4574-ci-mirrors: Publication held until unsafe env-sync corrected; depends on req-4574-ci-staging-boundary",
+    "task-12-12": "req-4574-ci-staging-boundary: PR4598 backend-unit gate fails; decision blocker staging-ci-access-403",
+    "task-12-17": "req-4574-decision-reply-recovery: NEW-4 verified comment-time binding and NEW-5 recovery safety unresolved",
+    # Phase 14: Live operator corrections
+    "task-14-3": "req-4582-clickable-decisions: Installed decision compatibility verified; operator host restart unverified",
+    "task-14-6": "req-4582-telegram-input: Running host predates extension configuration; operator clean restart needed",
 }
 
 
@@ -156,15 +222,19 @@ class InventoryItem:
 
     @property
     def is_cancelled(self) -> bool:
-        return self.status in ("cancelled", "dropped", "dropped_by_operator")
+        return self.status in ("cancelled", "dropped", "dropped_by_operator", "abandoned")
+
+    @property
+    def is_retained_backlog(self) -> bool:
+        return self.status in ("retained_backlog", "backlog_unassigned") or self.phase == "Preserved GitHub issue inventory"
 
     @property
     def is_blocked(self) -> bool:
-        return not self.is_cancelled and not self.is_completed and (bool(self.blocker_reason) or self.status == "blocked")
+        return not self.is_cancelled and not self.is_completed and not self.is_retained_backlog and (bool(self.blocker_reason) or self.status == "blocked")
 
     @property
     def is_runnable(self) -> bool:
-        return not self.is_completed and not self.is_cancelled and not self.is_blocked
+        return not self.is_completed and not self.is_cancelled and not self.is_blocked and not self.is_retained_backlog
 
 
 @dataclass
@@ -225,6 +295,7 @@ class GuardReport:
     open_tasks: int
     runnable_tasks: int
     blocked_tasks: int
+    retained_backlog_tasks: int
     active_workers_count: int  # ONLY running useful workers
     idle_workers_count: int
     parked_workers_count: int
@@ -470,6 +541,20 @@ class TopicInventoryGuard:
                 correlated.append(it)
             elif it.is_completed:
                 correlated.append(it)
+            elif it.phase == "Preserved GitHub issue inventory":
+                correlated.append(InventoryItem(
+                    id=it.id,
+                    content=it.content,
+                    phase=it.phase,
+                    status="retained_backlog",
+                    owner=it.owner,
+                    issue_url=it.issue_url,
+                    issue_number=it.issue_number,
+                    blocker_reason="Retained backlog issue inventory; fail-closed on unverified assignment/authorization (retained does not imply assigned)",
+                    dependencies=it.dependencies,
+                    evidence=it.evidence,
+                    metadata=dict(it.metadata, retained_backlog=True)
+                ))
             else:
                 reason = dynamic_task_blockers.get(it.id) or dynamic_topic_blockers.get(it.phase)
                 if reason:
@@ -719,6 +804,7 @@ class TopicInventoryGuard:
         cancelled_tasks = sum(1 for it in inventory if it.is_cancelled)
         open_tasks = total_tasks - completed_tasks - cancelled_tasks
         blocked_tasks = sum(1 for it in inventory if it.is_blocked)
+        retained_backlog_tasks = sum(1 for it in inventory if it.is_retained_backlog)
         runnable_tasks = sum(1 for it in inventory if it.is_runnable)
 
         covered_topics: List[str] = []
@@ -849,7 +935,7 @@ class TopicInventoryGuard:
 
         summary = (
             f"Inventory: {total_tasks} total ({completed_tasks} completed, {cancelled_tasks} cancelled, "
-            f"{open_tasks} open: {runnable_tasks} runnable, {blocked_tasks} blocked). "
+            f"{open_tasks} open: {runnable_tasks} runnable, {blocked_tasks} blocked, {retained_backlog_tasks} retained backlog). "
             f"Actively running workers: {effective_active_count}/{required_floor} "
             f"(idle: {len(idle_workers)}, parked: {len(parked_workers)}; floor {'satisfied' if floor_satisfied else 'DEFICIT'}). "
             f"Topics: {len(covered_topics)} covered, {len(uncovered_topics)} uncovered, {len(blocked_topics)} blocked. "
@@ -865,6 +951,7 @@ class TopicInventoryGuard:
             open_tasks=open_tasks,
             runnable_tasks=runnable_tasks,
             blocked_tasks=blocked_tasks,
+            retained_backlog_tasks=retained_backlog_tasks,
             active_workers_count=effective_active_count,
             idle_workers_count=len(idle_workers),
             parked_workers_count=len(parked_workers),

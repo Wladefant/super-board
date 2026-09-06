@@ -304,8 +304,9 @@ class TestTopicInventoryGuard(unittest.TestCase):
     # Proof 9: open vs independently runnable reconciliation
     # ----------------------------------------------------------------------
     def test_proof_9_open_vs_independently_runnable_reconciliation(self):
-        # Locate real full-topic-board-current.json
         board_candidates = [
+            Path("local://authoritative-host-board-current.json"),
+            Path(self.home_dir) / ".veyyon" / "profiles" / "default" / "agent" / "sessions" / "-development-polysimulator" / "2026-08-28T17-33-52-246Z_01a0496f-64f6-733e-a9a6-89f15fc2a437" / "local" / "authoritative-host-board-current.json",
             Path("local://full-topic-board-current.json"),
             Path(self.home_dir) / ".veyyon" / "profiles" / "default" / "agent" / "sessions" / "-development-polysimulator" / "2026-08-28T17-33-52-246Z_01a0496f-64f6-733e-a9a6-89f15fc2a437" / "local" / "full-topic-board-current.json",
             Path(SCRIPT_DIR) / "full-topic-board-current.json",
@@ -323,15 +324,16 @@ class TestTopicInventoryGuard(unittest.TestCase):
                 roster=[],
             )
 
-            # Reconcile exact counts (supports baseline 342 tasks or 348 tasks with 6 appended scheduler findings)
-            self.assertIn(report.total_tasks, (342, 348))
-            self.assertIn(report.completed_tasks, (16, 22))
+            # Reconcile exact counts on authoritative 348-task host board
+            self.assertEqual(report.total_tasks, 348)
+            self.assertEqual(report.completed_tasks, 17)
             self.assertEqual(report.cancelled_tasks, 1)
-            self.assertEqual(report.open_tasks, 325)
-            self.assertEqual(report.blocked_tasks, 55)
-            self.assertEqual(report.runnable_tasks, 270)
-            self.assertEqual(report.total_tasks, report.completed_tasks + report.cancelled_tasks + report.blocked_tasks + report.runnable_tasks)
-
+            self.assertEqual(report.open_tasks, 330)
+            self.assertEqual(report.blocked_tasks, 69)
+            self.assertEqual(report.retained_backlog_tasks, 226)
+            self.assertEqual(report.runnable_tasks, 35)
+            self.assertEqual(report.total_tasks, report.completed_tasks + report.cancelled_tasks + report.open_tasks)
+            self.assertEqual(report.open_tasks, report.blocked_tasks + report.retained_backlog_tasks + report.runnable_tasks)
             # Blocked topics must not be flagged as uncovered runnable topics
             blocked_topic_names = {b["topic"] for b in report.blocked_topics}
             self.assertIn("Motion acceptance details", blocked_topic_names)
