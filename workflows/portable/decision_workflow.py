@@ -37,10 +37,24 @@ Key Features:
       * Supported periodic polling / goal resumption via bounded one-shot sync:
         `python decision_workflow.py sync [--id DEC-ID] [--once]`
       * Coordinator-driven sync at coordination barriers or periodic polling loop.
+  - Question Lifecycle vs Reply Outcome:
+      * A refused reply (stale, agent-authored, unauthorized, unsafe) is an INPUT
+        outcome, recorded in audit_trail and rejected_inputs. It never becomes the
+        question's own status, so an unanswered question stays `pending` (or
+        `clarification_requested`) and therefore stays visible to `sync`.
+      * Replaying an unchanged refused comment is idempotent: full provenance
+        validation still runs, but no duplicate audit row or ledger write is made.
+      * `status: rejected` survives only as a legacy value written by earlier
+        versions, which stamped a refused reply onto the question and dropped it out
+        of the sync window. Reopen such a record explicitly and fail-closed:
+        `python decision_workflow.py recover DEC-ID --actor <handle> --reason <why>`
+        Recovery refuses terminal, resolved or ambiguous records, retains audit,
+        question binding and blockers, and never manufactures an answer.
 """
 
 import argparse
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -108,6 +122,36 @@ class ProvenanceType:
     UNVERIFIED_CALLER = "unverified_caller"
 
 
+class DecisionStatus:
+    """Question lifecycle states. A refused *reply* is never one of these."""
+
+    PENDING = "pending"
+    CLARIFICATION_REQUESTED = "clarification_requested"
+    ANSWERED = "answered"
+    # Legacy only: written by versions that stamped a refused reply onto the
+    # question. Never assigned by process_reply; reopened via `recover`.
+    REJECTED = "rejected"
+
+
+# A question in one of these states is still unresolved and still actionable,
+# so `sync_decisions` must keep scanning it for a genuine answer.
+OPEN_DECISION_STATUSES = (
+    DecisionStatus.PENDING,
+    DecisionStatus.CLARIFICATION_REQUESTED,
+)
+
+TERMINAL_DECISION_STATUSES = (DecisionStatus.ANSWERED,)
+
+
+class DecisionRecoveryRefused(Exception):
+    """An explicit legacy-recovery request that was refused fail-closed."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 AGENT_SIGNATURE_PATTERNS = [
     r"<!--\s*veyyon-agent-authored",
     r"<!--\s*veyyon-agent-provenance",
@@ -151,7 +195,7 @@ class DecisionContract:
     blocking_dependencies: List[str]
     authorized_responders: List[str]
     decision_scope: str = DecisionScope.ARCHITECTURAL_PREFERENCE
-    status: str = "pending"  # pending, answered, clarification_requested, rejected
+    status: str = DecisionStatus.PENDING  # pending, clarification_requested, answered
     format_preference: str = "plain"  # plain or form
     issue_number: Optional[int] = None
     issue_url: Optional[str] = None
@@ -163,6 +207,11 @@ class DecisionContract:
     clarification_prompt: Optional[str] = None
     rejection_reason: Optional[str] = None
     audit_trail: List[Dict[str, Any]] = field(default_factory=list)
+    # Refused reply inputs, keyed by comment id. Separate from `status`: a refused
+    # comment is audited evidence about an input, not the state of the question.
+    rejected_inputs: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    last_rejected_input: Optional[Dict[str, Any]] = None
+    recovery: Optional[Dict[str, Any]] = None
 
 
 def validate_decision_scope(decision: DecisionContract) -> Tuple[bool, str]:
@@ -227,6 +276,21 @@ def is_agent_authored(
             return True, f"Comment body matches agent signature pattern '{pat}'."
 
     return False, ""
+
+
+def rejected_input_fingerprint(body: str, comment_updated_at: Optional[str]) -> str:
+    """
+    Identity of a refused comment *as an input*.
+
+    Replaying the same untouched comment must not duplicate audit rows, but an
+    edited body or a new edit timestamp is a different input and is revalidated
+    from scratch.
+    """
+    digest = hashlib.sha256()
+    digest.update((body or "").encode("utf-8"))
+    digest.update(b"\x00")
+    digest.update((comment_updated_at or "").encode("utf-8"))
+    return digest.hexdigest()
 
 
 def extract_form_fields(text: str) -> Dict[str, str]:
@@ -759,6 +823,31 @@ class DecisionManager:
                 parse_result["interpretation"] = "Stale comment rejected."
                 parse_result["rejection_reason"] = stale_reason
 
+            # Refused-input replay. Validation above already ran in full, so this
+            # never weakens provenance: it only suppresses a duplicate audit row and
+            # a redundant ledger write for a comment that is byte-for-byte the one
+            # already refused.
+            if parse_result["status"] == "rejected" and comment_id:
+                fingerprint = rejected_input_fingerprint(reply_text, comment_updated_at)
+                prior = (dec_dict.get("rejected_inputs") or {}).get(str(comment_id))
+                if prior and prior.get("fingerprint") == fingerprint:
+                    prior["occurrences"] = int(prior.get("occurrences", 1)) + 1
+                    prior["last_seen_at"] = get_iso_timestamp()
+                    dec_dict["last_rejected_input"] = dict(prior)
+                    self._save_data_unlocked(data)
+                    return {
+                        "idempotent_replay": True,
+                        "status": parse_result["status"],
+                        "decision_id": decision_id,
+                        "interpretation": parse_result["interpretation"],
+                        "rejection_reason": parse_result["rejection_reason"],
+                        "clarification_prompt": parse_result["clarification_prompt"],
+                        "unblocked_requests": [],
+                        "provenance": parse_result.get("provenance", provenance),
+                        "question_status": dec_dict.get("status", DecisionStatus.PENDING),
+                        "rejected_input_occurrences": prior["occurrences"],
+                    }
+
             now = get_iso_timestamp()
 
             audit_entry = {
@@ -879,7 +968,24 @@ class DecisionManager:
                         pass
 
             elif parse_result["status"] == "rejected":
-                dec_dict["status"] = "rejected"
+                # A refused reply is an INPUT outcome. The question stays unresolved:
+                # writing the refusal onto `status` is exactly what poisoned
+                # unanswered decisions out of the pending-only sync window.
+                rejected_record = {
+                    "comment_id": str(comment_id) if comment_id else None,
+                    "comment_url": comment_url,
+                    "responder": responder,
+                    "fingerprint": rejected_input_fingerprint(reply_text, comment_updated_at),
+                    "reason": parse_result["rejection_reason"],
+                    "provenance": parse_result.get("provenance", provenance),
+                    "interpretation": parse_result["interpretation"],
+                    "first_seen_at": now,
+                    "last_seen_at": now,
+                    "occurrences": 1,
+                }
+                if comment_id:
+                    dec_dict.setdefault("rejected_inputs", {})[str(comment_id)] = rejected_record
+                dec_dict["last_rejected_input"] = dict(rejected_record)
                 dec_dict["rejection_reason"] = parse_result["rejection_reason"]
                 for req_id in decision.blocking_dependencies:
                     try:
@@ -903,6 +1009,7 @@ class DecisionManager:
                 "rejection_reason": parse_result["rejection_reason"],
                 "clarification_prompt": parse_result["clarification_prompt"],
                 "unblocked_requests": unblocked,
+                "question_status": dec_dict.get("status", DecisionStatus.PENDING),
                 "provenance": parse_result.get("provenance", provenance),
             }
 
@@ -993,7 +1100,7 @@ class DecisionManager:
           or bounded one-shot sync calls at execution barriers.
         """
         target_ids = [decision_id] if decision_id else [
-            d["decision_id"] for d in self.list_decisions(status="pending")
+            d["decision_id"] for d in self.list_open_decisions()
         ]
 
         summary = {
@@ -1012,7 +1119,7 @@ class DecisionManager:
             for d_id in target_ids:
                 try:
                     dec = self.get_decision(d_id)
-                    if dec.get("status") != "pending":
+                    if dec.get("status", DecisionStatus.PENDING) not in OPEN_DECISION_STATUSES:
                         continue
                     issue_num = dec.get("issue_number")
                     if not issue_num:
@@ -1088,6 +1195,193 @@ class DecisionManager:
                     continue
                 results.append(d)
             return results
+
+    def list_open_decisions(self) -> List[Dict[str, Any]]:
+        """Questions that are still unresolved, and therefore still worth scanning."""
+        with FileLock(self.lock_path):
+            data = self._load_data_unlocked()
+            return [
+                d
+                for d in data["decisions"].values()
+                if d.get("status", DecisionStatus.PENDING) in OPEN_DECISION_STATUSES
+            ]
+
+    def recover_rejected_question(
+        self,
+        decision_id: str,
+        actor: str = "operator",
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Reopen a legacy record whose *question* was stamped `rejected` by a refused
+        reply, so an authorized operator can still answer it.
+
+        Fail-closed. The record must be an unanswered question with demonstrable
+        input-rejection history; anything terminal, resolved or ambiguous is refused.
+        Recovery restores the question and nothing else: it never writes an answer,
+        never clears a blocker, and never touches authorization.
+        """
+        with FileLock(self.lock_path):
+            data = self._load_data_unlocked()
+            if decision_id not in data["decisions"]:
+                raise KeyError(f"Decision '{decision_id}' not found.")
+            dec_dict = data["decisions"][decision_id]
+
+            status = dec_dict.get("status", DecisionStatus.PENDING)
+            if status != DecisionStatus.REJECTED:
+                raise DecisionRecoveryRefused(
+                    "status_not_legacy_rejected",
+                    f"Decision '{decision_id}' has status '{status}', not the legacy "
+                    f"'{DecisionStatus.REJECTED}' question status. Recovery only reopens a "
+                    "question that a refused reply wrote over; it never reopens an already "
+                    "open, answered or otherwise terminal decision.",
+                )
+            if dec_dict.get("answer"):
+                raise DecisionRecoveryRefused(
+                    "answer_present",
+                    f"Decision '{decision_id}' already carries a recorded answer (comment "
+                    f"{dec_dict['answer'].get('comment_id')}). A resolved decision is terminal "
+                    "and is never reopened by recovery.",
+                )
+
+            audit = dec_dict.get("audit_trail") or []
+            if not any(e.get("status") == DecisionStatus.REJECTED for e in audit):
+                raise DecisionRecoveryRefused(
+                    "no_input_rejection_history",
+                    f"Decision '{decision_id}' has no audited reply rejection, so there is no "
+                    "evidence its 'rejected' status came from a refused input. Recovery refuses "
+                    "to guess why a record is rejected.",
+                )
+            if any(e.get("status") == DecisionStatus.ANSWERED for e in audit):
+                raise DecisionRecoveryRefused(
+                    "ambiguous_answered_history",
+                    f"Decision '{decision_id}' has an audited 'answered' reply but no committed "
+                    "answer. That record is ambiguous and needs an operator, not an automatic "
+                    "reopen.",
+                )
+            rejected_ids = [
+                str(e.get("comment_id"))
+                for e in audit
+                if e.get("status") == DecisionStatus.REJECTED and e.get("comment_id") is not None
+            ]
+
+            contract = DecisionContract(
+                decision_id=dec_dict["decision_id"],
+                request_id=dec_dict["request_id"],
+                prompt=dec_dict.get("prompt", ""),
+                question=dec_dict.get("question", ""),
+                options=dec_dict.get("options", []),
+                recommendation=dec_dict.get("recommendation", ""),
+                blocking_dependencies=dec_dict.get("blocking_dependencies", []),
+                authorized_responders=dec_dict.get("authorized_responders", []),
+                decision_scope=dec_dict.get(
+                    "decision_scope", DecisionScope.ARCHITECTURAL_PREFERENCE
+                ),
+            )
+            is_scope_valid, scope_err = validate_decision_scope(contract)
+            if not is_scope_valid:
+                raise DecisionRecoveryRefused(
+                    "unsafe_question_scope",
+                    f"Decision '{decision_id}' no longer passes scope validation and will not be "
+                    f"reopened: {scope_err}",
+                )
+
+            # A decision the ledger already resolved is terminal there too.
+            for req_id in contract.blocking_dependencies:
+                try:
+                    req_data = self.ledger.get_request(req_id)
+                except KeyError:
+                    continue
+                except Exception as e:
+                    raise DecisionRecoveryRefused(
+                        "ledger_unreadable",
+                        f"Cannot cross-check decision '{decision_id}' against request "
+                        f"'{req_id}': {e}. Recovery refuses to reopen a question it cannot verify.",
+                    )
+                for entry in req_data.get("decisions") or []:
+                    if str(entry.get("id")) != decision_id:
+                        continue
+                    if entry.get("status") == "resolved" or entry.get("answer"):
+                        raise DecisionRecoveryRefused(
+                            "ambiguous_ledger_resolution",
+                            f"Request '{req_id}' records decision '{decision_id}' as resolved "
+                            f"(answer: {entry.get('answer')!r}). Recovery refuses to reopen a "
+                            "question the ledger considers answered.",
+                        )
+
+            restored = (
+                DecisionStatus.CLARIFICATION_REQUESTED
+                if dec_dict.get("clarification_prompt")
+                else DecisionStatus.PENDING
+            )
+            now = get_iso_timestamp()
+            prior_reason = dec_dict.get("rejection_reason")
+            recovery_reason = reason or (
+                "Legacy rejected question reopened: the reply was refused, the question was "
+                "never answered."
+            )
+            dec_dict["status"] = restored
+            dec_dict["rejection_reason"] = None
+            dec_dict["recovery"] = {
+                "recovered_at": now,
+                "actor": actor,
+                "reason": recovery_reason,
+                "previous_status": DecisionStatus.REJECTED,
+                "restored_status": restored,
+                "prior_rejection_reason": prior_reason,
+                "rejected_input_comment_ids": rejected_ids,
+                "authorization_granted": False,
+            }
+            dec_dict["updated_at"] = now
+            audit.append(
+                {
+                    "timestamp": now,
+                    "action": "legacy_rejected_recovery",
+                    "actor": actor,
+                    "status": restored,
+                    "previous_status": DecisionStatus.REJECTED,
+                    "restored_status": restored,
+                    "prior_rejection_reason": prior_reason,
+                    "reason": recovery_reason,
+                    "rejected_input_comment_ids": rejected_ids,
+                    "authorization_granted": False,
+                }
+            )
+            dec_dict["audit_trail"] = audit
+            self._save_data_unlocked(data)
+
+        # Restate the blocker truthfully. Blockers and authorization are deliberately
+        # left standing: reopening a question grants no authority to act on it.
+        responders = ", ".join(contract.authorized_responders) or "an authorized responder"
+        for req_id in contract.blocking_dependencies:
+            try:
+                self.ledger.update_request(
+                    req_id=req_id,
+                    blocker=f"Awaiting human decision [{decision_id}]: {contract.question}",
+                    next_action=(
+                        f"Awaiting valid authorized response on recovered decision "
+                        f"[{decision_id}] from {responders}"
+                    ),
+                    actor=f"decision-workflow:@{actor}",
+                    reason=f"Recovered legacy rejected decision {decision_id}",
+                )
+            except KeyError:
+                pass
+
+        return {
+            "recovered": True,
+            "decision_id": decision_id,
+            "previous_status": DecisionStatus.REJECTED,
+            "restored_status": restored,
+            "prior_rejection_reason": prior_reason,
+            "rejected_input_comment_ids": rejected_ids,
+            "answer": None,
+            "authorization_granted": False,
+            "blocking_dependencies": contract.blocking_dependencies,
+            "recovered_at": now,
+            "actor": actor,
+            "reason": recovery_reason,
+        }
 
 
 # ----------------------------------------------------------------------
@@ -1233,6 +1527,18 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["pending", "answered", "clarification_requested", "rejected"],
     )
 
+    # RECOVER
+    p_rcv = subparsers.add_parser(
+        "recover",
+        help="Reopen a legacy rejected question that was never answered (fail-closed)",
+    )
+    p_rcv.add_argument("id", help="Decision ID")
+    p_rcv.add_argument("--actor", required=True, help="Operator requesting the recovery")
+    p_rcv.add_argument(
+        "--reason", default=None, help="Why this record is a legacy poisoned question"
+    )
+    p_rcv.add_argument("--json", action="store_true", help="Emit the recovery result as JSON")
+
     return parser
 
 
@@ -1355,6 +1661,27 @@ def main():
                 scope = d.get("decision_scope", "architectural_preference")
                 print(f"{d['decision_id']:<18} {d['status']:<24} {scope:<24} {d['request_id']:<18} {auth}")
 
+        elif args.command == "recover":
+            res = mgr.recover_rejected_question(
+                decision_id=args.id, actor=args.actor, reason=args.reason
+            )
+            if args.json:
+                print(json.dumps(res, indent=2))
+            else:
+                print(f"[RECOVERED] Decision '{args.id}' reopened as '{res['restored_status']}'.")
+                print(f"     Prior rejection: {res['prior_rejection_reason']}")
+                print(
+                    "     Rejected inputs retained: "
+                    f"{', '.join(res['rejected_input_comment_ids']) or 'none'}"
+                )
+                print(
+                    "     No answer was manufactured; decision blockers and authorization "
+                    "are unchanged."
+                )
+
+    except DecisionRecoveryRefused as e:
+        print(f"[REFUSED] {e.code}: {e.message}", file=sys.stderr)
+        sys.exit(3)
     except Exception as e:
         print(f"[ERROR] {e}", file=sys.stderr)
         sys.exit(1)
