@@ -812,5 +812,205 @@ class GraphQLDecisionHistoryProof(unittest.TestCase):
         dec = self.mgr.get_decision("DEC-1")
         self.assertEqual(dec["status"], "answered")
         self.assertEqual(dec["answer"]["selected_option_id"], "A")
+
+class TestTelegramCallbackResolutionAndSessionProvenance(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="telegram_callback_test_")
+        self.decisions_path = os.path.join(self.tmp, "decisions.json")
+        self.ledger_path = os.path.join(self.tmp, "ledger.json")
+        self.ledger = RequestLedger(self.ledger_path)
+        self.ledger.add_request(
+            req_id="req-test-cb",
+            prompt="Test request for callback resolution.",
+            session="session-alpha-100",
+            project="super-board",
+            acceptance_criteria=["Callback resolves properly"],
+            owner="TestWorker",
+            task_type="harness",
+            state="implementation",
+        )
+        self.mgr = DecisionManager(decisions_path=self.decisions_path, ledger_path=self.ledger_path)
+        self.decision = DecisionContract(
+            decision_id="DEC-CB-1",
+            request_id="req-test-cb",
+            prompt="Architectural choice prompt",
+            question="Choose architecture A or B",
+            options=OPTIONS,
+            recommendation="Option A",
+            blocking_dependencies=["req-test-cb"],
+            authorized_responders=["Operator"],
+            decision_scope=DecisionScope.ARCHITECTURAL_PREFERENCE,
+            status="pending",
+        )
+        self.mgr.register_question(self.decision)
+        # Bind session to the decision record
+        data = self.mgr._load_data_unlocked()
+        data["decisions"]["DEC-CB-1"]["session"] = "session-alpha-100"
+        data["decisions"]["DEC-CB-1"]["session_id"] = "session-alpha-100"
+        self.mgr._save_data_unlocked(data)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_valid_session_bound_callback_resolves_and_records_context(self):
+        res = self.mgr.resolve_telegram_callback(
+            decision_id="DEC-CB-1",
+            choice_id="A",
+            callback_token="tok_abc_123",
+            responder="Operator",
+            session_id="session-alpha-100",
+            context="Approved with audit retention requirement",
+        )
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["status"], "answered")
+        self.assertEqual(res["choice_id"], "A")
+        self.assertEqual(res["session_id"], "session-alpha-100")
+        self.assertEqual(res["context"], "Approved with audit retention requirement")
+        self.assertEqual(res["provenance"], ProvenanceType.TELEGRAM_VERIFIED_CALLBACK)
+        self.assertIn("req-test-cb", res["unblocked_requests"])
+
+        # Verify decision store
+        dec = self.mgr.get_decision("DEC-CB-1")
+        self.assertEqual(dec["status"], "answered")
+        ans = dec["answer"]
+        self.assertEqual(ans["selected_option_id"], "A")
+        self.assertEqual(ans["session_id"], "session-alpha-100")
+        self.assertEqual(ans["context"], "Approved with audit retention requirement")
+        self.assertEqual(ans["provenance"], ProvenanceType.TELEGRAM_VERIFIED_CALLBACK)
+
+        # Verify ledger request unblocked and evidence recorded
+        req = self.ledger.get_request("req-test-cb")
+        self.assertNotIn("DEC-CB-1", req.get("decision_blockers", []))
+
+    def test_callback_mismatched_session_is_refused(self):
+        res = self.mgr.resolve_telegram_callback(
+            decision_id="DEC-CB-1",
+            choice_id="A",
+            callback_token="tok_mismatch_456",
+            responder="Operator",
+            session_id="session-wrong-999",
+            context="Mismatched session attempt",
+        )
+        self.assertFalse(res["ok"])
+        self.assertIn("Session mismatch", res["error"])
+        dec = self.mgr.get_decision("DEC-CB-1")
+        self.assertEqual(dec["status"], "pending")
+        self.assertIsNone(dec.get("answer"))
+        req = self.ledger.get_request("req-test-cb")
+        self.assertIn("DEC-CB-1", req.get("decision_blockers", []))
+
+    def test_callback_missing_session_when_decision_session_bound_is_refused(self):
+        res = self.mgr.resolve_telegram_callback(
+            decision_id="DEC-CB-1",
+            choice_id="A",
+            callback_token="tok_missing_session",
+            responder="Operator",
+            session_id=None,
+        )
+        self.assertFalse(res["ok"])
+        self.assertIn("Session mismatch", res["error"])
+        dec = self.mgr.get_decision("DEC-CB-1")
+        self.assertEqual(dec["status"], "pending")
+        self.assertIsNone(dec.get("answer"))
+
+    def test_callback_on_already_answered_decision_is_refused(self):
+        # First resolve
+        self.mgr.resolve_telegram_callback(
+            decision_id="DEC-CB-1",
+            choice_id="A",
+            callback_token="tok_first",
+            responder="Operator",
+            session_id="session-alpha-100",
+        )
+        # Second attempt on terminal/answered decision
+        res2 = self.mgr.resolve_telegram_callback(
+            decision_id="DEC-CB-1",
+            choice_id="B",
+            callback_token="tok_second",
+            responder="Operator",
+            session_id="session-alpha-100",
+        )
+        self.assertFalse(res2["ok"])
+        self.assertEqual(res2["error"], "decision_already_answered")
+        dec = self.mgr.get_decision("DEC-CB-1")
+        self.assertEqual(dec["answer"]["selected_option_id"], "A")
+
+    def test_callback_invalid_choice_is_refused(self):
+        res = self.mgr.resolve_telegram_callback(
+            decision_id="DEC-CB-1",
+            choice_id="Z",
+            callback_token="tok_bad_choice",
+            responder="Operator",
+            session_id="session-alpha-100",
+        )
+        self.assertFalse(res["ok"])
+        self.assertIn("Invalid choice", res["error"])
+        dec = self.mgr.get_decision("DEC-CB-1")
+        self.assertEqual(dec["status"], "pending")
+        self.assertIsNone(dec.get("answer"))
+
+    def test_callback_unauthorized_responder_is_refused(self):
+        res = self.mgr.resolve_telegram_callback(
+            decision_id="DEC-CB-1",
+            choice_id="A",
+            callback_token="tok_unauth",
+            responder="Intruder",
+            session_id="session-alpha-100",
+        )
+        self.assertFalse(res["ok"])
+        self.assertIn("Unauthorized responder", res["error"])
+        dec = self.mgr.get_decision("DEC-CB-1")
+        self.assertEqual(dec["status"], "pending")
+        self.assertIsNone(dec.get("answer"))
+
+    def test_no_authorization_by_silence_empty_reply_rejected(self):
+        res = self.mgr.process_reply(
+            decision_id="DEC-CB-1",
+            reply_text="   \n\t  ",
+            responder="Operator",
+            provenance=ProvenanceType.GITHUB_VERIFIED_USER,
+        )
+        self.assertEqual(res["status"], "rejected")
+        self.assertIn("Empty reply received", res["rejection_reason"])
+        dec = self.mgr.get_decision("DEC-CB-1")
+        self.assertEqual(dec["status"], "pending")
+        self.assertIsNone(dec.get("answer"))
+        req = self.ledger.get_request("req-test-cb")
+        self.assertIn("DEC-CB-1", req.get("decision_blockers", []))
+
+    def test_process_reply_session_mismatch_refused(self):
+        res = self.mgr.process_reply(
+            decision_id="DEC-CB-1",
+            reply_text="Option A",
+            responder="Operator",
+            provenance=ProvenanceType.GITHUB_VERIFIED_USER,
+            comment_created_at="2026-09-08T12:00:00+00:00",
+            comment_time_provenance="api_verified",
+            session_id="session-wrong-999",
+        )
+        self.assertEqual(res["status"], "rejected")
+        self.assertIn("Session mismatch", res["rejection_reason"])
+        dec = self.mgr.get_decision("DEC-CB-1")
+        self.assertEqual(dec["status"], "pending")
+        self.assertIsNone(dec.get("answer"))
+
+    def test_unselected_free_text_does_not_unblock_or_authorize(self):
+        res = self.mgr.process_reply(
+            decision_id="DEC-CB-1",
+            reply_text="I think we should consider a third option C using Redis streams instead.",
+            responder="Operator",
+            provenance=ProvenanceType.GITHUB_VERIFIED_USER,
+            comment_created_at="2026-09-08T12:00:00+00:00",
+            comment_time_provenance="api_verified",
+        )
+        self.assertEqual(res["status"], "clarification_requested")
+        self.assertEqual(res["unblocked_requests"], [])
+        self.assertIn("Alternative proposal", res["interpretation"])
+        dec = self.mgr.get_decision("DEC-CB-1")
+        self.assertEqual(dec["status"], "clarification_requested")
+        self.assertIsNone(dec.get("answer"))
+        req = self.ledger.get_request("req-test-cb")
+        self.assertIn("DEC-CB-1", req.get("decision_blockers", []))
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

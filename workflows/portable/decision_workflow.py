@@ -587,6 +587,19 @@ def parse_plain_reply(
     Parse a reply to a decision contract.
     Enforces safety guardrails, provenance checks, authorization, and typed option resolution.
     """
+    # 0. Empty/Silence Check: No authorization by silence
+    clean_reply = (reply_text or "").strip()
+    if not clean_reply:
+        return {
+            "status": "rejected",
+            "selected_option": None,
+            "interpretation": "Empty reply received.",
+            "form_fields": {},
+            "rejection_reason": "Empty reply received; cannot resolve decision.",
+            "clarification_prompt": None,
+            "provenance": provenance,
+        }
+
     # 1. Safety Guardrail Check
     is_safe, safety_err = check_safety_guardrails(reply_text)
     if not is_safe:
@@ -690,13 +703,13 @@ def parse_plain_reply(
         opt_id = re.escape(opt["id"])
         opt_label = re.escape(opt["label"])
         explicit_id = re.compile(
-            rf"^\s*(?:(?:i\s+(?:choose|prefer)|go\s+with)\s+)?(?:option|choice)\s+\[?{opt_id}\]?"
+            rf"^\s*(?:(?:i\s+(?:choose|prefer)|(?:let'?s\s+)?go\s+with)\s+)?(?:option|choice)\s+\[?{opt_id}\]?"
             rf"(?=\s*[:\-\.]|\s|$)",
             re.IGNORECASE,
         )
         bare_id = re.compile(rf"^\s*\[?{opt_id}\]?\s*$", re.IGNORECASE)
         explicit_label = re.compile(
-            rf"^\s*(?:(?:i\s+(?:choose|prefer)|go\s+with)\s+){opt_label}"
+            rf"^\s*(?:(?:i\s+(?:choose|prefer)|(?:let'?s\s+)?go\s+with)\s+){opt_label}"
             rf"(?=\s*[:\-\.]|\s|$)",
             re.IGNORECASE,
         )
@@ -1382,6 +1395,7 @@ class DecisionManager:
         comment_created_at: Optional[str] = None,
         comment_updated_at: Optional[str] = None,
         comment_time_provenance: str = CommentTimeProvenance.CALLER_SUPPLIED,
+        session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Process a reply to a decision.
@@ -1531,6 +1545,21 @@ class DecisionManager:
                     "provenance": recorded_answer.get("provenance", ProvenanceType.HUMAN_OPERATOR),
                 }
 
+            # Empty / silence check: no authorization by silence
+            clean_reply = (reply_text or "").strip()
+            if not clean_reply:
+                return {
+                    "idempotent_replay": False,
+                    "status": "rejected",
+                    "decision_id": decision_id,
+                    "interpretation": "Empty reply received.",
+                    "rejection_reason": "Empty reply received; cannot resolve decision.",
+                    "clarification_prompt": None,
+                    "unblocked_requests": [],
+                    "provenance": provenance,
+                    "question_status": dec_dict.get("status", DecisionStatus.PENDING),
+                }
+
             # Authored-comment / synthetic probe check
             is_authored, authored_reason = is_agent_authored(comment_id, reply_text, authored_ids)
             if is_authored:
@@ -1584,6 +1613,18 @@ class DecisionManager:
                 parse_result["selected_option"] = None
                 parse_result["interpretation"] = "Stale comment rejected."
                 parse_result["rejection_reason"] = stale_reason
+            # Session binding check if decision carries a session
+            dec_session = dec_dict.get("session") or dec_dict.get("session_id")
+            if dec_session and session_id and str(session_id).strip() != str(dec_session).strip():
+                parse_result = {
+                    "status": "rejected",
+                    "selected_option": None,
+                    "interpretation": "Session mismatch in reply.",
+                    "form_fields": {},
+                    "rejection_reason": f"Session mismatch: reply session '{session_id}' does not match decision session '{dec_session}'.",
+                    "clarification_prompt": None,
+                    "provenance": provenance,
+                }
 
             # API identity alone cannot prove a manual action when the same
             # credential posted the agent question, or when no trusted transport
@@ -1659,6 +1700,7 @@ class DecisionManager:
                 "comment_created_at": comment_created_at,
                 "comment_updated_at": comment_updated_at,
                 "comment_time_provenance": comment_time_provenance,
+                "session_id": session_id or dec_session,
             }
             dec_dict.setdefault("audit_trail", []).append(audit_entry)
 
@@ -1696,6 +1738,7 @@ class DecisionManager:
                     "prior_alternative_proposal": dec_dict.get("last_alternative_proposal"),
                     "provenance": parse_result.get("provenance", provenance),
                     "is_test": is_test,
+                    "session_id": session_id or dec_session,
                 }
 
                 # Only a distinct, API-verified GitHub user event may resolve new
@@ -1910,12 +1953,13 @@ class DecisionManager:
 
             # Verify session binding if decision carries one
             dec_session = dec_dict.get("session") or dec_dict.get("session_id")
-            if session_id and dec_session and dec_session != session_id:
-                return {
-                    "ok": False,
-                    "error": f"Session mismatch: callback session '{session_id}' != decision session '{dec_session}'",
-                    "decision_id": decision_id,
-                }
+            if dec_session:
+                if not session_id or str(session_id).strip() != str(dec_session).strip():
+                    return {
+                        "ok": False,
+                        "error": f"Session mismatch: callback session '{session_id}' does not match decision session '{dec_session}'",
+                        "decision_id": decision_id,
+                    }
 
             now = get_iso_timestamp()
             opt_id = matched_opt["id"]
@@ -1937,6 +1981,7 @@ class DecisionManager:
                 "provenance": ProvenanceType.TELEGRAM_VERIFIED_CALLBACK,
                 "context": context,
                 "is_test": False,
+                "session_id": session_id or dec_session,
             }
 
             audit_entry = {
@@ -1950,6 +1995,7 @@ class DecisionManager:
                 "interpretation": interpretation,
                 "context": context,
                 "is_test": False,
+                "session_id": session_id or dec_session,
             }
 
             dec_dict["status"] = DecisionStatus.ANSWERED
@@ -1979,11 +2025,13 @@ class DecisionManager:
                             f"Callback Token: {callback_token} | "
                             f"Selected: {opt_id} - {opt_label} | "
                             f"Provenance: {ProvenanceType.TELEGRAM_VERIFIED_CALLBACK} | "
-                            f"Context: {context or 'None'}"
+                            f"Context: {context or 'None'} | "
+                            f"Session: {session_id or dec_session or 'None'}"
                         ),
                         "recorded_by": f"telegram-callback:@{clean_actor}",
                         "comment_id": callback_token,
                         "responder": responder,
+                        "session": session_id or dec_session,
                     }
                     upd_kwargs = {
                         "req_id": req_id,
@@ -2012,6 +2060,7 @@ class DecisionManager:
                 "provenance": ProvenanceType.TELEGRAM_VERIFIED_CALLBACK,
                 "unblocked_requests": unblocked,
                 "context": context,
+                "session_id": session_id or dec_session,
             }
 
     def ingest_comment(
