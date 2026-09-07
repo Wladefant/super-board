@@ -7,7 +7,13 @@ from pathlib import Path
 
 from decision_workflow import DecisionContract, DecisionManager, DecisionScope
 from ledger import RequestLedger
-from telegram_workflow import MAX_PAGE_SIZE, TelegramIdentity, TelegramWorkflowFacade
+from telegram_workflow import (
+    MAX_PAGE_SIZE,
+    NativeControlAuth,
+    NativeControlSnapshotConsumer,
+    TelegramIdentity,
+    TelegramWorkflowFacade,
+)
 
 
 class _Packet:
@@ -88,6 +94,42 @@ class TelegramWorkflowFacadeTest(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_native_control_consumer_calls_exact_host_contract(self):
+        calls = []
+
+        class NativeControl:
+            def getSessionIdentity(self, auth):
+                calls.append(("identity", auth))
+                return {"id": "session-main", "actorId": "Wladefant", "chatId": "chat-1"}
+
+            def listAgents(self, request):
+                calls.append(("agents", request))
+                return {
+                    "items": [
+                        {
+                            "id": "agent-native",
+                            "name": "Native worker",
+                            "status": "running",
+                            "updatedAt": 123,
+                        }
+                    ]
+                }
+
+        consumer = NativeControlSnapshotConsumer(
+            NativeControl(),
+            NativeControlAuth(
+                auth_token="native-token",
+                actor_id="Wladefant",
+                chat_id="chat-1",
+                session_id="session-main",
+            ),
+        )
+        snapshot = consumer()
+        self.assertEqual("session-main", snapshot["identity"]["id"])
+        self.assertEqual(["agent-native"], [item["id"] for item in snapshot["agents"]])
+        self.assertEqual("native-token", calls[0][1]["authToken"])
+        self.assertEqual(MAX_PAGE_SIZE, calls[1][1]["limit"])
+
     def test_binding_is_fail_closed_for_every_view(self):
         invalid = TelegramIdentity("chat-2", "user-1", "session-main", "Wladefant")
         with self.assertRaises(PermissionError):
@@ -127,10 +169,10 @@ class TelegramWorkflowFacadeTest(unittest.TestCase):
         self.assertEqual(5, len(second["items"]))
         self.assertIsNone(second["next_cursor"])
 
-    def test_status_delegates_to_existing_coordinator_without_dispatch(self):
+    def test_status_reads_ledger_health_without_coordinator_side_effects(self):
         result = self.facade.task_status(self.identity, "REQ-00")
-        self.assertEqual(["REQ-00"], self.coordinator.calls)
-        self.assertEqual("ready", result["status"])
+        self.assertEqual([], self.coordinator.calls)
+        self.assertEqual("HEALTHY", result["status"])
         self.assertEqual("session-main", result["session_id"])
 
     def test_authentic_decision_choice_unblocks_and_replay_is_idempotent(self):
