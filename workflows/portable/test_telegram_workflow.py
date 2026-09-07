@@ -104,15 +104,19 @@ class TelegramWorkflowFacadeTest(unittest.TestCase):
 
             def listAgents(self, request):
                 calls.append(("agents", request))
+                start = int(request.get("cursor", "0"))
+                items = [
+                    {
+                        "id": f"agent-{index}",
+                        "name": f"Native worker {index}",
+                        "status": "running",
+                        "updatedAt": 123 + index,
+                    }
+                    for index in range(start, min(start + MAX_PAGE_SIZE, 25))
+                ]
                 return {
-                    "items": [
-                        {
-                            "id": "agent-native",
-                            "name": "Native worker",
-                            "status": "running",
-                            "updatedAt": 123,
-                        }
-                    ]
+                    "items": items,
+                    **({"nextCursor": str(start + len(items))} if start + len(items) < 25 else {}),
                 }
 
         consumer = NativeControlSnapshotConsumer(
@@ -126,9 +130,11 @@ class TelegramWorkflowFacadeTest(unittest.TestCase):
         )
         snapshot = consumer()
         self.assertEqual("session-main", snapshot["identity"]["id"])
-        self.assertEqual(["agent-native"], [item["id"] for item in snapshot["agents"]])
+        self.assertEqual(25, len(snapshot["agents"]))
+        self.assertEqual("agent-24", snapshot["agents"][-1]["id"])
         self.assertEqual("native-token", calls[0][1]["authToken"])
         self.assertEqual(MAX_PAGE_SIZE, calls[1][1]["limit"])
+        self.assertEqual("20", calls[2][1]["cursor"])
 
     def test_binding_is_fail_closed_for_every_view(self):
         invalid = TelegramIdentity("chat-2", "user-1", "session-main", "Wladefant")
@@ -164,6 +170,10 @@ class TelegramWorkflowFacadeTest(unittest.TestCase):
         self.assertEqual(25, page["total"])
         self.assertNotIn("super-secret", page["items"][0]["prompt"])
         self.assertNotIn("C:\\private", page["items"][0]["prompt"])
+        self.assertEqual(
+            "https://github.com/Wladefant/super-board/issues/75",
+            page["items"][0]["issue_url"],
+        )
 
         second = self.facade.list_tasks(self.identity, cursor=page["next_cursor"], limit=999)
         self.assertEqual(5, len(second["items"]))

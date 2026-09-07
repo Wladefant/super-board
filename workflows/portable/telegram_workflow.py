@@ -24,6 +24,7 @@ except ImportError as exc:  # pragma: no cover - import diagnostics
 
 MAX_PAGE_SIZE = 20
 MAX_TEXT_LENGTH = 1200
+MAX_NATIVE_SNAPSHOT_ITEMS = 200
 
 
 @dataclass(frozen=True)
@@ -74,17 +75,39 @@ class NativeControlSnapshotConsumer:
     def __call__(self) -> Mapping[str, Any]:
         native_auth = self.auth.to_native()
         identity = self.native_control.getSessionIdentity(dict(native_auth))
-        page = self.native_control.listAgents(
-            {**native_auth, "limit": MAX_PAGE_SIZE}
-        )
-        if not isinstance(identity, Mapping) or not isinstance(page, Mapping):
-            raise TypeError("native control returned an invalid snapshot response")
-        items = page.get("items")
-        if not isinstance(items, Sequence) or isinstance(items, (str, bytes)):
-            raise TypeError("native control listAgents response must contain items")
+        if not isinstance(identity, Mapping):
+            raise TypeError("native control returned an invalid identity response")
+
+        agents: List[Dict[str, Any]] = []
+        cursor: Optional[str] = None
+        seen_cursors = set()
+        while len(agents) < MAX_NATIVE_SNAPSHOT_ITEMS:
+            request: Dict[str, Any] = {**native_auth, "limit": MAX_PAGE_SIZE}
+            if cursor is not None:
+                request["cursor"] = cursor
+            page = self.native_control.listAgents(request)
+            if not isinstance(page, Mapping):
+                raise TypeError("native control returned an invalid agent page")
+            items = page.get("items")
+            if not isinstance(items, Sequence) or isinstance(items, (str, bytes)):
+                raise TypeError("native control listAgents response must contain items")
+            agents.extend(
+                dict(item)
+                for item in items
+                if isinstance(item, Mapping)
+            )
+            agents = agents[:MAX_NATIVE_SNAPSHOT_ITEMS]
+            next_cursor = page.get("nextCursor") or page.get("next_cursor")
+            if next_cursor is None:
+                break
+            cursor = str(next_cursor)
+            if not cursor or cursor in seen_cursors:
+                raise ValueError("native control returned a repeated pagination cursor")
+            seen_cursors.add(cursor)
+
         return {
             "identity": dict(identity),
-            "agents": [dict(item) for item in items if isinstance(item, Mapping)],
+            "agents": agents,
             "sessions": [
                 dict(item)
                 for item in (self.sessions() if self.sessions else [])
@@ -176,7 +199,7 @@ class TelegramWorkflowFacade:
             text,
         )
         text = re.sub(r"(?i)\b[A-Z]:\\(?:[^\\\s]+\\)+", r"C:\\<path>\\", text)
-        text = re.sub(r"(?<![:/])/(?:[^/\s,;]+/)+[^/\s,;]+", "/<path>", text)
+        text = re.sub(r"(?<![:/A-Za-z0-9._~-])/(?:[^/\s,;]+/)+[^/\s,;]+", "/<path>", text)
         return text[:limit]
 
     @classmethod
