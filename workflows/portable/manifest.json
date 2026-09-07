@@ -152,6 +152,24 @@
         "DeliveryReceipt (JSON or terminal summary), deduplicated Telegram messages"
       ]
     },
+    "telegram_workflow.py": {
+      "role": "Transport-free, fail-closed Telegram read facade over canonical Veyyon agent/session snapshots, Superboard ledger tasks, coordinator status, and authentic DecisionManager approvals",
+      "owner": "TelegramWorkflow",
+      "inputs": [
+        "Verified Telegram actor/chat/session binding supplied by the native adapter",
+        "Read-only Veyyon agent and session snapshot",
+        "RequestLedger, Coordinator, and DecisionManager instances"
+      ],
+      "outputs": [
+        "Bounded sanitized agent, session, task, status, and decision pages",
+        "Replay-safe decision results forwarded to the existing DecisionManager"
+      ],
+      "boundaries": [
+        "No polling or webhook ownership",
+        "No scheduler, worker lifecycle, session creation, credential storage, merge, or deploy",
+        "Transport must acknowledge callback queries and remains the sole poller owner"
+      ]
+    },
     "worker_backend.py": {
       "role": "Durable native background worker execution by default: validates the exact repository/head before persisting a compact prompt/schema ticket, binds the actual agent task handle, and finalizes the delivered result through one shared exact-head, artifact, executed-check, and bug-reproduction validation path. Explicit agent CLI backends remain opt-in; preparation never advances lifecycle state.",
       "owner": "ImplementContinuousExecution",
