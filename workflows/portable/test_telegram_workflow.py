@@ -61,12 +61,13 @@ class TelegramWorkflowFacadeTest(unittest.TestCase):
             chat_id="chat-1", user_id="user-1", session_id="session-main", actor="Wladefant"
         )
         snapshot = {
+            "identity": {"id": "session-main", "actorId": "Wladefant", "chatId": "chat-1"},
             "agents": [
                 {
                     "id": "agent-1",
                     "status": "running",
-                    "session_id": "session-main",
-                    "progress": "Reading files",
+                    "summary": "Reading files",
+                    "updatedAt": 123,
                     "secret": "must-not-leak",
                 },
                 {"id": "other", "status": "idle", "session_id": "other-session"},
@@ -93,6 +94,14 @@ class TelegramWorkflowFacadeTest(unittest.TestCase):
             self.facade.list_agents(invalid)
         with self.assertRaises(PermissionError):
             self.facade.list_tasks(invalid)
+
+    def test_native_snapshot_identity_must_match_verified_binding(self):
+        self.facade.native_snapshot = lambda: {
+            "identity": {"id": "other-session", "actorId": "Wladefant", "chatId": "chat-1"},
+            "agents": [],
+        }
+        with self.assertRaises(PermissionError):
+            self.facade.list_agents(self.identity)
 
     def test_agent_and_session_views_are_scoped_sanitized_and_identified(self):
         agents = self.facade.list_agents(self.identity)

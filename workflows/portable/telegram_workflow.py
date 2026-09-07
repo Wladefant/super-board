@@ -52,8 +52,9 @@ class TelegramWorkflowFacade:
     """Bounded read views and authentic decision forwarding for Telegram clients.
 
     ``binding_verifier`` is mandatory and fail-closed. ``native_snapshot`` is an
-    injected read-only adapter over Veyyon's canonical agent/session APIs.  Neither
-    dependency is recreated or persisted here.
+    injected read-only adapter over Veyyon's canonical agent/session APIs. It must
+    include the result of native ``getSessionIdentity`` beside ``listAgents``.
+    Neither dependency is recreated or persisted here.
     """
 
     _AGENT_FIELDS = (
@@ -69,7 +70,7 @@ class TelegramWorkflowFacade:
         ledger: RequestLedger,
         decisions: DecisionManager,
         coordinator: Any,
-        native_snapshot: Callable[[], Mapping[str, Sequence[Mapping[str, Any]]]],
+        native_snapshot: Callable[[], Mapping[str, Any]],
         binding_verifier: Callable[[TelegramIdentity], bool],
     ):
         if not callable(native_snapshot) or not callable(binding_verifier):
@@ -85,6 +86,20 @@ class TelegramWorkflowFacade:
             raise PermissionError("Telegram identity binding is incomplete")
         if not self.binding_verifier(identity):
             raise PermissionError("Telegram actor/chat/session binding was not verified")
+    def _verified_snapshot(self, identity: TelegramIdentity) -> Mapping[str, Any]:
+        snapshot = self.native_snapshot()
+        native_identity = snapshot.get("identity") or {}
+        session_id = str(native_identity.get("id") or native_identity.get("sessionId") or "")
+        actor_id = str(native_identity.get("actorId") or native_identity.get("actor_id") or "")
+        chat_id = str(native_identity.get("chatId") or native_identity.get("chat_id") or "")
+        if (
+            session_id != identity.session_id
+            or actor_id not in {identity.user_id, identity.actor}
+            or chat_id != identity.chat_id
+        ):
+            raise PermissionError("Native snapshot identity does not match Telegram binding")
+        return snapshot
+
 
     @staticmethod
     def _page_bounds(cursor: Optional[str], limit: int) -> tuple[int, int]:
@@ -116,6 +131,25 @@ class TelegramWorkflowFacade:
                 value = raw[key]
                 item[key] = value if isinstance(value, (bool, int, float)) else cls._safe_text(value)
         return item
+    @classmethod
+    def _native_agent_item(
+        cls, raw: Mapping[str, Any], session_id: str
+    ) -> Dict[str, Any]:
+        normalized = dict(raw)
+        aliases = {
+            "updatedAt": "updated_at",
+            "currentTask": "current_task",
+            "resultSummary": "result_summary",
+            "result": "result_summary",
+            "summary": "progress",
+            "sessionId": "session_id",
+        }
+        for source, target in aliases.items():
+            if source in normalized and target not in normalized:
+                normalized[target] = normalized[source]
+        normalized.setdefault("session_id", session_id)
+        return cls._native_item(normalized, cls._AGENT_FIELDS)
+
 
     @staticmethod
     def _workspace_label(raw: Mapping[str, Any]) -> Optional[str]:
@@ -141,18 +175,24 @@ class TelegramWorkflowFacade:
         self, identity: TelegramIdentity, cursor: Optional[str] = None, limit: int = 10
     ) -> Dict[str, Any]:
         self._authorize(identity)
-        snapshot = self.native_snapshot()
-        agents = [self._native_item(item, self._AGENT_FIELDS) for item in snapshot.get("agents", [])]
-        agents = [item for item in agents if item.get("session_id") == identity.session_id]
+        snapshot = self._verified_snapshot(identity)
+        agents = [
+            self._native_agent_item(item, identity.session_id)
+            for item in snapshot.get("agents", [])
+            if not item.get("session_id") or str(item.get("session_id")) == identity.session_id
+        ]
         return self._page(identity, "agents", agents, cursor, limit)
 
     def list_sessions(
         self, identity: TelegramIdentity, cursor: Optional[str] = None, limit: int = 10
     ) -> Dict[str, Any]:
         self._authorize(identity)
-        snapshot = self.native_snapshot()
+        snapshot = self._verified_snapshot(identity)
+        raw_sessions = list(snapshot.get("sessions", []))
+        if not raw_sessions:
+            raw_sessions = [{"id": identity.session_id, "status": "running"}]
         sessions = []
-        for raw in snapshot.get("sessions", []):
+        for raw in raw_sessions:
             candidate_id = str(raw.get("id") or "")
             candidate = TelegramIdentity(
                 chat_id=identity.chat_id,
