@@ -269,8 +269,33 @@ class ProcessProbe:
         return None
 
 
+def parse_iso_utc(ts: str) -> Optional[datetime.datetime]:
+    """Parses ISO8601 string to timezone-aware UTC datetime."""
+    if not ts or not isinstance(ts, str):
+        return None
+    try:
+        clean = ts.strip()
+        if clean.endswith("Z"):
+            clean = clean[:-1] + "+00:00"
+        dt = datetime.datetime.fromisoformat(clean)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return dt.astimezone(datetime.timezone.utc)
+    except Exception:
+        return None
+
+
 class PlannedStopEvaluator:
-    """Evaluates planned stop / restart markers to suppress crash alerts on intentional shutdowns."""
+    """Evaluates planned stop / restart markers to suppress crash alerts on intentional shutdowns.
+
+    Invariants:
+    1. Marker must explicitly declare an owner (e.g. RuntimeCrashCutover, operator).
+    2. Marker must match target session_id.
+    3. Status 'complete' is an old consumed marker and NEVER suppresses future crashes.
+    4. Marker must declare valid unexpired timestamp (expires_utc or created_utc within TTL).
+    """
+
+    DEFAULT_MARKER_MAX_AGE_SECONDS = 900.0  # 15 minutes default TTL
 
     @classmethod
     def get_default_marker_paths(cls, session_id: str) -> List[Path]:
@@ -293,12 +318,16 @@ class PlannedStopEvaluator:
         session_id: str,
         pid: int,
         marker_paths: Optional[Sequence[Path]] = None,
+        max_age_seconds: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
-        """Checks if a planned stop marker exists and matches target session and PID."""
+        """Checks if an active, unexpired planned stop marker exists and matches target session and PID."""
         candidates = list(marker_paths or [])
         candidates.extend(cls.get_default_marker_paths(session_id))
 
-        valid_statuses = {"planned", "suppress", "expected", "restarting", "complete"}
+        # Strictly active intent statuses only; 'complete' is excluded so old markers never suppress future crashes
+        valid_statuses = {"planned", "suppress", "expected", "restarting"}
+        ttl = max_age_seconds if max_age_seconds is not None else cls.DEFAULT_MARKER_MAX_AGE_SECONDS
+        now = datetime.datetime.now(datetime.timezone.utc)
 
         for p in candidates:
             if not p.exists():
@@ -308,28 +337,50 @@ class PlannedStopEvaluator:
                 if not isinstance(data, dict):
                     continue
 
-                marker_session = data.get("session_id")
-                if marker_session and marker_session != session_id:
+                # 1. Verify owner binding (must not be anonymous/empty)
+                owner = str(data.get("owner", "")).strip()
+                if not owner:
                     continue
 
+                # 2. Verify session binding
+                marker_session = data.get("session_id")
+                if not marker_session or marker_session != session_id:
+                    continue
+
+                # 3. Verify PID binding if specified
                 marker_pid = data.get("target_pid")
                 if marker_pid is not None and int(marker_pid) != pid:
                     continue
 
-                status = str(data.get("status", "")).lower()
-                if status in valid_statuses:
-                    return {
-                        "matched_marker_path": str(p),
-                        "reason": data.get("reason", "planned_restart"),
-                        "owner": data.get("owner", "unknown"),
-                        "status": status,
-                        "created_utc": data.get("created_utc", utc_now_iso()),
-                    }
+                # 4. Verify status (old 'complete' markers are strictly rejected)
+                status = str(data.get("status", "")).lower().strip()
+                if status not in valid_statuses:
+                    continue
+
+                # 5. Verify expiry / TTL binding
+                if "expires_utc" in data:
+                    exp_dt = parse_iso_utc(str(data["expires_utc"]))
+                    if not exp_dt or now > exp_dt:
+                        continue  # Expired marker
+                elif "created_utc" in data:
+                    crt_dt = parse_iso_utc(str(data["created_utc"]))
+                    if not crt_dt or (now - crt_dt).total_seconds() > ttl:
+                        continue  # Expired marker
+                else:
+                    # Neither expires_utc nor created_utc provided: reject (must bind expiry/time)
+                    continue
+
+                return {
+                    "matched_marker_path": str(p),
+                    "reason": data.get("reason", "planned_restart"),
+                    "owner": owner,
+                    "status": status,
+                    "created_utc": data.get("created_utc", utc_now_iso()),
+                }
             except Exception:
                 continue
 
         return None
-
 
 class CrashMonitorStateLedger:
     """Durable disk-backed state ledger for crash monitor observations and deduplication."""
@@ -438,9 +489,9 @@ def format_crash_alert_text(
     extra_details: Optional[str] = None,
 ) -> str:
     """Formats a concise plain-language crash alert without raw tool spam or leaked secrets."""
-    if is_test:
-        header = "🧪 TEST / PROOF: Disposable Session Crash Monitor Verification"
-        note = "This is a controlled verification message proving Telegram API receipt. Please ignore."
+    if is_test or "TEST" in session_id:
+        header = "🧪 TEST / PROOF: Disposable Process Crash Detection Verification"
+        note = "Controlled verification: disposable process unexpected termination detected through monitor. Real Main session is untouched. Please ignore."
     else:
         header = "⚠️ PolySimulator Session Crash Alert"
         note = "Automated session monitor detected unexpected termination."
@@ -541,14 +592,15 @@ class SessionCrashMonitor:
             is_test=is_test,
         )
 
+        is_test_mode = is_test or ("TEST" in self.session_id)
         event = NotificationEvent(
-            event_type="blocker" if not is_test else "status",
+            event_type="blocker" if not is_test_mode else "status",
             project=self.project,
             request_id=f"crash-{self.session_id[:8]}",
             summary=(
                 f"Session {self.session_id} PID {pid} unexpected termination ({observed_reason}). Recovery: {recovery_cmd}"
-                if not is_test
-                else f"TEST PROOF: Disposable crash monitor verification for session {self.session_id} PID {pid}"
+                if not is_test_mode
+                else f"TEST PROOF: Disposable crash monitor verification for PID {pid} ({observed_reason}). Main session untouched"
             ),
             canonical_link=self.canonical_link,
             metadata={
@@ -762,6 +814,44 @@ class SessionCrashMonitor:
 
             time.sleep(self.poll_interval)
 
+def run_disposable_crash_test(
+    session_id: str = DEFAULT_SESSION_ID,
+    state_file: Optional[Path] = None,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Runs an actual disposable process unexpected exit through the monitor to verify real Telegram delivery."""
+    # 1. Spawn a disposable python subprocess that terminates unexpectedly with exit code 88
+    test_session_id = f"{session_id}-DISPOSABLE-TEST"
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import sys, time; time.sleep(0.5); sys.exit(88)", f"--resume={test_session_id}"]
+    )
+    pid = proc.pid
+    monitor = SessionCrashMonitor(
+        session_id=test_session_id,
+        pid=pid,
+        state_file=state_file or DEFAULT_STATE_FILE,
+        poll_interval=0.5,
+        dry_run=dry_run,
+    )
+
+    ok, msg = monitor.bind_target()
+    if not ok:
+        return {"ok": False, "error": f"Failed to bind disposable process PID {pid}: {msg}"}
+
+    # 2. Wait for process to terminate
+    proc.wait(timeout=5)
+
+    # 3. Monitor step detects termination, evaluates marker (none), delivers alert to Telegram
+    step_res = monitor.step()
+
+    return {
+        "ok": True,
+        "disposable_pid": pid,
+        "test_session_id": test_session_id,
+        "exit_code": proc.returncode,
+        "step_result": step_res,
+    }
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Independent Telegram Session Crash Monitor")
@@ -812,6 +902,11 @@ def main() -> int:
         help="Send a real clearly-labelled test verification message to Telegram and exit",
     )
     parser.add_argument(
+        "--test-disposable-crash",
+        action="store_true",
+        help="Run an actual disposable process unexpected exit through monitor to verify real Telegram delivery",
+    )
+    parser.add_argument(
         "--status",
         action="store_true",
         help="Inspect and print monitor state for the target session",
@@ -858,6 +953,17 @@ def main() -> int:
             )
         )
         return 0 if receipt.delivered or args.dry_run else 1
+
+    if args.test_disposable_crash:
+        print("[session-crash-monitor] Running disposable process unexpected exit verification through monitor...")
+        res = run_disposable_crash_test(
+            session_id=args.session_id,
+            state_file=args.state_file,
+            dry_run=args.dry_run,
+        )
+        print(json.dumps(res, indent=2, default=str))
+        delivered = res.get("step_result", {}).get("receipt", {}).get("delivered", False)
+        return 0 if delivered or args.dry_run else 1
 
     return monitor.run(max_cycles=args.max_cycles)
 

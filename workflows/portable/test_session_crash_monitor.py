@@ -31,9 +31,20 @@ try:
         SessionCrashMonitor,
         SessionProcessInfo,
         format_crash_alert_text,
+        utc_now_iso,
     )
     from telegram_notifier import DeliveryReceipt, NotificationEvent
 except ImportError:
+    from workflows.portable.session_crash_monitor import (
+        CrashMonitorStateLedger,
+        PlannedStopEvaluator,
+        ProcessProbe,
+        SessionCrashMonitor,
+        SessionProcessInfo,
+        format_crash_alert_text,
+        utc_now_iso,
+    )
+    from workflows.portable.telegram_notifier import DeliveryReceipt, NotificationEvent
     from workflows.portable.session_crash_monitor import (
         CrashMonitorStateLedger,
         PlannedStopEvaluator,
@@ -232,13 +243,15 @@ class TestSessionCrashMonitor(unittest.TestCase):
         notifier = MockTelegramAdapter()
 
         # Write planned restart marker
+        # Write planned restart marker with verified owner and unexpired timestamp
         marker_data = {
             "schema": "veyyon/planned-restart-marker/v1",
             "session_id": self.session_id,
             "target_pid": 12345,
+            "owner": "RuntimeCrashCutover",
             "status": "planned",
             "reason": "planned_binary_cutover_by_RuntimeCrashCutover",
-            "created_utc": "2026-09-08T00:05:00Z",
+            "created_utc": utc_now_iso(),
         }
         self.marker_file.write_text(json.dumps(marker_data), encoding="utf-8")
 
@@ -451,12 +464,15 @@ class TestSessionCrashMonitor(unittest.TestCase):
         pid2 = proc2.pid
 
         # Write planned restart marker for proc2
+        # Write planned restart marker for proc2 with verified owner and timestamp
         marker_data = {
             "schema": "veyyon/planned-restart-marker/v1",
             "session_id": self.session_id,
             "target_pid": pid2,
+            "owner": "test_operator",
             "status": "planned",
             "reason": "clean_disposable_test_shutdown",
+            "created_utc": utc_now_iso(),
         }
         self.marker_file.write_text(json.dumps(marker_data), encoding="utf-8")
 
@@ -478,6 +494,94 @@ class TestSessionCrashMonitor(unittest.TestCase):
         # Delivery count should still be 1 (no new alert)
         self.assertEqual(notifier.delivery_count, 1)
 
+
+    def test_old_complete_or_expired_marker_does_not_suppress_crash(self):
+        """Old 'complete' marker, expired timestamp, or missing owner does NOT suppress a future crash."""
+        probe = MockProcessProbe()
+        notifier = MockTelegramAdapter()
+
+        # 1. Test 'complete' marker does NOT suppress crash
+        probe.set_process(
+            pid=22222,
+            session_id=self.session_id,
+            creation_time_utc="2026-09-08T00:00:00Z",
+            is_alive=True,
+            command_line=f"veyyon.exe --resume {self.session_id}",
+        )
+        complete_marker = {
+            "schema": "veyyon/planned-restart-marker/v1",
+            "session_id": self.session_id,
+            "target_pid": 22222,
+            "owner": "RuntimeCrashCutover",
+            "status": "complete",  # Completed prior restart; must not suppress new crash!
+            "created_utc": utc_now_iso(),
+        }
+        self.marker_file.write_text(json.dumps(complete_marker), encoding="utf-8")
+
+        monitor = SessionCrashMonitor(
+            session_id=self.session_id,
+            pid=22222,
+            state_file=self.state_file,
+            marker_paths=[self.marker_file],
+            notifier_adapter=notifier,
+            probe=probe,
+        )
+        monitor.bind_target()
+
+        # Process crashes
+        probe.set_process(
+            pid=22222,
+            session_id=self.session_id,
+            creation_time_utc="2026-09-08T00:00:00Z",
+            is_alive=False,
+            exit_code=1,
+            command_line=f"veyyon.exe --resume {self.session_id}",
+        )
+        res = monitor.step()
+        self.assertEqual(res["status"], "terminated")
+        self.assertEqual(res["classification"], "UNEXPECTED_TERMINATION")
+        self.assertEqual(notifier.delivery_count, 1)
+
+        # 2. Test expired marker (older than 900s) does NOT suppress crash
+        probe.set_process(
+            pid=33333,
+            session_id=self.session_id,
+            creation_time_utc="2026-09-08T00:00:00Z",
+            is_alive=True,
+            command_line=f"veyyon.exe --resume {self.session_id}",
+        )
+        expired_marker = {
+            "schema": "veyyon/planned-restart-marker/v1",
+            "session_id": self.session_id,
+            "target_pid": 33333,
+            "owner": "RuntimeCrashCutover",
+            "status": "planned",
+            "created_utc": "2026-09-01T00:00:00Z",  # 7 days old!
+        }
+        self.marker_file.write_text(json.dumps(expired_marker), encoding="utf-8")
+
+        monitor2 = SessionCrashMonitor(
+            session_id=self.session_id,
+            pid=33333,
+            state_file=self.state_file,
+            marker_paths=[self.marker_file],
+            notifier_adapter=notifier,
+            probe=probe,
+        )
+        monitor2.bind_target()
+
+        probe.set_process(
+            pid=33333,
+            session_id=self.session_id,
+            creation_time_utc="2026-09-08T00:00:00Z",
+            is_alive=False,
+            exit_code=1,
+            command_line=f"veyyon.exe --resume {self.session_id}",
+        )
+        res2 = monitor2.step()
+        self.assertEqual(res2["status"], "terminated")
+        self.assertEqual(res2["classification"], "UNEXPECTED_TERMINATION")
+        self.assertEqual(notifier.delivery_count, 2)
 
 if __name__ == "__main__":
     unittest.main()
