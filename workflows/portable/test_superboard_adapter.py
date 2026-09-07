@@ -16,8 +16,11 @@ execution tooling:
 import json
 import os
 import shutil
+import sqlite3
+import subprocess
 import sys
 import tempfile
+import time
 from unittest.mock import patch
 import unittest
 from pathlib import Path
@@ -38,7 +41,8 @@ from model_routing import TaskType, RiskLevel
 from project_adapter import SuperboardLifecycleOutcome
 import project_adapter
 from decision_workflow import DecisionContract
-from telegram_notifier import TelegramNotificationAdapter
+from telegram_notifier import OutboundCorrelationStore, TelegramNotificationAdapter
+from worker_backend import evaluate_check_expectations
 
 
 class StubWorkerBackend:
@@ -181,6 +185,9 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
                     notify_telegram=True,
                     telegram_dry_run=False,
                     telegram_send=True,
+                    # Named explicitly so this fixture can never resolve to the
+                    # installed pool and write into a real session bridge index.
+                    telegram_pool_db=str(state_dir / "bot_pool.db"),
                 )
                 try:
                     for index, working_dir in enumerate(working_dirs):
@@ -208,6 +215,188 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
                     self.assertEqual(transport.call_count, 1)
                 finally:
                     os.chdir(original_cwd)
+
+    def _seed_active_lease(self, pool_db: Path, slot_id: str, session_id: str) -> None:
+        conn = sqlite3.connect(str(pool_db))
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS bot_leases ("
+                    "slot_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, project_path TEXT NOT NULL, "
+                    "owner_pid INTEGER NOT NULL, owner_proc_start TEXT NOT NULL, acquired_at REAL NOT NULL, "
+                    "heartbeat_at REAL NOT NULL, ttl_seconds REAL NOT NULL DEFAULT 20.0, lease_status TEXT NOT NULL)"
+                )
+                now = time.time()
+                conn.execute(
+                    "INSERT OR REPLACE INTO bot_leases VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')",
+                    (slot_id, session_id, "C:/dev/polysimulator", 4242, "0", now, now, 20.0),
+                )
+        finally:
+            conn.close()
+
+    def test_configured_pool_database_reaches_both_notification_hooks(self):
+        """The correlation index must be reachable from the adapter's own configuration.
+
+        Before this, the store was only ever enabled by VEYYON_POOL_DB, which no
+        launcher, config, or module set, so every adapter notification went out
+        uncorrelated in the real runtime and the bridge refused every reply to one.
+        """
+        req_id = "req-configured-pool-db"
+        self._add_pipeline_request(req_id)  # ledger records session 'test-session-01'
+        configured_pool = Path(self.test_dir) / "configured" / "bot_pool.db"
+
+        env = {
+            "TELEGRAM_NOTIFY_CHAT_ID": "1247617658",
+            "TELEGRAM_BOT_TOKEN": "dummy_token_for_dry_run",
+        }
+        for hook, message_id in (("status", 991001), ("decision", 991002)):
+            with self.subTest(hook=hook), patch.dict(os.environ, env), patch(
+                "urllib.request.urlopen"
+            ) as transport:
+                # No VEYYON_POOL_DB anywhere: the configuration argument is the only
+                # thing that can enable correlation here.
+                os.environ.pop("VEYYON_POOL_DB", None)
+                transport.return_value.__enter__.return_value.read.return_value = json.dumps({
+                    "ok": True,
+                    "result": {
+                        "message_id": message_id,
+                        "from": {"id": 54321},
+                        "chat": {"id": 1247617658},
+                    },
+                }).encode("utf-8")
+
+                # A fresh dedup/rate-limit state per hook: the two hooks are independent
+                # assertions, not a burst of notifications.
+                hook_state = Path(self.test_dir) / f"pool-{hook}" / "state"
+                hook_state.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(self.ledger_path, hook_state / "ledger.json")
+
+                adapter = SuperboardExecutionAdapter(
+                    state_dir=str(hook_state),
+                    notify_telegram=True,
+                    telegram_dry_run=False,
+                    telegram_send=True,
+                    telegram_pool_db=str(configured_pool),
+                )
+                # The configuration must reach the coordinator's own hook too, not just
+                # the adapter's.
+                self.assertEqual(adapter.coordinator.telegram_pool_db, str(configured_pool))
+
+                if hook == "status":
+                    receipt = adapter.emit_telegram_event(
+                        {"id": req_id, "issue_number": 75},
+                        status="advanced",
+                        stage="qa",
+                        summary=f"Configured pool database fixture {message_id}",
+                    )
+                else:
+                    receipt = adapter.emit_telegram_decision_event({
+                        "decision_id": f"DEC-CONFIGURED-{message_id}",
+                        "request_id": req_id,
+                        "status": "pending",
+                        "question": "Choose a supported execution path",
+                        "options": [{"id": "A", "label": "First"}, {"id": "B", "label": "Second"}],
+                        "recommendation": "A",
+                        "issue_url": "https://github.com/Bavariance/polysimulator/issues/75",
+                    })
+
+                self.assertEqual(receipt["status"], "sent")
+                self.assertEqual(receipt["correlation_source"], "explicit")
+                self.assertTrue(receipt["correlation_recorded"], receipt["reason"])
+
+                row = OutboundCorrelationStore(configured_pool).lookup("54321", "1247617658", message_id)
+                self.assertIsNotNone(row, "the configured pool holds no correlation for the delivered message")
+                self.assertEqual(row["session_id"], "test-session-01")
+                # The decision hook labels its request id with the decision it carries.
+                self.assertTrue(
+                    row["request_id"].startswith(req_id),
+                    f"correlated request id {row['request_id']!r} does not name {req_id!r}",
+                )
+
+    def test_installed_pool_is_the_default_when_no_path_is_configured(self):
+        """With nothing configured, resolution matches the TypeScript bridge's default.
+
+        The default is exercised against a stand-in installed pool rather than the real
+        one: the rule under test is 'an existing installed pool is used, a missing one is
+        not created', and proving it must not write into a live session bridge index.
+        """
+        installed = Path(self.test_dir) / "installed" / "bot_pool.db"
+        installed.parent.mkdir(parents=True, exist_ok=True)
+        installed.write_bytes(b"")
+
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("VEYYON_POOL_DB", None)
+            store = OutboundCorrelationStore(default_path=installed)
+            self.assertTrue(store.enabled)
+            self.assertEqual(store.source, "installed")
+
+            absent = OutboundCorrelationStore(default_path=Path(self.test_dir) / "nowhere" / "bot_pool.db")
+            self.assertFalse(absent.enabled)
+            self.assertEqual(absent.source, "absent")
+            self.assertFalse((Path(self.test_dir) / "nowhere").exists())
+
+    def test_telegram_notification_binds_originating_session_not_current_lease(self):
+        """A notification must carry the request's own session even while an unrelated
+        session holds the Telegram bot lease, and the bridge must then refuse that
+        lease-holder's reply while accepting the owning session's."""
+        req_id = "req-origin-session-binding"
+        self._add_pipeline_request(req_id)  # ledger records session 'test-session-01'
+
+        pool_db = Path(self.test_dir) / "bot_pool.db"
+        self._seed_active_lease(pool_db, "telegram-polysim", "sess-unrelated-lease")
+
+        with patch.dict(os.environ, {
+            "TELEGRAM_NOTIFY_CHAT_ID": "1247617658",
+            "TELEGRAM_BOT_TOKEN": "dummy_token_for_dry_run",
+            "VEYYON_POOL_DB": str(pool_db),
+        }), patch("urllib.request.urlopen") as transport:
+            transport.return_value.__enter__.return_value.read.return_value = json.dumps({
+                "ok": True,
+                "result": {"message_id": 778899, "from": {"id": 54321}},
+            }).encode("utf-8")
+
+            adapter = SuperboardExecutionAdapter(
+                state_dir=self.state_dir,
+                notify_telegram=True,
+                telegram_dry_run=False,
+                telegram_send=True,
+            )
+            # The real caller shape: a request dict that carries no session of its own.
+            receipt = adapter.emit_telegram_event(
+                {"id": req_id, "issue_number": 75},
+                status="blocked",
+                stage="build",
+                summary="Worker blocked awaiting a prerequisite",
+            )
+
+        self.assertEqual(receipt["status"], "sent")
+        self.assertEqual(receipt["session_id"], "test-session-01")
+        self.assertNotEqual(receipt["session_id"], "sess-unrelated-lease")
+        self.assertTrue(receipt["correlation_recorded"])
+
+        store = OutboundCorrelationStore(pool_db)
+        row = store.lookup("54321", "1247617658", 778899)
+        self.assertEqual(row["session_id"], "test-session-01")
+        self.assertEqual(row["request_id"], req_id)
+
+        probe = Path.home() / ".veyyon" / "telegram" / "tests" / "reply_probe.ts"
+        bun = shutil.which("bun")
+        if not (bun and probe.exists()):
+            self.skipTest("bridge-side leg requires bun and the installed Telegram session bridge")
+
+        def decide(session_id: str) -> dict:
+            proc = subprocess.run(
+                [bun, str(probe), str(pool_db), "54321", "1247617658", "778899", session_id],
+                cwd=str(probe.parent.parent),
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            self.assertEqual(proc.returncode, 0, f"probe failed: {proc.stderr}")
+            return json.loads(proc.stdout.strip().splitlines()[-1])
+
+        self.assertEqual(decide("test-session-01")["decision"], "deliver")
+        self.assertEqual(decide("sess-unrelated-lease")["decision"], "reject_foreign_session")
 
     def test_01_fixture_execution_never_advances_request_state(self):
         """A labelled fixture proves dispatch plumbing and must never advance real state."""
@@ -362,12 +551,22 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
 
         # Run with real_worker=True (exercises git status or config validate subprocess)
         res = adapter.run_step(request_id=req_id, real_worker=True)
-        self.assertEqual(res.status, "advanced")
         self.assertIsNotNone(res.worker_result)
         self.assertFalse(res.worker_result.is_fixture)
         self.assertEqual(res.worker_result.exit_code, 0)
         self.assertIn("[REAL_WORKER_EXECUTION]", res.worker_result.output)
         self.assertEqual(res.boundaries["execution_dispatched"], True)
+
+        # The subprocess really ran and exited 0, but a probe substantiates the
+        # dispatch plumbing and nothing about this request. The step must say so:
+        # reporting "advanced" for a gate that refused told the driver about
+        # progress the ledger never made.
+        self.assertTrue(res.worker_result.is_probe)
+        self.assertEqual(res.status, "blocked")
+        self.assertFalse(res.gate_result["verified"])
+        self.assertIn("safe probe", res.gate_result["advance_refused"])
+        self.assertIn("safe probe", res.next_action)
+        self.assertEqual(self.ledger.get_request(req_id)["state"], "implementation")
 
     def test_04_telegram_notification_event_formatting(self):
         """Test concise, single-sentence Telegram notification formatting with canonical link."""
@@ -1168,9 +1367,12 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
             notify_telegram=False,
         ).run_step(request_id=req_id)
 
-        self.assertEqual(result.status, "advanced")
+        # The bug was reopened, which moves the request backwards. A refused gate
+        # must never be reported as an advance, whichever gate refused.
+        self.assertEqual(result.status, "blocked")
         self.assertTrue(result.gate_result["reopened"])
         self.assertIn("Desktop after-fix visual asset", result.gate_result["repro_refused"])
+        self.assertIn("Desktop after-fix visual asset", result.next_action)
         self.assertEqual(self.ledger.get_request(req_id)["state"], "implementation")
 
     def test_15_native_preparation_is_pending_and_never_advances_state(self):
@@ -1211,6 +1413,206 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
         self.assertFalse(result.gate_result["verified"])
         self.assertFalse(result.boundaries["execution_dispatched"])
         self.assertEqual(self.ledger.get_request(req_id)["state"], "implementation")
+
+    # -- the shared check-expectation contract ------------------------------
+    #
+    # The reproduced defect lived exactly here: worker_backend accepted a
+    # completion whose baseline check exited 1, this adapter refused the same
+    # result as "no structured evidence", and run_step still reported "advanced"
+    # while the ledger never moved. The driver then parked the request as
+    # 'no_progress' and the real reason never surfaced.
+
+    #: Packets the two boundaries must agree on, with the substring of the shared
+    #: refusal each one is expected to produce. None means "acceptable evidence".
+    CONTRACT_CASES = (
+        (
+            "undeclared success",
+            [{"name": "suite", "command": ["pytest"], "exit_code": 0, "observed": "ok"}],
+            None,
+        ),
+        (
+            "legacy unclassified failure",
+            [{"name": "baseline", "command": ["repro"], "exit_code": 1, "observed": "fails"},
+             {"name": "suite", "command": ["pytest"], "exit_code": 0, "observed": "ok"}],
+            "unclassified failing check",
+        ),
+        (
+            "declared controls beside a verification",
+            [{"name": "baseline", "command": ["repro"], "exit_code": 1, "observed": "fails",
+              "purpose": "baseline", "expected_exit_code": 1},
+             {"name": "guard", "command": ["guard"], "exit_code": 3, "observed": "refused",
+              "purpose": "negative_control", "expected_exit_code": 3},
+             {"name": "suite", "command": ["pytest"], "exit_code": 0, "observed": "ok"}],
+            None,
+        ),
+        (
+            "controls only",
+            [{"name": "baseline", "command": ["repro"], "exit_code": 1, "observed": "fails",
+              "purpose": "baseline", "expected_exit_code": 1}],
+            "none is a successful 'verification' check",
+        ),
+        (
+            "control that did not fail as declared",
+            [{"name": "baseline", "command": ["repro"], "exit_code": 0, "observed": "passes",
+              "purpose": "baseline", "expected_exit_code": 1},
+             {"name": "suite", "command": ["pytest"], "exit_code": 0, "observed": "ok"}],
+            "expecting exit 1 but exited 0",
+        ),
+        (
+            "unexpected verification failure",
+            [{"name": "suite", "command": ["pytest"], "exit_code": 2, "observed": "failed",
+              "purpose": "verification", "expected_exit_code": 0}],
+            "expecting exit 0 but exited 2",
+        ),
+        (
+            "malformed purpose",
+            [{"name": "suite", "command": ["pytest"], "exit_code": 0, "observed": "ok",
+              "purpose": "smoke"}],
+            "which is not one of",
+        ),
+        (
+            "malformed expected_exit_code",
+            [{"name": "suite", "command": ["pytest"], "exit_code": 0, "observed": "ok",
+              "expected_exit_code": "0"}],
+            "is not an integer",
+        ),
+        (
+            "no checks at all",
+            [],
+            "No executed checks were reported",
+        ),
+    )
+
+    def test_16_both_validators_answer_identically(self):
+        """
+        One contract, one answer. The adapter's evidence gate must be the same
+        function the backend validated with, not a second local reading of it.
+        """
+        for label, checks, expected in self.CONTRACT_CASES:
+            with self.subTest(case=label):
+                backend_verdict = evaluate_check_expectations(checks)
+                adapter_verdict = WorkerExecutionResult(
+                    stage="qa",
+                    exit_code=0,
+                    output="",
+                    head_sha=self.HEAD_SHA,
+                    backend_name="stub",
+                    evidence={"checks": checks},
+                ).check_expectations
+                self.assertEqual(adapter_verdict, backend_verdict)
+                self.assertIs(backend_verdict.ok, expected is None)
+                if expected is not None:
+                    self.assertIn(expected, backend_verdict.reason)
+
+    def test_17_declared_controls_advance_once_with_observed_exits_intact(self):
+        """
+        A packet carrying real controls and one real verification advances exactly
+        one stage, and the nonzero exits the worker observed are recorded as they
+        were observed rather than normalised to make the packet acceptable.
+        """
+        req_id = "req-typed-controls-17"
+        self._add_pipeline_request(req_id)
+        checks = [
+            {"name": "baseline defect reproduction", "command": ["python", "repro.py"],
+             "exit_code": 1, "observed": "defect present", "purpose": "baseline",
+             "expected_exit_code": 1},
+            {"name": "guard still refuses laundering", "command": ["python", "guard.py"],
+             "exit_code": 3, "observed": "refused", "purpose": "negative_control",
+             "expected_exit_code": 3},
+            {"name": "focused suite", "command": ["python", "-m", "unittest"],
+             "exit_code": 0, "observed": "68 tests OK", "purpose": "verification"},
+        ]
+        adapter = SuperboardExecutionAdapter(
+            state_dir=self.state_dir,
+            worker_backend=StubWorkerBackend(
+                head_sha=self.HEAD_SHA, evidence={"checks": checks},
+            ),
+            notify_telegram=False,
+        )
+
+        res = adapter.run_step(request_id=req_id)
+        self.assertEqual(res.status, "advanced")
+        self.assertTrue(res.gate_result["verified"])
+        self.assertNotIn("advance_refused", res.gate_result)
+        expectations = res.gate_result["check_expectations"]
+        self.assertEqual(expectations["verifications_passed"], 1)
+        self.assertEqual(expectations["controls_retained"], 2)
+        self.assertEqual(
+            [c["observed_exit_code"] for c in expectations["checks"]], [1, 3, 0],
+        )
+        self.assertEqual(self.ledger.get_request(req_id)["state"], "QA")
+
+        # Exactly once: a second step on the already-advanced request is a QA
+        # stage, not a repeat of the build advance.
+        again = adapter.run_step(request_id=req_id)
+        self.assertEqual(again.stage, "qa")
+        self.assertEqual(self.ledger.get_request(req_id)["state"], "review")
+
+    def test_18_refused_checks_report_a_truthful_status_and_leave_the_ledger_alone(self):
+        """
+        The reproduced falsehood. Every refusal must report a non-advanced status,
+        carry the actionable reason, and change nothing in the ledger.
+        """
+        refusing_cases = [
+            (label, checks, expected)
+            for label, checks, expected in self.CONTRACT_CASES
+            if expected is not None and checks
+        ]
+        self.assertTrue(refusing_cases, "no refusing contract cases to exercise")
+
+        for index, (label, checks, expected) in enumerate(refusing_cases):
+            with self.subTest(case=label):
+                req_id = f"req-refused-18-{index}"
+                self._add_pipeline_request(req_id)
+                before = self.ledger.get_request(req_id)
+
+                res = SuperboardExecutionAdapter(
+                    state_dir=self.state_dir,
+                    worker_backend=StubWorkerBackend(
+                        head_sha=self.HEAD_SHA, evidence={"checks": checks},
+                    ),
+                    notify_telegram=False,
+                ).run_step(request_id=req_id)
+
+                self.assertNotEqual(res.status, "advanced")
+                self.assertEqual(res.status, "blocked")
+                self.assertFalse(res.gate_result["verified"])
+                self.assertIn(expected, res.gate_result["advance_refused"])
+                self.assertIn(expected, res.next_action)
+                # The refusal names the failing check, never "no structured evidence".
+                self.assertNotIn("no structured evidence", res.status_reason)
+                self.assertEqual(self.ledger.get_request(req_id), before)
+
+    def test_19_refusal_never_rewrites_an_observed_exit_code(self):
+        """
+        A refused packet is reported with the exits the worker really saw. Nothing
+        may 'correct' an exit code to make a packet acceptable or a refusal tidy.
+        """
+        req_id = "req-observed-exits-19"
+        self._add_pipeline_request(req_id)
+        checks = [
+            {"name": "baseline", "command": ["python", "repro.py"], "exit_code": 7,
+             "observed": "defect present"},
+            {"name": "suite", "command": ["pytest"], "exit_code": 0, "observed": "ok"},
+        ]
+        res = SuperboardExecutionAdapter(
+            state_dir=self.state_dir,
+            worker_backend=StubWorkerBackend(
+                head_sha=self.HEAD_SHA, evidence={"checks": checks},
+            ),
+            notify_telegram=False,
+        ).run_step(request_id=req_id)
+
+        self.assertEqual(res.status, "blocked")
+        self.assertIn("exited 7", res.gate_result["advance_refused"])
+        self.assertEqual(
+            [c["exit_code"] for c in res.worker_result.evidence["checks"]], [7, 0],
+        )
+        self.assertEqual(
+            [c["observed_exit_code"]
+             for c in res.gate_result["check_expectations"]["checks"]],
+            [7, 0],
+        )
 
 def run_tests():
     print("=" * 70)

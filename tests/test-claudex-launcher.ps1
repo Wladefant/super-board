@@ -8,6 +8,39 @@ $Audit = Join-Path $Skill 'scripts\audit.ps1'
 
 function Assert-True([bool]$Condition, [string]$Message) { if (-not $Condition) { throw "ASSERT: $Message" } }
 function Assert-Equal($Actual, $Expected, [string]$Message) { if ($Actual -ne $Expected) { throw "ASSERT: $Message (actual='$Actual', expected='$Expected')" } }
+function Test-SddlEquivalence([string]$ActualSddl, [string]$ExpectedSddl) {
+    if ($ActualSddl -eq $ExpectedSddl) { return $true }
+    if ([string]::IsNullOrEmpty($ActualSddl) -or [string]::IsNullOrEmpty($ExpectedSddl)) { return $false }
+    try {
+        $actual = New-Object System.Security.AccessControl.RawSecurityDescriptor($ActualSddl)
+        $expected = New-Object System.Security.AccessControl.RawSecurityDescriptor($ExpectedSddl)
+    } catch {
+        return $false
+    }
+    if ($actual.Owner -ne $expected.Owner) { return $false }
+    if ($actual.Group -ne $expected.Group) { return $false }
+    $actualProtected = ($actual.ControlFlags -band [System.Security.AccessControl.ControlFlags]::DiscretionaryAclProtected) -ne 0
+    $expectedProtected = ($expected.ControlFlags -band [System.Security.AccessControl.ControlFlags]::DiscretionaryAclProtected) -ne 0
+    if ($actualProtected -ne $expectedProtected) { return $false }
+    $actualDacl = $actual.DiscretionaryAcl
+    $expectedDacl = $expected.DiscretionaryAcl
+    if ($null -eq $actualDacl -and $null -eq $expectedDacl) { return $true }
+    if ($null -eq $actualDacl -or $null -eq $expectedDacl) { return $false }
+    if ($actualDacl.Count -ne $expectedDacl.Count) { return $false }
+    for ($i = 0; $i -lt $actualDacl.Count; $i++) {
+        $a = $actualDacl[$i]; $b = $expectedDacl[$i]
+        if ($a.AceType -ne $b.AceType) { return $false }
+        if ($a.AceFlags -ne $b.AceFlags) { return $false }
+        if ($a.AccessMask -ne $b.AccessMask) { return $false }
+        if ($a.SecurityIdentifier -ne $b.SecurityIdentifier) { return $false }
+    }
+    return $true
+}
+function Assert-AclEqual([string]$Actual, [string]$Expected, [string]$Message) {
+    if (-not (Test-SddlEquivalence $Actual $Expected)) {
+        throw "ASSERT: $Message (actual='$Actual', expected='$Expected')"
+    }
+}
 function Get-EnvValue([string]$Name) { $item = Get-Item "Env:$Name" -ErrorAction SilentlyContinue; if ($null -eq $item) { return $null }; return $item.Value }
 function Get-ByteHash([byte[]]$Bytes) { $sha = [Security.Cryptography.SHA256]::Create(); try { return [BitConverter]::ToString($sha.ComputeHash($Bytes)) } finally { $sha.Dispose() } }
 
@@ -20,6 +53,8 @@ function Invoke-Process {
     $start.UseShellExecute = $false
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
+    $start.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $start.StandardErrorEncoding = [System.Text.Encoding]::UTF8
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $start
     $null = $process.Start()
@@ -149,7 +184,7 @@ try {
     Assert-Equal $apply.ExitCode 0 "setup apply succeeds: $($apply.Output)"
     $appliedBytes = [IO.File]::ReadAllBytes($fixture.Profile)
     Assert-True ($appliedBytes[0] -eq 0xEF -and $appliedBytes[1] -eq 0xBB -and $appliedBytes[2] -eq 0xBF) 'UTF-8 BOM preserved'
-    Assert-Equal (Get-Acl -LiteralPath $fixture.Profile).Sddl $originalAcl 'ACL preserved after apply'
+    Assert-AclEqual (Get-Acl -LiteralPath $fixture.Profile).Sddl $originalAcl 'ACL preserved after apply'
     $stateJson = [IO.File]::ReadAllText((Join-Path $fixture.State 'state.json')) | ConvertFrom-Json
     Assert-True ($stateJson.backupPath.StartsWith([IO.Path]::GetFullPath($fixture.State), [StringComparison]::OrdinalIgnoreCase)) 'backup stored under fixture state'
     Assert-Equal (Get-ByteHash ([IO.File]::ReadAllBytes($stateJson.backupPath))) (Get-ByteHash $originalBytes) 'transaction backup is byte exact'
@@ -161,8 +196,9 @@ try {
 
     $env:CLAUDEX_OPTIMIZED_PROBE_ARGV = '1'
     $invokeScript = Join-Path $tempRoot 'invoke-profile.ps1'
-    $invokeBody = @'
+$invokeBody = @'
 param([string]$Profile)
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 . $Profile
 $unicode = -join @([char]0x47,[char]0x72,[char]0xFC,[char]0xDF,[char]0x65,[char]0x4E16,[char]0x754C)
 claude-codex 'space value' 'quote"inside' '' $unicode '--'
@@ -181,7 +217,7 @@ claude-codex 'space value' 'quote"inside' '' $unicode '--'
     $rollback = Invoke-SetupFixture Rollback $fixture.Profile $fixture.Junction $fixture.State $fixture.Canonical
     Assert-Equal $rollback.ExitCode 0 "rollback succeeds: $($rollback.Output)"
     Assert-Equal (Get-ByteHash ([IO.File]::ReadAllBytes($fixture.Profile))) (Get-ByteHash $originalBytes) 'rollback restores exact bytes'
-    Assert-Equal (Get-Acl -LiteralPath $fixture.Profile).Sddl $originalAcl 'rollback restores ACL'
+    Assert-AclEqual (Get-Acl -LiteralPath $fixture.Profile).Sddl $originalAcl 'rollback restores ACL'
     Assert-True (-not (Test-Path -LiteralPath $fixture.Junction)) 'rollback removes junction'
 
     $encodingCases = @(
@@ -204,12 +240,12 @@ claude-codex 'space value' 'quote"inside' '' $unicode '--'
         $preamble = $case.Encoding.GetPreamble()
         for ($i=0; $i -lt $preamble.Length; $i++) { Assert-Equal $afterBytes[$i] $preamble[$i] "$($case.Name) preamble byte $i preserved" }
         if ($preamble.Length -eq 0) { Assert-True (-not ($afterBytes.Length -ge 3 -and $afterBytes[0] -eq 0xEF -and $afterBytes[1] -eq 0xBB -and $afterBytes[2] -eq 0xBF)) "$($case.Name) remains BOM-free" }
-        Assert-Equal (Get-Acl -LiteralPath $encoded.Profile).Sddl $beforeAcl "$($case.Name) ACL preserved after apply"
+        Assert-AclEqual (Get-Acl -LiteralPath $encoded.Profile).Sddl $beforeAcl "$($case.Name) ACL preserved after apply"
         Assert-Equal (Invoke-SetupFixture Validate $encoded.Profile $encoded.Junction $encoded.State $encoded.Canonical).ExitCode 0 "$($case.Name) validate succeeds"
         Assert-Equal (@(Get-ChildItem -LiteralPath $encoded.State -Force | Where-Object { $_.Name -like '.state-*' }).Count) 0 "$($case.Name) atomic state write leaves no temp files"
         Assert-Equal (Invoke-SetupFixture Rollback $encoded.Profile $encoded.Junction $encoded.State $encoded.Canonical).ExitCode 0 "$($case.Name) rollback succeeds"
         Assert-Equal (Get-ByteHash ([IO.File]::ReadAllBytes($encoded.Profile))) (Get-ByteHash $beforeBytes) "$($case.Name) rollback restores exact bytes"
-        Assert-Equal (Get-Acl -LiteralPath $encoded.Profile).Sddl $beforeAcl "$($case.Name) rollback restores ACL"
+        Assert-AclEqual (Get-Acl -LiteralPath $encoded.Profile).Sddl $beforeAcl "$($case.Name) rollback restores ACL"
     }
     $invalidEncoding = New-FixtureCase 'invalid-bomless-encoding'
     [IO.File]::WriteAllBytes($invalidEncoding.Profile, [byte[]]@(0x23,0x20,0x80,0x0A))
@@ -225,7 +261,7 @@ claude-codex 'space value' 'quote"inside' '' $unicode '--'
     $recoverOnceResult = Invoke-SetupFixture Apply $recoverOnce.Profile $recoverOnce.Junction $recoverOnce.State $recoverOnce.Canonical 'ApplyPostReplaceAclOnce'
     Assert-True ($recoverOnceResult.ExitCode -ne 0) 'fixture injects one post-replace ACL failure'
     Assert-Equal (Get-ByteHash ([IO.File]::ReadAllBytes($recoverOnce.Profile))) (Get-ByteHash $recoverOnceBytes) 'one-shot failure restores original bytes'
-    Assert-Equal (Get-Acl -LiteralPath $recoverOnce.Profile).Sddl $recoverOnceAcl 'one-shot failure restores original ACL'
+    Assert-AclEqual (Get-Acl -LiteralPath $recoverOnce.Profile).Sddl $recoverOnceAcl 'one-shot failure restores original ACL'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $recoverOnce.State 'state.json'))) 'verified restoration removes transaction state'
     Assert-Equal (@(Get-ChildItem -LiteralPath (Split-Path -Parent $recoverOnce.Profile) -Filter '.claudex-profile-*' -Force).Count) 0 'verified restoration removes File.Replace recovery copies'
     Assert-True (-not (Test-Path -LiteralPath $recoverOnce.Junction)) 'verified restoration removes transaction-created junction'
@@ -481,7 +517,105 @@ ThreadingHTTPServer(('127.0.0.1',port),H).serve_forever()
     Assert-True ($verifiedAudit.Output -notmatch [regex]::Escape([Environment]::UserName)) 'audit output does not expose username paths'
     Write-Output '  ok  audit routing-state validation and path redaction'
 
-    Write-Output "`n8/8 PowerShell groups passed."
+    $shimCase = Join-Path $tempRoot 'npm-shim-test'
+    $shimBin = Join-Path $shimCase 'bin'
+    $null = New-Item -ItemType Directory -Path $shimBin -Force
+    $pkgDir = Join-Path $shimCase 'node_modules\@anthropic-ai\claude-code'
+    $null = New-Item -ItemType Directory -Path $pkgDir -Force
+    $targetScript = Join-Path $pkgDir 'cli-wrapper.cjs'
+    $captureFile = Join-Path $shimCase 'capture.json'
+    $sentinelFile = Join-Path $shimCase 'pwned.txt'
+    $escapedCapture = $captureFile.Replace('\', '\\')
+    $jsCode = "const fs = require('fs'); fs.writeFileSync('$escapedCapture', JSON.stringify(process.argv.slice(2)), 'utf8'); process.exit(0);"
+    [IO.File]::WriteAllText($targetScript, $jsCode, (New-Object Text.UTF8Encoding($false)))
+    $claudeCmd = Join-Path $shimBin 'claude.cmd'
+    $relativeScript = '..\node_modules\@anthropic-ai\claude-code\cli-wrapper.cjs'
+    $shimText = "@ECHO off`r`nGOTO start`r`n:find_dp0`r`nSET dp0=%~dp0`r`nEXIT /b`r`n:start`r`nSETLOCAL`r`nCALL :find_dp0`r`n`"%_prog%`" `"%dp0%\$relativeScript`" %*`r`n"
+    [IO.File]::WriteAllText($claudeCmd, $shimText, [Text.Encoding]::ASCII)
+    $testScript = Join-Path $shimCase 'test-invocation.ps1'
+    $testBody = @"
+param([string]`$LaunchScript, [string]`$BinPath, [string]`$SentinelPath, [string]`$CapturePath)
+`$env:PATH = `$BinPath + ';' + `$env:PATH
+. `$LaunchScript -ProbeArgvRoundTrip
+`$unicode = -join @([char]0x47,[char]0x72,[char]0xFC,[char]0xDF,[char]0x65,[char]0x4E16,[char]0x754C)
+`$pwnArg = 'foo & echo PWNED > "' + `$SentinelPath + '"'
+`$payload = @(
+    '%USERPROFILE%',
+    '%PATH%',
+    '!NOT_EXPANDED!',
+    `$pwnArg,
+    '| pipe < redirect > out ^ caret',
+    'quote"inside',
+    'space value',
+    '',
+    `$unicode
+)
+`$code = Invoke-ClaudeExact `$payload
+exit `$code
+"@
+    [IO.File]::WriteAllText($testScript, $testBody, (New-Object Text.UTF8Encoding($true)))
+    $shimRun = Invoke-Process 'powershell.exe' @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $testScript, $Launch, $shimBin, $sentinelFile, $captureFile)
+    Assert-Equal $shimRun.ExitCode 0 "npm shim invocation succeeds: $($shimRun.Output)"
+    Assert-True (-not (Test-Path -LiteralPath $sentinelFile)) 'shell metacharacters are never executed by cmd.exe'
+    Assert-True (Test-Path -LiteralPath $captureFile) 'capture file is produced by native process'
+    $capturedArgs = [IO.File]::ReadAllText($captureFile, [Text.Encoding]::UTF8) | ConvertFrom-Json
+    $expectedUnicode = -join @([char]0x47,[char]0x72,[char]0xFC,[char]0xDF,[char]0x65,[char]0x4E16,[char]0x754C)
+    $expectedPayload = @(
+        '%USERPROFILE%',
+        '%PATH%',
+        '!NOT_EXPANDED!',
+        "foo & echo PWNED > `"$sentinelFile`"",
+        '| pipe < redirect > out ^ caret',
+        'quote"inside',
+        'space value',
+        '',
+        $expectedUnicode
+    )
+    Assert-Equal $capturedArgs.Count $expectedPayload.Count 'captured argument count matches verbatim'
+    for ($i = 0; $i -lt $expectedPayload.Count; $i++) {
+        Assert-Equal $capturedArgs[$i] $expectedPayload[$i] "payload argument $i preserved verbatim without shell interpolation"
+    }
+
+    $unknownCmd = Join-Path $shimCase 'unknown.cmd'
+    [IO.File]::WriteAllText($unknownCmd, "@ECHO off`r`necho Arbitrary shell commands %*`r`n")
+    $failClosedScript = Join-Path $shimCase 'test-fail-closed.ps1'
+    $failClosedBody = @"
+param([string]`$LaunchScript, [string]`$UnknownCmd)
+. `$LaunchScript -ProbeArgvRoundTrip
+try {
+    Resolve-ClaudeInvocation `$UnknownCmd
+    exit 1
+} catch {
+    if (`$_.Exception.Message.Contains('Refusing to execute unrecognized batch wrapper')) {
+        exit 0
+    }
+    exit 2
+}
+"@
+    [IO.File]::WriteAllText($failClosedScript, $failClosedBody, (New-Object Text.UTF8Encoding($true)))
+    $failClosedRun = Invoke-Process 'powershell.exe' @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $failClosedScript, $Launch, $unknownCmd)
+    Assert-Equal $failClosedRun.ExitCode 0 'unrecognized batch wrapper safely fails closed'
+    Write-Output '  ok  npm claude.cmd wrapper safe resolution, metacharacter preservation, and fail-closed security'
+
+    # Faithful DACL normalization fixture
+    $normSddlActual = 'O:BAG:S-1-5-21-1456194669-2875347699-3862154473-513D:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;LA)'
+    $normSddlExpected = 'O:BAG:S-1-5-21-1456194669-2875347699-3862154473-513D:(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;LA)'
+    Assert-True (Test-SddlEquivalence $normSddlActual $normSddlExpected) 'unprotected auto-inherited control bit normalizes between identical ACEs'
+    $diffOwner = 'O:SYG:S-1-5-21-1456194669-2875347699-3862154473-513D:(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;LA)'
+    Assert-True (-not (Test-SddlEquivalence $normSddlActual $diffOwner)) 'different owner is rejected'
+    $diffGroup = 'O:BAG:S-1-5-32-544D:(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;LA)'
+    Assert-True (-not (Test-SddlEquivalence $normSddlActual $diffGroup)) 'different group is rejected'
+    $protectedAcl = 'O:BAG:S-1-5-21-1456194669-2875347699-3862154473-513D:P(A;FA;;;SY)(A;FA;;;BA)(A;FA;;;LA)'
+    Assert-True (-not (Test-SddlEquivalence $normSddlActual $protectedAcl)) 'protected inheritance P is never normalized away'
+    $diffRights = 'O:BAG:S-1-5-21-1456194669-2875347699-3862154473-513D:(A;ID;FR;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;LA)'
+    Assert-True (-not (Test-SddlEquivalence $normSddlActual $diffRights)) 'different rights/mask is rejected'
+    $diffOrder = 'O:BAG:S-1-5-21-1456194669-2875347699-3862154473-513D:(A;ID;FA;;;BA)(A;ID;FA;;;SY)(A;ID;FA;;;LA)'
+    Assert-True (-not (Test-SddlEquivalence $normSddlActual $diffOrder)) 'different ACE order is rejected'
+    $diffCount = 'O:BAG:S-1-5-21-1456194669-2875347699-3862154473-513D:(A;ID;FA;;;SY)(A;ID;FA;;;BA)'
+    Assert-True (-not (Test-SddlEquivalence $normSddlActual $diffCount)) 'missing ACE is rejected'
+    Write-Output '  ok  faithful DACL normalization, owner/group preservation, and protected inheritance guards'
+
+    Write-Output "`n10/10 PowerShell groups passed."
 }
 finally {
     foreach ($process in $gatewayProcesses) { if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force -Confirm:$false } }

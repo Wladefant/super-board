@@ -147,13 +147,32 @@ never a synthetic success:
 11. `verdict: "pass"` with an empty `checks` list, or a check with no command,
     no integer exit code, or nothing observed. **Exit status alone is never
     evidence.**
-12. A claimed `head_sha` that differs from the observed HEAD. The observed
+12. A check with an invalid `purpose` (must be one of `verification`, `baseline`,
+    or `negative_control`) or a non-integer `expected_exit_code`.
+13. A `verification` check declaring a non-zero `expected_exit_code`. Verification
+    substantiates the work on the current head and must expect exit 0; declare
+    `purpose: "baseline"` or `purpose: "negative_control"` for a check that is
+    expected to fail.
+14. An unclassified non-zero check — a check exiting non-zero that declares
+    neither `purpose` nor `expected_exit_code`. It is refused rather than assumed
+    to be an intended control: declare `purpose: "baseline"` or
+    `purpose: "negative_control"` with the matching `expected_exit_code` if the
+    failure was intended.
+15. An observed/expected exit code mismatch either way — a check whose observed
+    exit code contradicts its declared `expected_exit_code`. A baseline that was
+    expected to fail and passed is as much a broken assumption as a verification
+    that was expected to pass and failed.
+16. A controls-only packet — all reported checks are `baseline` or
+    `negative_control` diagnostics and none is a successful `verification` check
+    exiting 0. Controls record what the code used to do and what it still
+    refuses; they never substitute for proving the request works on this head.
+17. A claimed `head_sha` that differs from the observed HEAD. The observed
     commit always wins, and is what the outcome reports.
-13. For `qa` and `review`: HEAD moved during the run, or the tested commit is not
+18. For `qa` and `review`: HEAD moved during the run, or the tested commit is not
     the dispatched one. A verification stage must not mutate the tree it judges.
-14. For `build`: a `pass` that produced neither a new commit nor any artifact.
-15. A declared artifact that does not exist on disk.
-16. For a bug at `qa`: no `reproduction` record, or one lacking a real command,
+19. For `build`: a `pass` that produced neither a new commit nor any artifact.
+20. A declared artifact that does not exist on disk.
+21. For a bug at `qa`: no `reproduction` record, or one lacking a real command,
     a real integer exit code, a real observation, a scenario string, or with
     `still_reproduces` not literally `false`.
 
@@ -387,7 +406,324 @@ Safe defaults remain no network transmission. Enabling live notification require
 
 ---
 
-## 7. Recorded verification
+## 7. `recurrence_guard.py` — recurrence and corrective-action gates
+
+Every other module here is single-step: it observes one failure, reports it, and
+forgets it. Nothing remembered that the same failure had already happened, so the
+honest response to a repeated failure was to retry it unchanged, forever. This
+module is that missing memory, and only that: it dispatches nothing, retries
+nothing, and decides nothing about eligibility.
+
+### The signature
+
+A failure is identified by `project | environment | operation | error_class`.
+`error_class` is a digest of the error text with the volatile parts replaced —
+paths, timestamps, uuids, hex digests, addresses, bare integers — so the same
+fault in a different temp directory under a different run id is still recognised
+as the same fault. A Python traceback is reduced to its raised final line, since
+the intermediate frames move with every refactor. A caller that knows the real
+identity passes `--error-class` and the heuristic is not consulted.
+
+Quoted strings are deliberately **not** collapsed: in an error message the quoted
+symbol is usually the discriminating part (`'str' object has no attribute 'get'`),
+and merging distinct faults into one class would invent a recurrence that never
+happened.
+
+### Duplicate ingestion is not recurrence
+
+Every observation carries a unique observation id, supplied by the caller or
+derived from the event's own durable identity. Re-ingesting a known id is
+idempotent: no occurrence, no state change, no escalation, no ledger write. What
+makes an id distinct in practice is the **attempt identity** — a native run id, a
+CI run id, the driver's journalled dispatch ordinal. Re-reading the same incident
+artifact ten times is one occurrence.
+
+### An intended failure is not a broken system
+
+`_validate_result` (delegating to `evaluate_check_expectations`) accepts a
+non-zero check exit alongside a `pass` verdict only when the check explicitly
+declares `purpose: "baseline"` or `purpose: "negative_control"` with the matching
+`expected_exit_code`, and at least one `verification` check has succeeded
+(exited 0). An undeclared non-zero check defaults to `verification` expecting
+exit 0 and is refused as an unclassified failing check rather than quietly
+assumed to be an intended control, and a packet consisting only of controls
+proves nothing about the current head and is refused. So intake fires only on a
+validated failing outcome, never on a passing result that carries a retained,
+correctly classified control failure.
+
+Example of an advanceable check packet carrying a retained baseline and a passing verification:
+
+```json
+[
+  {
+    "name": "baseline defect reproduction",
+    "command": ["python", "repro.py"],
+    "exit_code": 1,
+    "observed": "fails with defect present",
+    "purpose": "baseline",
+    "expected_exit_code": 1
+  },
+  {
+    "name": "guard against bad input",
+    "command": ["python", "guard.py", "--bad-input"],
+    "exit_code": 3,
+    "observed": "refused with exit 3",
+    "purpose": "negative_control",
+    "expected_exit_code": 3
+  },
+  {
+    "name": "verification suite",
+    "command": ["python", "-m", "unittest", "tests/test_fix.py"],
+    "exit_code": 0,
+    "observed": "OK (68 tests passed)",
+    "purpose": "verification",
+    "expected_exit_code": 0
+  }
+]
+```
+
+Example of a refused packet (unclassified non-zero exit without purpose or expected_exit_code):
+
+```json
+[
+  {
+    "name": "baseline defect reproduction",
+    "command": ["python", "repro.py"],
+    "exit_code": 1,
+    "observed": "fails with defect present"
+  },
+  {
+    "name": "verification suite",
+    "command": ["python", "-m", "unittest", "tests/test_fix.py"],
+    "exit_code": 0,
+    "observed": "OK"
+  }
+]
+```
+
+For everything the worker path does not see, the disposition is explicit:
+
+| disposition | counts toward gates | meaning |
+| --- | --- | --- |
+| `unexpected` (default) | yes | something is broken now |
+| `expected_negative_control` | no | a probe or baseline that is *supposed* to fail |
+| `superseded_attempt` | no | a real failure since shown intentional or obsolete |
+
+Both retained dispositions stay in history verbatim; they stay out of every
+threshold. Piping every non-zero exit in as `unexpected` is how a guard like this
+escalates off a test suite's own output, so the classification is never inferred
+from an exit code. `supersede-observation` reclassifies an already-counted
+observation, requires an actor and a reason, is written into history, and cannot
+move one back to `unexpected` — it can retain an occurrence out of the count,
+never manufacture one.
+
+### What each occurrence does
+
+1. **First** — `open`. Retry permitted. An actionable diagnosis, an owner and a
+   next action are recorded, and their absence is reported rather than assumed.
+2. **Second distinct** — `corrective_action_required`. Unchanged blind retry is
+   refused: `WorkerBackend.retry_native` raises, and the driver parks with
+   `recurrence_blocked` **before** spending a dispatch. Refusing alone would be
+   an inert flag, so this also opens a durable **corrective work item** in the
+   ledger — `req-corrective-<sig12>`, idempotent per signature, `pending` and
+   `local`, owned by whoever owns the failing request, carrying acceptance
+   criteria that bind its closure to the systemic change and to the original
+   scenario re-executed. `ledger next` reports it as `[RUNNABLE]` while the
+   failing request is `[BLOCKED]` naming it, so the existing coordinator picks it
+   up as work. Opening a work item is not doing the work: an authorized lane
+   implements it through the normal isolated build/QA/review path, under the same
+   gates as any other request.
+3. **Third and beyond** — `escalated`, once per escalation epoch. An epoch closes
+   when a resolution, or a corrective action that is *bound to a verified change*,
+   is recorded, so ten identical restarts in ten minutes produce one notification
+   event rather than eight — and recording an unresolvable reference cannot
+   silence the escalation either.
+
+A corrective action is **recorded, never executed**, and recording it is not the
+same act as opening the retry gate. The record always lands — a proposal, or a
+reference somebody wants on the record, is worth keeping — and the gate opens
+only when all of this is true, each checked against reality rather than asserted:
+
+* the verification context is **related to this failure**. It has to resolve one
+  of the heads the failure was observed on (`git cat-file -e`), which a second
+  worktree of the same repository does because it shares the object store; where
+  the failure recorded no head at all, it has to be the repository the failure was
+  recorded in (same `--git-common-dir`). `--verify-root` names a reachable
+  repository when the one the failure was observed in is gone, which is the normal
+  case for an ephemeral worktree; it changes where the lookup happens, never
+  whether one is required and never whether it has to be related to the failure.
+  A recorded head no reachable context resolves is a *fail-closed* outcome: the
+  record lands and the gate stays shut. A failure that recorded neither a head nor
+  a reachable repository has nothing a proof could be related to: the record says
+  so (`gate_binding.lineage: "unanchored"`) and **binds nothing**. That is not a
+  deadlock and it invents no authorization — the refusal names the two recovery
+  paths this module already contracts, either re-observing the failure with
+  `--head-sha` (and `--repo-root`) so it has a lineage, or an operator taking its
+  counted observations out of the count with `supersede-observation --actor
+  --reason`;
+* the `--change-ref` **resolves** in that context, and names something that
+  actually changed:
+  * `commit:<sha>` exists there and is not one of the observed failing heads;
+  * `config:<path>#<key>` and `test:<path>::<name>` are read out of the
+    **committed tree of `--head-sha`** (`git show <head>:<path>`), not out of the
+    checkout, and the comparison is scoped to **what the reference names**: the
+    referenced key's own assignment (plus the block it opens) or the referenced
+    test's own definition (decorators included), against the same reference at
+    every observed failing head. Whole-file inequality was not enough — a
+    revision bump beside the key, a comment, or a different test added below it
+    made an untouched reference count as the change. Blank lines, whole-line
+    comments and inline comments are normalized out, so a comment-only edit is
+    not a change. A reference that does not identify **one** committed assignment
+    or definition — assigned or defined twice, or reachable only inside a flow or
+    minified line whose region would be the whole file — is refused outright
+    rather than compared against a region nobody named, and a tree where the
+    comparison is ambiguous records `change_comparison: "ambiguous"` and opens
+    nothing. So a key or a test that had been there unchanged since before the
+    failure, and one that exists only as an uncommitted edit, both resolve and
+    open nothing;
+  * `decision:<id>` is recorded `answered` in the decision record beside the store
+    **and** its `answer.comment_created_at` — the API-verified instant the
+    answering comment was *posted* — is later than the last counted occurrence of
+    this signature. `answer.answered_at` is the instant the reply was *ingested*
+    and is audit only: ingestion runs at barriers, so reading it made every
+    comment posted before the failure and swept up afterwards "postdate" it.
+    There is no fallback — an answer with no readable `comment_created_at`
+    (including a legacy record, or one carrying only `answered_at` or a
+    hand-edited `updated_at`) resolves and opens nothing;
+
+  A reference the context *refutes* is refused outright. A reference that cannot
+  be resolved at all — a pull request, which needs a remote API this module never
+  contacts, or anything in a worktree that no longer exists — is recorded
+  unverified and never opens the gate;
+* `--evidence-exit-code` is **0**. A non-zero exit is the scenario still failing;
+* `--head-sha` is the tree the correction was actually proved on. It is not one of
+  the heads the failure was observed on, is not an **ancestor** of one (`git
+  merge-base --is-ancestor`) — a tree the failing tree was built on top of
+  predates the failure — and it **descends from every counted observed failing
+  head** (`git merge-base --is-ancestor <observed> <head>`, once per head), so the
+  run that passed is a run of the failing tree with the correction on top of it.
+  Being *able to resolve* the failing head is not descent: an orphan branch in the
+  same repository, an orphan commit in any clone that merely holds the failing
+  commit, and a sibling branch cut from its parent all resolve it and none of them
+  ever carried the failure. A counted head this context cannot resolve, and an
+  ancestry query git will not answer, are fail-closed. Where the failure recorded
+  no head at all there is nothing to descend from, so the anchor is that the
+  evidence head was itself **committed after** the last counted observation (git
+  reports that to the second, and a committer date is self-reported, so it is
+  recorded as the separate, weaker fact `head_committed_after_failure`). For a
+  commit reference the head additionally **contains** that commit.
+
+`record-corrective-action` exits 0 when the record opened the gate and 3 when it
+landed with the gate still closed, and every gate decision is recomputed from the
+action's own recorded facts on load rather than read from a stored verdict. So
+`decision:later` with the description "will retry later", an exit code of 1 and
+the failing head as the evidence head is recorded and clears nothing — and
+neither does any of the shapes above whose reference merely *resolves*. What this
+closes is that one class; it is not a claim that no laundering exists, because the
+store is cooperative local state on a writable checkout.
+
+`resolve` then requires *both* halves of closure — a current corrective action
+that is itself gate-bound, whose change references it copies into the resolution,
+and a `--scenario` naming the original failing scenario that was re-executed on
+the named commit. A generic suite passing closes nothing.
+
+Opening the gate is all a corrective action does: it does not verify an
+acceptance criterion, does not satisfy head-bound QA or review, and does not
+authorize a merge or a deployment. A privileged kind (`ddl`, `deployment`,
+`privileged_operation`, `gate_change`) is only recordable with an explicit
+authorization reference naming the human who authorized it, because recording one
+asserts that they did.
+
+### Diagnostics are redacted at the durable write boundary
+
+Redaction is a property of the boundary, not a list of fields: every string a
+write would newly persist — into `recurrence.json`, into `ledger.json`, into the
+escalation outbox — is redacted on the way out, so a field nobody remembered to
+name cannot reach disk raw. Text that was already durable is left byte-exact,
+because rewriting it would edit recorded history rather than redact a new write.
+A value that something is later looked up by (a repository root, a commit, a
+reference, an id) keeps its shape and still has credential forms stripped, so the
+gate can still open the repository it was told to verify against. Coverage is
+pattern-level: URL userinfo, `Authorization:` headers, prefixed `key=value`
+assignments (`PGPASSWORD=`, `AWS_SECRET_ACCESS_KEY=`) and known token shapes are
+recognised; a bare secret written as an unlabelled word is not detectable and is
+not claimed to be.
+
+### History survives, and a correction can be undone by reality
+
+The store is `recurrence.json` beside `ledger.json`, written atomically under the
+shared `ledger.FileLock`. Status and the retry gate are recomputed from the
+observation, corrective-action and resolution sequence on **every load**, so no
+stored flag can open a gate its own history says is closed, and a corrupt store is
+reported rather than silently replaced with an empty one.
+
+A corrective action recorded *before* a later observation is stale by
+construction: the new observation reopens the signature and blocks retry again.
+`resolve` requires a full 40-character commit and exercised evidence, and closes
+the signature for that scenario on that commit only — it claims no universal
+absence, and a later observation reopens it.
+
+### A suppressed projection is not a gap, and a late one is not the present
+
+Each observation records what its ledger projection is owed: `pending`,
+`applied`, `failed`, `suppressed` or `not_applicable`. A replay or
+`resync-ledger` re-applies an outstanding one and adds no occurrence. A
+projection the caller suppressed with `--no-ledger-update` is honoured on replay
+and on resync — writing it anyway takes an explicit `--include-suppressed
+--unsuppressed-by`, recorded on the observation as a deliberate act — because
+reading "no row" as "a missing row" is how a resync wrote the row a caller had
+refused.
+
+Each observation also keeps an immutable observation-time snapshot of its
+occurrence, count and status, and a projection reports its evidence row from that
+snapshot. A projection recovered after later failures landed otherwise describes
+the present as if it were the past: the row for occurrence 1 read "occurrence 2 /
+corrective_action_required". Where no snapshot exists, the row carries
+projection-time numbers and says so rather than inventing a history that was
+never recorded; the request's current state stays available as
+`occurrences_at_projection` / `status_at_projection`.
+
+### Where it is wired
+
+* `WorkerBackend.complete_native` — an authentic failing outcome is observed once
+  per attempt under the attempt's own observation identity, derived from the
+  native run id, so a replayed completion is a duplicate. For a non-pass verdict
+  the fault identity is the structured verdict on that request at that commit,
+  never the agent's summary text, so two attempts at one defect with reworded
+  summaries accumulate and the second closes the gate. A `retry_native` of a
+  signature owing a corrective action raises.
+* `SuperboardExecutionAdapter` — a blocked result derived from a native attempt
+  carries that attempt's run id and fault class, so the seams downstream observe
+  the one attempt instead of inventing a second identity for it.
+* `ContinuationDriver` — a `blocked`/`error` park and a raised `run_step` are
+  observed; when the step carries a native attempt the driver ingests it under
+  that attempt's identity, so one native failure is one occurrence with one
+  ledger evidence row however many restarts re-read the terminal ticket. A
+  failure with no attempt behind it is the driver's own and is identified by the
+  journal's dispatch ordinal. The pre-dispatch gate parks `recurrence_blocked`
+  and the run exits non-zero.
+* `Coordinator.select_target_request` — a request labelled
+  `selection:explicit-only`, which is how the guard opens its corrective work
+  item, is skipped by every implicit selection branch and runs only when a caller
+  names it.
+* Escalation produces the `NotificationEvent` payload plus that contract's own
+  dedup signature, and `deliver-escalations` consumes it: each pending escalation
+  is handed to an injected sender exposing the contract's `notify`, and only what
+  the sender actually took (`sent`, or `deduped` because it already holds it) is
+  acknowledged. Rate limiting, refusal and a raised transport leave the
+  escalation pending with the attempt recorded. This module still never sends and
+  never constructs a transport: delivery, credentials, destination, correlation
+  and rate limiting stay with the notification owner, and the shipped
+  `OfflineEscalationOutbox` hands off to a durable local file so consumption can
+  be exercised with no network and no bot pool.
+
+Every integration soft-imports the module, so a partial export still runs. A module
+that is installed but whose history cannot be read is a **refusal**, not an
+absence: an unreadable failure record must not be mistaken for no failures.
+
+---
+
+## 8. Recorded verification
 
 Every claim below was executed, not modelled. Fixtures were used only where
 named.
@@ -483,7 +819,7 @@ green. Pre-existing suites re-run green with these modules in place:
 
 ---
 
-## 8. Quick reference
+## 9. Quick reference
 
 ```bash
 # What backends exist, and is each command installed?
@@ -536,4 +872,78 @@ python continuation_driver.py --request-id req-1 --state-dir <dir> \
 # Inspect and clear parking
 python continuation_driver.py --state-dir <dir> --show-parked
 python continuation_driver.py --state-dir <dir> --unpark req-1 --show-parked
+
+# Record an observed CI/deploy/tool failure. --attempt is what separates a real
+# new occurrence from a replay of the same event.
+python recurrence_guard.py --state-dir <dir> observe \
+  --environment staging --operation deploy:staging \
+  --error "$(cat failure.log)" --source deploy \
+  --request-id req-1 --attempt "$CI_RUN_ID" \
+  --diagnosis "..." --owner <lane> --next-action "..."
+
+# A probe that is SUPPOSED to exit non-zero is retained, not counted
+python recurrence_guard.py --state-dir <dir> observe \
+  --environment ci --operation ci:mutation-probe --error "$(cat probe.log)" \
+  --source ci --attempt "$CI_RUN_ID" --disposition expected_negative_control
+
+# Gate a retry: exit 0 permitted, exit 3 refused pending a corrective action
+python recurrence_guard.py --state-dir <dir> check-retry --request-id req-1
+
+# Record (never execute) the systemic corrective action that unblocks retry.
+# The record always lands. Exit 0 means it opened the retry gate; exit 3 means it
+# landed and the gate stayed closed, because the verification context could not be
+# related to this failure (a failure with no head and no reachable repository can
+# be related to nothing and binds nothing), the reference did not resolve (pr:
+# cannot be resolved offline at all) or named no change to the key or test it
+# points at, the proof exited non-zero, or the evidence head is a failing head,
+# precedes one, does not descend from every counted failing head, or does not
+# carry the change.
+# --verify-root names a reachable repository when the observed worktree is gone; it
+# still has to resolve every head the failure was observed on and the evidence head
+# still has to descend from them, which a second worktree of the same repository
+# and a plain clone both satisfy.
+python recurrence_guard.py --state-dir <dir> record-corrective-action \
+  --signature <sig> --kind code_change --actor <lane> \
+  --description "what systemically changed" \
+  --change-ref commit:<40-char-sha> \
+  --scenario "the original failing scenario" \
+  --evidence "what re-running it produced" \
+  --evidence-command python -m pytest tests/test_it.py \
+  --evidence-exit-code 0 \
+  --head-sha <40-char-sha-descending-from-every-observed-failing-head> \
+  --verify-root <git-repository-that-resolves-the-failing-heads>
+
+# Retain an already-counted failure out of the count, with an audited reason
+python recurrence_guard.py --state-dir <dir> supersede-observation \
+  --observation-id <obs> --actor <lane> \
+  --reason "the probe's non-zero exit was the intended negative control"
+
+# Repair a projection that never reached the ledger (crash between the two locks).
+# Adds no occurrence; --strict exits 1 while anything is still outstanding. A
+# projection suppressed with --no-ledger-update is reported and left alone.
+python recurrence_guard.py --state-dir <dir> resync-ledger --strict
+
+# Deliberately project a suppressed observation after all (not a repair, and
+# recorded on the observation as an explicit act):
+python recurrence_guard.py --state-dir <dir> resync-ledger \
+  --include-suppressed --unsuppressed-by <operator>
+
+# What is known, what is owed, and what is waiting for a sender
+python recurrence_guard.py --state-dir <dir> --summary list
+python recurrence_guard.py --state-dir <dir> --summary show --signature <sig>
+python recurrence_guard.py --state-dir <dir> escalations
+python recurrence_guard.py --state-dir <dir> escalations \
+  --ack <escalation-id> --acknowledged-by <notification-owner>
+
+# Consume pending escalations into a durable offline outbox and acknowledge only
+# what it took. Live transport, credentials, destination and bot pool belong to the
+# notification owner: this command constructs none of them and sends nothing.
+python recurrence_guard.py --state-dir <dir> deliver-escalations \
+  --outbox <dir>/escalations.jsonl --dedup-state <dir>/escalations.dedup.json \
+  --acknowledged-by <notification-owner>
+
+# Close a signature against exercised evidence on one exact commit
+python recurrence_guard.py --state-dir <dir> resolve --signature <sig> \
+  --head-sha <40-char-sha> --actor <lane> \
+  --evidence "command, exit code and what was observed"
 ```

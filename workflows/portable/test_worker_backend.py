@@ -686,6 +686,191 @@ class TestResultContract(_Fixture):
         self.assertIn("req-somebody-else", out.blocked_reason)
 
 
+class TestCheckExpectationContract(_Fixture):
+    """
+    The typed check-expectation contract, at the boundary that produces evidence.
+
+    Before it existed, this module accepted a "pass" carrying a check that exited
+    nonzero, and superboard_adapter refused the same result a moment later while
+    the step still reported that it had advanced. Every test here defends one half
+    of the rule that closed that gap: an expected outcome must be declared before
+    it is credited, and no declaration ever substitutes for real verification.
+    """
+
+    def _run_with_result(self, result_obj, **req_over):
+        body = (
+            "import json\n"
+            "print(json.dumps({'structured_output': json.loads(%r)}))\n"
+            % json.dumps(result_obj)
+        )
+        backend = self._backend(self._script_backend(body, name="expectations"))
+        return backend.execute(self._request(**req_over))
+
+    def _result(self, checks):
+        return {
+            "stage": "qa",
+            "request_id": "req-test",
+            "head_sha": self.head,
+            "verdict": "pass",
+            "summary": "ok",
+            "checks": checks,
+            "artifacts": [],
+        }
+
+    @staticmethod
+    def _verification(exit_code=0, **over):
+        check = {
+            "name": "verification suite",
+            "command": ["cat", "seed.txt"],
+            "exit_code": exit_code,
+            "observed": "seed",
+        }
+        check.update(over)
+        return check
+
+    @staticmethod
+    def _baseline(exit_code=1, **over):
+        check = {
+            "name": "pre-fix baseline",
+            "command": ["python", "repro.py"],
+            "exit_code": exit_code,
+            "observed": "defect present",
+            "purpose": "baseline",
+            "expected_exit_code": 1,
+        }
+        check.update(over)
+        return check
+
+    def test_undeclared_successful_check_is_verification_by_default(self):
+        """The conservative default keeps every pre-existing honest result valid."""
+        out = self._run_with_result(self._result([self._verification()]))
+        self.assertTrue(out.ok, out.blocked_reason)
+        expectations = out.evidence["check_expectations"]
+        self.assertEqual(expectations["verifications_passed"], 1)
+        self.assertEqual(expectations["controls_retained"], 0)
+        self.assertEqual(expectations["checks"][0]["purpose"], "verification")
+        self.assertFalse(expectations["checks"][0]["purpose_declared"])
+
+    def test_legacy_unclassified_failing_check_is_refused_as_unclassified(self):
+        """
+        The reproduced defect. A nonzero check declaring nothing is refused here,
+        and refused in those words: relabeling it as somebody's intended control
+        is precisely the silent reinterpretation that produced a false advance.
+        """
+        out = self._run_with_result(self._result([
+            {"name": "baseline defect reproduction", "command": ["python", "repro.py"],
+             "exit_code": 1, "observed": "defect present"},
+            self._verification(),
+        ]))
+        self.assertFalse(out.ok)
+        self.assertIn("unclassified failing check", out.blocked_reason)
+        self.assertIn("declares neither 'purpose' nor 'expected_exit_code'", out.blocked_reason)
+
+    def test_declared_control_is_retained_with_its_observed_exit_intact(self):
+        """An expected nonzero outcome is credited as a control, not rewritten."""
+        out = self._run_with_result(self._result([
+            self._baseline(),
+            {"name": "guard still refuses laundering", "command": ["python", "guard.py"],
+             "exit_code": 3, "observed": "refused", "purpose": "negative_control",
+             "expected_exit_code": 3},
+            self._verification(),
+        ]))
+        self.assertTrue(out.ok, out.blocked_reason)
+        expectations = out.evidence["check_expectations"]
+        self.assertEqual(expectations["verifications_passed"], 1)
+        self.assertEqual(expectations["controls_retained"], 2)
+        # The exits the worker really observed survive verbatim in both places.
+        self.assertEqual([c["exit_code"] for c in out.evidence["checks"]], [1, 3, 0])
+        self.assertEqual(
+            [c["observed_exit_code"] for c in expectations["checks"]], [1, 3, 0],
+        )
+
+    def test_controls_alone_never_substitute_for_verification(self):
+        """Diagnostics say what the code used to do, never that it works now."""
+        out = self._run_with_result(self._result([
+            self._baseline(),
+            {"name": "guard refuses", "command": ["python", "guard.py"],
+             "exit_code": 3, "observed": "refused", "purpose": "negative_control",
+             "expected_exit_code": 3},
+        ]))
+        self.assertFalse(out.ok)
+        self.assertIn("none is a successful 'verification' check", out.blocked_reason)
+
+    def test_control_that_did_not_fail_as_declared_is_refused(self):
+        """A baseline expected to fail and passing is a broken assumption, not proof."""
+        out = self._run_with_result(self._result([
+            self._baseline(exit_code=0, observed="defect absent already"),
+            self._verification(),
+        ]))
+        self.assertFalse(out.ok)
+        self.assertIn("expecting exit 1 but exited 0", out.blocked_reason)
+
+    def test_unexpected_verification_failure_is_refused(self):
+        """A check that declared success and failed is refused as a mismatch."""
+        out = self._run_with_result(self._result([
+            self._verification(
+                exit_code=1, observed="suite failed",
+                purpose="verification", expected_exit_code=0,
+            ),
+        ]))
+        self.assertFalse(out.ok)
+        self.assertIn("expecting exit 0 but exited 1", out.blocked_reason)
+
+    def test_verification_may_not_declare_a_nonzero_expected_exit(self):
+        """Otherwise 'expected to fail' becomes a one-line bypass of verification."""
+        out = self._run_with_result(self._result([
+            self._verification(exit_code=1, purpose="verification", expected_exit_code=1),
+        ]))
+        self.assertFalse(out.ok)
+        self.assertIn("must expect success", out.blocked_reason)
+
+    def test_unknown_purpose_is_refused_never_defaulted(self):
+        out = self._run_with_result(self._result([
+            self._verification(purpose="smoke"),
+        ]))
+        self.assertFalse(out.ok)
+        self.assertIn("declares purpose 'smoke'", out.blocked_reason)
+
+    def test_declared_purpose_tolerates_case_and_padding_only(self):
+        out = self._run_with_result(self._result([
+            self._baseline(purpose="  Baseline  "),
+            self._verification(purpose="VERIFICATION"),
+        ]))
+        self.assertTrue(out.ok, out.blocked_reason)
+        self.assertEqual(out.evidence["check_expectations"]["controls_retained"], 1)
+
+    def test_malformed_expected_exit_code_is_refused(self):
+        for bad in ("0", 1.0, True, [0]):
+            with self.subTest(expected=bad):
+                out = self._run_with_result(self._result([
+                    self._verification(expected_exit_code=bad),
+                ]))
+                self.assertFalse(out.ok, f"{bad!r} was accepted")
+                self.assertIn("is not an integer", out.blocked_reason)
+
+    def test_boolean_exit_code_is_not_an_integer_exit_code(self):
+        out = self._run_with_result(self._result([
+            self._verification(exit_code=True),
+        ]))
+        self.assertFalse(out.ok)
+        self.assertIn("integer exit_code", out.blocked_reason)
+
+    def test_generated_prompt_and_schema_state_the_contract(self):
+        """A worker cannot satisfy a rule the dispatch never told it about."""
+        schema = agent_result_schema()
+        check = schema["properties"]["checks"]["items"]["properties"]
+        self.assertEqual(check["purpose"]["enum"], list(worker_backend.CHECK_PURPOSES))
+        self.assertEqual(check["expected_exit_code"]["type"], "integer")
+        # Optional, so an honest legacy result still validates against the schema.
+        self.assertNotIn("purpose", schema["properties"]["checks"]["items"]["required"])
+
+        prompt = worker_backend.build_stage_prompt(self._request(), schema)
+        self.assertIn("\"expected_exit_code\"", prompt)
+        self.assertIn("negative_control", prompt)
+        self.assertIn("At least one \"verification\" check must have exited 0", prompt)
+        self.assertIn("Never adjust one so it looks expected", prompt)
+
+
 class TestHeadBinding(_Fixture):
 
     def _run(self, result_obj, **req_over):

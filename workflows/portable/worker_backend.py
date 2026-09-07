@@ -131,6 +131,25 @@ DEFAULT_TIMEOUT_SECONDS = 1800
 
 NATIVE_BACKEND_NAME = "native"
 
+#: Declared purpose of one reported check. This is the whole vocabulary; a value
+#: outside it is refused rather than guessed at, because the difference between
+#: "this proves the work" and "this is a control I expected to fail" cannot be
+#: recovered from a command line or a sentence of prose.
+#:
+#:   verification    - substantiates the request on the current head. Must succeed.
+#:   baseline        - records the pre-fix behaviour, typically a nonzero exit.
+#:   negative_control- proves a guard refuses what it is supposed to refuse.
+CHECK_PURPOSES = ("verification", "baseline", "negative_control")
+
+#: Purposes that may legitimately declare a nonzero expected exit code. They are
+#: retained with their observed exit intact and never credited as verification.
+CONTROL_CHECK_PURPOSES = ("baseline", "negative_control")
+
+#: Conservative defaults for a check that declares neither field. An undeclared
+#: check is read as a verification that was expected to succeed, so a legacy
+#: nonzero check is an explicit refusal instead of a silently tolerated control.
+DEFAULT_CHECK_PURPOSE = "verification"
+DEFAULT_EXPECTED_EXIT_CODE = 0
 
 # ---------------------------------------------------------------------------
 # Structured agent result schema
@@ -146,8 +165,28 @@ def agent_result_schema() -> Dict[str, Any]:
         "properties": {
             "name": {"type": "string"},
             "command": {"type": "array", "items": {"type": "string"}},
-            "exit_code": {"type": "integer"},
+            "exit_code": {
+                "type": "integer",
+                "description": "The real exit code the command returned. Never adjust it to match what you expected.",
+            },
             "observed": {"type": "string"},
+            "purpose": {
+                "type": "string",
+                "enum": list(CHECK_PURPOSES),
+                "description": (
+                    "Why this check is in the packet. 'verification' substantiates the request on "
+                    "the current head and must succeed. 'baseline' records the pre-fix behaviour. "
+                    "'negative_control' proves a guard still refuses what it must refuse. Omitted "
+                    "means 'verification'."
+                ),
+            },
+            "expected_exit_code": {
+                "type": "integer",
+                "description": (
+                    "The exit code this check was expected to return, declared before it ran. "
+                    "Omitted means 0. A 'verification' check may not expect a nonzero exit."
+                ),
+            },
         },
         "required": ["name", "command", "exit_code", "observed"],
     }
@@ -164,7 +203,13 @@ def agent_result_schema() -> Dict[str, Any]:
             "summary": {"type": "string"},
             "checks": {
                 "type": "array",
-                "description": "Commands you actually executed, with their real exit codes and observed output. A pass verdict with no checks is rejected.",
+                "description": (
+                    "Commands you actually executed, with their real exit codes and observed "
+                    "output. A pass verdict with no checks is rejected. A check whose observed "
+                    "exit code differs from its expected_exit_code is rejected, and at least one "
+                    "'verification' check must have succeeded: baseline and negative_control "
+                    "checks are retained but never substitute for it."
+                ),
                 "items": check,
             },
             "artifacts": {
@@ -194,6 +239,217 @@ def agent_result_schema() -> Dict[str, Any]:
         },
         "required": ["stage", "request_id", "head_sha", "verdict", "summary", "checks", "artifacts"],
     }
+
+# ---------------------------------------------------------------------------
+# The shared check-expectation contract
+#
+# One evaluator, called by this module's own result validation and by
+# superboard_adapter's evidence gate. Two implementations of "is this check
+# acceptable?" is exactly how a completion came to be accepted here and refused
+# there while the step still reported that it had advanced.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class CheckExpectation:
+    """One reported check, resolved against the expectation it declared."""
+    index: int
+    name: str
+    purpose: str
+    #: False when the field was absent and the conservative default was applied.
+    purpose_declared: bool
+    expected_exit_code: int
+    expected_declared: bool
+    #: The exit code the worker reported, carried through untouched.
+    observed_exit_code: int
+    satisfied: bool
+
+    @property
+    def is_control(self) -> bool:
+        return self.purpose in CONTROL_CHECK_PURPOSES
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class CheckExpectationVerdict:
+    """The single answer both validation boundaries act on."""
+    ok: bool
+    reason: Optional[str]
+    entries: Tuple[CheckExpectation, ...] = ()
+    verifications_passed: int = 0
+    controls_retained: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "reason": self.reason,
+            "verifications_passed": self.verifications_passed,
+            "controls_retained": self.controls_retained,
+            "checks": [entry.to_dict() for entry in self.entries],
+        }
+
+
+def _resolve_check_expectation(
+    index: int, chk: Any
+) -> Union[CheckExpectation, str]:
+    """
+    Resolve one check against its declared expectation, or return the refusal.
+
+    Nothing here reads a name, a command or an observation for meaning. A check
+    is a control because it says so in ``purpose``, never because it is called
+    "baseline" or because its output mentions a defect.
+    """
+    if not isinstance(chk, Mapping):
+        return f"Worker check #{index} is not an object."
+
+    name = chk.get("name")
+    label = f"Worker check #{index} ({name!r})"
+
+    cmd = chk.get("command")
+    if not isinstance(cmd, list) or not cmd or not all(str(c).strip() for c in cmd):
+        return (
+            f"{label} carries no executed command. A pass verdict needs commands that "
+            f"actually ran."
+        )
+
+    observed = chk.get("exit_code")
+    if not isinstance(observed, int) or isinstance(observed, bool):
+        return f"{label} has no integer exit_code."
+
+    if not str(chk.get("observed") or "").strip():
+        return f"{label} reports nothing observed."
+
+    raw_purpose = chk.get("purpose")
+    purpose_declared = raw_purpose is not None
+    if purpose_declared:
+        # Whitespace and letter case are normalized because they are not meaning.
+        # Anything that is still not one of the three tokens is refused, so an
+        # invented purpose can never fall back to a permissive default.
+        purpose = str(raw_purpose).strip().lower()
+        if purpose not in CHECK_PURPOSES:
+            return (
+                f"{label} declares purpose {raw_purpose!r}, which is not one of "
+                f"{CHECK_PURPOSES}. Declare the purpose explicitly or omit it to mean "
+                f"'{DEFAULT_CHECK_PURPOSE}'."
+            )
+    else:
+        purpose = DEFAULT_CHECK_PURPOSE
+
+    raw_expected = chk.get("expected_exit_code")
+    expected_declared = raw_expected is not None
+    if expected_declared:
+        if not isinstance(raw_expected, int) or isinstance(raw_expected, bool):
+            return (
+                f"{label} declares expected_exit_code {raw_expected!r}, which is not an "
+                f"integer."
+            )
+        expected = int(raw_expected)
+    else:
+        expected = DEFAULT_EXPECTED_EXIT_CODE
+
+    if purpose == DEFAULT_CHECK_PURPOSE and expected != 0:
+        return (
+            f"{label} declares purpose 'verification' with expected_exit_code {expected}. "
+            f"A verification check substantiates the work and must expect success; declare "
+            f"purpose 'baseline' or 'negative_control' for a check that is expected to fail."
+        )
+
+    return CheckExpectation(
+        index=index,
+        name=str(name) if name is not None else "",
+        purpose=purpose,
+        purpose_declared=purpose_declared,
+        expected_exit_code=expected,
+        expected_declared=expected_declared,
+        observed_exit_code=observed,
+        satisfied=observed == expected,
+    )
+
+
+def evaluate_check_expectations(checks: Any) -> CheckExpectationVerdict:
+    """
+    Decide whether a reported check packet is advanceable evidence.
+
+    The rules, and why each one exists:
+
+    * Every check must name a command that ran, an integer exit code and an
+      observation. Exit status alone was never evidence.
+    * A check is judged against the ``expected_exit_code`` it declared, and the
+      observed code is compared, never rewritten. An expected nonzero outcome is
+      retained with its real exit intact.
+    * A mismatch is a refusal whatever the purpose. A baseline that was expected
+      to fail and passed is as much a broken assumption as a verification that
+      was expected to pass and failed.
+    * A check declaring neither field is a verification expected to succeed, so a
+      legacy unclassified nonzero check is refused in those words rather than
+      being quietly re-read as somebody's intended control.
+    * At least one verification check must have succeeded. Baseline and negative
+      control checks are diagnostics: they say what the code used to do and what
+      it still refuses, and neither says the request now works. A packet made
+      only of controls proves nothing about the current head.
+    """
+    if not isinstance(checks, list) or not checks:
+        return CheckExpectationVerdict(
+            ok=False,
+            reason="No executed checks were reported. Exit status alone is never evidence.",
+        )
+
+    entries: List[CheckExpectation] = []
+    for index, chk in enumerate(checks):
+        resolved = _resolve_check_expectation(index, chk)
+        if isinstance(resolved, str):
+            return CheckExpectationVerdict(ok=False, reason=resolved, entries=tuple(entries))
+        entries.append(resolved)
+
+    for entry in entries:
+        if entry.satisfied:
+            continue
+        label = f"Worker check #{entry.index} ({entry.name!r})"
+        if not entry.purpose_declared and not entry.expected_declared:
+            return CheckExpectationVerdict(
+                ok=False,
+                reason=(
+                    f"{label} exited {entry.observed_exit_code} and declares neither 'purpose' "
+                    f"nor 'expected_exit_code', so it is an unclassified failing check. It is "
+                    f"refused rather than assumed to be an expected control: declare "
+                    f"purpose 'baseline' or 'negative_control' with the matching "
+                    f"expected_exit_code if the failure was intended."
+                ),
+                entries=tuple(entries),
+            )
+        return CheckExpectationVerdict(
+            ok=False,
+            reason=(
+                f"{label} declares purpose '{entry.purpose}' expecting exit "
+                f"{entry.expected_exit_code} but exited {entry.observed_exit_code}. "
+                f"An outcome that contradicts its own declared expectation is refused."
+            ),
+            entries=tuple(entries),
+        )
+
+    verifications = sum(1 for entry in entries if entry.purpose == DEFAULT_CHECK_PURPOSE)
+    controls = sum(1 for entry in entries if entry.is_control)
+    if verifications == 0:
+        return CheckExpectationVerdict(
+            ok=False,
+            reason=(
+                f"All {controls} reported check(s) are baseline/negative_control diagnostics "
+                f"and none is a successful 'verification' check. Controls record what the code "
+                f"used to do and what it still refuses; they never substitute for proving the "
+                f"request works on this head."
+            ),
+            entries=tuple(entries),
+            controls_retained=controls,
+        )
+
+    return CheckExpectationVerdict(
+        ok=True,
+        reason=None,
+        entries=tuple(entries),
+        verifications_passed=verifications,
+        controls_retained=controls,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +898,111 @@ def _sha256_file(path: str) -> Optional[str]:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Recurrence intake and the unchanged-retry gate
+#
+# The recurrence store is durable advisory memory owned by recurrence_guard.py.
+# It is soft-imported so a partial export still runs: a missing module means the
+# feature is absent and is reported as such, never silently reinterpreted. A
+# module that IS installed but whose history cannot be read raises out of the
+# guard, because an unreadable failure history must not be mistaken for none.
+# ---------------------------------------------------------------------------
+
+def verdict_failure_class(
+    structured: Mapping[str, Any],
+    stage: str,
+    request_id: str,
+    head_sha: Optional[str],
+) -> Optional[str]:
+    """
+    The stable identity of a worker's own non-pass verdict, or None.
+
+    A worker that judges its stage failed says so in ``verdict`` and explains it
+    in ``summary``. The judgement is the fault; the summary is prose, and a real
+    agent rewords it on every attempt. Deriving the recurrence identity from the
+    blocked reason therefore made two attempts at the *same* defect two separate
+    first occurrences, so the retry gate never closed on the case it exists for -
+    it only closed when a byte-identical summary came back, which is a fixture
+    behaviour and not an agent one.
+
+    Identity here is the structured judgement instead: this verdict, for this
+    stage, on this request, at this commit. Every part is load-bearing.
+    ``request_id`` keeps two unrelated requests failing review from collapsing
+    into one invented recurrence, and the observed commit is what makes the gate
+    mean "unchanged": ``retry_native`` re-dispatches the same request against the
+    same bound head, so a second non-pass verdict there is the same attempt
+    repeated, while a different commit is a different attempt at the problem.
+
+    Returns None for every other failure, because those reasons are authored by
+    this module rather than by an agent: they are already stable text and the
+    guard's own normalization is the right identity for them.
+    """
+    verdict = structured.get("verdict")
+    if verdict not in VALID_VERDICTS or verdict == "pass":
+        return None
+    return (
+        f"worker_verdict:{stage}:{verdict}:{request_id}@{str(head_sha or 'unknown-head').lower()}"
+    )
+
+
+def _observe_failure(
+    state_dir: str,
+    stage: str,
+    request_id: str,
+    repo_root: str,
+    reason: str,
+    run_id: Optional[str],
+    head_sha: Optional[str],
+    exit_code: Optional[int],
+    explicit_error_class: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Record one authentic worker failure in the durable recurrence store.
+
+    The attempt's run id supplies both identities the guard needs: the attempt
+    itself, and the single observation id every seam that later sees this attempt
+    derives from it, so one real failure is one occurrence whether it is observed
+    here, re-read by the driver, or replayed after a restart.
+    """
+    try:
+        from recurrence_guard import native_attempt_observation_id, observe_worker_failure
+    except ImportError as e:
+        return {"recorded": False, "reason": f"recurrence_guard is not installed: {e}"}
+    return observe_worker_failure(
+        state_dir=state_dir,
+        stage=stage,
+        request_id=request_id,
+        repo_root=repo_root,
+        reason=reason,
+        run_id=run_id,
+        head_sha=head_sha,
+        exit_code=exit_code,
+        source="native_worker",
+        explicit_error_class=explicit_error_class,
+        observation_id=(native_attempt_observation_id(run_id) if run_id else None),
+    ) or {"recorded": False, "reason": "recurrence intake returned nothing"}
+
+
+def _recurrence_retry_refusal(state_dir: str, request_id: Optional[str]) -> Optional[str]:
+    """
+    The reason an unchanged retry is refused, or None when it is permitted.
+
+    A retry of an attempt that already failed twice for the same reason would
+    reproduce the same failure at the same cost. This is the only question asked
+    of the recurrence store here; it decides nothing else about the retry.
+    """
+    if not request_id or not str(request_id).strip():
+        return None
+    try:
+        from recurrence_guard import RecurrenceGuard
+    except ImportError:
+        return None
+    decision = RecurrenceGuard(state_dir=state_dir).check_retry(request_id=str(request_id).strip())
+    if decision.allowed:
+        return None
+    return f"{decision.reason} {decision.required_action}".strip()
+
+
 def _coerce_result_object(payload: Any, keys: Sequence[str]) -> Optional[Dict[str, Any]]:
     """
     Pull the agent's structured answer out of a CLI envelope.
@@ -795,6 +1156,16 @@ def build_stage_prompt(req: Any, schema: Dict[str, Any]) -> str:
         "repository you worked in. It is cross-checked against the real HEAD.",
         "- \"checks\" must describe commands you actually executed. A \"pass\" verdict with an "
         "empty checks list is rejected.",
+        "- Report every check's real \"exit_code\". Never adjust one so it looks expected.",
+        "- A check with no \"purpose\" means \"verification\" and a check with no "
+        "\"expected_exit_code\" means 0, so an unexplained failing check is rejected. If a "
+        "command was supposed to fail, say so before it ran: set \"purpose\" to \"baseline\" or "
+        "\"negative_control\" and \"expected_exit_code\" to the code you expected. A check whose "
+        "real exit code differs from its \"expected_exit_code\" is rejected either way.",
+        "- \"purpose\": \"verification\" may not declare a nonzero \"expected_exit_code\".",
+        "- At least one \"verification\" check must have exited 0 on the commit you worked in. "
+        "Baseline and negative-control checks are kept as diagnostics but never count as that "
+        "proof, so a result carrying only controls is rejected.",
         "- Every \"artifacts\" path must exist on disk when you exit.",
         "- Do not claim a reproduction is gone with a phrase. If this is a bug, fill in "
         "\"reproduction\" with the scenario re-executed, its command, its real exit code and what "
@@ -1193,6 +1564,20 @@ class WorkerBackend:
                 raise WorkerBackendError(
                     f"Native dispatch {run_id} cannot retry on its bound head: {retry_error}"
                 )
+            try:
+                refusal = _recurrence_retry_refusal(
+                    self.state_dir, (record.get("request") or {}).get("request_id")
+                )
+            except Exception as e:
+                raise WorkerBackendError(
+                    f"Native dispatch {run_id} cannot be retried: the recurrence history that "
+                    f"governs unchanged retry is unreadable ({type(e).__name__}: {e}). Repair it "
+                    "rather than retrying blind."
+                )
+            if refusal:
+                raise WorkerBackendError(
+                    f"Native dispatch {run_id} will not be retried unchanged: {refusal}"
+                )
             nonce = f"{run_id}|{record.get('attempt', 1)}|{_now()}"
             next_run_id = "native_" + hashlib.sha256(nonce.encode("utf-8")).hexdigest()[:24]
             next_record = {
@@ -1391,6 +1776,32 @@ class WorkerBackend:
             record["finished_at"] = _now()
             record["state"] = "finalized" if outcome.ok else "blocked"
             record["outcome"] = outcome.to_dict()
+            if not outcome.ok:
+                # Real, already-validated worker failure. Recorded once per attempt:
+                # the run id is the attempt identity, so a replayed completion of
+                # the same run is a duplicate observation and never a new
+                # occurrence, and any other seam that later sees this attempt lands
+                # on the same observation rather than counting it again.
+                failure_class = verdict_failure_class(
+                    structured_result, request.stage, request.request_id, head_after
+                )
+                # Carried on the outcome so a seam that only receives the outcome -
+                # the adapter, and through it the driver - observes the same fault
+                # identity instead of re-deriving one from the reason's prose.
+                outcome.evidence["native_run_id"] = run_id
+                outcome.evidence["failure_error_class"] = failure_class
+                record["outcome"] = outcome.to_dict()
+                record["recurrence"] = _observe_failure(
+                    state_dir=self.state_dir,
+                    stage=request.stage,
+                    request_id=request.request_id,
+                    repo_root=repo_root,
+                    reason=str(outcome.blocked_reason or "worker reported failure"),
+                    run_id=run_id,
+                    head_sha=head_after,
+                    exit_code=outcome.exit_code,
+                    explicit_error_class=failure_class,
+                )
             self._write_native_record(record)
             return outcome
 
@@ -1732,6 +2143,13 @@ class WorkerBackend:
         base_evidence["artifact_digests"] = digests
         base_evidence["artifacts"] = artifacts
         base_evidence["checks"] = structured.get("checks") or []
+        # The resolved classification of every check, so the adapter, the driver
+        # and a human reading the record all see which checks were credited as
+        # verification and which expected-failure controls were retained -
+        # alongside the observed exit codes, which are never modified.
+        base_evidence["check_expectations"] = evaluate_check_expectations(
+            structured.get("checks")
+        ).to_dict()
         base_evidence["summary"] = structured.get("summary") or ""
         repro = structured.get("reproduction")
         if isinstance(repro, Mapping):
@@ -1842,7 +2260,10 @@ class WorkerBackend:
                     f"tested commit is {observed}."
                 ), verdict
 
-        # --- executed checks ---------------------------------------------
+        # --- executed checks, judged against their declared expectations ---
+        # The one evaluator superboard_adapter also calls, so a completion this
+        # method accepts is one the adapter can advance on, and a completion it
+        # refuses is refused for the same stated reason at both boundaries.
         checks = structured.get("checks")
         if not isinstance(checks, list) or not checks:
             return False, (
@@ -1850,28 +2271,12 @@ class WorkerBackend:
                 f"Exit status alone is never evidence."
             ), verdict
 
-        good_checks = 0
-        for idx, chk in enumerate(checks):
-            if not isinstance(chk, Mapping):
-                return False, f"Worker check #{idx} is not an object.", verdict
-            cmd = chk.get("command")
-            if not isinstance(cmd, list) or not cmd or not all(str(c).strip() for c in cmd):
-                return False, (
-                    f"Worker check #{idx} ({chk.get('name')!r}) carries no executed command. "
-                    f"A pass verdict needs commands that actually ran."
-                ), verdict
-            if not isinstance(chk.get("exit_code"), int):
-                return False, (
-                    f"Worker check #{idx} ({chk.get('name')!r}) has no integer exit_code."
-                ), verdict
-            if not str(chk.get("observed") or "").strip():
-                return False, (
-                    f"Worker check #{idx} ({chk.get('name')!r}) reports nothing observed."
-                ), verdict
-            good_checks += 1
-
-        if good_checks == 0:
-            return False, "Worker returned no substantiated check.", verdict
+        expectations = evaluate_check_expectations(checks)
+        if not expectations.ok:
+            return False, (
+                f"Worker returned verdict 'pass' for stage '{stage}' but its checks are not "
+                f"acceptable evidence: {expectations.reason}"
+            ), verdict
 
         # --- build must have produced something --------------------------
         artifacts = structured.get("artifacts")

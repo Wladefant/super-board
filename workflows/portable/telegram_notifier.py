@@ -20,8 +20,18 @@ Invariants:
    - Global rate limiter prevents flooding the transport.
 6. Generic Multi-Repo Transport:
    - Per-project destination configuration maps repository/project names to Telegram slots.
-   - No hardcoded single-project assumptions.
-7. Fail-Closed Resilience: Network or API failures fail safely with structured receipts
+   - Strict project affinity: with a configured slot pool, a project with no affinity
+     match is refused rather than delivered through another project's bot.
+7. Reply Correlation:
+   - Every delivered message is indexed by (bot_id, chat_id, message_id) against the
+     originating session and request in the shared bot_pool.db, so the session bridge
+     can route a reply back to its owner and refuse an unknown or stale one.
+   - The pool database resolves the same way the TypeScript bridge resolves it: an
+     explicit path (constructor argument or --pool-db), else VEYYON_POOL_DB, else the
+     installed pool at ~/.veyyon/telegram/bot_pool.db when that file exists. Outside an
+     installed pool there is nothing to correlate against, so correlation stays off
+     rather than creating a database no bridge reads.
+8. Fail-Closed Resilience: Network or API failures fail safely with structured receipts
    without halting or disrupting the coordinator execution flow.
 """
 
@@ -32,11 +42,13 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import closing
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -58,6 +70,65 @@ DEFAULT_MANIFEST_PATHS = [
     Path.home() / ".veyyon" / "telegram" / "manifest.json",
 ]
 DEFAULT_CHANNELS_BASE = Path.home() / ".claude" / "channels"
+DEFAULT_POOL_DB_PATH = Path.home() / ".veyyon" / "telegram" / "bot_pool.db"
+
+# Shared with the TypeScript session bridge (coordinator.ts). Both writers must keep
+# this definition byte-identical so a reply can be resolved by either side.
+MESSAGE_CORRELATIONS_DDL = """
+CREATE TABLE IF NOT EXISTS message_correlations (
+    bot_id       TEXT NOT NULL,
+    chat_id      TEXT NOT NULL,
+    message_id   INTEGER NOT NULL,
+    slot_id      TEXT NOT NULL,
+    session_id   TEXT NOT NULL,
+    request_id   TEXT,
+    decision_id  TEXT,
+    project_path TEXT,
+    created_at   REAL NOT NULL,
+    PRIMARY KEY (bot_id, chat_id, message_id)
+)
+"""
+
+# Values of VEYYON_POOL_DB that mean "no correlation", so a caller inside an installed
+# pool can turn recording off without editing code.
+POOL_DB_OFF_VALUES = {"", "0", "off", "none", "disabled", "false"}
+
+
+def resolve_pool_db_path(
+    explicit: Optional[Path] = None,
+    *,
+    default_path: Optional[Path] = DEFAULT_POOL_DB_PATH,
+    env: Optional[Dict[str, str]] = None,
+) -> Tuple[Optional[Path], str]:
+    """Resolves the shared bot_pool.db to record outbound correlations in.
+
+    Returns the path and the name of whatever decided it:
+
+    ``explicit``       a caller named the path (constructor argument, --pool-db, config)
+    ``env``            VEYYON_POOL_DB named it
+    ``env_disabled``   VEYYON_POOL_DB explicitly turned correlation off
+    ``installed``      the installed pool exists at the default path
+    ``absent``         no pool database anywhere, so correlation is off
+
+    An explicit path is honoured even if the file does not exist yet: naming it is the
+    caller's statement that this is the pool. The default is honoured only when the file
+    already exists, because a bot_pool.db conjured somewhere no bridge reads would
+    silently swallow every correlation and make replies look routable when they are not.
+    """
+    if explicit:
+        return Path(explicit), "explicit"
+
+    environ = os.environ if env is None else env
+    raw = environ.get("VEYYON_POOL_DB")
+    if raw is not None:
+        if raw.strip().lower() in POOL_DB_OFF_VALUES:
+            return None, "env_disabled"
+        return Path(raw.strip()), "env"
+
+    if default_path is not None and Path(default_path).exists():
+        return Path(default_path), "installed"
+
+    return None, "absent"
 
 
 @dataclass
@@ -68,6 +139,8 @@ class NotificationEvent:
     summary: str
     canonical_link: str
     metadata: Dict[str, Any] = field(default_factory=dict)
+    session_id: Optional[str] = None
+    slot_id: Optional[str] = None
 
     def validate(self) -> None:
         if self.event_type not in VALID_EVENT_TYPES:
@@ -92,6 +165,14 @@ class DeliveryReceipt:
     chat_id: Optional[str] = None
     bot_id: Optional[str] = None
     timestamp_utc: float = field(default_factory=time.time)
+    slot_id: Optional[str] = None
+    session_id: Optional[str] = None
+    correlation_status: str = "not_attempted"
+    correlation_recorded: bool = False
+    # Which rule decided the pool database: explicit, env, env_disabled, installed,
+    # absent. Without it a "disabled" status is indistinguishable from a misconfigured
+    # one at the caller.
+    correlation_source: str = "absent"
 
 
 class SecretSanitizer:
@@ -201,19 +282,13 @@ class ProjectSlotResolver:
                         "source": "manifest_substring",
                     }
 
-        # 3. Fallback to telegram-polysim if available, or first enabled slot
+        # 3. Strict project affinity: with a configured pool, refuse rather than
+        #    delivering this project's notification through another project's bot.
         if slots:
-            for s in slots:
-                if s.get("slotId") == "telegram-polysim" and s.get("enabled", True):
-                    return {
-                        "slotId": s.get("slotId"),
-                        "stateDir": s.get("stateDir"),
-                        "source": "manifest_default",
-                    }
             return {
-                "slotId": slots[0].get("slotId"),
-                "stateDir": slots[0].get("stateDir"),
-                "source": "manifest_first",
+                "slotId": None,
+                "stateDir": None,
+                "source": "unresolved",
             }
 
         # 4. Fallback if manifest is missing
@@ -372,6 +447,114 @@ class DeduplicationLedger:
         return sig
 
 
+class OutboundCorrelationStore:
+    """Shared (bot_id, chat_id, message_id) -> (session_id, request_id) index.
+
+    Lives in the same bot_pool.db the TypeScript session bridge reads when deciding
+    whether an inbound Telegram reply may be delivered. A reply whose target message
+    has no correlation row, or whose row names a different session, is refused by the
+    bridge, so recording here is what makes a reply to a workflow notification routable
+    back to the session that owns the request.
+
+    Only the originating session of a request may be recorded here. The session that
+    happens to hold the bot lease is never substituted: it may own nothing related to
+    this request, and binding to it would route someone else's reply into it.
+
+    Resolution order is `resolve_pool_db_path`: an explicit path wins, then
+    VEYYON_POOL_DB, then the installed pool when it exists. `source` records which of
+    those answered, so a receipt can say why correlation is on or off.
+    """
+
+    def __init__(
+        self,
+        db_path: Optional[Path] = None,
+        default_path: Optional[Path] = DEFAULT_POOL_DB_PATH,
+    ):
+        self.db_path, self.source = resolve_pool_db_path(db_path, default_path=default_path)
+
+    @property
+    def enabled(self) -> bool:
+        return self.db_path is not None
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.db_path), timeout=5.0)
+        conn.execute("PRAGMA busy_timeout = 5000;")
+        return conn
+
+    def record(
+        self,
+        bot_id: str,
+        chat_id: str,
+        message_id: int,
+        slot_id: str,
+        session_id: str,
+        request_id: Optional[str] = None,
+        decision_id: Optional[str] = None,
+        project_path: Optional[str] = None,
+        now: Optional[float] = None,
+    ) -> bool:
+        if not self.enabled or not bot_id or not chat_id or message_id is None or not session_id:
+            return False
+        now = now if now is not None else time.time()
+        try:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            with closing(self._connect()) as conn:
+                with conn:
+                    conn.execute(MESSAGE_CORRELATIONS_DDL)
+                    conn.execute(
+                        "INSERT INTO message_correlations ("
+                        "bot_id, chat_id, message_id, slot_id, session_id, "
+                        "request_id, decision_id, project_path, created_at"
+                        ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                        "ON CONFLICT(bot_id, chat_id, message_id) DO UPDATE SET "
+                        "slot_id = excluded.slot_id, session_id = excluded.session_id, "
+                        "request_id = excluded.request_id, decision_id = excluded.decision_id, "
+                        "project_path = excluded.project_path, created_at = excluded.created_at",
+                        (
+                            str(bot_id),
+                            str(chat_id),
+                            int(message_id),
+                            str(slot_id),
+                            str(session_id),
+                            request_id,
+                            decision_id,
+                            project_path,
+                            float(now),
+                        ),
+                    )
+            return True
+        except (sqlite3.Error, OSError):
+            return False
+
+    def lookup(self, bot_id: str, chat_id: str, message_id: int) -> Optional[Dict[str, Any]]:
+        if not self.enabled or not self.db_path.exists():
+            return None
+        try:
+            with closing(self._connect()) as conn:
+                row = conn.execute(
+                    "SELECT bot_id, chat_id, message_id, slot_id, session_id, request_id, "
+                    "decision_id, project_path, created_at FROM message_correlations "
+                    "WHERE bot_id = ? AND chat_id = ? AND message_id = ?",
+                    (str(bot_id), str(chat_id), int(message_id)),
+                ).fetchone()
+        except sqlite3.Error:
+            return None
+        if not row:
+            return None
+        keys = (
+            "bot_id",
+            "chat_id",
+            "message_id",
+            "slot_id",
+            "session_id",
+            "request_id",
+            "decision_id",
+            "project_path",
+            "created_at",
+        )
+        return dict(zip(keys, row))
+
+
 class TelegramNotificationAdapter:
     """Portable Telegram notification adapter for multi-agent workflows."""
 
@@ -380,8 +563,10 @@ class TelegramNotificationAdapter:
         resolver: Optional[ProjectSlotResolver] = None,
         ledger: Optional[DeduplicationLedger] = None,
         state_dir_override: Optional[Path] = None,
+        correlation_store: Optional[OutboundCorrelationStore] = None,
     ):
         self.resolver = resolver or ProjectSlotResolver()
+        self.correlation_store = correlation_store or OutboundCorrelationStore()
         if ledger:
             self.ledger = ledger
         else:
@@ -427,6 +612,16 @@ class TelegramNotificationAdapter:
     def test_connection(self, project: str = "polysimulator", slot_id: Optional[str] = None) -> Dict[str, Any]:
         """Read-only test to verify bot credentials and API reachability via getMe."""
         slot_info = self.resolver.resolve_slot(project, explicit_slot=slot_id)
+        if slot_info.get("source") == "unresolved":
+            return {
+                "ok": False,
+                "status": "blocked",
+                "reason": (
+                    f"No Telegram bot slot declares affinity for project '{project}'; "
+                    "refusing to test another project's bot."
+                ),
+                "slot": None,
+            }
         state_dir = Path(slot_info["stateDir"])
         token = self.resolver.load_token(state_dir)
         destinations = self.resolver.load_allowed_destinations(state_dir)
@@ -487,6 +682,17 @@ class TelegramNotificationAdapter:
 
         # 1. Resolve project destination slot and credentials
         slot_info = self.resolver.resolve_slot(event.project, explicit_slot=explicit_slot)
+        if slot_info.get("source") == "unresolved":
+            return DeliveryReceipt(
+                delivered=False,
+                status="blocked",
+                reason=(
+                    f"No Telegram bot slot declares affinity for project '{event.project}'; "
+                    "refusing to deliver through another project's bot."
+                ),
+                event_signature=sig,
+            )
+
         state_dir = Path(slot_info["stateDir"])
         token = self.resolver.load_token(state_dir)
         allowed_chats = self.resolver.load_allowed_destinations(state_dir)
@@ -533,6 +739,14 @@ class TelegramNotificationAdapter:
                     chat_id="[REDACTED_DESTINATION]",
                 )
 
+        # A reply to this message must reach the session that OWNS the request, so the
+        # binding comes from the event's originating session and nowhere else. It is
+        # deliberately never taken from whichever session currently holds the bot lease:
+        # that session may be unrelated to this request, and binding to it would hand it
+        # someone else's reply. With no originating identity the message stays
+        # uncorrelated and the session bridge refuses any reply to it.
+        bound_session = event.session_id or None
+
         # 3. Format message
         message_text = self.format_message(event)
 
@@ -544,6 +758,10 @@ class TelegramNotificationAdapter:
                 reason=f"[DRY-RUN] Would send message to slot '{slot_info['slotId']}': {message_text}",
                 event_signature=sig,
                 chat_id="[REDACTED_DESTINATION]",
+                slot_id=slot_info["slotId"],
+                session_id=bound_session,
+                correlation_status="dry_run",
+                correlation_source=self.correlation_store.source,
             )
 
         # 5. Network dispatch
@@ -568,9 +786,31 @@ class TelegramNotificationAdapter:
             with urllib.request.urlopen(req, timeout=DEFAULT_HTTP_TIMEOUT) as resp:
                 resp_data = json.loads(resp.read().decode("utf-8"))
                 if resp_data.get("ok"):
-                    msg_id = resp_data.get("result", {}).get("message_id")
-                    bot_id = str(resp_data.get("result", {}).get("from", {}).get("id", ""))
+                    result = resp_data.get("result", {})
+                    msg_id = result.get("message_id")
+                    bot_id = str(result.get("from", {}).get("id", ""))
+                    # The chat the API actually delivered to. `target_chat` may be a
+                    # channel name from the allowlist, and the session bridge looks a
+                    # reply up by the numeric chat id Telegram reports, so keying on the
+                    # requested destination would produce a row no reply can ever match.
+                    delivered_chat_id = str(result.get("chat", {}).get("id", target_chat))
                     self.ledger.record_dispatch(event)
+
+                    correlation_status = "disabled" if not self.correlation_store.enabled else "unbound"
+                    correlation_recorded = False
+                    if self.correlation_store.enabled and bound_session and msg_id is not None:
+                        correlation_recorded = self.correlation_store.record(
+                            bot_id=bot_id,
+                            chat_id=delivered_chat_id,
+                            message_id=int(msg_id),
+                            slot_id=str(slot_info["slotId"]),
+                            session_id=bound_session,
+                            request_id=event.request_id or None,
+                            decision_id=event.metadata.get("decision_id"),
+                            project_path=event.project or None,
+                        )
+                        correlation_status = "recorded" if correlation_recorded else "record_failed"
+
                     return DeliveryReceipt(
                         delivered=True,
                         status="sent",
@@ -579,6 +819,11 @@ class TelegramNotificationAdapter:
                         message_id=msg_id,
                         chat_id="[REDACTED_DESTINATION]",
                         bot_id=bot_id,
+                        slot_id=slot_info["slotId"],
+                        session_id=bound_session,
+                        correlation_status=correlation_status,
+                        correlation_recorded=correlation_recorded,
+                        correlation_source=self.correlation_store.source,
                     )
                 else:
                     return DeliveryReceipt(
@@ -620,6 +865,9 @@ class TelegramNotificationAdapter:
         req_id = request.get("id") or "req-unknown"
         req_state = request.get("state") or "unknown"
         issue_url = request.get("issue_url") or "https://github.com/Bavariance/polysimulator"
+        # Carried through so a reply to this notification resolves to the session that
+        # owns the request rather than to whichever session holds the bot lease later.
+        session_id = request.get("session") or request.get("session_id") or None
         project = project_override or packet.get("boundaries", {}).get("shared_authority", "Bavariance/polysimulator")
         if "Bavariance/polysimulator" in project:
             project = "Bavariance/polysimulator"
@@ -636,6 +884,7 @@ class TelegramNotificationAdapter:
                 summary=f"Request paused awaiting human authorization on {dec_str}",
                 canonical_link=issue_url,
                 metadata={"decision_ids": decision_ids},
+                session_id=session_id,
             )
 
         # 2. Blocker
@@ -651,6 +900,7 @@ class TelegramNotificationAdapter:
                 summary=f"Request blocked by {reason}",
                 canonical_link=issue_url,
                 metadata={"blockers": blockers},
+                session_id=session_id,
             )
 
         # 3. Completion
@@ -661,6 +911,7 @@ class TelegramNotificationAdapter:
                 request_id=req_id,
                 summary=f"Request completed and verified against all criteria",
                 canonical_link=issue_url,
+                session_id=session_id,
             )
 
         # 4. Milestone (advancement to review or integration)
@@ -672,6 +923,7 @@ class TelegramNotificationAdapter:
                 summary=f"Request advanced to state '{req_state}' with verified criteria",
                 canonical_link=issue_url,
                 metadata={"state": req_state},
+                session_id=session_id,
             )
 
         # Routine chatter (implementation, discovery, etc.) is dropped
@@ -819,6 +1071,11 @@ class TelegramNotificationAdapter:
             or "https://github.com/Bavariance/polysimulator/issues/4543"
         )
         project = project_override or "Bavariance/polysimulator"
+        # A decision reply must reach the session that raised it, so prefer the
+        # decision's own session and fall back to the linked ledger request.
+        resolved_request = ledger_request or cls.lookup_ledger_request(
+            str(d_dict.get("request_id") or ""), ledger=ledger
+        )
 
         opt_summaries = []
         for opt in options:
@@ -843,7 +1100,14 @@ class TelegramNotificationAdapter:
                 "options": options,
                 "recommendation": recommendation,
             },
+            session_id=(
+                d_dict.get("session")
+                or d_dict.get("session_id")
+                or (resolved_request or {}).get("session")
+                or None
+            ),
         )
+
     @classmethod
     def load_decision_from_file(
         cls,
@@ -891,9 +1155,25 @@ def main() -> int:
     parser.add_argument("--send", action="store_true", help="Execute live network delivery")
     parser.add_argument("--force", action="store_true", help="Bypass dedup and cooldown checks")
     parser.add_argument("--json", action="store_true", help="Output machine-readable JSON receipt")
+    parser.add_argument(
+        "--session",
+        default=None,
+        help="Originating session id; binds this message so a reply routes back to that session",
+    )
+    parser.add_argument(
+        "--pool-db",
+        default=None,
+        help=(
+            "Path to the shared bot_pool.db holding the message correlation index. "
+            "Defaults to VEYYON_POOL_DB, else the installed pool at "
+            "~/.veyyon/telegram/bot_pool.db when it exists; set VEYYON_POOL_DB=off to record nothing"
+        ),
+    )
 
     args = parser.parse_args()
-    adapter = TelegramNotificationAdapter()
+    adapter = TelegramNotificationAdapter(
+        correlation_store=OutboundCorrelationStore(Path(args.pool_db) if args.pool_db else None),
+    )
 
     if args.test_connection:
         result = adapter.test_connection(project=args.project, slot_id=args.slot)
@@ -955,10 +1235,14 @@ def main() -> int:
             summary=args.summary,
             canonical_link=primary_link,
             metadata={"links": args.links} if args.links else {},
+            session_id=args.session,
         )
     else:
         parser.print_help()
         return 1
+
+    if args.session:
+        event.session_id = args.session
 
     # Execute notification
     dry_run_mode = args.dry_run or (not args.send)
