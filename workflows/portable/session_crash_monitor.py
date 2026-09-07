@@ -102,12 +102,25 @@ class ProcessProbe:
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         SYNCHRONIZE = 0x00100000
 
+        k32.OpenProcess.argtypes = [w.DWORD, w.BOOL, w.DWORD]
+        k32.OpenProcess.restype = w.HANDLE
+        k32.GetProcessTimes.argtypes = [
+            w.HANDLE,
+            ctypes.POINTER(w.FILETIME),
+            ctypes.POINTER(w.FILETIME),
+            ctypes.POINTER(w.FILETIME),
+            ctypes.POINTER(w.FILETIME),
+        ]
+        k32.GetProcessTimes.restype = w.BOOL
+        k32.GetExitCodeProcess.argtypes = [w.HANDLE, ctypes.POINTER(w.DWORD)]
+        k32.GetExitCodeProcess.restype = w.BOOL
+        k32.CloseHandle.argtypes = [w.HANDLE]
+        k32.CloseHandle.restype = w.BOOL
+
         h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, pid)
         if not h:
             # Fallback with just QUERY_LIMITED_INFORMATION
             h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-
-        if not h:
             return None
 
         try:
@@ -164,6 +177,8 @@ class ProcessProbe:
     def _get_posix_process_info(
         self, pid: int, expected_creation_time: Optional[str] = None
     ) -> Optional[SessionProcessInfo]:
+        if pid <= 0:
+            return None
         try:
             os.kill(pid, 0)
         except (ProcessLookupError, OSError):
@@ -251,12 +266,13 @@ class ProcessProbe:
         """Discovers running veyyon process PID holding --resume <session_id>."""
         if sys.platform == "win32":
             try:
+                ps_session_id = session_id.replace("'", "''")
                 cmd = [
                     "powershell",
                     "-NoProfile",
                     "-Command",
                     'Get-CimInstance Win32_Process -Filter "Name=\'veyyon.exe\'" | '
-                    f'Where-Object {{ $_.CommandLine -like "*{session_id}*" }} | '
+                    f"Where-Object {{ $_.CommandLine -like '*{ps_session_id}*' }} | "
                     "Select-Object -ExpandProperty ProcessId",
                 ]
                 res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
@@ -580,8 +596,10 @@ class SessionCrashMonitor:
     ) -> DeliveryReceipt:
         """Delivers alert to Telegram with bounded retries and records unsent status if transport is down."""
         utc_ts = utc_now_iso()
+        recovery_executable = "veyyon.exe" if sys.platform == "win32" else "veyyon"
+        recovery_extension = Path.home() / ".veyyon" / "telegram" / "index.ts"
         recovery_cmd = (
-            f"veyyon.exe --extension C:/Users/wkiri/.veyyon/telegram/index.ts --resume {self.session_id}"
+            f"{recovery_executable} --extension {recovery_extension} --resume {self.session_id}"
         )
         msg_text = format_crash_alert_text(
             session_id=self.session_id,
@@ -610,7 +628,7 @@ class SessionCrashMonitor:
                 "creation_time_utc": creation_time_utc,
                 "observed_reason": observed_reason,
             },
-            session_id=self.session_id,
+            session_id=None if is_test_mode else self.session_id,
         )
 
         receipt: Optional[DeliveryReceipt] = None
@@ -770,6 +788,9 @@ class SessionCrashMonitor:
 
     def run(self, max_cycles: Optional[int] = None) -> int:
         """Runs the monitoring loop until termination is observed or max_cycles reached."""
+        if self.poll_interval <= 0:
+            print("[session-crash-monitor] poll_interval must be positive", file=sys.stderr)
+            return 1
         ok, msg = self.bind_target()
         if not ok:
             print(f"[session-crash-monitor] Bind failed: {msg}", file=sys.stderr)
