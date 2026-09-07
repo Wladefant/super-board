@@ -170,6 +170,26 @@
         "Transport must acknowledge callback queries and remains the sole poller owner"
       ]
     },
+    "session_crash_monitor.py": {
+      "role": "Independent external supervisor for target Veyyon session instances. Binds sessionUUID + verified PID + creation time to detect unexpected terminations, distinguish planned restarts via marker suppression, handle PID reuse, deduplicate per owner termination, and deliver alerts through verified Telegram outbound routing without running an inbound poller.",
+      "owner": "CrashTelegramMonitor",
+      "cli_command": "python session_crash_monitor.py [--session-id <uuid>] [--pid <pid>] [--state-file <path>] [--marker-path <path>] [--poll-interval <sec>] [--dry-run] [--test-telegram] [--status]",
+      "inputs": [
+        "Operating system process probe (PID, creation time, exit code, command line)",
+        "Planned restart marker JSON (session directory or workflows directory)",
+        "Durable crash monitor state JSON with file locking",
+        "TelegramNotificationAdapter configuration for outbound alert"
+      ],
+      "outputs": [
+        "Durable recorded terminations and unsent queues in crash_monitor_state.json",
+        "Concise plain-text crash alerts delivered to verified Telegram slot"
+      ],
+      "boundaries": [
+        "Strictly outbound supervisor: zero inbound poller or receiver ownership",
+        "No automatic restart of Main process",
+        "Distinguishes alive process (quiet/slow model/paused goal) from termination"
+      ]
+    },
     "worker_backend.py": {
       "role": "Durable native background worker execution by default: validates the exact repository/head before persisting a compact prompt/schema ticket, binds the actual agent task handle, and finalizes the delivered result through one shared exact-head, artifact, executed-check, and bug-reproduction validation path. Explicit agent CLI backends remain opt-in; preparation never advances lifecycle state.",
       "owner": "ImplementContinuousExecution",
@@ -313,7 +333,9 @@
       "continuation_driver.py",
       "recurrence_guard.py",
       "WORKER_EXECUTION.md",
-      "diagnostics.py"
+      "diagnostics.py",
+      "telegram_workflow.py",
+      "session_crash_monitor.py"
     ],
     "optional_files": [
       "usage_snapshot_cache.json",
@@ -326,7 +348,9 @@
       "test_worker_backend.py",
       "test_continuation_driver.py",
       "test_recurrence_guard.py",
-      "test_diagnostics.py"
+      "test_diagnostics.py",
+      "test_telegram_workflow.py",
+      "test_session_crash_monitor.py"
     ]
   }
 }
