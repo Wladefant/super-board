@@ -654,8 +654,10 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
         self.assertIsNotNone(receipt)
         self.assertEqual(receipt.get("status"), "dry_run")
         self.assertIn("Park and Idle Wait", receipt.get("reason", ""))
-        self.assertIn("❓ <b>Problem:</b>", receipt.get("reason", ""))
-        self.assertIn("👉 <b>Proposed Action:</b>", receipt.get("reason", ""))
+        self.assertIn("❓ <b>Decision needed</b>", receipt.get("reason", ""))
+        self.assertIn("How should background execution proceed on blocking decisions?", receipt.get("reason", ""))
+        self.assertIn("<b>Proposal:</b>", receipt.get("reason", ""))
+        self.assertIn("<b>Impact:</b>", receipt.get("reason", ""))
 
     def test_04e_telegram_decision_refusal_retired_and_synthetic(self):
         """Regression: Verify retired/synthetic/completed decisions are strictly refused by adapter hook."""
@@ -759,7 +761,10 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
         self.assertEqual(pending.stage, "decision")
         self.assertEqual(pending.status, "blocked")
         self.assertEqual(pending.notification_receipt["status"], "dry_run")
-        self.assertIn("❓ <b>Problem:</b>", pending.notification_receipt["reason"])
+        self.assertIn("❓ <b>Decision needed</b>", pending.notification_receipt["reason"])
+        self.assertIn("Choose the supported execution path?", pending.notification_receipt["reason"])
+        self.assertIn("<b>Proposal:</b>", pending.notification_receipt["reason"])
+        self.assertIn("<b>Impact:</b>", pending.notification_receipt["reason"])
         self.assertNotIn("[Blocker]", pending.notification_receipt["reason"])
 
         # Even if a malformed coordinator packet loses its DecisionStatus, the

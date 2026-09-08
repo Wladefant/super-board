@@ -33,6 +33,7 @@ export class SocketGuiHostPort implements GuiHostPort {
   private connected = false;
   private connectionResolve: (() => void) | null = null;
   private connectionReject: ((error: Error) => void) | null = null;
+  private connectionTimer: NodeJS.Timeout | null = null;
   private buffer = "";
   private nextId = 1;
   private pending: PendingRequest | null = null;
@@ -86,12 +87,19 @@ export class SocketGuiHostPort implements GuiHostPort {
       socket.on("connect", () => {
         if (this.authToken) socket.write(`${JSON.stringify({ Authenticate: { token: this.authToken } })}\n`);
       });
-      socket.on("data", chunk => this.onData(String(chunk)));
-      socket.on("error", error => this.fail(new GuiHostRequestError(error.message, "SOCKET_ERROR")));
-      socket.on("close", () => this.fail(new GuiHostRequestError("Veyyon GUI host connection closed", "SOCKET_CLOSED")));
-      const timer = setTimeout(() => this.fail(new GuiHostRequestError("Veyyon GUI host connection timed out", "TIMEOUT")), this.timeoutMs);
-      timer.unref?.();
-      this.connecting?.then(() => clearTimeout(timer), () => clearTimeout(timer));
+      socket.on("data", chunk => { if (this.socket === socket) this.onData(String(chunk)); });
+      socket.on("error", error => {
+        if (this.socket === socket) this.fail(new GuiHostRequestError(error.message, "SOCKET_ERROR"));
+      });
+      socket.on("close", () => {
+        if (this.socket === socket) this.fail(new GuiHostRequestError("Veyyon GUI host connection closed", "SOCKET_CLOSED"));
+      });
+      this.connectionTimer = setTimeout(() => {
+        if (this.socket === socket && !this.connected) {
+          this.fail(new GuiHostRequestError("Veyyon GUI host connection timed out", "TIMEOUT"));
+        }
+      }, this.timeoutMs);
+      this.connectionTimer.unref?.();
     }).finally(() => {
       this.connecting = null;
     });
@@ -125,9 +133,7 @@ export class SocketGuiHostPort implements GuiHostPort {
     const connection = record?.ConnectionChanged as Record<string, unknown> | undefined;
     if (connection && "Connected" in connection && !this.connected) {
       this.connected = true;
-      this.connectionResolve?.();
-      this.connectionResolve = null;
-      this.connectionReject = null;
+      this.settleConnection();
       return;
     }
     if (!this.pending || !record) return;
@@ -153,18 +159,29 @@ export class SocketGuiHostPort implements GuiHostPort {
     }
   }
 
-  private fail(error: Error): void {
-    this.connected = false;
-    this.connectionReject?.(error);
+  private settleConnection(error?: Error): void {
+    if (this.connectionTimer) clearTimeout(this.connectionTimer);
+    this.connectionTimer = null;
+    const resolve = this.connectionResolve;
+    const reject = this.connectionReject;
     this.connectionResolve = null;
     this.connectionReject = null;
+    if (error) reject?.(error);
+    else resolve?.();
+  }
+
+  private fail(error: Error): void {
+    this.connected = false;
+    this.buffer = "";
+    this.settleConnection(error);
     if (this.pending) {
       clearTimeout(this.pending.timer);
       this.pending.reject(error);
       this.pending = null;
     }
-    if (this.socket && !this.socket.destroyed) this.socket.destroy();
+    const socket = this.socket;
     this.socket = null;
+    if (socket && !socket.destroyed) socket.destroy();
   }
 
   close(): void {

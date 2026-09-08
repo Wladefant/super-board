@@ -1458,8 +1458,9 @@ class TestContinuationDriverTelegramNotifications(_Fixture):
             payload = json.loads(req.data.decode("utf-8"))
             self.assertIn("chat_id", payload)
             self.assertIn("text", payload)
-            self.assertIn("req-explicit-send", payload["text"])
-            self.assertIn("https://github.com/", payload["text"])
+            self.assertIn('<a href="https://github.com/Bavariance/polysimulator/issues/104">polysimulator</a>', payload["text"])
+            self.assertIn("<b>Blocked</b>", payload["text"])
+            self.assertNotIn("req-explicit-send", payload["text"])
 
 
 if __name__ == "__main__":
