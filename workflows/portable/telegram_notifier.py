@@ -810,13 +810,13 @@ def render_card(event: NotificationEvent) -> str:
             lines.append(safe(" · ".join(options)))
     else:
         bullets = [re.sub(r"^[•*-]\s+", "", row.strip()) for row in event.summary.splitlines() if row.strip()]
-        for row in bullets[:5]:
-            labeled = re.match(r"^([\w ][\w /-]{0,23}):\s+(.+)$", row)
+        for row in bullets[:7]:
+            labeled = re.match(r"^([\w ][\w /+& -]{0,23}):\s+(.+)$", row)
             rendered = f"<b>{safe(labeled.group(1))}:</b> {safe(labeled.group(2))}" if labeled else safe(row)
             if rendered:
-                lines.append(f"• {truncate_html(rendered, 400)}")
-        if len(bullets) > 5:
-            lines.append("<blockquote expandable>" + safe("\n".join(bullets[5:])) + "</blockquote>")
+                lines.append(f"• {truncate_html(rendered, 1000)}")
+        if len(bullets) > 7:
+            lines.append("<blockquote expandable>" + safe("\n".join(bullets[7:])) + "</blockquote>")
     detail = event.metadata.get("long_detail") or event.metadata.get("detail")
     if detail:
         lines.extend(["", f"<blockquote expandable>{safe(detail)}</blockquote>"])
