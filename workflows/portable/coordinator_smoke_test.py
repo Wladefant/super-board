@@ -240,7 +240,28 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
     assert_true(p2["status"] == "wait", f"Coordinator emits 'wait' on decision blocker (got {p2['status']})")
     assert_true(p2["decision_status"]["blocking_this_request"] is True, "Decision blocking flag is True")
 
-    # A3: Resolve decision: reply directly via decision_workflow (which resolves ledger directly)
+    # A3a: Rejected session case: mismatched session is refused and coordinator remains in 'wait'
+    reply_now = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=5)).isoformat()
+    rej_reply_cmd = [
+        PYTHON_EXE, decisions_py,
+        "--decisions", decisions_json,
+        "--ledger", ledger_json,
+        "reply", dec_id,
+        "--text", "Option A",
+        "--responder", "Wladefant",
+        "--comment-id", "999888776",
+        "--provenance", "github_verified_user",
+        "--comment-created-at", reply_now,
+        "--comment-time-provenance", "api_verified",
+        "--session", "00000000-0000-0000-0000-wrongsession",
+    ]
+    res_rej = subprocess.run(rej_reply_cmd, capture_output=True, text=True)
+    assert_true(res_rej.returncode == 0, f"Executed rejected reply: {res_rej.stderr}")
+    assert_true("Session mismatch" in res_rej.stdout or "Session mismatch" in res_rej.stderr, "Output notes session mismatch")
+    p_rej = run_coord(local_req_id)
+    assert_true(p_rej["status"] == "wait", f"Coordinator remains in 'wait' on mismatched session (got {p_rej['status']})")
+
+    # A3b: Allowed session case: valid session resolves decision and coordinator returns to 'ready'
     reply_cmd = [
         PYTHON_EXE, decisions_py,
         "--decisions", decisions_json,
@@ -249,6 +270,10 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
         "--text", "Option A",
         "--responder", "Wladefant",
         "--comment-id", "999888777",
+        "--provenance", "github_verified_user",
+        "--comment-created-at", reply_now,
+        "--comment-time-provenance", "api_verified",
+        "--session", "00000000-0000-0000-0000-000000000001",
     ]
     res = subprocess.run(reply_cmd, capture_output=True, text=True)
     assert_true(res.returncode == 0, f"Resolved decision via workflow: {res.stderr}")
