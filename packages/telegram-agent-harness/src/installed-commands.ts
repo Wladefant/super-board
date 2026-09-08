@@ -47,7 +47,6 @@ export async function handleInstalledCommand(text: string, port: InstalledComman
         if (port.session().id !== session.id) { await port.send("Session changed; nothing was sent. Refresh <code>/agents</code>."); return true; }
         await port.inbound(message, port.session().idle);
       } else if (target.startsWith("herdr:")) {
-        await port.send("<b>Checking Herdr target.</b>");
         const result = await herdr.prompt(target.slice(6), message);
         await port.send(`<b>${result.ok ? "Prompt delivered" : "Prompt not sent"}.</b> ${escapeHtml(result.detail)}`);
       } else {

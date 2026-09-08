@@ -49,9 +49,10 @@ test("prompt never redirects a worker or switched session to Main", async () => 
   await handleInstalledCommand("/prompt veyyon:root hello", f.port, f.runner);
   expect(f.inbound).toHaveLength(0);
 });
-test("Herdr prompt uses get-state then actual CLI prompt argv", async () => {
+test("Herdr prompt is explicitly unavailable and never invokes mutation CLI", async () => {
   const f = fixture(); await handleInstalledCommand("/prompt herdr:h1 hello world", f.port, f.runner);
-  expect(f.calls).toEqual([["herdr", "agent", "get", "h1"], ["herdr", "agent", "prompt", "h1", "hello world"]]);
+  expect(f.calls).toEqual([]);
+  expect(f.sent.join("\n")).toContain("read-only");
   expect(f.inbound).toHaveLength(0);
 });
 test("shot sends latest PNG as native photo with session caption", async () => {

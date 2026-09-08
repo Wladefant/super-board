@@ -13,11 +13,6 @@ class FakeRunner implements CommandRunner {
   }
 }
 
-const ok = (value: unknown): CommandResult => ({
-  exitCode: 0,
-  stdout: JSON.stringify({ id: "test", result: value }),
-  stderr: "",
-});
 
 describe("HerdrAdapter", () => {
   test("parses live agent states and stable targets", () => {
@@ -36,7 +31,7 @@ describe("HerdrAdapter", () => {
     expect(sessions.map(session => [session.id, session.state, session.canPrompt])).toEqual([
       ["builder", "working", false],
       ["w1:p2", "blocked", false],
-      ["w1:p3", "idle", true],
+      ["w1:p3", "idle", false],
     ]);
     expect(sessions[0].observedAt).toBe(123);
   });
@@ -48,25 +43,11 @@ describe("HerdrAdapter", () => {
     expect(sessions[0]).toMatchObject({ backend: "herdr", state: "stale", canPrompt: false });
   });
 
-  test("rejects a busy target without injecting the prompt", async () => {
-    const runner = new FakeRunner([ok({
-      type: "agent_get",
-      agent: { pane_id: "w1:p1", name: "builder", agent: "codex", agent_status: "working" },
-    })]);
+  test("read-only Herdr refuses mutation without invoking the terminal CLI", async () => {
+    const runner = new FakeRunner([]);
     const adapter = new HerdrAdapter(runner);
-    const result = await adapter.prompt("builder", "do not inject");
-    expect(result).toMatchObject({ ok: false, disposition: "rejected" });
-    expect(runner.calls).toEqual([["herdr", "agent", "get", "builder"]]);
-  });
-
-  test("prompts the exact idle target through the CLI", async () => {
-    const runner = new FakeRunner([
-      ok({ type: "agent_get", agent: { pane_id: "w1:p2", name: "reviewer", agent: "claude", agent_status: "idle" } }),
-      ok({ type: "agent_prompted" }),
-    ]);
-    const adapter = new HerdrAdapter(runner);
-    const result = await adapter.prompt("reviewer", "Review only this diff");
-    expect(result).toMatchObject({ ok: true, disposition: "started" });
-    expect(runner.calls[1]).toEqual(["herdr", "agent", "prompt", "reviewer", "Review only this diff"]);
+    expect(await adapter.prompt("builder", "hello")).toMatchObject({ ok: false, disposition: "rejected" });
+    expect(await adapter.abort("builder")).toMatchObject({ ok: false });
+    expect(runner.calls).toEqual([]);
   });
 });
