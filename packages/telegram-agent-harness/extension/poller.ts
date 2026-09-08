@@ -840,6 +840,66 @@ export class TelegramPoller {
     }
   }
 
+  public async sendMediaGroup(chatId: string, files: string[], caption?: string): Promise<void> {
+    if (!files || files.length === 0) {
+      throw new Error("Media group requires at least one file");
+    }
+    const targetFiles = files.slice(0, 10);
+    if (targetFiles.length === 1) {
+      return this.sendTelegramPhoto(chatId, targetFiles[0], caption ?? "");
+    }
+
+    const sessionId = this.correlation?.getSessionId();
+    const slotId = this.correlation?.getSlotId();
+    const form = new FormData();
+    form.set("chat_id", chatId);
+
+    const mediaList = targetFiles.map((file, idx) => {
+      const attachName = `photo_${idx}`;
+      form.set(attachName, Bun.file(file), path.basename(file));
+      const entry: Record<string, unknown> = {
+        type: "photo",
+        media: `attach://${attachName}`,
+      };
+      if (idx === 0 && caption && caption.trim()) {
+        entry.caption = redactSecrets(caption);
+        entry.parse_mode = "HTML";
+      }
+      return entry;
+    });
+
+    form.set("media", JSON.stringify(mediaList));
+
+    const response = await fetch(`https://api.telegram.org/bot${this.botToken}/sendMediaGroup`, {
+      method: "POST",
+      body: form,
+      signal: this.abortController.signal,
+    });
+    const data = (await response.json()) as {
+      ok: boolean;
+      result?: Array<{ message_id: number; chat?: { id: number } }>;
+    };
+    if (!response.ok || !data.ok || !Array.isArray(data.result) || data.result.length === 0) {
+      throw new Error("Media group delivery failed");
+    }
+
+    if (sessionId && slotId && this.correlation) {
+      for (const msg of data.result) {
+        this.correlation.record({
+          botId: this.botId,
+          chatId: String(msg.chat?.id ?? chatId),
+          messageId: msg.message_id,
+          slotId,
+          sessionId,
+          requestId: null,
+          decisionId: null,
+          projectPath: null,
+          createdAt: Date.now() / 1000,
+        });
+      }
+    }
+  }
+
   public stop(): void {
     this.isRunning = false;
     this.abortController.abort();

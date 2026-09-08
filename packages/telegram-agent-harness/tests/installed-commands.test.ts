@@ -1,5 +1,14 @@
 import { test, expect } from "bun:test";
-import { handleInstalledCommand, type InstalledCommandPort } from "../src/installed-commands";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { Database } from "bun:sqlite";
+import {
+  handleInstalledCommand,
+  readPendingDecisions,
+  readRecentOutboundCards,
+  type InstalledCommandPort,
+} from "../src/installed-commands";
 import type { CommandRunner } from "../src/contract";
 
 function fixture(idle = true) {
@@ -79,4 +88,141 @@ test("invalid prompt and backend exceptions are explicit and not retried", async
   f.runner.run = async () => { throw new Error("private backend detail"); };
   await handleInstalledCommand("/usage", f.port, f.runner);
   expect(f.sent[1]).toContain("Command unavailable"); expect(f.sent[1]).not.toContain("private");
+});
+
+test("status command renders full HTML status with model, agents, decisions, cards, and usage", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "tg-status-test-"));
+  try {
+    const decisionsFile = path.join(tmpDir, "decisions.json");
+    fs.writeFileSync(
+      decisionsFile,
+      JSON.stringify({
+        decisions: {
+          "DEC-1": {
+            decision_id: "DEC-1",
+            request_id: "req-101",
+            issue_number: 4500,
+            issue_url: "https://github.com/Bavariance/polysimulator/issues/4500",
+            question: "Approve migration plan?",
+            status: "pending",
+          },
+          "DEC-2": {
+            decision_id: "DEC-2",
+            question: "Old decision already resolved",
+            status: "resolved",
+          },
+        },
+      }),
+    );
+
+    const dbFile = path.join(tmpDir, "bot_pool.db");
+    const db = new Database(dbFile);
+    db.run(`CREATE TABLE message_correlations (
+      bot_id TEXT, chat_id TEXT, message_id INTEGER, slot_id TEXT,
+      session_id TEXT, request_id TEXT, decision_id TEXT, project_path TEXT, created_at REAL
+    )`);
+    const nowSec = Date.now() / 1000;
+    db.run(
+      "INSERT INTO message_correlations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ["bot1", "chat1", 1476, "slot1", "sess1", "phases-resend", null, "poly", nowSec - 60],
+    );
+    db.run(
+      "INSERT INTO message_correlations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ["bot1", "chat1", 1479, "slot1", "sess1", "status-summary", "DEC-1", "poly", nowSec - 10],
+    );
+    db.close();
+
+    const f = fixture(false);
+    f.state.id = "session-test-01a0";
+    (f.state as Record<string, unknown>).model = "gemini-3.8-flash:high";
+    (f.state as Record<string, unknown>).decisionsPath = decisionsFile;
+    (f.state as Record<string, unknown>).poolDbPath = dbFile;
+
+    const handled = await handleInstalledCommand("/status", f.port, f.runner);
+    expect(handled).toBe(true);
+    expect(f.sent).toHaveLength(1);
+    const output = f.sent[0];
+
+    expect(output).toContain("📊 <b>Veyyon Session Status</b>");
+    expect(output).toContain("session-test-01a0");
+    expect(output).toContain("gemini-3.8-flash:high");
+    expect(output).toContain("<b>Running / Streaming</b>");
+
+    expect(output).toContain("👥 <b>Active Agents");
+    expect(output).toContain("veyyon:session-test-01a0");
+    expect(output).toContain("herdr:Herdr &lt;worker&gt;");
+
+    expect(output).toContain("❓ <b>Open Operator Decisions (1 pending):</b>");
+    expect(output).toContain("<b>DEC-1</b>");
+    expect(output).toContain("https://github.com/Bavariance/polysimulator/issues/4500");
+    expect(output).toContain("Approve migration plan?");
+    expect(output).not.toContain("DEC-2");
+
+    expect(output).toContain("📤 <b>Recent Outbound Cards:</b>");
+    expect(output).toContain("#1479 · <code>decision: DEC-1</code>");
+    expect(output).toContain("#1476 · <code>phases-resend</code>");
+
+    expect(output).toContain("⚡ <b>Resource &amp; Quota Usage:</b>");
+    expect(output).toContain("Codex Spark");
+    expect(output).toContain("85% remaining");
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("readPendingDecisions extracts pending and open decisions safely", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "tg-decisions-test-"));
+  try {
+    const missing = readPendingDecisions(path.join(tmpDir, "missing.json"));
+    expect(missing).toEqual([]);
+
+    const decisionsFile = path.join(tmpDir, "decisions.json");
+    fs.writeFileSync(
+      decisionsFile,
+      JSON.stringify({
+        decisions: {
+          "D-1": { decision_id: "D-1", question: "Pending Q", status: "pending" },
+          "D-2": { decision_id: "D-2", question: "Open Q", status: "open", issue_number: 123 },
+          "D-3": { decision_id: "D-3", question: "Resolved Q", status: "resolved" },
+        },
+      }),
+    );
+
+    const result = readPendingDecisions(decisionsFile);
+    expect(result).toHaveLength(2);
+    expect(result[0].decisionId).toBe("D-1");
+    expect(result[1].decisionId).toBe("D-2");
+    expect(result[1].issueNumber).toBe(123);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("readRecentOutboundCards queries sqlite database with descending limit", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "tg-cards-test-"));
+  try {
+    const missing = readRecentOutboundCards(path.join(tmpDir, "missing.db"));
+    expect(missing).toEqual([]);
+
+    const dbFile = path.join(tmpDir, "test_pool.db");
+    const db = new Database(dbFile);
+    db.run(`CREATE TABLE message_correlations (
+      bot_id TEXT, chat_id TEXT, message_id INTEGER, slot_id TEXT,
+      session_id TEXT, request_id TEXT, decision_id TEXT, project_path TEXT, created_at REAL
+    )`);
+    for (let i = 1; i <= 7; i++) {
+      db.run(
+        "INSERT INTO message_correlations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ["b", "c", 1000 + i, "s", "sess", `req-${i}`, null, "p", 100 + i],
+      );
+    }
+    db.close();
+
+    const cards = readRecentOutboundCards(dbFile, 5);
+    expect(cards).toHaveLength(5);
+    expect(cards[0].messageId).toBe(1007);
+    expect(cards[4].messageId).toBe(1003);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });

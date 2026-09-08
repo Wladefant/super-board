@@ -20,7 +20,7 @@ import type {
 import { BotPoolCoordinator } from "./coordinator";
 import { DangerousToolGuard } from "./guard";
 import { TelegramPoller } from "./poller";
-import { chunkMessage, escapeHtml } from "./sanitizer";
+import { chunkMessage, escapeHtml, markdownToTelegramHtml } from "./sanitizer";
 import type { DiscoveredSlot, MessageCorrelationBridge } from "./types";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -76,11 +76,11 @@ function getStatusSummary(ctx: ExtensionContext, slot: DiscoveredSlot | null, se
 
   return [
     "📊 <b>Veyyon Session Status</b>",
-    `Session ID: <code>${sessionId}</code>`,
-    `Model: <code>${modelName}</code>`,
-    `State: <b>${idleState}</b>`,
-    `Bot Slot: <code>${slotName}</code> (Bot ID: ${botId})`,
-    `Directory: <code>${escapeHtml(ctx.cwd)}</code>`,
+    `• <b>Session ID:</b> <code>${sessionId}</code>`,
+    `• <b>Model:</b> <code>${modelName}</code>`,
+    `• <b>State:</b> <b>${idleState}</b>`,
+    `• <b>Bot Slot:</b> <code>${slotName}</code> (Bot ID: ${botId})`,
+    `• <b>Directory:</b> <code>${escapeHtml(ctx.cwd)}</code>`,
   ].join("\n");
 }
 
@@ -117,11 +117,11 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
         const chunk = chunks[i];
         if (i < sentTelegramMessageIds.length) {
           if (chunk !== streamedChunks[i]) {
-            await root.poller.editTelegramMessage(primaryChat, sentTelegramMessageIds[i], escapeHtml(chunk));
+            await root.poller.editTelegramMessage(primaryChat, sentTelegramMessageIds[i], markdownToTelegramHtml(chunk));
             streamedChunks[i] = chunk;
           }
         } else {
-          const res = await root.poller.sendTelegramMessage(primaryChat, escapeHtml(chunk));
+          const res = await root.poller.sendTelegramMessage(primaryChat, markdownToTelegramHtml(chunk));
           if (res?.ok && typeof res.result?.message_id === "number") {
             sentTelegramMessageIds.push(res.result.message_id);
             streamedChunks.push(chunk);
@@ -275,12 +275,18 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
           },
           getStatusText: () => getStatusSummary(ctx, activeSlot, currentSessionId()),
           onHarnessCommand: (text, chatId) => handleInstalledCommand(text, {
-            session: () => ({ id: currentSessionId(), cwd: ctx.cwd, idle: ctx.isIdle() }),
+            session: () => ({
+              id: currentSessionId(),
+              cwd: ctx.cwd,
+              idle: ctx.isIdle(),
+              model: ctx.model?.id,
+            }),
             send: async html => {
               const sent = await poller.sendTelegramMessage(chatId, html);
               if (!sent?.ok) throw new Error("Telegram delivery failed");
             },
             photo: (file, caption) => poller.sendTelegramPhoto(chatId, file, caption),
+            mediaGroup: (files, caption) => poller.sendMediaGroup(chatId, files, caption),
             latestPng: async id => {
               if (id !== currentSessionId()) return null;
               const sessionFile = ctx.sessionManager.getSessionFile();
