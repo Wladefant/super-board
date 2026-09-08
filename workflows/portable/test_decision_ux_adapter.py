@@ -994,6 +994,46 @@ class TestTelegramCallbackResolutionAndSessionProvenance(unittest.TestCase):
         self.assertEqual(dec["status"], "pending")
         self.assertIsNone(dec.get("answer"))
 
+    def test_process_reply_valid_session_resolves_and_unblocks(self):
+        res = self.mgr.process_reply(
+            decision_id="DEC-CB-1",
+            reply_text="Option A",
+            responder="Operator",
+            provenance=ProvenanceType.GITHUB_VERIFIED_USER,
+            comment_id="comment-valid-100",
+            comment_created_at="2026-09-08T12:00:00+00:00",
+            comment_time_provenance="api_verified",
+            session_id="session-alpha-100",
+        )
+        self.assertEqual(res["status"], "answered")
+        self.assertIn("req-test-cb", res["unblocked_requests"])
+        dec = self.mgr.get_decision("DEC-CB-1")
+        self.assertEqual(dec["status"], "answered")
+        self.assertIsNotNone(dec.get("answer"))
+        self.assertEqual(dec["answer"]["session_id"], "session-alpha-100")
+        self.assertEqual(dec["answer"]["selected_option_id"], "A")
+        req = self.ledger.get_request("req-test-cb")
+        self.assertNotIn("DEC-CB-1", req.get("decision_blockers", []))
+
+    def test_register_question_inherits_session_from_ledger_request(self):
+        new_dec = DecisionContract(
+            decision_id="DEC-INHERIT-1",
+            request_id="req-test-cb",
+            prompt="Inheritance test prompt",
+            question="Choose A or B",
+            options=OPTIONS,
+            recommendation="Option A",
+            blocking_dependencies=["req-test-cb"],
+            authorized_responders=["Operator"],
+            decision_scope=DecisionScope.ARCHITECTURAL_PREFERENCE,
+            status="pending",
+        )
+        registered = self.mgr.register_question(new_dec)
+        self.assertEqual(registered.get("session_id"), "session-alpha-100")
+        self.assertEqual(registered.get("session"), "session-alpha-100")
+        dec_record = self.mgr.get_decision("DEC-INHERIT-1")
+        self.assertEqual(dec_record.get("session_id"), "session-alpha-100")
+        self.assertEqual(dec_record.get("session"), "session-alpha-100")
     def test_unselected_free_text_does_not_unblock_or_authorize(self):
         res = self.mgr.process_reply(
             decision_id="DEC-CB-1",

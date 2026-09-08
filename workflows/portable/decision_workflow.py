@@ -286,6 +286,7 @@ class DecisionContract:
     rejected_inputs: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     last_rejected_input: Optional[Dict[str, Any]] = None
     recovery: Optional[Dict[str, Any]] = None
+    session_id: Optional[str] = None
 
 
 def validate_decision_scope(decision: DecisionContract) -> Tuple[bool, str]:
@@ -1188,6 +1189,16 @@ class DecisionManager:
         if not is_scope_valid:
             raise ValueError(f"Cannot register decision '{decision.decision_id}': {scope_err}")
 
+        # Inherit session from ledger request if not explicitly provided
+        if not getattr(decision, "session_id", None) and decision.request_id and hasattr(self.ledger, "get_request"):
+            try:
+                req_data = self.ledger.get_request(decision.request_id)
+                req_session = req_data.get("session") or req_data.get("session_id")
+                if req_session:
+                    decision.session_id = str(req_session).strip()
+            except Exception:
+                pass
+
         with FileLock(self.lock_path):
             data = self._load_data_unlocked()
             d_id = decision.decision_id
@@ -1195,6 +1206,9 @@ class DecisionManager:
                 raise ValueError(f"Decision '{d_id}' already exists.")
 
             dec_dict = asdict(decision)
+            if getattr(decision, "session_id", None):
+                dec_dict["session"] = decision.session_id
+                dec_dict["session_id"] = decision.session_id
             data["decisions"][d_id] = dec_dict
             self._save_data_unlocked(data)
 
@@ -1445,6 +1459,7 @@ class DecisionManager:
                 clarification_prompt=dec_dict.get("clarification_prompt"),
                 rejection_reason=dec_dict.get("rejection_reason"),
                 audit_trail=dec_dict.get("audit_trail", []),
+                session_id=dec_dict.get("session_id") or dec_dict.get("session"),
             )
 
             # Open-decision replay is keyed to the immutable GitHub comment
@@ -1744,9 +1759,12 @@ class DecisionManager:
                 # Only a distinct, API-verified GitHub user event may resolve new
                 # real work. Legacy human_operator remains readable on historical
                 # answers but can never authorize a new state transition.
-                if is_test or parse_result.get("provenance") != ProvenanceType.GITHUB_VERIFIED_USER:
+                if is_test or parse_result.get("provenance") not in (
+                    ProvenanceType.GITHUB_VERIFIED_USER,
+                    ProvenanceType.TELEGRAM_VERIFIED_CALLBACK,
+                ):
                     dec_dict["rejection_reason"] = (
-                        "Selection was retained but did not carry distinct, verified GitHub user provenance; "
+                        "Selection was retained but did not carry distinct, verified GitHub user or Telegram callback provenance; "
                         "real task unblock is prohibited."
                     )
                     # Do not set status = answered on real decision
@@ -2198,6 +2216,7 @@ class DecisionManager:
                 clarification_prompt=dec_dict.get("clarification_prompt"),
                 rejection_reason=dec_dict.get("rejection_reason"),
                 audit_trail=dec_dict.get("audit_trail", []),
+                session_id=dec_dict.get("session_id") or dec_dict.get("session"),
             )
 
             # Check if decision is already terminal
@@ -3613,6 +3632,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ask.add_argument("--issue", type=int, default=None, help="GitHub issue number to attach/post")
     p_ask.add_argument("--repo", default=DEFAULT_REPO, help="GitHub repo")
     p_ask.add_argument("--post", action="store_true", help="Post to GitHub issue immediately")
+    p_ask.add_argument("--session", default=None, help="Optional session ID (inherited from request if omitted)")
 
     # INGEST
     p_ing = subparsers.add_parser("ingest", help="Ingest and verify a reply comment from GitHub API")
@@ -3636,6 +3656,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_rep.add_argument("--comment-id", default=None, help="Optional comment ID")
     p_rep.add_argument("--comment-url", default=None, help="Optional comment URL")
     p_rep.add_argument("--test", action="store_true", help="Mark as synthetic test (cannot unblock real ledger tasks)")
+    p_rep.add_argument("--session", default=None, help="Optional session ID for session binding verification")
+    p_rep.add_argument(
+        "--provenance",
+        choices=[
+            ProvenanceType.GITHUB_VERIFIED_USER,
+            ProvenanceType.TELEGRAM_VERIFIED_CALLBACK,
+            ProvenanceType.UNVERIFIED_CALLER,
+            ProvenanceType.SYNTHETIC_TEST,
+        ],
+        default=None,
+        help="Explicit caller provenance type",
+    )
+    p_rep.add_argument("--comment-created-at", default=None, help="Optional comment creation timestamp (ISO 8601)")
+    p_rep.add_argument(
+        "--comment-time-provenance",
+        choices=[CommentTimeProvenance.API_VERIFIED, CommentTimeProvenance.CALLER_SUPPLIED],
+        default=None,
+        help="Provenance of comment creation timestamp",
+    )
 
     # SYNC
     p_syn = subparsers.add_parser("sync", help="Synchronize pending decisions with GitHub issue comments")
@@ -3729,6 +3768,7 @@ def main():
                 authorized_responders=authorized,
                 decision_scope=args.scope,
                 issue_number=args.issue,
+                session_id=args.session,
             )
 
             res = mgr.register_question(contract)
@@ -3837,8 +3877,17 @@ def main():
                 responder=args.responder,
                 comment_id=args.comment_id,
                 comment_url=args.comment_url,
-                provenance=ProvenanceType.SYNTHETIC_TEST if args.test else ProvenanceType.UNVERIFIED_CALLER,
+                provenance=args.provenance or (
+                    ProvenanceType.SYNTHETIC_TEST if args.test else ProvenanceType.UNVERIFIED_CALLER
+                ),
                 is_test=args.test,
+                comment_created_at=args.comment_created_at,
+                comment_time_provenance=(
+                    args.comment_time_provenance
+                    if args.comment_time_provenance
+                    else (CommentTimeProvenance.API_VERIFIED if (args.comment_created_at and args.provenance == ProvenanceType.GITHUB_VERIFIED_USER) else CommentTimeProvenance.CALLER_SUPPLIED)
+                ),
+                session_id=args.session,
             )
             print(f"Decision:    {args.id}")
             print(f"Status:      {res['status']}")
