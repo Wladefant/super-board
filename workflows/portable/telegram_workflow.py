@@ -24,6 +24,7 @@ except ImportError as exc:  # pragma: no cover - import diagnostics
 
 MAX_PAGE_SIZE = 20
 MAX_TEXT_LENGTH = 1200
+MAX_NATIVE_SNAPSHOT_ITEMS = 200
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,84 @@ class TelegramIdentity:
     session_id: str
     actor: str
 
+
+@dataclass(frozen=True)
+class NativeControlAuth:
+    """Exact authentication envelope accepted by Veyyon's native bridge."""
+
+    auth_token: str
+    actor_id: str
+    chat_id: str
+    session_id: str
+
+    def to_native(self) -> Dict[str, str]:
+        return {
+            "authToken": self.auth_token,
+            "actorId": self.actor_id,
+            "chatId": self.chat_id,
+            "sessionId": self.session_id,
+        }
+
+
+class NativeControlSnapshotConsumer:
+    """Consumes the real native bridge contract into the portable snapshot shape."""
+
+    def __init__(
+        self,
+        native_control: Any,
+        auth: NativeControlAuth,
+        sessions: Optional[Callable[[], Sequence[Mapping[str, Any]]]] = None,
+    ):
+        if not callable(getattr(native_control, "getSessionIdentity", None)):
+            raise TypeError("native_control must expose getSessionIdentity")
+        if not callable(getattr(native_control, "listAgents", None)):
+            raise TypeError("native_control must expose listAgents")
+        self.native_control = native_control
+        self.auth = auth
+        self.sessions = sessions
+
+    def __call__(self) -> Mapping[str, Any]:
+        native_auth = self.auth.to_native()
+        identity = self.native_control.getSessionIdentity(dict(native_auth))
+        if not isinstance(identity, Mapping):
+            raise TypeError("native control returned an invalid identity response")
+
+        agents: List[Dict[str, Any]] = []
+        cursor: Optional[str] = None
+        seen_cursors = set()
+        while len(agents) < MAX_NATIVE_SNAPSHOT_ITEMS:
+            request: Dict[str, Any] = {**native_auth, "limit": MAX_PAGE_SIZE}
+            if cursor is not None:
+                request["cursor"] = cursor
+            page = self.native_control.listAgents(request)
+            if not isinstance(page, Mapping):
+                raise TypeError("native control returned an invalid agent page")
+            items = page.get("items")
+            if not isinstance(items, Sequence) or isinstance(items, (str, bytes)):
+                raise TypeError("native control listAgents response must contain items")
+            agents.extend(
+                dict(item)
+                for item in items
+                if isinstance(item, Mapping)
+            )
+            agents = agents[:MAX_NATIVE_SNAPSHOT_ITEMS]
+            next_cursor = page.get("nextCursor") or page.get("next_cursor")
+            if next_cursor is None:
+                break
+            cursor = str(next_cursor)
+            if not cursor or cursor in seen_cursors:
+                raise ValueError("native control returned a repeated pagination cursor")
+            seen_cursors.add(cursor)
+
+        return {
+            "identity": dict(identity),
+            "agents": agents,
+            "sessions": [
+                dict(item)
+                for item in (self.sessions() if self.sessions else [])
+                if isinstance(item, Mapping)
+            ],
+        }
 
 @dataclass
 class WorkflowPage:
@@ -115,12 +194,12 @@ class TelegramWorkflowFacade:
     def _safe_text(value: Any, limit: int = MAX_TEXT_LENGTH) -> str:
         text = SecretSanitizer.sanitize(str(value or ""))
         text = re.sub(
-            r"(?i)\b(password|secret|token|api[_-]?key)\s*[:=]\s*[^\s,;]+",
+            r"(?i)\b(password|secret|token|api[_-]?key)\s*[\"']?\s*[:=]\s*[^\s,;]+",
             r"\1=[REDACTED]",
             text,
         )
         text = re.sub(r"(?i)\b[A-Z]:\\(?:[^\\\s]+\\)+", r"C:\\<path>\\", text)
-        text = re.sub(r"(?<!:)\/(?:home|Users|srv|opt|var)\/[^\s,;]+", "/<path>", text)
+        text = re.sub(r"(?<![:/A-Za-z0-9._~-])/(?:[^/\s,;]+/)+[^/\s,;]+", "/<path>", text)
         return text[:limit]
 
     @classmethod
@@ -156,7 +235,7 @@ class TelegramWorkflowFacade:
         workspace = raw.get("workspace_label") or raw.get("workspace") or raw.get("cwd")
         if not workspace:
             return None
-        return os.path.basename(str(workspace).rstrip("/\\"))[:120]
+        return os.path.basename(str(workspace).rstrip("/\\").replace("\\", "/"))[:120]
 
     def _page(
         self,
@@ -179,7 +258,9 @@ class TelegramWorkflowFacade:
         agents = [
             self._native_agent_item(item, identity.session_id)
             for item in snapshot.get("agents", [])
-            if not item.get("session_id") or str(item.get("session_id")) == identity.session_id
+            if (
+                not item.get("session_id") and not item.get("sessionId")
+            ) or str(item.get("session_id") or item.get("sessionId")) == identity.session_id
         ]
         return self._page(identity, "agents", agents, cursor, limit)
 
@@ -278,26 +359,28 @@ class TelegramWorkflowFacade:
         }
 
     def task_status(self, identity: TelegramIdentity, request_id: str) -> Dict[str, Any]:
-        """Use the existing coordinator's bounded evaluation; never dispatch a worker."""
+        """Return a side-effect-free ledger health view; never sync or notify."""
         self._authorize(identity)
-        self._require_session_request(identity, self.ledger.get_request(request_id))
-        packet = self.coordinator.evaluate_step(request_id=request_id)
-        payload = packet.to_dict() if hasattr(packet, "to_dict") else dict(packet)
+        request = self._require_session_request(
+            identity, self.ledger.get_request(request_id)
+        )
+        payload = self.ledger.check_request(request_id)
         return {
             "kind": "coordinator_status",
             "session_id": identity.session_id,
             "status": self._safe_text(payload.get("status"), 80),
-            "status_reason": self._safe_text(payload.get("status_reason"), 500),
+            "status_reason": self._safe_text(
+                "; ".join(list(payload.get("issues") or []) + list(payload.get("warnings") or [])),
+                500,
+            ),
             "next_action": self._safe_text(payload.get("next_action"), 500),
-            "request": self._task_item(payload["request"]) if payload.get("request") else None,
+            "request": self._task_item(request),
             "decision_status": {
-                "pending_count": int((payload.get("decision_status") or {}).get("pending_count") or 0),
-                "blocking_this_request": bool(
-                    (payload.get("decision_status") or {}).get("blocking_this_request")
-                ),
+                "pending_count": len(payload.get("decision_blockers") or []),
+                "blocking_this_request": bool(payload.get("decision_blockers")),
                 "blocking_decision_ids": [
                     self._safe_text(value, 160)
-                    for value in (payload.get("decision_status") or {}).get("blocking_decision_ids", [])[:20]
+                    for value in (payload.get("decision_blockers") or [])[:20]
                 ],
             },
         }
@@ -355,6 +438,15 @@ class TelegramWorkflowFacade:
         decision = self.decisions.get_decision(decision_id)
         request = self.ledger.get_request(decision.get("request_id"))
         self._require_session_request(identity, request)
+        for dependency_id in decision.get("blocking_dependencies", []):
+            dependency = self.ledger.get_request(dependency_id)
+            self._require_session_request(identity, dependency)
+        authorized_responders = list(decision.get("authorized_responders") or [])
+        if len(authorized_responders) != 1:
+            raise ValueError(
+                "Telegram decisions require exactly one authorized responder until "
+                "the shared ledger supports responder sets"
+            )
         replay_key = f"telegram:{identity.chat_id}:{update_id}"
         result = self.decisions.process_reply(
             decision_id=decision_id,
