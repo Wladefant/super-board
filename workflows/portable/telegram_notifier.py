@@ -821,51 +821,81 @@ class TelegramNotificationAdapter:
 
     @classmethod
     def format_message(cls, event: NotificationEvent, plain_language: bool = False) -> str:
-        """Formats an event into exactly ONE concise sentence + canonical link.
-        Ensures no secrets or internal paths leak.
-        When plain_language is True (or for decision events with plain presentation),
-        delegates to format_decision_presentation.
-        """
+        """Render one quiet, escaped Telegram HTML card with one details link."""
         event.validate()
 
-        if event.event_type == "decision" and plain_language:
-            return format_decision_presentation(
-                problem=event.metadata.get("problem") or event.summary,
-                proposed_action=event.metadata.get("proposed_action") or "Select an option below to proceed with authorized execution.",
-                consequence_or_risk=event.metadata.get("consequence_or_risk") or "Work on dependent tasks remains suspended until an authorized choice is selected.",
-                details_url=event.metadata.get("details_url") or event.canonical_link,
-                options=event.metadata.get("options"),
-            )
-
-
-        type_labels = {
-            "milestone": "Milestone",
-            "blocker": "Blocker",
-            "decision": "Decision Needed",
-            "question": "Question",
-            "status": "Status Update",
-            "completion": "Completed",
+        presentation = {
+            "milestone": ("🚀", "Milestone reached"),
+            "blocker": ("🛑", "Blocked"),
+            "decision": ("❓", "Decision needed"),
+            "question": ("❓", "Question"),
+            "status": ("📊", "Status update"),
+            "completion": ("✅", "Completed"),
         }
-        label = type_labels.get(event.event_type, event.event_type.capitalize())
+        emoji, title = presentation.get(event.event_type, ("ℹ️", event.event_type.capitalize()))
+        project = SecretSanitizer.sanitize(str(event.project).strip())
+        request_id = SecretSanitizer.sanitize(str(event.request_id).strip())
+        summary = SecretSanitizer.sanitize(str(event.summary).strip())
+        detail = SecretSanitizer.sanitize(
+            str(event.metadata.get("long_detail") or event.metadata.get("detail") or "").strip()
+        )
 
-        # Clean summary to concise sentences
-        clean_summary = SecretSanitizer.sanitize(event.summary.strip().replace("\n", " "))
-        # Ensure single sentence punctuation
-        if not clean_summary.endswith((".", "!", "?")):
-            clean_summary += "."
+        lines = [
+            f"{emoji} <b>{escape_html(title)}</b>",
+            f"<i>{escape_html(project)} · {escape_html(request_id)}</i>",
+            "",
+        ]
 
-        # Collect canonical links: event.canonical_link plus any metadata links
-        raw_links = event.canonical_link.strip().split()
-        if "links" in event.metadata and isinstance(event.metadata["links"], list):
-            for lk in event.metadata["links"]:
-                lk_str = str(lk).strip()
-                if lk_str and lk_str not in raw_links:
-                    raw_links.append(lk_str)
-        links_str = " ".join(raw_links)
+        if event.event_type == "decision" and plain_language:
+            problem = SecretSanitizer.sanitize(
+                str(event.metadata.get("problem") or summary).strip()
+            )
+            action = SecretSanitizer.sanitize(
+                str(
+                    event.metadata.get("proposed_action")
+                    or "Choose one option below, or reply with guidance."
+                ).strip()
+            )
+            risk = SecretSanitizer.sanitize(
+                str(
+                    event.metadata.get("consequence_or_risk")
+                    or "Dependent work remains paused until this is answered."
+                ).strip()
+            )
+            lines.extend(
+                [
+                    f"• <b>What:</b> {escape_html(problem)}",
+                    f"• <b>Action:</b> {escape_html(action)}",
+                    f"• <b>Impact:</b> {escape_html(risk)}",
+                ]
+            )
+        elif len(summary) > 280 or "\n" in summary:
+            lines.append("• Full update below.")
+            detail = "\n\n".join(part for part in (summary, detail) if part)
+        else:
+            lines.append(f"• {escape_html(summary)}")
 
-        # Build message
-        msg = f"[{label}] {event.project} {event.request_id}: {clean_summary} {links_str}"
-        return msg
+        options = event.metadata.get("options")
+        if event.event_type in ("decision", "question") and isinstance(options, list):
+            for option in options:
+                if isinstance(option, dict):
+                    option_id = SecretSanitizer.sanitize(str(option.get("id") or "").strip())
+                    option_label = SecretSanitizer.sanitize(
+                        str(option.get("label") or option.get("description") or option_id).strip()
+                    )
+                    prefix = f"{option_id}: " if option_id and option_id != option_label else ""
+                    lines.append(f"• <b>{escape_html(prefix + option_label)}</b>")
+
+        if detail:
+            lines.extend(["", f"<blockquote expandable>{escape_html(detail)}</blockquote>"])
+
+        details_url = str(
+            event.metadata.get("details_url") or event.canonical_link or ""
+        ).strip().split()[0]
+        if details_url.startswith(("http://", "https://")):
+            lines.extend(["", f'<a href="{escape_html(details_url)}">Details</a>'])
+
+        return "\n".join(lines)
 
     def test_connection(self, project: str = "polysimulator", slot_id: Optional[str] = None) -> Dict[str, Any]:
         """Read-only test to verify bot credentials and API reachability via getMe."""
@@ -1007,14 +1037,15 @@ class TelegramNotificationAdapter:
         bound_session = event.session_id or None
 
         # 3. Format message
-        if event.event_type == "decision":
-            message_text = self.format_message(event, plain_language=True)
-        else:
-            message_text = self.format_message(event)
+        message_text = self.format_message(
+            event,
+            plain_language=event.event_type == "decision",
+        )
 
-        # Build inline keyboard buttons for decision options
+        # Questions and decisions share the existing actor/chat/session-bound
+        # callback store. Free-text replies remain guidance, never approval.
         reply_markup = None
-        if event.event_type == "decision" and event.metadata.get("options"):
+        if event.event_type in ("decision", "question") and event.metadata.get("options"):
             reply_markup = build_decision_inline_keyboard(
                 decision_id=str(event.metadata.get("decision_id") or event.request_id or ""),
                 options=event.metadata.get("options") or [],
@@ -1049,8 +1080,7 @@ class TelegramNotificationAdapter:
             "text": message_text,
             "disable_web_page_preview": False,
         }
-        if event.event_type == "decision":
-            payload["parse_mode"] = "HTML"
+        payload["parse_mode"] = "HTML"
         if reply_markup:
             payload["reply_markup"] = reply_markup
         data_bytes = json.dumps(payload).encode("utf-8")
