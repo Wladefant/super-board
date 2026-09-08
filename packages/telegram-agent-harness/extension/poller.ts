@@ -104,6 +104,7 @@ export class TelegramPoller {
   private db: Database;
   private isRunning = false;
   private primaryChatId: string | null = null;
+  private pendingDrain: Promise<void> | null = null;
 
   constructor(
     botToken: string,
@@ -247,7 +248,7 @@ export class TelegramPoller {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
-          signal: this.abortController.signal,
+          signal: AbortSignal.any([this.abortController.signal, AbortSignal.timeout(3000)]),
         },
       );
 
@@ -321,7 +322,7 @@ export class TelegramPoller {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }),
-        signal: this.abortController.signal,
+        signal: AbortSignal.any([this.abortController.signal, AbortSignal.timeout(3000)]),
       });
       const data: unknown = await response.json();
       return Boolean(data && typeof data === "object" && "ok" in data && data.ok === true);
@@ -488,7 +489,17 @@ export class TelegramPoller {
     }
   }
 
-  public async redrivePendingUpdates(): Promise<void> {
+  public redrivePendingUpdates(): Promise<void> {
+    // One leased poller owns the queue. Concurrent redrives share its drain,
+    // so delayed consumption cannot let two clicks dispatch simultaneously.
+    if (!this.pendingDrain) {
+      this.pendingDrain = Promise.resolve().then(() => this.drainPendingUpdates())
+        .finally(() => { this.pendingDrain = null; });
+    }
+    return this.pendingDrain;
+  }
+
+  private async drainPendingUpdates(): Promise<void> {
     let rows: LedgerRow[];
     try {
       rows = this.db
@@ -590,7 +601,7 @@ export class TelegramPoller {
         );
         await this.sendTelegramMessage(chatId, `Selection not delivered: ${escapeHtml(resolution.detail)}. Reconnect the original session or reply to the question with your choice.`);
         if (typeof row.reply_to_message_id === "number" &&
-            ["reject_expired", "reject_already_consumed", "reject_already_answered"].includes(resolution.decision)) {
+            ["reject_unknown", "reject_expired", "reject_already_consumed", "reject_already_answered"].includes(resolution.decision)) {
           await this.clearCallbackButtons(chatId, row.reply_to_message_id);
         }
         return;
@@ -604,13 +615,25 @@ export class TelegramPoller {
       if (record.sessionId !== this.correlation.getSessionId()) {
         throw new Error("Session changed; reconnect the original session and retry your choice.");
       }
-      if (!this.correlation.consumeCallback(callbackToken)) {
-        if (cbQueryId) await this.answerCallbackQuery(cbQueryId, "This choice was already received.", true);
-        this.db.run("UPDATE update_ledger SET status = 'REJECTED', error = 'CALLBACK_ALREADY_CONSUMED' WHERE update_id = ?", [row.update_id]);
+      // A completed local delivery also deduplicates if the shared callback
+      // store could not persist consumption after accepting the operator reply.
+      const delivered = this.db.query(
+        "SELECT update_id FROM update_ledger WHERE callback_data = ? AND status = 'COMPLETED' LIMIT 1",
+      ).get(callbackToken);
+      if (delivered) {
+        this.db.run("UPDATE update_ledger SET status = 'REJECTED', error = 'CALLBACK_ALREADY_DELIVERED' WHERE update_id = ?", [row.update_id]);
+        await this.sendTelegramMessage(chatId, "This choice was already delivered to the session.");
+        if (typeof row.reply_to_message_id === "number") await this.clearCallbackButtons(chatId, row.reply_to_message_id);
         return;
       }
       this.callbacks.onTelegramTurnStart();
-      await this.callbacks.onDecisionCallback(record.decisionId, record.choiceId, row.reply_to_text ?? undefined);
+      await this.callbacks.onDecisionCallback(record.decisionId, record.choiceId,
+        [`Callback identity: ${record.callbackToken}`, row.reply_to_text].filter(Boolean).join("\n"));
+      // At-least-once across a crash between delivery and consumption: never
+      // irreversibly discard a choice before the session has accepted it.
+      if (!this.correlation.consumeCallback(callbackToken)) {
+        this.callbacks.onLedgerFailure(`Callback ${row.update_id} delivered but consumption was not confirmed`);
+      }
 
       // Preserve the original question/caption (including photo messages). Do not
       // claim canonical authorization or a cleared blocker merely from a click.
@@ -630,6 +653,7 @@ export class TelegramPoller {
     //    answers, so it must resolve to an outbound message of THIS session. An
     //    unknown, unbound, or foreign-session target is refused instead of being
     //    injected into whichever session currently holds the bot lease.
+    const inboundSessionId = this.correlation?.getSessionId();
     let replyCorrelation: OutboundMessageCorrelation | null = null;
     if (typeof row.reply_to_message_id === "number") {
       const resolution = this.correlation
@@ -696,6 +720,9 @@ export class TelegramPoller {
     if (!row.media_json && await this.callbacks.onHarnessCommand?.(rawText, chatId)) {
       this.db.run("UPDATE update_ledger SET status = 'COMPLETED' WHERE update_id = ?", [row.update_id]);
       return;
+    }
+    if (this.correlation?.getSessionId() !== inboundSessionId) {
+      throw new Error("Session changed during message routing; resend to the intended session");
     }
     if (rawText === "/help" || rawText === "/start") {
       const helpMsg = [

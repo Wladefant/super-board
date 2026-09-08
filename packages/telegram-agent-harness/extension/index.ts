@@ -298,6 +298,13 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
           onDecisionCallback: async (decisionId, choiceId, context) => {
             if (guard) guard.startTelegramTurn();
             const decisionSessionId = currentSessionId();
+            // Accept the operator reply before canonical side effects. A session
+            // switch while the resolver runs cannot redirect or lose this reply.
+            pi.sendUserMessage([
+              `[Telegram Decision Received] Operator selected Option ${choiceId} for decision '${decisionId}'.`,
+              context ? `Context: ${context}` : "",
+              "This is an operator selection, not proof that a blocker was cleared. Verify the canonical decision before resuming gated work.",
+            ].filter(Boolean).join("\n"), { deliverAs: ctx.isIdle() ? "followUp" : "steer" });
             let canonicalResolved = false;
             try {
               const workflowScript = path.join(os.homedir(), ".veyyon", "workflows", "decision_workflow.py");
@@ -325,18 +332,9 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
               pi.logger.warn(`Could not trigger canonical decision resolution: ${String(err)}`);
             }
 
-            if (currentSessionId() !== decisionSessionId) {
-              throw new Error("Session changed during decision resolution; choice was not injected into the new session");
+            if (!canonicalResolved) {
+              pi.logger.warn(`Operator choice delivered, but canonical decision '${decisionId}' was not resolved`);
             }
-            const promptText = [
-              `[Telegram Decision Received] Operator selected Option ${choiceId} for decision '${decisionId}'.`,
-              context ? `Context: ${context}` : "",
-              canonicalResolved
-                ? "Canonical decision resolver completed successfully."
-                : "This is the operator's selection, not confirmation that a decision blocker was cleared. Check the decision before resuming gated work.",
-            ].filter(Boolean).join("\n");
-
-            pi.sendUserMessage(promptText, { deliverAs: ctx.isIdle() ? "followUp" : "steer" });
           },
           onLedgerFailure: message => {
             pi.logger.warn(
