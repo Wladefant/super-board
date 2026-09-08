@@ -96,6 +96,7 @@ export interface TelegramCallbackQuery {
     };
     date: number;
     text?: string;
+    caption?: string;
   };
   data?: string;
 }

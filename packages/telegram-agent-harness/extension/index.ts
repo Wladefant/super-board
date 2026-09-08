@@ -297,6 +297,15 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
           },
           onDecisionCallback: async (decisionId, choiceId, context) => {
             if (guard) guard.startTelegramTurn();
+            const decisionSessionId = currentSessionId();
+            // Accept the operator reply before canonical side effects. A session
+            // switch while the resolver runs cannot redirect or lose this reply.
+            pi.sendUserMessage([
+              `[Telegram Decision Received] Operator selected Option ${choiceId} for decision '${decisionId}'.`,
+              context ? `Context: ${context}` : "",
+              "This is an operator selection, not proof that a blocker was cleared. Verify the canonical decision before resuming gated work.",
+            ].filter(Boolean).join("\n"), { deliverAs: ctx.isIdle() ? "followUp" : "steer" });
+            let canonicalResolved = false;
             try {
               const workflowScript = path.join(os.homedir(), ".veyyon", "workflows", "decision_workflow.py");
               if (fs.existsSync(workflowScript)) {
@@ -309,24 +318,23 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
                   "--choice",
                   choiceId,
                   "--token",
-                  `telegram-session-${currentSessionId()}`,
+                  `telegram-session-${decisionSessionId}`,
                   "--session",
-                  currentSessionId(),
+                  decisionSessionId,
                   "--json",
-                ]);
-                await proc.exited;
+                ], { stdout: "pipe", stderr: "ignore" });
+                const [exitCode, output] = await Promise.all([proc.exited, new Response(proc.stdout).text()]);
+                const result: unknown = JSON.parse(output);
+                canonicalResolved = exitCode === 0 && result !== null && typeof result === "object" &&
+                  "ok" in result && result.ok === true;
               }
             } catch (err: unknown) {
               pi.logger.warn(`Could not trigger canonical decision resolution: ${String(err)}`);
             }
 
-            const promptText = [
-              `[Telegram Decision Received] Operator selected Option ${choiceId} for decision '${decisionId}'.`,
-              context ? `Context: ${context}` : "",
-              `Decision blocker has been cleared in request ledger. Resuming authorized work.`,
-            ].filter(Boolean).join("\n");
-
-            pi.sendUserMessage(promptText, { deliverAs: "followUp" });
+            if (!canonicalResolved) {
+              pi.logger.warn(`Operator choice delivered, but canonical decision '${decisionId}' was not resolved`);
+            }
           },
           onLedgerFailure: message => {
             pi.logger.warn(
