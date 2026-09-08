@@ -4,14 +4,14 @@ workflows/telegram_notifier.py — Portable Telegram Workflow Status Notificatio
 
 A harness-agnostic, pure Python standard library notification adapter for multi-agent workflows.
 Consumes portable CoordinatorPacket events or direct status updates and dispatches strictly
-deduped, rate-limited HTML status cards with a single canonical details link.
+deduped, rate-limited HTML cards with entity-local links and optional embedded media.
 
 Invariants:
 1. Canonical Authority: Status is always anchored to GitHub Issues / PRs and Superboard.
    Telegram is strictly an outbound notification transport, never a parallel system of record.
-2. Filtered Event Classes: milestone, blocker, decision, completion ONLY.
+2. Filtered Event Classes: milestone, blocker, decision, question, status, completion.
    Routine tool execution, subagent traces, and search/read chatter are strictly rejected.
-3. Message Format: Compact escaped HTML, expandable detail, and one canonical Details link.
+3. Message Format: Compact HTML cards, labeled choices, expandable detail; no link footers.
 4. No Credential Leakage: Tokens, keys, and local file paths are strictly redacted.
    Bot tokens are loaded into private memory only and never echoed, printed, or persisted to logs.
 5. Deduplication & Cooldown:
@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import os
 import re
@@ -177,8 +178,6 @@ class NotificationEvent:
             raise ValueError("project is required")
         if not self.summary:
             raise ValueError("summary is required")
-        if not self.canonical_link:
-            raise ValueError("canonical_link is required")
 
 
 @dataclass
@@ -712,52 +711,147 @@ def escape_html(text: str) -> str:
     )
 
 
-def format_decision_presentation(
-    problem: str,
-    proposed_action: str,
-    consequence_or_risk: str,
-    details_url: Optional[str] = None,
-    options: Optional[List[Any]] = None,
-) -> str:
-    """Formats a decision for Telegram in strict plain language.
-    Guarantees:
-    - Short plain-language problem
-    - Concrete proposed action
-    - Consequence / risk
-    - Clearly labeled buttons / options summary
-    - At most ONE optional details link
-    - No request IDs, raw paths, or multiple URLs
-    """
-    clean_problem = SecretSanitizer.sanitize(str(problem or "").strip())
-    clean_action = SecretSanitizer.sanitize(str(proposed_action or "").strip())
-    clean_risk = SecretSanitizer.sanitize(str(consequence_or_risk or "").strip())
+def card_link(url: str, label: str) -> str:
+    if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
+        return escape_html(label)
+    return f'<a href="{escape_html(url)}">{escape_html(label)}</a>'
 
-    lines = [
-        f"❓ <b>Problem:</b> {escape_html(clean_problem)}",
-        "",
-        f"👉 <b>Proposed Action:</b> {escape_html(clean_action)}",
-        "",
-        f"⚠️ <b>Risk / Consequence:</b> {escape_html(clean_risk)}",
-    ]
 
-    if options:
-        lines.append("")
-        lines.append("<b>Choices:</b>")
-        for opt in options:
+def inline_text(value: Any, project: str = "") -> str:
+    """Escape untrusted prose, preserving only validated inline links."""
+    text = SecretSanitizer.sanitize(str(value or "").strip())
+    text = re.sub(r"\*\*([^*]+)\*\*|`([^`]+)`", lambda m: m.group(1) or m.group(2), text)
+    text = re.sub(r"\[\d+\]", "", text)
+    text = re.sub(r"(?im)^\s*(?:Details|References|Sources):\s*https?://\S+\s*$", "", text).strip()
+    repo = project if re.fullmatch(r"[\w.-]+/[\w.-]+", project) else ""
+    pattern = re.compile(r'<a\s+href=["\']([^"\']+)["\']\s*>(.*?)</a>|\[([^\]\n]+)\]\((https?://[^\s)]+)\)|https?://[^\s<>"]+|(?:[\w.-]+/[\w.-]+)?#\d+|\b[0-9a-fA-F]{40}\b', re.S)
+    parts, end = [], 0
+    for match in pattern.finditer(text):
+        parts.append(escape_html(text[end:match.start()]))
+        token = match.group()
+        if match.group(1):
+            parts.append(card_link(html.unescape(match.group(1)), html.unescape(re.sub(r"<[^>]*>", "", match.group(2)))))
+        elif match.group(3):
+            parts.append(card_link(match.group(4), match.group(3)))
+        elif token.startswith(("https://", "http://")):
+            url = token.rstrip(".,;:!)")
+            parts.append(card_link(url, url) + escape_html(token[len(url):]))
+        elif re.fullmatch(r"[0-9a-fA-F]{40}", token) and repo:
+            parts.append(f'<a href="https://github.com/{repo}/commit/{token}"><code>{token[:8]}</code></a>')
+        elif "#" in token:
+            explicit, number = token.rsplit("#", 1)
+            target = explicit or repo
+            kind = "pull" if re.search(r"\bPR\s*$", text[:match.start()], re.I) else "issues"
+            parts.append(card_link(f"https://github.com/{target}/{kind}/{number}", token) if target else escape_html(token))
+        else:
+            parts.append(escape_html(token))
+        end = match.end()
+    parts.append(escape_html(text[end:]))
+    return "".join(parts)
+
+
+def truncate_html(value: str, limit: int) -> str:
+    """Bound serialized HTML conservatively, reserving space for closing tags."""
+    if len(value.encode("utf-16-le")) // 2 <= limit:
+        return value
+    output, stack, used = [], [], 0
+    for token in re.findall(r"<[^>]+>|&(?:#\d+|#x[0-9a-fA-F]+|\w+);|[^<&]|[<&]", value):
+        next_stack = list(stack)
+        if token.startswith("</"):
+            if next_stack:
+                next_stack.pop()
+        elif token.startswith("<"):
+            name = re.match(r"<([a-z]+)", token)
+            if name:
+                next_stack.append(name.group(1))
+        closing = "".join(f"</{name}>" for name in reversed(next_stack))
+        size = len(token.encode("utf-16-le")) // 2
+        if used + size + len(closing) + 1 > limit:
+            break
+        output.append(token)
+        used += size
+        stack = next_stack
+    return "".join(output).rstrip() + "…" + "".join(f"</{name}>" for name in reversed(stack))
+
+
+def render_card(event: NotificationEvent) -> str:
+    if event.metadata.get("consolidated_questions"):
+        return format_consolidated_blockers_presentation(event.metadata["consolidated_questions"], event.canonical_link)
+    titles = {"status": "📊 Status update", "milestone": "🚀 Milestone reached",
+              "blocker": "🛑 Blocked", "decision": "❓ Decision needed",
+              "question": "❓ Question", "completion": "✅ Completed"}
+    state = event.metadata.get("state")
+    title = {"merged": "🔀 Merged", "live": "🟢 Live"}.get(state, titles[event.event_type])
+    if event.metadata.get("is_due_reminder"):
+        title = "🔔 Decision reminder"
+    icon, label = title.split(" ", 1)
+    project = event.project
+    link = event.canonical_link or ""
+    match = re.match(r"https://github.com/([^/]+/[^/]+)", link)
+    repo = match.group(1) if match else project
+    safe = lambda value: inline_text(value, repo)
+    subject = event.metadata.get("subject") or project
+    lines = [f"{icon} <b>{label}</b>", f"• {card_link(link, subject) if link else safe(subject)}"]
+    if event.event_type in ("question", "decision"):
+        lines.extend([
+            f"• {safe(event.metadata.get('problem') or ('Your guidance is needed before continuing.' if '?' in event.summary else event.summary))}",
+            f"• <b>Proposal:</b> {safe(event.metadata.get('proposed_action') or 'Choose an option below or reply with guidance.')}",
+            f"• <b>Impact:</b> {safe(event.metadata.get('consequence_or_risk') or 'Dependent work waits for your answer.')}",
+        ])
+        question = event.metadata.get("question") or (event.summary if "?" in event.summary else "Which option should we use?")
+        lines.extend(["", f"<b>{safe(question)}</b>"])
+        options = []
+        for opt in event.metadata.get("options") or []:
             if isinstance(opt, dict):
-                opt_id = opt.get("id", "")
-                opt_label = opt.get("label") or opt.get("description", "")
-                lines.append(f"• <b>Option {escape_html(opt_id)}</b>: {escape_html(opt_label)}")
+                options.append(f"{opt.get('id', '')} = {opt.get('label') or opt.get('description') or ''}")
             else:
-                lines.append(f"• {escape_html(str(opt))}")
+                options.append(str(opt))
+        if options:
+            lines.append(safe(" · ".join(options)))
+    else:
+        bullets = [re.sub(r"^[•*-]\s+", "", row.strip()) for row in event.summary.splitlines() if row.strip()]
+        for row in bullets[:5]:
+            labeled = re.match(r"^([\w ][\w /-]{0,23}):\s+(.+)$", row)
+            rendered = f"<b>{safe(labeled.group(1))}:</b> {safe(labeled.group(2))}" if labeled else safe(row)
+            if rendered:
+                lines.append(f"• {truncate_html(rendered, 400)}")
+        if len(bullets) > 5:
+            lines.append("<blockquote expandable>" + safe("\n".join(bullets[5:])) + "</blockquote>")
+    detail = event.metadata.get("long_detail") or event.metadata.get("detail")
+    if detail:
+        lines.extend(["", f"<blockquote expandable>{safe(detail)}</blockquote>"])
+    return truncate_html("\n".join(lines), 1024 if event.metadata.get("screenshot") or event.metadata.get("images") else 4096)
 
-    if details_url:
-        first_url = str(details_url).strip().split()[0]
-        if first_url.startswith(("http://", "https://")):
-            lines.append("")
-            lines.append(f'🔗 <a href="{escape_html(first_url)}">View Details on GitHub</a>')
 
-    return "\n".join(lines)
+def format_decision_presentation(
+    problem: str, proposed_action: str, consequence_or_risk: str,
+    details_url: Optional[str] = None, options: Optional[List[Any]] = None,
+    reminder_count: Optional[int] = None,
+) -> str:
+    return render_card(NotificationEvent(
+        "decision", "Decision", "", problem, details_url or "",
+        {"problem": problem, "proposed_action": proposed_action,
+         "consequence_or_risk": consequence_or_risk, "options": options or [],
+         "is_due_reminder": bool(reminder_count)},
+    ))
+
+
+def format_consolidated_blockers_presentation(
+    questions: List[Any], details_url: Optional[str] = None,
+) -> str:
+    lines = ["🔔 <b>Decisions waiting</b>"]
+    for index, question in enumerate(questions, 1):
+        item = asdict(question) if hasattr(question, "__dataclass_fields__") else question
+        topic = str(item.get("topic") or f"Decision {index}").replace("-", " ")
+        url = item.get("canonical_link") or details_url or ""
+        problem = item.get("problem") or item.get("question") or "Your guidance is needed."
+        lines.append(f"• {card_link(url, topic)} — {inline_text(problem)}")
+        if item.get("proposed_action"):
+            lines.append(f"  <b>Proposal:</b> {inline_text(item['proposed_action'])}")
+        if item.get("consequence_or_risk"):
+            lines.append(f"  <b>Impact:</b> {inline_text(item['consequence_or_risk'])}")
+    lines.extend(["", "<b>Which decision should we address first?</b>", "Reply with the topic name."])
+    return truncate_html("\n".join(lines), 4096)
 
 
 def build_decision_inline_keyboard(
@@ -778,6 +872,10 @@ def build_decision_inline_keyboard(
         if isinstance(opt, dict):
             opt_id = str(opt.get("id", ""))
             opt_label = str(opt.get("label") or opt_id)
+        elif isinstance(opt, str) and ":" in opt:
+            parts = opt.split(":", 1)
+            opt_id = parts[0].strip()
+            opt_label = parts[1].strip()
         else:
             opt_id = str(opt)
             opt_label = str(opt)
@@ -798,29 +896,6 @@ def build_decision_inline_keyboard(
     if buttons:
         return {"inline_keyboard": [buttons]}
     return None
-
-def link_references(text: str, project: str) -> str:
-    """Escape prose and link explicit GitHub references without guessing other repos."""
-    repo = project if re.fullmatch(r"[\w.-]+/[\w.-]+", project) else None
-    pattern = r'https?://[^\s<>"]+|(?:[\w.-]+/[\w.-]+)?#\d+|\b[0-9a-fA-F]{40}\b'
-    parts = []
-    end = 0
-    for match in re.finditer(pattern, text):
-        parts.append(escape_html(text[end:match.start()]))
-        label = match.group()
-        url = label if label.startswith(("http://", "https://")) else None
-        if url is None and re.fullmatch(r"[0-9a-fA-F]{40}", label):
-            url = f"https://github.com/{repo}/commit/{label}" if repo else None
-        elif url is None:
-            explicit_repo, number = label.rsplit("#", 1)
-            target_repo = explicit_repo or repo
-            if target_repo:
-                kind = "pull" if re.search(r"\bPR\s*$", text[:match.start()], re.I) else "issues"
-                url = f"https://github.com/{target_repo}/{kind}/{number}"
-        parts.append(f'<a href="{escape_html(url)}">{escape_html(label)}</a>' if url else escape_html(label))
-        end = match.end()
-    parts.append(escape_html(text[end:]))
-    return "".join(parts)
 
 class TelegramNotificationAdapter:
     """Portable Telegram notification adapter for multi-agent workflows."""
@@ -844,83 +919,9 @@ class TelegramNotificationAdapter:
 
     @classmethod
     def format_message(cls, event: NotificationEvent, plain_language: bool = False) -> str:
-        """Render one quiet, escaped Telegram HTML card with one details link."""
+        """Render a bounded card; links belong to the entity, never a footer."""
         event.validate()
-
-        presentation = {
-            "milestone": ("🚀", "Milestone reached"),
-            "blocker": ("🛑", "Blocked"),
-            "decision": ("❓", "Decision needed"),
-            "question": ("❓", "Question"),
-            "status": ("📊", "Status update"),
-            "completion": ("✅", "Completed"),
-        }
-        emoji, title = presentation.get(event.event_type, ("ℹ️", event.event_type.capitalize()))
-        project = SecretSanitizer.sanitize(str(event.project).strip())
-        summary = SecretSanitizer.sanitize(str(event.summary).strip())
-        detail = SecretSanitizer.sanitize(
-            str(event.metadata.get("long_detail") or event.metadata.get("detail") or "").strip()
-        )
-
-        lines = [
-            f"{emoji} <b>{escape_html(title)}</b>",
-            f"<i>{escape_html(project)}</i>",
-            "",
-        ]
-
-        if event.event_type in ("decision", "question") and plain_language:
-            problem = SecretSanitizer.sanitize(
-                str(event.metadata.get("problem") or summary).strip()
-            )
-            action = SecretSanitizer.sanitize(
-                str(
-                    event.metadata.get("proposed_action")
-                    or "Choose one option below, or reply with guidance."
-                ).strip()
-            )
-            risk = SecretSanitizer.sanitize(
-                str(
-                    event.metadata.get("consequence_or_risk")
-                    or "Dependent work remains paused until this is answered."
-                ).strip()
-            )
-            lines.extend(
-                [
-                    f"• <b>What:</b> {link_references(problem, project)}",
-                    f"• <b>Action:</b> {link_references(action, project)}",
-                    f"• <b>Impact:</b> {link_references(risk, project)}",
-                ]
-            )
-        elif len(summary) > 280 or "\n" in summary:
-            lines.append("• Full update below.")
-            detail = "\n\n".join(part for part in (summary, detail) if part)
-        else:
-            lines.append(f"• {link_references(summary, project)}")
-
-        options = event.metadata.get("options")
-        if event.event_type in ("decision", "question") and isinstance(options, list):
-            for option in options:
-                if isinstance(option, dict):
-                    option_id = SecretSanitizer.sanitize(str(option.get("id") or "").strip())
-                    option_label = SecretSanitizer.sanitize(
-                        str(option.get("label") or option.get("description") or option_id).strip()
-                    )
-                    prefix = f"{option_id}: " if option_id and option_id != option_label else ""
-                    lines.append(f"• <b>{link_references(prefix + option_label, project)}</b>")
-
-        if event.event_type in ("decision", "question"):
-            lines.append("Reply with guidance at any time; free text does not approve an action.")
-
-        if detail:
-            lines.extend(["", f"<blockquote expandable>{link_references(detail, project)}</blockquote>"])
-
-        details_url = str(
-            event.metadata.get("details_url") or event.canonical_link or ""
-        ).strip().split()[0]
-        if details_url.startswith(("http://", "https://")):
-            lines.extend(["", f'<a href="{escape_html(details_url)}">Details</a>'])
-
-        return "\n".join(lines)
+        return render_card(event)
 
     def test_connection(self, project: str = "polysimulator", slot_id: Optional[str] = None) -> Dict[str, Any]:
         """Read-only test to verify bot credentials and API reachability via getMe."""
@@ -1062,13 +1063,12 @@ class TelegramNotificationAdapter:
         bound_session = event.session_id or None
 
         # 3. Format message
-        message_text = self.format_message(
-            event,
-            plain_language=event.event_type in ("decision", "question"),
-        )
+        if event.event_type in ("decision", "question"):
+            message_text = self.format_message(event, plain_language=True)
+        else:
+            message_text = self.format_message(event)
 
-        # Questions and decisions share the existing actor/chat/session-bound
-        # callback store. Free-text replies remain guidance, never approval.
+        # Build inline keyboard buttons for decision options
         reply_markup = None
         if event.event_type in ("decision", "question") and event.metadata.get("options"):
             reply_markup = build_decision_inline_keyboard(
@@ -1082,6 +1082,22 @@ class TelegramNotificationAdapter:
                 ttl_seconds=86400.0,
                 now=now,
             )
+        for item in event.metadata.get("consolidated_questions") or []:
+            keyboard = build_decision_inline_keyboard(
+                decision_id=str(item.get("decision_id") or ""),
+                options=item.get("options") or [], session_id=bound_session or "unbound",
+                chat_id=str(target_chat), user_id=str(target_chat),
+                question_text=str(item.get("question") or ""), callback_store=self.callback_store, now=now,
+            )
+            if keyboard:
+                reply_markup = reply_markup or {"inline_keyboard": []}
+                for row in keyboard["inline_keyboard"]:
+                    for button in row:
+                        button["text"] = str(item.get("topic") or "Decision")[:18] + " · " + button["text"]
+                    reply_markup["inline_keyboard"].append(row)
+        if event.canonical_link and urllib.parse.urlsplit(event.canonical_link).scheme in ("http", "https"):
+            reply_markup = reply_markup or {"inline_keyboard": []}
+            reply_markup["inline_keyboard"].append([{"text": "Open on GitHub", "url": event.canonical_link}])
 
         # 4. Dry-run gate
         if dry_run:
@@ -1103,21 +1119,31 @@ class TelegramNotificationAdapter:
         payload = {
             "chat_id": str(target_chat),
             "text": message_text,
-            "disable_web_page_preview": False,
+            "disable_web_page_preview": True,
         }
         payload["parse_mode"] = "HTML"
         if reply_markup:
             payload["reply_markup"] = reply_markup
-        photo = event.metadata.get("screenshot")
-        if photo:
-            if not isinstance(photo, str) or not (photo.startswith("https://") or re.fullmatch(r"[A-Za-z0-9_-]{20,}", photo)):
-                return DeliveryReceipt(delivered=False, status="blocked", reason="Screenshot must be an authorized HTTPS image or Telegram file ID.")
-            if len(message_text) > 1024:
-                return DeliveryReceipt(delivered=False, status="blocked", reason="Screenshot caption exceeds Telegram's limit; shorten the card.")
-            api_url = f"https://api.telegram.org/bot{token}/sendPhoto"
+        images = event.metadata.get("images") or ([event.metadata["screenshot"]] if event.metadata.get("screenshot") else [])
+        if images:
+            if not isinstance(images, list) or len(images) > 10 or any(
+                not isinstance(photo, str) or not (photo.startswith("https://") or re.fullmatch(r"[A-Za-z0-9_-]{20,}", photo))
+                for photo in images
+            ):
+                return DeliveryReceipt(delivered=False, status="blocked", reason="Provide up to ten authorized HTTPS images or Telegram file IDs.")
             payload.pop("text")
             payload.pop("disable_web_page_preview")
-            payload.update({"photo": photo, "caption": message_text})
+            if len(images) == 1:
+                api_url = f"https://api.telegram.org/bot{token}/sendPhoto"
+                payload.update({"photo": images[0], "caption": truncate_html(message_text, 1024)})
+            else:
+                api_url = f"https://api.telegram.org/bot{token}/sendMediaGroup"
+                payload.pop("parse_mode")
+                payload.pop("reply_markup", None)
+                payload["media"] = [
+                    dict(type="photo", media=photo, **({"caption": truncate_html(message_text, 1024), "parse_mode": "HTML"} if index == 0 else {}))
+                    for index, photo in enumerate(images)
+                ]
         data_bytes = json.dumps(payload).encode("utf-8")
 
         try:
@@ -1134,6 +1160,21 @@ class TelegramNotificationAdapter:
                 resp_data = json.loads(resp.read().decode("utf-8"))
                 if resp_data.get("ok"):
                     result = resp_data.get("result", {})
+                    delivered_messages = result if isinstance(result, list) else [result]
+                    if isinstance(result, list):
+                        result = result[0]
+                        if reply_markup:
+                            keyboard_request = urllib.request.Request(
+                                f"https://api.telegram.org/bot{token}/sendMessage",
+                                data=json.dumps({"chat_id": str(target_chat), "text": "Actions for the images above",
+                                                 "reply_markup": reply_markup, "parse_mode": "HTML"}).encode("utf-8"),
+                                headers={"Content-Type": "application/json"}, method="POST",
+                            )
+                            with urllib.request.urlopen(keyboard_request, timeout=DEFAULT_HTTP_TIMEOUT) as keyboard_response:
+                                keyboard_result = json.loads(keyboard_response.read())
+                                if not keyboard_result.get("ok"):
+                                    raise ValueError("Album delivered but action message failed")
+                                delivered_messages.append(keyboard_result["result"])
                     msg_id = result.get("message_id")
                     bot_id = str(result.get("from", {}).get("id", ""))
                     # The chat the API actually delivered to. `target_chat` may be a
@@ -1146,16 +1187,19 @@ class TelegramNotificationAdapter:
                     correlation_status = "disabled" if not self.correlation_store.enabled else "unbound"
                     correlation_recorded = False
                     if self.correlation_store.enabled and bound_session and msg_id is not None:
-                        correlation_recorded = self.correlation_store.record(
-                            bot_id=bot_id,
-                            chat_id=delivered_chat_id,
-                            message_id=int(msg_id),
-                            slot_id=str(slot_info["slotId"]),
-                            session_id=bound_session,
-                            request_id=event.request_id or None,
-                            decision_id=event.metadata.get("decision_id"),
-                            project_path=event.project or None,
-                        )
+                        recorded = []
+                        for delivered_message in delivered_messages:
+                            recorded.append(self.correlation_store.record(
+                                bot_id=str(delivered_message.get("from", {}).get("id", bot_id)),
+                                chat_id=str(delivered_message.get("chat", {}).get("id", delivered_chat_id)),
+                                message_id=int(delivered_message["message_id"]),
+                                slot_id=str(slot_info["slotId"]),
+                                session_id=bound_session,
+                                request_id=event.request_id or None,
+                                decision_id=event.metadata.get("decision_id"),
+                                project_path=event.project or None,
+                            ))
+                        correlation_recorded = all(recorded)
                         correlation_status = "recorded" if correlation_recorded else "record_failed"
 
                     return DeliveryReceipt(
@@ -1495,6 +1539,32 @@ class TelegramNotificationAdapter:
                                 return d
                 except Exception:
                     pass
+
+        # Also check ledger.json requests
+        ledger_candidates = [
+            Path.cwd() / "ledger.json",
+            Path(__file__).resolve().parent / "ledger.json",
+            Path.home() / ".veyyon" / "workflows" / "ledger.json",
+        ]
+        for lp in ledger_candidates:
+            if lp.exists():
+                try:
+                    ldata = json.loads(lp.read_text(encoding="utf-8"))
+                    reqs = ldata.get("requests", {})
+                    req_items = reqs.values() if isinstance(reqs, dict) else (reqs if isinstance(reqs, list) else [])
+                    for r in req_items:
+                        if not isinstance(r, dict):
+                            continue
+                        for dec in r.get("decisions", []):
+                            if isinstance(dec, dict) and dec.get("id") == decision_id:
+                                d_copy = dict(dec)
+                                d_copy["decision_id"] = d_copy["id"]
+                                d_copy["request_id"] = r.get("id")
+                                d_copy["issue_url"] = r.get("github", {}).get("issue_url")
+                                d_copy["session"] = dec.get("session") or r.get("session")
+                                return d_copy
+                except Exception:
+                    pass
         return None
 
 
@@ -1518,7 +1588,10 @@ class UnresolvedQuestion:
     is_due: bool
     seconds_remaining: int
     raw_status: str
-
+    prompt: Optional[str] = None
+    problem: Optional[str] = None
+    proposed_action: Optional[str] = None
+    consequence_or_risk: Optional[str] = None
 
 class QuestionReminderManager:
     """Manages script-owned recurring reminders for unresolved operator questions.
@@ -1816,6 +1889,10 @@ class QuestionReminderManager:
                     is_due=is_due,
                     seconds_remaining=seconds_remaining,
                     raw_status=raw_status,
+                    prompt=d.get("prompt"),
+                    problem=d.get("problem"),
+                    proposed_action=d.get("proposed_action"),
+                    consequence_or_risk=d.get("consequence_or_risk"),
                 )
             )
 
@@ -1875,27 +1952,31 @@ class QuestionReminderManager:
 
                 seen_decision_ids.add(d_id)
                 unresolved.append(
-                    UnresolvedQuestion(
-                        decision_id=d_id,
-                        request_id=req_id,
-                        topic=dec.get("topic") or d_id,
-                        owner=owner,
-                        canonical_link=canonical_link,
-                        question=dec.get("question") or "Operator decision required",
-                        options=dec.get("options") or [],
-                        recommendation=dec.get("recommendation") or "",
-                        cadence_seconds=cadence,
-                        last_notified_at=last_notified,
-                        next_reminder_at=next_reminder,
-                        reminder_count=reminder_count,
-                        reminder_status=dec.get("reminder_status", "active"),
-                        stop_reason=dec.get("stop_reason"),
-                        session_id=session_id,
-                        is_due=is_due,
-                        seconds_remaining=seconds_remaining,
-                        raw_status=raw_status,
-                    )
+                UnresolvedQuestion(
+                    decision_id=d_id,
+                    request_id=req_id,
+                    topic=dec.get("topic") or d_id,
+                    owner=owner,
+                    canonical_link=canonical_link,
+                    question=dec.get("question") or "Operator decision required",
+                    options=dec.get("options") or [],
+                    recommendation=dec.get("recommendation") or "",
+                    cadence_seconds=cadence,
+                    last_notified_at=last_notified,
+                    next_reminder_at=next_reminder,
+                    reminder_count=reminder_count,
+                    reminder_status=dec.get("reminder_status", "active"),
+                    stop_reason=dec.get("stop_reason"),
+                    session_id=session_id,
+                    is_due=is_due,
+                    seconds_remaining=seconds_remaining,
+                    raw_status=raw_status,
+                    prompt=dec.get("prompt") or l_req.get("prompt"),
+                    problem=dec.get("problem"),
+                    proposed_action=dec.get("proposed_action"),
+                    consequence_or_risk=dec.get("consequence_or_risk"),
                 )
+            )
 
         return unresolved
 
@@ -1908,6 +1989,7 @@ class QuestionReminderManager:
         explicit_slot: Optional[str] = None,
         explicit_chat_id: Optional[str] = None,
         session_id: Optional[str] = None,
+        consolidate: bool = False,
     ) -> Dict[str, Any]:
         """Scans unresolved questions, checks 15-minute cadence, and dispatches due reminders.
 
@@ -1916,6 +1998,8 @@ class QuestionReminderManager:
         - Live delivery performs metadata-only merge under FileLock; never overwrites concurrent verified answers.
         - Preserves fresh notify_state sent_signatures written by adapter.notify.
         - Resolves session_id explicitly without guessing or silent mis-binding.
+        - When consolidate=True: compiles all due questions into a single plain-language numbered message.
+        - When consolidate=False: dispatches each due question as a plain-language decision presentation with interactive buttons.
         """
         now = now or time.time()
         questions = self.get_unresolved_questions(now=now)
@@ -1929,6 +2013,78 @@ class QuestionReminderManager:
                 "dispatched": [],
             }
 
+        if consolidate:
+            primary_link = due_questions[0].canonical_link if due_questions else "https://github.com/Bavariance/polysimulator"
+            bound_session = session_id or due_questions[0].session_id or None
+
+            event = NotificationEvent(
+                event_type="decision",
+                project="polysimulator",
+                request_id="consolidated-blockers",
+                summary="Decisions waiting for your guidance",
+                canonical_link=primary_link,
+                metadata={
+                    "is_due_reminder": True,
+                    "is_consolidated": True,
+                    "plain_presentation": True,
+                    "consolidated_questions": [asdict(q) for q in due_questions],
+                    "due_count": len(due_questions),
+                },
+                session_id=bound_session,
+            )
+
+            receipt = adapter.notify(
+                event,
+                dry_run=dry_run,
+                force=force,
+                explicit_slot=explicit_slot,
+                explicit_chat_id=explicit_chat_id,
+                now=now,
+            )
+
+            dispatched_receipts = []
+            for q in due_questions:
+                next_count = q.reminder_count + 1
+                dispatched_receipts.append({
+                    "decision_id": q.decision_id,
+                    "topic": q.topic,
+                    "reminder_count": next_count,
+                    "receipt": asdict(receipt),
+                })
+
+                if not dry_run and receipt.delivered:
+                    metadata_updated = self._save_decision_reminder_metadata_under_lock(
+                        decision_id=q.decision_id,
+                        now=now,
+                        cadence_seconds=q.cadence_seconds,
+                        next_count=next_count,
+                    )
+                    if metadata_updated:
+                        self._update_notify_state_reminder_under_lock(
+                            decision_id=q.decision_id,
+                            reminder_dict={
+                                "decision_id": q.decision_id,
+                                "request_id": q.request_id,
+                                "topic": q.topic,
+                                "owner": q.owner,
+                                "canonical_link": q.canonical_link,
+                                "cadence_seconds": q.cadence_seconds,
+                                "last_notified_at": now,
+                                "next_reminder_at": now + q.cadence_seconds,
+                                "reminder_count": next_count,
+                                "status": "active",
+                                "stop_reason": None,
+                            },
+                        )
+
+            return {
+                "status": "reminders_dispatched",
+                "unresolved_count": len(questions),
+                "due_count": len(due_questions),
+                "consolidated": True,
+                "dispatched": dispatched_receipts,
+            }
+
         dispatched_receipts = []
 
         for q in due_questions:
@@ -1940,6 +2096,9 @@ class QuestionReminderManager:
                     opt_id = opt.get("id", "")
                     opt_lbl = opt.get("label") or opt.get("description", "")
                     opt_summaries.append(f"{opt_id}: {opt_lbl}" if opt_id else opt_lbl)
+                elif isinstance(opt, str) and ":" in opt:
+                    parts = opt.split(":", 1)
+                    opt_summaries.append(f"{parts[0].strip()}: {parts[1].strip()}")
                 else:
                     opt_summaries.append(str(opt))
             opts_str = f" Options: {'; '.join(opt_summaries)}." if opt_summaries else ""
@@ -1947,11 +2106,28 @@ class QuestionReminderManager:
 
             summary = f"[Reminder #{next_count}] {q.question.rstrip('.')}.{opts_str}{rec_str}".strip()
 
-            # Explicit session binding: explicit session takes precedence, then question-bound session
             bound_session = session_id or q.session_id or None
 
+            clean_q = re.sub(r"https?://\S+", "", str(q.question or "")).strip()
+            clean_q = re.sub(r"req-[a-zA-Z0-9_-]+(?:\s*\([^)]*\))?:\s*", "", clean_q).strip()
+            clean_q = re.sub(r"\b(?:Report|Existing question|Details):\s*$", "", clean_q, flags=re.IGNORECASE).strip()
+            clean_q = clean_q.rstrip(" :.-")
+            clean_prompt = re.sub(r"https?://\S+", "", str(getattr(q, "prompt", None) or "")).strip()
+            clean_prompt = re.sub(r"req-[a-zA-Z0-9_-]+(?:\s*\([^)]*\))?:\s*", "", clean_prompt).strip()
+            clean_prompt = clean_prompt.rstrip(" :.-")
+
+            problem = getattr(q, "problem", None) or clean_prompt or clean_q or "Human decision required to proceed."
+            if getattr(q, "proposed_action", None):
+                action = getattr(q, "proposed_action")
+            elif q.options:
+                action = f"Choose between: {'; '.join(opt_summaries)}."
+            else:
+                action = clean_q or "Select an option below."
+
+            consequence = getattr(q, "consequence_or_risk", None) or "Work on dependent tasks remains suspended until an authorized choice is selected."
+
             event = NotificationEvent(
-                event_type="question",
+                event_type="decision",
                 project="polysimulator",
                 request_id=q.request_id,
                 summary=summary,
@@ -1962,6 +2138,12 @@ class QuestionReminderManager:
                     "decision_id": q.decision_id,
                     "cadence_seconds": q.cadence_seconds,
                     "topic": q.topic,
+                    "problem": problem,
+                    "proposed_action": action,
+                    "consequence_or_risk": consequence,
+                    "details_url": q.canonical_link,
+                    "options": q.options,
+                    "plain_presentation": True,
                 },
                 session_id=bound_session,
             )
@@ -1983,7 +2165,6 @@ class QuestionReminderManager:
 
             # CRITICAL: dry_run is STRICTLY READ-ONLY. Never advance timestamps or save state on dry_run!
             if not dry_run and receipt.delivered:
-                # Metadata-only merge under FileLock: re-reads fresh decisions and checks terminal state
                 metadata_updated = self._save_decision_reminder_metadata_under_lock(
                     decision_id=q.decision_id,
                     now=now,
@@ -1991,7 +2172,6 @@ class QuestionReminderManager:
                     next_count=next_count,
                 )
                 if metadata_updated:
-                    # Re-reads fresh notify_state under lock to preserve adapter.notify signatures
                     self._update_notify_state_reminder_under_lock(
                         decision_id=q.decision_id,
                         reminder_dict={
@@ -2104,13 +2284,14 @@ class QuestionReminderManager:
         max_iterations: Optional[int] = None,
         stop_event: Optional[Any] = None,
         log_callback: Optional[Callable[[str], None]] = None,
+        consolidate: bool = False,
     ) -> Dict[str, Any]:
         """Supervised recurring reminder loop entrypoint (pure Python, zero model worker overhead).
         Periodically evaluates canonical decisions.json and dispatches deliberate due reminders
         at the bounded 15-minute cadence.
         """
         log = log_callback or (lambda msg: print(f"[{time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}] {msg}", flush=True))
-        log(f"Supervised reminder loop started (interval={interval_seconds}s, cadence={self.default_cadence}s, dry_run={dry_run})")
+        log(f"Supervised reminder loop started (interval={interval_seconds}s, cadence={self.default_cadence}s, dry_run={dry_run}, consolidate={consolidate})")
         iterations = 0
         total_dispatched = 0
 
@@ -2126,6 +2307,7 @@ class QuestionReminderManager:
                     explicit_slot=explicit_slot,
                     explicit_chat_id=explicit_chat_id,
                     session_id=session_id,
+                    consolidate=consolidate,
                 )
                 due_count = res.get("due_count", 0)
                 if due_count > 0:
@@ -2163,8 +2345,8 @@ def main() -> int:
     parser.add_argument("--chat-id", default=None, help="Explicit destination chat ID")
     parser.add_argument("--event-type", choices=sorted(VALID_EVENT_TYPES), help="Event type: milestone, blocker, decision, completion, question, status")
     parser.add_argument("--request-id", default="req-manual", help="Request ID (e.g. req-4543)")
-    parser.add_argument("--summary", default="", help="One-sentence status summary")
-    parser.add_argument("--link", default="", help="Canonical issue or PR URL")
+    parser.add_argument("--summary", default="", help="Status text; each nonempty line becomes a bullet")
+    parser.add_argument("--link", default="", help="Optional canonical issue or PR URL")
     parser.add_argument("--links", nargs="*", default=[], help="Additional canonical URLs (e.g. PRs, issues)")
     parser.add_argument("--decision-id", default=None, help="Decision ID from decisions.json to notify")
     parser.add_argument("--decisions-file", default=None, help="Path to decisions.json file")
@@ -2190,6 +2372,7 @@ def main() -> int:
     )
     parser.add_argument("--reminders", action="store_true", help="List all unresolved operator questions and reminder due status")
     parser.add_argument("--dispatch-reminders", action="store_true", help="Dispatch due reminders for unresolved operator questions")
+    parser.add_argument("--consolidate", action="store_true", help="Consolidate all due questions into a single plain-language numbered message with one details link")
     parser.add_argument("--stop-topic", default=None, help="Explicitly stop recurring reminders for a question topic ID")
     parser.add_argument("--stop-reason", default="Operator explicit stop", help="Reason for stopping reminders on a topic")
     parser.add_argument("--stop-actor", default="Operator", help="Actor identity recording the stop (e.g. Wladefant)")
@@ -2197,7 +2380,6 @@ def main() -> int:
     parser.add_argument("--loop", action="store_true", help="Run supervised recurring reminder loop (no model daemon)")
     parser.add_argument("--loop-interval", type=float, default=60.0, help="Check interval in seconds for the supervised loop (default 60)")
     parser.add_argument("--max-iterations", type=int, default=None, help="Maximum loop iterations (optional, for bounded testing)")
-
     args = parser.parse_args()
     adapter = TelegramNotificationAdapter(
         correlation_store=OutboundCorrelationStore(Path(args.pool_db) if args.pool_db else None),
@@ -2227,6 +2409,7 @@ def main() -> int:
                 explicit_chat_id=args.chat_id,
                 session_id=args.session,
                 max_iterations=args.max_iterations,
+                consolidate=args.consolidate,
             )
             if args.json:
                 print(json.dumps(loop_res, indent=2))
@@ -2240,6 +2423,7 @@ def main() -> int:
                 explicit_slot=args.slot,
                 explicit_chat_id=args.chat_id,
                 session_id=args.session,
+                consolidate=args.consolidate,
             )
             if args.json:
                 print(json.dumps(res, indent=2))
@@ -2314,7 +2498,7 @@ def main() -> int:
             return 0
         if args.links:
             event.metadata.setdefault("links", []).extend(args.links)
-    elif args.event_type and args.summary and (args.link or args.links):
+    elif args.event_type and args.summary:
         primary_link = args.link or (args.links[0] if args.links else "")
         event = NotificationEvent(
             event_type=args.event_type,

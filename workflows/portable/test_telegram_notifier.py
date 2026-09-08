@@ -120,7 +120,7 @@ class TestMessageFormatting(unittest.TestCase):
         msg = TelegramNotificationAdapter.format_message(ev)
         self.assertTrue(msg.startswith("🚀 <b>Milestone reached</b>"))
         self.assertIn("• Implementation complete, advancing to review", msg)
-        self.assertTrue(msg.endswith('">Details</a>'))
+        self.assertNotIn('">Details</a>', msg)
 
     def test_format_decision_label(self):
         ev = NotificationEvent(
@@ -144,7 +144,7 @@ class TestMessageFormatting(unittest.TestCase):
         msg = TelegramNotificationAdapter.format_message(status_ev)
         self.assertTrue(msg.startswith("📊 <b>Status update</b>"))
         self.assertIn("1a28d9d8ad1976160db7223a0d5df57df421f862", msg)
-        self.assertIn('<a href="https://github.com/Wladefant/super-board/pull/74">Details</a>', msg)
+        self.assertIn('<a href="https://github.com/Wladefant/super-board/pull/74">Bavariance/polysimulator</a>', msg)
 
         question_ev = NotificationEvent(
             event_type="question",
@@ -217,7 +217,7 @@ class TestMessageFormatting(unittest.TestCase):
             metadata={"detail": " ".join(urls)},
         )
         message = TelegramNotificationAdapter.format_message(event)
-        self.assertIn(f'<a href="https://github.com/Wladefant/super-board/commit/{sha}">{sha}</a>', message)
+        self.assertIn(f'<a href="https://github.com/Wladefant/super-board/commit/{sha}"><code>{sha[:8]}</code></a>', message)
         for url in urls:
             self.assertIn(f'<a href="{url}">{url}</a>', message)
 
@@ -607,7 +607,7 @@ class TestTelegramNotificationAdapter(unittest.TestCase):
         self.assertTrue(formatted.startswith("❓ <b>Decision needed</b>"))
         self.assertIn("Options: A: Park and Idle Wait; B: Speculative Feature Branching", formatted)
         self.assertIn("Recommended: Option A", formatted)
-        self.assertTrue(formatted.endswith('<a href="https://github.com/Bavariance/polysimulator/issues/4543">Details</a>'))
+        self.assertIn('<a href="https://github.com/Bavariance/polysimulator/issues/4543">', formatted)
 
     def test_load_decision_from_file(self):
         temp_dec_file = Path(self.temp_dir.name) / "test_decisions.json"
@@ -1329,12 +1329,12 @@ class TestDecisionInteractiveCallback(unittest.TestCase):
             details_url="https://github.com/Bavariance/polysimulator/issues/4574",
             options=[{"id": "A", "label": "Approved access remedy"}, {"id": "B", "label": "Approved non-retired runner"}],
         )
-        self.assertIn("❓ <b>Problem:</b> PolySimulator staging automated tests cannot run because CI lacks access.", msg)
-        self.assertIn("👉 <b>Proposed Action:</b> Choose how to configure authorized staging CI access.", msg)
-        self.assertIn("⚠️ <b>Risk / Consequence:</b> Option A requires access credentials; Option B requires registering a fresh runner.", msg)
-        self.assertIn("• <b>Option A</b>: Approved access remedy", msg)
-        self.assertIn("• <b>Option B</b>: Approved non-retired runner", msg)
-        self.assertIn('<a href="https://github.com/Bavariance/polysimulator/issues/4574">View Details on GitHub</a>', msg)
+        self.assertIn("• PolySimulator staging automated tests cannot run because CI lacks access.", msg)
+        self.assertIn("• <b>Proposal:</b> Choose how to configure authorized staging CI access.", msg)
+        self.assertIn("• <b>Impact:</b> Option A requires access credentials; Option B requires registering a fresh runner.", msg)
+        self.assertIn("A = Approved access remedy", msg)
+        self.assertIn("B = Approved non-retired runner", msg)
+        self.assertIn('<a href="https://github.com/Bavariance/polysimulator/issues/4574">Decision</a>', msg)
         # No raw request IDs or raw paths
         self.assertNotIn("req-", msg)
         self.assertNotIn("C:\\", msg)
