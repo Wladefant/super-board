@@ -192,6 +192,35 @@ class TestMessageFormatting(unittest.TestCase):
         self.assertIn('href="https://example.com/?a=1&amp;b=&quot;two&quot;"', msg)
         self.assertNotIn("<script>", msg)
 
+    def test_mentions_are_clickable_references(self):
+        event = NotificationEvent(
+            event_type="status", project="Wladefant/super-board", request_id="links",
+            summary="Issue #83, PR #84 and other/repo#12: https://github.com/other/repo/blob/main/doc.md",
+            canonical_link="https://github.com/Wladefant/super-board/issues/83",
+        )
+        message = TelegramNotificationAdapter.format_message(event)
+        self.assertIn('<a href="https://github.com/Wladefant/super-board/issues/83">#83</a>', message)
+        self.assertIn('<a href="https://github.com/Wladefant/super-board/pull/84">#84</a>', message)
+        self.assertIn('<a href="https://github.com/other/repo/issues/12">other/repo#12</a>', message)
+        self.assertIn('<a href="https://github.com/other/repo/blob/main/doc.md">', message)
+
+    def test_commit_branch_run_and_document_links(self):
+        sha = "a" * 40
+        urls = [
+            "https://github.com/Wladefant/super-board/tree/feat/example",
+            "https://github.com/Wladefant/super-board/actions/runs/123",
+            "https://github.com/Wladefant/super-board/blob/main/doc.md",
+        ]
+        event = NotificationEvent(
+            event_type="status", project="Wladefant/super-board", request_id="references",
+            summary=f"Commit {sha}", canonical_link="https://github.com/Wladefant/super-board/issues/83",
+            metadata={"detail": " ".join(urls)},
+        )
+        message = TelegramNotificationAdapter.format_message(event)
+        self.assertIn(f'<a href="https://github.com/Wladefant/super-board/commit/{sha}">{sha}</a>', message)
+        for url in urls:
+            self.assertIn(f'<a href="{url}">{url}</a>', message)
+
 
 class TestCoordinatorPacketIngestion(unittest.TestCase):
     def test_decision_packet_translation(self):
@@ -514,6 +543,28 @@ class TestTelegramNotificationAdapter(unittest.TestCase):
         self.assertEqual(receipt.chat_id, "[REDACTED_DESTINATION]")
         self.assertNotIn("1247617658", receipt.reason)
         self.assertEqual(receipt.bot_id, "8566730274")
+
+    @patch("urllib.request.urlopen")
+    def test_screenshot_is_native_photo_not_description(self, mock_urlopen):
+        response = MagicMock()
+        response.read.return_value = json.dumps({"ok": True, "result": {
+            "message_id": 321, "from": {"id": 999},
+        }}).encode()
+        mock_urlopen.return_value.__enter__.return_value = response
+        event = NotificationEvent(
+            event_type="status", project="polysimulator", request_id="photo",
+            summary="Session evidence", canonical_link="https://github.com/Wladefant/super-board/issues/83",
+            metadata={"screenshot": "https://example.com/authorized-session.png"},
+        )
+        receipt = self.adapter.notify(event, force=True)
+        self.assertTrue(receipt.delivered)
+        request = mock_urlopen.call_args.args[0]
+        self.assertTrue(request.full_url.endswith("/sendPhoto"))
+        payload = json.loads(request.data)
+        self.assertEqual(payload["photo"], event.metadata["screenshot"])
+        self.assertEqual(payload["parse_mode"], "HTML")
+        self.assertNotIn("text", payload)
+        self.assertIn("Session evidence", payload["caption"])
 
     def test_unallowlisted_chat_blocked(self):
         ev = NotificationEvent(

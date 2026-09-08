@@ -799,6 +799,29 @@ def build_decision_inline_keyboard(
         return {"inline_keyboard": [buttons]}
     return None
 
+def link_references(text: str, project: str) -> str:
+    """Escape prose and link explicit GitHub references without guessing other repos."""
+    repo = project if re.fullmatch(r"[\w.-]+/[\w.-]+", project) else None
+    pattern = r'https?://[^\s<>"]+|(?:[\w.-]+/[\w.-]+)?#\d+|\b[0-9a-fA-F]{40}\b'
+    parts = []
+    end = 0
+    for match in re.finditer(pattern, text):
+        parts.append(escape_html(text[end:match.start()]))
+        label = match.group()
+        url = label if label.startswith(("http://", "https://")) else None
+        if url is None and re.fullmatch(r"[0-9a-fA-F]{40}", label):
+            url = f"https://github.com/{repo}/commit/{label}" if repo else None
+        elif url is None:
+            explicit_repo, number = label.rsplit("#", 1)
+            target_repo = explicit_repo or repo
+            if target_repo:
+                kind = "pull" if re.search(r"\bPR\s*$", text[:match.start()], re.I) else "issues"
+                url = f"https://github.com/{target_repo}/{kind}/{number}"
+        parts.append(f'<a href="{escape_html(url)}">{escape_html(label)}</a>' if url else escape_html(label))
+        end = match.end()
+    parts.append(escape_html(text[end:]))
+    return "".join(parts)
+
 class TelegramNotificationAdapter:
     """Portable Telegram notification adapter for multi-agent workflows."""
 
@@ -863,16 +886,16 @@ class TelegramNotificationAdapter:
             )
             lines.extend(
                 [
-                    f"• <b>What:</b> {escape_html(problem)}",
-                    f"• <b>Action:</b> {escape_html(action)}",
-                    f"• <b>Impact:</b> {escape_html(risk)}",
+                    f"• <b>What:</b> {link_references(problem, project)}",
+                    f"• <b>Action:</b> {link_references(action, project)}",
+                    f"• <b>Impact:</b> {link_references(risk, project)}",
                 ]
             )
         elif len(summary) > 280 or "\n" in summary:
             lines.append("• Full update below.")
             detail = "\n\n".join(part for part in (summary, detail) if part)
         else:
-            lines.append(f"• {escape_html(summary)}")
+            lines.append(f"• {link_references(summary, project)}")
 
         options = event.metadata.get("options")
         if event.event_type in ("decision", "question") and isinstance(options, list):
@@ -883,13 +906,13 @@ class TelegramNotificationAdapter:
                         str(option.get("label") or option.get("description") or option_id).strip()
                     )
                     prefix = f"{option_id}: " if option_id and option_id != option_label else ""
-                    lines.append(f"• <b>{escape_html(prefix + option_label)}</b>")
+                    lines.append(f"• <b>{link_references(prefix + option_label, project)}</b>")
 
         if event.event_type in ("decision", "question"):
             lines.append("Reply with guidance at any time; free text does not approve an action.")
 
         if detail:
-            lines.extend(["", f"<blockquote expandable>{escape_html(detail)}</blockquote>"])
+            lines.extend(["", f"<blockquote expandable>{link_references(detail, project)}</blockquote>"])
 
         details_url = str(
             event.metadata.get("details_url") or event.canonical_link or ""
@@ -1085,6 +1108,16 @@ class TelegramNotificationAdapter:
         payload["parse_mode"] = "HTML"
         if reply_markup:
             payload["reply_markup"] = reply_markup
+        photo = event.metadata.get("screenshot")
+        if photo:
+            if not isinstance(photo, str) or not (photo.startswith("https://") or re.fullmatch(r"[A-Za-z0-9_-]{20,}", photo)):
+                return DeliveryReceipt(delivered=False, status="blocked", reason="Screenshot must be an authorized HTTPS image or Telegram file ID.")
+            if len(message_text) > 1024:
+                return DeliveryReceipt(delivered=False, status="blocked", reason="Screenshot caption exceeds Telegram's limit; shorten the card.")
+            api_url = f"https://api.telegram.org/bot{token}/sendPhoto"
+            payload.pop("text")
+            payload.pop("disable_web_page_preview")
+            payload.update({"photo": photo, "caption": message_text})
         data_bytes = json.dumps(payload).encode("utf-8")
 
         try:
