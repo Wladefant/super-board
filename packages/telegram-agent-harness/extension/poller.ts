@@ -5,7 +5,13 @@
 import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { escapeHtml, getTokenFingerprint, redactSecrets } from "./sanitizer";
+import {
+  escapeHtml,
+  formatTelegramCaption,
+  getTokenFingerprint,
+  markdownToTelegramHtml,
+  redactSecrets,
+} from "./sanitizer";
 import { downloadInboundMedia, selectInboundMedia, type InboundMedia } from "./inbound-media";
 import type {
   AccessConfig,
@@ -212,25 +218,28 @@ export class TelegramPoller {
   public async sendTelegramMessage(
     chatId: string | number,
     text: string,
-    parseMode: "HTML" | "Markdown" | undefined = "HTML",
-    replyMarkup?: Record<string, unknown>,
+    replyMarkupOrParseMode?: Record<string, unknown> | "HTML" | "Markdown",
+    maybeReplyMarkup?: Record<string, unknown>,
     correlationMeta?: {
       requestId?: string | null;
       decisionId?: string | null;
       projectPath?: string | null;
     },
+    defaultRepo = "Bavariance/polysimulator",
   ): Promise<TelegramSendMessageResponse | null> {
-    const sanitized = redactSecrets(text);
-    if (!sanitized.trim()) return null;
+    const formatted = markdownToTelegramHtml(redactSecrets(text), defaultRepo);
+    if (!formatted.trim()) return null;
+
+    const replyMarkup = typeof replyMarkupOrParseMode === "string"
+      ? maybeReplyMarkup
+      : (replyMarkupOrParseMode ?? maybeReplyMarkup);
 
     try {
       const body: Record<string, unknown> = {
         chat_id: chatId,
-        text: sanitized,
+        text: formatted,
+        parse_mode: "HTML",
       };
-      if (parseMode) {
-        body.parse_mode = parseMode;
-      }
       if (replyMarkup) {
         body.reply_markup = replyMarkup;
       }
@@ -284,21 +293,20 @@ export class TelegramPoller {
     chatId: string | number,
     messageId: number,
     text: string,
-    parseMode: "HTML" | "Markdown" | undefined = "HTML",
+    _parseMode?: "HTML" | "Markdown",
+    defaultRepo = "Bavariance/polysimulator",
   ): Promise<TelegramSendMessageResponse | null> {
-    const sanitized = redactSecrets(text);
-    if (!sanitized.trim()) return null;
+    const formatted = markdownToTelegramHtml(redactSecrets(text), defaultRepo);
+    if (!formatted.trim()) return null;
 
     try {
       const body: Record<string, unknown> = {
         chat_id: chatId,
         message_id: messageId,
-        text: sanitized,
+        text: formatted,
+        parse_mode: "HTML",
         reply_markup: { inline_keyboard: [] },
       };
-      if (parseMode) {
-        body.parse_mode = parseMode;
-      }
 
       const response = await fetch(
         `https://api.telegram.org/bot${this.botToken}/editMessageText`,
@@ -818,14 +826,26 @@ export class TelegramPoller {
     this.db.run("UPDATE update_ledger SET status = 'COMPLETED' WHERE update_id = ?", [row.update_id]);
   }
 
-  public async sendTelegramPhoto(chatId: string, file: string, caption: string): Promise<void> {
+  public async sendTelegramPhoto(
+    chatId: string,
+    file: string,
+    caption: string,
+    replyMarkup?: Record<string, unknown>,
+    defaultRepo = "Bavariance/polysimulator",
+  ): Promise<void> {
     const sessionId = this.correlation?.getSessionId();
     const slotId = this.correlation?.getSlotId();
     const form = new FormData();
     form.set("chat_id", chatId);
     form.set("photo", Bun.file(file), path.basename(file));
-    form.set("caption", redactSecrets(caption));
-    form.set("parse_mode", "HTML");
+    const formattedCaption = formatTelegramCaption(redactSecrets(caption), 1024, defaultRepo);
+    if (formattedCaption) {
+      form.set("caption", formattedCaption);
+      form.set("parse_mode", "HTML");
+    }
+    if (replyMarkup) {
+      form.set("reply_markup", JSON.stringify(replyMarkup));
+    }
     const response = await fetch(`https://api.telegram.org/bot${this.botToken}/sendPhoto`, {
       method: "POST", body: form, signal: this.abortController.signal,
     });
@@ -837,6 +857,75 @@ export class TelegramPoller {
         messageId: data.result.message_id, slotId, sessionId,
         requestId: null, decisionId: null, projectPath: null, createdAt: Date.now() / 1000,
       });
+    }
+  }
+
+  public async sendMediaGroup(
+    chatId: string,
+    files: string[],
+    caption?: string,
+    defaultRepo = "Bavariance/polysimulator",
+  ): Promise<void> {
+    if (!files || files.length === 0) {
+      throw new Error("Media group requires at least one file");
+    }
+    const targetFiles = files.slice(0, 10);
+    if (targetFiles.length === 1) {
+      return this.sendTelegramPhoto(chatId, targetFiles[0], caption ?? "", undefined, defaultRepo);
+    }
+
+    const sessionId = this.correlation?.getSessionId();
+    const slotId = this.correlation?.getSlotId();
+    const form = new FormData();
+    form.set("chat_id", chatId);
+
+    const formattedCaption = caption
+      ? formatTelegramCaption(redactSecrets(caption), 1024, defaultRepo)
+      : "";
+
+    const mediaList = targetFiles.map((file, idx) => {
+      const attachName = `photo_${idx}`;
+      form.set(attachName, Bun.file(file), path.basename(file));
+      const entry: Record<string, unknown> = {
+        type: "photo",
+        media: `attach://${attachName}`,
+      };
+      if (idx === 0 && formattedCaption) {
+        entry.caption = formattedCaption;
+        entry.parse_mode = "HTML";
+      }
+      return entry;
+    });
+
+    form.set("media", JSON.stringify(mediaList));
+
+    const response = await fetch(`https://api.telegram.org/bot${this.botToken}/sendMediaGroup`, {
+      method: "POST",
+      body: form,
+      signal: this.abortController.signal,
+    });
+    const data = (await response.json()) as {
+      ok: boolean;
+      result?: Array<{ message_id: number; chat?: { id: number } }>;
+    };
+    if (!response.ok || !data.ok || !Array.isArray(data.result) || data.result.length === 0) {
+      throw new Error("Media group delivery failed");
+    }
+
+    if (sessionId && slotId && this.correlation) {
+      for (const msg of data.result) {
+        this.correlation.record({
+          botId: this.botId,
+          chatId: String(msg.chat?.id ?? chatId),
+          messageId: msg.message_id,
+          slotId,
+          sessionId,
+          requestId: null,
+          decisionId: null,
+          projectPath: null,
+          createdAt: Date.now() / 1000,
+        });
+      }
     }
   }
 

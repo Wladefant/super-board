@@ -20,7 +20,7 @@ import type {
 import { BotPoolCoordinator } from "./coordinator";
 import { DangerousToolGuard } from "./guard";
 import { TelegramPoller } from "./poller";
-import { chunkMessage, escapeHtml } from "./sanitizer";
+import { chunkMessage, escapeHtml, markdownToTelegramHtml } from "./sanitizer";
 import type { DiscoveredSlot, MessageCorrelationBridge } from "./types";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -112,16 +112,17 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
       const primaryChat = root.poller.getPrimaryChatId();
       if (!primaryChat) return;
 
-      const chunks = chunkMessage(targetText, 3800);
+      const fullHtml = markdownToTelegramHtml(targetText);
+      const chunks = chunkMessage(fullHtml, 3800);
       for (let i = 0; i < chunks.length; i++) {
         const chunk = chunks[i];
         if (i < sentTelegramMessageIds.length) {
           if (chunk !== streamedChunks[i]) {
-            await root.poller.editTelegramMessage(primaryChat, sentTelegramMessageIds[i], escapeHtml(chunk));
+            await root.poller.editTelegramMessage(primaryChat, sentTelegramMessageIds[i], chunk);
             streamedChunks[i] = chunk;
           }
         } else {
-          const res = await root.poller.sendTelegramMessage(primaryChat, escapeHtml(chunk));
+          const res = await root.poller.sendTelegramMessage(primaryChat, chunk);
           if (res?.ok && typeof res.result?.message_id === "number") {
             sentTelegramMessageIds.push(res.result.message_id);
             streamedChunks.push(chunk);
