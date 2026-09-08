@@ -508,7 +508,7 @@ export class TelegramPoller {
     // Mark as in-flight PROCESSING
     this.db.run("UPDATE update_ledger SET status = 'PROCESSING' WHERE update_id = ?", [row.update_id]);
 
-    if (!row.text || !row.text.trim()) {
+    if ((!row.text || !row.text.trim()) && !row.media_json) {
       this.db.run("UPDATE update_ledger SET status = 'REJECTED', error = 'EMPTY_TEXT' WHERE update_id = ?", [
         row.update_id,
       ]);
@@ -538,7 +538,7 @@ export class TelegramPoller {
     }
 
     this.primaryChatId = chatId;
-    let rawText = row.text.trim();
+    let rawText = row.text?.trim() ?? "";
 
     // 3. Callback query handling for interactive decision buttons
     if (row.is_callback === 1 || Boolean(row.callback_query_id)) {
