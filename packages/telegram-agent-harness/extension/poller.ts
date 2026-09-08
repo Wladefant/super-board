@@ -315,6 +315,20 @@ export class TelegramPoller {
       return null;
     }
   }
+  public async clearCallbackButtons(chatId: string, messageId: number): Promise<boolean> {
+    try {
+      const response = await fetch(`https://api.telegram.org/bot${this.botToken}/editMessageReplyMarkup`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }),
+        signal: this.abortController.signal,
+      });
+      const data: unknown = await response.json();
+      return Boolean(data && typeof data === "object" && "ok" in data && data.ok === true);
+    } catch {
+      return false;
+    }
+  }
   public async answerCallbackQuery(
     callbackQueryId: string,
     text?: string,
@@ -335,11 +349,11 @@ export class TelegramPoller {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
-          signal: this.abortController.signal,
+          signal: AbortSignal.any([this.abortController.signal, AbortSignal.timeout(3000)]),
         },
       );
-      const data = (await response.json()) as { ok?: boolean };
-      return Boolean(data?.ok);
+      const data: unknown = await response.json();
+      return Boolean(data && typeof data === "object" && "ok" in data && data.ok === true);
     } catch {
       return false;
     }
@@ -357,7 +371,8 @@ export class TelegramPoller {
 
     while (this.isRunning && !this.abortController.signal.aborted) {
       try {
-        const url = `https://api.telegram.org/bot${this.botToken}/getUpdates?offset=${offset}&timeout=20`;
+        const allowedUpdates = encodeURIComponent(JSON.stringify(["message", "callback_query"]));
+        const url = `https://api.telegram.org/bot${this.botToken}/getUpdates?offset=${offset}&timeout=20&allowed_updates=${allowedUpdates}`;
         const res = await fetch(url, { signal: this.abortController.signal });
 
         if (!res.ok) {
@@ -372,6 +387,11 @@ export class TelegramPoller {
           // and retried rather than swallowed.
           try {
             this.ingestUpdates(data.result);
+            // Stop every click's spinner before media downloads or session delivery
+            // can hold up the serial ledger queue. This acknowledges receipt only.
+            await Promise.all(data.result.flatMap(update => update.callback_query
+              ? [this.answerCallbackQuery(update.callback_query.id, "Received; checking selection.")]
+              : []));
           } catch (err: unknown) {
             this.callbacks.onLedgerFailure(
               redactSecrets(err instanceof Error ? err.message : String(err)),
@@ -408,10 +428,10 @@ export class TelegramPoller {
           this.db.run(
             `INSERT INTO update_ledger (
                update_id, chat_id, user_id, text, received_at, status,
-               reply_to_message_id, callback_query_id, callback_data, is_callback
-             ) VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, 1)
+               reply_to_message_id, reply_to_text, callback_query_id, callback_data, is_callback
+             ) VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?, ?, ?, 1)
              ON CONFLICT(update_id) DO NOTHING;`,
-            [update.update_id, chatId, fromId, callbackData, now, replyToMessageId, callbackQueryId, callbackData],
+            [update.update_id, chatId, fromId, callbackData, now, replyToMessageId, cb.message?.text ?? cb.message?.caption ?? null, callbackQueryId, callbackData],
           );
           continue;
         }
@@ -500,6 +520,9 @@ export class TelegramPoller {
           row.update_id,
         ]);
         this.callbacks.onLedgerFailure(`update ${row.update_id} could not be processed: ${detail}`);
+        if (row.is_callback) {
+          await this.sendTelegramMessage(row.chat_id, `Choice could not be delivered: ${escapeHtml(detail)}. Reply to the original message with your choice.`);
+        }
       }
     }
   }
@@ -565,39 +588,36 @@ export class TelegramPoller {
           "UPDATE update_ledger SET status = 'REJECTED', error = ? WHERE update_id = ?",
           [`CALLBACK_${resolution.decision.toUpperCase()}`, row.update_id],
         );
+        await this.sendTelegramMessage(chatId, `Selection not delivered: ${escapeHtml(resolution.detail)}. Reconnect the original session or reply to the question with your choice.`);
+        if (typeof row.reply_to_message_id === "number" &&
+            ["reject_expired", "reject_already_consumed", "reject_already_answered"].includes(resolution.decision)) {
+          await this.clearCallbackButtons(chatId, row.reply_to_message_id);
+        }
         return;
       }
 
-      // Valid authentic callback
       const record = resolution.record;
-      if (this.correlation.consumeCallback) {
-        this.correlation.consumeCallback(callbackToken);
+      if (!this.callbacks.onDecisionCallback || !this.correlation.consumeCallback) {
+        throw new Error("Decision delivery unavailable; reply to the message with your choice.");
       }
-
-      if (cbQueryId) {
-        await this.answerCallbackQuery(cbQueryId, `Selection recorded: Option ${record.choiceId}`, false);
+      // Recheck after the asynchronous receipt acknowledgement, before delivery.
+      if (record.sessionId !== this.correlation.getSessionId()) {
+        throw new Error("Session changed; reconnect the original session and retry your choice.");
       }
+      if (!this.correlation.consumeCallback(callbackToken)) {
+        if (cbQueryId) await this.answerCallbackQuery(cbQueryId, "This choice was already received.", true);
+        this.db.run("UPDATE update_ledger SET status = 'REJECTED', error = 'CALLBACK_ALREADY_CONSUMED' WHERE update_id = ?", [row.update_id]);
+        return;
+      }
+      this.callbacks.onTelegramTurnStart();
+      await this.callbacks.onDecisionCallback(record.decisionId, record.choiceId, row.reply_to_text ?? undefined);
 
-      // Update the visible Telegram message to show resolved state and disable buttons
+      // Preserve the original question/caption (including photo messages). Do not
+      // claim canonical authorization or a cleared blocker merely from a click.
       if (typeof row.reply_to_message_id === "number") {
-        await this.editTelegramMessage(
-          chatId,
-          row.reply_to_message_id,
-          [
-            `✅ <b>Decision Resolved</b>`,
-            "",
-            `Choice: <b>Option ${escapeHtml(record.choiceId)}</b> recorded.`,
-            `Blocker cleared in request ledger.`,
-            `Resuming authorized work.`,
-          ].join("\n"),
-        );
+        await this.clearCallbackButtons(chatId, row.reply_to_message_id);
       }
-
-      // Trigger canonical resolution and deliver choice to active session
-      if (this.callbacks.onDecisionCallback) {
-        this.callbacks.onTelegramTurnStart();
-        await this.callbacks.onDecisionCallback(record.decisionId, record.choiceId);
-      }
+      await this.sendTelegramMessage(chatId, `Choice <b>${escapeHtml(record.choiceId)}</b> delivered to the session.`);
 
       this.db.run(
         "UPDATE update_ledger SET status = 'COMPLETED', correlated_session_id = ? WHERE update_id = ?",
