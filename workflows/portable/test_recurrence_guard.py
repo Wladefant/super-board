@@ -2556,8 +2556,11 @@ class TestEscalationsAreConsumedAndAcknowledged(unittest.TestCase):
         with open(outbox, "r", encoding="utf-8") as fh:
             lines = [json.loads(line) for line in fh if line.strip()]
         self.assertEqual(len(lines), 1)
-        self.assertIn("[Blocker]", lines[0]["message"])
-        self.assertIn("fixture-org/fixture-repo", lines[0]["message"])
+        self.assertIn("<b>Blocked</b>", lines[0]["message"])
+        self.assertIn(
+            '<a href="https://github.com/fixture-org/fixture-repo">fixture-org/fixture-repo</a>',
+            lines[0]["message"],
+        )
         self.assertTrue(os.path.exists(dedup))
 
     def test_the_offline_outbox_cli_delivers_once_and_then_has_nothing_to_do(self):
