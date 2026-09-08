@@ -1201,6 +1201,25 @@ class TestDecisionInteractiveCallback(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.pool_db = Path(self.tmp) / "bot_pool.db"
+        self.channels_dir = Path(self.tmp) / "channels"
+        self.polysim_dir = self.channels_dir / "telegram-polysim"
+        self.polysim_dir.mkdir(parents=True, exist_ok=True)
+        (self.polysim_dir / ".env").write_text("TELEGRAM_BOT_TOKEN=dummy_token_999\n", encoding="utf-8")
+        (self.polysim_dir / "access.json").write_text(json.dumps({"allowFrom": ["1247617658"]}), encoding="utf-8")
+        manifest_file = Path(self.tmp) / "manifest.json"
+        manifest_file.write_text(
+            json.dumps({
+                "version": 1,
+                "slots": [{
+                    "slotId": "telegram-polysim",
+                    "stateDir": str(self.polysim_dir),
+                    "preferredProjects": ["polysimulator", "Bavariance/polysimulator"],
+                    "enabled": True,
+                }],
+            }),
+            encoding="utf-8",
+        )
+        self.resolver = ProjectSlotResolver(manifest_path=manifest_file, channels_dir=self.channels_dir)
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -1278,7 +1297,7 @@ class TestDecisionInteractiveCallback(unittest.TestCase):
 
     def test_send_notification_dry_run_includes_buttons(self):
         store = DecisionCallbackStore(self.pool_db)
-        adapter = TelegramNotificationAdapter(callback_store=store)
+        adapter = TelegramNotificationAdapter(resolver=self.resolver, callback_store=store)
         ev = NotificationEvent(
             event_type="decision",
             project="Bavariance/polysimulator",
