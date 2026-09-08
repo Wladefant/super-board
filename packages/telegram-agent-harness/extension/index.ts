@@ -247,6 +247,7 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
         accessConfig,
         {
           isIdle: () => ctx.isIdle(),
+          getSessionFile: () => ctx.sessionManager.getSessionFile(),
           onUserMessage: text => {
             if (guard) guard.startTelegramTurn();
             pi.sendUserMessage(text);

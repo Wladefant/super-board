@@ -6,6 +6,7 @@ import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { escapeHtml, getTokenFingerprint, redactSecrets } from "./sanitizer";
+import { downloadInboundMedia, selectInboundMedia, type InboundMedia } from "./inbound-media";
 import type {
   AccessConfig,
   MessageCorrelationBridge,
@@ -16,6 +17,7 @@ import type {
 
 export interface PollerCallbacks {
   isIdle: () => boolean;
+  getSessionFile?: () => string | undefined;
   onUserMessage: (text: string) => void;
   onFollowUp: (text: string) => void;
   onSteer: (text: string) => void;
@@ -55,6 +57,7 @@ interface LedgerRow {
   callback_query_id: string | null;
   callback_data: string | null;
   is_callback: number | null;
+  media_json: string | null;
 }
 
 /**
@@ -78,6 +81,7 @@ const UPDATE_LEDGER_ADDITIVE_COLUMNS: Record<string, string> = {
   callback_query_id: "TEXT",
   callback_data: "TEXT",
   is_callback: "INTEGER DEFAULT 0",
+  media_json: "TEXT",
 };
 
 /**
@@ -438,13 +442,14 @@ export class TelegramPoller {
           }
         }
 
+        const media = selectInboundMedia(msg);
         this.db.run(
           `INSERT INTO update_ledger (
              update_id, chat_id, user_id, text, received_at, status,
-             reply_to_message_id, reply_to_text
-           ) VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?)
+             reply_to_message_id, reply_to_text, media_json
+           ) VALUES (?, ?, ?, ?, ?, 'PENDING', ?, ?, ?)
            ON CONFLICT(update_id) DO NOTHING;`,
-          [update.update_id, chatId, fromId, text, now, replyToMessageId, replyToText],
+          [update.update_id, chatId, fromId, text, now, replyToMessageId, replyToText, media ? JSON.stringify(media) : null],
         );
       }
       this.db.run("COMMIT;");
@@ -533,7 +538,7 @@ export class TelegramPoller {
     }
 
     this.primaryChatId = chatId;
-    const rawText = row.text.trim();
+    let rawText = row.text.trim();
 
     // 3. Callback query handling for interactive decision buttons
     if (row.is_callback === 1 || Boolean(row.callback_query_id)) {
@@ -646,8 +651,29 @@ export class TelegramPoller {
       );
     }
 
+    if (row.media_json) {
+      const sessionFile = this.callbacks.getSessionFile?.();
+      const sessionId = this.correlation?.getSessionId();
+      try {
+        if (!sessionFile) throw new Error("Session attachment directory unavailable. Please resend after reconnecting.");
+        const media = JSON.parse(row.media_json) as InboundMedia;
+        const attachment = await downloadInboundMedia(this.botToken, media,
+          path.join(path.dirname(sessionFile), "local", "telegram-inbound"), row.update_id, this.abortController.signal);
+        if (this.callbacks.getSessionFile?.() !== sessionFile || this.correlation?.getSessionId() !== sessionId) {
+          throw new Error("Session changed during attachment download. Please resend to the current session.");
+        }
+        const caption = rawText === "<photo>" || rawText.startsWith("<file:") || rawText === "<file>" ? "" : rawText;
+        rawText = `[Telegram ${media.mime_type === "application/pdf" ? "document" : "image"} from operator | ${caption}] attachment: ${attachment}`;
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : "Attachment download failed. Please resend.";
+        this.db.run("UPDATE update_ledger SET status = 'REJECTED', error = ? WHERE update_id = ?", [detail, row.update_id]);
+        await this.sendTelegramMessage(chatId, escapeHtml(detail));
+        return;
+      }
+    }
+
     // 4. Command handling
-    if (await this.callbacks.onHarnessCommand?.(rawText, chatId)) {
+    if (!row.media_json && await this.callbacks.onHarnessCommand?.(rawText, chatId)) {
       this.db.run("UPDATE update_ledger SET status = 'COMPLETED' WHERE update_id = ?", [row.update_id]);
       return;
     }
