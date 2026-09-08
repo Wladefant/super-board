@@ -791,7 +791,7 @@ def render_card(event: NotificationEvent) -> str:
     repo = match.group(1) if match else project
     safe = lambda value: inline_text(value, repo)
     subject = event.metadata.get("subject") or project
-    lines = [f"{icon} <b>{label}</b>", f"• {card_link(link, subject) if link else safe(subject)}"]
+    lines = [f"{icon} <b>{label}</b>", f"• {card_link(link, subject) if link else safe(subject)}", "────────"]
     if event.event_type in ("question", "decision"):
         lines.extend([
             f"• {safe(event.metadata.get('problem') or ('Your guidance is needed before continuing.' if '?' in event.summary else event.summary))}",
@@ -799,7 +799,7 @@ def render_card(event: NotificationEvent) -> str:
             f"• <b>Impact:</b> {safe(event.metadata.get('consequence_or_risk') or 'Dependent work waits for your answer.')}",
         ])
         question = event.metadata.get("question") or (event.summary if "?" in event.summary else "Which option should we use?")
-        lines.extend(["", f"<b>{safe(question)}</b>"])
+        lines.extend(["────────", f"<b>{safe(question)}</b>"])
         options = []
         for opt in event.metadata.get("options") or []:
             if isinstance(opt, dict):
@@ -807,7 +807,7 @@ def render_card(event: NotificationEvent) -> str:
             else:
                 options.append(str(opt))
         if options:
-            lines.append(safe(" · ".join(options)))
+            lines.extend(safe(option) for option in options)
     else:
         bullets = [re.sub(r"^[•*-]\s+", "", row.strip()) for row in event.summary.splitlines() if row.strip()]
         for row in bullets[:7]:
@@ -816,11 +816,11 @@ def render_card(event: NotificationEvent) -> str:
             if rendered:
                 lines.append(f"• {truncate_html(rendered, 1000)}")
         if len(bullets) > 7:
-            lines.append("<blockquote expandable>" + safe("\n".join(bullets[7:])) + "</blockquote>")
+            lines.extend(["────────", "<blockquote expandable>" + safe("\n\n".join(bullets[7:])) + "</blockquote>"])
     detail = event.metadata.get("long_detail") or event.metadata.get("detail")
     if detail:
-        lines.extend(["", f"<blockquote expandable>{safe(detail)}</blockquote>"])
-    return truncate_html("\n".join(lines), 1024 if event.metadata.get("screenshot") or event.metadata.get("images") else 4096)
+        lines.extend(["────────", f"<blockquote expandable>{safe(detail)}</blockquote>"])
+    return truncate_html("\n\n".join(lines), 1024 if event.metadata.get("screenshot") or event.metadata.get("images") else 4096)
 
 
 def format_decision_presentation(
@@ -845,13 +845,16 @@ def format_consolidated_blockers_presentation(
         topic = str(item.get("topic") or f"Decision {index}").replace("-", " ")
         url = item.get("canonical_link") or details_url or ""
         problem = item.get("problem") or item.get("question") or "Your guidance is needed."
-        lines.append(f"• {card_link(url, topic)} — {inline_text(problem)}")
+        lines.extend(["────────", f"• {card_link(url, topic)}", inline_text(problem)])
         if item.get("proposed_action"):
-            lines.append(f"  <b>Proposal:</b> {inline_text(item['proposed_action'])}")
+            lines.append(f"<b>Proposal:</b> {inline_text(item['proposed_action'])}")
         if item.get("consequence_or_risk"):
-            lines.append(f"  <b>Impact:</b> {inline_text(item['consequence_or_risk'])}")
-    lines.extend(["", "<b>Which decision should we address first?</b>", "Reply with the topic name."])
-    return truncate_html("\n".join(lines), 4096)
+            lines.append(f"<b>Impact:</b> {inline_text(item['consequence_or_risk'])}")
+        detail = item.get("long_detail") or item.get("detail")
+        if detail:
+            lines.append(f"<blockquote expandable>{inline_text(detail)}</blockquote>")
+    lines.extend(["────────", "<b>Which decision should we address first?</b>", "Reply with the topic name."])
+    return truncate_html("\n\n".join(lines), 4096)
 
 
 def build_decision_inline_keyboard(

@@ -8,6 +8,13 @@ test("portable notifier HTML and callback contracts", () => {
   expect(result.exitCode).toBe(0);
 }, 60_000);
 
+test("portable spacious card exact HTML contracts", () => {
+  const root = resolve(import.meta.dir, "../../..");
+  const result = Bun.spawnSync(["python", "-m", "unittest", "discover", "-s", "workflows/portable", "-p", "test_telegram_cards.py"], { cwd: root });
+  if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+  expect(result.exitCode).toBe(0);
+}, 60_000);
+
 test.skipIf(!process.env.TG_NOTIFIER_INSTALLED_PATH)("installed notifier HTML and callback contracts", () => {
   const root = resolve(import.meta.dir, "../../..");
   const result = Bun.spawnSync(["python", "-m", "unittest",
