@@ -4,14 +4,14 @@ workflows/telegram_notifier.py — Portable Telegram Workflow Status Notificatio
 
 A harness-agnostic, pure Python standard library notification adapter for multi-agent workflows.
 Consumes portable CoordinatorPacket events or direct status updates and dispatches strictly
-deduped, rate-limited, single-sentence status reports with canonical links.
+deduped, rate-limited HTML status cards with a single canonical details link.
 
 Invariants:
 1. Canonical Authority: Status is always anchored to GitHub Issues / PRs and Superboard.
    Telegram is strictly an outbound notification transport, never a parallel system of record.
 2. Filtered Event Classes: milestone, blocker, decision, completion ONLY.
    Routine tool execution, subagent traces, and search/read chatter are strictly rejected.
-3. Message Format: Exactly ONE concise sentence + canonical link (GitHub issue/PR or Superboard).
+3. Message Format: Compact escaped HTML, expandable detail, and one canonical Details link.
 4. No Credential Leakage: Tokens, keys, and local file paths are strictly redacted.
    Bot tokens are loaded into private memory only and never echoed, printed, or persisted to logs.
 5. Deduplication & Cooldown:
@@ -834,7 +834,6 @@ class TelegramNotificationAdapter:
         }
         emoji, title = presentation.get(event.event_type, ("ℹ️", event.event_type.capitalize()))
         project = SecretSanitizer.sanitize(str(event.project).strip())
-        request_id = SecretSanitizer.sanitize(str(event.request_id).strip())
         summary = SecretSanitizer.sanitize(str(event.summary).strip())
         detail = SecretSanitizer.sanitize(
             str(event.metadata.get("long_detail") or event.metadata.get("detail") or "").strip()
@@ -842,11 +841,11 @@ class TelegramNotificationAdapter:
 
         lines = [
             f"{emoji} <b>{escape_html(title)}</b>",
-            f"<i>{escape_html(project)} · {escape_html(request_id)}</i>",
+            f"<i>{escape_html(project)}</i>",
             "",
         ]
 
-        if event.event_type == "decision" and plain_language:
+        if event.event_type in ("decision", "question") and plain_language:
             problem = SecretSanitizer.sanitize(
                 str(event.metadata.get("problem") or summary).strip()
             )
@@ -885,6 +884,9 @@ class TelegramNotificationAdapter:
                     )
                     prefix = f"{option_id}: " if option_id and option_id != option_label else ""
                     lines.append(f"• <b>{escape_html(prefix + option_label)}</b>")
+
+        if event.event_type in ("decision", "question"):
+            lines.append("Reply with guidance at any time; free text does not approve an action.")
 
         if detail:
             lines.extend(["", f"<blockquote expandable>{escape_html(detail)}</blockquote>"])
@@ -1039,7 +1041,7 @@ class TelegramNotificationAdapter:
         # 3. Format message
         message_text = self.format_message(
             event,
-            plain_language=event.event_type == "decision",
+            plain_language=event.event_type in ("decision", "question"),
         )
 
         # Questions and decisions share the existing actor/chat/session-bound

@@ -24,7 +24,7 @@ interface PendingRequest {
   events: unknown[];
   resolve: (result: GuiHostResponse) => void;
   reject: (error: Error) => void;
-  timer: ReturnType<typeof setTimeout>;
+  timer: NodeJS.Timeout;
 }
 
 export class SocketGuiHostPort implements GuiHostPort {

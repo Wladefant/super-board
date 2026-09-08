@@ -118,10 +118,9 @@ class TestMessageFormatting(unittest.TestCase):
             canonical_link="https://github.com/Bavariance/polysimulator/issues/4545",
         )
         msg = TelegramNotificationAdapter.format_message(ev)
-        self.assertTrue(msg.startswith("[Milestone] Bavariance/polysimulator req-4545:"))
-        self.assertTrue(msg.endswith("https://github.com/Bavariance/polysimulator/issues/4545"))
-        # Verify single sentence (no newlines)
-        self.assertNotIn("\n", msg)
+        self.assertTrue(msg.startswith("🚀 <b>Milestone reached</b>"))
+        self.assertIn("• Implementation complete, advancing to review", msg)
+        self.assertTrue(msg.endswith('">Details</a>'))
 
     def test_format_decision_label(self):
         ev = NotificationEvent(
@@ -132,7 +131,7 @@ class TestMessageFormatting(unittest.TestCase):
             canonical_link="https://github.com/Bavariance/polysimulator/issues/4543#issuecomment-5550731410",
         )
         msg = TelegramNotificationAdapter.format_message(ev)
-        self.assertTrue(msg.startswith("[Decision Needed]"))
+        self.assertTrue(msg.startswith("❓ <b>Decision needed</b>"))
 
     def test_format_status_and_question_events(self):
         status_ev = NotificationEvent(
@@ -143,9 +142,9 @@ class TestMessageFormatting(unittest.TestCase):
             canonical_link="https://github.com/Wladefant/super-board/pull/74",
         )
         msg = TelegramNotificationAdapter.format_message(status_ev)
-        self.assertTrue(msg.startswith("[Status Update] Bavariance/polysimulator req-harness-continuous-orchestration:"))
+        self.assertTrue(msg.startswith("📊 <b>Status update</b>"))
         self.assertIn("1a28d9d8ad1976160db7223a0d5df57df421f862", msg)
-        self.assertTrue(msg.endswith("https://github.com/Wladefant/super-board/pull/74"))
+        self.assertIn('<a href="https://github.com/Wladefant/super-board/pull/74">Details</a>', msg)
 
         question_ev = NotificationEvent(
             event_type="question",
@@ -155,7 +154,7 @@ class TestMessageFormatting(unittest.TestCase):
             canonical_link="https://github.com/Bavariance/polysimulator/issues/4543",
         )
         q_msg = TelegramNotificationAdapter.format_message(question_ev)
-        self.assertTrue(q_msg.startswith("[Question] Bavariance/polysimulator DEC-4543-01:"))
+        self.assertTrue(q_msg.startswith("❓ <b>Question</b>"))
 
     def test_format_multiple_links_and_deduplication(self):
         ev = NotificationEvent(
@@ -174,10 +173,24 @@ class TestMessageFormatting(unittest.TestCase):
         )
         msg = TelegramNotificationAdapter.format_message(ev)
         self.assertIn("https://github.com/Wladefant/super-board/pull/74", msg)
-        self.assertIn("https://github.com/Bavariance/polysimulator/pull/4545", msg)
-        self.assertIn("https://github.com/Bavariance/polysimulator/issues/4543", msg)
-        # Verify deduplication: PR74 should appear exactly once
+        self.assertNotIn("https://github.com/Bavariance/polysimulator/pull/4545", msg)
+        self.assertNotIn("https://github.com/Bavariance/polysimulator/issues/4543", msg)
+        self.assertEqual(msg.count("<a href="), 1)
         self.assertEqual(msg.count("https://github.com/Wladefant/super-board/pull/74"), 1)
+
+    def test_html_escaping_and_expandable_detail(self):
+        ev = NotificationEvent(
+            event_type="status", project='A & <B>', request_id="example",
+            summary='Check <script> & "quotes"',
+            canonical_link='https://example.com/?a=1&b="two"',
+            metadata={"long_detail": "<private> & detail"},
+        )
+        msg = TelegramNotificationAdapter.format_message(ev)
+        self.assertIn("A &amp; &lt;B&gt;", msg)
+        self.assertIn("Check &lt;script&gt; &amp; &quot;quotes&quot;", msg)
+        self.assertIn("<blockquote expandable>&lt;private&gt; &amp; detail</blockquote>", msg)
+        self.assertIn('href="https://example.com/?a=1&amp;b=&quot;two&quot;"', msg)
+        self.assertNotIn("<script>", msg)
 
 
 class TestCoordinatorPacketIngestion(unittest.TestCase):
@@ -540,10 +553,10 @@ class TestTelegramNotificationAdapter(unittest.TestCase):
         self.assertIn("Option A: Park and Idle Wait", ev.summary)
 
         formatted = TelegramNotificationAdapter.format_message(ev)
-        self.assertTrue(formatted.startswith("[Decision Needed] Bavariance/polysimulator req-arch-01 (DEC-ARCH-01):"))
+        self.assertTrue(formatted.startswith("❓ <b>Decision needed</b>"))
         self.assertIn("Options: A: Park and Idle Wait; B: Speculative Feature Branching", formatted)
         self.assertIn("Recommended: Option A", formatted)
-        self.assertTrue(formatted.endswith("https://github.com/Bavariance/polysimulator/issues/4543"))
+        self.assertTrue(formatted.endswith('<a href="https://github.com/Bavariance/polysimulator/issues/4543">Details</a>'))
 
     def test_load_decision_from_file(self):
         temp_dec_file = Path(self.temp_dir.name) / "test_decisions.json"
@@ -1318,6 +1331,27 @@ class TestDecisionInteractiveCallback(unittest.TestCase):
         self.assertEqual(len(buttons), 2)
         self.assertEqual(buttons[0]["text"], "A: Access remedy")
         self.assertTrue(buttons[0]["callback_data"].startswith("cb:d_"))
+
+    def test_question_buttons_bind_choices_to_origin(self):
+        store = DecisionCallbackStore(self.pool_db)
+        adapter = TelegramNotificationAdapter(resolver=self.resolver, callback_store=store)
+        event = NotificationEvent(
+            event_type="question", project="Bavariance/polysimulator",
+            request_id="question-example", summary="Proceed with the harmless check?",
+            canonical_link="https://github.com/Wladefant/super-board/issues/83",
+            session_id="session-owner",
+            metadata={"decision_id": "decision-example", "options": [
+                {"id": "A", "label": "Run check"}, {"id": "B", "label": "Wait"},
+            ]},
+        )
+        receipt = adapter.notify(event, dry_run=True)
+        buttons = receipt.reply_markup["inline_keyboard"][0]
+        self.assertEqual([button["text"] for button in buttons], ["A: Run check", "B: Wait"])
+        for button, choice in zip(buttons, ["A", "B"]):
+            record = store.lookup(button["callback_data"])
+            self.assertEqual(record["choice_id"], choice)
+            self.assertEqual(record["decision_id"], "decision-example")
+            self.assertEqual(record["session_id"], "session-owner")
 
 
 if __name__ == "__main__":
