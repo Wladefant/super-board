@@ -2,6 +2,8 @@ import { expect, test, spyOn } from "bun:test";
 import { EventEmitter } from "node:events";
 import * as net from "node:net";
 import { SocketGuiHostPort } from "../src/gui-host-client";
+import { HerdrAdapter } from "../src/herdr-adapter";
+import type { CommandRunner } from "../src/contract";
 
 const flush = async () => { for (let i = 0; i < 10; i++) await Promise.resolve(); };
 
@@ -44,3 +46,26 @@ test("successful handshake clears its deadline while a later request is active",
   } finally { port.close(); set.mockRestore(); clear.mockRestore(); create.mockRestore(); }
 });
 
+for (const scenario of ["idle-to-prompt", "active-to-idle-abort", "active-to-subsequent-abort"] as const) {
+  test(`Herdr race reproduction: ${scenario}`, async () => {
+    let state = scenario === "idle-to-prompt" ? "idle" : "working";
+    let turn = 1;
+    const deliveries: { state: string; turn: number; command: string }[] = [];
+    const runner: CommandRunner = { async run(argv) {
+      if (argv[2] === "get") {
+        const snapshot = { agent: { name: "builder", agent_status: state } };
+        // The native lifecycle changes after the snapshot, before the next CLI request.
+        state = scenario === "active-to-idle-abort" ? "idle" : "working";
+        if (scenario === "active-to-subsequent-abort") turn++;
+        return { exitCode: 0, stdout: JSON.stringify({ result: snapshot }), stderr: "" };
+      }
+      deliveries.push({ state, turn, command: argv[2] });
+      return { exitCode: 0, stdout: JSON.stringify({ result: {} }), stderr: "" };
+    } };
+    const adapter = new HerdrAdapter(runner);
+    const result = scenario === "idle-to-prompt" ? await adapter.prompt("builder", "hello") : await adapter.abort("builder");
+    // These assertions characterize the confirmed upstream defect, not closure.
+    expect(result.ok).toBe(true);
+    expect(deliveries).toEqual([{ state, turn, command: scenario === "idle-to-prompt" ? "prompt" : "send-keys" }]);
+  });
+}

@@ -73,7 +73,7 @@ function toSession(value: unknown, observedAt: number): AgentSession {
     project: stringValue(agent.foreground_cwd) ?? stringValue(agent.cwd),
     observedAt,
     detail: state === "unknown" ? "Herdr cannot classify this agent yet." : kind,
-    canPrompt: false,
+    canPrompt: state === "idle",
   };
 }
 
@@ -160,20 +160,39 @@ export class HerdrAdapter implements AgentHarnessAdapter {
     }
   }
 
-  async prompt(_sessionId: string, _text: string, _mode: PromptMode = "auto"): Promise<PromptResult> {
-    return {
-      ok: false,
-      disposition: "rejected",
-      detail: "Herdr is read-only: prompting requires native atomic idle-submit support.",
-    };
+  async prompt(sessionId: string, text: string, _mode: PromptMode = "auto"): Promise<PromptResult> {
+    const prompt = text.trim();
+    if (!prompt) return { ok: false, disposition: "rejected", detail: "Prompt text is empty." };
+    const state = await this.getState(sessionId);
+    if (state.state !== "idle") {
+      return {
+        ok: false,
+        disposition: "rejected",
+        detail: state.state === "working"
+          ? "Herdr cannot safely queue or steer this busy agent. Nothing was sent."
+          : `Agent is ${state.state}; nothing was sent.`,
+      };
+    }
+    const result = await this.runner.run([this.binary, "agent", "prompt", sessionId, prompt]);
+    if (result.exitCode !== 0) {
+      return { ok: false, disposition: "rejected", detail: "Herdr rejected the prompt; nothing was retried." };
+    }
+    return { ok: true, disposition: "started", detail: "Prompt delivered to the idle Herdr agent." };
   }
 
   async answer(_sessionId: string, _interactionId: string, _answer: DecisionAnswer): Promise<ActionResult> {
     return { ok: false, detail: "Herdr terminal prompts do not provide typed approvals." };
   }
 
-  async abort(_sessionId: string): Promise<ActionResult> {
-    return { ok: false, detail: "Herdr is read-only: abort requires native generation-bound cancellation." };
+  async abort(sessionId: string): Promise<ActionResult> {
+    const state = await this.getState(sessionId);
+    if (state.state !== "working" && state.state !== "blocked") {
+      return { ok: false, detail: `Agent is ${state.state}; there is no observed active turn to abort.` };
+    }
+    const result = await this.runner.run([this.binary, "agent", "send-keys", sessionId, "ctrl+c"]);
+    return result.exitCode === 0
+      ? { ok: true, detail: "Abort signal sent to the selected Herdr agent." }
+      : { ok: false, detail: "Herdr could not abort the selected agent." };
   }
 
   async artifacts(_sessionId: string): Promise<ArtifactResult> {
