@@ -112,16 +112,17 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
       const primaryChat = root.poller.getPrimaryChatId();
       if (!primaryChat) return;
 
-      const chunks = chunkMessage(targetText, 3800);
+      const fullHtml = markdownToTelegramHtml(targetText);
+      const chunks = chunkMessage(fullHtml, 3800);
       for (let i = 0; i < chunks.length; i++) {
         const chunk = chunks[i];
         if (i < sentTelegramMessageIds.length) {
           if (chunk !== streamedChunks[i]) {
-            await root.poller.editTelegramMessage(primaryChat, sentTelegramMessageIds[i], markdownToTelegramHtml(chunk));
+            await root.poller.editTelegramMessage(primaryChat, sentTelegramMessageIds[i], chunk);
             streamedChunks[i] = chunk;
           }
         } else {
-          const res = await root.poller.sendTelegramMessage(primaryChat, markdownToTelegramHtml(chunk));
+          const res = await root.poller.sendTelegramMessage(primaryChat, chunk);
           if (res?.ok && typeof res.result?.message_id === "number") {
             sentTelegramMessageIds.push(res.result.message_id);
             streamedChunks.push(chunk);

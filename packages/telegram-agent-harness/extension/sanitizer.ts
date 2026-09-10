@@ -1,5 +1,6 @@
 /**
- * sanitizer.ts — Outbound text sanitization, HTML escaping, secrets redaction, and token fingerprinting.
+ * sanitizer.ts — Outbound text sanitization, HTML escaping, secrets redaction,
+ * token fingerprinting, and canonical Markdown-to-Telegram-HTML conversion.
  */
 import { createHmac } from "node:crypto";
 
@@ -153,7 +154,190 @@ export function redactSecrets(text: string): string {
 }
 
 /**
- * Splits long text into chunks that fit within Telegram's message limits (4096 max, 4000 safe).
+ * Converts Markdown to Telegram-compatible HTML.
+ * Preserves pre-existing valid HTML tags (such as <a href="...">, <b>, <blockquote>) without
+ * double-escaping, auto-links bare URLs, issue/PR references, and commit SHAs, converts tables
+ * to bullet lists, and safely escapes all literal user text characters (<, >, &).
+ */
+export function markdownToTelegramHtml(markdown: string, defaultRepo = "Bavariance/polysimulator"): string {
+  if (!markdown) return "";
+
+  const placeholders: string[] = [];
+  function addPlaceholder(val: string): string {
+    const idx = placeholders.length;
+    const key = `\x01TGPH_${idx}\x01`;
+    placeholders.push(val);
+    return key;
+  }
+
+  // 1. Normalize line endings
+  let text = markdown.replace(/\r\n/g, "\n");
+
+  // 2. Code blocks: ```lang\ncode\n```
+  text = text.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (_m, lang, code) => {
+    const trimmedLang = lang.trim();
+    const attr = trimmedLang ? ` class="language-${escapeHtml(trimmedLang)}"` : "";
+    return addPlaceholder(`<pre><code${attr}>${escapeHtml(code.replace(/\n$/, ""))}</code></pre>`);
+  });
+
+  // 3. Inline code: `code`
+  text = text.replace(/`([^`\n]+)`/g, (_m, code) => {
+    return addPlaceholder(`<code>${escapeHtml(code)}</code>`);
+  });
+
+  // 4. Pre-existing <a> tags: preserve without double-escaping or re-linking
+  text = text.replace(/<a\s+href=["']([^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi, (_m, rawUrl, body) => {
+    const safeUrl = rawUrl.replace(/&amp;/g, "&").replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+    return addPlaceholder(`<a href="${safeUrl}">${body}</a>`);
+  });
+
+  // 5. Pre-existing valid Telegram HTML tags: preserve tag delimiters
+  const validTagsPattern = /<\/?(?:b|strong|i|em|u|ins|s|strike|del|code|pre|blockquote|tg-spoiler|tg-emoji)(?:\s+expandable)?(?:\s+class=["'][^"']*["'])*>/gi;
+  text = text.replace(validTagsPattern, (match) => addPlaceholder(match));
+
+  // 6. Markdown blockquotes: >> and > (before escapeHtml, with placeholder delimiters)
+  text = convertBlockquotesToHtml(text, addPlaceholder);
+
+  // 7. Escape remaining user text (<, >, &)
+  text = escapeHtml(text);
+
+  // 8. Tables: convert to bullet lines
+  text = convertTablesToBullets(text);
+
+  // 9. Headers: # Header -> <b>Header</b>
+  text = text.replace(/^(#{1,6})\s+(.+)$/gm, (_m, _hashes, title) => `<b>${title.trim()}</b>`);
+
+  // 10. Bullet lists: - item or * item or + item -> • item
+  text = text.replace(/^(\s*)[-*+]\s+(.+)$/gm, "$1• $2");
+
+  // 11. Markdown links: [text](url) - protect with placeholder so label and url are not double-linked
+  text = text.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s\)\"'>]+)\)/g, (_m, label, url) => {
+    const safeUrl = url.trim().replace(/&amp;/g, "&").replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+    return addPlaceholder(`<a href="${safeUrl}">${label}</a>`);
+  });
+
+  // 12. Bare URLs: https://... - protect with placeholder
+  text = text.replace(/\bhttps?:\/\/[^\s<>"'\)]+/g, (token) => {
+    const url = token.replace(/[.,;:!?)>]+$/, "");
+    const trail = token.slice(url.length);
+    const safeUrl = url.replace(/&amp;/g, "&").replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+    return addPlaceholder(`<a href="${safeUrl}">${url}</a>`) + trail;
+  });
+
+  // 13. Issue / PR and Commit References - protect with placeholder
+  text = text.replace(/(?:([a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)?))?#(\d+)/g, (match, explicitRepo, num) => {
+    const repo = explicitRepo || defaultRepo;
+    if (repo && (repo.includes("/") || repo === defaultRepo)) {
+      const url = `https://github.com/${repo}/issues/${num}`;
+      return addPlaceholder(`<a href="${url}">${match}</a>`);
+    }
+    return match;
+  });
+
+  text = text.replace(/\b([0-9a-fA-F]{40})\b/g, (_match, sha) => {
+    if (defaultRepo) {
+      const url = `https://github.com/${defaultRepo}/commit/${sha}`;
+      return addPlaceholder(`<a href="${url}"><code>${sha.slice(0, 8)}</code></a>`);
+    }
+    return addPlaceholder(`<code>${sha.slice(0, 8)}</code>`);
+  });
+
+  // 14. Inline formatting: bold, italic, strikethrough
+  text = text.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
+  text = text.replace(/(^|[\s,.:;!?(])__([^_\n]+)__(?=[\s,.:;!?)]|$)/g, "$1<b>$2</b>");
+  text = text.replace(/(^|[^\*])\*([^*\n\s](?:[^*\n]*[^*\n\s])?)\*(?=[^\*]|$)/g, "$1<i>$2</i>");
+  text = text.replace(/(^|[\s,.:;!?(])_([^_\n\s](?:[^_\n]*[^_\n\s])?)_(?=[\s,.:;!?)]|$)/g, "$1<i>$2</i>");
+  text = text.replace(/~~([^~\n]+)~~/g, "<s>$1</s>");
+
+  // 15. Restore placeholders in reverse
+  for (let i = placeholders.length - 1; i >= 0; i--) {
+    const key = `\x01TGPH_${i}\x01`;
+    text = text.replaceAll(key, placeholders[i]);
+  }
+
+  return text;
+}
+
+function convertTablesToBullets(src: string): string {
+  const lines = src.split("\n");
+  const out: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (line.includes("|") && (line.trim().startsWith("|") || line.trim().endsWith("|"))) {
+      if (i + 1 < lines.length && /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$/.test(lines[i + 1])) {
+        const headerCells = line.trim().replace(/^\||\|$/g, "").split("|").map(c => c.trim());
+        i += 2;
+        const tableRows: string[] = [];
+        while (i < lines.length && lines[i].includes("|") && lines[i].trim() !== "") {
+          const rowCells = lines[i].trim().replace(/^\||\|$/g, "").split("|").map(c => c.trim());
+          const parts: string[] = [];
+          for (let hIdx = 0; hIdx < rowCells.length; hIdx++) {
+            const cell = rowCells[hIdx];
+            if (cell) {
+              if (hIdx < headerCells.length && headerCells[hIdx]) {
+                parts.push(`<b>${headerCells[hIdx]}:</b> ${cell}`);
+              } else {
+                parts.push(cell);
+              }
+            }
+          }
+          if (parts.length > 0) {
+            tableRows.push("• " + parts.join(" | "));
+          }
+          i++;
+        }
+        out.push(...tableRows);
+        continue;
+      }
+    }
+    out.push(line);
+    i++;
+  }
+  return out.join("\n");
+}
+
+function convertBlockquotesToHtml(src: string, addPlaceholder: (val: string) => string): string {
+  const lines = src.split("\n");
+  const out: string[] = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (/^\s*>>\s*/.test(line) || /^\s*>\s*\[(?:expandable|!NOTE|!COLLAPSIBLE)\]/i.test(line)) {
+      const bqLines: string[] = [];
+      if (/^\s*>\s*\[(?:expandable|!NOTE|!COLLAPSIBLE)\]/i.test(line)) {
+        i++;
+      }
+      while (i < lines.length && /^\s*>{1,2}\s*/.test(lines[i])) {
+        bqLines.push(lines[i].replace(/^\s*>{1,2}\s?/, ""));
+        i++;
+      }
+      const openTag = addPlaceholder("<blockquote expandable>");
+      const closeTag = addPlaceholder("</blockquote>");
+      out.push(`${openTag}\n${bqLines.join("\n")}\n${closeTag}`);
+      continue;
+    } else if (/^\s*>\s*/.test(line)) {
+      const bqLines: string[] = [];
+      while (i < lines.length && /^\s*>\s*/.test(lines[i]) && !/^\s*>>/.test(lines[i])) {
+        bqLines.push(lines[i].replace(/^\s*>\s?/, ""));
+        i++;
+      }
+      const openTag = addPlaceholder("<blockquote>");
+      const closeTag = addPlaceholder("</blockquote>");
+      out.push(`${openTag}\n${bqLines.join("\n")}\n${closeTag}`);
+      continue;
+    }
+    out.push(line);
+    i++;
+  }
+  return out.join("\n");
+}
+
+const BLOCK_TAGS: Record<string, true> = { blockquote: true, pre: true };
+
+/**
+ * Splits long HTML text into chunks that fit within Telegram's message limits (4096 max, 4000 safe).
+ * Preserves HTML tags and ensures tags and blockquotes are never split brokenly or left unclosed.
  */
 export function chunkMessage(text: string, maxChunkSize = 4000): string[] {
   if (!text) return [];
@@ -162,30 +346,133 @@ export function chunkMessage(text: string, maxChunkSize = 4000): string[] {
   const chunks: string[] = [];
   let remaining = text;
 
+  const tagRegex = /<\s*(\/)?\s*([a-zA-Z0-9_-]+)([^>]*)>/g;
+
   while (remaining.length > 0) {
     if (remaining.length <= maxChunkSize) {
       chunks.push(remaining);
       break;
     }
 
-    // Try splitting on paragraph boundary
-    let splitIdx = remaining.lastIndexOf("\n\n", maxChunkSize);
-    if (splitIdx < maxChunkSize / 2) {
-      // Try splitting on single newline
-      splitIdx = remaining.lastIndexOf("\n", maxChunkSize);
-    }
-    if (splitIdx < maxChunkSize / 2) {
-      // Try splitting on space
-      splitIdx = remaining.lastIndexOf(" ", maxChunkSize);
-    }
-    if (splitIdx <= 0) {
-      // Hard split
-      splitIdx = maxChunkSize;
+    let candidateEnd = maxChunkSize;
+
+    // Ensure candidateEnd is not inside a tag <...>
+    const lastLt = remaining.lastIndexOf("<", candidateEnd);
+    const lastGt = remaining.lastIndexOf(">", candidateEnd);
+    if (lastLt > lastGt) {
+      candidateEnd = lastLt;
     }
 
-    chunks.push(remaining.slice(0, splitIdx).trimEnd());
-    remaining = remaining.slice(splitIdx).trimStart();
+    // Parse open tags up to candidateEnd
+    const stack: Array<{ name: string; full: string }> = [];
+    tagRegex.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    const sub = remaining.slice(0, candidateEnd);
+    while ((match = tagRegex.exec(sub)) !== null) {
+      const isClose = Boolean(match[1]);
+      const tagName = match[2].toLowerCase();
+      const fullTag = match[0];
+      if (isClose) {
+        for (let i = stack.length - 1; i >= 0; i--) {
+          if (stack[i].name === tagName) {
+            stack.splice(i, 1);
+            break;
+          }
+        }
+      } else {
+        if (!fullTag.endsWith("/>") && !["br", "hr", "img"].includes(tagName)) {
+          stack.push({ name: tagName, full: fullTag });
+        }
+      }
+    }
+
+    // If there is an open blockquote or pre, see if we can split before it
+    const hasOpenBlock = stack.some(t => Boolean(BLOCK_TAGS[t.name]));
+    let chosenSplit = -1;
+
+    if (hasOpenBlock) {
+      let firstBlockIdx = -1;
+      const currStack: string[] = [];
+      tagRegex.lastIndex = 0;
+      while ((match = tagRegex.exec(sub)) !== null) {
+        const isClose = Boolean(match[1]);
+        const tagName = match[2].toLowerCase();
+        if (!isClose && BLOCK_TAGS[tagName]) {
+          if (!currStack.some(t => BLOCK_TAGS[t])) {
+            firstBlockIdx = match.index;
+          }
+          currStack.push(tagName);
+        } else if (isClose && BLOCK_TAGS[tagName]) {
+          if (currStack.length > 0 && currStack[currStack.length - 1] === tagName) {
+            currStack.pop();
+          }
+        }
+      }
+
+      if (firstBlockIdx > Math.floor(maxChunkSize / 3)) {
+        const splitCand = remaining.lastIndexOf("\n", firstBlockIdx);
+        chosenSplit = splitCand > 0 ? splitCand : firstBlockIdx;
+      }
+    }
+
+    if (chosenSplit <= 0) {
+      for (const sep of ["\n\n", "\n", " "]) {
+        const idx = remaining.lastIndexOf(sep, candidateEnd);
+        if (idx > Math.floor(maxChunkSize / 3)) {
+          const tLt = remaining.lastIndexOf("<", idx);
+          const tGt = remaining.lastIndexOf(">", idx);
+          if (tLt <= tGt) {
+            chosenSplit = idx + (sep === "\n\n" ? 2 : 0);
+            break;
+          }
+        }
+      }
+    }
+
+    if (chosenSplit <= 0) {
+      chosenSplit = candidateEnd;
+    }
+
+    // Determine open tags at chosenSplit
+    const openTagsAtSplit: Array<{ name: string; full: string }> = [];
+    tagRegex.lastIndex = 0;
+    const splitSub = remaining.slice(0, chosenSplit);
+    while ((match = tagRegex.exec(splitSub)) !== null) {
+      const isClose = Boolean(match[1]);
+      const tagName = match[2].toLowerCase();
+      const fullTag = match[0];
+      if (isClose) {
+        for (let i = openTagsAtSplit.length - 1; i >= 0; i--) {
+          if (openTagsAtSplit[i].name === tagName) {
+            openTagsAtSplit.splice(i, 1);
+            break;
+          }
+        }
+      } else {
+        if (!fullTag.endsWith("/>") && !["br", "hr", "img"].includes(tagName)) {
+          openTagsAtSplit.push({ name: tagName, full: fullTag });
+        }
+      }
+    }
+
+    const closingTags = openTagsAtSplit.slice().reverse().map(t => `</${t.name}>`).join("");
+    const reopeningTags = openTagsAtSplit.map(t => t.full).join("");
+
+    chunks.push(remaining.slice(0, chosenSplit).trimEnd() + closingTags);
+    remaining = reopeningTags + remaining.slice(chosenSplit).trimStart();
   }
 
   return chunks.filter(c => c.length > 0);
+}
+
+/**
+ * Formats a caption for Telegram photo or media group uploads (1024 char limit).
+ * Converts Markdown to Telegram HTML and truncates safely with balanced tags.
+ */
+export function formatTelegramCaption(caption: string, maxLen = 1024, defaultRepo = "Bavariance/polysimulator"): string {
+  if (!caption) return "";
+  const formatted = markdownToTelegramHtml(caption, defaultRepo);
+  if (formatted.length <= maxLen) return formatted;
+  const chunks = chunkMessage(formatted, maxLen);
+  return chunks[0] || "";
 }
