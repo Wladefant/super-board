@@ -38,11 +38,13 @@ describe("Sanitizer & Security Utilities", () => {
   test("redactSecrets masks API keys, bot tokens, and bearer credentials", () => {
     const dummySecret = crypto.randomUUID().replace(/-/g, "");
     const textWithSecrets = [
+      `Telegram token: 123456789:${dummySecret.padEnd(35, "a")}`,
+      "OpenAI key: sk-proj-1234567890abcdef1234567890",
+      "Polysim key: ps_live_0123456789abcdef0123456789abcdef",
+      "Resend key: re_1234567890abcdef12345678",
+      "Auth header: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
       "Here is the token: 123456789:ABCdefGHIjklMNOpqrsTUVwxyz1234567890",
       `live key: ps_live_${dummySecret}`,
-      "openai key: sk-proj-1234567890abcdef1234567890",
-      "resend key: re_1234567890abcdef12345678",
-      "bearer: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
     ].join("\n");
 
     const redacted = redactSecrets(textWithSecrets);

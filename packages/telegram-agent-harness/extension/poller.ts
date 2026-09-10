@@ -882,7 +882,6 @@ export class TelegramPoller {
     const formattedCaption = caption
       ? formatTelegramCaption(redactSecrets(caption), 1024, defaultRepo)
       : "";
-
     const mediaList = targetFiles.map((file, idx) => {
       const attachName = `photo_${idx}`;
       form.set(attachName, Bun.file(file), path.basename(file));

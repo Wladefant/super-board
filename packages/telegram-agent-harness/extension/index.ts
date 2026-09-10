@@ -76,11 +76,11 @@ function getStatusSummary(ctx: ExtensionContext, slot: DiscoveredSlot | null, se
 
   return [
     "📊 <b>Veyyon Session Status</b>",
-    `Session ID: <code>${sessionId}</code>`,
-    `Model: <code>${modelName}</code>`,
-    `State: <b>${idleState}</b>`,
-    `Bot Slot: <code>${slotName}</code> (Bot ID: ${botId})`,
-    `Directory: <code>${escapeHtml(ctx.cwd)}</code>`,
+    `• <b>Session ID:</b> <code>${sessionId}</code>`,
+    `• <b>Model:</b> <code>${modelName}</code>`,
+    `• <b>State:</b> <b>${idleState}</b>`,
+    `• <b>Bot Slot:</b> <code>${slotName}</code> (Bot ID: ${botId})`,
+    `• <b>Directory:</b> <code>${escapeHtml(ctx.cwd)}</code>`,
   ].join("\n");
 }
 
@@ -276,12 +276,18 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
           },
           getStatusText: () => getStatusSummary(ctx, activeSlot, currentSessionId()),
           onHarnessCommand: (text, chatId) => handleInstalledCommand(text, {
-            session: () => ({ id: currentSessionId(), cwd: ctx.cwd, idle: ctx.isIdle() }),
+            session: () => ({
+              id: currentSessionId(),
+              cwd: ctx.cwd,
+              idle: ctx.isIdle(),
+              model: ctx.model?.id,
+            }),
             send: async html => {
               const sent = await poller.sendTelegramMessage(chatId, html);
               if (!sent?.ok) throw new Error("Telegram delivery failed");
             },
             photo: (file, caption) => poller.sendTelegramPhoto(chatId, file, caption),
+            mediaGroup: (files, caption) => poller.sendMediaGroup(chatId, files, caption),
             latestPng: async id => {
               if (id !== currentSessionId()) return null;
               const sessionFile = ctx.sessionManager.getSessionFile();
