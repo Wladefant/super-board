@@ -83,7 +83,7 @@ test("getUpdates explicitly requests callbacks and acknowledges before dispatch"
   }) as typeof fetch;
   await f.poller.start();
   expect(f.delivered).toEqual(["preference:B:Callback identity: cb:d_test\nWhich layout?"]);
-  expect(f.calls[0].method).toBe("answerCallbackQuery");
+  expect(f.calls.filter(call => call.method !== "setMyCommands")[0].method).toBe("answerCallbackQuery");
 });
 
 test("failed dispatch leaves token available for the next click", async () => {

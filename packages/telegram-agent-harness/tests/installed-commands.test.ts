@@ -111,7 +111,7 @@ test("status command renders full HTML status with model, agents, decisions, car
           "DEC-2": {
             decision_id: "DEC-2",
             question: "Old decision already resolved",
-            status: "resolved",
+            status: "pending",
           },
         },
       }),
@@ -126,12 +126,14 @@ test("status command renders full HTML status with model, agents, decisions, car
     const nowSec = Date.now() / 1000;
     db.run(
       "INSERT INTO message_correlations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      ["bot1", "chat1", 1476, "slot1", "sess1", "phases-resend", null, "poly", nowSec - 60],
+      ["bot1", "chat1", 1476, "slot1", "session-test-01a0", "phases-resend", null, "poly", nowSec - 60],
     );
     db.run(
       "INSERT INTO message_correlations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      ["bot1", "chat1", 1479, "slot1", "sess1", "status-summary", "DEC-1", "poly", nowSec - 10],
+      ["bot1", "chat1", 1479, "slot1", "session-test-01a0", "status-summary", "DEC-1", "poly", nowSec - 10],
     );
+    db.run("INSERT INTO message_correlations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ["other-bot", "other-chat", 9999, "other-slot", "other-session", "foreign-request", "DEC-2", "other-project", nowSec]);
     db.close();
 
     const f = fixture(false);
@@ -154,15 +156,17 @@ test("status command renders full HTML status with model, agents, decisions, car
     expect(output).toContain("veyyon:session-test-01a0");
     expect(output).toContain("herdr:Herdr &lt;worker&gt;");
 
-    expect(output).toContain("❓ <b>Open Operator Decisions (1 pending):</b>");
+    expect(output).toContain("<b>Pending decisions in recent session cards (1):</b>");
     expect(output).toContain("<b>DEC-1</b>");
     expect(output).toContain("https://github.com/Bavariance/polysimulator/issues/4500");
     expect(output).toContain("Approve migration plan?");
     expect(output).not.toContain("DEC-2");
 
     expect(output).toContain("📤 <b>Recent Outbound Cards:</b>");
-    expect(output).toContain("#1479 · <code>decision: DEC-1</code>");
-    expect(output).toContain("#1476 · <code>phases-resend</code>");
+    expect(output).toContain("Message <code>1479</code> · <code>decision: DEC-1</code>");
+    expect(output).toContain("Message <code>1476</code> · <code>phases-resend</code>");
+    expect(output).not.toContain("9999");
+    expect(output).not.toContain("foreign-request");
 
     expect(output).toContain("⚡ <b>Resource &amp; Quota Usage:</b>");
     expect(output).toContain("Codex Spark");
@@ -203,7 +207,7 @@ test("readPendingDecisions extracts pending and open decisions safely", () => {
 test("readRecentOutboundCards queries sqlite database with descending limit", () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "tg-cards-test-"));
   try {
-    const missing = readRecentOutboundCards(path.join(tmpDir, "missing.db"));
+    const missing = readRecentOutboundCards("sess", path.join(tmpDir, "missing.db"));
     expect(missing).toEqual([]);
 
     const dbFile = path.join(tmpDir, "test_pool.db");
@@ -218,12 +222,15 @@ test("readRecentOutboundCards queries sqlite database with descending limit", ()
         ["b", "c", 1000 + i, "s", "sess", `req-${i}`, null, "p", 100 + i],
       );
     }
+    db.run("INSERT INTO message_correlations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ["foreign-bot", "foreign-chat", 9999, "foreign-slot", "foreign-session", "foreign-request", null, "foreign-project", 999]);
     db.close();
 
-    const cards = readRecentOutboundCards(dbFile, 5);
+    const cards = readRecentOutboundCards("sess", dbFile, 5);
     expect(cards).toHaveLength(5);
     expect(cards[0].messageId).toBe(1007);
     expect(cards[4].messageId).toBe(1003);
+    expect(readRecentOutboundCards("unknown-session", dbFile)).toEqual([]);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

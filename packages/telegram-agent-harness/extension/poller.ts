@@ -13,6 +13,7 @@ import {
   redactSecrets,
 } from "./sanitizer";
 import { downloadInboundMedia, selectInboundMedia, type InboundMedia } from "./inbound-media";
+import { registerTelegramCommands, renderTelegramHelp } from "./command-registry";
 import type {
   AccessConfig,
   MessageCorrelationBridge,
@@ -374,6 +375,17 @@ export class TelegramPoller {
   public async start(): Promise<void> {
     if (this.isRunning) return;
     this.isRunning = true;
+
+    // The lease holder refreshes the operator's private menu on every startup.
+    // Registration failure must not disconnect an otherwise usable input channel.
+    if (this.accessConfig.dmPolicy !== "disabled") {
+      try {
+        await registerTelegramCommands(this.botToken, this.accessConfig.allowFrom,
+          Boolean(this.callbacks.onHarnessCommand), this.abortController.signal);
+      } catch {
+        this.callbacks.onLedgerFailure("Telegram command registration failed; reconnect to retry the private-chat menu.");
+      }
+    }
 
     // 1. Redrive any pending updates from previous crashed runs safely
     await this.redrivePendingUpdates();
@@ -743,7 +755,8 @@ export class TelegramPoller {
     }
 
     // 4. Command handling
-    if (await this.callbacks.onHarnessCommand?.(rawText, chatId, fromId)) {
+    if (!row.media_json) rawText = rawText.replace(/^(\/\w+)@\w+(?=\s|$)/, "$1");
+    if (!row.media_json && await this.callbacks.onHarnessCommand?.(rawText, chatId, fromId)) {
       this.db.run("UPDATE update_ledger SET status = 'COMPLETED' WHERE update_id = ?", [row.update_id]);
       return;
     }
@@ -751,24 +764,7 @@ export class TelegramPoller {
       throw new Error("Session changed during message routing; resend to the intended session");
     }
     if (rawText === "/help" || rawText === "/start") {
-      const helpMsg = [
-        "🤖 <b>Veyyon Telegram Control Plane</b>",
-        "",
-        "<b>Commands:</b>",
-        "/status — Inspect active session, model, turn state, and slot info",
-        "/agents — List Herdr agents and this session",
-        "/prompt backend:id text — Prompt the named target",
-        "/shot backend:id — Latest session PNG",
-        "/usage — Allowances and reset windows, including Spark",
-        "/steer &lt;text&gt; — Steer active LLM generation with immediate instruction",
-        "/cancel — Abort active turn or tool execution",
-        "/release — Release bot lease and disconnect Telegram",
-        "/help — Show this help message",
-        "",
-        "<i>Plain text sent while idle begins a new turn in the active Veyyon session.</i>",
-        "<i>Plain text sent while busy steers the active turn at the next safe tool boundary.</i>",
-      ].join("\n");
-      await this.sendTelegramMessage(chatId, helpMsg);
+      await this.sendTelegramMessage(chatId, renderTelegramHelp(Boolean(this.callbacks.onHarnessCommand)));
       this.db.run("UPDATE update_ledger SET status = 'COMPLETED' WHERE update_id = ?", [row.update_id]);
       return;
     }
@@ -781,30 +777,41 @@ export class TelegramPoller {
     }
 
     if (rawText === "/cancel" || rawText === "/stop" || rawText === "/abort") {
-      this.callbacks.onAbort();
-      await this.sendTelegramMessage(chatId, "🛑 <b>Aborted current turn.</b>");
+      const idle = this.callbacks.isIdle();
+      if (!idle) this.callbacks.onAbort();
+      await this.sendTelegramMessage(chatId, idle
+        ? "<b>No active turn to cancel.</b>"
+        : "<b>Cancellation requested.</b> Already completed work is not undone.");
       this.db.run("UPDATE update_ledger SET status = 'COMPLETED' WHERE update_id = ?", [row.update_id]);
       return;
     }
 
     if (rawText === "/release") {
-      await this.sendTelegramMessage(chatId, "🔓 <b>Releasing Telegram bot lease...</b>");
-      await this.callbacks.onRelease();
+      await this.sendTelegramMessage(chatId, "<b>Disconnecting Telegram.</b> The session continues. Reconnect from the terminal; this chat cannot reconnect itself.");
+      // onRelease stops the poller and closes this ledger.
       this.db.run("UPDATE update_ledger SET status = 'COMPLETED' WHERE update_id = ?", [row.update_id]);
+      await this.callbacks.onRelease();
       return;
     }
 
     // Handle explicit /steer command
-    if (rawText.startsWith("/steer")) {
+    if (/^\/steer(?:\s|$)/.test(rawText)) {
       const steerText = rawText.replace(/^\/steer\s*/i, "").trim();
       if (steerText) {
         this.callbacks.onTelegramTurnStart();
-        this.callbacks.onSteer(steerText);
+        if (this.callbacks.isIdle()) this.callbacks.onUserMessage(steerText);
+        else this.callbacks.onSteer(steerText);
         this.db.run("UPDATE update_ledger SET status = 'COMPLETED' WHERE update_id = ?", [row.update_id]);
       } else {
         await this.sendTelegramMessage(chatId, "⚠️ <b>Usage:</b> <code>/steer &lt;instruction&gt;</code>");
         this.db.run("UPDATE update_ledger SET status = 'COMPLETED' WHERE update_id = ?", [row.update_id]);
       }
+      return;
+    }
+
+    if (!row.media_json && rawText.startsWith("/")) {
+      await this.sendTelegramMessage(chatId, "<b>Unknown command.</b> Use <code>/help</code> for supported commands and argument syntax. Nothing was sent to the session.");
+      this.db.run("UPDATE update_ledger SET status = 'REJECTED', error = 'UNKNOWN_COMMAND' WHERE update_id = ?", [row.update_id]);
       return;
     }
 

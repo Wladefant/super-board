@@ -19,6 +19,14 @@ describe("Sanitizer & Security Utilities", () => {
     expect(escapeHtml("No special chars 123")).toBe("No special chars 123");
   });
 
+  test("generated help entities render once without activating encoded markup", () => {
+    expect(markdownToTelegramHtml("<b>Resource &amp; quota</b>\n<code>/steer &lt;text&gt;</code>"))
+      .toBe("<b>Resource &amp; quota</b>\n<code>/steer &lt;text&gt;</code>");
+    expect(markdownToTelegramHtml("&lt;script&gt;alert(1)&lt;/script&gt; & raw"))
+      .toBe("&lt;script&gt;alert(1)&lt;/script&gt; &amp; raw");
+    expect(markdownToTelegramHtml("`&lt;literal&gt;`")).toBe("<code>&amp;lt;literal&amp;gt;</code>");
+  });
+
   test("getTokenFingerprint produces deterministic zero-leak fingerprints without last-4 leakage", () => {
     const dummyBotId = "9876543210";
     const dummySecret = `test_secret_${crypto.randomUUID().replace(/-/g, "")}`;
