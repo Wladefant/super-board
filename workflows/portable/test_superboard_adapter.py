@@ -108,6 +108,17 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
     HEAD_SHA = "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3"
 
     def setUp(self):
+        # Existing lifecycle tests isolate GitHub; test_github_work_item covers
+        # the actual mandatory API seam, stale-cache refusal and publication.
+        intake = patch.object(RequestLedger, "refresh_from_github", RequestLedger.get_request)
+        intake.start()
+        self.addCleanup(intake.stop)
+        reports = patch.object(
+            SuperboardExecutionAdapter, "publish_worker_report",
+            return_value="https://github.com/Wladefant/super-board/issues/114#issuecomment-1",
+        )
+        reports.start()
+        self.addCleanup(reports.stop)
         self.test_dir = tempfile.mkdtemp(prefix="test_sb_adapter_")
         self.state_dir = os.path.join(self.test_dir, "state")
         self.evidence_dir = os.path.join(self.test_dir, "evidence")
@@ -543,10 +554,15 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
             issue_number=75,
         )
 
+        # Installed workflows need not live below a git repository.
+        probe_repo = os.path.join(self.test_dir, "probe-repository")
+        os.makedirs(probe_repo)
+        subprocess.run(["git", "init", probe_repo], check=True, capture_output=True)
         adapter = SuperboardExecutionAdapter(
             state_dir=self.state_dir,
             fake_executor=False,
             notify_telegram=False,
+            repo_root=probe_repo,
         )
 
         # Run with real_worker=True (exercises git status or config validate subprocess)
@@ -1312,7 +1328,7 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
                 return {
                     "data": {"repository": {"issue": {"projectItems": {"nodes": [{
                         "id": "ITEM_1",
-                        "project": {"id": "PVT_1", "number": 1, "title": "Superboard"},
+                        "project": {"id": "PVT_1", "number": 5, "title": "Superboard", "owner": {"login": "Wladefant"}},
                         "fieldValueByName": {"name": observed_status["name"]},
                     }]}}}}
                 }

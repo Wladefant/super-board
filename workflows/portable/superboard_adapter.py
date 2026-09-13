@@ -492,10 +492,10 @@ class SuperboardExecutionAdapter:
 
     def _sync_project_lifecycle(self, req_id: str, state: str) -> Dict[str, Any]:
         """
-        Mirror a completed ledger transition to its configured GitHub Project V2 card.
+        Publish a verified execution transition, then cache the API readback.
 
-        An isolated/local request without a card is explicitly not applicable. It is
-        never reported as though an external card was updated.
+        The execution checkpoint is not board truth. A dry-run never changes its
+        cached board state; only a confirmed GitHub readback can do that.
         """
         record = self.coordinator.ledger.get_request(req_id) or {}
         board = record.get("superboard") or {}
@@ -509,7 +509,18 @@ class SuperboardExecutionAdapter:
                 "github_writes": 0,
             }
 
-        outcome = self.project_config.update_lifecycle(
+        config = self.project_config
+        if record.get("github_cache"):
+            from project_adapter import ProjectConfig
+            config_data = config.to_dict()
+            config_data["repo"] = github["repo"]
+            config_data["project_number"] = 5
+            config_data["metadata"] = {
+                **config_data.get("metadata", {}),
+                "project_owner": "Wladefant", "project_owner_type": "users",
+            }
+            config = ProjectConfig.from_dict(config_data)
+        outcome = config.update_lifecycle(
             request_id=req_id,
             state=state,
             head_sha=record.get("head"),
@@ -525,7 +536,7 @@ class SuperboardExecutionAdapter:
         result["status"] = "dry_run" if outcome.dry_run else (
             "idempotent" if outcome.github_writes == 0 else "updated"
         )
-        if outcome.new_status:
+        if outcome.new_status and not outcome.dry_run:
             self.coordinator.ledger.update_request(
                 req_id,
                 superboard_update={"status": outcome.new_status, "item_id": outcome.item_id},
@@ -906,6 +917,24 @@ class SuperboardExecutionAdapter:
             head_sha=target_sha or req_head,
         )
 
+    def publish_worker_report(self, req_id: str, worker_res: WorkerExecutionResult) -> str:
+        """Reports are GitHub markdown; only execution metadata remains on disk."""
+        from github_work_item import publish_report
+        record = self.coordinator.ledger.get_request(req_id)
+        github = record.get("github") or {}
+        sha = worker_res.head_sha
+        commit = f"https://github.com/{github['repo']}/commit/{sha}" if sha else "No commit reported"
+        output = worker_res.output or "(no output)"
+        fence = "`" * max(3, max((len(m.group()) + 1 for m in re.finditer(r"`+", output)), default=3))
+        body = (
+            f"## {worker_res.stage} execution evidence\n\n"
+            f"Head: {commit}\n\nExit code: {worker_res.exit_code}\n\n"
+            f"{fence}text\n{output}\n{fence}\n\n"
+            "### Reported checks\n\n"
+            + json.dumps(worker_res.evidence.get("checks", []), indent=2)
+        )
+        return publish_report(github.get("issue_url", ""), body)
+
     def verify_and_advance_request(
         self,
         req: Union[RequestSummary, Dict[str, Any]],
@@ -943,6 +972,12 @@ class SuperboardExecutionAdapter:
                 f"Native stage '{stage}' is {worker_res.pending_state}; no lifecycle state advanced",
                 gate_result,
             )
+        if not worker_res.is_fixture and not worker_res.is_probe:
+            try:
+                gate_result["report_url"] = self.publish_worker_report(req_id, worker_res)
+            except Exception as exc:
+                gate_result["advance_refused"] = f"GitHub evidence publication failed: {exc}"
+                return req_state, gate_result["advance_refused"], gate_result
         if worker_res.blocked_reason:
             gate_result["blocked_reason"] = worker_res.blocked_reason
             return req_state, f"Stage '{stage}' blocked: {worker_res.blocked_reason}", gate_result
@@ -962,7 +997,7 @@ class SuperboardExecutionAdapter:
             getattr(req, "task_type", None) == "bug"
             or (isinstance(req, dict) and req.get("task_type") == "bug")
             or "bug" in req_id.lower()
-            or any(str(label).lower() == "type:bug" for label in request_labels)
+            or any(str(label).lower() in ("kind:bug", "type:bug") for label in request_labels)
         )
         if is_bug and stage == "qa":
             evidence = worker_res.evidence or {}
@@ -1065,6 +1100,7 @@ class SuperboardExecutionAdapter:
             f"({expectations.verifications_passed} verification check(s) passed, "
             f"{expectations.controls_retained} expected-outcome control(s) retained)"
         )
+        evidence_note += " " + gate_result["report_url"]
         if stage == "build":
             # Advance: implementation -> QA
             new_state = "QA"
@@ -1076,7 +1112,7 @@ class SuperboardExecutionAdapter:
                 add_evidence={
                     "type": "implementation_verification",
                     "summary": evidence_note,
-                    "details": worker_res.output,
+                    "details": gate_result["report_url"],
                     "head": worker_res.head_sha,
                 },
             )
@@ -1110,7 +1146,7 @@ class SuperboardExecutionAdapter:
                 add_evidence={
                     "type": "qa_verification",
                     "summary": evidence_note,
-                    "details": worker_res.output,
+                    "details": gate_result["report_url"],
                     "head": worker_res.head_sha,
                 },
             )
@@ -1130,7 +1166,7 @@ class SuperboardExecutionAdapter:
                 add_evidence={
                     "type": "review_verification",
                     "summary": evidence_note,
-                    "details": worker_res.output,
+                    "details": gate_result["report_url"],
                     "head": worker_res.head_sha,
                 },
             )

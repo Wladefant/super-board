@@ -11,7 +11,7 @@ A single bounded, harness-agnostic coordinator command that:
   6. Emits one compact, machine-readable next-work packet or explicit status (ready, wait, block, done).
 
 Inviolable Architectural Invariants:
-  - Canonical System of Record: GitHub Issues and Superboard (Project #1) are authoritative.
+  - Canonical System of Record: GitHub Issues and Wladefant Project 5 are authoritative.
   - No Auto-Merge / No Auto-Deploy: Protected operations require explicit human authorization.
   - No Self-Spawn Loop: Single bounded evaluation step; emits recommendation without self-spawning.
   - No Native Scheduler Dependencies: Standalone execution via pure Python standard library + gh.
@@ -103,7 +103,7 @@ class CoordinatorBoundaries:
     auto_deploy_allowed: bool = False
     self_spawn_loop: bool = False
     execution_dispatched: bool = False
-    shared_authority: str = "GitHub Issues & Superboard (Project #1)"
+    shared_authority: str = "GitHub Issues & https://github.com/users/Wladefant/projects/5"
     local_recovery_cache: str = "ledger.json"
 
 
@@ -453,70 +453,41 @@ class Coordinator:
     def select_target_request(
         self, request_id: Optional[str] = None
     ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-        """
-        Select target request from ledger (specified ID, next runnable, or first active).
+        """Select only from registered scope, reading GitHub truth before routing.
 
-        Every implicit branch skips a request labelled for explicit selection only.
-        Machine-authored work - a corrective work item the recurrence guard opened
-        when a failure recurred, for instance - is real work with a real owner, but
-        no operator scoped it, and it is pending and unblocked, which made it the
-        *first* thing "whatever is runnable next" picked up. Naming it is still
-        honoured: an explicit request id is the explicit selection the label asks
-        for, and nothing here weakens the authorization, merge or deployment gates
-        that apply once a request is selected.
+        Local checkpoints are resumable caches, never issue/board authority.
+        Bound implicit API work to twenty candidates; inability to establish truth
+        is blocked, never mistaken for completion or a stale-cache fallback.
         """
-        data = self.ledger._load_data_unlocked()
-        requests = data.get("requests", {})
-        if not requests:
-            return None, "No requests found in ledger."
-
+        records = self.ledger.list_requests()
         if request_id:
-            req = requests.get(request_id)
-            if not req:
-                return None, f"Request '{request_id}' not found in ledger."
-            return req, None
-
-        def implicitly_selectable(candidate_id: Optional[str]) -> bool:
-            return not requires_explicit_selection(requests.get(candidate_id))
-
-        # Check if any requests are runnable via ledger.next_actions()
-        actions = self.ledger.next_actions()
-        runnable = [
-            a for a in actions
-            if not a.get("is_blocked") and implicitly_selectable(a.get("id"))
-        ]
-        if runnable:
-            req_id_cand = runnable[0]["id"]
-            return requests.get(req_id_cand), None
-
-        # Otherwise select first candidate from next_actions (e.g. blocked or waiting)
-        selectable_actions = [a for a in actions if implicitly_selectable(a.get("id"))]
-        if selectable_actions:
-            req_id_cand = selectable_actions[0]["id"]
-            return requests.get(req_id_cand), None
-
-        # Otherwise find first non-done request
-        active = [
-            r for r in requests.values()
-            if r.get("state") != "done" and not requires_explicit_selection(r)
-        ]
-        if active:
-            return active[0], None
-
-        explicit_only = [
-            r["id"] for r in requests.values()
-            if r.get("state") != "done" and requires_explicit_selection(r)
-        ]
-        if explicit_only:
-            return None, (
-                "No implicitly selectable request remains. "
-                f"{len(explicit_only)} request(s) are labelled "
-                f"'{EXPLICIT_SELECTION_LABEL}' and run only when named: "
-                f"{', '.join(sorted(explicit_only))}."
-            )
-
-        # All requests are done
-        return None, "All requests in ledger are in terminal 'done' state."
+            records = [r for r in records if r["id"] == request_id]
+            if not records:
+                return None, f"GitHub intake blocked: unknown request {request_id}"
+        if not records:
+            return None, "No registered execution checkpoints; select a GitHub issue explicitly."
+        failures = []
+        for cached in records[:20]:
+            try:
+                current = self.ledger.refresh_from_github(cached["id"])
+            except Exception as exc:
+                failures.append(f"{cached['id']}: {exc}")
+                continue
+            snapshot = current.get("github_snapshot") or {}
+            if current.get("state") == "done" and snapshot.get("state") == "CLOSED" and snapshot.get("project_status") == "Done":
+                continue
+            if not request_id and requires_explicit_selection(current):
+                failures.append(f"{cached['id']}: explicit selection required")
+                continue
+            if current.get("github_blocker"):
+                failures.append(f"{cached['id']}: {current['github_blocker']}")
+                continue
+            return current, None
+        if len(records) > 20:
+            failures.append("Twenty-candidate intake limit reached; select the next issue explicitly")
+        if not failures:
+            return None, "All registered checkpoints are done and GitHub confirms closure and Project Done."
+        return None, "GitHub intake blocked: " + "; ".join(failures)
 
     def evaluate_step(self, request_id: Optional[str] = None) -> CoordinatorPacket:
         """
@@ -539,9 +510,9 @@ class Coordinator:
             return self._finalize_packet(CoordinatorPacket(
                 schema_version="1.0",
                 generated_at_utc=now_utc,
-                status="done",
-                status_reason=err_msg or "All work in ledger is completed.",
-                next_action="No outstanding actions. Maintain monitoring or await new operator requests.",
+                status="blocked" if err_msg and err_msg.startswith("GitHub intake blocked:") else "done",
+                status_reason=err_msg or "No registered execution checkpoints.",
+                next_action="Reconcile the linked GitHub issue and execution cache; select an authorized issue explicitly.",
                 request=None,
                 decision_status=DecisionStatus(
                     sync_attempted=sync_att,

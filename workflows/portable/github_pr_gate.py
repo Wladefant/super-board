@@ -386,6 +386,18 @@ def fetch_pr_json(pr_number: int, repo: str = "Bavariance/polysimulator", timeou
 
     data = json.loads(res.stdout)
     data["baseRefOid"] = fetch_base_sha(pr_number, repo, timeout_sec)
+    reviews = _run_gh(["gh", "api", f"repos/{repo}/pulls/{pr_number}/reviews?per_page=100", "--paginate"], timeout_sec)
+    if reviews.returncode:
+        raise RuntimeError("Unable to fetch complete PR reviews")
+    from review_content import json_pages
+    data["reviews"] = [review for page in json_pages(reviews.stdout) for review in page]
+    subprocess.run(["git", "fetch", "origin", f"+refs/heads/{data['baseRefName']}:refs/remotes/origin/{data['baseRefName']}"], check=True)
+    from review_content import target_shas
+    for sha in target_shas(data["reviews"], data["headRefOid"]):
+        if subprocess.run(["git", "cat-file", "-e", sha + "^{commit}"], stderr=subprocess.DEVNULL).returncode:
+            # A target that stays unreachable fails closed in evaluate(), and only
+            # when it is actually needed; an unfetchable one must not abort the gate.
+            subprocess.run(["git", "fetch", "origin", sha], stderr=subprocess.DEVNULL)
     return data
 
 def evaluate_pr_gate(
@@ -526,13 +538,29 @@ def evaluate_pr_gate(
             return check_name in native_required_contexts
         return True
 
+    # Deduplicate status_rollup by check name: preserve latest check run
+    deduped_status_rollup: Dict[str, dict] = {}
     for check in status_rollup:
+        c_name = check.get("name") or check.get("context") or "unknown_check"
+        c_time = check.get("completedAt") or check.get("startedAt") or check.get("createdAt") or ""
+        if c_name not in deduped_status_rollup:
+            deduped_status_rollup[c_name] = check
+        else:
+            prev_time = (
+                deduped_status_rollup[c_name].get("completedAt")
+                or deduped_status_rollup[c_name].get("startedAt")
+                or deduped_status_rollup[c_name].get("createdAt")
+                or ""
+            )
+            if str(c_time) > str(prev_time):
+                deduped_status_rollup[c_name] = check
+
+    for check in deduped_status_rollup.values():
         # Check either CheckRun or StatusContext
         c_name = check.get("name") or check.get("context") or "unknown_check"
         c_status = str(check.get("status") or "").upper()
         c_conclusion = str(check.get("conclusion") or check.get("state") or "").upper()
         c_completed_at = check.get("completedAt") or check.get("createdAt")
-
         if c_conclusion in ("FAILURE", "TIMED_OUT", "ACTION_REQUIRED", "CANCELLED", "STARTUP_FAILURE"):
             if is_blocking(c_name):
                 failing_checks.append(c_name)
@@ -557,29 +585,32 @@ def evaluate_pr_gate(
     self_approvers: List[str] = []
     changes_requesters: List[str] = []
 
-    for review in reviews_list:
-        review_author = (review.get("author") or {}).get("login", "")
-        review_state = str(review.get("state") or "").upper()
-        review_commit = (
-            (review.get("commit") or {}).get("oid") or review.get("commitRefOid") or ""
+    from review_content import evaluate as evaluate_content
+    try:
+        content_review = evaluate_content(
+            reviews_list, head_sha, pr_author, base="origin/" + base_ref,
+            staging=repo == "Bavariance/polysimulator" and base_ref == "staging",
         )
-
-        if review_author == pr_author:
-            if review_state in ("APPROVED", "COMMENTED"):
+    except (ValueError, subprocess.CalledProcessError) as exc:
+        content_review = {"passed": False, "reason": str(exc)}
+    if content_review["passed"] and content_review["state"] == "APPROVED" and content_review["reviewer"].lower() != pr_author.lower():
+        valid_github_approvers.append(content_review["reviewer"])
+    for review in reviews_list:
+        review_author = (review.get("author") or review.get("user") or {}).get("login", "")
+        review_state = str(review.get("state") or "").upper()
+        if review_author.lower() == pr_author.lower():
+            if review_state in ("APPROVED", "COMMENTED") and not content_review["passed"]:
                 self_approvers.append(review_author)
             continue
-        if review_commit != head_sha:
-            continue
-        if review_state == "APPROVED":
-            valid_github_approvers.append(review_author)
-        elif review_state == "CHANGES_REQUESTED":
+        review_commit = review.get("commit_id") or (review.get("commit") or {}).get("oid") or review.get("commitRefOid")
+        if review_state == "CHANGES_REQUESTED" and review_commit == head_sha and not content_review["passed"]:
             changes_requesters.append(review_author)
 
     artifact_evidence: Optional[Dict[str, str]] = None
     review_invalidated = False
     invalidation_reason = None
-    review_reused = False
-    if review_artifact is not None:
+    review_reused = bool(content_review["passed"])
+    if review_artifact is not None and not content_review["passed"]:
         artifact_evidence, artifact_error = validate_review_artifact(
             review_artifact,
             repo=repo,
@@ -616,17 +647,12 @@ def evaluate_pr_gate(
                 if artifact_evidence["outcome"] == "changes_requested":
                     changes_requesters.append(artifact_evidence["actor_id"])
 
-    artifact_approved = bool(
-        artifact_evidence
-        and artifact_evidence["outcome"] == "approved"
-        and not review_invalidated
-    )
     if valid_github_approvers:
         approval_verdict = "APPROVED"
         approved_by = valid_github_approvers[-1]
-    elif artifact_approved:
+    elif content_review["passed"]:
         approval_verdict = "AUTOMATED_REVIEW_APPROVED"
-        approved_by = artifact_evidence["actor_id"] if artifact_evidence else None
+        approved_by = content_review["reviewer"]
     elif self_approvers:
         approval_verdict = "SELF_APPROVED_ONLY"
         approved_by = None
@@ -634,7 +660,7 @@ def evaluate_pr_gate(
         approval_verdict = "UNAPPROVED"
         approved_by = None
 
-    has_head_bound_review_evidence = bool(valid_github_approvers) or artifact_approved
+    has_head_bound_review_evidence = content_review["passed"]
 
     # 5. Final Gate Verdict
     if ci_verdict == "FAILURE":
@@ -687,6 +713,7 @@ def evaluate_pr_gate(
         if advisory_failing_checks:
             verdict_reason += f" Advisory (non-blocking) failures: {', '.join(advisory_failing_checks)}."
 
+    verdict_reason += " Content freshness: " + json.dumps(content_review, sort_keys=True)
     return PRGateEvaluation(
         pr_number=pr_number,
         repo=repo,

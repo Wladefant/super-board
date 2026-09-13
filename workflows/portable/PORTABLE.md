@@ -7,15 +7,18 @@ A harness-agnostic, pure Python standard library multi-agent coordination core l
 ## 1. Architectural Authority & Inviolable Principles
 
 1. **Shared System of Record (Canonical):**
-   * **GitHub Issues** and **Superboard (Project #1)** for `Bavariance/polysimulator` are the authoritative shared sources of truth for requirements, task status, human decisions, and verified closure.
+   * **GitHub Issues** and [Wladefant Project 5](https://github.com/users/Wladefant/projects/5) are the authoritative shared sources of truth for requirements, task status, human decisions, and verified closure.
    * **One independently actionable deliverable per issue and Project card.** Before dispatch, split a multi-deliverable request, reuse an existing matching issue or create a dedicated one for each deliverable, and enrol each issue on the repository's configured Project board. Keep its acceptance criteria, owner, dependencies, decisions, PR, evidence and next action on that issue. A program or phase is not one work item.
-   * **The Project board is the aggregation layer** for status, ordering and grouping. A master/index issue is optional and weightless: only a convenience checklist of links to dedicated issues, never the sole specification or tracking for work. No fixed issue number is an intake default.
+   * **Project 5 is the aggregation layer.** Group deliverables through native parent/sub-issues, canonical kind/area/risk labels, assignees and bounded capability milestones. Standalone issues explicitly explain why no parent applies. No Discussions; release tags remain an open question, not a gate.
    * Remote status always supersedes local caches on conflict.
 2. **Local Recovery Cache:**
    * `ledger.json` and `decisions.json` act as machine-local, crash-resilient, atomic restart recovery caches.
    * The ledger is a lossless cross-topic index linking dedicated issues, never their replacement. Retain original prompts, criteria, authorization, owners, dependencies, blockers, evidence and next actions across compaction and restarts, including unpublished intake. Migrate old umbrella items by linking dedicated issues without deleting history, silently closing unresolved work or dropping scope; only the operator may cancel scope.
-   * Intake and Project enrolment remain caller responsibilities: `ledger.add_request` records supplied issue/card identities, and `project_adapter` updates existing cards but does not create issues or enrol missing cards. Record an explicit publication/enrolment blocker before dispatch if those links are missing; do not use a shared umbrella as a shortcut.
+   * Intake and enrollment remain caller responsibilities. `refresh_from_github` now reads issue body, milestone, parent, labels, assignees, dependencies and Project 5 Status through the authenticated API before scheduling. Missing/partial data, missing structure or checkpoint disagreement blocks; cached claims never substitute. Implicit intake is bounded to 20 registered candidates; select an issue explicitly to address a larger cache. This does not discover or authorize new backlog work.
    * `github_plan_renderer.py render-plan` renders the acceptance steps of one deliverable, not a program backlog. Render and publish separately for each dedicated issue. `post-issue-comment --issue` takes that issue explicitly; managed-section updates do not decompose work or enrol it on the board.
+   * **No local reports:** reports, summaries, audits, findings and evidence must be readable GitHub markdown with returned URLs, never `local://` documents. Real worker completion publishes a GitHub issue comment with exact-body authenticated readback before any successful lifecycle advancement. A failed publication blocks advancement.
+   * The memoryless-agent issue contract is defined in [the versioned profile policy](../../policies/default/AGENTS.md): original request/scope, acceptance criteria, native parent/dependencies, assignee/lane, state/blocker, branch/PR/full head, evidence, next action and authorization/constraints.
+   * PolySimulator closing keywords do not fire for PRs merging into `staging` because its default is `main`; verified explicit closure is required. Native merge queues are unavailable for these account/repository plans.
    * They eliminate reliance on fictitious native schedulers or polling GitHub APIs continuously.
    * Multi-agent concurrency is protected via advisory file locking (`msvcrt` on Windows, `fcntl` on POSIX) and atomic filesystem replaces (`tempfile.mkstemp` + `os.replace`).
 3. **No Auto-Merge & No Auto-Deploy:**
@@ -27,7 +30,7 @@ A harness-agnostic, pure Python standard library multi-agent coordination core l
 5. **No Credential Exposure:**
    * Quota, balance, and probe utilities sanitize and redact all account identifiers, emails, project refs, and tokens.
 6. **Head-Bound Evidence Invalidation:**
-   * Git HEAD changes invalidate all head-bound acceptance criteria, QA proof URLs, and review signoffs, automatically resetting state to `implementation`.
+   * Execution-checkpoint proofs remain head-bound. The unchanged installed `github_pr_gate.py` and `review_content.py` retain the separate content-bound review contract: stable patch-id **and** whitespace-sensitive stripped-diff sha256, valid ancestor delta chains, staging approval waiver and anti-self-approval. This change does not weaken or reimplement those gates.
 
 ---
 
@@ -36,7 +39,7 @@ A harness-agnostic, pure Python standard library multi-agent coordination core l
 | Module | Owning Agent Lane | Architectural Role | CLI Interface | Primary Inputs | Primary Outputs |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **`coordinator.py`** | `PortableWorkflowCoordinator` | Single bounded coordinator combining state, decision sync, preflight gating, normalized usage, and model selection. | `python coordinator.py [--state-dir <dir>] [--json] [--summary] [--no-sync-decisions] [--usage-adapter auto\|file\|veyyon\|direct] [--balance-file <file>]` | `ledger.json`, `decisions.json`, `preflight_evidence/`, `usage_fixture.json` | `CoordinatorPacket` (JSON or terminal summary) |
-| **`ledger.py`** | `ImplementRequestLedger` / `FixLedgerInvariants` | Machine-local durable request ledger, transition graph validator, per-criterion evidence verification, and restart recovery. | `python ledger.py [add \| update \| check \| next \| list \| show \| recover] [--ledger <path>]` | `ledger.json` | State transitions, invariant reports, recovery queues |
+| **`ledger.py`** | `ImplementRequestLedger` / `IngrainPolicy` | Execution checkpoint cache, transition guards and mandatory API refresh before scheduling; no local work authority. | `python ledger.py [add \| update \| check \| next \| list \| show \| recover] [--ledger <path>]` | Checkpoint cache and authenticated GitHub API | API-backed execution view; cached inspection commands are not dispatch authorization |
 | **`decision_workflow.py`** | `IntegrateDecisionWorkflow` / `HardenDecisionProvenance` | Asynchronous human decision workflow with strict responder authorization, authored-comment exclusion, and bounded sync. A refused reply (stale, agent-authored, unauthorized, unsafe) is an audited *input* outcome recorded in `rejected_inputs`, never the question's own status, so an unanswered question stays `pending`/`clarification_requested` and stays inside the sync window; replaying an unchanged refused comment is idempotent. `answer.comment_created_at` carries the comment's API-verified creation time and is the only proof of when a decision was answered; `answer.answered_at` is ingest audit only. A resolved decision is terminal: only the exact authenticated comment replays, and no later or edited comment re-answers it or rewrites its timestamps. `status: rejected` exists only as a legacy value, reopened fail-closed by `recover` against a proven open ledger binding. | `python decision_workflow.py [ask \| ingest \| reply \| sync \| show \| list \| recover] [--decisions <path>] [--ledger <path>]` | `decisions.json`, GitHub issue comments via `gh` | Verified human decisions, unblocked ledger requests, clarification prompts, refused-input audit, reopened legacy questions |
 | **`preflight.py`** | `ImplementIntegrationPreflight` | Manifest-driven staging integration preflight gates (Dokploy staging compose, Supabase staging ref, Stripe test mode). | `python preflight.py [check \| probe \| record-evidence \| inventory] [--evidence-dir <dir>] [--json]` | Task manifests, service probe evidence | `PreflightResult` (passed, blocked, not_applicable), probe inventory |
 | **`balance_loader.py`** | `ImplementSubscriptionRouter` / `ReviewHarnessStrongModel` | Read-only sanitized subscription usage snapshot loader, multi-window constraint analyzer, and provider quota tracker. | `python balance_loader.py [--normalized] [--adapter veyyon\|file\|direct] [--balance-file <file>] [--json]` | `usage_snapshot_cache.json`, `usage_fixture.json`, or live CLI | `NormalizedBalanceSnapshot` (JSON) |
@@ -100,7 +103,7 @@ python coordinator.py \
   * `direct`: In-memory direct structure.
 * `--balance-file <file>`: Path to custom usage JSON fixture.
 * `--repo <repo>`: Target GitHub repository (default: `Bavariance/polysimulator`).
-* `--no-sync-decisions`: Skip remote GitHub decision synchronization (useful in offline or test environments).
+* `--no-sync-decisions`: Skip decision synchronization only. It does **not** disable mandatory GitHub work intake; offline dispatch is refused.
 * `--request-id <id>`: Target specific request ID instead of highest-priority eligible request.
 * `--json`: Emit machine-readable JSON packet.
 * `--summary`: Emit formatted terminal summary.
@@ -170,7 +173,7 @@ python coordinator.py \
     "auto_deploy_allowed": false,
     "self_spawn_loop": false,
     "execution_dispatched": false,
-    "shared_authority": "GitHub Issues & Superboard (Project #1)",
+    "shared_authority": "GitHub Issues & https://github.com/users/Wladefant/projects/5",
     "local_recovery_cache": "ledger.json"
   }
 }
@@ -324,6 +327,21 @@ python telegram_notifier.py --packet coordinator_output.json --send
 ---
 
 ## 6. Export Procedure & Verification
+
+### GitHub-native profile/runtime installation
+
+Commit `policies/default/AGENTS.md` and the workflow changes in an open PR before installation. From that same pinned source checkout:
+
+```text
+python workflows/portable/install_github_native.py --source-root <checkout>
+python workflows/portable/install_github_native.py --source-root <checkout> --check
+```
+
+The installer replaces only enumerated policy/code files atomically and verifies exact bytes. `--check` is read-only and returns nonzero on drift. Preserve the PR/commit URL in the migration issue comment, use that checkout to check parity, and change source through another PR before reinstalling. No session restart, process operation, state deletion or unrelated configuration replacement occurs.
+
+The installed manifest is updated only for GitHub authority and the owned module/export entries, preserving other integrations. The parity check validates those fields without replacing unrelated metadata.
+
+Migration evidence: [GitHub-native enforcement issue](https://github.com/Wladefant/super-board/issues/114).
 
 To export the portable workflow package to an isolated directory using the canonical standard library export recipe:
 

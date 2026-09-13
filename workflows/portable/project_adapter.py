@@ -157,7 +157,7 @@ def create_polysimulator_config() -> ProjectConfig:
     return ProjectConfig(
         repo="Bavariance/polysimulator",
         project_name="PolySimulator",
-        project_number=1,
+        project_number=5,
         base_branch="staging",
         staging=StagingEnvironmentConfig(
             dokploy_compose_id="TU7b_dY9l9_nCas6YBNwj",
@@ -180,6 +180,8 @@ def create_polysimulator_config() -> ProjectConfig:
             forbidden_supabase_refs=["zaraprptkegxqpvnsubu"],
         ),
         metadata={
+            "project_owner": "Wladefant",
+            "project_owner_type": "users",
             "description": "PolySimulator staging engineering environment",
             "dokploy_host": "hosting.wladefant.de",
             "staging_domain": "polysim.wladefant.de",
@@ -196,7 +198,7 @@ def create_generic_config(repo: str = "generic/unconfigured") -> ProjectConfig:
     return ProjectConfig(
         repo=repo,
         project_name=name,
-        project_number=1,
+        project_number=5 if repo in ("Wladefant/super-board", "Wladefant/veyyon") else 1,
         base_branch="main",
         staging=StagingEnvironmentConfig(
             dokploy_compose_id=None,
@@ -213,7 +215,11 @@ def create_generic_config(repo: str = "generic/unconfigured") -> ProjectConfig:
             forbidden_compose_ids=[],
             forbidden_supabase_refs=[],
         ),
-        metadata={"description": f"Generic adapter for {repo}"},
+        metadata={
+            "description": f"Generic adapter for {repo}",
+            **({"project_owner": "Wladefant", "project_owner_type": "users"}
+               if repo in ("Wladefant/super-board", "Wladefant/veyyon") else {}),
+        },
     )
 
 
@@ -795,7 +801,10 @@ class SuperboardProjectUpdater:
         items = (issue.get("projectItems") or {}).get("nodes") or []
         for it in items:
             proj = it.get("project") or {}
-            if proj.get("number") == project_number:
+            project_owner = self.config.metadata.get("project_owner", owner)
+            if proj.get("number") == project_number and (
+                (proj.get("owner") or {}).get("login", owner) == project_owner
+            ):
                 status_val = it.get("fieldValueByName") or {}
                 return {
                     "item_id": it.get("id"),
@@ -835,7 +844,9 @@ class SuperboardProjectUpdater:
             )
 
         project_number = int(self.config.project_number or 1)
-        board_url = f"https://github.com/orgs/{owner}/projects/{project_number}"
+        project_owner = self.config.metadata.get("project_owner", owner)
+        owner_type = self.config.metadata.get("project_owner_type", "orgs")
+        board_url = f"https://github.com/{owner_type}/{project_owner}/projects/{project_number}"
 
         # 2. Resolve issue number
         target_issue = self._resolve_issue_number(request_id, issue_number)
@@ -898,7 +909,7 @@ class SuperboardProjectUpdater:
 
         # 5. Dynamic schema discovery
         try:
-            schema = self.get_board_schema(owner, project_number)
+            schema = self.get_board_schema(project_owner, project_number)
         except Exception as e:
             return SuperboardLifecycleOutcome(
                 ok=False,
