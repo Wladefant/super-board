@@ -7,9 +7,11 @@ import {
   handleInstalledCommand,
   readPendingDecisions,
   readRecentOutboundCards,
+  renderApprovalRequest,
   type InstalledCommandPort,
 } from "../src/installed-commands";
 import type { CommandRunner } from "../src/contract";
+import { DangerousToolGuard, approveOperation } from "../extension/guard";
 
 function fixture(idle = true) {
   const sent: string[] = [], photos: string[][] = [], inbound: unknown[][] = [], calls: readonly string[][] = [];
@@ -225,4 +227,44 @@ test("readRecentOutboundCards queries sqlite database with descending limit", ()
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
+});
+
+test("approve command grants exactly the pending guard operation once", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "approval-command-"));
+  try {
+    const f = fixture(), guard = new DangerousToolGuard(dir);
+    f.port.session = () => ({ ...f.state, stateDir: dir });
+    f.port.approve = token => approveOperation(dir, token);
+    const input = { command: "git push --force origin feat/93" };
+    const token = guard.evaluateToolCall("bash", input, true).approvalHash!;
+    expect(await handleInstalledCommand(`/approve@sessionbot ${token}`, f.port, f.runner)).toBe(true);
+    const record = JSON.parse(fs.readFileSync(path.join(dir, "approved", `${token}.json`), "utf8"));
+    expect(record.category).toBe("destructive_git"); expect(record.singleUse).toBe(true);
+    expect(record.content).toBe(JSON.stringify({ toolName: "bash", input }));
+    expect(f.sent[0]).toContain("Approved for one identical call");
+    expect(f.calls).toHaveLength(0); expect(f.inbound).toHaveLength(0);
+    expect(guard.evaluateToolCall("bash", input, false)).toEqual({ allowed: true });
+    expect(guard.evaluateToolCall("bash", input, true).allowed).toBe(false);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+test("approve reports missing binding, invalid tokens and expired requests without dispatch", async () => {
+  const f = fixture();
+  expect(await handleInstalledCommand("/approve short", f.port, f.runner)).toBe(true);
+  expect(f.sent[0]).toContain("Usage:");
+  await handleInstalledCommand(`/approve ${"a".repeat(64)}`, f.port, f.runner);
+  expect(f.sent[1]).toContain("No channel guard");
+  f.port.session = () => ({ ...f.state, stateDir: "C:/isolated-test-only" });
+  f.port.approve = () => { throw new Error("Approval request expired or invalid."); };
+  await handleInstalledCommand(`/approve ${"a".repeat(64)}`, f.port, f.runner);
+  expect(f.sent[2]).toContain("expired");
+  expect(f.calls).toHaveLength(0); expect(f.inbound).toHaveLength(0);
+});
+
+test("approval inline button copies the complete authenticated command, never a short callback token", () => {
+  const token = "b".repeat(64);
+  const card = renderApprovalRequest("category<test>", token);
+  expect(card.text).toContain("category&lt;test&gt;");
+  expect(card.replyMarkup).toEqual({ inline_keyboard: [[{ text: "Copy approval command", copy_text: { text: `/approve ${token}` } }]] });
+  expect(card.text).toContain(`/approve ${token}`);
+  expect(() => renderApprovalRequest("category", "b".repeat(12))).toThrow("Invalid");
 });

@@ -2,7 +2,7 @@
  * Statically resolvable native process calls are classified as argv; dynamic process arguments
  * require exact approval instead of being silently allowed. Runtime tool guards remain the floor.
  */
-type Token = { kind: "name" | "string" | "symbol"; value: string; dynamic?: boolean };
+type Token = { kind: "name" | "string" | "symbol"; value: string; dynamic?: boolean; embedded?: string[] };
 type Value = string | Value[] | { [key: string]: Value };
 function tokenize(code: string, language: string): Token[] {
   const tokens: Token[] = [];
@@ -16,10 +16,23 @@ function tokenize(code: string, language: string): Token[] {
     if (language !== "py" && code.slice(i, i + 2) === "/*") {
       const end = code.indexOf("*/", i + 2); i = end < 0 ? code.length : end + 2; continue;
     }
+    // A JS regexp literal is data, not a sequence of executable identifiers.
+    if (language !== "py" && c === "/" && (!tokens.length || /^(=|\(|\[|,|:|return|=>)$/.test(tokens[tokens.length - 1].value))) {
+      let inClass = false; i++;
+      while (i < code.length) {
+        if (code[i] === "\\") { i += 2; continue; }
+        if (code[i] === "[") inClass = true;
+        if (code[i] === "]") inClass = false;
+        if (code[i++] === "/" && !inClass) break;
+      }
+      while (/[a-z]/i.test(code[i] ?? "")) i++;
+      tokens.push({ kind: "symbol", value: "regexp" }); continue;
+    }
     if (c === "'" || c === '"' || c === "`") {
       const triple = language === "py" && code.slice(i, i + 3) === c.repeat(3);
       const delimiter = triple ? c.repeat(3) : c;
       i += delimiter.length;
+      const rawStart = i;
       let value = "", closed = false;
       while (i < code.length) {
         if (code.slice(i, i + delimiter.length) === delimiter) { i += delimiter.length; closed = true; break; }
@@ -27,7 +40,9 @@ function tokenize(code: string, language: string): Token[] {
           const escaped = code[++i]; value += ({ n: "\n", r: "\r", t: "\t" } as Record<string, string>)[escaped] ?? escaped; i++;
         } else value += code[i++];
       }
-      tokens.push({ kind: "string", value, dynamic: !closed || c === "`" && value.includes("${") }); continue;
+      const rawValue = code.slice(rawStart, closed ? i - delimiter.length : i);
+      const embedded = c === "`" ? [...rawValue.matchAll(/(?<!\\)\$\{([\s\S]*?)\}/g)].map(match => match[1]) : [];
+      tokens.push({ kind: "string", value, dynamic: !closed || embedded.length > 0, embedded }); continue;
     }
     const name = /^[A-Za-z_$][\w$]*/.exec(code.slice(i));
     if (name) { tokens.push({ kind: "name", value: name[0] }); i += name[0].length; continue; }
@@ -40,6 +55,11 @@ export function evalCommands(code: string, language: string, parseShell: (comman
   const aliases = new Map<string, string>();
   const commands: string[][] = [];
   let unresolved = false;
+  for (const token of tokens) for (const expression of token.embedded ?? []) {
+    const result = evalCommands(expression, language, parseShell);
+    commands.push(...result.commands);
+    unresolved ||= result.unresolved;
+  }
   const valueAt = (start: number): { value?: Value; end: number } => {
     const token = tokens[start];
     if (!token) return { end: start };
@@ -82,7 +102,18 @@ export function evalCommands(code: string, language: string, parseShell: (comman
   for (let i = 0; i < tokens.length; i++) {
     const t = tokens[i];
     if (t.kind !== "name") continue;
-    if (tokens[i + 1]?.value === "as" && tokens[i + 2]?.kind === "name") aliases.set(tokens[i + 2].value, t.value);
+    if (language === "py" && t.value === "from" && tokens[i + 2]?.value === "import") {
+      const module = tokens[i + 1]?.value;
+      for (let j = i + 3; tokens[j]?.kind === "name";) {
+        const imported = tokens[j++].value;
+        const local = tokens[j]?.value === "as" ? tokens[j + 1]?.value : imported;
+        if (tokens[j]?.value === "as") j += 2;
+        if (local) aliases.set(local, `${module}.${imported}`);
+        if (tokens[j]?.value !== ",") break;
+        j++;
+      }
+    }
+    if (tokens[i + 1]?.value === "as" && tokens[i + 2]?.kind === "name" && !aliases.has(tokens[i + 2].value)) aliases.set(tokens[i + 2].value, t.value);
     if (tokens[i + 1]?.value === "=" && tokens[i + 2]?.value !== "=") {
       const result = valueAt(i + 2);
       if (result.value !== undefined) values.set(t.value, result.value); else values.delete(t.value);
@@ -97,6 +128,12 @@ export function evalCommands(code: string, language: string, parseShell: (comman
     if (tokens[i - 1]?.value === ".") continue;
     let call = aliases.get(t.value) ?? t.value, at = i + 1;
     while (tokens[at]?.value === "." && tokens[at + 1]?.kind === "name") { call += `.${tokens[at + 1].value}`; at += 2; }
+    for (let hop = 0; hop < 8; hop++) {
+      const [head, ...tail] = call.split(".");
+      const resolved = aliases.get(head);
+      if (!resolved || resolved === head) break;
+      call = [resolved, ...tail].join(".");
+    }
     const leaf = call.split(".").pop()!;
     if (leaf === "$" && tokens[at]?.kind === "string") { append(tokens[at].dynamic ? undefined : tokens[at].value); continue; }
     if (tokens[at]?.value !== "(") continue;
@@ -105,7 +142,7 @@ export function evalCommands(code: string, language: string, parseShell: (comman
     const complete = tokens[argument.end]?.value === "," || tokens[argument.end]?.value === ")";
     const value = complete ? argument.value : undefined;
     if (/^(os\.(system|popen)|subprocess\.(run|call|check_call|check_output|Popen)|.*\.(execSync|execFileSync|execFile|spawn|spawnSync)|execSync|execFileSync|execFile|spawn|spawnSync|Popen|system|popen|check_call|check_output)$/.test(call) ||
-        leaf === "exec" && call !== "exec" || call === "subprocess.run" || call === "subprocess.call") {
+        /^(child_process|cp|childProcess)\.exec$/.test(call) || call === "subprocess.run" || call === "subprocess.call") {
       if (leaf === "execFile" || leaf === "execFileSync" || leaf === "spawn" || leaf === "spawnSync") {
         if (call.startsWith("Bun.") && value && typeof value === "object" && !Array.isArray(value)) append(value.cmd);
         else if (Array.isArray(value)) append(value);
@@ -120,6 +157,11 @@ export function evalCommands(code: string, language: string, parseShell: (comman
       else if (leaf === "ssh") commands.push(["ssh"]);
       else if (typeof value.application === "string" && Array.isArray(value.args)) append([value.application, ...value.args]);
       else unresolved = true;
+    } else if (/^(fs(?:\.promises)?\.(rm|rmSync|rmdir|rmdirSync|unlink|unlinkSync)|shutil\.rmtree|os\.(remove|unlink|rmdir|kill))$/.test(call)) {
+      commands.push(["rm", "-rf"]);
+    } else if (/^(read|write|open|fs(?:\.promises)?\.(readFile|readFileSync|writeFile|writeFileSync)|Bun\.(file|write)|Path|pathlib\.Path)$/.test(call)) {
+      // Protect real path-taking native calls without scanning an inert string assignment.
+      if (typeof value === "string") commands.push(["cat", value]);
     } else if (/^(eval|exec|Function)$/.test(call)) {
       // Dynamic native code evaluation is an execution construct, not inert quoted data.
       unresolved = true;

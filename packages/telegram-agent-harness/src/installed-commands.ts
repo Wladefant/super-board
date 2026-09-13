@@ -16,6 +16,8 @@ export interface InstalledSession {
   agents?: AgentSession[];
   poolDbPath?: string;
   decisionsPath?: string;
+  /** Exact leased channel directory, never inferred from cwd or a default slot. */
+  stateDir?: string;
 }
 export interface InstalledCommandPort {
   session(): InstalledSession;
@@ -24,6 +26,7 @@ export interface InstalledCommandPort {
   mediaGroup?(files: string[], caption?: string): Promise<void>;
   latestPng(sessionId: string): Promise<string | null>;
   inbound(text: string, idle: boolean): Promise<void>;
+  approve?(token: string): { expiresAt: string };
 }
 
 export interface OutboundCardSummary {
@@ -169,15 +172,35 @@ export function renderFullStatus(params: {
   return lines.join("\n");
 }
 
+/** Copy buttons need no callback-token store and still require an authenticated command. */
+export function renderApprovalRequest(category: string, token: string): { text: string; replyMarkup: Record<string, unknown> } {
+  if (!/^[a-f0-9]{64}$/.test(token)) throw new Error("Invalid approval token");
+  const command = `/approve ${token}`;
+  return {
+    text: `<b>Operation needs your approval.</b>\nCategory: <code>${escapeHtml(category)}</code>\nCopy and send the command below, then retry the identical operation. The grant expires in 15 minutes and works once.\n<code>${command}</code>`,
+    replyMarkup: { inline_keyboard: [[{ text: "Copy approval command", copy_text: { text: command } }]] },
+  };
+}
+
 /** Called after the installed poller's actor/reply gates, never owns a lease or offset. */
 export async function handleInstalledCommand(text: string, port: InstalledCommandPort, runner: CommandRunner): Promise<boolean> {
-  const match = /^\/(agents|prompt|shot|usage|status)(?:@\w+)?(?:\s|$)/.exec(text.trim());
+  const match = /^\/(approve|agents|prompt|shot|usage|status)(?:@\w+)?(?:\s|$)/.exec(text.trim());
   if (!match) return false;
   const raw = text.trim().replace(/^(\/\w+)@\w+/, "$1");
   const session = { ...port.session() };
   const herdr = new HerdrAdapter(runner);
   try {
-    if (match[1] === "agents") {
+    if (match[1] === "approve") {
+      const approval = /^\/approve\s+([a-f0-9]{64})$/.exec(raw);
+      if (!approval) { await port.send("<b>Usage:</b> <code>/approve FULL_64_CHARACTER_TOKEN</code> from the refused operation."); return true; }
+      if (!session.stateDir || !port.approve) { await port.send("<b>Approval unavailable.</b> No channel guard is bound to this session. Use the local unlock instruction from the refusal."); return true; }
+      try {
+        const record = port.approve(approval[1]);
+        await port.send(`<b>Approved for one identical call.</b> Retry it before <code>${escapeHtml(record.expiresAt)}</code>. Approval does not execute the operation or override other safety gates.`);
+      } catch (error) {
+        await port.send(`<b>Not approved.</b> ${escapeHtml(error instanceof Error ? error.message : "Approval storage unavailable; retry the refused call.")}`);
+      }
+    } else if (match[1] === "agents") {
       const agents = await herdr.listSessions();
       const now = Date.now();
       agents.push({ backend: "veyyon", id: session.id, name: "Current session", state: session.idle ? "idle" : "working", project: session.cwd, observedAt: now, updatedAt: now, canPrompt: true });

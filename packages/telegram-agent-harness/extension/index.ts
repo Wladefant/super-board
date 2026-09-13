@@ -18,14 +18,14 @@ import type {
   ToolCallEvent,
 } from "@veyyon/coding-agent";
 import { BotPoolCoordinator } from "./coordinator";
-import { DangerousToolGuard } from "./guard";
+import { DangerousToolGuard, approveOperation } from "./guard";
 import { TelegramPoller } from "./poller";
 import { chunkMessage, escapeHtml, markdownToTelegramHtml } from "./sanitizer";
 import type { DiscoveredSlot, MessageCorrelationBridge } from "./types";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { handleInstalledCommand } from "./harness/installed-commands";
+import { handleInstalledCommand, renderApprovalRequest } from "./harness/installed-commands";
 import { BunCommandRunner } from "./harness/command-runner";
 import { latestSessionPng } from "./harness/session-artifacts";
 
@@ -281,7 +281,9 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
               cwd: ctx.cwd,
               idle: ctx.isIdle(),
               model: ctx.model?.id,
+              stateDir: activeSlot!.stateDir,
             }),
+            approve: token => approveOperation(activeSlot!.stateDir, token),
             send: async html => {
               const sent = await poller.sendTelegramMessage(chatId, html);
               if (!sent?.ok) throw new Error("Telegram delivery failed");
@@ -468,7 +470,7 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
     accumulatedAssistantText = "";
   });
 
-  // Assistant replies carry actionable explanations; raw tool lifecycle events stay local.
+  // Actionable approval requests are user-facing; other raw tool lifecycle events stay local.
 
   pi.on("tool_call", async (event: ToolCallEvent) => {
     const root = globalState[ACTIVE_ROOT_SYMBOL];
@@ -480,9 +482,15 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
     );
 
     if (!evaluation.allowed) {
+      const chatId = root.poller.getPrimaryChatId();
+      if (chatId && evaluation.approvalHash) {
+        const card = renderApprovalRequest(evaluation.category ?? "operation", evaluation.approvalHash);
+        // Delivery failure must never turn a refusal into permission.
+        try { await root.poller.sendTelegramMessage(chatId, card.text, card.replyMarkup); } catch {}
+      }
       return {
         block: true,
-        reason: evaluation.reason ?? "Production-sensitive operation blocked for remote turn.",
+        reason: evaluation.reason ?? "Sensitive operation requires operator approval.",
       };
     }
   });

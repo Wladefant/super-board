@@ -108,21 +108,60 @@ export function approveOperation(stateDir: string, token: string): ApprovalRecor
 /** Shell words, not a prose scan: separators outside quotes introduce invocations. */
 export function shellCommands(command: string): string[][] {
   const commands: string[][] = [], words: string[] = [];
+  const heredocs: { delimiter: string; quoted: boolean; stripTabs: boolean }[] = [];
   let word = "", quote = "", started = false;
   const flushWord = () => { if (started) words.push(word); word = ""; started = false; };
   const flush = () => { flushWord(); if (words.length) commands.push(words.splice(0)); };
   for (let i = 0; i < command.length; i++) {
     const c = command[i];
+    // Command substitution executes even inside double quotes; single quotes remain data.
+    if (quote !== "'" && (command.slice(i, i + 2) === "$(" || c === "`")) {
+      const backtick = c === "`";
+      let end = i + (backtick ? 1 : 2), nesting = 1;
+      const start = end;
+      for (; end < command.length; end++) {
+        if (command[end] === "\\") { end++; continue; }
+        if (backtick && command[end] === "`") break;
+        if (!backtick && command[end] === "(") nesting++;
+        if (!backtick && command[end] === ")" && --nesting === 0) break;
+      }
+      commands.push(...shellCommands(command.slice(start, end)));
+      i = end; started = true; continue;
+    }
     if (quote) {
       if (c === quote) { quote = ""; continue; }
       if (c === "\\" && quote === '"' && /["\\$`\n]/.test(command[i + 1] ?? "")) { word += command[++i]; continue; }
       word += c; continue;
     }
+    if (command.slice(i, i + 2) === "<<" && command[i + 2] !== "<") {
+      const match = /^<<(-?)\s*(?:'([^']+)'|"([^"]+)"|([^\s;&|]+))/.exec(command.slice(i));
+      if (match) {
+        flushWord();
+        heredocs.push({ delimiter: match[2] ?? match[3] ?? match[4], quoted: Boolean(match[2] || match[3]), stripTabs: match[1] === "-" });
+        i += match[0].length - 1; continue;
+      }
+    }
+    if (c === "\n" && heredocs.length) {
+      flush();
+      for (const document of heredocs.splice(0)) {
+        let body = "", start = i + 1;
+        while (start < command.length) {
+          let end = command.indexOf("\n", start);
+          if (end < 0) end = command.length;
+          const line = command.slice(start, end).replace(/\r$/, "");
+          if ((document.stripTabs ? line.replace(/^\t+/, "") : line) === document.delimiter) { i = end; break; }
+          body += line + "\n"; start = end + 1; i = end;
+        }
+        // Unquoted heredocs expand substitutions, but never execute their plain text.
+        if (!document.quoted) commands.push(...shellCommands(`echo "${body.replace(/"/g, '\\"')}"`));
+      }
+      continue;
+    }
     if (c === "'" || c === '"') { quote = c; started = true; }
     else if (c === "#" && !started) { while (i < command.length && command[i] !== "\n") i++; flush(); }
-    else if (/[;&|\n]/.test(c)) flush();
+    else if (/[;&|\n()]/.test(c)) flush();
     else if (/\s/.test(c)) flushWord();
-    else if (c === "\\" && /[\s'";&|]/.test(command[i + 1] ?? "")) { started = true; word += command[++i]; }
+    else if (c === "\\" && /[\s'";&|$`]/.test(command[i + 1] ?? "")) { started = true; word += command[++i]; }
     else { word += c; started = true; }
   }
   flush();
@@ -136,24 +175,28 @@ function commandCategory(words: string[], depth = 0): string | undefined {
   while (words.length && /^[A-Za-z_]\w*=/.test(words[0])) words = words.slice(1);
   if (!words.length) return;
   const app = executable(words[0]), args = words.slice(1), command = [app, ...args].join(" ");
-  if (app === "env" || app === "command" || app === "exec" || app === "call" || app === "&") return commandCategory(args, depth + 1);
+  if (/^(env|command|exec|call|if|then|do|while|!)$/.test(app)) {
+    let offset = 0;
+    while (args[offset]?.startsWith("-")) offset += /^(--unset|-u)$/.test(args[offset]) ? 2 : 1;
+    return commandCategory(args.slice(offset), depth + 1);
+  }
   // A real process may read keys regardless of the transport. Never inspect source-file contents.
-  if (args.some(arg => SECRET_PATH.test(arg) || DESTRUCTIVE_INTENTS.secrets.some(re => re.test(arg)))) return "secrets";
   if (PRODUCTION.test(command)) return "production_exclusion";
+  if (args.some(arg => SECRET_PATH.test(arg) || DESTRUCTIVE_INTENTS.secrets.some(re => re.test(arg)))) return "secrets";
   if (/^(sh|bash|zsh|cmd|powershell|pwsh)$/.test(app)) {
     const i = args.findIndex(arg => /^(-[a-z]*c|\/c|-command)$/i.test(arg));
-    if (i >= 0) return shellCommands(args.slice(i + 1).join(" ")).map(c => commandCategory(c, depth + 1)).find(Boolean);
+    if (i >= 0) return selectCategory(shellCommands(args.slice(i + 1).join(" ")).map(c => commandCategory(c, depth + 1)));
   }
   if (/^(node|bun|python|python3)$/.test(app)) {
     const i = args.findIndex(arg => /^(-c|-e|--eval)$/.test(arg));
     if (i >= 0) {
       const result = evalCommands(args[i + 1] ?? "", app.startsWith("python") ? "py" : "js", shellCommands);
-      if (result.unresolved) return "shell_destructive_os";
-      return result.commands.map(c => commandCategory(c, depth + 1)).find(Boolean);
+      return selectCategory([...result.commands.map(c => commandCategory(c, depth + 1)), result.unresolved ? "shell_destructive_os" : undefined]);
     }
   }
   if (/^(ssh|scp|sftp)$/.test(app)) return "remote_ssh";
-  if (DESTRUCTIVE_INTENTS.shell_destructive_os.some(re => re.test(command)) && /^(rm|format|shutdown|reboot|sudo|dd|kill|taskkill)$/.test(app)) return "shell_destructive_os";
+  if (app === "format" && args.some(arg => /^[a-z]:$/i.test(arg)) ||
+      DESTRUCTIVE_INTENTS.shell_destructive_os.some(re => re.test(command)) && /^(rm|format|shutdown|reboot|sudo|dd|kill|taskkill)$/.test(app)) return "shell_destructive_os";
   if (/^(psql|pg_dump|pg_restore|pg_stat|alembic)$/.test(app) || app === "supabase" && args[0] === "db") return "shared_db_ddl_dml";
   if (/^(deploy|redeploy|dokploy|compose\.redeploy|compose\.update)$/.test(app) ||
       /^(fly|staging-api|polysim-deploy)$/.test(app) && args.some(a => /^(deploy|staging|prod|production)$/.test(a)) ||
@@ -170,8 +213,10 @@ function commandCategory(words: string[], depth = 0): string | undefined {
   const action = args[i], rest = args.slice(i + 1);
   if (rest.some(a => /^--force(?:-with-lease|-if-includes)?(?:=|$)/.test(a)) ||
       /^(rebase|filter-branch|filter-repo)$/.test(action ?? "") ||
+      action === "commit" && rest.includes("--amend") ||
       action === "reset" && rest.includes("--hard") || action === "clean" ||
-      action === "branch" && rest.some(a => /^-[^-]*D/.test(a) || a === "--delete" && rest.includes("-f")) ||
+      action === "branch" && (rest.some(a => /^-[^-]*D/.test(a)) ||
+        rest.some(a => /^-[^-]*d/.test(a) || a === "--delete") && rest.some(a => /^-[^-]*f/.test(a))) ||
       action === "checkout" && rest.includes("--") && rest.includes(".") ||
       action === "restore" && rest.includes(".")) return "destructive_git";
   if (action !== "push") return;
@@ -180,6 +225,9 @@ function commandCategory(words: string[], depth = 0): string | undefined {
   // No explicit destination means configured refspecs; require exact approval rather than guess.
   if (refs.length < 2) return "destructive_git";
   if (refs.slice(1).some(ref => PROTECTED.test(ref.split(":").pop()!.replace(/^refs\/heads\//, "")) || ref.startsWith(":"))) return "destructive_git";
+}
+function selectCategory(categories: (string | undefined)[]): string | undefined {
+  return categories.includes("production_exclusion") ? "production_exclusion" : categories.find(Boolean);
 }
 function protectedPath(input: unknown, depth = 0): boolean {
   if (!input || typeof input !== "object" || depth > 10) return false;
@@ -200,14 +248,18 @@ export class DangerousToolGuard {
   public evaluateToolCall(toolName: string, input: Record<string, unknown>, _isTelegramOverride?: boolean): ToolGuardEvaluation {
     // Origin intentionally unused: every call follows exactly the same permission path.
     let category: string | undefined;
-    if (protectedPath(input)) category = "secrets";
-    else if (toolName === "bash") category = shellCommands(String(input.command ?? "")).map(c => commandCategory(c)).find(Boolean);
+    if (toolName === "bash") category = selectCategory(shellCommands(String(input.command ?? "")).map(c => commandCategory(c)));
     else if (toolName === "launch" && input.op === "start") category = commandCategory([String(input.application ?? ""), ...(Array.isArray(input.args) ? input.args.map(String) : [])]);
+    else if (toolName === "launch" && input.op === "restart") category = "shell_destructive_os";
     else if (toolName === "eval") {
       const result = evalCommands(String(input.code ?? ""), String(input.language ?? "js"), shellCommands);
-      category = result.unresolved ? "shell_destructive_os" : result.commands.map(c => commandCategory(c)).find(Boolean);
-    } else if (toolName === "ssh") category = "remote_ssh"; // Explicit execution tool, never a prose match.
-    else if (toolName in READ_ONLY_TOOLS) return { allowed: true };
+      category = selectCategory([...result.commands.map(c => commandCategory(c)), result.unresolved ? "shell_destructive_os" : undefined]);
+    } else if (toolName === "ssh") {
+      // An explicit remote-process tool is execution, not a prose mention.
+      category = PRODUCTION.test(`${input.host ?? ""} ${input.hostname ?? ""} ${input.command ?? ""}`) ? "production_exclusion" : "remote_ssh";
+    }
+    if (category !== "production_exclusion" && protectedPath(input)) category = "secrets";
+    if (!category && toolName in READ_ONLY_TOOLS) return { allowed: true };
     if (!category) return { allowed: true };
     if (category === "production_exclusion") return { allowed: false, category, reason: "Production is excluded for every transport; an approval cannot override this boundary." };
     // Bind approval to the full exact input, including cwd/env, not just matched words.
