@@ -1,0 +1,153 @@
+name: Task
+description: Single-deliverable implementation, refactoring, or tooling task
+title: "[Task]: "
+labels: ["kind:task"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Self-Sufficient Task Intake
+        Every task must represent exactly **one single deliverable** and contain everything required for a memoryless agent to execute, verify, and close the issue without relying on ephemeral chat context.
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope & Original Request
+      description: State the original request and the single deliverable. Explicitly name in-scope files/contracts and what is OUT of scope to prevent scope creep.
+      placeholder: |
+        Single deliverable: ...
+        In-scope files/contracts: ...
+        Out-of-scope non-goals: ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance Criteria
+      description: Binary, measurable, observable checklist that proves completion. Every criterion must be verifiable.
+      value: |
+        - [ ] 1. 
+        - [ ] 2. 
+        - [ ] 3. 
+    validations:
+      required: true
+
+  - type: input
+    id: dependencies-parent
+    attributes:
+      label: Dependencies & Parent Issue
+      description: Parent issue URL/number or blocking prerequisites. Parent must be weightless (zero direct PRs).
+      placeholder: "Parent: #123 (or 'None - Root Capability'); Blocked by: #456"
+    validations:
+      required: true
+
+  - type: input
+    id: owner
+    attributes:
+      label: Owner & Assignment
+      description: Assigned agent role/identity and responsible executor.
+      placeholder: "e.g. task / TemplatesAndGate / Wladimir Kirjanovs"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: milestone
+    attributes:
+      label: Target Milestone
+      description: Authoritative integration wave or capability program.
+      options:
+        - "GitHub System Integration"
+        - "Phase 1 - System hardening"
+        - "Phase 2 - Tooling + quota"
+        - "Phase 3 - Docs + rollout"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Subsystem domain boundary.
+      options:
+        - "area:workflow"
+        - "area:harness"
+        - "area:bridge"
+        - "area:sync"
+        - "area:ui"
+        - "area:infra"
+        - "area:security"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: risk
+    attributes:
+      label: Risk Level
+      description: Blast radius and operational hazard scale.
+      options:
+        - "risk:low"
+        - "risk:medium"
+        - "risk:high"
+        - "risk:money-path"
+        - "risk:migration"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: dispatch
+    attributes:
+      label: Dispatch Requirements
+      description: Workstation or environment constraint.
+      options:
+        - "standard"
+        - "dispatch:laptop"
+        - "dispatch:isolated-db"
+    validations:
+      required: true
+
+  - type: textarea
+    id: verification-recipe
+    attributes:
+      label: Verification Recipe
+      description: Exact executable commands and checks to prove behavior (unit test, script, or browser steps).
+      placeholder: "e.g. node .github/scripts/test.js or npm test"
+    validations:
+      required: true
+
+  - type: input
+    id: branch-pr-head
+    attributes:
+      label: Branch, PR & Exact Head
+      description: Tracking for candidate branch and 40-hex head SHA once work begins.
+      placeholder: "branch: feat/..., PR: #..., head: <40-char-sha>"
+    validations:
+      required: false
+
+  - type: textarea
+    id: current-state
+    attributes:
+      label: Current State & Blockers
+      description: Current status, blockers, or operator decisions required.
+      placeholder: "state: Ready / Building / Blocked (specify blocker)"
+    validations:
+      required: false
+
+  - type: input
+    id: next-action
+    attributes:
+      label: Next Action
+      description: Immediate next step for a memoryless agent picking up this issue.
+      placeholder: "Implement ... / Run tests / Review PR"
+    validations:
+      required: true
+
+  - type: textarea
+    id: authorization
+    attributes:
+      label: Authorization & Constraints
+      description: Explicit boundaries: merge commits only, no lockfile writes, production exclusion.
+      value: |
+        Constraints: Merge commits only (--no-ff); never rebase or squash. Zero production access. Git author/committer must be human Wladimir Kirjanovs <wladefant@gmail.com>.
+    validations:
+      required: true

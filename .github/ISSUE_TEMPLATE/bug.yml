@@ -1,0 +1,176 @@
+name: Defect / Bug Report
+description: Report a bug, regression, or crash with reproduction and regression proof
+title: "[Defect]: "
+labels: ["kind:bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Defect Intake & Closure Contract
+        A defect is resolved **ONLY** when full QA proves the original defect is absent by re-running the exact original failure scenario, exercising regression paths, and documenting proof on the authoritative head SHA.
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope & Defect Summary
+      description: Concise summary of the defect, impacted components, and failure scope.
+      placeholder: "Summary of failure, impacted modules, and observed trigger..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction Steps
+      description: Minimal, deterministic, step-by-step reproduction instructions and commands.
+      placeholder: |
+        1. Run command ...
+        2. Provide input ...
+        3. Observe error ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected-actual
+    attributes:
+      label: Expected vs Actual Behavior
+      description: What did you expect to happen vs what actually happened? Include error logs or stack traces.
+      placeholder: |
+        Expected: ...
+        Actual: ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: regression-proof
+    attributes:
+      label: Original Scenario Verification (Regression Proof)
+      description: Exact reproduction command/test that fails today and MUST pass to prove defect resolution, plus regression assertions.
+      placeholder: |
+        Failing command to verify: ...
+        Expected clean output after fix: ...
+        Regression test suite: ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance Criteria
+      description: Observable criteria proving defect resolution and non-recurrence.
+      value: |
+        - [ ] 1. Original failure scenario re-run and proven absent on candidate head
+        - [ ] 2. Regression tests added/passing with no collateral breakage
+        - [ ] 3. No breaking contract changes introduced
+    validations:
+      required: true
+
+  - type: input
+    id: dependencies-parent
+    attributes:
+      label: Dependencies & Parent Issue
+      description: Parent feature issue, component, or related tracking issue.
+      placeholder: "#123 (or 'None')"
+    validations:
+      required: true
+
+  - type: input
+    id: owner
+    attributes:
+      label: Owner & Assignment
+      description: Assigned investigator and responsible fixer.
+      placeholder: "e.g. task / RepairForkMain / Wladimir Kirjanovs"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: milestone
+    attributes:
+      label: Target Milestone
+      description: Authoritative integration wave or capability program.
+      options:
+        - "GitHub System Integration"
+        - "Phase 1 - System hardening"
+        - "Phase 2 - Tooling + quota"
+        - "Phase 3 - Docs + rollout"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Subsystem domain boundary.
+      options:
+        - "area:workflow"
+        - "area:harness"
+        - "area:bridge"
+        - "area:sync"
+        - "area:ui"
+        - "area:infra"
+        - "area:security"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: risk
+    attributes:
+      label: Risk Level
+      description: Blast radius and operational hazard scale.
+      options:
+        - "risk:low"
+        - "risk:medium"
+        - "risk:high"
+        - "risk:money-path"
+        - "risk:migration"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: dispatch
+    attributes:
+      label: Dispatch Requirements
+      description: Workstation or environment constraint.
+      options:
+        - "standard"
+        - "dispatch:laptop"
+        - "dispatch:isolated-db"
+    validations:
+      required: true
+
+  - type: input
+    id: branch-pr-head
+    attributes:
+      label: Branch, PR & Exact Head
+      description: Tracking for candidate fix branch and 40-hex head SHA once work begins.
+      placeholder: "branch: fix/..., PR: #..., head: <40-char-sha>"
+    validations:
+      required: false
+
+  - type: textarea
+    id: current-state
+    attributes:
+      label: Current State & Blockers
+      description: Current status, blockers, or operator decisions required.
+      placeholder: "state: Ready / Building / Blocked (specify blocker)"
+    validations:
+      required: false
+
+  - type: input
+    id: next-action
+    attributes:
+      label: Next Action
+      description: Immediate next step for a memoryless agent picking up this defect.
+      placeholder: "Reproduce failure / Apply fix / Run regression test"
+    validations:
+      required: true
+
+  - type: textarea
+    id: authorization
+    attributes:
+      label: Authorization & Constraints
+      description: Explicit boundaries: merge commits only, no lockfile writes, production exclusion.
+      value: |
+        Constraints: Merge commits only (--no-ff); never rebase or squash. Zero production access. Git author/committer must be human Wladimir Kirjanovs <wladefant@gmail.com>.
+    validations:
+      required: true
