@@ -19,6 +19,7 @@ RUNTIME_FILES = (
     "coordinator_smoke_test.py", "test_superboard_adapter.py", "test_github_work_item.py",
     "test_github_pr_gate.py", "test_project_adapter.py", "test_continuation_driver.py",
     "test_review_content.py", "test_review_content_gate.py",
+    "github_plan_renderer.py", "github_plan_templates.py", "test_github_publication.py",
     "install_github_native.py", "test_install_github_native.py", "PORTABLE.md",
 )
 POLICY = Path("policies/default/AGENTS.md")

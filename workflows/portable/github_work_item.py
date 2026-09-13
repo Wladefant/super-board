@@ -22,6 +22,10 @@ ISSUE_QUERY = """query($owner:String!, $repo:String!, $number:Int!) {
       id url title body state updatedAt
       milestone { number title state url }
       parent { id url title }
+      comments(first:100) {
+        nodes { id url body author { login } createdAt updatedAt }
+        pageInfo { hasNextPage endCursor }
+      }
       labels(first:100) { nodes { name } pageInfo { hasNextPage } }
       assignees(first:100) { nodes { login } pageInfo { hasNextPage } }
       blockedBy(first:100) { nodes { url state } pageInfo { hasNextPage } }
@@ -55,6 +59,41 @@ def issue_sections(body: str) -> dict[str, str]:
     clean = re.sub(r"<!--.*?-->", "", body, flags=re.S)
     parts = re.split(r"(?m)^#{2,3}\s+([^\n]+)\n", clean)
     return {parts[i].strip().casefold(): parts[i + 1].strip() for i in range(1, len(parts), 2)}
+
+
+def read_comments(issue: dict, runner: Callable) -> list[dict]:
+    """Read the complete discussion; publication and recovery use this same path."""
+    connection = issue.get("comments") or {}
+    comments, ids, cursors = [], set(), set()
+    while True:
+        page = connection.get("pageInfo") or {}
+        if not isinstance(connection.get("nodes"), list) or not isinstance(page.get("hasNextPage"), bool):
+            raise ValueError("Incomplete GitHub comments connection")
+        for comment in connection["nodes"]:
+            if (not isinstance(comment, dict) or not comment.get("id")
+                or not isinstance(comment.get("body"), str)
+                or not isinstance(comment.get("url"), str)
+                or not re.fullmatch(re.escape(issue["url"]) + r"#issuecomment-[1-9][0-9]*", comment["url"])
+                or comment["id"] in ids):
+                raise ValueError("Incomplete, duplicate or foreign GitHub comment")
+            ids.add(comment["id"])
+            comments.append(comment)
+        if not page["hasNextPage"]:
+            return comments
+        cursor = page.get("endCursor")
+        if not cursor or cursor in cursors:
+            raise ValueError("GitHub comments pagination did not advance")
+        cursors.add(cursor)
+        response = runner(
+            """query($id:ID!,$cursor:String!){node(id:$id){... on Issue {
+            id url comments(first:100,after:$cursor){
+              nodes{id url body author{login} createdAt updatedAt}
+              pageInfo{hasNextPage endCursor}
+            }}}}""", {"id": issue["id"], "cursor": cursor})
+        node = (response.get("data") or {}).get("node") or {}
+        if response.get("errors") or node.get("id") != issue["id"] or node.get("url") != issue["url"]:
+            raise ValueError("GitHub comments pagination lost issue identity")
+        connection = node.get("comments") or {}
 
 
 def fetch_work_item(record: dict, runner: Callable | None = None) -> dict:
@@ -107,6 +146,7 @@ def fetch_work_item(record: dict, runner: Callable | None = None) -> dict:
     if not issue.get("parent") and not re.search(r"(?i)\bstandalone\b|\bno parent\b", dependency_text):
         raise ValueError("Link the native parent, or explicitly state standalone/no parent with rationale")
     issue["sections"] = sections
+    issue["comments"] = read_comments(issue, runner)
     return issue
 
 
@@ -116,6 +156,12 @@ def execution_view(record: dict, issue: dict) -> dict:
     result = dict(record)
     result["github_snapshot"] = issue
     result["prompt"] = issue["body"]
+    for comment in issue["comments"]:
+        author = (comment.get("author") or {}).get("login") or "deleted account"
+        result["prompt"] += (
+            f"\n\n## GitHub discussion: {comment['url']}\n"
+            f"Author: {author}; updated: {comment.get('updatedAt') or 'unknown'}\n\n{comment['body']}"
+        )
     result["labels"] = issue["labels"]
     result["owner"] = ", ".join(issue["assignees"])
     result["next_action"] = issue["sections"]["next action"]
@@ -144,28 +190,41 @@ def execution_view(record: dict, issue: dict) -> dict:
     return result
 
 
-def publish_report(issue_url: str, body: str, runner: Callable | None = None) -> str:
-    """Publish readable markdown and confirm exact body via authenticated readback."""
+def publish_report(issue_url: str, body: str, runner: Callable | None = None,
+                   *, comment_id: str | None = None) -> str:
+    """Publish/update only when the installed recovery reader can retrieve the result."""
     from project_adapter import default_graphql_runner
     runner = runner or default_graphql_runner
-    if not isinstance(issue_url, str) or not (match := ISSUE_URL.fullmatch(issue_url)):
+    if not isinstance(issue_url, str) or not ISSUE_URL.fullmatch(issue_url):
         raise ValueError("Report requires a canonical GitHub issue URL")
     if not isinstance(body, str):
         raise ValueError("Report body must be markdown text")
     reject_local_reports(body)
     if not body.strip():
         raise ValueError("Report body is empty")
-    owner, repo, number = match.groups()
-    response = runner("query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){issue(number:$number){id url}}}", {"owner": owner, "repo": repo, "number": int(number)})
-    issue = ((response.get("data") or {}).get("repository") or {}).get("issue")
-    if response.get("errors") or not issue or issue["url"] != issue_url:
-        raise ValueError("Report issue identity could not be verified")
-    response = runner("mutation($id:ID!,$body:String!){addComment(input:{subjectId:$id,body:$body}){commentEdge{node{id url}}}}", {"id": issue["id"], "body": body})
-    if response.get("errors"):
-        raise ValueError("GitHub report publication failed")
-    comment = response["data"]["addComment"]["commentEdge"]["node"]
-    proof = runner("query($id:ID!){node(id:$id){... on IssueComment {url body}}}", {"id": comment["id"]})
-    observed = (proof.get("data") or {}).get("node") or {}
-    if proof.get("errors") or observed.get("body") != body or observed.get("url") != comment["url"]:
-        raise ValueError("Published report readback differs; do not claim delivered evidence")
+    record = {"github": {"issue_url": issue_url}}
+    issue = fetch_work_item(record, runner)
+    if comment_id is None:
+        response = runner(
+            "mutation($id:ID!,$body:String!){addComment(input:{subjectId:$id,body:$body}){commentEdge{node{id url}}}}",
+            {"id": issue["id"], "body": body})
+        comment = (((response.get("data") or {}).get("addComment") or {}).get("commentEdge") or {}).get("node") or {}
+    else:
+        matches = [comment for comment in issue["comments"]
+                   if comment["url"] == f"{issue_url}#issuecomment-{comment_id}"]
+        if len(matches) != 1:
+            raise ValueError("Comment does not belong to the canonical issue")
+        response = runner(
+            "mutation($id:ID!,$body:String!){updateIssueComment(input:{id:$id,body:$body}){issueComment{id url}}}",
+            {"id": matches[0]["id"], "body": body})
+        comment = ((response.get("data") or {}).get("updateIssueComment") or {}).get("issueComment") or {}
+    if response.get("errors") or not comment.get("id") or not comment.get("url"):
+        raise ValueError("GitHub report publication returned no verified comment identity")
+    try:
+        recovered = fetch_work_item(record, runner)
+    except Exception as exc:
+        raise ValueError(f"Recovery readback failed for {comment['url']}: {exc}") from exc
+    if not any(item["id"] == comment["id"] and item["url"] == comment["url"] and item["body"] == body
+               for item in recovered["comments"]):
+        raise ValueError(f"Published report readback differs at {comment['url']}; do not claim delivered evidence")
     return comment["url"]

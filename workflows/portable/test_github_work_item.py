@@ -23,6 +23,7 @@ def api_issue():
             "parent": {"id": "PARENT", "url": "https://github.com/Wladefant/super-board/issues/113"},
             "labels": connection([{"name": label} for label in ("kind:task", "area:workflow", "risk:low")]),
             "assignees": connection([{"login": "Wladefant"}]), "blockedBy": connection([]),
+            "comments": connection([]),
             "projectItems": connection([{"id": "CARD", "project": {"id": "BOARD", "url": PROJECT_URL, "number": 5}, "fieldValueByName": {"name": "Building"}}])}
 
 
@@ -131,9 +132,13 @@ class GitHubAuthority(unittest.TestCase):
         calls = []
         def runner(query, variables):
             calls.append(variables)
-            if "repository(" in query: return {"data": {"repository": {"issue": {"id": "ISSUE", "url": url}}}}
-            if "addComment" in query: return {"data": {"addComment": {"commentEdge": {"node": {"id": "COMMENT", "url": url + "#issuecomment-1"}}}}}
-            return {"data": {"node": {"body": "## Proof\nPassed", "url": url + "#issuecomment-1"}}}
+            comment = {"id": "COMMENT", "url": url + "#issuecomment-1", "body": "## Proof\nPassed"}
+            if "repository(" in query:
+                issue = api_issue()
+                if len(calls) > 1:
+                    issue["comments"]["nodes"] = [comment]
+                return {"data": {"repository": {"issue": issue}}}
+            return {"data": {"addComment": {"commentEdge": {"node": comment}}}}
         self.assertTrue(publish_report(url, "## Proof\nPassed", runner).endswith("#issuecomment-1"))
         self.assertEqual(len(calls), 3)
         with self.assertRaisesRegex(ValueError, "readback"):
