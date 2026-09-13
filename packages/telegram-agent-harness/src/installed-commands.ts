@@ -6,6 +6,7 @@ import { HerdrAdapter } from "./herdr-adapter";
 import { parseVeyyonUsage } from "./veyyon-adapter";
 import { escapeHtml, renderAgentList, renderUsage } from "./telegram-router";
 import type { AgentSession, CommandRunner, UsageLimit } from "./contract";
+import type { ApprovalRecord } from "../extension/approvals";
 
 export interface InstalledSession {
   id: string;
@@ -26,7 +27,7 @@ export interface InstalledCommandPort {
   mediaGroup?(files: string[], caption?: string): Promise<void>;
   latestPng(sessionId: string): Promise<string | null>;
   inbound(text: string, idle: boolean): Promise<void>;
-  approve?(token: string): { expiresAt: string };
+  approve?(token: string): { expiresAt: string } | Promise<{ expiresAt: string }>;
 }
 
 export interface OutboundCardSummary {
@@ -172,13 +173,29 @@ export function renderFullStatus(params: {
   return lines.join("\n");
 }
 
-/** Copy buttons need no callback-token store and still require an authenticated command. */
-export function renderApprovalRequest(category: string, token: string): { text: string; replyMarkup: Record<string, unknown> } {
-  if (!/^[a-f0-9]{64}$/.test(token)) throw new Error("Invalid approval token");
-  const command = `/approve ${token}`;
+/** Callback data is the full 256-bit grant, encoded to fit Telegram's 64-byte limit. */
+export function renderApprovalRequest(record: ApprovalRecord): { text: string; replyMarkup: Record<string, unknown> } {
+  if (!/^[a-f0-9]{64}$/.test(record.token)) throw new Error("Invalid approval token");
+  const encoded = Buffer.from(record.token, "hex").toString("base64url");
+  const expiry = new Date(record.expiresAt).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, " UTC");
   return {
-    text: `<b>Operation needs your approval.</b>\nCategory: <code>${escapeHtml(category)}</code>\nCopy and send the command below, then retry the identical operation. The grant expires in 15 minutes and works once.\n<code>${command}</code>`,
-    replyMarkup: { inline_keyboard: [[{ text: "Copy approval command", copy_text: { text: command } }]] },
+    text: [
+      "<b>Approval needed — this call is blocked</b>",
+      `<b>Agent:</b> ${escapeHtml(record.requester)}`,
+      `<b>Task:</b> ${escapeHtml(record.task)}`,
+      `<b>Affected target:</b> ${escapeHtml(record.target)}`,
+      `<b>Working directory:</b> <code>${escapeHtml(record.cwd)}</code>`,
+      `<b>Why blocked:</b> ${escapeHtml(record.reason)} <code>${escapeHtml(record.category)}</code>`,
+      "<b>Deny:</b> This call stays blocked; the requester is told explicitly to skip it and continue independent work.",
+      `<b>Deadline:</b> ${escapeHtml(expiry)}. Approve permits one identical retry only; it does not execute anything.`,
+      record.approvable ? "" : "<b>Approval disabled:</b> Embedded credentials were redacted. Resubmit without them; never approve an opaque command.",
+      `<b>Exact command</b>\n<code>${escapeHtml(record.command)}</code>`,
+      `<blockquote expandable><b>Operation details</b>\n<code>${escapeHtml(record.details)}</code>\n<b>Boundary:</b> This exact-call gate is not an execution sandbox and cannot prove that equivalent work has not run through another path.\n<b>Typed fallback</b>\n<code>/approve ${record.token}</code></blockquote>`,
+    ].filter(Boolean).join("\n"),
+    replyMarkup: { inline_keyboard: [[
+      ...(record.approvable ? [{ text: "Approve once", callback_data: `ap:a:${encoded}` }] : []),
+      { text: "Deny", callback_data: `ap:d:${encoded}` },
+    ]] },
   };
 }
 
@@ -195,7 +212,7 @@ export async function handleInstalledCommand(text: string, port: InstalledComman
       if (!approval) { await port.send("<b>Usage:</b> <code>/approve FULL_64_CHARACTER_TOKEN</code> from the refused operation."); return true; }
       if (!session.stateDir || !port.approve) { await port.send("<b>Approval unavailable.</b> No channel guard is bound to this session. Use the local unlock instruction from the refusal."); return true; }
       try {
-        const record = port.approve(approval[1]);
+        const record = await port.approve(approval[1]);
         await port.send(`<b>Approved for one identical call.</b> Retry it before <code>${escapeHtml(record.expiresAt)}</code>. Approval does not execute the operation or override other safety gates.`);
       } catch (error) {
         await port.send(`<b>Not approved.</b> ${escapeHtml(error instanceof Error ? error.message : "Approval storage unavailable; retry the refused call.")}`);

@@ -3,6 +3,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { DangerousToolGuard, approveOperation, computeApprovalHash } from "../guard";
+import { Database } from "bun:sqlite";
+import { decideApproval } from "../approvals";
 let stateDir: string, guard: DangerousToolGuard;
 beforeEach(() => { stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "guard-93-")); guard = new DangerousToolGuard(stateDir); });
 afterEach(() => { fs.rmSync(stateDir, { recursive: true, force: true }); });
@@ -44,11 +46,9 @@ test("AC3: full token, runnable local unlock, expiry and single-use grant", () =
   expect(blocked.reason).toContain(`/approve ${blocked.approvalHash}`);
   expect(blocked.reason).toContain('bun "');
   const record = approveOperation(stateDir, blocked.approvalHash!);
-  expect(computeApprovalHash(record.category, record.content)).toBe(blocked.approvalHash!);
+  expect(record.operationHash).toBe(computeApprovalHash(record.category, JSON.stringify({ toolName: "bash", input, cwd: input.cwd })));
   expect(Date.parse(record.expiresAt) - Date.now()).toBeGreaterThan(899000);
-  expect(fs.existsSync(path.join(stateDir, "approved", `${blocked.approvalHash}.json`))).toBe(true);
   expect(guard.evaluateToolCall("bash", input)).toEqual({ allowed: true });
-  expect(fs.existsSync(path.join(stateDir, "approved", `${blocked.approvalHash}.json`))).toBe(false);
   expect(guard.evaluateToolCall("bash", input).allowed).toBe(false);
 });
 
@@ -141,20 +141,14 @@ test("eval native secret access and OS destruction stay gated", () => {
   expect(guard.evaluateToolCall("eval", { language: "py", code: 'shutil.rmtree("/data")' }).category).toBe("shell_destructive_os");
   expect(guard.evaluateToolCall("eval", { language: "js", code: 'fs.rmSync("/data", {recursive:true})' }).category).toBe("shell_destructive_os");
 });
-test("approval rejects unknown, partial, expired, malformed and mismatched records", () => {
+test("approval rejects unknown, partial and expired grants", () => {
   expect(() => approveOperation(stateDir, "a".repeat(12))).toThrow("64-character");
   expect(() => approveOperation(stateDir, "a".repeat(64))).toThrow("No pending");
   const input = { command: "ssh host" }, token = guard.evaluateToolCall("bash", input).approvalHash!;
-  const pending = path.join(stateDir, "approved", "pending", `${token}.json`);
-  const record = JSON.parse(fs.readFileSync(pending, "utf8"));
-  fs.writeFileSync(pending, JSON.stringify({ ...record, expiresAt: new Date(0).toISOString() }));
+  const db = new Database(path.join(stateDir, "approval-audit.sqlite"));
+  db.run("UPDATE approvals SET expires_at = ?", [new Date(0).toISOString()]);
+  db.close();
   expect(() => approveOperation(stateDir, token)).toThrow("expired");
-  const approved = path.join(stateDir, "approved", `${token}.json`);
-  for (const invalid of [{ ...record, expiresAt: 0 }, { ...record, content: "other" }, { ...record, singleUse: false }, { ...record, expiresAt: "not-a-date" }, { ...record, expiresAt: new Date(0).toISOString() }]) {
-    fs.writeFileSync(approved, JSON.stringify(invalid));
-    expect(guard.evaluateToolCall("bash", input).allowed).toBe(false);
-  }
-  fs.writeFileSync(approved, "{");
   expect(guard.evaluateToolCall("bash", input).allowed).toBe(false);
 });
 test("approval cannot authorize a changed working directory or environment", () => {
@@ -172,6 +166,47 @@ test("local unlock instruction executes the real CLI without executing the refus
   expect(JSON.parse(result.stdout.toString()).approved).toBe(true);
   expect(guard.evaluateToolCall("bash", input)).toEqual({ allowed: true });
   expect(guard.evaluateToolCall("bash", input).allowed).toBe(false);
+});
+
+test("a grant for one command cannot authorize another command, session or requester", () => {
+  const input = { command: "rm -rf disposable-one" };
+  const token = guard.evaluateToolCall("bash", input).approvalHash!;
+  expect(() => decideApproval(stateDir, token, "approved", { sessionId: "foreign", userId: "1", chatId: "2" })).toThrow("another session");
+  approveOperation(stateDir, token);
+  expect(guard.evaluateToolCall("bash", { command: "rm -rf disposable-two" }).allowed).toBe(false);
+  expect(guard.evaluateToolCall("bash", input, false, { sessionId: "other", requester: "Other", task: "Other", cwd: "/tmp" }).allowed).toBe(false);
+  expect(guard.evaluateToolCall("bash", input).allowed).toBe(true);
+  const repeated = guard.evaluateToolCall("bash", input);
+  expect(repeated.allowed).toBe(false);
+  expect(repeated.approvalHash).not.toBe(token);
+  expect(() => approveOperation(stateDir, token)).toThrow("consumed");
+});
+
+test("denial persists and is not mistaken for silence; audit retains full safe command and actor", () => {
+  const input = { command: "rm -rf disposable" };
+  const token = guard.evaluateToolCall("bash", input).approvalHash!;
+  decideApproval(stateDir, token, "denied", { sessionId: "local", userId: "operator-42", chatId: "chat-7" });
+  expect(new DangerousToolGuard(stateDir).evaluateToolCall("bash", input).reason).toContain("explicitly denied");
+  expect(() => approveOperation(stateDir, token)).toThrow("denied");
+  const db = new Database(path.join(stateDir, "approval-audit.sqlite"), { readonly: true });
+  const events = db.query("SELECT decision, actor, at, record FROM approval_events ORDER BY id").all() as { decision: string; actor: string; at: string; record: string }[];
+  db.close();
+  expect(events.map(event => event.decision)).toEqual(["pending", "denied"]);
+  expect(events[1].actor).toContain("operator-42");
+  expect(JSON.parse(events[1].record).command).toBe(input.command);
+  expect(JSON.parse(events[1].record).requester).toBe("Local operator");
+  expect(Date.parse(events[1].at)).toBeGreaterThan(0);
+});
+
+test("secret-bearing commands cannot be approved blind and secrets never enter audit", () => {
+  const secret = "synthetic-private-value";
+  const result = guard.evaluateToolCall("bash", { command: `ssh host --password=${secret}`, env: { PASSWORD: secret } });
+  expect(result.approval!.approvable).toBe(false);
+  expect(result.approval!.command).not.toContain(secret);
+  expect(() => approveOperation(stateDir, result.approvalHash!)).toThrow("redacted");
+  const db = new Database(path.join(stateDir, "approval-audit.sqlite"), { readonly: true });
+  expect(JSON.stringify(db.query("SELECT * FROM approval_events").all())).not.toContain(secret);
+  db.close();
 });
 
 test("shell heredoc prose stays inert while substitutions and trailing commands execute", () => {
@@ -245,4 +280,21 @@ test("review delta: shell builtins and process wrappers preserve execution bound
       "printf ref | xargs -n 1 echo",
     ]) expect(guard.evaluateToolCall("bash", { command }, origin)).toEqual({ allowed: true });
   }
+});
+
+test("implicit current working directory is part of exact-operation binding", () => {
+  const input = { command: "rm -rf relative-target" };
+  const context = { sessionId: "local", requester: "Same requester", task: "Remove fixture", cwd: "/one" };
+  const token = guard.evaluateToolCall("bash", input, false, context).approvalHash!;
+  approveOperation(stateDir, token);
+  expect(guard.evaluateToolCall("bash", input, false, { ...context, cwd: "/two" }).allowed).toBe(false);
+  expect(guard.evaluateToolCall("bash", input, false, context).allowed).toBe(true);
+});
+
+test("audit storage failure is fail-closed and cannot offer an unaudited grant", () => {
+  fs.mkdirSync(path.join(stateDir, "approval-audit.sqlite"));
+  const result = guard.evaluateToolCall("bash", { command: "rm -rf fixture" });
+  expect(result.allowed).toBe(false);
+  expect(result.approvalHash).toBeUndefined();
+  expect(result.reason).toContain("approval store is not writable");
 });

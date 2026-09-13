@@ -4,6 +4,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { TelegramPoller, type PollerCallbacks } from "../extension/poller";
 import type { CallbackValidationDecision, MessageCorrelationBridge, TelegramUpdate } from "../extension/types";
+import { DangerousToolGuard } from "../extension/guard";
+import { approvalCallback, parseApprovalCallback, decideApproval, approvalOutcome } from "../extension/approvals";
+import { renderApprovalRequest } from "../src/installed-commands";
 
 const originalFetch = globalThis.fetch;
 const cleanup: Array<() => void> = [];
@@ -32,7 +35,7 @@ function fixture(decision: CallbackValidationDecision = "deliver", consume = tru
   }) as typeof fetch;
   cleanup.push(() => { poller.stop(); fs.rmSync(dir, { recursive: true, force: true }); });
   const update: TelegramUpdate = { update_id: 1, callback_query: { id: "click-1", from: { id: 1, is_bot: false, first_name: "Test" }, data: "cb:d_test", message: { message_id: 9, chat: { id: 1, type: "private" }, date: 0, caption: "Which layout?" } } };
-  return { poller, calls, delivered, update, callbacks, bridge, switchSession: () => { session = "session-b"; } };
+  return { dir, poller, calls, delivered, update, callbacks, bridge, switchSession: () => { session = "session-b"; } };
 }
 
 test("caption button delivers context once and removes markup without replacing the question", async () => {
@@ -160,3 +163,50 @@ for (const idle of [true, false]) {
     });
   }
 }
+
+for (const choice of ["approved", "denied"] as const) {
+  test(`approval ${choice} travels through authenticated poller and reaches requester`, async () => {
+    const f = fixture();
+    const guard = new DangerousToolGuard(f.dir);
+    const context = { sessionId: "session-a", requester: "ProofAgent", task: "Remove owned disposable fixture", cwd: "/tmp" };
+    const input = { command: "rm -rf disposable" };
+    const request = guard.evaluateToolCall("bash", input, false, context).approval!;
+    f.callbacks.onApprovalCallback = async (data, userId, chatId, sessionId) => {
+      const parsed = parseApprovalCallback(data)!;
+      const record = decideApproval(f.dir, parsed.token, parsed.decision, { userId, chatId, sessionId });
+      f.delivered.push(approvalOutcome(record));
+      return `Operator ${record.state}`;
+    };
+    f.update.callback_query!.data = approvalCallback(request.token, choice);
+    f.poller.ingestUpdates([f.update]); await f.poller.redrivePendingUpdates();
+    expect(f.delivered).toHaveLength(1);
+    expect(f.delivered[0]).toContain(`Operator ${choice}`);
+    expect(f.delivered[0]).toContain("ProofAgent");
+    if (choice === "denied") expect(f.delivered[0]).toContain("this call is blocked at the gate");
+    expect(guard.evaluateToolCall("bash", input, false, context).allowed).toBe(choice === "approved");
+    f.poller.ingestUpdates([{ ...f.update, update_id: 2 }]); await f.poller.redrivePendingUpdates();
+    expect(f.delivered).toHaveLength(1);
+    expect(f.calls.some(call => call.method === "editMessageReplyMarkup")).toBe(true);
+  });
+}
+
+test("approval callbacks from an unauthorized actor or foreign session cannot grant permission", async () => {
+  const f = fixture();
+  let reached = 0;
+  f.callbacks.onApprovalCallback = async () => { reached++; return "unexpected"; };
+  f.update.callback_query!.data = approvalCallback("a".repeat(64), "approved");
+  f.update.callback_query!.from.id = 99;
+  f.poller.ingestUpdates([f.update]); await f.poller.redrivePendingUpdates();
+  expect(reached).toBe(0);
+});
+
+test("explicit approval HTML preserves exact command bytes and full commit IDs", async () => {
+  const f = fixture();
+  const input = { command: `ssh host 'echo <a> && echo ${"a".repeat(40)}'` };
+  const record = new DangerousToolGuard(f.dir).evaluateToolCall("bash", input).approval!;
+  const card = renderApprovalRequest(record);
+  await f.poller.sendTelegramMessage("1", card.text, "HTML", card.replyMarkup);
+  const sent = f.calls.find(call => call.method === "sendMessage")!;
+  expect(sent.body.text).toBe(card.text);
+  expect(sent.body.reply_markup).toEqual(card.replyMarkup);
+});

@@ -245,9 +245,6 @@ test("approve command grants exactly the pending guard operation once", async ()
     const input = { command: "git push --force origin feat/93" };
     const token = guard.evaluateToolCall("bash", input, true).approvalHash!;
     expect(await handleInstalledCommand(`/approve@sessionbot ${token}`, f.port, f.runner)).toBe(true);
-    const record = JSON.parse(fs.readFileSync(path.join(dir, "approved", `${token}.json`), "utf8"));
-    expect(record.category).toBe("destructive_git"); expect(record.singleUse).toBe(true);
-    expect(record.content).toBe(JSON.stringify({ toolName: "bash", input }));
     expect(f.sent[0]).toContain("Approved for one identical call");
     expect(f.calls).toHaveLength(0); expect(f.inbound).toHaveLength(0);
     expect(guard.evaluateToolCall("bash", input, false)).toEqual({ allowed: true });
@@ -267,11 +264,21 @@ test("approve reports missing binding, invalid tokens and expired requests witho
   expect(f.calls).toHaveLength(0); expect(f.inbound).toHaveLength(0);
 });
 
-test("approval inline button copies the complete authenticated command, never a short callback token", () => {
-  const token = "b".repeat(64);
-  const card = renderApprovalRequest("category<test>", token);
-  expect(card.text).toContain("category&lt;test&gt;");
-  expect(card.replyMarkup).toEqual({ inline_keyboard: [[{ text: "Copy approval command", copy_text: { text: `/approve ${token}` } }]] });
-  expect(card.text).toContain(`/approve ${token}`);
-  expect(() => renderApprovalRequest("category", "b".repeat(12))).toThrow("Invalid");
+test("approval buttons preserve the whole grant within Telegram's callback limit", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "approval-card-"));
+  try {
+    const record = new DangerousToolGuard(dir).evaluateToolCall("bash", { command: "ssh host" }, false, { sessionId: "test", requester: "Agent <one>", task: "Inspect host", cwd: "/tmp" }).approval!;
+    const card = renderApprovalRequest(record);
+    expect(card.text).toContain("Agent &lt;one&gt;");
+    expect(card.text).toContain("<code>ssh host</code>");
+    expect(card.text).toContain("<blockquote expandable>");
+    expect(card.text).toContain("UTC");
+    expect(card.text).toContain(`/approve ${record.token}`);
+    const keyboard = card.replyMarkup.inline_keyboard as { text: string; callback_data: string }[][];
+    expect(keyboard[0].map(button => button.text)).toEqual(["Approve once", "Deny"]);
+    for (const button of keyboard[0]) {
+      expect(Buffer.byteLength(button.callback_data)).toBeLessThanOrEqual(64);
+      expect(Buffer.from(button.callback_data.slice(5), "base64url").toString("hex")).toBe(record.token);
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
