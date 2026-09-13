@@ -287,16 +287,13 @@ export class TelegramPoller {
       messageId = sent.result.message_id;
       this.setMeta(key, String(messageId));
     }
-    const chat = await this.dashboardApi("getChat", { chat_id: chatId });
-    if (chat.result?.pinned_message?.message_id !== messageId) {
-      await this.dashboardApi("pinChatMessage", { chat_id: chatId, message_id: messageId, disable_notification: true });
-    }
+    // Private-chat operator pins can disappear while getChat still reports this id.
+    // Reassert the same pin silently; coalescing and pacing bound this idempotent call.
+    await this.dashboardApi("pinChatMessage", { chat_id: chatId, message_id: messageId, disable_notification: true });
     this.setMeta(`${key}:updated`, String(Date.now()));
   }
 
-  private async dashboardApi(method: string, body: Record<string, unknown>): Promise<{
-    result?: { pinned_message?: { message_id: number } };
-  }> {
+  private async dashboardApi(method: string, body: Record<string, unknown>): Promise<void> {
     await this.paceOutbound();
     const response = await fetch(`https://api.telegram.org/bot${this.botToken}/${method}`, {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
@@ -305,7 +302,6 @@ export class TelegramPoller {
     const data = await response.json();
     this.observeRateLimit(data);
     if (!data.ok) throw new Error(`Dashboard ${method} unavailable; check pin permission and Telegram retry window`);
-    return data;
   }
 
   public async sendTelegramMessage(

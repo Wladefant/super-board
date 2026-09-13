@@ -22,6 +22,7 @@ function fixture(thread?: number) {
   const answers: unknown[] = [];
   let messageId = 100;
   let pinned: number | null = null;
+  let operatorPinned: number | null = null;
   let deleted = false;
   const bridge: MessageCorrelationBridge = {
     getSessionId: () => "root", getSlotId: () => "test", record: row => { messages.set(row.messageId, row); },
@@ -42,7 +43,7 @@ function fixture(thread?: number) {
     const body = JSON.parse(String(init?.body));
     calls.push({ method, body, at: Date.now() });
     if (method === "getChat") return Response.json({ ok: true, result: { pinned_message: pinned ? { message_id: pinned } : undefined } });
-    if (method === "pinChatMessage") pinned = body.message_id;
+    if (method === "pinChatMessage") operatorPinned = pinned = body.message_id;
     if (method === "editMessageText" && deleted) { deleted = false; return Response.json({ ok: false, error_code: 400, description: "Bad Request: message to edit not found" }); }
     return Response.json({ ok: true, result: { message_id: body.message_id ?? ++messageId, chat: { id: 1 }, date: 0 } });
   }) as typeof fetch;
@@ -51,7 +52,10 @@ function fixture(thread?: number) {
     message_id: updateId, chat: { id: 1, type: "private" }, from: { id: 1, is_bot: false }, date: 0, text,
     message_thread_id: thread, reply_to_message: { message_id: id },
   } });
-  return { dir, poller, calls, turns, answers, messages, reply, unpin: () => { pinned = null; }, deleteCard: () => { deleted = true; } };
+  return { dir, poller, calls, turns, answers, messages, reply,
+    unpin: () => { operatorPinned = pinned = null; },
+    unpinForOperator: () => { operatorPinned = null; },
+    operatorPin: () => operatorPinned, deleteCard: () => { deleted = true; } };
 }
 
 test("question callbacks and prose go only to the bound waiting-question handler", async () => {
@@ -119,8 +123,12 @@ test("dashboard edits one id, coalesces immediate updates, repins and recreates 
     f.poller.setMeta(key, "0"); await f.poller.updateDashboard("1", `Update ${update}`);
   }
   expect(new Set(f.calls.filter(call => call.method === "editMessageText").map(call => call.body.message_id)).size).toBe(1);
+  const originalPin = f.operatorPin();
+  f.unpinForOperator(); f.poller.setMeta(key, "0"); await f.poller.updateDashboard("1", "Recover operator-only unpin");
+  expect(f.operatorPin()).toBe(originalPin);
+  expect(f.calls.filter(call => call.method === "pinChatMessage").every(call => call.body.disable_notification === true)).toBe(true);
   f.unpin(); f.poller.setMeta(key, "0"); await f.poller.updateDashboard("1", "Re-pin");
-  expect(f.calls.filter(call => call.method === "pinChatMessage")).toHaveLength(2);
+  expect(f.calls.filter(call => call.method === "pinChatMessage")).toHaveLength(5);
   expect(f.calls.filter(call => call.method === "sendMessage")).toHaveLength(1);
   f.deleteCard(); f.poller.setMeta(key, "0"); await f.poller.updateDashboard("1", "Recover deleted card");
   expect(f.calls.filter(call => call.method === "sendMessage")).toHaveLength(2);
