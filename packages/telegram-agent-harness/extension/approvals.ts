@@ -133,5 +133,5 @@ export function parseApprovalCallback(data: string): { token: string; decision: 
   return approvalCallback(token, decision) === data ? { token, decision } : null;
 }
 export function approvalOutcome(record: ApprovalRecord): string {
-  return `Operator ${record.state} ${record.requester}'s ${record.category} request (${record.toolCallId ?? record.token}). Task: ${record.task}. ${record.state === "denied" ? "Do not retry or work around this refused operation. Nothing was executed; continue independent work." : `One identical retry is authorized before ${record.expiresAt}; this decision did not execute anything.`}`;
+  return `Operator ${record.state} ${record.requester}'s ${record.category} request (${record.toolCallId ?? record.token}). Task: ${record.task}. ${record.state === "denied" ? "Denied — this call is blocked at the gate. The gate cannot prove no equivalent action ran elsewhere; continue independent work." : `One identical retry is authorized before ${record.expiresAt}; this decision did not execute anything.`}`;
 }

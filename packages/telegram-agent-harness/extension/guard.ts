@@ -266,7 +266,7 @@ export class DangerousToolGuard {
       return { allowed: false, category, approvalHash: record.token, approval: record,
         reason: `Operation '${category}' requires exact operator approval. Await Approve or Deny in this session's Telegram bot; denial is explicit and must not be worked around. Typed fallback: /approve ${record.token}. Expires ${record.expiresAt}. After approval retry the identical call once. Local operator equivalent: bun "${path.join(import.meta.dir, "guard.ts")}" approve "${this.stateDir}" ${record.token} ${JSON.stringify(context.sessionId)}` };
     } catch {
-      return { allowed: false, category, reason: "Cannot persist the approval request and audit. No operation executed; restore approval-store write access before retrying." };
+      return { allowed: false, category, reason: "Blocked — approval store is not writable, so this call was not approved. Restore write access before retrying." };
     }
   }
 }

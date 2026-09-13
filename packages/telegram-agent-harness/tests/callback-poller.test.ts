@@ -182,6 +182,7 @@ for (const choice of ["approved", "denied"] as const) {
     expect(f.delivered).toHaveLength(1);
     expect(f.delivered[0]).toContain(`Operator ${choice}`);
     expect(f.delivered[0]).toContain("ProofAgent");
+    if (choice === "denied") expect(f.delivered[0]).toContain("this call is blocked at the gate");
     expect(guard.evaluateToolCall("bash", input, false, context).allowed).toBe(choice === "approved");
     f.poller.ingestUpdates([{ ...f.update, update_id: 2 }]); await f.poller.redrivePendingUpdates();
     expect(f.delivered).toHaveLength(1);

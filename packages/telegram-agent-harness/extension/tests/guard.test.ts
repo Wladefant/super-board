@@ -296,5 +296,5 @@ test("audit storage failure is fail-closed and cannot offer an unaudited grant",
   const result = guard.evaluateToolCall("bash", { command: "rm -rf fixture" });
   expect(result.allowed).toBe(false);
   expect(result.approvalHash).toBeUndefined();
-  expect(result.reason).toContain("Cannot persist");
+  expect(result.reason).toContain("approval store is not writable");
 });
