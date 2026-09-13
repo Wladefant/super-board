@@ -36,15 +36,15 @@ export interface OutboundCardSummary {
   createdAt: number;
 }
 
-export function readRecentOutboundCards(dbPath?: string, limit = 5): OutboundCardSummary[] {
+export function readRecentOutboundCards(sessionId: string, dbPath?: string, limit = 5): OutboundCardSummary[] {
   const resolved = dbPath ?? path.join(os.homedir(), ".veyyon", "telegram", "bot_pool.db");
   if (!fs.existsSync(resolved)) return [];
   try {
     const db = new Database(resolved, { readonly: true });
     try {
       const rows = db.query(
-        "SELECT message_id, request_id, decision_id, created_at FROM message_correlations ORDER BY created_at DESC LIMIT ?"
-      ).all(limit) as Array<{
+        "SELECT message_id, request_id, decision_id, created_at FROM message_correlations WHERE session_id = ? ORDER BY created_at DESC LIMIT ?"
+      ).all(sessionId, limit) as Array<{
         message_id: number;
         request_id: string | null;
         decision_id: string | null;
@@ -133,14 +133,14 @@ export function renderFullStatus(params: {
   }
   lines.push("");
 
-  lines.push(`❓ <b>Open Operator Decisions (${params.decisions.length} pending):</b>`);
+  lines.push(`<b>Pending decisions in recent session cards (${params.decisions.length}):</b>`);
   if (params.decisions.length === 0) {
-    lines.push("• <i>None pending.</i>");
+    lines.push("• <i>None linked to these recent cards.</i>");
   } else {
     for (const dec of params.decisions) {
       const issueLink = dec.issueUrl
         ? ` (<a href="${escapeHtml(dec.issueUrl)}">#${dec.issueNumber ?? "issue"}</a>)`
-        : dec.issueNumber ? ` (#${dec.issueNumber})` : "";
+        : "";
       const qText = dec.question.length > 80 ? `${dec.question.slice(0, 77)}...` : dec.question;
       lines.push(`• <b>${escapeHtml(dec.decisionId)}</b>${issueLink}: ${escapeHtml(qText)}`);
     }
@@ -155,7 +155,7 @@ export function renderFullStatus(params: {
       const ageSeconds = Math.max(0, Math.round(now / 1000 - card.createdAt));
       const ageStr = ageSeconds < 60 ? `${ageSeconds}s ago` : ageSeconds < 3600 ? `${Math.round(ageSeconds / 60)}m ago` : `${Math.round(ageSeconds / 3600)}h ago`;
       const topic = card.decisionId ? `decision: ${card.decisionId}` : (card.requestId ? card.requestId : "general");
-      lines.push(`• #${card.messageId} · <code>${escapeHtml(topic)}</code> (${ageStr})`);
+      lines.push(`• Message <code>${card.messageId}</code> · <code>${escapeHtml(topic)}</code> (${ageStr})`);
     }
   }
   lines.push("");
@@ -226,8 +226,9 @@ export async function handleInstalledCommand(text: string, port: InstalledComman
       });
       agents.push(...(session.agents ?? []));
 
-      const decisions = readPendingDecisions(session.decisionsPath);
-      const outboundCards = readRecentOutboundCards(session.poolDbPath, 5);
+      const outboundCards = readRecentOutboundCards(session.id, session.poolDbPath, 5);
+      const decisions = readPendingDecisions(session.decisionsPath).filter(decision =>
+        outboundCards.some(card => card.decisionId === decision.decisionId));
 
       let usageLimits: UsageLimit[] = [];
       try {
