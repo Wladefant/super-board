@@ -2,7 +2,7 @@
 """
 Request Ledger Utility (workflows/ledger.py)
 
-Machine-local durable request ledger and restart recovery cache using Python standard library.
+Machine-local execution checkpoint and restart recovery cache using Python standard library.
 Pure standard library implementation with no harness or framework imports.
 
 Architecture:
@@ -23,6 +23,13 @@ Architecture:
         preserving process isolation and crash safety.
       * Atomic writes (tempfile + os.replace on same filesystem).
       * Configurable state directory and ledger paths.
+      * Scope preservation: criteria removal or state regression requires an explicit
+        authorization note (`notes` in `authorization`). Unauthorized scope drops or
+        regressions are tracked in `dropped_criteria` and `unauthorized_regressions`
+        and flagged by `check --strict`.
+      * Durable failure observation (`observe` subcommand): first failure records
+        actionable diagnosis, owner, and next action durably; repeat failures trigger
+        the repeat-failure rule refusing unchanged attempts and forcing reassignment.
 """
 
 import argparse
@@ -34,7 +41,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 VALID_STATES = [
     "pending",
@@ -48,6 +55,7 @@ VALID_STATES = [
 ]
 
 DEPLOYMENT_STATES = ["integration", "live verification"]
+STATE_ORDER = {s: i for i, s in enumerate(VALID_STATES)}
 
 # States that assert QA and review already completed. From here on, an unverified, missing
 # or stale acceptance criterion is a contradiction of the state itself, not a pending note.
@@ -106,6 +114,7 @@ ALLOWED_TRANSITIONS_LOCAL_DOC: Dict[str, List[str]] = {
     "QA": ["review", "implementation"],
     "review": ["done", "QA", "implementation", "awaiting authorization"],
     "awaiting authorization": ["done", "implementation"],
+    "integration": ["done", "implementation"],
     "done": [],  # Terminal state
 }
 
@@ -357,8 +366,8 @@ class FileLock:
 
 class RequestLedger:
     """
-    Durable JSON request ledger manager with exclusive locking, atomic updates,
-    and strict invariant enforcement.
+    Execution checkpoint cache with exclusive locking and atomic updates.
+    GitHub owns issue structure and project state; refresh before scheduling.
     """
 
     def __init__(
@@ -406,6 +415,8 @@ class RequestLedger:
 
     def _save_data_unlocked(self, data: Dict[str, Any]):
         data["updated_at"] = get_iso_timestamp()
+        data["role"] = "local_recovery_cache"
+        data["authority"] = "github_issues_and_superboard"
         dir_name = os.path.dirname(self.ledger_path)
         os.makedirs(dir_name, exist_ok=True)
 
@@ -616,8 +627,14 @@ class RequestLedger:
         add_decision_blocker: Optional[str] = None,
         clear_decision_blocker: Optional[str] = None,
         actor: Optional[str] = None,
+        remove_criterion: Optional[str] = None,
         reason: str = "Update",
     ) -> Dict[str, Any]:
+        try:
+            from github_work_item import reject_local_reports
+            reject_local_reports([add_evidence, criterion_update, github_update])
+        except ImportError:
+            pass
         with FileLock(self.lock_path):
             data = self._load_data_unlocked()
             if req_id not in data["requests"]:
@@ -759,6 +776,44 @@ class RequestLedger:
                         break
                 if not found:
                     raise KeyError(f"Criterion '{c_id}' not found on request '{req_id}'.")
+
+            # 4b. Remove Criterion (Scope preservation guard)
+            if remove_criterion:
+                c_id = str(remove_criterion).strip()
+                found_idx = None
+                for idx, c in enumerate(req.get("acceptance_criteria", [])):
+                    if c["id"] == c_id:
+                        found_idx = idx
+                        break
+                if found_idx is None:
+                    raise KeyError(f"Criterion '{c_id}' not found on request '{req_id}'.")
+
+                removed_c = req["acceptance_criteria"].pop(found_idx)
+                auth_notes = ""
+                if authorization_update and authorization_update.get("notes"):
+                    auth_notes = str(authorization_update.get("notes")).strip()
+                elif req.get("authorization", {}).get("notes"):
+                    auth_notes = str(req["authorization"]["notes"]).strip()
+
+                is_authorized = bool(auth_notes)
+                drop_record = {
+                    "id": c_id,
+                    "description": removed_c.get("description", ""),
+                    "removed_at": now,
+                    "removed_by": effective_actor,
+                    "authorized": is_authorized,
+                    "notes": auth_notes,
+                }
+                req["dropped_criteria"] = req.get("dropped_criteria", []) + [drop_record]
+                req["history"].append({
+                    "timestamp": now,
+                    "event": "criterion_removed",
+                    "criterion_id": c_id,
+                    "authorized": is_authorized,
+                    "notes": auth_notes,
+                    "actor": effective_actor,
+                    "reason": reason or ("Authorized scope reduction" if is_authorized else "Criterion removed without authorization note"),
+                })
 
             # 5. Add Evidence
             if add_evidence:
@@ -1018,6 +1073,23 @@ class RequestLedger:
                         f"Allowed transitions from '{prev_state}': {allowed_next}"
                     )
 
+
+                # Check for state regression without authorization note (scope preservation invariant)
+                if STATE_ORDER.get(target_state, 0) < STATE_ORDER.get(prev_state, 0) and not (head is not None and head != old_head):
+                    auth_notes = ""
+                    if authorization_update and authorization_update.get("notes"):
+                        auth_notes = str(authorization_update.get("notes")).strip()
+                    elif req.get("authorization", {}).get("notes"):
+                        auth_notes = str(req["authorization"]["notes"]).strip()
+
+                    if not auth_notes:
+                        req["unauthorized_regressions"] = req.get("unauthorized_regressions", []) + [{
+                            "from_state": prev_state,
+                            "to_state": target_state,
+                            "at": now,
+                            "reason": reason,
+                            "actor": effective_actor,
+                        }]
                 if target_state == "review":
                     require_current_head_stage_evidence("QA")
                 elif target_state == "awaiting authorization":
@@ -1191,7 +1263,27 @@ class RequestLedger:
             reason=f"Cleared decision blocker {decision_id}",
         )
 
+    def refresh_from_github(self, req_id: str, reader=None) -> Dict[str, Any]:
+        """Read API truth; retain a labelled cache, never a stale dispatch fallback."""
+        from github_work_item import execution_view, fetch_work_item
+        before = self.get_request(req_id)
+        snapshot = (reader or fetch_work_item)(before)
+        with FileLock(self.lock_path):
+            data = self._load_data_unlocked()
+            current = data["requests"][req_id]
+            if current.get("github", {}).get("issue_url") != before.get("github", {}).get("issue_url"):
+                raise ValueError("Issue identity changed during GitHub refresh; retry intake")
+            view = execution_view(current, snapshot)
+            current["github_cache"] = {
+                "role": "api_read_cache", "fetched_at": get_iso_timestamp(),
+                "authority": snapshot["url"], "snapshot": snapshot,
+            }
+            current["superboard"] = view["superboard"]
+            self._save_data_unlocked(data)
+            return view
+
     def get_request(self, req_id: str) -> Dict[str, Any]:
+        """Inspect a resumable execution cache; use refresh_from_github to schedule."""
         with FileLock(self.lock_path):
             data = self._load_data_unlocked()
             if req_id not in data["requests"]:
@@ -1300,6 +1392,38 @@ class RequestLedger:
                 if auth.get("status") != "authorized":
                     issues.append("In integration state without authorized status.")
 
+
+            # Scope preservation: check for silently dropped scope
+            auth_notes = str(req.get("authorization", {}).get("notes") or "").strip()
+
+            # 1. Dropped acceptance criteria without authorization note
+            if req.get("dropped_criteria"):
+                unauthorized_drops = [
+                    dc.get("id") for dc in req["dropped_criteria"]
+                    if not dc.get("authorized") and not auth_notes
+                ]
+                if unauthorized_drops:
+                    issues.append(
+                        f"Scope silently dropped: acceptance criterion/criteria {unauthorized_drops} "
+                        "removed without an authorization note."
+                    )
+
+            # 2. State regressed without authorization note
+            if req.get("unauthorized_regressions"):
+                unauthorized_regs = [
+                    f"{r.get('from_state')} -> {r.get('to_state')}"
+                    for r in req["unauthorized_regressions"]
+                    if not auth_notes
+                ]
+                if unauthorized_regs:
+                    issues.append(
+                        f"Scope silently dropped: state regression(s) {unauthorized_regs} "
+                        "occurred without an authorization note."
+                    )
+
+            # 3. All criteria removed on active request without authorization note
+            if not req.get("acceptance_criteria") and req.get("state") != "pending" and not auth_notes:
+                issues.append("Scope silently dropped: all acceptance criteria removed without an authorization note.")
             status = "HEALTHY" if not issues else "BLOCKED"
             return {
                 "id": req_id,
@@ -1447,6 +1571,220 @@ class RequestLedger:
                 "active_requests": active_requests,
             }
 
+    def check_topic_coverage(
+        self,
+        roster: Optional[Sequence[Dict[str, Any]]] = None,
+        sources: Optional[Sequence[Union[str, Dict[str, Any]]]] = None,
+        ram_used_pct: Optional[float] = None,
+        authorized_task_ids: Optional[Set[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Evaluate full topic coverage and inventory preservation invariants.
+        Enforces that every runnable topic has an active native worker,
+        worker floor (7) is satisfied unless RAM exception applies,
+        no items dropped, and emits actionable next-ready assignments.
+        """
+        try:
+            from topic_inventory_guard import TopicInventoryGuard
+        except ImportError:
+            import topic_inventory_guard
+            TopicInventoryGuard = topic_inventory_guard.TopicInventoryGuard
+
+        guard = TopicInventoryGuard(baseline_sources=sources)
+        with FileLock(self.lock_path):
+            ledger_data = self._load_data_unlocked()
+
+        ledger_items = guard.parse_inventory_source(ledger_data)
+        reconciled_items, _ = guard.reconcile_sources_additively(
+            sources=sources, current_inventory=ledger_items if not sources else None
+        )
+
+        report = guard.evaluate_topic_coverage(
+            inventory=reconciled_items,
+            roster=roster or [],
+            ram_used_pct=ram_used_pct,
+            authorized_task_ids=authorized_task_ids,
+        )
+        return report.to_dict()
+
+    def observe_failure(
+        self,
+        req_id: str,
+        diagnosis: Optional[str] = None,
+        owner: Optional[str] = None,
+        next_action: Optional[str] = None,
+        error: str = "",
+        error_class: Optional[str] = None,
+        environment: Optional[str] = None,
+        operation: Optional[str] = None,
+        head_sha: Optional[str] = None,
+        attempt: Optional[str] = None,
+        observation_id: Optional[str] = None,
+        disposition: str = "unexpected",
+        actor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Record a failure observation with actionable diagnosis, owner, and next action durably.
+
+        Interacts with RecurrenceGuard if installed:
+        - First failure: records actionable diagnosis, owner, and next action durably.
+        - Repeat failures: triggers the repeat-failure rule (occurrences >= 2), blocks retries,
+          sets blocker on request, and forces reassignment / corrective action.
+        - Third identical attempt is refused by the recurrence guard retry gate.
+        Updates the ledger request with owner, next action, blocker, and failure observation evidence.
+        """
+        req = self.get_request(req_id)
+        if not req:
+            raise KeyError(f"Request '{req_id}' not found in ledger.")
+
+        now = get_iso_timestamp()
+        effective_actor = actor or "observe"
+        recurrence_info = {}
+        guard = None
+        blocker = None
+
+        try:
+            from recurrence_guard import RecurrenceGuard
+            guard = RecurrenceGuard(state_dir=os.path.dirname(self.ledger_path))
+        except ImportError:
+            guard = None
+
+        if guard is not None:
+            data = guard.load()
+            existing_sigs = data["request_index"].get(req_id, [])
+
+            if not str(error or "").strip() and not error_class and existing_sigs:
+                sig = existing_sigs[0]
+                entry = data["signatures"].get(sig, {})
+                refined = False
+                if diagnosis and str(diagnosis).strip():
+                    entry["diagnosis"] = str(diagnosis).strip()
+                    refined = True
+                if owner and str(owner).strip():
+                    entry["owner"] = str(owner).strip()
+                    refined = True
+                if next_action and str(next_action).strip():
+                    entry["next_action"] = str(next_action).strip()
+                    refined = True
+                if refined:
+                    guard._derive(entry)
+                    guard._save_unlocked(data)
+
+                recurrence_info = {
+                    "signature": sig,
+                    "occurrences": entry.get("occurrences", 1),
+                    "status": entry.get("status"),
+                    "retry_allowed": not bool(entry.get("retry_blocked")),
+                    "diagnosis": entry.get("diagnosis"),
+                    "owner": entry.get("owner"),
+                    "next_action": entry.get("next_action"),
+                    "diagnosis_complete": bool(entry.get("diagnosis_complete")),
+                    "required_action": entry.get("required_action"),
+                }
+                if entry.get("retry_blocked") or entry.get("occurrences", 0) >= 2:
+                    blocker = (
+                        f"Recurring failure ({entry.get('occurrences')} distinct occurrences) in "
+                        f"'{entry.get('operation')}' on '{entry.get('environment')}': "
+                        f"{entry.get('error_class')}. Unchanged retry is refused pending a systemic "
+                        f"corrective action. Recurrence signature {entry.get('signature')}."
+                    )
+            else:
+                obs_err = error or f"Failure observed on request {req_id}"
+                intake = guard.observe(
+                    project=req.get("project") or DEFAULT_REPO,
+                    environment=environment or "harness",
+                    operation=operation or "worker:qa",
+                    error=obs_err,
+                    explicit_error_class=error_class,
+                    request_id=req_id,
+                    head_sha=head_sha or req.get("head"),
+                    attempt=attempt,
+                    observation_id=observation_id,
+                    diagnosis=diagnosis,
+                    owner=owner,
+                    next_action=next_action,
+                    disposition=disposition,
+                    ledger=self,
+                )
+                entry = guard.get(intake.signature) or {}
+                recurrence_info = intake.to_dict()
+                recurrence_info["diagnosis_complete"] = bool(entry.get("diagnosis_complete"))
+                recurrence_info["required_action"] = str(entry.get("required_action") or "")
+                if entry.get("retry_blocked") or entry.get("occurrences", 0) >= 2:
+                    blocker = (
+                        f"Recurring failure ({entry.get('occurrences')} distinct occurrences) in "
+                        f"'{entry.get('operation')}' on '{entry.get('environment')}': "
+                        f"{entry.get('error_class')}. Unchanged retry is refused pending a systemic "
+                        f"corrective action. Recurrence signature {entry.get('signature')}."
+                    )
+
+        with FileLock(self.lock_path):
+            data = self._load_data_unlocked()
+            req = data["requests"][req_id]
+
+            if owner and str(owner).strip():
+                req["owner"] = str(owner).strip()
+            elif recurrence_info.get("owner"):
+                req["owner"] = str(recurrence_info["owner"]).strip()
+
+            if next_action and str(next_action).strip():
+                req["next_action"] = str(next_action).strip()
+            elif recurrence_info.get("next_action"):
+                req["next_action"] = str(recurrence_info["next_action"]).strip()
+            elif recurrence_info.get("required_action"):
+                req["next_action"] = str(recurrence_info["required_action"]).strip()
+
+            if blocker:
+                req["blocker"] = blocker
+                if recurrence_info.get("occurrences", 0) >= 2:
+                    req["reassignment_required"] = True
+                    prev_failing_owner = recurrence_info.get("owner") or req.get("owner")
+                    if not owner or owner == prev_failing_owner:
+                        req["next_action"] = (
+                            f"Reassign task from failing owner '{prev_failing_owner}' and "
+                            f"implement systemic corrective action before retrying."
+                        )
+
+            diag_str = diagnosis or recurrence_info.get("diagnosis") or ""
+            own_str = owner or recurrence_info.get("owner") or req.get("owner") or ""
+            act_str = next_action or recurrence_info.get("next_action") or req.get("next_action") or ""
+            ev_id = f"ev-obs-{int(time.time()*1000)}"
+            ev_entry = {
+                "id": ev_id,
+                "criterion_id": None,
+                "head": head_sha or req.get("head"),
+                "type": "failure_observation",
+                "summary": f"Failure observation: diagnosis='{diag_str}', owner='{own_str}', next_action='{act_str}'",
+                "details": json.dumps({
+                    "diagnosis": diag_str,
+                    "owner": own_str,
+                    "next_action": act_str,
+                    "recurrence": recurrence_info,
+                }),
+                "recorded_by": effective_actor,
+                "recorded_at": now,
+                "stale": False,
+            }
+            req["evidence"].append(ev_entry)
+            req["history"].append({
+                "timestamp": now,
+                "from_state": req["state"],
+                "to_state": req["state"],
+                "actor": effective_actor,
+                "reason": f"Failure observation recorded (diagnosis_complete={recurrence_info.get('diagnosis_complete', False)})",
+            })
+            req["updated_at"] = now
+            self._save_data_unlocked(data)
+
+        return {
+            "id": req_id,
+            "owner": req.get("owner"),
+            "next_action": req.get("next_action"),
+            "blocker": req.get("blocker"),
+            "recurrence": recurrence_info,
+            "evidence_id": ev_id,
+        }
+
 
 # ----------------------------------------------------------------------
 # CLI Interface
@@ -1557,6 +1895,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_upd.add_argument("--auth-provenance", default=None, help="Authorization provenance (e.g. comment ID, PR URL)")
     p_upd.add_argument("--auth-notes", default="", help="Authorization notes")
 
+    p_upd.add_argument("--remove-criterion", default=None, help="Remove an acceptance criterion by ID (requires authorization note)")
     # GitHub & Superboard update flags
     p_upd.add_argument("--github-proof", default=None, help="GitHub proof URL (PR, comment, commit, or asset)")
     p_upd.add_argument("--verify-github-proof", action="store_true", help="Mark GitHub proof verified")
@@ -1580,6 +1919,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_upd.add_argument("--add-decision-blocker", default=None, help="Add decision ID to blockers")
     p_upd.add_argument("--clear-decision-blocker", default=None, help="Clear decision blocker ID or 'all'")
 
+
+    # OBSERVE
+    p_obs = subparsers.add_parser(
+        "observe",
+        help="Record a failure observation, diagnosis, owner, and next action durably",
+    )
+    p_obs.add_argument("id", help="Request ID (e.g. req-4582-scope-preservation)")
+    p_obs.add_argument("--diagnosis", default=None, help="Actionable diagnosis of the failure")
+    p_obs.add_argument("--owner", default=None, help="Who owns fixing it / reassignment")
+    p_obs.add_argument("--next-action", default=None, help="Immediate next action")
+    p_obs.add_argument("--error", default="", help="Error message or failure reason")
+    p_obs.add_argument("--error-class", default=None, help="Explicit error class")
+    p_obs.add_argument("--environment", default=None, help="Environment (staging, harness, ci, local)")
+    p_obs.add_argument("--operation", default=None, help="Operation (worker:qa, ci:build, deploy:staging, etc.)")
+    p_obs.add_argument("--head-sha", default=None, help="Commit the failure was observed on")
+    p_obs.add_argument("--attempt", default=None, help="Attempt identifier")
+    p_obs.add_argument("--observation-id", default=None, help="Explicit observation ID")
+    p_obs.add_argument(
+        "--disposition",
+        default="unexpected",
+        choices=["unexpected", "expected_negative_control", "superseded_attempt"],
+    )
+    p_obs.add_argument("--actor", default=None, help="Actor recording the observation")
+    p_obs.add_argument("--json", action="store_true", help="Output JSON")
     # CHECK
     p_chk = subparsers.add_parser("check", help="Verify request health and invariants")
     p_chk.add_argument("id", nargs="?", default=None, help="Request ID (omit to check all)")
@@ -1606,6 +1969,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_rec = subparsers.add_parser("recover", help="Restart recovery reading disk ledger")
     p_rec.add_argument("--json", action="store_true", help="Output JSON")
 
+
+    # TOPIC-COVERAGE
+    p_cov = subparsers.add_parser("topic-coverage", help="Evaluate topic inventory and active worker coverage invariants")
+    p_cov.add_argument("--sources", nargs="*", help="Baseline source JSON file paths")
+    p_cov.add_argument("--roster-json", default=None, help="Path to native roster JSON file")
+    p_cov.add_argument("--ram-pct", type=float, default=None, help="Measured RAM usage percentage")
+    p_cov.add_argument("--strict", action="store_true", help="Exit non-zero if violations found")
+    p_cov.add_argument("--json", action="store_true", help="Output JSON")
     return parser
 
 
@@ -1679,6 +2050,10 @@ def main():
                     "authorized_by": args.authorized_by or args.actor or "unspecified",
                     "notes": args.auth_notes,
                 }
+            elif args.auth_notes:
+                auth_upd = {
+                    "notes": args.auth_notes,
+                }
 
             gh_upd = None
             if args.github_proof or args.verify_github_proof or args.issue_number or args.issue_url or args.remote_verify:
@@ -1749,8 +2124,43 @@ def main():
                 clear_decision_blocker=args.clear_decision_blocker,
                 actor=args.actor,
                 reason=args.reason,
+                remove_criterion=args.remove_criterion,
             )
             print(f"[OK] Updated request '{req['id']}': state='{req['state']}', owner='{req['owner']}'")
+
+        elif args.command == "observe":
+            res = ledger.observe_failure(
+                req_id=args.id,
+                diagnosis=args.diagnosis,
+                owner=args.owner,
+                next_action=args.next_action,
+                error=args.error,
+                error_class=args.error_class,
+                environment=args.environment,
+                operation=args.operation,
+                head_sha=args.head_sha,
+                attempt=args.attempt,
+                observation_id=args.observation_id,
+                disposition=args.disposition,
+                actor=args.actor,
+            )
+            if args.json:
+                print(json.dumps(res, indent=2, default=str))
+            else:
+                print(f"[OK] Recorded failure observation on request '{args.id}':")
+                print(f"  Owner:       {res.get('owner') or '(none)'}")
+                print(f"  Next Action: {res.get('next_action') or '(none)'}")
+                if res.get("blocker"):
+                    print(f"  Blocker:     {res['blocker']}")
+                if res.get("recurrence"):
+                    rec = res["recurrence"]
+                    sig = rec.get("signature", "")
+                    sig_short = sig[:16] if sig else "(none)"
+                    print(f"  Signature:   {sig_short} (occurrences: {rec.get('occurrences')})")
+                    print(f"  Status:      {rec.get('status')}")
+                    print(f"  Diagnosis:   {rec.get('diagnosis') or '(none)'}")
+                    print(f"  Diagnosis Complete: {rec.get('diagnosis_complete')}")
+                    print(f"  Required Action:    {rec.get('required_action')}")
 
         elif args.command == "check":
             req_ids = [args.id] if args.id else [r["id"] for r in ledger.list_requests()]
@@ -1883,6 +2293,31 @@ def main():
                     if info["stale_evidence_count"] > 0:
                         print(f"      Stale Evidence Count: {info['stale_evidence_count']}")
                     print("  " + "-" * 50)
+        elif args.command == "topic-coverage":
+            roster = []
+            if args.roster_json and os.path.exists(args.roster_json):
+                with open(args.roster_json, "r", encoding="utf-8") as f:
+                    roster = json.load(f)
+            cov = ledger.check_topic_coverage(
+                roster=roster,
+                sources=args.sources,
+                ram_used_pct=args.ram_pct,
+            )
+            if args.json:
+                print(json.dumps(cov, indent=2))
+            else:
+                print(f"Status: {'PASS' if cov['ok'] else 'FAIL'}")
+                print(cov.get("summary", ""))
+                if cov.get("violations"):
+                    print("\nViolations:")
+                    for v in cov["violations"]:
+                        print(f"  - [{v['kind']}] {v['message']}")
+                if cov.get("next_assignments"):
+                    print(f"\nNext Actionable Assignments ({len(cov['next_assignments'])}):")
+                    for a in cov["next_assignments"]:
+                        print(f"  - [P{a['priority']}] [{a['topic']}] {a['content']}")
+            if args.strict and not cov["ok"]:
+                sys.exit(1)
 
     except Exception as e:
         print(f"[ERROR] {e}", file=sys.stderr)
