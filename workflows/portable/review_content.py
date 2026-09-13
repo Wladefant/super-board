@@ -111,7 +111,8 @@ def evaluate(reviews, head, author, base='origin/staging', cwd=None, staging=Fal
         valid = all(source in covered and is_ancestor(source, sha, cwd) for source in sources)
         latest = {'reviewed_sha': sha, 'reviewed_patch_id': identity[0], 'reviewed_digest': identity[1],
                   'head_patch_id': head_id, 'head_digest': head_digest,
-                  'reviewer': actor, 'state': state, 'valid_chain': valid}
+                  'reviewer': actor, 'state': state, 'valid_chain': valid,
+                  'reviewed_at': review.get('submitted_at') or review.get('submittedAt') or ''}
         if valid:
             covered[sha] = identity
     if not latest:

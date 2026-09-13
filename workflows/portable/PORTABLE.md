@@ -30,7 +30,7 @@ A harness-agnostic, pure Python standard library multi-agent coordination core l
 5. **No Credential Exposure:**
    * Quota, balance, and probe utilities sanitize and redact all account identifiers, emails, project refs, and tokens.
 6. **Head-Bound Evidence Invalidation:**
-   * Execution-checkpoint proofs remain head-bound. The unchanged installed `github_pr_gate.py` and `review_content.py` retain the separate content-bound review contract: stable patch-id **and** whitespace-sensitive stripped-diff sha256, valid ancestor delta chains, staging approval waiver and anti-self-approval. This change does not weaken or reimplement those gates.
+   * Execution-checkpoint proofs remain head-bound. The installed `github_pr_gate.py` and `review_content.py` retain stable patch-id **and** whitespace-sensitive stripped-diff sha256, valid ancestor delta chains, the staging COMMENT-review waiver and anti-self-approval. Native review timestamps additionally bind fresh CI/security invalidation: unchanged content never permits a newly broken or newly vulnerable candidate through the gate. Legacy local review metadata cannot grant approval.
 
 ---
 

@@ -931,7 +931,7 @@ class SuperboardExecutionAdapter:
             f"Head: {commit}\n\nExit code: {worker_res.exit_code}\n\n"
             f"{fence}text\n{output}\n{fence}\n\n"
             "### Reported checks\n\n"
-            + json.dumps(worker_res.evidence.get("checks", []), indent=2)
+            + json.dumps((worker_res.evidence or {}).get("checks", []), indent=2)
         )
         return publish_report(github.get("issue_url", ""), body)
 
@@ -976,16 +976,20 @@ class SuperboardExecutionAdapter:
             try:
                 gate_result["report_url"] = self.publish_worker_report(req_id, worker_res)
             except Exception as exc:
-                gate_result["advance_refused"] = f"GitHub evidence publication failed: {exc}"
-                return req_state, gate_result["advance_refused"], gate_result
+                gate_result["publication_error"] = f"GitHub evidence publication failed: {exc}"
+
+        def report_reason(reason: str) -> str:
+            error = gate_result.get("publication_error")
+            return f"{reason}; {error}" if error else reason
+
         if worker_res.blocked_reason:
             gate_result["blocked_reason"] = worker_res.blocked_reason
-            return req_state, f"Stage '{stage}' blocked: {worker_res.blocked_reason}", gate_result
+            return req_state, report_reason(f"Stage '{stage}' blocked: {worker_res.blocked_reason}"), gate_result
 
         if worker_res.exit_code != 0:
             reason = f"Worker {stage} execution failed with exit code {worker_res.exit_code}"
             gate_result["error"] = worker_res.output
-            return req_state, reason, gate_result
+            return req_state, report_reason(reason), gate_result
 
         # Bug retention: a defect whose reproduction is not proven absent must reopen, so
         # this is evaluated before the generic provenance gate. Reopening only ever moves a
@@ -1048,7 +1052,7 @@ class SuperboardExecutionAdapter:
                 gate_result["verified"] = False
                 gate_result["reopened"] = True
                 gate_result["repro_refused"] = closure_reason
-                return "implementation", f"{closure_reason}; reopened to implementation", gate_result
+                return "implementation", report_reason(f"{closure_reason}; reopened to implementation"), gate_result
 
             gate_result["reproduction_scenario"] = scenario
             gate_result["bug_closure"] = closure_reason
@@ -1064,7 +1068,7 @@ class SuperboardExecutionAdapter:
             gate_result["check_expectations"] = worker_res.check_expectations.to_dict()
             return (
                 req_state,
-                f"Stage '{stage}' did not advance: {why}. Request remains in '{req_state}'.",
+                report_reason(f"Stage '{stage}' did not advance: {why}. Request remains in '{req_state}'."),
                 gate_result,
             )
 
@@ -1081,12 +1085,16 @@ class SuperboardExecutionAdapter:
             gate_result["advance_refused"] = "head mismatch"
             return (
                 req_state,
-                (
+                report_reason(
                     f"Stage '{stage}' did not advance: evidence is bound to {worker_res.head_sha} "
                     f"but the ledger head is {req_head}."
                 ),
                 gate_result,
             )
+
+        if gate_result.get("publication_error"):
+            gate_result["advance_refused"] = gate_result["publication_error"]
+            return req_state, gate_result["publication_error"], gate_result
 
         expectations = worker_res.check_expectations
         gate_result["check_expectations"] = expectations.to_dict()

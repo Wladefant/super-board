@@ -799,9 +799,9 @@ class SuperboardProjectUpdater:
             raise RuntimeError(err_msg)
 
         items = (issue.get("projectItems") or {}).get("nodes") or []
+        project_owner = self.config.metadata.get("project_owner", owner)
         for it in items:
             proj = it.get("project") or {}
-            project_owner = self.config.metadata.get("project_owner", owner)
             if proj.get("number") == project_number and (
                 (proj.get("owner") or {}).get("login", owner) == project_owner
             ):
@@ -815,7 +815,7 @@ class SuperboardProjectUpdater:
                     "option_id": status_val.get("optionId"),
                 }
 
-        raise RuntimeError(f"Issue #{issue_number} is not linked to project #{project_number} on {owner}")
+        raise RuntimeError(f"Issue #{issue_number} is not linked to project #{project_number} on {project_owner}")
 
     def update_lifecycle(
         self,

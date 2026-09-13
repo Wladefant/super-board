@@ -35,6 +35,7 @@ import sys
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
@@ -52,15 +53,45 @@ from github_pr_gate import (
 
 class TestGitHubPRGate(unittest.TestCase):
 
+    @classmethod
+    def setUpClass(cls):
+        # Every test reads the same immutable commits; mutable API payloads
+        # are rebuilt in setUp. No live GitHub call belongs in this suite.
+        cls.repository = tempfile.TemporaryDirectory(prefix="gate-content-fixture-")
+        cls.addClassCleanup(cls.repository.cleanup)
+        previous = os.getcwd()
+        cls.addClassCleanup(os.chdir, previous)
+        os.chdir(cls.repository.name)
+        def git(*args):
+            return subprocess.check_output(["git", *args], stderr=subprocess.DEVNULL).decode().strip()
+        git("init", "-b", "fixture-base")
+        git("config", "user.name", "Wladimir Kirjanovs")
+        git("config", "user.email", "wladefant@gmail.com")
+        with open("change.txt", "w", encoding="utf-8") as source:
+            source.write("base\n")
+        git("add", ".")
+        git("commit", "-m", "base")
+        cls.base_sha = git("rev-parse", "HEAD")
+        for base in ("fixture-base", "main", "staging"):
+            git("update-ref", f"refs/remotes/origin/{base}", cls.base_sha)
+            if base != "fixture-base":
+                git("branch", base, cls.base_sha)
+        git("remote", "add", "origin", cls.repository.name)
+        git("checkout", "-b", "feature")
+        with open("change.txt", "w", encoding="utf-8") as source:
+            source.write("changed\n")
+        git("add", ".")
+        git("commit", "-m", "feature")
+        cls.head_sha = git("rev-parse", "HEAD")
+
     def setUp(self):
-        self.head_sha = "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3"
-        self.base_sha = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
         self.mock_pr = {
             "number": 4545,
             "state": "OPEN",
             "isDraft": False,
             "headRefOid": self.head_sha,
             "baseRefOid": self.base_sha,
+            "baseRefName": "fixture-base",
             "author": {"login": "feature-developer"},
             "statusCheckRollup": [
                 {
@@ -340,14 +371,45 @@ class TestGitHubPRGate(unittest.TestCase):
         self.assertIn("security alert", result.invalidation_reason.lower())
         print(f"  [PASS] New security alert invalidated approval: {result.invalidation_reason}")
 
+    def test_native_review_safety_does_not_depend_on_local_artifact(self):
+        pr = copy.deepcopy(self.mock_pr)
+        pr["statusCheckRollup"][0].update(
+            conclusion="FAILURE", completedAt="2026-09-05T08:20:00Z"
+        )
+        failed_ci = evaluate_pr_gate(pr, policy=self.waived_policy())
+        self.assertEqual(failed_ci.gate_verdict, "BLOCKED")
+        self.assertTrue(failed_ci.review_invalidated)
+        self.assertFalse(failed_ci.review_reused)
+
+        pr = copy.deepcopy(self.mock_pr)
+        for alerts in (
+            [{"created_at": "2026-09-05T08:30:00Z", "severity": "high"}],
+            [{"severity": "high"}],
+        ):
+            blocked = evaluate_pr_gate(pr, security_alerts=alerts, policy=self.waived_policy())
+            self.assertEqual(blocked.gate_verdict, "BLOCKED")
+            self.assertTrue(blocked.review_invalidated)
+        known_alert = evaluate_pr_gate(
+            pr, security_alerts=[{"created_at": "2026-09-05T08:00:00Z"}],
+            policy=self.waived_policy(),
+        )
+        self.assertEqual(known_alert.gate_verdict, "PASSED")
+        self.assertTrue(known_alert.review_reused)
+
+        del pr["reviews"][0]["submittedAt"]
+        unknown_time = evaluate_pr_gate(
+            pr, security_alerts=[{"created_at": "2026-09-05T08:00:00Z"}],
+            policy=self.waived_policy(),
+        )
+        self.assertEqual(unknown_time.gate_verdict, "BLOCKED")
+
     # -------------------------------------------------------------------------
     # TEST 10: Review Reuse on Unchanged Head & Clean Checks
     # -------------------------------------------------------------------------
     def test_review_reuse_unchanged_head(self):
         print("\n--- TEST 10: Review Reuse on Unchanged Head (Zero LLM Tokens) ---")
-        # PR has no inlined reviews on GitHub, but ledger/cache has prior verified review
+        # Native reviews bind to content; local artifacts are not work authority.
         pr = copy.deepcopy(self.mock_pr)
-        pr["reviews"] = []
 
         prior_review = self.make_review_artifact()
 
@@ -357,8 +419,8 @@ class TestGitHubPRGate(unittest.TestCase):
         self.assertEqual(result.gate_verdict, "PASSED")
         self.assertTrue(result.review_reused)
         self.assertFalse(result.review_invalidated)
-        self.assertEqual(result.approved_by, "independent-review-agent")
-        self.assertIn("automated review artifact", result.verdict_reason.lower())
+        self.assertEqual(result.approved_by, "independent-reviewer")
+        self.assertIn("review matches current content", result.verdict_reason.lower())
         print(f"  [PASS] Review successfully reused: {result.verdict_reason}")
 
     # -------------------------------------------------------------------------
@@ -429,14 +491,14 @@ class TestGitHubPRGate(unittest.TestCase):
         self.assertTrue(unresolved.review_invalidated)
         print("  [PASS] Unresolved base blocks base-bound review reuse")
 
-        # Matching base still reuses.
+        # A structurally valid local artifact alone is still insufficient:
+        # the preserved installed gate requires a content-bound GitHub review.
         prior_ok = self.make_review_artifact()
-        reused = evaluate_pr_gate(
-            pr, review_artifact=prior_ok, policy=self.waived_policy()
-        )
-        self.assertEqual(reused.gate_verdict, "PASSED")
-        self.assertTrue(reused.review_reused)
-        print("  [PASS] Unchanged base reuses review")
+        reused = evaluate_pr_gate(pr, review_artifact=prior_ok, policy=self.waived_policy())
+        self.assertEqual(reused.gate_verdict, "BLOCKED")
+        self.assertFalse(reused.review_invalidated)
+        pr["reviews"] = copy.deepcopy(self.mock_pr["reviews"])
+        self.assertEqual(evaluate_pr_gate(pr, policy=self.waived_policy()).gate_verdict, "PASSED")
 
     # -------------------------------------------------------------------------
     # TEST 15: An approval with no commit OID is not head-bound evidence
@@ -581,15 +643,17 @@ class TestGitHubPRGate(unittest.TestCase):
         self.assertEqual(self_only.approval_verdict, "SELF_APPROVED_ONLY")
         print("  [PASS] Self-approval rejected even with approval waived")
 
-        # A source-backed artifact clears the waived gate without pretending to be a
-        # GitHub APPROVED event.
+        # A local artifact alone cannot clear the installed content gate.
         ok = copy.deepcopy(bare)
         artifact = self.make_review_artifact()
-        passed = evaluate_pr_gate(ok, policy=waived, review_artifact=artifact)
+        without_native = evaluate_pr_gate(ok, policy=waived, review_artifact=artifact)
+        self.assertEqual(without_native.gate_verdict, "BLOCKED")
+        ok["reviews"] = [{"author": {"login": "independent-reviewer"}, "state": "COMMENTED",
+                          "body": "APPROVE", "commit": {"oid": self.head_sha}}]
+        passed = evaluate_pr_gate(ok, policy=waived)
         self.assertEqual(passed.gate_verdict, "PASSED")
         self.assertEqual(passed.approval_verdict, "AUTOMATED_REVIEW_APPROVED")
-        self.assertIn("automated review artifact", passed.verdict_reason)
-        print("  [PASS] Source-backed automated review artifact clears the waived gate")
+        self.assertIn("review matches current content", passed.verdict_reason)
 
         # The same PR with no reviews under the strict default is blocked for approval.
         strict = evaluate_pr_gate(bare, policy=GateApprovalPolicy())
@@ -647,14 +711,16 @@ class TestGitHubPRGate(unittest.TestCase):
         current_result = evaluate_pr_gate(
             pr, policy=self.waived_policy(), review_artifact=current
         )
-        self.assertEqual(current_result.gate_verdict, "PASSED")
+        self.assertEqual(current_result.gate_verdict, "BLOCKED")
+        self.assertFalse(current_result.review_invalidated)
 
         past_result = evaluate_pr_gate(
             pr,
             policy=self.waived_policy(),
             review_artifact=self.make_review_artifact(),
         )
-        self.assertEqual(past_result.gate_verdict, "PASSED")
+        self.assertEqual(past_result.gate_verdict, "BLOCKED")
+        self.assertFalse(past_result.review_invalidated)
 
         future = self.make_review_artifact()
         future["submitted_at"] = (
@@ -723,8 +789,8 @@ class TestGitHubPRGate(unittest.TestCase):
 
     def test_executable_cli_review_record_boundary(self):
         """Exercise --review-record through a real process and a labelled gh fixture."""
-        head_sha = "1" * 40
-        base_sha = "2" * 40
+        head_sha = self.head_sha
+        base_sha = self.base_sha
         fixture_pr = {
             "number": 74,
             "state": "OPEN",
@@ -751,6 +817,9 @@ class TestGitHubPRGate(unittest.TestCase):
                     "args = sys.argv[1:]\n"
                     "if args[:2] == ['pr', 'view']:\n"
                     "    print(open(os.environ['GATE_FIXTURE_PR'], encoding='utf-8').read())\n"
+                    "    raise SystemExit(0)\n"
+                    "if args and args[0] == 'api' and '/reviews' in args[1]:\n"
+                    "    print(json.dumps(json.load(open(os.environ['GATE_FIXTURE_PR'], encoding='utf-8'))['reviews']))\n"
                     "    raise SystemExit(0)\n"
                     "if args and args[0] == 'api' and '/pulls/74' in args[1]:\n"
                     "    print(os.environ['GATE_FIXTURE_BASE'])\n"
@@ -806,9 +875,8 @@ class TestGitHubPRGate(unittest.TestCase):
                 reviewer="fixture-independent-reviewer",
             )
             completed = run_cli(valid)
-            self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
-            output = json.loads(completed.stdout)
-            self.assertEqual(output["approval_verdict"], "AUTOMATED_REVIEW_APPROVED")
+            self.assertEqual(completed.returncode, 2, completed.stderr or completed.stdout)
+            self.assertEqual(json.loads(completed.stdout)["gate_verdict"], "BLOCKED")
 
             invalid_records = [
                 {"status": "approved", "approved_by": "fabricated"},
@@ -828,25 +896,26 @@ class TestGitHubPRGate(unittest.TestCase):
                 rejected = run_cli(record)
                 self.assertEqual(rejected.returncode, 2, rejected.stderr or rejected.stdout)
                 self.assertEqual(json.loads(rejected.stdout)["gate_verdict"], "BLOCKED")
+            # Positive control: authenticated native review metadata and real
+            # git content clear the same executable CLI, without a local artifact.
+            fixture_pr["reviews"] = [{
+                "user": {"login": "fixture-independent-reviewer"}, "state": "APPROVED",
+                "body": "APPROVE", "commit_id": head_sha,
+            }]
+            with open(pr_path, "w", encoding="utf-8") as fixture_file:
+                json.dump(fixture_pr, fixture_file)
+            passed = run_cli(valid)
+            self.assertEqual(passed.returncode, 0, passed.stderr or passed.stdout)
+            self.assertEqual(json.loads(passed.stdout)["approval_verdict"], "APPROVED")
 
     # -------------------------------------------------------------------------
-    # TEST 11: Real Live gh CLI Invocation Smoke
+    # TEST 11: GitHub access failure is an explicit error, never approval
     # -------------------------------------------------------------------------
-    def test_live_gh_cli_smoke(self):
-        print("\n--- TEST 11: Real gh CLI Live Invocation Smoke ---")
-        # Test calling gh pr view on public / accessible repo
-        try:
-            # Check PR #4545 or PR #1 if accessible
-            data = fetch_pr_json(pr_number=4545, repo="Bavariance/polysimulator")
-            self.assertIsNotNone(data)
-            self.assertIn("number", data)
-            eval_res = evaluate_pr_gate(data, repo="Bavariance/polysimulator")
-            self.assertIsNotNone(eval_res.gate_verdict)
-            print(f"  [PASS] Live gh pr view #4545 returned state: {data.get('state')}, verdict: {eval_res.gate_verdict}")
-        except Exception as e:
-            # If PR 4545 does not exist or network is restricted, verify error is actionable
-            print(f"  [INFO] Live fetch notice: {e}")
-            self.assertTrue(True)
+    def test_gh_access_failure_is_not_approval(self):
+        denied = subprocess.CompletedProcess(["gh"], 1, "", "HTTP 403: access denied")
+        with patch("github_pr_gate._run_gh", return_value=denied):
+            with self.assertRaisesRegex(RuntimeError, "HTTP 403"):
+                fetch_pr_json(pr_number=1, repo="example/fixture")
 
 
 def main():

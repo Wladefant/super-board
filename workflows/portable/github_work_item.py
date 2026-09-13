@@ -148,9 +148,10 @@ def publish_report(issue_url: str, body: str, runner: Callable | None = None) ->
     """Publish readable markdown and confirm exact body via authenticated readback."""
     from project_adapter import default_graphql_runner
     runner = runner or default_graphql_runner
-    match = ISSUE_URL.fullmatch(issue_url)
-    if not match:
+    if not isinstance(issue_url, str) or not (match := ISSUE_URL.fullmatch(issue_url)):
         raise ValueError("Report requires a canonical GitHub issue URL")
+    if not isinstance(body, str):
+        raise ValueError("Report body must be markdown text")
     reject_local_reports(body)
     if not body.strip():
         raise ValueError("Report body is empty")

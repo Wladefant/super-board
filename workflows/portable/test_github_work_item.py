@@ -140,6 +140,33 @@ class GitHubAuthority(unittest.TestCase):
             publish_report(url, "Different text", runner)
         with self.assertRaises(ValueError): publish_report(url, "local://secret.md", runner)
 
+    def test_missing_publication_values_are_actionable_without_network(self):
+        def no_network(*_):
+            self.fail("Invalid publication values must never call GitHub")
+        for url in (None, "", 42, {}):
+            with self.assertRaisesRegex(ValueError, "canonical GitHub issue URL"):
+                publish_report(url, "Evidence", no_network)
+        with self.assertRaisesRegex(ValueError, "markdown text"):
+            publish_report(self.record["github"]["issue_url"], None, no_network)
+
+    def test_publication_failure_preserves_primary_worker_diagnosis(self):
+        adapter = SuperboardExecutionAdapter(state_dir=self.temp.name, notify_telegram=False)
+        for result, primary in (
+            (WorkerExecutionResult(stage="build", exit_code=0, output="checks failed",
+                                   head_sha="a" * 40, blocked_reason="unclassified failing check"),
+             "Stage 'build' blocked: unclassified failing check"),
+            (WorkerExecutionResult(stage="build", exit_code=2, output="compiler error",
+                                   head_sha="a" * 40),
+             "Worker build execution failed with exit code 2"),
+        ):
+            with patch("github_work_item.publish_report", side_effect=RuntimeError("write denied")):
+                state, reason, gate = adapter.verify_and_advance_request(self.record, "build", result)
+            self.assertEqual(state, "implementation")
+            self.assertTrue(reason.startswith(primary), reason)
+            self.assertIn("write denied", reason)
+            self.assertIn("write denied", gate["publication_error"])
+            self.assertFalse(gate["verified"])
+
     def test_publication_failure_cannot_advance_successful_worker(self):
         adapter = SuperboardExecutionAdapter(state_dir=self.temp.name, notify_telegram=False)
         result = WorkerExecutionResult(stage="build", exit_code=0, output="Passed", head_sha="a" * 40)

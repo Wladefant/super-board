@@ -229,7 +229,7 @@ class TestProjectAdapterLifecycle(unittest.TestCase):
                                     "nodes": [
                                         {
                                             "id": "ITEM_1",
-                                            "project": {"id": "PVT_1", "number": 1},
+                                            "project": {"id": "PVT_1", "number": 5, "owner": {"login": "Wladefant"}},
                                             "fieldValueByName": {"name": "Building", "optionId": "OPT_BUILD_1"},
                                         }
                                     ]
@@ -289,7 +289,7 @@ class TestProjectAdapterLifecycle(unittest.TestCase):
                                     "nodes": [
                                         {
                                             "id": "ITEM_1",
-                                            "project": {"id": "PVT_1", "number": 1},
+                                            "project": {"id": "PVT_1", "number": 5, "owner": {"login": "Wladefant"}},
                                             "fieldValueByName": {"name": "QA", "optionId": "OPT_QA_1"},
                                         }
                                     ]
@@ -378,7 +378,7 @@ class TestProjectAdapterLifecycle(unittest.TestCase):
                                     "nodes": [
                                         {
                                             "id": "ITEM_1",
-                                            "project": {"id": "PVT_1", "number": 1},
+                                            "project": {"id": "PVT_1", "number": 5, "owner": {"login": "Wladefant"}},
                                             "fieldValueByName": {"name": "Building", "optionId": "OPT_BUILD_1"},
                                         }
                                     ]
@@ -446,7 +446,7 @@ class TestProjectAdapterLifecycle(unittest.TestCase):
                                     "nodes": [
                                         {
                                             "id": "ITEM_1",
-                                            "project": {"id": "PVT_1", "number": 1},
+                                            "project": {"id": "PVT_1", "number": 5, "owner": {"login": "Wladefant"}},
                                             "fieldValueByName": {"name": "Building", "optionId": "OPT_BUILD_1"},
                                         }
                                     ]
@@ -470,7 +470,8 @@ class TestProjectAdapterLifecycle(unittest.TestCase):
         """Ensure all baseline project adapter safety functions remain intact."""
         cfg = create_polysimulator_config()
         self.assertEqual(cfg.repo, "Bavariance/polysimulator")
-        self.assertEqual(cfg.project_number, 1)
+        self.assertEqual(cfg.project_number, 5)
+        self.assertEqual(cfg.metadata["project_owner"], "Wladefant")
 
         # Safety pattern checks
         is_bad, match = check_text_for_forbidden_patterns("zaraprptkegxqpvnsubu", cfg)

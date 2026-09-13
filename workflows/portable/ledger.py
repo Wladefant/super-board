@@ -408,7 +408,7 @@ class RequestLedger:
     def _save_data_unlocked(self, data: Dict[str, Any]):
         data["updated_at"] = get_iso_timestamp()
         data["role"] = "local_recovery_cache"
-        data["authority"] = "github_issues_and_project_5"
+        data["authority"] = "github_issues_and_superboard"
         dir_name = os.path.dirname(self.ledger_path)
         os.makedirs(dir_name, exist_ok=True)
 

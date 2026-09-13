@@ -416,9 +416,8 @@ def evaluate_pr_gate(
     hard BLOCK, because every QA and review artifact is bound to one exact head SHA.
 
     `policy` decides whether a non-author GitHub APPROVED review is mandatory for this
-    repo/base. On a named automated branch, a valid `portable-review/v1` artifact may
-    satisfy independent review without being represented as GitHub approval. The artifact
-    is advisory trusted-workflow evidence, not a cryptographic identity proof.
+    repo/base. Named automated branches still require a content-bound GitHub review.
+    Legacy local review metadata is advisory cache data and cannot grant approval.
     """
     now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     base_ref = str(pr_data.get("baseRefName") or (pr_data.get("base") or {}).get("ref") or "")
@@ -587,8 +586,18 @@ def evaluate_pr_gate(
 
     from review_content import evaluate as evaluate_content
     try:
+        # GitHub cannot grant an author formal approval. The staging waiver
+        # accepts an explicit automated COMMENT verdict, not self-APPROVED data.
+        eligible_reviews = [
+            review for review in reviews_list
+            if not (
+                (review.get("author") or review.get("user") or {}).get("login", "").lower()
+                == pr_author.lower()
+                and str(review.get("state") or "").upper() == "APPROVED"
+            )
+        ]
         content_review = evaluate_content(
-            reviews_list, head_sha, pr_author, base="origin/" + base_ref,
+            eligible_reviews, head_sha, pr_author, base="origin/" + base_ref,
             staging=repo == "Bavariance/polysimulator" and base_ref == "staging",
         )
     except (ValueError, subprocess.CalledProcessError) as exc:
@@ -610,6 +619,32 @@ def evaluate_pr_gate(
     review_invalidated = False
     invalidation_reason = None
     review_reused = bool(content_review["passed"])
+    # Content equality preserves the code review, not permission to ignore
+    # newly failing checks or alerts. Bind freshness to GitHub review time,
+    # never to an optional local artifact that could hide a later finding.
+    if content_review["passed"]:
+        review_time = content_review.get("reviewed_at") or ""
+        if latest_ci_failure_time and (
+            not review_time or latest_ci_failure_time > review_time
+        ):
+            review_invalidated = True
+            invalidation_reason = (
+                "New CI failure occurred after automated review "
+                f"({latest_ci_failure_time} > {review_time or 'unknown review time'})"
+            )
+        elif security_alerts:
+            new_alerts = [
+                alert for alert in security_alerts
+                if not review_time or not alert.get("created_at")
+                or alert["created_at"] > review_time
+            ]
+            if new_alerts:
+                review_invalidated = True
+                invalidation_reason = (
+                    f"{len(new_alerts)} new security alert(s) detected after automated review"
+                )
+        if review_invalidated:
+            review_reused = False
     if review_artifact is not None and not content_review["passed"]:
         artifact_evidence, artifact_error = validate_review_artifact(
             review_artifact,
