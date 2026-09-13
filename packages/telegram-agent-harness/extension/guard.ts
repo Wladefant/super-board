@@ -66,7 +66,7 @@ function extractAllStrings(val: unknown, depth = 0): string[] {
   return [];
 }
 
-const SECRET_PATH = /\b(id_rsa|service_role|jwt_secret|\.env\.prod)\b/i;
+const SECRET_PATH = /(?:^|[/\\])\.env\.prod\b|\b(id_rsa|service_role|jwt_secret|\.env\.prod)\b/i;
 const PROTECTED = /^(main|master|staging|production|prod)$/i;
 const PRODUCTION = /(?:\bzaraprptkegxqpvnsubu\b|\bakamai-iad-prod\b)/i;
 const TTL = 15 * 60 * 1000;
@@ -175,9 +175,22 @@ function commandCategory(words: string[], depth = 0): string | undefined {
   while (words.length && /^[A-Za-z_]\w*=/.test(words[0])) words = words.slice(1);
   if (!words.length) return;
   const app = executable(words[0]), args = words.slice(1), command = [app, ...args].join(" ");
-  if (/^(env|command|exec|call|if|then|do|while|!)$/.test(app)) {
+  // The shell builtin reparses its argument string; argv wrappers do not.
+  if (app === "eval") {
+    const script = (args[0] === "--" ? args.slice(1) : args).join(" ");
+    return selectCategory(shellCommands(script).map(c => commandCategory(c, depth + 1)));
+  }
+  if (/^(env|command|exec|call|if|then|do|while|!|time|nohup|xargs)$/.test(app)) {
     let offset = 0;
-    while (args[offset]?.startsWith("-")) offset += /^(--unset|-u)$/.test(args[offset]) ? 2 : 1;
+    while (args[offset]?.startsWith("-")) {
+      if (args[offset] === "--") { offset++; break; }
+      const takesValue = app === "xargs"
+        ? /^(-[aEdInPLs]|--arg-file|--eof|--delimiter|--replace|--max-args|--max-procs|--max-lines|--max-chars|--process-slot-var)$/.test(args[offset])
+        : app === "time"
+          ? /^(-[fo]|--format|--output)$/.test(args[offset])
+          : /^(--unset|-u|-a)$/.test(args[offset]);
+      offset += takesValue ? 2 : 1;
+    }
     return commandCategory(args.slice(offset), depth + 1);
   }
   // A real process may read keys regardless of the transport. Never inspect source-file contents.

@@ -213,3 +213,36 @@ test("dedicated remote-process tool has transport-neutral production exclusion",
     expect(guard.evaluateToolCall("ssh", { host: "test-host", command: "uptime" }, origin).category).toBe("remote_ssh");
   }
 });
+
+test("review delta: production environment paths are protected without scanning file content", () => {
+  for (const origin of [false, true]) for (const file of [".env.prod", "backend/.env.prod", "C:\\app\\.env.prod", "/app/.env.prod"]) {
+    expect(guard.evaluateToolCall("write", { path: file, content: "example" }, origin).category).toBe("secrets");
+    expect(guard.evaluateToolCall("read", { path: file }, origin).category).toBe("secrets");
+  }
+  expect(guard.evaluateToolCall("write", { path: "docs/config.txt", content: "Document backend/.env.prod here" })).toEqual({ allowed: true });
+  expect(guard.evaluateToolCall("write", { path: ".env.product", content: "example" })).toEqual({ allowed: true });
+});
+test("review delta: shell builtins and process wrappers preserve execution boundaries", () => {
+  for (const origin of [false, true]) {
+    for (const command of [
+      'eval "git push --force origin main"',
+      'eval "git " "push --force origin main"',
+      "nohup git push --force origin main",
+      "time git push --force origin main",
+      "time -f %e -o timing.txt git push --force origin main",
+      "printf ref | xargs git push --force origin main",
+      "printf ref | xargs -I item git push --force origin main",
+      "printf ref | xargs -n 1 -P 2 git push --force origin main",
+    ]) expect(guard.evaluateToolCall("bash", { command }, origin).category).toBe("destructive_git");
+    for (const command of [
+      'echo \'eval "git push --force origin main"\'',
+      'eval \'echo "git push --force origin main"\'',
+      'nohup echo "git push --force origin main"',
+      'time echo "git push --force origin main"',
+      'printf ref | xargs echo "git push --force origin main"',
+      "nohup git push origin feat/x",
+      "time git push origin fix/x",
+      "printf ref | xargs -n 1 echo",
+    ]) expect(guard.evaluateToolCall("bash", { command }, origin)).toEqual({ allowed: true });
+  }
+});
