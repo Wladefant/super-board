@@ -58,7 +58,7 @@ except ImportError:
 DEFAULT_SESSION_ID = "01a0496f-64f6-733e-a9a6-89f15fc2a437"
 DEFAULT_STATE_FILE = Path.home() / ".veyyon" / "workflows" / "crash_monitor_state.json"
 DEFAULT_PROJECT = "polysimulator"
-DEFAULT_CANONICAL_LINK = "https://github.com/Bavariance/polysimulator/issues/4543"
+DEFAULT_CANONICAL_LINK = "https://github.com/orgs/Bavariance/projects/1"
 
 
 def utc_now_iso() -> str:
@@ -320,6 +320,9 @@ class PlannedStopEvaluator:
         session_root = Path.home() / ".veyyon" / "profiles" / "default" / "agent" / "sessions"
         if session_root.exists():
             for p in session_root.glob(f"*{session_id}*"):
+                if p.is_dir():
+                    paths.append(p / "local" / "planned-restart-marker.json")
+            for p in session_root.glob(f"*/*{session_id}*"):
                 if p.is_dir():
                     paths.append(p / "local" / "planned-restart-marker.json")
 
