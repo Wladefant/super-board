@@ -22,6 +22,7 @@ import tempfile
 import time
 import unittest
 from typing import Any, Dict, List, Optional, Tuple
+from unittest.mock import patch
 
 try:
     from session_crash_monitor import (
@@ -218,6 +219,7 @@ class TestSessionCrashMonitor(unittest.TestCase):
         # Verify alert content
         event = notifier.sent_events[0]
         self.assertEqual(event.session_id, self.session_id)
+        self.assertEqual(event.canonical_link, "https://github.com/orgs/Bavariance/projects/1")
         details_text = event.metadata.get("details", "")
         self.assertIn("Observed PID: 12345", details_text)
         self.assertIn("code 1", details_text)
@@ -229,6 +231,22 @@ class TestSessionCrashMonitor(unittest.TestCase):
         record = ledger.get_record(self.session_id, 12345, "2026-09-08T00:00:00Z")
         self.assertEqual(record["classification"], "UNEXPECTED_TERMINATION")
         self.assertTrue(record["alert_sent"])
+
+    def test_nested_session_marker_survives_source_refresh(self):
+        home = Path(self.temp_dir.name)
+        marker = home / ".veyyon" / "profiles" / "default" / "agent" / "sessions" / "project" / self.session_id / "local" / "planned-restart-marker.json"
+        marker.parent.mkdir(parents=True)
+        marker.write_text(json.dumps({
+            "session_id": self.session_id,
+            "target_pid": 12345,
+            "owner": "operator",
+            "status": "planned",
+            "created_utc": utc_now_iso(),
+        }), encoding="utf-8")
+        with patch.object(Path, "home", return_value=home):
+            result = PlannedStopEvaluator.check_planned_stop(self.session_id, 12345)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["matched_marker_path"], str(marker))
 
     def test_planned_stop_suppression(self):
         """Planned stop marker suppresses Telegram crash alert."""

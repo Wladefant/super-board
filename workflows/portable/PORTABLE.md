@@ -8,9 +8,14 @@ A harness-agnostic, pure Python standard library multi-agent coordination core l
 
 1. **Shared System of Record (Canonical):**
    * **GitHub Issues** and **Superboard (Project #1)** for `Bavariance/polysimulator` are the authoritative shared sources of truth for requirements, task status, human decisions, and verified closure.
+   * **One independently actionable deliverable per issue and Project card.** Before dispatch, split a multi-deliverable request, reuse an existing matching issue or create a dedicated one for each deliverable, and enrol each issue on the repository's configured Project board. Keep its acceptance criteria, owner, dependencies, decisions, PR, evidence and next action on that issue. A program or phase is not one work item.
+   * **The Project board is the aggregation layer** for status, ordering and grouping. A master/index issue is optional and weightless: only a convenience checklist of links to dedicated issues, never the sole specification or tracking for work. No fixed issue number is an intake default.
    * Remote status always supersedes local caches on conflict.
 2. **Local Recovery Cache:**
    * `ledger.json` and `decisions.json` act as machine-local, crash-resilient, atomic restart recovery caches.
+   * The ledger is a lossless cross-topic index linking dedicated issues, never their replacement. Retain original prompts, criteria, authorization, owners, dependencies, blockers, evidence and next actions across compaction and restarts, including unpublished intake. Migrate old umbrella items by linking dedicated issues without deleting history, silently closing unresolved work or dropping scope; only the operator may cancel scope.
+   * Intake and Project enrolment remain caller responsibilities: `ledger.add_request` records supplied issue/card identities, and `project_adapter` updates existing cards but does not create issues or enrol missing cards. Record an explicit publication/enrolment blocker before dispatch if those links are missing; do not use a shared umbrella as a shortcut.
+   * `github_plan_renderer.py render-plan` renders the acceptance steps of one deliverable, not a program backlog. Render and publish separately for each dedicated issue. `post-issue-comment --issue` takes that issue explicitly; managed-section updates do not decompose work or enrol it on the board.
    * They eliminate reliance on fictitious native schedulers or polling GitHub APIs continuously.
    * Multi-agent concurrency is protected via advisory file locking (`msvcrt` on Windows, `fcntl` on POSIX) and atomic filesystem replaces (`tempfile.mkstemp` + `os.replace`).
 3. **No Auto-Merge & No Auto-Deploy:**
@@ -309,7 +314,7 @@ python telegram_notifier.py \
   --project "Bavariance/polysimulator" \
   --request-id "req-001" \
   --summary "Request transitioned to QA on commit 693de377." \
-  --link "https://github.com/Bavariance/polysimulator/issues/4543" \
+  --link "https://github.com/<owner>/<repo>/issues/<dedicated-issue-number>" \
   --dry-run \
   --json
 
