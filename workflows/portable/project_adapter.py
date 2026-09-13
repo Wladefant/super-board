@@ -683,7 +683,7 @@ def default_graphql_runner(query: str, variables: Dict[str, Any]) -> Dict[str, A
     cmd.extend(["-f", f"query={query}"])
 
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=30)
     except Exception as e:
         raise RuntimeError(f"Failed to execute gh api graphql subprocess: {e}")
 

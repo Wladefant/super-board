@@ -2,7 +2,9 @@
 import contextlib
 import copy
 import io
+import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -38,14 +40,22 @@ class GitHubTransport:
         # A direct-node read can succeed while ordinary recovery still loses it.
         return {'data': {'node': copy.deepcopy(self.comments[-1])}}
 
+    def subprocess_run(self, cmd, **options):
+        variables = dict(value.split('=', 1) for value in cmd[4::2])
+        query = variables.pop('query')
+        payload = json.dumps(self(query, variables), ensure_ascii=False).encode('utf-8')
+        # Reproduce gh UTF-8 output on a Windows host whose default is cp1252.
+        return subprocess.CompletedProcess(cmd, 0, payload.decode(options.get('encoding') or 'cp1252'), '')
+
 
 class PublicationRegressions(unittest.TestCase):
     def test_write_must_be_readable_by_normal_recovery(self):
         api = GitHubTransport()
         record = {'github': {'issue_url': api.issue['url']}}
-        text = 'Operator correction: retain the original failure and these acceptance steps.'
-        url = work.publish_report(api.issue['url'], text, api)
-        view = work.execution_view(record, work.fetch_work_item(record, api))
+        text = 'Operator correction — retain the original failure and these acceptance steps.'
+        with patch('project_adapter.subprocess.run', side_effect=api.subprocess_run):
+            url = work.publish_report(api.issue['url'], text)
+            view = work.execution_view(record, work.fetch_work_item(record))
         self.assertIn(text, view['prompt'])
         self.assertIn(url, view['prompt'])
         api = GitHubTransport()
