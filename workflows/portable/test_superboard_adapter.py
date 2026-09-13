@@ -108,6 +108,17 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
     HEAD_SHA = "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3"
 
     def setUp(self):
+        # Existing lifecycle tests isolate GitHub; test_github_work_item covers
+        # the actual mandatory API seam, stale-cache refusal and publication.
+        intake = patch.object(RequestLedger, "refresh_from_github", RequestLedger.get_request)
+        intake.start()
+        self.addCleanup(intake.stop)
+        reports = patch.object(
+            SuperboardExecutionAdapter, "publish_worker_report",
+            return_value="https://github.com/Wladefant/super-board/issues/114#issuecomment-1",
+        )
+        reports.start()
+        self.addCleanup(reports.stop)
         self.test_dir = tempfile.mkdtemp(prefix="test_sb_adapter_")
         self.state_dir = os.path.join(self.test_dir, "state")
         self.evidence_dir = os.path.join(self.test_dir, "evidence")
@@ -543,10 +554,15 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
             issue_number=75,
         )
 
+        # Installed workflows need not live below a git repository.
+        probe_repo = os.path.join(self.test_dir, "probe-repository")
+        os.makedirs(probe_repo)
+        subprocess.run(["git", "init", probe_repo], check=True, capture_output=True)
         adapter = SuperboardExecutionAdapter(
             state_dir=self.state_dir,
             fake_executor=False,
             notify_telegram=False,
+            repo_root=probe_repo,
         )
 
         # Run with real_worker=True (exercises git status or config validate subprocess)
@@ -654,7 +670,10 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
         self.assertIsNotNone(receipt)
         self.assertEqual(receipt.get("status"), "dry_run")
         self.assertIn("Park and Idle Wait", receipt.get("reason", ""))
-        self.assertIn("DEC-ARCH-01", receipt.get("reason", ""))
+        self.assertIn("❓ <b>Decision needed</b>", receipt.get("reason", ""))
+        self.assertIn("How should background execution proceed on blocking decisions?", receipt.get("reason", ""))
+        self.assertIn("<b>Proposal:</b>", receipt.get("reason", ""))
+        self.assertIn("<b>Impact:</b>", receipt.get("reason", ""))
 
     def test_04e_telegram_decision_refusal_retired_and_synthetic(self):
         """Regression: Verify retired/synthetic/completed decisions are strictly refused by adapter hook."""
@@ -758,7 +777,10 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
         self.assertEqual(pending.stage, "decision")
         self.assertEqual(pending.status, "blocked")
         self.assertEqual(pending.notification_receipt["status"], "dry_run")
-        self.assertIn("[Decision Needed]", pending.notification_receipt["reason"])
+        self.assertIn("❓ <b>Decision needed</b>", pending.notification_receipt["reason"])
+        self.assertIn("Choose the supported execution path?", pending.notification_receipt["reason"])
+        self.assertIn("<b>Proposal:</b>", pending.notification_receipt["reason"])
+        self.assertIn("<b>Impact:</b>", pending.notification_receipt["reason"])
         self.assertNotIn("[Blocker]", pending.notification_receipt["reason"])
 
         # Even if a malformed coordinator packet loses its DecisionStatus, the
@@ -1306,7 +1328,7 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
                 return {
                     "data": {"repository": {"issue": {"projectItems": {"nodes": [{
                         "id": "ITEM_1",
-                        "project": {"id": "PVT_1", "number": 1, "title": "Superboard"},
+                        "project": {"id": "PVT_1", "number": 5, "title": "Superboard", "owner": {"login": "Wladefant"}},
                         "fieldValueByName": {"name": observed_status["name"]},
                     }]}}}}
                 }

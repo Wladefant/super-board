@@ -582,7 +582,7 @@ def _pending_decision(req_id="req-dec", decision_id="DEC-1"):
 
 
 def _answered_decision(req_id="req-dec", decision_id="DEC-1", responder="Wladefant",
-                       provenance="human_operator", is_test=False,
+                       provenance="github_verified_user", is_test=False,
                        interpretation="Option A"):
     return {
         "decision_id": decision_id,
@@ -618,12 +618,20 @@ class TestDecisionGating(_Fixture):
         outcome = self._driver(self._adapter(decision_mgr=mgr), ["req-dec"]).run()
         self.assertIn("disabled", outcome.parked[0]["reason"])
 
-    def test_authorized_human_answer_unblocks(self):
+    def test_authorized_github_user_answer_unblocks(self):
         self._add("req-dec")
         mgr = FakeDecisionManager([_answered_decision()])
         adapter = self._adapter(decision_mgr=mgr)
         self._driver(adapter, ["req-dec"]).run()
         self.assertTrue(adapter.calls, "an answered decision did not unblock the request")
+        self.assertEqual(self.ledger.get_request("req-dec")["state"], "awaiting authorization")
+
+    def test_authorized_telegram_callback_answer_unblocks(self):
+        self._add("req-dec")
+        mgr = FakeDecisionManager([_answered_decision(provenance="telegram_verified_callback")])
+        adapter = self._adapter(decision_mgr=mgr)
+        self._driver(adapter, ["req-dec"]).run()
+        self.assertTrue(adapter.calls, "an answered telegram callback did not unblock the request")
         self.assertEqual(self.ledger.get_request("req-dec")["state"], "awaiting authorization")
 
     def test_only_a_genuine_authorized_answer_counts(self):
@@ -633,10 +641,16 @@ class TestDecisionGating(_Fixture):
         """
         cases = {
             "synthetic test": _answered_decision(is_test=True),
+            "legacy human operator": _answered_decision(provenance="human_operator"),
             "agent authored": _answered_decision(provenance="agent_authored"),
             "unauthorized responder": _answered_decision(responder="RandomPerson"),
             "empty interpretation": _answered_decision(interpretation="   "),
             "still pending": _pending_decision(),
+            "unverified telegram callback": _answered_decision(provenance="telegram_unverified_callback"),
+            "untrusted provenance": _answered_decision(provenance="untrusted_input"),
+            "telegram callback synthetic test": _answered_decision(provenance="telegram_verified_callback", is_test=True),
+            "telegram callback unauthorized responder": _answered_decision(provenance="telegram_verified_callback", responder="RandomPerson"),
+            "telegram callback empty interpretation": _answered_decision(provenance="telegram_verified_callback", interpretation="   "),
         }
         for label, decision in cases.items():
             with self.subTest(label):
@@ -645,8 +659,17 @@ class TestDecisionGating(_Fixture):
                     f"{label} was accepted as an authorized answer",
                 )
         self.assertTrue(
-            ContinuationDriver._decision_is_authorized_answer(_answered_decision()))
-
+            ContinuationDriver._decision_is_authorized_answer(
+                _answered_decision(provenance="github_verified_user")
+            ),
+            "github_verified_user was rejected as an authorized answer",
+        )
+        self.assertTrue(
+            ContinuationDriver._decision_is_authorized_answer(
+                _answered_decision(provenance="telegram_verified_callback")
+            ),
+            "telegram_verified_callback was rejected as an authorized answer",
+        )
     def test_bounded_recheck_resumes_only_on_a_real_answer(self):
         """The re-check is finite and resumes on a genuine answer, without polling."""
         self._add("req-dec")
@@ -803,9 +826,22 @@ class TestInstalledDriverCliRepoRoot(_Fixture):
         return config
 
     def _run_cli(self, request_id: str, repo_root: str, config: str):
+        # Isolate GitHub intake/publication, not the CLI or child worker.
+        # Network success/failure and readback have separate contract fixtures.
+        bootstrap = os.path.join(self.tmp, "fixture_cli.py")
+        with open(bootstrap, "w", encoding="utf-8") as fixture:
+            fixture.write(
+                "import sys, runpy\n"
+                f"sys.path.insert(0, {SCRIPT_DIR!r})\n"
+                "from unittest.mock import patch\n"
+                "from ledger import RequestLedger\n"
+                "from superboard_adapter import SuperboardExecutionAdapter\n"
+                "with patch.object(RequestLedger, 'refresh_from_github', RequestLedger.get_request), patch.object(SuperboardExecutionAdapter, 'publish_worker_report', return_value='https://github.com/example/fixture/issues/1#issuecomment-1'):\n"
+                f"    runpy.run_path({os.path.join(SCRIPT_DIR, 'continuation_driver.py')!r}, run_name='__main__')\n"
+            )
         return subprocess.run(
             [
-                sys.executable, os.path.join(SCRIPT_DIR, "continuation_driver.py"),
+                sys.executable, bootstrap,
                 "--request-id", request_id,
                 "--state-dir", self.tmp,
                 "--repo-root", repo_root,
@@ -998,6 +1034,13 @@ class TestNativeCheckExpectationReconcile(_Fixture):
 
     def setUp(self):
         super().setUp()
+        intake = patch.object(RequestLedger, "refresh_from_github", RequestLedger.get_request)
+        intake.start()
+        self.addCleanup(intake.stop)
+        reports = patch("superboard_adapter.SuperboardExecutionAdapter.publish_worker_report",
+                        return_value="https://github.com/example/fixture/issues/1#issuecomment-1")
+        reports.start()
+        self.addCleanup(reports.stop)
         self.repo = os.path.join(self.tmp, "repo")
         os.makedirs(self.repo)
         self._git("init", "-q", "-b", "main")
@@ -1218,6 +1261,11 @@ class TestContinuationDriverTelegramNotifications(_Fixture):
 
     def setUp(self):
         super().setUp()
+        # These notification fixtures do not authorize reads of real issues.
+        # Actual API intake is covered by test_github_work_item.
+        intake = patch.object(RequestLedger, "refresh_from_github", RequestLedger.get_request)
+        intake.start()
+        self.addCleanup(intake.stop)
         # Zero-quota fixture credentials for dry-run Telegram notification testing
         self._orig_chat_id = os.environ.get("TELEGRAM_NOTIFY_CHAT_ID")
         self._orig_token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -1435,8 +1483,9 @@ class TestContinuationDriverTelegramNotifications(_Fixture):
             payload = json.loads(req.data.decode("utf-8"))
             self.assertIn("chat_id", payload)
             self.assertIn("text", payload)
-            self.assertIn("req-explicit-send", payload["text"])
-            self.assertIn("https://github.com/", payload["text"])
+            self.assertIn('<a href="https://github.com/Bavariance/polysimulator/issues/104">polysimulator</a>', payload["text"])
+            self.assertIn("<b>Blocked</b>", payload["text"])
+            self.assertNotIn("req-explicit-send", payload["text"])
 
 
 if __name__ == "__main__":

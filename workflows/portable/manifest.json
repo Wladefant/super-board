@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "Harness-agnostic automated multi-agent workflow core and module integration package",
   "authority": {
-    "shared_system_of_record": "GitHub Issues and Superboard for configured project (e.g. Project #1 for Bavariance/polysimulator or custom project adapter)",
+    "shared_system_of_record": "GitHub Issues and https://github.com/users/Wladefant/projects/5; authenticated API intake is mandatory before dispatch",
     "local_recovery_cache": "ledger.json and decisions.json (machine-local crash-resilient restart recovery cache)",
     "preflight_inventory": "preflight_evidence/ (manifest-based staging probe inventory and TTL tracker)"
   },
@@ -18,6 +18,18 @@
     "recurrence_changes_behaviour": "A repeated failure changes what the system does instead of being retried unchanged. The second distinct occurrence of one project+environment+operation+error signature refuses unchanged blind retry; the third escalates once per escalation epoch. Duplicate ingestion of a known observation id is never a recurrence, and an intended negative control is retained as evidence without counting. Recording a corrective action and opening the retry gate are separate outcomes: the record always lands, and the gate opens only when the verification context is related to this failure, the change reference resolved there and names a change to the very key, test or decision it points at, the exercising command exited 0, and the evidence head descends from every counted observed failing head (or, where the failure recorded none, was itself committed after the last one) and carries the change commit - recomputed from the action's own recorded facts on every load, never read from a stored verdict. A reference that cannot be resolved (a pull request, or anything in a worktree that no longer exists) is recorded unverified and never opens the gate or closes an escalation epoch. Opening the gate is all it does: it never verifies acceptance criteria, satisfies head-bound QA or review, or authorizes a merge or deployment. The refusal is not inert: it opens a durable corrective work item whose closure must name the corrective change and the original failure scenario re-executed on the corrected head. A failure that recorded neither a failing head nor a reachable repository can be related to nothing, so no proof binds to it: the refusal names the operator recovery paths this module already contracts - re-observe it with a head and repository, or supersede its counted observations with an actor and a reason - rather than opening on nothing or inventing an authorization."
   },
   "modules": {
+    "github_work_item.py": {
+      "role": "Mandatory authenticated GitHub intake of issue, milestone, parent, assignees, labels, dependencies and Project 5 status; verified GitHub-only report publication",
+      "owner": "IngrainPolicy"
+    },
+    "review_content.py": {
+      "role": "Preserved installed content-bound review identity: stable patch-id plus stripped-diff sha256 and approved ancestor delta chain",
+      "owner": "IngrainPolicy"
+    },
+    "install_github_native.py": {
+      "role": "Narrow versioned policy/runtime installation and read-only source parity check; never operates on processes or execution state",
+      "owner": "IngrainPolicy"
+    },
     "project_adapter.py": {
       "role": "Project configuration and environment adapter isolating generic workflow core from repository identities, Superboard numbers, and staging coordinates",
       "owner": "PackagePortableCoordinator",
@@ -45,7 +57,7 @@
       ]
     },
     "ledger.py": {
-      "role": "Durable request ledger utility, atomic crash-resilient recovery cache, and transition graph invariant enforcer",
+      "role": "Local execution checkpoint and atomic recovery cache; GitHub owns issue structure and Project lifecycle state",
       "owner": "ImplementRequestLedger / FixLedgerInvariants",
       "cli_command": "python ledger.py [add | update | check | next | list | show | recover | observe] [--ledger <path>]",
       "inputs": [
@@ -170,6 +182,26 @@
         "Transport must acknowledge callback queries and remains the sole poller owner"
       ]
     },
+    "session_crash_monitor.py": {
+      "role": "Independent external supervisor for target Veyyon session instances. Binds sessionUUID + verified PID + creation time to detect unexpected terminations, distinguish planned restarts via marker suppression, handle PID reuse, deduplicate per owner termination, and deliver alerts through verified Telegram outbound routing without running an inbound poller.",
+      "owner": "CrashTelegramMonitor",
+      "cli_command": "python session_crash_monitor.py [--session-id <uuid>] [--pid <pid>] [--state-file <path>] [--marker-path <path>] [--poll-interval <sec>] [--dry-run] [--test-telegram] [--status]",
+      "inputs": [
+        "Operating system process probe (PID, creation time, exit code, command line)",
+        "Planned restart marker JSON (session directory or workflows directory)",
+        "Durable crash monitor state JSON with file locking",
+        "TelegramNotificationAdapter configuration for outbound alert"
+      ],
+      "outputs": [
+        "Durable recorded terminations and unsent queues in crash_monitor_state.json",
+        "Concise plain-text crash alerts delivered to verified Telegram slot"
+      ],
+      "boundaries": [
+        "Strictly outbound supervisor: zero inbound poller or receiver ownership",
+        "No automatic restart of Main process",
+        "Distinguishes alive process (quiet/slow model/paused goal) from termination"
+      ]
+    },
     "worker_backend.py": {
       "role": "Durable native background worker execution by default: validates the exact repository/head before persisting a compact prompt/schema ticket, binds the actual agent task handle, and finalizes the delivered result through one shared exact-head, artifact, executed-check, and bug-reproduction validation path. Explicit agent CLI backends remain opt-in; preparation never advances lifecycle state.",
       "owner": "ImplementContinuousExecution",
@@ -292,6 +324,8 @@
   "export": {
     "required_files": [
       "coordinator.py",
+      "github_work_item.py",
+      "review_content.py",
       "ledger.py",
       "decision_workflow.py",
       "preflight.py",
@@ -314,10 +348,15 @@
       "continuation_driver.py",
       "recurrence_guard.py",
       "WORKER_EXECUTION.md",
-      "diagnostics.py"
+      "diagnostics.py",
+      "telegram_workflow.py",
+      "session_crash_monitor.py"
     ],
     "optional_files": [
       "usage_snapshot_cache.json",
+      "test_github_work_item.py",
+      "test_install_github_native.py",
+      "install_github_native.py",
       "ledger.json",
       "test_superboard_adapter.py",
       "test_github_pr_gate.py",
@@ -328,7 +367,9 @@
       "test_worker_backend.py",
       "test_continuation_driver.py",
       "test_recurrence_guard.py",
-      "test_diagnostics.py"
+      "test_diagnostics.py",
+      "test_telegram_workflow.py",
+      "test_session_crash_monitor.py"
     ]
   }
 }

@@ -739,20 +739,21 @@ class ContinuationDriver:
     @staticmethod
     def _decision_is_authorized_answer(dec: Mapping[str, Any]) -> bool:
         """
-        True only for a real answer from an authorized human operator.
+        True only for an answer from a distinct authorized GitHub user event or
+        verified Telegram callback.
 
-        Requires all of: status "answered", an answer payload, human_operator
-        provenance, not flagged as a test, a non-empty interpretation, and a
-        responder on the decision's own authorized_responders list. Any weaker
-        combination is exactly what the decision workflow is built to reject, so
-        the driver must not resume on it.
+        Requires all of: status "answered", an answer payload,
+        github_verified_user or telegram_verified_callback provenance, not
+        flagged as a test, a non-empty interpretation, and a responder on the
+        decision's authorized list. Legacy human_operator, synthetic,
+        ambiguous, and unverified provenance remain blocking.
         """
         if dec.get("status") != "answered":
             return False
         answer = dec.get("answer")
         if not isinstance(answer, Mapping):
             return False
-        if answer.get("provenance") != "human_operator":
+        if answer.get("provenance") not in ("github_verified_user", "telegram_verified_callback"):
             return False
         if answer.get("is_test"):
             return False
