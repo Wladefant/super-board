@@ -1607,7 +1607,8 @@ class TelegramNotificationAdapter:
         issue_url = (
             d_dict.get("issue_url")
             or d_dict.get("canonical_issue_url")
-            or "https://github.com/Bavariance/polysimulator/issues/4543"
+            or d_dict.get("project_url")
+            or ""
         )
         project = project_override or "Bavariance/polysimulator"
         # A decision reply must reach the session that raised it, so prefer the
