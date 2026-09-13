@@ -116,6 +116,10 @@ export function markdownToTelegramHtml(markdown: string, defaultRepo = "Bavarian
   // 6. Markdown blockquotes: >> and > (before escapeHtml, with placeholder delimiters)
   text = convertBlockquotesToHtml(text, addPlaceholder);
 
+  // Generated command/help HTML already escapes its text. Keep valid entities
+  // encoded once; restoring them never turns encoded markup into active tags.
+  text = text.replace(/&(?:amp|lt|gt|quot|#\d+|#x[0-9a-f]+);/gi, entity => addPlaceholder(entity));
+
   // 7. Escape remaining user text (<, >, &)
   text = escapeHtml(text);
 
