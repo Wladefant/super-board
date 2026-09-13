@@ -2,7 +2,7 @@
 """
 Request Ledger Utility (workflows/ledger.py)
 
-Machine-local durable request ledger and restart recovery cache using Python standard library.
+Machine-local execution checkpoint and restart recovery cache using Python standard library.
 Pure standard library implementation with no harness or framework imports.
 
 Architecture:
@@ -34,7 +34,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 VALID_STATES = [
     "pending",
@@ -106,6 +106,7 @@ ALLOWED_TRANSITIONS_LOCAL_DOC: Dict[str, List[str]] = {
     "QA": ["review", "implementation"],
     "review": ["done", "QA", "implementation", "awaiting authorization"],
     "awaiting authorization": ["done", "implementation"],
+    "integration": ["done", "implementation"],
     "done": [],  # Terminal state
 }
 
@@ -357,8 +358,8 @@ class FileLock:
 
 class RequestLedger:
     """
-    Durable JSON request ledger manager with exclusive locking, atomic updates,
-    and strict invariant enforcement.
+    Execution checkpoint cache with exclusive locking and atomic updates.
+    GitHub owns issue structure and project state; refresh before scheduling.
     """
 
     def __init__(
@@ -406,6 +407,8 @@ class RequestLedger:
 
     def _save_data_unlocked(self, data: Dict[str, Any]):
         data["updated_at"] = get_iso_timestamp()
+        data["role"] = "local_recovery_cache"
+        data["authority"] = "github_issues_and_superboard"
         dir_name = os.path.dirname(self.ledger_path)
         os.makedirs(dir_name, exist_ok=True)
 
@@ -618,6 +621,8 @@ class RequestLedger:
         actor: Optional[str] = None,
         reason: str = "Update",
     ) -> Dict[str, Any]:
+        from github_work_item import reject_local_reports
+        reject_local_reports([add_evidence, criterion_update, github_update])
         with FileLock(self.lock_path):
             data = self._load_data_unlocked()
             if req_id not in data["requests"]:
@@ -1191,7 +1196,27 @@ class RequestLedger:
             reason=f"Cleared decision blocker {decision_id}",
         )
 
+    def refresh_from_github(self, req_id: str, reader=None) -> Dict[str, Any]:
+        """Read API truth; retain a labelled cache, never a stale dispatch fallback."""
+        from github_work_item import execution_view, fetch_work_item
+        before = self.get_request(req_id)
+        snapshot = (reader or fetch_work_item)(before)
+        with FileLock(self.lock_path):
+            data = self._load_data_unlocked()
+            current = data["requests"][req_id]
+            if current.get("github", {}).get("issue_url") != before.get("github", {}).get("issue_url"):
+                raise ValueError("Issue identity changed during GitHub refresh; retry intake")
+            view = execution_view(current, snapshot)
+            current["github_cache"] = {
+                "role": "api_read_cache", "fetched_at": get_iso_timestamp(),
+                "authority": snapshot["url"], "snapshot": snapshot,
+            }
+            current["superboard"] = view["superboard"]
+            self._save_data_unlocked(data)
+            return view
+
     def get_request(self, req_id: str) -> Dict[str, Any]:
+        """Inspect a resumable execution cache; use refresh_from_github to schedule."""
         with FileLock(self.lock_path):
             data = self._load_data_unlocked()
             if req_id not in data["requests"]:
@@ -1447,6 +1472,42 @@ class RequestLedger:
                 "active_requests": active_requests,
             }
 
+    def check_topic_coverage(
+        self,
+        roster: Optional[Sequence[Dict[str, Any]]] = None,
+        sources: Optional[Sequence[Union[str, Dict[str, Any]]]] = None,
+        ram_used_pct: Optional[float] = None,
+        authorized_task_ids: Optional[Set[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Evaluate full topic coverage and inventory preservation invariants.
+        Enforces that every runnable topic has an active native worker,
+        worker floor (7) is satisfied unless RAM exception applies,
+        no items dropped, and emits actionable next-ready assignments.
+        """
+        try:
+            from topic_inventory_guard import TopicInventoryGuard
+        except ImportError:
+            import topic_inventory_guard
+            TopicInventoryGuard = topic_inventory_guard.TopicInventoryGuard
+
+        guard = TopicInventoryGuard(baseline_sources=sources)
+        with FileLock(self.lock_path):
+            ledger_data = self._load_data_unlocked()
+
+        ledger_items = guard.parse_inventory_source(ledger_data)
+        reconciled_items, _ = guard.reconcile_sources_additively(
+            sources=sources, current_inventory=ledger_items if not sources else None
+        )
+
+        report = guard.evaluate_topic_coverage(
+            inventory=reconciled_items,
+            roster=roster or [],
+            ram_used_pct=ram_used_pct,
+            authorized_task_ids=authorized_task_ids,
+        )
+        return report.to_dict()
+
 
 # ----------------------------------------------------------------------
 # CLI Interface
@@ -1606,6 +1667,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_rec = subparsers.add_parser("recover", help="Restart recovery reading disk ledger")
     p_rec.add_argument("--json", action="store_true", help="Output JSON")
 
+
+    # TOPIC-COVERAGE
+    p_cov = subparsers.add_parser("topic-coverage", help="Evaluate topic inventory and active worker coverage invariants")
+    p_cov.add_argument("--sources", nargs="*", help="Baseline source JSON file paths")
+    p_cov.add_argument("--roster-json", default=None, help="Path to native roster JSON file")
+    p_cov.add_argument("--ram-pct", type=float, default=None, help="Measured RAM usage percentage")
+    p_cov.add_argument("--strict", action="store_true", help="Exit non-zero if violations found")
+    p_cov.add_argument("--json", action="store_true", help="Output JSON")
     return parser
 
 
@@ -1883,6 +1952,31 @@ def main():
                     if info["stale_evidence_count"] > 0:
                         print(f"      Stale Evidence Count: {info['stale_evidence_count']}")
                     print("  " + "-" * 50)
+        elif args.command == "topic-coverage":
+            roster = []
+            if args.roster_json and os.path.exists(args.roster_json):
+                with open(args.roster_json, "r", encoding="utf-8") as f:
+                    roster = json.load(f)
+            cov = ledger.check_topic_coverage(
+                roster=roster,
+                sources=args.sources,
+                ram_used_pct=args.ram_pct,
+            )
+            if args.json:
+                print(json.dumps(cov, indent=2))
+            else:
+                print(f"Status: {'PASS' if cov['ok'] else 'FAIL'}")
+                print(cov.get("summary", ""))
+                if cov.get("violations"):
+                    print("\nViolations:")
+                    for v in cov["violations"]:
+                        print(f"  - [{v['kind']}] {v['message']}")
+                if cov.get("next_assignments"):
+                    print(f"\nNext Actionable Assignments ({len(cov['next_assignments'])}):")
+                    for a in cov["next_assignments"]:
+                        print(f"  - [P{a['priority']}] [{a['topic']}] {a['content']}")
+            if args.strict and not cov["ok"]:
+                sys.exit(1)
 
     except Exception as e:
         print(f"[ERROR] {e}", file=sys.stderr)
