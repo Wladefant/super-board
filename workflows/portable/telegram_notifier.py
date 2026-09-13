@@ -38,13 +38,16 @@ Invariants:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import html
 import json
 import os
 import re
+import socket
 import sqlite3
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -68,7 +71,10 @@ DEFAULT_COOLDOWN_SECONDS = 300       # 5 minutes per request
 DEFAULT_GLOBAL_MIN_INTERVAL = 30     # 30 seconds between outgoing messages
 DEFAULT_REMINDER_CADENCE_SECONDS = 900.0  # 15 minutes bounded recurring cadence
 DEFAULT_HTTP_TIMEOUT = 10            # 10 seconds timeout for Telegram Bot API
-
+DEFAULT_HARD_DEADLINE_SECONDS = 15.0  # Hard overall execution deadline per issue #93
+DEFAULT_CONNECT_TIMEOUT = 5.0
+DEFAULT_SQLITE_TIMEOUT = 3.0
+DEFAULT_LOCK_TIMEOUT = 3.0
 # Default paths
 DEFAULT_MANIFEST_PATHS = [
     Path(__file__).resolve().parent.parent / "telegram" / "manifest.json",
@@ -78,6 +84,7 @@ DEFAULT_MANIFEST_PATHS = [
 ]
 DEFAULT_CHANNELS_BASE = Path.home() / ".claude" / "channels"
 DEFAULT_POOL_DB_PATH = Path.home() / ".veyyon" / "telegram" / "bot_pool.db"
+DEFAULT_STATE_FILE_PATH = Path.home() / ".veyyon" / "telegram" / "telegram_notify_state.json"
 
 # Shared with the TypeScript session bridge (coordinator.ts). Both writers must keep
 # this definition byte-identical so a reply can be resolved by either side.
@@ -119,6 +126,91 @@ CREATE INDEX IF NOT EXISTS idx_decision_callbacks_session
 # Values of VEYYON_POOL_DB that mean "no correlation", so a caller inside an installed
 # pool can turn recording off without editing code.
 POOL_DB_OFF_VALUES = {"", "0", "off", "none", "disabled", "false"}
+
+
+def _safe_urlopen(
+    req: urllib.request.Request,
+    timeout: float = DEFAULT_HTTP_TIMEOUT,
+    deadline: float = DEFAULT_HARD_DEADLINE_SECONDS,
+) -> bytes:
+    """Execute HTTP request with strict socket timeout and overall deadline bounds.
+
+    Guarantees that DNS resolution, TLS handshake, connect, send, and read
+    complete within min(timeout, deadline) seconds or raise TimeoutError.
+    """
+    effective_timeout = min(timeout, deadline)
+    old_timeout = socket.getdefaulttimeout()
+    try:
+        socket.setdefaulttimeout(effective_timeout)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            def _fetch() -> bytes:
+                with urllib.request.urlopen(req, timeout=effective_timeout) as resp:
+                    res = resp.read()
+                    return res.encode("utf-8") if isinstance(res, str) else res
+            future = executor.submit(_fetch)
+            try:
+                return future.result(timeout=effective_timeout)
+            except concurrent.futures.TimeoutError:
+                raise TimeoutError(f"HTTP request timed out after {effective_timeout:.1f}s")
+    finally:
+        socket.setdefaulttimeout(old_timeout)
+
+
+class ProcessDeadlineWatchdog:
+    """Guaranteed process deadline watchdog to prevent silent hangs.
+
+    Enforces issue #93 receipt contract: if execution exceeds deadline (default 15s),
+    a structured JSON receipt (or formatted failure) is emitted and process exits non-zero.
+    """
+
+    def __init__(
+        self,
+        timeout: float = DEFAULT_HARD_DEADLINE_SECONDS,
+        json_output: bool = True,
+        slot_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        event_signature: Optional[str] = None,
+    ):
+        self.timeout = timeout
+        self.json_output = json_output
+        self.slot_id = slot_id
+        self.session_id = session_id
+        self.event_signature = event_signature
+        self._timer: Optional[threading.Timer] = None
+
+    def start(self) -> None:
+        def _on_timeout() -> None:
+            receipt = {
+                "delivered": False,
+                "status": "failed",
+                "reason": f"Execution deadline exceeded ({self.timeout:.1f}s timeout)",
+                "event_signature": self.event_signature or "",
+                "message_id": None,
+                "chat_id": "[REDACTED_DESTINATION]",
+                "bot_id": None,
+                "timestamp_utc": time.time(),
+                "slot_id": self.slot_id,
+                "session_id": self.session_id,
+                "correlation_status": "deadline_exceeded",
+                "correlation_recorded": False,
+                "correlation_source": "none",
+                "reply_markup": None,
+            }
+            if self.json_output:
+                sys.stdout.write(json.dumps(receipt, indent=2) + "\n")
+            else:
+                sys.stdout.write(f"[FAILED] Execution deadline exceeded ({self.timeout:.1f}s timeout)\n")
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(1)
+
+        self._timer = threading.Timer(self.timeout, _on_timeout)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def cancel(self) -> None:
+        if self._timer:
+            self._timer.cancel()
 
 
 def resolve_pool_db_path(
@@ -177,7 +269,10 @@ class NotificationEvent:
         if not self.project:
             raise ValueError("project is required")
         if not self.summary:
-            raise ValueError("summary is required")
+            if self.metadata.get("raw_message"):
+                self.summary = f"Notification: {self.event_type}"
+            else:
+                raise ValueError("summary is required")
 
 
 @dataclass
@@ -375,12 +470,12 @@ class DeduplicationLedger:
 
     def __init__(
         self,
-        state_file: Path,
+        state_file: Optional[Path] = None,
         dedup_window: float = DEFAULT_DEDUP_WINDOW_SECONDS,
         cooldown_window: float = DEFAULT_COOLDOWN_SECONDS,
         min_global_interval: float = DEFAULT_GLOBAL_MIN_INTERVAL,
     ):
-        self.state_file = state_file
+        self.state_file = Path(state_file) if state_file else DEFAULT_STATE_FILE_PATH
         self.dedup_window = dedup_window
         self.cooldown_window = cooldown_window
         self.min_global_interval = min_global_interval
@@ -404,13 +499,22 @@ class DeduplicationLedger:
             }
 
     def _save(self, data: Dict[str, Any]) -> None:
-        self.state_file.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.state_file.with_suffix(".tmp")
         try:
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self.state_file.with_suffix(f".tmp.{os.getpid()}")
             tmp_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-            tmp_path.replace(self.state_file)
+            for attempt in range(5):
+                try:
+                    tmp_path.replace(self.state_file)
+                    break
+                except PermissionError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.05)
         except Exception:
-            if tmp_path.exists():
+            pass
+        finally:
+            if "tmp_path" in locals() and tmp_path.exists():
                 try:
                     tmp_path.unlink()
                 except Exception:
@@ -511,8 +615,8 @@ class OutboundCorrelationStore:
         return self.db_path is not None
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path), timeout=5.0)
-        conn.execute("PRAGMA busy_timeout = 5000;")
+        conn = sqlite3.connect(str(self.db_path), timeout=DEFAULT_SQLITE_TIMEOUT)
+        conn.execute(f"PRAGMA busy_timeout = {int(DEFAULT_SQLITE_TIMEOUT * 1000)};")
         return conn
 
     def record(
@@ -526,6 +630,7 @@ class OutboundCorrelationStore:
         decision_id: Optional[str] = None,
         project_path: Optional[str] = None,
         now: Optional[float] = None,
+        force: bool = False,
     ) -> bool:
         if not self.enabled or not bot_id or not chat_id or message_id is None or not session_id:
             return False
@@ -557,7 +662,7 @@ class OutboundCorrelationStore:
                         ),
                     )
             return True
-        except (sqlite3.Error, OSError):
+        except (sqlite3.Error, OSError, TimeoutError):
             return False
 
     def lookup(self, bot_id: str, chat_id: str, message_id: int) -> Optional[Dict[str, Any]]:
@@ -571,7 +676,7 @@ class OutboundCorrelationStore:
                     "WHERE bot_id = ? AND chat_id = ? AND message_id = ?",
                     (str(bot_id), str(chat_id), int(message_id)),
                 ).fetchone()
-        except sqlite3.Error:
+        except (sqlite3.Error, OSError, TimeoutError):
             return None
         if not row:
             return None
@@ -606,8 +711,8 @@ class DecisionCallbackStore:
         return self.db_path is not None
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path), timeout=5.0)
-        conn.execute("PRAGMA busy_timeout = 5000;")
+        conn = sqlite3.connect(str(self.db_path), timeout=DEFAULT_SQLITE_TIMEOUT)
+        conn.execute(f"PRAGMA busy_timeout = {int(DEFAULT_SQLITE_TIMEOUT * 1000)};")
         return conn
 
     def create_callback(
@@ -650,7 +755,7 @@ class DecisionCallbackStore:
                         ),
                     )
             return token
-        except (sqlite3.Error, OSError):
+        except (sqlite3.Error, OSError, TimeoutError):
             return None
 
     def lookup(self, callback_token: str) -> Optional[Dict[str, Any]]:
@@ -664,7 +769,7 @@ class DecisionCallbackStore:
                     "FROM decision_callbacks WHERE callback_token = ?",
                     (str(callback_token),),
                 ).fetchone()
-        except sqlite3.Error:
+        except (sqlite3.Error, OSError, TimeoutError):
             return None
         if not row:
             return None
@@ -775,6 +880,8 @@ def truncate_html(value: str, limit: int) -> str:
 
 
 def render_card(event: NotificationEvent) -> str:
+    if event.metadata.get("raw_message"):
+        return str(event.metadata["raw_message"])
     if event.metadata.get("consolidated_questions"):
         return format_consolidated_blockers_presentation(event.metadata["consolidated_questions"], event.canonical_link)
     titles = {"status": "📊 Status update", "milestone": "🚀 Milestone reached",
@@ -913,14 +1020,16 @@ class TelegramNotificationAdapter:
         state_dir_override: Optional[Path] = None,
         correlation_store: Optional[OutboundCorrelationStore] = None,
         callback_store: Optional[DecisionCallbackStore] = None,
+        deadline_seconds: float = DEFAULT_HARD_DEADLINE_SECONDS,
     ):
         self.resolver = resolver or ProjectSlotResolver()
         self.correlation_store = correlation_store or OutboundCorrelationStore()
         self.callback_store = callback_store or DecisionCallbackStore(db_path=self.correlation_store.db_path)
+        self.deadline_seconds = deadline_seconds
         if ledger:
             self.ledger = ledger
         else:
-            state_file = (state_dir_override or Path.cwd()) / "telegram_notify_state.json"
+            state_file = (state_dir_override or Path.cwd()) / "telegram_notify_state.json" if state_dir_override else DEFAULT_STATE_FILE_PATH
             self.ledger = DeduplicationLedger(state_file)
 
     @classmethod
@@ -959,25 +1068,32 @@ class TelegramNotificationAdapter:
         url = f"https://api.telegram.org/bot{token}/getMe"
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "Veyyon-Coordinator/1.0"})
-            with urllib.request.urlopen(req, timeout=DEFAULT_HTTP_TIMEOUT) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                result = data.get("result", {})
-                return {
-                    "ok": True,
-                    "status": "connected",
-                    "slot": slot_info["slotId"],
-                    "state_dir": str(state_dir),
-                    "bot_id": str(result.get("id")),
-                    "bot_username": result.get("username"),
-                    "bot_name": result.get("first_name"),
-                    "configured_destinations": ["[CONFIGURED_DESTINATION]" for _ in destinations],
-                }
+            resp_bytes = _safe_urlopen(req, timeout=DEFAULT_HTTP_TIMEOUT, deadline=self.deadline_seconds)
+            data = json.loads(resp_bytes.decode("utf-8"))
+            result = data.get("result", {})
+            return {
+                "ok": True,
+                "status": "connected",
+                "slot": slot_info["slotId"],
+                "state_dir": str(state_dir),
+                "bot_id": str(result.get("id")),
+                "bot_username": result.get("username"),
+                "bot_name": result.get("first_name"),
+                "configured_destinations": ["[CONFIGURED_DESTINATION]" for _ in destinations],
+            }
         except urllib.error.HTTPError as e:
             return {
                 "ok": False,
                 "status": "http_error",
                 "code": e.code,
                 "reason": f"Telegram HTTP error {e.code}: {e.reason}",
+                "slot": slot_info["slotId"],
+            }
+        except (TimeoutError, socket.timeout) as e:
+            return {
+                "ok": False,
+                "status": "timeout",
+                "reason": f"Connection timed out: {e}",
                 "slot": slot_info["slotId"],
             }
         except Exception as e:
@@ -996,8 +1112,10 @@ class TelegramNotificationAdapter:
         explicit_slot: Optional[str] = None,
         explicit_chat_id: Optional[str] = None,
         now: Optional[float] = None,
+        deadline_seconds: Optional[float] = None,
     ) -> DeliveryReceipt:
         """Evaluates deduplication, formats message, and sends to verified owner destination."""
+        effective_deadline = deadline_seconds if deadline_seconds is not None else self.deadline_seconds
         event.validate()
         sig = DeduplicationLedger.compute_signature(event)
 
@@ -1130,6 +1248,8 @@ class TelegramNotificationAdapter:
         payload["parse_mode"] = "HTML"
         if reply_markup:
             payload["reply_markup"] = reply_markup
+        if event.metadata.get("reply_to_message_id"):
+            payload["reply_parameters"] = {"message_id": int(event.metadata["reply_to_message_id"])}
         images = event.metadata.get("images") or ([event.metadata["screenshot"]] if event.metadata.get("screenshot") else [])
         if images:
             if not isinstance(images, list) or len(images) > 10 or any(
@@ -1162,75 +1282,78 @@ class TelegramNotificationAdapter:
                 },
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=DEFAULT_HTTP_TIMEOUT) as resp:
-                resp_data = json.loads(resp.read().decode("utf-8"))
-                if resp_data.get("ok"):
-                    result = resp_data.get("result", {})
-                    delivered_messages = result if isinstance(result, list) else [result]
-                    if isinstance(result, list):
-                        result = result[0]
-                        if reply_markup:
-                            keyboard_request = urllib.request.Request(
-                                f"https://api.telegram.org/bot{token}/sendMessage",
-                                data=json.dumps({"chat_id": str(target_chat), "text": "Actions for the images above",
-                                                 "reply_markup": reply_markup, "parse_mode": "HTML"}).encode("utf-8"),
-                                headers={"Content-Type": "application/json"}, method="POST",
-                            )
-                            with urllib.request.urlopen(keyboard_request, timeout=DEFAULT_HTTP_TIMEOUT) as keyboard_response:
-                                keyboard_result = json.loads(keyboard_response.read())
-                                if not keyboard_result.get("ok"):
-                                    raise ValueError("Album delivered but action message failed")
-                                delivered_messages.append(keyboard_result["result"])
-                    msg_id = result.get("message_id")
-                    bot_id = str(result.get("from", {}).get("id", ""))
-                    # The chat the API actually delivered to. `target_chat` may be a
-                    # channel name from the allowlist, and the session bridge looks a
-                    # reply up by the numeric chat id Telegram reports, so keying on the
-                    # requested destination would produce a row no reply can ever match.
-                    delivered_chat_id = str(result.get("chat", {}).get("id", target_chat))
-                    self.ledger.record_dispatch(event, now=now)
+            resp_bytes = _safe_urlopen(req, timeout=DEFAULT_HTTP_TIMEOUT, deadline=effective_deadline)
+            resp_data = json.loads(resp_bytes.decode("utf-8"))
+            if resp_data.get("ok"):
+                result = resp_data.get("result", {})
+                delivered_messages = result if isinstance(result, list) else [result]
+                if isinstance(result, list):
+                    result = result[0]
+                    if reply_markup:
+                        keyboard_request = urllib.request.Request(
+                            f"https://api.telegram.org/bot{token}/sendMessage",
+                            data=json.dumps({"chat_id": str(target_chat), "text": "Actions for the images above",
+                                             "reply_markup": reply_markup, "parse_mode": "HTML"}).encode("utf-8"),
+                            headers={"Content-Type": "application/json"}, method="POST",
+                        )
+                        keyboard_bytes = _safe_urlopen(keyboard_request, timeout=DEFAULT_HTTP_TIMEOUT, deadline=effective_deadline)
+                        keyboard_result = json.loads(keyboard_bytes.decode("utf-8"))
+                        if not keyboard_result.get("ok"):
+                            raise ValueError("Album delivered but action message failed")
+                        delivered_messages.append(keyboard_result["result"])
+                msg_id = result.get("message_id")
+                bot_id = str(result.get("from", {}).get("id", ""))
+                # The chat the API actually delivered to. `target_chat` may be a
+                # channel name from the allowlist, and the session bridge looks a
+                # reply up by the numeric chat id Telegram reports, so keying on the
+                # requested destination would produce a row no reply can ever match.
+                delivered_chat_id = str(result.get("chat", {}).get("id", target_chat))
+                self.ledger.record_dispatch(event, now=now)
 
-                    correlation_status = "disabled" if not self.correlation_store.enabled else "unbound"
-                    correlation_recorded = False
-                    if self.correlation_store.enabled and bound_session and msg_id is not None:
-                        recorded = []
-                        for delivered_message in delivered_messages:
-                            recorded.append(self.correlation_store.record(
-                                bot_id=str(delivered_message.get("from", {}).get("id", bot_id)),
-                                chat_id=str(delivered_message.get("chat", {}).get("id", delivered_chat_id)),
-                                message_id=int(delivered_message["message_id"]),
-                                slot_id=str(slot_info["slotId"]),
-                                session_id=bound_session,
-                                request_id=event.request_id or None,
-                                decision_id=event.metadata.get("decision_id"),
-                                project_path=event.project or None,
-                            ))
-                        correlation_recorded = all(recorded)
-                        correlation_status = "recorded" if correlation_recorded else "record_failed"
+                correlation_status = "disabled" if not self.correlation_store.enabled else "unbound"
+                correlation_recorded = False
+                if self.correlation_store.enabled and bound_session and msg_id is not None:
+                    recorded = []
+                    for delivered_message in delivered_messages:
+                        recorded.append(self.correlation_store.record(
+                            bot_id=str(delivered_message.get("from", {}).get("id", bot_id)),
+                            chat_id=str(delivered_message.get("chat", {}).get("id", delivered_chat_id)),
+                            message_id=int(delivered_message["message_id"]),
+                            slot_id=str(slot_info["slotId"]),
+                            session_id=bound_session,
+                            request_id=event.request_id or None,
+                            decision_id=event.metadata.get("decision_id"),
+                            project_path=event.project or None,
+                            force=force,
+                        ))
+                    correlation_recorded = all(recorded)
+                    correlation_status = "recorded" if correlation_recorded else "record_failed"
 
-                    return DeliveryReceipt(
-                        delivered=True,
-                        status="sent",
-                        reason=f"Notification delivered to channel slot '{slot_info['slotId']}' (message_id: {msg_id})",
-                        event_signature=sig,
-                        message_id=msg_id,
-                        chat_id="[REDACTED_DESTINATION]",
-                        bot_id=bot_id,
-                        slot_id=slot_info["slotId"],
-                        session_id=bound_session,
-                        correlation_status=correlation_status,
-                        correlation_recorded=correlation_recorded,
-                        correlation_source=self.correlation_store.source,
-                        reply_markup=reply_markup,
-                    )
-                else:
-                    return DeliveryReceipt(
-                        delivered=False,
-                        status="failed",
-                        reason=f"Telegram API error: {resp_data.get('description', 'Unknown error')}",
-                        event_signature=sig,
-                        chat_id="[REDACTED_DESTINATION]",
-                    )
+                return DeliveryReceipt(
+                    delivered=True,
+                    status="sent",
+                    reason=f"Notification delivered to channel slot '{slot_info['slotId']}' (message_id: {msg_id})",
+                    event_signature=sig,
+                    message_id=msg_id,
+                    chat_id="[REDACTED_DESTINATION]",
+                    bot_id=bot_id,
+                    slot_id=slot_info["slotId"],
+                    session_id=bound_session,
+                    correlation_status=correlation_status,
+                    correlation_recorded=correlation_recorded,
+                    correlation_source=self.correlation_store.source,
+                    reply_markup=reply_markup,
+                )
+            else:
+                return DeliveryReceipt(
+                    delivered=False,
+                    status="failed",
+                    reason=f"Telegram API error: {resp_data.get('description', 'Unknown error')}",
+                    event_signature=sig,
+                    chat_id="[REDACTED_DESTINATION]",
+                    slot_id=slot_info.get("slotId"),
+                    session_id=bound_session,
+                )
         except urllib.error.HTTPError as e:
             try:
                 err_body = e.read().decode("utf-8")
@@ -1244,6 +1367,18 @@ class TelegramNotificationAdapter:
                 reason=f"HTTP {e.code} delivery failure: {desc}",
                 event_signature=sig,
                 chat_id="[REDACTED_DESTINATION]",
+                slot_id=slot_info.get("slotId"),
+                session_id=bound_session,
+            )
+        except (TimeoutError, socket.timeout) as e:
+            return DeliveryReceipt(
+                delivered=False,
+                status="failed",
+                reason=f"Network delivery timed out: {e}",
+                event_signature=sig,
+                chat_id="[REDACTED_DESTINATION]",
+                slot_id=slot_info.get("slotId"),
+                session_id=bound_session,
             )
         except Exception as e:
             return DeliveryReceipt(
@@ -1252,6 +1387,8 @@ class TelegramNotificationAdapter:
                 reason=f"Network delivery exception: {type(e).__name__}: {e}",
                 event_signature=sig,
                 chat_id="[REDACTED_DESTINATION]",
+                slot_id=slot_info.get("slotId"),
+                session_id=bound_session,
             )
 
     @classmethod
@@ -1470,7 +1607,8 @@ class TelegramNotificationAdapter:
         issue_url = (
             d_dict.get("issue_url")
             or d_dict.get("canonical_issue_url")
-            or "https://github.com/Bavariance/polysimulator/issues/4543"
+            or d_dict.get("project_url")
+            or ""
         )
         project = project_override or "Bavariance/polysimulator"
         # A decision reply must reach the session that raised it, so prefer the
@@ -1618,11 +1756,13 @@ class QuestionReminderManager:
         ledger_path: Optional[Path] = None,
         state_file: Optional[Path] = None,
         default_cadence: float = DEFAULT_REMINDER_CADENCE_SECONDS,
+        lock_timeout: float = DEFAULT_LOCK_TIMEOUT,
     ):
         self.decisions_path = Path(decisions_path) if decisions_path else self._locate_decisions_file()
         self.ledger_path = Path(ledger_path) if ledger_path else self._locate_ledger_file()
-        self.state_file = Path(state_file) if state_file else (Path.cwd() / "telegram_notify_state.json")
+        self.state_file = Path(state_file) if state_file else DEFAULT_STATE_FILE_PATH
         self.default_cadence = default_cadence
+        self.lock_timeout = lock_timeout
 
     @classmethod
     def _locate_decisions_file(cls) -> Path:
@@ -1700,51 +1840,58 @@ class QuestionReminderManager:
         """Re-reads decisions.json or ledger.json under FileLock and performs a metadata-only merge.
         Returns False if decision was answered/stopped or became terminal concurrently."""
         lock_file = str(self.decisions_path) + ".lock"
-        with FileLock(lock_file):
-            data = self._load_decisions()
-            decs = data.get("decisions", {})
-            if isinstance(decs, dict) and decision_id in decs:
-                d = decs[decision_id]
-                # Check for concurrent verified answer or stop: NEVER overwrite or resurrect!
-                if d.get("answer") is not None or d.get("status") == "answered" or d.get("reminder_status") in ("answered", "stopped"):
-                    return False
+        try:
+            with FileLock(lock_file, timeout=self.lock_timeout):
+                data = self._load_decisions()
+                decs = data.get("decisions", {})
+                if isinstance(decs, dict) and decision_id in decs:
+                    d = decs[decision_id]
+                    # Check for concurrent verified answer or stop: NEVER overwrite or resurrect!
+                    if d.get("answer") is not None or d.get("status") == "answered" or d.get("reminder_status") in ("answered", "stopped"):
+                        return False
 
-                # Metadata-only merge: update reminder timestamps/counts ONLY
-                d["last_notified_at"] = now
-                d["next_reminder_at"] = now + cadence_seconds
-                d["reminder_count"] = next_count
-                d["reminder_status"] = "active"
+                    # Metadata-only merge: update reminder timestamps/counts ONLY
+                    d["last_notified_at"] = now
+                    d["next_reminder_at"] = now + cadence_seconds
+                    d["reminder_count"] = next_count
+                    d["reminder_status"] = "active"
 
-                self._save_decisions(data)
-                return True
+                    self._save_decisions(data)
+                    return True
+        except (TimeoutError, Exception):
+            pass
 
         # Check ledger.json
         if self.ledger_path.exists():
             ledger_lock = str(self.ledger_path) + ".lock"
-            with FileLock(ledger_lock):
-                try:
-                    ldata = json.loads(self.ledger_path.read_text(encoding="utf-8"))
-                except Exception:
-                    return False
-                found_dec = None
-                for req in ldata.get("requests", {}).values():
-                    for dec in req.get("decisions", []):
-                        if str(dec.get("id") or "").strip() == decision_id:
-                            found_dec = dec
+            try:
+                with FileLock(ledger_lock, timeout=self.lock_timeout):
+                    try:
+                        ldata = json.loads(self.ledger_path.read_text(encoding="utf-8"))
+                    except Exception:
+                        return False
+                    found_dec = None
+                    for req in ldata.get("requests", {}).values():
+                        for dec in req.get("decisions", []):
+                            if str(dec.get("id") or "").strip() == decision_id:
+                                found_dec = dec
+                                break
+                        if found_dec:
                             break
-                    if found_dec:
-                        break
-                if not found_dec:
-                    return False
-                if found_dec.get("answer") is not None or str(found_dec.get("status") or "").strip().lower() in ("answered", "resolved") or found_dec.get("reminder_status") in ("answered", "stopped"):
-                    return False
+                    if not found_dec:
+                        return False
+                    if found_dec.get("answer") is not None or str(found_dec.get("status") or "").strip().lower() in ("answered", "resolved") or found_dec.get("reminder_status") in ("answered", "stopped"):
+                        return False
 
-                found_dec["last_notified_at"] = now
-                found_dec["next_reminder_at"] = now + cadence_seconds
-                found_dec["reminder_count"] = next_count
-                found_dec["reminder_status"] = "active"
-                self.ledger_path.write_text(json.dumps(ldata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-                return True
+                    found_dec["last_notified_at"] = now
+                    found_dec["next_reminder_at"] = now + cadence_seconds
+                    found_dec["reminder_count"] = next_count
+                    found_dec["reminder_status"] = "active"
+
+                    self.ledger_path.write_text(json.dumps(ldata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+                    return True
+            except (TimeoutError, Exception):
+                pass
 
         return False
 
@@ -1756,12 +1903,15 @@ class QuestionReminderManager:
         """Re-reads notify_state.json under lock and updates only question_reminders,
         preserving fresh sent_signatures and last_dispatched_at written by adapter.notify."""
         lock_file = str(self.state_file) + ".lock"
-        with FileLock(lock_file):
-            state = self._load_notify_state()
-            state.setdefault("question_reminders", {})[decision_id] = reminder_dict
-            self._save_notify_state(state)
+        try:
+            with FileLock(lock_file, timeout=self.lock_timeout):
+                state = self._load_notify_state()
+                state.setdefault("question_reminders", {})[decision_id] = reminder_dict
+                self._save_notify_state(state)
+        except (TimeoutError, Exception):
+            pass
 
-    def get_unresolved_questions(self, now: Optional[float] = None) -> List[UnresolvedQuestion]:
+    def get_unresolved_questions(self, now: Optional[float] = None, force: bool = False) -> List[UnresolvedQuestion]:
         now = now or time.time()
         dec_data = self._load_decisions()
         raw_decs = dec_data.get("decisions", {})
@@ -1860,7 +2010,10 @@ class QuestionReminderManager:
             if last_notified is not None and next_reminder is None:
                 next_reminder = last_notified + cadence
 
-            if last_notified is None:
+            if force:
+                is_due = True
+                seconds_remaining = 0
+            elif last_notified is None:
                 is_due = True
                 seconds_remaining = 0
             elif next_reminder is not None:
@@ -1939,7 +2092,10 @@ class QuestionReminderManager:
                 if last_notified is not None and next_reminder is None:
                     next_reminder = last_notified + cadence
 
-                if last_notified is None:
+                if force:
+                    is_due = True
+                    seconds_remaining = 0
+                elif last_notified is None:
                     is_due = True
                     seconds_remaining = 0
                 elif next_reminder is not None:
@@ -2008,8 +2164,8 @@ class QuestionReminderManager:
         - When consolidate=False: dispatches each due question as a plain-language decision presentation with interactive buttons.
         """
         now = now or time.time()
-        questions = self.get_unresolved_questions(now=now)
-        due_questions = [q for q in questions if q.is_due]
+        questions = self.get_unresolved_questions(now=now, force=force)
+        due_questions = [q for q in questions if (q.is_due or force)]
 
         if not due_questions:
             return {
@@ -2214,7 +2370,7 @@ class QuestionReminderManager:
         now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         lock_file = str(self.decisions_path) + ".lock"
         found_in_decisions = False
-        with FileLock(lock_file):
+        with FileLock(lock_file, timeout=self.lock_timeout):
             dec_data = self._load_decisions()
             decs = dec_data.get("decisions", {})
             if isinstance(decs, dict) and decision_id in decs:
@@ -2239,7 +2395,7 @@ class QuestionReminderManager:
             found_in_ledger = False
             if self.ledger_path.exists():
                 ledger_lock = str(self.ledger_path) + ".lock"
-                with FileLock(ledger_lock):
+                with FileLock(ledger_lock, timeout=self.lock_timeout):
                     try:
                         ldata = json.loads(self.ledger_path.read_text(encoding="utf-8"))
                     except Exception:
@@ -2386,14 +2542,66 @@ def main() -> int:
     parser.add_argument("--loop", action="store_true", help="Run supervised recurring reminder loop (no model daemon)")
     parser.add_argument("--loop-interval", type=float, default=60.0, help="Check interval in seconds for the supervised loop (default 60)")
     parser.add_argument("--max-iterations", type=int, default=None, help="Maximum loop iterations (optional, for bounded testing)")
+    parser.add_argument("--raw-message", default=None, help="Explicit pre-formatted HTML message body")
+    parser.add_argument("--reply-to", type=int, default=None, help="Reply to existing Telegram message ID")
+    parser.add_argument("--deadline", type=float, default=DEFAULT_HARD_DEADLINE_SECONDS, help="Overall execution deadline in seconds (default 15.0)")
+    parser.add_argument("--state-file", default=None, help="Explicit path to telegram_notify_state.json")
     args = parser.parse_args()
-    adapter = TelegramNotificationAdapter(
-        correlation_store=OutboundCorrelationStore(Path(args.pool_db) if args.pool_db else None),
-    )
 
+    custom_state_file = Path(args.state_file) if args.state_file else None
+    custom_ledger = DeduplicationLedger(custom_state_file) if custom_state_file else None
+    adapter = TelegramNotificationAdapter(
+        ledger=custom_ledger,
+        correlation_store=OutboundCorrelationStore(Path(args.pool_db) if args.pool_db else None),
+        deadline_seconds=args.deadline if args.deadline is not None else DEFAULT_HARD_DEADLINE_SECONDS,
+    )
+    watchdog = ProcessDeadlineWatchdog(
+        timeout=args.deadline if args.deadline is not None else DEFAULT_HARD_DEADLINE_SECONDS,
+        json_output=args.json,
+        slot_id=args.slot,
+        session_id=args.session,
+    )
+    if not args.loop:
+        watchdog.start()
+
+    try:
+        return _run_main(args, adapter, custom_state_file=custom_state_file, parser=parser)
+    except Exception as e:
+        if args.json:
+            fail_receipt = {
+                "delivered": False,
+                "status": "failed",
+                "reason": f"Execution error: {type(e).__name__}: {e}",
+                "event_signature": "",
+                "message_id": None,
+                "chat_id": "[REDACTED_DESTINATION]",
+                "bot_id": None,
+                "timestamp_utc": time.time(),
+                "slot_id": getattr(args, "slot", None),
+                "session_id": getattr(args, "session", None),
+                "correlation_status": "error",
+                "correlation_recorded": False,
+                "correlation_source": "none",
+                "reply_markup": None,
+            }
+            print(json.dumps(fail_receipt, indent=2))
+        else:
+            print(f"[FAILED] Execution error: {type(e).__name__}: {e}", file=sys.stderr)
+        return 1
+    finally:
+        watchdog.cancel()
+
+
+def _run_main(
+    args: argparse.Namespace,
+    adapter: TelegramNotificationAdapter,
+    custom_state_file: Optional[Path] = None,
+    parser: Optional[argparse.ArgumentParser] = None,
+) -> int:
     if args.reminders or args.dispatch_reminders or args.stop_topic or args.loop:
         rem_mgr = QuestionReminderManager(
             decisions_path=Path(args.decisions_file) if args.decisions_file else None,
+            state_file=custom_state_file,
             default_cadence=args.cadence or DEFAULT_REMINDER_CADENCE_SECONDS,
         )
         if args.stop_topic:
@@ -2504,19 +2712,34 @@ def main() -> int:
             return 0
         if args.links:
             event.metadata.setdefault("links", []).extend(args.links)
-    elif args.event_type and args.summary:
+    elif (args.event_type and args.summary) or args.raw_message:
         primary_link = args.link or (args.links[0] if args.links else "")
+        ev_type = args.event_type or "status"
+        summary_text = args.summary or (f"Notification: {ev_type}" if args.raw_message else "")
         event = NotificationEvent(
-            event_type=args.event_type,
-            project=args.project,
-            request_id=args.request_id,
-            summary=args.summary,
+            event_type=ev_type,
+            project=args.project or "polysimulator",
+            request_id=args.request_id or "cli-notification",
+            summary=summary_text,
             canonical_link=primary_link,
             metadata={"links": args.links} if args.links else {},
             session_id=args.session,
         )
+        if args.raw_message:
+            event.metadata["raw_message"] = args.raw_message
+        if getattr(args, "reply_to", None):
+            event.metadata["reply_to_message_id"] = args.reply_to
     else:
-        parser.print_help()
+        if args.json:
+            print(json.dumps({
+                "delivered": False,
+                "status": "failed",
+                "reason": "Missing required arguments: specify --decision-id, --packet, or --summary/--raw-message",
+                "chat_id": "[REDACTED_DESTINATION]",
+            }, indent=2))
+            return 1
+        if parser:
+            parser.print_help()
         return 1
 
     if args.session:

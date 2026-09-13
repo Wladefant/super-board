@@ -22,6 +22,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -32,6 +33,7 @@ from telegram_notifier import (
     DEFAULT_COOLDOWN_SECONDS,
     DEFAULT_DEDUP_WINDOW_SECONDS,
     DEFAULT_GLOBAL_MIN_INTERVAL,
+    DEFAULT_HARD_DEADLINE_SECONDS,
     MESSAGE_CORRELATIONS_DDL,
     VALID_EVENT_TYPES,
     DeduplicationLedger,
@@ -42,6 +44,9 @@ from telegram_notifier import (
     SecretSanitizer,
     TelegramNotificationAdapter,
     DecisionCallbackStore,
+    ProcessDeadlineWatchdog,
+    QuestionReminderManager,
+    _safe_urlopen,
     build_decision_inline_keyboard,
     format_decision_presentation,
     resolve_pool_db_path,
@@ -1409,6 +1414,125 @@ class TestDecisionInteractiveCallback(unittest.TestCase):
             self.assertEqual(record["choice_id"], choice)
             self.assertEqual(record["decision_id"], "decision-example")
             self.assertEqual(record["session_id"], "session-owner")
+
+
+class TestTelegramNotifierHardening(unittest.TestCase):
+    """Targeted regression tests for Issue #92 and #93 hardening:
+    - Bounded network execution via _safe_urlopen
+    - Guaranteed JSON failure receipt on deadline watchdog
+    - --force bypasses cadence in QuestionReminderManager
+    - Structured delivery receipts on transport timeout
+    - Raw HTML message and reply-to message ID support
+    """
+
+    def test_safe_urlopen_timeout_enforced(self):
+        import urllib.request
+        # Using a dummy unreachable/blackhole IP to verify quick timeout without hanging
+        req = urllib.request.Request("http://10.255.255.1:81/")
+        start_t = time.time()
+        with self.assertRaises((TimeoutError, OSError)):
+            _safe_urlopen(req, timeout=0.2, deadline=0.2)
+        elapsed = time.time() - start_t
+        self.assertLess(elapsed, 2.0, "Timeout should be enforced well within 2 seconds")
+
+    def test_watchdog_process_deadline_emits_json_receipt(self):
+        # Run a subprocess script that initializes watchdog with 0.3s deadline and hangs
+        code = (
+            "import sys, time; "
+            "from telegram_notifier import ProcessDeadlineWatchdog; "
+            "wd = ProcessDeadlineWatchdog(timeout=0.3, json_output=True, slot_id='test-slot'); "
+            "wd.start(); "
+            "time.sleep(5.0)"
+        )
+        start_t = time.time()
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            cwd=str(Path(__file__).parent),
+        )
+        elapsed = time.time() - start_t
+        self.assertNotEqual(proc.returncode, 0, "Subprocess must exit non-zero when deadline exceeded")
+        self.assertLess(elapsed, 2.0, "Watchdog must terminate process promptly")
+        # Verify JSON receipt was emitted to stdout
+        data = json.loads(proc.stdout)
+        self.assertFalse(data.get("delivered"))
+        self.assertEqual(data.get("status"), "failed")
+        self.assertIn("Execution deadline exceeded", data.get("reason", ""))
+        self.assertEqual(data.get("slot_id"), "test-slot")
+
+    def test_question_reminder_force_bypasses_cadence(self):
+        with tempfile.TemporaryDirectory() as td:
+            dp = Path(td) / "decisions.json"
+            sp = Path(td) / "telegram_notify_state.json"
+            lp = Path(td) / "empty_ledger.json"
+            lp.write_text(json.dumps({"version": 1, "requests": {}}), encoding="utf-8")
+            now = time.time()
+            dp.write_text(json.dumps({
+                "version": 1,
+                "decisions": {
+                    "dec-123": {
+                        "decision_id": "dec-123",
+                        "status": "pending",
+                        "question": "Choose an option?",
+                        "last_notified_at": now - 10.0,  # Only 10s ago (cadence 900s)
+                        "next_reminder_at": now + 890.0,
+                    }
+                }
+            }), encoding="utf-8")
+            mgr = QuestionReminderManager(decisions_path=dp, ledger_path=lp, state_file=sp)
+            # Normal check: not due
+            unresolved_normal = mgr.get_unresolved_questions(now=now, force=False)
+            self.assertEqual(len(unresolved_normal), 1)
+            self.assertFalse(unresolved_normal[0].is_due)
+
+            # Forced check: due immediately!
+            unresolved_forced = mgr.get_unresolved_questions(now=now, force=True)
+            self.assertEqual(len(unresolved_forced), 1)
+            self.assertTrue(unresolved_forced[0].is_due)
+            self.assertEqual(unresolved_forced[0].seconds_remaining, 0)
+
+    def test_adapter_network_timeout_receipt_contract(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_dir = Path(td) / "test-slot"
+            state_dir.mkdir(parents=True)
+            (state_dir / ".env").write_text("TELEGRAM_BOT_TOKEN=dummy:token\n", encoding="utf-8")
+            (state_dir / "access.json").write_text(json.dumps({"allowFrom": ["123456"]}), encoding="utf-8")
+            manifest = {
+                "version": 1,
+                "slots": [{"slotId": "test-slot", "stateDir": str(state_dir), "preferredProjects": ["test"], "enabled": True}],
+            }
+            manifest_path = Path(td) / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            resolver = ProjectSlotResolver(manifest_path=manifest_path)
+            adapter = TelegramNotificationAdapter(resolver=resolver, state_dir_override=Path(td))
+            event = NotificationEvent(
+                event_type="milestone",
+                project="test",
+                request_id="req-1",
+                summary="Build succeeded",
+                canonical_link="https://example.com",
+            )
+            with patch("telegram_notifier._safe_urlopen", side_effect=TimeoutError("HTTP request timed out after 10.0s")):
+                receipt = adapter.notify(event, dry_run=False)
+                self.assertFalse(receipt.delivered)
+                self.assertEqual(receipt.status, "failed")
+                self.assertIn("timed out", receipt.reason)
+                self.assertEqual(receipt.chat_id, "[REDACTED_DESTINATION]")
+    def test_raw_message_and_reply_to_payload(self):
+        raw_html = "<b>Bold title</b>\n<code>Code block</code>"
+        event = NotificationEvent(
+            event_type="status",
+            project="test",
+            request_id="req-2",
+            summary="",
+            canonical_link="",
+            metadata={"raw_message": raw_html, "reply_to_message_id": 9988},
+        )
+        event.validate()
+        rendered = TelegramNotificationAdapter.format_message(event)
+        self.assertEqual(rendered, raw_html)
 
 
 if __name__ == "__main__":
