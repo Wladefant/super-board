@@ -31,7 +31,8 @@ export interface PollerCallbacks {
   onRelease: () => Promise<void>;
   getStatusText: () => string;
   onTelegramTurnStart: () => void;
-  onHarnessCommand?: (text: string, chatId: string) => Promise<boolean>;
+  onHarnessCommand?: (text: string, chatId: string, userId?: string) => Promise<boolean>;
+  onApprovalCallback?: (data: string, userId: string, chatId: string, sessionId: string) => Promise<string>;
   onDecisionCallback?: (
     decisionId: string,
     choiceId: string,
@@ -227,7 +228,8 @@ export class TelegramPoller {
     },
     defaultRepo = "Bavariance/polysimulator",
   ): Promise<TelegramSendMessageResponse | null> {
-    const formatted = markdownToTelegramHtml(redactSecrets(text), defaultRepo);
+    const sanitized = redactSecrets(text);
+    const formatted = replyMarkupOrParseMode === "HTML" ? sanitized : markdownToTelegramHtml(sanitized, defaultRepo);
     if (!formatted.trim()) return null;
 
     const replyMarkup = typeof replyMarkupOrParseMode === "string"
@@ -586,6 +588,22 @@ export class TelegramPoller {
     if (row.is_callback === 1 || Boolean(row.callback_query_id)) {
       const callbackToken = row.callback_data || row.text || "";
       const cbQueryId = row.callback_query_id || "";
+      if (callbackToken.startsWith("ap:")) {
+        const sessionId = this.correlation?.getSessionId();
+        try {
+          if (!sessionId || !this.callbacks.onApprovalCallback) throw new Error("Approval handling is unavailable.");
+          const outcome = await this.callbacks.onApprovalCallback(callbackToken, fromId, chatId, sessionId);
+          if (cbQueryId) await this.answerCallbackQuery(cbQueryId, outcome);
+          if (typeof row.reply_to_message_id === "number") await this.clearCallbackButtons(chatId, row.reply_to_message_id);
+          await this.sendTelegramMessage(chatId, escapeHtml(outcome));
+          this.db.run("UPDATE update_ledger SET status = 'COMPLETED', correlated_session_id = ? WHERE update_id = ?", [sessionId, row.update_id]);
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : "Approval decision unavailable; nothing authorized.";
+          if (cbQueryId) await this.answerCallbackQuery(cbQueryId, detail, true);
+          this.db.run("UPDATE update_ledger SET status = 'REJECTED', error = 'APPROVAL_REJECTED' WHERE update_id = ?", [row.update_id]);
+        }
+        return;
+      }
 
       if (!this.correlation?.resolveCallback) {
         if (cbQueryId) {
@@ -725,7 +743,7 @@ export class TelegramPoller {
     }
 
     // 4. Command handling
-    if (!row.media_json && await this.callbacks.onHarnessCommand?.(rawText, chatId)) {
+    if (await this.callbacks.onHarnessCommand?.(rawText, chatId, fromId)) {
       this.db.run("UPDATE update_ledger SET status = 'COMPLETED' WHERE update_id = ?", [row.update_id]);
       return;
     }

@@ -19,6 +19,7 @@ import type {
 } from "@veyyon/coding-agent";
 import { BotPoolCoordinator } from "./coordinator";
 import { DangerousToolGuard, approveOperation } from "./guard";
+import { decideApproval, parseApprovalCallback, approvalOutcome } from "./approvals";
 import { TelegramPoller } from "./poller";
 import { chunkMessage, escapeHtml, markdownToTelegramHtml } from "./sanitizer";
 import type { DiscoveredSlot, MessageCorrelationBridge } from "./types";
@@ -275,7 +276,7 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
             }
           },
           getStatusText: () => getStatusSummary(ctx, activeSlot, currentSessionId()),
-          onHarnessCommand: (text, chatId) => handleInstalledCommand(text, {
+          onHarnessCommand: (text, chatId, userId) => handleInstalledCommand(text, {
             session: () => ({
               id: currentSessionId(),
               cwd: ctx.cwd,
@@ -283,7 +284,12 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
               model: ctx.model?.id,
               stateDir: activeSlot!.stateDir,
             }),
-            approve: token => approveOperation(activeSlot!.stateDir, token),
+            approve: async token => {
+              if (!userId) throw new Error("Authenticated actor is missing.");
+              const record = approveOperation(activeSlot!.stateDir, token, { sessionId: currentSessionId(), userId, chatId });
+              await pi.sendUserMessage(approvalOutcome(record), ctx.isIdle() ? undefined : { deliverAs: "steer" });
+              return record;
+            },
             send: async html => {
               const sent = await poller.sendTelegramMessage(chatId, html);
               if (!sent?.ok) throw new Error("Telegram delivery failed");
@@ -301,6 +307,13 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
               else pi.sendUserMessage(message, { deliverAs: "steer" });
             },
           }, new BunCommandRunner()),
+          onApprovalCallback: async (data, userId, chatId, sessionId) => {
+            const selection = parseApprovalCallback(data);
+            if (!selection || sessionId !== currentSessionId()) throw new Error("Invalid or foreign-session approval callback.");
+            const record = decideApproval(activeSlot!.stateDir, selection.token, selection.decision, { sessionId, userId, chatId });
+            await pi.sendUserMessage(approvalOutcome(record), ctx.isIdle() ? undefined : { deliverAs: "steer" });
+            return record.state === "denied" ? "Denied. The requester was told not to run this operation." : `Approved once. Requester notified; identical retry expires ${record.expiresAt}.`;
+          },
           onTelegramTurnStart: () => {
             if (guard) guard.startTelegramTurn();
           },
@@ -472,21 +485,35 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
 
   // Actionable approval requests are user-facing; other raw tool lifecycle events stay local.
 
-  pi.on("tool_call", async (event: ToolCallEvent) => {
+  pi.on("tool_call", async (event: ToolCallEvent, ctx: ExtensionContext) => {
     const root = globalState[ACTIVE_ROOT_SYMBOL];
     if (!root || root.instanceId !== instanceId || !root.guard) return;
 
     const evaluation = root.guard.evaluateToolCall(
       event.toolName,
       event.input as Record<string, unknown>,
+      undefined,
+      {
+        sessionId: root.sessionId,
+        requester: ctx.agentId ?? "Main (interactive root agent)",
+        task: String(event.input.i ?? event.input.title ?? `Run ${event.toolName}; no task description supplied`),
+        cwd: ctx.cwd,
+        toolCallId: event.toolCallId,
+      },
     );
 
     if (!evaluation.allowed) {
       const chatId = root.poller.getPrimaryChatId();
-      if (chatId && evaluation.approvalHash) {
-        const card = renderApprovalRequest(evaluation.category ?? "operation", evaluation.approvalHash);
-        // Delivery failure must never turn a refusal into permission.
-        try { await root.poller.sendTelegramMessage(chatId, card.text, card.replyMarkup); } catch {}
+      if (chatId && evaluation.approval) {
+        const card = renderApprovalRequest(evaluation.approval);
+        // Send every detail before attaching buttons; never silently truncate a command.
+        try {
+          const chunks = chunkMessage(card.text);
+          for (let n = 0; n < chunks.length; n++) {
+            const sent = await root.poller.sendTelegramMessage(chatId, chunks[n], "HTML", n === chunks.length - 1 ? card.replyMarkup : undefined);
+            if (!sent?.ok) break;
+          }
+        } catch {}
       }
       return {
         block: true,

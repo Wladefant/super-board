@@ -1,14 +1,15 @@
 /** Channel-neutral execution guard. Transport origin is observability, never authority. */
-import { createHash, randomUUID } from "node:crypto";
-import * as fs from "node:fs";
+import { createHash } from "node:crypto";
 import * as path from "node:path";
 import { evalCommands } from "./guard-eval";
+import { describeApproval, evaluateApproval, decideApproval, type ApprovalContext, type ApprovalActor, type ApprovalRecord } from "./approvals";
 
 export interface ToolGuardEvaluation {
   allowed: boolean;
   reason?: string;
   category?: string;
   approvalHash?: string;
+  approval?: ApprovalRecord;
 }
 
 // Historical inventory retained intact for diagnosis; NOT applied to arbitrary tool text.
@@ -69,40 +70,13 @@ function extractAllStrings(val: unknown, depth = 0): string[] {
 const SECRET_PATH = /(?:^|[/\\])\.env\.prod\b|\b(id_rsa|service_role|jwt_secret|\.env\.prod)\b/i;
 const PROTECTED = /^(main|master|staging|production|prod)$/i;
 const PRODUCTION = /(?:\bzaraprptkegxqpvnsubu\b|\bakamai-iad-prod\b)/i;
-const TTL = 15 * 60 * 1000;
-export interface ApprovalRecord {
-  version: 1;
-  category: string;
-  content: string;
-  expiresAt: string;
-  singleUse: true;
-}
+const LOCAL_CONTEXT: ApprovalContext = { sessionId: "local", requester: "Local operator", task: "Local guarded operation", cwd: process.cwd() };
 export function computeApprovalHash(category: string, content: string): string {
   return createHash("sha256").update(`${category}:${content.trim()}`).digest("hex");
 }
-function validRecord(data: ApprovalRecord, token: string): boolean {
-  return data.version === 1 && data.singleUse === true && typeof data.category === "string" &&
-    typeof data.content === "string" && typeof data.expiresAt === "string" &&
-    Number.isFinite(Date.parse(data.expiresAt)) && Date.parse(data.expiresAt) > Date.now() &&
-    computeApprovalHash(data.category, data.content) === token;
-}
-/** Only an authenticated operator command may call this; the guard never approves itself. */
-export function approveOperation(stateDir: string, token: string): ApprovalRecord {
-  if (!/^[a-f0-9]{64}$/.test(token)) throw new Error("Use the complete 64-character approval token.");
-  const pending = path.join(stateDir, "approved", "pending", `${token}.json`);
-  let record: ApprovalRecord;
-  try { record = JSON.parse(fs.readFileSync(pending, "utf8")); }
-  catch { throw new Error("No pending operation for this token. Retry the refused call to request approval."); }
-  if (!validRecord(record, token)) throw new Error("Approval request expired or invalid. Retry the refused call.");
-  const approved = path.join(stateDir, "approved", `${token}.json`);
-  const claim = `${pending}.${randomUUID()}.claimed`;
-  // Atomic rename prevents two command processes from approving the same request.
-  fs.renameSync(pending, claim);
-  try {
-    record.expiresAt = new Date(Date.now() + TTL).toISOString();
-    fs.writeFileSync(approved, JSON.stringify(record), { flag: "wx", mode: 0o600 });
-  } finally { fs.unlinkSync(claim); }
-  return record;
+/** Only the authenticated Telegram transport or an explicit local operator command calls this. */
+export function approveOperation(stateDir: string, token: string, actor: ApprovalActor = { sessionId: "local", userId: "local-operator", chatId: "local" }): ApprovalRecord {
+  return decideApproval(stateDir, token, "approved", actor);
 }
 
 /** Shell words, not a prose scan: separators outside quotes introduce invocations. */
@@ -258,14 +232,22 @@ export class DangerousToolGuard {
   public startLocalTurn(): void { this.currentTurnState = "LOCAL_ACTIVE"; this.activeTelegramTurnId = null; }
   public endTurn(): void { this.currentTurnState = "IDLE"; this.activeTelegramTurnId = null; }
   public isTelegramTurnActive(): boolean { return this.currentTurnState === "TELEGRAM_ACTIVE"; }
-  public evaluateToolCall(toolName: string, input: Record<string, unknown>, _isTelegramOverride?: boolean): ToolGuardEvaluation {
+  public evaluateToolCall(toolName: string, input: Record<string, unknown>, _isTelegramOverride?: boolean, context: ApprovalContext = LOCAL_CONTEXT): ToolGuardEvaluation {
     // Origin intentionally unused: every call follows exactly the same permission path.
     let category: string | undefined;
-    if (toolName === "bash") category = selectCategory(shellCommands(String(input.command ?? "")).map(c => commandCategory(c)));
-    else if (toolName === "launch" && input.op === "start") category = commandCategory([String(input.application ?? ""), ...(Array.isArray(input.args) ? input.args.map(String) : [])]);
+    let commands: string[][] = [], unresolved = false;
+    if (toolName === "bash") {
+      commands = shellCommands(String(input.command ?? ""));
+      category = selectCategory(commands.map(c => commandCategory(c)));
+    } else if (toolName === "launch" && input.op === "start") {
+      commands = [[String(input.application ?? ""), ...(Array.isArray(input.args) ? input.args.map(String) : [])]];
+      category = commandCategory(commands[0]);
+    }
     else if (toolName === "launch" && input.op === "restart") category = "shell_destructive_os";
     else if (toolName === "eval") {
       const result = evalCommands(String(input.code ?? ""), String(input.language ?? "js"), shellCommands);
+      commands = result.commands;
+      unresolved = result.unresolved;
       category = selectCategory([...result.commands.map(c => commandCategory(c)), result.unresolved ? "shell_destructive_os" : undefined]);
     } else if (toolName === "ssh") {
       // An explicit remote-process tool is execution, not a prose mention.
@@ -276,36 +258,23 @@ export class DangerousToolGuard {
     if (!category) return { allowed: true };
     if (category === "production_exclusion") return { allowed: false, category, reason: "Production is excluded for every transport; an approval cannot override this boundary." };
     // Bind approval to the full exact input, including cwd/env, not just matched words.
-    const content = JSON.stringify({ toolName, input });
-    const approvalHash = this.computeApprovalHash(category, content);
-    if (this.isLocallyApproved(approvalHash)) return { allowed: true };
-    const pendingDir = path.join(this.stateDir, "approved", "pending");
+    const content = JSON.stringify({ toolName, input, cwd: String(input.cwd ?? context.cwd) });
     try {
-      fs.mkdirSync(pendingDir, { recursive: true });
-      const record: ApprovalRecord = { version: 1, category, content, expiresAt: new Date(Date.now() + TTL).toISOString(), singleUse: true };
-      fs.writeFileSync(path.join(pendingDir, `${approvalHash}.json`), JSON.stringify(record), { mode: 0o600 });
+      const record = evaluateApproval(this.stateDir, computeApprovalHash(category, content), describeApproval(toolName, input, category, context, commands, unresolved));
+      if (record.state === "consumed") return { allowed: true };
+      if (record.state === "denied") return { allowed: false, category, reason: "The operator explicitly denied this exact operation. Do not retry or work around it; continue independent work." };
+      return { allowed: false, category, approvalHash: record.token, approval: record,
+        reason: `Operation '${category}' requires exact operator approval. Await Approve or Deny in this session's Telegram bot; denial is explicit and must not be worked around. Typed fallback: /approve ${record.token}. Expires ${record.expiresAt}. After approval retry the identical call once. Local operator equivalent: bun "${path.join(import.meta.dir, "guard.ts")}" approve "${this.stateDir}" ${record.token} ${JSON.stringify(context.sessionId)}` };
     } catch {
-      return { allowed: false, category, approvalHash, reason: `Approval token: ${approvalHash}. Cannot write approval request in ${pendingDir}; restore directory write access and retry. No operation executed.` };
+      return { allowed: false, category, reason: "Cannot persist the approval request and audit. No operation executed; restore approval-store write access before retrying." };
     }
-    return { allowed: false, category, approvalHash,
-      reason: `Operation '${category}' requires exact operator approval. Approval token: ${approvalHash}. Send /approve ${approvalHash} to this session's Telegram bot, then retry the identical call once (15 minute expiry). Local equivalent: bun "${path.join(import.meta.dir, "guard.ts")}" approve "${this.stateDir}" ${approvalHash}` };
-  }
-  private computeApprovalHash(category: string, content: string): string { return computeApprovalHash(category, content); }
-  private isLocallyApproved(approvalHash: string): boolean {
-    const file = path.join(this.stateDir, "approved", `${approvalHash}.json`);
-    const claim = `${file}.${randomUUID()}.consumed`;
-    try {
-      fs.renameSync(file, claim); // Exactly one competing caller can consume the grant.
-      return validRecord(JSON.parse(fs.readFileSync(claim, "utf8")), approvalHash);
-    } catch { return false; }
-    finally { try { fs.unlinkSync(claim); } catch {} }
   }
 }
 if (import.meta.main) {
   try {
-    const [action, stateDir, token] = process.argv.slice(2);
-    if (action !== "approve" || !stateDir || !token) throw new Error("Usage: bun guard.ts approve <stateDir> <full-token>");
-    const record = approveOperation(stateDir, token);
-    console.log(JSON.stringify({ approved: true, token, expiresAt: record.expiresAt, singleUse: true }));
+    const [action, stateDir, token, sessionId = "local"] = process.argv.slice(2);
+    if (action !== "approve" || !stateDir || !token) throw new Error("Usage: bun guard.ts approve <stateDir> <full-token> <sessionId>");
+    const record = approveOperation(stateDir, token, { sessionId, userId: "local-operator", chatId: "local" });
+    console.log(JSON.stringify({ approved: true, expiresAt: record.expiresAt, singleUse: true }));
   } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1; }
 }
