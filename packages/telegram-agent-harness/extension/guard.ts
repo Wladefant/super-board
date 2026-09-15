@@ -1,4 +1,5 @@
 /** Channel-neutral execution guard. Transport origin is observability, never authority. */
+import * as fs from "node:fs";
 import { createHash } from "node:crypto";
 import * as path from "node:path";
 import { evalCommands } from "./guard-eval";
@@ -12,42 +13,47 @@ export interface ToolGuardEvaluation {
   approval?: ApprovalRecord;
 }
 
-// Historical inventory retained intact for diagnosis; NOT applied to arbitrary tool text.
-const READ_ONLY_TOOLS: Record<string, true> = {
-  read: true, glob: true, grep: true, ast_grep: true,
-  read_memory: true, output: true, job: true,
+export interface GuardConfig {
+  mode: "minimal" | "off";
+  allow: string[];
+  deny: string[];
+}
+
+const DEFAULT_GUARD_CONFIG: GuardConfig = {
+  mode: "minimal",
+  allow: [],
+  deny: [],
 };
-const DESTRUCTIVE_INTENTS: Record<string, RegExp[]> = {
-  shared_db_ddl_dml: [
-    /\b(drop\s+(database|table|schema|index|view|column)|alter\s+table|truncate(\s+table)?|delete\s+from|update\s+\w+\s+set|insert\s+into)\b/i,
-    /\b(alembic\s+(upgrade|downgrade|revision|stamp)|psql|supabase\s+db|pg_stat|pg_dump|pg_restore)\b/i,
-    /\b(prod(uction)?\s+db|shared\s+(database|db|postgres))\b/i,
-  ],
-  deployments: [
-    /\b(deploy\s+(prod|staging)|redeploy|compose\.redeploy|dokploy|staging-api\s+deploy)\b/i,
-    /\b(fly\s+deploy|docker\s+compose\s+up|compose\.update)\b/i,
-    /\b(production\s+deploy|deploy\s+prod)\b/i,
-  ],
-  cloudflare_stripe_mutations: [
-    /\b(wrangler\s+(deploy|publish|secret|kv|d1)|cf\s+worker\s+(upload|deploy)|maint_mode\s*=\s*1)\b/i,
-    /\b(stripe\s+(charges|customers|subscriptions|refunds|payment_intents)\s+(create|update|cancel|delete))\b/i,
-    /\b(topup_main_reset|create_checkout_session)\b/i,
-  ],
-  destructive_git: [
-    /\bgit\s+(reset\s+--hard|clean\s+-[fxd]+|branch\s+-[dD]|checkout\s+--\s+\.|restore\s+\.)\b/i,
-    /\bgit\s+push\s+.*(main|staging)\b/i,
-    /\bgit\s+push\b/i,
-    /\b(force-push|force\s+push|--force)\b/i,
-  ],
-  secrets: [
-    /\b(resend_api_key|supabase_key|stripe_key|service_role_key|jwt_secret)\b/i,
-    /\b(private_key|secret_key|id_rsa|ps_live_[a-f0-9]+)\b/i,
-  ],
-  remote_ssh: [/\b(ssh|scp|sftp)\b/i],
-  shell_destructive_os: [
-    /\b(rm\s+-[rf]+|format\s+[a-z]:|shutdown|reboot|sudo\b|dd\s+if=|kill\s+-9|taskkill\s+\/f)\b/i,
-  ],
-};
+
+const loggedConfigErrors = new Set<string>();
+
+export function loadGuardConfig(stateDir: string): GuardConfig {
+  const configFile = path.join(stateDir, "guard.json");
+  try {
+    if (!fs.existsSync(configFile)) {
+      return { ...DEFAULT_GUARD_CONFIG };
+    }
+    const raw = fs.readFileSync(configFile, "utf8");
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") {
+      if (!loggedConfigErrors.has(configFile)) {
+        loggedConfigErrors.add(configFile);
+        console.warn(`[guard] Invalid guard config in ${configFile}, using default minimal`);
+      }
+      return { ...DEFAULT_GUARD_CONFIG };
+    }
+    const mode = parsed.mode === "off" ? "off" : "minimal";
+    const allow = Array.isArray(parsed.allow) ? parsed.allow.filter((x: unknown) => typeof x === "string") : [];
+    const deny = Array.isArray(parsed.deny) ? parsed.deny.filter((x: unknown) => typeof x === "string") : [];
+    return { mode, allow, deny };
+  } catch (err) {
+    if (!loggedConfigErrors.has(configFile)) {
+      loggedConfigErrors.add(configFile);
+      console.warn(`[guard] Failed to load guard config from ${configFile}, using default minimal:`, err instanceof Error ? err.message : String(err));
+    }
+    return { ...DEFAULT_GUARD_CONFIG };
+  }
+}
 function extractAllStrings(val: unknown, depth = 0): string[] {
   if (depth > 10 || val === null || val === undefined) return [];
   if (typeof val === "string") return [val];
@@ -144,7 +150,40 @@ export function shellCommands(command: string): string[][] {
 function executable(value: string): string {
   return value.replace(/\\/g, "/").split("/").pop()!.replace(/\.(exe|cmd|bat)$/i, "").toLowerCase();
 }
-function commandCategory(words: string[], depth = 0): string | undefined {
+export function isDestructiveRmTarget(operand: string, cwd: string): boolean {
+  const clean = operand.trim().replace(/^["']|["']$/g, "");
+  if (!clean) return false;
+  if (clean === "/" || clean === "\\" || /^(~|\$HOME|\$\{HOME\})(?:[\\/].*)?$/.test(clean)) {
+    return true;
+  }
+  if (/^[A-Za-z]:[\\/]?$/.test(clean)) {
+    return true;
+  }
+  if (clean === ".." || clean.startsWith("../") || clean.startsWith("..\\")) {
+    return true;
+  }
+  const normCwd = path.resolve(cwd).replace(/\\/g, "/").replace(/\/+$/, "");
+  const isWindows = process.platform === "win32" || /^[A-Za-z]:/i.test(cwd) || /^[A-Za-z]:/i.test(clean);
+  const compareCwd = isWindows ? normCwd.toLowerCase() : normCwd;
+
+  const isAbs = path.isAbsolute(clean) || /^[A-Za-z]:/i.test(clean) || clean.startsWith("/") || clean.startsWith("\\");
+  if (isAbs) {
+    const normTarget = path.resolve(clean).replace(/\\/g, "/").replace(/\/+$/, "");
+    const compareTarget = isWindows ? normTarget.toLowerCase() : normTarget;
+    if (compareTarget !== compareCwd && !compareTarget.startsWith(compareCwd + "/")) {
+      return true;
+    }
+  } else {
+    const normTarget = path.resolve(cwd, clean).replace(/\\/g, "/").replace(/\/+$/, "");
+    const compareTarget = isWindows ? normTarget.toLowerCase() : normTarget;
+    if (compareTarget !== compareCwd && !compareTarget.startsWith(compareCwd + "/")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+export function commandCategory(words: string[], cwd = process.cwd(), depth = 0): string | undefined {
   if (depth > 8) return "shell_destructive_os";
   while (words.length && /^[A-Za-z_]\w*=/.test(words[0])) words = words.slice(1);
   if (!words.length) return;
@@ -152,7 +191,7 @@ function commandCategory(words: string[], depth = 0): string | undefined {
   // The shell builtin reparses its argument string; argv wrappers do not.
   if (app === "eval") {
     const script = (args[0] === "--" ? args.slice(1) : args).join(" ");
-    return selectCategory(shellCommands(script).map(c => commandCategory(c, depth + 1)));
+    return selectCategory(shellCommands(script).map(c => commandCategory(c, cwd, depth + 1)));
   }
   if (/^(env|command|exec|call|if|then|do|while|!|time|nohup|xargs)$/.test(app)) {
     let offset = 0;
@@ -165,53 +204,79 @@ function commandCategory(words: string[], depth = 0): string | undefined {
           : /^(--unset|-u|-a)$/.test(args[offset]);
       offset += takesValue ? 2 : 1;
     }
-    return commandCategory(args.slice(offset), depth + 1);
+    return commandCategory(args.slice(offset), cwd, depth + 1);
   }
   // A real process may read keys regardless of the transport. Never inspect source-file contents.
   if (PRODUCTION.test(command)) return "production_exclusion";
-  if (args.some(arg => SECRET_PATH.test(arg) || DESTRUCTIVE_INTENTS.secrets.some(re => re.test(arg)))) return "secrets";
+  if (args.some(arg => SECRET_PATH.test(arg))) return "secrets";
   if (/^(sh|bash|zsh|cmd|powershell|pwsh)$/.test(app)) {
     const i = args.findIndex(arg => /^(-[a-z]*c|\/c|-command)$/i.test(arg));
-    if (i >= 0) return selectCategory(shellCommands(args.slice(i + 1).join(" ")).map(c => commandCategory(c, depth + 1)));
+    if (i >= 0) return selectCategory(shellCommands(args.slice(i + 1).join(" ")).map(c => commandCategory(c, cwd, depth + 1)));
   }
   if (/^(node|bun|python|python3)$/.test(app)) {
     const i = args.findIndex(arg => /^(-c|-e|--eval)$/.test(arg));
     if (i >= 0) {
       const result = evalCommands(args[i + 1] ?? "", app.startsWith("python") ? "py" : "js", shellCommands);
-      return selectCategory([...result.commands.map(c => commandCategory(c, depth + 1)), result.unresolved ? "shell_destructive_os" : undefined]);
+      return selectCategory(result.commands.map(c => commandCategory(c, cwd, depth + 1)));
     }
   }
-  if (/^(ssh|scp|sftp)$/.test(app)) return "remote_ssh";
-  if (app === "format" && args.some(arg => /^[a-z]:$/i.test(arg)) ||
-      DESTRUCTIVE_INTENTS.shell_destructive_os.some(re => re.test(command)) && /^(rm|format|shutdown|reboot|sudo|dd|kill|taskkill)$/.test(app)) return "shell_destructive_os";
-  if (/^(psql|pg_dump|pg_restore|pg_stat|alembic)$/.test(app) || app === "supabase" && args[0] === "db") return "shared_db_ddl_dml";
-  if (/^(deploy|redeploy|dokploy|compose\.redeploy|compose\.update)$/.test(app) ||
-      /^(fly|staging-api|polysim-deploy)$/.test(app) && args.some(a => /^(deploy|staging|prod|production)$/.test(a)) ||
-      app === "docker" && args[0] === "compose" && args.includes("up")) return "deployments";
-  if (app === "wrangler" && /^(deploy|publish|secret|kv|d1)$/.test(args[0] ?? "") ||
-      app === "cf" && args[0] === "worker" && /^(upload|deploy)$/.test(args[1] ?? "") ||
-      app === "stripe" && /^(charges|customers|subscriptions|refunds|payment_intents)$/.test(args[0] ?? "") && /^(create|update|cancel|delete)$/.test(args[1] ?? "") ||
-      /^(topup_main_reset|create_checkout_session)$/.test(app)) return "cloudflare_stripe_mutations";
+  if (app === "format" && args.some(arg => /^[a-z]:$/i.test(arg))) return "shell_destructive_os";
+  if (app === "dd" && args.some(arg => /^if=/i.test(arg))) return "shell_destructive_os";
+  if (app === "shutdown" || app === "reboot") return "shell_destructive_os";
+  if (app === "rm" || app === "rmdir" || app === "remove-item") {
+    const isRecursive = app === "rmdir"
+      ? args.some(a => /^[\/-]s$/i.test(a))
+      : app === "remove-item"
+        ? args.some(a => /^-[a-z]*r/i.test(a) || /^-recurse$/i.test(a))
+        : args.some(a => /^-[a-z]*r/i.test(a) || a === "--recursive");
+    if (isRecursive) {
+      let inDoubleDash = false;
+      const operands: string[] = [];
+      for (const arg of args) {
+        if (inDoubleDash) operands.push(arg);
+        else if (arg === "--") inDoubleDash = true;
+        else if (app === "rmdir") { if (!/^[\/-][sq]/i.test(arg)) operands.push(arg); }
+        else if (app === "remove-item") { if (!arg.startsWith("-")) operands.push(arg); }
+        else { if (!arg.startsWith("-")) operands.push(arg); }
+      }
+      if (operands.some(op => isDestructiveRmTarget(op, cwd))) return "shell_destructive_os";
+    }
+  }
+  if (app === "psql" || app === "pg_restore") return "shared_db_ddl_dml";
+  if (app === "alembic" && args.some(a => /^(upgrade|downgrade|stamp)$/.test(a))) return "shared_db_ddl_dml";
+  if (app === "supabase" && args[0] === "db" && /^(push|reset|remote)$/.test(args[1] ?? "")) return "shared_db_ddl_dml";
+  if (app === "dokploy" || (args.includes("dokploy") && !/^(echo|printf|cat)$/.test(app))) return "deployments";
+  if ((app === "fly" || app === "flyctl") && args.includes("deploy") && !/^(echo|printf|cat)$/.test(app)) return "deployments";
+  if (app === "wrangler" && /^(deploy|publish)$/.test(args[0] ?? "")) return "deployments";
+  if (app === "deploy" && args.some(a => /^(prod|production)$/i.test(a))) return "deployments";
+  const deployIdx = args.findIndex(a => a.toLowerCase() === "deploy");
+  if (deployIdx >= 0 && /^(prod|production)$/i.test(args[deployIdx + 1] ?? "") && !/^(echo|printf|cat)$/.test(app)) return "deployments";
+  if (app === "wrangler" && /^(secret|kv|d1)$/.test(args[0] ?? "")) return "cloudflare_stripe_mutations";
+  if (app === "stripe" && args.some(a => /^(create|update|cancel|delete)$/.test(a)) && !/^(echo|printf|cat)$/.test(app)) return "cloudflare_stripe_mutations";
+  if (app === "topup_main_reset" || (args.includes("topup_main_reset") && !/^(echo|printf|cat)$/.test(app))) return "cloudflare_stripe_mutations";
   if (app !== "git") return;
   let i = 0;
   while (i < args.length && args[i].startsWith("-")) {
     if (/^(-C|-c|--git-dir|--work-tree)$/.test(args[i])) i += 2; else i++;
   }
   const action = args[i], rest = args.slice(i + 1);
-  if (rest.some(a => /^--force(?:-with-lease|-if-includes)?(?:=|$)/.test(a)) ||
-      /^(rebase|filter-branch|filter-repo)$/.test(action ?? "") ||
-      action === "commit" && rest.includes("--amend") ||
-      action === "reset" && rest.includes("--hard") || action === "clean" ||
-      action === "branch" && (rest.some(a => /^-[^-]*D/.test(a)) ||
-        rest.some(a => /^-[^-]*d/.test(a) || a === "--delete") && rest.some(a => /^-[^-]*f/.test(a))) ||
-      action === "checkout" && rest.includes("--") && rest.includes(".") ||
-      action === "restore" && rest.includes(".")) return "destructive_git";
-  if (action !== "push") return;
-  if (rest.some(a => /^-[^-]*f/.test(a) || /^\+/.test(a) || /^(--delete|--mirror|--all)$/.test(a))) return "destructive_git";
-  const refs = rest.filter(a => !a.startsWith("-"));
-  // No explicit destination means configured refspecs; require exact approval rather than guess.
-  if (refs.length < 2) return "destructive_git";
-  if (refs.slice(1).some(ref => PROTECTED.test(ref.split(":").pop()!.replace(/^refs\/heads\//, "")) || ref.startsWith(":"))) return "destructive_git";
+  if (/^(filter-branch|filter-repo)$/.test(action ?? "")) return "destructive_git";
+  if (action === "push") {
+    const isMirror = rest.some(a => a === "--mirror");
+    if (isMirror) return "destructive_git";
+    const isForce = rest.some(a => /^-[^-]*f/.test(a) || /^--force(?:-with-lease|-if-includes)?(?:=.*)?$/.test(a));
+    const isDelete = rest.some(a => a === "--delete" || /^-[^-]*d$/.test(a));
+    const nonFlags = rest.filter(a => !a.startsWith("-"));
+    const refspecs = nonFlags.length > 1 ? nonFlags.slice(1) : nonFlags;
+    const isProtected = (ref: string) => {
+      const dest = ref.includes(":") ? ref.split(":").pop()! : ref.replace(/^\+/, "");
+      return PROTECTED.test(dest.replace(/^refs\/heads\//, ""));
+    };
+    if (isForce && refspecs.some(isProtected)) return "destructive_git";
+    if (isDelete && refspecs.some(isProtected)) return "destructive_git";
+    if (refspecs.some(r => r.startsWith("+") && isProtected(r))) return "destructive_git";
+    if (refspecs.some(r => r.startsWith(":") && isProtected(r))) return "destructive_git";
+  }
 }
 function selectCategory(categories: (string | undefined)[]): string | undefined {
   return categories.includes("production_exclusion") ? "production_exclusion" : categories.find(Boolean);
@@ -227,38 +292,52 @@ export type TurnOrigin = "IDLE" | "TELEGRAM_ACTIVE" | "LOCAL_ACTIVE";
 export class DangerousToolGuard {
   private currentTurnState: TurnOrigin = "IDLE";
   private activeTelegramTurnId: string | null = null;
+  private config?: GuardConfig;
   constructor(private stateDir: string) {}
+  public getGuardConfig(): GuardConfig {
+    if (!this.config) this.config = loadGuardConfig(this.stateDir);
+    return this.config;
+  }
+  public reloadGuardConfig(): GuardConfig {
+    this.config = loadGuardConfig(this.stateDir);
+    return this.config;
+  }
   public startTelegramTurn(turnId?: string): void { this.currentTurnState = "TELEGRAM_ACTIVE"; this.activeTelegramTurnId = turnId || String(Date.now()); }
   public startLocalTurn(): void { this.currentTurnState = "LOCAL_ACTIVE"; this.activeTelegramTurnId = null; }
   public endTurn(): void { this.currentTurnState = "IDLE"; this.activeTelegramTurnId = null; }
   public isTelegramTurnActive(): boolean { return this.currentTurnState === "TELEGRAM_ACTIVE"; }
   public evaluateToolCall(toolName: string, input: Record<string, unknown>, _isTelegramOverride?: boolean, context: ApprovalContext = LOCAL_CONTEXT): ToolGuardEvaluation {
-    // Origin intentionally unused: every call follows exactly the same permission path.
+    const cwd = String(input.cwd ?? context.cwd ?? process.cwd());
     let category: string | undefined;
     let commands: string[][] = [], unresolved = false;
     if (toolName === "bash") {
       commands = shellCommands(String(input.command ?? ""));
-      category = selectCategory(commands.map(c => commandCategory(c)));
+      category = selectCategory(commands.map(c => commandCategory(c, cwd)));
     } else if (toolName === "launch" && input.op === "start") {
       commands = [[String(input.application ?? ""), ...(Array.isArray(input.args) ? input.args.map(String) : [])]];
-      category = commandCategory(commands[0]);
-    }
-    else if (toolName === "launch" && input.op === "restart") category = "shell_destructive_os";
-    else if (toolName === "eval") {
+      category = commandCategory(commands[0], cwd);
+    } else if (toolName === "eval") {
       const result = evalCommands(String(input.code ?? ""), String(input.language ?? "js"), shellCommands);
       commands = result.commands;
       unresolved = result.unresolved;
-      category = selectCategory([...result.commands.map(c => commandCategory(c)), result.unresolved ? "shell_destructive_os" : undefined]);
+      category = selectCategory(result.commands.map(c => commandCategory(c, cwd)));
     } else if (toolName === "ssh") {
-      // An explicit remote-process tool is execution, not a prose mention.
-      category = PRODUCTION.test(`${input.host ?? ""} ${input.hostname ?? ""} ${input.command ?? ""}`) ? "production_exclusion" : "remote_ssh";
+      category = PRODUCTION.test(`${input.host ?? ""} ${input.hostname ?? ""} ${input.command ?? ""}`) ? "production_exclusion" : undefined;
     }
     if (category !== "production_exclusion" && protectedPath(input)) category = "secrets";
-    if (!category && toolName in READ_ONLY_TOOLS) return { allowed: true };
     if (!category) return { allowed: true };
     if (category === "production_exclusion") return { allowed: false, category, reason: "Production is excluded for every transport; an approval cannot override this boundary." };
+
+    const config = this.getGuardConfig();
+    const isDenied = config.deny.includes(category);
+    const isAllowed = config.allow.includes(category);
+    if (!isDenied) {
+      if (config.mode === "off") return { allowed: true };
+      if (isAllowed) return { allowed: true };
+    }
+
     // Bind approval to the full exact input, including cwd/env, not just matched words.
-    const content = JSON.stringify({ toolName, input, cwd: String(input.cwd ?? context.cwd) });
+    const content = JSON.stringify({ toolName, input, cwd });
     try {
       const record = evaluateApproval(this.stateDir, computeApprovalHash(category, content), describeApproval(toolName, input, category, context, commands, unresolved));
       if (record.state === "consumed") return { allowed: true };

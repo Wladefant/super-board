@@ -169,7 +169,7 @@ for (const choice of ["approved", "denied"] as const) {
     const f = fixture();
     const guard = new DangerousToolGuard(f.dir);
     const context = { sessionId: "session-a", requester: "ProofAgent", task: "Remove owned disposable fixture", cwd: "/tmp" };
-    const input = { command: "rm -rf disposable" };
+    const input = { command: "git push --force origin main" };
     const request = guard.evaluateToolCall("bash", input, false, context).approval!;
     f.callbacks.onApprovalCallback = async (data, userId, chatId, sessionId) => {
       const parsed = parseApprovalCallback(data)!;
@@ -202,7 +202,7 @@ test("approval callbacks from an unauthorized actor or foreign session cannot gr
 
 test("explicit approval HTML preserves exact command bytes and full commit IDs", async () => {
   const f = fixture();
-  const input = { command: `ssh host 'echo <a> && echo ${"a".repeat(40)}'` };
+  const input = { command: `psql 'echo <a> && echo ${"a".repeat(40)}'` };
   const record = new DangerousToolGuard(f.dir).evaluateToolCall("bash", input).approval!;
   const card = renderApprovalRequest(record);
   await f.poller.sendTelegramMessage("1", card.text, "HTML", card.replyMarkup);
