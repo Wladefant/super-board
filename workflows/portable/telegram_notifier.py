@@ -910,11 +910,16 @@ def render_card(event: NotificationEvent) -> str:
         options = []
         for opt in event.metadata.get("options") or []:
             if isinstance(opt, dict):
-                options.append(f"{opt.get('id', '')} = {opt.get('label') or opt.get('description') or ''}")
+                label = f"{opt.get('id', '')} = {opt.get('label') or opt.get('description') or ''}"
+                detail = opt.get("description") or opt.get("tradeoffs")
+                options.append(label + (f": {detail}" if detail else ""))
             else:
                 options.append(str(opt))
+        if event.metadata.get("recommendation"):
+            lines.extend(["", f"<b>Recommended:</b> {safe(event.metadata['recommendation'])}"])
         if options:
-            lines.extend(safe(option) for option in options)
+            lines.extend(["", "<blockquote expandable>" + safe("\n".join(options)) + "</blockquote>"])
+        lines.extend(["", "<i>Reply to this message in your own words; options never replace free text.</i>"])
     else:
         bullets = [re.sub(r"^[•*-]\s+", "", row.strip()) for row in event.summary.splitlines() if row.strip()]
         visible = [row for row in bullets if len(row) <= 160][:3]
@@ -1003,11 +1008,10 @@ def build_decision_inline_keyboard(
             now=now,
         )
         if token:
-            btn_text = f"{opt_id}: {opt_label}" if opt_id and opt_id != opt_label else opt_label
-            btn_text = btn_text[:40]
+            btn_text = opt_label[:60]
             buttons.append({"text": btn_text, "callback_data": token})
     if buttons:
-        return {"inline_keyboard": [buttons]}
+        return {"inline_keyboard": [[button] for button in buttons]}
     return None
 
 class TelegramNotificationAdapter:
@@ -1135,6 +1139,17 @@ class TelegramNotificationAdapter:
         state_dir = Path(slot_info["stateDir"])
         token = self.resolver.load_token(state_dir)
         allowed_chats = self.resolver.load_allowed_destinations(state_dir)
+        access_path = state_dir / "access.json"
+        try:
+            configured_thread = json.loads(access_path.read_text(encoding="utf-8")).get("message_thread_id") if access_path.exists() else None
+            thread_id = event.metadata.get("message_thread_id", configured_thread)
+            if configured_thread is not None and thread_id != configured_thread:
+                raise ValueError("The requested topic differs from this channel's configured topic")
+            if thread_id is not None and (type(thread_id) is not int or thread_id <= 0):
+                raise ValueError("message_thread_id must be a positive integer")
+        except (ValueError, OSError):
+            return DeliveryReceipt(delivered=False, status="blocked", reason="Invalid or mismatched channel message_thread_id")
+        thread_fields = {"message_thread_id": thread_id} if thread_id is not None else {}
 
         target_chat = explicit_chat_id
         if not target_chat:
@@ -1245,6 +1260,7 @@ class TelegramNotificationAdapter:
             "text": message_text,
             "disable_web_page_preview": True,
         }
+        payload.update(thread_fields)
         payload["parse_mode"] = "HTML"
         if reply_markup:
             payload["reply_markup"] = reply_markup
@@ -1293,7 +1309,7 @@ class TelegramNotificationAdapter:
                         keyboard_request = urllib.request.Request(
                             f"https://api.telegram.org/bot{token}/sendMessage",
                             data=json.dumps({"chat_id": str(target_chat), "text": "Actions for the images above",
-                                             "reply_markup": reply_markup, "parse_mode": "HTML"}).encode("utf-8"),
+                                             "reply_markup": reply_markup, "parse_mode": "HTML", **thread_fields}).encode("utf-8"),
                             headers={"Content-Type": "application/json"}, method="POST",
                         )
                         keyboard_bytes = _safe_urlopen(keyboard_request, timeout=DEFAULT_HTTP_TIMEOUT, deadline=effective_deadline)
@@ -2165,7 +2181,13 @@ class QuestionReminderManager:
         """
         now = now or time.time()
         questions = self.get_unresolved_questions(now=now, force=force)
-        due_questions = [q for q in questions if (q.is_due or force)]
+        records = self._load_decisions().get("decisions", {})
+        records = records.values() if isinstance(records, dict) else records
+        channel_owned = {record.get("decision_id") for record in records
+                         if isinstance(record, dict) and record.get("transport", {}).get("kind") == "operator_question"}
+        # The session channel owns editable, reply-correlated question reminders.
+        # The global notifier must not also send an unbound copy (even with --force).
+        due_questions = [q for q in questions if (q.is_due or force) and q.decision_id not in channel_owned]
 
         if not due_questions:
             return {
