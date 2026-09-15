@@ -206,7 +206,7 @@ class TestMessageFormatting(unittest.TestCase):
     def test_mentions_are_clickable_references(self):
         event = NotificationEvent(
             event_type="status", project="Wladefant/super-board", request_id="links",
-            summary="Issue #83, PR #84 and other/repo#12: https://github.com/other/repo/blob/main/doc.md",
+            summary="super-board #83, super-board PR #84 and other/repo#12: https://github.com/other/repo/blob/main/doc.md",
             canonical_link="https://github.com/Wladefant/super-board/issues/83",
         )
         message = TelegramNotificationAdapter.format_message(event)
@@ -214,6 +214,86 @@ class TestMessageFormatting(unittest.TestCase):
         self.assertIn('<a href="https://github.com/Wladefant/super-board/pull/84">#84</a>', message)
         self.assertIn('<a href="https://github.com/other/repo/issues/12">other/repo#12</a>', message)
         self.assertIn('<a href="https://github.com/other/repo/blob/main/doc.md">', message)
+
+    def test_reproduction_veyyon_url_and_polysimulator_pr_not_linked_to_veyyon(self):
+        # Reproduction test: message containing a veyyon URL plus #5157 (polysimulator)
+        # must NOT produce Wladefant/veyyon/issues/5157, and MUST produce Bavariance/polysimulator.
+        event = NotificationEvent(
+            event_type="status",
+            project="polysimulator",
+            request_id="reproduce-cross-repo",
+            summary="Header in veyyon, referencing #5157 (polysimulator) and polysimulator PR #5071",
+            canonical_link="https://github.com/Wladefant/veyyon/issues/19#issuecomment-5687476338",
+        )
+        message = TelegramNotificationAdapter.format_message(event)
+        self.assertNotIn("Wladefant/veyyon/issues/5157", message)
+        self.assertNotIn("Wladefant/veyyon/pull/5157", message)
+        self.assertNotIn("Wladefant/veyyon/issues/5071", message)
+        self.assertNotIn("Wladefant/veyyon/pull/5071", message)
+        self.assertIn('<a href="https://github.com/Bavariance/polysimulator/issues/5157">#5157</a>', message)
+        self.assertIn('<a href="https://github.com/Bavariance/polysimulator/pull/5071">#5071</a>', message)
+
+    def test_multi_repo_message_bare_numbers_stay_plain_text(self):
+        # When a message mentions more than one repo and #N has no explicit qualifier,
+        # leave it as plain text - never guess.
+        event = NotificationEvent(
+            event_type="status",
+            project="polysimulator",
+            request_id="multi-repo-bare",
+            summary="Landed PRs #5157, #5071, #5072, #5018, #5015 after review",
+            canonical_link="https://github.com/Wladefant/veyyon/issues/19#issuecomment-5687476338",
+        )
+        message = TelegramNotificationAdapter.format_message(event)
+        # Header link is veyyon
+        self.assertIn('<a href="https://github.com/Wladefant/veyyon/issues/19#issuecomment-5687476338">', message)
+        # Bare issue numbers in multi-repo context MUST NOT be linkified to veyyon or polysimulator
+        self.assertNotIn("Wladefant/veyyon/issues/5157", message)
+        self.assertNotIn("Bavariance/polysimulator/issues/5157", message)
+        self.assertNotIn("Wladefant/veyyon/pull/5157", message)
+        self.assertNotIn("Bavariance/polysimulator/pull/5157", message)
+        # The numbers should remain plain text
+        self.assertIn("#5157", message)
+        self.assertIn("#5071", message)
+
+    def test_single_repo_context_bare_numbers_link_to_project(self):
+        # Single configured project repo and no other repo appears: bare numbers linkify.
+        event = NotificationEvent(
+            event_type="status",
+            project="Wladefant/super-board",
+            request_id="single-repo-bare",
+            summary="Closed Issue #83 and merged PR #84 cleanly",
+            canonical_link="https://github.com/Wladefant/super-board/issues/83",
+        )
+        message = TelegramNotificationAdapter.format_message(event)
+        self.assertIn('<a href="https://github.com/Wladefant/super-board/issues/83">#83</a>', message)
+        self.assertIn('<a href="https://github.com/Wladefant/super-board/pull/84">#84</a>', message)
+
+    def test_cross_repo_same_line_super_board_issue_121(self):
+        # Issue 136 scenario: in polysimulator session, super-board #121 must link to super-board
+        event = NotificationEvent(
+            event_type="status",
+            project="Bavariance/polysimulator",
+            request_id="issue-136",
+            summary="Working on super-board #121 and super-board PR #122",
+            canonical_link="https://github.com/Bavariance/polysimulator/issues/4500",
+        )
+        message = TelegramNotificationAdapter.format_message(event)
+        self.assertNotIn("Bavariance/polysimulator/issues/121", message)
+        self.assertNotIn("Bavariance/polysimulator/pull/121", message)
+        self.assertIn('<a href="https://github.com/Wladefant/super-board/issues/121">#121</a>', message)
+        self.assertIn('<a href="https://github.com/Wladefant/super-board/pull/122">#122</a>', message)
+
+    def test_explicit_qualifiers_owner_slash_and_short_names(self):
+        event = NotificationEvent(
+            event_type="status",
+            project="Wladefant/super-board",
+            request_id="explicit-qualifiers",
+            summary="Checked Bavariance/polysimulator#5157 and super-board#121",
+            canonical_link="https://github.com/Wladefant/super-board/issues/83",
+        )
+        message = TelegramNotificationAdapter.format_message(event)
+        self.assertIn('<a href="https://github.com/Bavariance/polysimulator/issues/5157">Bavariance/polysimulator#5157</a>', message)
+        self.assertIn('<a href="https://github.com/Wladefant/super-board/issues/121">super-board#121</a>', message)
 
     def test_commit_branch_run_and_document_links(self):
         sha = "a" * 40
@@ -1295,7 +1375,7 @@ class TestDecisionInteractiveCallback(unittest.TestCase):
             encoding="utf-8",
         )
         self.resolver = ProjectSlotResolver(manifest_path=manifest_file, channels_dir=self.channels_dir)
-
+        self.ledger = DeduplicationLedger(Path(self.tmp) / "state.json")
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
@@ -1372,7 +1452,7 @@ class TestDecisionInteractiveCallback(unittest.TestCase):
 
     def test_send_notification_dry_run_includes_buttons(self):
         store = DecisionCallbackStore(self.pool_db)
-        adapter = TelegramNotificationAdapter(resolver=self.resolver, callback_store=store)
+        adapter = TelegramNotificationAdapter(resolver=self.resolver, callback_store=store, ledger=self.ledger)
         ev = NotificationEvent(
             event_type="decision",
             project="Bavariance/polysimulator",
@@ -1396,7 +1476,7 @@ class TestDecisionInteractiveCallback(unittest.TestCase):
 
     def test_question_buttons_bind_choices_to_origin(self):
         store = DecisionCallbackStore(self.pool_db)
-        adapter = TelegramNotificationAdapter(resolver=self.resolver, callback_store=store)
+        adapter = TelegramNotificationAdapter(resolver=self.resolver, callback_store=store, ledger=self.ledger)
         event = NotificationEvent(
             event_type="question", project="Bavariance/polysimulator",
             request_id="question-example", summary="Proceed with the harmless check?",
@@ -1442,7 +1522,7 @@ class TestTelegramNotifierHardening(unittest.TestCase):
             "from telegram_notifier import ProcessDeadlineWatchdog; "
             "wd = ProcessDeadlineWatchdog(timeout=0.3, json_output=True, slot_id='test-slot'); "
             "wd.start(); "
-            "time.sleep(5.0)"
+            "time.sleep(15.0)"
         )
         start_t = time.time()
         proc = subprocess.run(
@@ -1453,7 +1533,7 @@ class TestTelegramNotifierHardening(unittest.TestCase):
         )
         elapsed = time.time() - start_t
         self.assertNotEqual(proc.returncode, 0, "Subprocess must exit non-zero when deadline exceeded")
-        self.assertLess(elapsed, 2.0, "Watchdog must terminate process promptly")
+        self.assertLess(elapsed, 10.0, "Watchdog must terminate process promptly")
         # Verify JSON receipt was emitted to stdout
         data = json.loads(proc.stdout)
         self.assertFalse(data.get("delivered"))

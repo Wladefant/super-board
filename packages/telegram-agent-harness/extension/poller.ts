@@ -131,6 +131,8 @@ export class TelegramPoller {
   private options: Required<PollerOptions>;
   private abortController: AbortController;
   private db: Database;
+  private dbPath: string;
+  private loopPromise: Promise<void> | null = null;
   private isRunning = false;
   private primaryChatId: string | null = null;
   private pendingDrain: Promise<void> | null = null;
@@ -160,9 +162,18 @@ export class TelegramPoller {
       fs.mkdirSync(stateDir, { recursive: true });
     }
 
-    const dbPath = path.join(stateDir, "veyyon_bridge_state.db");
-    this.db = new Database(dbPath);
+    this.dbPath = path.join(stateDir, "veyyon_bridge_state.db");
+    this.db = new Database(this.dbPath);
     this.initLedger();
+  }
+
+  private ensureDbOpen(): void {
+    try {
+      this.db.query("SELECT 1").get();
+    } catch {
+      this.db = new Database(this.dbPath);
+      this.initLedger();
+    }
   }
 
   private initLedger(): void {
@@ -354,12 +365,15 @@ export class TelegramPoller {
       return null;
     }
   }
-  public async clearCallbackButtons(chatId: string, messageId: number): Promise<boolean> {
+  public async clearCallbackButtons(chatId: string, messageId: number, replacementText?: string): Promise<boolean> {
     try {
+      const reply_markup = replacementText
+        ? { inline_keyboard: [[{ text: replacementText, callback_data: "noop" }]] }
+        : { inline_keyboard: [] };
       const response = await fetch(`https://api.telegram.org/bot${this.botToken}/editMessageReplyMarkup`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }),
+        body: JSON.stringify({ chat_id: chatId, message_id: messageId, reply_markup }),
         signal: AbortSignal.any([this.abortController.signal, AbortSignal.timeout(3000)]),
       });
       const data: unknown = await response.json();
@@ -402,7 +416,19 @@ export class TelegramPoller {
   public async start(): Promise<void> {
     if (this.isRunning) return;
     this.isRunning = true;
+    this.abortController = new AbortController();
+    this.ensureDbOpen();
 
+    this.loopPromise = this.runPollLoop();
+    try {
+      await this.loopPromise;
+    } finally {
+      this.isRunning = false;
+      this.loopPromise = null;
+    }
+  }
+
+  private async runPollLoop(): Promise<void> {
     // The lease holder refreshes the operator's private menu on every startup.
     // Registration failure must not disconnect an otherwise usable input channel.
     if (this.accessConfig.dmPolicy !== "disabled") {
@@ -670,7 +696,13 @@ export class TelegramPoller {
           if (!sessionId || !this.callbacks.onApprovalCallback) throw new Error("Approval handling is unavailable.");
           const outcome = await this.callbacks.onApprovalCallback(callbackToken, fromId, chatId, sessionId);
           if (cbQueryId) await this.answerCallbackQuery(cbQueryId, outcome);
-          if (typeof row.reply_to_message_id === "number") await this.clearCallbackButtons(chatId, row.reply_to_message_id);
+          if (typeof row.reply_to_message_id === "number") {
+            const isApproved = callbackToken.startsWith("ap:a:");
+            const d = new Date();
+            const timeStr = `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")} UTC`;
+            const buttonText = isApproved ? `✅ Approved by you at ${timeStr}` : "❌ Denied";
+            await this.clearCallbackButtons(chatId, row.reply_to_message_id, buttonText);
+          }
           await this.sendTelegramMessage(chatId, escapeHtml(outcome));
           this.db.run("UPDATE update_ledger SET status = 'COMPLETED', correlated_session_id = ? WHERE update_id = ?", [sessionId, row.update_id]);
         } catch (error) {
@@ -1017,9 +1049,15 @@ export class TelegramPoller {
     }
   }
 
-  public stop(): void {
+  public async stop(): Promise<void> {
     this.isRunning = false;
     this.abortController.abort();
+    if (this.loopPromise) {
+      try {
+        await this.loopPromise;
+      } catch {}
+      this.loopPromise = null;
+    }
     try {
       this.db.close();
     } catch {}

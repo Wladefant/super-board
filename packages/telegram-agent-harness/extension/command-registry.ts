@@ -10,6 +10,7 @@ export const TELEGRAM_COMMANDS = [
   { command: "steer", description: "Send an instruction at the next safe tool boundary", group: "Direct work", syntax: "/steer text", harness: false },
   { command: "cancel", description: "Abort the active turn (does not undo completed work)", group: "Control", syntax: "/cancel", harness: false },
   { command: "release", description: "Disconnect this bot; reconnect from the terminal", group: "Control", syntax: "/release", harness: false },
+  { command: "reload", description: "Hot reload Telegram harness runtime in-process", group: "Control", syntax: "/reload", harness: false },
   { command: "help", description: "Command syntax and how plain text is delivered", group: "Control", syntax: "/help", harness: false },
 ] as const;
 

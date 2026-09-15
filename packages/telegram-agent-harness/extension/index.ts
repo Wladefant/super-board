@@ -1,13 +1,16 @@
 /**
- * index.ts — Veyyon Telegram Session Extension.
+ * index.ts — Veyyon Telegram Session Extension (Thin Loader).
  *
  * Attaches Telegram as an alternate bidirectional I/O channel to the CURRENT
- * active Veyyon interactive root session (sharing the exact conversation, turn state,
- * and tools) using atomic bot leases from the shared bot pool.
+ * active Veyyon interactive root session.
+ *
+ * Acts as a stable loader that forwards all extension lifecycle hooks to a
+ * dynamically imported runtime module (runtime.ts). Supports in-process hot reload
+ * via Telegram `/reload` and Veyyon slash command `/tg-reload` without restarting
+ * the host session.
  */
 
 import type {
-  AssistantMessage,
   ExtensionAPI,
   ExtensionCommandContext,
   ExtensionContext,
@@ -17,569 +20,271 @@ import type {
   SessionStartEvent,
   ToolCallEvent,
 } from "@veyyon/coding-agent";
-import { BotPoolCoordinator } from "./coordinator";
-import { DangerousToolGuard, approveOperation } from "./guard";
-import { decideApproval, parseApprovalCallback, approvalOutcome } from "./approvals";
-import { TelegramPoller } from "./poller";
-import { chunkMessage, escapeHtml, markdownToTelegramHtml } from "./sanitizer";
-import type { DiscoveredSlot, MessageCorrelationBridge } from "./types";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { handleInstalledCommand, renderApprovalRequest } from "./harness/installed-commands";
-import { BunCommandRunner } from "./harness/command-runner";
-import { latestSessionPng } from "./harness/session-artifacts";
+import {
+  ACTIVE_LEASE_SYMBOL,
+  ACTIVE_ROOT_SYMBOL,
+  type ActiveRootState,
+  type GlobalTelegramState,
+  isEligibleRootSession,
+  isSubagent,
+  TelegramRuntime,
+  type TelegramRuntimeOptions,
+} from "./runtime";
 
-export const ACTIVE_ROOT_SYMBOL = Symbol.for("veyyon.telegram.active_root");
-export const ACTIVE_LEASE_SYMBOL = Symbol.for("veyyon.telegram.active_lease");
+export {
+  ACTIVE_LEASE_SYMBOL,
+  ACTIVE_ROOT_SYMBOL,
+  type ActiveRootState,
+  type GlobalTelegramState,
+  isEligibleRootSession,
+  isSubagent,
+};
 
-export interface ActiveRootState {
-  instanceId: string;
-  sessionId: string;
-  slotId: string;
-  pi: ExtensionAPI;
-  poller: TelegramPoller;
-  guard: DangerousToolGuard;
-  coordinator: BotPoolCoordinator;
-  activeSlot: DiscoveredSlot;
+export interface ReloadOptions {
+  chatId?: string;
+  interactive?: boolean;
+  manifestPath?: string;
+  runtimeSpecifier?: string;
+  runtimeOptions?: TelegramRuntimeOptions;
 }
 
-export interface GlobalTelegramState {
-  [ACTIVE_ROOT_SYMBOL]?: ActiveRootState;
-  [ACTIVE_LEASE_SYMBOL]?: {
-    slotId: string;
-    sessionId: string;
+export interface ReloadResult {
+  success: boolean;
+  sha?: string;
+  error?: string;
+}
+
+export function getInstalledSourceSha(manifestPath?: string): string {
+  const manifestFile =
+    manifestPath ??
+    path.join(os.homedir(), ".veyyon", "telegram", "install-manifest.json");
+  try {
+    if (fs.existsSync(manifestFile)) {
+      const parsed = JSON.parse(fs.readFileSync(manifestFile, "utf-8")) as Record<string, unknown>;
+      const candidate =
+        parsed.source_sha ??
+        parsed.sourceSha ??
+        parsed.sha ??
+        parsed.git_commit ??
+        parsed.commit;
+      if (typeof candidate === "string" && candidate.length > 0) {
+        return candidate;
+      }
+    }
+  } catch {}
+  return "unknown";
+}
+
+let activeRuntime: TelegramRuntime | null = null;
+let savedContext: ExtensionContext | null = null;
+let currentApi: ExtensionAPI | null = null;
+let reloadLock: Promise<unknown> = Promise.resolve();
+
+export function getActiveRuntime(): TelegramRuntime | null {
+  return activeRuntime;
+}
+
+export function setActiveRuntime(runtime: TelegramRuntime | null): void {
+  activeRuntime = runtime;
+}
+
+export function setSavedContext(ctx: ExtensionContext | null): void {
+  savedContext = ctx;
+}
+
+export async function loadRuntimeModule(
+  specifier?: string,
+): Promise<{ createRuntime: (pi: ExtensionAPI, options?: TelegramRuntimeOptions) => TelegramRuntime }> {
+  const importUrl = specifier ?? `./runtime.ts?v=${Date.now()}`;
+  // Dynamic import with cache-busting timestamp is REQUIRED for in-process hot reload
+  // so the runtime engine invalidates its module cache on reload.
+  const mod = (await import(importUrl)) as {
+    createRuntime?: (pi: ExtensionAPI, options?: TelegramRuntimeOptions) => TelegramRuntime;
   };
+  if (!mod || typeof mod.createRuntime !== "function") {
+    throw new Error(`Module from "${importUrl}" does not export createRuntime`);
+  }
+  return { createRuntime: mod.createRuntime };
 }
 
-export function isSubagent(ctx: ExtensionContext): boolean {
-  return Boolean(
-    ctx.isSubagent === true ||
-    (ctx.taskDepth ?? 0) > 0 ||
-    Boolean(ctx.parentTaskPrefix),
-  );
+export async function reload(opts?: ReloadOptions): Promise<ReloadResult> {
+  const prevLock = reloadLock;
+  let releaseLock: () => void = () => {};
+  reloadLock = new Promise<void>(resolve => {
+    releaseLock = resolve;
+  });
+
+  try {
+    await prevLock;
+    return await executeReload(opts);
+  } finally {
+    releaseLock();
+  }
 }
 
-export function isEligibleRootSession(ctx: ExtensionContext): boolean {
-  return Boolean(
-    ctx.hasUI &&
-    ctx.isSubagent !== true &&
-    (ctx.taskDepth ?? 0) === 0 &&
-    !ctx.parentTaskPrefix,
-  );
-}
+async function executeReload(opts?: ReloadOptions): Promise<ReloadResult> {
+  if (opts?.chatId && activeRuntime) {
+    const allowFrom = activeRuntime.getAllowFrom();
+    if (allowFrom.length > 0 && !allowFrom.includes(opts.chatId)) {
+      currentApi?.logger?.warn(
+        `Telegram /reload rejected from non-allowlisted chat ${opts.chatId}`,
+      );
+      return { success: false, error: "Unauthorized chat" };
+    }
+  }
 
-function getStatusSummary(ctx: ExtensionContext, slot: DiscoveredSlot | null, sessionId: string): string {
-  const modelName = ctx.model?.id ?? "default";
-  const idleState = ctx.isIdle() ? "Idle" : "Running / Streaming";
-  const slotName = slot?.slotId ?? "None";
-  const botId = slot?.botId ?? "Unknown";
+  let newModule: { createRuntime: (pi: ExtensionAPI, options?: TelegramRuntimeOptions) => TelegramRuntime };
+  try {
+    newModule = await loadRuntimeModule(opts?.runtimeSpecifier);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    currentApi?.logger?.error(`[Telegram Hot Reload] Dynamic import failed: ${message}`);
+    if (opts?.chatId && activeRuntime) {
+      try {
+        await activeRuntime.notifyOperator(
+          opts.chatId,
+          `<b>Hot reload failed:</b> ${message}. Previous runtime retained.`,
+        );
+      } catch {}
+    }
+    return { success: false, error: message };
+  }
 
-  return [
-    "📊 <b>Veyyon Session Status</b>",
-    `• <b>Session ID:</b> <code>${sessionId}</code>`,
-    `• <b>Model:</b> <code>${modelName}</code>`,
-    `• <b>State:</b> <b>${idleState}</b>`,
-    `• <b>Bot Slot:</b> <code>${slotName}</code> (Bot ID: ${botId})`,
-    `• <b>Directory:</b> <code>${escapeHtml(ctx.cwd)}</code>`,
-  ].join("\n");
+  const oldRuntime = activeRuntime;
+  const operatorChatId = opts?.chatId || oldRuntime?.getPrimaryChatId();
+
+  if (oldRuntime) {
+    try {
+      await oldRuntime.dispose();
+    } catch (err: unknown) {
+      currentApi?.logger?.warn(
+        `[Telegram Hot Reload] Error disposing previous runtime: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  if (!currentApi) {
+    return { success: false, error: "ExtensionAPI not initialized" };
+  }
+
+  const newRuntime = newModule.createRuntime(currentApi, opts?.runtimeOptions);
+  newRuntime.setReloadTrigger(reload);
+  activeRuntime = newRuntime;
+
+  if (savedContext) {
+    try {
+      await newRuntime.initSession(savedContext, { isReload: true });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      currentApi?.logger?.error(`[Telegram Hot Reload] Failed to re-initialize session: ${message}`);
+      return { success: false, error: message };
+    }
+  }
+
+  const sha = getInstalledSourceSha(opts?.manifestPath);
+  const targetChat = operatorChatId || newRuntime.getPrimaryChatId();
+  if (targetChat) {
+    try {
+      await newRuntime.notifyOperator(
+        targetChat,
+        `<b>Telegram harness reloaded.</b> Source SHA: <code>${sha}</code>`,
+      );
+    } catch (notifyErr: unknown) {
+      currentApi?.logger?.warn(
+        `[Telegram Hot Reload] Failed to notify operator chat: ${notifyErr instanceof Error ? notifyErr.message : String(notifyErr)}`,
+      );
+    }
+  }
+
+  return { success: true, sha };
 }
 
 export default function telegramSessionExtension(pi: ExtensionAPI): void {
   pi.setLabel("Telegram Alternate Channel");
+  currentApi = pi;
 
-  const instanceId = crypto.randomUUID();
-  const globalState = globalThis as unknown as GlobalTelegramState;
-
-  let streamDebounceTimer: Timer | null = null;
-  let sentTelegramMessageIds: number[] = [];
-  let streamedChunks: string[] = [];
-  let accumulatedAssistantText = "";
-
-  let outboundQueue: Promise<void> = Promise.resolve();
-
-  function queueOutbound(task: () => Promise<void>): Promise<void> {
-    const next = outboundQueue.then(task, task);
-    outboundQueue = next;
-    return next;
-  }
-
-
-  async function syncAssistantOutput(targetText: string): Promise<void> {
-    return queueOutbound(async () => {
-      const root = globalState[ACTIVE_ROOT_SYMBOL];
-      if (!root || root.instanceId !== instanceId || !targetText.trim()) return;
-
-      const primaryChat = root.poller.getPrimaryChatId();
-      if (!primaryChat) return;
-
-      const fullHtml = markdownToTelegramHtml(targetText);
-      const chunks = chunkMessage(fullHtml, 3800);
-      for (let i = 0; i < chunks.length; i++) {
-        const chunk = chunks[i];
-        if (i < sentTelegramMessageIds.length) {
-          if (chunk !== streamedChunks[i]) {
-            await root.poller.editTelegramMessage(primaryChat, sentTelegramMessageIds[i], chunk);
-            streamedChunks[i] = chunk;
-          }
-        } else {
-          const res = await root.poller.sendTelegramMessage(primaryChat, chunk);
-          if (res?.ok && typeof res.result?.message_id === "number") {
-            sentTelegramMessageIds.push(res.result.message_id);
-            streamedChunks.push(chunk);
-          }
-        }
-      }
-    });
-  }
-
-  /**
-   * Re-points this root's lease at `nextSessionId`, or gives the channel up.
-   *
-   * Only a lease this process still holds may carry a new session identity. If the pool
-   * reclaimed it, this root stops polling a bot it no longer owns and stops being the
-   * active root, rather than binding its outbound messages to a session the pool has
-   * already reassigned. Every re-entry path shares this rule: which lifecycle event the
-   * new session id arrived through must not decide whether ownership is rechecked.
-   *
-   * Returns true when the lease still belongs to this process.
-   */
-  function repointLeaseOrRelinquish(
-    root: ActiveRootState,
-    nextSessionId: string,
-    projectCwd: string,
-  ): boolean {
-    const repointed = root.coordinator.updateLeaseSession(
-      root.activeSlot.slotId,
-      nextSessionId,
-      projectCwd,
-      process.pid,
-    );
-
-    if (!repointed) {
-      pi.logger.warn(
-        `Telegram bot lease on slot ${root.activeSlot.slotId} is no longer held by this process; releasing the channel instead of re-pointing it to session ${nextSessionId}.`,
-      );
-      root.poller.stop();
-      root.coordinator.close();
-      delete globalState[ACTIVE_ROOT_SYMBOL];
-      delete globalState[ACTIVE_LEASE_SYMBOL];
-      return false;
-    }
-
-    root.sessionId = nextSessionId;
-    globalState[ACTIVE_LEASE_SYMBOL] = {
-      slotId: root.activeSlot.slotId,
-      sessionId: nextSessionId,
-    };
-    return true;
-  }
-
-  // --------------------------------------------------------------------------
-  // Lifecycle: Session Start (Acquire Lease & Start Poller)
-  // --------------------------------------------------------------------------
-  pi.on("session_start", async (_event: SessionStartEvent, ctx: ExtensionContext) => {
-    if (!isEligibleRootSession(ctx)) {
-      return;
-    }
-
-    const newSessionId = ctx.sessionManager.getSessionId();
-    const existingRoot = globalState[ACTIVE_ROOT_SYMBOL];
-
-    if (existingRoot) {
-      if (existingRoot.instanceId === instanceId || existingRoot.sessionId === newSessionId) {
-        if (existingRoot.activeSlot && existingRoot.sessionId !== newSessionId) {
-          repointLeaseOrRelinquish(existingRoot, newSessionId, ctx.cwd);
-        }
+  pi.on("session_start", async (event: SessionStartEvent, ctx: ExtensionContext) => {
+    savedContext = ctx;
+    if (!activeRuntime) {
+      try {
+        const mod = await loadRuntimeModule();
+        activeRuntime = mod.createRuntime(pi);
+        activeRuntime.setReloadTrigger(reload);
+      } catch (err: unknown) {
+        pi.logger?.error(
+          `[Telegram Loader] Initial runtime load failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
         return;
       }
-      return;
+
     }
-
-    const coordinator = new BotPoolCoordinator();
-    const claim = await coordinator.acquireLease(newSessionId, ctx.cwd, process.pid);
-
-    if (!claim.ok || !claim.slot) {
-      pi.logger.warn(
-        `Telegram bot lease not acquired for session ${newSessionId}: ${claim.reason || "Pool busy"}`,
-      );
-      coordinator.close();
-      return;
-    }
-
-    const activeSlot = claim.slot;
-    const token = coordinator.readRawTokenForSlot(activeSlot.stateDir);
-
-    if (!token) {
-      coordinator.releaseLease(activeSlot.slotId, newSessionId, process.pid);
-      coordinator.close();
-      pi.logger.warn(`Telegram bot token missing for slot ${activeSlot.slotId}. Released lease.`);
-      return;
-    }
-
-    const guard = new DangerousToolGuard(activeSlot.stateDir);
-    const accessConfig = coordinator.readAccessConfig(activeSlot.stateDir);
-
-    // The session that owns this channel can change while the lease is held (an
-    // in-TUI session switch), so the correlation surface resolves it on every call
-    // instead of capturing the session id from session_start.
-    const currentSessionId = (): string => {
-      const root = globalState[ACTIVE_ROOT_SYMBOL];
-      return root && root.instanceId === instanceId ? root.sessionId : newSessionId;
-    };
-
-    const correlationBridge: MessageCorrelationBridge = {
-      getSessionId: currentSessionId,
-      getSlotId: () => activeSlot.slotId,
-      record: correlation => {
-        coordinator.recordOutboundMessage(correlation);
-      },
-      resolveReply: (botId, chatId, replyToMessageId) =>
-        coordinator.resolveReplyRouting(botId, chatId, replyToMessageId, currentSessionId()),
-      resolveCallback: (callbackToken, userId, chatId) =>
-        coordinator.validateDecisionCallback(callbackToken, userId, chatId, currentSessionId()),
-      consumeCallback: callbackToken =>
-        coordinator.consumeDecisionCallback(callbackToken),
-    };
-
-    try {
-      const poller = new TelegramPoller(
-        token,
-        activeSlot.stateDir,
-        accessConfig,
-        {
-          isIdle: () => ctx.isIdle(),
-          getSessionFile: () => ctx.sessionManager.getSessionFile(),
-          onUserMessage: text => {
-            if (guard) guard.startTelegramTurn();
-            pi.sendUserMessage(text);
-          },
-          onFollowUp: text => {
-            if (guard) guard.startTelegramTurn();
-            pi.sendUserMessage(text, { deliverAs: "followUp" });
-          },
-          onSteer: text => {
-            if (guard) guard.startTelegramTurn();
-            pi.sendUserMessage(text, { deliverAs: "steer" });
-          },
-          onAbort: () => {
-            ctx.abort();
-          },
-          onRelease: async () => {
-            const root = globalState[ACTIVE_ROOT_SYMBOL];
-            if (root && root.instanceId === instanceId) {
-              root.poller.stop();
-              root.coordinator.releaseLease(root.activeSlot.slotId, root.sessionId, process.pid);
-              root.coordinator.close();
-              delete globalState[ACTIVE_ROOT_SYMBOL];
-              delete globalState[ACTIVE_LEASE_SYMBOL];
-            }
-          },
-          getStatusText: () => getStatusSummary(ctx, activeSlot, currentSessionId()),
-          onHarnessCommand: (text, chatId, userId) => handleInstalledCommand(text, {
-            session: () => ({
-              id: currentSessionId(),
-              cwd: ctx.cwd,
-              idle: ctx.isIdle(),
-              model: ctx.model?.id,
-              stateDir: activeSlot!.stateDir,
-            }),
-            approve: async token => {
-              if (!userId) throw new Error("Authenticated actor is missing.");
-              const record = approveOperation(activeSlot!.stateDir, token, { sessionId: currentSessionId(), userId, chatId });
-              await pi.sendUserMessage(approvalOutcome(record), ctx.isIdle() ? undefined : { deliverAs: "steer" });
-              return record;
-            },
-            send: async html => {
-              const sent = await poller.sendTelegramMessage(chatId, html);
-              if (!sent?.ok) throw new Error("Telegram delivery failed");
-            },
-            photo: (file, caption) => poller.sendTelegramPhoto(chatId, file, caption),
-            mediaGroup: (files, caption) => poller.sendMediaGroup(chatId, files, caption),
-            latestPng: async id => {
-              if (id !== currentSessionId()) return null;
-              const sessionFile = ctx.sessionManager.getSessionFile();
-              return sessionFile ? latestSessionPng(sessionFile) : null;
-            },
-            inbound: async (message, idle) => {
-              guard.startTelegramTurn();
-              if (idle) pi.sendUserMessage(message);
-              else pi.sendUserMessage(message, { deliverAs: "steer" });
-            },
-          }, new BunCommandRunner()),
-          onApprovalCallback: async (data, userId, chatId, sessionId) => {
-            const selection = parseApprovalCallback(data);
-            if (!selection || sessionId !== currentSessionId()) throw new Error("Invalid or foreign-session approval callback.");
-            const record = decideApproval(activeSlot!.stateDir, selection.token, selection.decision, { sessionId, userId, chatId });
-            await pi.sendUserMessage(approvalOutcome(record), ctx.isIdle() ? undefined : { deliverAs: "steer" });
-            return record.state === "denied" ? "Denied. The requester was told not to run this operation." : `Approved once. Requester notified; identical retry expires ${record.expiresAt}.`;
-          },
-          onTelegramTurnStart: () => {
-            if (guard) guard.startTelegramTurn();
-          },
-          onDecisionCallback: async (decisionId, choiceId, context) => {
-            if (guard) guard.startTelegramTurn();
-            const decisionSessionId = currentSessionId();
-            // Accept the operator reply before canonical side effects. A session
-            // switch while the resolver runs cannot redirect or lose this reply.
-            pi.sendUserMessage([
-              `[Telegram Decision Received] Operator selected Option ${choiceId} for decision '${decisionId}'.`,
-              context ? `Context: ${context}` : "",
-              "This is an operator selection, not proof that a blocker was cleared. Verify the canonical decision before resuming gated work.",
-            ].filter(Boolean).join("\n"), { deliverAs: ctx.isIdle() ? "followUp" : "steer" });
-            let canonicalResolved = false;
-            try {
-              const workflowScript = path.join(os.homedir(), ".veyyon", "workflows", "decision_workflow.py");
-              if (fs.existsSync(workflowScript)) {
-                const proc = Bun.spawn([
-                  "python",
-                  workflowScript,
-                  "resolve-callback",
-                  "--id",
-                  decisionId,
-                  "--choice",
-                  choiceId,
-                  "--token",
-                  `telegram-session-${decisionSessionId}`,
-                  "--session",
-                  decisionSessionId,
-                  "--json",
-                ], { stdout: "pipe", stderr: "ignore" });
-                const [exitCode, output] = await Promise.all([proc.exited, new Response(proc.stdout).text()]);
-                const result: unknown = JSON.parse(output);
-                canonicalResolved = exitCode === 0 && result !== null && typeof result === "object" &&
-                  "ok" in result && result.ok === true;
-              }
-            } catch (err: unknown) {
-              pi.logger.warn(`Could not trigger canonical decision resolution: ${String(err)}`);
-            }
-
-            if (!canonicalResolved) {
-              pi.logger.warn(`Operator choice delivered, but canonical decision '${decisionId}' was not resolved`);
-            }
-          },
-          onConflict: (diagnosis, attempt, maxAttempts) => {
-            pi.logger.warn(`Telegram poller HTTP 409 conflict on slot ${activeSlot.slotId}: ${diagnosis}`);
-            if (attempt >= maxAttempts) {
-              ctx.ui.notify(
-                `Telegram polling stopped on slot ${activeSlot.slotId}: HTTP 409 Conflict with another running bot instance.`,
-                "error",
-              );
-            }
-          },
-          onLedgerFailure: message => {
-            pi.logger.warn(
-              `Telegram inbound ledger failure on slot ${activeSlot.slotId}: ${message}. Inbound updates are not being recorded; delivery is stalled until this clears.`,
-            );
-          },
-        },
-        correlationBridge,
-      );
-
-      globalState[ACTIVE_ROOT_SYMBOL] = {
-        instanceId,
-        sessionId: newSessionId,
-        slotId: activeSlot.slotId,
-        pi,
-        poller,
-        guard,
-        coordinator,
-        activeSlot,
-      };
-
-      globalState[ACTIVE_LEASE_SYMBOL] = {
-        slotId: activeSlot.slotId,
-        sessionId: newSessionId,
-      };
-
-      void poller.start();
-
-      const primaryChatId = poller.getPrimaryChatId();
-      if (primaryChatId) {
-        const greeting = [
-          "🟢 <b>Veyyon Session Connected</b>",
-          `Session: <code>${newSessionId}</code>`,
-          `Model: <code>${ctx.model?.id ?? "default"}</code>`,
-          `Slot: <code>${activeSlot.slotId}</code>`,
-          `Project: <code>${escapeHtml(ctx.cwd)}</code>`,
-        ].join("\n");
-        await poller.sendTelegramMessage(primaryChatId, greeting);
-      }
-    } catch {
-      coordinator.releaseLease(activeSlot.slotId, newSessionId, process.pid);
-      coordinator.close();
-      delete globalState[ACTIVE_ROOT_SYMBOL];
-      delete globalState[ACTIVE_LEASE_SYMBOL];
-    }
+    await activeRuntime.onSessionStart(event, ctx);
   });
 
-  // --------------------------------------------------------------------------
-  // Lifecycle: In-TUI Session Switch (Re-point Lease & Correlation Identity)
-  // --------------------------------------------------------------------------
-  // Registration is guarded because a host that predates this lifecycle event must
-  // still load the extension; the lease then stays pinned until session_shutdown.
   try {
-    pi.on("session_switch", async (_event: unknown, ctx: ExtensionContext) => {
-      const root = globalState[ACTIVE_ROOT_SYMBOL];
-      if (!root || root.instanceId !== instanceId) return;
-
-      const switchedSessionId = ctx.sessionManager.getSessionId();
-      if (!switchedSessionId || switchedSessionId === root.sessionId) return;
-
-      repointLeaseOrRelinquish(root, switchedSessionId, ctx.cwd);
+    pi.on("session_switch", async (event: unknown, ctx: ExtensionContext) => {
+      savedContext = ctx;
+      await activeRuntime?.onSessionSwitch(event, ctx);
     });
   } catch (err: unknown) {
-    pi.logger.warn(
+    pi.logger?.warn(
       `Telegram session_switch lifecycle event unavailable on this host: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
 
-  // --------------------------------------------------------------------------
-  // Outbound Assistant Message Streaming & Mirroring (Multi-Chunk Safe)
-  // --------------------------------------------------------------------------
-  pi.on("message_start", async event => {
-    const root = globalState[ACTIVE_ROOT_SYMBOL];
-    if (!root || root.instanceId !== instanceId) return;
-    if (event.message.role === "assistant") {
-      accumulatedAssistantText = "";
-      sentTelegramMessageIds = [];
-      streamedChunks = [];
-    }
+  pi.on("message_start", async (event: { message: { role: string } }) => {
+    await activeRuntime?.onMessageStart(event);
   });
 
   pi.on("message_update", async (event: MessageUpdateEvent) => {
-    const root = globalState[ACTIVE_ROOT_SYMBOL];
-    if (!root || root.instanceId !== instanceId || event.message.role !== "assistant") return;
-    const streamEvent = event.assistantMessageEvent;
-
-    if (streamEvent.type === "text_delta" && streamEvent.delta) {
-      accumulatedAssistantText += streamEvent.delta;
-
-      if (!streamDebounceTimer) {
-        streamDebounceTimer = setTimeout(async () => {
-          streamDebounceTimer = null;
-          await syncAssistantOutput(accumulatedAssistantText);
-        }, 1500);
-
-        if (typeof streamDebounceTimer.unref === "function") {
-          streamDebounceTimer.unref();
-        }
-      }
-    }
+    await activeRuntime?.onMessageUpdate(event);
   });
 
   pi.on("message_end", async (event: MessageEndEvent) => {
-    const root = globalState[ACTIVE_ROOT_SYMBOL];
-    if (!root || root.instanceId !== instanceId || event.message.role !== "assistant") return;
-
-    if (streamDebounceTimer) {
-      clearTimeout(streamDebounceTimer);
-      streamDebounceTimer = null;
-    }
-
-    const assistantMsg = event.message as AssistantMessage;
-    const fullText = assistantMsg.content
-      .filter((c): c is { type: "text"; text: string } => c.type === "text")
-      .map(c => c.text)
-      .join("\n");
-
-    if (fullText.trim()) {
-      await syncAssistantOutput(fullText);
-    }
-
-    sentTelegramMessageIds = [];
-    streamedChunks = [];
-    accumulatedAssistantText = "";
+    await activeRuntime?.onMessageEnd(event);
   });
-
-  // Actionable approval requests are user-facing; other raw tool lifecycle events stay local.
 
   pi.on("tool_call", async (event: ToolCallEvent, ctx: ExtensionContext) => {
-    const root = globalState[ACTIVE_ROOT_SYMBOL];
-    if (!root || root.instanceId !== instanceId || !root.guard) return;
-
-    const evaluation = root.guard.evaluateToolCall(
-      event.toolName,
-      event.input as Record<string, unknown>,
-      undefined,
-      {
-        sessionId: root.sessionId,
-        requester: ctx.agentId ?? "Main (interactive root agent)",
-        task: String(event.input.i ?? event.input.title ?? `Run ${event.toolName}; no task description supplied`),
-        cwd: ctx.cwd,
-        toolCallId: event.toolCallId,
-      },
-    );
-
-    if (!evaluation.allowed) {
-      const chatId = root.poller.getPrimaryChatId();
-      if (chatId && evaluation.approval) {
-        const card = renderApprovalRequest(evaluation.approval);
-        // Send every detail before attaching buttons; never silently truncate a command.
-        try {
-          const chunks = chunkMessage(card.text);
-          for (let n = 0; n < chunks.length; n++) {
-            const sent = await root.poller.sendTelegramMessage(chatId, chunks[n], "HTML", n === chunks.length - 1 ? card.replyMarkup : undefined);
-            if (!sent?.ok) break;
-          }
-        } catch {}
-      }
-      return {
-        block: true,
-        reason: evaluation.reason ?? "Sensitive operation requires operator approval.",
-      };
-    }
+    return await activeRuntime?.onToolCall(event, ctx);
   });
 
-
   pi.on("agent_end", async () => {
-    const root = globalState[ACTIVE_ROOT_SYMBOL];
-    if (!root || root.instanceId !== instanceId) return;
-    root.guard.endTurn();
+    await activeRuntime?.onAgentEnd();
   });
 
   pi.on("turn_end", async () => {
-    const root = globalState[ACTIVE_ROOT_SYMBOL];
-    if (!root || root.instanceId !== instanceId) return;
-    root.guard.endTurn();
+    await activeRuntime?.onTurnEnd();
   });
 
-  // --------------------------------------------------------------------------
-  // Teardown: Session Shutdown (Within 2s budget)
-  // --------------------------------------------------------------------------
-  pi.on("session_shutdown", async (_event: SessionShutdownEvent) => {
-    const root = globalState[ACTIVE_ROOT_SYMBOL];
-    if (!root || root.instanceId !== instanceId) return;
-
-    if (streamDebounceTimer) {
-      clearTimeout(streamDebounceTimer);
-      streamDebounceTimer = null;
+  pi.on("session_shutdown", async (event: SessionShutdownEvent) => {
+    if (activeRuntime) {
+      await activeRuntime.onSessionShutdown(event);
+      activeRuntime = null;
     }
-
-    root.poller.stop();
-    root.coordinator.releaseLease(root.activeSlot.slotId, root.sessionId, process.pid);
-    root.coordinator.close();
-
-    delete globalState[ACTIVE_ROOT_SYMBOL];
-    delete globalState[ACTIVE_LEASE_SYMBOL];
   });
 
-  // --------------------------------------------------------------------------
-  // CLI / TUI Commands
-  // --------------------------------------------------------------------------
   pi.registerCommand("telegram", {
-    description: "Inspect or release Telegram bot lease for this session",
+    description: "Inspect, release, or reload Telegram bot lease for this session",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const trimmed = args.trim().toLowerCase();
-      const root = globalState[ACTIVE_ROOT_SYMBOL];
+      if (trimmed === "reload") {
+        ctx.ui.notify("Reloading Telegram harness runtime...", "info");
+        const res = await reload({ interactive: true });
+        if (res.success) {
+          ctx.ui.notify(`Telegram harness reloaded (SHA: ${res.sha ?? "unknown"}).`, "info");
+        } else {
+          ctx.ui.notify(`Telegram harness reload failed: ${res.error ?? "unknown error"}`, "error");
+        }
+        return;
+      }
 
       if (trimmed === "release") {
-        if (root && root.instanceId === instanceId) {
-          root.poller.stop();
-          root.coordinator.releaseLease(root.activeSlot.slotId, root.sessionId, process.pid);
-          root.coordinator.close();
-          delete globalState[ACTIVE_ROOT_SYMBOL];
-          delete globalState[ACTIVE_LEASE_SYMBOL];
+        if (activeRuntime) {
+          await activeRuntime.dispose();
+          activeRuntime = null;
           ctx.ui.notify("Telegram bot lease released.", "info");
         } else {
           ctx.ui.notify("No active Telegram bot lease.", "warning");
@@ -587,16 +292,29 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
         return;
       }
 
-      // Default: status
-      const coordinator = new BotPoolCoordinator();
-      try {
+      const coordinator = activeRuntime?.getCoordinator();
+      if (coordinator) {
         const poolStatus = coordinator.getPoolStatus();
+        const slot = activeRuntime?.getActiveSlot();
         ctx.ui.notify(
-          `Telegram Status: ${root ? `Claimed [${root.slotId}]` : "Unclaimed"} (Total: ${poolStatus.totalSlots}, Free: ${poolStatus.freeSlots})`,
+          `Telegram Status: ${slot ? `Claimed [${slot.slotId}]` : "Unclaimed"} (Total: ${poolStatus.totalSlots}, Free: ${poolStatus.freeSlots})`,
           "info",
         );
-      } finally {
-        coordinator.close();
+      } else {
+        ctx.ui.notify("Telegram Status: Unclaimed", "info");
+      }
+    },
+  });
+
+  pi.registerCommand("tg-reload", {
+    description: "Hot reload Telegram harness runtime in-process",
+    handler: async (_args: string, ctx: ExtensionCommandContext) => {
+      ctx.ui.notify("Reloading Telegram harness runtime...", "info");
+      const res = await reload({ interactive: true });
+      if (res.success) {
+        ctx.ui.notify(`Telegram harness reloaded (SHA: ${res.sha ?? "unknown"}).`, "info");
+      } else {
+        ctx.ui.notify(`Telegram harness reload failed: ${res.error ?? "unknown error"}`, "error");
       }
     },
   });

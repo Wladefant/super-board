@@ -242,7 +242,7 @@ test("approve command grants exactly the pending guard operation once", async ()
     const f = fixture(), guard = new DangerousToolGuard(dir);
     f.port.session = () => ({ ...f.state, stateDir: dir });
     f.port.approve = token => approveOperation(dir, token);
-    const input = { command: "git push --force origin feat/93" };
+    const input = { command: "git push --force origin main" };
     const token = guard.evaluateToolCall("bash", input, true).approvalHash!;
     expect(await handleInstalledCommand(`/approve@sessionbot ${token}`, f.port, f.runner)).toBe(true);
     expect(f.sent[0]).toContain("Approved for one identical call");
@@ -267,18 +267,79 @@ test("approve reports missing binding, invalid tokens and expired requests witho
 test("approval buttons preserve the whole grant within Telegram's callback limit", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "approval-card-"));
   try {
-    const record = new DangerousToolGuard(dir).evaluateToolCall("bash", { command: "ssh host" }, false, { sessionId: "test", requester: "Agent <one>", task: "Inspect host", cwd: "/tmp" }).approval!;
+    const record = new DangerousToolGuard(dir).evaluateToolCall("bash", { command: "git push --force origin main" }, false, { sessionId: "test", requester: "Agent <one>", task: "Inspect host", cwd: "/tmp" }).approval!;
+    const encoded = Buffer.from(record.token, "hex").toString("base64url");
     const card = renderApprovalRequest(record);
-    expect(card.text).toContain("Agent &lt;one&gt;");
-    expect(card.text).toContain("<code>ssh host</code>");
+
+    // 1. First line bold summary (fallback when summary not provided)
+    expect(card.text).toContain(`<b>${record.summary ?? `${record.category} operation`}</b>`);
+    // 2. Command code block
+    expect(card.text).toContain("<b>Command:</b>\n<code>git push --force origin main</code>");
+    // 3. Where line with folder name and cwd
+    expect(card.text).toContain("<b>Where:</b> tmp · <code>/tmp</code>");
+    // 4. Why asked line
+    expect(card.text).toContain(`<b>Why asked:</b> ${record.reason}`);
+    // 5. Agent/Task line
+    expect(card.text).toContain("<b>Agent/Task:</b> Agent &lt;one&gt; · Inspect host");
+
+    // 6. Expandable blockquote with details and typed fallback
     expect(card.text).toContain("<blockquote expandable>");
     expect(card.text).toContain("UTC");
     expect(card.text).toContain(`/approve ${record.token}`);
+
+    // 7. No jargon in visible part
+    const [visiblePart, blockquotePart] = card.text.split("<blockquote expandable>");
+    expect(visiblePart).not.toContain("exact-call gate");
+    expect(visiblePart).not.toContain("not an execution sandbox");
+    expect(blockquotePart).toContain("exact-call gate");
+    expect(blockquotePart).toContain("not an execution sandbox");
+
+    // 8. Buttons on ONE row: "✅ Yes, run it" and "❌ No"
     const keyboard = card.replyMarkup.inline_keyboard as { text: string; callback_data: string }[][];
-    expect(keyboard[0].map(button => button.text)).toEqual(["Approve once", "Deny"]);
+    expect(keyboard).toHaveLength(1);
+    expect(keyboard[0].map(button => button.text)).toEqual(["✅ Yes, run it", "❌ No"]);
+    expect(keyboard[0][0].callback_data).toBe(`ap:a:${encoded}`);
+    expect(keyboard[0][1].callback_data).toBe(`ap:d:${encoded}`);
     for (const button of keyboard[0]) {
       expect(Buffer.byteLength(button.callback_data)).toBeLessThanOrEqual(64);
-      expect(Buffer.from(button.callback_data.slice(5), "base64url").toString("hex")).toBe(record.token);
     }
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("renderApprovalRequest renders custom summary and handles non-approvable secret redaction", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "approval-secret-"));
+  try {
+    const record = new DangerousToolGuard(dir).evaluateToolCall("bash", { command: "git push --force origin main" }, false, { sessionId: "test", requester: "Main", task: "Push release", cwd: "C:/Users/wkiri/development/super-board" }).approval!;
+    const customRecord = {
+      ...record,
+      summary: "Force-push branch feat/x to origin/main (rewrites shared history)",
+    };
+    const card = renderApprovalRequest(customRecord);
+    expect(card.text).toContain("<b>Force-push branch feat/x to origin/main (rewrites shared history)</b>");
+    expect(card.text).toContain("<b>Where:</b> super-board · <code>C:/Users/wkiri/development/super-board</code>");
+    expect(card.text).toContain("<b>Command:</b>\n<code>git push --force origin main</code>");
+    expect(card.text).toContain("<b>Agent/Task:</b> Main · Push release");
+
+    // Non-approvable card has only "❌ No" button and warning line
+    const nonApprovable = { ...customRecord, approvable: false };
+    const nonApprovableCard = renderApprovalRequest(nonApprovable);
+    expect(nonApprovableCard.text).toContain("Cannot approve: the command contained a secret; ask the agent to resend without it.");
+    const keyboard = nonApprovableCard.replyMarkup.inline_keyboard as { text: string; callback_data: string }[][];
+    expect(keyboard).toHaveLength(1);
+    expect(keyboard[0].map(button => button.text)).toEqual(["❌ No"]);
+    expect(keyboard[0][0].callback_data).toBe(`ap:d:${Buffer.from(record.token, "hex").toString("base64url")}`);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+test("reload invokes port.reload when available", async () => {
+  const f = fixture();
+  let reloaded = false;
+  f.port.reload = async () => { reloaded = true; };
+  expect(await handleInstalledCommand("/reload", f.port, f.runner)).toBe(true);
+  expect(reloaded).toBe(true);
+});
+
+test("reload notifies when hot reload is unsupported", async () => {
+  const f = fixture();
+  expect(await handleInstalledCommand("/reload", f.port, f.runner)).toBe(true);
+  expect(f.sent[0]).toContain("Hot reload unavailable");
 });

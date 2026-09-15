@@ -213,4 +213,38 @@ describe("Sanitizer & Security Utilities", () => {
     expect(result).toContain('<a href="https://github.com/Bavariance/polysimulator/issues/4799">#4799</a>');
     expect(result).toContain('<a href="https://github.com/Bavariance/polysimulator/issues/4440">#4440</a>');
   });
+  test("issue/PR linkification adheres to multi-repo disambiguation rules", () => {
+    // 1. Single repo context auto-links bare #N
+    const singleRepoText = "Fixed issue #123 in current build.";
+    const singleResult = markdownToTelegramHtml(singleRepoText, "Wladefant/super-board");
+    expect(singleResult).toContain('<a href="https://github.com/Wladefant/super-board/issues/123">#123</a>');
+
+    // 2. Multi-repo context: bare #N must remain plain text
+    const multiRepoText = [
+      "Header: https://github.com/Wladefant/veyyon/issues/19",
+      "PRs in progress: #5157, #5071",
+    ].join("\n");
+    const multiResult = markdownToTelegramHtml(multiRepoText, "Bavariance/polysimulator");
+    // Bare #5157 and #5071 must NOT be linked to veyyon or polysimulator because context has multiple repos
+    expect(multiResult).not.toContain("https://github.com/Wladefant/veyyon/issues/5157");
+    expect(multiResult).not.toContain("https://github.com/Bavariance/polysimulator/issues/5157");
+    expect(multiResult).toContain("PRs in progress: #5157, #5071");
+
+    // 3. Explicit qualifier owner/repo#N
+    const explicitText = "Check Bavariance/polysimulator#5157 and Wladefant/super-board#121";
+    const explicitResult = markdownToTelegramHtml(explicitText);
+    expect(explicitResult).toContain('<a href="https://github.com/Bavariance/polysimulator/issues/5157">Bavariance/polysimulator#5157</a>');
+    expect(explicitResult).toContain('<a href="https://github.com/Wladefant/super-board/issues/121">Wladefant/super-board#121</a>');
+
+    // 4. Same-line repo qualifier (preceding or following)
+    const sameLineText = [
+      "Fixed in super-board #121 yesterday.",
+      "Reviewing polysimulator PR #5157 right now.",
+      "Tracked in #5071 (polysimulator).",
+    ].join("\n");
+    const sameLineResult = markdownToTelegramHtml(sameLineText, "Wladefant/veyyon");
+    expect(sameLineResult).toContain('<a href="https://github.com/Wladefant/super-board/issues/121">#121</a>');
+    expect(sameLineResult).toContain('<a href="https://github.com/Bavariance/polysimulator/pull/5157">#5157</a>');
+    expect(sameLineResult).toContain('<a href="https://github.com/Bavariance/polysimulator/issues/5071">#5071</a>');
+  });
 });
