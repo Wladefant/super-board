@@ -330,3 +330,16 @@ test("renderApprovalRequest renders custom summary and handles non-approvable se
     expect(keyboard[0][0].callback_data).toBe(`ap:d:${Buffer.from(record.token, "hex").toString("base64url")}`);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+test("reload invokes port.reload when available", async () => {
+  const f = fixture();
+  let reloaded = false;
+  f.port.reload = async () => { reloaded = true; };
+  expect(await handleInstalledCommand("/reload", f.port, f.runner)).toBe(true);
+  expect(reloaded).toBe(true);
+});
+
+test("reload notifies when hot reload is unsupported", async () => {
+  const f = fixture();
+  expect(await handleInstalledCommand("/reload", f.port, f.runner)).toBe(true);
+  expect(f.sent[0]).toContain("Hot reload unavailable");
+});

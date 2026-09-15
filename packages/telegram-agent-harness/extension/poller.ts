@@ -110,6 +110,8 @@ export class TelegramPoller {
   private correlation: MessageCorrelationBridge | null;
   private abortController: AbortController;
   private db: Database;
+  private dbPath: string;
+  private loopPromise: Promise<void> | null = null;
   private isRunning = false;
   private primaryChatId: string | null = null;
   private pendingDrain: Promise<void> | null = null;
@@ -133,9 +135,18 @@ export class TelegramPoller {
       fs.mkdirSync(stateDir, { recursive: true });
     }
 
-    const dbPath = path.join(stateDir, "veyyon_bridge_state.db");
-    this.db = new Database(dbPath);
+    this.dbPath = path.join(stateDir, "veyyon_bridge_state.db");
+    this.db = new Database(this.dbPath);
     this.initLedger();
+  }
+
+  private ensureDbOpen(): void {
+    try {
+      this.db.query("SELECT 1").get();
+    } catch {
+      this.db = new Database(this.dbPath);
+      this.initLedger();
+    }
   }
 
   private initLedger(): void {
@@ -378,7 +389,19 @@ export class TelegramPoller {
   public async start(): Promise<void> {
     if (this.isRunning) return;
     this.isRunning = true;
+    this.abortController = new AbortController();
+    this.ensureDbOpen();
 
+    this.loopPromise = this.runPollLoop();
+    try {
+      await this.loopPromise;
+    } finally {
+      this.isRunning = false;
+      this.loopPromise = null;
+    }
+  }
+
+  private async runPollLoop(): Promise<void> {
     // The lease holder refreshes the operator's private menu on every startup.
     // Registration failure must not disconnect an otherwise usable input channel.
     if (this.accessConfig.dmPolicy !== "disabled") {
@@ -962,9 +985,15 @@ export class TelegramPoller {
     }
   }
 
-  public stop(): void {
+  public async stop(): Promise<void> {
     this.isRunning = false;
     this.abortController.abort();
+    if (this.loopPromise) {
+      try {
+        await this.loopPromise;
+      } catch {}
+      this.loopPromise = null;
+    }
     try {
       this.db.close();
     } catch {}

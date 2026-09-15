@@ -28,6 +28,7 @@ export interface InstalledCommandPort {
   latestPng(sessionId: string): Promise<string | null>;
   inbound(text: string, idle: boolean): Promise<void>;
   approve?(token: string): { expiresAt: string } | Promise<{ expiresAt: string }>;
+  reload?(): Promise<{ success: boolean; sha?: string; error?: string } | void> | void;
 }
 
 export interface OutboundCardSummary {
@@ -215,7 +216,7 @@ export function renderApprovalRequest(record: ApprovalRecord): { text: string; r
 
 /** Called after the installed poller's actor/reply gates, never owns a lease or offset. */
 export async function handleInstalledCommand(text: string, port: InstalledCommandPort, runner: CommandRunner): Promise<boolean> {
-  const match = /^\/(approve|agents|prompt|shot|usage|status)(?:@\w+)?(?:\s|$)/.exec(text.trim());
+  const match = /^\/(approve|agents|prompt|shot|usage|status|reload)(?:@\w+)?(?:\s|$)/.exec(text.trim());
   if (!match) return false;
   const raw = text.trim().replace(/^(\/\w+)@\w+/, "$1");
   const session = { ...port.session() };
@@ -293,6 +294,12 @@ export async function handleInstalledCommand(text: string, port: InstalledComman
         await port.send(`<b>${result.ok ? "Prompt delivered" : "Prompt not sent"}.</b> ${escapeHtml(result.detail)}`);
       } else {
         await port.send("<b>Target unavailable.</b> Copy the full backend:id from <code>/agents</code>. Worker prompts are not redirected to Main.");
+      }
+    } else if (match[1] === "reload") {
+      if (port.reload) {
+        await port.reload();
+      } else {
+        await port.send("<b>Hot reload unavailable.</b> This runtime does not support in-process reload.");
       }
     } else {
       const shot = /^\/shot\s+(\S+)$/.exec(raw);

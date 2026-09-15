@@ -20,7 +20,7 @@ test("private registration exposes exactly the supported help surface, without g
   }) as typeof fetch;
   await registerTelegramCommands("1:test", ["101", "102", "101", "-100123"]);
   expect(calls.map(call => call.scope)).toEqual([{ type: "chat", chat_id: "101" }, { type: "chat", chat_id: "102" }]);
-  expect(calls[0].commands.map(command => command.command)).toEqual(["status", "agents", "usage", "shot", "prompt", "steer", "cancel", "release", "help"]);
+  expect(calls[0].commands.map(command => command.command)).toEqual(["status", "agents", "usage", "shot", "prompt", "steer", "cancel", "release", "reload", "help"]);
   const help = renderTelegramHelp();
   for (const command of TELEGRAM_COMMANDS) {
     expect(help).toContain(`<code>${command.syntax}</code>`);
@@ -39,7 +39,7 @@ test("a transport-only host does not advertise unbound harness commands", async 
     return Response.json({ ok: true });
   }) as typeof fetch;
   await registerTelegramCommands("1:test", ["101"], false);
-  expect(commands.map(command => command.command)).toEqual(["status", "steer", "cancel", "release", "help"]);
+  expect(commands.map(command => command.command)).toEqual(["status", "steer", "cancel", "release", "reload", "help"]);
   expect(renderTelegramHelp(false)).not.toContain("/agents");
 });
 
