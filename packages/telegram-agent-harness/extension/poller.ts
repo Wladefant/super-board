@@ -17,6 +17,7 @@ import { registerTelegramCommands, renderTelegramHelp } from "./command-registry
 import type {
   AccessConfig,
   MessageCorrelationBridge,
+  OutboundMessageCorrelation,
   TelegramGetUpdatesResponse,
   TelegramSendMessageResponse,
   TelegramUpdate,
@@ -39,6 +40,7 @@ export interface PollerCallbacks {
     choiceId: string,
     context?: string,
   ) => void | Promise<void>;
+  onQuestionAnswer?: (decisionId: string, eventId: string, answer: { choice?: string; text?: string }) => Promise<void>;
   /**
    * Reports a ledger write the poller could not complete. Required rather than
    * optional: an ingest failure means inbound Telegram traffic is being dropped and
@@ -66,6 +68,8 @@ interface LedgerRow {
   callback_data: string | null;
   is_callback: number | null;
   media_json: string | null;
+  sender_origin: string | null;
+  message_thread_id: number | null;
 }
 
 /**
@@ -90,6 +94,8 @@ const UPDATE_LEDGER_ADDITIVE_COLUMNS: Record<string, string> = {
   callback_data: "TEXT",
   is_callback: "INTEGER DEFAULT 0",
   media_json: "TEXT",
+  sender_origin: "TEXT",
+  message_thread_id: "INTEGER",
 };
 
 /**
@@ -113,6 +119,9 @@ export class TelegramPoller {
   private isRunning = false;
   private primaryChatId: string | null = null;
   private pendingDrain: Promise<void> | null = null;
+  private nextOutboundAt = 0;
+  private outboundReservation: Promise<void> = Promise.resolve();
+  private dashboardUpdate: Promise<void> | null = null;
 
   constructor(
     botToken: string,
@@ -120,6 +129,7 @@ export class TelegramPoller {
     accessConfig: AccessConfig,
     callbacks: PollerCallbacks,
     correlation: MessageCorrelationBridge | null = null,
+    private readonly messageThreadId?: number,
   ) {
     this.botToken = botToken;
     this.botId = getTokenFingerprint(botToken).botId;
@@ -128,6 +138,9 @@ export class TelegramPoller {
     this.callbacks = callbacks;
     this.correlation = correlation;
     this.abortController = new AbortController();
+    if (messageThreadId !== undefined && (!Number.isSafeInteger(messageThreadId) || messageThreadId <= 0)) {
+      throw new Error("message_thread_id must be a positive integer");
+    }
 
     if (!fs.existsSync(stateDir)) {
       fs.mkdirSync(stateDir, { recursive: true });
@@ -216,6 +229,82 @@ export class TelegramPoller {
     }
     return null;
   }
+  public getMeta(key: string): string | null {
+    return (this.db.query("SELECT value FROM bridge_meta WHERE key = ?").get(key) as { value: string } | null)?.value ?? null;
+  }
+
+  public setMeta(key: string, value: string): void {
+    this.db.run("INSERT INTO bridge_meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [key, value]);
+  }
+
+  private paceOutbound(): Promise<void> {
+    const reserve = this.outboundReservation.then(async () => {
+      const delay = Math.max(0, this.nextOutboundAt - Date.now());
+      if (delay) await new Promise<void>((resolve, reject) => {
+        const signal = this.abortController.signal;
+        const abort = () => { clearTimeout(timer); reject(new Error("Telegram transport stopped")); };
+        const timer = setTimeout(() => { signal.removeEventListener("abort", abort); resolve(); }, delay);
+        signal.addEventListener("abort", abort, { once: true });
+        if (signal.aborted) abort();
+      });
+      this.abortController.signal.throwIfAborted();
+      this.nextOutboundAt = Date.now() + 1250;
+    });
+    this.outboundReservation = reserve.catch(() => {});
+    return reserve;
+  }
+
+  private observeRateLimit(data: TelegramSendMessageResponse): void {
+    if (data.error_code === 429) {
+      this.nextOutboundAt = Math.max(this.nextOutboundAt, Date.now() + Math.max(1, data.parameters?.retry_after ?? 30) * 1000);
+    }
+  }
+
+  public updateDashboard(chatId: string, html: string): Promise<void> {
+    // The caller refreshes its newest snapshot every 30s; never enqueue one edit per event.
+    if (!this.dashboardUpdate) {
+      this.dashboardUpdate = this.writeDashboard(chatId, html).finally(() => { this.dashboardUpdate = null; });
+    }
+    return this.dashboardUpdate;
+  }
+
+  private async writeDashboard(chatId: string, html: string): Promise<void> {
+    const key = `dashboard:${this.correlation?.getSessionId()}:${chatId}:${this.messageThreadId ?? 0}`;
+    const last = Number(this.getMeta(`${key}:updated`) ?? 0);
+    if (Date.now() - last < 30_000) return;
+    let messageId = Number(this.getMeta(key) ?? 0);
+    if (messageId) {
+      const edited = await this.editTelegramMessage(chatId, messageId, html);
+      if (!edited?.ok && !edited?.description?.includes("message is not modified")) {
+        if (edited?.error_code === 400 && edited.description?.includes("message to edit not found")) {
+          messageId = 0;
+        } else {
+          throw new Error("Dashboard refresh delayed; existing card retained (no duplicate posted)");
+        }
+      }
+    }
+    if (!messageId) {
+      const sent = await this.sendTelegramMessage(chatId, html);
+      if (!sent?.ok || !sent.result?.message_id) throw new Error("Dashboard delivery failed");
+      messageId = sent.result.message_id;
+      this.setMeta(key, String(messageId));
+    }
+    // Private-chat operator pins can disappear while getChat still reports this id.
+    // Reassert the same pin silently; coalescing and pacing bound this idempotent call.
+    await this.dashboardApi("pinChatMessage", { chat_id: chatId, message_id: messageId, disable_notification: true });
+    this.setMeta(`${key}:updated`, String(Date.now()));
+  }
+
+  private async dashboardApi(method: string, body: Record<string, unknown>): Promise<void> {
+    await this.paceOutbound();
+    const response = await fetch(`https://api.telegram.org/bot${this.botToken}/${method}`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      signal: AbortSignal.any([this.abortController.signal, AbortSignal.timeout(3000)]),
+    });
+    const data = await response.json();
+    this.observeRateLimit(data);
+    if (!data.ok) throw new Error(`Dashboard ${method} unavailable; check pin permission and Telegram retry window`);
+  }
 
   public async sendTelegramMessage(
     chatId: string | number,
@@ -226,6 +315,8 @@ export class TelegramPoller {
       requestId?: string | null;
       decisionId?: string | null;
       projectPath?: string | null;
+      laneId?: string;
+      laneState?: "active" | "exited" | "unknown";
     },
     defaultRepo = "Bavariance/polysimulator",
   ): Promise<TelegramSendMessageResponse | null> {
@@ -243,6 +334,7 @@ export class TelegramPoller {
         text: formatted,
         parse_mode: "HTML",
       };
+      if (this.messageThreadId !== undefined) body.message_thread_id = this.messageThreadId;
       if (replyMarkup) {
         body.reply_markup = replyMarkup;
       }
@@ -254,6 +346,7 @@ export class TelegramPoller {
       const boundSlotId = this.correlation?.getSlotId() ?? null;
       const boundSessionId = this.correlation?.getSessionId() ?? null;
 
+      await this.paceOutbound();
       const response = await fetch(
         `https://api.telegram.org/bot${this.botToken}/sendMessage`,
         {
@@ -265,6 +358,7 @@ export class TelegramPoller {
       );
 
       const data = (await response.json()) as TelegramSendMessageResponse;
+      this.observeRateLimit(data);
       if (
         data?.ok &&
         typeof data.result?.message_id === "number" &&
@@ -284,6 +378,9 @@ export class TelegramPoller {
           decisionId: correlationMeta?.decisionId ?? null,
           projectPath: correlationMeta?.projectPath ?? null,
           createdAt: Date.now() / 1000,
+          laneId: correlationMeta?.laneId,
+          laneState: correlationMeta?.laneState,
+          senderOrigin: "agent",
         });
       }
       return data;
@@ -298,6 +395,7 @@ export class TelegramPoller {
     text: string,
     _parseMode?: "HTML" | "Markdown",
     defaultRepo = "Bavariance/polysimulator",
+    replyMarkup?: Record<string, unknown>,
   ): Promise<TelegramSendMessageResponse | null> {
     const formatted = markdownToTelegramHtml(redactSecrets(text), defaultRepo);
     if (!formatted.trim()) return null;
@@ -308,20 +406,22 @@ export class TelegramPoller {
         message_id: messageId,
         text: formatted,
         parse_mode: "HTML",
-        reply_markup: { inline_keyboard: [] },
+        reply_markup: replyMarkup ?? { inline_keyboard: [] },
       };
 
+      await this.paceOutbound();
       const response = await fetch(
         `https://api.telegram.org/bot${this.botToken}/editMessageText`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
-          signal: this.abortController.signal,
+          signal: AbortSignal.any([this.abortController.signal, AbortSignal.timeout(3000)]),
         },
       );
 
       const data = (await response.json()) as TelegramSendMessageResponse;
+      this.observeRateLimit(data);
       return data;
     } catch {
       return null;
@@ -456,6 +556,10 @@ export class TelegramPoller {
              ON CONFLICT(update_id) DO NOTHING;`,
             [update.update_id, chatId, fromId, callbackData, now, replyToMessageId, cb.message?.text ?? cb.message?.caption ?? null, callbackQueryId, callbackData],
           );
+          this.db.run("UPDATE update_ledger SET sender_origin = COALESCE(sender_origin, ?) WHERE update_id = ?",
+            [cb.from.is_bot ? "agent" : "telegram_account", update.update_id]);
+          this.db.run("UPDATE update_ledger SET message_thread_id = ? WHERE update_id = ?",
+            [cb.message?.message_thread_id ?? null, update.update_id]);
           continue;
         }
 
@@ -494,6 +598,10 @@ export class TelegramPoller {
            ON CONFLICT(update_id) DO NOTHING;`,
           [update.update_id, chatId, fromId, text, now, replyToMessageId, replyToText, media ? JSON.stringify(media) : null],
         );
+        this.db.run("UPDATE update_ledger SET sender_origin = COALESCE(sender_origin, ?) WHERE update_id = ?",
+          [msg?.from?.is_bot ? "agent" : msg?.from ? "telegram_account" : "unknown", update.update_id]);
+        this.db.run("UPDATE update_ledger SET message_thread_id = ? WHERE update_id = ?",
+          [msg?.message_thread_id ?? null, update.update_id]);
       }
       this.db.run("COMMIT;");
     } catch (err: unknown) {
@@ -593,6 +701,16 @@ export class TelegramPoller {
       return;
     }
 
+    // Telegram authenticates an account, not the human or automation at its keyboard.
+    // Bot-authored/unknown input is never admitted as an operator turn.
+    if (row.sender_origin !== "telegram_account") {
+      this.db.run("UPDATE update_ledger SET status = 'REJECTED', error = 'NON_OPERATOR_ORIGIN' WHERE update_id = ?", [row.update_id]);
+      return;
+    }
+    if (this.messageThreadId !== undefined && row.message_thread_id !== this.messageThreadId) {
+      this.db.run("UPDATE update_ledger SET status = 'REJECTED', error = 'WRONG_THREAD' WHERE update_id = ?", [row.update_id]);
+      return;
+    }
     this.primaryChatId = chatId;
     let rawText = row.text?.trim() ?? "";
 
@@ -646,6 +764,18 @@ export class TelegramPoller {
       }
 
       const record = resolution.record;
+      if (record.decisionId.startsWith("tq:")) {
+        if (!this.callbacks.onQuestionAnswer || !this.correlation.consumeCallback) {
+          throw new Error("Question delivery unavailable. Reply to the original question when the channel reconnects.");
+        }
+        await this.callbacks.onQuestionAnswer(record.decisionId, `update:${row.update_id}`, { choice: record.choiceId });
+        if (!this.correlation.consumeCallback(callbackToken)) {
+          this.callbacks.onLedgerFailure(`Question callback ${row.update_id} saved but consumption was not confirmed`);
+        }
+        this.db.run("UPDATE update_ledger SET status = 'COMPLETED', correlated_session_id = ? WHERE update_id = ?",
+          [record.sessionId, row.update_id]);
+        return;
+      }
       if (!this.callbacks.onDecisionCallback || !this.correlation.consumeCallback) {
         throw new Error("Decision delivery unavailable; reply to the message with your choice.");
       }
@@ -731,6 +861,17 @@ export class TelegramPoller {
           row.update_id,
         ],
       );
+    }
+    if (replyCorrelation?.decisionId?.startsWith("tq:")) {
+      if (!this.callbacks.onQuestionAnswer) throw new Error("Question receiver unavailable; answer was not delivered");
+      try {
+        await this.callbacks.onQuestionAnswer(replyCorrelation.decisionId, `update:${row.update_id}`, { text: rawText });
+        this.db.run("UPDATE update_ledger SET status = 'COMPLETED' WHERE update_id = ?", [row.update_id]);
+      } catch (error) {
+        await this.sendTelegramMessage(chatId, `Answer not delivered: ${escapeHtml(String(error))}`);
+        throw error;
+      }
+      return;
     }
 
     if (row.media_json) {
@@ -828,6 +969,13 @@ export class TelegramPoller {
       if (replyCorrelation?.requestId) {
         metaParts.push(`task: ${replyCorrelation.requestId}`);
       }
+      if (replyCorrelation?.laneId) {
+        contextLines.push(`[Concerning lane: ${replyCorrelation.laneId}; last reported state: ${replyCorrelation.laneState ?? "unknown"}. Reply delivered to Main for dispatch, not directly to the lane.]`);
+        if (replyCorrelation.laneState === "exited") {
+          await this.sendTelegramMessage(chatId,
+            `<b>${escapeHtml(replyCorrelation.laneId)} has exited.</b> Your reply is going to Main with the original lane context, not to a dead worker.`);
+        }
+      }
       if (replyCorrelation?.decisionId) {
         metaParts.push(`decision: ${replyCorrelation.decisionId}`);
       }
@@ -842,6 +990,7 @@ export class TelegramPoller {
       deliveredText = `${contextLines.join("\n")}\n\n${rawText}`;
     }
 
+    deliveredText = `[Telegram sender: ${fromId}; origin: telegram_account; human presence not attested]\n${deliveredText}`;
     if (this.callbacks.isIdle()) {
       this.callbacks.onUserMessage(deliveredText);
     } else {
@@ -862,6 +1011,7 @@ export class TelegramPoller {
     const slotId = this.correlation?.getSlotId();
     const form = new FormData();
     form.set("chat_id", chatId);
+    if (this.messageThreadId !== undefined) form.set("message_thread_id", String(this.messageThreadId));
     form.set("photo", Bun.file(file), path.basename(file));
     const formattedCaption = formatTelegramCaption(redactSecrets(caption), 1024, defaultRepo);
     if (formattedCaption) {
@@ -903,6 +1053,7 @@ export class TelegramPoller {
     const slotId = this.correlation?.getSlotId();
     const form = new FormData();
     form.set("chat_id", chatId);
+    if (this.messageThreadId !== undefined) form.set("message_thread_id", String(this.messageThreadId));
 
     const formattedCaption = caption
       ? formatTelegramCaption(redactSecrets(caption), 1024, defaultRepo)

@@ -29,6 +29,10 @@ import * as path from "node:path";
 import { handleInstalledCommand, renderApprovalRequest } from "./harness/installed-commands";
 import { BunCommandRunner } from "./harness/command-runner";
 import { latestSessionPng } from "./harness/session-artifacts";
+import { OperatorQuestionService } from "./harness/operator-questions";
+import { MessageContextStore } from "./harness/message-context";
+import { LiveDashboard } from "./harness/live-dashboard";
+import { readMessageThreadId } from "./harness/channel-config";
 
 export const ACTIVE_ROOT_SYMBOL = Symbol.for("veyyon.telegram.active_root");
 export const ACTIVE_LEASE_SYMBOL = Symbol.for("veyyon.telegram.active_lease");
@@ -42,6 +46,9 @@ export interface ActiveRootState {
   guard: DangerousToolGuard;
   coordinator: BotPoolCoordinator;
   activeSlot: DiscoveredSlot;
+  questions?: OperatorQuestionService;
+  messageContext?: MessageContextStore;
+  dashboard?: LiveDashboard;
 }
 
 export interface GlobalTelegramState {
@@ -97,6 +104,86 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
   let accumulatedAssistantText = "";
 
   let outboundQueue: Promise<void> = Promise.resolve();
+  const z = pi.zod;
+  pi.registerTool({
+    name: "telegram_question",
+    label: "Ask operator on Telegram",
+    description: "Ask a clear question on the session's Telegram route, with labeled options, recommendation and prose replies. Returns only that question's answer; never grants approval. Use get/wait with its id after an interruption.",
+    parameters: z.object({
+      action: z.enum(["ask", "get", "wait"]).default("ask"),
+      id: z.string().optional(),
+      question: z.string().optional(),
+      problem: z.string().optional(),
+      impact: z.string().optional(),
+      recommendation: z.string().optional(),
+      options: z.array(z.object({ id: z.string(), label: z.string(), description: z.string().optional() })).optional(),
+      details_url: z.string().optional(),
+      wait: z.boolean().default(true),
+    }),
+    async execute(_id, params, signal, onUpdate) {
+      const root = globalState[ACTIVE_ROOT_SYMBOL];
+      if (!root || root.instanceId !== instanceId || !root.questions) {
+        throw new Error("No active session-bound Telegram question receiver. Do not substitute a terminal question.");
+      }
+      const service = root.questions;
+      let question;
+      if (params.action === "ask") {
+        if (!params.question || !params.options || !params.recommendation) {
+          throw new Error("Provide question, options with readable labels, and a recommended option id.");
+        }
+        question = await service.ask({ ...params, question: params.question, options: params.options,
+          recommendation: params.recommendation });
+      } else {
+        if (!params.id) throw new Error("Question id is required for get/wait");
+        question = await service.get(params.id);
+      }
+      onUpdate?.({ content: [{ type: "text", text: `Telegram question ${question.decision_id} is ${question.status}. Silence leaves it pending.` }] });
+      const result = params.action === "get" || !params.wait
+        ? question : await service.wait(question.decision_id, signal);
+      return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
+    },
+  });
+  pi.registerTool({
+    name: "telegram_message",
+    label: "Send attributed Telegram message",
+    description: "Send a lane update to the session's Telegram route with durable reply context. For a decision use telegram_question; do not send a question without its real labeled choices. Mark exited lanes explicitly.",
+    parameters: z.object({
+      text: z.string(),
+      lane_id: z.string(),
+      lane_state: z.enum(["active", "exited", "unknown"]),
+    }),
+    async execute(_id, params) {
+      const root = globalState[ACTIVE_ROOT_SYMBOL];
+      if (!root || root.instanceId !== instanceId) throw new Error("No active Telegram route");
+      const chat = root.poller.getPrimaryChatId();
+      if (!chat) throw new Error("No authorized Telegram recipient");
+      root.messageContext?.setLaneState(root.sessionId, params.lane_id, params.lane_state);
+      const sent = await root.poller.sendTelegramMessage(chat,
+        `<b>Agent · ${escapeHtml(params.lane_id)}</b>\n${params.text}`, undefined, undefined,
+        { laneId: params.lane_id, laneState: params.lane_state });
+      if (!sent?.ok) throw new Error("Attributed message was not delivered");
+      return { content: [{ type: "text", text: `Delivered message ${sent.result?.message_id}; replies return to Main with lane context.` }] };
+    },
+  });
+  pi.registerTool({
+    name: "telegram_dashboard",
+    label: "Update Telegram fleet dashboard",
+    description: "Refresh the one pinned Telegram dashboard with the actual lane tasks, questions waiting on the operator, and merge queue. Edits coalesce every 30 seconds; no new post per event. Supply observed state, never invent a live registry.",
+    parameters: z.object({
+      lanes: z.array(z.object({ name: z.string(), task: z.string(), state: z.enum(["active", "blocked", "exited"]) })),
+      blockers: z.array(z.object({ question: z.string(), url: z.string().optional() })),
+      mergeQueue: z.array(z.object({ title: z.string(), url: z.string(), state: z.string() })),
+    }),
+    async execute(_id, params) {
+      const root = globalState[ACTIVE_ROOT_SYMBOL];
+      if (!root || root.instanceId !== instanceId || !root.dashboard) throw new Error("No active Telegram dashboard");
+      root.dashboard.set({ ...params, observedAt: Date.now() });
+      for (const lane of params.lanes) {
+        root.messageContext?.setLaneState(root.sessionId, lane.name, lane.state === "exited" ? "exited" : "active");
+      }
+      return { content: [{ type: "text", text: "Dashboard snapshot saved; the pinned message will update at the next coalesced refresh." }] };
+    },
+  });
 
   function queueOutbound(task: () => Promise<void>): Promise<void> {
     const next = outboundQueue.then(task, task);
@@ -160,6 +247,9 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
       pi.logger.warn(
         `Telegram bot lease on slot ${root.activeSlot.slotId} is no longer held by this process; releasing the channel instead of re-pointing it to session ${nextSessionId}.`,
       );
+      root.questions?.stop();
+      root.dashboard?.stop();
+      root.messageContext?.close();
       root.poller.stop();
       root.coordinator.close();
       delete globalState[ACTIVE_ROOT_SYMBOL];
@@ -228,14 +318,22 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
       return root && root.instanceId === instanceId ? root.sessionId : newSessionId;
     };
 
+    const poolPath = process.env.VEYYON_POOL_DB || path.join(os.homedir(), ".veyyon", "telegram", "bot_pool.db");
+    const messageContext = new MessageContextStore(poolPath);
     const correlationBridge: MessageCorrelationBridge = {
       getSessionId: currentSessionId,
       getSlotId: () => activeSlot.slotId,
       record: correlation => {
         coordinator.recordOutboundMessage(correlation);
+        messageContext.record(correlation.botId, correlation.chatId, correlation.messageId, correlation);
       },
-      resolveReply: (botId, chatId, replyToMessageId) =>
-        coordinator.resolveReplyRouting(botId, chatId, replyToMessageId, currentSessionId()),
+      resolveReply: (botId, chatId, replyToMessageId) => {
+        const resolution = coordinator.resolveReplyRouting(botId, chatId, replyToMessageId, currentSessionId());
+        if (resolution.correlation) {
+          Object.assign(resolution.correlation, messageContext.lookup(botId, chatId, replyToMessageId));
+        }
+        return resolution;
+      },
       resolveCallback: (callbackToken, userId, chatId) =>
         coordinator.validateDecisionCallback(callbackToken, userId, chatId, currentSessionId()),
       consumeCallback: callbackToken =>
@@ -243,6 +341,7 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
     };
 
     try {
+      let questions: OperatorQuestionService;
       const poller = new TelegramPoller(
         token,
         activeSlot.stateDir,
@@ -268,6 +367,9 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
           onRelease: async () => {
             const root = globalState[ACTIVE_ROOT_SYMBOL];
             if (root && root.instanceId === instanceId) {
+              root.questions?.stop();
+              root.dashboard?.stop();
+              root.messageContext?.close();
               root.poller.stop();
               root.coordinator.releaseLease(root.activeSlot.slotId, root.sessionId, process.pid);
               root.coordinator.close();
@@ -317,6 +419,7 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
           onTelegramTurnStart: () => {
             if (guard) guard.startTelegramTurn();
           },
+          onQuestionAnswer: (id, eventId, answer) => questions.answer(id, eventId, answer),
           onDecisionCallback: async (decisionId, choiceId, context) => {
             if (guard) guard.startTelegramTurn();
             const decisionSessionId = currentSessionId();
@@ -365,7 +468,15 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
           },
         },
         correlationBridge,
+        readMessageThreadId(activeSlot.stateDir),
       );
+      questions = new OperatorQuestionService(poller, () => {
+        const chat = poller.getPrimaryChatId();
+        if (!chat) throw new Error("No authorized operator chat for this session");
+        return { session_id: currentSessionId(), chat_id: chat, user_id: chat };
+      }, path.join(os.homedir(), ".veyyon", "workflows", "decisions.json"),
+      process.env.VEYYON_POOL_DB || path.join(os.homedir(), ".veyyon", "telegram", "bot_pool.db"),
+      message => pi.logger.warn(message));
 
       globalState[ACTIVE_ROOT_SYMBOL] = {
         instanceId,
@@ -377,6 +488,12 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
         coordinator,
         activeSlot,
       };
+      globalState[ACTIVE_ROOT_SYMBOL]!.questions = questions;
+      globalState[ACTIVE_ROOT_SYMBOL]!.messageContext = messageContext;
+      const dashboard = new LiveDashboard(poller, new BunCommandRunner(), currentSessionId, message => pi.logger.warn(message));
+      globalState[ACTIVE_ROOT_SYMBOL]!.dashboard = dashboard;
+      dashboard.start();
+      questions.start();
 
       globalState[ACTIVE_LEASE_SYMBOL] = {
         slotId: activeSlot.slotId,
@@ -547,6 +664,9 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
       streamDebounceTimer = null;
     }
 
+    root.questions?.stop();
+    root.dashboard?.stop();
+    root.messageContext?.close();
     root.poller.stop();
     root.coordinator.releaseLease(root.activeSlot.slotId, root.sessionId, process.pid);
     root.coordinator.close();
@@ -566,6 +686,9 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
 
       if (trimmed === "release") {
         if (root && root.instanceId === instanceId) {
+          root.questions?.stop();
+          root.dashboard?.stop();
+          root.messageContext?.close();
           root.poller.stop();
           root.coordinator.releaseLease(root.activeSlot.slotId, root.sessionId, process.pid);
           root.coordinator.close();
