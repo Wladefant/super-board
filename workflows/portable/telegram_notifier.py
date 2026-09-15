@@ -1163,6 +1163,41 @@ def build_decision_inline_keyboard(
 ) -> Optional[Dict[str, Any]]:
     if not callback_store or not callback_store.enabled or not options:
         return None
+    if options and isinstance(options[0], list):
+        rows = []
+        for row_opts in options:
+            row_btns = []
+            for opt in row_opts:
+                if isinstance(opt, dict):
+                    opt_id = str(opt.get("id", ""))
+                    opt_label = str(opt.get("label") or opt_id)
+                elif isinstance(opt, str) and ":" in opt:
+                    parts = opt.split(":", 1)
+                    opt_id = parts[0].strip()
+                    opt_label = parts[1].strip()
+                else:
+                    opt_id = str(opt)
+                    opt_label = str(opt)
+                token = callback_store.create_callback(
+                    decision_id=decision_id,
+                    choice_id=opt_id,
+                    session_id=session_id,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    question_text=question_text,
+                    ttl_seconds=ttl_seconds,
+                    now=now,
+                )
+                if token:
+                    btn_text = f"{opt_id}: {opt_label}" if opt_id and opt_id != opt_label else opt_label
+                    btn_text = btn_text[:40]
+                    row_btns.append({"text": btn_text, "callback_data": token})
+            if row_btns:
+                rows.append(row_btns)
+        if rows:
+            return {"inline_keyboard": rows}
+        return None
+
     buttons = []
     for opt in options:
         if isinstance(opt, dict):
@@ -1190,7 +1225,9 @@ def build_decision_inline_keyboard(
             btn_text = btn_text[:40]
             buttons.append({"text": btn_text, "callback_data": token})
     if buttons:
-        return {"inline_keyboard": [buttons]}
+        if len(buttons) <= 2:
+            return {"inline_keyboard": [buttons]}
+        return {"inline_keyboard": [[b] for b in buttons]}
     return None
 
 class TelegramNotificationAdapter:
