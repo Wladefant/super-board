@@ -17,6 +17,7 @@ import { registerTelegramCommands, renderTelegramHelp } from "./command-registry
 import type {
   AccessConfig,
   MessageCorrelationBridge,
+  OutboundMessageCorrelation,
   TelegramGetUpdatesResponse,
   TelegramSendMessageResponse,
   TelegramUpdate,
@@ -40,12 +41,31 @@ export interface PollerCallbacks {
     context?: string,
   ) => void | Promise<void>;
   /**
+   * Reports an HTTP 409 conflict when Telegram getUpdates reports another poller
+   * instance is polling with the same bot token.
+   */
+  onConflict?: (diagnosis: string, attempt: number, maxAttempts: number) => void;
+  /**
    * Reports a ledger write the poller could not complete. Required rather than
    * optional: an ingest failure means inbound Telegram traffic is being dropped and
    * the offset cannot advance, so no caller may silently discard it.
    */
   onLedgerFailure: (message: string) => void;
 }
+
+export interface PollerOptions {
+  maxConflictRetries?: number;
+  initialConflictBackoffMs?: number;
+  maxConflictBackoffMs?: number;
+  conflictBackoffFactor?: number;
+}
+
+const DEFAULT_POLLER_OPTIONS: Required<PollerOptions> = {
+  maxConflictRetries: 5,
+  initialConflictBackoffMs: 1000,
+  maxConflictBackoffMs: 15000,
+  conflictBackoffFactor: 2.0,
+};
 
 interface LedgerRow {
   update_id: number;
@@ -108,6 +128,7 @@ export class TelegramPoller {
   private accessConfig: AccessConfig;
   private callbacks: PollerCallbacks;
   private correlation: MessageCorrelationBridge | null;
+  private options: Required<PollerOptions>;
   private abortController: AbortController;
   private db: Database;
   private dbPath: string;
@@ -116,12 +137,17 @@ export class TelegramPoller {
   private primaryChatId: string | null = null;
   private pendingDrain: Promise<void> | null = null;
 
+  public get running(): boolean {
+    return this.isRunning;
+  }
+
   constructor(
     botToken: string,
     stateDir: string,
     accessConfig: AccessConfig,
     callbacks: PollerCallbacks,
     correlation: MessageCorrelationBridge | null = null,
+    options?: PollerOptions,
   ) {
     this.botToken = botToken;
     this.botId = getTokenFingerprint(botToken).botId;
@@ -129,6 +155,7 @@ export class TelegramPoller {
     this.accessConfig = accessConfig;
     this.callbacks = callbacks;
     this.correlation = correlation;
+    this.options = { ...DEFAULT_POLLER_OPTIONS, ...(options || {}) };
     this.abortController = new AbortController();
 
     if (!fs.existsSync(stateDir)) {
@@ -417,6 +444,7 @@ export class TelegramPoller {
     await this.redrivePendingUpdates();
 
     let offset = this.getNextContiguousOffset();
+    let conflictCount = 0;
 
     while (this.isRunning && !this.abortController.signal.aborted) {
       try {
@@ -425,9 +453,45 @@ export class TelegramPoller {
         const res = await fetch(url, { signal: this.abortController.signal });
 
         if (!res.ok) {
+          if (res.status === 409) {
+            conflictCount++;
+            let description = "Conflict: terminated by other getUpdates request";
+            try {
+              const body = (await res.json()) as { description?: string };
+              if (body?.description) {
+                description = body.description;
+              }
+            } catch {}
+
+            const isExhausted = conflictCount >= this.options.maxConflictRetries;
+            const diagnosis = `Telegram getUpdates HTTP 409 Conflict (attempt ${conflictCount}/${this.options.maxConflictRetries}): ${description}. ${
+              isExhausted
+                ? "Conflict retry limit reached; terminating polling loop to prevent thrashing with another bot instance."
+                : "Backing off before retry."
+            }`;
+
+            this.callbacks.onConflict?.(diagnosis, conflictCount, this.options.maxConflictRetries);
+
+            if (isExhausted) {
+              this.callbacks.onLedgerFailure(diagnosis);
+              this.isRunning = false;
+              break;
+            }
+
+            const backoff = Math.min(
+              this.options.maxConflictBackoffMs,
+              this.options.initialConflictBackoffMs * Math.pow(this.options.conflictBackoffFactor, conflictCount - 1),
+            );
+            await Bun.sleep(backoff);
+            continue;
+          }
+
           await Bun.sleep(3000);
           continue;
         }
+
+        // Reset conflict counter on successful response
+        conflictCount = 0;
 
         const data = (await res.json()) as TelegramGetUpdatesResponse;
         if (data.ok && Array.isArray(data.result)) {

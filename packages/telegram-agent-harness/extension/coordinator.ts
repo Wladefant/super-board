@@ -15,6 +15,7 @@ import type {
   AccessConfig,
   BotLeaseRecord,
   BotPoolManifest,
+  BusySlotHolder,
   ClaimResult,
   DiscoveredSlot,
   PoolStatusSummary,
@@ -175,39 +176,104 @@ interface CorrelationRow {
 }
 
 /**
- * True when the project directory carries one of the slot's declared affinity tokens.
- * Matching is one-directional (a path segment contains the declared token), so widening
- * one slot's affinity can never admit a foreign project into another slot.
+ * Matches projectCwd against a glob pattern.
+ * Supports:
+ * - Empty / "*" / "**" -> matches any project
+ * - Wildcard patterns with * and ? (e.g. "*project-alpha*", "*-backend")
+ * - Path globs with directory separators (e.g. "project-core/*", "/workspace/frontend")
+ * - Case-insensitive and normalizes / vs \
+ * - Plain project segment tokens (e.g. "core-service", "worker") for backward compatibility
  */
-export function slotMatchesProject(preferredProjects: string[], projectCwd: string): boolean {
-  const segments = String(projectCwd || "")
-    .toLowerCase()
-    .split(/[\\/]+/)
-    .map(segment => segment.trim())
-    .filter(segment => segment.length > 0);
-  if (segments.length === 0) return false;
-
-  for (const raw of preferredProjects || []) {
-    const token = String(raw || "").trim().toLowerCase();
-    if (!token) continue;
-    if (segments.some(segment => segment === token || segment.includes(token))) {
-      return true;
-    }
+export function matchProjectGlob(pattern: string, projectCwd: string): boolean {
+  const rawPat = String(pattern || "").trim();
+  if (!rawPat || rawPat === "*" || rawPat === "**") {
+    return true;
   }
+
+  const normalizedCwd = projectCwd.replace(/\\/g, "/").toLowerCase();
+  const normalizedPat = rawPat.replace(/\\/g, "/").toLowerCase();
+
+  if (normalizedCwd === normalizedPat) {
+    return true;
+  }
+
+  if (normalizedPat.includes("*") || normalizedPat.includes("?")) {
+    const starReplacer = normalizedPat.includes("/") ? "[^/]*" : ".*";
+    const regexStr = "^" + normalizedPat
+      .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+      .replace(/\*\*/g, "___GLOBSTAR___")
+      .replace(/\*/g, starReplacer)
+      .replace(/___GLOBSTAR___/g, ".*")
+      .replace(/\?/g, "[^/]") + "$";
+
+    try {
+      const regex = new RegExp(regexStr);
+      if (regex.test(normalizedCwd)) {
+        return true;
+      }
+    } catch {}
+
+    try {
+      const relaxedRegexStr = "(^|/)" + normalizedPat
+        .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+        .replace(/\*\*/g, ".*")
+        .replace(/\*/g, ".*")
+        .replace(/\?/g, ".") + "(/|$)";
+      const subRegex = new RegExp(relaxedRegexStr);
+      if (subRegex.test(normalizedCwd)) {
+        return true;
+      }
+    } catch {}
+  }
+
+  const segments = normalizedCwd
+    .split("/")
+    .map(s => s.trim())
+    .filter(s => s.length > 0);
+
+  if (segments.some(segment => segment === normalizedPat || segment.includes(normalizedPat))) {
+    return true;
+  }
+
   return false;
 }
 
 /**
- * Strict project affinity gate. A slot that declares preferredProjects is claimable
- * ONLY by a session whose project path matches one of them. A slot that declares no
- * affinity is a shared pool slot and stays claimable by any project.
+ * Configuration-driven project affinity gate. A slot declares the projects (cwd globs) it serves.
+ * Default (omitted, empty array, or discovered without explicit project config) = any project.
+ * Wildcard ('*' or '**') = any project.
+ * Otherwise, the session's project path must match at least one declared glob.
  */
-export function isSlotEligibleForProject(preferredProjects: string[], projectCwd: string): boolean {
-  const declared = (preferredProjects || []).filter(p => String(p || "").trim().length > 0);
+export function isSlotEligibleForProject(preferredProjects: string[] | undefined, projectCwd: string): boolean {
+  if (!preferredProjects || !Array.isArray(preferredProjects)) return true;
+  const declared = preferredProjects.filter(p => String(p || "").trim().length > 0);
   if (declared.length === 0) return true;
-  return slotMatchesProject(declared, projectCwd);
+  return declared.some(p => matchProjectGlob(p, projectCwd));
 }
 
+/**
+ * Returns true when projectCwd matches one of the slot's declared project globs.
+ */
+export function slotMatchesProject(preferredProjects: string[] | undefined, projectCwd: string): boolean {
+  if (!preferredProjects || !Array.isArray(preferredProjects)) return false;
+  const declared = preferredProjects.filter(p => String(p || "").trim().length > 0);
+  if (declared.length === 0) return false;
+  return declared.some(p => matchProjectGlob(p, projectCwd));
+}
+
+/**
+ * Returns true if the slot has a specific non-wildcard declaration matching the project.
+ * Used for priority sorting so dedicated slots are claimed before shared/wildcard slots.
+ */
+export function slotHasSpecificAffinity(preferredProjects: string[] | undefined, projectCwd: string): boolean {
+  if (!preferredProjects || !Array.isArray(preferredProjects)) return false;
+  const declared = preferredProjects.filter(p => {
+    const s = String(p || "").trim();
+    return s.length > 0 && s !== "*" && s !== "**";
+  });
+  if (declared.length === 0) return false;
+  return declared.some(p => matchProjectGlob(p, projectCwd));
+}
 export class BotPoolCoordinator {
   private db: Database;
   private dbPath: string;
@@ -278,7 +344,7 @@ export class BotPoolCoordinator {
     this.db.run("CREATE INDEX IF NOT EXISTS idx_leases_heartbeat ON bot_leases(heartbeat_at, lease_status);");
 
     // Shared outbound correlation index. Written by this coordinator (interactive
-    // channel traffic) and by the portable Python sender (Superboard notifications);
+    // channel traffic) and by the portable Python sender (outbound notifications);
     // read by the poller to bind an inbound reply back to its originating session.
     this.db.run(`
       CREATE TABLE IF NOT EXISTS message_correlations (
@@ -360,12 +426,14 @@ export class BotPoolCoordinator {
             const token = this.readRawTokenForSlot(s.stateDir);
             if (!token) continue;
             const fp = getTokenFingerprint(token);
+            const projects = (s.projects && s.projects.length > 0) ? s.projects : (s.preferredProjects || []);
             slotsMap.set(s.slotId, {
               slotId: s.slotId,
               stateDir: s.stateDir,
               botId: fp.botId,
               fingerprint: fp.fingerprint,
-              preferredProjects: s.preferredProjects || [],
+              preferredProjects: projects,
+              projects,
               enabled: s.enabled,
             });
           }
@@ -375,7 +443,9 @@ export class BotPoolCoordinator {
       }
     }
 
-    // 2. Discover channel directories under channelsDir
+    // 2. Discover channel directories under channelsDir.
+    // Discovered slots default to an empty preference list (eligible for any project)
+    // unless explicitly configured via slot.json/config.json/access.json.
     if (fs.existsSync(this.channelsDir)) {
       try {
         const entries = fs.readdirSync(this.channelsDir, { withFileTypes: true });
@@ -391,8 +461,26 @@ export class BotPoolCoordinator {
           if (!token) continue;
 
           const fp = getTokenFingerprint(token);
-          const projectAffinity = slotId.replace(/^telegram-?/, "");
-          const preferred = projectAffinity ? [projectAffinity] : [];
+          let preferred: string[] = [];
+          for (const cfgFile of ["slot.json", "config.json", "access.json"]) {
+            const cfgPath = path.join(stateDir, cfgFile);
+            if (fs.existsSync(cfgPath)) {
+              try {
+                const parsed = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+                const configured = (Array.isArray(parsed.projects) && parsed.projects.length > 0)
+                  ? parsed.projects
+                  : (Array.isArray(parsed.preferredProjects) && parsed.preferredProjects.length > 0
+                    ? parsed.preferredProjects
+                    : null);
+                if (configured) {
+                  preferred = configured.map(String);
+                  break;
+                }
+              } catch {
+                // Ignore parse errors in config files
+              }
+            }
+          }
 
           slotsMap.set(slotId, {
             slotId,
@@ -505,11 +593,29 @@ export class BotPoolCoordinator {
     slot: DiscoveredSlot,
     currentPid: number,
     currentSessionId: string,
-  ): { busy: boolean; reason?: string; activePid?: number } {
+  ): {
+    busy: boolean;
+    reason?: string;
+    activePid?: number;
+    holder?: { sessionId?: string; projectPath?: string; ownerPid?: number };
+  } {
     // 1. Claude channel poller lock
     const claudeCheck = this.checkPidFileConflict(slot.stateDir, CLAUDE_PID_FILES, currentPid);
     if (claudeCheck.busy && claudeCheck.pid !== null) {
-      return { busy: true, reason: `Claude channel poller active (PID ${claudeCheck.pid})`, activePid: claudeCheck.pid };
+      const lease = this.getSlotLease(slot.slotId);
+      const isMatchingLease = lease && lease.ownerPid === claudeCheck.pid && lease.leaseStatus === "ACTIVE";
+      return {
+        busy: true,
+        reason: isMatchingLease
+          ? `Veyyon session active (PID ${claudeCheck.pid}, Session ${lease.sessionId}, cwd ${lease.projectPath})`
+          : `Claude channel poller active (PID ${claudeCheck.pid})`,
+        activePid: claudeCheck.pid,
+        holder: {
+          sessionId: isMatchingLease ? lease.sessionId : undefined,
+          projectPath: isMatchingLease ? lease.projectPath : slot.stateDir,
+          ownerPid: claudeCheck.pid,
+        },
+      };
     }
 
     // 1b. Veyyon channel poller lock. The legacy Python bridge (veyyon_telegram_bridge.py)
@@ -521,10 +627,19 @@ export class BotPoolCoordinator {
     // stale-PID recovery unchanged.
     const veyyonCheck = this.checkPidFileConflict(slot.stateDir, VEYYON_PID_FILES, currentPid);
     if (veyyonCheck.busy && veyyonCheck.pid !== null) {
+      const lease = this.getSlotLease(slot.slotId);
+      const isMatchingLease = lease && lease.ownerPid === veyyonCheck.pid && lease.leaseStatus === "ACTIVE";
       return {
         busy: true,
-        reason: `Veyyon channel poller active (PID ${veyyonCheck.pid} in ${veyyonCheck.pidFile})`,
+        reason: isMatchingLease
+          ? `Veyyon session active (PID ${veyyonCheck.pid}, Session ${lease.sessionId}, cwd ${lease.projectPath})`
+          : `Veyyon channel poller active (PID ${veyyonCheck.pid} in ${veyyonCheck.pidFile})`,
         activePid: veyyonCheck.pid,
+        holder: {
+          sessionId: isMatchingLease ? lease.sessionId : undefined,
+          projectPath: isMatchingLease ? lease.projectPath : slot.stateDir,
+          ownerPid: veyyonCheck.pid,
+        },
       };
     }
 
@@ -553,8 +668,13 @@ export class BotPoolCoordinator {
       ) {
         return {
           busy: true,
-          reason: `Veyyon session active (PID ${lease.ownerPid}, Session ${lease.sessionId})`,
+          reason: `Veyyon session active (PID ${lease.ownerPid}, Session ${lease.sessionId}, cwd ${lease.projectPath})`,
           activePid: lease.ownerPid,
+          holder: {
+            sessionId: lease.sessionId,
+            projectPath: lease.projectPath,
+            ownerPid: lease.ownerPid,
+          },
         };
       }
 
@@ -562,8 +682,13 @@ export class BotPoolCoordinator {
       if (elapsed <= lease.ttlSeconds) {
         return {
           busy: true,
-          reason: `Veyyon session lease active within TTL (PID ${lease.ownerPid})`,
+          reason: `Veyyon session lease active within TTL (PID ${lease.ownerPid}, Session ${lease.sessionId}, cwd ${lease.projectPath})`,
           activePid: lease.ownerPid,
+          holder: {
+            sessionId: lease.sessionId,
+            projectPath: lease.projectPath,
+            ownerPid: lease.ownerPid,
+          },
         };
       }
     }
@@ -586,18 +711,21 @@ export class BotPoolCoordinator {
     while (true) {
       const slots = this.syncSlots();
 
-      // Strict project affinity: a session may claim only a slot whose declared
-      // affinity covers its project, or a slot that declares no affinity at all
-      // (shared pool slot). Affinity-matched slots are tried first so a project
-      // keeps its own bot instead of consuming the shared pool.
-      const eligibleSlots = slots.filter(s => isSlotEligibleForProject(s.preferredProjects, projectCwd));
+      // Configuration-driven project affinity: a session may claim only a slot
+      // whose declared projects/preferredProjects covers its project (via glob match or empty/wildcard),
+      // or a slot that declares no affinity at all (shared pool slot).
+      // Specific affinity-matched slots are tried first so dedicated project bots
+      // are consumed before shared/wildcard slots.
+      const eligibleSlots = slots.filter(s => isSlotEligibleForProject(s.projects ?? s.preferredProjects, projectCwd));
       const sortedSlots = [...eligibleSlots].sort((a, b) => {
-        const aMatches = slotMatchesProject(a.preferredProjects, projectCwd);
-        const bMatches = slotMatchesProject(b.preferredProjects, projectCwd);
+        const aMatches = slotHasSpecificAffinity(a.projects ?? a.preferredProjects, projectCwd);
+        const bMatches = slotHasSpecificAffinity(b.projects ?? b.preferredProjects, projectCwd);
         if (aMatches && !bMatches) return -1;
         if (!aMatches && bMatches) return 1;
         return 0;
       });
+
+      const busyHolders: BusySlotHolder[] = [];
 
       for (const slot of sortedSlots) {
         // Must have readable token
@@ -608,6 +736,13 @@ export class BotPoolCoordinator {
 
         const busyCheck = this.isSlotBusy(slot, ownerPid, sessionId);
         if (busyCheck.busy) {
+          busyHolders.push({
+            slotId: slot.slotId,
+            sessionId: busyCheck.holder?.sessionId,
+            projectPath: busyCheck.holder?.projectPath,
+            ownerPid: busyCheck.activePid ?? busyCheck.holder?.ownerPid,
+            reason: busyCheck.reason,
+          });
           continue;
         }
 
@@ -629,6 +764,13 @@ export class BotPoolCoordinator {
             if (!heldByCaller && (live.alive || live.uncertain)) {
               if (el <= currentLease.ttlSeconds) {
                 this.db.run("ROLLBACK;");
+                busyHolders.push({
+                  slotId: slot.slotId,
+                  sessionId: currentLease.sessionId,
+                  projectPath: currentLease.projectPath,
+                  ownerPid: currentLease.ownerPid,
+                  reason: `Active database lease held by session ${currentLease.sessionId} (PID ${currentLease.ownerPid}, cwd ${currentLease.projectPath})`,
+                });
                 continue;
               }
             }
@@ -680,13 +822,30 @@ export class BotPoolCoordinator {
       }
 
       if (waitTimeoutMs <= 0 || Date.now() - startTime >= waitTimeoutMs) {
+        let reason: string;
+        if (eligibleSlots.length === 0) {
+          reason = `No Telegram bot slot declares affinity for this project (${slots.length} slots in pool, none eligible for cwd '${projectCwd}').`;
+        } else if (busyHolders.length > 0) {
+          const details = busyHolders
+            .map(h => {
+              const parts = [
+                h.sessionId ? `session '${h.sessionId}'` : undefined,
+                h.projectPath ? `cwd '${h.projectPath}'` : undefined,
+                h.ownerPid ? `pid ${h.ownerPid}` : undefined,
+              ].filter(Boolean).join(", ");
+              return `slot '${h.slotId}' leased by ${parts || "unknown holder"}`;
+            })
+            .join("; ");
+          reason = `All ${eligibleSlots.length} Telegram bot slot(s) eligible for this project are currently in use: ${details}.`;
+        } else {
+          reason = `All ${eligibleSlots.length} Telegram bot slots eligible for this project are currently in use.`;
+        }
+
         return {
           ok: false,
           error: "POOL_EXHAUSTED",
-          reason:
-            eligibleSlots.length === 0
-              ? `No Telegram bot slot declares affinity for this project (${slots.length} slots in pool, none eligible).`
-              : `All ${eligibleSlots.length} Telegram bot slots eligible for this project are currently in use.`,
+          reason,
+          busyHolders: busyHolders.length > 0 ? busyHolders : undefined,
         };
       }
 

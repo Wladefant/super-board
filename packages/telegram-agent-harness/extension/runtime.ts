@@ -394,6 +394,15 @@ export class TelegramRuntime {
           `Telegram inbound ledger failure on slot ${activeSlot.slotId}: ${message}. Inbound updates are not being recorded; delivery is stalled until this clears.`,
         );
       },
+      onConflict: (diagnosis: string, attempt: number, maxAttempts: number) => {
+        this.pi.logger?.warn(`Telegram poller HTTP 409 conflict on slot ${activeSlot.slotId}: ${diagnosis}`);
+        if (attempt >= maxAttempts) {
+          ctx.ui?.notify?.(
+            `Telegram polling stopped on slot ${activeSlot.slotId}: HTTP 409 Conflict with another running bot instance.`,
+            "error",
+          );
+        }
+      },
     };
 
     const poller = this.options.pollerFactory
