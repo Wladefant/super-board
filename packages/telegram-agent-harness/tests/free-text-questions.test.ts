@@ -105,96 +105,12 @@ function fixture(options: QuestionFixtureOptions = {}) {
   const poolPath = path.join(dir, "pool.db");
   fs.writeFileSync(decisionsPath, JSON.stringify({ decisions: {} }));
 
-  interface TestQuestionRecord {
-    decision_id: string;
-    question: string;
-    options: Array<{ id: string; label: string; description?: string }>;
-    recommendation?: string;
-    status: "pending" | "answered";
-    answer: { question_id: string; choice_id: string | null; text: string | null; authorization: boolean } | null;
-    transport: QuestionRoute & {
-      kind: "operator_question";
-      message_id: number | null;
-      selection?: string | null;
-      events: Array<{ id: string; choice?: string; text?: string }>;
-    };
-  }
-
-  const questionsStore = new Map<string, TestQuestionRecord>();
-  const customInvoke = async (operation: string, payload: object, card: boolean) => {
-    const p = payload as Record<string, unknown>;
-    const route = currentRoute;
-    if (operation === "register") {
-      const id = "tq:" + Math.random().toString(36).slice(2, 10);
-      const options = (p.options as Array<{ id: string; label: string; description?: string }>) ?? [];
-      const record: TestQuestionRecord = {
-        decision_id: id,
-        question: String(p.question ?? ""),
-        options,
-        recommendation: p.recommendation ? String(p.recommendation) : undefined,
-        status: "pending",
-        answer: null,
-        transport: { ...route, kind: "operator_question", message_id: null, events: [] },
-      };
-      questionsStore.set(id, record);
-      fs.writeFileSync(decisionsPath, JSON.stringify({ decisions: Object.fromEntries(questionsStore) }));
-      return {
-        question: record,
-        card: card
-          ? {
-              id,
-              text: `<b>${String(p.question ?? "")}</b>\n${String(p.problem ?? "")}`,
-              reply_markup: { inline_keyboard: [[{ text: "Option A", callback_data: `cb:${id}:opt-a` }]] },
-            }
-          : undefined,
-      };
-    }
-    if (operation === "sent") {
-      const id = String(p.id);
-      const record = questionsStore.get(id);
-      if (record) {
-        record.transport.message_id = typeof p.message_id === "number" ? p.message_id : null;
-        fs.writeFileSync(decisionsPath, JSON.stringify({ decisions: Object.fromEntries(questionsStore) }));
-      }
-      return { question: record };
-    }
-    if (operation === "answer") {
-      const id = String(p.id);
-      const record = questionsStore.get(id);
-      if (!record) throw new Error("Question not found");
-      const event = {
-        id: String(p.event_id),
-        choice: p.choice ? String(p.choice) : undefined,
-        text: p.text ? String(p.text) : undefined,
-      };
-      record.transport.events.push(event);
-
-      // Answer is complete when choice or text is present
-      const choiceId = event.choice ?? record.transport.selection ?? (record.transport.events.find(e => e.choice)?.choice ?? null);
-      const text = event.text ?? (record.transport.events.find(e => e.text)?.text ?? null);
-
-      if (choiceId || text) {
-        record.status = "answered";
-        record.answer = {
-          question_id: record.decision_id,
-          choice_id: choiceId,
-          text: text,
-          authorization: false,
-        };
-      }
-      fs.writeFileSync(decisionsPath, JSON.stringify({ decisions: Object.fromEntries(questionsStore) }));
-      return { question: record };
-    }
-    throw new Error(`Unsupported operation: ${operation}`);
-  };
-
   const service = new OperatorQuestionService(
     poller,
     () => currentRoute,
     decisionsPath,
     poolPath,
     () => {},
-    customInvoke,
   );
   serviceInstance = service;
 
@@ -378,7 +294,14 @@ test("multimodal answer: choice callback followed by free text combines into com
   // 1. Choice button callback clicked
   await f.service.answer(questionId, "event-click", { choice: "opt-a" });
 
-  // 2. Free-text elaboration added
+  // Production state machine preserves selection vs submission distinction:
+  // Selecting an option records selection but keeps question pending and answer null
+  const intermediate = await f.service.get(questionId);
+  expect(intermediate.status).toBe("pending");
+  expect(intermediate.answer).toBeNull();
+  expect(intermediate.transport.selection).toBe("opt-a");
+
+  // 2. Free-text elaboration added via reply to the question card
   f.poller.ingestUpdates([f.reply(questionMsgId, "Max 5 retries with 500ms backoff", 901)]);
   await f.poller.redrivePendingUpdates();
 
@@ -388,7 +311,19 @@ test("multimodal answer: choice callback followed by free text combines into com
     question_id: questionId,
     choice_id: "opt-a",
     text: "Max 5 retries with 500ms backoff",
+    origin: "telegram_account",
+    actor_id: "1",
+    authorization: false,
   });
+
+  // Production state machine rejects answer mutation after answering
+  await expect(
+    f.service.answer(questionId, "event-mutate", { text: "Attempt to mutate answer" }),
+  ).rejects.toThrow("Answer already sent; reopen the question to change it");
+
+  const unmutated = await f.service.get(questionId);
+  expect(unmutated.answer?.text).toBe("Max 5 retries with 500ms backoff");
+  expect(unmutated.answer?.choice_id).toBe("opt-a");
 }, 20_000);
 
 test("question cannot be accessed or answered from an unrelated session route", async () => {
