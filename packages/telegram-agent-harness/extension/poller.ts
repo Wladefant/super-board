@@ -327,12 +327,15 @@ export class TelegramPoller {
       return null;
     }
   }
-  public async clearCallbackButtons(chatId: string, messageId: number): Promise<boolean> {
+  public async clearCallbackButtons(chatId: string, messageId: number, replacementText?: string): Promise<boolean> {
     try {
+      const reply_markup = replacementText
+        ? { inline_keyboard: [[{ text: replacementText, callback_data: "noop" }]] }
+        : { inline_keyboard: [] };
       const response = await fetch(`https://api.telegram.org/bot${this.botToken}/editMessageReplyMarkup`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }),
+        body: JSON.stringify({ chat_id: chatId, message_id: messageId, reply_markup }),
         signal: AbortSignal.any([this.abortController.signal, AbortSignal.timeout(3000)]),
       });
       const data: unknown = await response.json();
@@ -606,7 +609,13 @@ export class TelegramPoller {
           if (!sessionId || !this.callbacks.onApprovalCallback) throw new Error("Approval handling is unavailable.");
           const outcome = await this.callbacks.onApprovalCallback(callbackToken, fromId, chatId, sessionId);
           if (cbQueryId) await this.answerCallbackQuery(cbQueryId, outcome);
-          if (typeof row.reply_to_message_id === "number") await this.clearCallbackButtons(chatId, row.reply_to_message_id);
+          if (typeof row.reply_to_message_id === "number") {
+            const isApproved = callbackToken.startsWith("ap:a:");
+            const d = new Date();
+            const timeStr = `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")} UTC`;
+            const buttonText = isApproved ? `✅ Approved by you at ${timeStr}` : "❌ Denied";
+            await this.clearCallbackButtons(chatId, row.reply_to_message_id, buttonText);
+          }
           await this.sendTelegramMessage(chatId, escapeHtml(outcome));
           this.db.run("UPDATE update_ledger SET status = 'COMPLETED', correlated_session_id = ? WHERE update_id = ?", [sessionId, row.update_id]);
         } catch (error) {

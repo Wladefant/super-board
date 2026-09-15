@@ -178,24 +178,38 @@ export function renderApprovalRequest(record: ApprovalRecord): { text: string; r
   if (!/^[a-f0-9]{64}$/.test(record.token)) throw new Error("Invalid approval token");
   const encoded = Buffer.from(record.token, "hex").toString("base64url");
   const expiry = new Date(record.expiresAt).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, " UTC");
-  const folderName = record.cwd ? path.basename(record.cwd) || record.cwd : "";
-  const location = folderName ? `${folderName} (${record.cwd})` : record.cwd;
-  const agentTask = record.task ? `${record.requester} / ${record.task}` : record.requester;
+  const summary = record.summary ?? `${record.category} operation`;
+  const folder = path.basename(record.cwd.replace(/[/\\]+$/, "")) || record.cwd;
+
+  const lines: string[] = [
+    `<b>${escapeHtml(summary)}</b>`,
+    `<b>Command:</b>\n<code>${escapeHtml(record.command)}</code>`,
+    `<b>Where:</b> ${escapeHtml(folder)} · <code>${escapeHtml(record.cwd)}</code>`,
+    `<b>Why asked:</b> ${escapeHtml(record.reason)}`,
+    `<b>Agent/Task:</b> ${escapeHtml(record.requester)} · ${escapeHtml(record.task)}`,
+  ];
+
+  if (!record.approvable) {
+    lines.push("Cannot approve: the command contained a secret; ask the agent to resend without it.");
+  }
+
+  lines.push(
+    `<blockquote expandable><b>Operation details</b>\n<code>${escapeHtml(record.details)}</code>\n` +
+    (record.target ? `<b>Target:</b> ${escapeHtml(record.target)}\n` : "") +
+    `<b>Category:</b> <code>${escapeHtml(record.category)}</code>\n` +
+    `<b>Deadline:</b> ${escapeHtml(expiry)} (permits one identical retry)\n` +
+    `<b>Boundary:</b> This exact-call gate is not an execution sandbox and cannot prove that equivalent work has not run through another path.\n` +
+    `<b>Typed fallback</b>\n<code>/approve ${record.token}</code></blockquote>`
+  );
 
   return {
-    text: [
-      `<b>${escapeHtml(record.summary || record.reason || "Approval needed")}</b>`,
-      `<b>Command:</b>\n<code>${escapeHtml(record.command)}</code>`,
-      `<b>Where:</b> ${escapeHtml(location)}`,
-      `<b>Why asked:</b> ${escapeHtml(record.reason)}`,
-      `<b>Agent/Task:</b> ${escapeHtml(agentTask)}`,
-      ...(record.approvable ? [] : ["<b>Approval disabled:</b> Embedded credentials were redacted. Resubmit without them; never approve an opaque command."]),
-      `<blockquote expandable><b>Details:</b> <code>${escapeHtml(record.details || record.target || record.category)}</code>\n<b>Expires:</b> ${escapeHtml(expiry)}\n<b>Typed fallback:</b> <code>/approve ${record.token}</code></blockquote>`,
-    ].filter(Boolean).join("\n"),
-    replyMarkup: { inline_keyboard: [[
-      ...(record.approvable ? [{ text: "✅ Yes, run it", callback_data: `ap:a:${encoded}` }] : []),
-      { text: "❌ No", callback_data: `ap:d:${encoded}` },
-    ]] },
+    text: lines.join("\n"),
+    replyMarkup: {
+      inline_keyboard: [[
+        ...(record.approvable ? [{ text: "✅ Yes, run it", callback_data: `ap:a:${encoded}` }] : []),
+        { text: "❌ No", callback_data: `ap:d:${encoded}` },
+      ]],
+    },
   };
 }
 
@@ -210,12 +224,12 @@ export async function handleInstalledCommand(text: string, port: InstalledComman
     if (match[1] === "approve") {
       const approval = /^\/approve\s+([a-f0-9]{64})$/.exec(raw);
       if (!approval) { await port.send("<b>Usage:</b> <code>/approve FULL_64_CHARACTER_TOKEN</code> from the refused operation."); return true; }
-      if (!session.stateDir || !port.approve) { await port.send("<b>Approval unavailable.</b> No channel guard is bound to this session. Use the local unlock instruction from the refusal."); return true; }
+      if (!session.stateDir || !port.approve) { await port.send("<b>No channel guard is bound to this session.</b>"); return true; }
       try {
         const record = await port.approve(approval[1]);
-        await port.send(`<b>Approved for one identical call.</b> Retry it before <code>${escapeHtml(record.expiresAt)}</code>. Approval does not execute the operation or override other safety gates.`);
+        await port.send(`<b>Approved for one identical call:</b> retry it before <code>${escapeHtml(record.expiresAt)}</code>.`);
       } catch (error) {
-        await port.send(`<b>Not approved.</b> ${escapeHtml(error instanceof Error ? error.message : "Approval storage unavailable; retry the refused call.")}`);
+        await port.send(`<b>Not approved:</b> ${escapeHtml(error instanceof Error ? error.message : "approval storage unavailable.")}`);
       }
     } else if (match[1] === "agents") {
       const agents = await herdr.listSessions();
