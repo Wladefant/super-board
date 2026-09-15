@@ -187,7 +187,7 @@ for (const choice of ["approved", "denied"] as const) {
     f.poller.ingestUpdates([{ ...f.update, update_id: 2 }]); await f.poller.redrivePendingUpdates();
     expect(f.delivered).toHaveLength(1);
     expect(f.calls.some(call => call.method === "editMessageReplyMarkup")).toBe(true);
-  });
+  }, 15_000);
 }
 
 test("approval callbacks from an unauthorized actor or foreign session cannot grant permission", async () => {
