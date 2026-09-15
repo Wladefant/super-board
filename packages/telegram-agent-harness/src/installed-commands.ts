@@ -178,23 +178,23 @@ export function renderApprovalRequest(record: ApprovalRecord): { text: string; r
   if (!/^[a-f0-9]{64}$/.test(record.token)) throw new Error("Invalid approval token");
   const encoded = Buffer.from(record.token, "hex").toString("base64url");
   const expiry = new Date(record.expiresAt).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, " UTC");
+  const folderName = record.cwd ? path.basename(record.cwd) || record.cwd : "";
+  const location = folderName ? `${folderName} (${record.cwd})` : record.cwd;
+  const agentTask = record.task ? `${record.requester} / ${record.task}` : record.requester;
+
   return {
     text: [
-      "<b>Approval needed — this call is blocked</b>",
-      `<b>Agent:</b> ${escapeHtml(record.requester)}`,
-      `<b>Task:</b> ${escapeHtml(record.task)}`,
-      `<b>Affected target:</b> ${escapeHtml(record.target)}`,
-      `<b>Working directory:</b> <code>${escapeHtml(record.cwd)}</code>`,
-      `<b>Why blocked:</b> ${escapeHtml(record.reason)} <code>${escapeHtml(record.category)}</code>`,
-      "<b>Deny:</b> This call stays blocked; the requester is told explicitly to skip it and continue independent work.",
-      `<b>Deadline:</b> ${escapeHtml(expiry)}. Approve permits one identical retry only; it does not execute anything.`,
-      record.approvable ? "" : "<b>Approval disabled:</b> Embedded credentials were redacted. Resubmit without them; never approve an opaque command.",
-      `<b>Exact command</b>\n<code>${escapeHtml(record.command)}</code>`,
-      `<blockquote expandable><b>Operation details</b>\n<code>${escapeHtml(record.details)}</code>\n<b>Boundary:</b> This exact-call gate is not an execution sandbox and cannot prove that equivalent work has not run through another path.\n<b>Typed fallback</b>\n<code>/approve ${record.token}</code></blockquote>`,
+      `<b>${escapeHtml(record.summary || record.reason || "Approval needed")}</b>`,
+      `<b>Command:</b>\n<code>${escapeHtml(record.command)}</code>`,
+      `<b>Where:</b> ${escapeHtml(location)}`,
+      `<b>Why asked:</b> ${escapeHtml(record.reason)}`,
+      `<b>Agent/Task:</b> ${escapeHtml(agentTask)}`,
+      ...(record.approvable ? [] : ["<b>Approval disabled:</b> Embedded credentials were redacted. Resubmit without them; never approve an opaque command."]),
+      `<blockquote expandable><b>Details:</b> <code>${escapeHtml(record.details || record.target || record.category)}</code>\n<b>Expires:</b> ${escapeHtml(expiry)}\n<b>Typed fallback:</b> <code>/approve ${record.token}</code></blockquote>`,
     ].filter(Boolean).join("\n"),
     replyMarkup: { inline_keyboard: [[
-      ...(record.approvable ? [{ text: "Approve once", callback_data: `ap:a:${encoded}` }] : []),
-      { text: "Deny", callback_data: `ap:d:${encoded}` },
+      ...(record.approvable ? [{ text: "✅ Yes, run it", callback_data: `ap:a:${encoded}` }] : []),
+      { text: "❌ No", callback_data: `ap:d:${encoded}` },
     ]] },
   };
 }

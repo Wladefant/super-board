@@ -242,7 +242,7 @@ test("approve command grants exactly the pending guard operation once", async ()
     const f = fixture(), guard = new DangerousToolGuard(dir);
     f.port.session = () => ({ ...f.state, stateDir: dir });
     f.port.approve = token => approveOperation(dir, token);
-    const input = { command: "git push --force origin feat/93" };
+    const input = { command: "git push --force origin main" };
     const token = guard.evaluateToolCall("bash", input, true).approvalHash!;
     expect(await handleInstalledCommand(`/approve@sessionbot ${token}`, f.port, f.runner)).toBe(true);
     expect(f.sent[0]).toContain("Approved for one identical call");
@@ -267,15 +267,15 @@ test("approve reports missing binding, invalid tokens and expired requests witho
 test("approval buttons preserve the whole grant within Telegram's callback limit", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "approval-card-"));
   try {
-    const record = new DangerousToolGuard(dir).evaluateToolCall("bash", { command: "ssh host" }, false, { sessionId: "test", requester: "Agent <one>", task: "Inspect host", cwd: "/tmp" }).approval!;
+    const record = new DangerousToolGuard(dir).evaluateToolCall("bash", { command: "git push --force origin main" }, false, { sessionId: "test", requester: "Agent <one>", task: "Inspect host", cwd: "/tmp" }).approval!;
     const card = renderApprovalRequest(record);
     expect(card.text).toContain("Agent &lt;one&gt;");
-    expect(card.text).toContain("<code>ssh host</code>");
+    expect(card.text).toContain("<code>git push --force origin main</code>");
     expect(card.text).toContain("<blockquote expandable>");
     expect(card.text).toContain("UTC");
     expect(card.text).toContain(`/approve ${record.token}`);
     const keyboard = card.replyMarkup.inline_keyboard as { text: string; callback_data: string }[][];
-    expect(keyboard[0].map(button => button.text)).toEqual(["Approve once", "Deny"]);
+    expect(keyboard[0].map(button => button.text)).toEqual(["✅ Yes, run it", "❌ No"]);
     for (const button of keyboard[0]) {
       expect(Buffer.byteLength(button.callback_data)).toBeLessThanOrEqual(64);
       expect(Buffer.from(button.callback_data.slice(5), "base64url").toString("hex")).toBe(record.token);

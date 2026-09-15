@@ -15,6 +15,7 @@ export interface ApprovalRecord extends ApprovalContext {
   token: string;
   operationHash: string;
   category: string;
+  summary: string;
   command: string;
   target: string;
   reason: string;
@@ -28,16 +29,165 @@ export interface ApprovalActor { sessionId: string; userId: string; chatId: stri
 export type ApprovalDescription = Omit<ApprovalRecord, "token" | "operationHash" | "requestedAt" | "expiresAt" | "state">;
 const TTL = 15 * 60 * 1000;
 const REASONS: Record<string, string> = {
-  shell_destructive_os: "This operation can stop processes, remove files, or execute a process whose arguments cannot be resolved statically.",
-  destructive_git: "This operation can overwrite repository history or change a protected branch.",
-  shared_db_ddl_dml: "This operation can change database structure or stored data.",
-  deployments: "This operation can change running services or publish a deployment.",
-  cloudflare_stripe_mutations: "This operation can change cloud resources or payment state.",
-  remote_ssh: "This operation executes on or transfers files to a remote host.",
-  secrets: "This operation accesses a protected secret-bearing path.",
+  shell_destructive_os: "This operation performs destructive filesystem or OS-level modifications.",
+  destructive_git: "This operation can overwrite repository history or delete protected branches.",
+  shared_db_ddl_dml: "This operation can modify database schema or overwrite stored data.",
+  deployments: "This operation publishes deployments or updates live service infrastructure.",
+  cloudflare_stripe_mutations: "This operation modifies live cloud infrastructure, keys, or payment records.",
+  remote_ssh: "This operation executes commands or transfers files on a remote host.",
+  secrets: "This operation accesses protected credentials, private keys, or environment secrets.",
 };
 
 /** Keep credentials out of both Telegram and the durable audit. Bind the original input by hash only. */
+function findCommandWords(commands: string[][], targetApps: string[]): string[] | undefined {
+  for (const cmd of commands) {
+    let words = cmd;
+    while (words.length && /^[A-Za-z_]\w*=/.test(words[0])) words = words.slice(1);
+    while (words.length && /^(env|command|exec|call|if|then|do|while|!|time|nohup|xargs|sudo)$/i.test(words[0])) {
+      words = words.slice(1);
+      while (words.length && words[0].startsWith("-")) words = words.slice(1);
+    }
+    if (!words.length) continue;
+    const app = words[0].replace(/\\/g, "/").split("/").pop()!.replace(/\.(exe|cmd|bat)$/i, "").toLowerCase();
+    if (targetApps.includes(app)) return words;
+    if (/^(sh|bash|zsh|cmd|powershell|pwsh)$/i.test(app)) {
+      const idx = words.findIndex(w => /^(-[a-z]*c|\/c|-command)$/i.test(w));
+      if (idx >= 0 && words[idx + 1]) {
+        const inner = words.slice(idx + 1).join(" ").trim().split(/\s+/);
+        const innerApp = inner[0]?.replace(/\\/g, "/").split("/").pop()!.replace(/\.(exe|cmd|bat)$/i, "").toLowerCase();
+        if (targetApps.includes(innerApp)) return inner;
+      }
+    }
+  }
+  return undefined;
+}
+
+export function formatApprovalSummary(category: string, tool: string, input: Record<string, unknown>, commands: string[][], command: string): string {
+  if (category === "destructive_git") {
+    const gitCmd = findCommandWords(commands, ["git"]);
+    if (gitCmd) {
+      let idx = 1;
+      while (idx < gitCmd.length && gitCmd[idx].startsWith("-")) {
+        if (/^(-C|-c|--git-dir|--work-tree)$/.test(gitCmd[idx])) idx += 2;
+        else idx++;
+      }
+      const action = gitCmd[idx];
+      const rest = gitCmd.slice(idx + 1);
+      if (action === "filter-branch" || action === "filter-repo") {
+        return `Rewrite repository history with git ${action}`;
+      }
+      if (action === "push") {
+        const isMirror = rest.some(a => a === "--mirror");
+        const isDelete = rest.some(a => a === "--delete" || /^-[^-]*d$/.test(a));
+        const nonFlags = rest.filter(a => !a.startsWith("-"));
+        const remote = nonFlags[0] || "origin";
+        const refspecs = nonFlags.slice(1);
+        const refspec = refspecs[0] || "";
+        if (isMirror) {
+          return `Mirror push all refs to ${remote} (overwrites remote repository)`;
+        }
+        if (isDelete || refspec.startsWith(":")) {
+          const branch = refspec ? refspec.replace(/^:/, "").replace(/^refs\/heads\//, "") : "branch";
+          return `Delete branch ${branch} on ${remote}`;
+        }
+        const branch = refspec ? (refspec.includes(":") ? refspec.split(":").pop()! : refspec).replace(/^\+/, "").replace(/^refs\/heads\//, "") : "branch";
+        return `Force-push branch ${branch} to ${remote} (rewrites shared history)`;
+      }
+    }
+    return "Force-push git repository (rewrites shared history)";
+  }
+
+  if (category === "shell_destructive_os") {
+    const osCmd = findCommandWords(commands, ["rm", "rmdir", "remove-item", "format", "dd", "shutdown", "reboot"]);
+    if (osCmd) {
+      const app = osCmd[0]?.replace(/\\/g, "/").split("/").pop()!.replace(/\.(exe|cmd|bat)$/i, "").toLowerCase();
+      const args = osCmd.slice(1);
+      if (app === "rm" || app === "rmdir" || app === "remove-item") {
+        const targets = args.filter(a => !a.startsWith("-") && !/^[\/-][sq]/i.test(a)).join(" ");
+        return `Remove files recursively at ${targets || "target path"}`;
+      }
+      if (app === "format") {
+        const drive = args.find(a => /^[a-z]:$/i.test(a)) || "drive";
+        return `Format drive ${drive}`;
+      }
+      if (app === "dd") return "Low-level disk overwrite with dd";
+      if (app === "shutdown") return "Shut down the operating system";
+      if (app === "reboot") return "Reboot the operating system";
+    }
+    return "Execute destructive operating system command";
+  }
+
+  if (category === "shared_db_ddl_dml") {
+    const dbCmd = findCommandWords(commands, ["psql", "alembic", "supabase", "pg_restore"]);
+    if (dbCmd) {
+      const app = dbCmd[0]?.replace(/\\/g, "/").split("/").pop()!.replace(/\.(exe|cmd|bat)$/i, "").toLowerCase();
+      const args = dbCmd.slice(1);
+      if (app === "psql") return "Execute database queries via psql";
+      if (app === "pg_restore") return "Restore database dump via pg_restore";
+      if (app === "alembic") {
+        const sub = args.find(a => !a.startsWith("-")) || "migration";
+        return `Run database migration via alembic ${sub}`;
+      }
+      if (app === "supabase") {
+        const sub = args.filter(a => !a.startsWith("-")).join(" ") || "db command";
+        return `Modify database via supabase ${sub}`;
+      }
+    }
+    return "Execute shared database DDL/DML operation";
+  }
+
+  if (category === "deployments") {
+    const depCmd = findCommandWords(commands, ["dokploy", "fly", "wrangler", "deploy"]);
+    if (depCmd) {
+      const app = depCmd[0]?.replace(/\\/g, "/").split("/").pop()!.replace(/\.(exe|cmd|bat)$/i, "").toLowerCase();
+      const args = depCmd.slice(1);
+      if (app === "dokploy") return "Trigger deployment via dokploy";
+      if (app === "fly") return "Deploy application using fly deploy";
+      if (app === "wrangler") {
+        const sub = args.find(a => !a.startsWith("-")) || "deploy";
+        return `Deploy worker via wrangler ${sub}`;
+      }
+      if (/\b(prod|production)\b/i.test(args.join(" "))) return "Deploy application to production";
+    }
+    if (/\bdeploy\s+(prod|production)\b/i.test(command)) return "Deploy application to production";
+    return "Publish or update application deployment";
+  }
+
+  if (category === "cloudflare_stripe_mutations") {
+    const cfCmd = findCommandWords(commands, ["stripe", "wrangler", "topup_main_reset"]);
+    if (cfCmd) {
+      const app = cfCmd[0]?.replace(/\\/g, "/").split("/").pop()!.replace(/\.(exe|cmd|bat)$/i, "").toLowerCase();
+      const args = cfCmd.slice(1);
+      if (app === "stripe") {
+        const sub = args.filter(a => !a.startsWith("-")).slice(0, 2).join(" ");
+        return `Mutate payment resource via stripe ${sub || "mutation"}`;
+      }
+      if (app === "wrangler") {
+        const sub = args.find(a => !a.startsWith("-")) || "resource";
+        return `Modify Cloudflare resources via wrangler ${sub}`;
+      }
+      if (app === "topup_main_reset") return "Reset main account balance";
+    }
+    return "Modify cloud resources or payment state";
+  }
+
+  if (category === "remote_ssh") {
+    const host = String(input.host ?? input.hostname ?? (tool === "ssh" ? input.host : undefined) ?? "");
+    return `Execute command on remote host ${host || "remote"}`;
+  }
+
+  if (category === "secrets") {
+    const explicit = [input.path, input.file].filter(x => typeof x === "string").join("; ");
+    return `Access protected sensitive path (${explicit || "secret"})`;
+  }
+
+  if (category === "production_exclusion") {
+    return "Access production environment (strictly prohibited)";
+  }
+
+  return `Execute guarded ${category.replace(/_/g, " ")} operation`;
+}
+
 export function describeApproval(tool: string, input: Record<string, unknown>, category: string, context: ApprovalContext, commands: string[][] = [], unresolved = false): ApprovalDescription {
   const command = typeof input.command === "string" ? input.command : typeof input.code === "string" ? input.code :
     typeof input.application === "string" ? JSON.stringify([input.application, ...(Array.isArray(input.args) ? input.args : [])]) : JSON.stringify(input);
@@ -56,10 +206,10 @@ export function describeApproval(tool: string, input: Record<string, unknown>, c
   const explicit = [input.path, input.host, input.hostname, input.name].filter(x => typeof x === "string").join("; ");
   const operands = commands.flatMap(words => words.slice(1).filter(word => !word.startsWith("-"))).join("; ");
   const target = safe([explicit || operands || (tool === "eval" ? "Files/processes named in the script" : "Whole-host or dynamically resolved target; inspect the complete command"), unresolved ? "Some process arguments are dynamic: their runtime targets cannot be proven from this request." : ""].filter(Boolean).join(". "));
-  // env values are never copied to the display or audit, including apparently innocuous ones.
-  const details = safe(JSON.stringify({ tool, cwd, ...Object.fromEntries(Object.entries(input).filter(([key]) => !["command", "code", "application", "args", "env"].includes(key))), environmentKeys: Object.keys((input.env ?? {}) as object) }, null, 2));
-  return { ...context, requester: safe(context.requester), task: safe(context.task), cwd, category, command: safeCommand, target,
-    reason: unresolved ? "The script executes a subprocess with dynamically constructed arguments. The guard cannot prove its runtime effects, so it requires approval; this does not mean a destructive action was observed." : REASONS[category] ?? "This category requires exact operator authorization.", details,
+  const details = safe(JSON.stringify({ tool, cwd, ...Object.fromEntries(Object.entries(input).filter(([key]) => !["command", "code", "application", "args", "env"].includes(key))), environmentKeys: Object.keys((input.env ?? {}) as object), ...(unresolved ? { unresolvedProcessArguments: true } : {}) }, null, 2));
+  const summary = safe(formatApprovalSummary(category, tool, input, commands, safeCommand));
+  return { ...context, requester: safe(context.requester), task: safe(context.task), cwd, category, summary, command: safeCommand, target,
+    reason: REASONS[category] ?? "This category requires exact operator authorization.", details,
     // Never put an approval button on a redacted or truncated operation.
     approvable: safeCommand === command && !safeCommand.includes("[REDACTED_SECRET]") };
 }

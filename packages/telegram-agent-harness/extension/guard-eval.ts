@@ -158,7 +158,7 @@ export function evalCommands(code: string, language: string, parseShell: (comman
       else if (typeof value.application === "string" && Array.isArray(value.args)) append([value.application, ...value.args]);
       else unresolved = true;
     } else if (/^(fs(?:\.promises)?\.(rm|rmSync|rmdir|rmdirSync|unlink|unlinkSync)|shutil\.rmtree|os\.(remove|unlink|rmdir|kill))$/.test(call)) {
-      commands.push(["rm", "-rf"]);
+      commands.push(["rm", "-rf", ...(typeof value === "string" ? [value] : [])]);
     } else if (/^(read|write|open|fs(?:\.promises)?\.(readFile|readFileSync|writeFile|writeFileSync)|Bun\.(file|write)|Path|pathlib\.Path)$/.test(call)) {
       // Protect real path-taking native calls without scanning an inert string assignment.
       if (typeof value === "string") commands.push(["cat", value]);
