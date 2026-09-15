@@ -5,7 +5,8 @@
 export interface ManifestSlot {
   slotId: string;
   stateDir: string;
-  preferredProjects: string[];
+  preferredProjects?: string[];
+  projects?: string[];
   enabled: boolean;
 }
 
@@ -20,6 +21,7 @@ export interface DiscoveredSlot {
   botId: string;
   fingerprint: string;
   preferredProjects: string[];
+  projects?: string[];
   enabled: boolean;
 }
 
@@ -48,12 +50,21 @@ export interface AccessConfig {
   allowFrom: string[];
 }
 
+export interface BusySlotHolder {
+  slotId: string;
+  sessionId?: string;
+  projectPath?: string;
+  ownerPid?: number;
+  reason?: string;
+}
+
 export interface ClaimResult {
   ok: boolean;
   slot?: DiscoveredSlot;
   error?: string;
   reason?: string;
   activeOwnerPid?: number;
+  busyHolders?: BusySlotHolder[];
 }
 
 export interface PoolStatusSummary {

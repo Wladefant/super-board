@@ -358,6 +358,15 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
               pi.logger.warn(`Operator choice delivered, but canonical decision '${decisionId}' was not resolved`);
             }
           },
+          onConflict: (diagnosis, attempt, maxAttempts) => {
+            pi.logger.warn(`Telegram poller HTTP 409 conflict on slot ${activeSlot.slotId}: ${diagnosis}`);
+            if (attempt >= maxAttempts) {
+              ctx.ui.notify(
+                `Telegram polling stopped on slot ${activeSlot.slotId}: HTTP 409 Conflict with another running bot instance.`,
+                "error",
+              );
+            }
+          },
           onLedgerFailure: message => {
             pi.logger.warn(
               `Telegram inbound ledger failure on slot ${activeSlot.slotId}: ${message}. Inbound updates are not being recorded; delivery is stalled until this clears.`,
