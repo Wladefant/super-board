@@ -148,3 +148,84 @@ describe("lease coordinator priority and busy holder diagnostics", () => {
     expect(polyHolder?.reason).toContain("Veyyon session active");
   });
 });
+
+describe("discovered slot eligibility and portable comments", () => {
+  test("discovered slot with no manifest entry defaults to empty preference list and is eligible for any project", async () => {
+    const discDir = fs.mkdtempSync(path.join(os.tmpdir(), "veyyon-disc-slot-"));
+    try {
+      const channelsDir = path.join(discDir, "channels");
+      const spareDir = path.join(channelsDir, "telegram-spare");
+      fs.mkdirSync(spareDir, { recursive: true });
+      fs.writeFileSync(path.join(spareDir, ".env"), "TELEGRAM_BOT_TOKEN=123456789:AABBCloseMockToken123456789\n", "utf8");
+
+      const dbPath = path.join(discDir, "bot_pool.db");
+      const manifestPath = path.join(discDir, "manifest.json"); // does not exist
+
+      const discCoordinator = new BotPoolCoordinator(dbPath, manifestPath, channelsDir);
+      try {
+        const slots = discCoordinator.syncSlots();
+        const spareSlot = slots.find(s => s.slotId === "telegram-spare");
+        expect(spareSlot).toBeDefined();
+        // Must preserve an empty preference list unless explicitly configured
+        expect(spareSlot?.preferredProjects).toEqual([]);
+
+        // Must be eligible for an unrelated project (default = any project)
+        const claim = await discCoordinator.acquireLease("sess-unrelated", "C:/dev/unrelated-app", 20001);
+        expect(claim.ok).toBe(true);
+        expect(claim.slot?.slotId).toBe("telegram-spare");
+      } finally {
+        discCoordinator.close();
+      }
+    } finally {
+      try {
+        fs.rmSync(discDir, { recursive: true, force: true });
+      } catch {}
+    }
+  });
+
+  test("discovered slot with explicit slot.json preserves configured preference list", async () => {
+    const discDir = fs.mkdtempSync(path.join(os.tmpdir(), "veyyon-disc-cfg-"));
+    try {
+      const channelsDir = path.join(discDir, "channels");
+      const dedicatedDir = path.join(channelsDir, "telegram-worker");
+      fs.mkdirSync(dedicatedDir, { recursive: true });
+      fs.writeFileSync(path.join(dedicatedDir, ".env"), "TELEGRAM_BOT_TOKEN=123456789:AABBCloseMockToken987654321\n", "utf8");
+      fs.writeFileSync(
+        path.join(dedicatedDir, "slot.json"),
+        JSON.stringify({ preferredProjects: ["*dedicated-worker*"] }),
+        "utf8",
+      );
+
+      const dbPath = path.join(discDir, "bot_pool.db");
+      const manifestPath = path.join(discDir, "manifest.json"); // does not exist
+
+      const discCoordinator = new BotPoolCoordinator(dbPath, manifestPath, channelsDir);
+      try {
+        const slots = discCoordinator.syncSlots();
+        const workerSlot = slots.find(s => s.slotId === "telegram-worker");
+        expect(workerSlot).toBeDefined();
+        expect(workerSlot?.preferredProjects).toEqual(["*dedicated-worker*"]);
+      } finally {
+        discCoordinator.close();
+      }
+    } finally {
+      try {
+        fs.rmSync(discDir, { recursive: true, force: true });
+      } catch {}
+    }
+  });
+
+  test("coordinator.ts source comments have no hardcoded personal project names or personal workstation paths", () => {
+    const coordinatorSource = fs.readFileSync(
+      path.join(__dirname, "../extension/coordinator.ts"),
+      "utf8",
+    );
+    const commentMatches = coordinatorSource.match(/\/\*[\s\S]*?\*\/|\/\/.*/g) || [];
+    const allComments = commentMatches.join("\n");
+
+    expect(allComments).not.toMatch(/super-board/i);
+    expect(allComments).not.toMatch(/polysimulator/i);
+    expect(allComments).not.toMatch(/\bing\b/i);
+    expect(allComments).not.toMatch(/C:\/dev\//i);
+  });
+});

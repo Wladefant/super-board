@@ -179,10 +179,10 @@ interface CorrelationRow {
  * Matches projectCwd against a glob pattern.
  * Supports:
  * - Empty / "*" / "**" -> matches any project
- * - Wildcard patterns with * and ? (e.g. "*super-board*", "*-polysimulator")
- * - Path globs with directory separators (e.g. "** /super-board/**", "C:/dev/polysimulator")
+ * - Wildcard patterns with * and ? (e.g. "*project-alpha*", "*-backend")
+ * - Path globs with directory separators (e.g. "project-core/*", "/workspace/frontend")
  * - Case-insensitive and normalizes / vs \
- * - Plain project segment tokens (e.g. "polysimulator", "ing") for backward compatibility
+ * - Plain project segment tokens (e.g. "core-service", "worker") for backward compatibility
  */
 export function matchProjectGlob(pattern: string, projectCwd: string): boolean {
   const rawPat = String(pattern || "").trim();
@@ -240,7 +240,7 @@ export function matchProjectGlob(pattern: string, projectCwd: string): boolean {
 
 /**
  * Configuration-driven project affinity gate. A slot declares the projects (cwd globs) it serves.
- * Default (omitted or empty array) = any project.
+ * Default (omitted, empty array, or discovered without explicit project config) = any project.
  * Wildcard ('*' or '**') = any project.
  * Otherwise, the session's project path must match at least one declared glob.
  */
@@ -344,7 +344,7 @@ export class BotPoolCoordinator {
     this.db.run("CREATE INDEX IF NOT EXISTS idx_leases_heartbeat ON bot_leases(heartbeat_at, lease_status);");
 
     // Shared outbound correlation index. Written by this coordinator (interactive
-    // channel traffic) and by the portable Python sender (Superboard notifications);
+    // channel traffic) and by the portable Python sender (outbound notifications);
     // read by the poller to bind an inbound reply back to its originating session.
     this.db.run(`
       CREATE TABLE IF NOT EXISTS message_correlations (
@@ -443,7 +443,9 @@ export class BotPoolCoordinator {
       }
     }
 
-    // 2. Discover channel directories under channelsDir
+    // 2. Discover channel directories under channelsDir.
+    // Discovered slots default to an empty preference list (eligible for any project)
+    // unless explicitly configured via slot.json/config.json/access.json.
     if (fs.existsSync(this.channelsDir)) {
       try {
         const entries = fs.readdirSync(this.channelsDir, { withFileTypes: true });
@@ -459,8 +461,26 @@ export class BotPoolCoordinator {
           if (!token) continue;
 
           const fp = getTokenFingerprint(token);
-          const projectAffinity = slotId.replace(/^telegram-?/, "");
-          const preferred = projectAffinity ? [projectAffinity] : [];
+          let preferred: string[] = [];
+          for (const cfgFile of ["slot.json", "config.json", "access.json"]) {
+            const cfgPath = path.join(stateDir, cfgFile);
+            if (fs.existsSync(cfgPath)) {
+              try {
+                const parsed = JSON.parse(fs.readFileSync(cfgPath, "utf8"));
+                const configured = (Array.isArray(parsed.projects) && parsed.projects.length > 0)
+                  ? parsed.projects
+                  : (Array.isArray(parsed.preferredProjects) && parsed.preferredProjects.length > 0
+                    ? parsed.preferredProjects
+                    : null);
+                if (configured) {
+                  preferred = configured.map(String);
+                  break;
+                }
+              } catch {
+                // Ignore parse errors in config files
+              }
+            }
+          }
 
           slotsMap.set(slotId, {
             slotId,
