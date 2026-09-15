@@ -282,3 +282,16 @@ test("approval buttons preserve the whole grant within Telegram's callback limit
     }
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
+test("reload invokes port.reload when available", async () => {
+  const f = fixture();
+  let reloaded = false;
+  f.port.reload = async () => { reloaded = true; };
+  expect(await handleInstalledCommand("/reload", f.port, f.runner)).toBe(true);
+  expect(reloaded).toBe(true);
+});
+
+test("reload notifies when hot reload is unsupported", async () => {
+  const f = fixture();
+  expect(await handleInstalledCommand("/reload", f.port, f.runner)).toBe(true);
+  expect(f.sent[0]).toContain("Hot reload unavailable");
+});
