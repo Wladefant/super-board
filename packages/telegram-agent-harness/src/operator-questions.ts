@@ -83,14 +83,14 @@ export class OperatorQuestionService {
     return question;
   }
 
-  async wait(id: string, signal?: AbortSignal): Promise<QuestionAnswer> {
+  async wait(id: string, signal?: AbortSignal, pollIntervalMs = 200): Promise<QuestionAnswer> {
     for (;;) {
       signal?.throwIfAborted();
       const question = await this.get(id);
       if (question.answer) return question.answer;
       await new Promise<void>((resolve, reject) => {
         const abort = () => { clearTimeout(timer); reject(signal?.reason); };
-        const timer = setTimeout(() => { signal?.removeEventListener("abort", abort); resolve(); }, 1000);
+        const timer = setTimeout(() => { signal?.removeEventListener("abort", abort); resolve(); }, pollIntervalMs);
         signal?.addEventListener("abort", abort, { once: true });
         if (signal?.aborted) abort();
       });
