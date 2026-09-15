@@ -312,7 +312,7 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
             if (!selection || sessionId !== currentSessionId()) throw new Error("Invalid or foreign-session approval callback.");
             const record = decideApproval(activeSlot!.stateDir, selection.token, selection.decision, { sessionId, userId, chatId });
             await pi.sendUserMessage(approvalOutcome(record), ctx.isIdle() ? undefined : { deliverAs: "steer" });
-            return record.state === "denied" ? "Denied. The requester was told not to run this operation." : `Approved once. Requester notified; identical retry expires ${record.expiresAt}.`;
+            return approvalOutcome(record);
           },
           onTelegramTurnStart: () => {
             if (guard) guard.startTelegramTurn();
@@ -496,7 +496,13 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
       {
         sessionId: root.sessionId,
         requester: ctx.agentId ?? "Main (interactive root agent)",
-        task: String(event.input.i ?? event.input.title ?? `Run ${event.toolName}; no task description supplied`),
+        task: String(
+          event.input.i ??
+          event.input.task ??
+          event.input.description ??
+          event.input.title ??
+          (typeof event.input.command === "string" && event.input.command ? event.input.command : `Run ${event.toolName}`)
+        ),
         cwd: ctx.cwd,
         toolCallId: event.toolCallId,
       },

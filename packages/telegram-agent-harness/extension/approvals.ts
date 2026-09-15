@@ -23,6 +23,7 @@ export interface ApprovalRecord extends ApprovalContext {
   requestedAt: string;
   expiresAt: string;
   state: "pending" | "approved" | "denied" | "consumed" | "expired";
+  summary?: string;
 }
 export interface ApprovalActor { sessionId: string; userId: string; chatId: string }
 export type ApprovalDescription = Omit<ApprovalRecord, "token" | "operationHash" | "requestedAt" | "expiresAt" | "state">;
@@ -60,6 +61,7 @@ export function describeApproval(tool: string, input: Record<string, unknown>, c
   const details = safe(JSON.stringify({ tool, cwd, ...Object.fromEntries(Object.entries(input).filter(([key]) => !["command", "code", "application", "args", "env"].includes(key))), environmentKeys: Object.keys((input.env ?? {}) as object) }, null, 2));
   return { ...context, requester: safe(context.requester), task: safe(context.task), cwd, category, command: safeCommand, target,
     reason: unresolved ? "The script executes a subprocess with dynamically constructed arguments. The guard cannot prove its runtime effects, so it requires approval; this does not mean a destructive action was observed." : REASONS[category] ?? "This category requires exact operator authorization.", details,
+    summary: `${category} operation`,
     // Never put an approval button on a redacted or truncated operation.
     approvable: safeCommand === command && !safeCommand.includes("[REDACTED_SECRET]") };
 }
@@ -133,5 +135,8 @@ export function parseApprovalCallback(data: string): { token: string; decision: 
   return approvalCallback(token, decision) === data ? { token, decision } : null;
 }
 export function approvalOutcome(record: ApprovalRecord): string {
-  return `Operator ${record.state} ${record.requester}'s ${record.category} request (${record.toolCallId ?? record.token}). Task: ${record.task}. ${record.state === "denied" ? "Denied — this call is blocked at the gate. The gate cannot prove no equivalent action ran elsewhere; continue independent work." : `One identical retry is authorized before ${record.expiresAt}; this decision did not execute anything.`}`;
+  if (record.state === "denied") {
+    return "Operator denied: do not run it or work around it; continue other work.";
+  }
+  return `Operator approved: run the identical call now (valid until ${record.expiresAt}).`;
 }

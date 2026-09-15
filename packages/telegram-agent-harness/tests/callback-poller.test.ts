@@ -175,18 +175,31 @@ for (const choice of ["approved", "denied"] as const) {
       const parsed = parseApprovalCallback(data)!;
       const record = decideApproval(f.dir, parsed.token, parsed.decision, { userId, chatId, sessionId });
       f.delivered.push(approvalOutcome(record));
-      return `Operator ${record.state}`;
+      return approvalOutcome(record);
     };
     f.update.callback_query!.data = approvalCallback(request.token, choice);
     f.poller.ingestUpdates([f.update]); await f.poller.redrivePendingUpdates();
     expect(f.delivered).toHaveLength(1);
-    expect(f.delivered[0]).toContain(`Operator ${choice}`);
-    expect(f.delivered[0]).toContain("ProofAgent");
-    if (choice === "denied") expect(f.delivered[0]).toContain("this call is blocked at the gate");
+    if (choice === "approved") {
+      expect(f.delivered[0]).toBe(`Operator approved: run the identical call now (valid until ${request.expiresAt}).`);
+    } else {
+      expect(f.delivered[0]).toBe("Operator denied: do not run it or work around it; continue other work.");
+    }
     expect(guard.evaluateToolCall("bash", input, false, context).allowed).toBe(choice === "approved");
     f.poller.ingestUpdates([{ ...f.update, update_id: 2 }]); await f.poller.redrivePendingUpdates();
     expect(f.delivered).toHaveLength(1);
-    expect(f.calls.some(call => call.method === "editMessageReplyMarkup")).toBe(true);
+    const editCalls = f.calls.filter(call => call.method === "editMessageReplyMarkup");
+    expect(editCalls.length).toBeGreaterThan(0);
+    const edit = editCalls[0];
+    if (choice === "approved") {
+      expect(edit.body.reply_markup).toEqual({
+        inline_keyboard: [[{ text: expect.stringMatching(/^✅ Approved by you at \d{2}:\d{2} UTC$/), callback_data: "noop" }]],
+      });
+    } else {
+      expect(edit.body.reply_markup).toEqual({
+        inline_keyboard: [[{ text: "❌ Denied", callback_data: "noop" }]],
+      });
+    }
   });
 }
 
