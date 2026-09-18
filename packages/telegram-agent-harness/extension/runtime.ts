@@ -19,12 +19,18 @@ import type {
 import { BotPoolCoordinator } from "./coordinator";
 import { DangerousToolGuard, approveOperation } from "./guard";
 import { decideApproval, parseApprovalCallback, approvalOutcome } from "./approvals";
-import { TelegramPoller, type PollerCallbacks } from "./poller";
+import { TelegramPoller, type PollerCallbacks, type PollerOptions } from "./poller";
 import { chunkMessage, escapeHtml, markdownToTelegramHtml } from "./sanitizer";
 import type { AccessConfig, DiscoveredSlot, MessageCorrelationBridge } from "./types";
 import { handleInstalledCommand, renderApprovalRequest } from "./harness/installed-commands";
 import { BunCommandRunner, type CommandRunner } from "./harness/command-runner";
 import { latestSessionPng } from "./harness/session-artifacts";
+import { OperatorQuestionService } from "./harness/operator-questions";
+import { MessageContextStore } from "./harness/message-context";
+import { LiveDashboard, type DashboardSnapshot } from "./harness/live-dashboard";
+import { readMessageThreadId } from "./harness/channel-config";
+import * as os from "node:os";
+import * as path from "node:path";
 
 export const ACTIVE_ROOT_SYMBOL = Symbol.for("veyyon.telegram.active_root");
 export const ACTIVE_LEASE_SYMBOL = Symbol.for("veyyon.telegram.active_lease");
@@ -38,6 +44,9 @@ export interface ActiveRootState {
   guard: DangerousToolGuard;
   coordinator: BotPoolCoordinator;
   activeSlot: DiscoveredSlot;
+  questions?: OperatorQuestionService;
+  messageContext?: MessageContextStore;
+  dashboard?: LiveDashboard;
 }
 
 export interface GlobalTelegramState {
@@ -89,6 +98,7 @@ export interface TelegramRuntimeOptions {
     accessConfig: AccessConfig,
     callbacks: PollerCallbacks,
     correlationBridge: MessageCorrelationBridge,
+    options?: PollerOptions,
   ) => TelegramPoller;
   commandRunnerFactory?: () => CommandRunner;
 }
@@ -111,6 +121,9 @@ export class TelegramRuntime {
   private activeSlot: DiscoveredSlot | null = null;
   private accessConfig: AccessConfig | null = null;
   private sessionId: string | null = null;
+  private questions: OperatorQuestionService | null = null;
+  private messageContext: MessageContextStore | null = null;
+  private dashboard: LiveDashboard | null = null;
   private isDisposed = false;
 
   constructor(pi: ExtensionAPI, options: TelegramRuntimeOptions = {}) {
@@ -124,6 +137,18 @@ export class TelegramRuntime {
 
   public getPoller(): TelegramPoller | null {
     return this.poller;
+  }
+
+  public getQuestions(): OperatorQuestionService | null {
+    return this.questions;
+  }
+
+  public getDashboard(): LiveDashboard | null {
+    return this.dashboard;
+  }
+
+  public getMessageContext(): MessageContextStore | null {
+    return this.messageContext;
   }
 
   public getCoordinator(): BotPoolCoordinator | null {
@@ -276,6 +301,20 @@ export class TelegramRuntime {
     this.guard = new DangerousToolGuard(activeSlot.stateDir);
     this.accessConfig = coordinator.readAccessConfig(activeSlot.stateDir);
 
+    const poolPath = process.env.VEYYON_POOL_DB || path.join(os.homedir(), ".veyyon", "telegram", "bot_pool.db");
+    // Lane provenance is extra columns on the coordinator's own correlation rows. If the
+    // pool predates them the channel still attaches; replies then reach Main without a
+    // lane attribution rather than not at all.
+    let messageContext: MessageContextStore | null = null;
+    try {
+      messageContext = new MessageContextStore(poolPath);
+    } catch (err: unknown) {
+      this.pi.logger?.warn(
+        `Telegram lane provenance unavailable on slot ${activeSlot.slotId}: ${err instanceof Error ? err.message : String(err)}. Replies route to Main without lane context.`,
+      );
+    }
+    this.messageContext = messageContext;
+
     const currentSessionId = (): string => {
       return this.sessionId ?? newSessionId;
     };
@@ -285,9 +324,15 @@ export class TelegramRuntime {
       getSlotId: () => activeSlot.slotId,
       record: correlation => {
         coordinator.recordOutboundMessage(correlation);
+        messageContext?.record(correlation.botId, correlation.chatId, correlation.messageId, correlation);
       },
-      resolveReply: (botId, chatId, replyToMessageId) =>
-        coordinator.resolveReplyRouting(botId, chatId, replyToMessageId, currentSessionId()),
+      resolveReply: (botId, chatId, replyToMessageId) => {
+        const resolution = coordinator.resolveReplyRouting(botId, chatId, replyToMessageId, currentSessionId());
+        if (resolution.correlation && messageContext) {
+          Object.assign(resolution.correlation, messageContext.lookup(botId, chatId, replyToMessageId));
+        }
+        return resolution;
+      },
       resolveCallback: (callbackToken, userId, chatId) =>
         coordinator.validateDecisionCallback(callbackToken, userId, chatId, currentSessionId()),
       consumeCallback: callbackToken =>
@@ -371,6 +416,10 @@ export class TelegramRuntime {
       onTelegramTurnStart: () => {
         if (this.guard) this.guard.startTelegramTurn();
       },
+      onQuestionAnswer: async (decisionId: string, eventId: string, answer: { choice?: string; text?: string }) => {
+        if (!this.questions) throw new Error("Question receiver unavailable; answer was not delivered");
+        await this.questions.answer(decisionId, eventId, answer);
+      },
       onDecisionCallback: async (decisionId: string, choiceId: string, context?: string) => {
         if (this.guard) this.guard.startTelegramTurn();
         const decisionSessionId = currentSessionId();
@@ -405,11 +454,46 @@ export class TelegramRuntime {
       },
     };
 
+    let messageThreadId: number | undefined;
+    try {
+      messageThreadId = readMessageThreadId(activeSlot.stateDir);
+    } catch (err: unknown) {
+      coordinator.releaseLease(activeSlot.slotId, newSessionId, process.pid);
+      coordinator.close();
+      messageContext?.close();
+      this.messageContext = null;
+      this.coordinator = null;
+      this.pi.logger?.warn(
+        `Telegram slot ${activeSlot.slotId} not attached: ${err instanceof Error ? err.message : String(err)}. Fix access.json before the channel can bind to its topic.`,
+      );
+      return false;
+    }
+    const pollerOptions: PollerOptions | undefined = messageThreadId === undefined ? undefined : { messageThreadId };
+
     const poller = this.options.pollerFactory
-      ? this.options.pollerFactory(token, activeSlot.stateDir, this.accessConfig, pollerCallbacks, correlationBridge)
-      : new TelegramPoller(token, activeSlot.stateDir, this.accessConfig, pollerCallbacks, correlationBridge);
+      ? this.options.pollerFactory(token, activeSlot.stateDir, this.accessConfig, pollerCallbacks, correlationBridge, pollerOptions)
+      : new TelegramPoller(token, activeSlot.stateDir, this.accessConfig, pollerCallbacks, correlationBridge, pollerOptions);
 
     this.poller = poller;
+
+    const questions = new OperatorQuestionService(
+      poller,
+      () => {
+        const chat = poller.getPrimaryChatId();
+        if (!chat) throw new Error("No authorized operator chat for this session");
+        return { session_id: currentSessionId(), chat_id: chat, user_id: chat };
+      },
+      path.join(os.homedir(), ".veyyon", "workflows", "decisions.json"),
+      poolPath,
+      message => this.pi.logger?.warn(message),
+    );
+    this.questions = questions;
+
+    const dashboard = new LiveDashboard(poller, runner, currentSessionId, message => this.pi.logger?.warn(message));
+    this.dashboard = dashboard;
+
+    questions.start();
+    dashboard.start();
 
     globalState[ACTIVE_ROOT_SYMBOL] = {
       instanceId: this.instanceId,
@@ -420,6 +504,9 @@ export class TelegramRuntime {
       guard: this.guard,
       coordinator,
       activeSlot,
+      questions,
+      messageContext: messageContext ?? undefined,
+      dashboard,
     };
 
     globalState[ACTIVE_LEASE_SYMBOL] = {
@@ -572,6 +659,20 @@ export class TelegramRuntime {
     if (this.streamDebounceTimer) {
       clearTimeout(this.streamDebounceTimer);
       this.streamDebounceTimer = null;
+    }
+
+    this.questions?.stop();
+    this.questions = null;
+    this.dashboard?.stop();
+    this.dashboard = null;
+
+    if (this.messageContext) {
+      try {
+        this.messageContext.close();
+      } catch (err) {
+        this.pi.logger?.warn(`Error closing lane provenance store: ${err}`);
+      }
+      this.messageContext = null;
     }
 
     if (this.poller) {

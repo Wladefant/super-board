@@ -11,6 +11,7 @@ class MediaContracts(unittest.TestCase):
     tearDown = transport_fixtures.TestTelegramNotificationAdapter.tearDown
 
     def test_photo_album_and_choice_payloads(self):
+        (self.polysim_dir / 'access.json').write_text(json.dumps({'allowFrom': ['1247617658'], 'message_thread_id': 42}))
         for count in (1, 2):
             event = NotificationEvent('question' if count == 1 else 'status', 'polysimulator', 'sample', 'Use this image?', URL,
                                       {'images': ['https://example.com/image.png'] * count, 'options': [{'id': 'A', 'label': 'Yes'}]},
@@ -27,6 +28,7 @@ class MediaContracts(unittest.TestCase):
                 request = send.call_args_list[0].args[0]
                 self.assertTrue(receipt.delivered)
                 payload = json.loads(request.data)
+                self.assertEqual(payload['message_thread_id'], 42)
                 self.assertTrue(request.full_url.endswith('/sendPhoto' if count == 1 else '/sendMediaGroup'))
                 if count == 1:
                     self.assertEqual(payload['parse_mode'], 'HTML')
@@ -38,10 +40,20 @@ class MediaContracts(unittest.TestCase):
                     self.assertEqual(payload['media'][0]['parse_mode'], 'HTML')
                     self.assertNotIn('caption', payload['media'][1])
                     controls = json.loads(send.call_args_list[1].args[0].data)
+                    self.assertEqual(controls['message_thread_id'], 42)
                     self.assertEqual(controls['text'], 'Actions for the images above')
                     self.assertEqual(controls['reply_markup']['inline_keyboard'][-1], [{'text': 'Open on GitHub', 'url': URL}])
                     for message_id in (321, 322, 323):
                         self.assertEqual(self.adapter.correlation_store.lookup('123', '456', message_id)['session_id'], 'session-test')
+
+    def test_thread_mismatch_blocks_before_network_dispatch(self):
+        (self.polysim_dir / 'access.json').write_text(json.dumps({'allowFrom': ['1247617658'], 'message_thread_id': 42}))
+        event = NotificationEvent('status', 'polysimulator', 'thread-mismatch', 'Do not send', URL,
+                                  {'message_thread_id': 43}, session_id='session-test')
+        with patch('urllib.request.urlopen') as send:
+            receipt = self.adapter.notify(event, force=True)
+        self.assertEqual(receipt.status, 'blocked')
+        send.assert_not_called()
 
 
 class CardContracts(unittest.TestCase):
@@ -60,7 +72,7 @@ class CardContracts(unittest.TestCase):
     def test_exact_question_decision_reminder(self):
         for kind, reminder, title in [('question', False, '❓ <b>Question</b>'), ('decision', False, '❓ <b>Decision needed</b>'), ('decision', True, '🔔 <b>Decision reminder</b>')]:
             event = self.event(kind, problem='Spacing is tight.', proposed_action='Use compact cards.', consequence_or_risk='No behavior changes.', question='Keep this style?', options=[{'id': 'A', 'label': 'Yes'}, {'id': 'B', 'label': 'No'}], is_due_reminder=reminder)
-            self.assertEqual(TelegramNotificationAdapter.format_message(event), title + '\n<a href="' + URL + '">Wladefant/super-board</a>\n\n• Spacing is tight.\n• <b>Proposal:</b> Use compact cards.\n• <b>Impact:</b> No behavior changes.\n\n<b>Keep this style?</b>\nA = Yes\nB = No')
+            self.assertEqual(TelegramNotificationAdapter.format_message(event), title + '\n<a href="' + URL + '">Wladefant/super-board</a>\n\n• Spacing is tight.\n• <b>Proposal:</b> Use compact cards.\n• <b>Impact:</b> No behavior changes.\n\n<b>Keep this style?</b>\n\n<blockquote expandable>A = Yes\nB = No</blockquote>\n\n<i>Reply to this message in your own words; options never replace free text.</i>')
 
     def test_exact_consolidation(self):
         self.assertEqual(format_consolidated_blockers_presentation([{'topic': 'Card spacing', 'canonical_link': URL, 'problem': 'Choose density.', 'proposed_action': 'Keep compact.', 'consequence_or_risk': 'Visual only.'}]), '🔔 <b>Decisions waiting</b>\n\n<b><a href="' + URL + '">Card spacing</a></b>\nChoose density.\n<b>Proposal:</b> Keep compact.\n<b>Impact:</b> Visual only.\n\n<b>Which decision should we address first?</b>\nReply with the topic name.')

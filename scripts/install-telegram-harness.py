@@ -113,6 +113,7 @@ def plan_sync_items(harness_root: Path, target: Path) -> List[SyncItem]:
     Mapping rules:
     - packages/telegram-agent-harness/extension/*.ts (excluding tests/) -> target/
     - packages/telegram-agent-harness/src/*.ts -> target/harness/
+    - packages/telegram-agent-harness/src/*.py -> target/harness/
     - extension/tests/*.ts -> target/tests/ (ONLY if target/tests already exists)
     - tests/*.ts -> target/harness/tests/ (ONLY if target/harness/tests already exists)
     """
@@ -125,10 +126,12 @@ def plan_sync_items(harness_root: Path, target: Path) -> List[SyncItem]:
             if p.is_file():
                 items.append(SyncItem(source_path=p, rel_target=p.name))
 
-    # 2. src/*.ts -> target/harness/
+    # 2. src/*.ts and src/*.py -> target/harness/
+    # The Python sidecars are spawned by their TypeScript callers relative to import.meta.dir,
+    # so an installed tree without them fails at the first question the operator is asked.
     src_dir = harness_root / "src"
     if src_dir.is_dir():
-        for p in sorted(src_dir.glob("*.ts")):
+        for p in sorted([*src_dir.glob("*.ts"), *src_dir.glob("*.py")]):
             if p.is_file():
                 items.append(SyncItem(source_path=p, rel_target=f"harness/{p.name}"))
 
