@@ -100,13 +100,30 @@ function Invoke-DaemonVerb([string]$verb) {
         Write-Host "Daemon entrypoint missing: $DaemonEntry. Run scripts/install-telegram-harness.py." -ForegroundColor Red
         exit 1
     }
-    # Through Write-Host, and NOT left on the success stream: a function's return
+    # Captured into a variable, then printed with Write-Host: a function's return
     # value in PowerShell is everything it emitted, so `& $bun ...` writing to the
-    # pipeline made this return the daemon's output lines with the exit code last.
-    # `exit (Invoke-DaemonVerb "check")` then exited 0 for a daemon that reported
-    # 78, and printed nothing at all.
-    & $bun $DaemonEntry $verb 2>&1 | ForEach-Object { Write-Host $_ }
-    return $LASTEXITCODE
+    # pipeline made this return the daemon's output lines with the exit code last,
+    # and `exit (Invoke-DaemonVerb "check")` exited 0 for a daemon that reported
+    # 78 while printing nothing at all. Piping into ForEach-Object fixed the
+    # printing but not the code: $LASTEXITCODE read after a piped native command
+    # was 0, so `check` still exited 0 on a daemon exiting 78. Assigning the call
+    # ends it before anything else can move $LASTEXITCODE.
+    #
+    # $ErrorActionPreference is "Stop" for this script, and under it a native
+    # command's stderr line becomes a NativeCommandError record: the daemon's own
+    # diagnosis ("No slot opted in...") came back wrapped in a PowerShell error
+    # naming a line in this launcher, which reads like the launcher broke. Stderr
+    # from the daemon is output, not a PowerShell failure.
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $output = & $bun $DaemonEntry $verb 2>&1
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    foreach ($line in $output) { Write-Host $line }
+    return $code
 }
 
 function Start-Daemon {
