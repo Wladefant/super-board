@@ -69,8 +69,48 @@ export function redactSecrets(text: string): string {
     });
   }
   return result;
+
+}
+export const PROJECT_SLUG_MAP: Record<string, string> = {
+  polysimulator: "Bavariance/polysimulator",
+  polysim: "Bavariance/polysimulator",
+  "super-board": "Wladefant/super-board",
+  superboard: "Wladefant/super-board",
+  veyyon: "Wladefant/veyyon",
+  "codex-chatgpt-web": "Wladefant/codex-chatgpt-web",
+};
+
+export function resolveRepoSlug(nameOrSlug?: string): string | null {
+  if (!nameOrSlug) return null;
+  const trimmed = nameOrSlug.trim().replace(/[.,;:!?)>]+$/, "");
+  if (trimmed.includes("/")) return trimmed;
+  const lower = trimmed.toLowerCase();
+  return PROJECT_SLUG_MAP[lower] || null;
 }
 
+export function extractMentionedRepos(text: string): Set<string> {
+  const repos = new Set<string>();
+  if (!text) return repos;
+  // 1. Full GitHub URLs
+  const urlMatches = text.matchAll(/https?:\/\/github\.com\/([a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+)/g);
+  for (const m of urlMatches) {
+    const slug = m[1].replace(/[.,;:!?)>]+$/, "");
+    if (slug.includes("/")) repos.add(slug);
+  }
+  // 2. Explicit owner/repo#N
+  const explicitMatches = text.matchAll(/\b([a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+)#\d+/g);
+  for (const m of explicitMatches) {
+    repos.add(m[1]);
+  }
+  // 3. Known project names or shorthand slugs
+  for (const [name, slug] of Object.entries(PROJECT_SLUG_MAP)) {
+    const re = new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
+    if (re.test(text)) {
+      repos.add(slug);
+    }
+  }
+  return repos;
+}
 /**
  * Converts Markdown to Telegram-compatible HTML.
  * Preserves pre-existing valid HTML tags (such as <a href="...">, <b>, <blockquote>) without
@@ -86,6 +126,11 @@ export function markdownToTelegramHtml(markdown: string, defaultRepo = "Bavarian
     const key = `\x01TGPH_${idx}\x01`;
     placeholders.push(val);
     return key;
+  }
+  const allRepos = extractMentionedRepos(markdown);
+  const projectRepo = resolveRepoSlug(defaultRepo) || (defaultRepo?.includes("/") ? defaultRepo : null);
+  if (projectRepo) {
+    allRepos.add(projectRepo);
   }
 
   // 1. Normalize line endings
@@ -116,6 +161,10 @@ export function markdownToTelegramHtml(markdown: string, defaultRepo = "Bavarian
   // 6. Markdown blockquotes: >> and > (before escapeHtml, with placeholder delimiters)
   text = convertBlockquotesToHtml(text, addPlaceholder);
 
+  // Generated command/help HTML already escapes its text. Keep valid entities
+  // encoded once; restoring them never turns encoded markup into active tags.
+  text = text.replace(/&(?:amp|lt|gt|quot|#\d+|#x[0-9a-f]+);/gi, entity => addPlaceholder(entity));
+
   // 7. Escape remaining user text (<, >, &)
   text = escapeHtml(text);
 
@@ -143,18 +192,71 @@ export function markdownToTelegramHtml(markdown: string, defaultRepo = "Bavarian
   });
 
   // 13. Issue / PR and Commit References - protect with placeholder
-  text = text.replace(/(?:([a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)?))?#(\d+)/g, (match, explicitRepo, num) => {
-    const repo = explicitRepo || defaultRepo;
-    if (repo && (repo.includes("/") || repo === defaultRepo)) {
-      const url = `https://github.com/${repo}/issues/${num}`;
-      return addPlaceholder(`<a href="${url}">${match}</a>`);
+  text = text.replace(/(?:([a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)?))?#(\d+)/g, (match, explicitRepo, num, offset, fullText) => {
+    // 1. Explicit qualifier attached to token (e.g. owner/repo#N or super-board#N)
+    if (explicitRepo) {
+      const targetRepo = explicitRepo.includes("/") ? explicitRepo : resolveRepoSlug(explicitRepo);
+      if (targetRepo) {
+        const textBefore = fullText.slice(0, offset);
+        const isPr = /\b(?:PR|pull\s*request|pull)\s*:?\s*$/i.test(textBefore);
+        const kind = isPr ? "pull" : "issues";
+        return addPlaceholder(`<a href="https://github.com/${targetRepo}/${kind}/${num}">${match}</a>`);
+      }
+      return match;
     }
+
+    // Bare '#number'
+    const lineStart = fullText.lastIndexOf("\n", offset) + 1;
+    let lineEnd = fullText.indexOf("\n", offset + match.length);
+    if (lineEnd === -1) lineEnd = fullText.length;
+
+    const beforeOnLine = fullText.slice(lineStart, offset);
+    const afterOnLine = fullText.slice(offset + match.length, lineEnd);
+
+    // 2. Repo named in the same sentence/line
+    // 2a. Preceding repo name on same line: e.g. "super-board #121", "polysimulator PR #5157"
+    const mPre = beforeOnLine.match(/\b([a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)?)\s*(?:\||:)?\s*(?:(?:PR|pull\s*request|pull|issue)s?\s*:?\s*)?$/i);
+    if (mPre) {
+      const cand = mPre[1];
+      const resolved = resolveRepoSlug(cand) || (cand.includes("/") ? cand : null);
+      if (resolved) {
+        const isPr = /\b(?:PR|pull\s*request|pull)\s*:?\s*$/i.test(beforeOnLine);
+        const kind = isPr ? "pull" : "issues";
+        return addPlaceholder(`<a href="https://github.com/${resolved}/${kind}/${num}">${match}</a>`);
+      }
+    }
+
+    // 2b. Following repo name on same line: e.g. "#5157 (polysimulator)", "#5157 in polysimulator"
+    const mPost = afterOnLine.match(/^\s*(?:\(([^)]+)\)|(?:in|of|for)\s+([a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)?))/i);
+    if (mPost) {
+      const rawCand = (mPost[1] || mPost[2]).trim();
+      const cand = rawCand.split(/\s+/)[0];
+      const resolved = resolveRepoSlug(cand) || (cand.includes("/") ? cand : null);
+      if (resolved) {
+        const isPr = /\b(?:PR|pull\s*request|pull)\b/i.test(beforeOnLine + " " + rawCand);
+        const kind = isPr ? "pull" : "issues";
+        return addPlaceholder(`<a href="https://github.com/${resolved}/${kind}/${num}">${match}</a>`);
+      }
+    }
+
+    // 3. Single configured project repo when NO other repo appears in the message
+    if (allRepos.size > 1) {
+      // Ambiguous: multiple repos appear in the message! Never guess.
+      return match;
+    }
+
+    if (allRepos.size === 1 && projectRepo && allRepos.has(projectRepo)) {
+      const isPr = /\b(?:PR|pull\s*request|pull)\s*:?\s*$/i.test(beforeOnLine);
+      const kind = isPr ? "pull" : "issues";
+      return addPlaceholder(`<a href="https://github.com/${projectRepo}/${kind}/${num}">${match}</a>`);
+    }
+
     return match;
   });
 
   text = text.replace(/\b([0-9a-fA-F]{40})\b/g, (_match, sha) => {
-    if (defaultRepo) {
-      const url = `https://github.com/${defaultRepo}/commit/${sha}`;
+    if (projectRepo) {
+      const url = `https://github.com/${projectRepo}/commit/${sha}`;
       return addPlaceholder(`<a href="${url}"><code>${sha.slice(0, 8)}</code></a>`);
     }
     return addPlaceholder(`<code>${sha.slice(0, 8)}</code>`);

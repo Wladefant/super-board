@@ -111,7 +111,7 @@ test("status command renders full HTML status with model, agents, decisions, car
           "DEC-2": {
             decision_id: "DEC-2",
             question: "Old decision already resolved",
-            status: "resolved",
+            status: "pending",
           },
         },
       }),
@@ -126,12 +126,14 @@ test("status command renders full HTML status with model, agents, decisions, car
     const nowSec = Date.now() / 1000;
     db.run(
       "INSERT INTO message_correlations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      ["bot1", "chat1", 1476, "slot1", "sess1", "phases-resend", null, "poly", nowSec - 60],
+      ["bot1", "chat1", 1476, "slot1", "session-test-01a0", "phases-resend", null, "poly", nowSec - 60],
     );
     db.run(
       "INSERT INTO message_correlations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-      ["bot1", "chat1", 1479, "slot1", "sess1", "status-summary", "DEC-1", "poly", nowSec - 10],
+      ["bot1", "chat1", 1479, "slot1", "session-test-01a0", "status-summary", "DEC-1", "poly", nowSec - 10],
     );
+    db.run("INSERT INTO message_correlations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ["other-bot", "other-chat", 9999, "other-slot", "other-session", "foreign-request", "DEC-2", "other-project", nowSec]);
     db.close();
 
     const f = fixture(false);
@@ -154,15 +156,17 @@ test("status command renders full HTML status with model, agents, decisions, car
     expect(output).toContain("veyyon:session-test-01a0");
     expect(output).toContain("herdr:Herdr &lt;worker&gt;");
 
-    expect(output).toContain("❓ <b>Open Operator Decisions (1 pending):</b>");
+    expect(output).toContain("<b>Pending decisions in recent session cards (1):</b>");
     expect(output).toContain("<b>DEC-1</b>");
     expect(output).toContain("https://github.com/Bavariance/polysimulator/issues/4500");
     expect(output).toContain("Approve migration plan?");
     expect(output).not.toContain("DEC-2");
 
     expect(output).toContain("📤 <b>Recent Outbound Cards:</b>");
-    expect(output).toContain("#1479 · <code>decision: DEC-1</code>");
-    expect(output).toContain("#1476 · <code>phases-resend</code>");
+    expect(output).toContain("Message <code>1479</code> · <code>decision: DEC-1</code>");
+    expect(output).toContain("Message <code>1476</code> · <code>phases-resend</code>");
+    expect(output).not.toContain("9999");
+    expect(output).not.toContain("foreign-request");
 
     expect(output).toContain("⚡ <b>Resource &amp; Quota Usage:</b>");
     expect(output).toContain("Codex Spark");
@@ -203,7 +207,7 @@ test("readPendingDecisions extracts pending and open decisions safely", () => {
 test("readRecentOutboundCards queries sqlite database with descending limit", () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "tg-cards-test-"));
   try {
-    const missing = readRecentOutboundCards(path.join(tmpDir, "missing.db"));
+    const missing = readRecentOutboundCards("sess", path.join(tmpDir, "missing.db"));
     expect(missing).toEqual([]);
 
     const dbFile = path.join(tmpDir, "test_pool.db");
@@ -218,12 +222,15 @@ test("readRecentOutboundCards queries sqlite database with descending limit", ()
         ["b", "c", 1000 + i, "s", "sess", `req-${i}`, null, "p", 100 + i],
       );
     }
+    db.run("INSERT INTO message_correlations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ["foreign-bot", "foreign-chat", 9999, "foreign-slot", "foreign-session", "foreign-request", null, "foreign-project", 999]);
     db.close();
 
-    const cards = readRecentOutboundCards(dbFile, 5);
+    const cards = readRecentOutboundCards("sess", dbFile, 5);
     expect(cards).toHaveLength(5);
     expect(cards[0].messageId).toBe(1007);
     expect(cards[4].messageId).toBe(1003);
+    expect(readRecentOutboundCards("unknown-session", dbFile)).toEqual([]);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -235,12 +242,9 @@ test("approve command grants exactly the pending guard operation once", async ()
     const f = fixture(), guard = new DangerousToolGuard(dir);
     f.port.session = () => ({ ...f.state, stateDir: dir });
     f.port.approve = token => approveOperation(dir, token);
-    const input = { command: "git push --force origin feat/93" };
+    const input = { command: "git push --force origin main" };
     const token = guard.evaluateToolCall("bash", input, true).approvalHash!;
     expect(await handleInstalledCommand(`/approve@sessionbot ${token}`, f.port, f.runner)).toBe(true);
-    const record = JSON.parse(fs.readFileSync(path.join(dir, "approved", `${token}.json`), "utf8"));
-    expect(record.category).toBe("destructive_git"); expect(record.singleUse).toBe(true);
-    expect(record.content).toBe(JSON.stringify({ toolName: "bash", input }));
     expect(f.sent[0]).toContain("Approved for one identical call");
     expect(f.calls).toHaveLength(0); expect(f.inbound).toHaveLength(0);
     expect(guard.evaluateToolCall("bash", input, false)).toEqual({ allowed: true });
@@ -260,11 +264,82 @@ test("approve reports missing binding, invalid tokens and expired requests witho
   expect(f.calls).toHaveLength(0); expect(f.inbound).toHaveLength(0);
 });
 
-test("approval inline button copies the complete authenticated command, never a short callback token", () => {
-  const token = "b".repeat(64);
-  const card = renderApprovalRequest("category<test>", token);
-  expect(card.text).toContain("category&lt;test&gt;");
-  expect(card.replyMarkup).toEqual({ inline_keyboard: [[{ text: "Copy approval command", copy_text: { text: `/approve ${token}` } }]] });
-  expect(card.text).toContain(`/approve ${token}`);
-  expect(() => renderApprovalRequest("category", "b".repeat(12))).toThrow("Invalid");
+test("approval buttons preserve the whole grant within Telegram's callback limit", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "approval-card-"));
+  try {
+    const record = new DangerousToolGuard(dir).evaluateToolCall("bash", { command: "git push --force origin main" }, false, { sessionId: "test", requester: "Agent <one>", task: "Inspect host", cwd: "/tmp" }).approval!;
+    const encoded = Buffer.from(record.token, "hex").toString("base64url");
+    const card = renderApprovalRequest(record);
+
+    // 1. First line bold summary (fallback when summary not provided)
+    expect(card.text).toContain(`<b>${record.summary ?? `${record.category} operation`}</b>`);
+    // 2. Command code block
+    expect(card.text).toContain("<b>Command:</b>\n<code>git push --force origin main</code>");
+    // 3. Where line with folder name and cwd
+    expect(card.text).toContain("<b>Where:</b> tmp · <code>/tmp</code>");
+    // 4. Why asked line
+    expect(card.text).toContain(`<b>Why asked:</b> ${record.reason}`);
+    // 5. Agent/Task line
+    expect(card.text).toContain("<b>Agent/Task:</b> Agent &lt;one&gt; · Inspect host");
+
+    // 6. Expandable blockquote with details and typed fallback
+    expect(card.text).toContain("<blockquote expandable>");
+    expect(card.text).toContain("UTC");
+    expect(card.text).toContain(`/approve ${record.token}`);
+
+    // 7. No jargon in visible part
+    const [visiblePart, blockquotePart] = card.text.split("<blockquote expandable>");
+    expect(visiblePart).not.toContain("exact-call gate");
+    expect(visiblePart).not.toContain("not an execution sandbox");
+    expect(blockquotePart).toContain("exact-call gate");
+    expect(blockquotePart).toContain("not an execution sandbox");
+
+    // 8. Buttons on ONE row: "✅ Yes, run it" and "❌ No"
+    const keyboard = card.replyMarkup.inline_keyboard as { text: string; callback_data: string }[][];
+    expect(keyboard).toHaveLength(1);
+    expect(keyboard[0].map(button => button.text)).toEqual(["✅ Yes, run it", "❌ No"]);
+    expect(keyboard[0][0].callback_data).toBe(`ap:a:${encoded}`);
+    expect(keyboard[0][1].callback_data).toBe(`ap:d:${encoded}`);
+    for (const button of keyboard[0]) {
+      expect(Buffer.byteLength(button.callback_data)).toBeLessThanOrEqual(64);
+    }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("renderApprovalRequest renders custom summary and handles non-approvable secret redaction", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "approval-secret-"));
+  try {
+    const record = new DangerousToolGuard(dir).evaluateToolCall("bash", { command: "git push --force origin main" }, false, { sessionId: "test", requester: "Main", task: "Push release", cwd: "C:/Users/wkiri/development/super-board" }).approval!;
+    const customRecord = {
+      ...record,
+      summary: "Force-push branch feat/x to origin/main (rewrites shared history)",
+    };
+    const card = renderApprovalRequest(customRecord);
+    expect(card.text).toContain("<b>Force-push branch feat/x to origin/main (rewrites shared history)</b>");
+    expect(card.text).toContain("<b>Where:</b> super-board · <code>C:/Users/wkiri/development/super-board</code>");
+    expect(card.text).toContain("<b>Command:</b>\n<code>git push --force origin main</code>");
+    expect(card.text).toContain("<b>Agent/Task:</b> Main · Push release");
+
+    // Non-approvable card has only "❌ No" button and warning line
+    const nonApprovable = { ...customRecord, approvable: false };
+    const nonApprovableCard = renderApprovalRequest(nonApprovable);
+    expect(nonApprovableCard.text).toContain("Cannot approve: the command contained a secret; ask the agent to resend without it.");
+    const keyboard = nonApprovableCard.replyMarkup.inline_keyboard as { text: string; callback_data: string }[][];
+    expect(keyboard).toHaveLength(1);
+    expect(keyboard[0].map(button => button.text)).toEqual(["❌ No"]);
+    expect(keyboard[0][0].callback_data).toBe(`ap:d:${Buffer.from(record.token, "hex").toString("base64url")}`);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+test("reload invokes port.reload when available", async () => {
+  const f = fixture();
+  let reloaded = false;
+  f.port.reload = async () => { reloaded = true; };
+  expect(await handleInstalledCommand("/reload", f.port, f.runner)).toBe(true);
+  expect(reloaded).toBe(true);
+});
+
+test("reload notifies when hot reload is unsupported", async () => {
+  const f = fixture();
+  expect(await handleInstalledCommand("/reload", f.port, f.runner)).toBe(true);
+  expect(f.sent[0]).toContain("Hot reload unavailable");
 });

@@ -37,7 +37,7 @@ function fixture(thread?: number) {
     onAbort: () => turns.push("ABORT"), onRelease: async () => { turns.push("RELEASE"); }, onTelegramTurnStart: () => {},
     getStatusText: () => "test", onLedgerFailure: () => {},
     onQuestionAnswer: async (id, event, answer) => { answers.push({ id, event, answer }); },
-  }, bridge, thread);
+  }, bridge, { messageThreadId: thread });
   globalThis.fetch = (async (url, init) => {
     const method = String(url).split("/").pop()!;
     const body = JSON.parse(String(init?.body));
@@ -174,4 +174,6 @@ test("the actual Python question store survives service restart and returns answ
   expect(f.turns).toEqual([]);
   route.session_id = "other";
   await expect(restarted.get(pending.decision_id)).rejects.toThrow("unavailable");
-}, 20_000);
+  // Every store call spawns the real Python process; 60s matches the other python-backed
+  // suites so a full-suite run under load cannot time this out.
+}, 60_000);

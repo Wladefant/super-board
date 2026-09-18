@@ -59,7 +59,7 @@
     "ledger.py": {
       "role": "Local execution checkpoint and atomic recovery cache; GitHub owns issue structure and Project lifecycle state",
       "owner": "ImplementRequestLedger / FixLedgerInvariants",
-      "cli_command": "python ledger.py [add | update | check | next | list | show | recover] [--ledger <path>]",
+      "cli_command": "python ledger.py [add | update | check | next | list | show | recover | observe] [--ledger <path>]",
       "inputs": [
         "ledger.json"
       ],

@@ -6,6 +6,7 @@ import { HerdrAdapter } from "./herdr-adapter";
 import { parseVeyyonUsage } from "./veyyon-adapter";
 import { escapeHtml, renderAgentList, renderUsage } from "./telegram-router";
 import type { AgentSession, CommandRunner, UsageLimit } from "./contract";
+import type { ApprovalRecord } from "../extension/approvals";
 
 export interface InstalledSession {
   id: string;
@@ -26,7 +27,8 @@ export interface InstalledCommandPort {
   mediaGroup?(files: string[], caption?: string): Promise<void>;
   latestPng(sessionId: string): Promise<string | null>;
   inbound(text: string, idle: boolean): Promise<void>;
-  approve?(token: string): { expiresAt: string };
+  approve?(token: string): { expiresAt: string } | Promise<{ expiresAt: string }>;
+  reload?(): Promise<{ success: boolean; sha?: string; error?: string } | void> | void;
 }
 
 export interface OutboundCardSummary {
@@ -36,15 +38,15 @@ export interface OutboundCardSummary {
   createdAt: number;
 }
 
-export function readRecentOutboundCards(dbPath?: string, limit = 5): OutboundCardSummary[] {
+export function readRecentOutboundCards(sessionId: string, dbPath?: string, limit = 5): OutboundCardSummary[] {
   const resolved = dbPath ?? path.join(os.homedir(), ".veyyon", "telegram", "bot_pool.db");
   if (!fs.existsSync(resolved)) return [];
   try {
     const db = new Database(resolved, { readonly: true });
     try {
       const rows = db.query(
-        "SELECT message_id, request_id, decision_id, created_at FROM message_correlations ORDER BY created_at DESC LIMIT ?"
-      ).all(limit) as Array<{
+        "SELECT message_id, request_id, decision_id, created_at FROM message_correlations WHERE session_id = ? ORDER BY created_at DESC LIMIT ?"
+      ).all(sessionId, limit) as Array<{
         message_id: number;
         request_id: string | null;
         decision_id: string | null;
@@ -133,14 +135,14 @@ export function renderFullStatus(params: {
   }
   lines.push("");
 
-  lines.push(`❓ <b>Open Operator Decisions (${params.decisions.length} pending):</b>`);
+  lines.push(`<b>Pending decisions in recent session cards (${params.decisions.length}):</b>`);
   if (params.decisions.length === 0) {
-    lines.push("• <i>None pending.</i>");
+    lines.push("• <i>None linked to these recent cards.</i>");
   } else {
     for (const dec of params.decisions) {
       const issueLink = dec.issueUrl
         ? ` (<a href="${escapeHtml(dec.issueUrl)}">#${dec.issueNumber ?? "issue"}</a>)`
-        : dec.issueNumber ? ` (#${dec.issueNumber})` : "";
+        : "";
       const qText = dec.question.length > 80 ? `${dec.question.slice(0, 77)}...` : dec.question;
       lines.push(`• <b>${escapeHtml(dec.decisionId)}</b>${issueLink}: ${escapeHtml(qText)}`);
     }
@@ -155,7 +157,7 @@ export function renderFullStatus(params: {
       const ageSeconds = Math.max(0, Math.round(now / 1000 - card.createdAt));
       const ageStr = ageSeconds < 60 ? `${ageSeconds}s ago` : ageSeconds < 3600 ? `${Math.round(ageSeconds / 60)}m ago` : `${Math.round(ageSeconds / 3600)}h ago`;
       const topic = card.decisionId ? `decision: ${card.decisionId}` : (card.requestId ? card.requestId : "general");
-      lines.push(`• #${card.messageId} · <code>${escapeHtml(topic)}</code> (${ageStr})`);
+      lines.push(`• Message <code>${card.messageId}</code> · <code>${escapeHtml(topic)}</code> (${ageStr})`);
     }
   }
   lines.push("");
@@ -172,19 +174,49 @@ export function renderFullStatus(params: {
   return lines.join("\n");
 }
 
-/** Copy buttons need no callback-token store and still require an authenticated command. */
-export function renderApprovalRequest(category: string, token: string): { text: string; replyMarkup: Record<string, unknown> } {
-  if (!/^[a-f0-9]{64}$/.test(token)) throw new Error("Invalid approval token");
-  const command = `/approve ${token}`;
+/** Callback data is the full 256-bit grant, encoded to fit Telegram's 64-byte limit. */
+export function renderApprovalRequest(record: ApprovalRecord): { text: string; replyMarkup: Record<string, unknown> } {
+  if (!/^[a-f0-9]{64}$/.test(record.token)) throw new Error("Invalid approval token");
+  const encoded = Buffer.from(record.token, "hex").toString("base64url");
+  const expiry = new Date(record.expiresAt).toISOString().replace("T", " ").replace(/\.\d{3}Z$/, " UTC");
+  const summary = record.summary ?? `${record.category} operation`;
+  const folder = path.basename(record.cwd.replace(/[/\\]+$/, "")) || record.cwd;
+
+  const lines: string[] = [
+    `<b>${escapeHtml(summary)}</b>`,
+    `<b>Command:</b>\n<code>${escapeHtml(record.command)}</code>`,
+    `<b>Where:</b> ${escapeHtml(folder)} · <code>${escapeHtml(record.cwd)}</code>`,
+    `<b>Why asked:</b> ${escapeHtml(record.reason)}`,
+    `<b>Agent/Task:</b> ${escapeHtml(record.requester)} · ${escapeHtml(record.task)}`,
+  ];
+
+  if (!record.approvable) {
+    lines.push("Cannot approve: the command contained a secret; ask the agent to resend without it.");
+  }
+
+  lines.push(
+    `<blockquote expandable><b>Operation details</b>\n<code>${escapeHtml(record.details)}</code>\n` +
+    (record.target ? `<b>Target:</b> ${escapeHtml(record.target)}\n` : "") +
+    `<b>Category:</b> <code>${escapeHtml(record.category)}</code>\n` +
+    `<b>Deadline:</b> ${escapeHtml(expiry)} (permits one identical retry)\n` +
+    `<b>Boundary:</b> This exact-call gate is not an execution sandbox and cannot prove that equivalent work has not run through another path.\n` +
+    `<b>Typed fallback</b>\n<code>/approve ${record.token}</code></blockquote>`
+  );
+
   return {
-    text: `<b>Operation needs your approval.</b>\nCategory: <code>${escapeHtml(category)}</code>\nCopy and send the command below, then retry the identical operation. The grant expires in 15 minutes and works once.\n<code>${command}</code>`,
-    replyMarkup: { inline_keyboard: [[{ text: "Copy approval command", copy_text: { text: command } }]] },
+    text: lines.join("\n"),
+    replyMarkup: {
+      inline_keyboard: [[
+        ...(record.approvable ? [{ text: "✅ Yes, run it", callback_data: `ap:a:${encoded}` }] : []),
+        { text: "❌ No", callback_data: `ap:d:${encoded}` },
+      ]],
+    },
   };
 }
 
 /** Called after the installed poller's actor/reply gates, never owns a lease or offset. */
 export async function handleInstalledCommand(text: string, port: InstalledCommandPort, runner: CommandRunner): Promise<boolean> {
-  const match = /^\/(approve|agents|prompt|shot|usage|status)(?:@\w+)?(?:\s|$)/.exec(text.trim());
+  const match = /^\/(approve|agents|prompt|shot|usage|status|reload)(?:@\w+)?(?:\s|$)/.exec(text.trim());
   if (!match) return false;
   const raw = text.trim().replace(/^(\/\w+)@\w+/, "$1");
   const session = { ...port.session() };
@@ -193,12 +225,12 @@ export async function handleInstalledCommand(text: string, port: InstalledComman
     if (match[1] === "approve") {
       const approval = /^\/approve\s+([a-f0-9]{64})$/.exec(raw);
       if (!approval) { await port.send("<b>Usage:</b> <code>/approve FULL_64_CHARACTER_TOKEN</code> from the refused operation."); return true; }
-      if (!session.stateDir || !port.approve) { await port.send("<b>Approval unavailable.</b> No channel guard is bound to this session. Use the local unlock instruction from the refusal."); return true; }
+      if (!session.stateDir || !port.approve) { await port.send("<b>No channel guard is bound to this session.</b>"); return true; }
       try {
-        const record = port.approve(approval[1]);
-        await port.send(`<b>Approved for one identical call.</b> Retry it before <code>${escapeHtml(record.expiresAt)}</code>. Approval does not execute the operation or override other safety gates.`);
+        const record = await port.approve(approval[1]);
+        await port.send(`<b>Approved for one identical call:</b> retry it before <code>${escapeHtml(record.expiresAt)}</code>.`);
       } catch (error) {
-        await port.send(`<b>Not approved.</b> ${escapeHtml(error instanceof Error ? error.message : "Approval storage unavailable; retry the refused call.")}`);
+        await port.send(`<b>Not approved:</b> ${escapeHtml(error instanceof Error ? error.message : "approval storage unavailable.")}`);
       }
     } else if (match[1] === "agents") {
       const agents = await herdr.listSessions();
@@ -226,8 +258,9 @@ export async function handleInstalledCommand(text: string, port: InstalledComman
       });
       agents.push(...(session.agents ?? []));
 
-      const decisions = readPendingDecisions(session.decisionsPath);
-      const outboundCards = readRecentOutboundCards(session.poolDbPath, 5);
+      const outboundCards = readRecentOutboundCards(session.id, session.poolDbPath, 5);
+      const decisions = readPendingDecisions(session.decisionsPath).filter(decision =>
+        outboundCards.some(card => card.decisionId === decision.decisionId));
 
       let usageLimits: UsageLimit[] = [];
       try {
@@ -261,6 +294,12 @@ export async function handleInstalledCommand(text: string, port: InstalledComman
         await port.send(`<b>${result.ok ? "Prompt delivered" : "Prompt not sent"}.</b> ${escapeHtml(result.detail)}`);
       } else {
         await port.send("<b>Target unavailable.</b> Copy the full backend:id from <code>/agents</code>. Worker prompts are not redirected to Main.");
+      }
+    } else if (match[1] === "reload") {
+      if (port.reload) {
+        await port.reload();
+      } else {
+        await port.send("<b>Hot reload unavailable.</b> This runtime does not support in-process reload.");
       }
     } else {
       const shot = /^\/shot\s+(\S+)$/.exec(raw);

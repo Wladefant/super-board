@@ -1320,7 +1320,21 @@ class RecurrenceGuard:
                         f"under signature {known_signature!r}, which is absent; repair it rather "
                         "than treating a known failure as new."
                     )
-                self._derive(entry)
+                refined = False
+                for name, value in (
+                    ("diagnosis", diagnosis),
+                    ("owner", owner),
+                    ("next_action", next_action),
+                    ("canonical_link", canonical_link),
+                    ("session", session),
+                ):
+                    if value and str(value).strip():
+                        entry[name] = str(value).strip()
+                        refined = True
+                if refined:
+                    self._derive(entry)
+                    self._save_unlocked(data)
+
                 stored = next(
                     (o for o in entry.get("observations") or []
                      if o.get("observation_id") == obs_id),
@@ -1356,7 +1370,7 @@ class RecurrenceGuard:
                 # refused: the suppression is a durable decision, and undoing it
                 # takes an explicit `resync-ledger --include-suppressed`.
                 duplicate_projection_state = self._projection_state(stored)
-                if duplicate_projection_state in PROJECTION_OUTSTANDING_STATES:
+                if duplicate_projection_state in PROJECTION_OUTSTANDING_STATES or refined:
                     duplicate_request_id = str(stored.get("request_id") or "") or None
                 duplicate_entry = dict(entry)
                 duplicate_observation = dict(stored)
@@ -4009,9 +4023,15 @@ class RecurrenceGuard:
                     f"Complete corrective work item {corrective_id} (systemic change plus "
                     f"original-scenario proof), then retry. {next_action}"
                 ).strip()
+            if entry.get("occurrences", 0) >= 2 and existing.get("owner"):
+                next_action = (
+                    f"Reassign task from failing owner '{existing.get('owner')}' and "
+                    f"implement systemic corrective action before retrying. {next_action}"
+                ).strip()
         elif result.counted and result.occurrences == 1 and not entry.get("diagnosis_complete"):
             next_action = str(entry.get("required_action") or "")
-
+        elif entry.get("diagnosis_complete") and entry.get("next_action"):
+            next_action = str(entry.get("next_action") or "")
         snapshot = (observation or {}).get("at_observation") or {}
         occurrence_evidence = "observation_time" if snapshot else "projection_time"
         occurrences_then = int(snapshot.get("occurrences", result.occurrences))
@@ -4100,7 +4120,8 @@ class RecurrenceGuard:
             # store: everything this projection would persist into the ledger is
             # redacted here, including text copied out of an entry an older build
             # wrote unredacted.
-            update = redact_durable({
+            owner_to_project = entry.get("owner")
+            update_payload = {
                 "blocker": blocker,
                 "next_action": next_action,
                 "add_evidence": add_evidence,
@@ -4110,7 +4131,10 @@ class RecurrenceGuard:
                     if recovery
                     else f"Recurrence intake for observation {result.observation_id}"
                 ),
-            })
+            }
+            if owner_to_project and str(owner_to_project).strip():
+                update_payload["owner"] = str(owner_to_project).strip()
+            update = redact_durable(update_payload)
             ledger.update_request(request_id, **update)
         except (KeyError, OSError, ValueError) as e:
             return {"recorded": False, "reason": f"{type(e).__name__}: {e}"}
@@ -4625,12 +4649,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         if args.command == "observe":
             if not str(args.error or "").strip() and not args.error_class:
-                print(
-                    "observe requires --error text or an explicit --error-class; refusing to "
-                    "record a failure with no identity.",
-                    file=sys.stderr,
-                )
-                return EXIT_ERROR
+                found_sig = None
+                store_data = guard.load()
+                if args.observation_id and args.observation_id in store_data.get("observation_index", {}):
+                    found_sig = store_data["observation_index"][args.observation_id]
+                elif args.request_id and args.request_id in store_data.get("request_index", {}):
+                    sigs = store_data["request_index"][args.request_id]
+                    if sigs:
+                        found_sig = sigs[0]
+                if found_sig:
+                    sig_entry = store_data["signatures"].get(found_sig, {})
+                    if not args.environment:
+                        args.environment = sig_entry.get("environment", "harness")
+                    if not args.operation:
+                        args.operation = sig_entry.get("operation", "worker:qa")
+                    if not args.project:
+                        args.project = sig_entry.get("project")
+                    args.error = sig_entry.get("error_sample", f"Failure on {found_sig}")
+                    args.error_class = sig_entry.get("error_class")
+                else:
+                    print(
+                        "observe requires --error text or an explicit --error-class; refusing to "
+                        "record a failure with no identity.",
+                        file=sys.stderr,
+                    )
+                    return EXIT_ERROR
             result = guard.observe(
                 project=args.project,
                 environment=args.environment,
