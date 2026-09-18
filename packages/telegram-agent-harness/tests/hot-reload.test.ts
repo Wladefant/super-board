@@ -44,10 +44,32 @@ interface MockPoller {
   sendTelegramMessage: (chatId: string, text: string) => Promise<{ ok: boolean; result?: { message_id: number } }>;
 }
 
+/**
+ * Stands in for the host-supplied zod by recording the shape a builder call declared
+ * rather than validating values: the extension only needs it to describe its tools, and
+ * tool behaviour is exercised against the real services in operator-interface.test.ts.
+ */
+function createSchemaRecorder(): Record<string, (arg?: unknown) => Record<string, unknown>> {
+  const leaf = (kind: string): Record<string, unknown> => {
+    const node: Record<string, unknown> = { kind };
+    node.optional = () => node;
+    node.default = () => node;
+    return node;
+  };
+  return {
+    object: (shape?: unknown) => ({ ...leaf("object"), keys: Object.keys((shape ?? {}) as object) }),
+    string: () => leaf("string"),
+    boolean: () => leaf("boolean"),
+    enum: () => leaf("enum"),
+    array: () => leaf("array"),
+  };
+}
+
 function createMockExtensionAPI(): {
   api: ExtensionAPI;
   listeners: Map<string, ((...args: unknown[]) => unknown)[]>;
   commands: Map<string, { description: string; handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }>;
+  tools: Map<string, { label: string; description: string; parameterKeys: string[] }>;
   notifications: { message: string; type?: string }[];
   userMessages: { text: string; options?: unknown }[];
   aborted: boolean;
@@ -56,6 +78,7 @@ function createMockExtensionAPI(): {
   const commands = new Map<string, { description: string; handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }>();
   const notifications: { message: string; type?: string }[] = [];
   const userMessages: { text: string; options?: unknown }[] = [];
+  const tools = new Map<string, { label: string; description: string; parameterKeys: string[] }>();
   let aborted = false;
 
   const api = {
@@ -67,6 +90,10 @@ function createMockExtensionAPI(): {
     },
     registerCommand: (name: string, def: { description: string; handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }) => {
       commands.set(name, def);
+    },
+    zod: createSchemaRecorder(),
+    registerTool: (def: { name: string; label: string; description: string; parameters: { keys: string[] } }) => {
+      tools.set(def.name, { label: def.label, description: def.description, parameterKeys: def.parameters.keys });
     },
     sendUserMessage: (text: string, options?: unknown) => {
       userMessages.push({ text, options });
@@ -82,7 +109,7 @@ function createMockExtensionAPI(): {
     },
   } as unknown as ExtensionAPI;
 
-  return { api, listeners, commands, notifications, userMessages, aborted };
+  return { api, listeners, commands, tools, notifications, userMessages, aborted };
 }
 
 function createMockContext(sessionId = "test-session-123"): ExtensionContext {
@@ -457,5 +484,17 @@ describe("Telegram Harness Hot Reload", () => {
     expect(notifications.some(n => n.msg.includes("Telegram harness reloaded"))).toBe(true);
 
     await getActiveRuntime()?.dispose();
+  });
+
+  test("Extension registers the operator question, message and dashboard tools", () => {
+    const mockApi = createMockExtensionAPI();
+    telegramSessionExtension(mockApi.api);
+
+    expect([...mockApi.tools.keys()].sort()).toEqual(["telegram_dashboard", "telegram_message", "telegram_question"]);
+    expect(mockApi.tools.get("telegram_question")?.parameterKeys).toContain("options");
+    expect(mockApi.tools.get("telegram_message")?.parameterKeys).toEqual(["text", "lane_id", "lane_state"]);
+    expect(mockApi.tools.get("telegram_dashboard")?.parameterKeys).toEqual(["lanes", "blockers", "mergeQueue"]);
+    // Without a session-bound channel every tool must refuse rather than fall back to the terminal.
+    expect(mockApi.tools.get("telegram_question")?.description).toContain("never grants approval");
   });
 });

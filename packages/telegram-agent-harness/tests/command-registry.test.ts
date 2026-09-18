@@ -92,8 +92,11 @@ test("command boundaries, native idle/busy delivery and release preserve the dur
     await deliver("/steer busy explicit");
     await deliver("/steerwrong must not run");
     await deliver("/cancel");
-    expect(user).toEqual(["idle plain", "idle explicit"]);
-    expect(steer).toEqual(["busy plain", "busy explicit"]);
+    // Plain and explicit /steer text both arrive stamped with the sending Telegram
+    // account, so neither route can be read as an attested operator instruction.
+    const stamp = "[Telegram sender: 101; origin: telegram_account; human presence not attested]";
+    expect(user).toEqual([`${stamp}\nidle plain`, `${stamp}\nidle explicit`]);
+    expect(steer).toEqual([`${stamp}\nbusy plain`, `${stamp}\nbusy explicit`]);
     expect(aborts).toBe(1);
     expect(replies.some(reply => reply.includes("Unknown command"))).toBe(true);
     await deliver("/release");
