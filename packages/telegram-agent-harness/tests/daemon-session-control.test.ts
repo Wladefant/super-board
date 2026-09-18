@@ -6,10 +6,14 @@
  */
 
 import { afterEach, describe, expect, test } from "bun:test";
+import * as fs from "node:fs";
 import * as net from "node:net";
+import * as os from "node:os";
+import * as path from "node:path";
 import {
   GuiHostSessionControl,
   assistantTexts,
+  guiHostAgentDirs,
   readActiveSessionId,
   readSessionSummaries,
   resolveGuiHostEndpoint,
@@ -279,6 +283,98 @@ describe("GUI host frame decoding", () => {
     } finally {
       if (previous === undefined) delete process.env.VEYYON_GUI_HOST_ENDPOINT;
       else process.env.VEYYON_GUI_HOST_ENDPOINT = previous;
+    }
+  });
+
+  test("the endpoint file the host publishes in the profile agent dir is found", () => {
+    // `veyyon gui` writes into getAgentDir(), which is the active profile's agent
+    // directory. A daemon that only searched ~/.veyyon found nothing.
+    const saved = {
+      endpoint: process.env.VEYYON_GUI_HOST_ENDPOINT,
+      agentDir: process.env.VEYYON_CODING_AGENT_DIR,
+      configDir: process.env.VEYYON_CONFIG_DIR,
+      profile: process.env.VEYYON_PROFILE,
+    };
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "daemon-endpoint-"));
+    try {
+      delete process.env.VEYYON_GUI_HOST_ENDPOINT;
+      delete process.env.VEYYON_CODING_AGENT_DIR;
+      process.env.VEYYON_CONFIG_DIR = ".veyyon";
+      process.env.VEYYON_PROFILE = "default";
+
+      const profileAgentDir = path.join(home, ".veyyon", "profiles", "default", "agent");
+      const legacyDir = path.join(home, ".veyyon");
+      fs.mkdirSync(profileAgentDir, { recursive: true });
+
+      expect(resolveGuiHostEndpoint(profileAgentDir, legacyDir)).toBeNull();
+
+      fs.writeFileSync(path.join(profileAgentDir, "gui-host.endpoint"), "tcp:127.0.0.1:7699\n", "utf8");
+      expect(resolveGuiHostEndpoint(profileAgentDir, legacyDir)).toBe("tcp:127.0.0.1:7699");
+
+      // A bare path is still accepted and read as a socket, so an operator who
+      // wrote the file by hand is not silently ignored.
+      fs.writeFileSync(path.join(legacyDir, "gui-host.endpoint"), `${path.join(home, "host.sock")}\n`, "utf8");
+      fs.rmSync(path.join(profileAgentDir, "gui-host.endpoint"));
+      expect(resolveGuiHostEndpoint(profileAgentDir, legacyDir)).toBe(`unix:${path.join(home, "host.sock")}`);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+      for (const [key, value] of [
+        ["VEYYON_GUI_HOST_ENDPOINT", saved.endpoint],
+        ["VEYYON_CODING_AGENT_DIR", saved.agentDir],
+        ["VEYYON_CONFIG_DIR", saved.configDir],
+        ["VEYYON_PROFILE", saved.profile],
+      ] as const) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
+  test("every installed profile is searched, with the active one first", () => {
+    // Which profile is active is Veyyon's decision, recorded in the config root
+    // rather than the environment, so a daemon that searched only the env-named
+    // profile missed a host running under the operator's actual default.
+    const saved = {
+      agentDir: process.env.VEYYON_CODING_AGENT_DIR,
+      profile: process.env.VEYYON_PROFILE,
+    };
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "daemon-profiles-"));
+    try {
+      delete process.env.VEYYON_CODING_AGENT_DIR;
+      process.env.VEYYON_PROFILE = "work";
+      for (const name of ["default", "work", "oss"]) {
+        fs.mkdirSync(path.join(root, "profiles", name, "agent"), { recursive: true });
+      }
+      fs.writeFileSync(path.join(root, "profiles", "not-a-profile"), "", "utf8");
+
+      expect(guiHostAgentDirs(root)).toEqual([
+        path.join(root, "profiles", "work", "agent"),
+        path.join(root, "profiles", "default", "agent"),
+        path.join(root, "profiles", "oss", "agent"),
+        root,
+      ]);
+
+      // A host published under a profile nobody named is still reachable.
+      fs.writeFileSync(
+        path.join(root, "profiles", "oss", "agent", "gui-host.endpoint"),
+        "tcp:127.0.0.1:7711\n",
+        "utf8",
+      );
+      expect(resolveGuiHostEndpoint(...guiHostAgentDirs(root))).toBe("tcp:127.0.0.1:7711");
+
+      // An explicit agent-dir override is the only place the host can be, so it
+      // replaces the profile search rather than being tried alongside it.
+      process.env.VEYYON_CODING_AGENT_DIR = path.join(os.tmpdir(), "explicit-agent");
+      expect(guiHostAgentDirs(root)).toEqual([path.join(os.tmpdir(), "explicit-agent")]);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+      for (const [key, value] of [
+        ["VEYYON_CODING_AGENT_DIR", saved.agentDir],
+        ["VEYYON_PROFILE", saved.profile],
+      ] as const) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
     }
   });
 });
