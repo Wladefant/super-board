@@ -25,6 +25,12 @@ import type { AccessConfig, DiscoveredSlot, MessageCorrelationBridge } from "./t
 import { handleInstalledCommand, renderApprovalRequest } from "./harness/installed-commands";
 import { BunCommandRunner, type CommandRunner } from "./harness/command-runner";
 import { latestSessionPng } from "./harness/session-artifacts";
+import { OperatorQuestionService } from "./harness/operator-questions";
+import { MessageContextStore } from "./harness/message-context";
+import { LiveDashboard } from "./harness/live-dashboard";
+import { readMessageThreadId } from "./harness/channel-config";
+import * as os from "node:os";
+import * as path from "node:path";
 
 export const ACTIVE_ROOT_SYMBOL = Symbol.for("veyyon.telegram.active_root");
 export const ACTIVE_LEASE_SYMBOL = Symbol.for("veyyon.telegram.active_lease");
@@ -38,6 +44,9 @@ export interface ActiveRootState {
   guard: DangerousToolGuard;
   coordinator: BotPoolCoordinator;
   activeSlot: DiscoveredSlot;
+  questions?: OperatorQuestionService;
+  messageContext?: MessageContextStore;
+  dashboard?: LiveDashboard;
 }
 
 export interface GlobalTelegramState {
@@ -111,6 +120,9 @@ export class TelegramRuntime {
   private activeSlot: DiscoveredSlot | null = null;
   private accessConfig: AccessConfig | null = null;
   private sessionId: string | null = null;
+  private questions: OperatorQuestionService | null = null;
+  private messageContext: MessageContextStore | null = null;
+  private dashboard: LiveDashboard | null = null;
   private isDisposed = false;
 
   constructor(pi: ExtensionAPI, options: TelegramRuntimeOptions = {}) {
@@ -215,6 +227,9 @@ export class TelegramRuntime {
       this.pi.logger?.warn(
         `Telegram bot lease on slot ${root.activeSlot.slotId} is no longer held by this process; releasing the channel instead of re-pointing it to session ${nextSessionId}.`,
       );
+      root.questions?.stop();
+      root.dashboard?.stop();
+      root.messageContext?.close();
       void root.poller.stop();
       root.coordinator.close();
       delete globalState[ACTIVE_ROOT_SYMBOL];
@@ -280,14 +295,24 @@ export class TelegramRuntime {
       return this.sessionId ?? newSessionId;
     };
 
+    const poolPath = process.env.VEYYON_POOL_DB || path.join(os.homedir(), ".veyyon", "telegram", "bot_pool.db");
+    const messageContext = new MessageContextStore(poolPath);
+    this.messageContext = messageContext;
+
     const correlationBridge: MessageCorrelationBridge = {
       getSessionId: currentSessionId,
       getSlotId: () => activeSlot.slotId,
       record: correlation => {
         coordinator.recordOutboundMessage(correlation);
+        messageContext.record(correlation.botId, correlation.chatId, correlation.messageId, correlation);
       },
-      resolveReply: (botId, chatId, replyToMessageId) =>
-        coordinator.resolveReplyRouting(botId, chatId, replyToMessageId, currentSessionId()),
+      resolveReply: (botId, chatId, replyToMessageId) => {
+        const resolution = coordinator.resolveReplyRouting(botId, chatId, replyToMessageId, currentSessionId());
+        if (resolution.correlation) {
+          Object.assign(resolution.correlation, messageContext.lookup(botId, chatId, replyToMessageId));
+        }
+        return resolution;
+      },
       resolveCallback: (callbackToken, userId, chatId) =>
         coordinator.validateDecisionCallback(callbackToken, userId, chatId, currentSessionId()),
       consumeCallback: callbackToken =>
@@ -296,7 +321,7 @@ export class TelegramRuntime {
 
     const runner = this.options.commandRunnerFactory ? this.options.commandRunnerFactory() : new BunCommandRunner();
 
-    const pollerCallbacks = {
+    const pollerCallbacks: PollerCallbacks = {
       isIdle: () => ctx.isIdle(),
       getSessionFile: () => ctx.sessionManager.getSessionFile(),
       onUserMessage: (text: string) => {
@@ -307,16 +332,18 @@ export class TelegramRuntime {
           this.pi.sendUserMessage(text, { deliverAs: "steer" });
         }
       },
+      onFollowUp: (text: string) => {
+        if (this.guard) this.guard.startTelegramTurn();
+        this.pi.sendUserMessage(text, { deliverAs: "followUp" });
+      },
       onSteer: (text: string) => {
         if (this.guard) this.guard.startTelegramTurn();
         this.pi.sendUserMessage(text, { deliverAs: "steer" });
       },
-      onCancel: async () => {
-        await this.pi.abortActiveTurn();
-        const primaryChat = this.poller?.getPrimaryChatId();
-        if (primaryChat && this.poller) {
-          await this.poller.sendTelegramMessage(primaryChat, "🛑 <b>Turn cancelled by operator.</b>");
-        }
+      // Abort only. The poller owns the operator-facing cancellation reply, so
+      // sending one here would deliver it twice.
+      onAbort: () => {
+        void this.pi.abortActiveTurn();
       },
       onRelease: async () => {
         await this.dispose();
@@ -371,6 +398,12 @@ export class TelegramRuntime {
       onTelegramTurnStart: () => {
         if (this.guard) this.guard.startTelegramTurn();
       },
+      // The service is constructed after the poller it writes through, so the
+      // receiver is resolved per answer rather than captured at wiring time.
+      onQuestionAnswer: async (decisionId: string, eventId: string, answer: { choice?: string; text?: string }) => {
+        if (!this.questions) throw new Error("Question receiver unavailable; answer was not delivered");
+        await this.questions.answer(decisionId, eventId, answer);
+      },
       onDecisionCallback: async (decisionId: string, choiceId: string, context?: string) => {
         if (this.guard) this.guard.startTelegramTurn();
         const decisionSessionId = currentSessionId();
@@ -407,9 +440,31 @@ export class TelegramRuntime {
 
     const poller = this.options.pollerFactory
       ? this.options.pollerFactory(token, activeSlot.stateDir, this.accessConfig, pollerCallbacks, correlationBridge)
-      : new TelegramPoller(token, activeSlot.stateDir, this.accessConfig, pollerCallbacks, correlationBridge);
+      : new TelegramPoller(
+          token,
+          activeSlot.stateDir,
+          this.accessConfig,
+          pollerCallbacks,
+          correlationBridge,
+          readMessageThreadId(activeSlot.stateDir),
+        );
 
     this.poller = poller;
+
+    const questions = new OperatorQuestionService(
+      poller,
+      () => {
+        const chat = poller.getPrimaryChatId();
+        if (!chat) throw new Error("No authorized operator chat for this session");
+        return { session_id: currentSessionId(), chat_id: chat, user_id: chat };
+      },
+      path.join(os.homedir(), ".veyyon", "workflows", "decisions.json"),
+      poolPath,
+      message => this.pi.logger?.warn(message),
+    );
+    const dashboard = new LiveDashboard(poller, runner, currentSessionId, message => this.pi.logger?.warn(message));
+    this.questions = questions;
+    this.dashboard = dashboard;
 
     globalState[ACTIVE_ROOT_SYMBOL] = {
       instanceId: this.instanceId,
@@ -420,7 +475,13 @@ export class TelegramRuntime {
       guard: this.guard,
       coordinator,
       activeSlot,
+      questions,
+      messageContext,
+      dashboard,
     };
+
+    questions.start();
+    dashboard.start();
 
     globalState[ACTIVE_LEASE_SYMBOL] = {
       slotId: activeSlot.slotId,
@@ -572,6 +633,22 @@ export class TelegramRuntime {
     if (this.streamDebounceTimer) {
       clearTimeout(this.streamDebounceTimer);
       this.streamDebounceTimer = null;
+    }
+
+    // Stop the timer-driven services before the poller they write through, so a
+    // coalesced refresh cannot fire against a stopped channel.
+    this.questions?.stop();
+    this.questions = null;
+    this.dashboard?.stop();
+    this.dashboard = null;
+
+    if (this.messageContext) {
+      try {
+        this.messageContext.close();
+      } catch (err) {
+        this.pi.logger?.warn(`Error closing message context store: ${err}`);
+      }
+      this.messageContext = null;
     }
 
     if (this.poller) {

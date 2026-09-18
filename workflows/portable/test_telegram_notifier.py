@@ -1443,11 +1443,12 @@ class TestDecisionInteractiveCallback(unittest.TestCase):
         )
         self.assertIsNotNone(kb)
         self.assertIn("inline_keyboard", kb)
-        buttons = kb["inline_keyboard"][0]
+        self.assertTrue(all(len(row) == 1 for row in kb["inline_keyboard"]))
+        buttons = [button for row in kb["inline_keyboard"] for button in row]
         self.assertEqual(len(buttons), 2)
-        self.assertEqual(buttons[0]["text"], "A: Approved access path")
+        self.assertEqual(buttons[0]["text"], "Approved access path")
         self.assertTrue(buttons[0]["callback_data"].startswith("cb:d_"))
-        self.assertEqual(buttons[1]["text"], "B: Approved runner")
+        self.assertEqual(buttons[1]["text"], "Approved runner")
         self.assertTrue(buttons[1]["callback_data"].startswith("cb:d_"))
 
     def test_send_notification_dry_run_includes_buttons(self):
@@ -1469,9 +1470,9 @@ class TestDecisionInteractiveCallback(unittest.TestCase):
         self.assertTrue(receipt.delivered)
         self.assertIsNotNone(receipt.reply_markup)
         self.assertIn("inline_keyboard", receipt.reply_markup)
-        buttons = receipt.reply_markup["inline_keyboard"][0]
+        buttons = [button for row in receipt.reply_markup["inline_keyboard"] for button in row if "callback_data" in button]
         self.assertEqual(len(buttons), 2)
-        self.assertEqual(buttons[0]["text"], "A: Access remedy")
+        self.assertEqual(buttons[0]["text"], "Access remedy")
         self.assertTrue(buttons[0]["callback_data"].startswith("cb:d_"))
 
     def test_question_buttons_bind_choices_to_origin(self):
@@ -1487,8 +1488,8 @@ class TestDecisionInteractiveCallback(unittest.TestCase):
             ]},
         )
         receipt = adapter.notify(event, dry_run=True)
-        buttons = receipt.reply_markup["inline_keyboard"][0]
-        self.assertEqual([button["text"] for button in buttons], ["A: Run check", "B: Wait"])
+        buttons = [button for row in receipt.reply_markup["inline_keyboard"] for button in row if "callback_data" in button]
+        self.assertEqual([button["text"] for button in buttons], ["Run check", "Wait"])
         for button, choice in zip(buttons, ["A", "B"]):
             record = store.lookup(button["callback_data"])
             self.assertEqual(record["choice_id"], choice)

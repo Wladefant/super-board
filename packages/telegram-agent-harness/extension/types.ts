@@ -106,6 +106,7 @@ export interface TelegramCallbackQuery {
   };
   message?: {
     message_id: number;
+    message_thread_id?: number;
     chat: {
       id: number;
       type: "private" | "group" | "supergroup" | "channel";
@@ -123,6 +124,7 @@ export interface TelegramUpdate {
   update_id: number;
   message?: {
     message_id: number;
+    message_thread_id?: number;
     from?: {
       id: number;
       is_bot: boolean;
@@ -180,6 +182,7 @@ export interface TelegramSendMessageResponse {
   };
   description?: string;
   error_code?: number;
+  parameters?: { retry_after?: number };
 }
 
 /**
@@ -198,6 +201,9 @@ export interface OutboundMessageCorrelation {
   decisionId: string | null;
   projectPath: string | null;
   createdAt: number;
+  laneId?: string;
+  laneState?: "active" | "exited" | "unknown";
+  senderOrigin?: "agent";
 }
 
 export type ReplyRoutingDecision =
