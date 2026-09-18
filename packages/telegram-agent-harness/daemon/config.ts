@@ -41,8 +41,18 @@ export function getDaemonStatusPath(): string {
   return path.join(getDaemonRunDir(), "daemon.status.json");
 }
 
+/**
+ * The one log file. The launcher redirects the detached process's stdout and
+ * stderr here so a startup crash before any of this code runs is still readable,
+ * and sets `VEYYON_TELEGRAM_DAEMON_LOG` so the daemon appends its own lines to the
+ * same file rather than a second one. Both of those redirects buffer, which is why
+ * the daemon writes here directly instead of printing.
+ */
 export function getDaemonLogPath(): string {
-  return path.join(getDaemonRunDir(), "daemon.log");
+  return (
+    process.env.VEYYON_TELEGRAM_DAEMON_LOG ||
+    path.join(os.homedir(), ".veyyon", "telegram", "daemon.log")
+  );
 }
 
 /**

@@ -6,6 +6,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -320,6 +321,128 @@ class TestInstallTelegramHarness(unittest.TestCase):
         self.assertEqual(len(backups), 1)
         backup_name = backups[0].name
         self.assertTrue(backup_name.endswith("-c0ffee1234567890abcdef"))
+
+    def test_daemon_tree_and_launcher_installed(self):
+        """The daemon modules and its launcher are part of every install, and --check covers them."""
+        code = install_module.main([
+            "--source-root", str(self.source_root),
+            "--target", str(self.target),
+            "--allow-dirty",
+        ])
+        self.assertEqual(code, EXIT_OK)
+
+        for name in ("main.ts", "config.ts", "runtime.ts", "router.ts", "session-control.ts", "store.ts"):
+            self.assertTrue((self.target / "daemon" / name).is_file(), f"daemon/{name} missing")
+        self.assertTrue((self.target / "veyyon-telegram-daemon.ps1").is_file())
+
+        installed = json.loads((self.target / "install-manifest.json").read_text(encoding="utf-8"))
+        recorded = {entry["path"] for entry in installed["files"]}
+        self.assertIn("daemon/main.ts", recorded)
+        self.assertIn("veyyon-telegram-daemon.ps1", recorded)
+
+        # --check must pass on the freshly installed tree, which only holds when it
+        # compares against the rewritten bytes rather than the raw source file.
+        self.assertEqual(install_module.main([
+            "--source-root", str(self.source_root),
+            "--target", str(self.target),
+            "--check",
+        ]), EXIT_OK)
+
+        # ...and must report drift once a daemon file or the launcher is touched.
+        (self.target / "daemon" / "runtime.ts").write_text("// DRIFTED", encoding="utf-8")
+        (self.target / "veyyon-telegram-daemon.ps1").write_text("# DRIFTED", encoding="utf-8")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(install_module.main([
+                "--source-root", str(self.source_root),
+                "--target", str(self.target),
+                "--check",
+            ]), EXIT_DRIFT)
+        output = buf.getvalue()
+        self.assertIn("daemon/runtime.ts (modified)", output)
+        self.assertIn("veyyon-telegram-daemon.ps1 (modified)", output)
+
+        (self.target / "daemon" / "main.ts").unlink()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(install_module.main([
+                "--source-root", str(self.source_root),
+                "--target", str(self.target),
+                "--check",
+            ]), EXIT_DRIFT)
+        self.assertIn("daemon/main.ts (missing)", buf.getvalue())
+
+    def test_daemon_imports_retargeted_at_installed_layout(self):
+        """Installed daemon modules import the flattened tree, not the source package layout."""
+        code = install_module.main([
+            "--source-root", str(self.source_root),
+            "--target", str(self.target),
+            "--allow-dirty",
+        ])
+        self.assertEqual(code, EXIT_OK)
+
+        for name in ("main.ts", "config.ts", "runtime.ts", "router.ts", "session-control.ts", "store.ts"):
+            text = (self.target / "daemon" / name).read_text(encoding="utf-8")
+            self.assertNotIn('from "../extension/', text, f"daemon/{name} still imports ../extension/")
+            self.assertNotIn('from "../src/', text, f"daemon/{name} still imports ../src/")
+
+        # Every rewritten specifier must resolve to a file the installer actually placed.
+        for name in ("main.ts", "config.ts", "runtime.ts", "router.ts", "session-control.ts", "store.ts"):
+            source = (self.target / "daemon" / name)
+            for line in source.read_text(encoding="utf-8").splitlines():
+                match = re.search(r'from "\.\./([^"]+)"', line)
+                if not match:
+                    continue
+                resolved = self.target / f"{match.group(1)}.ts"
+                self.assertTrue(resolved.is_file(), f"daemon/{name}: '{match.group(1)}' resolves to nothing")
+
+    def test_rewrite_daemon_imports_is_exact(self):
+        """The rewrite maps each source directory onto its installed location."""
+        rewritten = install_module.rewrite_daemon_imports(
+            'import { a } from "../extension/coordinator";\n'
+            'import { b } from "../extension/harness/command-runner";\n'
+            'import { c } from "../src/gui-host-client";\n'
+            'import { d } from "./config";\n'
+        )
+        self.assertEqual(
+            rewritten,
+            'import { a } from "../coordinator";\n'
+            'import { b } from "../harness/command-runner";\n'
+            'import { c } from "../harness/gui-host-client";\n'
+            'import { d } from "./config";\n',
+        )
+
+    def test_daemon_runtime_state_is_protected(self):
+        """Live daemon pid/log/db state survives an install and is kept out of backups."""
+        run_dir = self.target / "daemon" / "run"
+        run_dir.mkdir(parents=True)
+        (run_dir / "daemon.pid").write_text("4242", encoding="utf-8")
+        (run_dir / "daemon.log").write_text("[ts] Slot telegram-ing polling\n", encoding="utf-8")
+        (self.target / "daemon.db").write_bytes(b"SQLITE_FAKE_DAEMON_DB")
+        (self.target / "daemon.log").write_text("launcher log\n", encoding="utf-8")
+        (self.target / "guard.ts").write_text("// to overwrite", encoding="utf-8")
+
+        self.assertEqual(install_module.main([
+            "--source-root", str(self.source_root),
+            "--target", str(self.target),
+            "--allow-dirty",
+        ]), EXIT_OK)
+
+        self.assertEqual((run_dir / "daemon.pid").read_text(encoding="utf-8"), "4242")
+        self.assertEqual((self.target / "daemon.db").read_bytes(), b"SQLITE_FAKE_DAEMON_DB")
+        self.assertEqual((self.target / "daemon.log").read_text(encoding="utf-8"), "launcher log\n")
+
+        backup_dir = next((self.target / ".backups").iterdir())
+        self.assertFalse((backup_dir / "daemon.db").exists())
+        self.assertFalse((backup_dir / "daemon" / "run" / "daemon.pid").exists())
+
+    def test_operator_launcher_still_protected(self):
+        """Naming the daemon launcher installer-owned must not unprotect other .ps1 files."""
+        self.assertTrue(install_module.is_protected_rel_path("veyyon-telegram.ps1"))
+        self.assertTrue(install_module.is_protected_rel_path("veyyon-polysim.ps1"))
+        self.assertFalse(install_module.is_protected_rel_path("veyyon-telegram-daemon.ps1"))
+        self.assertFalse(install_module.is_protected_rel_path("daemon/main.ts"))
+        self.assertTrue(install_module.is_protected_rel_path("daemon/run/daemon.pid"))
 
     def test_invalid_usage_exits_64(self):
         """Test that invalid argument flags exit with code 64."""

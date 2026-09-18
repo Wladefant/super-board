@@ -107,17 +107,28 @@ export class TelegramDaemon {
         });
   }
 
+  /**
+   * One line per event, appended to `getDaemonLogPath()`.
+   *
+   * Appended, and NOT printed: the daemon is started detached, so its stdout is a
+   * redirect — and both `cmd`'s `>>` and PowerShell's `*>>` buffer a long-lived
+   * process's output, which left the log the launcher points the operator at empty
+   * for the daemon's whole lifetime. The redirect still exists, for the crash that
+   * happens before this class is reachable; this write is what makes a running
+   * daemon watchable, and it lands in the same file.
+   */
   public log(message: string): void {
     const line = `[${new Date().toISOString()}] ${message}`;
     if (this.options.log) {
       this.options.log(line);
       return;
     }
-    console.log(line);
     try {
       fs.mkdirSync(path.dirname(getDaemonLogPath()), { recursive: true });
       fs.appendFileSync(getDaemonLogPath(), `${line}\n`, "utf8");
-    } catch {}
+    } catch {
+      console.log(line);
+    }
   }
 
   /**

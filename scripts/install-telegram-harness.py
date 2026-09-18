@@ -38,6 +38,11 @@ EXIT_CONFIG = 65
 PROTECTED_PATTERNS = (
     "manifest.json",
     "bot_pool.db*",
+    "daemon.db*",
+    "daemon.log",
+    "daemon.startup.log",
+    "daemon/run",
+    "daemon/run/*",
     "*.ps1",
     "veyyon_telegram_bridge.py",
     "veyyon_telegram_guard.js",
@@ -50,16 +55,51 @@ PROTECTED_PATTERNS = (
     ".pytest_cache/*",
 )
 
+# Files the installer owns even though a broader pattern above would protect them.
+# The blanket "*.ps1" guard exists for launchers the operator wrote by hand; the
+# daemon launcher ships with the harness and has to track it, so it is named here.
+INSTALLER_OWNED = ("veyyon-telegram-daemon.ps1",)
+
+# Import specifiers rewritten when a daemon module is installed. The installed tree
+# flattens the package: extension/*.ts lands at the target root and src/*.ts under
+# harness/, so "../extension/coordinator" and "../src/gui-host-client" resolve to
+# nothing once daemon/*.ts sits at <target>/daemon/. extension/harness/* is only a
+# re-export of src/*, so it collapses onto harness/ as well.
+DAEMON_IMPORT_REWRITES = (
+    ('from "../extension/harness/', 'from "../harness/'),
+    ('from "../extension/', 'from "../'),
+    ('from "../src/', 'from "../harness/'),
+)
+
 
 class SyncItem(NamedTuple):
     source_path: Path
     rel_target: str  # POSIX relative path from target root, e.g. "guard.ts", "harness/index.ts"
+    # Whether DAEMON_IMPORT_REWRITES apply to this file's text on the way in.
+    rewrite_imports: bool = False
+
+
+def rewrite_daemon_imports(text: str) -> str:
+    """Retarget a daemon module's cross-directory imports at the installed layout."""
+    for source_prefix, installed_prefix in DAEMON_IMPORT_REWRITES:
+        text = text.replace(source_prefix, installed_prefix)
+    return text
+
+
+def expected_bytes(item: SyncItem) -> bytes:
+    """The exact bytes `item` must have in the target, which --check compares against."""
+    raw = item.source_path.read_bytes()
+    if not item.rewrite_imports:
+        return raw
+    return rewrite_daemon_imports(raw.decode("utf-8")).encode("utf-8")
 
 
 def is_protected_rel_path(rel_path: str) -> bool:
     """Check whether a relative path within target matches any protected pattern."""
     normalized = rel_path.replace("\\", "/")
     parts = normalized.split("/")
+    if normalized in INSTALLER_OWNED:
+        return False
 
     for pattern in PROTECTED_PATTERNS:
         # Check against the full relative path
@@ -114,6 +154,8 @@ def plan_sync_items(harness_root: Path, target: Path) -> List[SyncItem]:
     - packages/telegram-agent-harness/extension/*.ts (excluding tests/) -> target/
     - packages/telegram-agent-harness/src/*.ts -> target/harness/
     - packages/telegram-agent-harness/src/*.py -> target/harness/
+    - daemon/*.ts -> target/daemon/ with imports retargeted at the installed layout
+    - daemon/veyyon-telegram-daemon.ps1 -> target/ (the launcher lives beside the harness)
     - extension/tests/*.ts -> target/tests/ (ONLY if target/tests already exists)
     - tests/*.ts -> target/harness/tests/ (ONLY if target/harness/tests already exists)
     """
@@ -135,7 +177,19 @@ def plan_sync_items(harness_root: Path, target: Path) -> List[SyncItem]:
             if p.is_file():
                 items.append(SyncItem(source_path=p, rel_target=f"harness/{p.name}"))
 
-    # 3. extension/tests -> target/tests if target/tests exists
+    # 3. daemon/*.ts -> target/daemon/, and the launcher to the target root. The
+    #    daemon is what keeps the bot answering with no session open, so it is part
+    #    of every install rather than conditional on the target already having it.
+    daemon_dir = harness_root / "daemon"
+    if daemon_dir.is_dir():
+        for p in sorted(daemon_dir.glob("*.ts")):
+            if p.is_file():
+                items.append(SyncItem(source_path=p, rel_target=f"daemon/{p.name}", rewrite_imports=True))
+        launcher = daemon_dir / "veyyon-telegram-daemon.ps1"
+        if launcher.is_file():
+            items.append(SyncItem(source_path=launcher, rel_target=launcher.name))
+
+    # 4. extension/tests -> target/tests if target/tests exists
     target_tests_dir = target / "tests"
     ext_tests_dir = harness_root / "extension" / "tests"
     if target_tests_dir.is_dir() and ext_tests_dir.is_dir():
@@ -143,7 +197,7 @@ def plan_sync_items(harness_root: Path, target: Path) -> List[SyncItem]:
             if p.is_file():
                 items.append(SyncItem(source_path=p, rel_target=f"tests/{p.name}"))
 
-    # 4. tests/ -> target/harness/tests if target/harness/tests exists
+    # 5. tests/ -> target/harness/tests if target/harness/tests exists
     target_harness_tests_dir = target / "harness" / "tests"
     tests_dir = harness_root / "tests"
     if target_harness_tests_dir.is_dir() and tests_dir.is_dir():
@@ -240,8 +294,14 @@ def create_backup(target: Path, old_sha: str) -> Optional[Path]:
         ]
         root_path = Path(root)
         for f in files:
-            # Skip runtime state, database files, and caches
-            if fnmatch.fnmatch(f, "bot_pool.db*"):
+            # Skip runtime state, database files, logs, and caches. A daemon log is
+            # the largest thing in the tree and restoring one would resurrect old
+            # output over the live log.
+            if (
+                fnmatch.fnmatch(f, "bot_pool.db*")
+                or fnmatch.fnmatch(f, "daemon.db*")
+                or f in ("daemon.log", "daemon.startup.log")
+            ):
                 continue
             file_path = root_path / f
             try:
@@ -249,8 +309,8 @@ def create_backup(target: Path, old_sha: str) -> Optional[Path]:
             except ValueError:
                 continue
             if is_protected_rel_path(rel):
-                # Don't back up sensitive databases, caches, or backups
-                if fnmatch.fnmatch(rel, "bot_pool.db*") or rel.startswith(".backups"):
+                # Don't back up sensitive databases, live daemon state, caches, or backups
+                if rel.startswith(".backups") or rel.startswith("daemon/run/"):
                     continue
             files_to_backup.append((file_path, rel))
     if not files_to_backup:
@@ -274,9 +334,8 @@ def run_check(items: List[SyncItem], target: Path) -> int:
         if not target_file.exists():
             drift_list.append(f"{item.rel_target} (missing)")
         else:
-            s_hash = sha256_file(item.source_path)
-            t_hash = sha256_file(target_file)
-            if s_hash != t_hash:
+            expected = expected_bytes(item)
+            if hashlib.sha256(expected).hexdigest() != sha256_file(target_file):
                 drift_list.append(f"{item.rel_target} (modified)")
 
     if drift_list:
@@ -329,7 +388,7 @@ def run_install(
     for item in items:
         dest = target / item.rel_target
         dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(item.source_path, dest)
+        dest.write_bytes(expected_bytes(item))
         file_hash = sha256_file(dest)
         installed_files_record.append({
             "path": item.rel_target,

@@ -14,7 +14,7 @@ import {
 } from "./config";
 import { claimDaemonPidFile, TelegramDaemon } from "./runtime";
 import { getProcessIdentity } from "../extension/coordinator";
-import { resolveGuiHostEndpoint } from "./session-control";
+import { guiHostAgentDirs, resolveGuiHostEndpoint } from "./session-control";
 
 async function run(): Promise<number> {
   const claim = claimDaemonPidFile();
@@ -94,7 +94,10 @@ function check(): number {
     return 78;
   }
   if (!endpoint) {
-    console.error("No GUI host endpoint discovered; the daemon can poll but cannot drive sessions.");
+    console.error(
+      "No GUI host endpoint discovered; the daemon can poll but cannot drive sessions. " +
+        `Start one with \`veyyon gui tcp:127.0.0.1:7699\`. Searched: ${guiHostAgentDirs().join(", ")}`,
+    );
     return 70;
   }
   return 0;

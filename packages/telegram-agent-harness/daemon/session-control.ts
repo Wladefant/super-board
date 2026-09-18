@@ -52,23 +52,64 @@ export interface SessionControlOptions {
 }
 
 /**
+ * Directories a GUI host may have published its endpoint in, most specific first.
+ *
+ * `veyyon gui` writes its endpoint into `getAgentDir()` — the ACTIVE PROFILE's
+ * agent directory, `~/.veyyon/profiles/<profile>/agent`, not `~/.veyyon`. A daemon
+ * that only looked at `~/.veyyon` never found a running host.
+ *
+ * Which profile is active is decided by Veyyon's own resolution (env, then a
+ * global default recorded in the config root), and this does not reimplement it:
+ * the env-named profile is preferred, then EVERY profile that exists is searched,
+ * so a host started under a non-default profile is still found. `~/.veyyon` stays
+ * last because it is where an operator pointing the daemon at a host by hand
+ * would write the file, and the error message tells them to.
+ *
+ * @param configRoot injected so tests scan a real profiles tree of their own
+ *   rather than the operator's; defaults to the config root Veyyon uses.
+ */
+export function guiHostAgentDirs(configRoot?: string): string[] {
+  const override = process.env.VEYYON_CODING_AGENT_DIR?.trim();
+  if (override) return [path.resolve(override)];
+
+  const root = configRoot ?? path.join(os.homedir(), process.env.VEYYON_CONFIG_DIR?.trim() || ".veyyon");
+  const profilesRoot = path.join(root, "profiles");
+  const preferred = process.env.VEYYON_PROFILE?.trim() || "default";
+
+  const dirs = [path.join(profilesRoot, preferred, "agent")];
+  let present: string[] = [];
+  try {
+    present = fs
+      .readdirSync(profilesRoot, { withFileTypes: true })
+      .filter(entry => entry.isDirectory() && entry.name !== preferred)
+      .map(entry => path.join(profilesRoot, entry.name, "agent"));
+  } catch {}
+  dirs.push(...present.sort(), root);
+  return dirs;
+}
+
+/**
  * Discovery order for the host endpoint. The host itself only ever knows the
  * endpoint it was told to listen on, so an explicit env value wins, then the
- * endpoint file a launcher writes, then the documented default socket — and only
+ * endpoint file the host publishes, then the documented default socket — and only
  * when it exists, because dialling a missing socket is a five-second stall per try.
  */
-export function resolveGuiHostEndpoint(agentDir: string = path.join(os.homedir(), ".veyyon")): string | null {
+export function resolveGuiHostEndpoint(...agentDirs: string[]): string | null {
   const configured = process.env.VEYYON_GUI_HOST_ENDPOINT?.trim();
   if (configured) return normalizeEndpoint(configured);
 
-  const endpointFile = path.join(agentDir, "gui-host.endpoint");
-  try {
-    const written = fs.readFileSync(endpointFile, "utf8").trim();
-    if (written) return normalizeEndpoint(written);
-  } catch {}
-
-  const socketPath = path.join(agentDir, "gui-host.sock");
-  return fs.existsSync(socketPath) ? `unix:${socketPath}` : null;
+  const candidates = agentDirs.length > 0 ? agentDirs : guiHostAgentDirs();
+  for (const agentDir of candidates) {
+    try {
+      const written = fs.readFileSync(path.join(agentDir, "gui-host.endpoint"), "utf8").trim();
+      if (written) return normalizeEndpoint(written);
+    } catch {}
+  }
+  for (const agentDir of candidates) {
+    const socketPath = path.join(agentDir, "gui-host.sock");
+    if (fs.existsSync(socketPath)) return `unix:${socketPath}`;
+  }
+  return null;
 }
 
 function normalizeEndpoint(written: string): string {
@@ -206,7 +247,10 @@ export class GuiHostSessionControl {
     const endpoint = this.options.endpoint;
     if (!endpoint) {
       throw new SessionControlUnavailableError(
-        "No Veyyon GUI host endpoint was discovered (set VEYYON_GUI_HOST_ENDPOINT or write ~/.veyyon/gui-host.endpoint)",
+        "No Veyyon GUI host endpoint was discovered. Start one with `veyyon gui tcp:127.0.0.1:7699`, " +
+          `or set VEYYON_GUI_HOST_ENDPOINT. Searched: ${guiHostAgentDirs()
+            .map(dir => path.join(dir, "gui-host.endpoint"))
+            .join(", ")}`,
       );
     }
     const onFrame = (frame: unknown) => {
