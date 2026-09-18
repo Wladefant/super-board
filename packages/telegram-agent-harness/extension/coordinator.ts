@@ -697,6 +697,130 @@ export class BotPoolCoordinator {
     return { busy: false };
   }
 
+  /**
+   * Claims one named slot for `sessionId`, or reports who holds it. Shared by pool
+   * acquisition and by a caller that owns a specific slot (the standalone daemon),
+   * so a lease is written in exactly one place.
+   */
+  private claimSlot(
+    slot: DiscoveredSlot,
+    sessionId: string,
+    projectCwd: string,
+    ownerPid: number,
+    procStartStr: string,
+  ): { claimed: boolean; holder?: BusySlotHolder } {
+    if (!this.readRawTokenForSlot(slot.stateDir)) {
+      return { claimed: false };
+    }
+
+    const busyCheck = this.isSlotBusy(slot, ownerPid, sessionId);
+    if (busyCheck.busy) {
+      return {
+        claimed: false,
+        holder: {
+          slotId: slot.slotId,
+          sessionId: busyCheck.holder?.sessionId,
+          projectPath: busyCheck.holder?.projectPath,
+          ownerPid: busyCheck.activePid ?? busyCheck.holder?.ownerPid,
+          reason: busyCheck.reason,
+        },
+      };
+    }
+
+    const now = Date.now() / 1000;
+
+    try {
+      this.db.run("BEGIN IMMEDIATE;");
+
+      const currentLease = this.getSlotLease(slot.slotId);
+      if (currentLease && currentLease.leaseStatus === "ACTIVE") {
+        // A live lease held by this very session and process is ours to renew;
+        // only a lease belonging to someone else blocks the claim.
+        const heldByCaller =
+          currentLease.sessionId === sessionId && currentLease.ownerPid === ownerPid;
+        const el = now - currentLease.heartbeatAt;
+        const live = getProcessIdentity(currentLease.ownerPid);
+        if (!heldByCaller && (live.alive || live.uncertain)) {
+          if (el <= currentLease.ttlSeconds) {
+            this.db.run("ROLLBACK;");
+            return {
+              claimed: false,
+              holder: {
+                slotId: slot.slotId,
+                sessionId: currentLease.sessionId,
+                projectPath: currentLease.projectPath,
+                ownerPid: currentLease.ownerPid,
+                reason: `Active database lease held by session ${currentLease.sessionId} (PID ${currentLease.ownerPid}, cwd ${currentLease.projectPath})`,
+              },
+            };
+          }
+        }
+      }
+
+      this.db.run(
+        `
+        INSERT INTO bot_leases (
+          slot_id, session_id, project_path, owner_pid, owner_proc_start,
+          acquired_at, heartbeat_at, ttl_seconds, lease_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')
+        ON CONFLICT(slot_id) DO UPDATE SET
+          session_id = excluded.session_id,
+          project_path = excluded.project_path,
+          owner_pid = excluded.owner_pid,
+          owner_proc_start = excluded.owner_proc_start,
+          acquired_at = excluded.acquired_at,
+          heartbeat_at = excluded.heartbeat_at,
+          ttl_seconds = excluded.ttl_seconds,
+          lease_status = 'ACTIVE';
+      `,
+        [slot.slotId, sessionId, projectCwd, ownerPid, procStartStr, now, now, LEASE_TTL_SECONDS],
+      );
+
+      this.db.run("COMMIT;");
+    } catch {
+      try {
+        this.db.run("ROLLBACK;");
+      } catch {}
+      return { claimed: false };
+    }
+
+    try {
+      fs.writeFileSync(path.join(slot.stateDir, "veyyon-bot.pid"), String(ownerPid), "utf8");
+      fs.writeFileSync(path.join(slot.stateDir, "bot.pid"), String(ownerPid), "utf8");
+    } catch {}
+
+    // Start unreferenced heartbeat
+    this.startHeartbeat(slot.slotId, sessionId);
+    return { claimed: true };
+  }
+
+  /**
+   * Claims the slot named by `slotId` regardless of project affinity. The daemon
+   * owns whole tokens rather than competing for a pool, and the lease it writes is
+   * what makes every in-session poller see the slot as busy.
+   */
+  public acquireLeaseForSlot(
+    slotId: string,
+    sessionId: string,
+    projectCwd: string,
+    ownerPid: number = process.pid,
+  ): ClaimResult {
+    this.ensureDbOpen();
+    const slot = this.syncSlots().find(candidate => candidate.slotId === slotId);
+    if (!slot) {
+      return { ok: false, error: "SLOT_NOT_FOUND", reason: `Slot '${slotId}' is not an enabled slot with a readable token.` };
+    }
+    const procStartStr = String(getProcessIdentity(ownerPid).creationTime);
+    const result = this.claimSlot(slot, sessionId, projectCwd, ownerPid, procStartStr);
+    if (result.claimed) return { ok: true, slot };
+    return {
+      ok: false,
+      error: "SLOT_BUSY",
+      reason: result.holder?.reason ?? `Slot '${slotId}' could not be claimed.`,
+      busyHolders: result.holder ? [result.holder] : undefined,
+    };
+  }
+
   public async acquireLease(
     sessionId: string,
     projectCwd: string,
@@ -728,97 +852,9 @@ export class BotPoolCoordinator {
       const busyHolders: BusySlotHolder[] = [];
 
       for (const slot of sortedSlots) {
-        // Must have readable token
-        const rawToken = this.readRawTokenForSlot(slot.stateDir);
-        if (!rawToken) {
-          continue;
-        }
-
-        const busyCheck = this.isSlotBusy(slot, ownerPid, sessionId);
-        if (busyCheck.busy) {
-          busyHolders.push({
-            slotId: slot.slotId,
-            sessionId: busyCheck.holder?.sessionId,
-            projectPath: busyCheck.holder?.projectPath,
-            ownerPid: busyCheck.activePid ?? busyCheck.holder?.ownerPid,
-            reason: busyCheck.reason,
-          });
-          continue;
-        }
-
-        // Try atomic claim inside transaction
-        let claimSucceeded = false;
-        const now = Date.now() / 1000;
-
-        try {
-          this.db.run("BEGIN IMMEDIATE;");
-
-          const currentLease = this.getSlotLease(slot.slotId);
-          if (currentLease && currentLease.leaseStatus === "ACTIVE") {
-            // A live lease held by this very session and process is ours to renew;
-            // only a lease belonging to someone else blocks the claim.
-            const heldByCaller =
-              currentLease.sessionId === sessionId && currentLease.ownerPid === ownerPid;
-            const el = now - currentLease.heartbeatAt;
-            const live = getProcessIdentity(currentLease.ownerPid);
-            if (!heldByCaller && (live.alive || live.uncertain)) {
-              if (el <= currentLease.ttlSeconds) {
-                this.db.run("ROLLBACK;");
-                busyHolders.push({
-                  slotId: slot.slotId,
-                  sessionId: currentLease.sessionId,
-                  projectPath: currentLease.projectPath,
-                  ownerPid: currentLease.ownerPid,
-                  reason: `Active database lease held by session ${currentLease.sessionId} (PID ${currentLease.ownerPid}, cwd ${currentLease.projectPath})`,
-                });
-                continue;
-              }
-            }
-          }
-
-          this.db.run(
-            `
-            INSERT INTO bot_leases (
-              slot_id, session_id, project_path, owner_pid, owner_proc_start,
-              acquired_at, heartbeat_at, ttl_seconds, lease_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')
-            ON CONFLICT(slot_id) DO UPDATE SET
-              session_id = excluded.session_id,
-              project_path = excluded.project_path,
-              owner_pid = excluded.owner_pid,
-              owner_proc_start = excluded.owner_proc_start,
-              acquired_at = excluded.acquired_at,
-              heartbeat_at = excluded.heartbeat_at,
-              ttl_seconds = excluded.ttl_seconds,
-              lease_status = 'ACTIVE';
-          `,
-            [slot.slotId, sessionId, projectCwd, ownerPid, procStartStr, now, now, LEASE_TTL_SECONDS],
-          );
-
-          this.db.run("COMMIT;");
-          claimSucceeded = true;
-        } catch {
-          try {
-            this.db.run("ROLLBACK;");
-          } catch {}
-          continue;
-        }
-
-        if (claimSucceeded) {
-          // Write PID files
-          try {
-            fs.writeFileSync(path.join(slot.stateDir, "veyyon-bot.pid"), String(ownerPid), "utf8");
-            fs.writeFileSync(path.join(slot.stateDir, "bot.pid"), String(ownerPid), "utf8");
-          } catch {}
-
-          // Start unreferenced heartbeat
-          this.startHeartbeat(slot.slotId, sessionId);
-
-          return {
-            ok: true,
-            slot,
-          };
-        }
+        const result = this.claimSlot(slot, sessionId, projectCwd, ownerPid, procStartStr);
+        if (result.claimed) return { ok: true, slot };
+        if (result.holder) busyHolders.push(result.holder);
       }
 
       if (waitTimeoutMs <= 0 || Date.now() - startTime >= waitTimeoutMs) {

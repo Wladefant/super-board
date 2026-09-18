@@ -11,6 +11,7 @@
 - `telegram_dashboard` tool refreshing one pinned fleet dashboard from observed lane, blocker and merge-queue state on a 30-second coalesced edit.
 - Telegram free-text replies and callback selections answer the question they reply to instead of starting a new operator turn.
 - Configured message thread id is read from the leased channel so a forum-topic channel receives messages in its own topic.
+- Standalone Telegram bot daemon (`daemon/`): polls opted-in bot tokens machine-wide and drives Veyyon sessions through the GUI host action protocol, so a bot keeps answering with no session open in the project. Slots opt in with `"daemon": true` in `manifest.json` (or `VEYYON_TELEGRAM_DAEMON_SLOTS`); the daemon holds an ordinary pool lease per slot, so in-session pollers see the slot as busy and the single-poller-per-token invariant is unchanged. Durable per-chat session routing and per-entry delivery claims in `~/.veyyon/telegram/daemon.db` keep a restart from replaying a transcript into the operator's chat. Chat commands: `/sessions`, `/attach <id>`, `/new [path]`, `/detach`, `/where`. CLI: `bun daemon/main.ts run|status|stop|check`.
 
 ### Fixed
 - Preserve empty preference list for discovered Telegram bot slots lacking explicit configuration, restoring any-project eligibility default and removing hardcoded comment examples.

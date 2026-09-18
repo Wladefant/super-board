@@ -8,6 +8,13 @@ export interface ManifestSlot {
   preferredProjects?: string[];
   projects?: string[];
   enabled: boolean;
+  /**
+   * Opt-in to standalone-daemon ownership of this slot's token. Absent or false
+   * leaves the slot to the in-session extension exactly as before; true hands the
+   * token to the machine-wide daemon, which holds a normal pool lease so no
+   * in-session poller can claim the same token concurrently.
+   */
+  daemon?: boolean;
 }
 
 export interface BotPoolManifest {

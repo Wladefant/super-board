@@ -1,0 +1,362 @@
+/**
+ * runtime.ts — Standalone Telegram daemon: owns opted-in bot tokens machine-wide.
+ *
+ * Why this exists: the in-session extension only polls while a Veyyon session is
+ * running in the right project, so the bot goes silent the moment the operator
+ * closes the terminal. The daemon polls independently and drives sessions through
+ * the GUI host instead of living inside one.
+ *
+ * The no-double-poller invariant is unchanged and enforced by the same mechanism as
+ * before: the daemon takes a real `bot_leases` lease per slot, so every in-session
+ * poller sees the slot as busy and skips it. Nothing here bypasses the pool.
+ */
+
+import * as fs from "node:fs";
+import * as path from "node:path";
+import {
+  BotPoolCoordinator,
+  getDefaultManifestPath,
+  getProcessIdentity,
+} from "../extension/coordinator";
+import { TelegramPoller } from "../extension/poller";
+import { chunkMessage } from "../extension/sanitizer";
+import type { AccessConfig, MessageCorrelationBridge } from "../extension/types";
+import { BunCommandRunner } from "../extension/harness/command-runner";
+import { handleInstalledCommand } from "../src/installed-commands";
+import {
+  getDaemonLogPath,
+  getDaemonPidPath,
+  getDaemonStatusPath,
+  resolveDaemonSlots,
+  type DaemonSlot,
+} from "./config";
+import { SlotRouter } from "./router";
+import {
+  GuiHostSessionControl,
+  resolveGuiHostEndpoint,
+  type SessionEvent,
+} from "./session-control";
+import { DaemonStore } from "./store";
+
+export interface DaemonSlotReport {
+  slotId: string;
+  botId: string;
+  workspace: string | null;
+  polling: boolean;
+  /** Why the slot is not polling; absent when it is. */
+  skipped?: string;
+}
+
+export interface DaemonStatusReport {
+  pid: number;
+  startedAt: number;
+  endpoint: string | null;
+  slots: DaemonSlotReport[];
+}
+
+export interface DaemonRuntimeOptions {
+  poolDbPath?: string;
+  manifestPath?: string;
+  daemonDbPath?: string;
+  channelsDir?: string;
+  /** Overrides endpoint discovery; null means "no host reachable". */
+  endpoint?: string | null;
+  log?: (message: string) => void;
+  /** Injected in tests so no real Bot API call or GUI host connection is made. */
+  pollerFactory?: (
+    token: string,
+    stateDir: string,
+    access: AccessConfig,
+    callbacks: ConstructorParameters<typeof TelegramPoller>[3],
+    correlation: MessageCorrelationBridge,
+  ) => TelegramPoller;
+  controlFactory?: (
+    onEvent: (event: SessionEvent) => void,
+    onLog: (message: string) => void,
+  ) => GuiHostSessionControl;
+}
+
+interface ActiveSlot {
+  slot: DaemonSlot;
+  poller: TelegramPoller;
+  router: SlotRouter;
+  /** Lease identity; also what in-session pollers see as the slot holder. */
+  leaseSessionId: string;
+}
+
+export class TelegramDaemon {
+  private readonly options: DaemonRuntimeOptions;
+  private readonly coordinator: BotPoolCoordinator;
+  private readonly store: DaemonStore;
+  private readonly control: GuiHostSessionControl;
+  private readonly active: ActiveSlot[] = [];
+  private readonly startedAt = Date.now();
+  private stopping = false;
+
+  constructor(options: DaemonRuntimeOptions = {}) {
+    this.options = options;
+    this.coordinator = new BotPoolCoordinator(options.poolDbPath, options.manifestPath, options.channelsDir);
+    this.store = new DaemonStore(options.daemonDbPath);
+    const endpoint = options.endpoint !== undefined ? options.endpoint : resolveGuiHostEndpoint();
+    this.control = options.controlFactory
+      ? options.controlFactory(event => this.fanOut(event), message => this.log(message))
+      : new GuiHostSessionControl({
+          endpoint,
+          onEvent: event => this.fanOut(event),
+          onLog: message => this.log(message),
+        });
+  }
+
+  public log(message: string): void {
+    const line = `[${new Date().toISOString()}] ${message}`;
+    if (this.options.log) {
+      this.options.log(line);
+      return;
+    }
+    console.log(line);
+    try {
+      fs.mkdirSync(path.dirname(getDaemonLogPath()), { recursive: true });
+      fs.appendFileSync(getDaemonLogPath(), `${line}\n`, "utf8");
+    } catch {}
+  }
+
+  /**
+   * Claims every opted-in slot and starts polling it. A slot the daemon cannot claim
+   * is reported and skipped, never force-claimed: a live in-session poller holding
+   * that token is a legitimate owner, and stealing it is how 409 conflicts start.
+   */
+  public async start(): Promise<DaemonStatusReport> {
+    const slots = resolveDaemonSlots(this.coordinator, this.options.manifestPath ?? getDefaultManifestPath());
+    const reports: DaemonSlotReport[] = [];
+
+    for (const slot of slots) {
+      const leaseSessionId = `daemon:${slot.slotId}`;
+      const claim = this.coordinator.acquireLeaseForSlot(
+        slot.slotId,
+        leaseSessionId,
+        slot.workspace ?? process.cwd(),
+      );
+      if (!claim.ok) {
+        this.log(`Slot ${slot.slotId} not claimed: ${claim.reason ?? "unavailable"}`);
+        reports.push({ slotId: slot.slotId, botId: slot.botId, workspace: slot.workspace, polling: false, skipped: claim.reason ?? "unavailable" });
+        continue;
+      }
+
+      const token = this.coordinator.readRawTokenForSlot(slot.stateDir);
+      if (!token) {
+        this.coordinator.releaseLease(slot.slotId, leaseSessionId);
+        reports.push({ slotId: slot.slotId, botId: slot.botId, workspace: slot.workspace, polling: false, skipped: "bot token unreadable" });
+        continue;
+      }
+
+      const activeSlot = this.startSlot(slot, token, leaseSessionId);
+      this.active.push(activeSlot);
+      await activeSlot.poller.start();
+      this.log(`Slot ${slot.slotId} polling (bot ${slot.botId}, workspace ${slot.workspace ?? "unresolved"})`);
+      reports.push({ slotId: slot.slotId, botId: slot.botId, workspace: slot.workspace, polling: true });
+    }
+
+    const report: DaemonStatusReport = {
+      pid: process.pid,
+      startedAt: this.startedAt,
+      endpoint: this.control.endpoint,
+      slots: reports,
+    };
+    this.writeStatus(report);
+    return report;
+  }
+
+  private startSlot(slot: DaemonSlot, token: string, leaseSessionId: string): ActiveSlot {
+    const access = this.coordinator.readAccessConfig(slot.stateDir);
+    // Assigned after construction: the poller and the router each need the other,
+    // and the poller is what knows which chat a callback is currently serving.
+    let poller: TelegramPoller;
+
+    const currentChat = (): string => poller.getPrimaryChatId() ?? "";
+    const router = new SlotRouter({
+      slot,
+      store: this.store,
+      control: this.control,
+      send: async (chatId, html) => {
+        for (const chunk of chunkMessage(html)) await poller.sendTelegramMessage(chatId, chunk, "HTML");
+      },
+      relay: async (chatId, markdown) => {
+        for (const chunk of chunkMessage(markdown)) await poller.sendTelegramMessage(chatId, chunk);
+      },
+      log: message => this.log(message),
+    });
+
+    const sessionIdForChat = (): string => router.boundSession(currentChat()) ?? leaseSessionId;
+    const correlation: MessageCorrelationBridge = {
+      getSessionId: sessionIdForChat,
+      getSlotId: () => slot.slotId,
+      record: correlationRow => {
+        this.coordinator.recordOutboundMessage(correlationRow);
+      },
+      resolveReply: (botId, chatId, replyToMessageId) =>
+        this.coordinator.resolveReplyRouting(botId, chatId, replyToMessageId, sessionIdForChat()),
+      resolveCallback: (callbackToken, userId, chatId) =>
+        this.coordinator.validateDecisionCallback(callbackToken, userId, chatId, sessionIdForChat()),
+      consumeCallback: callbackToken => this.coordinator.consumeDecisionCallback(callbackToken),
+    };
+
+    const runner = new BunCommandRunner();
+    const callbacks = {
+      isIdle: () => !router.isBusy(currentChat()),
+      onUserMessage: (text: string) => {
+        void this.acknowledge(router, currentChat(), text, "auto");
+      },
+      onSteer: (text: string) => {
+        void this.acknowledge(router, currentChat(), text, "steer");
+      },
+      onFollowUp: (text: string) => {
+        void this.acknowledge(router, currentChat(), text, "followUp");
+      },
+      onAbort: () => {
+        const chatId = currentChat();
+        void router.abort(chatId).catch(error => {
+          this.log(`Slot ${slot.slotId}: abort failed: ${error instanceof Error ? error.message : String(error)}`);
+        });
+      },
+      onRelease: async () => {
+        await this.stopSlot(slot.slotId);
+      },
+      getStatusText: () => router.statusText(currentChat()),
+      onTelegramTurnStart: () => {},
+      onHarnessCommand: async (text: string, chatId: string, userId?: string) => {
+        if (await router.handleCommand(text, chatId)) return true;
+        return handleInstalledCommand(text, {
+          session: () => ({
+            id: router.boundSession(chatId) ?? leaseSessionId,
+            cwd: slot.workspace ?? "",
+            idle: !router.isBusy(chatId),
+            stateDir: slot.stateDir,
+          }),
+          send: async html => {
+            for (const chunk of chunkMessage(html)) await poller.sendTelegramMessage(chatId, chunk, "HTML");
+          },
+          photo: (file, caption) => poller.sendTelegramPhoto(chatId, file, caption),
+          mediaGroup: (files, caption) => poller.sendMediaGroup(chatId, files, caption),
+          latestPng: async () => null,
+          inbound: async message => {
+            await router.deliver(chatId, message, "auto");
+          },
+        }, runner);
+      },
+      onDecisionCallback: async (decisionId: string, choiceId: string, context?: string) => {
+        const chatId = currentChat();
+        await router.deliver(
+          chatId,
+          `Decision recorded from Telegram: question=${decisionId} choice=${choiceId}\n${context ?? ""}`.trim(),
+          "auto",
+        );
+      },
+      onLedgerFailure: (message: string) => {
+        this.log(`Slot ${slot.slotId} inbound ledger failure: ${message}. Inbound Telegram updates are not being recorded.`);
+      },
+      onConflict: (diagnosis: string, attempt: number, maxAttempts: number) => {
+        this.log(`Slot ${slot.slotId} HTTP 409 conflict (attempt ${attempt}/${maxAttempts}): ${diagnosis}`);
+      },
+    };
+
+    poller = this.options.pollerFactory
+      ? this.options.pollerFactory(token, slot.stateDir, access, callbacks, correlation)
+      : new TelegramPoller(token, slot.stateDir, access, callbacks, correlation);
+
+    return { slot, poller, router, leaseSessionId };
+  }
+
+  /**
+   * Delivers text and posts the router's acknowledgement. Poller message callbacks
+   * are fire-and-forget, so a failure here has to reach the operator's chat rather
+   * than becoming an unhandled rejection in a background loop.
+   */
+  private async acknowledge(
+    router: SlotRouter,
+    chatId: string,
+    text: string,
+    mode: "auto" | "steer" | "followUp",
+  ): Promise<void> {
+    try {
+      const ack = await router.deliver(chatId, text, mode);
+      if (ack) for (const chunk of chunkMessage(ack)) await this.sendTo(router, chatId, chunk);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      this.log(`Delivery to chat ${chatId} failed: ${detail}`);
+      await this.sendTo(router, chatId, `⚠️ <b>Not delivered.</b> ${detail}`).catch(() => undefined);
+    }
+  }
+
+  private async sendTo(router: SlotRouter, chatId: string, html: string): Promise<void> {
+    const active = this.active.find(entry => entry.router === router);
+    await active?.poller.sendTelegramMessage(chatId, html, "HTML");
+  }
+
+  private fanOut(event: SessionEvent): void {
+    for (const entry of this.active) {
+      void entry.router.onSessionEvent(event).catch(error => {
+        this.log(`Slot ${entry.slot.slotId}: session event handling failed: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }
+  }
+
+  public async stopSlot(slotId: string): Promise<boolean> {
+    const index = this.active.findIndex(entry => entry.slot.slotId === slotId);
+    if (index < 0) return false;
+    const [entry] = this.active.splice(index, 1);
+    await entry.poller.stop();
+    this.coordinator.releaseLease(entry.slot.slotId, entry.leaseSessionId);
+    this.log(`Slot ${entry.slot.slotId} stopped and lease released`);
+    return true;
+  }
+
+  public async stop(): Promise<void> {
+    if (this.stopping) return;
+    this.stopping = true;
+    for (const entry of [...this.active]) await this.stopSlot(entry.slot.slotId);
+    this.control.close();
+    this.store.close();
+    this.coordinator.close();
+    try {
+      fs.rmSync(getDaemonPidPath(), { force: true });
+    } catch {}
+    this.log("Daemon stopped");
+  }
+
+  public status(): DaemonStatusReport {
+    return {
+      pid: process.pid,
+      startedAt: this.startedAt,
+      endpoint: this.control.endpoint,
+      slots: this.active.map(entry => ({
+        slotId: entry.slot.slotId,
+        botId: entry.slot.botId,
+        workspace: entry.slot.workspace,
+        polling: entry.poller.running,
+      })),
+    };
+  }
+
+  private writeStatus(report: DaemonStatusReport): void {
+    try {
+      fs.mkdirSync(path.dirname(getDaemonStatusPath()), { recursive: true });
+      fs.writeFileSync(getDaemonStatusPath(), `${JSON.stringify(report, null, 2)}\n`, "utf8");
+    } catch {}
+  }
+}
+
+/**
+ * Claims the machine-wide daemon pid file. Two daemons would poll the same tokens
+ * and trade HTTP 409s forever, so a live holder wins and the new process refuses.
+ */
+export function claimDaemonPidFile(pidPath: string = getDaemonPidPath()): { ok: boolean; holder?: number } {
+  fs.mkdirSync(path.dirname(pidPath), { recursive: true });
+  const recorded = fs.existsSync(pidPath) ? fs.readFileSync(pidPath, "utf8").trim() : "";
+  const existing = Number.parseInt(recorded, 10);
+  if (Number.isFinite(existing) && existing > 0 && existing !== process.pid) {
+    const identity = getProcessIdentity(existing);
+    if (identity.alive || identity.uncertain) return { ok: false, holder: existing };
+  }
+  fs.writeFileSync(pidPath, String(process.pid), "utf8");
+  return { ok: true };
+}
