@@ -169,25 +169,38 @@ for (const choice of ["approved", "denied"] as const) {
     const f = fixture();
     const guard = new DangerousToolGuard(f.dir);
     const context = { sessionId: "session-a", requester: "ProofAgent", task: "Remove owned disposable fixture", cwd: "/tmp" };
-    const input = { command: "rm -rf disposable" };
+    const input = { command: "git push --force origin main" };
     const request = guard.evaluateToolCall("bash", input, false, context).approval!;
     f.callbacks.onApprovalCallback = async (data, userId, chatId, sessionId) => {
       const parsed = parseApprovalCallback(data)!;
       const record = decideApproval(f.dir, parsed.token, parsed.decision, { userId, chatId, sessionId });
       f.delivered.push(approvalOutcome(record));
-      return `Operator ${record.state}`;
+      return approvalOutcome(record);
     };
     f.update.callback_query!.data = approvalCallback(request.token, choice);
     f.poller.ingestUpdates([f.update]); await f.poller.redrivePendingUpdates();
     expect(f.delivered).toHaveLength(1);
-    expect(f.delivered[0]).toContain(`Operator ${choice}`);
-    expect(f.delivered[0]).toContain("ProofAgent");
-    if (choice === "denied") expect(f.delivered[0]).toContain("this call is blocked at the gate");
+    if (choice === "approved") {
+      expect(f.delivered[0]).toBe(`Operator approved: run the identical call now (valid until ${request.expiresAt}).`);
+    } else {
+      expect(f.delivered[0]).toBe("Operator denied: do not run it or work around it; continue other work.");
+    }
     expect(guard.evaluateToolCall("bash", input, false, context).allowed).toBe(choice === "approved");
     f.poller.ingestUpdates([{ ...f.update, update_id: 2 }]); await f.poller.redrivePendingUpdates();
     expect(f.delivered).toHaveLength(1);
-    expect(f.calls.some(call => call.method === "editMessageReplyMarkup")).toBe(true);
-  });
+    const editCalls = f.calls.filter(call => call.method === "editMessageReplyMarkup");
+    expect(editCalls.length).toBeGreaterThan(0);
+    const edit = editCalls[0];
+    if (choice === "approved") {
+      expect(edit.body.reply_markup).toEqual({
+        inline_keyboard: [[{ text: expect.stringMatching(/^✅ Approved by you at \d{2}:\d{2} UTC$/), callback_data: "noop" }]],
+      });
+    } else {
+      expect(edit.body.reply_markup).toEqual({
+        inline_keyboard: [[{ text: "❌ Denied", callback_data: "noop" }]],
+      });
+    }
+  }, 15_000);
 }
 
 test("approval callbacks from an unauthorized actor or foreign session cannot grant permission", async () => {
@@ -202,7 +215,7 @@ test("approval callbacks from an unauthorized actor or foreign session cannot gr
 
 test("explicit approval HTML preserves exact command bytes and full commit IDs", async () => {
   const f = fixture();
-  const input = { command: `ssh host 'echo <a> && echo ${"a".repeat(40)}'` };
+  const input = { command: `psql 'echo <a> && echo ${"a".repeat(40)}'` };
   const record = new DangerousToolGuard(f.dir).evaluateToolCall("bash", input).approval!;
   const card = renderApprovalRequest(record);
   await f.poller.sendTelegramMessage("1", card.text, "HTML", card.replyMarkup);

@@ -86,6 +86,56 @@ DEFAULT_CHANNELS_BASE = Path.home() / ".claude" / "channels"
 DEFAULT_POOL_DB_PATH = Path.home() / ".veyyon" / "telegram" / "bot_pool.db"
 DEFAULT_STATE_FILE_PATH = Path.home() / ".veyyon" / "telegram" / "telegram_notify_state.json"
 
+DEFAULT_PROJECT_SLUGS: Dict[str, str] = {
+    "polysimulator": "Bavariance/polysimulator",
+    "polysim": "Bavariance/polysimulator",
+    "super-board": "Wladefant/super-board",
+    "superboard": "Wladefant/super-board",
+    "veyyon": "Wladefant/veyyon",
+    "codex-chatgpt-web": "Wladefant/codex-chatgpt-web",
+}
+
+
+def resolve_repo_slug(name_or_slug: Optional[str], manifest: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Resolve a project name or shorthand to its full owner/repo slug."""
+    if not name_or_slug:
+        return None
+    cleaned = str(name_or_slug).strip().rstrip(".,;:!?)")
+    if "/" in cleaned:
+        return cleaned
+    key = cleaned.lower()
+    if key in DEFAULT_PROJECT_SLUGS:
+        return DEFAULT_PROJECT_SLUGS[key]
+    if manifest and isinstance(manifest, dict):
+        adapters = manifest.get("adapters", {})
+        if isinstance(adapters, dict) and key in adapters:
+            repo = adapters[key].get("repo")
+            if repo:
+                return repo
+        project_repos = manifest.get("project_repos", {})
+        if isinstance(project_repos, dict) and key in project_repos:
+            return project_repos[key]
+    return None
+
+
+def extract_mentioned_repos(text: str) -> Set[str]:
+    """Extract all full GitHub repository slugs mentioned in text."""
+    repos: Set[str] = set()
+    if not text:
+        return repos
+    # 1. Full GitHub URLs: https://github.com/owner/repo/...
+    for m in re.finditer(r"https?://github\.com/([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)", text):
+        slug = m.group(1).rstrip(".,;:!?)")
+        if "/" in slug:
+            repos.add(slug)
+    # 2. Explicit owner/repo#N mentions
+    for m in re.finditer(r"\b([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)#\d+", text):
+        repos.add(m.group(1))
+    # 3. Known project names or shorthand slugs
+    for name, slug in DEFAULT_PROJECT_SLUGS.items():
+        if re.search(r"\b" + re.escape(name) + r"\b", text, re.IGNORECASE):
+            repos.add(slug)
+    return repos
 # Shared with the TypeScript session bridge (coordinator.ts). Both writers must keep
 # this definition byte-identical so a reply can be resolved by either side.
 MESSAGE_CORRELATIONS_DDL = """
@@ -370,8 +420,12 @@ class ProjectSlotResolver:
 
         # Normalize project string
         clean_proj = project_or_repo.strip().lower()
+        mapped_slug = DEFAULT_PROJECT_SLUGS.get(clean_proj)
+        mapped_repo = mapped_slug.split("/")[-1].lower() if (mapped_slug and "/" in mapped_slug) else None
         if "/" in clean_proj:
             repo_name = clean_proj.split("/")[-1]
+        elif mapped_repo:
+            repo_name = mapped_repo
         else:
             repo_name = clean_proj
 
@@ -383,7 +437,7 @@ class ProjectSlotResolver:
             if not s.get("enabled", True):
                 continue
             preferred = [p.lower() for p in s.get("preferredProjects", [])]
-            if clean_proj in preferred or repo_name in preferred:
+            if clean_proj in preferred or repo_name in preferred or (mapped_repo and mapped_repo in preferred):
                 return {
                     "slotId": s.get("slotId"),
                     "stateDir": s.get("stateDir"),
@@ -822,14 +876,112 @@ def card_link(url: str, label: str) -> str:
     return f'<a href="{escape_html(url)}">{escape_html(label)}</a>'
 
 
-def inline_text(value: Any, project: str = "") -> str:
+def resolve_issue_reference(
+    token: str,
+    full_text: str,
+    match_start: int,
+    match_end: int,
+    project_repo: str,
+    all_repos: Set[str],
+) -> Optional[Tuple[str, str, str, str]]:
+    """Resolve an issue or PR reference token to (target_repo, kind, number, label).
+
+    Resolution order per Contract:
+    1. Explicit qualifier attached to token (owner/repo#N or short_name#N).
+    2. Repo named in the same sentence/line (super-board #121, polysimulator PR #5157).
+    3. Single configured project repo when NO other repo appears in message.
+    4. Otherwise, leave as plain text (None).
+    """
+    prefix, number = token.rsplit("#", 1)
+    if not number.isdigit():
+        return None
+
+    # 1. Explicit qualifier attached to token (e.g. owner/repo#N or super-board#N)
+    if prefix:
+        if "/" in prefix:
+            target_repo = prefix
+        else:
+            target_repo = resolve_repo_slug(prefix)
+        if target_repo:
+            text_before = full_text[:match_start]
+            is_pr = bool(re.search(r"\b(?:PR|pull\s*request|pull)\s*:?\s*$", text_before, re.I))
+            kind = "pull" if is_pr else "issues"
+            return (target_repo, kind, number, token)
+        return None
+
+    # Token is bare '#number'
+    line_start = full_text.rfind("\n", 0, match_start) + 1
+    line_end = full_text.find("\n", match_end)
+    if line_end == -1:
+        line_end = len(full_text)
+
+    before_on_line = full_text[line_start:match_start]
+    after_on_line = full_text[match_end:line_end]
+
+    # 2. Repo named in the same sentence/line
+    # 2a. Preceding repo name on same line: e.g. "super-board #121", "polysimulator PR #5157", "| super-board | #121"
+    m_pre = re.search(
+        r'\b([a-zA-Z0-9_.-]+(?:/[a-zA-Z0-9_.-]+)?)\s*(?:\||:)?\s*(?:(?:PR|pull\s*request|pull|issue)s?\s*:?\s*)?$',
+        before_on_line,
+        re.I,
+    )
+    if m_pre:
+        cand = m_pre.group(1)
+        resolved = resolve_repo_slug(cand) or (cand if "/" in cand else None)
+        if resolved:
+            is_pr = bool(re.search(r"\b(?:PR|pull\s*request|pull)\s*:?\s*$", before_on_line, re.I))
+            kind = "pull" if is_pr else "issues"
+            return (resolved, kind, number, token)
+
+    # 2b. Following repo name on same line: e.g. "#5157 (polysimulator)", "#5157 in polysimulator"
+    m_post = re.match(
+        r'^\s*(?:\(([^)]+)\)|(?:in|of|for)\s+([a-zA-Z0-9_.-]+(?:/[a-zA-Z0-9_.-]+)?))',
+        after_on_line,
+        re.I,
+    )
+    if m_post:
+        raw_cand = (m_post.group(1) or m_post.group(2)).strip()
+        cand = raw_cand.split()[0] if raw_cand else ""
+        resolved = resolve_repo_slug(cand) or (cand if "/" in cand else None)
+        if resolved:
+            is_pr = bool(re.search(r"\b(?:PR|pull\s*request|pull)\b", before_on_line + " " + raw_cand, re.I))
+            kind = "pull" if is_pr else "issues"
+            return (resolved, kind, number, token)
+
+    # 3. Single configured project repo when NO other repo appears in the message
+    if len(all_repos) > 1:
+        # Ambiguous: multiple repos appear in the message! Never guess.
+        return None
+
+    if len(all_repos) == 1 and project_repo and project_repo in all_repos:
+        is_pr = bool(re.search(r"\b(?:PR|pull\s*request|pull)\s*:?\s*$", before_on_line, re.I))
+        kind = "pull" if is_pr else "issues"
+        return (project_repo, kind, number, token)
+
+    return None
+
+
+def inline_text(value: Any, project: str = "", context_repos: Optional[Set[str]] = None) -> str:
     """Escape untrusted prose, preserving only validated inline links."""
     text = SecretSanitizer.sanitize(str(value or "").strip())
     text = re.sub(r"\*\*([^*]+)\*\*|`([^`]+)`", lambda m: m.group(1) or m.group(2), text)
     text = re.sub(r"\[\d+\]", "", text)
     text = re.sub(r"(?im)^\s*(?:Details|References|Sources):\s*https?://\S+\s*$", "", text).strip()
-    repo = project if re.fullmatch(r"[\w.-]+/[\w.-]+", project) else ""
-    pattern = re.compile(r'<a\s+href=["\']([^"\']+)["\']\s*>(.*?)</a>|\[([^\]\n]+)\]\((https?://[^\s)]+)\)|https?://[^\s<>"]+|(?:[\w.-]+/[\w.-]+)?#\d+|\b[0-9a-fA-F]{40}\b', re.S)
+
+    project_repo = resolve_repo_slug(project) or (project if "/" in project else "")
+    all_repos: Set[str] = set(context_repos or ())
+    all_repos |= extract_mentioned_repos(text)
+    if project_repo:
+        all_repos.add(project_repo)
+
+    pattern = re.compile(
+        r'<a\s+href=["\']([^"\']+)["\']\s*>(.*?)</a>|'
+        r'\[([^\]\n]+)\]\((https?://[^\s)]+)\)|'
+        r'https?://[^\s<>"]+|'
+        r'(?:[a-zA-Z0-9_.-]+(?:/[a-zA-Z0-9_.-]+)?)?#\d+|'
+        r'\b[0-9a-fA-F]{40}\b',
+        re.S,
+    )
     parts, end = [], 0
     for match in pattern.finditer(text):
         parts.append(escape_html(text[end:match.start()]))
@@ -841,13 +993,15 @@ def inline_text(value: Any, project: str = "") -> str:
         elif token.startswith(("https://", "http://")):
             url = token.rstrip(".,;:!)")
             parts.append(card_link(url, url) + escape_html(token[len(url):]))
-        elif re.fullmatch(r"[0-9a-fA-F]{40}", token) and repo:
-            parts.append(f'<a href="https://github.com/{repo}/commit/{token}"><code>{token[:8]}</code></a>')
+        elif re.fullmatch(r"[0-9a-fA-F]{40}", token) and project_repo:
+            parts.append(f'<a href="https://github.com/{project_repo}/commit/{token}"><code>{token[:8]}</code></a>')
         elif "#" in token:
-            explicit, number = token.rsplit("#", 1)
-            target = explicit or repo
-            kind = "pull" if re.search(r"\bPR\s*$", text[:match.start()], re.I) else "issues"
-            parts.append(card_link(f"https://github.com/{target}/{kind}/{number}", token) if target else escape_html(token))
+            resolved = resolve_issue_reference(token, text, match.start(), match.end(), project_repo, all_repos)
+            if resolved:
+                target_repo, kind, number, label = resolved
+                parts.append(card_link(f"https://github.com/{target_repo}/{kind}/{number}", label))
+            else:
+                parts.append(escape_html(token))
         else:
             parts.append(escape_html(token))
         end = match.end()
@@ -894,9 +1048,18 @@ def render_card(event: NotificationEvent) -> str:
     icon, label = title.split(" ", 1)
     project = event.project
     link = event.canonical_link or ""
-    match = re.match(r"https://github.com/([^/]+/[^/]+)", link)
-    repo = match.group(1) if match else project
-    safe = lambda value: inline_text(value, repo)
+    proj_repo = resolve_repo_slug(project) or (project if "/" in project else "")
+    match = re.match(r"https?://github\.com/([^/\s]+/[^/\s]+)", link)
+    canonical_repo = match.group(1).rstrip(".,;:!?)") if match else ""
+
+    all_event_text = f"{link} {event.summary or ''} {event.metadata.get('detail') or ''} {event.metadata.get('long_detail') or ''} {event.metadata.get('problem') or ''} {event.metadata.get('proposed_action') or ''} {event.metadata.get('consequence_or_risk') or ''} {event.metadata.get('question') or ''}"
+    context_repos = extract_mentioned_repos(all_event_text)
+    if proj_repo:
+        context_repos.add(proj_repo)
+    if canonical_repo:
+        context_repos.add(canonical_repo)
+
+    safe = lambda value: inline_text(value, proj_repo, context_repos=context_repos)
     subject = event.metadata.get("subject") or project
     lines = [f"{icon} <b>{label}</b>", f"{card_link(link, subject) if link else safe(subject)}", ""]
     if event.event_type in ("question", "decision"):
@@ -955,19 +1118,39 @@ def format_consolidated_blockers_presentation(
     questions: List[Any], details_url: Optional[str] = None,
 ) -> str:
     lines = ["🔔 <b>Decisions waiting</b>"]
+    all_text_parts = [details_url or ""]
+    for question in questions:
+        item = asdict(question) if hasattr(question, "__dataclass_fields__") else question
+        all_text_parts.extend([
+            str(item.get("canonical_link") or ""),
+            str(item.get("problem") or ""),
+            str(item.get("proposed_action") or ""),
+            str(item.get("consequence_or_risk") or ""),
+            str(item.get("detail") or ""),
+            str(item.get("long_detail") or ""),
+        ])
+    context_repos = extract_mentioned_repos(" ".join(all_text_parts))
+
     for index, question in enumerate(questions, 1):
         item = asdict(question) if hasattr(question, "__dataclass_fields__") else question
         topic = str(item.get("topic") or f"Decision {index}").replace("-", " ")
         url = item.get("canonical_link") or details_url or ""
+        q_repo = ""
+        if url:
+            m = re.match(r"https?://github\.com/([^/\s]+/[^/\s]+)", url)
+            if m:
+                q_repo = m.group(1).rstrip(".,;:!?)")
+                context_repos.add(q_repo)
+        safe = lambda val: inline_text(val, q_repo, context_repos=context_repos)
         problem = item.get("problem") or item.get("question") or "Your guidance is needed."
-        lines.extend(["", f"<b>{card_link(url, topic)}</b>", inline_text(problem)])
+        lines.extend(["", f"<b>{card_link(url, topic)}</b>", safe(problem)])
         if item.get("proposed_action"):
-            lines.append(f"<b>Proposal:</b> {inline_text(item['proposed_action'])}")
+            lines.append(f"<b>Proposal:</b> {safe(item['proposed_action'])}")
         if item.get("consequence_or_risk"):
-            lines.append(f"<b>Impact:</b> {inline_text(item['consequence_or_risk'])}")
+            lines.append(f"<b>Impact:</b> {safe(item['consequence_or_risk'])}")
         detail = item.get("long_detail") or item.get("detail")
         if detail:
-            lines.extend(["", f"<blockquote expandable>{inline_text(detail)}</blockquote>"])
+            lines.extend(["", f"<blockquote expandable>{safe(detail)}</blockquote>"])
     lines.extend(["", "<b>Which decision should we address first?</b>", "Reply with the topic name."])
     return truncate_html("\n".join(lines), 4096)
 
@@ -985,6 +1168,41 @@ def build_decision_inline_keyboard(
 ) -> Optional[Dict[str, Any]]:
     if not callback_store or not callback_store.enabled or not options:
         return None
+    if options and isinstance(options[0], list):
+        rows = []
+        for row_opts in options:
+            row_btns = []
+            for opt in row_opts:
+                if isinstance(opt, dict):
+                    opt_id = str(opt.get("id", ""))
+                    opt_label = str(opt.get("label") or opt_id)
+                elif isinstance(opt, str) and ":" in opt:
+                    parts = opt.split(":", 1)
+                    opt_id = parts[0].strip()
+                    opt_label = parts[1].strip()
+                else:
+                    opt_id = str(opt)
+                    opt_label = str(opt)
+                token = callback_store.create_callback(
+                    decision_id=decision_id,
+                    choice_id=opt_id,
+                    session_id=session_id,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    question_text=question_text,
+                    ttl_seconds=ttl_seconds,
+                    now=now,
+                )
+                if token:
+                    btn_text = f"{opt_id}: {opt_label}" if opt_id and opt_id != opt_label else opt_label
+                    btn_text = btn_text[:40]
+                    row_btns.append({"text": btn_text, "callback_data": token})
+            if row_btns:
+                rows.append(row_btns)
+        if rows:
+            return {"inline_keyboard": rows}
+        return None
+
     buttons = []
     for opt in options:
         if isinstance(opt, dict):
@@ -1011,6 +1229,9 @@ def build_decision_inline_keyboard(
             btn_text = opt_label[:60]
             buttons.append({"text": btn_text, "callback_data": token})
     if buttons:
+        # A flat option list renders one button per row: a decision label is prose and
+        # a shared row truncates it. A caller that wants buttons side by side passes
+        # explicit rows (nested lists), handled above.
         return {"inline_keyboard": [[button] for button in buttons]}
     return None
 

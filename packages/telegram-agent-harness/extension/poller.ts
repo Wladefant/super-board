@@ -42,12 +42,31 @@ export interface PollerCallbacks {
   ) => void | Promise<void>;
   onQuestionAnswer?: (decisionId: string, eventId: string, answer: { choice?: string; text?: string }) => Promise<void>;
   /**
+   * Reports an HTTP 409 conflict when Telegram getUpdates reports another poller
+   * instance is polling with the same bot token.
+   */
+  onConflict?: (diagnosis: string, attempt: number, maxAttempts: number) => void;
+  /**
    * Reports a ledger write the poller could not complete. Required rather than
    * optional: an ingest failure means inbound Telegram traffic is being dropped and
    * the offset cannot advance, so no caller may silently discard it.
    */
   onLedgerFailure: (message: string) => void;
 }
+
+export interface PollerOptions {
+  maxConflictRetries?: number;
+  initialConflictBackoffMs?: number;
+  maxConflictBackoffMs?: number;
+  conflictBackoffFactor?: number;
+}
+
+const DEFAULT_POLLER_OPTIONS: Required<PollerOptions> = {
+  maxConflictRetries: 5,
+  initialConflictBackoffMs: 1000,
+  maxConflictBackoffMs: 15000,
+  conflictBackoffFactor: 2.0,
+};
 
 interface LedgerRow {
   update_id: number;
@@ -114,14 +133,22 @@ export class TelegramPoller {
   private accessConfig: AccessConfig;
   private callbacks: PollerCallbacks;
   private correlation: MessageCorrelationBridge | null;
+  private options: Required<PollerOptions>;
   private abortController: AbortController;
   private db: Database;
+  private dbPath: string;
+  private loopPromise: Promise<void> | null = null;
   private isRunning = false;
   private primaryChatId: string | null = null;
   private pendingDrain: Promise<void> | null = null;
   private nextOutboundAt = 0;
   private outboundReservation: Promise<void> = Promise.resolve();
   private dashboardUpdate: Promise<void> | null = null;
+  private readonly messageThreadId?: number;
+
+  public get running(): boolean {
+    return this.isRunning;
+  }
 
   constructor(
     botToken: string,
@@ -129,7 +156,8 @@ export class TelegramPoller {
     accessConfig: AccessConfig,
     callbacks: PollerCallbacks,
     correlation: MessageCorrelationBridge | null = null,
-    private readonly messageThreadId?: number,
+    threadOrOptions?: number | PollerOptions,
+    options?: PollerOptions,
   ) {
     this.botToken = botToken;
     this.botId = getTokenFingerprint(botToken).botId;
@@ -137,8 +165,15 @@ export class TelegramPoller {
     this.accessConfig = accessConfig;
     this.callbacks = callbacks;
     this.correlation = correlation;
+    // Positional slot 6 carries either the forum topic this channel is pinned to
+    // (number) or the poller tuning options (object). Two features claimed the same
+    // argument, so callers of each shape are both still honoured.
+    const threadId = typeof threadOrOptions === "number" ? threadOrOptions : undefined;
+    const tuning = typeof threadOrOptions === "object" && threadOrOptions !== null ? threadOrOptions : options;
+    this.messageThreadId = threadId;
+    this.options = { ...DEFAULT_POLLER_OPTIONS, ...(tuning || {}) };
     this.abortController = new AbortController();
-    if (messageThreadId !== undefined && (!Number.isSafeInteger(messageThreadId) || messageThreadId <= 0)) {
+    if (threadId !== undefined && (!Number.isSafeInteger(threadId) || threadId <= 0)) {
       throw new Error("message_thread_id must be a positive integer");
     }
 
@@ -146,9 +181,18 @@ export class TelegramPoller {
       fs.mkdirSync(stateDir, { recursive: true });
     }
 
-    const dbPath = path.join(stateDir, "veyyon_bridge_state.db");
-    this.db = new Database(dbPath);
+    this.dbPath = path.join(stateDir, "veyyon_bridge_state.db");
+    this.db = new Database(this.dbPath);
     this.initLedger();
+  }
+
+  private ensureDbOpen(): void {
+    try {
+      this.db.query("SELECT 1").get();
+    } catch {
+      this.db = new Database(this.dbPath);
+      this.initLedger();
+    }
   }
 
   private initLedger(): void {
@@ -427,12 +471,15 @@ export class TelegramPoller {
       return null;
     }
   }
-  public async clearCallbackButtons(chatId: string, messageId: number): Promise<boolean> {
+  public async clearCallbackButtons(chatId: string, messageId: number, replacementText?: string): Promise<boolean> {
     try {
+      const reply_markup = replacementText
+        ? { inline_keyboard: [[{ text: replacementText, callback_data: "noop" }]] }
+        : { inline_keyboard: [] };
       const response = await fetch(`https://api.telegram.org/bot${this.botToken}/editMessageReplyMarkup`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: chatId, message_id: messageId, reply_markup: { inline_keyboard: [] } }),
+        body: JSON.stringify({ chat_id: chatId, message_id: messageId, reply_markup }),
         signal: AbortSignal.any([this.abortController.signal, AbortSignal.timeout(3000)]),
       });
       const data: unknown = await response.json();
@@ -475,7 +522,19 @@ export class TelegramPoller {
   public async start(): Promise<void> {
     if (this.isRunning) return;
     this.isRunning = true;
+    this.abortController = new AbortController();
+    this.ensureDbOpen();
 
+    this.loopPromise = this.runPollLoop();
+    try {
+      await this.loopPromise;
+    } finally {
+      this.isRunning = false;
+      this.loopPromise = null;
+    }
+  }
+
+  private async runPollLoop(): Promise<void> {
     // The lease holder refreshes the operator's private menu on every startup.
     // Registration failure must not disconnect an otherwise usable input channel.
     if (this.accessConfig.dmPolicy !== "disabled") {
@@ -491,6 +550,7 @@ export class TelegramPoller {
     await this.redrivePendingUpdates();
 
     let offset = this.getNextContiguousOffset();
+    let conflictCount = 0;
 
     while (this.isRunning && !this.abortController.signal.aborted) {
       try {
@@ -499,9 +559,45 @@ export class TelegramPoller {
         const res = await fetch(url, { signal: this.abortController.signal });
 
         if (!res.ok) {
+          if (res.status === 409) {
+            conflictCount++;
+            let description = "Conflict: terminated by other getUpdates request";
+            try {
+              const body = (await res.json()) as { description?: string };
+              if (body?.description) {
+                description = body.description;
+              }
+            } catch {}
+
+            const isExhausted = conflictCount >= this.options.maxConflictRetries;
+            const diagnosis = `Telegram getUpdates HTTP 409 Conflict (attempt ${conflictCount}/${this.options.maxConflictRetries}): ${description}. ${
+              isExhausted
+                ? "Conflict retry limit reached; terminating polling loop to prevent thrashing with another bot instance."
+                : "Backing off before retry."
+            }`;
+
+            this.callbacks.onConflict?.(diagnosis, conflictCount, this.options.maxConflictRetries);
+
+            if (isExhausted) {
+              this.callbacks.onLedgerFailure(diagnosis);
+              this.isRunning = false;
+              break;
+            }
+
+            const backoff = Math.min(
+              this.options.maxConflictBackoffMs,
+              this.options.initialConflictBackoffMs * Math.pow(this.options.conflictBackoffFactor, conflictCount - 1),
+            );
+            await Bun.sleep(backoff);
+            continue;
+          }
+
           await Bun.sleep(3000);
           continue;
         }
+
+        // Reset conflict counter on successful response
+        conflictCount = 0;
 
         const data = (await res.json()) as TelegramGetUpdatesResponse;
         if (data.ok && Array.isArray(data.result)) {
@@ -724,7 +820,13 @@ export class TelegramPoller {
           if (!sessionId || !this.callbacks.onApprovalCallback) throw new Error("Approval handling is unavailable.");
           const outcome = await this.callbacks.onApprovalCallback(callbackToken, fromId, chatId, sessionId);
           if (cbQueryId) await this.answerCallbackQuery(cbQueryId, outcome);
-          if (typeof row.reply_to_message_id === "number") await this.clearCallbackButtons(chatId, row.reply_to_message_id);
+          if (typeof row.reply_to_message_id === "number") {
+            const isApproved = callbackToken.startsWith("ap:a:");
+            const d = new Date();
+            const timeStr = `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")} UTC`;
+            const buttonText = isApproved ? `✅ Approved by you at ${timeStr}` : "❌ Denied";
+            await this.clearCallbackButtons(chatId, row.reply_to_message_id, buttonText);
+          }
           await this.sendTelegramMessage(chatId, escapeHtml(outcome));
           this.db.run("UPDATE update_ledger SET status = 'COMPLETED', correlated_session_id = ? WHERE update_id = ?", [sessionId, row.update_id]);
         } catch (error) {
@@ -1104,9 +1206,15 @@ export class TelegramPoller {
     }
   }
 
-  public stop(): void {
+  public async stop(): Promise<void> {
     this.isRunning = false;
     this.abortController.abort();
+    if (this.loopPromise) {
+      try {
+        await this.loopPromise;
+      } catch {}
+      this.loopPromise = null;
+    }
     try {
       this.db.close();
     } catch {}
