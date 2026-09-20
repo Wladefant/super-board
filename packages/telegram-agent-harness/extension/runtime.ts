@@ -625,7 +625,10 @@ export class TelegramRuntime {
   }
 
   public async onToolCall(event: ToolCallEvent, ctx: ExtensionContext): Promise<{ block: boolean; reason: string } | void> {
-    if (!this.guard || !this.sessionId || !this.poller) return;
+    // Only the guard and the session identity are required to judge a call. A channel that
+    // never attached (bad access.json, stopped poller, disposed runtime) must not turn the
+    // gate off: it costs the operator the approval card, not the block.
+    if (!this.guard || !this.sessionId) return;
 
     const evaluation = this.guard.evaluateToolCall(
       event.toolName,
@@ -646,23 +649,29 @@ export class TelegramRuntime {
       },
     );
 
-    if (!evaluation.allowed) {
-      const chatId = this.poller.getPrimaryChatId();
-      if (chatId && evaluation.approval) {
-        const card = renderApprovalRequest(evaluation.approval);
-        try {
-          const chunks = chunkMessage(card.text);
-          for (let n = 0; n < chunks.length; n++) {
-            const sent = await this.poller.sendTelegramMessage(chatId, chunks[n], "HTML", n === chunks.length - 1 ? card.replyMarkup : undefined);
-            if (!sent?.ok) break;
-          }
-        } catch {}
-      }
-      return {
-        block: true,
-        reason: evaluation.reason ?? "Sensitive operation requires operator approval.",
-      };
+    if (evaluation.allowed) return;
+
+    const chatId = this.poller?.getPrimaryChatId();
+    let cardDelivered = false;
+    if (chatId && evaluation.approval) {
+      const card = renderApprovalRequest(evaluation.approval);
+      try {
+        const chunks = chunkMessage(card.text);
+        for (let n = 0; n < chunks.length; n++) {
+          const sent = await this.poller?.sendTelegramMessage(chatId, chunks[n], "HTML", n === chunks.length - 1 ? card.replyMarkup : undefined);
+          if (!sent?.ok) break;
+          cardDelivered = n === chunks.length - 1;
+        }
+      } catch {}
     }
+
+    const reason = evaluation.reason ?? "Sensitive operation requires operator approval.";
+    return {
+      block: true,
+      reason: evaluation.approval && !cardDelivered
+        ? `${reason} The Telegram approval card could not be delivered, so no approval is pending; ask the operator to approve out of band or narrow the operation.`
+        : reason,
+    };
   }
 
   public async onAgentEnd(): Promise<void> {
