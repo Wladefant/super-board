@@ -112,8 +112,10 @@ function Find-DaemonProcessByScan([string]$entryPath) {
     try {
         $candidates = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
             $_.ProcessId -ne $PID -and
+            ($_.Name -like "bun*" -or $_.Name -eq "bun.exe") -and
             $_.Name -notlike "powershell*" -and
             $_.Name -notlike "pwsh*" -and
+            $_.Name -notlike "cmd*" -and
             $_.CommandLine -and
             (Test-DaemonCommandLine $_.CommandLine $entryPath)
         }
@@ -139,7 +141,7 @@ function Get-LiveDaemonPid {
         $parsed = 0
         if ([int]::TryParse($recorded, [ref]$parsed) -and $parsed -gt 0) {
             $proc = Get-Process -Id $parsed -ErrorAction SilentlyContinue
-            if ($proc -and $proc.ProcessName -notlike "powershell*" -and $proc.ProcessName -notlike "pwsh*") {
+            if ($proc -and ($proc.ProcessName -like "bun*" -or $proc.ProcessName -eq "bun") -and $proc.ProcessName -notlike "powershell*" -and $proc.ProcessName -notlike "pwsh*" -and $proc.ProcessName -notlike "cmd*") {
                 $cmdLine = Get-ProcessCommandLine $parsed
                 if ($cmdLine -and (Test-DaemonCommandLine $cmdLine $DaemonEntry)) {
                     $foundPid = $parsed
@@ -254,8 +256,26 @@ function Start-Daemon {
 
     $deadline = (Get-Date).AddSeconds($StartTimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
+        # Find the bun child process spawned by the launcher wrapper
+        $childProc = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+            $_.ParentProcessId -eq $launcher.Id -and
+            ($_.Name -like "bun*" -or $_.Name -eq "bun.exe") -and
+            $_.Name -notlike "powershell*" -and
+            $_.Name -notlike "pwsh*" -and
+            $_.Name -notlike "cmd*"
+        } | Select-Object -First 1
+
+        if ($childProc) {
+            $daemonPid = $childProc.ProcessId
+            Set-Content -Path $DaemonPidPath -Value $daemonPid -Encoding ascii -Force
+            Write-Host "Telegram daemon started (pid $daemonPid, launcher $($launcher.Id))." -ForegroundColor Green
+            Write-Host "Log: $LogPath"
+            return 0
+        }
+
         $daemonPid = Get-LiveDaemonPid
         if ($daemonPid) {
+            Set-Content -Path $DaemonPidPath -Value $daemonPid -Encoding ascii -Force
             Write-Host "Telegram daemon started (pid $daemonPid, launcher $($launcher.Id))." -ForegroundColor Green
             Write-Host "Log: $LogPath"
             return 0
