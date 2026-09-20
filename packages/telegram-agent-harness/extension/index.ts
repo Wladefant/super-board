@@ -244,6 +244,7 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
       options: z.array(z.object({ id: z.string(), label: z.string(), description: z.string().optional() })).optional(),
       details_url: z.string().optional(),
       wait: z.boolean().default(true),
+      timeout: z.number().optional(),
     }),
     async execute(_id, params, signal, onUpdate) {
       const root = ownedRoot();
@@ -267,9 +268,23 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
         question = await service.get(params.id);
       }
       onUpdate?.({ content: [{ type: "text", text: `Telegram question ${question.decision_id} is ${question.status}. Silence leaves it pending.` }] });
+      const timeoutMs = (params.timeout ? Math.max(1, Math.min(300, params.timeout)) : 60) * 1000;
+      let lastProgressSec = 0;
       const result = params.action === "get" || !params.wait
         ? question
-        : await service.wait(question.decision_id, signal);
+        : await service.wait(
+            question.decision_id,
+            signal,
+            200,
+            timeoutMs,
+            elapsedMs => {
+              const elapsedSec = Math.floor(elapsedMs / 1000);
+              if (elapsedSec > 0 && elapsedSec - lastProgressSec >= 5) {
+                lastProgressSec = elapsedSec;
+                onUpdate?.({ content: [{ type: "text", text: `Waiting for Telegram answer (${question.decision_id}), ${elapsedSec}s elapsed...` }] });
+              }
+            },
+          );
       return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
     },
   });

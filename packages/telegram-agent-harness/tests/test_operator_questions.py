@@ -90,6 +90,12 @@ class OperatorQuestionTests(unittest.TestCase):
         self.assertEqual(reminders.dispatch_reminders(adapter, force=True)["due_count"], 0)
         adapter.notify.assert_not_called()
         self.assertEqual(self.service.run("due", {}, self.route)["questions"][0]["decision_id"], record["decision_id"])
+    def test_wait_times_out_and_returns_pending(self):
+        record = self.ask()
+        result = self.service.run("wait", {"id": record["decision_id"], "timeout": 0.3}, self.route)
+        self.assertEqual(result["status"], "pending")
+        self.assertTrue(result.get("timed_out"))
+        self.assertEqual(result["question"]["decision_id"], record["decision_id"])
 
 
 if __name__ == "__main__":
