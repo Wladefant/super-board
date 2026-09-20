@@ -85,6 +85,11 @@ function tokenize(code: string, language: string): Token[] {
   return tokens;
 }
 
+/** `node:child_process` and `child_process` are the same module; `fs/promises` is the `fs.promises` namespace. */
+function moduleName(specifier: string): string {
+  return specifier.replace(/^node:/, "").replace(/^fs\/promises$/, "fs.promises");
+}
+
 export function evalCommands(code: string, language: string, parseShell: (command: string) => string[][]): { commands: string[][]; unresolved: boolean } {
   const tokens = tokenize(code, language), values = new Map<string, Value>();
   const aliases = new Map<string, string>();
@@ -229,7 +234,14 @@ export function evalCommands(code: string, language: string, parseShell: (comman
       if (result.value !== undefined) values.set(t.value, result.value); else values.delete(t.value);
       if (tokens[i + 2]?.kind === "name") {
         let target = tokens[i + 2].value, j = i + 3;
-        while (tokens[j]?.value === "." && tokens[j + 1]?.kind === "name") { target += `.${tokens[j + 1].value}`; j += 2; }
+        for (;;) {
+          // `const cp = require("node:child_process")` binds the module, not the loader.
+          if (/(^|\.)(require|import_module|__import__)$/.test(target) && tokens[j]?.value === "(" && tokens[j + 1]?.kind === "string" && !tokens[j + 1].dynamic && tokens[j + 2]?.value === ")") {
+            target = moduleName(tokens[j + 1].value); j += 3; continue;
+          }
+          if (tokens[j]?.value === "." && tokens[j + 1]?.kind === "name") { target += `.${tokens[j + 1].value}`; j += 2; continue; }
+          break;
+        }
         aliases.set(t.value, target);
       }
     }
@@ -246,12 +258,16 @@ export function evalCommands(code: string, language: string, parseShell: (comman
         at = j;
       }
     }
-    // `require("child_process").execSync(...)` is one expression: continue the member walk from the module.
-    if (language !== "py" && t.value === "require" && tokens[i + 1]?.value === "(" && tokens[i + 2]?.kind === "string" && tokens[i + 3]?.value === ")") {
-      call = tokens[i + 2].value;
-      at = i + 4;
-    }
     for (;;) {
+      // `require("node:child_process").execSync(...)` is one expression, and so are
+      // `process.mainModule.require(...)` and `importlib.import_module(...)`: the module names the
+      // callee, so resolve it and keep walking members from there.
+      if (/(^|\.)(require|import_module)$/.test(call) && tokens[at]?.value === "(" && tokens[at + 1]?.kind === "string" && tokens[at + 2]?.value === ")") {
+        if (tokens[at + 1].dynamic) { unresolved = true; break; }
+        call = moduleName(tokens[at + 1].value);
+        at += 3;
+        continue;
+      }
       if (tokens[at]?.value === "." && tokens[at + 1]?.kind === "name") { call += `.${tokens[at + 1].value}`; at += 2; continue; }
       if (tokens[at]?.value !== "[") break;
       const key = valueAt(at + 1);
@@ -297,14 +313,22 @@ export function evalCommands(code: string, language: string, parseShell: (comman
       else unresolved = true;
       continue;
     }
-    if (/^(os\.(system|popen)|subprocess\.(run|call|check_call|check_output|Popen)|.*\.(execSync|execFileSync|execFile|spawn|spawnSync|execa|execaSync|execaCommand|execaCommandSync)|execSync|execFileSync|execFile|spawn|spawnSync|Popen|system|popen|check_call|check_output|execa|execaSync|execaCommand|execaCommandSync)$/.test(call) ||
-        /^(child_process|cp|childProcess)\.exec$/.test(call) || call === "subprocess.run" || call === "subprocess.call") {
-      if (/^(execFile|execFileSync|spawn|spawnSync|execa|execaSync)$/.test(leaf)) {
+    if (/^(os\.(system|popen|popen2|popen3|popen4)|subprocess\.(run|call|check_call|check_output|Popen|getoutput|getstatusoutput)|asyncio\.create_subprocess_(shell|exec)|.*\.(execSync|execFileSync|execFile|spawn|spawnSync|execa|execaSync|execaCommand|execaCommandSync)|execSync|execFileSync|execFile|spawn|spawnSync|Popen|system|popen|popen2|popen3|popen4|check_call|check_output|getoutput|getstatusoutput|create_subprocess_shell|create_subprocess_exec|execa|execaSync|execaCommand|execaCommandSync)$/.test(call) ||
+        /^(child_process|cp|childProcess)\.exec$/.test(call)) {
+      if (/^(execFile|execFileSync|spawn|spawnSync|execa|execaSync|create_subprocess_exec)$/.test(leaf)) {
         if (call.startsWith("Bun.") && value && typeof value === "object" && !Array.isArray(value)) append(value.cmd);
         else if (Array.isArray(value)) append(value);
         else if (typeof value === "string" && tokens[argument.end]?.value === ",") {
-          const args = valueAt(argument.end + 1).value;
-          if (Array.isArray(args)) append([value, ...args]); else unresolved = true;
+          // `spawn(file, [args])` and the variadic `create_subprocess_exec(file, "-rf", "/")` both name argv.
+          const argv = [value];
+          for (let k = argument.end; tokens[k]?.value === ",";) {
+            const next = valueAt(k + 1);
+            if (typeof next.value === "string") argv.push(next.value);
+            else if (Array.isArray(next.value) && next.value.every(item => typeof item === "string")) argv.push(...(next.value as string[]));
+            else break;
+            k = next.end;
+          }
+          if (argv.length > 1) append(argv); else unresolved = true;
         } else if (typeof value === "string") append([value]); else unresolved = true;
       } else append(value);
     } else if (/^tool\.(bash|launch|ssh)$/.test(call)) {
@@ -315,11 +339,34 @@ export function evalCommands(code: string, language: string, parseShell: (comman
       else unresolved = true;
     } else if (/^(fs(?:\.promises)?\.(rm|rmSync|rmdir|rmdirSync|unlink|unlinkSync)|shutil\.rmtree|os\.(remove|unlink|rmdir|kill))$/.test(call)) {
       commands.push(["rm", "-rf", ...(typeof value === "string" ? [value] : [])]);
+    } else if (/^(fs(?:\.promises)?\.(cp|cpSync|copyFile|copyFileSync|rename|renameSync|link|linkSync|symlink|symlinkSync)|shutil\.(move|copy|copy2|copyfile|copytree)|os\.(rename|replace|link|symlink))$/.test(call)) {
+      // A copy, move or link clobbers its destination, and the destination is the second operand.
+      const destination = tokens[argument.end]?.value === "," ? valueAt(argument.end + 1).value : undefined;
+      commands.push(["tee", ...(typeof destination === "string" ? [destination] : [])]);
+    } else if (/^(fs(?:\.promises)?\.(truncate|truncateSync|ftruncate|appendFile|appendFileSync|createWriteStream|chmod|chmodSync|chown|chownSync)|os\.(truncate|chmod|chown))$/.test(call)) {
+      // Truncating, appending to or re-permissioning a file mutates the path it names.
+      commands.push(["tee", ...(typeof value === "string" ? [value] : [])]);
+    } else if (call === "process.binding" || call === "process._linkedBinding") {
+      // A raw internal binding hands back a process API this lexer cannot follow.
+      unresolved = true;
     } else if (/^(read|write|open|fs(?:\.promises)?\.(readFile|readFileSync|writeFile|writeFileSync)|Bun\.(file|write)|Path|pathlib\.Path)$/.test(call)) {
       // A write clobbers its path; only a read leaves the file intact.
       const mode = tokens[argument.end]?.value === "," ? valueAt(argument.end + 1).value : undefined;
-      const writes = /write/i.test(leaf) || (typeof mode === "string" && /[wax+]/.test(mode));
-      if (typeof value === "string") commands.push([writes ? "tee" : "cat", value]);
+      let effect = /write/i.test(leaf) || (typeof mode === "string" && /[wax+]/.test(mode)) ? "tee" : "cat";
+      if (leaf === "Path") {
+        // `Path(p)` is inert until a method names the effect: `.write_text()` clobbers, `.unlink()` deletes.
+        const method = tokens[argument.end]?.value === ")" && tokens[argument.end + 1]?.value === "." ? tokens[argument.end + 2]?.value ?? "" : "";
+        if (/^(unlink|rmdir)$/.test(method)) effect = "rm";
+        else if (/^(write_text|write_bytes|touch|mkdir|chmod)$/.test(method)) effect = "tee";
+        else if (/^(rename|replace)$/.test(method)) {
+          const destination = valueAt(argument.end + 4).value;
+          commands.push(["tee", ...(typeof destination === "string" ? [destination] : [])]);
+        } else if (method === "open") {
+          const openMode = valueAt(argument.end + 4).value;
+          effect = typeof openMode === "string" && /[wax+]/.test(openMode) ? "tee" : "cat";
+        }
+      }
+      if (typeof value === "string") commands.push(effect === "rm" ? ["rm", "-rf", value] : [effect, value]);
     } else if (call === "getattr") {
       // `getattr(os, "sys" + "tem")(...)` is the Python spelling of a computed member call.
       let close = at + 1, comma = -1;
@@ -345,6 +392,12 @@ export function evalCommands(code: string, language: string, parseShell: (comman
       } else {
         unresolved = true;
       }
+    } else if (/^(setTimeout|setInterval)$/.test(call) && typeof value === "string") {
+      // A timer called with a callback is inert; called with a string, the runtime evaluates it as code.
+      const inner = evalCommands(value, language, parseShell);
+      commands.push(...inner.commands);
+      unresolved ||= inner.unresolved;
+      if (!inner.commands.length && !inner.unresolved) commands.push(...parseShell(value));
     }
   }
   return { commands, unresolved };
