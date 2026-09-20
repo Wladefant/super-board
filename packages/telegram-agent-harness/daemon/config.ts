@@ -107,11 +107,17 @@ export function knownProjectPaths(coordinator: BotPoolCoordinator): string[] {
 
 /**
  * Resolve the workspace a slot's sessions run in: an absolute declared directory
- * wins, otherwise the first known project path a declared token matches.
+ * wins, then the first known project path a declared token matches, and finally the
+ * slot's `defaultProject`.
+ *
+ * The fallback exists because a bot that serves every project declares no affinity
+ * at all, and an empty declaration matches nothing: without it the daemon polls and
+ * answers but refuses `/new`, having no directory to start a session in.
  */
 export function resolveWorkspace(
   preferredProjects: string[] | undefined,
   candidates: string[],
+  defaultProject?: string,
 ): string | null {
   const declared = (preferredProjects ?? []).map(entry => String(entry).trim()).filter(Boolean);
   for (const entry of declared) {
@@ -122,6 +128,8 @@ export function resolveWorkspace(
       if (isDirectory(candidate) && matchProjectGlob(entry, candidate)) return candidate;
     }
   }
+  const fallback = defaultProject?.trim();
+  if (fallback && path.isAbsolute(fallback) && isDirectory(fallback)) return fallback;
   return null;
 }
 
@@ -146,6 +154,6 @@ export function resolveDaemonSlots(
     .filter(slot => optedIn.has(slot.slotId))
     .map(slot => ({
       ...slot,
-      workspace: resolveWorkspace(slot.projects ?? slot.preferredProjects, candidates),
+      workspace: resolveWorkspace(slot.projects ?? slot.preferredProjects, candidates, slot.defaultProject),
     }));
 }

@@ -21,6 +21,7 @@ interface SlotSpec {
   slotId: string;
   daemon?: boolean;
   projects?: string[];
+  defaultProject?: string;
 }
 
 let root: string;
@@ -74,6 +75,7 @@ function writePool(specs: SlotSpec[]): void {
       projects: spec.projects ?? [workspace],
       enabled: true,
       ...(spec.daemon === undefined ? {} : { daemon: spec.daemon }),
+      ...(spec.defaultProject === undefined ? {} : { defaultProject: spec.defaultProject }),
     };
   });
   fs.writeFileSync(manifestPath, JSON.stringify({ version: 1, slots }, null, 2), "utf8");
@@ -155,6 +157,21 @@ describe("daemon slot opt-in", () => {
     writePool([{ slotId: "slot-daemon", daemon: true, projects: ["C:/definitely/not/here"] }]);
     expect(resolveDaemonSlots(coordinator(), manifestPath)[0].workspace).toBeNull();
   });
+
+  test("a slot that declares no project runs its sessions in defaultProject", () => {
+    writePool([{ slotId: "slot-daemon", daemon: true, projects: [], defaultProject: workspace }]);
+    expect(resolveDaemonSlots(coordinator(), manifestPath)[0].workspace).toBe(workspace);
+  });
+
+  test("a defaultProject that is not a directory on this machine resolves to nothing", () => {
+    writePool([{ slotId: "slot-daemon", daemon: true, projects: [], defaultProject: "C:/definitely/not/here" }]);
+    expect(resolveDaemonSlots(coordinator(), manifestPath)[0].workspace).toBeNull();
+  });
+
+  test("a declared project that resolves wins over defaultProject", () => {
+    writePool([{ slotId: "slot-daemon", daemon: true, projects: [workspace], defaultProject: root }]);
+    expect(resolveDaemonSlots(coordinator(), manifestPath)[0].workspace).toBe(workspace);
+  });
 });
 
 describe("no double poller", () => {
@@ -168,17 +185,26 @@ describe("no double poller", () => {
     expect(startedPollers.length).toBe(1);
     expect(startedPollers[0].running).toBe(true);
 
-    // What an in-session extension does on session start.
+    // What an in-session extension does on session start: the daemon's token is not
+    // in the pool it draws from at all.
     const claim = await coordinator().acquireLease("session-in-tui", workspace);
     expect(claim.ok).toBe(false);
     expect(claim.error).toBe("POOL_EXHAUSTED");
-    expect(claim.reason).toContain("currently in use");
-    expect(claim.busyHolders?.[0]?.sessionId).toBe("daemon:slot-daemon");
+    expect(claim.reason).toContain("owned by the standalone daemon");
+
+    // And a claim that names the slot anyway is refused by the daemon's own lease,
+    // naming the holder rather than quietly starting a second poller.
+    const byName = coordinator().acquireLeaseForSlot("slot-daemon", "session-in-tui", workspace);
+    expect(byName.ok).toBe(false);
+    expect(byName.error).toBe("SLOT_BUSY");
+    expect(byName.busyHolders?.[0]?.sessionId).toBe("daemon:slot-daemon");
   });
 
-  test("a slot the session already holds is skipped, not stolen", async () => {
+  test("a slot an older session still holds is skipped, not stolen", async () => {
     writePool([{ slotId: "slot-daemon", daemon: true }]);
-    const sessionClaim = await coordinator().acquireLease("session-in-tui", workspace);
+    // A poller from before the slot was handed to the daemon, claiming it by name
+    // the way the in-session pool used to: its lease is a legitimate holder.
+    const sessionClaim = coordinator().acquireLeaseForSlot("slot-daemon", "session-in-tui", workspace);
     expect(sessionClaim.ok).toBe(true);
 
     const report = await daemon().start();
@@ -196,7 +222,7 @@ describe("no double poller", () => {
     expect(claim.slot?.slotId).toBe("slot-session");
   });
 
-  test("releasing a slot hands the token back to the session pool", async () => {
+  test("a released slot goes back to the daemon, never to the session pool", async () => {
     writePool([{ slotId: "slot-daemon", daemon: true }]);
     const instance = daemon();
     await instance.start();
@@ -207,8 +233,24 @@ describe("no double poller", () => {
     expect(instance.status().slots).toEqual([]);
 
     const claim = await coordinator().acquireLease("session-in-tui", workspace);
-    expect(claim.ok).toBe(true);
-    expect(claim.slot?.slotId).toBe("slot-daemon");
+    expect(claim.ok).toBe(false);
+    expect(claim.error).toBe("POOL_EXHAUSTED");
+  });
+
+  test("a daemon-owned slot with no affinity is not the wildcard every session claims", async () => {
+    // The operator's bug: a bot that serves every project declares no projects, an
+    // empty declaration is eligible for all of them, and the daemon was not running
+    // yet — so the next terminal opened claimed the daemon's token and kept it.
+    writePool([{ slotId: "slot-daemon", daemon: true, projects: [] }]);
+
+    const claim = await coordinator().acquireLease("session-in-tui", workspace);
+    expect(claim.ok).toBe(false);
+    expect(claim.error).toBe("POOL_EXHAUSTED");
+    expect(claim.reason).toContain("1 owned by the standalone daemon");
+
+    // And the daemon, starting afterwards, finds the token free.
+    const report = await daemon().start();
+    expect(report.slots[0]).toMatchObject({ slotId: "slot-daemon", polling: true });
   });
 
   test("stop releases every lease it holds", async () => {
