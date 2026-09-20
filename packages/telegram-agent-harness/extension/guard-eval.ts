@@ -4,6 +4,23 @@
  */
 type Token = { kind: "name" | "string" | "symbol"; value: string; dynamic?: boolean; embedded?: string[] };
 type Value = string | Value[] | { [key: string]: Value };
+
+export function decodeBase64(raw: string): string {
+  try {
+    const clean = raw.trim().replace(/^b['"]|['"]$/g, "").replace(/\s+/g, "");
+    if (!clean || clean.length < 2) return "";
+    const buf = Buffer.from(clean, "base64");
+    if (!buf.length) return "";
+    const u16 = buf.toString("utf16le");
+    if (/^[\x20-\x7e\t\r\n]+$/.test(u16) && /[a-zA-Z]/.test(u16)) return u16;
+    const u8 = buf.toString("utf8");
+    if (/^[\x20-\x7e\t\r\n]+$/.test(u8)) return u8;
+    return u8;
+  } catch {
+    return "";
+  }
+}
+
 function tokenize(code: string, language: string): Token[] {
   const tokens: Token[] = [];
   for (let i = 0; i < code.length;) {
@@ -28,9 +45,18 @@ function tokenize(code: string, language: string): Token[] {
       while (/[a-z]/i.test(code[i] ?? "")) i++;
       tokens.push({ kind: "symbol", value: "regexp" }); continue;
     }
-    if (c === "'" || c === '"' || c === "`") {
-      const triple = language === "py" && code.slice(i, i + 3) === c.repeat(3);
-      const delimiter = triple ? c.repeat(3) : c;
+    let strPrefix = "";
+    if (language === "py" && /^[bBruU]?[rR]?['"`]/.test(code.slice(i))) {
+      const pMatch = /^[bBruU]?[rR]?/.exec(code.slice(i));
+      if (pMatch && pMatch[0].length > 0) {
+        strPrefix = pMatch[0];
+        i += strPrefix.length;
+      }
+    }
+    const sc = code[i];
+    if (sc === "'" || sc === '"' || sc === "`") {
+      const triple = language === "py" && code.slice(i, i + 3) === sc.repeat(3);
+      const delimiter = triple ? sc.repeat(3) : sc;
       i += delimiter.length;
       const rawStart = i;
       let value = "", closed = false;
@@ -41,8 +67,10 @@ function tokenize(code: string, language: string): Token[] {
         } else value += code[i++];
       }
       const rawValue = code.slice(rawStart, closed ? i - delimiter.length : i);
-      const embedded = c === "`" ? [...rawValue.matchAll(/(?<!\\)\$\{([\s\S]*?)\}/g)].map(match => match[1]) : [];
+      const embedded = sc === "`" ? [...rawValue.matchAll(/(?<!\\)\$\{([\s\S]*?)\}/g)].map(match => match[1]) : [];
       tokens.push({ kind: "string", value, dynamic: !closed || embedded.length > 0, embedded }); continue;
+    } else if (strPrefix) {
+      i -= strPrefix.length;
     }
     const name = /^[A-Za-z_$][\w$]*/.exec(code.slice(i));
     if (name) { tokens.push({ kind: "name", value: name[0] }); i += name[0].length; continue; }
@@ -50,6 +78,7 @@ function tokenize(code: string, language: string): Token[] {
   }
   return tokens;
 }
+
 export function evalCommands(code: string, language: string, parseShell: (command: string) => string[][]): { commands: string[][]; unresolved: boolean } {
   const tokens = tokenize(code, language), values = new Map<string, Value>();
   const aliases = new Map<string, string>();
@@ -64,9 +93,53 @@ export function evalCommands(code: string, language: string, parseShell: (comman
     const token = tokens[start];
     if (!token) return { end: start };
     let value: Value | undefined, end = start + 1;
-    if (token.kind === "string" && !token.dynamic) value = token.value;
-    else if (token.kind === "name") value = values.get(token.value);
-    else if (token.value === "[") {
+    if (token.kind === "string" && !token.dynamic) {
+      value = token.value;
+      if (tokens[end]?.value === "." && tokens[end + 1]?.value === "join" && tokens[end + 2]?.value === "(") {
+        const listArg = valueAt(end + 3);
+        if (Array.isArray(listArg.value) && listArg.value.every(v => typeof v === "string")) {
+          value = (listArg.value as string[]).join(token.value);
+          end = tokens[listArg.end]?.value === ")" ? listArg.end + 1 : listArg.end;
+        }
+      }
+    } else if (token.kind === "name") {
+      let nameChain = token.value, next = start + 1;
+      while (tokens[next]?.value === "." && tokens[next + 1]?.kind === "name") {
+        nameChain += "." + tokens[next + 1].value;
+        next += 2;
+      }
+      const resolved = aliases.get(nameChain) ?? nameChain;
+      if (tokens[next]?.value === "(") {
+        if (/^(atob|decodeBase64)$/.test(resolved) || /^(base64\.(b64decode|decodebytes)|b64decode)$/.test(resolved)) {
+          const arg = valueAt(next + 1);
+          if (typeof arg.value === "string") {
+            value = decodeBase64(arg.value);
+            end = tokens[arg.end]?.value === ")" ? arg.end + 1 : arg.end;
+          } else end = next + 1;
+        } else if (resolved === "Buffer.from") {
+          const arg1 = valueAt(next + 1);
+          let at = arg1.end;
+          if (tokens[at]?.value === ",") {
+            const arg2 = valueAt(at + 1);
+            at = arg2.end;
+            if (typeof arg1.value === "string" && (arg2.value === "base64" || typeof arg2.value !== "string")) {
+              value = decodeBase64(arg1.value);
+            }
+          }
+          end = tokens[at]?.value === ")" ? at + 1 : at;
+        } else if (resolved === "[System.Convert]::FromBase64String" || resolved === "FromBase64String") {
+          const arg = valueAt(next + 1);
+          if (typeof arg.value === "string") {
+            value = decodeBase64(arg.value);
+            end = tokens[arg.end]?.value === ")" ? arg.end + 1 : arg.end;
+          } else end = next + 1;
+        } else {
+          value = values.get(token.value);
+        }
+      } else {
+        value = values.get(token.value);
+      }
+    } else if (token.value === "[") {
       const items: Value[] = []; let at = start + 1;
       while (tokens[at] && tokens[at].value !== "]") {
         const item = valueAt(at);
@@ -87,7 +160,38 @@ export function evalCommands(code: string, language: string, parseShell: (comman
       }
       if (tokens[at]?.value === "}") { value = object; end = at + 1; }
     }
-    if (tokens[end]?.value === "+") {
+    while (tokens[end]?.value === "." && tokens[end + 1]?.kind === "name") {
+      const method = tokens[end + 1].value;
+      if (tokens[end + 2]?.value === "(") {
+        let depth = 1, closeParen = end + 3;
+        while (closeParen < tokens.length) {
+          if (tokens[closeParen].value === "(") depth++;
+          else if (tokens[closeParen].value === ")") { if (--depth === 0) break; }
+          closeParen++;
+        }
+        if (/^(decode|toString|strip|trim)$/.test(method) && typeof value === "string") {
+          if (method === "strip" || method === "trim") value = value.trim();
+          end = closeParen + 1;
+          continue;
+        }
+        if (method === "join" && Array.isArray(value)) {
+          const joinArg = valueAt(end + 3);
+          const delim = typeof joinArg.value === "string" ? joinArg.value : " ";
+          value = (value as string[]).join(delim);
+          end = closeParen + 1;
+          continue;
+        }
+        if (method === "split" && typeof value === "string") {
+          const splitArg = valueAt(end + 3);
+          const delim = typeof splitArg.value === "string" ? splitArg.value : " ";
+          value = value.split(delim);
+          end = closeParen + 1;
+          continue;
+        }
+      }
+      break;
+    }
+    while (tokens[end]?.value === "+") {
       const rhs = valueAt(end + 1);
       value = typeof value === "string" && typeof rhs.value === "string" ? value + rhs.value : undefined;
       end = rhs.end;
@@ -117,16 +221,25 @@ export function evalCommands(code: string, language: string, parseShell: (comman
     if (tokens[i + 1]?.value === "=" && tokens[i + 2]?.value !== "=") {
       const result = valueAt(i + 2);
       if (result.value !== undefined) values.set(t.value, result.value); else values.delete(t.value);
-      // Preserve imported/module aliases and captured process call names.
       if (tokens[i + 2]?.kind === "name") {
         let target = tokens[i + 2].value, j = i + 3;
         while (tokens[j]?.value === "." && tokens[j + 1]?.kind === "name") { target += `.${tokens[j + 1].value}`; j += 2; }
         aliases.set(t.value, target);
       }
     }
-    // Only the root of a dotted call is visited (never words inside a string).
     if (tokens[i - 1]?.value === ".") continue;
     let call = aliases.get(t.value) ?? t.value, at = i + 1;
+    if (language === "py" && t.value === "__import__" && tokens[i + 1]?.value === "(" && tokens[i + 2]?.kind === "string") {
+      const mod = tokens[i + 2].value;
+      let close = i + 3;
+      while (close < tokens.length && tokens[close].value !== ")") close++;
+      let target = mod, j = close + 1;
+      while (tokens[j]?.value === "." && tokens[j + 1]?.kind === "name") { target += `.${tokens[j + 1].value}`; j += 2; }
+      if (target !== mod) {
+        call = target;
+        at = j;
+      }
+    }
     while (tokens[at]?.value === "." && tokens[at + 1]?.kind === "name") { call += `.${tokens[at + 1].value}`; at += 2; }
     for (let hop = 0; hop < 8; hop++) {
       const [head, ...tail] = call.split(".");
@@ -138,7 +251,6 @@ export function evalCommands(code: string, language: string, parseShell: (comman
     if (leaf === "$" && tokens[at]?.kind === "string") { append(tokens[at].dynamic ? undefined : tokens[at].value); continue; }
     if (tokens[at]?.value !== "(") continue;
     const argument = valueAt(at + 1);
-    // Partial expressions (f-strings, indexing, calls, interpolation) are NOT static commands.
     const complete = tokens[argument.end]?.value === "," || tokens[argument.end]?.value === ")";
     const value = complete ? argument.value : undefined;
     if (/^(os\.(system|popen)|subprocess\.(run|call|check_call|check_output|Popen)|.*\.(execSync|execFileSync|execFile|spawn|spawnSync)|execSync|execFileSync|execFile|spawn|spawnSync|Popen|system|popen|check_call|check_output)$/.test(call) ||
@@ -160,11 +272,15 @@ export function evalCommands(code: string, language: string, parseShell: (comman
     } else if (/^(fs(?:\.promises)?\.(rm|rmSync|rmdir|rmdirSync|unlink|unlinkSync)|shutil\.rmtree|os\.(remove|unlink|rmdir|kill))$/.test(call)) {
       commands.push(["rm", "-rf", ...(typeof value === "string" ? [value] : [])]);
     } else if (/^(read|write|open|fs(?:\.promises)?\.(readFile|readFileSync|writeFile|writeFileSync)|Bun\.(file|write)|Path|pathlib\.Path)$/.test(call)) {
-      // Protect real path-taking native calls without scanning an inert string assignment.
       if (typeof value === "string") commands.push(["cat", value]);
     } else if (/^(eval|exec|Function)$/.test(call)) {
-      // Dynamic native code evaluation is an execution construct, not inert quoted data.
-      unresolved = true;
+      if (typeof value === "string") {
+        const inner = evalCommands(value, language, parseShell);
+        commands.push(...inner.commands);
+        unresolved ||= inner.unresolved;
+      } else {
+        unresolved = true;
+      }
     }
   }
   return { commands, unresolved };

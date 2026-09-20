@@ -2,7 +2,7 @@
 import * as fs from "node:fs";
 import { createHash } from "node:crypto";
 import * as path from "node:path";
-import { evalCommands } from "./guard-eval";
+import { evalCommands, decodeBase64 } from "./guard-eval";
 import { describeApproval, evaluateApproval, decideApproval, type ApprovalContext, type ApprovalActor, type ApprovalRecord } from "./approvals";
 
 export interface ToolGuardEvaluation {
@@ -88,10 +88,23 @@ export function approveOperation(stateDir: string, token: string, actor: Approva
 /** Shell words, not a prose scan: separators outside quotes introduce invocations. */
 export function shellCommands(command: string): string[][] {
   const commands: string[][] = [], words: string[] = [];
-  const heredocs: { delimiter: string; quoted: boolean; stripTabs: boolean }[] = [];
+  const heredocs: { delimiter: string; quoted: boolean; stripTabs: boolean; targetApp?: string }[] = [];
   let word = "", quote = "", started = false;
   const flushWord = () => { if (started) words.push(word); word = ""; started = false; };
   const flush = () => { flushWord(); if (words.length) commands.push(words.splice(0)); };
+
+  // Pipeline check for base64 decode piped into an interpreter
+  const b64Pipe = /(?:echo|printf)\s+(?:-n\s+)?['"]?([A-Za-z0-9+/=]{8,})['"]?\s*\|\s*(?:base64\s+(?:-d|--decode)|openssl\s+base64\s+-d)\s*\|\s*(sh|bash|zsh|powershell|pwsh|python3?|node|bun)\b/i.exec(command);
+  if (b64Pipe) {
+    const decoded = decodeBase64(b64Pipe[1]);
+    if (decoded) {
+      const interp = b64Pipe[2].toLowerCase();
+      if (/^python/.test(interp)) commands.push(...evalCommands(decoded, "py", shellCommands).commands);
+      else if (/^(node|bun)/.test(interp)) commands.push(...evalCommands(decoded, "js", shellCommands).commands);
+      else commands.push(...shellCommands(decoded));
+    }
+  }
+
   for (let i = 0; i < command.length; i++) {
     const c = command[i];
     // Command substitution executes even inside double quotes; single quotes remain data.
@@ -105,7 +118,13 @@ export function shellCommands(command: string): string[][] {
         if (!backtick && command[end] === "(") nesting++;
         if (!backtick && command[end] === ")" && --nesting === 0) break;
       }
-      commands.push(...shellCommands(command.slice(start, end)));
+      const sub = command.slice(start, end);
+      commands.push(...shellCommands(sub));
+      const b64Sub = /(?:echo|printf)\s+(?:-n\s+)?['"]?([A-Za-z0-9+/=]{8,})['"]?\s*\|\s*(?:base64\s+(?:-d|--decode)|openssl\s+base64\s+-d)\b/i.exec(sub);
+      if (b64Sub) {
+        const decoded = decodeBase64(b64Sub[1]);
+        if (decoded) commands.push(...shellCommands(decoded));
+      }
       i = end; started = true; continue;
     }
     if (quote) {
@@ -117,7 +136,8 @@ export function shellCommands(command: string): string[][] {
       const match = /^<<(-?)\s*(?:'([^']+)'|"([^"]+)"|([^\s;&|]+))/.exec(command.slice(i));
       if (match) {
         flushWord();
-        heredocs.push({ delimiter: match[2] ?? match[3] ?? match[4], quoted: Boolean(match[2] || match[3]), stripTabs: match[1] === "-" });
+        const targetApp = words[0] ? executable(words[0]) : undefined;
+        heredocs.push({ delimiter: match[2] ?? match[3] ?? match[4], quoted: Boolean(match[2] || match[3]), stripTabs: match[1] === "-", targetApp });
         i += match[0].length - 1; continue;
       }
     }
@@ -132,8 +152,15 @@ export function shellCommands(command: string): string[][] {
           if ((document.stripTabs ? line.replace(/^\t+/, "") : line) === document.delimiter) { i = end; break; }
           body += line + "\n"; start = end + 1; i = end;
         }
-        // Unquoted heredocs expand substitutions, but never execute their plain text.
-        if (!document.quoted) commands.push(...shellCommands(`echo "${body.replace(/"/g, '\\"')}"`));
+        if (document.targetApp && /^(sh|bash|zsh|powershell|pwsh)$/.test(document.targetApp)) {
+          commands.push(...shellCommands(body));
+        } else if (document.targetApp && /^python/.test(document.targetApp)) {
+          commands.push(...evalCommands(body, "py", shellCommands).commands);
+        } else if (document.targetApp && /^(node|bun)/.test(document.targetApp)) {
+          commands.push(...evalCommands(body, "js", shellCommands).commands);
+        } else if (!document.quoted) {
+          commands.push(...shellCommands(`echo "${body.replace(/"/g, '\\"')}"`));
+        }
       }
       continue;
     }
@@ -186,11 +213,14 @@ export function isDestructiveRmTarget(operand: string, cwd: string): boolean {
 export function commandCategory(words: string[], cwd = process.cwd(), depth = 0): string | undefined {
   if (depth > 8) return "shell_destructive_os";
   while (words.length && /^[A-Za-z_]\w*=/.test(words[0])) words = words.slice(1);
+  while (words[0] === "&" || words[0] === "{" || words[0] === "}") words = words.slice(1);
+  if (!words.length) return;
+  if (words[words.length - 1] === "}") words = words.slice(0, -1);
   if (!words.length) return;
   const app = executable(words[0]), args = words.slice(1), command = [app, ...args].join(" ");
   // The shell builtin reparses its argument string; argv wrappers do not.
-  if (app === "eval") {
-    const script = (args[0] === "--" ? args.slice(1) : args).join(" ");
+  if (app === "eval" || app === "invoke-expression" || app === "iex") {
+    const script = (args[0] === "--" ? args.slice(1) : args).join(" ").replace(/^\{|\}$/g, "");
     return selectCategory(shellCommands(script).map(c => commandCategory(c, cwd, depth + 1)));
   }
   if (/^(env|command|exec|call|if|then|do|while|!|time|nohup|xargs)$/.test(app)) {
@@ -210,8 +240,16 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
   if (PRODUCTION.test(command)) return "production_exclusion";
   if (args.some(arg => SECRET_PATH.test(arg))) return "secrets";
   if (/^(sh|bash|zsh|cmd|powershell|pwsh)$/.test(app)) {
+    const encIdx = args.findIndex(arg => /^(-[a-z]*enc[a-z]*|-[a-z]*e)$/i.test(arg));
+    if (encIdx >= 0 && args[encIdx + 1]) {
+      const decoded = decodeBase64(args[encIdx + 1]);
+      if (decoded) return selectCategory(shellCommands(decoded).map(c => commandCategory(c, cwd, depth + 1)));
+    }
     const i = args.findIndex(arg => /^(-[a-z]*c|\/c|-command)$/i.test(arg));
-    if (i >= 0) return selectCategory(shellCommands(args.slice(i + 1).join(" ")).map(c => commandCategory(c, cwd, depth + 1)));
+    if (i >= 0) {
+      const innerCmd = args.slice(i + 1).join(" ").replace(/^(&\s*)?\{|\}$/g, "").trim();
+      return selectCategory(shellCommands(innerCmd).map(c => commandCategory(c, cwd, depth + 1)));
+    }
   }
   if (/^(node|bun|python|python3)$/.test(app)) {
     const i = args.findIndex(arg => /^(-c|-e|--eval)$/.test(arg));
