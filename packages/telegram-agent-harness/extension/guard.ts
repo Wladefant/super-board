@@ -776,6 +776,18 @@ function selectCategory(categories: (string | undefined)[]): string | undefined 
   if (categories.includes("production_exclusion")) return "production_exclusion";
   return categories.find(category => category && category !== DYNAMIC_CATEGORY) ?? categories.find(Boolean);
 }
+/** The files a hashline patch writes: every `[path#tag]` section header and every `MV` destination. */
+function editTargets(patch: string): string[] {
+  const targets: string[] = [];
+  for (const raw of patch.split(/\r?\n/)) {
+    const line = raw.trim();
+    const header = /^\[(.+)#[0-9A-Fa-f]{4}\]$/.exec(line);
+    if (header) { targets.push(header[1]); continue; }
+    const move = /^MV\s+(.+)$/.exec(line);
+    if (move) targets.push(move[1].trim().replace(/^["']|["']$/g, ""));
+  }
+  return targets;
+}
 function protectedPath(input: unknown, depth = 0): boolean {
   if (!input || typeof input !== "object" || depth > 10) return false;
   return Object.entries(input).some(([key, value]) =>
@@ -811,13 +823,32 @@ export class DangerousToolGuard {
     } else if (toolName === "launch" && input.op === "start") {
       commands = [[String(input.application ?? ""), ...(Array.isArray(input.args) ? input.args.map(String) : [])]];
       category = commandCategory(commands[0], cwd);
-    } else if (toolName === "eval") {
-      const result = evalCommands(String(input.code ?? ""), String(input.language ?? "js"), shellCommands);
+    } else if (toolName === "launch" && input.op === "send") {
+      // Text typed into a live process is a command line as soon as that process is a shell.
+      commands = shellCommands(String(input.text ?? ""));
+      category = selectCategory(commands.map(c => commandCategory(c, cwd)));
+    } else if (toolName === "eval" || (toolName === "browser" && input.action === "run")) {
+      // Browser automation code runs in the harness process with full Node access, like an eval payload.
+      const result = evalCommands(String(input.code ?? ""), toolName === "eval" ? String(input.language ?? "js") : "js", shellCommands);
       commands = result.commands;
       unresolved = result.unresolved;
       category = selectCategory(result.commands.map(c => commandCategory(c, cwd)));
+    } else if (toolName === "write") {
+      // Creating a file clobbers its path, whichever tool performs the write.
+      commands = [["tee", String(input.path ?? "")]];
+      category = commandCategory(commands[0], cwd);
+    } else if (toolName === "edit" || toolName === "ast_edit") {
+      const targets = toolName === "edit" ? editTargets(String(input.input ?? "")) : extractAllStrings(input.paths);
+      commands = targets.map(target => ["tee", target]);
+      category = selectCategory(commands.map(c => commandCategory(c, cwd)));
     } else if (toolName === "ssh") {
-      category = PRODUCTION.test(`${input.host ?? ""} ${input.hostname ?? ""} ${input.command ?? ""}`) ? "production_exclusion" : undefined;
+      // The remote filesystem is not this project's tree, but a system root, a protected ref and
+      // production mean the same thing on either side of the connection.
+      commands = shellCommands(String(input.command ?? ""));
+      category = selectCategory([
+        PRODUCTION.test(`${input.host ?? ""} ${input.hostname ?? ""}`) ? "production_exclusion" : undefined,
+        ...commands.map(c => commandCategory(c, cwd)),
+      ]);
     }
     // A substitution feeding an argument is data; only an unresolvable program name or eval payload is dynamic code.
     if (category !== "production_exclusion" && protectedPath(input)) category = "secrets";

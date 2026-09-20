@@ -346,6 +346,15 @@ export function evalCommands(code: string, language: string, parseShell: (comman
     } else if (/^(fs(?:\.promises)?\.(truncate|truncateSync|ftruncate|appendFile|appendFileSync|createWriteStream|chmod|chmodSync|chown|chownSync)|os\.(truncate|chmod|chown))$/.test(call)) {
       // Truncating, appending to or re-permissioning a file mutates the path it names.
       commands.push(["tee", ...(typeof value === "string" ? [value] : [])]);
+    } else if (leaf === "uploadFile") {
+      // Attaching a file to a form reads it, and the paths follow the selector.
+      for (let k = argument.end; tokens[k]?.value === ",";) {
+        const next = valueAt(k + 1);
+        if (typeof next.value === "string") commands.push(["cat", next.value]);
+        else if (Array.isArray(next.value)) for (const item of next.value) if (typeof item === "string") commands.push(["cat", item]);
+        else break;
+        k = next.end;
+      }
     } else if (call === "process.binding" || call === "process._linkedBinding") {
       // A raw internal binding hands back a process API this lexer cannot follow.
       unresolved = true;
