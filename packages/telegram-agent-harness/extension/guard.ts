@@ -72,6 +72,13 @@ function extractAllStrings(val: unknown, depth = 0): string[] {
   }
   return [];
 }
+/** `ssh://host/<path>` addresses another machine, so the path is absolute there and never inside
+ * this project's tree. Reading it as that absolute path puts a write through the file tools on the
+ * same footing as `ssh host "tee <path>"`, which the ssh surface already gates. */
+function remoteTarget(value: string): string {
+  const remote = /^ssh:\/\/[^/]+(\/.+)$/.exec(value);
+  return remote ? remote[1] : value;
+}
 
 // Every dotted .env variant holds real values; the committed template variants hold placeholders.
 const SECRET_PATH = /(?:^|[/\\])\.env(?:\.(?!(?:example|sample|template|dist|defaults|schema)\b)[\w-]+)*$|\b(id_(rsa|dsa|ecdsa|ed25519)|service_role|jwt_secret|agent\.db)\b|\.(pem|p12|pfx|key|keystore|jks|ppk)$|(?:^|[/\\])credentials(\.json)?$|(?:^|[/\\])\.(npmrc|netrc|pgpass|git-credentials|pypirc)$|(?:^|[/\\])\.ssh(?:[/\\]|$)|(?:^|[/\\])\.kube[/\\]config$|(?:^|[/\\])\.docker[/\\]config\.json$|(?:^|[/\\])\.gnupg[/\\]|(?:^|[/\\])secrets?\.(json|ya?ml|toml)$|(?:^|[/\\])terraform\.tfstate$|(?:^|[/\\])proc[/\\][^/\\]+[/\\]environ$/i;
@@ -883,11 +890,11 @@ export class DangerousToolGuard {
         category = selectCategory(result.commands.map(c => commandCategory(c, cwd)));
       } else if (toolName === "write") {
         // Creating a file clobbers its path, whichever tool performs the write.
-        commands = [["tee", String(input.path ?? "")]];
+        commands = [["tee", remoteTarget(String(input.path ?? ""))]];
         category = commandCategory(commands[0], cwd);
       } else if (toolName === "edit" || toolName === "ast_edit") {
         const targets = toolName === "edit" ? editTargets(String(input.input ?? "")) : extractAllStrings(input.paths);
-        commands = targets.map(target => ["tee", target]);
+        commands = targets.map(target => ["tee", remoteTarget(target)]);
         category = selectCategory(commands.map(c => commandCategory(c, cwd)));
       } else if (toolName === "search" && input.type === "files") {
         // A file glob is a path expression, so `**/*.pem` enumerates keys however harmless its scope looks.
