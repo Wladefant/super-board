@@ -936,9 +936,11 @@ export class TelegramPoller {
     const operatorIsAllowed = this.accessConfig.allowFrom.includes(fromId);
     const isDirectMessage = chatId === fromId;
     const group = isDirectMessage ? null : this.groupAccess(chatId);
-    const isAllowed = isDirectMessage
-      ? operatorIsAllowed
-      : group !== null && (group.allowFrom ?? this.accessConfig.allowFrom).includes(fromId);
+    // A group's own allowFrom intersects the channel allowlist rather than replacing
+    // it: a group entry restricts where an allowlisted account may speak, and must
+    // never admit an account the channel itself does not allow.
+    const isAllowed = operatorIsAllowed
+      && (isDirectMessage || (group !== null && (group.allowFrom === undefined || group.allowFrom.includes(fromId))));
     if (!isAllowed) {
       this.db.run(
         "UPDATE update_ledger SET status = 'REJECTED', error = 'UNAUTHORIZED' WHERE update_id = ?",

@@ -341,6 +341,16 @@ describe("poller authorization for a forum supergroup", () => {
     expect(f.ledgerRow(1)).toMatchObject({ status: "REJECTED", error: "UNAUTHORIZED" });
   });
 
+  test("a per-group allowFrom cannot admit an account the channel allowlist omits", async () => {
+    const f = groupPoller({ allowFrom: ["555"], groups: { [FORUM_CHAT_ID]: { allowFrom: [OPERATOR_ID] } } });
+    f.poller.ingestUpdates([groupMessage(1, "Hello", 9)]);
+    await f.poller.redrivePendingUpdates();
+    // A group entry restricts where an allowlisted account may speak; it is never a
+    // second door into the channel.
+    expect(f.inbound).toEqual([]);
+    expect(f.ledgerRow(1)).toMatchObject({ status: "REJECTED", error: "UNAUTHORIZED" });
+  });
+
   test("an unserved group is rejected and the operator is told why, at most once", async () => {
     const f = groupPoller({});
     f.poller.ingestUpdates([groupMessage(1, "Hello", 9), groupMessage(2, "Anyone there?", 9)]);

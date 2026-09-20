@@ -65,8 +65,10 @@ export interface ProcessIdentity {
 
 /**
  * Per-group entry of {@link AccessConfig.groups}. An empty object means "this chat is
- * allowed, use the channel allowlist"; `allowFrom` narrows it to a subset of operators
- * for that one chat.
+ * allowed, use the channel allowlist"; `allowFrom` narrows it to a subset of the
+ * channel allowlist for that one chat. It can only take operators away: a group entry
+ * is a restriction on where an allowlisted account may speak, never a second door
+ * into the channel.
  */
 export interface GroupAccessConfig {
   allowFrom?: string[];
