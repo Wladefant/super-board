@@ -187,8 +187,8 @@ class SecretSanitizer:
         (re.compile(r"(?:password|secret|key|token)\s*[:=]\s*['\"][^'\"]+['\"]", re.IGNORECASE), "[REDACTED_SECRET]"),
         (re.compile(r"\b1247617658\b"), "[REDACTED_DESTINATION]"),
         (re.compile(r"(?:chat_id|destination|chat)\s*[:=]\s*['\"]?\d{8,}['\"]?", re.IGNORECASE), "chat_id=[REDACTED_DESTINATION]"),
-        (re.compile(r"[A-Za-z]:\\[Uu]sers\\[^\\]+\\", re.IGNORECASE), r"C:\\Users\\<user>\\"),
-        (re.compile(r"/home/[^/]+/", re.IGNORECASE), "/home/<user>/"),
+        (re.compile(r"[A-Za-z]:\\[Uu]sers\\[^\\]+\\(?!\.veyyon\\)", re.IGNORECASE), r"C:\\Users\\<user>\\"),
+        (re.compile(r"/home/[^/]+/(?!\.veyyon/)", re.IGNORECASE), "/home/<user>/"),
     ]
 
     @classmethod

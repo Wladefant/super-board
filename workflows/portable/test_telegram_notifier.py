@@ -68,6 +68,11 @@ class TestSecretSanitizer(unittest.TestCase):
         cleaned = SecretSanitizer.sanitize(text)
         self.assertNotIn(r"Users\wkiri", cleaned)
         self.assertIn(r"C:\Users\<user>\development", cleaned)
+    def test_veyyon_extension_path_preserved(self):
+        text = r"Recovery: veyyon.exe --extension C:\Users\wkiri\.veyyon\telegram\index.ts --resume 01a0496f"
+        cleaned = SecretSanitizer.sanitize(text)
+        self.assertIn(r"C:\Users\wkiri\.veyyon\telegram\index.ts", cleaned)
+        self.assertNotIn("<user>", cleaned)
 
 
 class TestNotificationEvent(unittest.TestCase):
