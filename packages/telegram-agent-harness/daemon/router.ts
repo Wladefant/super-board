@@ -44,6 +44,7 @@ export const ROUTER_COMMANDS: readonly DaemonCommandDescriptor[] = [
   { command: "new", description: "Start a new session in a workspace" },
   { command: "detach", description: "Detach this chat from the current session" },
   { command: "where", description: "Show which session this chat is bound to" },
+  { command: "topics", description: "List active forum topics (forum mode)" },
 ] as const;
 
 export const ROUTING_COMMANDS = ROUTER_COMMANDS.map(c => `/${c.command}`) as readonly string[];
@@ -180,6 +181,9 @@ export class SlotRouter {
 
   private async runCommand(verb: string, argument: string, chatId: string): Promise<string> {
     if (verb === "/where") return this.statusText(chatId);
+    if (verb === "/topics") {
+      return "ℹ️ <b>This bot is running in direct-chat mode.</b> Forum topics are enabled when the slot specifies <code>\"mode\": \"forum\"</code>.";
+    }
 
     if (verb === "/detach") {
       const removed = this.options.store.deleteRoute(this.slotId, chatId);

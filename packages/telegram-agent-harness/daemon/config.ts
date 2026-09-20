@@ -86,6 +86,14 @@ export interface DaemonSlot extends DiscoveredSlot {
    * and answers commands; it refuses to create a session instead of inventing a cwd.
    */
   workspace: string | null;
+  /**
+   * Slot mode: "dm" (default, 1-on-1 private chat) or "forum" (supergroup forum topics).
+   */
+  mode?: "dm" | "forum";
+  /**
+   * Supergroup chat id when mode is "forum" (e.g. "-1001234567890").
+   */
+  forumChatId?: string;
 }
 
 /**
@@ -149,11 +157,34 @@ export function resolveDaemonSlots(
   const optedIn = readDaemonSlotIds(manifestPath);
   if (optedIn.size === 0) return [];
   const candidates = knownProjectPaths(coordinator);
+  const manifestMap = new Map<string, { mode?: "dm" | "forum"; forumChatId?: string }>();
+  if (fs.existsSync(manifestPath)) {
+    try {
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as {
+        slots?: Array<{ slotId?: string; mode?: string; forumChatId?: string | number }>;
+      };
+      if (Array.isArray(manifest.slots)) {
+        for (const slot of manifest.slots) {
+          if (slot.slotId) {
+            manifestMap.set(slot.slotId, {
+              mode: slot.mode === "forum" ? "forum" : "dm",
+              forumChatId: slot.forumChatId !== undefined ? String(slot.forumChatId) : undefined,
+            });
+          }
+        }
+      }
+    } catch {}
+  }
   return coordinator
     .syncSlots()
     .filter(slot => optedIn.has(slot.slotId))
-    .map(slot => ({
-      ...slot,
-      workspace: resolveWorkspace(slot.projects ?? slot.preferredProjects, candidates, slot.defaultProject),
-    }));
+    .map(slot => {
+      const extra = manifestMap.get(slot.slotId);
+      return {
+        ...slot,
+        mode: extra?.mode ?? "dm",
+        forumChatId: extra?.forumChatId,
+        workspace: resolveWorkspace(slot.projects ?? slot.preferredProjects, candidates, slot.defaultProject),
+      };
+    });
 }

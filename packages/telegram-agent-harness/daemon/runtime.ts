@@ -38,6 +38,7 @@ import {
 } from "./session-control";
 import { DaemonStore } from "./store";
 import { connectMiniApp, miniAppUrl } from "./miniapp";
+import { ForumManager, type ForumApiClient } from "./forum";
 
 export interface DaemonSlotReport {
   slotId: string;
@@ -76,12 +77,15 @@ export interface DaemonRuntimeOptions {
     onEvent: (event: SessionEvent) => void,
     onLog: (message: string) => void,
   ) => GuiHostSessionControl;
+  /** Injected in tests to fake Bot API calls for forum supergroup topics. */
+  forumClientFactory?: (token: string, forumChatId: string) => ForumApiClient;
 }
 
 interface ActiveSlot {
   slot: DaemonSlot;
-  poller: TelegramPoller;
-  router: SlotRouter;
+  poller?: TelegramPoller;
+  forumManager?: ForumManager;
+  router?: SlotRouter;
   /** Lease identity; also what in-session pollers see as the slot holder. */
   leaseSessionId: string;
   stopMiniApp: () => void;
@@ -161,9 +165,10 @@ export class TelegramDaemon {
     const reports: DaemonSlotReport[] = [];
     for (const slot of this.optedInSlots()) {
       const active = this.active.find(entry => entry.slot.slotId === slot.slotId);
+      const isRunning = Boolean(active?.forumManager?.running || active?.poller?.running);
       reports.push(
         active
-          ? { slotId: slot.slotId, botId: slot.botId, workspace: slot.workspace, polling: active.poller.running }
+          ? { slotId: slot.slotId, botId: slot.botId, workspace: slot.workspace, polling: isRunning }
           : await this.claim(slot),
       );
     }
@@ -199,18 +204,31 @@ export class TelegramDaemon {
       return this.unclaimed(slot, "slot startup failed");
     }
     this.active.push(activeSlot);
-    void activeSlot.poller
-      .start()
-      .then(() => {
-        if (!activeSlot.poller.running) {
-          this.onPollerEnd(slot.slotId, leaseSessionId, "loop terminated");
-        }
-      })
-      .catch(error => {
-        this.onPollerEnd(slot.slotId, leaseSessionId, error instanceof Error ? error.message : String(error));
-      });
+    if (activeSlot.forumManager) {
+      void activeSlot.forumManager
+        .start()
+        .then(() => {
+          if (!activeSlot.forumManager?.running) {
+            this.onPollerEnd(slot.slotId, leaseSessionId, "forum loop terminated");
+          }
+        })
+        .catch(error => {
+          this.onPollerEnd(slot.slotId, leaseSessionId, error instanceof Error ? error.message : String(error));
+        });
+    } else if (activeSlot.poller) {
+      void activeSlot.poller
+        .start()
+        .then(() => {
+          if (!activeSlot.poller?.running) {
+            this.onPollerEnd(slot.slotId, leaseSessionId, "loop terminated");
+          }
+        })
+        .catch(error => {
+          this.onPollerEnd(slot.slotId, leaseSessionId, error instanceof Error ? error.message : String(error));
+        });
+    }
     this.skipReasons.delete(slot.slotId);
-    this.log(`Slot ${slot.slotId} polling (bot ${slot.botId}, workspace ${slot.workspace ?? "unresolved"})`);
+    this.log(`Slot ${slot.slotId} polling (bot ${slot.botId}, workspace ${slot.workspace ?? "unresolved"}, mode ${slot.mode ?? "dm"})`);
     return { slotId: slot.slotId, botId: slot.botId, workspace: slot.workspace, polling: true };
   }
 
@@ -230,15 +248,16 @@ export class TelegramDaemon {
   public hasPendingSlots(): boolean {
     return this.optedInSlots().some(slot => {
       const active = this.active.find(entry => entry.slot.slotId === slot.slotId);
-      return !active || !active.poller.running;
+      const isRunning = Boolean(active?.forumManager?.running || active?.poller?.running);
+      return !active || !isRunning;
     });
   }
-
   private currentReports(): DaemonSlotReport[] {
     return this.optedInSlots().map(slot => {
       const active = this.active.find(entry => entry.slot.slotId === slot.slotId);
       if (active) {
-        return { slotId: slot.slotId, botId: slot.botId, workspace: slot.workspace, polling: active.poller.running };
+        const isRunning = Boolean(active.forumManager?.running || active.poller?.running);
+        return { slotId: slot.slotId, botId: slot.botId, workspace: slot.workspace, polling: isRunning };
       }
       return {
         slotId: slot.slotId,
@@ -275,6 +294,27 @@ export class TelegramDaemon {
   }
 
   private startSlot(slot: DaemonSlot, token: string, leaseSessionId: string): ActiveSlot {
+    if (slot.mode === "forum" && slot.forumChatId) {
+      const client = this.options.forumClientFactory
+        ? this.options.forumClientFactory(token, slot.forumChatId)
+        : undefined;
+      const forumManager = new ForumManager({
+        slot,
+        token,
+        forumChatId: slot.forumChatId,
+        store: this.store,
+        control: this.control,
+        client,
+        log: message => this.log(message),
+      });
+      return {
+        slot,
+        forumManager,
+        leaseSessionId,
+        stopMiniApp: () => {},
+      };
+    }
+
     const access = this.coordinator.readAccessConfig(slot.stateDir);
     // Assigned after construction: the poller and the router each need the other,
     // and the poller is what knows which chat a callback is currently serving.
@@ -434,9 +474,16 @@ export class TelegramDaemon {
 
   private fanOut(event: SessionEvent): void {
     for (const entry of this.active) {
-      void entry.router.onSessionEvent(event).catch(error => {
-        this.log(`Slot ${entry.slot.slotId}: session event handling failed: ${error instanceof Error ? error.message : String(error)}`);
-      });
+      if (entry.forumManager) {
+        void entry.forumManager.onSessionEvent(event).catch(error => {
+          this.log(`Slot ${entry.slot.slotId}: forum session event handling failed: ${error instanceof Error ? error.message : String(error)}`);
+        });
+      }
+      if (entry.router) {
+        void entry.router.onSessionEvent(event).catch(error => {
+          this.log(`Slot ${entry.slot.slotId}: session event handling failed: ${error instanceof Error ? error.message : String(error)}`);
+        });
+      }
     }
   }
 
@@ -445,7 +492,8 @@ export class TelegramDaemon {
     if (index < 0) return false;
     const [entry] = this.active.splice(index, 1);
     entry.stopMiniApp();
-    await entry.poller.stop();
+    if (entry.forumManager) await entry.forumManager.stop();
+    if (entry.poller) await entry.poller.stop();
     this.coordinator.releaseLease(entry.slot.slotId, entry.leaseSessionId);
     this.log(`Slot ${entry.slot.slotId} stopped and lease released`);
     return true;
@@ -473,7 +521,7 @@ export class TelegramDaemon {
         slotId: entry.slot.slotId,
         botId: entry.slot.botId,
         workspace: entry.slot.workspace,
-        polling: entry.poller.running,
+        polling: Boolean(entry.forumManager?.running || entry.poller?.running),
       })),
     };
   }
