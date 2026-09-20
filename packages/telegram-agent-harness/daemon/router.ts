@@ -18,15 +18,39 @@ import type {
 import { SessionControlUnavailableError } from "./session-control";
 import type { DaemonStore } from "./store";
 
+/**
+ * Where a message came from, and where its answer goes: a chat, plus the forum topic
+ * inside it when the slot runs in forum mode. `topicId` is "" for a direct chat and
+ * for a forum's General topic — General is the chat itself, not a topic a session can
+ * be bound to.
+ */
+export interface RouteTarget {
+  chatId: string;
+  topicId: string;
+}
+
+/**
+ * Forum topic lifecycle, supplied only when the slot runs in forum mode. Routing is
+ * identical in both modes; the difference is that a forum binding needs a topic to
+ * exist before a session can be bound to it.
+ */
+export interface TopicLifecycle {
+  ensureTopic(sessionId: string, workspace: string, title?: string | null): Promise<number>;
+  closeTopic(messageThreadId: number): Promise<boolean>;
+  listTopicsText(currentTopicId: string): string;
+}
+
 export interface SlotRouterOptions {
   slot: DaemonSlot;
   store: DaemonStore;
   control: GuiHostSessionControl;
   /** Router UI text, already valid Telegram HTML. */
-  send: (chatId: string, html: string) => Promise<void>;
+  send: (target: RouteTarget, html: string) => Promise<void>;
   /** Agent prose, still markdown; the transport renders and chunks it. */
-  relay: (chatId: string, markdown: string) => Promise<void>;
+  relay: (target: RouteTarget, markdown: string) => Promise<void>;
   log: (message: string) => void;
+  /** Present only in forum mode. */
+  topics?: TopicLifecycle;
 }
 
 export interface DaemonCommandDescriptor {
@@ -79,31 +103,55 @@ export class SlotRouter {
     return this.options.slot.slotId;
   }
 
-  /** Session bound to `chatId`, or null when the chat has never been routed. */
-  public boundSession(chatId: string): string | null {
-    return this.options.store.getRoute(this.slotId, chatId)?.sessionId ?? null;
+  /** Session bound to `target`, or null when it has never been routed. */
+  public boundSession(target: RouteTarget): string | null {
+    return this.options.store.getRoute(this.slotId, target.chatId, target.topicId)?.sessionId ?? null;
   }
 
   /**
-   * Binds a chat to a session, attaching to the session's live output stream and
-   * marking its existing transcript as already delivered — a fresh binding must not
-   * replay a conversation that happened before the chat was listening.
+   * Delivery-claim key for a route. A topic-less route keeps the bare chat id it was
+   * claimed under before forum mode existed, so an upgrade does not replay a whole
+   * transcript into a chat that already received it.
    */
-  public async bind(chatId: string, sessionId: string, workspace: string): Promise<void> {
-    this.options.store.putRoute({ slotId: this.slotId, chatId, topicId: "", sessionId, workspace });
+  private static claimKey(route: { chatId: string; topicId: string }): string {
+    return route.topicId ? `${route.chatId}:${route.topicId}` : route.chatId;
+  }
+
+  /**
+   * Binds a chat (or forum topic) to a session, attaching to the session's live
+   * output stream and marking its existing transcript as already delivered — a fresh
+   * binding must not replay a conversation that happened before it was listening.
+   */
+  public async bind(target: RouteTarget, sessionId: string, workspace: string): Promise<void> {
+    this.options.store.putRoute({
+      slotId: this.slotId,
+      chatId: target.chatId,
+      topicId: target.topicId,
+      sessionId,
+      workspace,
+    });
     await this.options.control.loadTranscript(sessionId);
   }
 
   /**
-   * Delivers operator text to the chat's session, creating and binding one when the
-   * chat is unrouted. Returns the text to acknowledge with, or null when the caller
-   * should stay silent because the session itself will answer.
+   * Delivers operator text to the target's session, creating and binding one when
+   * the target is unrouted. Returns the text to acknowledge with, or null when the
+   * caller should stay silent because the session itself will answer.
    */
-  public async deliver(chatId: string, text: string, mode: DeliveryMode = "auto"): Promise<string | null> {
-    const bound = this.boundSession(chatId);
+  public async deliver(target: RouteTarget, text: string, mode: DeliveryMode = "auto"): Promise<string | null> {
+    const bound = this.boundSession(target);
     if (bound) {
       const outcome = await this.options.control.deliver(bound, text, mode);
       return outcome === "started" ? null : `↪️ <b>Queued as a ${outcome === "steered" ? "steer" : "follow-up"}</b> for the running turn.`;
+    }
+
+    // A forum's General topic is the group's lobby, not one operator's chat. Binding
+    // a session there would pour every topic's traffic into one transcript.
+    if (this.options.topics && !target.topicId) {
+      return [
+        "ℹ️ <b>General is the lobby, not a session.</b>",
+        "Open one with <code>/new</code>, list what is running with <code>/sessions</code>, or write inside an existing session topic.",
+      ].join("\n");
     }
 
     const workspace = this.options.slot.workspace;
@@ -116,29 +164,30 @@ export class SlotRouter {
     }
 
     const sessionId = await this.options.control.ensureSession(workspace, `Telegram ${this.slotId}`);
-    await this.bind(chatId, sessionId, workspace);
+    await this.bind(target, sessionId, workspace);
     await this.options.control.deliver(sessionId, text, mode);
     return `🔗 <b>Routed to session</b> <code>${escapeHtml(sessionId)}</code> in <code>${escapeHtml(workspace)}</code>.`;
   }
 
-  public async abort(chatId: string): Promise<boolean> {
-    const bound = this.boundSession(chatId);
+  public async abort(target: RouteTarget): Promise<boolean> {
+    const bound = this.boundSession(target);
     if (!bound) return false;
     return this.options.control.abort(bound);
   }
 
-  public isBusy(chatId: string): boolean {
-    const bound = this.boundSession(chatId);
+  public isBusy(target: RouteTarget): boolean {
+    const bound = this.boundSession(target);
     return bound !== null && this.options.control.isBusy(bound);
   }
 
-  public statusText(chatId: string): string {
-    const route = this.options.store.getRoute(this.slotId, chatId);
+  public statusText(target: RouteTarget): string {
+    const route = this.options.store.getRoute(this.slotId, target.chatId, target.topicId);
     const lines = [
       "🤖 <b>Veyyon Telegram daemon</b>",
       `Slot: <code>${escapeHtml(this.slotId)}</code>`,
       `Host: <code>${escapeHtml(this.options.control.endpoint ?? "not discovered")}</code>`,
     ];
+    if (target.topicId) lines.push(`Topic: <b>#${escapeHtml(target.topicId)}</b>`);
     if (route) {
       lines.push(
         `Session: <code>${escapeHtml(route.sessionId)}</code>`,
@@ -146,6 +195,8 @@ export class SlotRouter {
         `Turn: ${this.options.control.isBusy(route.sessionId) ? "running" : "idle"}`,
         `Delivered posts: ${this.options.store.deliveredCount(route.sessionId)}`,
       );
+    } else if (this.options.topics && !target.topicId) {
+      lines.push("Session: <i>General is the lobby — open one with /new, or write in a session topic.</i>");
     } else {
       lines.push("Session: <i>not routed yet — send a message to start one.</i>");
     }
@@ -162,31 +213,65 @@ export class SlotRouter {
    * Handles a routing command. Returns false when `text` is not one, so the caller
    * falls through to the shared installed-command and message paths.
    */
-  public async handleCommand(text: string, chatId: string): Promise<boolean> {
+  public async handleCommand(text: string, target: RouteTarget): Promise<boolean> {
     if (!SlotRouter.isRoutingCommand(text)) return false;
     const [verb, ...rest] = text.trim().split(/\s+/);
     const argument = rest.join(" ").trim();
     try {
-      await this.options.send(chatId, await this.runCommand(verb.toLowerCase().replace(/@\w+$/, ""), argument, chatId));
+      await this.options.send(target, await this.runCommand(verb.toLowerCase().replace(/@\w+$/, ""), argument, target));
     } catch (error) {
       const detail = error instanceof SessionControlUnavailableError
         ? `The Veyyon host is not reachable: ${error.message}`
         : error instanceof Error
           ? error.message
           : "Command failed.";
-      await this.options.send(chatId, `⚠️ <b>${escapeHtml(detail)}</b>`);
+      await this.options.send(target, `⚠️ <b>${escapeHtml(detail)}</b>`);
     }
     return true;
   }
 
-  private async runCommand(verb: string, argument: string, chatId: string): Promise<string> {
-    if (verb === "/where") return this.statusText(chatId);
+  /**
+   * Binds a session to the target, opening a forum topic for it first when the
+   * command was issued outside one. Returns the topic the session now lives in, or
+   * null in direct-chat mode.
+   */
+  private async bindWithTopic(
+    target: RouteTarget,
+    sessionId: string,
+    workspace: string,
+    title?: string | null,
+  ): Promise<number | null> {
+    const topics = this.options.topics;
+    if (!topics || target.topicId) {
+      await this.bind(target, sessionId, workspace);
+      return target.topicId ? Number(target.topicId) : null;
+    }
+    // ensureTopic reuses the topic this session already owns, so attaching twice from
+    // General never opens a duplicate topic for one session.
+    const threadId = await topics.ensureTopic(sessionId, workspace, title);
+    await this.bind({ chatId: target.chatId, topicId: String(threadId) }, sessionId, workspace);
+    return threadId;
+  }
+
+  private async runCommand(verb: string, argument: string, target: RouteTarget): Promise<string> {
+    if (verb === "/where") return this.statusText(target);
     if (verb === "/topics") {
-      return "ℹ️ <b>This bot is running in direct-chat mode.</b> Forum topics are enabled when the slot specifies <code>\"mode\": \"forum\"</code>.";
+      if (!this.options.topics) {
+        return "ℹ️ <b>This bot is running in direct-chat mode.</b> Forum topics are enabled when the slot specifies <code>\"mode\": \"forum\"</code>.";
+      }
+      return this.options.topics.listTopicsText(target.topicId);
     }
 
     if (verb === "/detach") {
-      const removed = this.options.store.deleteRoute(this.slotId, chatId);
+      const topics = this.options.topics;
+      if (topics && !target.topicId) return "ℹ️ <b>Run /detach inside the topic you want to close.</b>";
+      const removed = this.options.store.deleteRoute(this.slotId, target.chatId, target.topicId);
+      if (topics) {
+        await topics.closeTopic(Number(target.topicId));
+        return removed
+          ? `🔌 <b>Topic #${escapeHtml(target.topicId)} detached and closed.</b> The session keeps running.`
+          : `🔌 <b>Topic #${escapeHtml(target.topicId)} closed.</b> It was not bound to a session.`;
+      }
       return removed
         ? "🔌 <b>Chat detached.</b> The session keeps running; your next message starts or joins a session again."
         : "ℹ️ <b>This chat is not routed to a session.</b>";
@@ -195,7 +280,7 @@ export class SlotRouter {
     if (verb === "/sessions") {
       const sessions = await this.options.control.listSessions();
       if (sessions.length === 0) return "ℹ️ <b>No Veyyon sessions are running.</b>";
-      const bound = this.boundSession(chatId);
+      const bound = this.boundSession(target);
       const lines = sessions.slice(0, 15).map(session => {
         const marker = session.id === bound ? "➡️" : "•";
         const label = session.title ?? (session.cwd || "untitled");
@@ -207,11 +292,14 @@ export class SlotRouter {
     if (verb === "/attach") {
       if (!argument) return "⚠️ <b>Usage:</b> <code>/attach &lt;session-id&gt;</code>";
       const sessions = await this.options.control.listSessions();
-      const target = sessions.find(session => session.id === argument)
-        ?? sessions.find(session => session.id.startsWith(argument));
-      if (!target) return `🚫 <b>No running session matches</b> <code>${escapeHtml(argument)}</code>. Use <code>/sessions</code> to list them.`;
-      await this.bind(chatId, target.id, target.cwd || target.workspace);
-      return `🔗 <b>Attached to</b> <code>${escapeHtml(target.id)}</code> — ${escapeHtml(target.cwd || target.workspace)}.`;
+      const session = sessions.find(candidate => candidate.id === argument)
+        ?? sessions.find(candidate => candidate.id.startsWith(argument));
+      if (!session) return `🚫 <b>No running session matches</b> <code>${escapeHtml(argument)}</code>. Use <code>/sessions</code> to list them.`;
+      const workspace = session.cwd || session.workspace;
+      const threadId = await this.bindWithTopic(target, session.id, workspace, session.title);
+      return threadId === null
+        ? `🔗 <b>Attached to</b> <code>${escapeHtml(session.id)}</code> — ${escapeHtml(workspace)}.`
+        : `🔗 <b>Attached to</b> <code>${escapeHtml(session.id)}</code> in topic #${threadId} — ${escapeHtml(workspace)}.`;
     }
 
     // `/new`
@@ -220,24 +308,26 @@ export class SlotRouter {
       return "⚠️ <b>Usage:</b> <code>/new &lt;absolute-project-path&gt;</code> — this bot's slot declares no workspace.";
     }
     const created = await this.options.control.createSession(workspace, `Telegram ${this.slotId}`);
-    await this.bind(chatId, created, workspace);
-    return `🆕 <b>Session</b> <code>${escapeHtml(created)}</code> <b>started in</b> <code>${escapeHtml(workspace)}</code>.`;
+    const threadId = await this.bindWithTopic(target, created, workspace);
+    return threadId === null
+      ? `🆕 <b>Session</b> <code>${escapeHtml(created)}</code> <b>started in</b> <code>${escapeHtml(workspace)}</code>.`
+      : `🆕 <b>Session</b> <code>${escapeHtml(created)}</code> <b>started in topic #${threadId}</b> — <code>${escapeHtml(workspace)}</code>.`;
   }
 
   /**
-   * Forwards one session event to every chat bound to it. `history` claims entries
-   * without sending: it is the baseline that keeps a restart or a fresh binding from
-   * replaying the whole transcript into the operator's chat.
+   * Forwards one session event to every chat and topic bound to it. `history` claims
+   * entries without sending: it is the baseline that keeps a restart or a fresh
+   * binding from replaying the whole transcript into the operator's chat.
    */
   public async onSessionEvent(event: SessionEvent): Promise<void> {
     if (event.kind === "streaming") return;
     const routes = this.options.store.routesForSession(event.sessionId).filter(route => route.slotId === this.slotId);
     for (const route of routes) {
       for (const entry of event.entries) {
-        if (!this.options.store.claimDelivery(event.sessionId, entry.entryId, route.chatId)) continue;
+        if (!this.options.store.claimDelivery(event.sessionId, entry.entryId, SlotRouter.claimKey(route))) continue;
         if (event.kind === "history") continue;
         try {
-          await this.options.relay(route.chatId, entry.text);
+          await this.options.relay({ chatId: route.chatId, topicId: route.topicId }, entry.text);
         } catch (error) {
           this.options.log(
             `Slot ${this.slotId}: delivery of entry ${entry.entryId} to chat ${route.chatId} failed: ${error instanceof Error ? error.message : String(error)}`,

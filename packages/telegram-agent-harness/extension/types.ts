@@ -63,9 +63,26 @@ export interface ProcessIdentity {
   uncertain?: boolean;
 }
 
+/**
+ * Per-group entry of {@link AccessConfig.groups}. An empty object means "this chat is
+ * allowed, use the channel allowlist"; `allowFrom` narrows it to a subset of operators
+ * for that one chat.
+ */
+export interface GroupAccessConfig {
+  allowFrom?: string[];
+}
+
 export interface AccessConfig {
   dmPolicy: string;
   allowFrom: string[];
+  /**
+   * Group and supergroup chat ids this bot may be driven from, keyed by chat id
+   * (`"-1004422647618"`). A DM is authorized by `allowFrom` alone; a group needs its
+   * chat id here as well, because a Telegram account being allowlisted says nothing
+   * about which rooms that account may speak for. Absent is the same as empty: no
+   * group is authorized.
+   */
+  groups?: Record<string, GroupAccessConfig>;
 }
 
 export interface BusySlotHolder {

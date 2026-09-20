@@ -1,6 +1,6 @@
 /**
- * Per-slot routing: which session a chat talks to, what gets sent back to it, and
- * what must never be sent back (a transcript the chat already saw).
+ * Per-slot routing: which session a chat or forum topic talks to, what gets sent
+ * back to it, and what must never be sent back (a transcript it already saw).
  *
  * The session control is a stand-in for the GUI host — its own wire behaviour is
  * covered against a real socket in daemon-session-control.test.ts — so these tests
@@ -12,7 +12,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { DaemonSlot } from "../daemon/config";
-import { SlotRouter, getDaemonCommands } from "../daemon/router";
+import { SlotRouter, getDaemonCommands, type RouteTarget, type TopicLifecycle } from "../daemon/router";
 import { renderTelegramHelp } from "../extension/command-registry";
 import {
   SessionControlUnavailableError,
@@ -91,13 +91,52 @@ function summary(id: string, cwd: string, title: string | null = null): DaemonSe
   return { id, cwd, workspace: cwd, title, status: "Idle", modifiedAtMs: 1 };
 }
 
+/** Records what a forum slot asked of Telegram, without a Bot API call. */
+interface FakeTopics extends TopicLifecycle {
+  opened: { sessionId: string; workspace: string }[];
+  closed: number[];
+}
+
+function fakeTopics(): FakeTopics {
+  const opened: { sessionId: string; workspace: string }[] = [];
+  const closed: number[] = [];
+  const threads = new Map<string, number>();
+  return {
+    opened,
+    closed,
+    ensureTopic: async (sessionId: string, workspace: string) => {
+      const existing = threads.get(sessionId);
+      if (existing !== undefined) return existing;
+      opened.push({ sessionId, workspace });
+      const threadId = 100 + threads.size;
+      threads.set(sessionId, threadId);
+      return threadId;
+    },
+    closeTopic: async (messageThreadId: number) => {
+      closed.push(messageThreadId);
+      return true;
+    },
+    listTopicsText: (currentTopicId: string) => `topics@${currentTopicId}`,
+  };
+}
+
 const CHAT = "1247617658";
+const FORUM_CHAT = "-1004422647618";
+const DM: RouteTarget = { chatId: CHAT, topicId: "" };
+const GENERAL: RouteTarget = { chatId: FORUM_CHAT, topicId: "" };
+const TOPIC_9: RouteTarget = { chatId: FORUM_CHAT, topicId: "9" };
+const TOPIC_14: RouteTarget = { chatId: FORUM_CHAT, topicId: "14" };
+
 let root: string;
 let store: DaemonStore;
-let sent: { chatId: string; html: string }[];
-let relayed: { chatId: string; markdown: string }[];
+let sent: { target: RouteTarget; html: string }[];
+let relayed: { target: RouteTarget; markdown: string }[];
 
-function buildRouter(slot: Partial<DaemonSlot>, control: GuiHostSessionControl): SlotRouter {
+function buildRouter(
+  slot: Partial<DaemonSlot>,
+  control: GuiHostSessionControl,
+  topics?: TopicLifecycle,
+): SlotRouter {
   return new SlotRouter({
     slot: {
       slotId: "slot-1",
@@ -111,11 +150,12 @@ function buildRouter(slot: Partial<DaemonSlot>, control: GuiHostSessionControl):
     },
     store,
     control,
-    send: async (chatId, html) => {
-      sent.push({ chatId, html });
+    topics,
+    send: async (target, html) => {
+      sent.push({ target, html });
     },
-    relay: async (chatId, markdown) => {
-      relayed.push({ chatId, markdown });
+    relay: async (target, markdown) => {
+      relayed.push({ target, markdown });
     },
     log: () => {},
   });
@@ -138,13 +178,13 @@ describe("inbound routing", () => {
     const fake = fakeControl();
     const router = buildRouter({}, fake.control);
 
-    const ack = await router.deliver(CHAT, "first message");
+    const ack = await router.deliver(DM, "first message");
     expect(fake.created).toEqual([{ workspace: "C:/dev/demo", title: "Telegram slot-1" }]);
     expect(ack).toContain("sess-new-1");
-    expect(router.boundSession(CHAT)).toBe("sess-new-1");
+    expect(router.boundSession(DM)).toBe("sess-new-1");
 
     // Second message reuses the binding rather than creating another session.
-    expect(await router.deliver(CHAT, "second message")).toBeNull();
+    expect(await router.deliver(DM, "second message")).toBeNull();
     expect(fake.created.length).toBe(1);
     expect(fake.delivered).toEqual([
       { sessionId: "sess-new-1", text: "first message", mode: "auto" },
@@ -156,29 +196,29 @@ describe("inbound routing", () => {
     const fake = fakeControl([summary("sess-existing", "C:/dev/demo")]);
     const router = buildRouter({}, fake.control);
 
-    await router.deliver(CHAT, "hello");
+    await router.deliver(DM, "hello");
     expect(fake.created).toEqual([]);
-    expect(router.boundSession(CHAT)).toBe("sess-existing");
+    expect(router.boundSession(DM)).toBe("sess-existing");
   });
 
   test("a slot with no resolvable workspace refuses to invent one", async () => {
     const fake = fakeControl();
     const router = buildRouter({ workspace: null }, fake.control);
 
-    const ack = await router.deliver(CHAT, "hello");
+    const ack = await router.deliver(DM, "hello");
     expect(ack).toContain("No workspace is configured");
     expect(fake.created).toEqual([]);
     expect(fake.delivered).toEqual([]);
-    expect(router.boundSession(CHAT)).toBeNull();
+    expect(router.boundSession(DM)).toBeNull();
   });
 
   test("steer and follow-up modes are acknowledged distinctly and reach the bound session", async () => {
     const fake = fakeControl([summary("sess-existing", "C:/dev/demo")]);
     const router = buildRouter({}, fake.control);
-    await router.deliver(CHAT, "start");
+    await router.deliver(DM, "start");
 
-    expect(await router.deliver(CHAT, "redirect", "steer")).toContain("steer");
-    expect(await router.deliver(CHAT, "afterwards", "followUp")).toContain("follow-up");
+    expect(await router.deliver(DM, "redirect", "steer")).toContain("steer");
+    expect(await router.deliver(DM, "afterwards", "followUp")).toContain("follow-up");
     expect(fake.delivered.slice(1)).toEqual([
       { sessionId: "sess-existing", text: "redirect", mode: "steer" },
       { sessionId: "sess-existing", text: "afterwards", mode: "followUp" },
@@ -189,15 +229,130 @@ describe("inbound routing", () => {
     const fake = fakeControl([summary("sess-existing", "C:/dev/demo")]);
     const router = buildRouter({}, fake.control);
 
-    expect(router.isBusy(CHAT)).toBe(false);
-    expect(await router.abort(CHAT)).toBe(false);
+    expect(router.isBusy(DM)).toBe(false);
+    expect(await router.abort(DM)).toBe(false);
     expect(fake.aborted).toEqual([]);
 
-    await router.deliver(CHAT, "start");
+    await router.deliver(DM, "start");
     fake.busy.add("sess-existing");
-    expect(router.isBusy(CHAT)).toBe(true);
-    expect(await router.abort(CHAT)).toBe(true);
+    expect(router.isBusy(DM)).toBe(true);
+    expect(await router.abort(DM)).toBe(true);
     expect(fake.aborted).toEqual(["sess-existing"]);
+  });
+});
+
+describe("forum topic routing", () => {
+  test("each topic of one supergroup talks to its own session", async () => {
+    const fake = fakeControl([summary("sess-a", "C:/dev/a"), summary("sess-b", "C:/dev/b")]);
+    const router = buildRouter({}, fake.control, fakeTopics());
+
+    await router.bind(TOPIC_9, "sess-a", "C:/dev/a");
+    await router.bind(TOPIC_14, "sess-b", "C:/dev/b");
+
+    expect(router.boundSession(TOPIC_9)).toBe("sess-a");
+    expect(router.boundSession(TOPIC_14)).toBe("sess-b");
+
+    await router.deliver(TOPIC_9, "for a");
+    await router.deliver(TOPIC_14, "for b");
+    expect(fake.delivered).toEqual([
+      { sessionId: "sess-a", text: "for a", mode: "auto" },
+      { sessionId: "sess-b", text: "for b", mode: "auto" },
+    ]);
+  });
+
+  test("one session's output reaches only its own topic", async () => {
+    const fake = fakeControl([summary("sess-a", "C:/dev/a"), summary("sess-b", "C:/dev/b")]);
+    const router = buildRouter({}, fake.control, fakeTopics());
+    await router.bind(TOPIC_9, "sess-a", "C:/dev/a");
+    await router.bind(TOPIC_14, "sess-b", "C:/dev/b");
+
+    await router.onSessionEvent({ kind: "appended", sessionId: "sess-a", entries: [{ entryId: "e1", text: "from a" }] });
+    expect(relayed).toEqual([{ target: { chatId: FORUM_CHAT, topicId: "9" }, markdown: "from a" }]);
+  });
+
+  test("the General topic is a lobby: plain text binds nothing and says where to go", async () => {
+    const fake = fakeControl();
+    const router = buildRouter({}, fake.control, fakeTopics());
+
+    const reply = await router.deliver(GENERAL, "fix the bug");
+    expect(reply).toContain("General is the lobby");
+    expect(reply).toContain("/new");
+    expect(fake.created).toEqual([]);
+    expect(fake.delivered).toEqual([]);
+    expect(router.boundSession(GENERAL)).toBeNull();
+  });
+
+  test("/new from General opens a topic and binds the session to it, not to General", async () => {
+    const fake = fakeControl();
+    const topics = fakeTopics();
+    const router = buildRouter({}, fake.control, topics);
+
+    await router.handleCommand("/new", GENERAL);
+    expect(topics.opened).toEqual([{ sessionId: "sess-new-1", workspace: "C:/dev/demo" }]);
+    expect(sent.at(-1)?.html).toContain("started in topic #100");
+    expect(router.boundSession({ chatId: FORUM_CHAT, topicId: "100" })).toBe("sess-new-1");
+    expect(router.boundSession(GENERAL)).toBeNull();
+  });
+
+  test("/new inside a topic binds that topic instead of opening another", async () => {
+    const fake = fakeControl();
+    const topics = fakeTopics();
+    const router = buildRouter({}, fake.control, topics);
+
+    await router.handleCommand("/new", TOPIC_9);
+    expect(topics.opened).toEqual([]);
+    expect(router.boundSession(TOPIC_9)).toBe("sess-new-1");
+  });
+
+  test("/attach from General reuses the topic the session already owns", async () => {
+    const fake = fakeControl([summary("sess-abcdef", "C:/dev/other", "Other")]);
+    const topics = fakeTopics();
+    const router = buildRouter({}, fake.control, topics);
+
+    await router.handleCommand("/attach sess-abc", GENERAL);
+    await router.handleCommand("/attach sess-abc", GENERAL);
+    expect(topics.opened).toHaveLength(1);
+    expect(router.boundSession({ chatId: FORUM_CHAT, topicId: "100" })).toBe("sess-abcdef");
+  });
+
+  test("/topics is answered by the topic lifecycle in forum mode and refused in direct mode", async () => {
+    const forum = buildRouter({}, fakeControl().control, fakeTopics());
+    await forum.handleCommand("/topics", TOPIC_9);
+    expect(sent.at(-1)?.html).toBe("topics@9");
+
+    const direct = buildRouter({}, fakeControl().control);
+    await direct.handleCommand("/topics", DM);
+    expect(sent.at(-1)?.html).toContain("direct-chat mode");
+  });
+
+  test("/detach closes the topic it was run in and refuses to run from General", async () => {
+    const fake = fakeControl([summary("sess-a", "C:/dev/a")]);
+    const topics = fakeTopics();
+    const router = buildRouter({}, fake.control, topics);
+    await router.bind(TOPIC_9, "sess-a", "C:/dev/a");
+
+    await router.handleCommand("/detach", GENERAL);
+    expect(topics.closed).toEqual([]);
+    expect(sent.at(-1)?.html).toContain("inside the topic");
+
+    await router.handleCommand("/detach", TOPIC_9);
+    expect(topics.closed).toEqual([9]);
+    expect(router.boundSession(TOPIC_9)).toBeNull();
+    expect(sent.at(-1)?.html).toContain("Topic #9 detached and closed");
+    expect(fake.aborted).toEqual([]);
+  });
+
+  test("/where names the topic a message came from", async () => {
+    const fake = fakeControl([summary("sess-a", "C:/dev/a")]);
+    const router = buildRouter({}, fake.control, fakeTopics());
+    await router.bind(TOPIC_9, "sess-a", "C:/dev/a");
+
+    await router.handleCommand("/where", TOPIC_9);
+    expect(sent.at(-1)?.html).toContain("Topic: <b>#9</b>");
+    expect(sent.at(-1)?.html).toContain("sess-a");
+
+    await router.handleCommand("/where", GENERAL);
+    expect(sent.at(-1)?.html).toContain("General is the lobby");
   });
 });
 
@@ -205,19 +360,19 @@ describe("outbound delivery", () => {
   test("live output reaches the bound chat exactly once", async () => {
     const fake = fakeControl([summary("sess-a", "C:/dev/demo")]);
     const router = buildRouter({}, fake.control);
-    await router.deliver(CHAT, "start");
+    await router.deliver(DM, "start");
 
     const event = { kind: "appended" as const, sessionId: "sess-a", entries: [{ entryId: "e1", text: "the answer" }] };
     await router.onSessionEvent(event);
     await router.onSessionEvent(event);
 
-    expect(relayed).toEqual([{ chatId: CHAT, markdown: "the answer" }]);
+    expect(relayed).toEqual([{ target: DM, markdown: "the answer" }]);
   });
 
   test("binding a chat marks existing history delivered, so nothing is replayed", async () => {
     const fake = fakeControl([summary("sess-a", "C:/dev/demo")]);
     const router = buildRouter({}, fake.control);
-    await router.deliver(CHAT, "start");
+    await router.deliver(DM, "start");
     expect(fake.loaded).toEqual(["sess-a"]);
 
     // The transcript snapshot the host replies with, containing pre-existing prose.
@@ -237,7 +392,7 @@ describe("outbound delivery", () => {
         { entryId: "new-1", text: "brand new" },
       ],
     });
-    expect(relayed).toEqual([{ chatId: CHAT, markdown: "brand new" }]);
+    expect(relayed).toEqual([{ target: DM, markdown: "brand new" }]);
   });
 
   test("output for another slot's route is not delivered by this router", async () => {
@@ -252,7 +407,7 @@ describe("outbound delivery", () => {
   test("streaming events carry no text and are not relayed", async () => {
     const fake = fakeControl([summary("sess-a", "C:/dev/demo")]);
     const router = buildRouter({}, fake.control);
-    await router.deliver(CHAT, "start");
+    await router.deliver(DM, "start");
 
     await router.onSessionEvent({ kind: "streaming", sessionId: "sess-a", active: true });
     expect(relayed).toEqual([]);
@@ -268,16 +423,16 @@ describe("routing commands", () => {
     expect(SlotRouter.isRoutingCommand("please run the tests")).toBe(false);
 
     const router = buildRouter({}, fakeControl().control);
-    expect(await router.handleCommand("/status", CHAT)).toBe(false);
+    expect(await router.handleCommand("/status", DM)).toBe(false);
     expect(sent).toEqual([]);
   });
 
   test("/sessions lists running sessions and marks the bound one", async () => {
     const fake = fakeControl([summary("sess-a", "C:/dev/demo", "Demo"), summary("sess-b", "C:/dev/other", "Other")]);
     const router = buildRouter({}, fake.control);
-    await router.deliver(CHAT, "start");
+    await router.deliver(DM, "start");
 
-    expect(await router.handleCommand("/sessions", CHAT)).toBe(true);
+    expect(await router.handleCommand("/sessions", DM)).toBe(true);
     expect(sent[0].html).toContain("➡️ <code>sess-a</code>");
     expect(sent[0].html).toContain("• <code>sess-b</code>");
   });
@@ -286,8 +441,8 @@ describe("routing commands", () => {
     const fake = fakeControl([summary("sess-abcdef", "C:/dev/other", "Other")]);
     const router = buildRouter({}, fake.control);
 
-    await router.handleCommand("/attach sess-abc", CHAT);
-    expect(router.boundSession(CHAT)).toBe("sess-abcdef");
+    await router.handleCommand("/attach sess-abc", DM);
+    expect(router.boundSession(DM)).toBe("sess-abcdef");
     expect(fake.loaded).toEqual(["sess-abcdef"]);
     expect(store.getRoute("slot-1", CHAT)?.workspace).toBe("C:/dev/other");
   });
@@ -296,42 +451,42 @@ describe("routing commands", () => {
     const fake = fakeControl([summary("sess-a", "C:/dev/demo")]);
     const router = buildRouter({}, fake.control);
 
-    await router.handleCommand("/attach nope", CHAT);
+    await router.handleCommand("/attach nope", DM);
     expect(sent[0].html).toContain("No running session matches");
-    expect(router.boundSession(CHAT)).toBeNull();
+    expect(router.boundSession(DM)).toBeNull();
   });
 
   test("/new starts a fresh session even when one already serves the workspace", async () => {
     const fake = fakeControl([summary("sess-existing", "C:/dev/demo")]);
     const router = buildRouter({}, fake.control);
 
-    await router.handleCommand("/new", CHAT);
+    await router.handleCommand("/new", DM);
     expect(fake.created).toEqual([{ workspace: "C:/dev/demo", title: "Telegram slot-1" }]);
-    expect(router.boundSession(CHAT)).toBe("sess-new-1");
+    expect(router.boundSession(DM)).toBe("sess-new-1");
   });
 
   test("/detach drops the binding without touching the session", async () => {
     const fake = fakeControl([summary("sess-a", "C:/dev/demo")]);
     const router = buildRouter({}, fake.control);
-    await router.deliver(CHAT, "start");
+    await router.deliver(DM, "start");
 
-    await router.handleCommand("/detach", CHAT);
-    expect(router.boundSession(CHAT)).toBeNull();
+    await router.handleCommand("/detach", DM);
+    expect(router.boundSession(DM)).toBeNull();
     expect(fake.aborted).toEqual([]);
     expect(sent.at(-1)?.html).toContain("Chat detached");
 
-    await router.handleCommand("/detach", CHAT);
+    await router.handleCommand("/detach", DM);
     expect(sent.at(-1)?.html).toContain("not routed");
   });
 
   test("/where reports the route, and an unreachable host is reported instead of thrown", async () => {
     const fake = fakeControl([summary("sess-a", "C:/dev/demo")]);
     const router = buildRouter({}, fake.control);
-    expect(await router.handleCommand("/where", CHAT)).toBe(true);
+    expect(await router.handleCommand("/where", DM)).toBe(true);
     expect(sent[0].html).toContain("not routed yet");
 
     const broken = buildRouter({}, fakeControl([], { unavailable: true }).control);
-    expect(await broken.handleCommand("/sessions", CHAT)).toBe(true);
+    expect(await broken.handleCommand("/sessions", DM)).toBe(true);
     expect(sent.at(-1)?.html).toContain("not reachable");
   });
 
@@ -346,9 +501,11 @@ describe("routing commands", () => {
     expect(names).toContain("where");
     expect(names).toContain("status");
     expect(names).toContain("reload");
+    expect(names).toContain("topics");
 
     const help = renderTelegramHelp({ isDaemon: true });
     expect(help).toContain("Routing & Workspaces");
+    expect(help).toContain("/topics");
     expect(help).toContain("/sessions");
     expect(help).toContain("/attach &lt;id&gt;");
     expect(help).toContain("/new &lt;path&gt;");
