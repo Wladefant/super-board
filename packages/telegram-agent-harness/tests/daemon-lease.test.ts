@@ -312,6 +312,87 @@ describe("waiting out a holder", () => {
   });
 });
 
+describe("non-blocking polling startup", () => {
+  test("claim() resolves while a fake poller start() promise is still pending and status report shows polling: true", async () => {
+    writePool([{ slotId: "slot-pending", daemon: true }]);
+    let pollerResolve: () => void;
+    const pendingPromise = new Promise<void>(resolve => {
+      pollerResolve = resolve;
+    });
+
+    let pollerStarted = false;
+    const instance = daemon({
+      pollerFactory: (_token, stateDir) => {
+        const poller = new FakePoller(stateDir);
+        poller.start = async () => {
+          poller.running = true;
+          pollerStarted = true;
+          await pendingPromise;
+        };
+        startedPollers.push(poller);
+        return poller as unknown as TelegramPoller;
+      },
+    });
+
+    const report = await instance.start();
+    expect(pollerStarted).toBe(true);
+    expect(report.slots).toEqual([
+      {
+        slotId: "slot-pending",
+        botId: "1000000000",
+        workspace,
+        polling: true,
+      },
+    ]);
+    expect(instance.status().slots).toEqual([
+      {
+        slotId: "slot-pending",
+        botId: "1000000000",
+        workspace,
+        polling: true,
+      },
+    ]);
+
+    pollerResolve!();
+  });
+
+  test("poller termination/rejection releases lease and allows claimPending to reclaim", async () => {
+    writePool([{ slotId: "slot-failing", daemon: true }]);
+    let pollerReject: (err: Error) => void;
+    let shouldFail = true;
+
+    const instance = daemon({
+      pollerFactory: (_token, stateDir) => {
+        const poller = new FakePoller(stateDir);
+        poller.start = async () => {
+          poller.running = true;
+          if (shouldFail) {
+            await new Promise<void>((_, reject) => {
+              pollerReject = reject;
+            });
+          }
+        };
+        startedPollers.push(poller);
+        return poller as unknown as TelegramPoller;
+      },
+    });
+
+    const report = await instance.start();
+    expect(report.slots[0].polling).toBe(true);
+
+    pollerReject!(new Error("network connection dropped"));
+    await new Promise(r => setTimeout(r, 10));
+
+    expect(instance.status().slots).toHaveLength(0);
+    expect(instance.hasPendingSlots()).toBe(true);
+
+    shouldFail = false;
+    const retried = await instance.claimPending();
+    expect(retried.slots[0]).toMatchObject({ slotId: "slot-failing", polling: true });
+    expect(instance.status().slots[0]).toMatchObject({ slotId: "slot-failing", polling: true });
+  });
+});
+
 describe("single daemon per machine", () => {
   test("a live pid holder refuses a second daemon, a dead one does not", () => {
     const pidPath = path.join(root, "run", "daemon.pid");

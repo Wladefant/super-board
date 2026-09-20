@@ -30,7 +30,7 @@ import {
   resolveDaemonSlots,
   type DaemonSlot,
 } from "./config";
-import { SlotRouter } from "./router";
+import { getDaemonCommands, SlotRouter } from "./router";
 import {
   GuiHostSessionControl,
   resolveGuiHostEndpoint,
@@ -69,6 +69,7 @@ export interface DaemonRuntimeOptions {
     access: AccessConfig,
     callbacks: ConstructorParameters<typeof TelegramPoller>[3],
     correlation: MessageCorrelationBridge,
+    options?: ConstructorParameters<typeof TelegramPoller>[5],
   ) => TelegramPoller;
   controlFactory?: (
     onEvent: (event: SessionEvent) => void,
@@ -191,10 +192,54 @@ export class TelegramDaemon {
 
     const activeSlot = this.startSlot(slot, token, leaseSessionId);
     this.active.push(activeSlot);
-    await activeSlot.poller.start();
+    void activeSlot.poller
+      .start()
+      .then(() => {
+        if (!activeSlot.poller.running) {
+          this.onPollerEnd(slot.slotId, leaseSessionId, "loop terminated");
+        }
+      })
+      .catch(error => {
+        this.onPollerEnd(slot.slotId, leaseSessionId, error instanceof Error ? error.message : String(error));
+      });
     this.skipReasons.delete(slot.slotId);
     this.log(`Slot ${slot.slotId} polling (bot ${slot.botId}, workspace ${slot.workspace ?? "unresolved"})`);
     return { slotId: slot.slotId, botId: slot.botId, workspace: slot.workspace, polling: true };
+  }
+
+  private onPollerEnd(slotId: string, leaseSessionId: string, reason: string): void {
+    if (this.stopping) return;
+    const index = this.active.findIndex(entry => entry.slot.slotId === slotId);
+    if (index < 0) return;
+    this.active.splice(index, 1);
+    this.coordinator.releaseLease(slotId, leaseSessionId);
+    this.skipReasons.set(slotId, `poller ended: ${reason}`);
+    this.log(`Slot ${slotId} poller ended: ${reason}`);
+    this.publish(this.currentReports());
+  }
+
+  /** True when any opted-in slot is not currently active and polling. */
+  public hasPendingSlots(): boolean {
+    return this.optedInSlots().some(slot => {
+      const active = this.active.find(entry => entry.slot.slotId === slot.slotId);
+      return !active || !active.poller.running;
+    });
+  }
+
+  private currentReports(): DaemonSlotReport[] {
+    return this.optedInSlots().map(slot => {
+      const active = this.active.find(entry => entry.slot.slotId === slot.slotId);
+      if (active) {
+        return { slotId: slot.slotId, botId: slot.botId, workspace: slot.workspace, polling: active.poller.running };
+      }
+      return {
+        slotId: slot.slotId,
+        botId: slot.botId,
+        workspace: slot.workspace,
+        polling: false,
+        skipped: this.skipReasons.get(slot.slotId) ?? "not claimed",
+      };
+    });
   }
 
   /**
@@ -314,9 +359,13 @@ export class TelegramDaemon {
       },
     };
 
+    const pollerOptions = {
+      commands: getDaemonCommands(),
+    };
+
     poller = this.options.pollerFactory
-      ? this.options.pollerFactory(token, slot.stateDir, access, callbacks, correlation)
-      : new TelegramPoller(token, slot.stateDir, access, callbacks, correlation);
+      ? this.options.pollerFactory(token, slot.stateDir, access, callbacks, correlation, pollerOptions)
+      : new TelegramPoller(token, slot.stateDir, access, callbacks, correlation, pollerOptions);
 
     return { slot, poller, router, leaseSessionId };
   }
