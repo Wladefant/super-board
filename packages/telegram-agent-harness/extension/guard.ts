@@ -2,7 +2,7 @@
 import * as fs from "node:fs";
 import { createHash } from "node:crypto";
 import * as path from "node:path";
-import { evalCommands, decodeBase64 } from "./guard-eval";
+import { evalCommands, decodeBase64, stripUnexecutable } from "./guard-eval";
 import { describeApproval, evaluateApproval, decideApproval, type ApprovalContext, type ApprovalActor, type ApprovalRecord } from "./approvals";
 
 export interface ToolGuardEvaluation {
@@ -151,6 +151,21 @@ function literalOutput(words: string[]): string | undefined {
   const text = operands.join(" ");
   return text.includes(DYNAMIC) ? undefined : text;
 }
+/** An interpreter stage taking its program from stdin: no script operand, or an explicit `-`. A stage
+ * that names a script (`python3 report.py`) is reading data on stdin, not code. */
+function readsProgramFromStdin(words: string[]): boolean {
+  const app = executable(words[0] ?? "");
+  if (!INTERPRETER.test(app)) return false;
+  // A scheduler's operands are a time, never a script: its program always arrives on stdin unless -f names a file.
+  if (/^(at|batch)$/.test(app)) return !words.slice(1).some(operand => /^-{1,2}f$/.test(operand));
+  for (const operand of words.slice(1)) {
+    if (operand === "-") return true;
+    // An inline payload (`-c`, `-e`) is classified where that flag is parsed, not from the pipe.
+    if (/^-{1,2}(c|e|command|eval)$/i.test(operand)) return false;
+    if (!operand.startsWith("-")) return false;
+  }
+  return true;
+}
 /** Decode-and-run reconstructed from parsed pipeline stages, so quoted prose can never look like a pipeline. */
 function decodePipeline(stages: string[][]): string[][] {
   const derived: string[][] = [], apps = stages.map(stage => executable(stage[0] ?? ""));
@@ -161,6 +176,12 @@ function decodePipeline(stages: string[][]): string[][] {
     const payload = k > 0 ? literalOutput(stages[k - 1]) : undefined;
     const decoded = payload === undefined ? "" : decodeBase64(payload);
     derived.push(...(decoded ? interpretAs(apps[sink], decoded) : [[DYNAMIC]]));
+  }
+  // An interpreter fed on stdin runs whatever the upstream stage wrote, decoded or not.
+  for (let k = 1; k < stages.length; k++) {
+    if (!readsProgramFromStdin(stages[k]) || stages.slice(0, k).some(decodesBase64)) continue;
+    const payload = literalOutput(stages[k - 1]);
+    derived.push(...(payload === undefined ? [[DYNAMIC]] : interpretAs(apps[k], payload)));
   }
   // Fetching a script and piping it into an interpreter runs code this guard never sees.
   if (stages.length > 1 && FETCHER.test(apps[0]) && apps.slice(1).some(app => INTERPRETER.test(app))) derived.push([DYNAMIC]);
@@ -177,9 +198,9 @@ function substitutionOutput(pipelines: string[][][]): string | undefined {
 }
 
 /** Shell words grouped into pipelines, not a prose scan: separators outside quotes introduce invocations. */
-function parseScript(source: string): { commands: string[][]; pipelines: string[][][] } {
+function parseScript(source: string, depth = 0): { commands: string[][]; pipelines: string[][][] } {
   // $IFS expands to a separator at runtime, so resolving it keeps `rm${IFS}-rf${IFS}/` a real invocation.
-  const command = source.replace(/\$\{IFS\}/g, " ").replace(/\$IFS(?!\w)/g, " ");
+  const command = stripUnexecutable(source).replace(/\$\{IFS\}/g, " ").replace(/\$IFS(?!\w)/g, " ");
   const pipelines: string[][][] = [], derived: string[][] = [], words: string[] = [];
   const heredocs: { delimiter: string; quoted: boolean; stripTabs: boolean; owner: string[] }[] = [];
   let pipeline: string[][] = [], word = "", quote = "", started = false;
@@ -200,7 +221,8 @@ function parseScript(source: string): { commands: string[][]; pipelines: string[
         if (!backtick && command[end] === "(") nesting++;
         if (!backtick && command[end] === ")" && --nesting === 0) break;
       }
-      const inner = parseScript(command.slice(start, end));
+      // Nesting this deep is no command anyone wrote; stop recursing and let the word stay unresolved.
+      const inner = depth >= 32 ? { commands: [[DYNAMIC]], pipelines: [] as string[][][] } : parseScript(command.slice(start, end), depth + 1);
       derived.push(...inner.commands);
       // The substitution's output becomes part of the surrounding word; unprovable output stays dynamic.
       word += substitutionOutput(inner.pipelines) ?? DYNAMIC;
@@ -251,7 +273,7 @@ function parseScript(source: string): { commands: string[][]; pipelines: string[
         if (pipeline.some(stage => INTERPRETER.test(executable(stage[0] ?? "")) && stage.slice(1).some((arg, k) => /^(-[a-z]*c[a-z]*|--eval|--command)$/.test(arg) && stage[k + 2] !== undefined))) continue;
         const consumer = pipeline.map(stage => executable(stage[0] ?? "")).find(app => INTERPRETER.test(app)) ?? executable(document.owner[0] ?? "");
         if (INTERPRETER.test(consumer)) derived.push(...interpretAs(consumer, body));
-        else if (!document.quoted) derived.push(...parseScript(`echo "${body.replace(/"/g, '\\"')}"`).commands);
+        else if (!document.quoted) derived.push(...parseScript(`echo "${body.replace(/"/g, '\\"')}"`, depth + 1).commands);
       }
       continue;
     }
@@ -817,43 +839,50 @@ export class DangerousToolGuard {
     const cwd = String(input.cwd ?? context.cwd ?? process.cwd());
     let category: string | undefined;
     let commands: string[][] = [], unresolved = false;
-    if (toolName === "bash") {
-      commands = shellCommands(String(input.command ?? ""));
-      category = selectCategory(commands.map(c => commandCategory(c, cwd)));
-    } else if (toolName === "launch" && input.op === "start") {
-      commands = [[String(input.application ?? ""), ...(Array.isArray(input.args) ? input.args.map(String) : [])]];
-      category = commandCategory(commands[0], cwd);
-    } else if (toolName === "launch" && input.op === "send") {
-      // Text typed into a live process is a command line as soon as that process is a shell.
-      commands = shellCommands(String(input.text ?? ""));
-      category = selectCategory(commands.map(c => commandCategory(c, cwd)));
-    } else if (toolName === "eval" || (toolName === "browser" && input.action === "run")) {
-      // Browser automation code runs in the harness process with full Node access, like an eval payload.
-      const result = evalCommands(String(input.code ?? ""), toolName === "eval" ? String(input.language ?? "js") : "js", shellCommands);
-      commands = result.commands;
-      unresolved = result.unresolved;
-      category = selectCategory(result.commands.map(c => commandCategory(c, cwd)));
-    } else if (toolName === "write") {
-      // Creating a file clobbers its path, whichever tool performs the write.
-      commands = [["tee", String(input.path ?? "")]];
-      category = commandCategory(commands[0], cwd);
-    } else if (toolName === "edit" || toolName === "ast_edit") {
-      const targets = toolName === "edit" ? editTargets(String(input.input ?? "")) : extractAllStrings(input.paths);
-      commands = targets.map(target => ["tee", target]);
-      category = selectCategory(commands.map(c => commandCategory(c, cwd)));
-    } else if (toolName === "ssh") {
-      // The remote filesystem is not this project's tree, but a system root, a protected ref and
-      // production mean the same thing on either side of the connection.
-      commands = shellCommands(String(input.command ?? ""));
-      category = selectCategory([
-        PRODUCTION.test(`${input.host ?? ""} ${input.hostname ?? ""}`) ? "production_exclusion" : undefined,
-        ...commands.map(c => commandCategory(c, cwd)),
-      ]);
+    try {
+      if (toolName === "bash") {
+        commands = shellCommands(String(input.command ?? ""));
+        category = selectCategory(commands.map(c => commandCategory(c, cwd)));
+      } else if (toolName === "launch" && input.op === "start") {
+        commands = [[String(input.application ?? ""), ...(Array.isArray(input.args) ? input.args.map(String) : [])]];
+        category = commandCategory(commands[0], cwd);
+      } else if (toolName === "launch" && input.op === "send") {
+        // Text typed into a live process is a command line as soon as that process is a shell.
+        commands = shellCommands(String(input.text ?? ""));
+        category = selectCategory(commands.map(c => commandCategory(c, cwd)));
+      } else if (toolName === "eval" || (toolName === "browser" && input.action === "run")) {
+        // Browser automation code runs in the harness process with full Node access, like an eval payload.
+        const result = evalCommands(String(input.code ?? ""), toolName === "eval" ? String(input.language ?? "js") : "js", shellCommands);
+        commands = result.commands;
+        unresolved = result.unresolved;
+        category = selectCategory(result.commands.map(c => commandCategory(c, cwd)));
+      } else if (toolName === "write") {
+        // Creating a file clobbers its path, whichever tool performs the write.
+        commands = [["tee", String(input.path ?? "")]];
+        category = commandCategory(commands[0], cwd);
+      } else if (toolName === "edit" || toolName === "ast_edit") {
+        const targets = toolName === "edit" ? editTargets(String(input.input ?? "")) : extractAllStrings(input.paths);
+        commands = targets.map(target => ["tee", target]);
+        category = selectCategory(commands.map(c => commandCategory(c, cwd)));
+      } else if (toolName === "ssh") {
+        // The remote filesystem is not this project's tree, but a system root, a protected ref and
+        // production mean the same thing on either side of the connection.
+        commands = shellCommands(String(input.command ?? ""));
+        category = selectCategory([
+          PRODUCTION.test(`${input.host ?? ""} ${input.hostname ?? ""}`) ? "production_exclusion" : undefined,
+          ...commands.map(c => commandCategory(c, cwd)),
+        ]);
+      }
+      // A substitution feeding an argument is data; only an unresolvable program name or eval payload is dynamic code.
+      if (category !== "production_exclusion" && protectedPath(input)) category = "secrets";
+      // Code the lexer cannot resolve is approval-gated; silently allowing it is the bypass it was meant to stop.
+      if (!category && unresolved) category = DYNAMIC_CATEGORY;
+    } catch {
+      // Input pathological enough to break the parser (stack exhaustion, hostile getters) is never
+      // classified as safe: an unreadable command is exactly the one that must reach the operator.
+      category = category ?? DYNAMIC_CATEGORY;
+      unresolved = true;
     }
-    // A substitution feeding an argument is data; only an unresolvable program name or eval payload is dynamic code.
-    if (category !== "production_exclusion" && protectedPath(input)) category = "secrets";
-    // Code the lexer cannot resolve is approval-gated; silently allowing it is the bypass it was meant to stop.
-    if (!category && unresolved) category = DYNAMIC_CATEGORY;
     if (!category) return { allowed: true };
     commands = commands.map(words => words.map(word => word.split(DYNAMIC).join("<dynamic>")));
     if (category === "production_exclusion") return { allowed: false, category, reason: "Production is excluded for every transport; an approval cannot override this boundary." };

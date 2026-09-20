@@ -1185,6 +1185,60 @@ const SWEEP_CASES: SweepCase[] = [
   { id: "T22", label: "read the project source", want: "allow", tool: "read", input: { path: "./src/index.ts" } },
   { id: "T23", label: "ast_edit across /etc", want: "block", tool: "ast_edit", input: { ops: [{ pat: "$A", out: "" }], paths: ["/etc/**/*.conf"] } },
   { id: "T24", label: "ast_edit across the tree", want: "allow", tool: "ast_edit", input: { ops: [{ pat: "old($$$A)", out: "next($$$A)" }], paths: ["src/**/*.ts"] } },
+  // Robustness: hostile input sizes and shapes must gate, never throw out of the guard and never stall it.
+  { id: "U01", label: "deletion after 200k of padding", want: "block", tool: "bash", input: { command: "echo " + "a".repeat(200_000) + "; rm -rf /" } },
+  { id: "U02", label: "deletion after 50k quoted words", want: "block", tool: "bash", input: { command: "echo " + "'x' ".repeat(50_000) + "; rm -rf /" } },
+  { id: "U03", label: "10k unclosed quotes", want: "block", tool: "bash", input: { command: "rm -rf / " + "'".repeat(10_000) } },
+  { id: "U04", label: "5k nested command substitutions", want: "block", tool: "bash", input: { command: "$(".repeat(5_000) + "rm -rf /" + ")".repeat(5_000) } },
+  { id: "U05", label: "5k nested subshells", want: "block", tool: "bash", input: { command: "(".repeat(5_000) + "rm -rf /" + ")".repeat(5_000) } },
+  { id: "U06", label: "100k statements then a deletion", want: "block", tool: "bash", input: { command: "true; ".repeat(100_000) + "rm -rf /" } },
+  { id: "U07", label: "200k nesting levels exhausting the parser", want: "block", tool: "bash", input: { command: "$(".repeat(200_000) + "rm -rf /" + ")".repeat(200_000) } },
+  { id: "U08", label: "10k pipeline stages into a shell", want: "block", tool: "bash", input: { command: "echo 'rm -rf /'" + " | cat".repeat(10_000) + " | sh" } },
+  { id: "U09", label: "200k-char single word", want: "block", tool: "bash", input: { command: "rm -rf /" + "a".repeat(200_000) } },
+  { id: "U10", label: "deep backslash escaping", want: "block", tool: "bash", input: { command: "\\".repeat(20_000) + "rm -rf /" } },
+  { id: "U11", label: "12 nested evals around a deletion", want: "block", tool: "eval", input: { language: "js", code: Array.from({ length: 12 }).reduce<string>(code => `eval(${JSON.stringify(code)})`, "require('child_process').execSync('rm -rf /')") } },
+  { id: "U12", label: "5k concatenation terms", want: "block", tool: "eval", input: { language: "js", code: "require('child_process').execSync(" + Array.from({ length: 5_000 }, () => "''").join(" + ") + " + 'rm -rf /')" } },
+  { id: "U13", label: "10k member chain", want: "block", tool: "eval", input: { language: "js", code: "a" + ".b".repeat(10_000) + ".execSync('rm -rf /')" } },
+  { id: "U14", label: "200k-char base64 payload", want: "block", tool: "eval", input: { language: "js", code: `require('child_process').execSync(atob('${Buffer.from("rm -rf /" + " ".repeat(150_000)).toString("base64")}'))` } },
+  { id: "U15", label: "5k nested arrays", want: "block", tool: "eval", input: { language: "js", code: "require('child_process').spawn(" + "[".repeat(5_000) + "]".repeat(5_000) + ")" } },
+  { id: "U16", label: "unterminated template literal", want: "block", tool: "eval", input: { language: "js", code: "Bun.$`rm -rf /" } },
+  { id: "U17", label: "10k-deep object literal", want: "block", tool: "eval", input: { language: "js", code: "tool.bash({ command: " + "{ a: ".repeat(5_000) + "1" + " }".repeat(5_000) + " })" } },
+  { id: "U18", label: "100k-char secret path", want: "block", tool: "read", input: { path: "/x".repeat(50_000) + "/id_rsa" } },
+  { id: "U20", label: "empty and missing fields", want: "allow", tool: "bash", input: {} },
+  { id: "U21", label: "null bytes around the command", want: "block", tool: "bash", input: { command: "\u0000rm -rf /\u0000" } },
+  { id: "U22", label: "lone surrogates", want: "block", tool: "bash", input: { command: "\ud800rm -rf /\udfff" } },
+  { id: "U23", label: "in-tree deletion under a 20k-char cwd", want: "allow", tool: "bash", input: { command: "rm -rf ./dist" } },
+  { id: "U24", label: "non-string input types", want: "block", tool: "bash", input: { command: { toString: () => "rm -rf /" } as unknown as string } },
+
+  // An interpreter fed its program on stdin runs the upstream text; one handed a script only reads data.
+  { id: "V01", label: "echo a deletion into sh", want: "block", tool: "bash", input: { command: "echo 'rm -rf /' | sh" } },
+  { id: "V02", label: "printf a deletion into bash", want: "block", tool: "bash", input: { command: "printf 'rm -rf /\\n' | bash" } },
+  { id: "V03", label: "echo into bash -s", want: "block", tool: "bash", input: { command: "echo 'rm -rf /' | bash -s" } },
+  { id: "V04", label: "echo into bash explicit stdin", want: "block", tool: "bash", input: { command: "echo 'rm -rf /' | bash -" } },
+  { id: "V05", label: "echo python into python3 -", want: "block", tool: "bash", input: { command: "echo \"import os; os.system('rm -rf /')\" | python3 -" } },
+  { id: "V06", label: "echo node code into node", want: "block", tool: "bash", input: { command: "echo \"require('child_process').execSync('rm -rf /')\" | node" } },
+  { id: "V07", label: "echo into zsh via cat relay", want: "block", tool: "bash", input: { command: "echo 'rm -rf /' | cat | zsh" } },
+  { id: "V08", label: "unknown file into sh", want: "block", tool: "bash", input: { command: "cat bootstrap.sh | sh" } },
+  { id: "V09", label: "echo into powershell stdin", want: "block", tool: "bash", input: { command: "echo 'Remove-Item -Recurse -Force C:/' | powershell -" } },
+  { id: "V10", label: "echo a force push into sh", want: "block", tool: "bash", input: { command: "echo 'git push --force origin main' | sh" } },
+  { id: "V11", label: "echo a prod deploy into bash", want: "block", tool: "bash", input: { command: "echo 'dokploy deploy akamai-iad-prod' | bash" } },
+  { id: "V12", label: "echo DDL into bash via psql", want: "block", tool: "bash", input: { command: "echo \"psql -c 'drop table orders'\" | bash" } },
+  { id: "V13", label: "echo a secret read into sh", want: "block", tool: "bash", input: { command: "echo 'cat ~/.ssh/id_rsa' | sh" } },
+  { id: "V14", label: "deletion through two shells", want: "block", tool: "bash", input: { command: "echo 'rm -rf /' | sh | sh" } },
+  { id: "V15", label: "scheduled deletion on stdin", want: "block", tool: "bash", input: { command: "echo 'rm -rf /' | at now + 1 minute" } },
+  { id: "V16", label: "json data into a python script", want: "allow", tool: "bash", input: { command: "cat data.json | python3 scripts/process.py" } },
+  { id: "V17", label: "log data into a node script", want: "allow", tool: "bash", input: { command: "cat access.log | node tools/report.js" } },
+  { id: "V18", label: "data into python -c that only prints", want: "allow", tool: "bash", input: { command: "cat access.log | python3 -c 'import sys; print(len(sys.stdin.read()))'" } },
+  { id: "V19", label: "data into node -e that only prints", want: "allow", tool: "bash", input: { command: "npm ls --json | node -e 'process.stdin.on(\"data\", d => console.log(d.length))'" } },
+  { id: "V20", label: "harmless literal into sh", want: "allow", tool: "bash", input: { command: "echo 'ls -la' | sh" } },
+  { id: "V21", label: "harmless literal into node", want: "allow", tool: "bash", input: { command: "echo 'console.log(1)' | node" } },
+  { id: "V22", label: "ordinary text pipeline", want: "allow", tool: "bash", input: { command: "git log --oneline | head -20" } },
+  { id: "V23", label: "curl into jq", want: "allow", tool: "bash", input: { command: "curl -s https://api.example.com/items | jq '.[] | .id'" } },
+  { id: "V24", label: "sort into uniq", want: "allow", tool: "bash", input: { command: "sort names.txt | uniq -c | sort -rn" } },
+  { id: "V25", label: "test output into a bash script", want: "allow", tool: "bash", input: { command: "bun test 2>&1 | bash scripts/summarize.sh" } },
+  { id: "V26", label: "prose mentioning a pipe into sh", want: "allow", tool: "bash", input: { command: "echo 'the docs say: pipe the installer into sh'" } },
+  { id: "V27", label: "ruby script reading stdin data", want: "allow", tool: "bash", input: { command: "cat items.csv | ruby tools/import.rb" } },
+  { id: "V28", label: "perl one-liner filter", want: "allow", tool: "bash", input: { command: "cat build.log | perl -pe 's/\\x1b\\[[0-9;]*m//g'" } },
 ];
 
 describe("Issue #97: Table-driven audit of guard-eval.ts and guard.ts", () => {
@@ -1221,7 +1275,8 @@ describe("Issue #97: Table-driven audit of guard-eval.ts and guard.ts", () => {
       B: "reviewer sweep", R: "reviewer sweep", A: "reviewer sweep", E: "reviewer sweep", G: "guard.ts surfaces",
       C: "reviewer round 2", D: "reviewer round 2", H: "fix-lane probes", I: "fix-lane probes",
       J: "reviewer round 3", K: "exec family", L: "spelling sweep", M: "everyday commands", N: "HTTP verbs and launchers",
-      S: "eval executors and file sinks", T: "tool surfaces beside bash",
+      S: "eval executors and file sinks", T: "tool surfaces beside bash", U: "robustness and parser limits",
+      V: "interpreters fed on stdin",
     };
     const batches = new Map<string, SweepCase[]>();
     for (const testCase of SWEEP_CASES) {
@@ -1234,7 +1289,8 @@ describe("Issue #97: Table-driven audit of guard-eval.ts and guard.ts", () => {
           guard.evaluateToolCall(testCase.tool, { ...testCase.input, cwd: SWEEP_CWD }).allowed !== (testCase.want === "allow"))
           .map(testCase => `${testCase.id} ${testCase.label} (wanted ${testCase.want})`);
         expect(mismatches).toEqual([]);
-      });
+      // The robustness group feeds in several megabytes on purpose, which outlasts the 5s default.
+      }, 30_000);
     }
   });
 });

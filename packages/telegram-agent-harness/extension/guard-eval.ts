@@ -25,7 +25,15 @@ export function decodeBase64(raw: string): string {
   }
 }
 
-function tokenize(code: string, language: string): Token[] {
+/** Bytes no command line can carry: a NUL truncates the argument it sits in before any shell sees the
+ * rest, and an unpaired surrogate cannot be encoded at all. Removing them stops a payload from hiding
+ * behind one, and stops attacker text from forging this parser's own NUL-prefixed dynamic marker. */
+export function stripUnexecutable(source: string): string {
+  return source.replace(/\u0000/g, "").replace(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g, "");
+}
+
+function tokenize(source: string, language: string): Token[] {
+  const code = stripUnexecutable(source);
   const tokens: Token[] = [];
   for (let i = 0; i < code.length;) {
     const c = code[i];
