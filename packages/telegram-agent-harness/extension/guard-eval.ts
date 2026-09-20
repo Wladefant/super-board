@@ -287,6 +287,16 @@ export function evalCommands(code: string, language: string, parseShell: (comman
       if (rest.length) append(rest); else unresolved = true;
       continue;
     }
+    // `Deno.run({ cmd: [...] })` and `new Deno.Command(name, { args: [...] })` spawn like the Node pair.
+    if (call === "Deno.run" || call === "Deno.Command") {
+      if (typeof value === "string") {
+        const options = tokens[argument.end]?.value === "," ? valueAt(argument.end + 1).value : undefined;
+        const extra = options && typeof options === "object" && !Array.isArray(options) ? options.args : undefined;
+        append(Array.isArray(extra) && extra.every(item => typeof item === "string") ? [value, ...(extra as string[])] : [value]);
+      } else if (value && typeof value === "object" && !Array.isArray(value)) append(value.cmd);
+      else unresolved = true;
+      continue;
+    }
     if (/^(os\.(system|popen)|subprocess\.(run|call|check_call|check_output|Popen)|.*\.(execSync|execFileSync|execFile|spawn|spawnSync|execa|execaSync|execaCommand|execaCommandSync)|execSync|execFileSync|execFile|spawn|spawnSync|Popen|system|popen|check_call|check_output|execa|execaSync|execaCommand|execaCommandSync)$/.test(call) ||
         /^(child_process|cp|childProcess)\.exec$/.test(call) || call === "subprocess.run" || call === "subprocess.call") {
       if (/^(execFile|execFileSync|spawn|spawnSync|execa|execaSync)$/.test(leaf)) {

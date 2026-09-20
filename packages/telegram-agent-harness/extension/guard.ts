@@ -74,9 +74,11 @@ function extractAllStrings(val: unknown, depth = 0): string[] {
 }
 
 // Every dotted .env variant holds real values; the committed template variants hold placeholders.
-const SECRET_PATH = /(?:^|[/\\])\.env(?:\.(?!(?:example|sample|template|dist|defaults|schema)\b)[\w-]+)*$|\b(id_(rsa|dsa|ecdsa|ed25519)|service_role|jwt_secret|agent\.db)\b|\.(pem|p12|pfx)$|(?:^|[/\\])credentials(\.json)?$|(?:^|[/\\])\.(npmrc|netrc)$|(?:^|[/\\])proc[/\\][^/\\]+[/\\]environ$/i;
+const SECRET_PATH = /(?:^|[/\\])\.env(?:\.(?!(?:example|sample|template|dist|defaults|schema)\b)[\w-]+)*$|\b(id_(rsa|dsa|ecdsa|ed25519)|service_role|jwt_secret|agent\.db)\b|\.(pem|p12|pfx|key|keystore|jks|ppk)$|(?:^|[/\\])credentials(\.json)?$|(?:^|[/\\])\.(npmrc|netrc|pgpass|git-credentials|pypirc)$|(?:^|[/\\])\.kube[/\\]config$|(?:^|[/\\])\.docker[/\\]config\.json$|(?:^|[/\\])\.gnupg[/\\]|(?:^|[/\\])secrets?\.(json|ya?ml|toml)$|(?:^|[/\\])terraform\.tfstate$|(?:^|[/\\])proc[/\\][^/\\]+[/\\]environ$/i;
 const PROTECTED = /^(main|master|staging|production|prod)$/i;
 const PRODUCTION = /(?:\bzaraprptkegxqpvnsubu\b|\bakamai-iad-prod\b)/i;
+// The directories whose contents are the machine itself, wherever that machine is.
+const SYSTEM_PATH = /^(?:\/(?:etc|bin|sbin|boot|lib|lib64|sys|proc|usr(?:\/(?:bin|sbin|lib|local\/bin))?|var\/(?:spool|lib|www))(?:\/|$)|[A-Za-z]:[\\/](?:windows|program files))/i;
 const LOCAL_CONTEXT: ApprovalContext = { sessionId: "local", requester: "Local operator", task: "Local guarded operation", cwd: process.cwd() };
 export function computeApprovalHash(category: string, content: string): string {
   return createHash("sha256").update(`${category}:${content.trim()}`).digest("hex");
@@ -88,13 +90,47 @@ export function approveOperation(stateDir: string, token: string, actor: Approva
 
 /** A word whose runtime value the lexer cannot prove: substitution output, dynamic construction. */
 export const DYNAMIC = "\u0000dynamic";
-const INTERPRETER = /^(sh|bash|zsh|ksh|dash|ash|cmd|powershell|pwsh|python[\d.]*|py|node|bun|deno|perl|ruby|php|osascript)$/;
+const INTERPRETER = /^(sh|bash|zsh|ksh|dash|ash|cmd|powershell|pwsh|python[\d.]*|py|node|bun|deno|perl|ruby|php|osascript|rscript|r)$/;
 const FETCHER = /^(curl|wget|http|httpie|invoke-webrequest|iwr)$/;
 
 function interpretAs(app: string, body: string): string[][] {
-  if (/^(python[\d.]*|py)$/.test(app)) return evalCommands(body, "py", shellCommands).commands;
-  if (/^(node|bun|deno)$/.test(app)) return evalCommands(body, "js", shellCommands).commands;
-  return shellCommands(body);
+  return interpretCode(app, body).commands;
+}
+/** What an interpreter body finally runs: a call-site lex for a code language, a shell parse for a shell. */
+function interpretCode(app: string, body: string): { commands: string[][]; unresolved: boolean } {
+  if (/^(python[\d.]*|py)$/.test(app)) return evalCommands(body, "py", shellCommands);
+  if (/^(node|bun|deno)$/.test(app)) return evalCommands(body, "js", shellCommands);
+  // AppleScript reaches a shell only through `do shell script`.
+  if (app === "osascript") {
+    const commands: string[][] = [];
+    for (const match of body.matchAll(/do\s+shell\s+script\s+(?:"((?:[^"\\]|\\.)*)"|'([^']*)')/gi)) {
+      commands.push(...shellCommands((match[1] ?? match[2]).replace(/\\([\s\S])/g, "$1")));
+    }
+    return { commands, unresolved: false };
+  }
+  // Perl, Ruby, PHP, R and awk spell a shell escape as a call — `system(...)`, `exec(...)` — or as backticks.
+  if (/^(perl|ruby|php|rscript|r|awk|gawk|mawk|nawk)$/.test(app)) {
+    const lexed = evalCommands(body, "js", shellCommands), commands = [...lexed.commands];
+    if (!/^(awk|gawk|mawk|nawk)$/.test(app)) {
+      for (const match of body.matchAll(/`([^`]*)`|\bqx[{([]([^)}\]]*)[)}\]]/g)) commands.push(...shellCommands(match[1] ?? match[2]));
+    }
+    return { commands, unresolved: lexed.unresolved };
+  }
+  return { commands: shellCommands(body), unresolved: false };
+}
+/** `find / … | xargs rm -rf` deletes whatever the upstream stage enumerates: those paths are the operands. */
+function pipedOperands(stages: string[][]): string[][] {
+  const derived: string[][] = [];
+  for (let k = 1; k < stages.length; k++) {
+    if (executable(stages[k][0] ?? "") !== "xargs") continue;
+    const producer = stages[k - 1], app = executable(producer[0] ?? ""), operands = producer.slice(1);
+    const flag = operands.findIndex(arg => arg.startsWith("-"));
+    const roots = app === "find"
+      ? operands.slice(0, flag < 0 ? operands.length : flag)
+      : /^(ls|locate|echo|printf|cat|grep|rg)$/.test(app) ? operands.filter(arg => !arg.startsWith("-")) : [];
+    if (roots.length) derived.push([...stages[k], ...roots]);
+  }
+  return derived;
 }
 /** A stage that turns an operand back into executable text: `base64 -d`, `openssl enc -d -a`, `certutil -decode`. */
 function decodesBase64(words: string[]): boolean {
@@ -250,7 +286,7 @@ function parseScript(source: string): { commands: string[][]; pipelines: string[
   }
 
   const commands: string[][] = [];
-  for (const stages of pipelines) commands.push(...decodePipeline(stages), ...stages);
+  for (const stages of pipelines) commands.push(...decodePipeline(stages), ...pipedOperands(stages), ...stages);
   commands.push(...derived);
   return { commands, pipelines };
 }
@@ -293,6 +329,12 @@ export function isDestructiveRmTarget(operand: string, cwd: string): boolean {
     }
   }
   return false;
+}
+/** The path inside a `[user@]host:path` transfer spec; a drive letter and a URL scheme are local syntax. */
+function remotePath(target: string): string | undefined {
+  if (/^[a-z][a-z\d+.-]*:\/\//i.test(target)) return undefined;
+  const spec = /^(?:[\w.-]+@)?[\w.-]{2,}:([\s\S]*)$/.exec(target);
+  return spec ? spec[1] : undefined;
 }
 
 /** PowerShell accepts any unambiguous leading prefix of a parameter name, so `-e` is `-EncodedCommand`. */
@@ -404,6 +446,14 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
   // A real process may read keys regardless of the transport. Never inspect source-file contents.
   if (!readOnlyLocal && PRODUCTION.test(command)) return "production_exclusion";
   if (args.some(arg => SECRET_PATH.test(arg))) return "secrets";
+  // A secret manager hands out the same material the file holds, so reading it out is the same disclosure.
+  if (app === "gh" && args[0] === "auth" && args[1] === "token") return "secrets";
+  if (/^(vault|op|doppler|infisical)$/.test(app) && /^(read|get|kv|item|secrets|export)$/.test(args[0] ?? "")) return "secrets";
+  if (app === "aws" && (args[0] === "secretsmanager" && /^(get-secret-value|list-secrets)$/.test(args[1] ?? "")
+    || args[0] === "ssm" && args.includes("--with-decryption"))) return "secrets";
+  if (app === "kubectl" && /^(get|describe)$/.test(args[0] ?? "") && /^secrets?$/.test(args[1] ?? "")) return "secrets";
+  if (/^(fly|flyctl|wrangler|heroku|railway|vercel)$/.test(app)
+    && /^(secrets?|config)$/.test(args[0] ?? "") && /^(list|get|reveal|pull)$/.test(args[1] ?? "")) return "secrets";
   if (/^(sh|bash|zsh|ksh|dash|ash|cmd|powershell|pwsh)$/.test(app)) {
     const found: (string | undefined)[] = [];
     if (/^(powershell|pwsh)$/.test(app)) {
@@ -420,12 +470,31 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
     if (script >= 0) found.push(inspect(args.slice(script + 1).join(" ").replace(/^(&\s*)?\{|\}$/g, "").trim()) ?? (args[script + 1] === undefined ? DYNAMIC_CATEGORY : undefined));
     if (found.length) return selectCategory(found);
   }
-  if (/^(python[\d.]*|py|node|bun|deno|perl|ruby|php|osascript)$/.test(app)) {
-    const idx = args.findIndex(arg => /^(-c|-e|--eval|--exec)$/.test(arg) || /^(-c|-e|--eval)=/.test(arg));
+  // Each interpreter spells "run this string" its own way: -c, -e/-E, -p/--print, -r, deno's `eval`
+  // subcommand, and awk's program operand. Missing the spelling is missing the execution.
+  if (/^(python[\d.]*|py|node|bun|deno|perl|ruby|php|osascript|rscript|r|awk|gawk|mawk|nawk)$/.test(app)) {
+    const inlineFlag = /^(python[\d.]*|py)$/.test(app) ? /^(-c|--command)$/
+      : app === "php" ? /^(-r|--run)$/
+        : /^(node|bun)$/.test(app) ? /^(-e|-p|--eval|--print)$/
+          : /^(-e|-E|--eval|--exec)$/;
+    const idx = args.findIndex(arg => inlineFlag.test(arg) || inlineFlag.test(arg.replace(/=[\s\S]*$/, "")));
+    let payload: string | undefined, inlined = idx >= 0;
     if (idx >= 0) {
-      const inline = /^(?:-c|-e|--eval)=([\s\S]*)$/.exec(args[idx]);
-      const result = evalCommands(inline ? inline[1] : args[idx + 1] ?? "", /^(python[\d.]*|py)$/.test(app) ? "py" : "js", shellCommands);
-      return selectCategory([...result.commands.map(inner => commandCategory(inner, cwd, depth + 1)), result.unresolved ? DYNAMIC_CATEGORY : undefined]);
+      const assigned = /^[^=]+=([\s\S]*)$/.exec(args[idx]);
+      payload = assigned && !inlineFlag.test(args[idx]) ? assigned[1] : args[idx + 1];
+    } else if (app === "deno" && args[0] === "eval") {
+      inlined = true;
+      payload = args.slice(1).find(arg => !arg.startsWith("-"));
+    } else if (/^(awk|gawk|mawk|nawk)$/.test(app) && !args.some(arg => /^(-f|--file)/.test(arg))) {
+      // awk's first operand is its program; everything after it is data.
+      payload = args.find((arg, k) => !arg.startsWith("-") && !/^(-v|--assign|-F|--field-separator)$/.test(args[k - 1] ?? ""));
+      inlined = payload !== undefined;
+    }
+    if (inlined) {
+      if (payload === undefined) return DYNAMIC_CATEGORY;
+      const result = interpretCode(app, payload);
+      const category = selectCategory([...result.commands.map(inner => commandCategory(inner, cwd, depth + 1)), result.unresolved ? DYNAMIC_CATEGORY : undefined]);
+      if (category) return category;
     }
   }
   if (app === "ssh" || app === "plink") {
@@ -468,7 +537,7 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
   }
   if (app === "tee") written.push(...operands);
   // The final operand of a copying or linking command is the destination it clobbers.
-  if (/^(cp|mv|install|rsync|ln|copy|move|xcopy|robocopy)$/.test(app)) {
+  if (/^(cp|mv|install|rsync|ln|copy|move|xcopy|robocopy|scp|sftp)$/.test(app)) {
     // `-t DIR` names the destination and turns every operand into a source; otherwise the last operand is it.
     const flagged = args.findIndex(arg => /^(-t|--target-directory)$/.test(arg));
     const inline = args.find(arg => arg.startsWith("--target-directory="));
@@ -480,8 +549,13 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
     const scripted = args.some(arg => /^(-e|--expression|-f|--file)/.test(arg));
     written.push(...operands.slice(scripted ? 0 : 1));
   }
-  if (written.some(target => isDestructiveRmTarget(target, cwd))) return "shell_destructive_os";
-  if (app === "find" && (args.includes("-delete") || args.some((arg, k) => arg === "-exec" && /^(rm|unlink|shred)$/.test(executable(args[k + 1] ?? ""))))) {
+  // Uploading into a remote /tmp is ordinary transfer; writing a remote system path is privileged persistence.
+  if (written.some(target => {
+    const remote = remotePath(target);
+    return remote === undefined ? isDestructiveRmTarget(target, cwd) : SYSTEM_PATH.test(remote);
+  })) return "shell_destructive_os";
+  if (app === "find" && (args.includes("-delete") || args.some((arg, k) => /^-(exec|execdir|ok|okdir)$/.test(arg)
+    && /^(rm|unlink|shred|rmdir|truncate|dd|sh|bash|zsh)$/.test(executable(args[k + 1] ?? ""))))) {
     const firstFlag = args.findIndex(arg => arg.startsWith("-"));
     if (args.slice(0, firstFlag < 0 ? args.length : firstFlag).some(root => isDestructiveRmTarget(root, cwd))) return "shell_destructive_os";
   }
@@ -501,6 +575,22 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
   if ((app === "psql" || app === "pg_restore")
     && !(args.length > 0 && args.every(arg => /^(-V|--version|-\?|--help)$/.test(arg)))) return "shared_db_ddl_dml";
   if (app === "alembic" && args.some(a => /^(upgrade|downgrade|stamp)$/.test(a))) return "shared_db_ddl_dml";
+  // A client is only the pipe: the statement is the mutation, whichever binary carries it.
+  if (/^(mysql|mariadb|sqlite3|mongo|mongosh|clickhouse-client|cockroach|duckdb|sqlcmd|osql|surreal)$/.test(app)
+    && args.some(arg => /\b(drop\s+(table|database|schema|index|view)|truncate\b|delete\s+from|alter\s+table|create\s+(table|database|schema|index)|insert\s+into|update\s+\S+\s+set|grant\s|revoke\s)/i.test(arg)
+      || /\.(drop|dropDatabase|deleteMany|deleteOne|remove|updateMany|insertMany|renameCollection)\s*\(/.test(arg))) return "shared_db_ddl_dml";
+  if (/^(redis-cli|valkey-cli)$/.test(app) && args.some(arg => /^(flushall|flushdb|shutdown)$/i.test(arg))) return "shared_db_ddl_dml";
+  // A migration runner applies DDL that never appears on the command line.
+  if (app === "prisma" && args[0] === "migrate" && /^(deploy|dev|reset|resolve)$/.test(args[1] ?? "")) return "shared_db_ddl_dml";
+  if (app === "drizzle-kit" && /^(push|migrate|drop)$/.test(args[0] ?? "")) return "shared_db_ddl_dml";
+  if (app === "knex" && /^(migrate|seed):/.test(args[0] ?? "")) return "shared_db_ddl_dml";
+  if (app === "sequelize" && /^db:/.test(args[0] ?? "")) return "shared_db_ddl_dml";
+  if (app === "typeorm" && /^(migration:(run|revert)|schema:(sync|drop))$/.test(args[0] ?? "")) return "shared_db_ddl_dml";
+  if (/^(flyway|goose|dbmate|atlas|liquibase)$/.test(app)
+    && args.some(a => /^(migrate|up|down|apply|clean|update|drop|rollback)$/.test(a))) return "shared_db_ddl_dml";
+  if (/^(rails|rake|bundle|artisan)$/.test(app)
+    && args.some(a => /^db:(migrate|drop|reset|rollback|schema:load)$/.test(a) || a === "migrate:fresh")) return "shared_db_ddl_dml";
+  if (args.includes("manage.py") && args.some(a => /^(migrate|flush|sqlflush)$/.test(a))) return "shared_db_ddl_dml";
   if (app === "supabase") {
     if (args[0] === "db" && /^(push|reset|remote|execute|dump)$/.test(args[1] ?? "")) return "shared_db_ddl_dml";
     if (args[0] === "migration" && /^(up|repair)$/.test(args[1] ?? "")) return "shared_db_ddl_dml";
@@ -519,6 +609,21 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
   if (app === "dokploy" || (args.includes("dokploy") && !/^(echo|printf|cat)$/.test(app))) return "deployments";
   if ((app === "fly" || app === "flyctl") && args.includes("deploy") && !/^(echo|printf|cat)$/.test(app)) return "deployments";
   if (app === "wrangler" && /^(deploy|publish)$/.test(args[0] ?? "")) return "deployments";
+  if (/^(vercel|now|netlify)$/.test(app)
+    && (args.some(a => /^--prod(uction)?$/.test(a)) || args[0] === "deploy")) return "deployments";
+  if (app === "kubectl"
+    && /^(apply|delete|create|replace|patch|scale|rollout|drain|cordon|uncordon|set|taint|exec)$/.test(args[0] ?? "")) return "deployments";
+  if (app === "helm" && /^(install|upgrade|uninstall|delete|rollback)$/.test(args[0] ?? "")) return "deployments";
+  if (/^(terraform|tofu)$/.test(app) && /^(apply|destroy|import)$/.test(args[0] ?? "")) return "deployments";
+  if (app === "pulumi" && /^(up|destroy|refresh)$/.test(args[0] ?? "")) return "deployments";
+  if (app === "railway" && /^(up|redeploy|down|delete)$/.test(args[0] ?? "")) return "deployments";
+  if (/^(serverless|sls)$/.test(app) && /^(deploy|remove)$/.test(args[0] ?? "")) return "deployments";
+  if (app === "ansible-playbook" || app === "capistrano") return "deployments";
+  if (app === "eb" && /^(deploy|terminate)$/.test(args[0] ?? "")) return "deployments";
+  if (app === "gcloud" && args.includes("deploy")) return "deployments";
+  if (app === "aws" && (args[0] === "ecs" && args[1] === "update-service"
+    || args[0] === "cloudformation" && /^(deploy|delete-stack|update-stack)$/.test(args[1] ?? "")
+    || args[0] === "lambda" && /^update-function-(code|configuration)$/.test(args[1] ?? ""))) return "deployments";
   if (app === "deploy" && args.some(a => /^(prod|production)$/i.test(a))) return "deployments";
   // A wrapper script names its own purpose: deploy-prod.sh never reaches the argv checks below.
   if (/deploy[\w.-]*(prod|production)|(prod|production)[\w.-]*deploy/i.test(app)) return "deployments";
@@ -543,6 +648,18 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
     && rest.filter(a => !a.startsWith("-")).some(isProtected)) return "destructive_git";
   if (action === "update-ref" && rest.some(a => /^(-d|--delete)$/.test(a))
     && rest.filter(a => !a.startsWith("-")).some(isProtected)) return "destructive_git";
+  // Renaming or resetting a branch onto a protected name destroys that branch exactly as a delete does.
+  if (action === "branch") {
+    const operands = rest.filter(a => !a.startsWith("-"));
+    const forced = rest.some(a => /^(-[a-zA-Z]*f|--force)$/.test(a));
+    const renamed = rest.some(a => /^-[a-zA-Z]*M$/.test(a)) || (forced && rest.some(a => /^-[a-zA-Z]*m$/.test(a)));
+    if (renamed && operands.length && isProtected(operands[operands.length - 1])) return "destructive_git";
+    if (forced && operands.some(isProtected)) return "destructive_git";
+  }
+  // `git worktree remove` and `git clean` delete real files, so their targets face the out-of-tree test.
+  if (action === "worktree" && rest[0] === "remove"
+    && rest.slice(1).some(p => !p.startsWith("-") && isDestructiveRmTarget(p, cwd))) return "shell_destructive_os";
+  if (action === "clean" && rest.some(p => !p.startsWith("-") && isDestructiveRmTarget(p, cwd))) return "shell_destructive_os";
   if (action === "push") {
     const isMirror = rest.some(a => a === "--mirror" || a === "--prune");
     if (isMirror) return "destructive_git";
