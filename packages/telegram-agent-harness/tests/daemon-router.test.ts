@@ -12,7 +12,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { DaemonSlot } from "../daemon/config";
-import { SlotRouter } from "../daemon/router";
+import { SlotRouter, getDaemonCommands } from "../daemon/router";
+import { renderTelegramHelp } from "../extension/command-registry";
 import {
   SessionControlUnavailableError,
   type DaemonSessionSummary,
@@ -332,5 +333,28 @@ describe("routing commands", () => {
     const broken = buildRouter({}, fakeControl([], { unavailable: true }).control);
     expect(await broken.handleCommand("/sessions", CHAT)).toBe(true);
     expect(sent.at(-1)?.html).toContain("not reachable");
+  });
+
+  test("getDaemonCommands and renderTelegramHelp provide full routing command discovery in daemon mode", () => {
+    const commands = getDaemonCommands();
+    const names = commands.map(c => c.command);
+    expect(names).toContain("app");
+    expect(names).toContain("sessions");
+    expect(names).toContain("attach");
+    expect(names).toContain("new");
+    expect(names).toContain("detach");
+    expect(names).toContain("where");
+    expect(names).toContain("status");
+    expect(names).toContain("reload");
+
+    const help = renderTelegramHelp({ isDaemon: true });
+    expect(help).toContain("Routing & Workspaces");
+    expect(help).toContain("/sessions");
+    expect(help).toContain("/attach &lt;id&gt;");
+    expect(help).toContain("/new &lt;path&gt;");
+    expect(help).toContain("/where");
+    expect(help).toContain("/detach");
+    expect(help).toContain("/app");
+    expect(help).toContain("/reload");
   });
 });

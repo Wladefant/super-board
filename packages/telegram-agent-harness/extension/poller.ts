@@ -80,6 +80,10 @@ export interface PollerOptions {
    * When omitted, defaults to the standard availableCommands(hasHarness).
    */
   commands?: readonly { command: string; description: string }[];
+  /**
+   * Whether the poller is operating in standalone daemon mode.
+   */
+  isDaemon?: boolean;
 }
 
 const DEFAULT_POLLER_OPTIONS = {
@@ -296,6 +300,9 @@ export class TelegramPoller {
       return this.accessConfig.allowFrom[0];
     }
     return null;
+  }
+  public updateAccess(config: AccessConfig): void {
+    this.accessConfig = config;
   }
   public getMeta(key: string): string | null {
     return (this.db.query("SELECT value FROM bridge_meta WHERE key = ?").get(key) as { value: string } | null)?.value ?? null;
@@ -1040,7 +1047,17 @@ export class TelegramPoller {
       throw new Error("Session changed during message routing; resend to the intended session");
     }
     if (rawText === "/help" || rawText === "/start") {
-      await this.sendTelegramMessage(chatId, renderTelegramHelp(Boolean(this.callbacks.onHarnessCommand)));
+      const isDaemon = Boolean(
+        this.options.isDaemon ||
+        this.options.commands?.some(c => c.command === "sessions" || c.command === "attach" || c.command === "app"),
+      );
+      await this.sendTelegramMessage(
+        chatId,
+        renderTelegramHelp({
+          hasHarness: Boolean(this.callbacks.onHarnessCommand),
+          isDaemon,
+        }),
+      );
       this.db.run("UPDATE update_ledger SET status = 'COMPLETED' WHERE update_id = ?", [row.update_id]);
       return;
     }

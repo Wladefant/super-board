@@ -138,3 +138,48 @@ test("command boundaries, native idle/busy delivery and release preserve the dur
     finally { db.close(); }
   } finally { poller.stop(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("renderTelegramHelp in daemon mode renders Routing & Workspaces with all routing commands", () => {
+  const help = renderTelegramHelp({ isDaemon: true, hasHarness: true });
+  expect(help).toContain("<b>Routing & Workspaces</b>");
+  expect(help).toContain("/sessions");
+  expect(help).toContain("/attach &lt;id&gt;");
+  expect(help).toContain("/new &lt;path&gt;");
+  expect(help).toContain("/where");
+  expect(help).toContain("/detach");
+  expect(help).toContain("/app");
+  expect(help).toContain("<b>Inspect</b>");
+  expect(help).toContain("/status");
+});
+
+test("renderTelegramHelp in non-daemon mode omits routing commands", () => {
+  const help = renderTelegramHelp(true);
+  expect(help).not.toContain("<b>Routing & Workspaces</b>");
+  expect(help).not.toContain("/sessions");
+  expect(help).not.toContain("/attach");
+});
+
+test("poller with isDaemon: true responds to /help with daemon routing commands", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tg-daemon-help-"));
+  const replies: string[] = [];
+  const poller = new TelegramPoller("1:test", dir, { dmPolicy: "allowlist", allowFrom: ["101"] }, {
+    isIdle: () => true, onUserMessage: () => {}, onFollowUp: () => {}, onSteer: () => {}, onAbort: () => {}, onRelease: async () => {}, getStatusText: () => "test", onTelegramTurnStart: () => {}, onLedgerFailure: () => {},
+  }, null, { isDaemon: true });
+
+  poller.sendTelegramMessage = async (_chatId, html) => {
+    replies.push(html);
+    return { ok: true, result: { message_id: 1, chat: { id: 101 } } };
+  };
+
+  try {
+    await poller.processLedgerRow({ update_id: 1, text: "/help", chat_id: "101", user_id: "101", sender_origin: "telegram_account" });
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toContain("<b>Routing & Workspaces</b>");
+    expect(replies[0]).toContain("/sessions");
+    expect(replies[0]).toContain("/attach");
+    expect(replies[0]).toContain("/app");
+  } finally {
+    poller.stop();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
