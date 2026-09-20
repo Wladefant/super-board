@@ -255,6 +255,15 @@ export function evaluateApproval(stateDir: string, operationHash: string, descri
   });
 }
 
+/** Pending requests from the existing store, restricted to the chat's bound session. */
+export function pendingApprovals(stateDir: string, sessionId: string): ApprovalRecord[] {
+  return withStore(stateDir, db => {
+    expire(db);
+    const rows = db.query("SELECT record FROM approvals WHERE session_id=? AND state='pending' ORDER BY rowid").all(sessionId) as { record: string }[];
+    return rows.map(row => JSON.parse(row.record) as ApprovalRecord);
+  });
+}
+
 export function decideApproval(stateDir: string, token: string, decision: "approved" | "denied", actor: ApprovalActor): ApprovalRecord {
   if (!/^[a-f0-9]{64}$/.test(token)) throw new Error("Use the complete 64-character approval token.");
   const result = withStore(stateDir, db => {

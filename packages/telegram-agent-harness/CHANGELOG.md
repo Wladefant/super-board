@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### Added
+- Telegram Mini App with session status, session-bound Yes/No approvals, and freshness-labelled fleet/blocker/merge-queue snapshots. The dedicated Dokploy service serves static assets and relays API calls over an authenticated outbound WebSocket from the local daemon; bot polling and approval storage stay local. Telegram launch credentials are HMAC-validated within five minutes and exchanged for an eight-hour, bot-bound app session. Slot-local `miniapp.json` holds the HTTPS URL and relay secret; `/app` and per-operator menu buttons open it. Missing sources remain explicitly unavailable; merge execution and transcript/diff views are not included.
 - Config-driven Telegram bot slot eligibility matching cwd globs (defaulting to any project) and prioritizing specific project affinity over shared pool slots.
 - Detailed slot lease busy diagnostics exposing session ID, project path, and owner PID (`ClaimResult.busyHolders` and detailed formatted reason).
 - HTTP 409 conflict bounded exponential backoff, diagnostic warning logs, and host session error notifications on Telegram poller exhaustion.

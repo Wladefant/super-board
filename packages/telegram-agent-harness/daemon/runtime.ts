@@ -37,6 +37,7 @@ import {
   type SessionEvent,
 } from "./session-control";
 import { DaemonStore } from "./store";
+import { connectMiniApp, miniAppUrl } from "./miniapp";
 
 export interface DaemonSlotReport {
   slotId: string;
@@ -83,6 +84,7 @@ interface ActiveSlot {
   router: SlotRouter;
   /** Lease identity; also what in-session pollers see as the slot holder. */
   leaseSessionId: string;
+  stopMiniApp: () => void;
 }
 
 export class TelegramDaemon {
@@ -190,7 +192,12 @@ export class TelegramDaemon {
       return this.unclaimed(slot, "bot token unreadable");
     }
 
-    const activeSlot = this.startSlot(slot, token, leaseSessionId);
+    let activeSlot: ActiveSlot;
+    try { activeSlot = this.startSlot(slot, token, leaseSessionId); }
+    catch {
+      this.coordinator.releaseLease(slot.slotId, leaseSessionId);
+      return this.unclaimed(slot, "slot startup failed");
+    }
     this.active.push(activeSlot);
     void activeSlot.poller
       .start()
@@ -211,6 +218,7 @@ export class TelegramDaemon {
     if (this.stopping) return;
     const index = this.active.findIndex(entry => entry.slot.slotId === slotId);
     if (index < 0) return;
+    this.active[index].stopMiniApp();
     this.active.splice(index, 1);
     this.coordinator.releaseLease(slotId, leaseSessionId);
     this.skipReasons.set(slotId, `poller ended: ${reason}`);
@@ -324,6 +332,15 @@ export class TelegramDaemon {
       getStatusText: () => router.statusText(currentChat()),
       onTelegramTurnStart: () => {},
       onHarnessCommand: async (text: string, chatId: string, userId?: string) => {
+        if (/^\/app(?:@\w+)?\s*$/i.test(text)) {
+          const url = miniAppUrl(slot.stateDir);
+          if (url) {
+            await poller.sendTelegramMessage(chatId, "Open your Superboard dashboard", {
+              inline_keyboard: [[{ text: "Open Superboard", web_app: { url } }]],
+            });
+          } else await poller.sendTelegramMessage(chatId, "Mini App is not configured for this bot.");
+          return true;
+        }
         if (await router.handleCommand(text, chatId)) return true;
         return handleInstalledCommand(text, {
           session: () => ({
@@ -367,7 +384,26 @@ export class TelegramDaemon {
       ? this.options.pollerFactory(token, slot.stateDir, access, callbacks, correlation, pollerOptions)
       : new TelegramPoller(token, slot.stateDir, access, callbacks, correlation, pollerOptions);
 
-    return { slot, poller, router, leaseSessionId };
+    const stopMiniApp = connectMiniApp({
+      stateDir: slot.stateDir, token, allowedUsers: access.allowFrom,
+      session: userId => router.boundSession(userId),
+      sessions: () => this.control.listSessions(),
+      status: () => ({ polling: poller.running, slot: slot.slotId }),
+      dashboard: userId => {
+        const session = router.boundSession(userId);
+        const raw = session ? poller.getMeta(`dashboard-snapshot:${session}`) : null;
+        try { return raw ? JSON.parse(raw) : null; } catch { return null; }
+      },
+    });
+    const url = miniAppUrl(slot.stateDir);
+    if (url) for (const chatId of access.allowFrom) void fetch(`https://api.telegram.org/bot${token}/setChatMenuButton`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, menu_button: { type: "web_app", text: "Superboard", web_app: { url } } }),
+    }).then(async response => {
+      const result = await response.json();
+      if (!response.ok || !result.ok) this.log(`Slot ${slot.slotId}: Mini App menu registration rejected`);
+    }).catch(() => this.log(`Slot ${slot.slotId}: Mini App menu registration unavailable`));
+    return { slot, poller, router, leaseSessionId, stopMiniApp };
   }
 
   /**
@@ -408,6 +444,7 @@ export class TelegramDaemon {
     const index = this.active.findIndex(entry => entry.slot.slotId === slotId);
     if (index < 0) return false;
     const [entry] = this.active.splice(index, 1);
+    entry.stopMiniApp();
     await entry.poller.stop();
     this.coordinator.releaseLease(entry.slot.slotId, entry.leaseSessionId);
     this.log(`Slot ${entry.slot.slotId} stopped and lease released`);
