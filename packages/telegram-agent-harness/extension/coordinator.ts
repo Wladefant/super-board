@@ -968,6 +968,7 @@ export class BotPoolCoordinator {
           correlation.createdAt,
         ],
       );
+      this.touchHeartbeat(correlation.slotId, correlation.sessionId);
       return true;
     } catch {
       return false;
@@ -1035,6 +1036,9 @@ export class BotPoolCoordinator {
         correlation,
         detail: "Correlated message belongs to a different session than the one holding this channel.",
       };
+    }
+    if (correlation.slotId && correlation.sessionId) {
+      this.touchHeartbeat(correlation.slotId, correlation.sessionId);
     }
     return {
       decision: "deliver",
@@ -1185,6 +1189,7 @@ export class BotPoolCoordinator {
 
     const timer = setInterval(() => {
       try {
+        this.ensureDbOpen();
         const now = Date.now() / 1000;
         this.db.run(
           "UPDATE bot_leases SET heartbeat_at = ? WHERE slot_id = ? AND session_id = ? AND lease_status = 'ACTIVE'",
@@ -1198,6 +1203,17 @@ export class BotPoolCoordinator {
     }
 
     this.activeHeartbeatTimers.set(slotId, timer);
+  }
+
+  public touchHeartbeat(slotId: string, sessionId: string): void {
+    try {
+      this.ensureDbOpen();
+      const now = Date.now() / 1000;
+      this.db.run(
+        "UPDATE bot_leases SET heartbeat_at = ? WHERE slot_id = ? AND session_id = ? AND lease_status = 'ACTIVE'",
+        [now, slotId, sessionId],
+      );
+    } catch {}
   }
 
   private stopHeartbeat(slotId: string): void {

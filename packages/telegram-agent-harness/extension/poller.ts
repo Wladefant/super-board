@@ -80,6 +80,10 @@ export interface PollerOptions {
    * When omitted, defaults to the standard availableCommands(hasHarness).
    */
   commands?: readonly { command: string; description: string }[];
+  /**
+   * Whether the poller is operating in standalone daemon mode.
+   */
+  isDaemon?: boolean;
 }
 
 const DEFAULT_POLLER_OPTIONS = {
@@ -296,6 +300,9 @@ export class TelegramPoller {
       return this.accessConfig.allowFrom[0];
     }
     return null;
+  }
+  public updateAccess(config: AccessConfig): void {
+    this.accessConfig = config;
   }
   public getMeta(key: string): string | null {
     return (this.db.query("SELECT value FROM bridge_meta WHERE key = ?").get(key) as { value: string } | null)?.value ?? null;
@@ -800,7 +807,8 @@ export class TelegramPoller {
     // Mark as in-flight PROCESSING
     this.db.run("UPDATE update_ledger SET status = 'PROCESSING' WHERE update_id = ?", [row.update_id]);
 
-    if ((!row.text || !row.text.trim()) && !row.media_json) {
+    const hasVisibleText = Boolean(row.text?.replace(/[\s\u2000-\u200F\u2028-\u202F\u205F-\u206F\uFEFF]/g, ""));
+    if (!hasVisibleText && !row.media_json) {
       this.db.run("UPDATE update_ledger SET status = 'REJECTED', error = 'EMPTY_TEXT' WHERE update_id = ?", [
         row.update_id,
       ]);
@@ -1039,7 +1047,17 @@ export class TelegramPoller {
       throw new Error("Session changed during message routing; resend to the intended session");
     }
     if (rawText === "/help" || rawText === "/start") {
-      await this.sendTelegramMessage(chatId, renderTelegramHelp(Boolean(this.callbacks.onHarnessCommand)));
+      const isDaemon = Boolean(
+        this.options.isDaemon ||
+        this.options.commands?.some(c => c.command === "sessions" || c.command === "attach" || c.command === "app"),
+      );
+      await this.sendTelegramMessage(
+        chatId,
+        renderTelegramHelp({
+          hasHarness: Boolean(this.callbacks.onHarnessCommand),
+          isDaemon,
+        }),
+      );
       this.db.run("UPDATE update_ledger SET status = 'COMPLETED' WHERE update_id = ?", [row.update_id]);
       return;
     }
@@ -1123,6 +1141,14 @@ export class TelegramPoller {
       }
       contextLines.push(`[Note: Free-text reply; not automatic approval or authorization.]`);
       deliveredText = `${contextLines.join("\n")}\n\n${rawText}`;
+    }
+
+    const hasVisibleBody = Boolean(rawText.replace(/[\s\u2000-\u200F\u2028-\u202F\u205F-\u206F\uFEFF]/g, ""));
+    if (!hasVisibleBody && !row.media_json) {
+      this.db.run("UPDATE update_ledger SET status = 'REJECTED', error = 'EMPTY_TEXT' WHERE update_id = ?", [
+        row.update_id,
+      ]);
+      return;
     }
 
     deliveredText = attributeSender(fromId, deliveredText);

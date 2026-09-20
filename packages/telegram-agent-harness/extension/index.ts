@@ -107,11 +107,43 @@ export function setSavedContext(ctx: ExtensionContext | null): void {
  * therefore resolves null instead of borrowing that root's question service,
  * message route or dashboard.
  */
+export interface LastKnownRoute {
+  chatId?: string;
+  slotId?: string;
+  sessionId?: string;
+  unboundAt?: number;
+  unboundReason?: string;
+}
+
+export let lastKnownRoute: LastKnownRoute | null = null;
+
+export function recordLastKnownRoute(route: Partial<LastKnownRoute>): void {
+  lastKnownRoute = { ...lastKnownRoute, ...route };
+}
+
+export function recordRouteUnbound(reason: string): void {
+  if (lastKnownRoute) {
+    lastKnownRoute.unboundReason = reason;
+    lastKnownRoute.unboundAt = Date.now();
+  } else {
+    lastKnownRoute = { unboundReason: reason, unboundAt: Date.now() };
+  }
+}
+
 export function ownedRoot(): ActiveRootState | null {
   const runtime = activeRuntime;
   if (!runtime) return null;
   const root = (globalThis as unknown as GlobalTelegramState)[ACTIVE_ROOT_SYMBOL];
-  return root && root.instanceId === runtime.instanceId ? root : null;
+  if (root && root.instanceId === runtime.instanceId) {
+    recordLastKnownRoute({
+      chatId: root.poller.getPrimaryChatId() ?? undefined,
+      slotId: root.activeSlot.slotId,
+      sessionId: root.sessionId,
+      unboundReason: undefined,
+    });
+    return root;
+  }
+  return null;
 }
 
 export async function loadRuntimeModule(
@@ -195,10 +227,17 @@ async function executeReload(opts?: ReloadOptions): Promise<ReloadResult> {
 
   if (savedContext) {
     try {
-      await newRuntime.initSession(savedContext, { isReload: true });
+      const initialized = await newRuntime.initSession(savedContext, { isReload: true });
+      if (!initialized) {
+        const errorMsg = "Failed to re-initialize Telegram session after reload: bot lease not acquired or session not eligible.";
+        currentApi?.logger?.error(`[Telegram Hot Reload] ${errorMsg}`);
+        recordRouteUnbound(errorMsg);
+        return { success: false, error: errorMsg };
+      }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       currentApi?.logger?.error(`[Telegram Hot Reload] Failed to re-initialize session: ${message}`);
+      recordRouteUnbound(`Reload failed: ${message}`);
       return { success: false, error: message };
     }
   }
@@ -244,11 +283,22 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
       options: z.array(z.object({ id: z.string(), label: z.string(), description: z.string().optional() })).optional(),
       details_url: z.string().optional(),
       wait: z.boolean().default(true),
+      timeout: z.number().optional(),
     }),
     async execute(_id, params, signal, onUpdate) {
-      const root = ownedRoot();
+      let root = ownedRoot();
+      if (!root && savedContext && activeRuntime) {
+        try {
+          await activeRuntime.initSession(savedContext, { isReload: true });
+          root = ownedRoot();
+        } catch {}
+      }
       if (!root || !root.questions) {
-        throw new Error("No active session-bound Telegram question receiver. Do not substitute a terminal question.");
+        const routeInfo = lastKnownRoute
+          ? ` (last bound to chat ${lastKnownRoute.chatId ?? "unknown"}, slot ${lastKnownRoute.slotId ?? "unknown"}, unbound: ${lastKnownRoute.unboundReason ?? "unknown"})`
+          : "";
+        currentApi?.logger?.warn(`Telegram question receiver unavailable${routeInfo}`);
+        throw new Error(`No active session-bound Telegram question receiver${routeInfo}. Call telegram_message with rebind: true to re-acquire the channel. Do not substitute a terminal question.`);
       }
       const service = root.questions;
       let question;
@@ -267,9 +317,23 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
         question = await service.get(params.id);
       }
       onUpdate?.({ content: [{ type: "text", text: `Telegram question ${question.decision_id} is ${question.status}. Silence leaves it pending.` }] });
+      const timeoutMs = (params.timeout ? Math.max(1, Math.min(300, params.timeout)) : 60) * 1000;
+      let lastProgressSec = 0;
       const result = params.action === "get" || !params.wait
         ? question
-        : await service.wait(question.decision_id, signal);
+        : await service.wait(
+            question.decision_id,
+            signal,
+            200,
+            timeoutMs,
+            elapsedMs => {
+              const elapsedSec = Math.floor(elapsedMs / 1000);
+              if (elapsedSec > 0 && elapsedSec - lastProgressSec >= 5) {
+                lastProgressSec = elapsedSec;
+                onUpdate?.({ content: [{ type: "text", text: `Waiting for Telegram answer (${question.decision_id}), ${elapsedSec}s elapsed...` }] });
+              }
+            },
+          );
       return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
     },
   });
@@ -282,10 +346,25 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
       text: z.string(),
       lane_id: z.string(),
       lane_state: z.enum(["active", "exited", "unknown"]),
+      rebind: z.boolean().optional(),
     }),
     async execute(_id, params) {
-      const root = ownedRoot();
-      if (!root) throw new Error("No active Telegram route");
+      let root = ownedRoot();
+      if ((!root || params.rebind) && savedContext && activeRuntime) {
+        try {
+          await activeRuntime.initSession(savedContext, { isReload: true });
+          root = ownedRoot();
+        } catch (err: unknown) {
+          currentApi?.logger?.warn(`Telegram rebind failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+      if (!root) {
+        const routeInfo = lastKnownRoute
+          ? ` (last bound to chat ${lastKnownRoute.chatId ?? "unknown"}, slot ${lastKnownRoute.slotId ?? "unknown"}, unbound: ${lastKnownRoute.unboundReason ?? "unknown"})`
+          : "";
+        currentApi?.logger?.warn(`Telegram route unavailable${routeInfo}`);
+        throw new Error(`No active session-bound Telegram channel${routeInfo}. Call telegram_message with rebind: true to re-acquire the channel. Do not substitute a terminal question.`);
+      }
       const chat = root.poller.getPrimaryChatId();
       if (!chat) throw new Error("No authorized Telegram recipient");
       root.messageContext?.setLaneState(root.sessionId, params.lane_id, params.lane_state);
