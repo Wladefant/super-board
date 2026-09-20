@@ -90,6 +90,8 @@ export function approveOperation(stateDir: string, token: string, actor: Approva
 
 /** A word whose runtime value the lexer cannot prove: substitution output, dynamic construction. */
 export const DYNAMIC = "\u0000dynamic";
+// An expansion the lexer could not resolve: a shell variable, a PowerShell variable, a cmd `%VAR%`.
+const UNRESOLVED_EXPANSION = /\$\{?\w|\$env:|%\w[\w()]*%/i;
 const INTERPRETER = /^(sh|bash|zsh|ksh|dash|ash|fish|cmd|powershell|pwsh|python[\d.]*|py|node|bun|deno|perl|ruby|php|osascript|rscript|r|at|batch)$/;
 const FETCHER = /^(curl|wget|http|httpie|invoke-webrequest|iwr)$/;
 
@@ -585,6 +587,8 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
       else if (arg === "--") literal = true;
     }
     if (operands.some(operand => isDestructiveRmTarget(operand, cwd))) return "shell_destructive_os";
+    // A delete whose target the lexer cannot resolve may be the root: gate it rather than guess.
+    if (operands.some(operand => operand.includes(DYNAMIC) || UNRESOLVED_EXPANSION.test(operand))) return DYNAMIC_CATEGORY;
   }
   if (app === "truncate" && args.some(arg => /^(-s|--size)/.test(arg))
     && args.filter(arg => !arg.startsWith("-")).some(operand => isDestructiveRmTarget(operand, cwd))) return "shell_destructive_os";
