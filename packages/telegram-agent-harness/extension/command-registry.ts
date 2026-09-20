@@ -7,6 +7,7 @@ export const DAEMON_ROUTING_COMMANDS = [
   { command: "new", description: "Start a new session in a workspace", group: "Routing & Workspaces", syntax: "/new <path>", harness: false },
   { command: "where", description: "Show which session this chat is bound to", group: "Routing & Workspaces", syntax: "/where", harness: false },
   { command: "detach", description: "Detach this chat from the current session", group: "Routing & Workspaces", syntax: "/detach", harness: false },
+  { command: "topics", description: "List session topics (forum mode)", group: "Routing & Workspaces", syntax: "/topics", harness: false },
   { command: "app", description: "Open the Superboard Mini App", group: "Routing & Workspaces", syntax: "/app", harness: false },
 ] as const;
 
@@ -68,19 +69,26 @@ export interface TelegramCommandItem {
   description: string;
 }
 
-/** DM-only actor gates have no group equivalent: never advertise group controls. */
+/**
+ * Registers the command menu for every allowlisted operator's private chat, and for
+ * a forum slot's own supergroup when it has one. No other group is ever registered:
+ * DM-only actor gates have no group equivalent, so a bot sitting in an arbitrary
+ * group must not advertise controls that chat cannot use.
+ */
 export async function registerTelegramCommands(
   botToken: string,
   allowedUsers: readonly string[],
   hasHarness: boolean | readonly TelegramCommandItem[] = true,
   signal?: AbortSignal,
   customCommands?: readonly TelegramCommandItem[],
+  forumChatId?: string,
 ): Promise<void> {
   const commands: readonly TelegramCommandItem[] = Array.isArray(hasHarness)
     ? hasHarness
     : (customCommands ?? availableCommands(hasHarness).map(({ command, description }) => ({ command, description })));
-  for (const chatId of new Set(allowedUsers)) {
-    if (!/^\d+$/.test(chatId)) continue;
+  const chats = [...new Set(allowedUsers)].filter(chatId => /^\d+$/.test(chatId));
+  if (forumChatId) chats.push(forumChatId);
+  for (const chatId of chats) {
     try {
       const response = await fetch(`https://api.telegram.org/bot${botToken}/setMyCommands`, {
         method: "POST",

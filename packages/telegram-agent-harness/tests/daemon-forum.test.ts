@@ -1,18 +1,15 @@
 /**
- * daemon-forum.test.ts — Unit tests for supergroup forum-topics mode in the Veyyon Telegram daemon.
+ * daemon-forum.test.ts — Supergroup forum-topics mode.
  *
- * Covers:
- * - Forum slot configuration parsing ("mode": "forum", forumChatId)
- * - Topic creation via `createForumTopic` on /new or attach
- * - Inbound message routing by `message_thread_id` to bound sessions
- * - /topics command listing active topics with turn status
- * - Topic closure on /detach, /close, or session end
- * - Outbound session event relaying into topic threads
- * - Reconciling ended sessions automatically
- * - TelegramDaemon integration with forum mode
+ * A forum slot serves one supergroup and binds a session to a topic instead of to a
+ * chat. Everything else is the machinery DM mode uses, so what is exercised here is
+ * the part that differs: which chats the poller admits, which topic an admitted
+ * message belongs to, the topic lifecycle on the Bot API, and the manifest and
+ * daemon wiring that turns a slot into a forum slot.
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -23,41 +20,27 @@ import {
   formatTopicName,
   type ForumApiClient,
   type ForumTopic,
-  type TelegramForumUpdate,
 } from "../daemon/forum";
 import { TelegramDaemon } from "../daemon/runtime";
 import {
   type DaemonSessionSummary,
   type DeliveryMode,
   type GuiHostSessionControl,
-  type SessionEvent,
 } from "../daemon/session-control";
 import { DaemonStore } from "../daemon/store";
 import { BotPoolCoordinator } from "../extension/coordinator";
+import { TelegramPoller, type PollerCallbacks } from "../extension/poller";
+import type { TelegramUpdate } from "../extension/types";
 
 class FakeForumApiClient implements ForumApiClient {
-  public topics: Map<number, { name: string; iconColor?: number; closed: boolean }> = new Map();
-  public sentMessages: Array<{
-    chatId: string | number;
-    text: string;
-    messageThreadId?: number;
-    parseMode?: string;
-  }> = [];
-  public updatesQueue: TelegramForumUpdate[] = [];
+  public topics: Map<number, { name: string; closed: boolean }> = new Map();
+  public sentMessages: Array<{ chatId: string | number; text: string; messageThreadId?: number }> = [];
   private threadCounter = 100;
 
-  public async createForumTopic(
-    chatId: string | number,
-    name: string,
-    iconColor?: number,
-  ): Promise<ForumTopic> {
+  public async createForumTopic(chatId: string | number, name: string): Promise<ForumTopic> {
     const threadId = ++this.threadCounter;
-    this.topics.set(threadId, { name, iconColor, closed: false });
-    return {
-      message_thread_id: threadId,
-      name,
-      icon_color: iconColor,
-    };
+    this.topics.set(threadId, { name, closed: false });
+    return { message_thread_id: threadId, name };
   }
 
   public async closeForumTopic(chatId: string | number, messageThreadId: number): Promise<boolean> {
@@ -77,25 +60,10 @@ class FakeForumApiClient implements ForumApiClient {
   public async sendMessage(
     chatId: string | number,
     text: string,
-    options?: {
-      message_thread_id?: number;
-      parse_mode?: string;
-      reply_markup?: Record<string, unknown>;
-    },
+    options?: { message_thread_id?: number },
   ): Promise<{ ok: boolean; result: { message_id: number } }> {
-    this.sentMessages.push({
-      chatId,
-      text,
-      messageThreadId: options?.message_thread_id,
-      parseMode: options?.parse_mode,
-    });
+    this.sentMessages.push({ chatId, text, messageThreadId: options?.message_thread_id });
     return { ok: true, result: { message_id: this.sentMessages.length } };
-  }
-
-  public async getUpdates(): Promise<{ ok: boolean; result: TelegramForumUpdate[] }> {
-    const updates = [...this.updatesQueue];
-    this.updatesQueue = [];
-    return { ok: true, result: updates };
   }
 }
 
@@ -104,7 +72,6 @@ interface FakeControl {
   sessions: DaemonSessionSummary[];
   delivered: Array<{ sessionId: string; text: string; mode: DeliveryMode }>;
   created: Array<{ workspace: string; title: string }>;
-  loaded: string[];
   busy: Set<string>;
 }
 
@@ -112,7 +79,6 @@ function fakeControl(initialSessions: DaemonSessionSummary[] = []): FakeControl 
   const sessions = [...initialSessions];
   const delivered: Array<{ sessionId: string; text: string; mode: DeliveryMode }> = [];
   const created: Array<{ workspace: string; title: string }> = [];
-  const loaded: string[] = [];
   const busy = new Set<string>();
   let counter = 0;
 
@@ -140,19 +106,18 @@ function fakeControl(initialSessions: DaemonSessionSummary[] = []): FakeControl 
       return busy.has(sessionId) ? ("steered" as const) : ("started" as const);
     },
     abort: async () => true,
-    loadTranscript: async (sessionId: string) => {
-      loaded.push(sessionId);
-    },
+    loadTranscript: async () => {},
     usage: async () => null,
     close: () => {},
   };
 
-  return { control: control as unknown as GuiHostSessionControl, sessions, delivered, created, loaded, busy };
+  return { control: control as unknown as GuiHostSessionControl, sessions, delivered, created, busy };
 }
 
 const FORUM_CHAT_ID = "-1009876543210";
+const OPERATOR_ID = "1247617658";
 
-describe("ForumManager", () => {
+describe("ForumManager topic lifecycle", () => {
   let tempDir: string;
   let store: DaemonStore;
   let client: FakeForumApiClient;
@@ -186,8 +151,7 @@ describe("ForumManager", () => {
     });
   });
 
-  afterEach(async () => {
-    await manager.stop();
+  afterEach(() => {
     store.close();
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
@@ -197,134 +161,245 @@ describe("ForumManager", () => {
     expect(formatTopicName("session-abcdef", "C:/dev/super-board", null)).toBe("super-board (session-)");
   });
 
-  test("ensureTopic creates a Telegram topic on the Bot API and records the route", async () => {
+  test("ensureTopic creates a topic, records the route, and announces itself in the thread", async () => {
     const threadId = await manager.ensureTopic("sess-1", "C:/dev/proj", "Testing Topic");
     expect(threadId).toBeGreaterThan(0);
-    expect(client.topics.get(threadId)).toBeDefined();
     expect(client.topics.get(threadId)?.name).toContain("Testing Topic");
 
     const route = store.getRoute("slot-forum", FORUM_CHAT_ID, String(threadId));
-    expect(route).toBeDefined();
     expect(route?.sessionId).toBe("sess-1");
     expect(route?.workspace).toBe("C:/dev/proj");
 
-    // Welcome message was sent into the topic thread
     const welcome = client.sentMessages.find(m => m.messageThreadId === threadId);
-    expect(welcome).toBeDefined();
-    expect(welcome?.text).toContain("Veyyon Session Attached");
+    expect(welcome?.text).toContain("Veyyon session attached");
     expect(welcome?.text).toContain("sess-1");
   });
 
-  test("ensureTopic returns existing threadId if session already has a topic route", async () => {
-    const threadId1 = await manager.ensureTopic("sess-1", "C:/dev/proj");
-    const threadId2 = await manager.ensureTopic("sess-1", "C:/dev/proj");
-    expect(threadId2).toBe(threadId1);
+  test("ensureTopic reuses the topic a session already owns", async () => {
+    const first = await manager.ensureTopic("sess-1", "C:/dev/proj");
+    expect(await manager.ensureTopic("sess-1", "C:/dev/proj")).toBe(first);
     expect(client.topics.size).toBe(1);
   });
 
-  test("inbound messages in General topic prompt operator to use session topics", async () => {
-    const reply = await manager.handleMessage("hello there", undefined);
-    expect(reply).toContain("Veyyon Supergroup Forum Mode");
-    expect(reply).toContain("/topics");
+  test("ensureTopic does not reuse another slot's topic for the same session", async () => {
+    store.putRoute({
+      slotId: "other-slot",
+      chatId: FORUM_CHAT_ID,
+      topicId: "77",
+      sessionId: "sess-1",
+      workspace: "C:/dev/proj",
+    });
+    expect(await manager.ensureTopic("sess-1", "C:/dev/proj")).not.toBe(77);
   });
 
-  test("inbound messages in an unbound topic warn that the topic is not connected", async () => {
-    const reply = await manager.handleMessage("fix the bug", 999);
-    expect(reply).toContain("Unbound Topic (#999)");
-    expect(reply).toContain("/attach");
-  });
-
-  test("inbound messages in a bound topic route to the session by message_thread_id", async () => {
+  test("closeTopic closes on Telegram and reports a Bot API failure rather than throwing", async () => {
     const threadId = await manager.ensureTopic("sess-1", "C:/dev/proj");
+    expect(await manager.closeTopic(threadId)).toBe(true);
+    expect(client.topics.get(threadId)?.closed).toBe(true);
 
-    // Turn is started (idle session) -> deliver returns null so agent answers directly
-    const reply = await manager.handleMessage("make a test", threadId);
-    expect(reply).toBeNull();
-    expect(fake.delivered).toEqual([{ sessionId: "sess-1", text: "make a test", mode: "auto" }]);
-
-    // When turn is busy, steer/queued acknowledgment is returned
-    fake.busy.add("sess-1");
-    const ack = await manager.handleMessage("change approach", threadId);
-    expect(ack).toContain("Queued as a steer");
-    expect(fake.delivered).toHaveLength(2);
-    expect(fake.delivered[1].text).toBe("change approach");
+    const logged: string[] = [];
+    const failing = new ForumManager({
+      slot,
+      token: "fake-bot-token",
+      forumChatId: FORUM_CHAT_ID,
+      store,
+      control: fake.control,
+      log: message => logged.push(message),
+      client: {
+        ...client,
+        closeForumTopic: async () => {
+          throw new Error("TOPIC_NOT_MODIFIED");
+        },
+      } as unknown as ForumApiClient,
+    });
+    expect(await failing.closeTopic(threadId)).toBe(false);
+    expect(logged.join("\n")).toContain("TOPIC_NOT_MODIFIED");
   });
 
-  test("/new starts a session, creates a topic, and acknowledges", async () => {
-    const reply = await manager.handleCommand("/new", undefined);
-    expect(reply).toContain("started in topic #");
-    expect(fake.created).toHaveLength(1);
-    expect(fake.created[0].workspace).toBe("C:/dev/forum-proj");
-    expect(client.topics.size).toBe(1);
-  });
-
-  test("/topics lists active topics with running/idle status and highlights current topic", async () => {
+  test("listTopicsText marks the current topic and reports each session's turn state", async () => {
     const t1 = await manager.ensureTopic("sess-1", "C:/dev/proj1");
     const t2 = await manager.ensureTopic("sess-2", "C:/dev/proj2");
     fake.busy.add("sess-2");
 
-    const listing = await manager.handleCommand("/topics", t1);
-    expect(listing).toContain("Active Forum Topics (2)");
+    const listing = manager.listTopicsText(String(t1));
+    expect(listing).toContain("Session topics (2)");
     expect(listing).toContain(`➡️ <b>#${t1}</b>: <code>sess-1</code> — <i>C:/dev/proj1</i> (idle)`);
     expect(listing).toContain(`• <b>#${t2}</b>: <code>sess-2</code> — <i>C:/dev/proj2</i> (running)`);
   });
 
-  test("/where reports session details inside a topic", async () => {
-    const threadId = await manager.ensureTopic("sess-1", "C:/dev/proj1");
-    const info = await manager.handleCommand("/where", threadId);
-    expect(info).toContain(`Topic #${threadId}`);
-    expect(info).toContain("sess-1");
-    expect(info).toContain("C:/dev/proj1");
-    expect(info).toContain("Turn status: idle");
+  test("listTopicsText points at /new when the forum has no bound topic", () => {
+    expect(manager.listTopicsText("")).toContain("/new");
   });
 
-  test("/detach and /close close the forum topic and remove the route", async () => {
+  test("a live session's topic is never closed on its own", async () => {
     const threadId = await manager.ensureTopic("sess-1", "C:/dev/proj1");
+    fake.sessions.length = 0;
+    // No reconcile loop exists: absence from a host listing is a turn-status artifact,
+    // and closing on it took a live operator's topic away seconds after it opened.
+    await Promise.resolve();
     expect(client.topics.get(threadId)?.closed).toBe(false);
+    expect(store.getRoute("slot-forum", FORUM_CHAT_ID, String(threadId))).not.toBeNull();
+  });
+});
 
-    const reply = await manager.handleCommand("/detach", threadId);
-    expect(reply).toContain(`Topic #${threadId} detached and closed`);
-    expect(client.topics.get(threadId)?.closed).toBe(true);
+describe("poller authorization for a forum supergroup", () => {
+  const cleanup: Array<() => void> = [];
+  const originalFetch = globalThis.fetch;
 
-    const route = store.getRoute("slot-forum", FORUM_CHAT_ID, String(threadId));
-    expect(route).toBeNull();
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    for (const close of cleanup.splice(0)) close();
   });
 
-  test("outbound session events relay to the bound topic thread", async () => {
-    const threadId = await manager.ensureTopic("sess-1", "C:/dev/proj1");
-    client.sentMessages = [];
-
-    const event: SessionEvent = {
-      kind: "appended",
-      sessionId: "sess-1",
-      entries: [{ entryId: "e1", text: "Task completed successfully." }],
+  function groupPoller(access: Record<string, unknown>, options: Record<string, unknown> = {}) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "veyyon-forum-auth-"));
+    const inbound: Array<{ text: string; threadId: number | undefined }> = [];
+    const sent: Array<{ chatId: unknown; text: string; threadId: unknown }> = [];
+    const callbacks: PollerCallbacks = {
+      isIdle: () => true,
+      onUserMessage: text => inbound.push({ text, threadId: poller.getActiveThreadId() }),
+      onFollowUp: () => {},
+      onSteer: () => {},
+      onAbort: () => {},
+      onRelease: async () => {},
+      getStatusText: () => "test",
+      onTelegramTurnStart: () => {},
+      onLedgerFailure: () => {},
     };
+    const poller = new TelegramPoller(
+      "0:test-only",
+      dir,
+      { dmPolicy: "allowlist", allowFrom: [OPERATOR_ID], ...access } as never,
+      callbacks,
+      undefined,
+      options as never,
+    );
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body ?? "{}"));
+      if (String(input).endsWith("/sendMessage")) {
+        sent.push({ chatId: body.chat_id, text: String(body.text ?? ""), threadId: body.message_thread_id });
+      }
+      return Response.json({ ok: true, result: { message_id: sent.length, chat: { id: 1 }, date: 0 } });
+    }) as typeof fetch;
+    cleanup.push(() => {
+      poller.stop();
+      fs.rmSync(dir, { recursive: true, force: true });
+    });
+    const ledgerRow = (updateId: number) => {
+      const db = new Database(path.join(dir, "veyyon_bridge_state.db"), { readonly: true });
+      try {
+        return db
+          .query("SELECT status, error, message_thread_id, correlated_session_id FROM update_ledger WHERE update_id = ?")
+          .get(updateId) as { status: string; error: string | null; message_thread_id: number | null; correlated_session_id: string | null } | null;
+      } finally {
+        db.close();
+      }
+    };
+    return { poller, inbound, sent, ledgerRow };
+  }
 
-    await manager.onSessionEvent(event);
-    expect(client.sentMessages).toHaveLength(1);
-    expect(client.sentMessages[0].messageThreadId).toBe(threadId);
-    expect(client.sentMessages[0].text).toContain("Task completed successfully.");
+  function groupMessage(updateId: number, text: string, threadId?: number): TelegramUpdate {
+    return {
+      update_id: updateId,
+      message: {
+        message_id: updateId,
+        date: 0,
+        text,
+        chat: { id: Number(FORUM_CHAT_ID), type: "supergroup" },
+        from: { id: Number(OPERATOR_ID), is_bot: false, first_name: "Operator" },
+        ...(threadId === undefined ? {} : { message_thread_id: threadId }),
+      },
+    } as TelegramUpdate;
+  }
 
-    // Idempotent: same entryId is not delivered twice
-    await manager.onSessionEvent(event);
-    expect(client.sentMessages).toHaveLength(1);
+  test("an operator's supergroup message is admitted, routed by topic, and recorded", async () => {
+    const f = groupPoller({}, { forumChatId: FORUM_CHAT_ID });
+    f.poller.ingestUpdates([groupMessage(1, "Hello", 9)]);
+    await f.poller.redrivePendingUpdates();
+
+    expect(f.inbound).toHaveLength(1);
+    expect(f.inbound[0].text).toContain("Hello");
+    expect(f.inbound[0].threadId).toBe(9);
+    // The topic a message came from is the route key, so it has to survive a restart
+    // in the ledger rather than only in the poller's in-flight state.
+    expect(f.ledgerRow(1)).toMatchObject({ status: "COMPLETED", message_thread_id: 9 });
   });
 
-  test("reconcileEndedSessions closes topics for ended or non-existent sessions", async () => {
-    const t1 = await manager.ensureTopic("sess-active", "C:/dev/proj1");
-    const t2 = await manager.ensureTopic("sess-closed", "C:/dev/proj2");
+  test("an access.json groups entry admits a supergroup that is not the slot's forum", async () => {
+    const f = groupPoller({ groups: { [FORUM_CHAT_ID]: {} } });
+    f.poller.ingestUpdates([groupMessage(1, "Hello", 9)]);
+    await f.poller.redrivePendingUpdates();
+    expect(f.inbound).toHaveLength(1);
+    expect(f.ledgerRow(1)?.status).toBe("COMPLETED");
+  });
 
-    fake.sessions.push(
-      { id: "sess-active", cwd: "C:/dev/proj1", workspace: "C:/dev/proj1", title: "Active", status: "Idle", modifiedAtMs: 1 },
-      { id: "sess-closed", cwd: "C:/dev/proj2", workspace: "C:/dev/proj2", title: "Closed", status: "Closed", modifiedAtMs: 1 },
-    );
+  test("a per-group allowFrom narrows the channel allowlist for that chat alone", async () => {
+    const f = groupPoller({ groups: { [FORUM_CHAT_ID]: { allowFrom: ["999"] } } });
+    f.poller.ingestUpdates([groupMessage(1, "Hello", 9)]);
+    await f.poller.redrivePendingUpdates();
+    expect(f.inbound).toEqual([]);
+    expect(f.ledgerRow(1)).toMatchObject({ status: "REJECTED", error: "UNAUTHORIZED" });
+  });
 
-    const closed = await manager.reconcileEndedSessions();
-    expect(closed).toBe(1);
-    expect(client.topics.get(t1)?.closed).toBe(false);
-    expect(client.topics.get(t2)?.closed).toBe(true);
-    expect(store.getRoute("slot-forum", FORUM_CHAT_ID, String(t2))).toBeNull();
-    expect(store.getRoute("slot-forum", FORUM_CHAT_ID, String(t1))).toBeDefined();
+  test("a per-group allowFrom cannot admit an account the channel allowlist omits", async () => {
+    const f = groupPoller({ allowFrom: ["555"], groups: { [FORUM_CHAT_ID]: { allowFrom: [OPERATOR_ID] } } });
+    f.poller.ingestUpdates([groupMessage(1, "Hello", 9)]);
+    await f.poller.redrivePendingUpdates();
+    // A group entry restricts where an allowlisted account may speak; it is never a
+    // second door into the channel.
+    expect(f.inbound).toEqual([]);
+    expect(f.ledgerRow(1)).toMatchObject({ status: "REJECTED", error: "UNAUTHORIZED" });
+  });
+
+  test("an unserved group is rejected and the operator is told why, at most once", async () => {
+    const f = groupPoller({});
+    f.poller.ingestUpdates([groupMessage(1, "Hello", 9), groupMessage(2, "Anyone there?", 9)]);
+    await f.poller.redrivePendingUpdates();
+
+    expect(f.inbound).toEqual([]);
+    expect(f.ledgerRow(1)).toMatchObject({ status: "REJECTED", error: "UNAUTHORIZED" });
+    const notices = f.sent.filter(m => m.text.includes("does not serve this chat"));
+    expect(notices).toHaveLength(1);
+    expect(String(notices[0].chatId)).toBe(FORUM_CHAT_ID);
+  });
+
+  test("a non-allowlisted account in a served group is rejected silently", async () => {
+    const f = groupPoller({ groups: { [FORUM_CHAT_ID]: {} } });
+    const update = groupMessage(1, "Hello", 9);
+    const message = update.message;
+    if (message?.from) message.from.id = 999;
+    f.poller.ingestUpdates([update]);
+    await f.poller.redrivePendingUpdates();
+
+    expect(f.inbound).toEqual([]);
+    expect(f.ledgerRow(1)?.status).toBe("REJECTED");
+    expect(f.sent).toEqual([]);
+  });
+
+  test("the General topic reports no routable thread and replies land in General", async () => {
+    const f = groupPoller({}, { forumChatId: FORUM_CHAT_ID });
+    // Telegram reports thread id 1 for the General topic on the updates that carry one.
+    f.poller.ingestUpdates([groupMessage(1, "Hello", 1), groupMessage(2, "Hello again")]);
+    await f.poller.redrivePendingUpdates();
+
+    expect(f.inbound.map(entry => entry.threadId)).toEqual([undefined, undefined]);
+  });
+
+  test("the answer to a topic message goes back into that topic", async () => {
+    const f = groupPoller({}, { forumChatId: FORUM_CHAT_ID });
+    f.poller.ingestUpdates([groupMessage(1, "/status", 9)]);
+    await f.poller.redrivePendingUpdates();
+
+    const reply = f.sent.at(-1);
+    expect(String(reply?.chatId)).toBe(FORUM_CHAT_ID);
+    expect(reply?.threadId).toBe(9);
+  });
+
+  test("a channel pinned to one topic refuses a forum chat id", () => {
+    expect(() => new TelegramPoller("0:test-only", os.tmpdir(), { dmPolicy: "allowlist", allowFrom: [] }, {}, undefined, {
+      messageThreadId: 9,
+      forumChatId: FORUM_CHAT_ID,
+    } as never)).toThrow("pins it to one");
   });
 });
 
@@ -332,10 +407,7 @@ describe("DefaultTelegramForumClient wire contract", () => {
   test("calls Telegram Bot API endpoints with correct JSON payloads", async () => {
     const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
     const mockFetch = async (url: string | URL | Request, init?: RequestInit) => {
-      calls.push({
-        url: String(url),
-        body: JSON.parse(String(init?.body || "{}")),
-      });
+      calls.push({ url: String(url), body: JSON.parse(String(init?.body || "{}")) });
       if (String(url).endsWith("/createForumTopic")) {
         return new Response(JSON.stringify({ ok: true, result: { message_thread_id: 42, name: "Topic 42" } }), { status: 200 });
       }
@@ -364,6 +436,13 @@ describe("DefaultTelegramForumClient wire contract", () => {
     expect(sent.ok).toBe(true);
     expect(calls[2].url).toBe("https://api.telegram.org/botTEST_TOKEN/sendMessage");
     expect(calls[2].body).toEqual({ chat_id: "-100112233", text: "<b>Hello</b>", parse_mode: "HTML", message_thread_id: 42 });
+  });
+
+  test("a Bot API error surfaces Telegram's description instead of an HTTP code", async () => {
+    const mockFetch = async () =>
+      new Response(JSON.stringify({ ok: false, description: "Bad Request: the chat is not a forum" }), { status: 400 });
+    const client = new DefaultTelegramForumClient("TEST_TOKEN", "https://api.telegram.org", mockFetch as typeof fetch);
+    await expect(client.createForumTopic("-100112233", "New Topic")).rejects.toThrow("the chat is not a forum");
   });
 });
 
@@ -409,6 +488,42 @@ describe("Daemon slot manifest parsing for forum mode", () => {
     expect(slots[0].forumChatId).toBe("-10099887766");
     coordinator.close();
   });
+
+  test("allowGroupChat adds the chat without disturbing the rest of access.json", () => {
+    const stateDir = path.join(tempDir, "channels", "telegram-forum");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const accessPath = path.join(stateDir, "access.json");
+    fs.writeFileSync(accessPath, JSON.stringify({ dmPolicy: "allowlist", allowFrom: [OPERATOR_ID], groups: {} }));
+
+    const coordinator = new BotPoolCoordinator(
+      path.join(tempDir, "pool.db"),
+      path.join(tempDir, "manifest.json"),
+      path.join(tempDir, "channels"),
+    );
+    expect(coordinator.allowGroupChat(stateDir, FORUM_CHAT_ID)).toBe(true);
+    expect(coordinator.allowGroupChat(stateDir, FORUM_CHAT_ID)).toBe(false);
+
+    const access = coordinator.readAccessConfig(stateDir);
+    expect(access.allowFrom).toEqual([OPERATOR_ID]);
+    expect(access.groups).toEqual({ [FORUM_CHAT_ID]: {} });
+    coordinator.close();
+  });
+
+  test("an unparseable access.json is left alone rather than replaced", () => {
+    const stateDir = path.join(tempDir, "channels", "telegram-broken");
+    fs.mkdirSync(stateDir, { recursive: true });
+    const accessPath = path.join(stateDir, "access.json");
+    fs.writeFileSync(accessPath, "{ not json");
+
+    const coordinator = new BotPoolCoordinator(
+      path.join(tempDir, "pool.db"),
+      path.join(tempDir, "manifest.json"),
+      path.join(tempDir, "channels"),
+    );
+    expect(coordinator.allowGroupChat(stateDir, FORUM_CHAT_ID)).toBe(false);
+    expect(fs.readFileSync(accessPath, "utf8")).toBe("{ not json");
+    coordinator.close();
+  });
 });
 
 describe("TelegramDaemon forum mode integration", () => {
@@ -421,12 +536,13 @@ describe("TelegramDaemon forum mode integration", () => {
   afterEach(() => {
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
-  test("daemon starts forumManager for forum slot and handles events", async () => {
+
+  test("a forum slot polls once and authorizes its supergroup in access.json", async () => {
     const manifestPath = path.join(tempDir, "manifest.json");
     const stateDir = path.join(tempDir, "channels", "telegram-forum-slot");
     fs.mkdirSync(stateDir, { recursive: true });
     fs.writeFileSync(path.join(stateDir, ".env"), "TELEGRAM_BOT_TOKEN=123456789:ABCDefghIJKLmnOPQRstuvWXYZ\n");
-    fs.writeFileSync(path.join(stateDir, "access.json"), JSON.stringify({ dmPolicy: "allowlist", allowFrom: ["12345"] }));
+    fs.writeFileSync(path.join(stateDir, "access.json"), JSON.stringify({ dmPolicy: "allowlist", allowFrom: [OPERATOR_ID] }));
     fs.writeFileSync(
       manifestPath,
       JSON.stringify({
@@ -445,16 +561,27 @@ describe("TelegramDaemon forum mode integration", () => {
       }),
     );
 
-    const fakeClient = new FakeForumApiClient();
     const fake = fakeControl();
-
+    const pollers: Array<{ options: Record<string, unknown> }> = [];
     const daemon = new TelegramDaemon({
       manifestPath,
       poolDbPath: path.join(tempDir, "pool.db"),
       daemonDbPath: path.join(tempDir, "daemon.db"),
       channelsDir: path.join(tempDir, "channels"),
       controlFactory: () => fake.control,
-      forumClientFactory: () => fakeClient,
+      forumClientFactory: () => new FakeForumApiClient(),
+      pollerFactory: (token, dir, access, callbacks, correlation, options) => {
+        pollers.push({ options: (options ?? {}) as Record<string, unknown> });
+        return {
+          running: true,
+          start: async () => {},
+          stop: async () => {},
+          getPrimaryChatId: () => null,
+          getActiveThreadId: () => undefined,
+          getMeta: () => null,
+          sendTelegramMessage: async () => null,
+        } as unknown as TelegramPoller;
+      },
       log: () => {},
     });
 
@@ -463,9 +590,16 @@ describe("TelegramDaemon forum mode integration", () => {
     expect(status.slots[0].slotId).toBe("telegram-forum-slot");
     expect(status.slots[0].polling).toBe(true);
 
-    // Stop daemon releases lease and closes polling
+    // One Telegram consumer per slot: a second getUpdates loop inside the forum
+    // manager stole the first one's updates and the group looked dead.
+    expect(pollers).toHaveLength(1);
+    expect(pollers[0].options.forumChatId).toBe("-10055443322");
+
+    const access = JSON.parse(fs.readFileSync(path.join(stateDir, "access.json"), "utf8"));
+    expect(access.groups).toEqual({ "-10055443322": {} });
+    expect(access.allowFrom).toEqual([OPERATOR_ID]);
+
     await daemon.stop();
-    const stoppedStatus = daemon.status();
-    expect(stoppedStatus.slots).toHaveLength(0);
+    expect(daemon.status().slots).toHaveLength(0);
   });
 });

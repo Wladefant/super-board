@@ -115,13 +115,17 @@ export class DaemonStore {
    * Claims one transcript entry for delivery. Returns false when it was already
    * claimed, which is what makes outbound delivery idempotent across restarts and
    * across a transcript snapshot that repeats history the daemon has already sent.
+   *
+   * `deliveryKey` identifies the destination, not a chat: in forum mode a route is a
+   * chat and a topic, so the key is composite and the column keeps its original name
+   * rather than rewriting every row of an existing daemon.db.
    */
-  public claimDelivery(sessionId: string, entryId: string, chatId: string): boolean {
+  public claimDelivery(sessionId: string, entryId: string, deliveryKey: string): boolean {
     return (
       this.db.run(
         `INSERT INTO delivered_entries (session_id, entry_id, chat_id, delivered_at)
          VALUES (?, ?, ?, ?) ON CONFLICT(session_id, entry_id) DO NOTHING`,
-        [sessionId, entryId, chatId, Date.now()],
+        [sessionId, entryId, deliveryKey, Date.now()],
       ).changes > 0
     );
   }
