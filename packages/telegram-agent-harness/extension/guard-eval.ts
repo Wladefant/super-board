@@ -293,12 +293,25 @@ export function evalCommands(code: string, language: string, parseShell: (comman
     } else if (/^(fs(?:\.promises)?\.(rm|rmSync|rmdir|rmdirSync|unlink|unlinkSync)|shutil\.rmtree|os\.(remove|unlink|rmdir|kill))$/.test(call)) {
       commands.push(["rm", "-rf", ...(typeof value === "string" ? [value] : [])]);
     } else if (/^(read|write|open|fs(?:\.promises)?\.(readFile|readFileSync|writeFile|writeFileSync)|Bun\.(file|write)|Path|pathlib\.Path)$/.test(call)) {
-      if (typeof value === "string") commands.push(["cat", value]);
+      // A write clobbers its path; only a read leaves the file intact.
+      const mode = tokens[argument.end]?.value === "," ? valueAt(argument.end + 1).value : undefined;
+      const writes = /write/i.test(leaf) || (typeof mode === "string" && /[wax+]/.test(mode));
+      if (typeof value === "string") commands.push([writes ? "tee" : "cat", value]);
+    } else if (call === "getattr") {
+      // `getattr(os, name)(...)` is the Python spelling of a computed member call: its callee is unprovable.
+      let close = at + 1;
+      for (let depth = 1; close < tokens.length && depth > 0; close++) {
+        if (tokens[close].value === "(") depth++;
+        else if (tokens[close].value === ")") depth--;
+      }
+      if (tokens[close]?.value === "(") unresolved = true;
     } else if (/^(eval|exec|Function|(?:vm\.)?runIn(NewContext|ThisContext|Context))$/.test(call)) {
       if (typeof value === "string") {
         const inner = evalCommands(value, language, parseShell);
         commands.push(...inner.commands);
         unresolved ||= inner.unresolved;
+        // A payload that is no code in the host language is still whatever the runtime finally hands a shell.
+        if (!inner.commands.length && !inner.unresolved) commands.push(...parseShell(value));
       } else {
         unresolved = true;
       }

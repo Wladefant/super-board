@@ -238,7 +238,14 @@ function parseScript(source: string): { commands: string[][]; pipelines: string[
       if (!assignment) break;
       values.set(assignment[1], assignment[2]);
     }
-    for (; k < stage.length; k++) stage[k] = stage[k].replace(/\$\{(\w+)\}|\$(\w+)/g, (raw, braced, bare) => values.get(braced ?? bare) ?? raw);
+    // An unquoted expansion word-splits, so a value carrying whitespace becomes several argv words.
+    const expanded = stage.slice(0, k);
+    for (; k < stage.length; k++) {
+      const substituted = stage[k].replace(/\$\{(\w+)\}|\$(\w+)/g, (raw, braced, bare) => values.get(braced ?? bare) ?? raw);
+      if (substituted === stage[k]) expanded.push(stage[k]);
+      else expanded.push(...substituted.split(/\s+/).filter(Boolean));
+    }
+    stage.splice(0, stage.length, ...expanded);
   }
 
   const commands: string[][] = [];
@@ -301,9 +308,10 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
   if (!words.length) return;
   if (words[words.length - 1] === "}") words = words.slice(0, -1);
   if (!words.length) return;
-  // Substitution output, variable indirection and brace expansion hide the real program name.
+  // Substitution output, variable indirection, brace expansion and globbing hide the real program name.
   // An unresolvable command name is dynamically constructed code, never a silent allow.
-  if (words[0].includes(DYNAMIC) || /[$`]/.test(words[0]) || /^\{[^}]*,/.test(words[0])) return DYNAMIC_CATEGORY;
+  const globbed = /[?*]|\[[^\]]*\]/.test(words[0]) && words[0] !== "[" && words[0] !== "[[";
+  if (words[0].includes(DYNAMIC) || /[$`]/.test(words[0]) || /^\{[^}]*,/.test(words[0]) || globbed) return DYNAMIC_CATEGORY;
   const app = executable(words[0]), args = words.slice(1), command = [app, ...args].join(" ");
   const inspect = (script: string): string | undefined => script.includes(DYNAMIC)
     ? DYNAMIC_CATEGORY
@@ -340,9 +348,9 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
   }
   if (/^(pnpm|yarn)$/.test(app) && args[0] === "dlx") return commandCategory(args.slice(1), cwd, depth + 1);
   if (/^(pipx|poetry|uv|rye)$/.test(app) && /^(run|exec)$/.test(args[0] ?? "")) return commandCategory(args.slice(1), cwd, depth + 1);
-  // Searching or reading local files for the production ref touches nothing, and the ref must stay greppable.
-  const readOnlyLocal = (/^(grep|rg|ag|ack|ls|dir|cat|bat|head|tail|less|more|find|fd|wc|sort|uniq|diff|stat|file|tree)$/.test(app)
-    || (app === "git" && /^(log|grep|show|status|diff|blame|ls-files|cat-file)$/.test(args.find(arg => !arg.startsWith("-")) ?? "")))
+  // The production ref must stay greppable, but a file reader can still carry real key material out.
+  const readOnlyLocal = (/^(grep|rg|ag|ack)$/.test(app)
+    || (app === "git" && /^(log|grep|show|status|diff|blame|ls-files)$/.test(args.find(arg => !arg.startsWith("-")) ?? "")))
     && !args.some(arg => /^[a-z][a-z\d+.-]*:\/\//i.test(arg) || /@[\w.-]+:/.test(arg));
   // A real process may read keys regardless of the transport. Never inspect source-file contents.
   if (!readOnlyLocal && PRODUCTION.test(command)) return "production_exclusion";
@@ -359,7 +367,7 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
     // A POSIX shell takes -c anywhere in a combined cluster; only PowerShell abbreviates -Command.
     const script = args.findIndex(arg => /^(powershell|pwsh)$/.test(app)
       ? flagPrefixOf(arg, "command")
-      : app === "cmd" ? /^[-/]c$/i.test(arg) : /^-[a-z]*c[a-z]*$/.test(arg));
+      : app === "cmd" ? /^[-/][ck]$/i.test(arg) : /^-[a-z]*c[a-z]*$/.test(arg));
     if (script >= 0) found.push(inspect(args.slice(script + 1).join(" ").replace(/^(&\s*)?\{|\}$/g, "").trim()) ?? (args[script + 1] === undefined ? DYNAMIC_CATEGORY : undefined));
     if (found.length) return selectCategory(found);
   }
@@ -399,6 +407,22 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
   }
   if (app === "truncate" && args.some(arg => /^(-s|--size)/.test(arg))
     && args.filter(arg => !arg.startsWith("-")).some(operand => isDestructiveRmTarget(operand, cwd))) return "shell_destructive_os";
+  // Overwriting a file destroys it as surely as rm does, whichever binary performs the write.
+  const operands = args.filter(arg => !arg.startsWith("-")), written: string[] = [];
+  if (/^(sort|install|shred|tee)$/.test(app)) {
+    const flagged = args.findIndex(arg => /^(-o|--output)$/.test(arg));
+    if (flagged >= 0 && args[flagged + 1]) written.push(args[flagged + 1]);
+    const inline = args.find(arg => /^(-o|--output=)/.test(arg) && arg.length > 2);
+    if (inline) written.push(inline.replace(/^(-o|--output=)/, ""));
+  }
+  if (app === "tee") written.push(...operands);
+  // The final operand of a copying or linking command is the destination it clobbers.
+  if (/^(cp|mv|install|rsync|ln|copy|move|xcopy|robocopy)$/.test(app) && operands.length > 1) written.push(operands[operands.length - 1]);
+  if (app === "sed" && args.some(arg => /^-[a-z]*i/.test(arg))) {
+    const scripted = args.some(arg => /^(-e|--expression|-f|--file)/.test(arg));
+    written.push(...operands.slice(scripted ? 0 : 1));
+  }
+  if (written.some(target => isDestructiveRmTarget(target, cwd))) return "shell_destructive_os";
   if (app === "find" && (args.includes("-delete") || args.some((arg, k) => arg === "-exec" && /^(rm|unlink|shred)$/.test(executable(args[k + 1] ?? ""))))) {
     const firstFlag = args.findIndex(arg => arg.startsWith("-"));
     if (args.slice(0, firstFlag < 0 ? args.length : firstFlag).some(root => isDestructiveRmTarget(root, cwd))) return "shell_destructive_os";

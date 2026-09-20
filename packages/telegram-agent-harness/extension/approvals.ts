@@ -24,7 +24,6 @@ export interface ApprovalRecord extends ApprovalContext {
   requestedAt: string;
   expiresAt: string;
   state: "pending" | "approved" | "denied" | "consumed" | "expired";
-  summary?: string;
 }
 export interface ApprovalActor { sessionId: string; userId: string; chatId: string }
 export type ApprovalDescription = Omit<ApprovalRecord, "token" | "operationHash" | "requestedAt" | "expiresAt" | "state">;
