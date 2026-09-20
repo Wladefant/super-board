@@ -343,4 +343,35 @@ if (verb === "run") {
     }
     expect(procAlive).toBe(true);
   }, 20_000);
+  test("start discovers bun child process, writes child pid to daemon.pid, and does not adopt wrapper", async () => {
+    const { launcherPath, runDir, pidPath } = setupTestHarness();
+    const launcherPidPath = path.join(runDir, "launcher.pid");
+
+    const res = runLauncher(launcherPath, "start");
+    expect(res.code).toBe(0);
+    expect(res.stdout).toContain("Telegram daemon started");
+
+    expect(fs.existsSync(pidPath)).toBe(true);
+    const daemonPid = Number.parseInt(fs.readFileSync(pidPath, "utf8").trim(), 10);
+    expect(daemonPid).toBeGreaterThan(0);
+
+    // If launcher.pid exists, daemonPid MUST NOT equal launcherPid
+    if (fs.existsSync(launcherPidPath)) {
+      const launcherPid = Number.parseInt(fs.readFileSync(launcherPidPath, "utf8").trim(), 10);
+      expect(daemonPid).not.toBe(launcherPid);
+    }
+
+    // Stop daemon cleanly
+    const stopRes = runLauncher(launcherPath, "stop");
+    expect(stopRes.code).toBe(0);
+
+    // Verify daemon process is gone
+    let procAlive = true;
+    try {
+      process.kill(daemonPid, 0);
+    } catch {
+      procAlive = false;
+    }
+    expect(procAlive).toBe(false);
+  }, 20_000);
 });
