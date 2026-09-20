@@ -298,13 +298,20 @@ export function evalCommands(code: string, language: string, parseShell: (comman
       const writes = /write/i.test(leaf) || (typeof mode === "string" && /[wax+]/.test(mode));
       if (typeof value === "string") commands.push([writes ? "tee" : "cat", value]);
     } else if (call === "getattr") {
-      // `getattr(os, name)(...)` is the Python spelling of a computed member call: its callee is unprovable.
-      let close = at + 1;
+      // `getattr(os, "sys" + "tem")(...)` is the Python spelling of a computed member call.
+      let close = at + 1, comma = -1;
       for (let depth = 1; close < tokens.length && depth > 0; close++) {
-        if (tokens[close].value === "(") depth++;
-        else if (tokens[close].value === ")") depth--;
+        const punctuation = tokens[close].value;
+        if (punctuation === "(" || punctuation === "[" || punctuation === "{") depth++;
+        else if (punctuation === ")" || punctuation === "]" || punctuation === "}") depth--;
+        else if (punctuation === "," && depth === 1 && comma < 0) comma = close;
       }
-      if (tokens[close]?.value === "(") unresolved = true;
+      if (tokens[close]?.value === "(") {
+        const name = comma < 0 ? undefined : valueAt(comma + 1).value;
+        // A name the lexer cannot prove leaves the callee unknown; a proven one is that member being called.
+        if (typeof name !== "string") unresolved = true;
+        else if (/^(system|popen|exec|execSync|execFile|execFileSync|spawn|spawnSync|run|call|check_call|check_output|Popen)$/.test(name)) append(valueAt(close + 1).value);
+      }
     } else if (/^(eval|exec|Function|(?:vm\.)?runIn(NewContext|ThisContext|Context))$/.test(call)) {
       if (typeof value === "string") {
         const inner = evalCommands(value, language, parseShell);
