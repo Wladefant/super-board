@@ -5,6 +5,10 @@
 type Token = { kind: "name" | "string" | "symbol"; value: string; dynamic?: boolean; embedded?: string[] };
 type Value = string | Value[] | { [key: string]: Value };
 
+/** The hole a value the lexer cannot prove leaves behind. It is unencodable in a real command line, so
+ * no input can forge it: `stripUnexecutable` removes the NUL from anything an attacker supplies. */
+export const DYNAMIC = "\u0000dynamic";
+
 /** Decodes only canonical base64. Anything else returns "" so callers fall through to the raw string
  * instead of acting on mojibake that `Buffer.from(x, "base64")` silently produces for arbitrary text. */
 export function decodeBase64(raw: string): string {
@@ -157,6 +161,9 @@ export function evalCommands(code: string, language: string, parseShell: (comman
         }
       } else {
         value = values.get(token.value);
+        // An unresolved chain is still one value, so consume it: `process.env.HOME + "/.ssh/id_rsa"`
+        // concatenates into a path instead of stopping the walk at the first dot.
+        if (value === undefined) end = next;
       }
     } else if (token.value === "[") {
       const items: Value[] = []; let at = start + 1;
@@ -212,7 +219,11 @@ export function evalCommands(code: string, language: string, parseShell: (comman
     }
     while (tokens[end]?.value === "+") {
       const rhs = valueAt(end + 1);
-      value = typeof value === "string" && typeof rhs.value === "string" ? value + rhs.value : undefined;
+      // A term the lexer cannot prove leaves a hole, not a dead end: `process.env.HOME + "/.ssh/id_rsa"`
+      // still names the key it reads, and `"rm -rf " + target` still names the deletion.
+      value = typeof value === "string" || typeof rhs.value === "string"
+        ? (typeof value === "string" ? value : DYNAMIC) + (typeof rhs.value === "string" ? rhs.value : DYNAMIC)
+        : undefined;
       end = rhs.end;
     }
     return { value, end };

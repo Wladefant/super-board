@@ -2,7 +2,7 @@
 import * as fs from "node:fs";
 import { createHash } from "node:crypto";
 import * as path from "node:path";
-import { evalCommands, decodeBase64, stripUnexecutable } from "./guard-eval";
+import { evalCommands, decodeBase64, stripUnexecutable, DYNAMIC } from "./guard-eval";
 import { describeApproval, evaluateApproval, decideApproval, type ApprovalContext, type ApprovalActor, type ApprovalRecord } from "./approvals";
 
 export interface ToolGuardEvaluation {
@@ -89,7 +89,7 @@ export function approveOperation(stateDir: string, token: string, actor: Approva
 }
 
 /** A word whose runtime value the lexer cannot prove: substitution output, dynamic construction. */
-export const DYNAMIC = "\u0000dynamic";
+export { DYNAMIC };
 // An expansion the lexer could not resolve: a shell variable, a PowerShell variable, a cmd `%VAR%`.
 const UNRESOLVED_EXPANSION = /\$\{?\w|\$env:|%\w[\w()]*%/i;
 const INTERPRETER = /^(sh|bash|zsh|ksh|dash|ash|fish|cmd|powershell|pwsh|python[\d.]*|py|node|bun|deno|perl|ruby|php|osascript|rscript|r|at|batch)$/;
@@ -523,8 +523,8 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
     && !args.some(arg => /^[a-z][a-z\d+.-]*:\/\//i.test(arg) || /@[\w.-]+:/.test(arg));
   // A real process may read keys regardless of the transport. Never inspect source-file contents.
   if (!readOnlyLocal && PRODUCTION.test(command)) return "production_exclusion";
-  if (args.some(arg => SECRET_PATH.test(arg))) return "secrets";
-  // A secret manager hands out the same material the file holds, so reading it out is the same disclosure.
+  // A path can ride behind a prefix: curl reads a file as `@path`, `field=@path` or `--data=@path`.
+  if (args.some(arg => SECRET_PATH.test(arg) || (arg.includes("@") && SECRET_PATH.test(arg.slice(arg.lastIndexOf("@") + 1))))) return "secrets";
   if (app === "gh" && args[0] === "auth" && args[1] === "token") return "secrets";
   if (/^(vault|op|doppler|infisical)$/.test(app) && /^(read|get|kv|item|secrets|export)$/.test(args[0] ?? "")) return "secrets";
   if (app === "aws" && (args[0] === "secretsmanager" && /^(get-secret-value|list-secrets)$/.test(args[1] ?? "")
@@ -863,6 +863,10 @@ export class DangerousToolGuard {
       } else if (toolName === "edit" || toolName === "ast_edit") {
         const targets = toolName === "edit" ? editTargets(String(input.input ?? "")) : extractAllStrings(input.paths);
         commands = targets.map(target => ["tee", target]);
+        category = selectCategory(commands.map(c => commandCategory(c, cwd)));
+      } else if (toolName === "search" && input.type === "files") {
+        // A file glob is a path expression, so `**/*.pem` enumerates keys however harmless its scope looks.
+        commands = String(input.input ?? "").split(";").map(glob => ["cat", path.posix.join(String(input.path ?? "."), glob.trim())]);
         category = selectCategory(commands.map(c => commandCategory(c, cwd)));
       } else if (toolName === "ssh") {
         // The remote filesystem is not this project's tree, but a system root, a protected ref and
