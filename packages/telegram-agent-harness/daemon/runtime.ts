@@ -37,6 +37,7 @@ import {
   type SessionEvent,
 } from "./session-control";
 import { DaemonStore } from "./store";
+import { connectMiniApp, miniAppUrl } from "./miniapp";
 
 export interface DaemonSlotReport {
   slotId: string;
@@ -83,6 +84,7 @@ interface ActiveSlot {
   router: SlotRouter;
   /** Lease identity; also what in-session pollers see as the slot holder. */
   leaseSessionId: string;
+  stopMiniApp: () => void;
 }
 
 export class TelegramDaemon {
@@ -211,6 +213,7 @@ export class TelegramDaemon {
     if (this.stopping) return;
     const index = this.active.findIndex(entry => entry.slot.slotId === slotId);
     if (index < 0) return;
+    this.active[index].stopMiniApp();
     this.active.splice(index, 1);
     this.coordinator.releaseLease(slotId, leaseSessionId);
     this.skipReasons.set(slotId, `poller ended: ${reason}`);
@@ -324,6 +327,16 @@ export class TelegramDaemon {
       getStatusText: () => router.statusText(currentChat()),
       onTelegramTurnStart: () => {},
       onHarnessCommand: async (text: string, chatId: string, userId?: string) => {
+        if (/^\/app(?:@\w+)?\s*$/i.test(text)) {
+          const url = miniAppUrl(slot.stateDir);
+          if (url) {
+            await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+              method: "POST", headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ chat_id: chatId, text: "Open your Superboard dashboard", reply_markup: { inline_keyboard: [[{ text: "Open Superboard", web_app: { url } }]] } }),
+            });
+          } else await poller.sendTelegramMessage(chatId, "Mini App is not configured for this bot.");
+          return true;
+        }
         if (await router.handleCommand(text, chatId)) return true;
         return handleInstalledCommand(text, {
           session: () => ({
@@ -367,7 +380,23 @@ export class TelegramDaemon {
       ? this.options.pollerFactory(token, slot.stateDir, access, callbacks, correlation, pollerOptions)
       : new TelegramPoller(token, slot.stateDir, access, callbacks, correlation, pollerOptions);
 
-    return { slot, poller, router, leaseSessionId };
+    const stopMiniApp = connectMiniApp({
+      stateDir: slot.stateDir, token, allowedUsers: access.allowFrom,
+      session: () => router.boundSession(currentChat()),
+      sessions: () => this.control.listSessions(),
+      status: () => ({ polling: poller.running, slot: slot.slotId }),
+      dashboard: () => {
+        const session = router.boundSession(currentChat());
+        const raw = session ? poller.getMeta(`dashboard-snapshot:${session}`) : null;
+        try { return raw ? JSON.parse(raw) : null; } catch { return null; }
+      },
+    });
+    const url = miniAppUrl(slot.stateDir);
+    if (url) void fetch(`https://api.telegram.org/bot${token}/setChatMenuButton`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ menu_button: { type: "web_app", text: "Superboard", web_app: { url } } }),
+    }).catch(() => this.log(`Slot ${slot.slotId}: Mini App menu registration unavailable`));
+    return { slot, poller, router, leaseSessionId, stopMiniApp };
   }
 
   /**
@@ -408,6 +437,7 @@ export class TelegramDaemon {
     const index = this.active.findIndex(entry => entry.slot.slotId === slotId);
     if (index < 0) return false;
     const [entry] = this.active.splice(index, 1);
+    entry.stopMiniApp();
     await entry.poller.stop();
     this.coordinator.releaseLease(entry.slot.slotId, entry.leaseSessionId);
     this.log(`Slot ${entry.slot.slotId} stopped and lease released`);
