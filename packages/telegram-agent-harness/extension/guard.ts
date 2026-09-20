@@ -74,7 +74,7 @@ function extractAllStrings(val: unknown, depth = 0): string[] {
 }
 
 // Every dotted .env variant holds real values; the committed template variants hold placeholders.
-const SECRET_PATH = /(?:^|[/\\])\.env(?:\.(?!(?:example|sample|template|dist|defaults|schema)\b)[\w-]+)*$|\b(id_(rsa|dsa|ecdsa|ed25519)|service_role|jwt_secret|agent\.db)\b|\.(pem|p12|pfx|key|keystore|jks|ppk)$|(?:^|[/\\])credentials(\.json)?$|(?:^|[/\\])\.(npmrc|netrc|pgpass|git-credentials|pypirc)$|(?:^|[/\\])\.kube[/\\]config$|(?:^|[/\\])\.docker[/\\]config\.json$|(?:^|[/\\])\.gnupg[/\\]|(?:^|[/\\])secrets?\.(json|ya?ml|toml)$|(?:^|[/\\])terraform\.tfstate$|(?:^|[/\\])proc[/\\][^/\\]+[/\\]environ$/i;
+const SECRET_PATH = /(?:^|[/\\])\.env(?:\.(?!(?:example|sample|template|dist|defaults|schema)\b)[\w-]+)*$|\b(id_(rsa|dsa|ecdsa|ed25519)|service_role|jwt_secret|agent\.db)\b|\.(pem|p12|pfx|key|keystore|jks|ppk)$|(?:^|[/\\])credentials(\.json)?$|(?:^|[/\\])\.(npmrc|netrc|pgpass|git-credentials|pypirc)$|(?:^|[/\\])\.ssh(?:[/\\]|$)|(?:^|[/\\])\.kube[/\\]config$|(?:^|[/\\])\.docker[/\\]config\.json$|(?:^|[/\\])\.gnupg[/\\]|(?:^|[/\\])secrets?\.(json|ya?ml|toml)$|(?:^|[/\\])terraform\.tfstate$|(?:^|[/\\])proc[/\\][^/\\]+[/\\]environ$/i;
 const PROTECTED = /^(main|master|staging|production|prod)$/i;
 const PRODUCTION = /(?:\bzaraprptkegxqpvnsubu\b|\bakamai-iad-prod\b)/i;
 // The directories whose contents are the machine itself, wherever that machine is.
@@ -397,6 +397,22 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
     if (/^[\d.]+[smhd]?$/.test(args[offset] ?? "")) offset++;
     return commandCategory(args.slice(offset), cwd, depth + 1);
   }
+  // Windows launches a program through `start` and `Start-Process` rather than by naming it first.
+  if (app === "start") {
+    let offset = 0;
+    while (args[offset] !== undefined && args[offset].startsWith("/")) offset += /^\/(d|node|affinity|machine)$/i.test(args[offset]) ? 2 : 1;
+    const rest = args.slice(offset);
+    // `start "title" program …` spends its first operand on a window title, so both readings are classified.
+    return selectCategory([commandCategory(rest, cwd, depth + 1), commandCategory(rest.slice(1), cwd, depth + 1)]);
+  }
+  if (/^(start-process|saps)$/.test(app)) {
+    const named = args.findIndex(arg => /^-FilePath$/i.test(arg));
+    const program = named >= 0 ? args[named + 1] : args.find((arg, k) => !arg.startsWith("-") && !args[k - 1]?.startsWith("-"));
+    const listed = args.findIndex(arg => /^-(ArgumentList|Args)$/i.test(arg));
+    // -ArgumentList takes a comma-separated array, which the lexer sees as one word.
+    const list = listed >= 0 ? (args[listed + 1] ?? "").split(",").map(item => item.trim()).filter(Boolean) : [];
+    return program === undefined ? DYNAMIC_CATEGORY : commandCategory([program, ...list], cwd, depth + 1);
+  }
   // `watch` and `script -c` hand their argument back to a shell, so the payload is reparsed, not argv.
   if (app === "watch") {
     let offset = 0;
@@ -598,13 +614,35 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
     if (args[0] === "secrets" && /^(set|unset)$/.test(args[1] ?? "")) return "cloudflare_stripe_mutations";
   }
   // The management API performs the same mutation over HTTP; classify the endpoint, not only the project ref.
-  if (/^(curl|wget|http|httpie)$/.test(app)) {
+  // Every client spells a write differently: curl's -d/-F, wget's --post-data, PowerShell's -Method/-Body.
+  if (/^(curl|wget|http|httpie|invoke-restmethod|irm|invoke-webrequest|iwr)$/.test(app)) {
     const url = args.find(arg => /^https?:\/\//i.test(arg)) ?? "";
-    const mutates = args.some(arg => /^(-d|--data|--data-raw|--data-binary|--data-urlencode|--json|--upload-file|-T)$/.test(arg))
-      || args.some((arg, k) => /^(-X|--request|--method)$/.test(args[k - 1] ?? "") && /^(POST|PUT|PATCH|DELETE)$/i.test(arg))
-      || /^(POST|PUT|PATCH|DELETE)$/i.test(args[0] ?? "");
+    // PowerShell writes `-Method POST` with one dash and accepts any unambiguous prefix of the name.
+    const cmdlet = /^(invoke-restmethod|irm|invoke-webrequest|iwr)$/.test(app);
+    const verb = args.find((arg, k) => {
+      const previous = args[k - 1] ?? "";
+      return /^(-X|--request|--method)$/i.test(previous) || (cmdlet && /^-[A-Za-z]+$/.test(previous) && flagPrefixOf(previous, "method"));
+    })
+      ?? /^--(?:method|request)=([\s\S]+)$/i.exec(args.find(arg => /^--(method|request)=/i.test(arg)) ?? "")?.[1]
+      ?? args[0] ?? "";
+    const mutates = /^(POST|PUT|PATCH|DELETE)$/i.test(verb)
+      || args.some(arg => /^(-d|--data|--data-raw|--data-binary|--data-urlencode|--json|--upload-file|-T|-F|--form|--post-data|--post-file|--body-data|-Body|-InFile|-Form)$/i.test(arg)
+        || /^(--data[\w-]*|--post-data|--post-file|--body-data|--form|--json)=/i.test(arg));
     if (mutates && /api\.supabase\.com\/v1\/projects\/[^/]+\/(database|secrets|config)/i.test(url)) return "shared_db_ddl_dml";
     if (mutates && (/\/api\/[\w.]*(deploy|redeploy)\b/i.test(url) || /\b(api\.machines\.dev|api\.fly\.io)\b/i.test(url))) return "deployments";
+    // Deleting a protected ref over the REST API is the same deletion as `git push --delete`.
+    const ref = /\/git\/refs\/heads\/([\w./-]+)/i.exec(url)?.[1];
+    if (mutates && ref && PROTECTED.test(ref)) return "destructive_git";
+  }
+  // `gh api` carries the same REST calls with the token already attached.
+  if (app === "gh" && args[0] === "api") {
+    const verb = args.find((arg, k) => /^(-X|--method)$/.test(args[k - 1] ?? "")) ?? "GET";
+    const endpoint = args.slice(1).find(arg => !arg.startsWith("-") && !/^(GET|POST|PUT|PATCH|DELETE)$/i.test(arg)) ?? "";
+    if (/^(POST|PUT|PATCH|DELETE)$/i.test(verb)) {
+      const ref = /git\/refs\/heads\/([\w./-]+)/i.exec(endpoint)?.[1];
+      if (ref && PROTECTED.test(ref)) return "destructive_git";
+      if (/\/(deployments|pages\/builds)\b/i.test(endpoint)) return "deployments";
+    }
   }
   if (app === "dokploy" || (args.includes("dokploy") && !/^(echo|printf|cat)$/.test(app))) return "deployments";
   if ((app === "fly" || app === "flyctl") && args.includes("deploy") && !/^(echo|printf|cat)$/.test(app)) return "deployments";
