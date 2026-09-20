@@ -46,3 +46,49 @@ The goal of this system is to provide a universal, mobile-first, and desktop-fri
 2. **Proper Telegram HTML Formatting**: All messages use HTML parse mode with valid tags (`<b>`, `<code>`, `<a href="...">`, `<pre>`), avoiding raw Markdown artifacts.
 3. **In-place updates**: Live status cards update via `editMessageText` and `editMessageReplyMarkup` to avoid notification noise.
 4. **Idempotent Callbacks**: Inline button callback data tokens are consumed atomically to prevent race conditions or double-execution.
+---
+
+## Supergroup Forum Topics Mode (Opt-In Prototype)
+
+The daemon supports an opt-in forum mode where multiple Veyyon sessions are multiplexed into a single Telegram Supergroup using native Telegram Forum Topics (`message_thread_id`).
+
+### Architecture & Invariants
+- **One topic per Veyyon session**: Created automatically via Telegram Bot API `createForumTopic` when `/new` is run or a session is attached.
+- **Reply routing by `message_thread_id`**: Inbound messages sent within a topic thread are routed directly to that topic's bound Veyyon session.
+- **Topic closure on session end**: When a session ends or `/detach`/`/close` is executed in a topic, the topic is automatically closed via `closeForumTopic`.
+- **Topic overview**: `/topics` command lists all active topics, their bound session IDs, workspaces, and turn status (`running` vs `idle`).
+- **Opt-in only**: Default slots run in 1-on-1 direct chat mode (`mode: "dm"`). Forum mode requires explicit manifest configuration and is never enabled on live slots by default.
+
+### Operator Setup Steps
+1. **Create Supergroup**: In Telegram, create a group and convert it to a Supergroup (or create a group with yourself).
+2. **Enable Topics**: Open Group Settings (`Edit` -> `Topics`) and toggle **Topics** ON.
+3. **Add Bot as Admin**: Add your bot (e.g. `@superboarddevbot`) to the supergroup and promote it to Administrator with the **Manage Topics** (`can_manage_topics`) permission.
+4. **Get Supergroup Chat ID**: Find your supergroup chat ID (starts with `-100`, e.g. `-1001234567890`).
+5. **Configure Manifest Slot**: In `~/.veyyon/telegram/manifest.json`, add `"mode": "forum"` and `"forumChatId"` to the desired slot:
+   ```json
+   {
+     "slotId": "telegram-superboard",
+     "stateDir": "C:/Users/wkiri/.claude/channels/telegram-superboard",
+     "enabled": true,
+     "daemon": true,
+     "mode": "forum",
+     "forumChatId": "-1001234567890",
+     "defaultProject": "C:/Users/wkiri/development/super-board"
+   }
+   ```
+6. **Restart Daemon**: Restart the daemon to pick up the manifest configuration:
+   ```powershell
+   ~/.veyyon/telegram/veyyon-telegram-daemon.ps1 restart
+   ```
+
+### Forum Commands
+| Command | Description |
+| :--- | :--- |
+| `/topics` | List all active forum topics and their bound session status |
+| `/new [workspace]` | Start a new Veyyon session and open a dedicated forum topic |
+| `/attach <session-id>` | Attach current topic (or create a topic) for an existing session |
+| `/detach` / `/close` | Close current topic and detach from session |
+| `/where` | Show session details, workspace, and turn status for this topic |
+| `/sessions` | List all running Veyyon sessions across workspaces |
+| `/help` | Display forum command guide |
+
