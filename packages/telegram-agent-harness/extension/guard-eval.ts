@@ -369,7 +369,7 @@ export function evalCommands(code: string, language: string, parseShell: (comman
       else if (leaf === "ssh") commands.push(["ssh"]);
       else if (typeof value.application === "string" && Array.isArray(value.args)) append([value.application, ...value.args]);
       else unresolved = true;
-    } else if (/^(fs(?:\.promises)?\.(rm|rmSync|rmdir|rmdirSync|unlink|unlinkSync)|shutil\.rmtree|os\.(remove|unlink|rmdir|kill))$/.test(call)) {
+    } else if (/^(?:(?:fs(?:\.promises)?\.)?(rm|rmSync|rmdir|rmdirSync|unlink|unlinkSync)|shutil\.rmtree|os\.(remove|removedirs|unlink|rmdir|kill))$/.test(call)) {
       commands.push(["rm", "-rf", ...(typeof value === "string" ? [value] : [])]);
     } else if (/^(fs(?:\.promises)?\.(cp|cpSync|copyFile|copyFileSync|rename|renameSync|link|linkSync|symlink|symlinkSync)|shutil\.(move|copy|copy2|copyfile|copytree)|os\.(rename|replace|link|symlink))$/.test(call)) {
       // A copy, move or link clobbers its destination, and the destination is the second operand.
@@ -390,7 +390,7 @@ export function evalCommands(code: string, language: string, parseShell: (comman
     } else if (call === "process.binding" || call === "process._linkedBinding") {
       // A raw internal binding hands back a process API this lexer cannot follow.
       unresolved = true;
-    } else if (/^(read|write|open|fs(?:\.promises)?\.(readFile|readFileSync|writeFile|writeFileSync)|Bun\.(file|write)|Path|pathlib\.Path)$/.test(call)) {
+    } else if (/^(read|write|open|(?:fs(?:\.promises)?\.)?(readFile|readFileSync|writeFile|writeFileSync)|Bun\.(file|write)|Path|pathlib\.Path)$/.test(call)) {
       // A write clobbers its path; only a read leaves the file intact.
       const mode = tokens[argument.end]?.value === "," ? valueAt(argument.end + 1).value : undefined;
       let effect = /write/i.test(leaf) || (typeof mode === "string" && /[wax+]/.test(mode)) ? "tee" : "cat";

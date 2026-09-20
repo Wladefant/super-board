@@ -81,7 +81,7 @@ function remoteTarget(value: string): string {
 }
 
 // Every dotted .env variant holds real values; the committed template variants hold placeholders.
-const SECRET_PATH = /(?:^|[/\\])\.env(?:\.(?!(?:example|sample|template|dist|defaults|schema)\b)[\w-]+)*$|\b(id_(rsa|dsa|ecdsa|ed25519)|service_role|jwt_secret|agent\.db)\b|\.(pem|p12|pfx|key|keystore|jks|ppk)$|(?:^|[/\\])credentials(\.json)?$|(?:^|[/\\])\.(npmrc|netrc|pgpass|git-credentials|pypirc)$|(?:^|[/\\])\.ssh(?:[/\\]|$)|(?:^|[/\\])\.kube[/\\]config$|(?:^|[/\\])\.docker[/\\]config\.json$|(?:^|[/\\])\.gnupg[/\\]|(?:^|[/\\])secrets?\.(json|ya?ml|toml)$|(?:^|[/\\])terraform\.tfstate$|(?:^|[/\\])proc[/\\][^/\\]+[/\\]environ$/i;
+const SECRET_PATH = /(?:^|[/\\])\.env(?:\.(?!(?:example|sample|template|dist|defaults|schema)\b)[\w-]+)*$|\b(id_(rsa|dsa|ecdsa|ed25519)|service_role|jwt_secret|agent\.db)\b|\.(pem|p12|pfx|key|keystore|jks|ppk)$|(?:^|[/\\])credentials(\.json)?$|(?:^|[/\\])\.(npmrc|netrc|pgpass|git-credentials|pypirc)$|(?:^|[/\\])\.ssh(?:[/\\]|$)|(?:^|[/\\])\.kube[/\\]config$|(?:^|[/\\])\.docker[/\\]config\.json$|(?:^|[/\\])\.gnupg[/\\]|(?:^|[/\\])secrets?\.(json|ya?ml|toml)$|(?:^|[/\\])terraform\.tfstate$|(?:^|[/\\])proc[/\\][^/\\]+[/\\]environ$|(?:^|[/\\])etc[/\\](shadow|gshadow|sudoers|master\.passwd)$/i;
 const PROTECTED = /^(main|master|staging|production|prod)$/i;
 const PRODUCTION = /(?:\bzaraprptkegxqpvnsubu\b|\bakamai-iad-prod\b)/i;
 // The directories whose contents are the machine itself, wherever that machine is.
@@ -373,6 +373,23 @@ function flagPrefixOf(flag: string, parameter: string): boolean {
   const given = flag.replace(/^[-/]+/, "").toLowerCase();
   return given.length > 0 && parameter.startsWith(given);
 }
+
+/** A psql invocation whose every `-c` statement only reads. A write smuggled behind a semicolon, a
+ * data-modifying CTE, or a `-f` script whose contents are unknown all fall back to the gate. */
+function readsOnly(args: string[]): boolean {
+  const statements: string[] = [];
+  for (let k = 0; k < args.length; k++) {
+    const inline = /^(?:-c|--command=)([\s\S]+)$/.exec(args[k]);
+    if (inline) statements.push(inline[1]);
+    else if (/^(-c|--command)$/.test(args[k])) statements.push(args[++k] ?? "");
+    else if (/^(-f|--file|-l|--list)\b/.test(args[k])) return false;
+  }
+  return statements.length > 0 && statements.every(statement => statement.split(";").every(part => {
+    const text = part.trim();
+    return text === "" || (/^(select|with|show|explain|table|values)\b/i.test(text)
+      && !/\b(insert|update|delete|drop|truncate|alter|create|grant|revoke|copy|vacuum|reindex|call|do)\b/i.test(text));
+  }));
+}
 export const DYNAMIC_CATEGORY = "dynamic_code";
 
 export function commandCategory(words: string[], cwd = process.cwd(), depth = 0): string | undefined {
@@ -531,7 +548,10 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
   // A real process may read keys regardless of the transport. Never inspect source-file contents.
   if (!readOnlyLocal && PRODUCTION.test(command)) return "production_exclusion";
   // A path can ride behind a prefix: curl reads a file as `@path`, `field=@path` or `--data=@path`.
-  if (args.some(arg => SECRET_PATH.test(arg) || (arg.includes("@") && SECRET_PATH.test(arg.slice(arg.lastIndexOf("@") + 1))))) return "secrets";
+  // A search command's first operand is its pattern, not a path: `rg 'etc/shadow' src/` reads no secret,
+  // while `rg secret ~/.ssh/config` still names one.
+  const searched = /^(grep|rg|ag|ack)$/.test(app) ? args.filter(arg => !arg.startsWith("-")).slice(1) : args;
+  if (searched.some(arg => SECRET_PATH.test(arg) || (arg.includes("@") && SECRET_PATH.test(arg.slice(arg.lastIndexOf("@") + 1))))) return "secrets";
   if (app === "gh" && args[0] === "auth" && args[1] === "token") return "secrets";
   if (/^(vault|op|doppler|infisical)$/.test(app) && /^(read|get|kv|item|secrets|export)$/.test(args[0] ?? "")) return "secrets";
   if (app === "aws" && (args[0] === "secretsmanager" && /^(get-secret-value|list-secrets)$/.test(args[1] ?? "")
@@ -621,6 +641,11 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
   }
   if (app === "truncate" && args.some(arg => /^(-s|--size)/.test(arg))
     && args.filter(arg => !arg.startsWith("-")).some(operand => isDestructiveRmTarget(operand, cwd))) return "shell_destructive_os";
+  // Recursively stripping ownership or permissions off a root or system tree destroys the machine as
+  // surely as deleting it; an in-tree `chmod -R 755 ./scripts` is ordinary work and stays allowed.
+  if (/^(chmod|chown|chgrp|setfacl|chattr|icacls|takeown)$/.test(app)
+    && args.some(arg => /^(--recursive|-[A-Za-z]*R[A-Za-z]*)$/.test(arg) || /^[/-][Tt]$/.test(arg))
+    && args.filter(arg => !arg.startsWith("-")).some(operand => isDestructiveRmTarget(operand, cwd))) return "shell_destructive_os";
   // Overwriting a file destroys it as surely as rm does, whichever binary performs the write.
   const operands = args.filter(arg => !arg.startsWith("-")), written: string[] = [];
   if (/^(sort|install|shred|tee)$/.test(app)) {
@@ -665,9 +690,11 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
     const redirect = /^\d?>{1,2}([\s\S]*)$/.exec(args[k]);
     if (redirect && isDestructiveRmTarget(redirect[1] || args[k + 1] || "", cwd)) return "shell_destructive_os";
   }
-  // `psql --version` connects to nothing; every other invocation, bare included, opens a session.
+  // `psql --version` connects to nothing and a `-c` payload that only reads changes nothing; every
+  // other invocation, bare included, opens a session that can write.
   if ((app === "psql" || app === "pg_restore")
-    && !(args.length > 0 && args.every(arg => /^(-V|--version|-\?|--help)$/.test(arg)))) return "shared_db_ddl_dml";
+    && !(args.length > 0 && args.every(arg => /^(-V|--version|-\?|--help)$/.test(arg)))
+    && !(app === "psql" && readsOnly(args))) return "shared_db_ddl_dml";
   if (app === "alembic" && args.some(a => /^(upgrade|downgrade|stamp)$/.test(a))) return "shared_db_ddl_dml";
   // A client is only the pipe: the statement is the mutation, whichever binary carries it.
   if (/^(mysql|mariadb|sqlite3|mongo|mongosh|clickhouse-client|cockroach|duckdb|sqlcmd|osql|surreal)$/.test(app)

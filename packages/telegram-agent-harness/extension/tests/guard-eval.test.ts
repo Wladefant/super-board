@@ -1321,6 +1321,36 @@ const SWEEP_CASES: SweepCase[] = [
   { id: "Z18", label: "remote root deletion over ssh", want: "block", tool: "ssh", input: { host: "build-host", command: "rm -rf /" } },
   { id: "Z19", label: "remote key read over ssh", want: "block", tool: "ssh", input: { host: "build-host", command: "cat ~/.ssh/id_rsa" } },
   { id: "Z20", label: "remote service status", want: "allow", tool: "ssh", input: { host: "build-host", command: "systemctl status app" } },
+
+  // Reviewer round 4: permission destruction, pagers, read-only SQL and the eval-side file calls.
+  { id: "F01", label: "recursive chmod at the root", want: "block", tool: "bash", input: { command: "chmod -R 000 /" } },
+  { id: "F02", label: "recursive chown at the root", want: "block", tool: "bash", input: { command: "chown -R nobody /" } },
+  { id: "F03", label: "recursive chmod on a system tree", want: "block", tool: "bash", input: { command: "chmod -R 777 /usr/bin" } },
+  { id: "F04", label: "recursive chmod in this tree", want: "allow", tool: "bash", input: { command: "chmod -R 755 ./scripts" } },
+  { id: "F05", label: "single-file chmod in this tree", want: "allow", tool: "bash", input: { command: "chmod 644 packages/app/src/index.ts" } },
+  { id: "F06", label: "pager on the shadow file", want: "block", tool: "bash", input: { command: "less /etc/shadow" } },
+  { id: "F07", label: "more on the shadow file", want: "block", tool: "bash", input: { command: "more /etc/shadow" } },
+  { id: "F08", label: "editor on the sudoers file", want: "block", tool: "bash", input: { command: "vim /etc/sudoers" } },
+  { id: "F09", label: "pager on a source file", want: "allow", tool: "bash", input: { command: "less packages/app/src/index.ts" } },
+  { id: "F10", label: "searching for the word etc/shadow", want: "allow", tool: "bash", input: { command: "rg 'etc/shadow' packages" } },
+  { id: "F11", label: "searching inside the ssh directory", want: "block", tool: "bash", input: { command: "rg secret ~/.ssh/config" } },
+  { id: "F12", label: "read-only count", want: "allow", tool: "bash", input: { command: "psql -c 'SELECT count(*) FROM users'" } },
+  { id: "F13", label: "read-only CTE", want: "allow", tool: "bash", input: { command: "psql -c 'WITH recent AS (SELECT * FROM orders LIMIT 10) SELECT count(*) FROM recent'" } },
+  { id: "F14", label: "explain plan", want: "allow", tool: "bash", input: { command: "psql -c 'EXPLAIN SELECT * FROM orders'" } },
+  { id: "F15", label: "DDL smuggled behind a select", want: "block", tool: "bash", input: { command: "psql -c 'SELECT 1; DROP TABLE users'" } },
+  { id: "F16", label: "data-modifying CTE", want: "block", tool: "bash", input: { command: "psql -c 'WITH gone AS (DELETE FROM orders RETURNING id) SELECT count(*) FROM gone'" } },
+  { id: "F17", label: "copy out to a file", want: "block", tool: "bash", input: { command: "psql -c \"COPY users TO '/tmp/users.csv'\"" } },
+  { id: "F18", label: "a read and a write in one call", want: "block", tool: "bash", input: { command: "psql -c 'SELECT 1' -c 'TRUNCATE users'" } },
+  { id: "F19", label: "script file of unknown contents", want: "block", tool: "bash", input: { command: "psql -f migrate.sql" } },
+  { id: "F20", label: "interactive session", want: "block", tool: "bash", input: { command: "psql -h db -U app" } },
+  { id: "F21", label: "removedirs at the root", want: "block", tool: "eval", input: { language: "py", code: "os.removedirs('/')" } },
+  { id: "F22", label: "removedirs in a build directory", want: "allow", tool: "eval", input: { language: "py", code: "os.removedirs('./build/tmp')" } },
+  { id: "F23", label: "eval reads the shadow file", want: "block", tool: "eval", input: { language: "py", code: "print(open('/etc/shadow').read())" } },
+  { id: "F24", label: "destructured readFileSync on a key", want: "block", tool: "eval", input: { language: "js", code: "readFileSync(process.env.HOME + '/.ssh/id_rsa')" } },
+  { id: "F25", label: "destructured rmSync at the root", want: "block", tool: "eval", input: { language: "js", code: "rmSync('/', { recursive: true })" } },
+  { id: "F26", label: "destructured rm in this tree", want: "allow", tool: "eval", input: { language: "js", code: "await rm('./dist', { recursive: true })" } },
+  { id: "F27", label: "LiteralPath bound to the drive root", want: "block", tool: "bash", input: { command: "Remove-Item -LiteralPath:C:\\ -Recurse -Force" } },
+  { id: "F28", label: "commit message naming a protected path", want: "allow", tool: "bash", input: { command: "git commit -m 'harden the /etc/shadow reader rule'" } },
 ];
 
 describe("Issue #97: Table-driven audit of guard-eval.ts and guard.ts", () => {
@@ -1360,7 +1390,7 @@ describe("Issue #97: Table-driven audit of guard-eval.ts and guard.ts", () => {
       J: "reviewer round 3", K: "exec family", L: "spelling sweep", M: "everyday commands", N: "HTTP verbs and launchers",
       S: "eval executors and file sinks", T: "tool surfaces beside bash", U: "robustness and parser limits",
       V: "interpreters fed on stdin", W: "credential reads and exfiltration", Y: "debugger and app-spawn surfaces",
-      Z: "remote, selector and archive paths",
+      Z: "remote, selector and archive paths", F: "reviewer round 4",
     };
     const batches = new Map<string, SweepCase[]>();
     for (const testCase of SWEEP_CASES) {
