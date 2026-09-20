@@ -65,6 +65,7 @@ test("relay forwards signed API state and rejects forged browser credentials", a
   const dir = mkdtempSync(join(tmpdir(), "miniapp-"));
   try {
     await new Promise<void>((resolve, reject) => { ws.onopen = () => resolve(); ws.onerror = reject; });
+    expect((await fetch(`http://localhost:${server.port}/relay`, { headers: { Authorization: `Bearer ${secret}` } })).status).toBe(409);
     ws.onmessage = async event => {
       ws.send(JSON.stringify(await miniAppRequest(JSON.parse(String(event.data)), {
         stateDir: dir, token, allowedUsers: users, session: () => null,
@@ -125,6 +126,9 @@ test("authenticated actors cannot read or decide another private chat's pending 
     expect(rightActor.status).toBe(200);
     expect(pendingApprovals(dir, routes[bob])).toHaveLength(0);
     expect((await miniAppRequest({ id: "4", path: "/api/approval", method: "POST", initData: "", appSession: issueAppSession(bob, token), body: JSON.stringify(decision) }, options)).status).toBe(409);
+    for (const [path, method] of [["/api/unknown", "GET"], ["/api/state", "POST"], ["/api/approval", "GET"]]) {
+      expect((await miniAppRequest({ id: "5", path, method, initData: "", appSession: aliceSession, body: "" }, options)).status).toBe(404);
+    }
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
