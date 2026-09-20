@@ -99,6 +99,7 @@ function fixture(options: QuestionFixtureOptions = {}) {
           },
     },
     bridge,
+    { outboundPaceMs: 0 },
   );
 
   const decisionsPath = path.join(dir, "decisions.json");

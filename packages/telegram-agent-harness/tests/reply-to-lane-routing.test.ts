@@ -60,6 +60,7 @@ function fixture() {
       onLedgerFailure: () => {},
     },
     bridge,
+    { outboundPaceMs: 0 },
   );
 
   globalThis.fetch = (async (url, init) => {

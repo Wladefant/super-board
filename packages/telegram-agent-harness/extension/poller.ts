@@ -68,6 +68,8 @@ export interface PollerOptions {
   initialConflictBackoffMs?: number;
   maxConflictBackoffMs?: number;
   conflictBackoffFactor?: number;
+  /** Milliseconds to pace consecutive outbound requests. Defaults to 1250 ms. */
+  outboundPaceMs?: number;
   /**
    * Forum topic every outbound message and dashboard pin is bound to. Omitted for a
    * plain chat, where Telegram rejects the field outright, so it has no default.
@@ -85,6 +87,7 @@ const DEFAULT_POLLER_OPTIONS = {
   initialConflictBackoffMs: 1000,
   maxConflictBackoffMs: 15000,
   conflictBackoffFactor: 2.0,
+  outboundPaceMs: 1250,
 } satisfies PollerOptions;
 
 interface LedgerRow {
@@ -164,6 +167,7 @@ export class TelegramPoller {
   private nextOutboundAt = 0;
   private outboundReservation: Promise<void> = Promise.resolve();
   private dashboardUpdate: Promise<void> | null = null;
+  private readonly messageThreadId?: number;
 
   public get running(): boolean {
     return this.isRunning;
@@ -175,6 +179,7 @@ export class TelegramPoller {
     accessConfig: AccessConfig,
     callbacks: PollerCallbacks,
     correlation: MessageCorrelationBridge | null = null,
+    threadOrOptions?: number | PollerOptions,
     options?: PollerOptions,
   ) {
     this.botToken = botToken;
@@ -183,9 +188,15 @@ export class TelegramPoller {
     this.accessConfig = accessConfig;
     this.callbacks = callbacks;
     this.correlation = correlation;
-    this.options = { ...DEFAULT_POLLER_OPTIONS, ...(options || {}) };
+    // Positional slot 6 carries either the forum topic this channel is pinned to
+    // (number) or the poller tuning options (object). Two features claimed the same
+    // argument, so callers of each shape are both still honoured.
+    const threadId = typeof threadOrOptions === "number" ? threadOrOptions : undefined;
+    const tuning = typeof threadOrOptions === "object" && threadOrOptions !== null ? threadOrOptions : options;
+    this.messageThreadId = threadId;
+    this.options = { ...DEFAULT_POLLER_OPTIONS, ...(tuning || {}) };
     this.abortController = new AbortController();
-    this.messageThreadId = this.options.messageThreadId;
+    this.messageThreadId = (typeof threadOrOptions === "number" ? threadOrOptions : undefined) ?? this.options.messageThreadId;
     if (this.messageThreadId !== undefined && (!Number.isSafeInteger(this.messageThreadId) || this.messageThreadId <= 0)) {
       throw new Error("message_thread_id must be a positive integer");
     }
@@ -305,7 +316,8 @@ export class TelegramPoller {
         if (signal.aborted) abort();
       });
       this.abortController.signal.throwIfAborted();
-      this.nextOutboundAt = Date.now() + 1250;
+      const paceMs = this.options.outboundPaceMs ?? 1250;
+      this.nextOutboundAt = paceMs > 0 ? Date.now() + paceMs : 0;
     });
     this.outboundReservation = reserve.catch(() => {});
     return reserve;
@@ -770,10 +782,12 @@ export class TelegramPoller {
         // head-of-line block every later update indefinitely. Record why it failed
         // and move on, so the queue drains and the failure is visible in the ledger.
         const detail = redactSecrets(err instanceof Error ? err.message : String(err)).slice(0, 500);
-        this.db.run("UPDATE update_ledger SET status = 'REJECTED', error = ? WHERE update_id = ?", [
-          `PROCESSING_FAILED: ${detail}`,
-          row.update_id,
-        ]);
+        try {
+          this.db.run("UPDATE update_ledger SET status = 'REJECTED', error = ? WHERE update_id = ?", [
+            `PROCESSING_FAILED: ${detail}`,
+            row.update_id,
+          ]);
+        } catch {}
         this.callbacks.onLedgerFailure(`update ${row.update_id} could not be processed: ${detail}`);
         if (row.is_callback) {
           await this.sendTelegramMessage(row.chat_id, `Choice could not be delivered: ${escapeHtml(detail)}. Reply to the original message with your choice.`);

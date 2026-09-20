@@ -240,6 +240,9 @@ export class TelegramRuntime {
       this.pi.logger?.warn(
         `Telegram bot lease on slot ${root.activeSlot.slotId} is no longer held by this process; releasing the channel instead of re-pointing it to session ${nextSessionId}.`,
       );
+      root.questions?.stop();
+      root.dashboard?.stop();
+      root.messageContext?.close();
       void root.poller.stop();
       root.coordinator.close();
       delete globalState[ACTIVE_ROOT_SYMBOL];
@@ -319,6 +322,7 @@ export class TelegramRuntime {
       return this.sessionId ?? newSessionId;
     };
 
+
     const correlationBridge: MessageCorrelationBridge = {
       getSessionId: currentSessionId,
       getSlotId: () => activeSlot.slotId,
@@ -341,7 +345,7 @@ export class TelegramRuntime {
 
     const runner = this.options.commandRunnerFactory ? this.options.commandRunnerFactory() : new BunCommandRunner();
 
-    const pollerCallbacks = {
+    const pollerCallbacks: PollerCallbacks = {
       isIdle: () => ctx.isIdle(),
       getSessionFile: () => ctx.sessionManager.getSessionFile(),
       onUserMessage: (text: string) => {
@@ -352,16 +356,18 @@ export class TelegramRuntime {
           this.pi.sendUserMessage(text, { deliverAs: "steer" });
         }
       },
+      onFollowUp: (text: string) => {
+        if (this.guard) this.guard.startTelegramTurn();
+        this.pi.sendUserMessage(text, { deliverAs: "followUp" });
+      },
       onSteer: (text: string) => {
         if (this.guard) this.guard.startTelegramTurn();
         this.pi.sendUserMessage(text, { deliverAs: "steer" });
       },
-      onCancel: async () => {
-        await this.pi.abortActiveTurn();
-        const primaryChat = this.poller?.getPrimaryChatId();
-        if (primaryChat && this.poller) {
-          await this.poller.sendTelegramMessage(primaryChat, "🛑 <b>Turn cancelled by operator.</b>");
-        }
+      // Abort only. The poller owns the operator-facing cancellation reply, so
+      // sending one here would deliver it twice.
+      onAbort: () => {
+        void this.pi.abortActiveTurn();
       },
       onRelease: async () => {
         await this.dispose();
@@ -416,6 +422,8 @@ export class TelegramRuntime {
       onTelegramTurnStart: () => {
         if (this.guard) this.guard.startTelegramTurn();
       },
+      // The service is constructed after the poller it writes through, so the
+      // receiver is resolved per answer rather than captured at wiring time.
       onQuestionAnswer: async (decisionId: string, eventId: string, answer: { choice?: string; text?: string }) => {
         if (!this.questions) throw new Error("Question receiver unavailable; answer was not delivered");
         await this.questions.answer(decisionId, eventId, answer);
@@ -494,7 +502,6 @@ export class TelegramRuntime {
 
     questions.start();
     dashboard.start();
-
     globalState[ACTIVE_ROOT_SYMBOL] = {
       instanceId: this.instanceId,
       sessionId: newSessionId,
@@ -508,6 +515,9 @@ export class TelegramRuntime {
       messageContext: messageContext ?? undefined,
       dashboard,
     };
+
+    questions.start();
+    dashboard.start();
 
     globalState[ACTIVE_LEASE_SYMBOL] = {
       slotId: activeSlot.slotId,
@@ -661,6 +671,8 @@ export class TelegramRuntime {
       this.streamDebounceTimer = null;
     }
 
+    // Stop the timer-driven services before the poller they write through, so a
+    // coalesced refresh cannot fire against a stopped channel.
     this.questions?.stop();
     this.questions = null;
     this.dashboard?.stop();
