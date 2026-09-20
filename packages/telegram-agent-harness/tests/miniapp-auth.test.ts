@@ -2,7 +2,6 @@ import { describe, expect, test } from "bun:test";
 import { authenticateInitData } from "../daemon/miniapp-auth";
 import { authorizedRelay, startRelay } from "../miniapp/relay";
 import { miniAppRequest } from "../daemon/miniapp";
-import { connectMiniApp } from "../daemon/miniapp";
 import { createHmac } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";

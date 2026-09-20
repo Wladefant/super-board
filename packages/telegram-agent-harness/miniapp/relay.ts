@@ -11,7 +11,7 @@ export function authorizedRelay(header: string | null, secret: string): boolean 
 export function startRelay(secret: string, port = 3000) {
   if (secret.length < 43) throw new Error("RELAY_SECRET must contain at least 43 characters");
   let daemon: ServerWebSocket<undefined> | undefined;
-  const pending = new Map<string, { finish: (response: Response) => void; timer: ReturnType<typeof setTimeout> }>();
+  const pending = new Map<string, { finish: (response: Response) => void; timer: Timer }>();
   const unavailable = () => Response.json({ error: "Local daemon unavailable" }, { status: 503 });
   return Bun.serve<undefined>({
     port,
