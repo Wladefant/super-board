@@ -1,27 +1,33 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { authenticateInitData } from "./miniapp-auth";
+import { authenticateInitData, authenticateAppSession, issueAppSession } from "./miniapp-auth";
 import { decideApproval, pendingApprovals } from "../extension/approvals";
 
-export interface MiniAppRequest { id: string; path: string; method: string; initData: string; body: string }
+export interface MiniAppRequest { id: string; path: string; method: string; initData: string; appSession?: string; body: string }
 export interface MiniAppOptions {
   stateDir: string; token: string; allowedUsers: string[];
-  session: () => string | null;
+  session: (userId: string) => string | null;
   sessions: () => Promise<unknown>;
-  dashboard: () => unknown;
+  dashboard: (userId: string) => unknown;
   status: () => unknown;
 }
 export async function miniAppRequest(request: MiniAppRequest, options: MiniAppOptions) {
   let user: string;
-  try { user = authenticateInitData(request.initData, options.token, options.allowedUsers); }
+  try {
+    if (request.path === "/api/session" && request.method === "POST") {
+      user = authenticateInitData(request.initData, options.token, options.allowedUsers);
+      return { id: request.id, status: 200, data: { appSession: issueAppSession(user, options.token), expiresIn: 28800 } };
+    }
+    user = authenticateAppSession(request.appSession ?? "", options.token, options.allowedUsers);
+  }
   catch { return { id: request.id, status: 401, data: { error: "Open this app from Telegram again to authenticate." } }; }
   const respond = (status: number, data: unknown) => ({ id: request.id, status, data });
   try {
-    const session = options.session();
+    const session = options.session(user);
     if (request.path === "/api/state" && request.method === "GET") {
       let sessions: unknown = null;
       try { sessions = await options.sessions(); } catch { /* unavailable is explicit in the response */ }
-      return respond(200, { observedAt: Date.now(), session, sessions, status: options.status(), dashboard: options.dashboard(), approvals: session ? pendingApprovals(options.stateDir, session) : null });
+      return respond(200, { observedAt: Date.now(), session, sessions, status: options.status(), dashboard: options.dashboard(user), approvals: session ? pendingApprovals(options.stateDir, session) : null });
     }
     if (request.path === "/api/approval" && request.method === "POST") {
       if (!session) return respond(409, { error: "Chat is not bound to a session." });
@@ -38,8 +44,14 @@ export async function miniAppRequest(request: MiniAppRequest, options: MiniAppOp
 export function connectMiniApp(options: MiniAppOptions): () => void {
   const configPath = path.join(options.stateDir, "miniapp.json");
   if (!fs.existsSync(configPath)) return () => {};
-  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
-  if (!/^https:\/\//.test(config.url) || typeof config.secret !== "string" || config.secret.length < 43) throw new Error("Invalid Mini App relay configuration");
+  let config: { url: string; secret: string };
+  try {
+    const parsed = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    if (!parsed || typeof parsed.url !== "string" || typeof parsed.secret !== "string" || parsed.secret.length < 43) return () => {};
+    const url = new URL(parsed.url);
+    if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) return () => {};
+    config = { url: url.origin, secret: parsed.secret };
+  } catch { return () => {}; }
   let stopped = false;
   let socket: WebSocket | undefined;
   let retry: Timer | undefined;

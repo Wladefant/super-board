@@ -192,7 +192,12 @@ export class TelegramDaemon {
       return this.unclaimed(slot, "bot token unreadable");
     }
 
-    const activeSlot = this.startSlot(slot, token, leaseSessionId);
+    let activeSlot: ActiveSlot;
+    try { activeSlot = this.startSlot(slot, token, leaseSessionId); }
+    catch {
+      this.coordinator.releaseLease(slot.slotId, leaseSessionId);
+      return this.unclaimed(slot, "slot startup failed");
+    }
     this.active.push(activeSlot);
     void activeSlot.poller
       .start()
@@ -330,9 +335,8 @@ export class TelegramDaemon {
         if (/^\/app(?:@\w+)?\s*$/i.test(text)) {
           const url = miniAppUrl(slot.stateDir);
           if (url) {
-            await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-              method: "POST", headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ chat_id: chatId, text: "Open your Superboard dashboard", reply_markup: { inline_keyboard: [[{ text: "Open Superboard", web_app: { url } }]] } }),
+            await poller.sendTelegramMessage(chatId, "Open your Superboard dashboard", {
+              inline_keyboard: [[{ text: "Open Superboard", web_app: { url } }]],
             });
           } else await poller.sendTelegramMessage(chatId, "Mini App is not configured for this bot.");
           return true;
@@ -382,19 +386,22 @@ export class TelegramDaemon {
 
     const stopMiniApp = connectMiniApp({
       stateDir: slot.stateDir, token, allowedUsers: access.allowFrom,
-      session: () => router.boundSession(currentChat()),
+      session: userId => router.boundSession(userId),
       sessions: () => this.control.listSessions(),
       status: () => ({ polling: poller.running, slot: slot.slotId }),
-      dashboard: () => {
-        const session = router.boundSession(currentChat());
+      dashboard: userId => {
+        const session = router.boundSession(userId);
         const raw = session ? poller.getMeta(`dashboard-snapshot:${session}`) : null;
         try { return raw ? JSON.parse(raw) : null; } catch { return null; }
       },
     });
     const url = miniAppUrl(slot.stateDir);
-    if (url) void fetch(`https://api.telegram.org/bot${token}/setChatMenuButton`, {
+    if (url) for (const chatId of access.allowFrom) void fetch(`https://api.telegram.org/bot${token}/setChatMenuButton`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ menu_button: { type: "web_app", text: "Superboard", web_app: { url } } }),
+      body: JSON.stringify({ chat_id: chatId, menu_button: { type: "web_app", text: "Superboard", web_app: { url } } }),
+    }).then(async response => {
+      const result = await response.json();
+      if (!response.ok || !result.ok) this.log(`Slot ${slot.slotId}: Mini App menu registration rejected`);
     }).catch(() => this.log(`Slot ${slot.slotId}: Mini App menu registration unavailable`));
     return { slot, poller, router, leaseSessionId, stopMiniApp };
   }
