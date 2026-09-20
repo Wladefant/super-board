@@ -19,7 +19,7 @@ import {
   getProcessIdentity,
 } from "../extension/coordinator";
 import { TelegramPoller } from "../extension/poller";
-import { chunkMessage } from "../extension/sanitizer";
+import { chunkMessage, escapeHtml } from "../extension/sanitizer";
 import type { AccessConfig, MessageCorrelationBridge } from "../extension/types";
 import { BunCommandRunner } from "../extension/harness/command-runner";
 import { handleInstalledCommand } from "../src/installed-commands";
@@ -398,6 +398,21 @@ export class TelegramDaemon {
           inbound: async message => {
             await router.deliver(chatId, message, "auto");
           },
+          reload: async () => {
+            try {
+              const reloadedAccess = this.coordinator.readAccessConfig(slot.stateDir);
+              poller.updateAccess(reloadedAccess);
+              await poller.sendTelegramMessage(
+                chatId,
+                `<b>Telegram daemon reloaded.</b> Slot <code>${escapeHtml(slot.slotId)}</code> access rules and configuration refreshed.`,
+              );
+            } catch (err: unknown) {
+              await poller.sendTelegramMessage(
+                chatId,
+                `<b>Reload failed:</b> ${escapeHtml(err instanceof Error ? err.message : String(err))}`,
+              );
+            }
+          },
         }, runner);
       },
       onDecisionCallback: async (decisionId: string, choiceId: string, context?: string) => {
@@ -418,6 +433,7 @@ export class TelegramDaemon {
 
     const pollerOptions = {
       commands: getDaemonCommands(),
+      isDaemon: true,
     };
 
     poller = this.options.pollerFactory
