@@ -448,13 +448,13 @@ describe("routing commands", () => {
     expect(sent[1].html).toContain("No workspace");
   });
 
-  test("indices survive host reorder and are isolated by chat and topic", async () => {
+  test("indices survive router recreation and host reorder and are isolated by chat and topic", async () => {
     const sessions = [summary("a", "C:/a"), summary("b", "C:/b")];
     const fake = fakeControl(sessions);
     const router = buildRouter({}, fake.control);
     await router.handleCommand("/sessions", TOPIC_9);
     sessions.reverse();
-    await router.handleCommand("/attach 1", TOPIC_9);
+    await buildRouter({}, fake.control).handleCommand("/attach 1", TOPIC_9);
     expect(router.boundSession(TOPIC_9)).toBe("a");
     await router.handleCommand("/attach 1", TOPIC_14);
     await router.handleCommand("/attach 1", DM);
