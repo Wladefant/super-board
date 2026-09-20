@@ -59,6 +59,23 @@ export class DaemonStore {
         PRIMARY KEY (session_id, entry_id)
       );
     `);
+    this.db.run(`CREATE TABLE IF NOT EXISTS session_listings (
+      slot_id TEXT NOT NULL, chat_id TEXT NOT NULL, topic_id TEXT NOT NULL,
+      session_ids TEXT NOT NULL, PRIMARY KEY (slot_id, chat_id, topic_id)
+    )`);
+  }
+
+  public putSessionListing(slotId: string, chatId: string, topicId: string, ids: string[]): void {
+    this.db.run(`INSERT INTO session_listings VALUES (?, ?, ?, ?)
+      ON CONFLICT(slot_id, chat_id, topic_id) DO UPDATE SET session_ids = excluded.session_ids`,
+    [slotId, chatId, topicId, JSON.stringify(ids)]);
+  }
+
+  public getSessionListing(slotId: string, chatId: string, topicId: string): string[] {
+    const row = this.db.query<{ session_ids: string }, [string, string, string]>(
+      "SELECT session_ids FROM session_listings WHERE slot_id = ? AND chat_id = ? AND topic_id = ?",
+    ).get(slotId, chatId, topicId);
+    return row ? JSON.parse(row.session_ids) : [];
   }
 
   public getRoute(slotId: string, chatId: string, topicId = ""): DaemonRoute | null {
