@@ -1,0 +1,51 @@
+{
+  "timestamp": "2026-09-06T16:15:00Z",
+  "topic": "req-4582-recurrence-guard",
+  "dedicated_tracking_issue": "https://github.com/Bavariance/polysimulator/issues/4628",
+  "superboard_card_id": "PVTI_lADODpNYWs4BIXPZzg5qVoI",
+  "pr": "https://github.com/Wladefant/super-board/pull/76",
+  "pr_number": 76,
+  "published_remote_sha": "370a2ffe0614b2645769fd9043dfe41fbb6c7841",
+  "intermediate_merge_sha": "b29a2c068e6502bfa643970ac6ec6bf9573ff806",
+  "new_head_sha": "47036530944e3189522c74e12a193a038519458b",
+  "worktree_path": "C:/Users/wkiri/development/wt-workflow-gate-integration",
+  "ci_diagnostic_analysis": {
+    "job_id": 101513844898,
+    "run_id": 34043316600,
+    "artifact_ref": "artifact://37890",
+    "actual_sddl": "O:BAG:S-1-5-21-1456194669-2875347699-3862154473-513D:AI(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;LA)",
+    "expected_sddl": "O:BAG:S-1-5-21-1456194669-2875347699-3862154473-513D:(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;LA)",
+    "distinction": "Byte hash passes 100%. Owner (O:BA), Group, and all ordered ACEs are 100% identical. The sole difference was the D:AI vs D: auto-inherited DACL control-bit flag (SE_DACL_AUTO_INHERITED), which Windows assigns upon setting security descriptors when all ACEs carry the ID (inherited) flag on an unprotected descriptor. This was not an owner-assignment exception."
+  },
+  "security_preserving_correction": {
+    "setup_ps1": "Implemented Test-SddlEquivalence to compare descriptors. Requires exact match on Owner, Group, Protected Inheritance (P flag), and verbatim match on all ordered ACEs (AceType, AceFlags, AccessMask, SecurityIdentifier). Normalizes only the auto-inherited control bit (AI) on unprotected DACLs when all permissions are identical. Removed speculative try/catch fallback in Set-FileAclSddl.",
+    "test_claudex_launcher_ps1": "Implemented Assert-AclEqual with Test-SddlEquivalence. Added faithful DACL normalization fixture group verifying that D:AI vs D: normalizes between identical ACEs, while differing owners, differing groups, protected inheritance (P flag), differing rights/masks, differing ACE order, and missing/extra ACEs are strictly rejected. 10/10 PowerShell groups pass."
+  },
+  "exact_head_proof": {
+    "commit_sha": "47036530944e3189522c74e12a193a038519458b",
+    "commit_short": "4703653",
+    "commit_parent": "b29a2c068e6502bfa643970ac6ec6bf9573ff806",
+    "ancestorship_verified": "370a2ff is ancestor of HEAD (git merge-base --is-ancestor 370a2ff HEAD -> 0)",
+    "fast_forward_push": "Clean fast-forward push on origin without force-push or rebase",
+    "test_claudex_launcher_ps1": "10/10 PowerShell groups passed (100% PASS)",
+    "test_claudex_optimized_py": "34/34 passed (100% PASS)",
+    "probe_routing_local_bundle_syntax": "20/20 requests captured, returncode 0, verified=true (both under npm claude.cmd shim and native binary)",
+    "probe_routing_local_tool_search": "176 tools catalog conserved, material reduction verified=true, returncode 0"
+  },
+  "remaining_publication_steps": [
+    "Main pushes commit 47036530944e3189522c74e12a193a038519458b to branch fix/4582-workflow-gate-integration on origin as a clean fast-forward push.",
+    "GitHub Actions cross-platform.yml will execute all jobs.",
+    "PowerShell fixtures will verify all 10 test groups including DACL normalization on Windows Server 2025.",
+    "Zero-quota integration (which passed on run 34042158130 and verified locally 20/20) will pass."
+  ],
+  "safety_invariants": {
+    "system_ram_measured_pct": 73.96,
+    "installed_telegram_notifier_edited": false,
+    "decisions_state_edited": false,
+    "production_targets_accessed": false,
+    "quota_consumed_points": 0,
+    "local_pushes_executed_by_subagent": false,
+    "push_ownership": "Main owns push."
+  },
+  "next_action": "Main pushes commit 47036530944e3189522c74e12a193a038519458b to branch fix/4582-workflow-gate-integration on origin."
+}
