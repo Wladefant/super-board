@@ -53,7 +53,7 @@ function fixture(options: DashboardFixtureOptions = {}) {
       onLedgerFailure: () => {},
     },
     bridge,
-    { messageThreadId: options.thread },
+    { messageThreadId: options.thread, outboundPaceMs: 0 },
   );
 
   globalThis.fetch = (async (url, init) => {
