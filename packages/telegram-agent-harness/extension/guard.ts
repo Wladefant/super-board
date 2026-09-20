@@ -224,7 +224,8 @@ function parseScript(source: string): { commands: string[][]; pipelines: string[
     else if (c === "&" && command[i + 1] === "&") { endPipeline(); i++; }
     else if (/[;&\n()]/.test(c)) endPipeline();
     else if (/\s/.test(c)) flushWord();
-    else if (c === "\\" && /[\s'";&|$`]/.test(command[i + 1] ?? "")) { started = true; word += command[++i]; }
+    // A word already carrying a drive prefix is a Windows path: its backslashes are separators, not escapes.
+    else if (c === "\\" && !/^[A-Za-z]:/.test(word) && /[\s'";&|$`]/.test(command[i + 1] ?? "")) { started = true; word += command[++i]; }
     else { word += c; started = true; }
   }
   endPipeline();
@@ -311,7 +312,7 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
   // Substitution output, variable indirection, brace expansion and globbing hide the real program name.
   // An unresolvable command name is dynamically constructed code, never a silent allow.
   const globbed = /[?*]|\[[^\]]*\]/.test(words[0]) && words[0] !== "[" && words[0] !== "[[";
-  if (words[0].includes(DYNAMIC) || /[$`]/.test(words[0]) || /^\{[^}]*,/.test(words[0]) || globbed) return DYNAMIC_CATEGORY;
+  if (words[0].includes(DYNAMIC) || /[$`]/.test(words[0]) || /\{[^}]*,[^}]*\}/.test(words[0]) || globbed) return DYNAMIC_CATEGORY;
   const app = executable(words[0]), args = words.slice(1), command = [app, ...args].join(" ");
   const inspect = (script: string): string | undefined => script.includes(DYNAMIC)
     ? DYNAMIC_CATEGORY
@@ -321,7 +322,7 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
     const script = (args[0] === "--" ? args.slice(1) : args).join(" ").replace(/^\{|\}$/g, "").trim();
     return script ? inspect(script) : DYNAMIC_CATEGORY;
   }
-  if (/^(env|command|exec|call|if|then|do|while|!|time|nohup|xargs|sudo|doas|stdbuf|setsid|nice|ionice|npx|bunx|uvx)$/.test(app)) {
+  if (/^(env|command|exec|call|if|then|do|while|!|time|nohup|xargs|sudo|doas|stdbuf|setsid|nice|ionice|npx|bunx|uvx|taskset|chrt|setarch|arch|eatmydata|proxychains|proxychains4|torify|torsocks|catchsegv|setpriv|firejail|bwrap|retry)$/.test(app)) {
     let offset = 0;
     while (args[offset]?.startsWith("-")) {
       if (args[offset] === "--") { offset++; break; }
@@ -335,16 +336,64 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
               ? /^(-p|--package|-c|--call)$/.test(args[offset])
               : /^(nice|ionice|stdbuf)$/.test(app)
                 ? /^-[ncioep]$/.test(args[offset])
-                : /^(--unset|-u|-a)$/.test(args[offset]);
+                : /^(taskset|chrt)$/.test(app)
+                  ? /^(-c|--cpu-list|-p|--pid)$/.test(args[offset])
+                  : /^(proxychains4?|torify|torsocks|retry)$/.test(app)
+                    ? /^(-f|-t|--times|-d|--delay)$/.test(args[offset])
+                    : /^(--unset|-u|-a)$/.test(args[offset]);
       offset += takesValue ? 2 : 1;
     }
-    return commandCategory(args.slice(offset), cwd, depth + 1);
+    // `taskset 0x1 cmd`, `chrt 99 cmd` and `setarch <arch> cmd` spend an operand of no fixed shape before
+    // the program, so both readings are classified and the stronger one decides.
+    const readings = [commandCategory(args.slice(offset), cwd, depth + 1)];
+    if (/^(taskset|chrt|setarch|arch)$/.test(app)) readings.push(commandCategory(args.slice(offset + 1), cwd, depth + 1));
+    return selectCategory(readings);
   }
   if (app === "timeout") {
     let offset = 0;
     while (args[offset]?.startsWith("-")) offset += /^(-s|--signal|-k|--kill-after)$/.test(args[offset]) ? 2 : 1;
     if (/^[\d.]+[smhd]?$/.test(args[offset] ?? "")) offset++;
     return commandCategory(args.slice(offset), cwd, depth + 1);
+  }
+  // `watch` and `script -c` hand their argument back to a shell, so the payload is reparsed, not argv.
+  if (app === "watch") {
+    let offset = 0;
+    while (args[offset]?.startsWith("-")) offset += /^(-n|--interval|-x|--exec|-d|--differences)$/.test(args[offset]) ? 2 : 1;
+    return args[offset] === undefined ? DYNAMIC_CATEGORY : inspect(args.slice(offset).join(" "));
+  }
+  if (app === "script") {
+    const inline = args.find(arg => arg.startsWith("--command="));
+    if (inline) return inspect(inline.slice("--command=".length));
+    const flagged = args.findIndex(arg => /^-[a-z]*c$/.test(arg));
+    if (flagged >= 0) return args[flagged + 1] === undefined ? DYNAMIC_CATEGORY : inspect(args[flagged + 1]);
+  }
+  // `su`/`runuser` either reparse a -c payload or exec the argv after `--`.
+  if (app === "su" || app === "runuser") {
+    const inline = args.find(arg => arg.startsWith("--command="));
+    if (inline) return inspect(inline.slice("--command=".length));
+    const flagged = args.findIndex(arg => /^(-c|--command)$/.test(arg));
+    if (flagged >= 0) return args[flagged + 1] === undefined ? DYNAMIC_CATEGORY : inspect(args[flagged + 1]);
+    const separator = args.indexOf("--");
+    if (separator >= 0) return commandCategory(args.slice(separator + 1), cwd, depth + 1);
+  }
+  // Wrappers that execute the rest of their argv once their own flags and operands are consumed.
+  if (/^(flock|chroot|unshare|strace|ltrace|busybox|parallel)$/.test(app)) {
+    let offset = 0;
+    while (args[offset]?.startsWith("-")) {
+      const takesValue = /^(strace|ltrace)$/.test(app)
+        ? /^(-o|-e|-p|-s|-E|--output|--trace)$/.test(args[offset])
+        : app === "flock"
+          ? /^(-w|--wait|--timeout|-E|--conflict-exit-code)$/.test(args[offset])
+          : app === "parallel"
+            ? /^(-j|--jobs|-N|-d|--delimiter|--results)$/.test(args[offset])
+            : /^(--map-user|--map-group|--setuid|--setgid)$/.test(args[offset]);
+      offset += takesValue ? 2 : 1;
+    }
+    // `flock <lockfile> cmd` and `chroot <newroot> cmd` spend one operand before the program.
+    if ((app === "flock" || app === "chroot") && args[offset] !== undefined) offset++;
+    const inner = args.slice(offset), list = inner.indexOf(":::");
+    // `parallel cmd ::: a b` runs the command once per trailing item, so those items are its operands.
+    return commandCategory(list < 0 ? inner : [...inner.slice(0, list), ...inner.slice(list + 1)], cwd, depth + 1);
   }
   if (/^(pnpm|yarn)$/.test(app) && args[0] === "dlx") return commandCategory(args.slice(1), cwd, depth + 1);
   if (/^(pipx|poetry|uv|rye)$/.test(app) && /^(run|exec)$/.test(args[0] ?? "")) return commandCategory(args.slice(1), cwd, depth + 1);
@@ -399,9 +448,11 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
     const operands: string[] = [];
     let literal = false;
     for (const arg of args) {
-      if (literal) operands.push(arg);
+      // PowerShell binds a parameter with a colon as readily as with a space: `-Path:C:\`.
+      const bound = literal ? null : /^-[A-Za-z]+:(.+)$/.exec(arg);
+      if (literal || bound === null && !(cmdStyle ? /^[-/]\w/.test(arg) : arg.startsWith("-"))) operands.push(arg);
+      else if (bound) operands.push(bound[1]);
       else if (arg === "--") literal = true;
-      else if (!(cmdStyle ? /^[-/]\w/.test(arg) : arg.startsWith("-"))) operands.push(arg);
     }
     if (operands.some(operand => isDestructiveRmTarget(operand, cwd))) return "shell_destructive_os";
   }
@@ -417,8 +468,15 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
   }
   if (app === "tee") written.push(...operands);
   // The final operand of a copying or linking command is the destination it clobbers.
-  if (/^(cp|mv|install|rsync|ln|copy|move|xcopy|robocopy)$/.test(app) && operands.length > 1) written.push(operands[operands.length - 1]);
-  if (app === "sed" && args.some(arg => /^-[a-z]*i/.test(arg))) {
+  if (/^(cp|mv|install|rsync|ln|copy|move|xcopy|robocopy)$/.test(app)) {
+    // `-t DIR` names the destination and turns every operand into a source; otherwise the last operand is it.
+    const flagged = args.findIndex(arg => /^(-t|--target-directory)$/.test(arg));
+    const inline = args.find(arg => arg.startsWith("--target-directory="));
+    if (inline) written.push(inline.slice("--target-directory=".length));
+    else if (flagged >= 0 && args[flagged + 1]) written.push(args[flagged + 1]);
+    else if (operands.length > 1) written.push(operands[operands.length - 1]);
+  }
+  if (app === "sed" && args.some(arg => /^(-[a-z]*i|--in-place)/.test(arg))) {
     const scripted = args.some(arg => /^(-e|--expression|-f|--file)/.test(arg));
     written.push(...operands.slice(scripted ? 0 : 1));
   }

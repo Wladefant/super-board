@@ -274,9 +274,22 @@ export function evalCommands(code: string, language: string, parseShell: (comman
     const argument = valueAt(at + 1);
     const complete = tokens[argument.end]?.value === "," || tokens[argument.end]?.value === ")";
     const value = complete ? argument.value : undefined;
-    if (/^(os\.(system|popen)|subprocess\.(run|call|check_call|check_output|Popen)|.*\.(execSync|execFileSync|execFile|spawn|spawnSync)|execSync|execFileSync|execFile|spawn|spawnSync|Popen|system|popen|check_call|check_output)$/.test(call) ||
+    // `execv(path, argv)` and the variadic `execl(path, "rm", "-rf", "/")` run argv; the path names the image.
+    if (/^(os\.)?(execv|execve|execvp|execvpe|execl|execlp|execle|spawnv|spawnve|spawnvp|spawnl|spawnlp|posix_spawn|posix_spawnp)$/.test(call)) {
+      const rest: string[] = [];
+      for (let k = argument.end; tokens[k]?.value === ",";) {
+        const next = valueAt(k + 1);
+        if (typeof next.value === "string") rest.push(next.value);
+        else if (Array.isArray(next.value) && next.value.every(item => typeof item === "string")) rest.push(...(next.value as string[]));
+        else break;
+        k = next.end;
+      }
+      if (rest.length) append(rest); else unresolved = true;
+      continue;
+    }
+    if (/^(os\.(system|popen)|subprocess\.(run|call|check_call|check_output|Popen)|.*\.(execSync|execFileSync|execFile|spawn|spawnSync|execa|execaSync|execaCommand|execaCommandSync)|execSync|execFileSync|execFile|spawn|spawnSync|Popen|system|popen|check_call|check_output|execa|execaSync|execaCommand|execaCommandSync)$/.test(call) ||
         /^(child_process|cp|childProcess)\.exec$/.test(call) || call === "subprocess.run" || call === "subprocess.call") {
-      if (leaf === "execFile" || leaf === "execFileSync" || leaf === "spawn" || leaf === "spawnSync") {
+      if (/^(execFile|execFileSync|spawn|spawnSync|execa|execaSync)$/.test(leaf)) {
         if (call.startsWith("Bun.") && value && typeof value === "object" && !Array.isArray(value)) append(value.cmd);
         else if (Array.isArray(value)) append(value);
         else if (typeof value === "string" && tokens[argument.end]?.value === ",") {
