@@ -34,14 +34,22 @@ export function renderTelegramHelp(hasHarness = true): string {
   return lines.join("\n");
 }
 
+export interface TelegramCommandItem {
+  command: string;
+  description: string;
+}
+
 /** DM-only actor gates have no group equivalent: never advertise group controls. */
 export async function registerTelegramCommands(
   botToken: string,
   allowedUsers: readonly string[],
-  hasHarness = true,
+  hasHarness: boolean | readonly TelegramCommandItem[] = true,
   signal?: AbortSignal,
+  customCommands?: readonly TelegramCommandItem[],
 ): Promise<void> {
-  const commands = availableCommands(hasHarness).map(({ command, description }) => ({ command, description }));
+  const commands: readonly TelegramCommandItem[] = Array.isArray(hasHarness)
+    ? hasHarness
+    : (customCommands ?? availableCommands(hasHarness).map(({ command, description }) => ({ command, description })));
   for (const chatId of new Set(allowedUsers)) {
     if (!/^\d+$/.test(chatId)) continue;
     try {

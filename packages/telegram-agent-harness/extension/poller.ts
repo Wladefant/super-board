@@ -73,6 +73,11 @@ export interface PollerOptions {
    * plain chat, where Telegram rejects the field outright, so it has no default.
    */
   messageThreadId?: number;
+  /**
+   * Custom command surface for the chat-scoped menu (e.g. daemon commands).
+   * When omitted, defaults to the standard availableCommands(hasHarness).
+   */
+  commands?: readonly { command: string; description: string }[];
 }
 
 const DEFAULT_POLLER_OPTIONS = {
@@ -547,8 +552,13 @@ export class TelegramPoller {
     // Registration failure must not disconnect an otherwise usable input channel.
     if (this.accessConfig.dmPolicy !== "disabled") {
       try {
-        await registerTelegramCommands(this.botToken, this.accessConfig.allowFrom,
-          Boolean(this.callbacks.onHarnessCommand), this.abortController.signal);
+        await registerTelegramCommands(
+          this.botToken,
+          this.accessConfig.allowFrom,
+          Boolean(this.callbacks.onHarnessCommand),
+          this.abortController.signal,
+          this.options.commands,
+        );
       } catch {
         this.callbacks.onLedgerFailure("Telegram command registration failed; reconnect to retry the private-chat menu.");
       }

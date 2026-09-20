@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { Database } from "bun:sqlite";
 import { registerTelegramCommands, renderTelegramHelp, TELEGRAM_COMMANDS } from "../extension/command-registry";
 import { TelegramPoller } from "../extension/poller";
+import { getDaemonCommands } from "../daemon/router";
 
 const originalFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = originalFetch; });
@@ -66,6 +67,37 @@ test("real poller startup registers before polling and still polls after registr
       expect(failures.length).toBe(registrationOk ? 0 : 1);
     } finally { poller.stop(); fs.rmSync(dir, { recursive: true, force: true }); }
   }
+});
+
+test("daemon registration includes /sessions, /new, /attach from daemon router", async () => {
+  const daemonCommands = getDaemonCommands();
+  const commandNames = daemonCommands.map(c => c.command);
+  expect(commandNames).toContain("sessions");
+  expect(commandNames).toContain("new");
+  expect(commandNames).toContain("attach");
+  expect(commandNames).toContain("detach");
+  expect(commandNames).toContain("where");
+
+  const calls: Registration[] = [];
+  globalThis.fetch = (async (_url, init) => {
+    if (init && typeof init === "object" && "body" in init && typeof init.body === "string") {
+      const parsed: unknown = JSON.parse(init.body);
+      if (parsed && typeof parsed === "object" && "commands" in parsed && "scope" in parsed) {
+        calls.push(parsed as Registration);
+      }
+    }
+    return Response.json({ ok: true });
+  }) as typeof fetch;
+
+  await registerTelegramCommands("1:test", ["101"], true, undefined, daemonCommands);
+  expect(calls).toHaveLength(1);
+  const registeredNames = calls[0].commands.map(c => c.command);
+  expect(registeredNames).toContain("sessions");
+  expect(registeredNames).toContain("new");
+  expect(registeredNames).toContain("attach");
+  expect(registeredNames).toContain("detach");
+  expect(registeredNames).toContain("where");
+  expect(registeredNames).toContain("status");
 });
 
 test("command boundaries, native idle/busy delivery and release preserve the durable ledger", async () => {

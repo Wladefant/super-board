@@ -64,12 +64,12 @@ async function run(): Promise<number> {
     const timer = setInterval(() => {
       const polling = daemon.status().slots.some(slot => slot.polling);
       if (polling) handedOver = true;
-      if (stopped || (handedOver && !polling)) {
+      if (stopped || (handedOver && !polling && !daemon.hasPendingSlots())) {
         clearInterval(timer);
         resolve();
         return;
       }
-      if (polling || retrying || Date.now() < nextRetryAt) return;
+      if (!daemon.hasPendingSlots() || retrying || Date.now() < nextRetryAt) return;
       retrying = true;
       void daemon
         .claimPending()
