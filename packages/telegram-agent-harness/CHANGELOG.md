@@ -17,6 +17,7 @@
 - `daemon/main.ts run` waits out a slot that is held instead of exiting 75. A token claimed by an interactive session frees itself when that session exits or its operator runs `/telegram release`, and a detached daemon that gave up at startup is not there to notice; it now retries every 10s (`VEYYON_TELEGRAM_CLAIM_RETRY_MS`) and logs a skip only when the reason changes. Exiting on release is unchanged once a slot has actually been polled, so `/release` still stops the daemon.
 
 ### Fixed
+- `/sessions` groups entries by workspace folder and full path, with escaped 40-character latest-prompt excerpts, relative ages and numbered attach commands. Missing-workspace and finished-over-one-hour entries are hidden unless `/sessions all`; `/attach` accepts listing indices or unambiguous folder names as well as session IDs. Listing indices are saved per slot, chat and topic so host reordering and daemon restarts do not retarget them.
 - Preserve empty preference list for discovered Telegram bot slots lacking explicit configuration, restoring any-project eligibility default and removing hardcoded comment examples.
 - Operator tools resolve their Telegram channel on every call and refuse a session they do not own, so a tool retained across a hot reload can no longer post into another session's chat.
 - Telegram question, dashboard and lane-provenance services stop when the lease is relinquished or the session shuts down, instead of leaving timers writing to a released channel.
