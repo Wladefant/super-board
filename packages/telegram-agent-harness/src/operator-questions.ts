@@ -83,14 +83,32 @@ export class OperatorQuestionService {
     return question;
   }
 
-  async wait(id: string, signal?: AbortSignal, pollIntervalMs = 200): Promise<QuestionAnswer> {
+  async wait(
+    id: string,
+    signal?: AbortSignal,
+    pollIntervalMs = 200,
+    timeoutMs = 60_000,
+    onProgress?: (elapsedMs: number) => void,
+  ): Promise<QuestionAnswer | Question> {
+    const startTime = Date.now();
     for (;;) {
       signal?.throwIfAborted();
       const question = await this.get(id);
       if (question.answer) return question.answer;
+
+      const elapsed = Date.now() - startTime;
+      if (elapsed >= timeoutMs) {
+        return question;
+      }
+      onProgress?.(elapsed);
+
+      const remaining = timeoutMs - elapsed;
+      const waitTime = Math.min(pollIntervalMs, remaining);
+      if (waitTime <= 0) return question;
+
       await new Promise<void>((resolve, reject) => {
         const abort = () => { clearTimeout(timer); reject(signal?.reason); };
-        const timer = setTimeout(() => { signal?.removeEventListener("abort", abort); resolve(); }, pollIntervalMs);
+        const timer = setTimeout(() => { signal?.removeEventListener("abort", abort); resolve(); }, waitTime);
         signal?.addEventListener("abort", abort, { once: true });
         if (signal?.aborted) abort();
       });

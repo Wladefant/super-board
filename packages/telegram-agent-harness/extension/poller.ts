@@ -800,7 +800,8 @@ export class TelegramPoller {
     // Mark as in-flight PROCESSING
     this.db.run("UPDATE update_ledger SET status = 'PROCESSING' WHERE update_id = ?", [row.update_id]);
 
-    if ((!row.text || !row.text.trim()) && !row.media_json) {
+    const hasVisibleText = Boolean(row.text?.replace(/[\s\u2000-\u200F\u2028-\u202F\u205F-\u206F\uFEFF]/g, ""));
+    if (!hasVisibleText && !row.media_json) {
       this.db.run("UPDATE update_ledger SET status = 'REJECTED', error = 'EMPTY_TEXT' WHERE update_id = ?", [
         row.update_id,
       ]);
@@ -1123,6 +1124,14 @@ export class TelegramPoller {
       }
       contextLines.push(`[Note: Free-text reply; not automatic approval or authorization.]`);
       deliveredText = `${contextLines.join("\n")}\n\n${rawText}`;
+    }
+
+    const hasVisibleBody = Boolean(rawText.replace(/[\s\u2000-\u200F\u2028-\u202F\u205F-\u206F\uFEFF]/g, ""));
+    if (!hasVisibleBody && !row.media_json) {
+      this.db.run("UPDATE update_ledger SET status = 'REJECTED', error = 'EMPTY_TEXT' WHERE update_id = ?", [
+        row.update_id,
+      ]);
+      return;
     }
 
     deliveredText = attributeSender(fromId, deliveredText);
