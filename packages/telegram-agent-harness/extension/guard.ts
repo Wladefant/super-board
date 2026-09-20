@@ -90,7 +90,7 @@ export function approveOperation(stateDir: string, token: string, actor: Approva
 
 /** A word whose runtime value the lexer cannot prove: substitution output, dynamic construction. */
 export const DYNAMIC = "\u0000dynamic";
-const INTERPRETER = /^(sh|bash|zsh|ksh|dash|ash|cmd|powershell|pwsh|python[\d.]*|py|node|bun|deno|perl|ruby|php|osascript|rscript|r)$/;
+const INTERPRETER = /^(sh|bash|zsh|ksh|dash|ash|fish|cmd|powershell|pwsh|python[\d.]*|py|node|bun|deno|perl|ruby|php|osascript|rscript|r|at|batch)$/;
 const FETCHER = /^(curl|wget|http|httpie|invoke-webrequest|iwr)$/;
 
 function interpretAs(app: string, body: string): string[][] {
@@ -364,7 +364,14 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
     const script = (args[0] === "--" ? args.slice(1) : args).join(" ").replace(/^\{|\}$/g, "").trim();
     return script ? inspect(script) : DYNAMIC_CATEGORY;
   }
-  if (/^(env|command|exec|call|if|then|do|while|!|time|nohup|xargs|sudo|doas|stdbuf|setsid|nice|ionice|npx|bunx|uvx|taskset|chrt|setarch|arch|eatmydata|proxychains|proxychains4|torify|torsocks|catchsegv|setpriv|firejail|bwrap|retry)$/.test(app)) {
+  // A definition is not an invocation, but its body is what runs when the name is called.
+  if (app === "function" && args.length > 1) return commandCategory(args.slice(1), cwd, depth + 1);
+  if (/^[\w.-]+\(\)$/.test(app)) return commandCategory(args, cwd, depth + 1);
+  if (app === "alias") {
+    const bodies = args.flatMap(arg => /^[\w.-]+=([\s\S]+)$/.exec(arg)?.[1] ?? []);
+    if (bodies.length) return selectCategory(bodies.map(inspect));
+  }
+  if (/^(env|command|exec|call|if|then|do|while|!|time|nohup|xargs|sudo|doas|stdbuf|setsid|nice|ionice|npx|bunx|uvx|taskset|chrt|setarch|arch|eatmydata|proxychains|proxychains4|torify|torsocks|catchsegv|setpriv|firejail|bwrap|retry|systemd-run|nsenter)$/.test(app)) {
     let offset = 0;
     while (args[offset]?.startsWith("-")) {
       if (args[offset] === "--") { offset++; break; }
@@ -382,7 +389,9 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
                   ? /^(-c|--cpu-list|-p|--pid)$/.test(args[offset])
                   : /^(proxychains4?|torify|torsocks|retry)$/.test(app)
                     ? /^(-f|-t|--times|-d|--delay)$/.test(args[offset])
-                    : /^(--unset|-u|-a)$/.test(args[offset]);
+                    : /^(systemd-run|nsenter)$/.test(app)
+                      ? /^(-u|--unit|-p|--property|-E|--setenv|--on-active|--on-calendar|--slice|--description|-t|--target|-n|--net|--uid|--gid)$/.test(args[offset])
+                      : /^(--unset|-u|-a)$/.test(args[offset]);
       offset += takesValue ? 2 : 1;
     }
     // `taskset 0x1 cmd`, `chrt 99 cmd` and `setarch <arch> cmd` spend an operand of no fixed shape before
@@ -412,6 +421,35 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
     // -ArgumentList takes a comma-separated array, which the lexer sees as one word.
     const list = listed >= 0 ? (args[listed + 1] ?? "").split(",").map(item => item.trim()).filter(Boolean) : [];
     return program === undefined ? DYNAMIC_CATEGORY : commandCategory([program, ...list], cwd, depth + 1);
+  }
+  // A scheduler stores the command now and runs it later; the payload is still the command.
+  if (app === "schtasks") {
+    const inline = args.find(arg => /^[-/]tr:/i.test(arg));
+    if (inline) return inspect(inline.slice(inline.indexOf(":") + 1));
+    const run = args.findIndex(arg => /^[-/]tr$/i.test(arg));
+    if (run >= 0) return args[run + 1] === undefined ? DYNAMIC_CATEGORY : inspect(args[run + 1]);
+  }
+  // WSL runs the rest of its argv inside the distribution, against the same disks.
+  if (/^wsl(\.exe)?$/.test(app)) {
+    let offset = 0;
+    while (args[offset]?.startsWith("-")) {
+      if (args[offset] === "--" || /^(-e|--exec)$/.test(args[offset])) { offset++; break; }
+      offset += /^(-d|--distribution|-u|--user|--cd|--shell-type)$/.test(args[offset]) ? 2 : 1;
+    }
+    return commandCategory(args.slice(offset), cwd, depth + 1);
+  }
+  // `docker exec` and `kubectl exec` run a command in a container that may hold the host's filesystem.
+  if (/^(docker|podman)$/.test(app) && (args[0] === "exec" || (args[0] === "compose" && args[1] === "exec"))) {
+    let offset = args[0] === "exec" ? 1 : 2;
+    while (args[offset]?.startsWith("-")) offset += /^(-e|--env|-u|--user|-w|--workdir|--env-file|--index)$/.test(args[offset]) ? 2 : 1;
+    return commandCategory(args.slice(offset + 1), cwd, depth + 1);
+  }
+  if (app === "kubectl" && args[0] === "exec") {
+    const separator = args.indexOf("--");
+    if (separator >= 0) return commandCategory(args.slice(separator + 1), cwd, depth + 1);
+    let offset = 1;
+    while (args[offset]?.startsWith("-")) offset += /^(-c|--container|-n|--namespace|--pod-running-timeout)$/.test(args[offset]) ? 2 : 1;
+    return commandCategory(args.slice(offset + 1), cwd, depth + 1);
   }
   // `watch` and `script -c` hand their argument back to a shell, so the payload is reparsed, not argv.
   if (app === "watch") {
@@ -470,7 +508,7 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
   if (app === "kubectl" && /^(get|describe)$/.test(args[0] ?? "") && /^secrets?$/.test(args[1] ?? "")) return "secrets";
   if (/^(fly|flyctl|wrangler|heroku|railway|vercel)$/.test(app)
     && /^(secrets?|config)$/.test(args[0] ?? "") && /^(list|get|reveal|pull)$/.test(args[1] ?? "")) return "secrets";
-  if (/^(sh|bash|zsh|ksh|dash|ash|cmd|powershell|pwsh)$/.test(app)) {
+  if (/^(sh|bash|zsh|ksh|dash|ash|fish|cmd|powershell|pwsh)$/.test(app)) {
     const found: (string | undefined)[] = [];
     if (/^(powershell|pwsh)$/.test(app)) {
       const encoded = args.findIndex(arg => flagPrefixOf(arg, "encodedcommand"));
@@ -515,6 +553,13 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
   }
   if (app === "ssh" || app === "plink") {
     let offset = 0;
+    // `-o ProxyCommand=…` and its siblings run a local or remote command of their own.
+    const options = args.flatMap((arg, k) => args[k - 1] === "-o" ? [arg] : /^-o(\S[\s\S]*)$/.exec(arg)?.[1] ?? []);
+    const commanded = options.flatMap(option => /^(?:proxycommand|localcommand|remotecommand)[= ]([\s\S]+)$/i.exec(option)?.[1] ?? []);
+    if (commanded.length) {
+      const configured = selectCategory(commanded.map(inspect));
+      if (configured) return configured;
+    }
     while (args[offset]?.startsWith("-")) offset += /^-[bcDEeFIiJLlmOoPpQRSWw]$/.test(args[offset]) ? 2 : 1;
     const remote = args.slice(offset + 1).join(" ");
     if (remote) return inspect(remote);
@@ -571,7 +616,7 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
     return remote === undefined ? isDestructiveRmTarget(target, cwd) : SYSTEM_PATH.test(remote);
   })) return "shell_destructive_os";
   if (app === "find" && (args.includes("-delete") || args.some((arg, k) => /^-(exec|execdir|ok|okdir)$/.test(arg)
-    && /^(rm|unlink|shred|rmdir|truncate|dd|sh|bash|zsh)$/.test(executable(args[k + 1] ?? ""))))) {
+    && /^(rm|unlink|shred|rmdir|truncate|dd|sh|bash|zsh|ksh|dash|ash|fish)$/.test(executable(args[k + 1] ?? ""))))) {
     const firstFlag = args.findIndex(arg => arg.startsWith("-"));
     if (args.slice(0, firstFlag < 0 ? args.length : firstFlag).some(root => isDestructiveRmTarget(root, cwd))) return "shell_destructive_os";
   }
@@ -650,7 +695,7 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
   if (/^(vercel|now|netlify)$/.test(app)
     && (args.some(a => /^--prod(uction)?$/.test(a)) || args[0] === "deploy")) return "deployments";
   if (app === "kubectl"
-    && /^(apply|delete|create|replace|patch|scale|rollout|drain|cordon|uncordon|set|taint|exec)$/.test(args[0] ?? "")) return "deployments";
+    && /^(apply|delete|create|replace|patch|scale|rollout|drain|cordon|uncordon|set|taint)$/.test(args[0] ?? "")) return "deployments";
   if (app === "helm" && /^(install|upgrade|uninstall|delete|rollback)$/.test(args[0] ?? "")) return "deployments";
   if (/^(terraform|tofu)$/.test(app) && /^(apply|destroy|import)$/.test(args[0] ?? "")) return "deployments";
   if (app === "pulumi" && /^(up|destroy|refresh)$/.test(args[0] ?? "")) return "deployments";
@@ -675,6 +720,17 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
   while (i < args.length && args[i].startsWith("-")) {
     if (/^(-C|-c|--git-dir|--work-tree)$/.test(args[i])) i += 2; else i++;
   }
+  // `git -c` hands a command to git: an `!` alias, a pager, an editor, an external diff driver.
+  const configured = args.flatMap((arg, k) => arg === "-c" ? [args[k + 1] ?? ""] : /^-c(\S+=[\s\S]*)$/.exec(arg)?.[1] ?? []);
+  const runners = configured.flatMap(setting => {
+    const split = setting.indexOf("=");
+    const key = setting.slice(0, split), value = setting.slice(split + 1);
+    if (split < 0 || !value) return [];
+    if (/^alias\./i.test(key)) return [value.startsWith("!") ? value.slice(1) : `git ${value}`];
+    return /^(core\.(pager|editor|sshcommand)|sequence\.editor|diff\.external|pager\.[\w-]+|[\w.-]+\.textconv)$/i.test(key) ? [value] : [];
+  });
+  const configuredCategory = selectCategory(runners.map(inspect));
+  if (configuredCategory) return configuredCategory;
   const action = args[i], rest = args.slice(i + 1);
   const isProtected = (ref: string) => {
     const dest = ref.includes(":") ? ref.split(":").pop()! : ref.replace(/^\+/, "");
