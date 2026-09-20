@@ -73,7 +73,8 @@ function extractAllStrings(val: unknown, depth = 0): string[] {
   return [];
 }
 
-const SECRET_PATH = /(?:^|[/\\])\.env\.prod\b|\b(id_rsa|service_role|jwt_secret|\.env\.prod)\b/i;
+// Every dotted .env variant holds real values; the committed template variants hold placeholders.
+const SECRET_PATH = /(?:^|[/\\])\.env(?:\.(?!(?:example|sample|template|dist|defaults|schema)\b)[\w-]+)*$|\b(id_(rsa|dsa|ecdsa|ed25519)|service_role|jwt_secret|agent\.db)\b|\.(pem|p12|pfx)$|(?:^|[/\\])credentials(\.json)?$|(?:^|[/\\])\.(npmrc|netrc)$/i;
 const PROTECTED = /^(main|master|staging|production|prod)$/i;
 const PRODUCTION = /(?:\bzaraprptkegxqpvnsubu\b|\bakamai-iad-prod\b)/i;
 const LOCAL_CONTEXT: ApprovalContext = { sessionId: "local", requester: "Local operator", task: "Local guarded operation", cwd: process.cwd() };
@@ -85,25 +86,68 @@ export function approveOperation(stateDir: string, token: string, actor: Approva
   return decideApproval(stateDir, token, "approved", actor);
 }
 
-/** Shell words, not a prose scan: separators outside quotes introduce invocations. */
-export function shellCommands(command: string): string[][] {
-  const commands: string[][] = [], words: string[] = [];
-  const heredocs: { delimiter: string; quoted: boolean; stripTabs: boolean; targetApp?: string }[] = [];
-  let word = "", quote = "", started = false;
-  const flushWord = () => { if (started) words.push(word); word = ""; started = false; };
-  const flush = () => { flushWord(); if (words.length) commands.push(words.splice(0)); };
+/** A word whose runtime value the lexer cannot prove: substitution output, dynamic construction. */
+export const DYNAMIC = "\u0000dynamic";
+const INTERPRETER = /^(sh|bash|zsh|ksh|dash|ash|cmd|powershell|pwsh|python[\d.]*|py|node|bun|deno|perl|ruby|php|osascript)$/;
+const FETCHER = /^(curl|wget|http|httpie|invoke-webrequest|iwr)$/;
 
-  // Pipeline check for base64 decode piped into an interpreter
-  const b64Pipe = /(?:echo|printf)\s+(?:-n\s+)?['"]?([A-Za-z0-9+/=]{8,})['"]?\s*\|\s*(?:base64\s+(?:-d|--decode)|openssl\s+base64\s+-d)\s*\|\s*(sh|bash|zsh|powershell|pwsh|python3?|node|bun)\b/i.exec(command);
-  if (b64Pipe) {
-    const decoded = decodeBase64(b64Pipe[1]);
-    if (decoded) {
-      const interp = b64Pipe[2].toLowerCase();
-      if (/^python/.test(interp)) commands.push(...evalCommands(decoded, "py", shellCommands).commands);
-      else if (/^(node|bun)/.test(interp)) commands.push(...evalCommands(decoded, "js", shellCommands).commands);
-      else commands.push(...shellCommands(decoded));
-    }
+function interpretAs(app: string, body: string): string[][] {
+  if (/^(python[\d.]*|py)$/.test(app)) return evalCommands(body, "py", shellCommands).commands;
+  if (/^(node|bun|deno)$/.test(app)) return evalCommands(body, "js", shellCommands).commands;
+  return shellCommands(body);
+}
+/** A stage that turns an operand back into executable text: `base64 -d`, `openssl enc -d -a`, `certutil -decode`. */
+function decodesBase64(words: string[]): boolean {
+  const app = executable(words[0] ?? ""), args = words.slice(1);
+  if (app === "base64") return args.some(arg => arg === "--decode" || /^-[a-z]*d[a-z]*$/.test(arg));
+  if (app === "openssl") return /^(enc|base64)$/.test(args[0] ?? "") && args.includes("-d");
+  if (app === "certutil") return args.some(arg => /^[-/]decode$/i.test(arg));
+  return false;
+}
+/** The text an `echo`/`printf` stage writes, or undefined when the operand is not statically known. */
+function literalOutput(words: string[]): string | undefined {
+  const app = executable(words[0] ?? "");
+  if (app !== "echo" && app !== "printf") return undefined;
+  let operands = words.slice(1).filter(arg => !/^-[neE]+$/.test(arg));
+  if (app === "printf" && operands.length > 1 && /^%s\\?n?$/.test(operands[0])) operands = operands.slice(1);
+  const text = operands.join(" ");
+  return text.includes(DYNAMIC) ? undefined : text;
+}
+/** Decode-and-run reconstructed from parsed pipeline stages, so quoted prose can never look like a pipeline. */
+function decodePipeline(stages: string[][]): string[][] {
+  const derived: string[][] = [], apps = stages.map(stage => executable(stage[0] ?? ""));
+  for (let k = 0; k < stages.length; k++) {
+    if (!decodesBase64(stages[k])) continue;
+    const sink = apps.findIndex((app, downstream) => downstream > k && INTERPRETER.test(app));
+    if (sink < 0) continue;
+    const payload = k > 0 ? literalOutput(stages[k - 1]) : undefined;
+    const decoded = payload === undefined ? "" : decodeBase64(payload);
+    derived.push(...(decoded ? interpretAs(apps[sink], decoded) : [[DYNAMIC]]));
   }
+  // Fetching a script and piping it into an interpreter runs code this guard never sees.
+  if (stages.length > 1 && FETCHER.test(apps[0]) && apps.slice(1).some(app => INTERPRETER.test(app))) derived.push([DYNAMIC]);
+  return derived;
+}
+/** What `$(...)` expands to, when the lexer can prove it: a literal echo, or a literal echo decoded. */
+function substitutionOutput(pipelines: string[][][]): string | undefined {
+  if (pipelines.length !== 1) return undefined;
+  const stages = pipelines[0];
+  if (stages.length === 1) return literalOutput(stages[0]);
+  if (stages.length !== 2 || !decodesBase64(stages[1])) return undefined;
+  const payload = literalOutput(stages[0]);
+  return payload === undefined ? undefined : decodeBase64(payload) || undefined;
+}
+
+/** Shell words grouped into pipelines, not a prose scan: separators outside quotes introduce invocations. */
+function parseScript(source: string): { commands: string[][]; pipelines: string[][][] } {
+  // $IFS expands to a separator at runtime, so resolving it keeps `rm${IFS}-rf${IFS}/` a real invocation.
+  const command = source.replace(/\$\{IFS\}/g, " ").replace(/\$IFS(?!\w)/g, " ");
+  const pipelines: string[][][] = [], derived: string[][] = [], words: string[] = [];
+  const heredocs: { delimiter: string; quoted: boolean; stripTabs: boolean; owner: string[] }[] = [];
+  let pipeline: string[][] = [], word = "", quote = "", started = false;
+  const flushWord = () => { if (started) words.push(word); word = ""; started = false; };
+  const flush = () => { flushWord(); if (words.length) pipeline.push(words.splice(0)); };
+  const endPipeline = () => { flush(); if (pipeline.length) pipelines.push(pipeline); pipeline = []; };
 
   for (let i = 0; i < command.length; i++) {
     const c = command[i];
@@ -118,13 +162,10 @@ export function shellCommands(command: string): string[][] {
         if (!backtick && command[end] === "(") nesting++;
         if (!backtick && command[end] === ")" && --nesting === 0) break;
       }
-      const sub = command.slice(start, end);
-      commands.push(...shellCommands(sub));
-      const b64Sub = /(?:echo|printf)\s+(?:-n\s+)?['"]?([A-Za-z0-9+/=]{8,})['"]?\s*\|\s*(?:base64\s+(?:-d|--decode)|openssl\s+base64\s+-d)\b/i.exec(sub);
-      if (b64Sub) {
-        const decoded = decodeBase64(b64Sub[1]);
-        if (decoded) commands.push(...shellCommands(decoded));
-      }
+      const inner = parseScript(command.slice(start, end));
+      derived.push(...inner.commands);
+      // The substitution's output becomes part of the surrounding word; unprovable output stays dynamic.
+      word += substitutionOutput(inner.pipelines) ?? DYNAMIC;
       i = end; started = true; continue;
     }
     if (quote) {
@@ -132,12 +173,28 @@ export function shellCommands(command: string): string[][] {
       if (c === "\\" && quote === '"' && /["\\$`\n]/.test(command[i + 1] ?? "")) { word += command[++i]; continue; }
       word += c; continue;
     }
-    if (command.slice(i, i + 2) === "<<" && command[i + 2] !== "<") {
+    // A here-string feeds its operand into this stage's interpreter exactly like a heredoc body.
+    if (command.slice(i, i + 3) === "<<<") {
+      flushWord();
+      let j = i + 3;
+      while (/[ \t]/.test(command[j] ?? "")) j++;
+      let operand = "", inner = "";
+      for (; j < command.length; j++) {
+        const ch = command[j];
+        if (inner) { if (ch === inner) inner = ""; else operand += ch; continue; }
+        if (ch === "'" || ch === '"') { inner = ch; continue; }
+        if (/[\s;&|\n]/.test(ch)) break;
+        operand += ch;
+      }
+      const app = executable(words[0] ?? "");
+      if (INTERPRETER.test(app)) derived.push(...interpretAs(app, operand));
+      i = j - 1; continue;
+    }
+    if (command.slice(i, i + 2) === "<<") {
       const match = /^<<(-?)\s*(?:'([^']+)'|"([^"]+)"|([^\s;&|]+))/.exec(command.slice(i));
       if (match) {
         flushWord();
-        const targetApp = words[0] ? executable(words[0]) : undefined;
-        heredocs.push({ delimiter: match[2] ?? match[3] ?? match[4], quoted: Boolean(match[2] || match[3]), stripTabs: match[1] === "-", targetApp });
+        heredocs.push({ delimiter: match[2] ?? match[3] ?? match[4], quoted: Boolean(match[2] || match[3]), stripTabs: match[1] === "-", owner: words.slice() });
         i += match[0].length - 1; continue;
       }
     }
@@ -152,30 +209,50 @@ export function shellCommands(command: string): string[][] {
           if ((document.stripTabs ? line.replace(/^\t+/, "") : line) === document.delimiter) { i = end; break; }
           body += line + "\n"; start = end + 1; i = end;
         }
-        if (document.targetApp && /^(sh|bash|zsh|powershell|pwsh)$/.test(document.targetApp)) {
-          commands.push(...shellCommands(body));
-        } else if (document.targetApp && /^python/.test(document.targetApp)) {
-          commands.push(...evalCommands(body, "py", shellCommands).commands);
-        } else if (document.targetApp && /^(node|bun)/.test(document.targetApp)) {
-          commands.push(...evalCommands(body, "js", shellCommands).commands);
-        } else if (!document.quoted) {
-          commands.push(...shellCommands(`echo "${body.replace(/"/g, '\\"')}"`));
-        }
+        // stdin is only the program when no argv mode supplies one, and the consumer may be a later stage.
+        if (pipeline.some(stage => INTERPRETER.test(executable(stage[0] ?? "")) && stage.slice(1).some((arg, k) => /^(-[a-z]*c[a-z]*|--eval|--command)$/.test(arg) && stage[k + 2] !== undefined))) continue;
+        const consumer = pipeline.map(stage => executable(stage[0] ?? "")).find(app => INTERPRETER.test(app)) ?? executable(document.owner[0] ?? "");
+        if (INTERPRETER.test(consumer)) derived.push(...interpretAs(consumer, body));
+        else if (!document.quoted) derived.push(...parseScript(`echo "${body.replace(/"/g, '\\"')}"`).commands);
       }
       continue;
     }
     if (c === "'" || c === '"') { quote = c; started = true; }
-    else if (c === "#" && !started) { while (i < command.length && command[i] !== "\n") i++; flush(); }
-    else if (/[;&|\n()]/.test(c)) flush();
+    else if (c === "#" && !started) { while (i < command.length && command[i] !== "\n") i++; endPipeline(); }
+    else if (c === "|" && command[i + 1] === "|") { endPipeline(); i++; }
+    else if (c === "|") flush();
+    else if (c === "&" && command[i + 1] === "&") { endPipeline(); i++; }
+    else if (/[;&\n()]/.test(c)) endPipeline();
     else if (/\s/.test(c)) flushWord();
     else if (c === "\\" && /[\s'";&|$`]/.test(command[i + 1] ?? "")) { started = true; word += command[++i]; }
     else { word += c; started = true; }
   }
-  flush();
-  return commands;
+  endPipeline();
+
+  // Leading `NAME=value` assignments are the only variable binding the lexer can prove.
+  const values = new Map<string, string>();
+  for (const stages of pipelines) for (const stage of stages) {
+    let k = 0;
+    for (; k < stage.length; k++) {
+      const assignment = /^([A-Za-z_]\w*)=([\s\S]*)$/.exec(stage[k]);
+      if (!assignment) break;
+      values.set(assignment[1], assignment[2]);
+    }
+    for (; k < stage.length; k++) stage[k] = stage[k].replace(/\$\{(\w+)\}|\$(\w+)/g, (raw, braced, bare) => values.get(braced ?? bare) ?? raw);
+  }
+
+  const commands: string[][] = [];
+  for (const stages of pipelines) commands.push(...decodePipeline(stages), ...stages);
+  commands.push(...derived);
+  return { commands, pipelines };
+}
+export function shellCommands(command: string): string[][] {
+  return parseScript(command).commands;
 }
 function executable(value: string): string {
-  return value.replace(/\\/g, "/").split("/").pop()!.replace(/\.(exe|cmd|bat)$/i, "").toLowerCase();
+  // Outside quotes a backslash escapes the next character; a drive-qualified Windows path keeps its separators.
+  const unescaped = /^[A-Za-z]:[\\/]/.test(value) ? value : value.replace(/\\([\s\S])/g, "$1");
+  return unescaped.replace(/\\/g, "/").split("/").pop()!.replace(/\.(exe|cmd|bat)$/i, "").toLowerCase();
 }
 export function isDestructiveRmTarget(operand: string, cwd: string): boolean {
   const clean = operand.trim().replace(/^["']|["']$/g, "");
@@ -210,6 +287,13 @@ export function isDestructiveRmTarget(operand: string, cwd: string): boolean {
   return false;
 }
 
+/** PowerShell accepts any unambiguous leading prefix of a parameter name, so `-e` is `-EncodedCommand`. */
+function flagPrefixOf(flag: string, parameter: string): boolean {
+  const given = flag.replace(/^[-/]+/, "").toLowerCase();
+  return given.length > 0 && parameter.startsWith(given);
+}
+export const DYNAMIC_CATEGORY = "dynamic_code";
+
 export function commandCategory(words: string[], cwd = process.cwd(), depth = 0): string | undefined {
   if (depth > 8) return "shell_destructive_os";
   while (words.length && /^[A-Za-z_]\w*=/.test(words[0])) words = words.slice(1);
@@ -217,13 +301,19 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
   if (!words.length) return;
   if (words[words.length - 1] === "}") words = words.slice(0, -1);
   if (!words.length) return;
+  // Substitution output, variable indirection and brace expansion hide the real program name.
+  // An unresolvable command name is dynamically constructed code, never a silent allow.
+  if (words[0].includes(DYNAMIC) || /[$`]/.test(words[0]) || /^\{[^}]*,/.test(words[0])) return DYNAMIC_CATEGORY;
   const app = executable(words[0]), args = words.slice(1), command = [app, ...args].join(" ");
+  const inspect = (script: string): string | undefined => script.includes(DYNAMIC)
+    ? DYNAMIC_CATEGORY
+    : selectCategory(shellCommands(script).map(inner => commandCategory(inner, cwd, depth + 1)));
   // The shell builtin reparses its argument string; argv wrappers do not.
   if (app === "eval" || app === "invoke-expression" || app === "iex") {
-    const script = (args[0] === "--" ? args.slice(1) : args).join(" ").replace(/^\{|\}$/g, "");
-    return selectCategory(shellCommands(script).map(c => commandCategory(c, cwd, depth + 1)));
+    const script = (args[0] === "--" ? args.slice(1) : args).join(" ").replace(/^\{|\}$/g, "").trim();
+    return script ? inspect(script) : DYNAMIC_CATEGORY;
   }
-  if (/^(env|command|exec|call|if|then|do|while|!|time|nohup|xargs)$/.test(app)) {
+  if (/^(env|command|exec|call|if|then|do|while|!|time|nohup|xargs|sudo|doas|stdbuf|setsid|nice|ionice|npx|bunx|uvx)$/.test(app)) {
     let offset = 0;
     while (args[offset]?.startsWith("-")) {
       if (args[offset] === "--") { offset++; break; }
@@ -231,62 +321,125 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
         ? /^(-[aEdInPLs]|--arg-file|--eof|--delimiter|--replace|--max-args|--max-procs|--max-lines|--max-chars|--process-slot-var)$/.test(args[offset])
         : app === "time"
           ? /^(-[fo]|--format|--output)$/.test(args[offset])
-          : /^(--unset|-u|-a)$/.test(args[offset]);
+          : /^(sudo|doas)$/.test(app)
+            ? /^-[ugphCrtU]$/.test(args[offset])
+            : /^(npx|bunx|uvx)$/.test(app)
+              ? /^(-p|--package|-c|--call)$/.test(args[offset])
+              : /^(nice|ionice|stdbuf)$/.test(app)
+                ? /^-[ncioep]$/.test(args[offset])
+                : /^(--unset|-u|-a)$/.test(args[offset]);
       offset += takesValue ? 2 : 1;
     }
     return commandCategory(args.slice(offset), cwd, depth + 1);
   }
+  if (app === "timeout") {
+    let offset = 0;
+    while (args[offset]?.startsWith("-")) offset += /^(-s|--signal|-k|--kill-after)$/.test(args[offset]) ? 2 : 1;
+    if (/^[\d.]+[smhd]?$/.test(args[offset] ?? "")) offset++;
+    return commandCategory(args.slice(offset), cwd, depth + 1);
+  }
+  if (/^(pnpm|yarn)$/.test(app) && args[0] === "dlx") return commandCategory(args.slice(1), cwd, depth + 1);
+  if (/^(pipx|poetry|uv|rye)$/.test(app) && /^(run|exec)$/.test(args[0] ?? "")) return commandCategory(args.slice(1), cwd, depth + 1);
+  // Searching or reading local files for the production ref touches nothing, and the ref must stay greppable.
+  const readOnlyLocal = (/^(grep|rg|ag|ack|ls|dir|cat|bat|head|tail|less|more|find|fd|wc|sort|uniq|diff|stat|file|tree)$/.test(app)
+    || (app === "git" && /^(log|grep|show|status|diff|blame|ls-files|cat-file)$/.test(args.find(arg => !arg.startsWith("-")) ?? "")))
+    && !args.some(arg => /^[a-z][a-z\d+.-]*:\/\//i.test(arg) || /@[\w.-]+:/.test(arg));
   // A real process may read keys regardless of the transport. Never inspect source-file contents.
-  if (PRODUCTION.test(command)) return "production_exclusion";
+  if (!readOnlyLocal && PRODUCTION.test(command)) return "production_exclusion";
   if (args.some(arg => SECRET_PATH.test(arg))) return "secrets";
-  if (/^(sh|bash|zsh|cmd|powershell|pwsh)$/.test(app)) {
-    const encIdx = args.findIndex(arg => /^(-[a-z]*enc[a-z]*|-[a-z]*e)$/i.test(arg));
-    if (encIdx >= 0 && args[encIdx + 1]) {
-      const decoded = decodeBase64(args[encIdx + 1]);
-      if (decoded) return selectCategory(shellCommands(decoded).map(c => commandCategory(c, cwd, depth + 1)));
+  if (/^(sh|bash|zsh|ksh|dash|ash|cmd|powershell|pwsh)$/.test(app)) {
+    const found: (string | undefined)[] = [];
+    if (/^(powershell|pwsh)$/.test(app)) {
+      const encoded = args.findIndex(arg => flagPrefixOf(arg, "encodedcommand"));
+      if (encoded >= 0 && args[encoded + 1]) {
+        const decoded = decodeBase64(args[encoded + 1]);
+        found.push(decoded ? inspect(decoded) : DYNAMIC_CATEGORY);
+      }
     }
-    const i = args.findIndex(arg => /^(-[a-z]*c|\/c|-command)$/i.test(arg));
-    if (i >= 0) {
-      const innerCmd = args.slice(i + 1).join(" ").replace(/^(&\s*)?\{|\}$/g, "").trim();
-      return selectCategory(shellCommands(innerCmd).map(c => commandCategory(c, cwd, depth + 1)));
+    // A POSIX shell takes -c anywhere in a combined cluster; only PowerShell abbreviates -Command.
+    const script = args.findIndex(arg => /^(powershell|pwsh)$/.test(app)
+      ? flagPrefixOf(arg, "command")
+      : app === "cmd" ? /^[-/]c$/i.test(arg) : /^-[a-z]*c[a-z]*$/.test(arg));
+    if (script >= 0) found.push(inspect(args.slice(script + 1).join(" ").replace(/^(&\s*)?\{|\}$/g, "").trim()) ?? (args[script + 1] === undefined ? DYNAMIC_CATEGORY : undefined));
+    if (found.length) return selectCategory(found);
+  }
+  if (/^(python[\d.]*|py|node|bun|deno|perl|ruby|php|osascript)$/.test(app)) {
+    const idx = args.findIndex(arg => /^(-c|-e|--eval|--exec)$/.test(arg) || /^(-c|-e|--eval)=/.test(arg));
+    if (idx >= 0) {
+      const inline = /^(?:-c|-e|--eval)=([\s\S]*)$/.exec(args[idx]);
+      const result = evalCommands(inline ? inline[1] : args[idx + 1] ?? "", /^(python[\d.]*|py)$/.test(app) ? "py" : "js", shellCommands);
+      return selectCategory([...result.commands.map(inner => commandCategory(inner, cwd, depth + 1)), result.unresolved ? DYNAMIC_CATEGORY : undefined]);
     }
   }
-  if (/^(node|bun|python|python3)$/.test(app)) {
-    const i = args.findIndex(arg => /^(-c|-e|--eval)$/.test(arg));
-    if (i >= 0) {
-      const result = evalCommands(args[i + 1] ?? "", app.startsWith("python") ? "py" : "js", shellCommands);
-      return selectCategory(result.commands.map(c => commandCategory(c, cwd, depth + 1)));
-    }
+  if (app === "ssh" || app === "plink") {
+    let offset = 0;
+    while (args[offset]?.startsWith("-")) offset += /^-[bcDEeFIiJLlmOoPpQRSWw]$/.test(args[offset]) ? 2 : 1;
+    const remote = args.slice(offset + 1).join(" ");
+    if (remote) return inspect(remote);
   }
   if (app === "format" && args.some(arg => /^[a-z]:$/i.test(arg))) return "shell_destructive_os";
-  if (app === "dd" && args.some(arg => /^if=/i.test(arg))) return "shell_destructive_os";
+  if (/^mkfs(\.\w+)?$/.test(app)) return "shell_destructive_os";
+  // `dd` destroys only what it writes; reading /dev/urandom into an in-tree file is ordinary.
+  if (app === "dd") {
+    const sink = args.find(arg => /^of=/i.test(arg));
+    if (sink && (/^of=[\\/]dev[\\/]/i.test(sink) || isDestructiveRmTarget(sink.slice(3), cwd))) return "shell_destructive_os";
+  }
   if (app === "shutdown" || app === "reboot") return "shell_destructive_os";
-  if (app === "rm" || app === "rmdir" || app === "remove-item") {
-    const isRecursive = app === "rmdir"
-      ? args.some(a => /^[\/-]s$/i.test(a))
-      : app === "remove-item"
-        ? args.some(a => /^-[a-z]*r/i.test(a) || /^-recurse$/i.test(a))
-        : args.some(a => /^-[a-z]*r/i.test(a) || a === "--recursive");
-    if (isRecursive) {
-      let inDoubleDash = false;
-      const operands: string[] = [];
-      for (const arg of args) {
-        if (inDoubleDash) operands.push(arg);
-        else if (arg === "--") inDoubleDash = true;
-        else if (app === "rmdir") { if (!/^[\/-][sq]/i.test(arg)) operands.push(arg); }
-        else if (app === "remove-item") { if (!arg.startsWith("-")) operands.push(arg); }
-        else { if (!arg.startsWith("-")) operands.push(arg); }
-      }
-      if (operands.some(op => isDestructiveRmTarget(op, cwd))) return "shell_destructive_os";
+  // Deleting out-of-tree also without -r, and through the cmd and PowerShell spellings of rm.
+  if (/^(rm|unlink|shred|rmdir|rd|del|erase|remove-item|ri)$/.test(app)) {
+    const cmdStyle = /^(rd|del|erase)$/.test(app);
+    const operands: string[] = [];
+    let literal = false;
+    for (const arg of args) {
+      if (literal) operands.push(arg);
+      else if (arg === "--") literal = true;
+      else if (!(cmdStyle ? /^[-/]\w/.test(arg) : arg.startsWith("-"))) operands.push(arg);
+    }
+    if (operands.some(operand => isDestructiveRmTarget(operand, cwd))) return "shell_destructive_os";
+  }
+  if (app === "truncate" && args.some(arg => /^(-s|--size)/.test(arg))
+    && args.filter(arg => !arg.startsWith("-")).some(operand => isDestructiveRmTarget(operand, cwd))) return "shell_destructive_os";
+  if (app === "find" && (args.includes("-delete") || args.some((arg, k) => arg === "-exec" && /^(rm|unlink|shred)$/.test(executable(args[k + 1] ?? ""))))) {
+    const firstFlag = args.findIndex(arg => arg.startsWith("-"));
+    if (args.slice(0, firstFlag < 0 ? args.length : firstFlag).some(root => isDestructiveRmTarget(root, cwd))) return "shell_destructive_os";
+  }
+  if (app === "docker" && args[0] === "run") {
+    for (let k = 1; k < args.length; k++) {
+      const spec = /^(?:--volume|--mount)=([\s\S]*)$/.exec(args[k])?.[1] ?? (/^(-v|--volume|--mount)$/.test(args[k]) ? args[k + 1] ?? "" : "");
+      const host = spec.includes("=") ? /(?:^|,)(?:source|src)=([^,]+)/.exec(spec)?.[1] ?? "" : spec.split(":")[0];
+      if (host && isDestructiveRmTarget(host, cwd)) return "shell_destructive_os";
     }
   }
-  if (app === "psql" || app === "pg_restore") return "shared_db_ddl_dml";
+  // Redirection truncates its target as surely as rm does.
+  for (let k = 0; k < args.length; k++) {
+    const redirect = /^\d?>{1,2}([\s\S]*)$/.exec(args[k]);
+    if (redirect && isDestructiveRmTarget(redirect[1] || args[k + 1] || "", cwd)) return "shell_destructive_os";
+  }
+  // `psql --version` connects to nothing; every other invocation, bare included, opens a session.
+  if ((app === "psql" || app === "pg_restore")
+    && !(args.length > 0 && args.every(arg => /^(-V|--version|-\?|--help)$/.test(arg)))) return "shared_db_ddl_dml";
   if (app === "alembic" && args.some(a => /^(upgrade|downgrade|stamp)$/.test(a))) return "shared_db_ddl_dml";
-  if (app === "supabase" && args[0] === "db" && /^(push|reset|remote)$/.test(args[1] ?? "")) return "shared_db_ddl_dml";
+  if (app === "supabase") {
+    if (args[0] === "db" && /^(push|reset|remote|execute|dump)$/.test(args[1] ?? "")) return "shared_db_ddl_dml";
+    if (args[0] === "migration" && /^(up|repair)$/.test(args[1] ?? "")) return "shared_db_ddl_dml";
+    if (args[0] === "projects" && args[1] === "delete") return "shared_db_ddl_dml";
+    if (args[0] === "secrets" && /^(set|unset)$/.test(args[1] ?? "")) return "cloudflare_stripe_mutations";
+  }
+  // The management API performs the same mutation over HTTP; classify the endpoint, not only the project ref.
+  if (/^(curl|wget|http|httpie)$/.test(app)) {
+    const url = args.find(arg => /^https?:\/\//i.test(arg)) ?? "";
+    const mutates = args.some(arg => /^(-d|--data|--data-raw|--data-binary|--data-urlencode|--json|--upload-file|-T)$/.test(arg))
+      || args.some((arg, k) => /^(-X|--request|--method)$/.test(args[k - 1] ?? "") && /^(POST|PUT|PATCH|DELETE)$/i.test(arg))
+      || /^(POST|PUT|PATCH|DELETE)$/i.test(args[0] ?? "");
+    if (mutates && /api\.supabase\.com\/v1\/projects\/[^/]+\/(database|secrets|config)/i.test(url)) return "shared_db_ddl_dml";
+    if (mutates && (/\/api\/[\w.]*(deploy|redeploy)\b/i.test(url) || /\b(api\.machines\.dev|api\.fly\.io)\b/i.test(url))) return "deployments";
+  }
   if (app === "dokploy" || (args.includes("dokploy") && !/^(echo|printf|cat)$/.test(app))) return "deployments";
   if ((app === "fly" || app === "flyctl") && args.includes("deploy") && !/^(echo|printf|cat)$/.test(app)) return "deployments";
   if (app === "wrangler" && /^(deploy|publish)$/.test(args[0] ?? "")) return "deployments";
   if (app === "deploy" && args.some(a => /^(prod|production)$/i.test(a))) return "deployments";
+  // A wrapper script names its own purpose: deploy-prod.sh never reaches the argv checks below.
+  if (/deploy[\w.-]*(prod|production)|(prod|production)[\w.-]*deploy/i.test(app)) return "deployments";
   const deployIdx = args.findIndex(a => a.toLowerCase() === "deploy");
   if (deployIdx >= 0 && /^(prod|production)$/i.test(args[deployIdx + 1] ?? "") && !/^(echo|printf|cat)$/.test(app)) return "deployments";
   if (app === "wrangler" && /^(secret|kv|d1)$/.test(args[0] ?? "")) return "cloudflare_stripe_mutations";
@@ -298,26 +451,33 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
     if (/^(-C|-c|--git-dir|--work-tree)$/.test(args[i])) i += 2; else i++;
   }
   const action = args[i], rest = args.slice(i + 1);
+  const isProtected = (ref: string) => {
+    const dest = ref.includes(":") ? ref.split(":").pop()! : ref.replace(/^\+/, "");
+    return PROTECTED.test(dest.replace(/^refs\/heads\//, ""));
+  };
   if (/^(filter-branch|filter-repo)$/.test(action ?? "")) return "destructive_git";
+  // The hard-block set names protected-branch deletion, not only protected-branch pushes.
+  if (action === "branch" && rest.some(a => /^-[a-zA-Z]*[dD]$/.test(a) || a === "--delete")
+    && rest.filter(a => !a.startsWith("-")).some(isProtected)) return "destructive_git";
+  if (action === "update-ref" && rest.some(a => /^(-d|--delete)$/.test(a))
+    && rest.filter(a => !a.startsWith("-")).some(isProtected)) return "destructive_git";
   if (action === "push") {
-    const isMirror = rest.some(a => a === "--mirror");
+    const isMirror = rest.some(a => a === "--mirror" || a === "--prune");
     if (isMirror) return "destructive_git";
     const isForce = rest.some(a => /^-[^-]*f/.test(a) || /^--force(?:-with-lease|-if-includes)?(?:=.*)?$/.test(a));
     const isDelete = rest.some(a => a === "--delete" || /^-[^-]*d$/.test(a));
     const nonFlags = rest.filter(a => !a.startsWith("-"));
     const refspecs = nonFlags.length > 1 ? nonFlags.slice(1) : nonFlags;
-    const isProtected = (ref: string) => {
-      const dest = ref.includes(":") ? ref.split(":").pop()! : ref.replace(/^\+/, "");
-      return PROTECTED.test(dest.replace(/^refs\/heads\//, ""));
-    };
     if (isForce && refspecs.some(isProtected)) return "destructive_git";
     if (isDelete && refspecs.some(isProtected)) return "destructive_git";
     if (refspecs.some(r => r.startsWith("+") && isProtected(r))) return "destructive_git";
     if (refspecs.some(r => r.startsWith(":") && isProtected(r))) return "destructive_git";
   }
 }
+/** A proven category beats "the lexer could not resolve this"; production exclusion beats everything. */
 function selectCategory(categories: (string | undefined)[]): string | undefined {
-  return categories.includes("production_exclusion") ? "production_exclusion" : categories.find(Boolean);
+  if (categories.includes("production_exclusion")) return "production_exclusion";
+  return categories.find(category => category && category !== DYNAMIC_CATEGORY) ?? categories.find(Boolean);
 }
 function protectedPath(input: unknown, depth = 0): boolean {
   if (!input || typeof input !== "object" || depth > 10) return false;
@@ -362,8 +522,12 @@ export class DangerousToolGuard {
     } else if (toolName === "ssh") {
       category = PRODUCTION.test(`${input.host ?? ""} ${input.hostname ?? ""} ${input.command ?? ""}`) ? "production_exclusion" : undefined;
     }
+    // A substitution feeding an argument is data; only an unresolvable program name or eval payload is dynamic code.
     if (category !== "production_exclusion" && protectedPath(input)) category = "secrets";
+    // Code the lexer cannot resolve is approval-gated; silently allowing it is the bypass it was meant to stop.
+    if (!category && unresolved) category = DYNAMIC_CATEGORY;
     if (!category) return { allowed: true };
+    commands = commands.map(words => words.map(word => word.split(DYNAMIC).join("<dynamic>")));
     if (category === "production_exclusion") return { allowed: false, category, reason: "Production is excluded for every transport; an approval cannot override this boundary." };
 
     const config = this.getGuardConfig();

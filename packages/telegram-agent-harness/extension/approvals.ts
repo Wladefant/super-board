@@ -37,6 +37,7 @@ const REASONS: Record<string, string> = {
   cloudflare_stripe_mutations: "This operation modifies live cloud infrastructure, keys, or payment records.",
   remote_ssh: "This operation executes commands or transfers files on a remote host.",
   secrets: "This operation accesses protected credentials, private keys, or environment secrets.",
+  dynamic_code: "This operation builds the program it runs at runtime, so the guard cannot prove what it executes.",
 };
 
 /** Keep credentials out of both Telegram and the durable audit. Bind the original input by hash only. */
@@ -180,6 +181,10 @@ export function formatApprovalSummary(category: string, tool: string, input: Rec
   if (category === "secrets") {
     const explicit = [input.path, input.file].filter(x => typeof x === "string").join("; ");
     return `Access protected sensitive path (${explicit || "secret"})`;
+  }
+
+  if (category === "dynamic_code") {
+    return "Run a command the guard could not resolve statically";
   }
 
   if (category === "production_exclusion") {

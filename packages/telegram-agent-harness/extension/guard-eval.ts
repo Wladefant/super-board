@@ -5,17 +5,21 @@
 type Token = { kind: "name" | "string" | "symbol"; value: string; dynamic?: boolean; embedded?: string[] };
 type Value = string | Value[] | { [key: string]: Value };
 
+/** Decodes only canonical base64. Anything else returns "" so callers fall through to the raw string
+ * instead of acting on mojibake that `Buffer.from(x, "base64")` silently produces for arbitrary text. */
 export function decodeBase64(raw: string): string {
   try {
     const clean = raw.trim().replace(/^b['"]|['"]$/g, "").replace(/\s+/g, "");
-    if (!clean || clean.length < 2) return "";
+    if (clean.length < 4 || clean.length % 4 === 1) return "";
+    if (!/^[A-Za-z0-9+/]+={0,2}$/.test(clean)) return "";
     const buf = Buffer.from(clean, "base64");
     if (!buf.length) return "";
+    if (buf.toString("base64").replace(/=+$/, "") !== clean.replace(/=+$/, "")) return "";
+    const printable = /^[\x20-\x7e\t\r\n]+$/;
     const u16 = buf.toString("utf16le");
-    if (/^[\x20-\x7e\t\r\n]+$/.test(u16) && /[a-zA-Z]/.test(u16)) return u16;
+    if (printable.test(u16) && /[a-zA-Z]/.test(u16)) return u16;
     const u8 = buf.toString("utf8");
-    if (/^[\x20-\x7e\t\r\n]+$/.test(u8)) return u8;
-    return u8;
+    return printable.test(u8) && /[a-zA-Z]/.test(u8) ? u8 : "";
   } catch {
     return "";
   }
@@ -46,8 +50,8 @@ function tokenize(code: string, language: string): Token[] {
       tokens.push({ kind: "symbol", value: "regexp" }); continue;
     }
     let strPrefix = "";
-    if (language === "py" && /^[bBruU]?[rR]?['"`]/.test(code.slice(i))) {
-      const pMatch = /^[bBruU]?[rR]?/.exec(code.slice(i));
+    if (language === "py" && /^(?:[bBrRuUfF]{1,2})?['"`]/.test(code.slice(i))) {
+      const pMatch = /^(?:[bBrRuUfF]{1,2})?/.exec(code.slice(i));
       if (pMatch && pMatch[0].length > 0) {
         strPrefix = pMatch[0];
         i += strPrefix.length;
@@ -67,7 +71,9 @@ function tokenize(code: string, language: string): Token[] {
         } else value += code[i++];
       }
       const rawValue = code.slice(rawStart, closed ? i - delimiter.length : i);
-      const embedded = sc === "`" ? [...rawValue.matchAll(/(?<!\\)\$\{([\s\S]*?)\}/g)].map(match => match[1]) : [];
+      // An f-string interpolation is as unprovable as a JS template one, and its expression still runs.
+      const embedded = sc === "`" ? [...rawValue.matchAll(/(?<!\\)\$\{([\s\S]*?)\}/g)].map(match => match[1])
+        : /[fF]/.test(strPrefix) ? [...rawValue.matchAll(/(?<!\{)\{([^{}]+)\}/g)].map(match => match[1]) : [];
       tokens.push({ kind: "string", value, dynamic: !closed || embedded.length > 0, embedded }); continue;
     } else if (strPrefix) {
       i -= strPrefix.length;
@@ -240,7 +246,22 @@ export function evalCommands(code: string, language: string, parseShell: (comman
         at = j;
       }
     }
-    while (tokens[at]?.value === "." && tokens[at + 1]?.kind === "name") { call += `.${tokens[at + 1].value}`; at += 2; }
+    // `require("child_process").execSync(...)` is one expression: continue the member walk from the module.
+    if (language !== "py" && t.value === "require" && tokens[i + 1]?.value === "(" && tokens[i + 2]?.kind === "string" && tokens[i + 3]?.value === ")") {
+      call = tokens[i + 2].value;
+      at = i + 4;
+    }
+    for (;;) {
+      if (tokens[at]?.value === "." && tokens[at + 1]?.kind === "name") { call += `.${tokens[at + 1].value}`; at += 2; continue; }
+      if (tokens[at]?.value !== "[") break;
+      const key = valueAt(at + 1);
+      if (typeof key.value === "string" && tokens[key.end]?.value === "]") { call += `.${key.value}`; at = key.end + 1; continue; }
+      // A computed member whose key the lexer cannot prove, then invoked, is dynamically constructed code.
+      let close = at + 1, depth = 1;
+      while (close < tokens.length && depth) { if (tokens[close].value === "[") depth++; else if (tokens[close].value === "]") depth--; close++; }
+      if (tokens[close]?.value === "(") unresolved = true;
+      break;
+    }
     for (let hop = 0; hop < 8; hop++) {
       const [head, ...tail] = call.split(".");
       const resolved = aliases.get(head);
@@ -273,7 +294,7 @@ export function evalCommands(code: string, language: string, parseShell: (comman
       commands.push(["rm", "-rf", ...(typeof value === "string" ? [value] : [])]);
     } else if (/^(read|write|open|fs(?:\.promises)?\.(readFile|readFileSync|writeFile|writeFileSync)|Bun\.(file|write)|Path|pathlib\.Path)$/.test(call)) {
       if (typeof value === "string") commands.push(["cat", value]);
-    } else if (/^(eval|exec|Function)$/.test(call)) {
+    } else if (/^(eval|exec|Function|(?:vm\.)?runIn(NewContext|ThisContext|Context))$/.test(call)) {
       if (typeof value === "string") {
         const inner = evalCommands(value, language, parseShell);
         commands.push(...inner.commands);
