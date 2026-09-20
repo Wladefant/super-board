@@ -489,6 +489,20 @@ describe("routing commands", () => {
     expect(sent[0].html).not.toContain("Old title");
   });
 
+  test("a failed preview retains the title and does not hide other sessions", async () => {
+    const fake = fakeControl([summary("a", "C:/demo", "Saved title"), summary("b", "C:/other", "Other")]);
+    fake.control.lastPrompt = async id => {
+      if (id === "a") throw new Error("session removed during preview");
+      return "latest prompt";
+    };
+    const router = buildRouter({}, fake.control);
+    await router.handleCommand("/sessions", DM);
+    expect(sent[0].html).toContain("<i>Saved title</i>");
+    expect(sent[0].html).toContain("<i>latest prompt</i>");
+    await router.handleCommand("/attach 2", DM);
+    expect(router.boundSession(DM)).toBe("b");
+  });
+
   test("/sessions groups sessions by workspace instead of exposing internal IDs", async () => {
     const fake = fakeControl([summary("sess-a", "C:/dev/demo", "Demo"), summary("sess-b", "C:/dev/other", "Other")]);
     const router = buildRouter({}, fake.control);

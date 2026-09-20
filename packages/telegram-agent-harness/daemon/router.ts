@@ -307,7 +307,7 @@ export class SlotRouter {
           lines.push("", `<b>${escapeHtml(this.folder(workspace) || "No workspace")}</b> <code>${escapeHtml(workspace)}</code>`);
           previous = workspace;
         }
-        const prompt = await this.options.control.lastPrompt(session.id);
+        const prompt = await this.options.control.lastPrompt(session.id).catch(() => null);
         const excerpt = Array.from((prompt || session.title || "Untitled session").replace(/\s+/g, " ").trim()).slice(0, 40).join("");
         const minutes = session.modifiedAtMs === null ? null : Math.max(0, Math.floor((now - session.modifiedAtMs) / 60_000));
         const age = minutes === null ? "age unknown" : minutes < 60 ? `${minutes} min ago`
