@@ -23,3 +23,21 @@ export function authenticateInitData(raw: string, token: string, allowedUsers: r
   if (!user || !Number.isSafeInteger(user.id) || !allowedUsers.includes(String(user.id))) throw new Error("Unauthorized");
   return String(user.id);
 }
+
+/** App sessions are purpose-bound; Telegram launch credentials are exchanged once. */
+export function issueAppSession(user: string, token: string, now = Date.now()): string {
+  const payload = `${user}.${Math.floor(now / 1000)}`;
+  const signature = createHmac("sha256", token).update(`miniapp-session:${payload}`).digest("hex");
+  return `${payload}.${signature}`;
+}
+
+export function authenticateAppSession(session: string, token: string, allowedUsers: readonly string[], now = Date.now()): string {
+  const match = /^(\d+)\.(\d+)\.([a-f0-9]{64})$/.exec(session);
+  if (!match) throw new Error("Unauthorized");
+  const [, user, issued, signature] = match;
+  const age = now / 1000 - Number(issued);
+  if (age < -30 || age > 28800 || !allowedUsers.includes(user)) throw new Error("Unauthorized");
+  const expected = createHmac("sha256", token).update(`miniapp-session:${user}.${issued}`).digest();
+  if (!timingSafeEqual(expected, Buffer.from(signature, "hex"))) throw new Error("Unauthorized");
+  return user;
+}

@@ -382,11 +382,11 @@ export class TelegramDaemon {
 
     const stopMiniApp = connectMiniApp({
       stateDir: slot.stateDir, token, allowedUsers: access.allowFrom,
-      session: () => router.boundSession(currentChat()),
+      session: userId => router.boundSession(userId),
       sessions: () => this.control.listSessions(),
       status: () => ({ polling: poller.running, slot: slot.slotId }),
-      dashboard: () => {
-        const session = router.boundSession(currentChat());
+      dashboard: userId => {
+        const session = router.boundSession(userId);
         const raw = session ? poller.getMeta(`dashboard-snapshot:${session}`) : null;
         try { return raw ? JSON.parse(raw) : null; } catch { return null; }
       },
