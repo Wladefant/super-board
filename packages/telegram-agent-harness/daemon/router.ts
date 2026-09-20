@@ -253,6 +253,20 @@ export class SlotRouter {
     return threadId;
   }
 
+  private workspace(session: { cwd: string; workspace: string }): string {
+    const value = session.cwd || (/^(?:[A-Za-z]:[\\/]|\/)/.test(session.workspace) ? session.workspace : "");
+    return value.replace(/\\/g, "/").replace(/\/+$/, "");
+  }
+
+  private folder(workspace: string): string {
+    return workspace.split("/").at(-1) ?? workspace;
+  }
+
+  private visibleSession(session: { cwd: string; workspace: string; status: string; modifiedAtMs: number | null }, now: number): boolean {
+    return !!this.workspace(session) && !(/^(complete|completed|finished|interrupted|aborted|error)$/i.test(session.status)
+      && (session.modifiedAtMs === null || now - session.modifiedAtMs > 3_600_000));
+  }
+
   private async runCommand(verb: string, argument: string, target: RouteTarget): Promise<string> {
     if (verb === "/where") return this.statusText(target);
     if (verb === "/topics") {
@@ -278,24 +292,48 @@ export class SlotRouter {
     }
 
     if (verb === "/sessions") {
-      const sessions = await this.options.control.listSessions();
-      if (sessions.length === 0) return "ℹ️ <b>No Veyyon sessions are running.</b>";
-      const bound = this.boundSession(target);
-      const lines = sessions.slice(0, 15).map(session => {
-        const marker = session.id === bound ? "➡️" : "•";
-        const label = session.title ?? (session.cwd || "untitled");
-        return `${marker} <code>${escapeHtml(session.id)}</code> — ${escapeHtml(label)} <i>(${escapeHtml(session.status)})</i>`;
-      });
-      return ["🗂 <b>Veyyon sessions</b>", ...lines, "", "Attach with <code>/attach &lt;id&gt;</code>."].join("\n");
+      const now = Date.now();
+      const sessions = (await this.options.control.listSessions()).filter(session =>
+        argument.toLowerCase() === "all" || this.visibleSession(session, now));
+      sessions.sort((a, b) => this.workspace(a).localeCompare(this.workspace(b))
+        || (b.modifiedAtMs ?? 0) - (a.modifiedAtMs ?? 0) || a.id.localeCompare(b.id));
+      this.options.store.putSessionListing(this.slotId, target.chatId, target.topicId, sessions.map(session => session.id));
+      if (!sessions.length) return "<b>No recent workspace sessions.</b> Use <code>/sessions all</code> to include older and unassigned sessions.";
+      const lines = ["<b>Veyyon sessions</b>"];
+      let previous: string | undefined;
+      for (const [index, session] of sessions.entries()) {
+        const workspace = this.workspace(session);
+        if (workspace !== previous) {
+          lines.push("", `<b>${escapeHtml(this.folder(workspace) || "No workspace")}</b> <code>${escapeHtml(workspace)}</code>`);
+          previous = workspace;
+        }
+        const prompt = await this.options.control.lastPrompt(session.id);
+        const excerpt = Array.from((prompt || session.title || "Untitled session").replace(/\s+/g, " ").trim()).slice(0, 40).join("");
+        const minutes = session.modifiedAtMs === null ? null : Math.max(0, Math.floor((now - session.modifiedAtMs) / 60_000));
+        const age = minutes === null ? "age unknown" : minutes < 60 ? `${minutes} min ago`
+          : minutes < 1440 ? `${Math.floor(minutes / 60)} h ago` : `${Math.floor(minutes / 1440)} d ago`;
+        lines.push(`${index + 1}. <i>${escapeHtml(excerpt)}</i> · ${age} · /attach ${index + 1}`);
+      }
+      return lines.join("\n");
     }
 
     if (verb === "/attach") {
-      if (!argument) return "⚠️ <b>Usage:</b> <code>/attach &lt;session-id&gt;</code>";
+      if (!argument) return "<b>Usage:</b> <code>/attach &lt;index, folder or session-id&gt;</code>";
       const sessions = await this.options.control.listSessions();
-      const session = sessions.find(candidate => candidate.id === argument)
-        ?? sessions.find(candidate => candidate.id.startsWith(argument));
-      if (!session) return `🚫 <b>No running session matches</b> <code>${escapeHtml(argument)}</code>. Use <code>/sessions</code> to list them.`;
-      const workspace = session.cwd || session.workspace;
+      let matches;
+      if (/^\d+$/.test(argument)) {
+        const id = this.options.store.getSessionListing(this.slotId, target.chatId, target.topicId)[Number(argument) - 1];
+        matches = sessions.filter(session => session.id === id);
+      } else {
+        const exact = sessions.find(session => session.id === argument);
+        matches = exact ? [exact] : sessions.filter(session => session.id.startsWith(argument)
+          || (this.visibleSession(session, Date.now()) &&
+            [this.folder(this.workspace(session)), this.workspace(session)].some(value => value.toLowerCase() === argument.replace(/\\/g, "/").toLowerCase())));
+      }
+      if (matches.length > 1) return "<b>More than one session matches.</b> Use <code>/sessions</code> and attach with its number.";
+      const session = matches[0];
+      if (!session) return `🚫 <b>No running session matches</b> <code>${escapeHtml(argument)}</code>. Use <code>/sessions</code> in this chat/topic to refresh the listing.`;
+      const workspace = this.workspace(session);
       const threadId = await this.bindWithTopic(target, session.id, workspace, session.title);
       return threadId === null
         ? `🔗 <b>Attached to</b> <code>${escapeHtml(session.id)}</code> — ${escapeHtml(workspace)}.`

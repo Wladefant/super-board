@@ -102,6 +102,12 @@ function replyTo(id: number, action: unknown, behaviour: HostBehaviour): unknown
   if (verb === "AbortTurn" && behaviour.nothingToAbort) {
     return [{ RequestFailed: { request: id, error: { code: "NOT_RUNNING", message: "No turn is running" } } }];
   }
+  if (verb === "PreviewSessionTranscript") {
+    return [
+      { Snapshot: { SessionTranscript: { session: "sess-a", transcript: { revision: 2, value: behaviour.transcript ?? [] } } } },
+      { RequestSucceeded: { request: id } },
+    ];
+  }
   if (verb === "LoadTranscript") {
     return [
       { Snapshot: { Transcript: { revision: 2, value: behaviour.transcript ?? [] } } },
@@ -114,6 +120,17 @@ function replyTo(id: number, action: unknown, behaviour: HostBehaviour): unknown
 function assistantEntry(id: string, text: string): Record<string, unknown> {
   return { id, role: "Assistant", content: [{ Text: { text } }] };
 }
+
+test("last prompt uses read-only preview and ignores assistant and non-text content", async () => {
+  const fixture = await control({ transcript: [
+    { id: "u1", role: "User", content: [{ Text: { text: "first" } }] },
+    { id: "u2", role: "User", content: [{ Text: { text: "latest prompt" } }, { Image: {} }] },
+    assistantEntry("a", "not the prompt"),
+  ] });
+  expect(await fixture.control.lastPrompt("sess-a")).toBe("latest prompt");
+  expect(fixture.host.received).toEqual([{ PreviewSessionTranscript: { session: "sess-a" } }]);
+  expect(fixture.events).toEqual([]);
+});
 
 /**
  * Collects events and lets a test await the arrival of the Nth one. Push frames

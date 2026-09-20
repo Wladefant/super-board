@@ -146,6 +146,23 @@ export class GuiHostSessionControl {
     return readSessionSummaries(response);
   }
 
+  /** Read-only preview: unlike LoadTranscript, this never attaches or switches a session. */
+  public async lastPrompt(sessionId: string): Promise<string | null> {
+    const response = await this.controlPort().request({ PreviewSessionTranscript: { session: sessionId } });
+    for (const snapshot of snapshotSections(response)) {
+      const transcript = versionedValue(asRecord(snapshot.SessionTranscript)?.transcript);
+      if (!Array.isArray(transcript)) continue;
+      for (let index = transcript.length - 1; index >= 0; index--) {
+        const entry = asRecord(transcript[index]);
+        if (entry?.role !== "User" || !Array.isArray(entry.content)) continue;
+        const text = entry.content.map(block => asRecord(asRecord(block)?.Text)?.text)
+          .filter((text): text is string => typeof text === "string").join(" ").trim();
+        if (text) return text;
+      }
+    }
+    return null;
+  }
+
   /** Session already serving `workspace`, newest first, or null. */
   public async findSession(workspace: string): Promise<DaemonSessionSummary | null> {
     const target = path.resolve(workspace).toLowerCase();
