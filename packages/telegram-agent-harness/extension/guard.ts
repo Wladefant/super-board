@@ -74,7 +74,7 @@ function extractAllStrings(val: unknown, depth = 0): string[] {
 }
 
 // Every dotted .env variant holds real values; the committed template variants hold placeholders.
-const SECRET_PATH = /(?:^|[/\\])\.env(?:\.(?!(?:example|sample|template|dist|defaults|schema)\b)[\w-]+)*$|\b(id_(rsa|dsa|ecdsa|ed25519)|service_role|jwt_secret|agent\.db)\b|\.(pem|p12|pfx)$|(?:^|[/\\])credentials(\.json)?$|(?:^|[/\\])\.(npmrc|netrc)$/i;
+const SECRET_PATH = /(?:^|[/\\])\.env(?:\.(?!(?:example|sample|template|dist|defaults|schema)\b)[\w-]+)*$|\b(id_(rsa|dsa|ecdsa|ed25519)|service_role|jwt_secret|agent\.db)\b|\.(pem|p12|pfx)$|(?:^|[/\\])credentials(\.json)?$|(?:^|[/\\])\.(npmrc|netrc)$|(?:^|[/\\])proc[/\\][^/\\]+[/\\]environ$/i;
 const PROTECTED = /^(main|master|staging|production|prod)$/i;
 const PRODUCTION = /(?:\bzaraprptkegxqpvnsubu\b|\bakamai-iad-prod\b)/i;
 const LOCAL_CONTEXT: ApprovalContext = { sessionId: "local", requester: "Local operator", task: "Local guarded operation", cwd: process.cwd() };
