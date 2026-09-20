@@ -162,8 +162,21 @@ export function evalCommands(code: string, language: string, parseShell: (comman
       } else {
         value = values.get(token.value);
         // An unresolved chain is still one value, so consume it: `process.env.HOME + "/.ssh/id_rsa"`
-        // concatenates into a path instead of stopping the walk at the first dot.
-        if (value === undefined) end = next;
+        // concatenates into a path instead of stopping the walk at the first dot. A subscript belongs
+        // to that same value, so `os.environ['HOME'] + '/.ssh/id_rsa'` reaches the concatenation too.
+        if (value === undefined) {
+          end = next;
+          while (tokens[end]?.value === "[") {
+            let depth = 1, at = end + 1;
+            while (at < tokens.length && depth > 0) {
+              if (tokens[at].value === "[") depth++;
+              else if (tokens[at].value === "]") depth--;
+              at++;
+            }
+            if (depth > 0) break;
+            end = at;
+          }
+        }
       }
     } else if (token.value === "[") {
       const items: Value[] = []; let at = start + 1;

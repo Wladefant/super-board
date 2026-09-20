@@ -850,6 +850,31 @@ export class DangerousToolGuard {
         // Text typed into a live process is a command line as soon as that process is a shell.
         commands = shellCommands(String(input.text ?? ""));
         category = selectCategory(commands.map(c => commandCategory(c, cwd)));
+      } else if (toolName === "debug" && input.action === "launch") {
+        // A debug session starts a real process; the debugger in front of it changes nothing.
+        commands = [[String(input.program ?? ""), ...(Array.isArray(input.args) ? input.args.map(String) : [])]];
+        category = commandCategory(commands[0], cwd);
+      } else if (toolName === "debug" && input.action === "evaluate") {
+        // An expression evaluated in the debuggee runs inside that process with its whole API
+        // surface. The adapter's language is not in the call, so both spellings are read.
+        const expression = String(input.expression ?? "");
+        const readings = ["js", "py"].map(language => evalCommands(expression, language, shellCommands));
+        commands = readings.flatMap(reading => reading.commands);
+        unresolved = readings.every(reading => reading.unresolved);
+        category = selectCategory(commands.map(c => commandCategory(c, cwd)));
+      } else if (toolName === "debug" && input.action === "custom_request") {
+        // An adapter request carries whatever the adapter accepts, including a process to start
+        // (`launch`, `runInTerminal`), so classify every command line its arguments name.
+        commands = extractAllStrings(input.arguments).flatMap(text => shellCommands(text));
+        category = selectCategory(commands.map(c => commandCategory(c, cwd)));
+      } else if (toolName === "browser" && input.action === "open") {
+        // `app.path` spawns a binary with arguments in this host, exactly like `launch start`.
+        const app = input.app;
+        if (app && typeof app === "object" && "path" in app) {
+          const args = "args" in app && Array.isArray(app.args) ? app.args.map(String) : [];
+          commands = [[String(app.path), ...args]];
+          category = commandCategory(commands[0], cwd);
+        }
       } else if (toolName === "eval" || (toolName === "browser" && input.action === "run")) {
         // Browser automation code runs in the harness process with full Node access, like an eval payload.
         const result = evalCommands(String(input.code ?? ""), toolName === "eval" ? String(input.language ?? "js") : "js", shellCommands);

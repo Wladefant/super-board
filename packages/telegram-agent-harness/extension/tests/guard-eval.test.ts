@@ -1271,6 +1271,34 @@ const SWEEP_CASES: SweepCase[] = [
   { id: "W28", label: "read package metadata from an eval payload", want: "allow", tool: "eval", input: { language: "js", code: "JSON.parse(require('fs').readFileSync('./package.json', 'utf8')).version" } },
   { id: "W29", label: "scp a build artifact", want: "allow", tool: "bash", input: { command: "scp ./dist.tgz builder@build-host:/tmp/" } },
   { id: "W30", label: "write an in-tree path built at runtime", want: "allow", tool: "eval", input: { language: "js", code: "require('fs').writeFileSync('./out/' + name + '.json', body)" } },
+
+  // Tool surfaces that start a process or evaluate code without being `bash` or `eval`.
+  { id: "Y01", label: "debug launch of a shell one-liner", want: "block", tool: "debug", input: { action: "launch", program: "bash", args: ["-c", "rm -rf /"] } },
+  { id: "Y02", label: "debug launch of rm at the root", want: "block", tool: "debug", input: { action: "launch", program: "/bin/rm", args: ["-rf", "/"] } },
+  { id: "Y03", label: "debug launch of a python one-liner", want: "block", tool: "debug", input: { action: "launch", program: "python", args: ["-c", "import os; os.system('rm -rf /')"] } },
+  { id: "Y04", label: "debug launch into production", want: "block", tool: "debug", input: { action: "launch", program: "ssh", args: ["akamai-iad-prod"] } },
+  { id: "Y05", label: "debuggee evaluate runs python code", want: "block", tool: "debug", input: { action: "evaluate", expression: "__import__('os').system('rm -rf /')", context: "repl" } },
+  { id: "Y06", label: "debuggee evaluate runs js code", want: "block", tool: "debug", input: { action: "evaluate", expression: "require('child_process').execSync('rm -rf /')" } },
+  { id: "Y07", label: "debuggee evaluate clobbers a system file", want: "block", tool: "debug", input: { action: "evaluate", expression: "open('/etc/hosts','w').write('x')", context: "repl" } },
+  { id: "Y08", label: "debuggee evaluate reads a key behind a subscript", want: "block", tool: "debug", input: { action: "evaluate", expression: "open(os.environ['HOME'] + '/.ssh/id_rsa').read()" } },
+  { id: "Y09", label: "debug launch of an in-tree script", want: "allow", tool: "debug", input: { action: "launch", program: "./scripts/server.py", args: ["--port", "3000"] } },
+  { id: "Y10", label: "debuggee evaluate inspecting a variable", want: "allow", tool: "debug", input: { action: "evaluate", expression: "user.balance" } },
+  { id: "Y11", label: "reading the stack", want: "allow", tool: "debug", input: { action: "stack_trace" } },
+  { id: "Y12", label: "setting a breakpoint", want: "allow", tool: "debug", input: { action: "set_breakpoint", file: "src/main.ts", line: 42 } },
+  { id: "Y13", label: "browser app spawn of a shell", want: "block", tool: "browser", input: { action: "open", app: { path: "/bin/bash", args: ["-c", "rm -rf /"] } } },
+  { id: "Y14", label: "browser app spawn of powershell", want: "block", tool: "browser", input: { action: "open", app: { path: "powershell", args: ["-Command", "Remove-Item -Path C:\\ -Recurse -Force"] } } },
+  { id: "Y15", label: "ordinary page open", want: "allow", tool: "browser", input: { action: "open", url: "https://example.com" } },
+  { id: "Y16", label: "attaching to a desktop app", want: "allow", tool: "browser", input: { action: "open", app: { path: "/Applications/Cursor.app/Contents/MacOS/Cursor" } } },
+  { id: "Y17", label: "DAP custom request spawning a shell", want: "block", tool: "debug", input: { action: "custom_request", command: "runInTerminal", arguments: { args: ["bash", "-c", "rm -rf /"] } } },
+  { id: "Y18", label: "debuggee evaluate reads the env file", want: "block", tool: "debug", input: { action: "evaluate", expression: "open('.env').read()" } },
+  { id: "Y19", label: "debug launch against the production project", want: "block", tool: "debug", input: { action: "launch", program: "supabase", args: ["db", "push", "--project-ref", "zaraprptkegxqpvnsubu"] } },
+  { id: "Y20", label: "python length expression", want: "allow", tool: "debug", input: { action: "evaluate", expression: "len(items)" } },
+  { id: "Y21", label: "js inspection expression", want: "allow", tool: "debug", input: { action: "evaluate", expression: "JSON.stringify(order)" } },
+  { id: "Y22", label: "debugging a test run", want: "allow", tool: "debug", input: { action: "launch", program: "npm", args: ["run", "test:unit"] } },
+  { id: "Y23", label: "ordinary custom DAP request", want: "allow", tool: "debug", input: { action: "custom_request", command: "modules", arguments: { startModule: 0 } } },
+  { id: "Y24", label: "attaching over CDP spawns nothing", want: "allow", tool: "browser", input: { action: "open", app: { cdp_url: "http://127.0.0.1:9222" } } },
+  { id: "Y25", label: "reading an env var that names no secret", want: "allow", tool: "debug", input: { action: "evaluate", expression: "os.environ['HOME']" } },
+  { id: "Y26", label: "credential path built from a subscript", want: "block", tool: "debug", input: { action: "evaluate", expression: "open(os.environ['HOME'] + '/.aws/credentials').read()" } },
 ];
 
 describe("Issue #97: Table-driven audit of guard-eval.ts and guard.ts", () => {
@@ -1309,7 +1337,7 @@ describe("Issue #97: Table-driven audit of guard-eval.ts and guard.ts", () => {
       C: "reviewer round 2", D: "reviewer round 2", H: "fix-lane probes", I: "fix-lane probes",
       J: "reviewer round 3", K: "exec family", L: "spelling sweep", M: "everyday commands", N: "HTTP verbs and launchers",
       S: "eval executors and file sinks", T: "tool surfaces beside bash", U: "robustness and parser limits",
-      V: "interpreters fed on stdin", W: "credential reads and exfiltration",
+      V: "interpreters fed on stdin", W: "credential reads and exfiltration", Y: "debugger and app-spawn surfaces",
     };
     const batches = new Map<string, SweepCase[]>();
     for (const testCase of SWEEP_CASES) {
