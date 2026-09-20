@@ -292,4 +292,55 @@ if (verb === "run") {
     // Pid file should be cleaned up
     expect(fs.existsSync(pidPath)).toBe(false);
   }, 20_000);
+  test("never adopts powershell wrapper as daemon even if wrapper command line contains daemon entry", async () => {
+    const { launcherPath, daemonEntry, pidPath } = setupTestHarness();
+
+    // Spawn a PowerShell process whose command line contains daemonEntry (simulating launcher wrapper)
+    const wrapperProc = Bun.spawn(
+      [
+        "powershell.exe",
+        "-NoProfile",
+        "-Command",
+        `[Console]::WriteLine('WRAPPER_READY'); $null = [Console]::ReadLine() # ${daemonEntry}`,
+      ],
+      {
+        stdin: "pipe",
+        stdout: "pipe",
+        stderr: "pipe",
+      }
+    );
+    cleanupProcs.push(wrapperProc);
+
+    const reader = (wrapperProc.stdout as ReadableStream<Uint8Array>).getReader();
+    const decoder = new TextDecoder();
+    let accumulated = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      accumulated += decoder.decode(value);
+      if (accumulated.includes("WRAPPER_READY")) break;
+    }
+    reader.releaseLock();
+
+    const wrapperPid = wrapperProc.pid;
+    expect(wrapperPid).toBeGreaterThan(0);
+
+    // Put wrapper PID in daemon.pid
+    fs.writeFileSync(pidPath, String(wrapperPid), "utf8");
+
+    // Run status: it must mark the wrapper as stale and delete daemon.pid, and NOT adopt wrapper
+    const res = runLauncher(launcherPath, "status");
+    expect(res.stdout).toContain("Deleting stale PID file");
+    expect(res.stdout).toContain(String(wrapperPid));
+    expect(fs.existsSync(pidPath)).toBe(false);
+
+    // Wrapper process must NOT be killed
+    let procAlive = true;
+    try {
+      process.kill(wrapperPid, 0);
+    } catch {
+      procAlive = false;
+    }
+    expect(procAlive).toBe(true);
+  }, 20_000);
 });

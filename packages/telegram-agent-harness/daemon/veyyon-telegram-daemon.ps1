@@ -112,16 +112,15 @@ function Find-DaemonProcessByScan([string]$entryPath) {
     try {
         $candidates = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
             $_.ProcessId -ne $PID -and
+            $_.Name -notlike "powershell*" -and
+            $_.Name -notlike "pwsh*" -and
             $_.CommandLine -and
             (Test-DaemonCommandLine $_.CommandLine $entryPath)
         }
         if (-not $candidates) {
             return $null
         }
-        $daemonProc = $candidates | Where-Object { $_.Name -notlike "powershell*" -and $_.Name -notlike "pwsh*" } | Select-Object -First 1
-        if (-not $daemonProc) {
-            $daemonProc = $candidates | Select-Object -First 1
-        }
+        $daemonProc = $candidates | Select-Object -First 1
         if ($daemonProc) {
             return $daemonProc.ProcessId
         }
@@ -140,7 +139,7 @@ function Get-LiveDaemonPid {
         $parsed = 0
         if ([int]::TryParse($recorded, [ref]$parsed) -and $parsed -gt 0) {
             $proc = Get-Process -Id $parsed -ErrorAction SilentlyContinue
-            if ($proc) {
+            if ($proc -and $proc.ProcessName -notlike "powershell*" -and $proc.ProcessName -notlike "pwsh*") {
                 $cmdLine = Get-ProcessCommandLine $parsed
                 if ($cmdLine -and (Test-DaemonCommandLine $cmdLine $DaemonEntry)) {
                     $foundPid = $parsed
