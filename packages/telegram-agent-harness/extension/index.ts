@@ -83,6 +83,33 @@ let activeRuntime: TelegramRuntime | null = null;
 let savedContext: ExtensionContext | null = null;
 let currentApi: ExtensionAPI | null = null;
 let reloadLock: Promise<unknown> = Promise.resolve();
+let operatorReleased = false;
+let lastRebindAttemptAt = 0;
+const REBIND_MIN_INTERVAL_MS = 60_000;
+
+/**
+ * Rebinds the channel when the runtime was disposed while the host session is
+ * still alive (observed 2026-09-20: lease RELEASED mid-session, every
+ * telegram_* tool failing with "No active session-bound Telegram channel" and
+ * inbound silently dropped until an operator typed /tg-reload). Skipped after an
+ * explicit `/telegram release`; a failed claim (pool busy) retries on a later turn.
+ */
+async function ensureChannelBound(reason: string): Promise<void> {
+  if (operatorReleased || !savedContext || !currentApi) return;
+  if (activeRuntime?.getPoller()) return;
+  const now = Date.now();
+  if (now - lastRebindAttemptAt < REBIND_MIN_INTERVAL_MS) return;
+  lastRebindAttemptAt = now;
+  currentApi.logger?.warn(`[Telegram Loader] Channel unbound at ${reason}; attempting automatic rebind.`);
+  const res = await reload({ interactive: false });
+  if (res.success && activeRuntime?.getPoller()) {
+    currentApi.logger?.info?.(`[Telegram Loader] Channel rebound automatically (SHA: ${res.sha ?? "unknown"}).`);
+  } else {
+    currentApi.logger?.warn(
+      `[Telegram Loader] Automatic rebind did not attach a channel: ${res.error ?? "lease not acquired"}.`,
+    );
+  }
+}
 
 export function getActiveRuntime(): TelegramRuntime | null {
   return activeRuntime;
@@ -349,6 +376,9 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
   }
 
   pi.on("message_start", async (event: { message: { role: string } }) => {
+    if (event.message.role === "user") {
+      await ensureChannelBound("message_start");
+    }
     await activeRuntime?.onMessageStart(event);
   });
 
@@ -370,6 +400,7 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
 
   pi.on("turn_end", async () => {
     await activeRuntime?.onTurnEnd();
+    await ensureChannelBound("turn_end");
   });
 
   pi.on("session_shutdown", async (event: SessionShutdownEvent) => {
@@ -384,6 +415,7 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const trimmed = args.trim().toLowerCase();
       if (trimmed === "reload") {
+        operatorReleased = false;
         ctx.ui.notify("Reloading Telegram harness runtime...", "info");
         const res = await reload({ interactive: true });
         if (res.success) {
@@ -395,6 +427,7 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
       }
 
       if (trimmed === "release") {
+        operatorReleased = true;
         if (activeRuntime) {
           await activeRuntime.dispose();
           activeRuntime = null;
@@ -422,6 +455,7 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
   pi.registerCommand("tg-reload", {
     description: "Hot reload Telegram harness runtime in-process",
     handler: async (_args: string, ctx: ExtensionCommandContext) => {
+      operatorReleased = false;
       ctx.ui.notify("Reloading Telegram harness runtime...", "info");
       const res = await reload({ interactive: true });
       if (res.success) {
