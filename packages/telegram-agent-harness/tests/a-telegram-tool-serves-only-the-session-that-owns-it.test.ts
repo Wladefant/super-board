@@ -198,6 +198,7 @@ function createChannel(): {
       onLedgerFailure: () => {},
     },
     bridge,
+    { outboundPaceMs: 0 },
   );
 
   globalThis.fetch = (async (url, init) => {

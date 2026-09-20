@@ -37,7 +37,7 @@ function fixture(thread?: number) {
     onAbort: () => turns.push("ABORT"), onRelease: async () => { turns.push("RELEASE"); }, onTelegramTurnStart: () => {},
     getStatusText: () => "test", onLedgerFailure: () => {},
     onQuestionAnswer: async (id, event, answer) => { answers.push({ id, event, answer }); },
-  }, bridge, thread);
+  }, bridge, { messageThreadId: thread });
   globalThis.fetch = (async (url, init) => {
     const method = String(url).split("/").pop()!;
     const body = JSON.parse(String(init?.body));
@@ -153,6 +153,16 @@ test("dashboard never invents worker or Spark availability", () => {
   expect(card).toContain("stale/unavailable"); expect(card).toContain("Worker registry unavailable");
   expect(card).toContain("Host memory"); expect(card).toContain("Codex Spark: unavailable");
 });
+test("dashboard renders a snapshot whose lists were dropped in transport", () => {
+  // Main hands the snapshot over as JSON; a producer that omits a list must degrade to
+  // "unavailable" rather than crash the render and take the pinned dashboard down with it.
+  const partial = JSON.parse('{"observedAt":' + Date.now() + ',"lanes":[{"name":"Lane","task":"port","state":"active"}]}');
+  const card = renderDashboard(partial, "Codex Spark: unavailable");
+  expect(card).toContain("Lane");
+  expect(card).toContain("No blockers reported.");
+  expect(card).toContain("No pull requests queued by Main.");
+});
+
 test("the actual Python question store survives service restart and returns answers to a waiting tool", async () => {
   const f = fixture();
   const route = { session_id: "root", chat_id: "1", user_id: "1" };
@@ -174,4 +184,6 @@ test("the actual Python question store survives service restart and returns answ
   expect(f.turns).toEqual([]);
   route.session_id = "other";
   await expect(restarted.get(pending.decision_id)).rejects.toThrow("unavailable");
-}, 20_000);
+  // Every store call spawns the real Python process; 60s matches the other python-backed
+  // suites so a full-suite run under load cannot time this out.
+}, 60_000);

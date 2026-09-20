@@ -30,7 +30,7 @@ import {
   resolveDaemonSlots,
   type DaemonSlot,
 } from "./config";
-import { SlotRouter } from "./router";
+import { getDaemonCommands, SlotRouter } from "./router";
 import {
   GuiHostSessionControl,
   resolveGuiHostEndpoint,
@@ -69,6 +69,7 @@ export interface DaemonRuntimeOptions {
     access: AccessConfig,
     callbacks: ConstructorParameters<typeof TelegramPoller>[3],
     correlation: MessageCorrelationBridge,
+    options?: ConstructorParameters<typeof TelegramPoller>[5],
   ) => TelegramPoller;
   controlFactory?: (
     onEvent: (event: SessionEvent) => void,
@@ -91,6 +92,8 @@ export class TelegramDaemon {
   private readonly control: GuiHostSessionControl;
   private readonly active: ActiveSlot[] = [];
   private readonly startedAt = Date.now();
+  /** Last logged skip reason per slot, so a retry loop does not repeat itself. */
+  private readonly skipReasons = new Map<string, string>();
   private stopping = false;
 
   constructor(options: DaemonRuntimeOptions = {}) {
@@ -107,17 +110,28 @@ export class TelegramDaemon {
         });
   }
 
+  /**
+   * One line per event, appended to `getDaemonLogPath()`.
+   *
+   * Appended, and NOT printed: the daemon is started detached, so its stdout is a
+   * redirect — and both `cmd`'s `>>` and PowerShell's `*>>` buffer a long-lived
+   * process's output, which left the log the launcher points the operator at empty
+   * for the daemon's whole lifetime. The redirect still exists, for the crash that
+   * happens before this class is reachable; this write is what makes a running
+   * daemon watchable, and it lands in the same file.
+   */
   public log(message: string): void {
     const line = `[${new Date().toISOString()}] ${message}`;
     if (this.options.log) {
       this.options.log(line);
       return;
     }
-    console.log(line);
     try {
       fs.mkdirSync(path.dirname(getDaemonLogPath()), { recursive: true });
       fs.appendFileSync(getDaemonLogPath(), `${line}\n`, "utf8");
-    } catch {}
+    } catch {
+      console.log(line);
+    }
   }
 
   /**
@@ -126,41 +140,127 @@ export class TelegramDaemon {
    * that token is a legitimate owner, and stealing it is how 409 conflicts start.
    */
   public async start(): Promise<DaemonStatusReport> {
-    const slots = resolveDaemonSlots(this.coordinator, this.options.manifestPath ?? getDefaultManifestPath());
     const reports: DaemonSlotReport[] = [];
+    for (const slot of this.optedInSlots()) reports.push(await this.claim(slot));
+    return this.publish(reports);
+  }
 
-    for (const slot of slots) {
-      const leaseSessionId = `daemon:${slot.slotId}`;
-      const claim = this.coordinator.acquireLeaseForSlot(
-        slot.slotId,
-        leaseSessionId,
-        slot.workspace ?? process.cwd(),
+  /**
+   * Retries the opted-in slots that are not polling yet.
+   *
+   * A slot is skipped because someone else holds its token *right now* — an
+   * interactive session that claimed it before the daemon started, most often. That
+   * state ends on its own: the session exits, or its operator runs `/telegram
+   * release`. Without a retry the daemon would have to be restarted by hand at
+   * exactly that moment, which for a detached logon task means it never happens, so
+   * `run` calls this on an interval and the handover completes unattended.
+   */
+  public async claimPending(): Promise<DaemonStatusReport> {
+    const reports: DaemonSlotReport[] = [];
+    for (const slot of this.optedInSlots()) {
+      const active = this.active.find(entry => entry.slot.slotId === slot.slotId);
+      reports.push(
+        active
+          ? { slotId: slot.slotId, botId: slot.botId, workspace: slot.workspace, polling: active.poller.running }
+          : await this.claim(slot),
       );
-      if (!claim.ok) {
-        this.log(`Slot ${slot.slotId} not claimed: ${claim.reason ?? "unavailable"}`);
-        reports.push({ slotId: slot.slotId, botId: slot.botId, workspace: slot.workspace, polling: false, skipped: claim.reason ?? "unavailable" });
-        continue;
-      }
+    }
+    return this.publish(reports);
+  }
 
-      const token = this.coordinator.readRawTokenForSlot(slot.stateDir);
-      if (!token) {
-        this.coordinator.releaseLease(slot.slotId, leaseSessionId);
-        reports.push({ slotId: slot.slotId, botId: slot.botId, workspace: slot.workspace, polling: false, skipped: "bot token unreadable" });
-        continue;
-      }
+  private optedInSlots(): DaemonSlot[] {
+    return resolveDaemonSlots(this.coordinator, this.options.manifestPath ?? getDefaultManifestPath());
+  }
 
-      const activeSlot = this.startSlot(slot, token, leaseSessionId);
-      this.active.push(activeSlot);
-      await activeSlot.poller.start();
-      this.log(`Slot ${slot.slotId} polling (bot ${slot.botId}, workspace ${slot.workspace ?? "unresolved"})`);
-      reports.push({ slotId: slot.slotId, botId: slot.botId, workspace: slot.workspace, polling: true });
+  /** Claims one slot and starts its poller, or reports why it stays unclaimed. */
+  private async claim(slot: DaemonSlot): Promise<DaemonSlotReport> {
+    const leaseSessionId = `daemon:${slot.slotId}`;
+    const claim = this.coordinator.acquireLeaseForSlot(
+      slot.slotId,
+      leaseSessionId,
+      slot.workspace ?? process.cwd(),
+    );
+    if (!claim.ok) {
+      return this.unclaimed(slot, claim.reason ?? "unavailable");
     }
 
+    const token = this.coordinator.readRawTokenForSlot(slot.stateDir);
+    if (!token) {
+      this.coordinator.releaseLease(slot.slotId, leaseSessionId);
+      return this.unclaimed(slot, "bot token unreadable");
+    }
+
+    const activeSlot = this.startSlot(slot, token, leaseSessionId);
+    this.active.push(activeSlot);
+    void activeSlot.poller
+      .start()
+      .then(() => {
+        if (!activeSlot.poller.running) {
+          this.onPollerEnd(slot.slotId, leaseSessionId, "loop terminated");
+        }
+      })
+      .catch(error => {
+        this.onPollerEnd(slot.slotId, leaseSessionId, error instanceof Error ? error.message : String(error));
+      });
+    this.skipReasons.delete(slot.slotId);
+    this.log(`Slot ${slot.slotId} polling (bot ${slot.botId}, workspace ${slot.workspace ?? "unresolved"})`);
+    return { slotId: slot.slotId, botId: slot.botId, workspace: slot.workspace, polling: true };
+  }
+
+  private onPollerEnd(slotId: string, leaseSessionId: string, reason: string): void {
+    if (this.stopping) return;
+    const index = this.active.findIndex(entry => entry.slot.slotId === slotId);
+    if (index < 0) return;
+    this.active.splice(index, 1);
+    this.coordinator.releaseLease(slotId, leaseSessionId);
+    this.skipReasons.set(slotId, `poller ended: ${reason}`);
+    this.log(`Slot ${slotId} poller ended: ${reason}`);
+    this.publish(this.currentReports());
+  }
+
+  /** True when any opted-in slot is not currently active and polling. */
+  public hasPendingSlots(): boolean {
+    return this.optedInSlots().some(slot => {
+      const active = this.active.find(entry => entry.slot.slotId === slot.slotId);
+      return !active || !active.poller.running;
+    });
+  }
+
+  private currentReports(): DaemonSlotReport[] {
+    return this.optedInSlots().map(slot => {
+      const active = this.active.find(entry => entry.slot.slotId === slot.slotId);
+      if (active) {
+        return { slotId: slot.slotId, botId: slot.botId, workspace: slot.workspace, polling: active.poller.running };
+      }
+      return {
+        slotId: slot.slotId,
+        botId: slot.botId,
+        workspace: slot.workspace,
+        polling: false,
+        skipped: this.skipReasons.get(slot.slotId) ?? "not claimed",
+      };
+    });
+  }
+
+  /**
+   * Reports a slot the daemon left alone. Logged only when the reason changes: with
+   * a retry every few seconds, logging each attempt would bury the line that matters
+   * under thousands of identical ones.
+   */
+  private unclaimed(slot: DaemonSlot, reason: string): DaemonSlotReport {
+    if (this.skipReasons.get(slot.slotId) !== reason) {
+      this.skipReasons.set(slot.slotId, reason);
+      this.log(`Slot ${slot.slotId} not claimed: ${reason}`);
+    }
+    return { slotId: slot.slotId, botId: slot.botId, workspace: slot.workspace, polling: false, skipped: reason };
+  }
+
+  private publish(slots: DaemonSlotReport[]): DaemonStatusReport {
     const report: DaemonStatusReport = {
       pid: process.pid,
       startedAt: this.startedAt,
       endpoint: this.control.endpoint,
-      slots: reports,
+      slots,
     };
     this.writeStatus(report);
     return report;
@@ -259,9 +359,13 @@ export class TelegramDaemon {
       },
     };
 
+    const pollerOptions = {
+      commands: getDaemonCommands(),
+    };
+
     poller = this.options.pollerFactory
-      ? this.options.pollerFactory(token, slot.stateDir, access, callbacks, correlation)
-      : new TelegramPoller(token, slot.stateDir, access, callbacks, correlation);
+      ? this.options.pollerFactory(token, slot.stateDir, access, callbacks, correlation, pollerOptions)
+      : new TelegramPoller(token, slot.stateDir, access, callbacks, correlation, pollerOptions);
 
     return { slot, poller, router, leaseSessionId };
   }

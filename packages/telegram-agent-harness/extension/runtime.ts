@@ -19,7 +19,7 @@ import type {
 import { BotPoolCoordinator } from "./coordinator";
 import { DangerousToolGuard, approveOperation } from "./guard";
 import { decideApproval, parseApprovalCallback, approvalOutcome } from "./approvals";
-import { TelegramPoller, type PollerCallbacks } from "./poller";
+import { TelegramPoller, type PollerCallbacks, type PollerOptions } from "./poller";
 import { chunkMessage, escapeHtml, markdownToTelegramHtml } from "./sanitizer";
 import type { AccessConfig, DiscoveredSlot, MessageCorrelationBridge } from "./types";
 import { handleInstalledCommand, renderApprovalRequest } from "./harness/installed-commands";
@@ -27,7 +27,7 @@ import { BunCommandRunner, type CommandRunner } from "./harness/command-runner";
 import { latestSessionPng } from "./harness/session-artifacts";
 import { OperatorQuestionService } from "./harness/operator-questions";
 import { MessageContextStore } from "./harness/message-context";
-import { LiveDashboard } from "./harness/live-dashboard";
+import { LiveDashboard, type DashboardSnapshot } from "./harness/live-dashboard";
 import { readMessageThreadId } from "./harness/channel-config";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -98,6 +98,7 @@ export interface TelegramRuntimeOptions {
     accessConfig: AccessConfig,
     callbacks: PollerCallbacks,
     correlationBridge: MessageCorrelationBridge,
+    options?: PollerOptions,
   ) => TelegramPoller;
   commandRunnerFactory?: () => CommandRunner;
 }
@@ -136,6 +137,18 @@ export class TelegramRuntime {
 
   public getPoller(): TelegramPoller | null {
     return this.poller;
+  }
+
+  public getQuestions(): OperatorQuestionService | null {
+    return this.questions;
+  }
+
+  public getDashboard(): LiveDashboard | null {
+    return this.dashboard;
+  }
+
+  public getMessageContext(): MessageContextStore | null {
+    return this.messageContext;
   }
 
   public getCoordinator(): BotPoolCoordinator | null {
@@ -291,24 +304,35 @@ export class TelegramRuntime {
     this.guard = new DangerousToolGuard(activeSlot.stateDir);
     this.accessConfig = coordinator.readAccessConfig(activeSlot.stateDir);
 
+    const poolPath = process.env.VEYYON_POOL_DB || path.join(os.homedir(), ".veyyon", "telegram", "bot_pool.db");
+    // Lane provenance is extra columns on the coordinator's own correlation rows. If the
+    // pool predates them the channel still attaches; replies then reach Main without a
+    // lane attribution rather than not at all.
+    let messageContext: MessageContextStore | null = null;
+    try {
+      messageContext = new MessageContextStore(poolPath);
+    } catch (err: unknown) {
+      this.pi.logger?.warn(
+        `Telegram lane provenance unavailable on slot ${activeSlot.slotId}: ${err instanceof Error ? err.message : String(err)}. Replies route to Main without lane context.`,
+      );
+    }
+    this.messageContext = messageContext;
+
     const currentSessionId = (): string => {
       return this.sessionId ?? newSessionId;
     };
 
-    const poolPath = process.env.VEYYON_POOL_DB || path.join(os.homedir(), ".veyyon", "telegram", "bot_pool.db");
-    const messageContext = new MessageContextStore(poolPath);
-    this.messageContext = messageContext;
 
     const correlationBridge: MessageCorrelationBridge = {
       getSessionId: currentSessionId,
       getSlotId: () => activeSlot.slotId,
       record: correlation => {
         coordinator.recordOutboundMessage(correlation);
-        messageContext.record(correlation.botId, correlation.chatId, correlation.messageId, correlation);
+        messageContext?.record(correlation.botId, correlation.chatId, correlation.messageId, correlation);
       },
       resolveReply: (botId, chatId, replyToMessageId) => {
         const resolution = coordinator.resolveReplyRouting(botId, chatId, replyToMessageId, currentSessionId());
-        if (resolution.correlation) {
+        if (resolution.correlation && messageContext) {
           Object.assign(resolution.correlation, messageContext.lookup(botId, chatId, replyToMessageId));
         }
         return resolution;
@@ -438,16 +462,25 @@ export class TelegramRuntime {
       },
     };
 
+    let messageThreadId: number | undefined;
+    try {
+      messageThreadId = readMessageThreadId(activeSlot.stateDir);
+    } catch (err: unknown) {
+      coordinator.releaseLease(activeSlot.slotId, newSessionId, process.pid);
+      coordinator.close();
+      messageContext?.close();
+      this.messageContext = null;
+      this.coordinator = null;
+      this.pi.logger?.warn(
+        `Telegram slot ${activeSlot.slotId} not attached: ${err instanceof Error ? err.message : String(err)}. Fix access.json before the channel can bind to its topic.`,
+      );
+      return false;
+    }
+    const pollerOptions: PollerOptions | undefined = messageThreadId === undefined ? undefined : { messageThreadId };
+
     const poller = this.options.pollerFactory
-      ? this.options.pollerFactory(token, activeSlot.stateDir, this.accessConfig, pollerCallbacks, correlationBridge)
-      : new TelegramPoller(
-          token,
-          activeSlot.stateDir,
-          this.accessConfig,
-          pollerCallbacks,
-          correlationBridge,
-          readMessageThreadId(activeSlot.stateDir),
-        );
+      ? this.options.pollerFactory(token, activeSlot.stateDir, this.accessConfig, pollerCallbacks, correlationBridge, pollerOptions)
+      : new TelegramPoller(token, activeSlot.stateDir, this.accessConfig, pollerCallbacks, correlationBridge, pollerOptions);
 
     this.poller = poller;
 
@@ -462,10 +495,13 @@ export class TelegramRuntime {
       poolPath,
       message => this.pi.logger?.warn(message),
     );
-    const dashboard = new LiveDashboard(poller, runner, currentSessionId, message => this.pi.logger?.warn(message));
     this.questions = questions;
+
+    const dashboard = new LiveDashboard(poller, runner, currentSessionId, message => this.pi.logger?.warn(message));
     this.dashboard = dashboard;
 
+    questions.start();
+    dashboard.start();
     globalState[ACTIVE_ROOT_SYMBOL] = {
       instanceId: this.instanceId,
       sessionId: newSessionId,
@@ -476,7 +512,7 @@ export class TelegramRuntime {
       coordinator,
       activeSlot,
       questions,
-      messageContext,
+      messageContext: messageContext ?? undefined,
       dashboard,
     };
 
@@ -646,7 +682,7 @@ export class TelegramRuntime {
       try {
         this.messageContext.close();
       } catch (err) {
-        this.pi.logger?.warn(`Error closing message context store: ${err}`);
+        this.pi.logger?.warn(`Error closing lane provenance store: ${err}`);
       }
       this.messageContext = null;
     }

@@ -256,18 +256,24 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
         if (!params.question || !params.options || !params.recommendation) {
           throw new Error("Provide question, options with readable labels, and a recommended option id.");
         }
-        question = await service.ask({ ...params, question: params.question, options: params.options,
-          recommendation: params.recommendation });
+        question = await service.ask({
+          ...params,
+          question: params.question,
+          options: params.options,
+          recommendation: params.recommendation,
+        });
       } else {
         if (!params.id) throw new Error("Question id is required for get/wait");
         question = await service.get(params.id);
       }
       onUpdate?.({ content: [{ type: "text", text: `Telegram question ${question.decision_id} is ${question.status}. Silence leaves it pending.` }] });
       const result = params.action === "get" || !params.wait
-        ? question : await service.wait(question.decision_id, signal);
+        ? question
+        : await service.wait(question.decision_id, signal);
       return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
     },
   });
+
   pi.registerTool({
     name: "telegram_message",
     label: "Send attributed Telegram message",
@@ -283,13 +289,18 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
       const chat = root.poller.getPrimaryChatId();
       if (!chat) throw new Error("No authorized Telegram recipient");
       root.messageContext?.setLaneState(root.sessionId, params.lane_id, params.lane_state);
-      const sent = await root.poller.sendTelegramMessage(chat,
-        `<b>Agent · ${escapeHtml(params.lane_id)}</b>\n${params.text}`, undefined, undefined,
-        { laneId: params.lane_id, laneState: params.lane_state });
+      const sent = await root.poller.sendTelegramMessage(
+        chat,
+        `<b>Agent · ${escapeHtml(params.lane_id)}</b>\n${params.text}`,
+        undefined,
+        undefined,
+        { laneId: params.lane_id, laneState: params.lane_state },
+      );
       if (!sent?.ok) throw new Error("Attributed message was not delivered");
       return { content: [{ type: "text", text: `Delivered message ${sent.result?.message_id}; replies return to Main with lane context.` }] };
     },
   });
+
   pi.registerTool({
     name: "telegram_dashboard",
     label: "Update Telegram fleet dashboard",
@@ -325,7 +336,6 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
       `Telegram operator tools not registered on this host: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
-
   pi.on("session_start", async (event: SessionStartEvent, ctx: ExtensionContext) => {
     savedContext = ctx;
     if (!activeRuntime) {

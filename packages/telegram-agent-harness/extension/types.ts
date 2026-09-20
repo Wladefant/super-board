@@ -11,10 +11,17 @@ export interface ManifestSlot {
   /**
    * Opt-in to standalone-daemon ownership of this slot's token. Absent or false
    * leaves the slot to the in-session extension exactly as before; true hands the
-   * token to the machine-wide daemon, which holds a normal pool lease so no
-   * in-session poller can claim the same token concurrently.
+   * token to the machine-wide daemon: the daemon holds a normal pool lease while it
+   * runs, and the in-session pool never claims the slot at all, so the operator's
+   * bot does not silently fall back to whichever terminal happens to be open.
    */
   daemon?: boolean;
+  /**
+   * Absolute directory a daemon-owned slot's sessions run in when `preferredProjects`
+   * declares nothing. A slot that serves every project declares no affinity, which
+   * leaves the daemon without a cwd to create a session in; this names one.
+   */
+  defaultProject?: string;
 }
 
 export interface BotPoolManifest {
@@ -30,6 +37,10 @@ export interface DiscoveredSlot {
   preferredProjects: string[];
   projects?: string[];
   enabled: boolean;
+  /** Manifest opt-in to daemon ownership; see {@link ManifestSlot.daemon}. */
+  daemon?: boolean;
+  /** Manifest fallback workspace; see {@link ManifestSlot.defaultProject}. */
+  defaultProject?: string;
 }
 
 export type LeaseStatus = "ACTIVE" | "RELEASED";

@@ -16,21 +16,25 @@ export function renderDashboard(snapshot: DashboardSnapshot | null, usage: strin
   const lines = ["<b>Fleet dashboard</b>",
     `<i>Refreshed ${new Date(now).toISOString()} · lane state ${stale ? "stale/unavailable" : "reported by Main"}</i>`,
     "", "<b>Active lanes</b>"];
-  const active = snapshot?.lanes.filter(lane => lane.state !== "exited") ?? [];
+  // A snapshot handed over as deserialized JSON may omit a key entirely, so every list is
+  // defended once here and its length read from the defended value, never from the snapshot.
+  const active = (snapshot?.lanes ?? []).filter(lane => lane.state !== "exited");
+  const blockers = snapshot?.blockers ?? [];
+  const mergeQueue = snapshot?.mergeQueue ?? [];
   lines.push(...active.slice(0, 6).map(lane => `• <b>${escapeHtml(lane.name.slice(0, 40))}</b> · ${stale ? "last reported" : lane.state}: ${escapeHtml(lane.task.slice(0, 100))}`));
   if (!active.length) lines.push("Worker registry unavailable; no active lanes asserted.");
   if (active.length > 6) lines.push(`Plus ${active.length - 6} lanes in the full report.`);
   lines.push("", "<b>Awaiting your answer</b>");
-  lines.push(...(snapshot?.blockers ?? []).slice(0, 3).map(blocker => `• ${escapeHtml(blocker.question.slice(0, 140))}`));
-  if (!snapshot?.blockers.length) lines.push(snapshot ? "No blockers reported." : "Blocker state unavailable.");
+  lines.push(...blockers.slice(0, 3).map(blocker => `• ${escapeHtml(blocker.question.slice(0, 140))}`));
+  if (!blockers.length) lines.push(snapshot ? "No blockers reported." : "Blocker state unavailable.");
   lines.push("", "<b>Merge queue</b>");
-  for (const entry of (snapshot?.mergeQueue ?? []).slice(0, 3)) {
+  for (const entry of mergeQueue.slice(0, 3)) {
     const title = escapeHtml(entry.title.slice(0, 80));
     const label = /^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+$/.test(entry.url)
       ? `<a href="${escapeHtml(entry.url)}">${title}</a>` : title;
     lines.push(`• ${label} · ${escapeHtml(entry.state.slice(0, 80))}`);
   }
-  if (!snapshot?.mergeQueue.length) lines.push(snapshot ? "No pull requests queued by Main." : "Merge queue unavailable.");
+  if (!mergeQueue.length) lines.push(snapshot ? "No pull requests queued by Main." : "Merge queue unavailable.");
   lines.push("", `<b>Host memory:</b> ${(100 * (1 - os.freemem() / os.totalmem())).toFixed(1)}% used`, "", usage);
   return lines.join("\n");
 }

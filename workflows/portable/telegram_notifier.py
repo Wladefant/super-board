@@ -1226,12 +1226,12 @@ def build_decision_inline_keyboard(
             now=now,
         )
         if token:
-            btn_text = opt_label[:60]
+            btn_text = f"{opt_id}: {opt_label}" if opt_id and opt_id != opt_label else opt_label
+            btn_text = btn_text[:40]
             buttons.append({"text": btn_text, "callback_data": token})
     if buttons:
-        # A flat option list renders one button per row: a decision label is prose and
-        # a shared row truncates it. A caller that wants buttons side by side passes
-        # explicit rows (nested lists), handled above.
+        # One option per row: labels carry an id prefix and readable text, so a shared row
+        # truncates them on a phone. A caller that wants columns passes nested rows above.
         return {"inline_keyboard": [[button] for button in buttons]}
     return None
 

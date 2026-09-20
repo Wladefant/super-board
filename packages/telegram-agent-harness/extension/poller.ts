@@ -54,19 +54,41 @@ export interface PollerCallbacks {
   onLedgerFailure: (message: string) => void;
 }
 
+/**
+ * Stamps every inbound turn with the Telegram account it came from. A Telegram account
+ * is not an attested human: the session must not read a bare instruction as an operator
+ * identity, so the provenance travels with the text rather than beside it.
+ */
+function attributeSender(fromId: string, text: string): string {
+  return `[Telegram sender: ${fromId}; origin: telegram_account; human presence not attested]\n${text}`;
+}
+
 export interface PollerOptions {
   maxConflictRetries?: number;
   initialConflictBackoffMs?: number;
   maxConflictBackoffMs?: number;
   conflictBackoffFactor?: number;
+  /** Milliseconds to pace consecutive outbound requests. Defaults to 1250 ms. */
+  outboundPaceMs?: number;
+  /**
+   * Forum topic every outbound message and dashboard pin is bound to. Omitted for a
+   * plain chat, where Telegram rejects the field outright, so it has no default.
+   */
+  messageThreadId?: number;
+  /**
+   * Custom command surface for the chat-scoped menu (e.g. daemon commands).
+   * When omitted, defaults to the standard availableCommands(hasHarness).
+   */
+  commands?: readonly { command: string; description: string }[];
 }
 
-const DEFAULT_POLLER_OPTIONS: Required<PollerOptions> = {
+const DEFAULT_POLLER_OPTIONS = {
   maxConflictRetries: 5,
   initialConflictBackoffMs: 1000,
   maxConflictBackoffMs: 15000,
   conflictBackoffFactor: 2.0,
-};
+  outboundPaceMs: 1250,
+} satisfies PollerOptions;
 
 interface LedgerRow {
   update_id: number;
@@ -133,7 +155,8 @@ export class TelegramPoller {
   private accessConfig: AccessConfig;
   private callbacks: PollerCallbacks;
   private correlation: MessageCorrelationBridge | null;
-  private options: Required<PollerOptions>;
+  private options: typeof DEFAULT_POLLER_OPTIONS & PollerOptions;
+  private readonly messageThreadId: number | undefined;
   private abortController: AbortController;
   private db: Database;
   private dbPath: string;
@@ -173,7 +196,8 @@ export class TelegramPoller {
     this.messageThreadId = threadId;
     this.options = { ...DEFAULT_POLLER_OPTIONS, ...(tuning || {}) };
     this.abortController = new AbortController();
-    if (threadId !== undefined && (!Number.isSafeInteger(threadId) || threadId <= 0)) {
+    this.messageThreadId = (typeof threadOrOptions === "number" ? threadOrOptions : undefined) ?? this.options.messageThreadId;
+    if (this.messageThreadId !== undefined && (!Number.isSafeInteger(this.messageThreadId) || this.messageThreadId <= 0)) {
       throw new Error("message_thread_id must be a positive integer");
     }
 
@@ -292,7 +316,8 @@ export class TelegramPoller {
         if (signal.aborted) abort();
       });
       this.abortController.signal.throwIfAborted();
-      this.nextOutboundAt = Date.now() + 1250;
+      const paceMs = this.options.outboundPaceMs ?? 1250;
+      this.nextOutboundAt = paceMs > 0 ? Date.now() + paceMs : 0;
     });
     this.outboundReservation = reserve.catch(() => {});
     return reserve;
@@ -539,8 +564,13 @@ export class TelegramPoller {
     // Registration failure must not disconnect an otherwise usable input channel.
     if (this.accessConfig.dmPolicy !== "disabled") {
       try {
-        await registerTelegramCommands(this.botToken, this.accessConfig.allowFrom,
-          Boolean(this.callbacks.onHarnessCommand), this.abortController.signal);
+        await registerTelegramCommands(
+          this.botToken,
+          this.accessConfig.allowFrom,
+          Boolean(this.callbacks.onHarnessCommand),
+          this.abortController.signal,
+          this.options.commands,
+        );
       } catch {
         this.callbacks.onLedgerFailure("Telegram command registration failed; reconnect to retry the private-chat menu.");
       }
@@ -752,10 +782,12 @@ export class TelegramPoller {
         // head-of-line block every later update indefinitely. Record why it failed
         // and move on, so the queue drains and the failure is visible in the ledger.
         const detail = redactSecrets(err instanceof Error ? err.message : String(err)).slice(0, 500);
-        this.db.run("UPDATE update_ledger SET status = 'REJECTED', error = ? WHERE update_id = ?", [
-          `PROCESSING_FAILED: ${detail}`,
-          row.update_id,
-        ]);
+        try {
+          this.db.run("UPDATE update_ledger SET status = 'REJECTED', error = ? WHERE update_id = ?", [
+            `PROCESSING_FAILED: ${detail}`,
+            row.update_id,
+          ]);
+        } catch {}
         this.callbacks.onLedgerFailure(`update ${row.update_id} could not be processed: ${detail}`);
         if (row.is_callback) {
           await this.sendTelegramMessage(row.chat_id, `Choice could not be delivered: ${escapeHtml(detail)}. Reply to the original message with your choice.`);
@@ -1041,9 +1073,10 @@ export class TelegramPoller {
     if (/^\/steer(?:\s|$)/.test(rawText)) {
       const steerText = rawText.replace(/^\/steer\s*/i, "").trim();
       if (steerText) {
+        const attributed = attributeSender(fromId, steerText);
         this.callbacks.onTelegramTurnStart();
-        if (this.callbacks.isIdle()) this.callbacks.onUserMessage(steerText);
-        else this.callbacks.onSteer(steerText);
+        if (this.callbacks.isIdle()) this.callbacks.onUserMessage(attributed);
+        else this.callbacks.onSteer(attributed);
         this.db.run("UPDATE update_ledger SET status = 'COMPLETED' WHERE update_id = ?", [row.update_id]);
       } else {
         await this.sendTelegramMessage(chatId, "⚠️ <b>Usage:</b> <code>/steer &lt;instruction&gt;</code>");
@@ -1092,7 +1125,7 @@ export class TelegramPoller {
       deliveredText = `${contextLines.join("\n")}\n\n${rawText}`;
     }
 
-    deliveredText = `[Telegram sender: ${fromId}; origin: telegram_account; human presence not attested]\n${deliveredText}`;
+    deliveredText = attributeSender(fromId, deliveredText);
     if (this.callbacks.isIdle()) {
       this.callbacks.onUserMessage(deliveredText);
     } else {

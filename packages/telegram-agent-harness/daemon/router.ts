@@ -8,6 +8,7 @@
  */
 
 import { escapeHtml } from "../extension/sanitizer";
+import { availableCommands } from "../extension/command-registry";
 import type { DaemonSlot } from "./config";
 import type {
   DeliveryMode,
@@ -28,8 +29,43 @@ export interface SlotRouterOptions {
   log: (message: string) => void;
 }
 
-/** Chat-level routing commands. The daemon serves several sessions from one chat. */
-const ROUTING_COMMANDS = ["/sessions", "/attach", "/new", "/detach", "/where"] as const;
+export interface DaemonCommandDescriptor {
+  command: string;
+  description: string;
+}
+
+/**
+ * Chat-level routing commands. The daemon serves several sessions from one chat.
+ * This is the canonical definition for the daemon's routing command surface.
+ */
+export const ROUTER_COMMANDS: readonly DaemonCommandDescriptor[] = [
+  { command: "sessions", description: "List running Veyyon sessions" },
+  { command: "attach", description: "Attach this chat to a running session" },
+  { command: "new", description: "Start a new session in a workspace" },
+  { command: "detach", description: "Detach this chat from the current session" },
+  { command: "where", description: "Show which session this chat is bound to" },
+] as const;
+
+export const ROUTING_COMMANDS = ROUTER_COMMANDS.map(c => `/${c.command}`) as readonly string[];
+
+/**
+ * Full command set supported by the standalone daemon: routing commands first,
+ * followed by the base harness commands. Read by the daemon runtime for Telegram
+ * command registration without hardcoding a second list.
+ */
+export function getDaemonCommands(): DaemonCommandDescriptor[] {
+  const routerCommands = ROUTER_COMMANDS.map(({ command, description }) => ({ command, description }));
+  const baseCommands = availableCommands(true).map(({ command, description }) => ({ command, description }));
+  const seen = new Set<string>();
+  const result: DaemonCommandDescriptor[] = [];
+  for (const item of [...routerCommands, ...baseCommands]) {
+    if (!seen.has(item.command)) {
+      seen.add(item.command);
+      result.push(item);
+    }
+  }
+  return result;
+}
 
 export class SlotRouter {
   private readonly options: SlotRouterOptions;

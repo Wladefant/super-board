@@ -435,6 +435,10 @@ export class BotPoolCoordinator {
               preferredProjects: projects,
               projects,
               enabled: s.enabled,
+              daemon: s.daemon === true,
+              ...(typeof s.defaultProject === "string" && s.defaultProject.trim().length > 0
+                ? { defaultProject: s.defaultProject.trim() }
+                : {}),
             });
           }
         }
@@ -835,12 +839,20 @@ export class BotPoolCoordinator {
     while (true) {
       const slots = this.syncSlots();
 
+      // Daemon-owned slots leave the pool entirely. The lease alone was not enough:
+      // a slot declaring no affinity is eligible for every project, so any terminal
+      // opened while the daemon was down claimed the operator's daemon bot and held
+      // it for the session's whole life — the daemon then refuses to steal it back,
+      // which is exactly how the newest stack kept serving from an old in-session
+      // poller. `acquireLeaseForSlot` still claims one by name for the daemon itself.
+      const poolSlots = slots.filter(s => s.daemon !== true);
+
       // Configuration-driven project affinity: a session may claim only a slot
       // whose declared projects/preferredProjects covers its project (via glob match or empty/wildcard),
       // or a slot that declares no affinity at all (shared pool slot).
       // Specific affinity-matched slots are tried first so dedicated project bots
       // are consumed before shared/wildcard slots.
-      const eligibleSlots = slots.filter(s => isSlotEligibleForProject(s.projects ?? s.preferredProjects, projectCwd));
+      const eligibleSlots = poolSlots.filter(s => isSlotEligibleForProject(s.projects ?? s.preferredProjects, projectCwd));
       const sortedSlots = [...eligibleSlots].sort((a, b) => {
         const aMatches = slotHasSpecificAffinity(a.projects ?? a.preferredProjects, projectCwd);
         const bMatches = slotHasSpecificAffinity(b.projects ?? b.preferredProjects, projectCwd);
@@ -860,7 +872,9 @@ export class BotPoolCoordinator {
       if (waitTimeoutMs <= 0 || Date.now() - startTime >= waitTimeoutMs) {
         let reason: string;
         if (eligibleSlots.length === 0) {
-          reason = `No Telegram bot slot declares affinity for this project (${slots.length} slots in pool, none eligible for cwd '${projectCwd}').`;
+          const daemonOwned = slots.length - poolSlots.length;
+          const daemonNote = daemonOwned > 0 ? `, ${daemonOwned} owned by the standalone daemon` : "";
+          reason = `No Telegram bot slot declares affinity for this project (${slots.length} slots in pool${daemonNote}, none eligible for cwd '${projectCwd}').`;
         } else if (busyHolders.length > 0) {
           const details = busyHolders
             .map(h => {
