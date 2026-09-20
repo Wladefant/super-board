@@ -16,6 +16,13 @@ import { claimDaemonPidFile, TelegramDaemon } from "./runtime";
 import { getProcessIdentity } from "../extension/coordinator";
 import { guiHostAgentDirs, resolveGuiHostEndpoint } from "./session-control";
 
+/**
+ * How often `run` retries a slot someone else is holding. Seconds, not minutes: the
+ * handover happens the moment an interactive session exits, and the gap is a window
+ * in which the bot answers nobody.
+ */
+const CLAIM_RETRY_MS = Number.parseInt(process.env.VEYYON_TELEGRAM_CLAIM_RETRY_MS ?? "", 10) || 10_000;
+
 async function run(): Promise<number> {
   const claim = claimDaemonPidFile();
   if (!claim.ok) {
@@ -30,10 +37,12 @@ async function run(): Promise<number> {
     await daemon.stop();
     return 78;
   }
+  // Not an error: the token is held by a session that will exit or release it, and
+  // the daemon is the thing that is supposed to be running when that happens.
   if (!report.slots.some(slot => slot.polling)) {
-    daemon.log("No opted-in slot could be claimed; every one is held elsewhere. Not polling.");
-    await daemon.stop();
-    return 75;
+    daemon.log(
+      `No opted-in slot is free yet; every one is held elsewhere. Staying up and retrying every ${CLAIM_RETRY_MS / 1_000}s.`,
+    );
   }
 
   let stopped: Promise<void> | null = null;
@@ -44,14 +53,33 @@ async function run(): Promise<number> {
   process.on("SIGTERM", shutdown);
   process.on("SIGHUP", shutdown);
 
-  // Resolves when every poller has stopped, which is what `onRelease` and the
-  // signal handlers both lead to.
+  // Two conditions share one tick. Once a slot has polled, losing every poller means
+  // `onRelease` or a signal ran and the daemon is done — the pre-retry behaviour.
+  // Before that, nothing has been handed over yet, so an empty roster is the state
+  // this loop exists to end, and it retries instead of exiting.
+  let handedOver = report.slots.some(slot => slot.polling);
+  let retrying = false;
+  let nextRetryAt = Date.now() + CLAIM_RETRY_MS;
   await new Promise<void>(resolve => {
     const timer = setInterval(() => {
-      if (stopped || daemon.status().slots.every(slot => !slot.polling)) {
+      const polling = daemon.status().slots.some(slot => slot.polling);
+      if (polling) handedOver = true;
+      if (stopped || (handedOver && !polling)) {
         clearInterval(timer);
         resolve();
+        return;
       }
+      if (polling || retrying || Date.now() < nextRetryAt) return;
+      retrying = true;
+      void daemon
+        .claimPending()
+        .catch(error => {
+          daemon.log(`Claim retry failed: ${error instanceof Error ? error.message : String(error)}`);
+        })
+        .finally(() => {
+          nextRetryAt = Date.now() + CLAIM_RETRY_MS;
+          retrying = false;
+        });
     }, 1_000);
   });
   await (stopped ?? daemon.stop());
