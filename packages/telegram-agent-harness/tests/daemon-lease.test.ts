@@ -274,6 +274,44 @@ describe("no double poller", () => {
   });
 });
 
+describe("waiting out a holder", () => {
+  test("a slot held at startup is taken over once its holder releases", async () => {
+    writePool([{ slotId: "slot-daemon", daemon: true, projects: [] }]);
+    // The state this workstation was actually in: a session claimed the daemon's
+    // token before the daemon existed, so start() finds nothing to poll.
+    const holder = coordinator();
+    expect(holder.acquireLeaseForSlot("slot-daemon", "session-in-tui", workspace).ok).toBe(true);
+
+    const instance = daemon();
+    const initial = await instance.start();
+    expect(initial.slots[0]).toMatchObject({ polling: false });
+    expect(initial.slots[0].skipped).toContain("session-in-tui");
+
+    // Retrying while the holder is still there changes nothing, and starts no poller.
+    expect((await instance.claimPending()).slots[0]).toMatchObject({ polling: false });
+    expect(startedPollers.length).toBe(0);
+
+    holder.releaseLease("slot-daemon", "session-in-tui");
+
+    const after = await instance.claimPending();
+    expect(after.slots[0]).toMatchObject({ slotId: "slot-daemon", polling: true });
+    expect(startedPollers.length).toBe(1);
+    expect(startedPollers[0].running).toBe(true);
+  });
+
+  test("a retry does not disturb a slot the daemon already polls", async () => {
+    writePool([{ slotId: "slot-a", daemon: true }, { slotId: "slot-b", daemon: true }]);
+    const instance = daemon();
+    await instance.start();
+    expect(startedPollers.length).toBe(2);
+
+    const retried = await instance.claimPending();
+    expect(retried.slots.map(slot => slot.polling)).toEqual([true, true]);
+    // No second poller for a token already being polled: that is the 409 case.
+    expect(startedPollers.length).toBe(2);
+  });
+});
+
 describe("single daemon per machine", () => {
   test("a live pid holder refuses a second daemon, a dead one does not", () => {
     const pidPath = path.join(root, "run", "daemon.pid");
