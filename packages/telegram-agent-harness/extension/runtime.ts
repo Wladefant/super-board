@@ -267,14 +267,29 @@ export class TelegramRuntime {
     const globalState = globalThis as unknown as GlobalTelegramState;
     const existingRoot = globalState[ACTIVE_ROOT_SYMBOL];
 
+    // Idempotency guard: if this runtime already holds the active session and poller, do not churn
+    if (this.sessionId === newSessionId && this.poller && this.activeSlot && !opts?.isReload) {
+      return true;
+    }
+
     if (existingRoot && existingRoot.instanceId !== this.instanceId) {
-      if (existingRoot.sessionId === newSessionId) {
+      if (opts?.isReload) {
+        try {
+          await existingRoot.poller?.stop();
+        } catch {}
+        try {
+          existingRoot.coordinator?.close();
+        } catch {}
+        delete globalState[ACTIVE_ROOT_SYMBOL];
+        delete globalState[ACTIVE_LEASE_SYMBOL];
+      } else if (existingRoot.sessionId === newSessionId) {
         if (existingRoot.activeSlot && existingRoot.sessionId !== newSessionId) {
           this.repointLeaseOrRelinquish(existingRoot, newSessionId, ctx.cwd);
         }
         return false;
+      } else {
+        return false;
       }
-      return false;
     }
 
     const coordinator = this.options.coordinatorFactory ? this.options.coordinatorFactory() : new BotPoolCoordinator();
@@ -666,54 +681,56 @@ export class TelegramRuntime {
     if (this.isDisposed) return;
     this.isDisposed = true;
 
-    if (this.streamDebounceTimer) {
-      clearTimeout(this.streamDebounceTimer);
-      this.streamDebounceTimer = null;
-    }
-
-    // Stop the timer-driven services before the poller they write through, so a
-    // coalesced refresh cannot fire against a stopped channel.
-    this.questions?.stop();
-    this.questions = null;
-    this.dashboard?.stop();
-    this.dashboard = null;
-
-    if (this.messageContext) {
-      try {
-        this.messageContext.close();
-      } catch (err) {
-        this.pi.logger?.warn(`Error closing lane provenance store: ${err}`);
+    try {
+      if (this.streamDebounceTimer) {
+        clearTimeout(this.streamDebounceTimer);
+        this.streamDebounceTimer = null;
       }
-      this.messageContext = null;
-    }
 
-    if (this.poller) {
-      try {
-        await this.poller.stop();
-      } catch (err) {
-        this.pi.logger?.warn(`Error stopping poller: ${err}`);
-      }
-      this.poller = null;
-    }
+      // Stop the timer-driven services before the poller they write through, so a
+      // coalesced refresh cannot fire against a stopped channel.
+      this.questions?.stop();
+      this.questions = null;
+      this.dashboard?.stop();
+      this.dashboard = null;
 
-    if (this.coordinator && this.activeSlot && this.sessionId) {
-      try {
-        this.coordinator.releaseLease(this.activeSlot.slotId, this.sessionId, process.pid);
-      } catch (err) {
-        this.pi.logger?.warn(`Error releasing lease: ${err}`);
+      if (this.messageContext) {
+        try {
+          this.messageContext.close();
+        } catch (err) {
+          this.pi.logger?.warn(`Error closing lane provenance store: ${err}`);
+        }
+        this.messageContext = null;
       }
-      try {
-        this.coordinator.close();
-      } catch (err) {
-        this.pi.logger?.warn(`Error closing coordinator: ${err}`);
-      }
-      this.coordinator = null;
-    }
 
-    const globalState = globalThis as unknown as GlobalTelegramState;
-    if (globalState[ACTIVE_ROOT_SYMBOL]?.instanceId === this.instanceId) {
-      delete globalState[ACTIVE_ROOT_SYMBOL];
-      delete globalState[ACTIVE_LEASE_SYMBOL];
+      if (this.poller) {
+        try {
+          await this.poller.stop();
+        } catch (err) {
+          this.pi.logger?.warn(`Error stopping poller: ${err}`);
+        }
+        this.poller = null;
+      }
+
+      if (this.coordinator && this.activeSlot && this.sessionId) {
+        try {
+          this.coordinator.releaseLease(this.activeSlot.slotId, this.sessionId, process.pid);
+        } catch (err) {
+          this.pi.logger?.warn(`Error releasing lease: ${err}`);
+        }
+        try {
+          this.coordinator.close();
+        } catch (err) {
+          this.pi.logger?.warn(`Error closing coordinator: ${err}`);
+        }
+        this.coordinator = null;
+      }
+    } finally {
+      const globalState = globalThis as unknown as GlobalTelegramState;
+      if (globalState[ACTIVE_ROOT_SYMBOL]?.instanceId === this.instanceId) {
+        delete globalState[ACTIVE_ROOT_SYMBOL];
+        delete globalState[ACTIVE_LEASE_SYMBOL];
+      }
     }
   }
 }
