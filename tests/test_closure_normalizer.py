@@ -26,6 +26,7 @@ Or through discovery:
 
 from __future__ import annotations
 
+import copy
 import json
 import sys
 import unittest
@@ -40,7 +41,11 @@ from super_board_runtime.normalize import (  # noqa: E402
     ACCEPTED_COMPLETION_EVIDENCE_TYPES,
     CLOSURE_DISPOSITIONS,
     IssueOrPullRequestSnapshot,
+    MERGE_CLOSURE_REFUSALS,
+    NormalizationError,
+    merge_closure_readback,
     normalize_closure,
+    normalize_merge_closure,
 )
 from super_board_runtime.project import ProjectSnapshot  # noqa: E402
 from super_board_runtime.publication import (  # noqa: E402
@@ -52,6 +57,9 @@ FIXTURES = json.loads(
 )
 BOUNDARY = FIXTURES["activation_boundary"]
 CASES = {case["name"]: case for case in FIXTURES["cases"]}
+MERGE_FIXTURES = json.loads(
+    (_REPO_ROOT / "tests" / "fixtures" / "merge-closure-cases.json").read_text(encoding="utf-8")
+)
 
 ISSUE_NODE = "I_kwNOTAREALISSUENODE"
 ITEM_NODE = "PVTI_kwNOTAREALITEMNODE"
@@ -162,6 +170,11 @@ class FixtureMatrixTests(unittest.TestCase):
                 "reopened",
                 "open-in-completion-column",
                 "pre-activation-historical",
+                # The two the merge-closure decision adds (#117): the close a
+                # non-default-base merge never performed, and the already-closed
+                # merge it validates instead of performing again.
+                "merge-closure",
+                "merge-closure-validated",
             },
         )
 
@@ -474,6 +487,97 @@ class ReopenedAndStrayCardTests(unittest.TestCase):
         self.assertEqual(plan.operations, ())
         self.assertIsNone(plan.desired_status)
 
+
+def _apply_patch(base: dict[str, object], patch: dict[str, object]) -> dict[str, object]:
+    out = copy.deepcopy(base)
+    dest = out if any(k in patch for k in ("data", "repository")) else out["data"]["repository"]["pullRequest"]  # type: ignore[index]
+    def _apply(d: dict[str, object], p: dict[str, object]) -> None:
+        for k, v in p.items():
+            if v is None:
+                d.pop(k, None)
+            elif isinstance(v, dict) and isinstance(d.get(k), dict):
+                _apply(d[k], v)  # type: ignore[arg-type]
+            else:
+                d[k] = copy.deepcopy(v)
+    _apply(dest, patch)  # type: ignore[arg-type]
+    return out
+
+
+# ───────────────────────────── merge closure ─────────────────────────────
+
+
+class MergeClosureTests(unittest.TestCase):
+    def test_eight_merge_closure_cases(self) -> None:
+        for case in MERGE_FIXTURES["cases"]:
+            with self.subTest(case=case["name"]):
+                resp = _apply_patch(MERGE_FIXTURES["base_response"], case.get("patch", {}))
+                pull = merge_closure_readback(resp, linked_issue_records=case.get("linked_issue_records", ()))
+                plan = normalize_merge_closure(pull, _project(_item()))
+                exp = case["expect"]
+                self.assertEqual(plan.disposition, exp["disposition"])
+                self.assertEqual(plan.blocked_reason, exp["blocked_reason"])
+                self.assertEqual(_kinds(plan), exp["operations"])
+                if exp["operations"] == ["close"]:
+                    self.assertEqual(plan.operations[0].desired["state"], "closed")
+                    self.assertEqual(plan.operations[0].desired["state_reason"], "completed")
+
+    def test_has_next_page_raises_truncated(self) -> None:
+        resp = _apply_patch(
+            MERGE_FIXTURES["base_response"],
+            {"closingIssuesReferences": {"pageInfo": {"hasNextPage": True}}},
+        )
+        with self.assertRaises(NormalizationError) as ctx:
+            merge_closure_readback(resp)
+        self.assertEqual(ctx.exception.reason, "merge-linked-issues-truncated")
+
+    def test_merge_closure_refusals_pinned_by_exact_equality(self) -> None:
+        self.assertEqual(
+            MERGE_CLOSURE_REFUSALS,
+            (
+                "merge-subject-not-a-pull-request",
+                "merge-not-merged",
+                "merge-commit-missing",
+                "merge-default-branch-unknown",
+                "merge-base-branch-unknown",
+                "merge-actor-unknown",
+                "merge-performed-by-runtime",
+                "merge-linked-issue-missing",
+                "merge-linked-issue-ambiguous",
+                "merge-default-base-not-automated",
+                "merge-closure-evidence-missing",
+            ),
+        )
+
+    def test_exact_close_payload(self) -> None:
+        case = MERGE_FIXTURES["cases"][0]
+        resp = _apply_patch(MERGE_FIXTURES["base_response"], case.get("patch", {}))
+        pull = merge_closure_readback(resp, linked_issue_records=case.get("linked_issue_records", ()))
+        plan = normalize_merge_closure(pull, _project(_item()))
+        self.assertEqual(
+            plan.operations[0].desired,
+            {
+                "issue_url": "https://github.com/Bavariance/polysimulator/issues/101",
+                "state": "closed",
+                "state_reason": "completed",
+            },
+        )
+
+    def test_no_status_operation_is_ever_planned(self) -> None:
+        case = MERGE_FIXTURES["cases"][0]
+        resp = _apply_patch(MERGE_FIXTURES["base_response"], case.get("patch", {}))
+        pull = merge_closure_readback(resp, linked_issue_records=case.get("linked_issue_records", ()))
+        plan = normalize_merge_closure(pull, _project(_item()))
+        self.assertIsNone(plan.desired_status)
+        self.assertNotIn("status", _kinds(plan))
+
+    def test_compare_before_mutate_quarantine_honoured(self) -> None:
+        case = MERGE_FIXTURES["cases"][0]
+        resp = _apply_patch(MERGE_FIXTURES["base_response"], case.get("patch", {}))
+        pull = merge_closure_readback(resp, linked_issue_records=case.get("linked_issue_records", ()))
+        plan = normalize_merge_closure(pull, _project(_item(updated_at="2026-08-05T12:00:00Z")))
+        self.assertEqual(plan.operations, ())
+        self.assertEqual(plan.blocked_reason, "board-decision-newer")
+        self.assertTrue(plan.quarantined)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
