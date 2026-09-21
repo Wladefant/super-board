@@ -759,10 +759,14 @@ export class TelegramPoller {
             text = msg.document.file_name ? `<file: ${msg.document.file_name}>` : "<file>";
           }
         }
-        const replyToMessageId = msg?.reply_to_message?.message_id ?? null;
+        const isTopicRoot =
+          typeof msg?.message_thread_id === "number" &&
+          (msg.reply_to_message?.message_id === msg.message_thread_id ||
+            Boolean(msg.reply_to_message?.forum_topic_created));
+        const replyToMessageId = isTopicRoot ? null : (msg?.reply_to_message?.message_id ?? null);
         let replyToText: string | null = null;
         const rMsg = msg?.reply_to_message;
-        if (rMsg) {
+        if (rMsg && !isTopicRoot) {
           if (rMsg.text && rMsg.text.trim()) {
             replyToText = rMsg.text.trim();
           } else if (rMsg.caption && rMsg.caption.trim()) {
@@ -1078,7 +1082,16 @@ export class TelegramPoller {
     //    injected into whichever session currently holds the bot lease.
     const inboundSessionId = this.correlation?.getSessionId();
     let replyCorrelation: OutboundMessageCorrelation | null = null;
-    if (typeof row.reply_to_message_id === "number") {
+    const isTopicRoot =
+      typeof row.message_thread_id === "number" &&
+      row.message_thread_id > 1 &&
+      row.reply_to_message_id === row.message_thread_id;
+
+    const isForumTopic =
+      (typeof row.message_thread_id === "number" && row.message_thread_id > 1) ||
+      (typeof this.activeThreadId === "number" && this.activeThreadId > 1);
+
+    if (typeof row.reply_to_message_id === "number" && !isTopicRoot) {
       const resolution = this.correlation
         ? this.correlation.resolveReply(this.botId, chatId, row.reply_to_message_id)
         : {
@@ -1087,35 +1100,41 @@ export class TelegramPoller {
           };
 
       if (resolution.decision !== "deliver") {
+        if (isForumTopic && (resolution.decision === "reject_unknown" || resolution.decision === "reject_unavailable")) {
+          this.callbacks.onLedgerFailure(
+            `Reply to unindexed message ${row.reply_to_message_id} in topic ${this.activeThreadId}; routing to bound session.`,
+          );
+        } else {
+          this.db.run(
+            "UPDATE update_ledger SET status = 'REJECTED', error = ?, correlated_session_id = ? WHERE update_id = ?",
+            [
+              `REPLY_${resolution.decision.replace(/^reject_/, "").toUpperCase()}`,
+              resolution.correlation?.sessionId ?? null,
+              row.update_id,
+            ],
+          );
+          await this.sendTelegramMessage(
+            chatId,
+            [
+              "🚫 <b>Reply not routed.</b>",
+              escapeHtml(resolution.detail),
+              "<i>Send a new message instead of replying to an earlier one.</i>",
+            ].join("\n"),
+          );
+          return;
+        }
+      } else {
+        replyCorrelation = resolution.correlation ?? null;
+
         this.db.run(
-          "UPDATE update_ledger SET status = 'REJECTED', error = ?, correlated_session_id = ? WHERE update_id = ?",
+          "UPDATE update_ledger SET correlated_session_id = ?, correlated_request_id = ? WHERE update_id = ?",
           [
-            `REPLY_${resolution.decision.replace(/^reject_/, "").toUpperCase()}`,
             resolution.correlation?.sessionId ?? null,
+            resolution.correlation?.requestId ?? null,
             row.update_id,
           ],
         );
-        await this.sendTelegramMessage(
-          chatId,
-          [
-            "🚫 <b>Reply not routed.</b>",
-            escapeHtml(resolution.detail),
-            "<i>Send a new message instead of replying to an earlier one.</i>",
-          ].join("\n"),
-        );
-        return;
       }
-
-      replyCorrelation = resolution.correlation ?? null;
-
-      this.db.run(
-        "UPDATE update_ledger SET correlated_session_id = ?, correlated_request_id = ? WHERE update_id = ?",
-        [
-          resolution.correlation?.sessionId ?? null,
-          resolution.correlation?.requestId ?? null,
-          row.update_id,
-        ],
-      );
     }
     if (replyCorrelation?.decisionId?.startsWith("tq:")) {
       if (!this.callbacks.onQuestionAnswer) throw new Error("Question receiver unavailable; answer was not delivered");
@@ -1229,7 +1248,7 @@ export class TelegramPoller {
     this.callbacks.onTelegramTurnStart();
 
     let deliveredText = rawText;
-    if (typeof row.reply_to_message_id === "number") {
+    if (typeof row.reply_to_message_id === "number" && !isTopicRoot) {
       const contextLines: string[] = [];
       const metaParts: string[] = [`post #${row.reply_to_message_id}`];
       if (replyCorrelation?.requestId) {
