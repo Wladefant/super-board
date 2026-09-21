@@ -281,22 +281,7 @@ export class SlotRouter {
   }
 
   private async listAllSessions(): Promise<DaemonSessionSummary[]> {
-    const wireSessions = await this.options.control.listSessions();
-    const control = this.options.control;
-    if ("discoverDiskSessions" in control && typeof control.discoverDiskSessions === "function") {
-      const diskSessions = control.discoverDiskSessions();
-      if (!diskSessions.length) return wireSessions;
-      const map = new Map<string, DaemonSessionSummary>();
-      for (const s of diskSessions) {
-        map.set(s.id, s);
-      }
-      for (const s of wireSessions) {
-        const existing = map.get(s.id);
-        map.set(s.id, { ...existing, ...s });
-      }
-      return Array.from(map.values());
-    }
-    return wireSessions;
+    return await this.options.control.listSessions();
   }
 
   private visibleSession(session: { cwd: string; workspace: string; status: string; modifiedAtMs: number | null }, now: number): boolean {

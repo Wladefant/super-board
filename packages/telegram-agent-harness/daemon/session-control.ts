@@ -76,14 +76,24 @@ function discoverOwners(configRoot?: string): Owner[] {
 
 class TerminalConnection {
   private socket: net.Socket;
-  private pending = new Map<string, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+  private pending = new Map<string, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
   private ready: Promise<void>;
   public closed = false;
   constructor(readonly owner: Owner, onEvent: (event: SessionEvent) => void) {
     this.socket = net.createConnection(owner.endpoint);
-    this.ready = new Promise((resolve, reject) => {
-      this.socket.once("connect", resolve);
-      this.socket.once("error", reject);
+    const { promise, resolve, reject } = Promise.withResolvers<void>();
+    this.ready = promise;
+    const connectTimer = setTimeout(() => {
+      reject(new SessionControlUnavailableError("Terminal owner connect timed out; no GUI fallback is permitted"));
+      this.close();
+    }, 5_000);
+    this.socket.once("connect", () => {
+      clearTimeout(connectTimer);
+      resolve();
+    });
+    this.socket.once("error", error => {
+      clearTimeout(connectTimer);
+      reject(error);
     });
     let buffer = "";
     this.socket.setEncoding("utf8");
@@ -121,15 +131,15 @@ class TerminalConnection {
     await this.ready;
     if (this.closed) throw new SessionControlUnavailableError("Terminal owner disconnected; no GUI fallback is permitted");
     const id = crypto.randomUUID();
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new SessionControlUnavailableError("Terminal request timed out; acceptance unknown; not retried"));
-        this.close();
-      }, 15_000);
-      this.pending.set(id, { resolve, reject, timer });
-      this.socket.write(JSON.stringify({ version: 1, id, token: this.owner.token, sessionId: this.owner.sessionId, op, ...payload }) + "\n");
-    });
+    const { promise, resolve, reject } = Promise.withResolvers<unknown>();
+    const timer = setTimeout(() => {
+      this.pending.delete(id);
+      reject(new SessionControlUnavailableError("Terminal request timed out; acceptance unknown; not retried"));
+      this.close();
+    }, 15_000);
+    this.pending.set(id, { resolve, reject, timer });
+    this.socket.write(JSON.stringify({ version: 1, id, token: this.owner.token, sessionId: this.owner.sessionId, op, ...payload }) + "\n");
+    return promise;
   }
   close(): void {
     if (this.closed) return;

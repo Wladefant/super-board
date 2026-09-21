@@ -74,23 +74,6 @@ function Resolve-VeyyonBun {
     }
     return $null
 }
-function Test-HostPortOpen([string]$address = "127.0.0.1", [int]$targetPort = 7699) {
-    try {
-        $client = New-Object System.Net.Sockets.TcpClient
-        $async = $client.BeginConnect($address, $targetPort, $null, $null)
-        $wait = $async.AsyncWaitHandle.WaitOne(1000, $false)
-        if (-not $wait) {
-            $client.Close()
-            return $false
-        }
-        $client.EndConnect($async)
-        $client.Close()
-        return $true
-    } catch {
-        return $false
-    }
-}
-
 
 function Get-LivePid([string]$pidPath) {
     if (-not (Test-Path -PathType Leaf $pidPath)) {
@@ -248,40 +231,6 @@ function Start-Daemon {
     if ($running) {
         Write-Host "Telegram daemon already running (pid $running)." -ForegroundColor Yellow
         return 1
-    }
-    # Wait up to 30 s for GUI host port 7699
-    $hostPort = 7699
-    $targetAddress = "127.0.0.1"
-    if ($Endpoint -and $Endpoint -match "tcp:([^:]+):(\d+)") {
-        $targetAddress = $matches[1]
-        $hostPort = [int]$matches[2]
-    } elseif ($env:VEYYON_GUI_HOST_ENDPOINT -and $env:VEYYON_GUI_HOST_ENDPOINT -match "tcp:([^:]+):(\d+)") {
-        $targetAddress = $matches[1]
-        $hostPort = [int]$matches[2]
-    }
-    $waitTimeoutSec = if ($env:VEYYON_GUI_HOST_PORT_WAIT_TIMEOUT) {
-        [int]$env:VEYYON_GUI_HOST_PORT_WAIT_TIMEOUT
-    } else {
-        30
-    }
-    $hostReady = $false
-    $portDeadline = (Get-Date).AddSeconds($waitTimeoutSec)
-    while ((Get-Date) -lt $portDeadline) {
-        if (Test-HostPortOpen $targetAddress $hostPort) {
-            $hostReady = $true
-            break
-        }
-        Start-Sleep -Milliseconds 500
-    }
-    if ($hostReady) {
-        Write-Host "GUI host port $hostPort is ready." -ForegroundColor Green
-    } else {
-        Write-Host "GUI host port $hostPort is absent after waiting $waitTimeoutSec s." -ForegroundColor Yellow
-    }
-
-
-    if ($Endpoint) {
-        $env:VEYYON_GUI_HOST_ENDPOINT = $Endpoint
     }
     # The daemon appends its own lines to this exact file, so it and this launcher
     # agree on one log wherever this tree lives.

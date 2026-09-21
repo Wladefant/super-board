@@ -66,15 +66,15 @@ async function run(): Promise<number> {
   let handedOver = report.slots.some(slot => slot.polling);
   let retrying = false;
   let nextRetryAt = Date.now() + CLAIM_RETRY_MS;
-  await new Promise<void>(resolve => {
-    const timer = setInterval(() => {
-      const polling = daemon.status().slots.some(slot => slot.polling);
-      if (polling) handedOver = true;
-      if (stopped || (handedOver && !polling && !daemon.hasPendingSlots())) {
-        clearInterval(timer);
-        resolve();
-        return;
-      }
+  const { promise, resolve } = Promise.withResolvers<void>();
+  const timer = setInterval(() => {
+    const polling = daemon.status().slots.some(slot => slot.polling);
+    if (polling) handedOver = true;
+    if (stopped || (handedOver && !polling && !daemon.hasPendingSlots())) {
+      clearInterval(timer);
+      resolve();
+      return;
+    }
       if (!daemon.hasPendingSlots() || retrying || Date.now() < nextRetryAt) return;
       retrying = true;
       void daemon
@@ -86,8 +86,8 @@ async function run(): Promise<number> {
           nextRetryAt = Date.now() + CLAIM_RETRY_MS;
           retrying = false;
         });
-    }, 1_000);
-  });
+  }, 1_000);
+  await promise;
   await (stopped ?? daemon.stop());
   return 0;
 }
@@ -212,7 +212,7 @@ const isDryRun = rawArgs.includes("--dry-run");
 
 let exitCode = 0;
 if (isReconcileOnce) {
-  exitCode = await reconcileOnce(isDryRun || !rawArgs.includes("--live"));
+  exitCode = await reconcileOnce(true);
 } else {
   const verb = rawArgs[0] ?? "run";
   exitCode = verb === "run"
