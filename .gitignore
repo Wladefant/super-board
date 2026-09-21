@@ -5,6 +5,7 @@
 # build artifacts
 /dist/
 super-board-v*.zip
+node_modules/
 
 # editor / OS noise
 .idea/

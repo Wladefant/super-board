@@ -8,6 +8,8 @@ export function authorizedRelay(header: string | null, secret: string): boolean 
   return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
 
+export const SERVED_FILES: Record<string, string> = { "/": "index.html", "/app.js": "app.js", "/client.js": "client.js", "/style.css": "style.css" };
+
 export function startRelay(secret: string, port = 3000) {
   if (secret.length < 43) throw new Error("RELAY_SECRET must contain at least 43 characters");
   let daemon: ServerWebSocket<undefined> | undefined;
@@ -56,10 +58,11 @@ export function startRelay(secret: string, port = 3000) {
           daemon?.send(JSON.stringify({ id, path: url.pathname, method: request.method, initData, appSession, body }));
         });
       }
-      const files: Record<string, string> = { "/": "index.html", "/app.js": "app.js", "/style.css": "style.css" };
-      const file = files[url.pathname];
+      const file = SERVED_FILES[url.pathname];
       if (!file) return new Response("Not found", { status: 404 });
-      return new Response(Bun.file(new URL(file, import.meta.url)), { headers: { "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "Content-Security-Policy": "default-src 'none'; script-src 'self' https://telegram.org; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'" } });
+      const asset = Bun.file(new URL(file, import.meta.url));
+      if (!(await asset.exists())) return new Response("Not found", { status: 404 });
+      return new Response(asset, { headers: { "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "Content-Security-Policy": "default-src 'none'; script-src 'self' https://telegram.org; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'" } });
     },
     websocket: {
       maxPayloadLength: 1048576,
