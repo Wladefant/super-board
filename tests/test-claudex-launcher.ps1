@@ -176,7 +176,7 @@ try {
     $originalBytes = [IO.File]::ReadAllBytes($fixture.Profile)
     $originalAcl = (Get-Acl -LiteralPath $fixture.Profile).Sddl
     $plan = Invoke-SetupFixture Plan $fixture.Profile $fixture.Junction $fixture.State $fixture.Canonical
-    Assert-Equal $plan.ExitCode 0 'setup plan succeeds'
+    Assert-Equal $plan.ExitCode 0 "setup plan succeeds: $($plan.Output)"
     Assert-Equal (Get-ByteHash ([IO.File]::ReadAllBytes($fixture.Profile))) (Get-ByteHash $originalBytes) 'plan preserves bytes'
     Assert-True (-not (Test-Path -LiteralPath $fixture.Junction)) 'plan does not create junction'
     Assert-True (-not (Test-Path -LiteralPath $fixture.State)) 'plan does not create transaction state'
