@@ -1,3 +1,4 @@
+import { createClient } from './client.js';
 const app = window.Telegram?.WebApp;
 app?.ready(); app?.expand();
 const byId = id => document.getElementById(id);
@@ -13,19 +14,7 @@ function card(id, title, detail, state) {
 function unavailable() {
   for (const id of ['sessions', 'approvals', 'lanes', 'blockers', 'queue']) empty(id, 'Unavailable until a secure connection is established.');
 }
-let appSession = '';
-async function request(path, body) {
-  if (!appSession) {
-    const auth = await fetch('/api/session', { method: 'POST', headers: { 'x-telegram-init-data': app?.initData || '' } });
-    const session = await auth.json();
-    if (!auth.ok) throw new Error(session.error || 'Authentication unavailable');
-    appSession = session.appSession;
-  }
-  const response = await fetch(path, { method: body ? 'POST' : 'GET', headers: { 'x-miniapp-session': appSession, 'Content-Type': 'application/json' }, ...(body ? { body: JSON.stringify(body) } : {}) });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || 'Connection unavailable');
-  return data;
-}
+const request = createClient(() => app?.initData || '');
 let loading = false;
 async function refresh() {
   if (loading) return;

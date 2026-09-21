@@ -31,7 +31,7 @@ export function startRelay(secret: string, port = 3000) {
         const launch = new URLSearchParams(initData);
         const shaped = url.pathname === "/api/session"
           ? request.method === "POST" && initData.length <= 16384 && /^[a-f0-9]{64}$/.test(launch.get("hash") ?? "") && /^\d+$/.test(launch.get("auth_date") ?? "") && Boolean(launch.get("user"))
-          : /^\d+\.\d+\.[a-f0-9]{64}$/.test(appSession);
+          : /^\d+\.\d+\.[a-f0-9]{32}\.[a-f0-9]{64}$/.test(appSession);
         if (!shaped) return Response.json({ error: "Open this app from Telegram again to authenticate." }, { status: 401 });
         // Traefik appends the actual peer to X-Forwarded-For; never trust its first entry.
         const ip = request.headers.get("x-forwarded-for")?.split(",").at(-1)?.trim() || server.requestIP(request)?.address || "unknown";
@@ -43,6 +43,7 @@ export function startRelay(secret: string, port = 3000) {
           const oldest = buckets.keys().next().value;
           if (oldest) buckets.delete(oldest);
         }
+        buckets.delete(ip);
         buckets.set(ip, bucket);
         if (bucket.tokens < 1) return Response.json({ error: "Too many requests; retry shortly." }, { status: 429 });
         bucket.tokens--;
@@ -56,7 +57,7 @@ export function startRelay(secret: string, port = 3000) {
           daemon?.send(JSON.stringify({ id, path: url.pathname, method: request.method, initData, appSession, body }));
         });
       }
-      const files: Record<string, string> = { "/": "index.html", "/app.js": "app.js", "/style.css": "style.css" };
+      const files: Record<string, string> = { "/": "index.html", "/app.js": "app.js", "/client.js": "client.js", "/style.css": "style.css" };
       const file = files[url.pathname];
       if (!file) return new Response("Not found", { status: 404 });
       return new Response(Bun.file(new URL(file, import.meta.url)), { headers: { "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "Content-Security-Policy": "default-src 'none'; script-src 'self' https://telegram.org; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'" } });

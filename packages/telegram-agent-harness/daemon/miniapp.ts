@@ -1,6 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { authenticateInitData, authenticateAppSession, issueAppSession } from "./miniapp-auth";
+import { authenticateInitData, authenticateAppSession, issueAppSession, appSessionRevocation } from "./miniapp-auth";
 import { decideApproval, pendingApprovals } from "../extension/approvals";
 
 export interface MiniAppRequest { id: string; path: string; method: string; initData: string; appSession?: string; body: string }
@@ -19,10 +19,15 @@ export async function miniAppRequest(request: MiniAppRequest, options: MiniAppOp
       return { id: request.id, status: 200, data: { appSession: issueAppSession(user, options.token), expiresIn: 28800 } };
     }
     user = authenticateAppSession(request.appSession ?? "", options.token, options.allowedUsers);
+    if (appSessionRevocation(options.stateDir, request.appSession!)) throw new Error("Unauthorized");
   }
   catch { return { id: request.id, status: 401, data: { error: "Open this app from Telegram again to authenticate." } }; }
   const respond = (status: number, data: unknown) => ({ id: request.id, status, data });
   try {
+    if (request.path === "/api/logout" && request.method === "POST") {
+      appSessionRevocation(options.stateDir, request.appSession!, true);
+      return respond(200, { revoked: true });
+    }
     const session = options.session(user);
     if (request.path === "/api/state" && request.method === "GET") {
       let sessions: unknown = null;
