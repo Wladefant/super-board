@@ -162,6 +162,11 @@ class FixtureMatrixTests(unittest.TestCase):
                 "reopened",
                 "open-in-completion-column",
                 "pre-activation-historical",
+                # The two the merge-closure decision adds (#117): the close a
+                # non-default-base merge never performed, and the already-closed
+                # merge it validates instead of performing again.
+                "merge-closure",
+                "merge-closure-validated",
             },
         )
 

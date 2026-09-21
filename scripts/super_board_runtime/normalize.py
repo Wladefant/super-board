@@ -199,6 +199,8 @@ CLOSURE_DISPOSITIONS: tuple[str, ...] = (
     "reopened",
     "open-in-completion-column",
     "pre-activation-historical",
+    "merge-closure",
+    "merge-closure-validated",
 )
 
 #: The completion column. Only the closure normalizer writes it — see
@@ -258,6 +260,13 @@ class IssueOrPullRequestSnapshot:
     closed_at: Optional[str] = None
     merged_at: Optional[str] = None
     merge_commit_sha: Optional[str] = None
+    #: Who performed the merge. A GitHub App's login carries the `[bot]`
+    #: suffix, so one check tells a person apart from an automation.
+    merged_by: Optional[str] = None
+    #: The repository's default branch. A closing keyword fires only when the
+    #: commit reaches it, so the whole merge-closure decision turns on whether
+    #: this and `base_branch` differ.
+    default_branch: Optional[str] = None
     supersession_evidence: Optional[Mapping[str, Any]] = None
     abandonment_evidence: Optional[Mapping[str, Any]] = None
     close_evidence: Optional[Mapping[str, Any]] = None
@@ -378,6 +387,8 @@ class NormalizationPlan:
     evidence_preserved: bool = True
     pre_activation: bool = False
     disposition: Optional[str] = None
+    #: The merge this plan was decided from, when a merge decided it.
+    merge: Optional["MergeAttestation"] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -394,6 +405,7 @@ class NormalizationPlan:
             "is_member": self.is_member,
             "membership_key": self.membership_key,
             "membership_lookups": self.membership_lookups,
+            "merge": self.merge.to_dict() if self.merge else None,
             "milestone": self.milestone,
             "milestone_source": self.milestone_source,
             "normalized": self.normalized,
@@ -1116,8 +1128,348 @@ def normalize_closure(
     )
 
 
+# ───────────────────────────── the merge that closes nothing ─────────────────────────────
+
+#: The ONE readback the merge-closure decision is made on.
+#:
+#: `baseRefName` and `defaultBranchRef` are asked for together because the whole
+#: decision turns on whether they differ. A closing keyword fires only when the
+#: commit reaches the repository's DEFAULT branch, so on a board routed to
+#: `staging` a merged `Closes #N` creates no closing link, fires no close event,
+#: and leaves the issue open with nothing warning anybody.
+#:
+#: `mergedBy` is asked for because the merge has to be a person's. The runtime
+#: never merges, so a merge it performed itself cannot be the evidence that a
+#: human accepted the work.
+MERGE_CLOSURE_QUERY = """query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    defaultBranchRef { name }
+    pullRequest(number: $number) {
+      id
+      number
+      url
+      title
+      state
+      baseRefName
+      headRefName
+      mergedAt
+      mergeCommit { oid }
+      mergedBy { __typename login }
+      closingIssuesReferences(first: 25) {
+        nodes { id number url state title }
+        pageInfo { hasNextPage }
+      }
+    }
+  }
+}
+"""
+
+#: How many linked issues the readback asks for. Kept in step with the query.
+MERGE_CLOSURE_LINK_PAGE = 25
+
+#: A login ending in this is a GitHub App, not a person. GraphQL reports an
+#: App's login without it, so the readback restores the REST spelling and one
+#: check covers both.
+BOT_LOGIN_SUFFIX = "[bot]"
+
+#: Every reason the merge-closure decision declines to plan a close. Each one
+#: reports and mutates nothing. Pinned by exact equality in the suite, so a new
+#: reason cannot arrive without somebody recording what it decided.
+MERGE_CLOSURE_REFUSALS: tuple[str, ...] = (
+    "merge-subject-not-a-pull-request",
+    "merge-not-merged",
+    "merge-commit-missing",
+    "merge-default-branch-unknown",
+    "merge-base-branch-unknown",
+    "merge-actor-unknown",
+    "merge-performed-by-runtime",
+    "merge-linked-issue-missing",
+    "merge-linked-issue-ambiguous",
+    "merge-default-base-not-automated",
+    "merge-closure-evidence-missing",
+)
+
+
+@dataclass(frozen=True)
+class MergeAttestation:
+    """What GitHub itself says about one merge, and who performed it."""
+
+    pull_request_url: Optional[str]
+    base_branch: Optional[str]
+    default_branch: Optional[str]
+    merged_at: Optional[str]
+    merge_commit_sha: Optional[str]
+    merged_by: Optional[str]
+    base_is_default: Optional[bool]
+    refusal: Optional[str] = None
+
+    @property
+    def valid(self) -> bool:
+        """True only when this merge is real, complete, and a person's."""
+        return self.refusal is None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**asdict(self), "valid": self.valid}
+
+
+def merge_attestation(
+    pull: IssueOrPullRequestSnapshot, *, runtime_actors: Sequence[str] = ()
+) -> MergeAttestation:
+    """Attest one merge, or name the first thing that is not true about it.
+
+    Ordered from "is this a merge at all" outwards, so the refusal names the
+    first fact that failed rather than the last one checked.
+    """
+    base_branch = _clean(pull.base_branch)
+    default_branch = _clean(pull.default_branch)
+    actor = _clean(pull.merged_by)
+    record = MergeAttestation(
+        pull_request_url=_clean(pull.url),
+        base_branch=base_branch,
+        default_branch=default_branch,
+        merged_at=_clean(pull.merged_at),
+        merge_commit_sha=_clean(pull.merge_commit_sha),
+        merged_by=actor,
+        base_is_default=(base_branch == default_branch)
+        if (base_branch and default_branch)
+        else None,
+    )
+
+    if not pull.is_pull_request:
+        return replace(record, refusal="merge-subject-not-a-pull-request")
+    # `MERGED` **and** a timestamp. A merge commit SHA can sit on a pull request
+    # that was closed instead, and a state with no timestamp is a claim.
+    if (pull.state or "").strip().casefold() != "merged" or not record.merged_at:
+        return replace(record, refusal="merge-not-merged")
+    if not record.merge_commit_sha:
+        return replace(record, refusal="merge-commit-missing")
+    if not default_branch:
+        return replace(record, refusal="merge-default-branch-unknown")
+    if not base_branch:
+        return replace(record, refusal="merge-base-branch-unknown")
+    if not actor:
+        # Nobody to attribute the merge to is not the same thing as a human
+        # merge. It is a readback that cannot answer the question.
+        return replace(record, refusal="merge-actor-unknown")
+    folded = actor.casefold()
+    runtime = {
+        name.strip().casefold()
+        for name in runtime_actors
+        if isinstance(name, str) and name.strip()
+    }
+    if folded.endswith(BOT_LOGIN_SUFFIX) or folded in runtime:
+        return replace(record, refusal="merge-performed-by-runtime")
+    return record
+
+
+def _link_identity(issue: IssueOrPullRequestSnapshot) -> str:
+    """One issue's identity, for deciding whether a link set is a single issue."""
+    return _clean(issue.node_id) or _clean(issue.url) or f"#{issue.number}"
+
+
+def resolve_merge_closure_target(
+    pull: IssueOrPullRequestSnapshot,
+) -> tuple[Optional[IssueOrPullRequestSnapshot], Optional[str]]:
+    """The one issue this merge implements, or why there is no such issue.
+
+    Only GitHub's own structured link set counts. A pull-request body that
+    mentions its parent issue in prose is not claiming to close it, and a
+    heuristic that read prose as a closing link would retire the parent of
+    every child that lands.
+    """
+    distinct: dict[str, IssueOrPullRequestSnapshot] = {}
+    for linked in pull.linked_issues:
+        if isinstance(linked, IssueOrPullRequestSnapshot) and not linked.is_pull_request:
+            distinct.setdefault(_link_identity(linked), linked)
+    if not distinct:
+        return None, "merge-linked-issue-missing"
+    if len(distinct) > 1:
+        return None, "merge-linked-issue-ambiguous"
+    return next(iter(distinct.values())), None
+
+
+def merge_closure_readback(
+    response: Any, *, linked_issue_records: Sequence[Mapping[str, Any]] = ()
+) -> IssueOrPullRequestSnapshot:
+    """Map one recorded `MERGE_CLOSURE_QUERY` response onto the merge subject.
+
+    GitHub's half of the document is the merge and the link set. Superboard's
+    half is `linked_issue_records` — what the runtime already recorded about a
+    linked issue: its acceptance evidence, and the board timestamp the manifest
+    was built against. Records join onto nodes by immutable node ID, or by URL.
+
+    Nothing is inferred and nothing is fetched, so a plan built from this
+    readback can never claim evidence the readback never carried.
+    """
+    if not isinstance(response, Mapping):
+        raise NormalizationError(
+            "merge-readback-unusable", "the merge readback must be a JSON object"
+        )
+    if response.get("errors"):
+        raise NormalizationError(
+            "merge-readback-unusable", "the merge readback carries GraphQL errors"
+        )
+    data = response.get("data")
+    repository = (data if isinstance(data, Mapping) else response).get("repository")
+    if not isinstance(repository, Mapping):
+        raise NormalizationError(
+            "merge-readback-unusable", "the merge readback carries no repository"
+        )
+    pull = repository.get("pullRequest")
+    if not isinstance(pull, Mapping):
+        raise NormalizationError(
+            "merge-readback-unusable", "the merge readback carries no pull request"
+        )
+
+    references = pull.get("closingIssuesReferences")
+    references = references if isinstance(references, Mapping) else {}
+    page = references.get("pageInfo")
+    if isinstance(page, Mapping) and page.get("hasNextPage"):
+        # A page boundary is not a decision: a readback that does not carry the
+        # whole link set cannot say the set holds exactly one issue.
+        raise NormalizationError(
+            "merge-linked-issues-truncated",
+            f"the merge readback carries more than {MERGE_CLOSURE_LINK_PAGE} linked issues",
+        )
+
+    records: dict[str, Mapping[str, Any]] = {}
+    for record in linked_issue_records:
+        if not isinstance(record, Mapping):
+            continue
+        for key in ("node_id", "url"):
+            identity = _clean(record.get(key))
+            if identity:
+                records[identity] = record
+
+    linked: list[IssueOrPullRequestSnapshot] = []
+    for node in references.get("nodes") or ():
+        if not isinstance(node, Mapping):
+            continue
+        node_id = _clean(node.get("id"))
+        url = _clean(node.get("url"))
+        record = records.get(node_id or "") or records.get(url or "") or {}
+        linked.append(
+            IssueOrPullRequestSnapshot(
+                kind="issue",
+                event="merged",
+                number=node.get("number") if isinstance(node.get("number"), int) else None,
+                url=url,
+                node_id=node_id,
+                state=str(node.get("state") or "").strip().casefold() or None,
+                title=_clean(node.get("title")),
+                completion_evidence=record.get("completion_evidence"),
+                observed_project_updated_at=_clean(record.get("observed_project_updated_at")),
+            )
+        )
+
+    default_ref = repository.get("defaultBranchRef")
+    commit = pull.get("mergeCommit")
+    actor = pull.get("mergedBy")
+    login = _clean(actor.get("login")) if isinstance(actor, Mapping) else None
+    if login and actor.get("__typename") == "Bot" and not login.endswith(BOT_LOGIN_SUFFIX):
+        login = f"{login}{BOT_LOGIN_SUFFIX}"
+    return IssueOrPullRequestSnapshot(
+        kind="pull_request",
+        event="merged",
+        number=pull.get("number") if isinstance(pull.get("number"), int) else None,
+        url=_clean(pull.get("url")),
+        node_id=_clean(pull.get("id")),
+        state=str(pull.get("state") or "").strip().casefold() or None,
+        title=_clean(pull.get("title")),
+        base_branch=_clean(pull.get("baseRefName")),
+        head_branch=_clean(pull.get("headRefName")),
+        default_branch=_clean(default_ref.get("name")) if isinstance(default_ref, Mapping) else None,
+        merged_at=_clean(pull.get("mergedAt")),
+        merge_commit_sha=_clean(commit.get("oid")) if isinstance(commit, Mapping) else None,
+        merged_by=login,
+        linked_issues=tuple(linked),
+    )
+
+
+def normalize_merge_closure(
+    pull: IssueOrPullRequestSnapshot,
+    project: ProjectSnapshot,
+    *,
+    runtime_actors: Sequence[str] = (),
+) -> NormalizationPlan:
+    """Plan the explicit close that a merge into a non-default branch never did.
+
+    Detection and validation only. The plan names the one issue it would close
+    and the state reason it would write; every path that cannot prove all of
+    the merge, the single link and the acceptance evidence reports a refusal
+    and plans nothing at all.
+    """
+    attestation = merge_attestation(pull, runtime_actors=runtime_actors)
+    base = NormalizationPlan(
+        subject_url=None,
+        subject_kind="issue",
+        event=pull.event or "",
+        normalized=True,
+        classification=classify_pull_request(pull),
+        merge=attestation,
+    )
+    if not attestation.valid:
+        return replace(base, blocked_reason=attestation.refusal)
+
+    issue, refusal = resolve_merge_closure_target(pull)
+    if issue is None:
+        return replace(base, blocked_reason=refusal)
+    base = replace(base, subject_url=_clean(issue.url))
+
+    if getattr(project, "hit_cap", False):
+        return replace(base, blocked_reason="project-membership-unknown")
+    item = find_project_item(tuple(project.items), issue.node_id)
+    base = replace(base, membership_lookups=1, is_member=item is not None)
+    if item is None:
+        return replace(base, blocked_reason="closure-card-not-on-board")
+
+    if (issue.state or "").strip().casefold() != "open":
+        # Already closed: either the human merge into the default branch that
+        # GitHub closed by itself, or a closure somebody performed by hand.
+        # Validated, not performed again — a second close is a second state
+        # change on a record that already says what we wanted it to say.
+        return replace(base, disposition="merge-closure-validated")
+
+    if attestation.base_is_default:
+        # On the default branch the keyword either fired — in which case the
+        # issue is closed and this is the validated case above — or the author
+        # deliberately wrote `Part of`, because the diff does not satisfy every
+        # criterion. Closing here would be the eager close, not the missing one.
+        return replace(base, blocked_reason="merge-default-base-not-automated")
+
+    if not accepted_completion_evidence(issue.completion_evidence):
+        # The merge says the code landed. It does not say the acceptance
+        # criteria were evidenced, and only the second one closes an issue.
+        return replace(base, blocked_reason="merge-closure-evidence-missing")
+
+    expected, current = _states(item, issue)
+    # No status operation, deliberately: closing the issue fires the board's own
+    # `Item closed` workflow, and a status write beside it would be a second
+    # writer racing the first one to the same column.
+    return _finalize(
+        replace(
+            base,
+            disposition="merge-closure",
+            operations=(
+                _operation(
+                    "close",
+                    expected,
+                    current,
+                    {
+                        "issue_url": issue.url,
+                        "state": "closed",
+                        "state_reason": "completed",
+                    },
+                    comparable=True,
+                ),
+            ),
+        )
+    )
+
+
 __all__ = [
     "ACCEPTED_COMPLETION_EVIDENCE_TYPES",
+    "BOT_LOGIN_SUFFIX",
     "CLOSURE_DISPOSITIONS",
     "COMPLETION_STATUS",
     "ENVIRONMENT_CONSTRAINT_LABEL",
@@ -1125,6 +1477,9 @@ __all__ = [
     "INTAKE_ISSUE_EVENTS",
     "INTAKE_PULL_REQUEST_EVENTS",
     "LEGACY_ENVIRONMENT_ALIASES",
+    "MERGE_CLOSURE_LINK_PAGE",
+    "MERGE_CLOSURE_QUERY",
+    "MERGE_CLOSURE_REFUSALS",
     "PERIODIC_SWEEP_EVENT",
     "PRIORITIES",
     "PRIORITY_LABEL_PREFIX",
@@ -1135,6 +1490,7 @@ __all__ = [
     "IntakeForm",
     "IssueOrPullRequestSnapshot",
     "IssueSnapshot",
+    "MergeAttestation",
     "NormalizationError",
     "NormalizationPlan",
     "PlannedOperation",
@@ -1144,7 +1500,11 @@ __all__ = [
     "classify_pull_request",
     "find_project_item",
     "handles_event",
+    "merge_attestation",
+    "merge_closure_readback",
     "normalize_closure",
     "normalize_intake",
+    "normalize_merge_closure",
     "parse_intake_form",
+    "resolve_merge_closure_target",
 ]
