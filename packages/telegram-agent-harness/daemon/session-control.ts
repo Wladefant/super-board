@@ -19,6 +19,19 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { GuiHostRequestError, SocketGuiHostPort, type GuiHostPort, type GuiHostResponse } from "../src/gui-host-client";
+export function isConnectionRefusedError(error: unknown): boolean {
+  if (error instanceof GuiHostRequestError) {
+    return error.code === "ECONNREFUSED" || error.message.includes("ECONNREFUSED");
+  }
+  if (error instanceof Error) {
+    return (
+      (error as NodeJS.ErrnoException).code === "ECONNREFUSED" ||
+      error.message.includes("ECONNREFUSED")
+    );
+  }
+  return false;
+}
+
 
 export interface DaemonSessionSummary {
   id: string;

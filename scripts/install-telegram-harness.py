@@ -58,7 +58,10 @@ PROTECTED_PATTERNS = (
 # Files the installer owns even though a broader pattern above would protect them.
 # The blanket "*.ps1" guard exists for launchers the operator wrote by hand; the
 # daemon launcher ships with the harness and has to track it, so it is named here.
-INSTALLER_OWNED = ("veyyon-telegram-daemon.ps1",)
+INSTALLER_OWNED = (
+    "veyyon-telegram-daemon.ps1",
+    "veyyon-gui-host.ps1",
+)
 
 # Import specifiers rewritten when a daemon module is installed. The installed tree
 # flattens the package: extension/*.ts lands at the target root and src/*.ts under
@@ -188,6 +191,9 @@ def plan_sync_items(harness_root: Path, target: Path) -> List[SyncItem]:
         launcher = daemon_dir / "veyyon-telegram-daemon.ps1"
         if launcher.is_file():
             items.append(SyncItem(source_path=launcher, rel_target=launcher.name))
+        gui_launcher = daemon_dir / "veyyon-gui-host.ps1"
+        if gui_launcher.is_file():
+            items.append(SyncItem(source_path=gui_launcher, rel_target=gui_launcher.name))
 
     # 4. extension/tests -> target/tests if target/tests exists
     target_tests_dir = target / "tests"

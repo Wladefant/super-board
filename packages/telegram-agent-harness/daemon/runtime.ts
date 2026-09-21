@@ -37,6 +37,7 @@ import {
   type SessionEvent,
 } from "./session-control";
 import { DaemonStore } from "./store";
+import { GuiHostFallbackManager } from "./gui-host-fallback";
 import { connectMiniApp, miniAppUrl } from "./miniapp";
 import { ForumManager, type ForumApiClient } from "./forum";
 
@@ -77,6 +78,10 @@ export interface DaemonRuntimeOptions {
     onEvent: (event: SessionEvent) => void,
     onLog: (message: string) => void,
   ) => GuiHostSessionControl;
+  fallbackManagerFactory?: (
+    control: GuiHostSessionControl,
+    log: (message: string) => void,
+  ) => GuiHostFallbackManager;
   /** Injected in tests to fake Bot API calls for forum supergroup topics. */
   forumClientFactory?: (token: string, forumChatId: string) => ForumApiClient;
 }
@@ -95,6 +100,7 @@ export class TelegramDaemon {
   private readonly coordinator: BotPoolCoordinator;
   private readonly store: DaemonStore;
   private readonly control: GuiHostSessionControl;
+  private readonly fallbackManager: GuiHostFallbackManager;
   private readonly active: ActiveSlot[] = [];
   private readonly startedAt = Date.now();
   /** Last logged skip reason per slot, so a retry loop does not repeat itself. */
@@ -113,8 +119,14 @@ export class TelegramDaemon {
           onEvent: event => this.fanOut(event),
           onLog: message => this.log(message),
         });
+    this.fallbackManager = options.fallbackManagerFactory
+      ? options.fallbackManagerFactory(this.control, message => this.log(message))
+      : new GuiHostFallbackManager({
+          control: this.control,
+          endpoint,
+          log: message => this.log(message),
+        });
   }
-
   /**
    * One line per event, appended to `getDaemonLogPath()`.
    *
@@ -327,6 +339,7 @@ export class TelegramDaemon {
       relay: (target, markdown) => sendTo(target, markdown),
       log: message => this.log(message),
       topics: forumManager,
+      fallbackManager: this.fallbackManager,
     });
 
     const sessionIdForChat = (): string => router.boundSession(currentTarget()) ?? leaseSessionId;

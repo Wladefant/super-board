@@ -334,11 +334,13 @@ class TestInstallTelegramHarness(unittest.TestCase):
         for name in ("main.ts", "config.ts", "runtime.ts", "router.ts", "session-control.ts", "store.ts"):
             self.assertTrue((self.target / "daemon" / name).is_file(), f"daemon/{name} missing")
         self.assertTrue((self.target / "veyyon-telegram-daemon.ps1").is_file())
+        self.assertTrue((self.target / "veyyon-gui-host.ps1").is_file())
 
         installed = json.loads((self.target / "install-manifest.json").read_text(encoding="utf-8"))
         recorded = {entry["path"] for entry in installed["files"]}
         self.assertIn("daemon/main.ts", recorded)
         self.assertIn("veyyon-telegram-daemon.ps1", recorded)
+        self.assertIn("veyyon-gui-host.ps1", recorded)
 
         # --check must pass on the freshly installed tree, which only holds when it
         # compares against the rewritten bytes rather than the raw source file.
@@ -441,6 +443,7 @@ class TestInstallTelegramHarness(unittest.TestCase):
         self.assertTrue(install_module.is_protected_rel_path("veyyon-telegram.ps1"))
         self.assertTrue(install_module.is_protected_rel_path("veyyon-polysim.ps1"))
         self.assertFalse(install_module.is_protected_rel_path("veyyon-telegram-daemon.ps1"))
+        self.assertFalse(install_module.is_protected_rel_path("veyyon-gui-host.ps1"))
         self.assertFalse(install_module.is_protected_rel_path("daemon/main.ts"))
         self.assertTrue(install_module.is_protected_rel_path("daemon/run/daemon.pid"))
 

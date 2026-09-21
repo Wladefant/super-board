@@ -95,7 +95,8 @@ export class SocketGuiHostPort implements GuiHostPort {
       });
       socket.on("data", chunk => { if (this.socket === socket) this.onData(String(chunk)); });
       socket.on("error", error => {
-        if (this.socket === socket) this.fail(new GuiHostRequestError(error.message, "SOCKET_ERROR"));
+        const code = (error as NodeJS.ErrnoException).code || "SOCKET_ERROR";
+        if (this.socket === socket) this.fail(new GuiHostRequestError(error.message, code));
       });
       socket.on("close", () => {
         if (this.socket === socket) this.fail(new GuiHostRequestError("Veyyon GUI host connection closed", "SOCKET_CLOSED"));
