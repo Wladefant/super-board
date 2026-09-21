@@ -326,7 +326,7 @@ describe("forum topic routing", () => {
     expect(sent.at(-1)?.html).toContain("direct-chat mode");
   });
 
-  test("/detach closes the topic it was run in and refuses to run from General", async () => {
+  test("/detach unbinds the topic without closing, while /detach close closes it", async () => {
     const fake = fakeControl([summary("sess-a", "C:/dev/a")]);
     const topics = fakeTopics();
     const router = buildRouter({}, fake.control, topics);
@@ -337,10 +337,17 @@ describe("forum topic routing", () => {
     expect(sent.at(-1)?.html).toContain("inside the topic");
 
     await router.handleCommand("/detach", TOPIC_9);
+    expect(topics.closed).toEqual([]);
+    expect(router.boundSession(TOPIC_9)).toBeNull();
+    expect(sent.at(-1)?.html).toContain("Topic #9 detached");
+    expect(sent.at(-1)?.html).toContain("/detach close");
+    expect(fake.aborted).toEqual([]);
+
+    await router.bind(TOPIC_9, "sess-a", "C:/dev/a");
+    await router.handleCommand("/detach close", TOPIC_9);
     expect(topics.closed).toEqual([9]);
     expect(router.boundSession(TOPIC_9)).toBeNull();
     expect(sent.at(-1)?.html).toContain("Topic #9 detached and closed");
-    expect(fake.aborted).toEqual([]);
   });
 
   test("/where names the topic a message came from", async () => {
@@ -440,12 +447,11 @@ describe("routing commands", () => {
     await router.handleCommand("/sessions", DM);
     expect(sent[0].html).not.toContain("C:/old");
     expect(sent[0].html).not.toContain("No workspace");
-    expect(sent[0].html).toContain("C:/recent");
-    expect(sent[0].html).toContain("12 min ago");
-    expect(sent[0].html).toContain("C:/live");
+    expect(sent[0].html).toContain("<b>recent</b> <code>C:/recent</code>");
+    expect(sent[0].html).toContain("<b>live</b> <code>C:/live</code>");
+    expect(sent[0].html).toContain("/attach <n> or /attach <folder>");
     await router.handleCommand("/sessions all", DM);
-    expect(sent[1].html).toContain("C:/old");
-    expect(sent[1].html).toContain("No workspace");
+    expect(sent[1].html).toContain("<b>old</b> <code>C:/old</code>");
   });
 
   test("indices survive router recreation and host reorder and are isolated by chat and topic", async () => {
@@ -479,40 +485,66 @@ describe("routing commands", () => {
     expect(sent.slice(-2).every(message => message.html.includes("More than one"))).toBe(true);
   });
 
-  test("last prompt wins over title and is escaped after a forty-character Unicode excerpt", async () => {
-    const fake = fakeControl([summary("a", "C:/<demo>", "Old title")]);
-    fake.control.lastPrompt = async () => "<new> " + "x".repeat(50);
-    const router = buildRouter({}, fake.control);
+  test("filters spawned subagents and keeps only top-level interactive sessions", async () => {
+    const sessions: DaemonSessionSummary[] = [
+      summary("main-veyyon", "C:/Users/wkiri/development/veyyon"),
+      summary("main-sb", "C:/Users/wkiri/development/super-board"),
+      { ...summary("sub-1", "C:/Users/wkiri/development/veyyon"), parent_path: "C:/main.jsonl", parentPath: "C:/main.jsonl" },
+      { ...summary("sub-2", "C:/Users/wkiri/development/super-board"), kind: "subagent" },
+      { ...summary("sub-3", "C:/Users/wkiri/development/super-board"), isSubagent: true },
+      { ...summary("sub-4", "C:/Users/wkiri/development/super-board"), parentId: "main-sb" },
+      { ...summary("agent-worker", "C:/Users/wkiri/development/super-board") },
+    ];
+    const router = buildRouter({}, fakeControl(sessions).control);
     await router.handleCommand("/sessions", DM);
-    expect(sent[0].html).toContain(`<i>&lt;new&gt; ${"x".repeat(34)}</i>`);
-    expect(sent[0].html).toContain("<b>&lt;demo&gt;</b>");
-    expect(sent[0].html).not.toContain("Old title");
+    expect(sent[0].html).toContain("<b>super-board</b> <code>C:/Users/wkiri/development/super-board</code>");
+    expect(sent[0].html).toContain("<b>veyyon</b> <code>C:/Users/wkiri/development/veyyon</code>");
+    expect(sent[0].html).not.toContain("sub-1");
+    expect(sent[0].html).not.toContain("sub-2");
+    expect(sent[0].html).not.toContain("sub-3");
+    expect(sent[0].html).not.toContain("sub-4");
+    expect(sent[0].html).not.toContain("agent-worker");
+    expect(sent[0].html).toContain("/attach <n> or /attach <folder>");
   });
 
-  test("a failed preview retains the title and does not hide other sessions", async () => {
-    const fake = fakeControl([summary("a", "C:/demo", "Saved title"), summary("b", "C:/other", "Other")]);
-    fake.control.lastPrompt = async id => {
-      if (id === "a") throw new Error("session removed during preview");
-      return "latest prompt";
-    };
-    const router = buildRouter({}, fake.control);
+  test("sorts by folder basename, suffixes duplicates with (2), and attaches by folder", async () => {
+    const sessions = [
+      summary("s1", "C:/dev/zebra"),
+      summary("s2", "C:/dev/alpha"),
+      summary("s3", "D:/other/alpha"),
+    ];
+    const router = buildRouter({}, fakeControl(sessions).control);
     await router.handleCommand("/sessions", DM);
-    expect(sent[0].html).toContain("<i>Saved title</i>");
-    expect(sent[0].html).toContain("<i>latest prompt</i>");
-    await router.handleCommand("/attach 2", DM);
-    expect(router.boundSession(DM)).toBe("b");
+    const expected = [
+      "1. <b>alpha</b> <code>C:/dev/alpha</code>",
+      "2. <b>alpha (2)</b> <code>D:/other/alpha</code>",
+      "3. <b>zebra</b> <code>C:/dev/zebra</code>",
+      "/attach <n> or /attach <folder>",
+    ].join("\n");
+    expect(sent[0].html).toBe(expected);
+
+    // /attach by folder name
+    await router.handleCommand("/attach zebra", DM);
+    expect(router.boundSession(DM)).toBe("s1");
+
+    // /attach by suffixed name
+    await router.handleCommand("/attach alpha (2)", DM);
+    expect(router.boundSession(DM)).toBe("s3");
   });
 
-  test("/sessions groups sessions by workspace instead of exposing internal IDs", async () => {
+  test("/sessions groups sessions by workspace without headers or excerpts", async () => {
     const fake = fakeControl([summary("sess-a", "C:/dev/demo", "Demo"), summary("sess-b", "C:/dev/other", "Other")]);
     const router = buildRouter({}, fake.control);
     await router.deliver(DM, "start");
 
     expect(await router.handleCommand("/sessions", DM)).toBe(true);
-    expect(sent[0].html).toContain("<b>demo</b> <code>C:/dev/demo</code>");
-    expect(sent[0].html).toContain("1. <i>Demo</i>");
-    expect(sent[0].html).toContain("/attach 2");
+    expect(sent[0].html).toBe(
+      "1. <b>demo</b> <code>C:/dev/demo</code>\n" +
+      "2. <b>other</b> <code>C:/dev/other</code>\n" +
+      "/attach <n> or /attach <folder>"
+    );
     expect(sent[0].html).not.toContain("sess-a");
+    expect(sent[0].html).not.toContain("Demo");
   });
 
   test("/attach binds to an existing session by id prefix and loads its history", async () => {

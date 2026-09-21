@@ -262,6 +262,49 @@ export class SlotRouter {
     return workspace.split("/").at(-1) ?? workspace;
   }
 
+  private isTopLevelSession(session: DaemonSessionSummary): boolean {
+    if (session.isSubagent) return false;
+    if (session.parentPath || session.parentId) return false;
+    if (session.kind === "subagent") return false;
+    const record = session as unknown as Record<string, unknown>;
+    if (record.spawner) return false;
+    if (record.parent_path || record.parent_id) return false;
+    if (session.path) {
+      const normalized = session.path.replace(/\\/g, "/");
+      const filename = normalized.split("/").at(-1) ?? "";
+      if (!/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.-]+Z_[a-f0-9-]+\.jsonl$/i.test(filename)) {
+        return false;
+      }
+      const parentDir = normalized.split("/").slice(-2, -1)[0] ?? "";
+      if (/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.-]+Z_[a-f0-9-]+$/i.test(parentDir)) {
+        return false;
+      }
+    }
+    if (/^(sub[-_]|agent[-_]|worker[-_])/i.test(session.id) || (session.title && /^subagent/i.test(session.title))) {
+      return false;
+    }
+    return true;
+  }
+
+  private async listAllSessions(): Promise<DaemonSessionSummary[]> {
+    const wireSessions = await this.options.control.listSessions();
+    const control = this.options.control;
+    if ("discoverDiskSessions" in control && typeof control.discoverDiskSessions === "function") {
+      const diskSessions = control.discoverDiskSessions();
+      if (!diskSessions.length) return wireSessions;
+      const map = new Map<string, DaemonSessionSummary>();
+      for (const s of diskSessions) {
+        map.set(s.id, s);
+      }
+      for (const s of wireSessions) {
+        const existing = map.get(s.id);
+        map.set(s.id, { ...existing, ...s });
+      }
+      return Array.from(map.values());
+    }
+    return wireSessions;
+  }
+
   private visibleSession(session: { cwd: string; workspace: string; status: string; modifiedAtMs: number | null }, now: number): boolean {
     return !!this.workspace(session) && !(/^(complete|completed|finished|interrupted|aborted|error)$/i.test(session.status)
       && (session.modifiedAtMs === null || now - session.modifiedAtMs > 3_600_000));
@@ -279,12 +322,18 @@ export class SlotRouter {
     if (verb === "/detach") {
       const topics = this.options.topics;
       if (topics && !target.topicId) return "ℹ️ <b>Run /detach inside the topic you want to close.</b>";
+      const shouldClose = argument.trim().toLowerCase() === "close";
       const removed = this.options.store.deleteRoute(this.slotId, target.chatId, target.topicId);
       if (topics) {
-        await topics.closeTopic(Number(target.topicId));
+        if (shouldClose) {
+          await topics.closeTopic(Number(target.topicId));
+          return removed
+            ? `🔌 <b>Topic #${escapeHtml(target.topicId)} detached and closed.</b> The session keeps running.`
+            : `🔌 <b>Topic #${escapeHtml(target.topicId)} closed.</b> It was not bound to a session.`;
+        }
         return removed
-          ? `🔌 <b>Topic #${escapeHtml(target.topicId)} detached and closed.</b> The session keeps running.`
-          : `🔌 <b>Topic #${escapeHtml(target.topicId)} closed.</b> It was not bound to a session.`;
+          ? `🔌 <b>Topic #${escapeHtml(target.topicId)} detached.</b> The topic remains open; use <code>/detach close</code> to close it.`
+          : `ℹ️ <b>Topic #${escapeHtml(target.topicId)} was not bound to a session.</b>`;
       }
       return removed
         ? "🔌 <b>Chat detached.</b> The session keeps running; your next message starts or joins a session again."
@@ -293,48 +342,100 @@ export class SlotRouter {
 
     if (verb === "/sessions") {
       const now = Date.now();
-      const sessions = (await this.options.control.listSessions()).filter(session =>
+      const allSessions = await this.listAllSessions();
+      const interactive = allSessions.filter(session => this.isTopLevelSession(session));
+      const sessions = interactive.filter(session =>
         argument.toLowerCase() === "all" || this.visibleSession(session, now));
-      sessions.sort((a, b) => this.workspace(a).localeCompare(this.workspace(b))
+      sessions.sort((a, b) => this.folder(this.workspace(a)).localeCompare(this.folder(this.workspace(b)))
+        || this.workspace(a).localeCompare(this.workspace(b))
         || (b.modifiedAtMs ?? 0) - (a.modifiedAtMs ?? 0) || a.id.localeCompare(b.id));
-      this.options.store.putSessionListing(this.slotId, target.chatId, target.topicId, sessions.map(session => session.id));
-      if (!sessions.length) return "<b>No recent workspace sessions.</b> Use <code>/sessions all</code> to include older and unassigned sessions.";
-      const lines = ["<b>Veyyon sessions</b>"];
-      let previous: string | undefined;
-      for (const [index, session] of sessions.entries()) {
-        const workspace = this.workspace(session);
-        if (workspace !== previous) {
-          lines.push("", `<b>${escapeHtml(this.folder(workspace) || "No workspace")}</b> <code>${escapeHtml(workspace)}</code>`);
-          previous = workspace;
-        }
-        const prompt = await this.options.control.lastPrompt(session.id).catch(() => null);
-        const excerpt = Array.from((prompt || session.title || "Untitled session").replace(/\s+/g, " ").trim()).slice(0, 40).join("");
-        const minutes = session.modifiedAtMs === null ? null : Math.max(0, Math.floor((now - session.modifiedAtMs) / 60_000));
-        const age = minutes === null ? "age unknown" : minutes < 60 ? `${minutes} min ago`
-          : minutes < 1440 ? `${Math.floor(minutes / 60)} h ago` : `${Math.floor(minutes / 1440)} d ago`;
-        lines.push(`${index + 1}. <i>${escapeHtml(excerpt)}</i> · ${age} · /attach ${index + 1}`);
+      if (!sessions.length) {
+        this.options.store.putSessionListing(this.slotId, target.chatId, target.topicId, []);
+        return "<b>No recent workspace sessions.</b> Use <code>/sessions all</code> to include older and unassigned sessions.";
       }
+      const counts = new Map<string, number>();
+      const labeled: { session: DaemonSessionSummary; folderName: string; displayName: string }[] = [];
+      for (const session of sessions) {
+        const base = this.folder(this.workspace(session)) || "session";
+        const count = (counts.get(base.toLowerCase()) ?? 0) + 1;
+        counts.set(base.toLowerCase(), count);
+        const displayName = count === 1 ? base : `${base} (${count})`;
+        labeled.push({ session, folderName: base, displayName });
+      }
+      this.options.store.putSessionListing(this.slotId, target.chatId, target.topicId, labeled.map(item => item.session.id));
+      const lines = labeled.map((item, index) =>
+        `${index + 1}. <b>${escapeHtml(item.displayName)}</b> <code>${escapeHtml(this.workspace(item.session))}</code>`
+      );
+      lines.push("/attach <n> or /attach <folder>");
       return lines.join("\n");
     }
 
     if (verb === "/attach") {
       if (!argument) return "<b>Usage:</b> <code>/attach &lt;index, folder or session-id&gt;</code>";
-      const sessions = await this.options.control.listSessions();
-      let matches;
-      if (/^\d+$/.test(argument)) {
-        const id = this.options.store.getSessionListing(this.slotId, target.chatId, target.topicId)[Number(argument) - 1];
-        matches = sessions.filter(session => session.id === id);
-      } else {
-        const exact = sessions.find(session => session.id === argument);
-        matches = exact ? [exact] : sessions.filter(session => session.id.startsWith(argument)
-          || (this.visibleSession(session, Date.now()) &&
-            [this.folder(this.workspace(session)), this.workspace(session)].some(value => value.toLowerCase() === argument.replace(/\\/g, "/").toLowerCase())));
+      const now = Date.now();
+      const allSessions = await this.listAllSessions();
+      const interactive = allSessions.filter(session => this.isTopLevelSession(session));
+      const visible = interactive.filter(session => this.visibleSession(session, now));
+      const targetPool = visible.length > 0 ? visible : interactive;
+      targetPool.sort((a, b) => this.folder(this.workspace(a)).localeCompare(this.folder(this.workspace(b)))
+        || this.workspace(a).localeCompare(this.workspace(b))
+        || (b.modifiedAtMs ?? 0) - (a.modifiedAtMs ?? 0) || a.id.localeCompare(b.id));
+      const counts = new Map<string, number>();
+      const labeled: { session: DaemonSessionSummary; folderName: string; displayName: string }[] = [];
+      for (const session of targetPool) {
+        const base = this.folder(this.workspace(session)) || "session";
+        const count = (counts.get(base.toLowerCase()) ?? 0) + 1;
+        counts.set(base.toLowerCase(), count);
+        const displayName = count === 1 ? base : `${base} (${count})`;
+        labeled.push({ session, folderName: base, displayName });
       }
+
+      let matches: DaemonSessionSummary[] = [];
+      if (/^\d+$/.test(argument)) {
+        const index = Number(argument) - 1;
+        const savedIds = this.options.store.getSessionListing(this.slotId, target.chatId, target.topicId);
+        const idFromStore = savedIds[index];
+        if (idFromStore) {
+          const found = allSessions.find(s => s.id === idFromStore);
+          if (found) matches = [found];
+        }
+      } else {
+        const argNorm = argument.trim().toLowerCase();
+        const byExactDisplayName = labeled.filter(item => item.displayName.toLowerCase() === argNorm);
+        const byFolderName = labeled.filter(item => item.folderName.toLowerCase() === argNorm);
+        if (byFolderName.length === 1 && byExactDisplayName.length <= 1) {
+          matches = [byFolderName[0].session];
+        } else if (byFolderName.length > 1) {
+          if (byExactDisplayName.length === 1 && byExactDisplayName[0].displayName.toLowerCase() !== byExactDisplayName[0].folderName.toLowerCase()) {
+            matches = [byExactDisplayName[0].session];
+          } else {
+            matches = byFolderName.map(item => item.session);
+          }
+        } else if (byExactDisplayName.length === 1) {
+          matches = [byExactDisplayName[0].session];
+        } else {
+          const exactId = allSessions.find(s => s.id.toLowerCase() === argNorm);
+          if (exactId) {
+            matches = [exactId];
+          } else {
+            const prefixMatches = allSessions.filter(s => s.id.toLowerCase().startsWith(argNorm));
+            if (prefixMatches.length > 0) {
+              matches = prefixMatches;
+            } else {
+              const normPath = argument.replace(/\\/g, "/").toLowerCase();
+              const byPath = allSessions.filter(s => this.workspace(s).replace(/\\/g, "/").toLowerCase() === normPath);
+              matches = byPath;
+            }
+          }
+        }
+      }
+
       if (matches.length > 1) return "<b>More than one session matches.</b> Use <code>/sessions</code> and attach with its number.";
       const session = matches[0];
       if (!session) return `🚫 <b>No running session matches</b> <code>${escapeHtml(argument)}</code>. Use <code>/sessions</code> in this chat/topic to refresh the listing.`;
       const workspace = this.workspace(session);
-      const threadId = await this.bindWithTopic(target, session.id, workspace, session.title);
+      const folderName = this.folder(workspace);
+      const threadId = await this.bindWithTopic(target, session.id, workspace, folderName);
       return threadId === null
         ? `🔗 <b>Attached to</b> <code>${escapeHtml(session.id)}</code> — ${escapeHtml(workspace)}.`
         : `🔗 <b>Attached to</b> <code>${escapeHtml(session.id)}</code> in topic #${threadId} — ${escapeHtml(workspace)}.`;

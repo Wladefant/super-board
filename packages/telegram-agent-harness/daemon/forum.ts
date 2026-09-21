@@ -129,9 +129,9 @@ export class DefaultTelegramForumClient implements ForumApiClient {
 }
 
 export function formatTopicName(sessionId: string, workspace: string, title?: string | null): string {
-  const base = title?.trim() || path.basename(workspace) || "Session";
-  const label = `${base} (${sessionId.slice(0, 8)})`;
-  return label.slice(0, 128);
+  const folder = workspace.replace(/\\/g, "/").split("/").filter(Boolean).at(-1);
+  const base = folder || title?.trim() || path.basename(workspace) || "Session";
+  return base.slice(0, 128);
 }
 
 export interface ForumManagerOptions {
@@ -195,6 +195,22 @@ export class ForumManager implements TopicLifecycle {
       return Number(existing.topicId);
     }
 
+    const normTarget = workspace.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+    const existingWorkspaceRoute = this.options.store
+      .listRoutes(this.slotId)
+      .find(route => route.chatId === this.forumChatId && route.topicId !== "" &&
+        route.workspace.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase() === normTarget);
+    if (existingWorkspaceRoute) {
+      this.options.store.putRoute({
+        slotId: this.slotId,
+        chatId: this.forumChatId,
+        topicId: existingWorkspaceRoute.topicId,
+        sessionId,
+        workspace,
+      });
+      this.log(`Reused forum topic #${existingWorkspaceRoute.topicId} for workspace ${workspace} (rebound to session ${sessionId})`);
+      return Number(existingWorkspaceRoute.topicId);
+    }
     const created = await this.client.createForumTopic(this.forumChatId, formatTopicName(sessionId, workspace, title));
     const threadId = created.message_thread_id;
 
@@ -211,7 +227,7 @@ export class ForumManager implements TopicLifecycle {
       `Session: <code>${escapeHtml(sessionId)}</code>`,
       `Workspace: <code>${escapeHtml(workspace)}</code>`,
       ``,
-      `<i>Write in this topic to steer the session. <code>/detach</code> closes it.</i>`,
+      `<i>Write in this topic to steer the session. <code>/detach close</code> closes it.</i>`,
     ].join("\n");
 
     await this.client.sendMessage(this.forumChatId, welcome, {
