@@ -12,6 +12,21 @@ import {
 
 const OPERATOR_CHAT = "1247617658";
 
+/**
+ * A holder is a holder because its owner process is alive: `isSlotBusy` refuses a slot
+ * whose lease names a live (or liveness-uncertain) pid, and deliberately reclaims one
+ * whose owner is definitely dead, which is how a crashed session's slot comes back.
+ * Invented pids (10001..10003) name no process on any machine, so the three "occupied"
+ * slots below were stale leases the coordinator was right to hand out, and the busy
+ * refusal below never fired. This process is the live owner, as
+ * `daemon-lease.test.ts` ("a live pid holder refuses a second daemon, a dead one does
+ * not") already does; a different session id is what makes the lease somebody else's.
+ */
+const HOLDER_PID = process.pid;
+
+/** The pid of the session asking for a slot. Its own liveness is not part of the contract. */
+const CLAIMANT_PID = 10004;
+
 interface SlotSpec {
   slotId: string;
   projects?: string[];
@@ -112,29 +127,30 @@ describe("lease coordinator priority and busy holder diagnostics", () => {
 
   test("dedicated slot is preferred over shared slot for matching project", async () => {
     // polysimulator should claim telegram-polysim first, not telegram-shared
-    const claim = await coordinator.acquireLease("sess-poly-1", "C:/dev/polysimulator", 10001);
+    const claim = await coordinator.acquireLease("sess-poly-1", "C:/dev/polysimulator", HOLDER_PID);
     expect(claim.ok).toBe(true);
     expect(claim.slot?.slotId).toBe("telegram-polysim");
 
     // super-board should claim telegram-board first
-    const claimBoard = await coordinator.acquireLease("sess-board-1", "C:/dev/super-board", 10002);
+    const claimBoard = await coordinator.acquireLease("sess-board-1", "C:/dev/super-board", HOLDER_PID);
     expect(claimBoard.ok).toBe(true);
     expect(claimBoard.slot?.slotId).toBe("telegram-board");
 
     // third project (unrelated) claims telegram-shared
-    const claimOther = await coordinator.acquireLease("sess-other-1", "C:/dev/other-project", 10003);
+    const claimOther = await coordinator.acquireLease("sess-other-1", "C:/dev/other-project", HOLDER_PID);
     expect(claimOther.ok).toBe(true);
     expect(claimOther.slot?.slotId).toBe("telegram-shared");
   });
 
   test("busy refusal provides detailed diagnostics (sessionId, cwd, PID)", async () => {
-    // All 3 slots are now occupied. A new polysimulator request must fail with detailed diagnostics.
-    const busyClaim = await coordinator.acquireLease("sess-poly-new", "C:/dev/polysimulator", 10004);
+    // All 3 slots are held by live leases. A new polysimulator request must fail with
+    // detailed diagnostics naming the session sitting on the slot.
+    const busyClaim = await coordinator.acquireLease("sess-poly-new", "C:/dev/polysimulator", CLAIMANT_PID);
     expect(busyClaim.ok).toBe(false);
     expect(busyClaim.error).toBe("POOL_EXHAUSTED");
     expect(busyClaim.reason).toContain("sess-poly-1");
     expect(busyClaim.reason).toContain("C:/dev/polysimulator");
-    expect(busyClaim.reason).toContain("pid 10001");
+    expect(busyClaim.reason).toContain(`pid ${HOLDER_PID}`);
 
     // Assert structured busyHolders
     expect(busyClaim.busyHolders).toBeDefined();
@@ -144,7 +160,7 @@ describe("lease coordinator priority and busy holder diagnostics", () => {
     expect(polyHolder).toBeDefined();
     expect(polyHolder?.sessionId).toBe("sess-poly-1");
     expect(polyHolder?.projectPath).toBe("C:/dev/polysimulator");
-    expect(polyHolder?.ownerPid).toBe(10001);
+    expect(polyHolder?.ownerPid).toBe(HOLDER_PID);
     expect(polyHolder?.reason).toContain("Veyyon session active");
   });
 });
