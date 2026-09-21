@@ -1351,6 +1351,46 @@ const SWEEP_CASES: SweepCase[] = [
   { id: "F26", label: "destructured rm in this tree", want: "allow", tool: "eval", input: { language: "js", code: "await rm('./dist', { recursive: true })" } },
   { id: "F27", label: "LiteralPath bound to the drive root", want: "block", tool: "bash", input: { command: "Remove-Item -LiteralPath:C:\\ -Recurse -Force" } },
   { id: "F28", label: "commit message naming a protected path", want: "allow", tool: "bash", input: { command: "git commit -m 'harden the /etc/shadow reader rule'" } },
+
+  // Reviewer round 4 continuation: N1 (global eval), N2 (copy/move source grading), N3 (credential stores).
+  { id: "F29", label: "globalThis.eval executor blocked", want: "block", tool: "eval", input: { language: "js", code: "globalThis.eval(\"Bun.spawnSync(['rm','-rf','/'])\")" } },
+  { id: "F30", label: "globalThis evalCount allowed", want: "allow", tool: "eval", input: { language: "js", code: "globalThis.evalCount('ok')" } },
+  { id: "F31", label: "comma operator (0,eval) blocked", want: "block", tool: "eval", input: { language: "js", code: "(0,eval)(\"Bun.spawnSync(['rm','-rf','/'])\")" } },
+  { id: "F32", label: "comma operator evalCount allowed", want: "allow", tool: "eval", input: { language: "js", code: "(0, evalCount)('ok')" } },
+  { id: "F33", label: "copyFileSync reads secret source", want: "block", tool: "eval", input: { language: "js", code: "fs.copyFileSync('/root/.ssh/id_ed25519', './k')" } },
+  { id: "F34", label: "copyFileSync in-tree allowed", want: "allow", tool: "eval", input: { language: "js", code: "fs.copyFileSync('README.md', 'x')" } },
+  { id: "F35", label: "renameSync system path blocked", want: "block", tool: "eval", input: { language: "js", code: "fs.renameSync('/etc/passwd', './p')" } },
+  { id: "F36", label: "require fs copyFileSync in-tree allowed", want: "allow", tool: "eval", input: { language: "js", code: "require('fs').copyFileSync('./a.txt', './b.txt')" } },
+  { id: "F37", label: "cat staging PAT file blocked", want: "block", tool: "bash", input: { command: "cat ~/.veyyon/shared-auth/supabase_staging_management_pat.txt" } },
+  { id: "F38", label: "cat telegram daemon.db blocked", want: "block", tool: "bash", input: { command: "cat ~/.veyyon/telegram/daemon.db" } },
+  { id: "F39", label: "cat token.txt blocked", want: "block", tool: "bash", input: { command: "cat ~/token.txt" } },
+  { id: "F40", label: "cat gh-hosts-example.yml allowed", want: "allow", tool: "bash", input: { command: "cat ./docs/gh-hosts-example.yml" } },
+  { id: "F41", label: "cat gitignore allowed", want: "allow", tool: "bash", input: { command: "cat ~/.gitignore" } },
+  { id: "F42", label: "cat package.json allowed", want: "allow", tool: "bash", input: { command: "cat ./package.json" } },
+
+  // Group F successor: Reviewer round 5 (N1-N3 closed sweep cases)
+  { id: "O01", label: "globalThis.eval executor blocked", want: "block", tool: "eval", input: { language: "js", code: "globalThis.eval(\"Bun.spawnSync(['rm','-rf','/'])\")" } },
+  { id: "O02", label: "globalThis evalCount allowed", want: "allow", tool: "eval", input: { language: "js", code: "globalThis.evalCount('ok')" } },
+  { id: "O03", label: "globalThis computed eval blocked", want: "block", tool: "eval", input: { language: "js", code: "globalThis['ev'+'al'](\"Bun.spawnSync(['rm','-rf','/'])\")" } },
+  { id: "O04", label: "comma operator (0,eval) blocked", want: "block", tool: "eval", input: { language: "js", code: "(0,eval)(\"Bun.spawnSync(['rm','-rf','/'])\")" } },
+  { id: "O05", label: "comma operator evalCount allowed", want: "allow", tool: "eval", input: { language: "js", code: "(0, evalCount)('ok')" } },
+  { id: "O06", label: "globalThis.Function executor blocked", want: "block", tool: "eval", input: { language: "js", code: "globalThis.Function(\"Bun.spawnSync(['rm','-rf','/'])\")()" } },
+  { id: "O07", label: "py builtins eval blocked", want: "block", tool: "eval", input: { language: "py", code: "__builtins__.eval(\"__import__('os').system('rm -rf /')\")" } },
+  { id: "O08", label: "copyFileSync reads secret source", want: "block", tool: "eval", input: { language: "js", code: "fs.copyFileSync('/root/.ssh/id_ed25519', './k')" } },
+  { id: "O09", label: "copyFileSync in-tree allowed", want: "allow", tool: "eval", input: { language: "js", code: "fs.copyFileSync('README.md', 'x')" } },
+  { id: "O10", label: "require fs copyFileSync env HOME key", want: "block", tool: "eval", input: { language: "js", code: "require('fs').copyFileSync(process.env.HOME + '/.ssh/id_ed25519', './k')" } },
+  { id: "O11", label: "require fs copyFileSync in-tree allowed", want: "allow", tool: "eval", input: { language: "js", code: "require('fs').copyFileSync('./a.txt', './b.txt')" } },
+  { id: "O12", label: "cpSync secret dir blocked", want: "block", tool: "eval", input: { language: "js", code: "fs.cpSync('/root/.ssh', './k', { recursive: true })" } },
+  { id: "O13", label: "renameSync system path blocked", want: "block", tool: "eval", input: { language: "js", code: "fs.renameSync('/etc/passwd', './p')" } },
+  { id: "O14", label: "shutil copy secret source", want: "block", tool: "eval", input: { language: "py", code: "import shutil\nshutil.copy('/root/.ssh/id_ed25519', './k')" } },
+  { id: "O15", label: "cat staging PAT file blocked", want: "block", tool: "bash", input: { command: "cat ~/.veyyon/shared-auth/supabase_staging_management_pat.txt" } },
+  { id: "O16", label: "cat telegram daemon.db blocked", want: "block", tool: "bash", input: { command: "cat ~/.veyyon/telegram/daemon.db" } },
+  { id: "O17", label: "cat token.txt blocked", want: "block", tool: "bash", input: { command: "cat ~/token.txt" } },
+  { id: "O18", label: "cat stripe_secret_key.txt blocked", want: "block", tool: "bash", input: { command: "cat ./secrets/stripe_secret_key.txt" } },
+  { id: "O19", label: "cat config gh hosts blocked", want: "block", tool: "bash", input: { command: "cat ~/.config/gh/hosts.yml" } },
+  { id: "O20", label: "cat gh-hosts-example.yml allowed", want: "allow", tool: "bash", input: { command: "cat ./docs/gh-hosts-example.yml" } },
+  { id: "O21", label: "cat gitignore allowed", want: "allow", tool: "bash", input: { command: "cat ~/.gitignore" } },
+  { id: "O22", label: "cat package.json allowed", want: "allow", tool: "bash", input: { command: "cat ./package.json" } },
 ];
 
 describe("Issue #97: Table-driven audit of guard-eval.ts and guard.ts", () => {
@@ -1390,7 +1430,7 @@ describe("Issue #97: Table-driven audit of guard-eval.ts and guard.ts", () => {
       J: "reviewer round 3", K: "exec family", L: "spelling sweep", M: "everyday commands", N: "HTTP verbs and launchers",
       S: "eval executors and file sinks", T: "tool surfaces beside bash", U: "robustness and parser limits",
       V: "interpreters fed on stdin", W: "credential reads and exfiltration", Y: "debugger and app-spawn surfaces",
-      Z: "remote, selector and archive paths", F: "reviewer round 4",
+      Z: "remote, selector and archive paths", F: "reviewer round 4", O: "reviewer round 5",
     };
     const batches = new Map<string, SweepCase[]>();
     for (const testCase of SWEEP_CASES) {

@@ -318,6 +318,16 @@ export function evalCommands(code: string, language: string, parseShell: (comman
     }
     const leaf = call.split(".").pop()!;
     if (leaf === "$" && tokens[at]?.kind === "string") { append(tokens[at].dynamic ? undefined : tokens[at].value); continue; }
+    if (tokens[at]?.value === ")" && tokens[at + 1]?.value === "(") {
+      // Parenthesized callee: `(eval)(...)` or comma operator `(0, eval)(...)`
+      let prev = i - 1;
+      if (tokens[prev]?.value === ",") {
+        while (prev > 0 && tokens[prev - 1]?.value !== "(" && tokens[prev - 1]?.value !== ";" && tokens[prev - 1]?.value !== "{") prev--;
+      }
+      if (prev >= 0 && tokens[prev]?.value === "(" || tokens[prev - 1]?.value === "(") {
+        at++;
+      }
+    }
     if (tokens[at]?.value !== "(") continue;
     const argument = valueAt(at + 1);
     const complete = tokens[argument.end]?.value === "," || tokens[argument.end]?.value === ")";
@@ -371,8 +381,10 @@ export function evalCommands(code: string, language: string, parseShell: (comman
       else unresolved = true;
     } else if (/^(?:(?:fs(?:\.promises)?\.)?(rm|rmSync|rmdir|rmdirSync|unlink|unlinkSync)|shutil\.rmtree|os\.(remove|removedirs|unlink|rmdir|kill))$/.test(call)) {
       commands.push(["rm", "-rf", ...(typeof value === "string" ? [value] : [])]);
-    } else if (/^(fs(?:\.promises)?\.(cp|cpSync|copyFile|copyFileSync|rename|renameSync|link|linkSync|symlink|symlinkSync)|shutil\.(move|copy|copy2|copyfile|copytree)|os\.(rename|replace|link|symlink))$/.test(call)) {
-      // A copy, move or link clobbers its destination, and the destination is the second operand.
+    } else if (/^(?:(?:fs(?:\.promises)?\.)?(cpSync|copyFile|copyFileSync|renameSync|linkSync|symlinkSync)|fs(?:\.promises)?\.(cp|rename|link|symlink)|shutil\.(move|copy|copy2|copyfile|copytree)|os\.(rename|replace|link|symlink))$/.test(call)) {
+      // A copy, move or link reads its source and clobbers its destination.
+      if (typeof value === "string") commands.push(["cat", value]);
+      if (/^(?:.*?\.)?(rename|renameSync|move|replace)$/.test(call) && typeof value === "string") commands.push(["rm", "-rf", value]);
       const destination = tokens[argument.end]?.value === "," ? valueAt(argument.end + 1).value : undefined;
       commands.push(["tee", ...(typeof destination === "string" ? [destination] : [])]);
     } else if (/^(fs(?:\.promises)?\.(truncate|truncateSync|ftruncate|appendFile|appendFileSync|createWriteStream|chmod|chmodSync|chown|chownSync)|os\.(truncate|chmod|chown))$/.test(call)) {
@@ -390,7 +402,7 @@ export function evalCommands(code: string, language: string, parseShell: (comman
     } else if (call === "process.binding" || call === "process._linkedBinding") {
       // A raw internal binding hands back a process API this lexer cannot follow.
       unresolved = true;
-    } else if (/^(read|write|open|(?:fs(?:\.promises)?\.)?(readFile|readFileSync|writeFile|writeFileSync)|Bun\.(file|write)|Path|pathlib\.Path)$/.test(call)) {
+    } else if (/^(read|write|open|(?:fs(?:\.promises)?\.)?(readFile|readFileSync|writeFile|writeFileSync|createReadStream)|Bun\.(file|write)|Path|pathlib\.Path)$/.test(call)) {
       // A write clobbers its path; only a read leaves the file intact.
       const mode = tokens[argument.end]?.value === "," ? valueAt(argument.end + 1).value : undefined;
       let effect = /write/i.test(leaf) || (typeof mode === "string" && /[wax+]/.test(mode)) ? "tee" : "cat";
@@ -423,7 +435,7 @@ export function evalCommands(code: string, language: string, parseShell: (comman
         if (typeof name !== "string") unresolved = true;
         else if (/^(system|popen|exec|execSync|execFile|execFileSync|spawn|spawnSync|run|call|check_call|check_output|Popen)$/.test(name)) append(valueAt(close + 1).value);
       }
-    } else if (/^(eval|exec|Function|(?:vm\.)?runIn(NewContext|ThisContext|Context))$/.test(call)) {
+    } else if (/^(?:(?:globalThis|global|window|self|__builtins__)\.)?(eval|exec|Function|(?:vm\.)?runIn(NewContext|ThisContext|Context))$/.test(call)) {
       if (typeof value === "string") {
         const inner = evalCommands(value, language, parseShell);
         commands.push(...inner.commands);
