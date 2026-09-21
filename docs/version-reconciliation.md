@@ -200,6 +200,32 @@ Reconciled current release `2.2.0` + compatible new contract ⇒ **`2.3.0`**.
 `2.3.0` is likewise not tagged here; publication stays behind
 `authorize_release_publication`.
 
+## The release after that: `2.3.1`
+
+`2.3.0` shipped. The retired-status safety gate (`scan_retired_status`) had the
+identical installed-tree defect as the merge gate fixed in `2.0.1`: it relied
+entirely on `merge-scan-allowlist.txt` at the repository root, which is not part
+of the install payload. On an installed tree it flagged `lifecycle.py` and
+every document mentioning the retirement, and could never report clean.
+
+Fixed by introducing a definition-versus-use classifier and payload-safe
+exclusion, restoring the promised behaviour on installed trees. No contract
+changes and no new surface.
+
+| Source | Declared value |
+| --- | --- |
+| `VERSION` | `2.3.0` |
+| `skills/super-board/VERSION` | `2.3.0` |
+| `RELEASE-NOTES.md` newest heading | `v2.3.0` |
+| Only published Git tag | `v1.2.0` — still does not vote |
+
+The content sources agree, so the reconciled current release is `2.3.0`.
+
+Reconciled current release `2.3.0` + defect-fixes-only ⇒ **`2.3.1`**.
+
+`2.3.1` is likewise not tagged here; publication stays behind
+`authorize_release_publication`.
+
 ## What is now enforced
 
 - `VERSION`, `skills/super-board/VERSION`, and the newest `RELEASE-NOTES.md`
