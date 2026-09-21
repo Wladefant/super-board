@@ -226,6 +226,19 @@ test("a channel lost again inside the rebind interval is left alone until the in
   expect(getActiveRuntime()?.getPoller()).not.toBeNull();
 });
 
+test("two turn boundaries landing in the same tick produce one claim, not two", async () => {
+  await disposeRuntimeInPlace();
+  const claimsBefore = telegramCalls.filter(call => call === "setMyCommands").length;
+
+  await atClockOffset(122_000, async () => {
+    await Promise.all([fireTurnEnd(), fireMessageStart("user")]);
+  });
+
+  const claimsAfter = telegramCalls.filter(call => call === "setMyCommands").length;
+  expect(claimsAfter - claimsBefore).toBe(1);
+  expect(getActiveRuntime()?.getPoller()).not.toBeNull();
+});
+
 test("a channel the operator released stays released, and /tg-reload re-arms it", async () => {
   await commands.get("telegram")?.handler("release", commandContext);
   expect(getActiveRuntime()).toBeNull();
