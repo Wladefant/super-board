@@ -39,7 +39,7 @@ import {
 import { DaemonStore } from "./store";
 import { GuiHostFallbackManager } from "./gui-host-fallback";
 import { connectMiniApp, miniAppUrl } from "./miniapp";
-import { ForumManager, type ForumApiClient } from "./forum";
+import { ForumManager, type ForumApiClient, type AutoAttachResult } from "./forum";
 
 export interface DaemonSlotReport {
   slotId: string;
@@ -90,9 +90,10 @@ interface ActiveSlot {
   slot: DaemonSlot;
   poller: TelegramPoller;
   router: SlotRouter;
-  /** Lease identity; also what in-session pollers see as the slot holder. */
+  forumManager?: ForumManager;
   leaseSessionId: string;
   stopMiniApp: () => void;
+  autoAttachTimer?: NodeJS.Timeout;
 }
 
 export class TelegramDaemon {
@@ -102,6 +103,10 @@ export class TelegramDaemon {
   private readonly control: GuiHostSessionControl;
   private readonly fallbackManager: GuiHostFallbackManager;
   private readonly active: ActiveSlot[] = [];
+
+  public getActiveSlot(slotId: string): ActiveSlot | undefined {
+    return this.active.find(entry => entry.slot.slotId === slotId);
+  }
   private readonly startedAt = Date.now();
   /** Last logged skip reason per slot, so a retry loop does not repeat itself. */
   private readonly skipReasons = new Map<string, string>();
@@ -125,6 +130,11 @@ export class TelegramDaemon {
           control: this.control,
           endpoint,
           log: message => this.log(message),
+          onHostRecovered: () => {
+            void this.reconcileAllAutoAttach().catch(err => {
+              this.log(`Auto-attach reconciliation after host recovery failed: ${err instanceof Error ? err.message : String(err)}`);
+            });
+          },
         });
   }
   /**
@@ -159,7 +169,11 @@ export class TelegramDaemon {
   public async start(): Promise<DaemonStatusReport> {
     const reports: DaemonSlotReport[] = [];
     for (const slot of this.optedInSlots()) reports.push(await this.claim(slot));
-    return this.publish(reports);
+    const published = this.publish(reports);
+    await this.reconcileAllAutoAttach().catch(err => {
+      this.log(`Auto-attach on daemon start failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+    return published;
   }
 
   /**
@@ -183,7 +197,11 @@ export class TelegramDaemon {
           : await this.claim(slot),
       );
     }
-    return this.publish(reports);
+    const published = this.publish(reports);
+    await this.reconcileAllAutoAttach().catch(err => {
+      this.log(`Auto-attach after claimPending failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+    return published;
   }
 
   private optedInSlots(): DaemonSlot[] {
@@ -234,8 +252,11 @@ export class TelegramDaemon {
     if (this.stopping) return;
     const index = this.active.findIndex(entry => entry.slot.slotId === slotId);
     if (index < 0) return;
-    this.active[index].stopMiniApp();
-    this.active.splice(index, 1);
+    const [ended] = this.active.splice(index, 1);
+    if (ended.autoAttachTimer) {
+      clearInterval(ended.autoAttachTimer);
+    }
+    ended.stopMiniApp();
     this.coordinator.releaseLease(slotId, leaseSessionId);
     this.skipReasons.set(slotId, `poller ended: ${reason}`);
     this.log(`Slot ${slotId} poller ended: ${reason}`);
@@ -465,7 +486,17 @@ export class TelegramDaemon {
       const result = await response.json();
       if (!response.ok || !result.ok) this.log(`Slot ${slot.slotId}: Mini App menu registration rejected`);
     }).catch(() => this.log(`Slot ${slot.slotId}: Mini App menu registration unavailable`));
-    return { slot, poller, router, leaseSessionId, stopMiniApp };
+    let autoAttachTimer: NodeJS.Timeout | undefined;
+    if (forumManager && slot.autoAttach !== false) {
+      const intervalMs = slot.autoAttachIntervalMs ?? 10_000;
+      autoAttachTimer = setInterval(() => {
+        if (this.stopping) return;
+        void forumManager.reconcileAutoAttach(router).catch(err => {
+          this.log(`Slot ${slot.slotId}: auto-attach interval failed: ${err instanceof Error ? err.message : String(err)}`);
+        });
+      }, intervalMs);
+    }
+    return { slot, poller, router, forumManager, leaseSessionId, stopMiniApp, autoAttachTimer };
   }
 
   /**
@@ -514,11 +545,34 @@ export class TelegramDaemon {
     const index = this.active.findIndex(entry => entry.slot.slotId === slotId);
     if (index < 0) return false;
     const [entry] = this.active.splice(index, 1);
+    if (entry.autoAttachTimer) {
+      clearInterval(entry.autoAttachTimer);
+      entry.autoAttachTimer = undefined;
+    }
     entry.stopMiniApp();
     await entry.poller.stop();
     this.coordinator.releaseLease(entry.slot.slotId, entry.leaseSessionId);
     this.log(`Slot ${entry.slot.slotId} stopped and lease released`);
     return true;
+  }
+
+  /**
+   * Reconciles auto-attach topics across all active forum slots.
+   * Called on startup, on GUI host recovery, and directly by CLI dry-run.
+   */
+  public async reconcileAllAutoAttach(options?: { dryRun?: boolean }): Promise<Map<string, AutoAttachResult>> {
+    const results = new Map<string, AutoAttachResult>();
+    for (const entry of this.active) {
+      if (entry.forumManager && entry.slot.autoAttach !== false) {
+        try {
+          const res = await entry.forumManager.reconcileAutoAttach(entry.router, options);
+          results.set(entry.slot.slotId, res);
+        } catch (err) {
+          this.log(`Slot ${entry.slot.slotId}: reconcileAutoAttach failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    }
+    return results;
   }
 
   public async stop(): Promise<void> {

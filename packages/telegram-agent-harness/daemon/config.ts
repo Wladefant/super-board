@@ -94,6 +94,16 @@ export interface DaemonSlot extends DiscoveredSlot {
    * Supergroup chat id when mode is "forum" (e.g. "-1001234567890").
    */
   forumChatId?: string;
+  /**
+   * Automatically create or rebind forum topics for live top-level Veyyon sessions.
+   * Enabled by default for forum slots; set to false to opt out.
+   */
+  autoAttach?: boolean;
+  /**
+   * Reconcile interval in milliseconds for auto-attaching live sessions.
+   * Default: 10_000 (10 seconds).
+   */
+  autoAttachIntervalMs?: number;
 }
 
 /**
@@ -157,11 +167,22 @@ export function resolveDaemonSlots(
   const optedIn = readDaemonSlotIds(manifestPath);
   if (optedIn.size === 0) return [];
   const candidates = knownProjectPaths(coordinator);
-  const manifestMap = new Map<string, { mode?: "dm" | "forum"; forumChatId?: string }>();
+  const manifestMap = new Map<string, {
+    mode?: "dm" | "forum";
+    forumChatId?: string;
+    autoAttach?: boolean;
+    autoAttachIntervalMs?: number;
+  }>();
   if (fs.existsSync(manifestPath)) {
     try {
       const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as {
-        slots?: Array<{ slotId?: string; mode?: string; forumChatId?: string | number }>;
+        slots?: Array<{
+          slotId?: string;
+          mode?: string;
+          forumChatId?: string | number;
+          autoAttach?: boolean;
+          autoAttachIntervalMs?: number;
+        }>;
       };
       if (Array.isArray(manifest.slots)) {
         for (const slot of manifest.slots) {
@@ -169,6 +190,10 @@ export function resolveDaemonSlots(
             manifestMap.set(slot.slotId, {
               mode: slot.mode === "forum" ? "forum" : "dm",
               forumChatId: slot.forumChatId !== undefined ? String(slot.forumChatId) : undefined,
+              autoAttach: typeof slot.autoAttach === "boolean" ? slot.autoAttach : undefined,
+              autoAttachIntervalMs: typeof slot.autoAttachIntervalMs === "number" && slot.autoAttachIntervalMs > 0
+                ? slot.autoAttachIntervalMs
+                : undefined,
             });
           }
         }
@@ -184,6 +209,8 @@ export function resolveDaemonSlots(
         ...slot,
         mode: extra?.mode ?? "dm",
         forumChatId: extra?.forumChatId,
+        autoAttach: extra?.autoAttach ?? (extra?.mode === "forum" ? true : undefined),
+        autoAttachIntervalMs: extra?.autoAttachIntervalMs,
         workspace: resolveWorkspace(slot.projects ?? slot.preferredProjects, candidates, slot.defaultProject),
       };
     });

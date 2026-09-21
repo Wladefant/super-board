@@ -45,6 +45,15 @@ Forum mode allows an operator to manage multiple concurrent Veyyon sessions insi
    bun daemon/main.ts run
    ```
 
+### Automatic Topics (Auto-Attach)
+In forum mode, the daemon automatically creates and binds Telegram forum topics for live top-level Veyyon sessions:
+- **Live wire source of truth**: Checks live sessions via the GUI host (`control.listSessions()`). Historical disk sessions never trigger topic creation.
+- **Folder naming & ordinals**: Topics are named after the workspace folder (e.g. `super-board`). When multiple live sessions share a folder, subsequent topics receive an ordinal suffix (`super-board (2)`, `super-board (3)`).
+- **Dead-route rebinding**: If a topic exists for a workspace whose bound session has exited, starting a new session in that folder automatically rebinds the existing topic and posts a `🔁 Rebound to session <id>` note.
+- **Lifecycle & interval**: Runs on daemon startup, upon GUI host recovery/reconnect, and periodically every 10 seconds (`autoAttachIntervalMs`, default 10,000 ms). Can be disabled per slot with `"autoAttach": false`.
+- **Session listing indicator**: `/sessions` marks sessions that already have an attached forum topic with a `📌` indicator.
+- **Dry run**: Test or inspect actions without contacting Telegram via `bun daemon/main.ts --reconcile-once --dry-run`.
+
 ### Commands in Forum Mode
 - `/topics` — List active topics and bound session status (`idle` / `running`)
 - `/new [workspace]` — Start a new session in workspace and open a dedicated topic

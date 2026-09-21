@@ -32,7 +32,7 @@ import { BotPoolCoordinator } from "../extension/coordinator";
 import { TelegramPoller, type PollerCallbacks } from "../extension/poller";
 import type { TelegramUpdate } from "../extension/types";
 
-class FakeForumApiClient implements ForumApiClient {
+export class FakeForumApiClient implements ForumApiClient {
   public topics: Map<number, { name: string; closed: boolean }> = new Map();
   public sentMessages: Array<{ chatId: string | number; text: string; messageThreadId?: number }> = [];
   private threadCounter = 100;
@@ -70,15 +70,19 @@ class FakeForumApiClient implements ForumApiClient {
 interface FakeControl {
   control: GuiHostSessionControl;
   sessions: DaemonSessionSummary[];
+  diskSessions: DaemonSessionSummary[];
   delivered: Array<{ sessionId: string; text: string; mode: DeliveryMode }>;
   created: Array<{ workspace: string; title: string }>;
+  loaded: string[];
   busy: Set<string>;
 }
 
 function fakeControl(initialSessions: DaemonSessionSummary[] = []): FakeControl {
   const sessions = [...initialSessions];
+  const diskSessions: DaemonSessionSummary[] = [];
   const delivered: Array<{ sessionId: string; text: string; mode: DeliveryMode }> = [];
   const created: Array<{ workspace: string; title: string }> = [];
+  const loaded: string[] = [];
   const busy = new Set<string>();
   let counter = 0;
 
@@ -86,6 +90,7 @@ function fakeControl(initialSessions: DaemonSessionSummary[] = []): FakeControl 
     endpoint: "tcp:127.0.0.1:7699",
     isBusy: (sessionId: string) => busy.has(sessionId),
     listSessions: async () => sessions,
+    discoverDiskSessions: () => diskSessions,
     findSession: async (workspace: string) =>
       sessions.find(s => path.resolve(s.cwd).toLowerCase() === path.resolve(workspace).toLowerCase()) ?? null,
     createSession: async (workspace: string, title: string) => {
@@ -106,12 +111,14 @@ function fakeControl(initialSessions: DaemonSessionSummary[] = []): FakeControl 
       return busy.has(sessionId) ? ("steered" as const) : ("started" as const);
     },
     abort: async () => true,
-    loadTranscript: async () => {},
+    loadTranscript: async (sessionId: string) => {
+      loaded.push(sessionId);
+    },
     usage: async () => null,
     close: () => {},
   };
 
-  return { control: control as unknown as GuiHostSessionControl, sessions, delivered, created, busy };
+  return { control: control as unknown as GuiHostSessionControl, sessions, diskSessions, delivered, created, loaded, busy };
 }
 
 const FORUM_CHAT_ID = "-1009876543210";
@@ -159,6 +166,9 @@ describe("ForumManager topic lifecycle", () => {
   test("formatTopicName uses folder basename and caps length", () => {
     expect(formatTopicName("session-1234567890", "C:/dev/my-project", "Feature X")).toBe("my-project");
     expect(formatTopicName("session-abcdef", "C:/dev/super-board", null)).toBe("super-board");
+    expect(formatTopicName("session-1", "C:/dev/proj", null, 1)).toBe("proj");
+    expect(formatTopicName("session-2", "C:/dev/proj", null, 2)).toBe("proj (2)");
+    expect(formatTopicName("session-3", "C:/dev/proj", null, 3)).toBe("proj (3)");
   });
 
   test("ensureTopic creates a topic, records the route, and announces itself in the thread", async () => {
@@ -252,6 +262,220 @@ describe("ForumManager topic lifecycle", () => {
     await Promise.resolve();
     expect(client.topics.get(threadId)?.closed).toBe(false);
     expect(store.getRoute("slot-forum", FORUM_CHAT_ID, String(threadId))).not.toBeNull();
+  });
+  test("auto-attach: new live session -> creates topic, route, sends welcome, and binds", async () => {
+    fake.sessions.push({
+      id: "live-sess-1",
+      cwd: "C:/dev/my-project",
+      workspace: "C:/dev/my-project",
+      title: "Feature X",
+      status: "Idle",
+      modifiedAtMs: Date.now(),
+    });
+
+    const res = await manager.reconcileAutoAttach();
+    expect(res.created).toBe(1);
+    expect(res.rebound).toBe(0);
+    expect(res.skipped).toBe(0);
+    expect(res.errors).toBe(0);
+
+    expect(client.topics.size).toBe(1);
+    const [threadId, topic] = [...client.topics.entries()][0];
+    expect(topic.name).toBe("my-project");
+
+    const route = store.getRoute("slot-forum", FORUM_CHAT_ID, String(threadId));
+    expect(route?.sessionId).toBe("live-sess-1");
+    expect(route?.workspace).toBe("C:/dev/my-project");
+
+    expect(fake.loaded).toContain("live-sess-1");
+    const welcome = client.sentMessages.find(m => m.messageThreadId === threadId);
+    expect(welcome?.text).toContain("Veyyon session attached");
+    expect(welcome?.text).toContain("live-sess-1");
+  });
+
+  test("auto-attach: dead session in same folder -> rebinds topic not create, posts rebind note", async () => {
+    // Pre-existing route for dead session in same folder
+    store.putRoute({
+      slotId: "slot-forum",
+      chatId: FORUM_CHAT_ID,
+      topicId: "77",
+      sessionId: "dead-sess-old",
+      workspace: "C:/dev/my-project",
+    });
+    client.topics.set(77, { name: "my-project", closed: false });
+
+    // New live session starts in that folder
+    fake.sessions.push({
+      id: "live-sess-2",
+      cwd: "C:/dev/my-project",
+      workspace: "C:/dev/my-project",
+      title: "New Session",
+      status: "Idle",
+      modifiedAtMs: Date.now(),
+    });
+
+    const res = await manager.reconcileAutoAttach();
+    expect(res.created).toBe(0);
+    expect(res.rebound).toBe(1);
+    expect(client.topics.size).toBe(1); // Reused topic 77!
+
+    const route = store.getRoute("slot-forum", FORUM_CHAT_ID, "77");
+    expect(route?.sessionId).toBe("live-sess-2");
+
+    const rebindNote = client.sentMessages.find(m => m.messageThreadId === 77 && m.text.includes("Rebound"));
+    expect(rebindNote?.text).toContain("live-sess-2");
+    expect(fake.loaded).toContain("live-sess-2");
+  });
+
+  test("auto-attach: two live sessions in same folder -> ordinal topic for second", async () => {
+    fake.sessions.push(
+      {
+        id: "live-1",
+        cwd: "C:/dev/alpha",
+        workspace: "C:/dev/alpha",
+        title: null,
+        status: "Idle",
+        modifiedAtMs: 1,
+      },
+      {
+        id: "live-2",
+        cwd: "C:/dev/alpha",
+        workspace: "C:/dev/alpha",
+        title: null,
+        status: "Idle",
+        modifiedAtMs: 2,
+      },
+    );
+
+    const res = await manager.reconcileAutoAttach();
+    expect(res.created).toBe(2);
+    expect(client.topics.size).toBe(2);
+
+    const topicNames = [...client.topics.values()].map(t => t.name).sort();
+    expect(topicNames).toEqual(["alpha", "alpha (2)"]);
+
+    expect(fake.loaded).toContain("live-1");
+    expect(fake.loaded).toContain("live-2");
+  });
+
+  test("auto-attach: interval idempotence -> subsequent runs create nothing new", async () => {
+    fake.sessions.push({
+      id: "live-idem",
+      cwd: "C:/dev/idem",
+      workspace: "C:/dev/idem",
+      title: null,
+      status: "Idle",
+      modifiedAtMs: Date.now(),
+    });
+
+    const res1 = await manager.reconcileAutoAttach();
+    expect(res1.created).toBe(1);
+
+    const topicCount = client.topics.size;
+    const messageCount = client.sentMessages.length;
+
+    const res2 = await manager.reconcileAutoAttach();
+    expect(res2.created).toBe(0);
+    expect(res2.rebound).toBe(0);
+    expect(res2.skipped).toBe(1);
+    expect(res2.errors).toBe(0);
+
+    const res3 = await manager.reconcileAutoAttach();
+    expect(res3.created).toBe(0);
+    expect(res3.skipped).toBe(1);
+
+    expect(client.topics.size).toBe(topicCount);
+    expect(client.sentMessages.length).toBe(messageCount);
+  });
+
+  test("auto-attach: disk-only session -> nothing", async () => {
+    fake.sessions.length = 0; // Wire sessions empty
+    fake.diskSessions.push({
+      id: "disk-only-sess",
+      cwd: "C:/dev/disk-project",
+      workspace: "C:/dev/disk-project",
+      title: null,
+      status: "Idle",
+      modifiedAtMs: Date.now(),
+    });
+
+    const res = await manager.reconcileAutoAttach();
+    expect(res.actions).toHaveLength(0);
+    expect(res.created).toBe(0);
+    expect(res.rebound).toBe(0);
+    expect(client.topics.size).toBe(0);
+    expect(store.listRoutes("slot-forum")).toHaveLength(0);
+  });
+
+  test("auto-attach: Telegram error -> retries next tick with backoff without stalling other sessions", async () => {
+    fake.sessions.push(
+      {
+        id: "sess-fail",
+        cwd: "C:/dev/fail",
+        workspace: "C:/dev/fail",
+        title: null,
+        status: "Idle",
+        modifiedAtMs: 1,
+      },
+      {
+        id: "sess-ok",
+        cwd: "C:/dev/ok",
+        workspace: "C:/dev/ok",
+        title: null,
+        status: "Idle",
+        modifiedAtMs: 2,
+      },
+    );
+
+    const origCreate = client.createForumTopic.bind(client);
+    client.createForumTopic = async (chatId, name) => {
+      if (name.includes("fail")) {
+        throw new Error("Telegram API createForumTopic failed: 429 Too Many Requests");
+      }
+      return origCreate(chatId, name);
+    };
+
+    const res = await manager.reconcileAutoAttach();
+    expect(res.created).toBe(1);
+    expect(res.errors).toBe(1);
+    expect(client.topics.size).toBe(1);
+    const okTopic = [...client.topics.values()].find(t => t.name === "ok");
+    expect(okTopic).toBeDefined();
+    expect(fake.loaded).toContain("sess-ok");
+
+    // Immediate next tick: fail workspace is in backoff, does not throw, skips cleanly
+    const res2 = await manager.reconcileAutoAttach();
+    expect(res2.created).toBe(0);
+    expect(res2.skipped).toBe(1); // sess-ok is already bound
+
+    // Clear backoff & fix error -> retries and succeeds
+    manager.clearWorkspaceBackoff("C:/dev/fail");
+    client.createForumTopic = origCreate;
+
+    const res3 = await manager.reconcileAutoAttach();
+    expect(res3.created).toBe(1);
+    expect(client.topics.size).toBe(2);
+    expect(fake.loaded).toContain("sess-fail");
+  });
+
+  test("auto-attach: dryRun computes actions without calling Telegram or mutating store", async () => {
+    fake.sessions.push({
+      id: "live-dry",
+      cwd: "C:/dev/dry",
+      workspace: "C:/dev/dry",
+      title: null,
+      status: "Idle",
+      modifiedAtMs: Date.now(),
+    });
+
+    const res = await manager.reconcileAutoAttach(undefined, { dryRun: true });
+    expect(res.created).toBe(1);
+    expect(res.actions).toHaveLength(1);
+    expect(res.actions[0].action).toBe("create");
+    expect(res.actions[0].folder).toBe("dry");
+
+    expect(client.topics.size).toBe(0);
+    expect(store.listRoutes("slot-forum")).toHaveLength(0);
   });
 });
 
@@ -614,5 +838,136 @@ describe("TelegramDaemon forum mode integration", () => {
 
     await daemon.stop();
     expect(daemon.status().slots).toHaveLength(0);
+  });
+
+  test("autoAttach: false in manifest opts out of topic creation", async () => {
+    const manifestPath = path.join(tempDir, "manifest.json");
+    const stateDir = path.join(tempDir, "channels", "telegram-forum-optout");
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(path.join(stateDir, ".env"), "TELEGRAM_BOT_TOKEN=123456789:ABCDefghIJKLmnOPQRstuvWXYZ\n");
+    fs.writeFileSync(path.join(stateDir, "access.json"), JSON.stringify({ dmPolicy: "allowlist", allowFrom: [OPERATOR_ID] }));
+    fs.writeFileSync(
+      manifestPath,
+      JSON.stringify({
+        version: 1,
+        slots: [
+          {
+            slotId: "telegram-forum-optout",
+            stateDir,
+            enabled: true,
+            daemon: true,
+            mode: "forum",
+            forumChatId: "-10055443322",
+            autoAttach: false,
+            defaultProject: "C:/dev/test-optout",
+          },
+        ],
+      }),
+    );
+
+    const fake = fakeControl();
+    fake.sessions.push({
+      id: "live-optout-1",
+      cwd: "C:/dev/test-optout",
+      workspace: "C:/dev/test-optout",
+      title: null,
+      status: "Idle",
+      modifiedAtMs: Date.now(),
+    });
+
+    const forumClient = new FakeForumApiClient();
+    const daemon = new TelegramDaemon({
+      manifestPath,
+      poolDbPath: path.join(tempDir, "pool.db"),
+      daemonDbPath: path.join(tempDir, "daemon.db"),
+      channelsDir: path.join(tempDir, "channels"),
+      controlFactory: () => fake.control,
+      forumClientFactory: () => forumClient,
+      pollerFactory: () => ({
+        running: true,
+        start: async () => {},
+        stop: async () => {},
+        getPrimaryChatId: () => null,
+        getActiveThreadId: () => undefined,
+        getMeta: () => null,
+        sendTelegramMessage: async () => null,
+      } as unknown as TelegramPoller),
+      log: () => {},
+    });
+
+    await daemon.start();
+    // autoAttach: false -> no topic created on daemon start
+    expect(forumClient.topics.size).toBe(0);
+
+    await daemon.stop();
+  });
+
+  test("daemon start auto-attaches live sessions and binds them to forum topics", async () => {
+    const manifestPath = path.join(tempDir, "manifest.json");
+    const stateDir = path.join(tempDir, "channels", "telegram-forum-auto");
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(path.join(stateDir, ".env"), "TELEGRAM_BOT_TOKEN=123456789:ABCDefghIJKLmnOPQRstuvWXYZ\n");
+    fs.writeFileSync(path.join(stateDir, "access.json"), JSON.stringify({ dmPolicy: "allowlist", allowFrom: [OPERATOR_ID] }));
+    fs.writeFileSync(
+      manifestPath,
+      JSON.stringify({
+        version: 1,
+        slots: [
+          {
+            slotId: "telegram-forum-auto",
+            stateDir,
+            enabled: true,
+            daemon: true,
+            mode: "forum",
+            forumChatId: "-10055443322",
+            autoAttach: true,
+            defaultProject: "C:/dev/auto-attached",
+          },
+        ],
+      }),
+    );
+
+    const fake = fakeControl();
+    fake.sessions.push({
+      id: "live-auto-1",
+      cwd: "C:/dev/auto-attached",
+      workspace: "C:/dev/auto-attached",
+      title: null,
+      status: "Idle",
+      modifiedAtMs: Date.now(),
+    });
+
+    const forumClient = new FakeForumApiClient();
+    const daemon = new TelegramDaemon({
+      manifestPath,
+      poolDbPath: path.join(tempDir, "pool.db"),
+      daemonDbPath: path.join(tempDir, "daemon.db"),
+      channelsDir: path.join(tempDir, "channels"),
+      controlFactory: () => fake.control,
+      forumClientFactory: () => forumClient,
+      pollerFactory: () => ({
+        running: true,
+        start: async () => {},
+        stop: async () => {},
+        getPrimaryChatId: () => null,
+        getActiveThreadId: () => undefined,
+        getMeta: () => null,
+        sendTelegramMessage: async () => null,
+      } as unknown as TelegramPoller),
+      log: () => {},
+    });
+
+    await daemon.start();
+    expect(forumClient.topics.size).toBe(1);
+    const topic = [...forumClient.topics.values()][0];
+    expect(topic.name).toBe("auto-attached");
+
+    const store = new DaemonStore(path.join(tempDir, "daemon.db"));
+    const routes = store.listRoutes("telegram-forum-auto");
+    expect(routes).toHaveLength(1);
+    expect(routes[0].sessionId).toBe("live-auto-1");
+    store.close();
+
+    await daemon.stop();
   });
 });

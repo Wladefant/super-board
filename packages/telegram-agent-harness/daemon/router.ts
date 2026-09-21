@@ -36,9 +36,18 @@ export interface RouteTarget {
  * exist before a session can be bound to it.
  */
 export interface TopicLifecycle {
-  ensureTopic(sessionId: string, workspace: string, title?: string | null): Promise<number>;
+  ensureTopic(
+    sessionId: string,
+    workspace: string,
+    title?: string | null,
+    ordinal?: number,
+    liveSessionIds?: Set<string>,
+  ): Promise<number>;
   closeTopic(messageThreadId: number): Promise<boolean>;
   listTopicsText(currentTopicId: string): string;
+  markDetached?(sessionId: string): void;
+  isDetached?(sessionId: string): boolean;
+  clearDetached?(sessionId: string): void;
 }
 
 export interface SlotRouterOptions {
@@ -144,7 +153,8 @@ export class SlotRouter {
       sessionId,
       workspace,
     });
-    await this.options.control.loadTranscript(sessionId);
+    this.options.topics?.clearDetached?.(sessionId);
+    await this.options.control.loadTranscript(sessionId).catch(() => undefined);
   }
 
   /**
@@ -282,27 +292,7 @@ export class SlotRouter {
   }
 
   private isTopLevelSession(session: DaemonSessionSummary): boolean {
-    if (session.isSubagent) return false;
-    if (session.parentPath || session.parentId) return false;
-    if (session.kind === "subagent") return false;
-    const record = session as unknown as Record<string, unknown>;
-    if (record.spawner) return false;
-    if (record.parent_path || record.parent_id) return false;
-    if (session.path) {
-      const normalized = session.path.replace(/\\/g, "/");
-      const filename = normalized.split("/").at(-1) ?? "";
-      if (!/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.-]+Z_[a-f0-9-]+\.jsonl$/i.test(filename)) {
-        return false;
-      }
-      const parentDir = normalized.split("/").slice(-2, -1)[0] ?? "";
-      if (/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.-]+Z_[a-f0-9-]+$/i.test(parentDir)) {
-        return false;
-      }
-    }
-    if (/^(sub[-_]|agent[-_]|worker[-_])/i.test(session.id) || (session.title && /^subagent/i.test(session.title))) {
-      return false;
-    }
-    return true;
+    return isTopLevelSession(session);
   }
 
   private async listAllSessions(): Promise<DaemonSessionSummary[]> {
@@ -342,6 +332,10 @@ export class SlotRouter {
       const topics = this.options.topics;
       if (topics && !target.topicId) return "ℹ️ <b>Run /detach inside the topic you want to close.</b>";
       const shouldClose = argument.trim().toLowerCase() === "close";
+      const bound = this.boundSession(target);
+      if (bound && topics?.markDetached) {
+        topics.markDetached(bound);
+      }
       const removed = this.options.store.deleteRoute(this.slotId, target.chatId, target.topicId);
       if (topics) {
         if (shouldClose) {
@@ -391,9 +385,14 @@ export class SlotRouter {
         labeled.push({ session, folderName: base, displayName });
       }
       this.options.store.putSessionListing(this.slotId, target.chatId, target.topicId, labeled.map(item => item.session.id));
-      const lines = labeled.map((item, index) =>
-        `${index + 1}. <b>${escapeHtml(item.displayName)}</b> <code>${escapeHtml(this.workspace(item.session))}</code>`
-      );
+      const lines = labeled.map((item, index) => {
+        const hasTopic = Boolean(
+          this.options.topics &&
+          this.options.store.routesForSession(item.session.id).some(r => r.slotId === this.slotId && r.topicId !== "")
+        );
+        const pin = hasTopic ? "📌 " : "";
+        return `${index + 1}. ${pin}<b>${escapeHtml(item.displayName)}</b> <code>${escapeHtml(this.workspace(item.session))}</code>`;
+      });
       lines.push("/attach <n> or /attach <folder>");
       return lines.join("\n");
     }
@@ -512,4 +511,32 @@ export class SlotRouter {
       }
     }
   }
+}
+export function isTopLevelSession(session: DaemonSessionSummary): boolean {
+  if (session.isSubagent) return false;
+  if (session.parentPath || session.parentId) return false;
+  if (session.kind === "subagent") return false;
+  const record = session as unknown as Record<string, unknown>;
+  if (record.spawner) return false;
+  if (record.parent_path || record.parent_id) return false;
+  if (session.path) {
+    const normalized = session.path.replace(/\\/g, "/");
+    const filename = normalized.split("/").at(-1) ?? "";
+    if (!/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.-]+Z_[a-f0-9-]+\.jsonl$/i.test(filename)) {
+      return false;
+    }
+    const parentDir = normalized.split("/").slice(-2, -1)[0] ?? "";
+    if (/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.-]+Z_[a-f0-9-]+$/i.test(parentDir)) {
+      return false;
+    }
+  }
+  if (/^(sub[-_]|agent[-_]|worker[-_])/i.test(session.id) || (session.title && /^subagent/i.test(session.title))) {
+    return false;
+  }
+  return true;
+}
+
+export function getSessionWorkspace(session: { cwd?: string; workspace?: string }): string {
+  const value = session.cwd || (/^(?:[A-Za-z]:[\\/]|\/)/.test(session.workspace ?? "") ? (session.workspace ?? "") : "");
+  return value.replace(/\\/g, "/").replace(/\/+$/, "");
 }

@@ -15,6 +15,7 @@
  *    ends. Turn output arrives later, unsolicited, on the same connection.
  */
 
+import * as child_process from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -127,6 +128,9 @@ export function resolveGuiHostEndpoint(...agentDirs: string[]): string | null {
     const socketPath = path.join(agentDir, "gui-host.sock");
     if (fs.existsSync(socketPath)) return `unix:${socketPath}`;
   }
+  if (agentDirs.length === 0) {
+    return "tcp:127.0.0.1:7699";
+  }
   return null;
 }
 
@@ -160,8 +164,23 @@ export class GuiHostSessionControl {
   }
 
   public async listSessions(): Promise<DaemonSessionSummary[]> {
-    const response = await this.controlPort().request("ListSessions");
-    return readSessionSummaries(response);
+    if (!this.options.endpoint) {
+      throw new SessionControlUnavailableError(
+        "No Veyyon GUI host endpoint was discovered. Start one with `veyyon gui tcp:127.0.0.1:7699`, " +
+          `or set VEYYON_GUI_HOST_ENDPOINT. Searched: ${guiHostAgentDirs()
+            .map(dir => path.join(dir, "gui-host.endpoint"))
+            .join(", ")}`,
+      );
+    }
+    const running = discoverRunningInteractiveSessions(this.options.configRoot);
+    try {
+      const response = await this.controlPort().request("ListSessions");
+      const wire = readSessionSummaries(response);
+      return mergeSessions(wire, running);
+    } catch (error) {
+      if (running.length > 0) return running;
+      throw error;
+    }
   }
 
   public discoverDiskSessions(): DaemonSessionSummary[] {
@@ -461,4 +480,259 @@ export function assistantTexts(value: unknown): TranscriptText[] {
     if (parts.length > 0) texts.push({ entryId: entry.id, text: parts.join("\n\n") });
   }
   return texts;
+}
+
+const MAX_PROCESS_ID = 0x7fffffff;
+
+export function isProcessAlive(pid: number): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 0 || pid > MAX_PROCESS_ID) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+export function getRunningVeyyonPids(): Set<number> | null {
+  if (process.platform === "win32") {
+    try {
+      const out = child_process.execFileSync("tasklist", ["/NH", "/FO", "CSV", "/FI", "IMAGENAME eq veyyon.exe"], {
+        encoding: "utf8",
+        windowsHide: true,
+      });
+      const pids = new Set<number>();
+      for (const line of out.split("\n")) {
+        const match = /^"([^"]+)","(\d+)"/.exec(line.trim());
+        if (match) pids.add(Number.parseInt(match[2], 10));
+      }
+      return pids;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+export function getDefaultSessionDirName(cwd: string): string {
+  const resolved = path.resolve(cwd);
+  const home = os.homedir();
+  const tempRoot = os.tmpdir();
+  const homeRelative = path.relative(home, resolved);
+  const tempRelative = path.relative(tempRoot, resolved);
+  if (homeRelative === "" || (!homeRelative.startsWith("..") && !path.isAbsolute(homeRelative))) {
+    const enc = homeRelative.split(/[/\\]+/).filter(Boolean).join("-");
+    return enc ? `-${enc}` : "-";
+  }
+  if (tempRelative === "" || (!tempRelative.startsWith("..") && !path.isAbsolute(tempRelative))) {
+    const enc = tempRelative.split(/[/\\]+/).filter(Boolean).join("-");
+    return enc ? `-tmp-${enc}` : "-tmp";
+  }
+  const enc = resolved.replace(/^[/\\]/, "").split(/[/\\]+/).filter(Boolean).join("-");
+  return `--${enc}--`;
+}
+
+export function discoverRunningInteractiveSessions(configRoot?: string): DaemonSessionSummary[] {
+  const summaries: DaemonSessionSummary[] = [];
+  const root = configRoot ?? path.join(os.homedir(), process.env.VEYYON_CONFIG_DIR?.trim() || ".veyyon");
+  const profilesRoot = path.join(root, "profiles");
+  const preferred = process.env.VEYYON_PROFILE?.trim() || "default";
+
+  const profileNames = [preferred];
+  try {
+    if (fs.existsSync(profilesRoot)) {
+      for (const entry of fs.readdirSync(profilesRoot, { withFileTypes: true })) {
+        if (entry.isDirectory() && entry.name !== preferred) {
+          profileNames.push(entry.name);
+        }
+      }
+    }
+  } catch {}
+
+  const veyyonPids = configRoot ? null : getRunningVeyyonPids();
+  const seenPids = new Set<number>();
+  const seenSessionIds = new Set<string>();
+  // Collect all live clients grouped by sessionDir
+  interface LiveClient {
+    pid: number;
+    projectDir: string;
+    clientId?: string;
+  }
+  const clientsBySessionDir = new Map<string, LiveClient[]>();
+
+  for (const profile of profileNames) {
+    const daemonsDir = path.join(profilesRoot, profile, "run", "daemons");
+    const sessionsRoot = path.join(profilesRoot, profile, "agent", "sessions");
+    if (!fs.existsSync(daemonsDir)) continue;
+
+    try {
+      const projectDirs = fs.readdirSync(daemonsDir, { withFileTypes: true });
+      for (const pDir of projectDirs) {
+        if (!pDir.isDirectory()) continue;
+        const clientsDir = path.join(daemonsDir, pDir.name, "clients");
+        if (!fs.existsSync(clientsDir)) continue;
+
+        try {
+          const clientFiles = fs.readdirSync(clientsDir);
+          for (const cFile of clientFiles) {
+            if (!cFile.endsWith(".json")) continue;
+            const fullClientPath = path.join(clientsDir, cFile);
+            let clientData: { id?: string; pid?: number; projectDir?: string; cwd?: string } | null = null;
+            try {
+              clientData = JSON.parse(fs.readFileSync(fullClientPath, "utf8"));
+            } catch {
+              continue;
+            }
+            if (!clientData || typeof clientData.pid !== "number") continue;
+
+            const pid = clientData.pid;
+            if (seenPids.has(pid)) continue;
+            const isAlive = veyyonPids ? veyyonPids.has(pid) : isProcessAlive(pid);
+            if (!isAlive) continue;
+            seenPids.add(pid);
+
+            const projectDir = clientData.projectDir || clientData.cwd;
+            if (!projectDir || typeof projectDir !== "string") continue;
+
+            const sessionDirName = getDefaultSessionDirName(projectDir);
+            const sessionDir = path.join(sessionsRoot, sessionDirName);
+            const list = clientsBySessionDir.get(sessionDir) ?? [];
+            list.push({
+              pid,
+              projectDir,
+              clientId: clientData.id && clientData.id.length > 8 ? clientData.id : undefined,
+            });
+            clientsBySessionDir.set(sessionDir, list);
+          }
+        } catch {}
+      }
+    } catch {}
+  }
+
+  // For each sessionDir, assign distinct top-level session files to clients
+  for (const [, clients] of clientsBySessionDir.entries()) {
+    const candidateFiles: Array<{ id: string; title: string | null; path: string; mtime: number }> = [];
+    const firstProjectDir = clients[0]?.projectDir;
+    if (!firstProjectDir) continue;
+    const sessionDirName = getDefaultSessionDirName(firstProjectDir);
+    const sessionsRoot = path.join(profilesRoot, preferred, "agent", "sessions");
+    const sessionDir = path.join(sessionsRoot, sessionDirName);
+
+    if (fs.existsSync(sessionDir)) {
+      try {
+        const jsonlFiles = fs.readdirSync(sessionDir)
+          .filter(f => f.endsWith(".jsonl"))
+          .map(f => {
+            try {
+              const stat = fs.statSync(path.join(sessionDir, f));
+              return { name: f, mtime: stat.mtimeMs };
+            } catch {
+              return { name: f, mtime: 0 };
+            }
+          })
+          .sort((a, b) => b.mtime - a.mtime);
+
+        for (const file of jsonlFiles) {
+          const sessionPath = path.join(sessionDir, file.name);
+          const match = /_([^_]+)\.jsonl$/.exec(file.name);
+          let fileId = match ? match[1] : file.name.slice(0, -6);
+          let fileTitle: string | null = null;
+          let isSubagent = false;
+
+          try {
+            const fd = fs.openSync(sessionPath, "r");
+            const buf = Buffer.alloc(4096);
+            fs.readSync(fd, buf, 0, 4096, 0);
+            fs.closeSync(fd);
+            const lines = buf.toString("utf8").split("\n").filter(Boolean).slice(0, 10);
+            for (const line of lines) {
+              try {
+                const parsed = JSON.parse(line);
+                if (parsed.type === "title" && typeof parsed.title === "string") {
+                  fileTitle = parsed.title;
+                } else if (parsed.type === "session") {
+                  if (typeof parsed.id === "string") {
+                    fileId = parsed.id;
+                  }
+                  if (typeof parsed.title === "string" && !fileTitle) {
+                    fileTitle = parsed.title;
+                  }
+                  if (parsed.parentSession || parsed.parentSessionPath || parsed.isSubagent) {
+                    isSubagent = true;
+                  }
+                }
+              } catch {}
+            }
+          } catch {}
+
+          // Skip subagent session files so they never mask top-level interactive sessions
+          if (isSubagent) continue;
+
+          candidateFiles.push({
+            id: fileId,
+            title: fileTitle,
+            path: sessionPath,
+            mtime: file.mtime,
+          });
+        }
+      } catch {}
+    }
+
+    // Assign distinct candidates to each client
+    for (let i = 0; i < clients.length; i++) {
+      const client = clients[i];
+      let sessionId: string;
+      let sessionTitle: string | null;
+      let sessionPath: string | undefined;
+      let modifiedAtMs: number;
+
+      if (i < candidateFiles.length) {
+        const candidate = candidateFiles[i];
+        sessionId = candidate.id;
+        sessionTitle = candidate.title;
+        sessionPath = candidate.path;
+        modifiedAtMs = candidate.mtime;
+      } else {
+        sessionId = client.clientId ?? `live-${client.pid}`;
+        sessionTitle = null;
+        sessionPath = undefined;
+        modifiedAtMs = Date.now();
+      }
+
+      // If this sessionId was already claimed, make unique using PID
+      if (seenSessionIds.has(sessionId)) {
+        sessionId = `${sessionId}-${client.pid}`;
+      }
+      seenSessionIds.add(sessionId);
+
+      summaries.push({
+        id: sessionId,
+        cwd: client.projectDir,
+        workspace: client.projectDir,
+        title: sessionTitle || path.basename(client.projectDir),
+        status: "Running",
+        modifiedAtMs,
+        path: sessionPath,
+        parentPath: null,
+        parentId: null,
+        isSubagent: false,
+        kind: "interactive" as const,
+      });
+    }
+  }
+
+  return summaries;
+}
+
+function mergeSessions(wire: DaemonSessionSummary[], running: DaemonSessionSummary[]): DaemonSessionSummary[] {
+  const result = [...running];
+  for (const w of wire) {
+    const isLive = w.status === "Running" || w.status === "Active";
+    if (isLive || running.length === 0) {
+      if (!result.some(r => r.id === w.id)) {
+        result.push(w);
+      }
+    }
+  }
+  return result;
 }

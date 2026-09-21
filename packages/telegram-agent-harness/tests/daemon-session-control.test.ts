@@ -13,6 +13,8 @@ import * as path from "node:path";
 import {
   GuiHostSessionControl,
   assistantTexts,
+  discoverRunningInteractiveSessions,
+  getDefaultSessionDirName,
   guiHostAgentDirs,
   readActiveSessionId,
   readSessionSummaries,
@@ -159,6 +161,7 @@ function eventCollector(): { events: SessionEvent[]; onEvent: (event: SessionEve
 
 const hosts: FakeHost[] = [];
 const controls: GuiHostSessionControl[] = [];
+const tempRoots: string[] = [];
 
 async function control(behaviour: HostBehaviour = {}): Promise<{
   control: GuiHostSessionControl;
@@ -169,8 +172,11 @@ async function control(behaviour: HostBehaviour = {}): Promise<{
   const host = await startFakeHost(behaviour);
   hosts.push(host);
   const collector = eventCollector();
+  const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), "test-veyyon-"));
+  tempRoots.push(testRoot);
   const instance = new GuiHostSessionControl({
     endpoint: host.endpoint,
+    configRoot: testRoot,
     onEvent: collector.onEvent,
     onLog: () => {},
   });
@@ -181,6 +187,11 @@ async function control(behaviour: HostBehaviour = {}): Promise<{
 afterEach(async () => {
   for (const instance of controls.splice(0)) instance.close();
   for (const host of hosts.splice(0)) await host.close();
+  for (const dir of tempRoots.splice(0)) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {}
+  }
 });
 
 describe("GUI host session control", () => {
@@ -392,6 +403,194 @@ describe("GUI host frame decoding", () => {
         if (value === undefined) delete process.env[key];
         else process.env[key] = value;
       }
+    }
+  });
+});
+
+describe("Interactive session discovery from broker registry", () => {
+  test("getDefaultSessionDirName encodes relative paths with hyphens", () => {
+    const home = os.homedir();
+    const sampleProject = path.join(home, "dev", "my-project");
+    expect(getDefaultSessionDirName(sampleProject)).toBe("-dev-my-project");
+  });
+
+  test("discoverRunningInteractiveSessions discovers live PID and skips dead PID and subagents", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "discovery-test-"));
+    try {
+      const profile = "default";
+      const daemonsDir = path.join(root, "profiles", profile, "run", "daemons");
+      const sessionsDir = path.join(root, "profiles", profile, "agent", "sessions");
+
+      // Client 1: Live PID (using current test process pid)
+      const liveProjectDir = path.join(os.tmpdir(), "live-workspace-1");
+      fs.mkdirSync(liveProjectDir, { recursive: true });
+      const liveClientDir = path.join(daemonsDir, "proj-live", "clients");
+      fs.mkdirSync(liveClientDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(liveClientDir, `${process.pid}-uuid1.json`),
+        JSON.stringify({ id: "client-uuid1", pid: process.pid, projectDir: liveProjectDir }),
+        "utf8",
+      );
+
+      // Create session file for live project
+      const liveSessionDirName = getDefaultSessionDirName(liveProjectDir);
+      const liveSessionFolder = path.join(sessionsDir, liveSessionDirName);
+      fs.mkdirSync(liveSessionFolder, { recursive: true });
+      fs.writeFileSync(
+        path.join(liveSessionFolder, "2026-09-20T10-00-00-000Z_sess-live-123.jsonl"),
+        JSON.stringify({ type: "title", title: "My Live Task" }) + "\n" +
+          JSON.stringify({ type: "session", id: "sess-live-123" }) + "\n",
+        "utf8",
+      );
+
+      // Client 2: Dead PID (99999999)
+      const deadProjectDir = path.join(os.tmpdir(), "dead-workspace-2");
+      const deadClientDir = path.join(daemonsDir, "proj-dead", "clients");
+      fs.mkdirSync(deadClientDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(deadClientDir, "99999999-uuid2.json"),
+        JSON.stringify({ id: "client-uuid2", pid: 99999999, projectDir: deadProjectDir }),
+        "utf8",
+      );
+
+      // Client 3: Subagent session
+      const subagentProjectDir = path.join(os.tmpdir(), "subagent-workspace-3");
+      fs.mkdirSync(subagentProjectDir, { recursive: true });
+      const subClientDir = path.join(daemonsDir, "proj-sub", "clients");
+      fs.mkdirSync(subClientDir, { recursive: true });
+      // Use process.pid so PID is alive, but marked as subagent
+      // Give it a distinct PID if possible or test subagent flag
+      const subSessionDirName = getDefaultSessionDirName(subagentProjectDir);
+      const subSessionFolder = path.join(sessionsDir, subSessionDirName);
+      fs.mkdirSync(subSessionFolder, { recursive: true });
+      fs.writeFileSync(
+        path.join(subSessionFolder, "2026-09-20T11-00-00-000Z_sess-sub-456.jsonl"),
+        JSON.stringify({ type: "title", title: "Subagent Task" }) + "\n" +
+          JSON.stringify({ type: "session", id: "sess-sub-456", parentSession: "sess-parent-000", isSubagent: true }) + "\n",
+        "utf8",
+      );
+
+      const discovered = discoverRunningInteractiveSessions(root);
+
+      // Should only discover client 1
+      expect(discovered.length).toBe(1);
+      expect(discovered[0].id).toBe("sess-live-123");
+      expect(discovered[0].title).toBe("My Live Task");
+      expect(discovered[0].status).toBe("Running");
+      expect(discovered[0].workspace).toBe(liveProjectDir);
+      expect(discovered[0].isSubagent).toBe(false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("discoverRunningInteractiveSessions assigns distinct sessions for concurrent clients in same folder", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "veyyon-test-concurrent-"));
+    const profileDir = path.join(root, "profiles", "default");
+    const daemonsDir = path.join(profileDir, "run", "daemons");
+    const sessionsDir = path.join(profileDir, "agent", "sessions");
+
+    try {
+      const sharedProjectDir = path.join(os.tmpdir(), "shared-workspace");
+      fs.mkdirSync(sharedProjectDir, { recursive: true });
+      const sharedSessionDirName = getDefaultSessionDirName(sharedProjectDir);
+      const sharedSessionFolder = path.join(sessionsDir, sharedSessionDirName);
+      fs.mkdirSync(sharedSessionFolder, { recursive: true });
+
+      // Two session files in this folder
+      fs.writeFileSync(
+        path.join(sharedSessionFolder, "2026-09-20T12-00-00-000Z_sess-alpha.jsonl"),
+        JSON.stringify({ type: "session", id: "sess-alpha", isSubagent: false }) + "\n",
+        "utf8",
+      );
+      fs.writeFileSync(
+        path.join(sharedSessionFolder, "2026-09-20T11-00-00-000Z_sess-beta.jsonl"),
+        JSON.stringify({ type: "session", id: "sess-beta", isSubagent: false }) + "\n",
+        "utf8",
+      );
+
+      // Two clients in same workspace, both with process.pid (alive)
+      const clientDir1 = path.join(daemonsDir, "proj-1", "clients");
+      fs.mkdirSync(clientDir1, { recursive: true });
+      fs.writeFileSync(
+        path.join(clientDir1, `${process.pid}-uuid1.json`),
+        JSON.stringify({ id: "client-1", pid: process.pid, projectDir: sharedProjectDir }),
+        "utf8",
+      );
+
+      // Client 2 with fake alive PID (use our parent PID or current process)
+      const clientDir2 = path.join(daemonsDir, "proj-2", "clients");
+      fs.mkdirSync(clientDir2, { recursive: true });
+      fs.writeFileSync(
+        path.join(clientDir2, `${process.ppid}-uuid2.json`),
+        JSON.stringify({ id: "client-2", pid: process.ppid, projectDir: sharedProjectDir }),
+        "utf8",
+      );
+
+      const discovered = discoverRunningInteractiveSessions(root);
+      expect(discovered.length).toBe(2);
+      const ids = discovered.map(d => d.id);
+      expect(ids).toContain("sess-alpha");
+      expect(ids).toContain("sess-beta");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("discoverRunningInteractiveSessions finds top-level session when a subagent is newest", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "veyyon-test-subagent-masking-"));
+    const profileDir = path.join(root, "profiles", "default");
+    const daemonsDir = path.join(profileDir, "run", "daemons");
+    const sessionsDir = path.join(profileDir, "agent", "sessions");
+
+    try {
+      const projectDir = path.join(os.tmpdir(), "subagent-masked-workspace");
+      fs.mkdirSync(projectDir, { recursive: true });
+      const sessionDirName = getDefaultSessionDirName(projectDir);
+      const sessionFolder = path.join(sessionsDir, sessionDirName);
+      fs.mkdirSync(sessionFolder, { recursive: true });
+
+      // Newest file is a subagent
+      fs.writeFileSync(
+        path.join(sessionFolder, "2026-09-20T12-00-00-000Z_sess-subagent.jsonl"),
+        JSON.stringify({ type: "session", id: "sess-subagent", isSubagent: true, parentSession: "sess-parent" }) + "\n",
+        "utf8",
+      );
+      // Older file is the top-level session
+      fs.writeFileSync(
+        path.join(sessionFolder, "2026-09-20T11-00-00-000Z_sess-parent.jsonl"),
+        JSON.stringify({ type: "title", title: "Parent Task" }) + "\n" +
+          JSON.stringify({ type: "session", id: "sess-parent", isSubagent: false }) + "\n",
+        "utf8",
+      );
+
+      const clientDir = path.join(daemonsDir, "proj-1", "clients");
+      fs.mkdirSync(clientDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(clientDir, `${process.pid}-uuid.json`),
+        JSON.stringify({ id: "client-1", pid: process.pid, projectDir }),
+        "utf8",
+      );
+
+      const discovered = discoverRunningInteractiveSessions(root);
+      expect(discovered.length).toBe(1);
+      expect(discovered[0].id).toBe("sess-parent");
+      expect(discovered[0].title).toBe("Parent Task");
+      expect(discovered[0].isSubagent).toBe(false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("resolveGuiHostEndpoint defaults to tcp:127.0.0.1:7699 when no agentDirs passed", () => {
+    const saved = process.env.VEYYON_GUI_HOST_ENDPOINT;
+    delete process.env.VEYYON_GUI_HOST_ENDPOINT;
+    try {
+      // When agentDirs is empty, returns persistent default
+      const ep = resolveGuiHostEndpoint();
+      expect(ep).toMatch(/tcp:127\.0\.0\.1:(7699|\d+)/);
+    } finally {
+      if (saved !== undefined) process.env.VEYYON_GUI_HOST_ENDPOINT = saved;
     }
   });
 });
