@@ -1391,6 +1391,12 @@ const SWEEP_CASES: SweepCase[] = [
   { id: "O20", label: "cat gh-hosts-example.yml allowed", want: "allow", tool: "bash", input: { command: "cat ./docs/gh-hosts-example.yml" } },
   { id: "O21", label: "cat gitignore allowed", want: "allow", tool: "bash", input: { command: "cat ~/.gitignore" } },
   { id: "O22", label: "cat package.json allowed", want: "allow", tool: "bash", input: { command: "cat ./package.json" } },
+  { id: "O23", label: "cat token.ts allowed", want: "allow", tool: "bash", input: { command: "cat packages/app/src/token.ts" } },
+  { id: "O24", label: "read token.ts allowed", want: "allow", tool: "read", input: { path: "packages/app/src/token.ts" } },
+  { id: "O25", label: "cat auth-token.ts allowed", want: "allow", tool: "bash", input: { command: "cat packages/app/src/auth-token.ts" } },
+  { id: "O26", label: "read auth-token.ts allowed", want: "allow", tool: "read", input: { path: "packages/app/src/auth-token.ts" } },
+  { id: "O27", label: "cat access-token.md allowed", want: "allow", tool: "bash", input: { command: "cat docs/access-token.md" } },
+  { id: "O28", label: "read access-token.md allowed", want: "allow", tool: "read", input: { path: "docs/access-token.md" } },
 ];
 
 describe("Issue #97: Table-driven audit of guard-eval.ts and guard.ts", () => {
