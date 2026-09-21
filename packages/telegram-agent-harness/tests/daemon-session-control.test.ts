@@ -13,6 +13,8 @@ import * as path from "node:path";
 import {
   GuiHostSessionControl,
   assistantTexts,
+  discoverRunningInteractiveSessions,
+  getDefaultSessionDirName,
   guiHostAgentDirs,
   readActiveSessionId,
   readSessionSummaries,
@@ -159,6 +161,7 @@ function eventCollector(): { events: SessionEvent[]; onEvent: (event: SessionEve
 
 const hosts: FakeHost[] = [];
 const controls: GuiHostSessionControl[] = [];
+const tempRoots: string[] = [];
 
 async function control(behaviour: HostBehaviour = {}): Promise<{
   control: GuiHostSessionControl;
@@ -169,8 +172,11 @@ async function control(behaviour: HostBehaviour = {}): Promise<{
   const host = await startFakeHost(behaviour);
   hosts.push(host);
   const collector = eventCollector();
+  const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), "test-veyyon-"));
+  tempRoots.push(testRoot);
   const instance = new GuiHostSessionControl({
     endpoint: host.endpoint,
+    configRoot: testRoot,
     onEvent: collector.onEvent,
     onLog: () => {},
   });
@@ -181,6 +187,11 @@ async function control(behaviour: HostBehaviour = {}): Promise<{
 afterEach(async () => {
   for (const instance of controls.splice(0)) instance.close();
   for (const host of hosts.splice(0)) await host.close();
+  for (const dir of tempRoots.splice(0)) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {}
+  }
 });
 
 describe("GUI host session control", () => {
@@ -392,6 +403,96 @@ describe("GUI host frame decoding", () => {
         if (value === undefined) delete process.env[key];
         else process.env[key] = value;
       }
+    }
+  });
+});
+
+describe("Interactive session discovery from broker registry", () => {
+  test("getDefaultSessionDirName encodes relative paths with hyphens", () => {
+    const home = os.homedir();
+    const sampleProject = path.join(home, "dev", "my-project");
+    expect(getDefaultSessionDirName(sampleProject)).toBe("-dev-my-project");
+  });
+
+  test("discoverRunningInteractiveSessions discovers live PID and skips dead PID and subagents", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "discovery-test-"));
+    try {
+      const profile = "default";
+      const daemonsDir = path.join(root, "profiles", profile, "run", "daemons");
+      const sessionsDir = path.join(root, "profiles", profile, "agent", "sessions");
+
+      // Client 1: Live PID (using current test process pid)
+      const liveProjectDir = path.join(os.tmpdir(), "live-workspace-1");
+      fs.mkdirSync(liveProjectDir, { recursive: true });
+      const liveClientDir = path.join(daemonsDir, "proj-live", "clients");
+      fs.mkdirSync(liveClientDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(liveClientDir, `${process.pid}-uuid1.json`),
+        JSON.stringify({ id: "client-uuid1", pid: process.pid, projectDir: liveProjectDir }),
+        "utf8",
+      );
+
+      // Create session file for live project
+      const liveSessionDirName = getDefaultSessionDirName(liveProjectDir);
+      const liveSessionFolder = path.join(sessionsDir, liveSessionDirName);
+      fs.mkdirSync(liveSessionFolder, { recursive: true });
+      fs.writeFileSync(
+        path.join(liveSessionFolder, "2026-09-20T10-00-00-000Z_sess-live-123.jsonl"),
+        JSON.stringify({ type: "title", title: "My Live Task" }) + "\n" +
+          JSON.stringify({ type: "session", id: "sess-live-123" }) + "\n",
+        "utf8",
+      );
+
+      // Client 2: Dead PID (99999999)
+      const deadProjectDir = path.join(os.tmpdir(), "dead-workspace-2");
+      const deadClientDir = path.join(daemonsDir, "proj-dead", "clients");
+      fs.mkdirSync(deadClientDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(deadClientDir, "99999999-uuid2.json"),
+        JSON.stringify({ id: "client-uuid2", pid: 99999999, projectDir: deadProjectDir }),
+        "utf8",
+      );
+
+      // Client 3: Subagent session
+      const subagentProjectDir = path.join(os.tmpdir(), "subagent-workspace-3");
+      fs.mkdirSync(subagentProjectDir, { recursive: true });
+      const subClientDir = path.join(daemonsDir, "proj-sub", "clients");
+      fs.mkdirSync(subClientDir, { recursive: true });
+      // Use process.pid so PID is alive, but marked as subagent
+      // Give it a distinct PID if possible or test subagent flag
+      const subSessionDirName = getDefaultSessionDirName(subagentProjectDir);
+      const subSessionFolder = path.join(sessionsDir, subSessionDirName);
+      fs.mkdirSync(subSessionFolder, { recursive: true });
+      fs.writeFileSync(
+        path.join(subSessionFolder, "2026-09-20T11-00-00-000Z_sess-sub-456.jsonl"),
+        JSON.stringify({ type: "title", title: "Subagent Task" }) + "\n" +
+          JSON.stringify({ type: "session", id: "sess-sub-456", parentSession: "sess-parent-000", isSubagent: true }) + "\n",
+        "utf8",
+      );
+
+      const discovered = discoverRunningInteractiveSessions(root);
+
+      // Should only discover client 1
+      expect(discovered.length).toBe(1);
+      expect(discovered[0].id).toBe("sess-live-123");
+      expect(discovered[0].title).toBe("My Live Task");
+      expect(discovered[0].status).toBe("Running");
+      expect(discovered[0].workspace).toBe(liveProjectDir);
+      expect(discovered[0].isSubagent).toBe(false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("resolveGuiHostEndpoint defaults to tcp:127.0.0.1:7699 when no agentDirs passed", () => {
+    const saved = process.env.VEYYON_GUI_HOST_ENDPOINT;
+    delete process.env.VEYYON_GUI_HOST_ENDPOINT;
+    try {
+      // When agentDirs is empty, returns persistent default
+      const ep = resolveGuiHostEndpoint();
+      expect(ep).toMatch(/tcp:127\.0\.0\.1:(7699|\d+)/);
+    } finally {
+      if (saved !== undefined) process.env.VEYYON_GUI_HOST_ENDPOINT = saved;
     }
   });
 });

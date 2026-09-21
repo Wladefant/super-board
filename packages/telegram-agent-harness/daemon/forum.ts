@@ -256,6 +256,10 @@ export class ForumManager implements TopicLifecycle {
       const isDead = !liveSessionIds || !liveSessionIds.has(route.sessionId);
       if (!isDead) return false;
       return workspaceFolder(route.workspace).toLowerCase() === folderTarget;
+    }) ?? candidateRoutes.find(route => {
+      const isDead = !liveSessionIds || !liveSessionIds.has(route.sessionId);
+      if (!isDead) return false;
+      return workspaceFolder(route.workspace).toLowerCase().replace(/[-_]/g, "") === folderTarget.replace(/[-_]/g, "");
     });
 
     if (deadWorkspaceRoute) {
@@ -465,9 +469,15 @@ export class ForumManager implements TopicLifecycle {
       }
 
       // Check if a dead route exists for the same normalized workspace folder
-      const deadIndex = availableDeadRoutes.findIndex(r => normalizeWorkspace(r.workspace).toLowerCase() === normWs) !== -1
-        ? availableDeadRoutes.findIndex(r => normalizeWorkspace(r.workspace).toLowerCase() === normWs)
-        : availableDeadRoutes.findIndex(r => workspaceFolder(r.workspace).toLowerCase() === folderKey);
+      let deadIndex = availableDeadRoutes.findIndex(r => normalizeWorkspace(r.workspace).toLowerCase() === normWs);
+      if (deadIndex === -1) {
+        deadIndex = availableDeadRoutes.findIndex(r => workspaceFolder(r.workspace).toLowerCase() === folderKey);
+      }
+      if (deadIndex === -1) {
+        deadIndex = availableDeadRoutes.findIndex(
+          r => workspaceFolder(r.workspace).toLowerCase().replace(/[-_]/g, "") === folderKey.replace(/[-_]/g, ""),
+        );
+      }
 
       if (deadIndex >= 0) {
         const deadRoute = availableDeadRoutes.splice(deadIndex, 1)[0];
