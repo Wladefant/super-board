@@ -102,6 +102,15 @@ The live user's instructions in the active session override this file, standing 
   - Feature and bug PRs must remain strictly confined to their problem domain. Block unrelated scope expansion.
   - Operational, infrastructure, or migration files (`.env.defaults.*`, `docker-compose.*`, `alembic/`, `scripts/env_sync*`) must only be included in a PR when they are authorized, necessary, and strictly coherent with the stated scope (e.g. an authorized database migration or configuration update required by an accompanying application feature).
   - Opportunistic bundling of unrelated environment or infrastructure modifications into application PRs is strictly prohibited.
+- **Engineering & Implementation Principles (Harvested Standards):**
+  - **Simplicity First:** Choose the simplest implementation that fully meets the current requirements. Avoid speculative abstractions, configuration, and indirection.
+  - **Layered Growth:** Grow the system in layers. Start from the smallest version that works end to end, and add each new capability on top of a product that already works. Never trade a working product for unfinished complexity.
+  - **Modular Architecture:** Keep components modular and concerns clearly separated.
+  - **Prefer Established Libraries:** Prefer established, well-maintained libraries when they reduce overall complexity or improve reliability. Do not reimplement common functionality without a clear reason.
+  - **Leverage Project Dependencies:** Lean on the dependencies already in the project before writing a custom implementation or adding packages. Do not assume a library lacks a capability without checking its documentation and types.
+  - **Long-Term Architecture:** Make architectural decisions for the long term. Do not accept a stopgap that only works for now and is meant to be replaced later.
+  - **Research Proven Patterns:** Study how established products solve the problem before designing a solution. Adopt their proven patterns and conventions rather than inventing an approach from scratch.
+  - **Clean Cutover with Forward/Backward Compatibility Balance:** Remove obsolete application code paths cleanly (no leftover dead shims or aliases) when migrating callers; do not confuse clean application cutovers with schema/DDL migrations, which must strictly maintain forward- and backward-compatibility (§10).
 
 ---
 
