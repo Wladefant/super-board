@@ -45,6 +45,9 @@ export interface TopicLifecycle {
   ): Promise<number>;
   closeTopic(messageThreadId: number): Promise<boolean>;
   listTopicsText(currentTopicId: string): string;
+  markDetached?(sessionId: string): void;
+  isDetached?(sessionId: string): boolean;
+  clearDetached?(sessionId: string): void;
 }
 
 export interface SlotRouterOptions {
@@ -150,7 +153,8 @@ export class SlotRouter {
       sessionId,
       workspace,
     });
-    await this.options.control.loadTranscript(sessionId);
+    this.options.topics?.clearDetached?.(sessionId);
+    await this.options.control.loadTranscript(sessionId).catch(() => undefined);
   }
 
   /**
@@ -328,6 +332,10 @@ export class SlotRouter {
       const topics = this.options.topics;
       if (topics && !target.topicId) return "ℹ️ <b>Run /detach inside the topic you want to close.</b>";
       const shouldClose = argument.trim().toLowerCase() === "close";
+      const bound = this.boundSession(target);
+      if (bound && topics?.markDetached) {
+        topics.markDetached(bound);
+      }
       const removed = this.options.store.deleteRoute(this.slotId, target.chatId, target.topicId);
       if (topics) {
         if (shouldClose) {

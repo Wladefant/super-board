@@ -103,6 +103,10 @@ export class TelegramDaemon {
   private readonly control: GuiHostSessionControl;
   private readonly fallbackManager: GuiHostFallbackManager;
   private readonly active: ActiveSlot[] = [];
+
+  public getActiveSlot(slotId: string): ActiveSlot | undefined {
+    return this.active.find(entry => entry.slot.slotId === slotId);
+  }
   private readonly startedAt = Date.now();
   /** Last logged skip reason per slot, so a retry loop does not repeat itself. */
   private readonly skipReasons = new Map<string, string>();

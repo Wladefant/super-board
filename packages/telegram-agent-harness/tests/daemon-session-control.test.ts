@@ -484,6 +484,104 @@ describe("Interactive session discovery from broker registry", () => {
     }
   });
 
+  test("discoverRunningInteractiveSessions assigns distinct sessions for concurrent clients in same folder", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "veyyon-test-concurrent-"));
+    const profileDir = path.join(root, "profiles", "default");
+    const daemonsDir = path.join(profileDir, "run", "daemons");
+    const sessionsDir = path.join(profileDir, "agent", "sessions");
+
+    try {
+      const sharedProjectDir = path.join(os.tmpdir(), "shared-workspace");
+      fs.mkdirSync(sharedProjectDir, { recursive: true });
+      const sharedSessionDirName = getDefaultSessionDirName(sharedProjectDir);
+      const sharedSessionFolder = path.join(sessionsDir, sharedSessionDirName);
+      fs.mkdirSync(sharedSessionFolder, { recursive: true });
+
+      // Two session files in this folder
+      fs.writeFileSync(
+        path.join(sharedSessionFolder, "2026-09-20T12-00-00-000Z_sess-alpha.jsonl"),
+        JSON.stringify({ type: "session", id: "sess-alpha", isSubagent: false }) + "\n",
+        "utf8",
+      );
+      fs.writeFileSync(
+        path.join(sharedSessionFolder, "2026-09-20T11-00-00-000Z_sess-beta.jsonl"),
+        JSON.stringify({ type: "session", id: "sess-beta", isSubagent: false }) + "\n",
+        "utf8",
+      );
+
+      // Two clients in same workspace, both with process.pid (alive)
+      const clientDir1 = path.join(daemonsDir, "proj-1", "clients");
+      fs.mkdirSync(clientDir1, { recursive: true });
+      fs.writeFileSync(
+        path.join(clientDir1, `${process.pid}-uuid1.json`),
+        JSON.stringify({ id: "client-1", pid: process.pid, projectDir: sharedProjectDir }),
+        "utf8",
+      );
+
+      // Client 2 with fake alive PID (use our parent PID or current process)
+      const clientDir2 = path.join(daemonsDir, "proj-2", "clients");
+      fs.mkdirSync(clientDir2, { recursive: true });
+      fs.writeFileSync(
+        path.join(clientDir2, `${process.ppid}-uuid2.json`),
+        JSON.stringify({ id: "client-2", pid: process.ppid, projectDir: sharedProjectDir }),
+        "utf8",
+      );
+
+      const discovered = discoverRunningInteractiveSessions(root);
+      expect(discovered.length).toBe(2);
+      const ids = discovered.map(d => d.id);
+      expect(ids).toContain("sess-alpha");
+      expect(ids).toContain("sess-beta");
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("discoverRunningInteractiveSessions finds top-level session when a subagent is newest", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "veyyon-test-subagent-masking-"));
+    const profileDir = path.join(root, "profiles", "default");
+    const daemonsDir = path.join(profileDir, "run", "daemons");
+    const sessionsDir = path.join(profileDir, "agent", "sessions");
+
+    try {
+      const projectDir = path.join(os.tmpdir(), "subagent-masked-workspace");
+      fs.mkdirSync(projectDir, { recursive: true });
+      const sessionDirName = getDefaultSessionDirName(projectDir);
+      const sessionFolder = path.join(sessionsDir, sessionDirName);
+      fs.mkdirSync(sessionFolder, { recursive: true });
+
+      // Newest file is a subagent
+      fs.writeFileSync(
+        path.join(sessionFolder, "2026-09-20T12-00-00-000Z_sess-subagent.jsonl"),
+        JSON.stringify({ type: "session", id: "sess-subagent", isSubagent: true, parentSession: "sess-parent" }) + "\n",
+        "utf8",
+      );
+      // Older file is the top-level session
+      fs.writeFileSync(
+        path.join(sessionFolder, "2026-09-20T11-00-00-000Z_sess-parent.jsonl"),
+        JSON.stringify({ type: "title", title: "Parent Task" }) + "\n" +
+          JSON.stringify({ type: "session", id: "sess-parent", isSubagent: false }) + "\n",
+        "utf8",
+      );
+
+      const clientDir = path.join(daemonsDir, "proj-1", "clients");
+      fs.mkdirSync(clientDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(clientDir, `${process.pid}-uuid.json`),
+        JSON.stringify({ id: "client-1", pid: process.pid, projectDir }),
+        "utf8",
+      );
+
+      const discovered = discoverRunningInteractiveSessions(root);
+      expect(discovered.length).toBe(1);
+      expect(discovered[0].id).toBe("sess-parent");
+      expect(discovered[0].title).toBe("Parent Task");
+      expect(discovered[0].isSubagent).toBe(false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("resolveGuiHostEndpoint defaults to tcp:127.0.0.1:7699 when no agentDirs passed", () => {
     const saved = process.env.VEYYON_GUI_HOST_ENDPOINT;
     delete process.env.VEYYON_GUI_HOST_ENDPOINT;

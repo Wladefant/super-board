@@ -200,7 +200,19 @@ export class ForumManager implements TopicLifecycle {
   public readonly options: ForumManagerOptions;
   public readonly client: ForumApiClient;
   private readonly workspaceBackoffs = new Map<string, { until: number; delayMs: number }>();
+  private readonly detachedSessions = new Set<string>();
 
+  public markDetached(sessionId: string): void {
+    this.detachedSessions.add(sessionId);
+  }
+
+  public isDetached(sessionId: string): boolean {
+    return this.detachedSessions.has(sessionId);
+  }
+
+  public clearDetached(sessionId: string): void {
+    this.detachedSessions.delete(sessionId);
+  }
   constructor(options: ForumManagerOptions) {
     this.options = options;
     this.client =
@@ -234,6 +246,7 @@ export class ForumManager implements TopicLifecycle {
     ordinal?: number,
     liveSessionIds?: Set<string>,
   ): Promise<number> {
+    this.clearDetached(sessionId);
     const existing = this.options.store
       .routesForSession(sessionId)
       .find(route => route.slotId === this.slotId && route.chatId === this.forumChatId && route.topicId !== "");
@@ -452,6 +465,19 @@ export class ForumManager implements TopicLifecycle {
       const folder = workspaceFolder(ws);
       const folderKey = folder.toLowerCase();
       const normWs = normalizeWorkspace(ws).toLowerCase();
+
+      // Session was explicitly detached — skip auto-attach until explicitly re-attached
+      if (this.isDetached(session.id)) {
+        actions.push({
+          action: "skip",
+          sessionId: session.id,
+          workspace: ws,
+          folder,
+          reason: "explicitly detached",
+        });
+        skippedCount++;
+        continue;
+      }
 
       // Session already has a route on this forum
       const existingRoute = routesBySessionId.get(session.id);

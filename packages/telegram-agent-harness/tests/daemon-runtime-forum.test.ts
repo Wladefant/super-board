@@ -33,7 +33,9 @@ describe("TelegramDaemon forum auto-attach runtime", () => {
   });
 
   afterEach(() => {
-    fs.rmSync(tempDir, { recursive: true, force: true });
+    try {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    } catch {}
   });
 
   function createManifest(autoAttach = true, intervalMs = 60_000) {
@@ -183,6 +185,44 @@ describe("TelegramDaemon forum auto-attach runtime", () => {
     const topic = [...forumClient.topics.values()][0];
     expect(topic.name).toBe("recovered");
     expect(fake.loaded).toContain("recovered-sess");
+
+    await daemon.stop();
+  });
+  test("explicitly detached session is skipped by auto-attach reconciliation", async () => {
+    createManifest(true);
+
+    const fake = fakeControl([
+      {
+        id: "sess-detached",
+        cwd: "C:/dev/detached",
+        workspace: "C:/dev/detached",
+        title: null,
+        status: "Idle",
+        modifiedAtMs: Date.now(),
+      },
+    ]);
+    const forumClient = new FakeForumApiClient();
+
+    const daemon = new TelegramDaemon({
+      manifestPath,
+      poolDbPath: path.join(tempDir, "pool.db"),
+      daemonDbPath: path.join(tempDir, "daemon.db"),
+      channelsDir: path.join(tempDir, "channels"),
+      controlFactory: () => fake.control,
+      forumClientFactory: () => forumClient,
+      pollerFactory: () => dummyPoller(),
+      log: () => {},
+    });
+
+    await daemon.start();
+    expect(forumClient.topics.size).toBe(1);
+    const slot = daemon.getActiveSlot("slot-runtime-forum");
+    expect(slot).toBeDefined();
+    slot?.forumManager?.markDetached("sess-detached");
+    slot?.forumManager?.options.store.deleteRoute("slot-runtime-forum", FORUM_CHAT_ID, "1");
+
+    await daemon.reconcileAllAutoAttach();
+    expect(slot?.forumManager?.options.store.getRoute("slot-runtime-forum", FORUM_CHAT_ID, "1")).toBeNull();
 
     await daemon.stop();
   });

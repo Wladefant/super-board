@@ -552,6 +552,13 @@ export function discoverRunningInteractiveSessions(configRoot?: string): DaemonS
   const veyyonPids = configRoot ? null : getRunningVeyyonPids();
   const seenPids = new Set<number>();
   const seenSessionIds = new Set<string>();
+  // Collect all live clients grouped by sessionDir
+  interface LiveClient {
+    pid: number;
+    projectDir: string;
+    clientId?: string;
+  }
+  const clientsBySessionDir = new Map<string, LiveClient[]>();
 
   for (const profile of profileNames) {
     const daemonsDir = path.join(profilesRoot, profile, "run", "daemons");
@@ -589,84 +596,129 @@ export function discoverRunningInteractiveSessions(configRoot?: string): DaemonS
 
             const sessionDirName = getDefaultSessionDirName(projectDir);
             const sessionDir = path.join(sessionsRoot, sessionDirName);
-            let sessionId = clientData.id && clientData.id.length > 8 ? clientData.id : null;
-            let sessionTitle: string | null = null;
-            let sessionPath: string | undefined = undefined;
-            let modifiedAtMs: number = Date.now();
-            let isSubagent = false;
-            if (fs.existsSync(sessionDir)) {
-              try {
-                const jsonlFiles = fs.readdirSync(sessionDir)
-                  .filter(f => f.endsWith(".jsonl"))
-                  .map(f => {
-                    try {
-                      const stat = fs.statSync(path.join(sessionDir, f));
-                      return { name: f, mtime: stat.mtimeMs };
-                    } catch {
-                      return { name: f, mtime: 0 };
-                    }
-                  })
-                  .sort((a, b) => b.mtime - a.mtime);
-
-                if (jsonlFiles.length > 0) {
-                  const latest = jsonlFiles[0];
-                  const match = /_([^_]+)\.jsonl$/.exec(latest.name);
-                  if (match) sessionId = match[1];
-                  else if (!sessionId) sessionId = latest.name.slice(0, -6);
-                  sessionPath = path.join(sessionDir, latest.name);
-                  modifiedAtMs = latest.mtime;
-
-                  try {
-                    const fd = fs.openSync(sessionPath, "r");
-                    const buf = Buffer.alloc(4096);
-                    fs.readSync(fd, buf, 0, 4096, 0);
-                    fs.closeSync(fd);
-                    const lines = buf.toString("utf8").split("\n").filter(Boolean).slice(0, 10);
-                    for (const line of lines) {
-                      try {
-                        const parsed = JSON.parse(line);
-                        if (parsed.type === "title" && typeof parsed.title === "string") {
-                          sessionTitle = parsed.title;
-                        } else if (parsed.type === "session") {
-                          if (typeof parsed.id === "string") {
-                            sessionId = parsed.id;
-                          }
-                          if (typeof parsed.title === "string" && !sessionTitle) {
-                            sessionTitle = parsed.title;
-                          }
-                          if (parsed.parentSession || parsed.parentSessionPath || parsed.isSubagent) {
-                            isSubagent = true;
-                          }
-                        }
-                      } catch {}
-                    }
-                  } catch {}
-                }
-              } catch {}
-            }
-
-            if (isSubagent) continue;
-            if (!sessionId) sessionId = `live-${pid}`;
-            if (seenSessionIds.has(sessionId)) continue;
-            seenSessionIds.add(sessionId);
-
-            summaries.push({
-              id: sessionId,
-              cwd: projectDir,
-              workspace: projectDir,
-              title: sessionTitle || path.basename(projectDir),
-              status: "Running",
-              modifiedAtMs,
-              path: sessionPath,
-              parentPath: null,
-              parentId: null,
-              isSubagent: false,
-              kind: "interactive" as const,
+            const list = clientsBySessionDir.get(sessionDir) ?? [];
+            list.push({
+              pid,
+              projectDir,
+              clientId: clientData.id && clientData.id.length > 8 ? clientData.id : undefined,
             });
+            clientsBySessionDir.set(sessionDir, list);
           }
         } catch {}
       }
     } catch {}
+  }
+
+  // For each sessionDir, assign distinct top-level session files to clients
+  for (const [, clients] of clientsBySessionDir.entries()) {
+    const candidateFiles: Array<{ id: string; title: string | null; path: string; mtime: number }> = [];
+    const firstProjectDir = clients[0]?.projectDir;
+    if (!firstProjectDir) continue;
+    const sessionDirName = getDefaultSessionDirName(firstProjectDir);
+    const sessionsRoot = path.join(profilesRoot, preferred, "agent", "sessions");
+    const sessionDir = path.join(sessionsRoot, sessionDirName);
+
+    if (fs.existsSync(sessionDir)) {
+      try {
+        const jsonlFiles = fs.readdirSync(sessionDir)
+          .filter(f => f.endsWith(".jsonl"))
+          .map(f => {
+            try {
+              const stat = fs.statSync(path.join(sessionDir, f));
+              return { name: f, mtime: stat.mtimeMs };
+            } catch {
+              return { name: f, mtime: 0 };
+            }
+          })
+          .sort((a, b) => b.mtime - a.mtime);
+
+        for (const file of jsonlFiles) {
+          const sessionPath = path.join(sessionDir, file.name);
+          const match = /_([^_]+)\.jsonl$/.exec(file.name);
+          let fileId = match ? match[1] : file.name.slice(0, -6);
+          let fileTitle: string | null = null;
+          let isSubagent = false;
+
+          try {
+            const fd = fs.openSync(sessionPath, "r");
+            const buf = Buffer.alloc(4096);
+            fs.readSync(fd, buf, 0, 4096, 0);
+            fs.closeSync(fd);
+            const lines = buf.toString("utf8").split("\n").filter(Boolean).slice(0, 10);
+            for (const line of lines) {
+              try {
+                const parsed = JSON.parse(line);
+                if (parsed.type === "title" && typeof parsed.title === "string") {
+                  fileTitle = parsed.title;
+                } else if (parsed.type === "session") {
+                  if (typeof parsed.id === "string") {
+                    fileId = parsed.id;
+                  }
+                  if (typeof parsed.title === "string" && !fileTitle) {
+                    fileTitle = parsed.title;
+                  }
+                  if (parsed.parentSession || parsed.parentSessionPath || parsed.isSubagent) {
+                    isSubagent = true;
+                  }
+                }
+              } catch {}
+            }
+          } catch {}
+
+          // Skip subagent session files so they never mask top-level interactive sessions
+          if (isSubagent) continue;
+
+          candidateFiles.push({
+            id: fileId,
+            title: fileTitle,
+            path: sessionPath,
+            mtime: file.mtime,
+          });
+        }
+      } catch {}
+    }
+
+    // Assign distinct candidates to each client
+    for (let i = 0; i < clients.length; i++) {
+      const client = clients[i];
+      let sessionId: string;
+      let sessionTitle: string | null;
+      let sessionPath: string | undefined;
+      let modifiedAtMs: number;
+
+      if (i < candidateFiles.length) {
+        const candidate = candidateFiles[i];
+        sessionId = candidate.id;
+        sessionTitle = candidate.title;
+        sessionPath = candidate.path;
+        modifiedAtMs = candidate.mtime;
+      } else {
+        sessionId = client.clientId ?? `live-${client.pid}`;
+        sessionTitle = null;
+        sessionPath = undefined;
+        modifiedAtMs = Date.now();
+      }
+
+      // If this sessionId was already claimed, make unique using PID
+      if (seenSessionIds.has(sessionId)) {
+        sessionId = `${sessionId}-${client.pid}`;
+      }
+      seenSessionIds.add(sessionId);
+
+      summaries.push({
+        id: sessionId,
+        cwd: client.projectDir,
+        workspace: client.projectDir,
+        title: sessionTitle || path.basename(client.projectDir),
+        status: "Running",
+        modifiedAtMs,
+        path: sessionPath,
+        parentPath: null,
+        parentId: null,
+        isSubagent: false,
+        kind: "interactive" as const,
+      });
+    }
   }
 
   return summaries;

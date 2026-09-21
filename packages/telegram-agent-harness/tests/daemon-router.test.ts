@@ -96,15 +96,18 @@ function summary(id: string, cwd: string, title: string | null = null): DaemonSe
 interface FakeTopics extends TopicLifecycle {
   opened: { sessionId: string; workspace: string }[];
   closed: number[];
+  detached: Set<string>;
 }
 
 function fakeTopics(): FakeTopics {
   const opened: { sessionId: string; workspace: string }[] = [];
   const closed: number[] = [];
+  const detached = new Set<string>();
   const threads = new Map<string, number>();
   return {
     opened,
     closed,
+    detached,
     ensureTopic: async (sessionId: string, workspace: string) => {
       const existing = threads.get(sessionId);
       if (existing !== undefined) return existing;
@@ -118,6 +121,9 @@ function fakeTopics(): FakeTopics {
       return true;
     },
     listTopicsText: (currentTopicId: string) => `topics@${currentTopicId}`,
+    markDetached: (sessionId: string) => { detached.add(sessionId); },
+    isDetached: (sessionId: string) => detached.has(sessionId),
+    clearDetached: (sessionId: string) => { detached.delete(sessionId); },
   };
 }
 
@@ -349,6 +355,32 @@ describe("forum topic routing", () => {
     expect(router.boundSession(TOPIC_9)).toBeNull();
     expect(sent.at(-1)?.html).toContain("Topic #9 detached and closed");
   });
+  test("bind handles loadTranscript rejection gracefully (e.g. >32MB transcript)", async () => {
+    const fake = fakeControl([summary("sess-huge", "C:/dev/demo")]);
+    // Override loadTranscript to reject as if transcript exceeds 32MB buffer
+    fake.control.loadTranscript = async () => {
+      throw new Error("Payload too large (>32MB)");
+    };
+    const router = buildRouter({}, fake.control, fakeTopics());
+    // bind should not throw
+    await expect(router.bind(TOPIC_9, "sess-huge", "C:/dev/demo")).resolves.toBeUndefined();
+    expect(router.boundSession(TOPIC_9)).toBe("sess-huge");
+  });
+
+  test("/detach marks session as detached on TopicLifecycle and /attach clears it", async () => {
+    const fake = fakeControl([summary("sess-a", "C:/dev/a")]);
+    const topics = fakeTopics();
+    const router = buildRouter({}, fake.control, topics);
+    await router.bind(TOPIC_9, "sess-a", "C:/dev/a");
+    expect(topics.detached.has("sess-a")).toBe(false);
+
+    await router.handleCommand("/detach", TOPIC_9);
+    expect(topics.detached.has("sess-a")).toBe(true);
+
+    await router.handleCommand("/attach sess-a", TOPIC_9);
+    expect(topics.detached.has("sess-a")).toBe(false);
+  });
+
 
   test("/where names the topic a message came from", async () => {
     const fake = fakeControl([summary("sess-a", "C:/dev/a")]);
