@@ -52,6 +52,32 @@ follow, and both used to be wrong:
     carries a negation. A match inside a fenced code block is NEVER prose: a
     command cannot be excused by the paragraph above it.
 
+`scan_retired_status` is the sibling gate, and it had the identical defect for
+the identical reason: eleven allowlist entries existed only to stop it flagging
+the module that refuses the retired status and every document that records the
+retirement, and none of them exists on an installed tree. Its hits are values
+rather than prose, so neither rule above transplants. The distinction it needs
+is definition versus use:
+
+  * *The registry is excluded intrinsically*, by the same package-relative-path
+    plus own-declaration test — `super_board_runtime/lifecycle.py` carrying
+    `RETIRED_STATUSES`. It is a sibling in this package, so the installer
+    carries it to `.claude/bin/` beside the scanner. A file that merely occupies
+    that path is still scanned. The scanner reads its pattern from that module
+    rather than restating the literal, so there is one authority for what is
+    retired.
+  * *A status assignment is a use and nothing excuses it.* `status = "Skipped"`,
+    `{"status": "Skipped"}`, `--status skipped` — the value bound to a status
+    field. This is the counterpart of "a fenced code block is never prose": the
+    resurrection itself cannot be talked out of. The one exception is a binding
+    whose NAME says retired, because `RETIRED_STATUSES = ("Skipped",)` is a
+    declaration list, which is the definition and not a use.
+  * *Everything else is a mention unless the passage is about the status field
+    and does not call the value retired.* The bare word is ordinary English —
+    "Skipped after an operator typed", a QA cell marked Skipped, a sync report
+    reading `else 'Skipped'` — and those ship inside the payload, where no
+    allowlist could ever have reached them.
+
 `merge-scan-allowlist.txt` survives for the repository-only surfaces that
 neither rule reaches — the seeded fixtures, the contract tests that must name
 the patterns, the release notes. It is a supplement, not the mechanism. Never a
@@ -73,12 +99,14 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 try:  # normal package import
     from . import EXIT_CONFIG
     from .config import NormalizedConfig
+    from .lifecycle import LIFECYCLE_STATUSES, RETIRED_STATUSES
 except ImportError:  # executed as a plain file path
     import sys
 
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from super_board_runtime import EXIT_CONFIG
     from super_board_runtime.config import NormalizedConfig
+    from super_board_runtime.lifecycle import LIFECYCLE_STATUSES, RETIRED_STATUSES
 
 #: The explicit exclusion list. A FILE, deliberately — see the module docstring.
 ALLOWLIST_FILENAME = "merge-scan-allowlist.txt"
@@ -146,7 +174,48 @@ _SCANNED_SUFFIXES: frozenset[str] = frozenset(
 
 _ALWAYS_SKIPPED_DIRS: frozenset[str] = frozenset({".git", "node_modules", "__pycache__", ".venv"})
 
-_RETIRED_STATUS_RE = re.compile(r"\bSkipped\b")
+#: The retired statuses, read from the module that DECLARES them rather than
+#: restated here. That declaration is the definition; every other appearance is
+#: a mention or a use, which is the whole distinction below.
+_RETIRED_ALTERNATION = "|".join(re.escape(status) for status in RETIRED_STATUSES)
+
+_RETIRED_STATUS_RE = re.compile(rf"\b(?:{_RETIRED_ALTERNATION})\b")
+
+#: The retired value BOUND to a status: `status = "Skipped"`,
+#: `{"status": "Skipped"}`, `--status skipped`. This is the resurrection the
+#: gate exists to catch, so — exactly as a match inside a fenced code block is
+#: never prose for `scan_merge_prohibitions` — nothing around it can excuse it.
+#: Case-insensitive because `canonicalize_status` folds case: `"skipped"` is
+#: the same resurrection wearing a lowercase hat.
+_STATUS_ASSIGNMENT_RE = re.compile(
+    rf"""(?:status|state|column)\w*["'`]?\s*(?:=>|[:=]=?)\s*["'`]*\s*"""
+    rf"""(?:{_RETIRED_ALTERNATION})\b"""
+    rf"""|--status[=\s]+["'`]?(?:{_RETIRED_ALTERNATION})\b""",
+    re.IGNORECASE,
+)
+
+#: Words that make a passage about the board's Status field. Without one of
+#: these the bare token is ordinary English — "Skipped after an operator typed",
+#: a QA cell marked Skipped, a sync report reading `else 'Skipped'` — and
+#: flagging those is what no allowlist can fix on an installed tree, because
+#: those files ship inside the payload.
+_STATUS_CONTEXT_RE = re.compile(r"status(?:es)?\b|state(?:s)?\b|column(?:s)?\b|lifecycle", re.I)
+
+#: A sibling of the retired value in the canonical list is status context too:
+#: "moving a card to Blocked or Skipped" names no field and is still a status
+#: instruction. Case-sensitive — `done`, `ready` and `review` are common words.
+_CANONICAL_STATUS_RE = re.compile(rf"\b(?:{'|'.join(LIFECYCLE_STATUSES)})\b")
+
+#: A binding whose NAME says the value is retired. `RETIRED_STATUSES = (...)` is
+#: a declaration list, not a use — the distinction the negation classifier
+#: cannot make, because a declaration is code and carries no prose to negate.
+_RETIRED_BINDING_RE = re.compile(r"(?:RETIRED|LEGACY|DEPRECATED)[A-Za-z_]*\s*(?::[^=\n]*)?=")
+
+#: Retirement vocabulary. `_PROHIBITION_RE` covers "is not a status" and "is
+#: refused"; this covers the other half of how a retirement is written.
+_RETIREMENT_RE = re.compile(
+    r"retire\w*|deprecat\w*|\blegacy\b|\bremoved?\b|\bno longer\b|\bused to\b", re.I
+)
 
 #: Suffixes whose whole body is prose unless it is fenced.
 _PROSE_DOCUMENT_SUFFIXES: frozenset[str] = frozenset({".md"})
@@ -185,10 +254,35 @@ _SELF_MODULE_PATH: tuple[str, ...] = tuple(Path(__file__).resolve().parts[-2:])
 #: has to be there too.
 _SELF_DEFINITION = "def scan_merge_prohibitions("
 
+#: The module that DECLARES the retired statuses, identified the same way and
+#: for the same reason. It is the authority `scan_retired_status` reads its own
+#: pattern from, it has to name every retired status in order to refuse one,
+#: and it is a sibling in this package — so the installer carries it to
+#: `.claude/bin/super_board_runtime/lifecycle.py` alongside the scanner and the
+#: exclusion travels with the code instead of beside it.
+_REGISTRY_MODULE_PATH: tuple[str, ...] = (_SELF_MODULE_PATH[0], "lifecycle.py")
+_REGISTRY_DEFINITION = "RETIRED_STATUSES"
+
+
+def _is_module_source(
+    path: Path, text: str, *, module_path: Sequence[str], definition: str
+) -> bool:
+    """True when this file IS that module — wherever it has been installed."""
+    return tuple(Path(path).parts[-2:]) == tuple(module_path) and definition in text
+
 
 def _is_scanner_source(path: Path, text: str) -> bool:
     """True when this file IS this module — wherever it has been installed."""
-    return tuple(Path(path).parts[-2:]) == _SELF_MODULE_PATH and _SELF_DEFINITION in text
+    return _is_module_source(
+        path, text, module_path=_SELF_MODULE_PATH, definition=_SELF_DEFINITION
+    )
+
+
+def _is_retired_status_registry(path: Path, text: str) -> bool:
+    """True when this file IS the module that declares the retired statuses."""
+    return _is_module_source(
+        path, text, module_path=_REGISTRY_MODULE_PATH, definition=_REGISTRY_DEFINITION
+    )
 
 
 def _fenced_flags(lines: Sequence[str], *, prose_document: bool) -> tuple[bool, ...]:
@@ -251,6 +345,32 @@ def _is_prohibition_statement(
     if fenced[index]:
         return False
     return bool(_PROHIBITION_RE.search(_statement_scope(lines, index, fenced)))
+
+
+def _is_status_context(scope: str) -> bool:
+    """True when this passage is about the board's Status field at all."""
+    return bool(_STATUS_CONTEXT_RE.search(scope) or _CANONICAL_STATUS_RE.search(scope))
+
+
+def _is_retirement_mention(lines: Sequence[str], index: int, fenced: Sequence[bool]) -> bool:
+    """True when this line NAMES the value as retired rather than using it.
+
+    Two shapes, because a retirement is written two ways. In code it is a
+    declaration — a binding whose name says the values in it are retired, of
+    which `RETIRED_STATUSES = ("Skipped",)` is the one that matters. In prose
+    it is an assertion, and that is `_PROHIBITION_RE` ("is not a status", "is
+    refused") widened by the retirement vocabulary the merge gate never needed.
+
+    Unlike `_is_prohibition_statement` this reads a fenced or uncommented line
+    too: the retired status is a VALUE, so it appears in docstrings, error
+    messages and assertions, none of which are prose lines. What keeps that
+    from becoming an excuse for a real resurrection is that the caller settles
+    `_STATUS_ASSIGNMENT_RE` first and never reaches here for one.
+    """
+    scope = _statement_scope(lines, index, fenced)
+    return bool(_RETIRED_BINDING_RE.search(scope) or _RETIREMENT_RE.search(scope)) or bool(
+        _PROHIBITION_RE.search(scope)
+    )
 
 
 class MergeContractError(ValueError):
@@ -369,7 +489,26 @@ def scan_merge_prohibitions(
 def scan_retired_status(
     root: Path, *, allowlist: Optional[Sequence[str]] = None
 ) -> MergeScanReport:
-    """`Skipped` is not a lifecycle status; it must be absent from active surfaces."""
+    """A retired status must be absent from every active surface — as a USE.
+
+    Naming a retired value is not resurrecting it. The registry has to declare
+    it, the module that refuses it has to name it in the refusal, the document
+    that records the retirement has to print it, and a test has to feed it in
+    to prove the refusal bites. What the gate is looking for is the opposite:
+    the value being written to a status, offered in a status list, or handed to
+    a worker as somewhere to move a card.
+
+    The distinction is made three ways, in this order:
+
+      1. The registry module is excluded whole, by package-relative path plus
+         its own declaration, the same intrinsic test that excludes the scanner
+         from `scan_merge_prohibitions`. It travels into `.claude/bin/` with the
+         code; a file that merely occupies that path is still scanned.
+      2. A status ASSIGNMENT is an occurrence unconditionally. Nothing excuses
+         it, exactly as no paragraph excuses a command inside a code fence.
+      3. Anything else is an occurrence only where the passage is about the
+         status field AND does not name the value as retired.
+    """
     root = Path(root)
     entries = load_allowlist(root) if allowlist is None else tuple(allowlist)
     occurrences: list[MergeOccurrence] = []
@@ -378,12 +517,30 @@ def scan_retired_status(
         if relative == ALLOWLIST_FILENAME or _allowlisted(relative, entries):
             continue
         try:
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            body = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
+        if _is_retired_status_registry(path, body) or _is_scanner_source(path, body):
+            continue
+        lines = body.splitlines()
+        fenced = _fenced_flags(
+            lines, prose_document=path.suffix.lower() in _PROSE_DOCUMENT_SUFFIXES
+        )
         for number, text in enumerate(lines, start=1):
-            if _RETIRED_STATUS_RE.search(text):
+            # A binding whose NAME says retired is the declaration list, which
+            # is the definition and not a use — the one thing that can look
+            # like an assignment and be exempt from it.
+            if _STATUS_ASSIGNMENT_RE.search(text) and not _RETIRED_BINDING_RE.search(text):
                 occurrences.append(MergeOccurrence(relative, number, "retired-status-skipped"))
+                continue
+            if not _RETIRED_STATUS_RE.search(text):
+                continue
+            index = number - 1
+            if not _is_status_context(_statement_scope(lines, index, fenced)):
+                continue
+            if _is_retirement_mention(lines, index, fenced):
+                continue
+            occurrences.append(MergeOccurrence(relative, number, "retired-status-skipped"))
     return MergeScanReport(tuple(occurrences), not occurrences)
 
 

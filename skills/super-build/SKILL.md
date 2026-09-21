@@ -272,5 +272,5 @@ Hash inputs (joined with `|`): lane (`build`) | error class | first 3 unique nor
 ### Never merge
 Builder NEVER squash-merges. Reviewer owns merge.
 
-### Block/Skip exits use the §4 mandatory template
-When moving a card to Blocked or Skipped, populate the full template from `.claude/skills/super-board/references/block-template.md`. A 1-line "needs creds" comment is a contract violation.
+### Blocked exits use the §4 mandatory template
+When moving a card to Blocked, populate the full template from `.claude/skills/super-board/references/block-template.md`. A 1-line "needs creds" comment is a contract violation.
