@@ -25,7 +25,7 @@ import { TelegramDaemon } from "../daemon/runtime";
 import {
   type DaemonSessionSummary,
   type DeliveryMode,
-  type GuiHostSessionControl,
+  type TerminalSessionControl,
 } from "../daemon/session-control";
 import { DaemonStore } from "../daemon/store";
 import { BotPoolCoordinator } from "../extension/coordinator";
@@ -68,7 +68,7 @@ export class FakeForumApiClient implements ForumApiClient {
 }
 
 interface FakeControl {
-  control: GuiHostSessionControl;
+  control: TerminalSessionControl;
   sessions: DaemonSessionSummary[];
   diskSessions: DaemonSessionSummary[];
   delivered: Array<{ sessionId: string; text: string; mode: DeliveryMode }>;
@@ -118,7 +118,7 @@ function fakeControl(initialSessions: DaemonSessionSummary[] = []): FakeControl 
     close: () => {},
   };
 
-  return { control: control as unknown as GuiHostSessionControl, sessions, diskSessions, delivered, created, loaded, busy };
+  return { control: control as unknown as TerminalSessionControl, sessions, diskSessions, delivered, created, loaded, busy };
 }
 
 const FORUM_CHAT_ID = "-1009876543210";
@@ -191,17 +191,13 @@ describe("ForumManager topic lifecycle", () => {
     expect(client.topics.size).toBe(1);
   });
 
-  test("session ends or restarts in same folder -> existing topic is reused and rebound", async () => {
+  test("different sessions in the same folder retain separate topic identities", async () => {
     const firstThread = await manager.ensureTopic("sess-1", "C:/dev/proj");
-    expect(firstThread).toBeGreaterThan(0);
-
-    // New session started in the same workspace folder rebinds the same topic
     const secondThread = await manager.ensureTopic("sess-2", "C:/dev/proj");
-    expect(secondThread).toBe(firstThread);
-
-    const route = store.getRoute("slot-forum", FORUM_CHAT_ID, String(firstThread));
-    expect(route?.sessionId).toBe("sess-2");
-    expect(client.topics.size).toBe(1);
+    expect(secondThread).not.toBe(firstThread);
+    expect(store.getRoute("slot-forum", FORUM_CHAT_ID, String(firstThread))?.sessionId).toBe("sess-1");
+    expect(store.getRoute("slot-forum", FORUM_CHAT_ID, String(secondThread))?.sessionId).toBe("sess-2");
+    expect(client.topics.size).toBe(2);
   });
 
   test("ensureTopic does not reuse another slot's topic for the same session", async () => {
@@ -293,37 +289,22 @@ describe("ForumManager topic lifecycle", () => {
     expect(welcome?.text).toContain("live-sess-1");
   });
 
-  test("auto-attach: dead session in same folder -> rebinds topic not create, posts rebind note", async () => {
-    // Pre-existing route for dead session in same folder
+  test("missing owner endpoint never authorizes reassigning its topic to another session", async () => {
     store.putRoute({
-      slotId: "slot-forum",
-      chatId: FORUM_CHAT_ID,
-      topicId: "77",
-      sessionId: "dead-sess-old",
-      workspace: "C:/dev/my-project",
+      slotId: "slot-forum", chatId: FORUM_CHAT_ID, topicId: "77",
+      sessionId: "temporarily-unavailable-owner", workspace: "C:/dev/my-project",
     });
     client.topics.set(77, { name: "my-project", closed: false });
-
-    // New live session starts in that folder
     fake.sessions.push({
-      id: "live-sess-2",
-      cwd: "C:/dev/my-project",
-      workspace: "C:/dev/my-project",
-      title: "New Session",
-      status: "Idle",
-      modifiedAtMs: Date.now(),
+      id: "live-sess-2", cwd: "C:/dev/my-project", workspace: "C:/dev/my-project",
+      title: "New Session", status: "Idle", modifiedAtMs: Date.now(),
     });
-
     const res = await manager.reconcileAutoAttach();
-    expect(res.created).toBe(0);
-    expect(res.rebound).toBe(1);
-    expect(client.topics.size).toBe(1); // Reused topic 77!
-
-    const route = store.getRoute("slot-forum", FORUM_CHAT_ID, "77");
-    expect(route?.sessionId).toBe("live-sess-2");
-
-    const rebindNote = client.sentMessages.find(m => m.messageThreadId === 77 && m.text.includes("Rebound"));
-    expect(rebindNote?.text).toContain("live-sess-2");
+    expect(res.created).toBe(1);
+    expect(res.rebound).toBe(0);
+    expect(client.topics.size).toBe(2);
+    expect(store.getRoute("slot-forum", FORUM_CHAT_ID, "77")?.sessionId).toBe("temporarily-unavailable-owner");
+    expect(client.sentMessages.some(m => m.messageThreadId === 77)).toBe(false);
     expect(fake.loaded).toContain("live-sess-2");
   });
 

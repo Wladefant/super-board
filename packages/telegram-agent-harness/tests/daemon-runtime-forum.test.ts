@@ -6,11 +6,10 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { GuiHostFallbackManager } from "../daemon/gui-host-fallback";
 import { TelegramDaemon } from "../daemon/runtime";
 import {
   type DaemonSessionSummary,
-  type GuiHostSessionControl,
+  type TerminalSessionControl,
 } from "../daemon/session-control";
 import { TelegramPoller } from "../extension/poller";
 import { FakeForumApiClient } from "./daemon-forum.test";
@@ -63,11 +62,9 @@ describe("TelegramDaemon forum auto-attach runtime", () => {
   function fakeControl(sessions: DaemonSessionSummary[] = []) {
     const liveSessions = [...sessions];
     const loaded: string[] = [];
-    const control: GuiHostSessionControl = {
-      endpoint: "tcp:127.0.0.1:7699",
+    const control = {
       isBusy: () => false,
       listSessions: async () => liveSessions,
-      discoverDiskSessions: () => [],
       findSession: async (ws: string) => liveSessions.find(s => s.workspace === ws) ?? null,
       createSession: async () => "created-id",
       ensureSession: async () => "ensured-id",
@@ -76,9 +73,8 @@ describe("TelegramDaemon forum auto-attach runtime", () => {
       loadTranscript: async (id: string) => {
         loaded.push(id);
       },
-      usage: async () => null,
       close: () => {},
-    };
+    } as unknown as TerminalSessionControl;
     return { control, liveSessions, loaded };
   }
 
@@ -130,62 +126,30 @@ describe("TelegramDaemon forum auto-attach runtime", () => {
     await daemon.stop();
   });
 
-  test("reconciles on demand and wires fallback manager recovery", async () => {
+  test("reconciles newly registered owners on demand without a GUI recovery fallback", async () => {
     createManifest(true);
-
     const fake = fakeControl();
     const forumClient = new FakeForumApiClient();
-    let hostRecoveredHandler: (() => void) | undefined;
-
     const daemon = new TelegramDaemon({
       manifestPath,
       poolDbPath: path.join(tempDir, "pool.db"),
       daemonDbPath: path.join(tempDir, "daemon.db"),
       channelsDir: path.join(tempDir, "channels"),
       controlFactory: () => fake.control,
-      fallbackManagerFactory: (control, log) => {
-        const fallback = new GuiHostFallbackManager(control, {
-          log,
-          onHostRecovered: () => {
-            if (hostRecoveredHandler) hostRecoveredHandler();
-          },
-        });
-        return fallback;
-      },
       forumClientFactory: () => forumClient,
       pollerFactory: () => dummyPoller(),
       log: () => {},
     });
-
     await daemon.start();
     expect(forumClient.topics.size).toBe(0);
-
-    // Wire trigger
-    hostRecoveredHandler = () => {
-      void daemon.reconcileAllAutoAttach();
-    };
-
-    // New session arrives
     fake.liveSessions.push({
-      id: "recovered-sess",
-      cwd: "C:/dev/recovered",
-      workspace: "C:/dev/recovered",
-      title: null,
-      status: "Idle",
-      modifiedAtMs: Date.now(),
+      id: "recovered-sess", cwd: "C:/dev/recovered", workspace: "C:/dev/recovered",
+      title: null, status: "Idle", modifiedAtMs: Date.now(),
     });
-
-    // Simulate recovery event
-    hostRecoveredHandler();
-    // Allow microtasks to settle
-    await Promise.resolve();
     await daemon.reconcileAllAutoAttach();
-
     expect(forumClient.topics.size).toBe(1);
-    const topic = [...forumClient.topics.values()][0];
-    expect(topic.name).toBe("recovered");
+    expect([...forumClient.topics.values()][0].name).toBe("recovered");
     expect(fake.loaded).toContain("recovered-sess");
-
     await daemon.stop();
   });
   test("explicitly detached session is skipped by auto-attach reconciliation", async () => {

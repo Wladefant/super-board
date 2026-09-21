@@ -32,12 +32,10 @@ import {
 } from "./config";
 import { getDaemonCommands, SlotRouter, type RouteTarget } from "./router";
 import {
-  GuiHostSessionControl,
-  resolveGuiHostEndpoint,
+  TerminalSessionControl,
   type SessionEvent,
 } from "./session-control";
 import { DaemonStore } from "./store";
-import { GuiHostFallbackManager } from "./gui-host-fallback";
 import { connectMiniApp, miniAppUrl } from "./miniapp";
 import { ForumManager, type ForumApiClient, type AutoAttachResult } from "./forum";
 
@@ -53,7 +51,7 @@ export interface DaemonSlotReport {
 export interface DaemonStatusReport {
   pid: number;
   startedAt: number;
-  endpoint: string | null;
+  transport: "terminal-ipc";
   slots: DaemonSlotReport[];
 }
 
@@ -62,8 +60,6 @@ export interface DaemonRuntimeOptions {
   manifestPath?: string;
   daemonDbPath?: string;
   channelsDir?: string;
-  /** Overrides endpoint discovery; null means "no host reachable". */
-  endpoint?: string | null;
   log?: (message: string) => void;
   /** Injected in tests so no real Bot API call or GUI host connection is made. */
   pollerFactory?: (
@@ -77,11 +73,7 @@ export interface DaemonRuntimeOptions {
   controlFactory?: (
     onEvent: (event: SessionEvent) => void,
     onLog: (message: string) => void,
-  ) => GuiHostSessionControl;
-  fallbackManagerFactory?: (
-    control: GuiHostSessionControl,
-    log: (message: string) => void,
-  ) => GuiHostFallbackManager;
+  ) => TerminalSessionControl;
   /** Injected in tests to fake Bot API calls for forum supergroup topics. */
   forumClientFactory?: (token: string, forumChatId: string) => ForumApiClient;
 }
@@ -100,8 +92,7 @@ export class TelegramDaemon {
   private readonly options: DaemonRuntimeOptions;
   private readonly coordinator: BotPoolCoordinator;
   private readonly store: DaemonStore;
-  private readonly control: GuiHostSessionControl;
-  private readonly fallbackManager: GuiHostFallbackManager;
+  private readonly control: TerminalSessionControl;
   private readonly active: ActiveSlot[] = [];
 
   public getActiveSlot(slotId: string): ActiveSlot | undefined {
@@ -116,25 +107,11 @@ export class TelegramDaemon {
     this.options = options;
     this.coordinator = new BotPoolCoordinator(options.poolDbPath, options.manifestPath, options.channelsDir);
     this.store = new DaemonStore(options.daemonDbPath);
-    const endpoint = options.endpoint !== undefined ? options.endpoint : resolveGuiHostEndpoint();
     this.control = options.controlFactory
       ? options.controlFactory(event => this.fanOut(event), message => this.log(message))
-      : new GuiHostSessionControl({
-          endpoint,
+      : new TerminalSessionControl({
           onEvent: event => this.fanOut(event),
           onLog: message => this.log(message),
-        });
-    this.fallbackManager = options.fallbackManagerFactory
-      ? options.fallbackManagerFactory(this.control, message => this.log(message))
-      : new GuiHostFallbackManager({
-          control: this.control,
-          endpoint,
-          log: message => this.log(message),
-          onHostRecovered: () => {
-            void this.reconcileAllAutoAttach().catch(err => {
-              this.log(`Auto-attach reconciliation after host recovery failed: ${err instanceof Error ? err.message : String(err)}`);
-            });
-          },
         });
   }
   /**
@@ -305,7 +282,7 @@ export class TelegramDaemon {
     const report: DaemonStatusReport = {
       pid: process.pid,
       startedAt: this.startedAt,
-      endpoint: this.control.endpoint,
+      transport: "terminal-ipc",
       slots,
     };
     this.writeStatus(report);
@@ -346,10 +323,13 @@ export class TelegramDaemon {
       // so it routes as the chat itself — same key a direct chat uses.
       topicId: forumChatId ? String(poller.getActiveThreadId() ?? "") : "",
     });
-    const sendTo = async (target: RouteTarget, text: string, parseMode?: "HTML"): Promise<void> => {
+    const sendTo = async (target: RouteTarget, text: string, parseMode?: "HTML", sessionId?: string): Promise<void> => {
       const threadId = target.topicId ? Number(target.topicId) : undefined;
       for (const chunk of chunkMessage(text)) {
-        await poller.sendTelegramMessage(target.chatId, chunk, parseMode, undefined, undefined, undefined, threadId);
+        const result = await poller.sendTelegramMessage(target.chatId, chunk, parseMode, undefined, {
+          sessionId: sessionId ?? router.boundSession(target) ?? leaseSessionId,
+        }, undefined, threadId);
+        if (!result?.ok) throw new Error("Telegram rejected the outbound message");
       }
     };
     const router = new SlotRouter({
@@ -357,10 +337,9 @@ export class TelegramDaemon {
       store: this.store,
       control: this.control,
       send: (target, html) => sendTo(target, html, "HTML"),
-      relay: (target, markdown) => sendTo(target, markdown),
+      relay: (target, markdown, sessionId) => sendTo(target, markdown, undefined, sessionId),
       log: message => this.log(message),
       topics: forumManager,
-      fallbackManager: this.fallbackManager,
     });
 
     const sessionIdForChat = (): string => router.boundSession(currentTarget()) ?? leaseSessionId;
@@ -592,7 +571,7 @@ export class TelegramDaemon {
     return {
       pid: process.pid,
       startedAt: this.startedAt,
-      endpoint: this.control.endpoint,
+      transport: "terminal-ipc",
       slots: this.active.map(entry => ({
         slotId: entry.slot.slotId,
         botId: entry.slot.botId,

@@ -15,20 +15,19 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { SlotRouter, type RouteTarget } from "../daemon/router";
-import { GuiHostSessionControl, type SessionEvent } from "../daemon/session-control";
+import { TerminalSessionControl, type SessionEvent } from "../daemon/session-control";
 import { DaemonStore } from "../daemon/store";
 
 async function main() {
   console.log("=== VEYYON TWO-WAY ROUTING TERMINAL PROOF ===");
-  const endpoint = "tcp:127.0.0.1:7699";
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "veyyon-two-way-proof-"));
   const dbPath = path.join(tempDir, "daemon.db");
   const store = new DaemonStore(dbPath);
 
   let sessionEventHandler: ((event: SessionEvent) => void) | undefined;
 
-  const control = new GuiHostSessionControl({
-    endpoint,
+  const control = new TerminalSessionControl({
+    onLog: console.log,
     onEvent: (event) => {
       if (sessionEventHandler) sessionEventHandler(event);
     },

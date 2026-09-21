@@ -18,7 +18,7 @@ import {
   SessionControlUnavailableError,
   type DaemonSessionSummary,
   type DeliveryMode,
-  type GuiHostSessionControl,
+  type TerminalSessionControl,
 } from "../daemon/session-control";
 import { DaemonStore } from "../daemon/store";
 
@@ -29,7 +29,7 @@ interface Delivered {
 }
 
 interface FakeControl {
-  control: GuiHostSessionControl;
+  control: TerminalSessionControl;
   delivered: Delivered[];
   created: { workspace: string; title: string }[];
   loaded: string[];
@@ -85,7 +85,7 @@ function fakeControl(sessions: DaemonSessionSummary[] = [], options: { unavailab
     close: () => {},
   };
 
-  return { control: control as unknown as GuiHostSessionControl, delivered, created, loaded, aborted, busy };
+  return { control: control as unknown as TerminalSessionControl, delivered, created, loaded, aborted, busy };
 }
 
 function summary(id: string, cwd: string, title: string | null = null): DaemonSessionSummary {
@@ -141,7 +141,7 @@ let relayed: { target: RouteTarget; markdown: string }[];
 
 function buildRouter(
   slot: Partial<DaemonSlot>,
-  control: GuiHostSessionControl,
+  control: TerminalSessionControl,
   topics?: TopicLifecycle,
 ): SlotRouter {
   return new SlotRouter({

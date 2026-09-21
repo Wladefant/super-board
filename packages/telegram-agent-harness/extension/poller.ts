@@ -432,6 +432,8 @@ export class TelegramPoller {
     replyMarkupOrParseMode?: Record<string, unknown> | "HTML" | "Markdown",
     maybeReplyMarkup?: Record<string, unknown>,
     correlationMeta?: {
+      /** Explicit owner for asynchronous daemon relays, independent of the active inbound topic. */
+      sessionId?: string;
       requestId?: string | null;
       decisionId?: string | null;
       projectPath?: string | null;
@@ -471,7 +473,7 @@ export class TelegramPoller {
       // session arrived later, and a reply to it would be delivered into that
       // unrelated session instead of refused.
       const boundSlotId = this.correlation?.getSlotId() ?? null;
-      const boundSessionId = this.correlation?.getSessionId() ?? null;
+      const boundSessionId = correlationMeta?.sessionId ?? this.correlation?.getSessionId() ?? null;
 
       await this.paceOutbound();
       const response = await fetch(
