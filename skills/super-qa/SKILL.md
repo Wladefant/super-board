@@ -259,7 +259,7 @@ Examples:
 
 The script adds the issue to the resolved `Super Ultimate QA` project and moves it into the `Bug` column (override with `SUPER_QA_TARGET_OPTION_NAME`) so `super-build` in QA-loop mode (or a human) can pick it up immediately. The repo's standalone feature project is not touched by this flow.
 
-The `iteration-N.md` Section 3 is the per-iter audit (with `gh_issue: <N>` back-references); the GH issue is the durable tracker. The fix-commit message includes `(closes #<N>)` so the issue auto-closes on merge.
+The `iteration-N.md` Section 3 is the per-iter audit (with `gh_issue: <N>` back-references); the GH issue is the durable tracker. The fix-commit message includes `(closes #<N>)`, which auto-closes the issue only once that commit reaches the repository's default branch — on a repo whose work merges into a non-default base the keyword is inert, so close the issue explicitly with `gh issue close <N>` and evidence instead of assuming the merge did it.
 
 **Triage all loop-filed findings:**
 ```bash

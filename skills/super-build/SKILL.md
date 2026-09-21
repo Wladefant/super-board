@@ -238,7 +238,7 @@ When invoked by super-board (env `SUPER_BOARD_RUN=1` set by the runner, or invoc
 - Respect the worktree path super-board hands you (typically `.worktrees/issue-<N>-build/`). Don't create your own.
 - Respect the single branch super-board hands you (`issue-<N>-<slug>`). Don't create alternate branches.
 - Nested spawning is disabled: do not `task` / `spawn_subagent`. Announce file ownership over IRC before editing a shared file. Push early — a cancelled lane loses finished-but-unrecorded work.
-- Closing keywords (`Closes` / `Fixes` / `Resolves #N`) only when the diff satisfies every AC. Otherwise `Part of` plus the full issue URL.
+- Closing keywords (`Closes` / `Fixes` / `Resolves #N`) only when the diff satisfies every AC. Otherwise `Part of` plus the full issue URL. A keyword also fires only when the commit reaches the repository's default branch — when `config.base_branch` is not the default, it closes nothing, so close the issue explicitly against evidence rather than assuming the merge did it.
 - After a fix: name the bug class and hunt siblings before moving on. See `references/bug-hunting.md`. Attack the fix's NEW shape, not only the old hole.
 
 ### Lifecycle (Builder, first pass)

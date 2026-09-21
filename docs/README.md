@@ -42,6 +42,7 @@
 ## Runbooks
 
 - [Deploying a new app on Dokploy](https://github.com/Wladefant/super-board/blob/main/docs/runbooks/DOKPLOY-NEW-APP.md) — the deploy leg of the new-project bootstrap: pick the GitHub provider by repo owner (the personal-vs-Bavariance trap that fails silently on private repos), Cloudflare wildcard domains, the no-HEALTHCHECK constraint, and the build-type MCP quirk.
+- [Restoring the Perplexity Comet MCP](https://github.com/Wladefant/super-board/blob/main/docs/runbooks/PERPLEXITY-COMET-MCP.md) — the Comet MCP was deliberately unregistered on 2026-07-27 because `-s user` loaded its tools into every project: the preserved local installation, the build-and-register sequence, why the two scopes must never both be registered, and how to disable it again.
 
 ## Skills
 
