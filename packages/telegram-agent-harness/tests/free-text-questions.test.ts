@@ -99,6 +99,7 @@ function fixture(options: QuestionFixtureOptions = {}) {
           },
     },
     bridge,
+    { outboundPaceMs: 0 },
   );
 
   const decisionsPath = path.join(dir, "decisions.json");
@@ -382,3 +383,39 @@ test("missing onQuestionAnswer callback marks ledger update as REJECTED", async 
   expect(row?.status).toBe("REJECTED");
   expect(row?.error).toContain("Question receiver unavailable");
 }, 20_000);
+
+test("wait times out after timeoutMs and returns pending question with progress updates", async () => {
+  const f = fixture();
+  const pending = await f.service.ask({
+    question: "Test question",
+    recommendation: "opt-a",
+    options: [{ id: "opt-a", label: "OK" }],
+  });
+  const progress: number[] = [];
+  const result = await f.service.wait(pending.decision_id, undefined, 50, 200, elapsed => {
+    progress.push(elapsed);
+  });
+  expect(result).toBeDefined();
+  expect("status" in result && result.status).toBe("pending");
+  expect("decision_id" in result && result.decision_id).toBe(pending.decision_id);
+  expect(progress.length).toBeGreaterThan(0);
+}, 10_000);
+
+test("empty or whitespace-only reply is rejected as EMPTY_TEXT and never delivered to turns", async () => {
+  const f = fixture();
+  const sent = await f.poller.sendTelegramMessage("1", "Original message", undefined, undefined, {
+    laneId: "lane-1",
+    laneState: "active",
+  });
+  const msgId = sent?.result?.message_id!;
+
+  f.poller.ingestUpdates([f.reply(msgId, "   \u200b  ", 890)]);
+  await f.poller.redrivePendingUpdates();
+
+  expect(f.turns).toHaveLength(0);
+  const db = new Database(path.join(f.dir, "veyyon_bridge_state.db"), { readonly: true });
+  const row = db.query("SELECT status, error FROM update_ledger WHERE update_id = 890").get() as { status: string; error: string } | null;
+  db.close();
+  expect(row?.status).toBe("REJECTED");
+  expect(row?.error).toBe("EMPTY_TEXT");
+}, 10_000);

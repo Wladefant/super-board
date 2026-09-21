@@ -19,6 +19,19 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { GuiHostRequestError, SocketGuiHostPort, type GuiHostPort, type GuiHostResponse } from "../src/gui-host-client";
+export function isConnectionRefusedError(error: unknown): boolean {
+  if (error instanceof GuiHostRequestError) {
+    return error.code === "ECONNREFUSED" || error.message.includes("ECONNREFUSED");
+  }
+  if (error instanceof Error) {
+    return (
+      (error as NodeJS.ErrnoException).code === "ECONNREFUSED" ||
+      error.message.includes("ECONNREFUSED")
+    );
+  }
+  return false;
+}
+
 
 export interface DaemonSessionSummary {
   id: string;
@@ -27,6 +40,11 @@ export interface DaemonSessionSummary {
   title: string | null;
   status: string;
   modifiedAtMs: number | null;
+  path?: string;
+  parentPath?: string | null;
+  parentId?: string | null;
+  isSubagent?: boolean;
+  kind?: "interactive" | "subagent";
 }
 
 export interface TranscriptText {
@@ -144,6 +162,65 @@ export class GuiHostSessionControl {
   public async listSessions(): Promise<DaemonSessionSummary[]> {
     const response = await this.controlPort().request("ListSessions");
     return readSessionSummaries(response);
+  }
+
+  public discoverDiskSessions(): DaemonSessionSummary[] {
+    const summaries: DaemonSessionSummary[] = [];
+    const agentDirs = guiHostAgentDirs(this.options.configRoot);
+    for (const agentDir of agentDirs) {
+      const sessionsDir = path.join(agentDir, "sessions");
+      if (!fs.existsSync(sessionsDir)) continue;
+      try {
+        const entries = fs.readdirSync(sessionsDir, { withFileTypes: true });
+        for (const entry of entries) {
+          if (!entry.isDirectory()) continue;
+          const indexPath = path.join(sessionsDir, entry.name, ".session-list-index.json");
+          if (!fs.existsSync(indexPath)) continue;
+          try {
+            const parsed = JSON.parse(fs.readFileSync(indexPath, "utf8"));
+            const rows = Object.values(asRecord(parsed?.rows) ?? {});
+            for (const rowVal of rows) {
+              const row = asRecord(rowVal);
+              const id = typeof row?.id === "string" ? row.id : null;
+              if (!id) continue;
+              const parentPath = typeof row?.parentSessionPath === "string"
+                ? row.parentSessionPath
+                : (typeof row?.parentSession === "string" ? row.parentSession : null);
+              const isSub = Boolean(parentPath);
+              summaries.push({
+                id,
+                cwd: typeof row?.cwd === "string" ? row.cwd : "",
+                workspace: typeof row?.cwd === "string" ? row.cwd : "",
+                title: typeof row?.title === "string" ? row.title : null,
+                status: "Idle",
+                modifiedAtMs: typeof row?.mtimeMs === "number" ? row.mtimeMs : null,
+                parentPath,
+                isSubagent: isSub,
+                kind: isSub ? "subagent" : "interactive",
+              });
+            }
+          } catch {}
+        }
+      } catch {}
+    }
+    return summaries;
+  }
+
+  /** Read-only preview: unlike LoadTranscript, this never attaches or switches a session. */
+  public async lastPrompt(sessionId: string): Promise<string | null> {
+    const response = await this.controlPort().request({ PreviewSessionTranscript: { session: sessionId } });
+    for (const snapshot of snapshotSections(response)) {
+      const transcript = versionedValue(asRecord(snapshot.SessionTranscript)?.transcript);
+      if (!Array.isArray(transcript)) continue;
+      for (let index = transcript.length - 1; index >= 0; index--) {
+        const entry = asRecord(transcript[index]);
+        if (entry?.role !== "User" || !Array.isArray(entry.content)) continue;
+        const text = entry.content.map(block => asRecord(asRecord(block)?.Text)?.text)
+          .filter((text): text is string => typeof text === "string").join(" ").trim();
+        if (text) return text;
+      }
+    }
+    return null;
   }
 
   /** Session already serving `workspace`, newest first, or null. */
@@ -325,14 +402,31 @@ export function readSessionSummaries(response: GuiHostResponse): DaemonSessionSu
       const session = asRecord(entry);
       const id = typeof session?.id === "string" ? session.id : null;
       if (!id) continue;
-      summaries.push({
+      const parentPath = typeof session?.parent_path === "string"
+        ? session.parent_path
+        : (typeof session?.parentPath === "string" ? session.parentPath : null);
+      const parentId = typeof session?.parent_id === "string"
+        ? session.parent_id
+        : (typeof session?.parentId === "string" ? session.parentId : null);
+      const isSubagent = typeof session?.is_subagent === "boolean"
+        ? session.is_subagent
+        : (typeof session?.isSubagent === "boolean"
+          ? session.isSubagent
+          : (parentPath !== null || parentId !== null || session?.kind === "subagent"));
+      const summary: DaemonSessionSummary = {
         id,
         cwd: typeof session?.cwd === "string" ? session.cwd : "",
         workspace: typeof session?.workspace === "string" ? session.workspace : "",
         title: typeof session?.title === "string" ? session.title : null,
         status: typeof session?.status === "string" ? session.status : "Unknown",
         modifiedAtMs: typeof session?.modified_at_ms === "number" ? session.modified_at_ms : null,
-      });
+      };
+      if (typeof session?.path === "string") summary.path = session.path;
+      if (parentPath !== null) summary.parentPath = parentPath;
+      if (parentId !== null) summary.parentId = parentId;
+      if (isSubagent) summary.isSubagent = true;
+      if (session?.kind === "subagent") summary.kind = "subagent";
+      summaries.push(summary);
     }
     return summaries;
   }

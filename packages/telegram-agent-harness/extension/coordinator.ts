@@ -24,6 +24,7 @@ import type {
   ReplyRoutingResolution,
   DecisionCallbackRecord,
   DecisionCallbackResolution,
+  GroupAccessConfig,
 } from "./types";
 export function getDefaultPoolDbPath(): string {
   return process.env.VEYYON_POOL_DB || path.join(os.homedir(), ".veyyon", "telegram", "bot_pool.db");
@@ -33,6 +34,24 @@ export function getDefaultManifestPath(): string {
 }
 export function getDefaultChannelsDir(): string {
   return process.env.VEYYON_CHANNELS_DIR || path.join(os.homedir(), ".claude", "channels");
+}
+
+/**
+ * Group allowlist from an access.json `groups` value: keys are chat ids, and a value
+ * may narrow which operators are allowed in that one chat. Anything unparseable reads
+ * as "no group is authorized" — never as "every group is".
+ */
+function readGroupAccess(value: unknown): Record<string, GroupAccessConfig> {
+  const groups: Record<string, GroupAccessConfig> = {};
+  if (!value || typeof value !== "object" || Array.isArray(value)) return groups;
+  for (const [chatId, entry] of Object.entries(value)) {
+    const narrowed: GroupAccessConfig = {};
+    if (entry && typeof entry === "object" && "allowFrom" in entry && Array.isArray(entry.allowFrom)) {
+      narrowed.allowFrom = entry.allowFrom.map(String);
+    }
+    groups[chatId] = narrowed;
+  }
+  return groups;
 }
 /** Pid files a Claude channel poller writes; a live owner locks the channel. */
 const CLAUDE_PID_FILES = ["bot.pid", "poll.pid", "server.pid"] as const;
@@ -399,16 +418,52 @@ export class BotPoolCoordinator {
   public readAccessConfig(stateDir: string): AccessConfig {
     const accessPath = path.join(stateDir, "access.json");
     if (!fs.existsSync(accessPath)) {
-      return { dmPolicy: "allowlist", allowFrom: [] };
+      return { dmPolicy: "allowlist", allowFrom: [], groups: {} };
     }
     try {
       const raw = fs.readFileSync(accessPath, "utf8");
       const parsed = JSON.parse(raw);
       const dmPolicy = typeof parsed.dmPolicy === "string" ? parsed.dmPolicy : "allowlist";
       const allowFrom = Array.isArray(parsed.allowFrom) ? parsed.allowFrom.map(String) : [];
-      return { dmPolicy, allowFrom };
+      return { dmPolicy, allowFrom, groups: readGroupAccess(parsed.groups) };
     } catch {
-      return { dmPolicy: "allowlist", allowFrom: [] };
+      return { dmPolicy: "allowlist", allowFrom: [], groups: {} };
+    }
+  }
+
+  /**
+   * Records `chatId` as a group this slot may be driven from, leaving every other
+   * field of access.json untouched. A forum slot declares its supergroup in the
+   * manifest, and the operator reads authorization out of access.json; without this
+   * the two disagree and the visible file says no group is allowed while one is.
+   *
+   * Returns true when the file was changed.
+   */
+  public allowGroupChat(stateDir: string, chatId: string): boolean {
+    const accessPath = path.join(stateDir, "access.json");
+    let parsed: Record<string, unknown> = {};
+    if (fs.existsSync(accessPath)) {
+      try {
+        const candidate = JSON.parse(fs.readFileSync(accessPath, "utf8"));
+        if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) {
+          parsed = { ...candidate };
+        }
+      } catch {
+        // An unparseable access.json is operator state, not scratch: refuse to
+        // overwrite it rather than silently replacing the allowlist with a default.
+        return false;
+      }
+    }
+    const groups = readGroupAccess(parsed.groups);
+    if (Object.hasOwn(groups, chatId)) return false;
+    groups[chatId] = {};
+    parsed.groups = groups;
+    try {
+      fs.mkdirSync(stateDir, { recursive: true });
+      fs.writeFileSync(accessPath, `${JSON.stringify(parsed, null, 2)}\n`, "utf8");
+      return true;
+    } catch {
+      return false;
     }
   }
 
@@ -968,6 +1023,7 @@ export class BotPoolCoordinator {
           correlation.createdAt,
         ],
       );
+      this.touchHeartbeat(correlation.slotId, correlation.sessionId);
       return true;
     } catch {
       return false;
@@ -1035,6 +1091,9 @@ export class BotPoolCoordinator {
         correlation,
         detail: "Correlated message belongs to a different session than the one holding this channel.",
       };
+    }
+    if (correlation.slotId && correlation.sessionId) {
+      this.touchHeartbeat(correlation.slotId, correlation.sessionId);
     }
     return {
       decision: "deliver",
@@ -1185,6 +1244,7 @@ export class BotPoolCoordinator {
 
     const timer = setInterval(() => {
       try {
+        this.ensureDbOpen();
         const now = Date.now() / 1000;
         this.db.run(
           "UPDATE bot_leases SET heartbeat_at = ? WHERE slot_id = ? AND session_id = ? AND lease_status = 'ACTIVE'",
@@ -1198,6 +1258,17 @@ export class BotPoolCoordinator {
     }
 
     this.activeHeartbeatTimers.set(slotId, timer);
+  }
+
+  public touchHeartbeat(slotId: string, sessionId: string): void {
+    try {
+      this.ensureDbOpen();
+      const now = Date.now() / 1000;
+      this.db.run(
+        "UPDATE bot_leases SET heartbeat_at = ? WHERE slot_id = ? AND session_id = ? AND lease_status = 'ACTIVE'",
+        [now, slotId, sessionId],
+      );
+    } catch {}
   }
 
   private stopHeartbeat(slotId: string): void {

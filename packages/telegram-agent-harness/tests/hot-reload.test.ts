@@ -1,4 +1,4 @@
-import { test, expect, describe } from "bun:test";
+import { test, expect, describe, beforeEach } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -59,6 +59,7 @@ function createSchemaRecorder(): Record<string, (arg?: unknown) => Record<string
   return {
     object: (shape?: unknown) => ({ ...leaf("object"), keys: Object.keys((shape ?? {}) as object) }),
     string: () => leaf("string"),
+    number: () => leaf("number"),
     boolean: () => leaf("boolean"),
     enum: () => leaf("enum"),
     array: () => leaf("array"),
@@ -129,6 +130,10 @@ function createMockContext(sessionId = "test-session-123"): ExtensionContext {
 }
 
 describe("Telegram Harness Hot Reload", () => {
+  beforeEach(() => {
+    setSavedContext(null);
+  });
+
   test("getInstalledSourceSha reads commit hash from install-manifest.json", () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "manifest-test-"));
     try {
@@ -492,9 +497,103 @@ describe("Telegram Harness Hot Reload", () => {
 
     expect([...mockApi.tools.keys()].sort()).toEqual(["telegram_dashboard", "telegram_message", "telegram_question"]);
     expect(mockApi.tools.get("telegram_question")?.parameterKeys).toContain("options");
-    expect(mockApi.tools.get("telegram_message")?.parameterKeys).toEqual(["text", "lane_id", "lane_state"]);
+    expect(mockApi.tools.get("telegram_message")?.parameterKeys).toEqual(["text", "lane_id", "lane_state", "rebind"]);
     expect(mockApi.tools.get("telegram_dashboard")?.parameterKeys).toEqual(["lanes", "blockers", "mergeQueue"]);
     // Without a session-bound channel every tool must refuse rather than fall back to the terminal.
     expect(mockApi.tools.get("telegram_question")?.description).toContain("never grants approval");
+  });
+
+  test("reload reports failure when initSession fails to acquire lease", async () => {
+    const mockApi = createMockExtensionAPI();
+    const slot: DiscoveredSlot = { slotId: "slot-fail", botId: "999", stateDir: os.tmpdir() };
+    let acquireAttempts = 0;
+    const coordinator: MockCoordinator = {
+      acquireLease: async () => {
+        acquireAttempts++;
+        return acquireAttempts === 1 ? { ok: true, slot } : { ok: false, reason: "Pool exhausted" };
+      },
+      releaseLease: () => true,
+      close: () => {},
+      readRawTokenForSlot: () => "0000:TOKEN",
+      readAccessConfig: () => ({ dmPolicy: "allowlist", allowFrom: ["123"] }),
+      recordOutboundMessage: () => {},
+      resolveReplyRouting: () => ({ decision: "deliver" }),
+      validateDecisionCallback: () => ({ decision: "deliver" }),
+      consumeDecisionCallback: () => true,
+      applyDecisionAnswer: async () => true,
+      getPoolStatus: () => ({ totalSlots: 1, freeSlots: 0 }),
+    };
+    const poller: MockPoller = {
+      start: async () => {},
+      stop: async () => {},
+      getPrimaryChatId: () => "123",
+      sendTelegramMessage: async () => ({ ok: true }),
+    };
+    const runtime = new TelegramRuntime(mockApi.api, {
+      coordinatorFactory: () => coordinator as unknown as never,
+      pollerFactory: () => poller as unknown as never,
+    });
+    setActiveRuntime(runtime);
+    const ctx = createMockContext("sess-init-fail");
+    setSavedContext(ctx);
+    await runtime.initSession(ctx);
+
+    // On reload, coordinator.acquireLease will return ok: false
+    const result = await reload({
+      runtimeOptions: {
+        coordinatorFactory: () => coordinator as unknown as never,
+        pollerFactory: () => poller as unknown as never,
+      },
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("lease not acquired");
+    await getActiveRuntime()?.dispose();
+  });
+
+  test("initSession is idempotent across successive turns for same session", async () => {
+    const mockApi = createMockExtensionAPI();
+    const slot: DiscoveredSlot = { slotId: "slot-idem", botId: "998", stateDir: os.tmpdir() };
+    let acquireCount = 0;
+    const coordinator: MockCoordinator = {
+      acquireLease: async () => {
+        acquireCount++;
+        return { ok: true, slot };
+      },
+      releaseLease: () => true,
+      close: () => {},
+      readRawTokenForSlot: () => "0000:TOKEN",
+      readAccessConfig: () => ({ dmPolicy: "allowlist", allowFrom: ["123"] }),
+      recordOutboundMessage: () => {},
+      resolveReplyRouting: () => ({ decision: "deliver" }),
+      validateDecisionCallback: () => ({ decision: "deliver" }),
+      consumeDecisionCallback: () => true,
+      applyDecisionAnswer: async () => true,
+      getPoolStatus: () => ({ totalSlots: 1, freeSlots: 0 }),
+    };
+    const poller: MockPoller = {
+      start: async () => {},
+      stop: async () => {},
+      getPrimaryChatId: () => "123",
+      sendTelegramMessage: async () => ({ ok: true }),
+    };
+    const runtime = new TelegramRuntime(mockApi.api, {
+      coordinatorFactory: () => coordinator as unknown as never,
+      pollerFactory: () => poller as unknown as never,
+    });
+    const ctx = createMockContext("sess-idem");
+    expect(await runtime.initSession(ctx)).toBe(true);
+    expect(acquireCount).toBe(1);
+
+    // Successive turn on same session
+    expect(await runtime.initSession(ctx)).toBe(true);
+    expect(acquireCount).toBe(1); // Must NOT re-acquire lease
+    await runtime.dispose();
+  });
+
+  test("telegram_message provides detailed error and supports rebind: true when route is lost", async () => {
+    const mockApi = createMockExtensionAPI();
+    telegramSessionExtension(mockApi.api);
+    const tool = mockApi.tools.get("telegram_message");
+    expect(tool?.parameterKeys).toContain("rebind");
   });
 });

@@ -24,7 +24,6 @@ export interface ApprovalRecord extends ApprovalContext {
   requestedAt: string;
   expiresAt: string;
   state: "pending" | "approved" | "denied" | "consumed" | "expired";
-  summary?: string;
 }
 export interface ApprovalActor { sessionId: string; userId: string; chatId: string }
 export type ApprovalDescription = Omit<ApprovalRecord, "token" | "operationHash" | "requestedAt" | "expiresAt" | "state">;
@@ -37,6 +36,7 @@ const REASONS: Record<string, string> = {
   cloudflare_stripe_mutations: "This operation modifies live cloud infrastructure, keys, or payment records.",
   remote_ssh: "This operation executes commands or transfers files on a remote host.",
   secrets: "This operation accesses protected credentials, private keys, or environment secrets.",
+  dynamic_code: "This operation builds the program it runs at runtime, so the guard cannot prove what it executes.",
 };
 
 /** Keep credentials out of both Telegram and the durable audit. Bind the original input by hash only. */
@@ -182,6 +182,10 @@ export function formatApprovalSummary(category: string, tool: string, input: Rec
     return `Access protected sensitive path (${explicit || "secret"})`;
   }
 
+  if (category === "dynamic_code") {
+    return "Run a command the guard could not resolve statically";
+  }
+
   if (category === "production_exclusion") {
     return "Access production environment (strictly prohibited)";
   }
@@ -252,6 +256,15 @@ export function evaluateApproval(stateDir: string, operationHash: string, descri
     const record: ApprovalRecord = { ...description, operationHash, token: randomBytes(32).toString("hex"), requestedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + TTL).toISOString(), state: "pending" };
     persist(db, record, record.requester);
     return record;
+  });
+}
+
+/** Pending requests from the existing store, restricted to the chat's bound session. */
+export function pendingApprovals(stateDir: string, sessionId: string): ApprovalRecord[] {
+  return withStore(stateDir, db => {
+    expire(db);
+    const rows = db.query("SELECT record FROM approvals WHERE session_id=? AND state='pending' ORDER BY rowid").all(sessionId) as { record: string }[];
+    return rows.map(row => JSON.parse(row.record) as ApprovalRecord);
   });
 }
 

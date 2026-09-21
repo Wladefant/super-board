@@ -59,6 +59,23 @@ export class DaemonStore {
         PRIMARY KEY (session_id, entry_id)
       );
     `);
+    this.db.run(`CREATE TABLE IF NOT EXISTS session_listings (
+      slot_id TEXT NOT NULL, chat_id TEXT NOT NULL, topic_id TEXT NOT NULL,
+      session_ids TEXT NOT NULL, PRIMARY KEY (slot_id, chat_id, topic_id)
+    )`);
+  }
+
+  public putSessionListing(slotId: string, chatId: string, topicId: string, ids: string[]): void {
+    this.db.run(`INSERT INTO session_listings VALUES (?, ?, ?, ?)
+      ON CONFLICT(slot_id, chat_id, topic_id) DO UPDATE SET session_ids = excluded.session_ids`,
+    [slotId, chatId, topicId, JSON.stringify(ids)]);
+  }
+
+  public getSessionListing(slotId: string, chatId: string, topicId: string): string[] {
+    const row = this.db.query<{ session_ids: string }, [string, string, string]>(
+      "SELECT session_ids FROM session_listings WHERE slot_id = ? AND chat_id = ? AND topic_id = ?",
+    ).get(slotId, chatId, topicId);
+    return row ? JSON.parse(row.session_ids) : [];
   }
 
   public getRoute(slotId: string, chatId: string, topicId = ""): DaemonRoute | null {
@@ -115,13 +132,17 @@ export class DaemonStore {
    * Claims one transcript entry for delivery. Returns false when it was already
    * claimed, which is what makes outbound delivery idempotent across restarts and
    * across a transcript snapshot that repeats history the daemon has already sent.
+   *
+   * `deliveryKey` identifies the destination, not a chat: in forum mode a route is a
+   * chat and a topic, so the key is composite and the column keeps its original name
+   * rather than rewriting every row of an existing daemon.db.
    */
-  public claimDelivery(sessionId: string, entryId: string, chatId: string): boolean {
+  public claimDelivery(sessionId: string, entryId: string, deliveryKey: string): boolean {
     return (
       this.db.run(
         `INSERT INTO delivered_entries (session_id, entry_id, chat_id, delivered_at)
          VALUES (?, ?, ?, ?) ON CONFLICT(session_id, entry_id) DO NOTHING`,
-        [sessionId, entryId, chatId, Date.now()],
+        [sessionId, entryId, deliveryKey, Date.now()],
       ).changes > 0
     );
   }

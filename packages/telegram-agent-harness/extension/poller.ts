@@ -16,6 +16,7 @@ import { downloadInboundMedia, selectInboundMedia, type InboundMedia } from "./i
 import { registerTelegramCommands, renderTelegramHelp } from "./command-registry";
 import type {
   AccessConfig,
+  GroupAccessConfig,
   MessageCorrelationBridge,
   OutboundMessageCorrelation,
   TelegramGetUpdatesResponse,
@@ -68,6 +69,8 @@ export interface PollerOptions {
   initialConflictBackoffMs?: number;
   maxConflictBackoffMs?: number;
   conflictBackoffFactor?: number;
+  /** Milliseconds to pace consecutive outbound requests. Defaults to 1250 ms. */
+  outboundPaceMs?: number;
   /**
    * Forum topic every outbound message and dashboard pin is bound to. Omitted for a
    * plain chat, where Telegram rejects the field outright, so it has no default.
@@ -78,6 +81,17 @@ export interface PollerOptions {
    * When omitted, defaults to the standard availableCommands(hasHarness).
    */
   commands?: readonly { command: string; description: string }[];
+  /**
+   * Whether the poller is operating in standalone daemon mode.
+   */
+  isDaemon?: boolean;
+  /**
+   * Supergroup this channel serves in forum mode. Every topic of that chat is one
+   * channel, so the topic is a property of each message rather than of the poller,
+   * and {@link PollerOptions.messageThreadId} — which pins the channel to a single
+   * topic — must stay unset when this is given.
+   */
+  forumChatId?: string;
 }
 
 const DEFAULT_POLLER_OPTIONS = {
@@ -85,6 +99,7 @@ const DEFAULT_POLLER_OPTIONS = {
   initialConflictBackoffMs: 1000,
   maxConflictBackoffMs: 15000,
   conflictBackoffFactor: 2.0,
+  outboundPaceMs: 1250,
 } satisfies PollerOptions;
 
 interface LedgerRow {
@@ -145,6 +160,13 @@ const UPDATE_LEDGER_ADDITIVE_COLUMNS: Record<string, string> = {
 const NON_TERMINAL_STATUSES = ["PENDING", "PROCESSING"] as const;
 const NON_TERMINAL_STATUS_SQL = NON_TERMINAL_STATUSES.map(status => `'${status}'`).join(", ");
 
+/**
+ * How often an allowlisted operator is told that a chat is not served. Long enough
+ * that a conversation in the wrong group cannot turn into a reply per message, short
+ * enough that the answer is still there when they come back and try again.
+ */
+const CHAT_NOT_SERVED_NOTICE_MS = 60 * 60 * 1000;
+
 export class TelegramPoller {
   private botToken: string;
   private botId: string;
@@ -164,6 +186,13 @@ export class TelegramPoller {
   private nextOutboundAt = 0;
   private outboundReservation: Promise<void> = Promise.resolve();
   private dashboardUpdate: Promise<void> | null = null;
+  /**
+   * Topic of the update being processed right now, so a reply the handler produces
+   * lands in the topic the operator wrote in. Set for the duration of one ledger row
+   * and cleared after it: `drainPendingUpdates` awaits each row in turn, so there is
+   * never a second row in flight to read a stale value.
+   */
+  private activeThreadId: number | undefined;
 
   public get running(): boolean {
     return this.isRunning;
@@ -175,6 +204,7 @@ export class TelegramPoller {
     accessConfig: AccessConfig,
     callbacks: PollerCallbacks,
     correlation: MessageCorrelationBridge | null = null,
+    threadOrOptions?: number | PollerOptions,
     options?: PollerOptions,
   ) {
     this.botToken = botToken;
@@ -183,11 +213,19 @@ export class TelegramPoller {
     this.accessConfig = accessConfig;
     this.callbacks = callbacks;
     this.correlation = correlation;
-    this.options = { ...DEFAULT_POLLER_OPTIONS, ...(options || {}) };
+    // Positional slot 6 carries either the forum topic this channel is pinned to
+    // (number) or the poller tuning options (object). Two features claimed the same
+    // argument, so callers of each shape are both still honoured.
+    const threadId = typeof threadOrOptions === "number" ? threadOrOptions : undefined;
+    const tuning = typeof threadOrOptions === "object" && threadOrOptions !== null ? threadOrOptions : options;
+    this.options = { ...DEFAULT_POLLER_OPTIONS, ...(tuning || {}) };
     this.abortController = new AbortController();
-    this.messageThreadId = this.options.messageThreadId;
+    this.messageThreadId = threadId ?? this.options.messageThreadId;
     if (this.messageThreadId !== undefined && (!Number.isSafeInteger(this.messageThreadId) || this.messageThreadId <= 0)) {
       throw new Error("message_thread_id must be a positive integer");
+    }
+    if (this.messageThreadId !== undefined && this.options.forumChatId) {
+      throw new Error("a forum channel serves every topic of its chat; message_thread_id pins it to one");
     }
 
     if (!fs.existsSync(stateDir)) {
@@ -280,11 +318,26 @@ export class TelegramPoller {
   }
 
   public getPrimaryChatId(): string | null {
+    // A forum channel only ever serves its supergroup: the operator's own user id is
+    // not a chat this poller speaks in, so it must never be the fallback here.
+    if (this.options.forumChatId) return this.options.forumChatId;
     if (this.primaryChatId) return this.primaryChatId;
     if (this.accessConfig.allowFrom.length > 0) {
       return this.accessConfig.allowFrom[0];
     }
     return null;
+  }
+
+  /**
+   * Forum topic of the update being handled right now, or undefined outside a topic
+   * (a DM, or the supergroup's General topic). Read synchronously from a callback the
+   * poller invoked, which is the only point at which it is meaningful.
+   */
+  public getActiveThreadId(): number | undefined {
+    return this.activeThreadId;
+  }
+  public updateAccess(config: AccessConfig): void {
+    this.accessConfig = config;
   }
   public getMeta(key: string): string | null {
     return (this.db.query("SELECT value FROM bridge_meta WHERE key = ?").get(key) as { value: string } | null)?.value ?? null;
@@ -305,7 +358,8 @@ export class TelegramPoller {
         if (signal.aborted) abort();
       });
       this.abortController.signal.throwIfAborted();
-      this.nextOutboundAt = Date.now() + 1250;
+      const paceMs = this.options.outboundPaceMs ?? 1250;
+      this.nextOutboundAt = paceMs > 0 ? Date.now() + paceMs : 0;
     });
     this.outboundReservation = reserve.catch(() => {});
     return reserve;
@@ -363,6 +417,15 @@ export class TelegramPoller {
     if (!data.ok) throw new Error(`Dashboard ${method} unavailable; check pin permission and Telegram retry window`);
   }
 
+  /**
+   * Topic every outbound message defaults to: the topic this channel is pinned to,
+   * else the topic of the update being handled, so a handler's reply comes back where
+   * the operator wrote it. Undefined in a DM and in a forum's General topic.
+   */
+  private get outboundThreadId(): number | undefined {
+    return this.messageThreadId ?? this.activeThreadId;
+  }
+
   public async sendTelegramMessage(
     chatId: string | number,
     text: string,
@@ -376,6 +439,12 @@ export class TelegramPoller {
       laneState?: "active" | "exited" | "unknown";
     },
     defaultRepo = "Bavariance/polysimulator",
+    /**
+     * Forum topic to post into, for a send that is not a reply to the update being
+     * handled — relaying a session's output into its own topic, above all. Omitted
+     * falls back to {@link outboundThreadId}.
+     */
+    messageThreadId?: number,
   ): Promise<TelegramSendMessageResponse | null> {
     const sanitized = redactSecrets(text);
     const formatted = replyMarkupOrParseMode === "HTML" ? sanitized : markdownToTelegramHtml(sanitized, defaultRepo);
@@ -391,7 +460,8 @@ export class TelegramPoller {
         text: formatted,
         parse_mode: "HTML",
       };
-      if (this.messageThreadId !== undefined) body.message_thread_id = this.messageThreadId;
+      const threadId = messageThreadId ?? this.outboundThreadId;
+      if (threadId !== undefined) body.message_thread_id = threadId;
       if (replyMarkup) {
         body.reply_markup = replyMarkup;
       }
@@ -558,6 +628,7 @@ export class TelegramPoller {
           Boolean(this.callbacks.onHarnessCommand),
           this.abortController.signal,
           this.options.commands,
+          this.options.forumChatId,
         );
       } catch {
         this.callbacks.onLedgerFailure("Telegram command registration failed; reconnect to retry the private-chat menu.");
@@ -770,10 +841,12 @@ export class TelegramPoller {
         // head-of-line block every later update indefinitely. Record why it failed
         // and move on, so the queue drains and the failure is visible in the ledger.
         const detail = redactSecrets(err instanceof Error ? err.message : String(err)).slice(0, 500);
-        this.db.run("UPDATE update_ledger SET status = 'REJECTED', error = ? WHERE update_id = ?", [
-          `PROCESSING_FAILED: ${detail}`,
-          row.update_id,
-        ]);
+        try {
+          this.db.run("UPDATE update_ledger SET status = 'REJECTED', error = ? WHERE update_id = ?", [
+            `PROCESSING_FAILED: ${detail}`,
+            row.update_id,
+          ]);
+        } catch {}
         this.callbacks.onLedgerFailure(`update ${row.update_id} could not be processed: ${detail}`);
         if (row.is_callback) {
           await this.sendTelegramMessage(row.chat_id, `Choice could not be delivered: ${escapeHtml(detail)}. Reply to the original message with your choice.`);
@@ -783,10 +856,59 @@ export class TelegramPoller {
   }
 
   private async processLedgerRow(row: LedgerRow): Promise<void> {
+    // A forum's General topic carries no thread id; Telegram reports 1 for it on the
+    // updates that do, and neither is a topic a session can be bound to.
+    this.activeThreadId =
+      typeof row.message_thread_id === "number" && row.message_thread_id > 1 ? row.message_thread_id : undefined;
+    try {
+      await this.dispatchLedgerRow(row);
+    } finally {
+      this.activeThreadId = undefined;
+    }
+  }
+
+  /**
+   * Group or supergroup authorization for `chatId`, or null when this channel does
+   * not serve that chat.
+   */
+  private groupAccess(chatId: string): GroupAccessConfig | null {
+    const configured = this.accessConfig.groups?.[chatId];
+    if (configured) return configured;
+    // A forum channel's own supergroup is authorized by the manifest that put it in
+    // forum mode. access.json is healed to match at startup, but a write that did not
+    // land must not lock the operator out of the only chat this channel serves.
+    return this.options.forumChatId === chatId ? {} : null;
+  }
+
+  /**
+   * Tells an allowlisted operator that this bot does not serve the chat they wrote
+   * in, at most once an hour per chat. Dropping the message instead is what made a
+   * misconfigured forum look like a dead bot: every message vanished and the ledger
+   * row said UNAUTHORIZED where nobody was looking.
+   */
+  private async reportChatNotServed(chatId: string): Promise<void> {
+    const key = `chat-not-served-notice:${chatId}`;
+    if (Date.now() - Number(this.getMeta(key) ?? 0) < CHAT_NOT_SERVED_NOTICE_MS) return;
+    // Recorded before the send: a chat that keeps refusing delivery must not turn
+    // every inbound message into another outbound attempt.
+    this.setMeta(key, String(Date.now()));
+    await this.sendTelegramMessage(
+      chatId,
+      [
+        "🚫 <b>This bot does not serve this chat.</b>",
+        "Your Telegram account is allowed, but this group is not one this bot is bound to, so nothing here reaches a session.",
+        "Write in the bot's direct chat, or add this chat id to <code>groups</code> in the channel's <code>access.json</code> and reload.",
+      ].join("\n"),
+      "HTML",
+    );
+  }
+
+  private async dispatchLedgerRow(row: LedgerRow): Promise<void> {
     // Mark as in-flight PROCESSING
     this.db.run("UPDATE update_ledger SET status = 'PROCESSING' WHERE update_id = ?", [row.update_id]);
 
-    if ((!row.text || !row.text.trim()) && !row.media_json) {
+    const hasVisibleText = Boolean(row.text?.replace(/[\s\u2000-\u200F\u2028-\u202F\u205F-\u206F\uFEFF]/g, ""));
+    if (!hasVisibleText && !row.media_json) {
       this.db.run("UPDATE update_ledger SET status = 'REJECTED', error = 'EMPTY_TEXT' WHERE update_id = ?", [
         row.update_id,
       ]);
@@ -805,13 +927,26 @@ export class TelegramPoller {
       return;
     }
 
-    // 2. Allowlist authorization check: private DM only where chatId === fromId
-    const isAllowed = this.accessConfig.allowFrom.includes(fromId) && chatId === fromId;
+    // 2. Allowlist authorization. A private chat is authorized by the allowlist alone
+    //    (`chatId === fromId` is what makes it private); any other chat also has to be
+    //    named in access.json `groups`, because an allowlisted Telegram account says
+    //    nothing about which rooms that account may speak for. In a forum every topic
+    //    of the supergroup is admitted: the topic selects the session, not the right
+    //    to talk to one.
+    const operatorIsAllowed = this.accessConfig.allowFrom.includes(fromId);
+    const isDirectMessage = chatId === fromId;
+    const group = isDirectMessage ? null : this.groupAccess(chatId);
+    // A group's own allowFrom intersects the channel allowlist rather than replacing
+    // it: a group entry restricts where an allowlisted account may speak, and must
+    // never admit an account the channel itself does not allow.
+    const isAllowed = operatorIsAllowed
+      && (isDirectMessage || (group !== null && (group.allowFrom === undefined || group.allowFrom.includes(fromId))));
     if (!isAllowed) {
       this.db.run(
         "UPDATE update_ledger SET status = 'REJECTED', error = 'UNAUTHORIZED' WHERE update_id = ?",
         [row.update_id],
       );
+      if (operatorIsAllowed && !isDirectMessage) await this.reportChatNotServed(chatId);
       return;
     }
 
@@ -1025,7 +1160,17 @@ export class TelegramPoller {
       throw new Error("Session changed during message routing; resend to the intended session");
     }
     if (rawText === "/help" || rawText === "/start") {
-      await this.sendTelegramMessage(chatId, renderTelegramHelp(Boolean(this.callbacks.onHarnessCommand)));
+      const isDaemon = Boolean(
+        this.options.isDaemon ||
+        this.options.commands?.some(c => c.command === "sessions" || c.command === "attach" || c.command === "app"),
+      );
+      await this.sendTelegramMessage(
+        chatId,
+        renderTelegramHelp({
+          hasHarness: Boolean(this.callbacks.onHarnessCommand),
+          isDaemon,
+        }),
+      );
       this.db.run("UPDATE update_ledger SET status = 'COMPLETED' WHERE update_id = ?", [row.update_id]);
       return;
     }
@@ -1111,6 +1256,14 @@ export class TelegramPoller {
       deliveredText = `${contextLines.join("\n")}\n\n${rawText}`;
     }
 
+    const hasVisibleBody = Boolean(rawText.replace(/[\s\u2000-\u200F\u2028-\u202F\u205F-\u206F\uFEFF]/g, ""));
+    if (!hasVisibleBody && !row.media_json) {
+      this.db.run("UPDATE update_ledger SET status = 'REJECTED', error = 'EMPTY_TEXT' WHERE update_id = ?", [
+        row.update_id,
+      ]);
+      return;
+    }
+
     deliveredText = attributeSender(fromId, deliveredText);
     if (this.callbacks.isIdle()) {
       this.callbacks.onUserMessage(deliveredText);
@@ -1132,7 +1285,7 @@ export class TelegramPoller {
     const slotId = this.correlation?.getSlotId();
     const form = new FormData();
     form.set("chat_id", chatId);
-    if (this.messageThreadId !== undefined) form.set("message_thread_id", String(this.messageThreadId));
+    if (this.outboundThreadId !== undefined) form.set("message_thread_id", String(this.outboundThreadId));
     form.set("photo", Bun.file(file), path.basename(file));
     const formattedCaption = formatTelegramCaption(redactSecrets(caption), 1024, defaultRepo);
     if (formattedCaption) {
@@ -1174,7 +1327,7 @@ export class TelegramPoller {
     const slotId = this.correlation?.getSlotId();
     const form = new FormData();
     form.set("chat_id", chatId);
-    if (this.messageThreadId !== undefined) form.set("message_thread_id", String(this.messageThreadId));
+    if (this.outboundThreadId !== undefined) form.set("message_thread_id", String(this.outboundThreadId));
 
     const formattedCaption = caption
       ? formatTelegramCaption(redactSecrets(caption), 1024, defaultRepo)

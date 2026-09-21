@@ -67,6 +67,12 @@ class OperatorQuestions:
                 record = questions.get(identifier)
                 if not record or not self._owns(record, route):
                     raise ValueError("Question is unavailable on this session and operator route")
+                if operation == "wait":
+                    if record.get("status") == "answered" and record.get("answer"):
+                        return {"question": record, "status": "answered", "answer": record["answer"]}
+                    timeout = max(0.05, float(payload.get("timeout", 60.0)))
+                    poll_interval = max(0.02, float(payload.get("poll_interval", 0.05)))
+                    return self._wait_for_answer(identifier, route, timeout, poll_interval)
                 if operation == "answer":
                     event_id = str(payload["event_id"])
                     events = record["transport"]["events"]
@@ -105,6 +111,22 @@ class OperatorQuestions:
         transport = record.get("transport", {})
         return transport.get("kind") == "operator_question" and all(
             transport.get(key) == route.get(key) for key in ("session_id", "chat_id", "user_id"))
+
+    def _wait_for_answer(self, identifier: str, route: dict, timeout: float, poll_interval: float) -> dict:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(poll_interval)
+            with FileLock(self.manager.lock_path):
+                data = self.manager._load_data_unlocked()
+                record = data["decisions"].get(identifier)
+                if not record or not self._owns(record, route):
+                    raise ValueError("Question is unavailable on this session and operator route")
+                if record.get("status") == "answered" and record.get("answer"):
+                    return {"question": record, "status": "answered", "answer": record["answer"]}
+        with FileLock(self.manager.lock_path):
+            data = self.manager._load_data_unlocked()
+            record = data["decisions"].get(identifier)
+            return {"question": record, "status": "pending", "timed_out": True}
 
     def card(self, record: dict) -> dict:
         transport = record["transport"]

@@ -1,6 +1,17 @@
 import { escapeHtml } from "./sanitizer";
 
 /** The menu and help are projections of the same supported command surface. */
+export const DAEMON_ROUTING_COMMANDS = [
+  { command: "sessions", description: "List running Veyyon sessions", group: "Routing & Workspaces", syntax: "/sessions", harness: false },
+  { command: "attach", description: "Attach this chat to a running session", group: "Routing & Workspaces", syntax: "/attach <id>", harness: false },
+  { command: "new", description: "Start a new session in a workspace", group: "Routing & Workspaces", syntax: "/new <path>", harness: false },
+  { command: "where", description: "Show which session this chat is bound to", group: "Routing & Workspaces", syntax: "/where", harness: false },
+  { command: "detach", description: "Detach this chat from the current session", group: "Routing & Workspaces", syntax: "/detach", harness: false },
+  { command: "topics", description: "List session topics (forum mode)", group: "Routing & Workspaces", syntax: "/topics", harness: false },
+  { command: "app", description: "Open the Superboard Mini App", group: "Routing & Workspaces", syntax: "/app", harness: false },
+] as const;
+
+/** The menu and help are projections of the same supported command surface. */
 export const TELEGRAM_COMMANDS = [
   { command: "status", description: "Session state and available backend information", group: "Inspect", syntax: "/status", harness: false },
   { command: "agents", description: "Current session and reachable Herdr targets", group: "Inspect", syntax: "/agents", harness: true },
@@ -14,16 +25,35 @@ export const TELEGRAM_COMMANDS = [
   { command: "help", description: "Command syntax and how plain text is delivered", group: "Control", syntax: "/help", harness: false },
 ] as const;
 
-export function availableCommands(hasHarness = true) {
-  return TELEGRAM_COMMANDS.filter(command => hasHarness || !command.harness);
+export function availableCommands(hasHarness = true, isDaemon = false) {
+  const base = TELEGRAM_COMMANDS.filter(command => hasHarness || !command.harness);
+  if (isDaemon) {
+    return [...DAEMON_ROUTING_COMMANDS, ...base];
+  }
+  return base;
 }
 
-export function renderTelegramHelp(hasHarness = true): string {
-  const commands = availableCommands(hasHarness);
+export interface TelegramHelpOptions {
+  hasHarness?: boolean;
+  isDaemon?: boolean;
+}
+
+export function renderTelegramHelp(optionsOrHasHarness: boolean | TelegramHelpOptions = true): string {
+  const opts: TelegramHelpOptions = typeof optionsOrHasHarness === "boolean"
+    ? { hasHarness: optionsOrHasHarness, isDaemon: false }
+    : { hasHarness: true, isDaemon: false, ...optionsOrHasHarness };
+  const hasHarness = opts.hasHarness ?? true;
+  const isDaemon = opts.isDaemon ?? false;
+  const commands = availableCommands(hasHarness, isDaemon);
   const lines = ["<b>Veyyon Telegram control</b>"];
-  for (const group of ["Inspect", "Direct work", "Control"]) {
+  const groups = isDaemon
+    ? ["Routing & Workspaces", "Inspect", "Direct work", "Control"]
+    : ["Inspect", "Direct work", "Control"];
+  for (const group of groups) {
+    const groupCommands = commands.filter(command => command.group === group);
+    if (groupCommands.length === 0) continue;
     lines.push("", `<b>${group}</b>`);
-    for (const command of commands.filter(command => command.group === group)) {
+    for (const command of groupCommands) {
       lines.push(`• <code>${escapeHtml(command.syntax)}</code> — ${escapeHtml(command.description)}`);
     }
   }
@@ -39,19 +69,26 @@ export interface TelegramCommandItem {
   description: string;
 }
 
-/** DM-only actor gates have no group equivalent: never advertise group controls. */
+/**
+ * Registers the command menu for every allowlisted operator's private chat, and for
+ * a forum slot's own supergroup when it has one. No other group is ever registered:
+ * DM-only actor gates have no group equivalent, so a bot sitting in an arbitrary
+ * group must not advertise controls that chat cannot use.
+ */
 export async function registerTelegramCommands(
   botToken: string,
   allowedUsers: readonly string[],
   hasHarness: boolean | readonly TelegramCommandItem[] = true,
   signal?: AbortSignal,
   customCommands?: readonly TelegramCommandItem[],
+  forumChatId?: string,
 ): Promise<void> {
   const commands: readonly TelegramCommandItem[] = Array.isArray(hasHarness)
     ? hasHarness
     : (customCommands ?? availableCommands(hasHarness).map(({ command, description }) => ({ command, description })));
-  for (const chatId of new Set(allowedUsers)) {
-    if (!/^\d+$/.test(chatId)) continue;
+  const chats = [...new Set(allowedUsers)].filter(chatId => /^\d+$/.test(chatId));
+  if (forumChatId) chats.push(forumChatId);
+  for (const chatId of chats) {
     try {
       const response = await fetch(`https://api.telegram.org/bot${botToken}/setMyCommands`, {
         method: "POST",
