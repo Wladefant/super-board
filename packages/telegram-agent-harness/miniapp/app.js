@@ -1,4 +1,4 @@
-import { createClient, UNAVAILABLE_MESSAGE, REOPEN_MESSAGE, SECTIONS, getUnavailableState } from './client.js';
+import { createClient, UNAVAILABLE_MESSAGE, REOPEN_MESSAGE, SECTIONS, getUnavailableState, TerminalAuthError, isTerminalAuthError } from './client.js';
 const app = window.Telegram?.WebApp;
 app?.ready(); app?.expand();
 const byId = id => document.getElementById(id);
@@ -24,7 +24,7 @@ async function refresh() {
   if (loading) return;
   loading = true; byId('refresh').disabled = true;
   try {
-    if (!app?.initData) throw new Error('Open Superboard from the Telegram bot menu to securely access your workspace.');
+    if (!app?.initData) throw new TerminalAuthError('Open Superboard from the Telegram bot menu to securely access your workspace.');
     const data = await request('/api/state');
     byId('notice').textContent = '';
     byId('connection').textContent = data.status?.polling ? 'Daemon connected · Bot polling' : 'Daemon connected · Bot polling unavailable';
@@ -41,7 +41,14 @@ async function refresh() {
         button.onclick = async () => {
           node.querySelectorAll('button').forEach(b => { b.disabled = true; });
           try { await request('/api/approval', { token: approval.token, decision }); await refresh(); }
-          catch (error) { byId('notice').textContent = error.message; await refresh(); }
+          catch (error) {
+            if (isTerminalAuthError(error)) {
+              unavailable(error.message || REOPEN_MESSAGE);
+              return;
+            }
+            byId('notice').textContent = error.message;
+            await refresh();
+          }
         };
         node.append(button);
       }

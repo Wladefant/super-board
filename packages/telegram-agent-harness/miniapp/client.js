@@ -17,6 +17,18 @@ export function getUnavailableState(notice = REOPEN_MESSAGE) {
   };
 }
 
+export class TerminalAuthError extends Error {
+  constructor(message = REOPEN_MESSAGE) {
+    super(message);
+    this.name = 'TerminalAuthError';
+    this.isTerminalAuth = true;
+  }
+}
+
+export function isTerminalAuthError(error) {
+  return error instanceof TerminalAuthError || error?.name === 'TerminalAuthError' || Boolean(error?.isTerminalAuth);
+}
+
 export function createClient(getInitData, transport = fetch) {
   let appSession = '';
 
@@ -34,7 +46,7 @@ export function createClient(getInitData, transport = fetch) {
     }
     if (!auth.ok || !data?.appSession) {
       appSession = '';
-      throw new Error(data?.error || REOPEN_MESSAGE);
+      throw new TerminalAuthError(data?.error || REOPEN_MESSAGE);
     }
     appSession = data.appSession;
     return appSession;
@@ -77,7 +89,10 @@ export function createClient(getInitData, transport = fetch) {
     }
 
     if (!response.ok) {
-      throw new Error(data?.error || (response.status === 401 ? REOPEN_MESSAGE : 'Connection unavailable'));
+      if (response.status === 401) {
+        throw new TerminalAuthError(data?.error || REOPEN_MESSAGE);
+      }
+      throw new Error(data?.error || 'Connection unavailable');
     }
 
     return data;

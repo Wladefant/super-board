@@ -7,7 +7,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { evaluateApproval, describeApproval, pendingApprovals } from "../extension/approvals";
-import { createClient, getUnavailableState, UNAVAILABLE_MESSAGE, REOPEN_MESSAGE, SECTIONS } from "../miniapp/client.js";
+import { createClient, getUnavailableState, UNAVAILABLE_MESSAGE, REOPEN_MESSAGE, SECTIONS, TerminalAuthError, isTerminalAuthError } from "../miniapp/client.js";
 import { SERVED_FILES } from "../miniapp/relay";
 import { readFileSync } from "node:fs";
 
@@ -226,6 +226,57 @@ describe("Mini App client 401 session reset and unavailable state", () => {
     expect(JSON.parse(String(calls[2].body))).toEqual(decision);
   });
 
+  test("double-401 on /api/approval drops cached session and throws TerminalAuthError without unbounded retry", async () => {
+    const calls: { path: string; headers: Record<string, string> }[] = [];
+    const client = createClient(() => "launch-data-approval", async (path: string, init?: RequestInit) => {
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      calls.push({ path, headers });
+
+      if (path === "/api/session") return Response.json({ appSession: "new-approval-session-attempt" });
+      if (path === "/api/approval") {
+        return Response.json({ error: "Open this app from Telegram again to authenticate." }, { status: 401 });
+      }
+      return Response.json({ error: "Unexpected" }, { status: 500 });
+    });
+
+    client.setSession("stale-approval-session");
+
+    let caughtError: unknown;
+    try {
+      await client("/api/approval", { token: "tok-1", decision: "approved" });
+    } catch (err) {
+      caughtError = err;
+    }
+
+    expect(caughtError).toBeInstanceOf(TerminalAuthError);
+    expect(isTerminalAuthError(caughtError)).toBe(true);
+    expect((caughtError as Error).message).toBe("Open this app from Telegram again to authenticate.");
+    expect(client.getSession()).toBe("");
+    expect(calls.map(c => c.path)).toEqual(["/api/approval", "/api/session", "/api/approval"]);
+    expect(calls[0].headers["x-miniapp-session"]).toBe("stale-approval-session");
+    expect(calls[1].headers["x-telegram-init-data"]).toBe("launch-data-approval");
+    expect(calls[2].headers["x-miniapp-session"]).toBe("new-approval-session-attempt");
+  });
+
+  test("non-401 errors on /api/approval throw standard Error and do not clear session", async () => {
+    const client = createClient(() => "launch-data", async (path: string) => {
+      if (path === "/api/approval") return Response.json({ error: "Approval expired" }, { status: 400 });
+      return Response.json({});
+    });
+    client.setSession("valid-session");
+    let caughtError: unknown;
+    try {
+      await client("/api/approval", { token: "tok-expired", decision: "approved" });
+    } catch (err) {
+      caughtError = err;
+    }
+    expect(caughtError).toBeInstanceOf(Error);
+    expect(caughtError).not.toBeInstanceOf(TerminalAuthError);
+    expect(isTerminalAuthError(caughtError)).toBe(false);
+    expect((caughtError as Error).message).toBe("Approval expired");
+    expect(client.getSession()).toBe("valid-session");
+  });
+
   test("double-401 drops session and renders explicit unavailable / re-open from Telegram state when retry fails", async () => {
     const calls: string[] = [];
     const client = createClient(() => "launch-data", async (path: string) => {
@@ -248,6 +299,8 @@ describe("Mini App client 401 session reset and unavailable state", () => {
 
     expect(caughtError).toBeDefined();
     expect(caughtError?.message).toBe("Open this app from Telegram again to authenticate.");
+    expect(caughtError).toBeInstanceOf(TerminalAuthError);
+    expect(isTerminalAuthError(caughtError)).toBe(true);
     expect(calls).toEqual(["/api/state", "/api/session", "/api/state"]);
     expect(client.getSession()).toBe("");
 
@@ -286,6 +339,8 @@ describe("Mini App client 401 session reset and unavailable state", () => {
     expect(caughtError).toBeDefined();
     expect(caughtError?.message).toBe("Open this app from Telegram again to authenticate.");
     expect(calls).toEqual(["/api/state", "/api/session"]);
+    expect(caughtError).toBeInstanceOf(TerminalAuthError);
+    expect(isTerminalAuthError(caughtError)).toBe(true);
     expect(client.getSession()).toBe("");
 
     const unavailableState = getUnavailableState(caughtError?.message);
