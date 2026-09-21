@@ -3,8 +3,8 @@ import { expect, test } from 'bun:test';
 import { createClient } from '../miniapp/client.js';
 import { issueAppSession, authenticateAppSession, authenticateInitData } from '../daemon/miniapp-auth';
 import { miniAppRequest } from '../daemon/miniapp';
-import { startRelay } from '../miniapp/relay';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { startRelay, SERVED_FILES } from '../miniapp/relay';
+import { mkdtempSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -114,4 +114,97 @@ test('even correctly signed duplicate launch fields are rejected', () => {
   const key = createHmac('sha256', 'WebAppData').update(token).digest();
   p.set('hash', createHmac('sha256', key).update([...p].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([k, v]) => `${k}=${v}`).join('\n')).digest('hex'));
   expect(() => authenticateInitData(p.toString(), token, ['111'], 1700000000000)).toThrow();
+});
+
+test('approval rejects malformed JSON and non-object payloads with 400', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'miniapp-json-'));
+  const token = '123:disposable-token';
+  const options = {
+    stateDir: dir,
+    token,
+    allowedUsers: ['111'],
+    session: () => 'test-session',
+    sessions: async () => [],
+    dashboard: () => null,
+    status: () => ({}),
+  };
+  const appSession = issueAppSession('111', token);
+  const call = (body: string) => miniAppRequest({ id: 'test', path: '/api/approval', method: 'POST', initData: '', appSession, body }, options);
+  try {
+    const malformed = await call('not valid json');
+    expect(malformed.status).toBe(400);
+    expect(malformed.data).toEqual({ error: 'Invalid request body' });
+
+    const nullBody = await call('null');
+    expect(nullBody.status).toBe(400);
+    expect(nullBody.data).toEqual({ error: 'Invalid decision' });
+
+    const numberBody = await call('123');
+    expect(numberBody.status).toBe(400);
+    expect(numberBody.data).toEqual({ error: 'Invalid decision' });
+
+    const emptyObj = await call('{}');
+    expect(emptyObj.status).toBe(400);
+    expect(emptyObj.data).toEqual({ error: 'Invalid decision' });
+
+    const invalidDecision = await call(JSON.stringify({ decision: 'maybe', token: 'a'.repeat(64) }));
+    expect(invalidDecision.status).toBe(400);
+    expect(invalidDecision.data).toEqual({ error: 'Invalid decision' });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('relay serves every allowed asset and rejects unknown or missing files with 404 without path leak', async () => {
+  const secret = 's'.repeat(64);
+  const server = startRelay(secret, 0);
+  try {
+    for (const [route, file] of Object.entries(SERVED_FILES)) {
+      const res = await fetch(`http://localhost:${server.port}${route}`);
+      expect(res.status).toBe(200);
+      expect(res.headers.get('cache-control')).toBe('no-store');
+      expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+      const ct = res.headers.get('content-type') ?? '';
+      if (file.endsWith('.html')) expect(ct).toContain('text/html');
+      else if (file.endsWith('.js')) expect(ct).toContain('text/javascript');
+      else if (file.endsWith('.css')) expect(ct).toContain('text/css');
+      const body = await res.text();
+      expect(body.length).toBeGreaterThan(0);
+      expect(body).not.toContain('ENOENT');
+    }
+
+    const unlisted = await fetch(`http://localhost:${server.port}/nonexistent.js`);
+    expect(unlisted.status).toBe(404);
+    const unlistedBody = await unlisted.text();
+    expect(unlistedBody).toBe('Not found');
+    expect(unlistedBody).not.toContain('ENOENT');
+  } finally {
+    server.stop(true);
+  }
+
+  const emptyDir = mkdtempSync(join(tmpdir(), 'miniapp-empty-'));
+  const missingServer = startRelay(secret, 0, emptyDir);
+  try {
+    const res = await fetch(`http://localhost:${missingServer.port}/client.js`);
+    expect(res.status).toBe(404);
+    const body = await res.text();
+    expect(body).toBe('Not found');
+    expect(body).not.toContain('ENOENT');
+    expect(body).not.toContain(emptyDir);
+    expect(body).not.toContain('client.js');
+  } finally {
+    missingServer.stop(true);
+    rmSync(emptyDir, { recursive: true, force: true });
+  }
+});
+
+test('dockerfile copies every served asset and relay script', () => {
+  const dockerfile = readFileSync(new URL('../miniapp/Dockerfile', import.meta.url), 'utf8');
+  const copyLine = dockerfile.split('\n').find(line => line.startsWith('COPY '));
+  expect(copyLine).toBeDefined();
+  const copied = copyLine!.replace(/^COPY\s+/, '').replace(/\s+\.\/$/, '').split(/\s+/);
+  expect(copied).toContain('relay.ts');
+  for (const file of Object.values(SERVED_FILES)) {
+    expect(copied).toContain(file);
+  }
 });

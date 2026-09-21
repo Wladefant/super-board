@@ -36,8 +36,9 @@ export async function miniAppRequest(request: MiniAppRequest, options: MiniAppOp
     }
     if (request.path === "/api/approval" && request.method === "POST") {
       if (!session) return respond(409, { error: "Chat is not bound to a session." });
-      const body = JSON.parse(request.body);
-      if (body.decision !== "approved" && body.decision !== "denied") return respond(400, { error: "Invalid decision" });
+      let body: { token?: string; decision?: string } | null = null;
+      try { body = JSON.parse(request.body); } catch { return respond(400, { error: "Invalid request body" }); }
+      if (!body || typeof body !== "object" || (body.decision !== "approved" && body.decision !== "denied")) return respond(400, { error: "Invalid decision" });
       const result = decideApproval(options.stateDir, body.token, body.decision, { sessionId: session, userId: user, chatId: user });
       return respond(200, { state: result.state });
     }
