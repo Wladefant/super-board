@@ -1,3 +1,4 @@
+import { createClient, UNAVAILABLE_MESSAGE, REOPEN_MESSAGE, SECTIONS, getUnavailableState } from './client.js';
 const app = window.Telegram?.WebApp;
 app?.ready(); app?.expand();
 const byId = id => document.getElementById(id);
@@ -10,22 +11,14 @@ function card(id, title, detail, state) {
   if (state) { const badge = document.createElement('small'); badge.textContent = state; node.append(badge); }
   byId(id).append(node); return node;
 }
-function unavailable() {
-  for (const id of ['sessions', 'approvals', 'lanes', 'blockers', 'queue']) empty(id, 'Unavailable until a secure connection is established.');
+function unavailable(notice) {
+  const state = getUnavailableState(notice);
+  byId('connection').textContent = notice ? state.connection : 'Connecting securely…';
+  byId('notice').textContent = notice ? state.notice : '';
+  byId('freshness').textContent = state.freshness;
+  for (const id of SECTIONS) empty(id, state.sections[id]);
 }
-let appSession = '';
-async function request(path, body) {
-  if (!appSession) {
-    const auth = await fetch('/api/session', { method: 'POST', headers: { 'x-telegram-init-data': app?.initData || '' } });
-    const session = await auth.json();
-    if (!auth.ok) throw new Error(session.error || 'Authentication unavailable');
-    appSession = session.appSession;
-  }
-  const response = await fetch(path, { method: body ? 'POST' : 'GET', headers: { 'x-miniapp-session': appSession, 'Content-Type': 'application/json' }, ...(body ? { body: JSON.stringify(body) } : {}) });
-  const data = await response.json();
-  if (!response.ok) throw new Error(data.error || 'Connection unavailable');
-  return data;
-}
+const request = createClient(() => app?.initData || '');
 let loading = false;
 async function refresh() {
   if (loading) return;
@@ -35,7 +28,7 @@ async function refresh() {
     const data = await request('/api/state');
     byId('notice').textContent = '';
     byId('connection').textContent = data.status?.polling ? 'Daemon connected · Bot polling' : 'Daemon connected · Bot polling unavailable';
-    for (const id of ['sessions', 'approvals', 'lanes', 'blockers', 'queue']) byId(id).replaceChildren();
+    for (const id of SECTIONS) byId(id).replaceChildren();
     if (!data.sessions) empty('sessions', 'Session host unavailable.');
     else if (!data.sessions.length) empty('sessions', 'No sessions reported by the host.');
     else for (const session of data.sessions) card('sessions', session.title || session.id, session.cwd || session.workspace || '', session.id === data.session ? 'Attached to this chat' : session.id);
@@ -65,7 +58,7 @@ async function refresh() {
         if (/^https:\/\/github\.com\//.test(item.url || '')) { const link = document.createElement('a'); link.href = item.url; link.textContent = 'View on GitHub'; link.target = '_blank'; link.rel = 'noopener noreferrer'; node.append(link); }
       }
     }
-  } catch (error) { byId('connection').textContent = 'Not connected'; byId('notice').textContent = error.message; unavailable(); }
+  } catch (error) { unavailable(error.message || REOPEN_MESSAGE); }
   finally { loading = false; byId('refresh').disabled = false; }
 }
 byId('refresh').onclick = refresh;
