@@ -99,7 +99,10 @@ fragment superboardWorkflows on ProjectV2Owner {
   projectV2(number: $number) {
     id
     title
-    workflows(first: 50) { nodes { id name number enabled } }
+    workflows(first: 50) {
+      nodes { id name number enabled }
+      pageInfo { hasNextPage }
+    }
   }
 }
 """
@@ -566,6 +569,10 @@ class WorkflowAudit:
 
     project_owner: str
     project_number: int
+    #: The board GitHub actually returned, as opposed to the owner and number a
+    #: caller asked for. An audit record that names only the arguments proves
+    #: nothing about which board was read.
+    project_node_id: Optional[str]
     project_title: Optional[str]
     workflows: tuple[Mapping[str, Any], ...]
     findings: tuple[WorkflowFinding, ...]
@@ -578,6 +585,7 @@ class WorkflowAudit:
         return {
             "findings": [finding.to_dict() for finding in self.findings],
             "ok": self.ok,
+            "project_node_id": self.project_node_id,
             "project_number": self.project_number,
             "project_owner": self.project_owner,
             "project_title": self.project_title,
@@ -624,6 +632,13 @@ def project_workflows_from_graphql(raw: Any) -> dict[str, Any]:
             "project-workflows-unreadable",
             "the Project resolved but carries no workflow connection; refusing to report a "
             "board as clean",
+        )
+    page = connection.get("pageInfo")
+    if isinstance(page, Mapping) and page.get("hasNextPage"):
+        raise MutationConflict(
+            "project-workflows-incomplete",
+            "the board returned more workflows than one page carries, so the audit read only "
+            "part of them; a partially read board is not a clean board",
         )
     return {
         "project_node_id": project.get("id"),
@@ -705,6 +720,7 @@ def audit_project_workflows(
     return WorkflowAudit(
         project_owner=project_owner,
         project_number=project_number,
+        project_node_id=read["project_node_id"],
         project_title=read["project_title"],
         workflows=tuple(read["workflows"]),
         findings=tuple(sorted(findings, key=lambda f: (f.workflow_number or 0, f.workflow_name))),

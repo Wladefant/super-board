@@ -126,6 +126,13 @@ class RecordedBoardTests(unittest.TestCase):
         )
         self.assertIs(audit.to_dict()["ok"], False)
 
+    def test_the_audit_names_the_board_github_returned_not_the_one_asked_for(self) -> None:
+        # An audit record whose only identity is the owner and number a caller
+        # typed proves nothing about which board answered. The node id does.
+        audit = _audit(_recorded())
+        self.assertEqual(audit.project_node_id, "PVT_kwHOBL7E1c4Beofv")
+        self.assertEqual(audit.to_dict()["project_node_id"], "PVT_kwHOBL7E1c4Beofv")
+
     def test_turning_the_workflow_off_clears_the_board(self) -> None:
         audit = _audit(_with("Auto-close issue", enabled=False))
         self.assertTrue(audit.ok, f"unexpected findings: {_reported(audit)}")
@@ -261,6 +268,26 @@ class UnreadableBoardTests(unittest.TestCase):
     def test_a_response_that_is_not_an_object_refuses(self) -> None:
         self.assertEqual(self._reason(["not", "a", "response"]), "project-workflows-unreadable")
 
+    def test_a_board_with_a_second_page_of_workflows_refuses(self) -> None:
+        # One page holds 50 and a board ships a handful, so this cannot bite
+        # today — but a read that stopped early would report the workflows it
+        # happened to see as the whole board.
+        payload = _recorded()
+        payload["data"]["repositoryOwner"]["projectV2"]["workflows"]["pageInfo"] = {
+            "hasNextPage": True
+        }
+        self.assertEqual(self._reason(payload), "project-workflows-incomplete")
+
+    def test_one_page_of_workflows_is_read_as_the_whole_board(self) -> None:
+        self.assertIs(
+            _recorded()["data"]["repositoryOwner"]["projectV2"]["workflows"]["pageInfo"][
+                "hasNextPage"
+            ],
+            False,
+            "the recorded board fits one page, so its findings cover all of it",
+        )
+        self.assertFalse(_audit(_recorded()).ok)
+
 
 class CommandLineTests(unittest.TestCase):
     """The CLI exits non-zero and names the operator's click path."""
@@ -319,6 +346,7 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(out.getvalue().strip(), PROJECT_WORKFLOWS_QUERY.strip())
         self.assertIn("... on Organization", out.getvalue())
         self.assertIn("workflows(first: 50)", out.getvalue())
+        self.assertIn("pageInfo { hasNextPage }", out.getvalue())
 
 
 if __name__ == "__main__":

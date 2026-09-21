@@ -43,7 +43,10 @@
               "name": "Pull request merged",
               "number": 2
             }
-          ]
+          ],
+          "pageInfo": {
+            "hasNextPage": false
+          }
         }
       }
     }
