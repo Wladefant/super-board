@@ -125,8 +125,11 @@ Part of https://github.com/<owner>/<repo>/issues/<N> — <title>
 
 Use a closing keyword (`Closes` / `Fixes` / `Resolves #<N>`) only when the
 diff satisfies every acceptance-criterion checkbox on that issue. A partial
-PR that says `Closes #N` still closes the issue on merge. See
-`references/github-ops.md`.
+PR that says `Closes #N` still closes the issue on merge. And a keyword fires
+only when the commit reaches the repository's default branch: if
+`config.base_branch` is not the default branch, no keyword closes anything —
+write `Refs #<N>` plus the full issue URL and close the issue explicitly
+against evidence. See `references/github-ops.md`.
 
 ## Acceptance Criteria
 - [ ] AC1: <text>

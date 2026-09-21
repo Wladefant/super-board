@@ -68,9 +68,14 @@ discipline applies to every handoff comment and every review body.
 
 ## Closing an issue
 
-A PR body that says `Closes #N` (or `Fixes` / `Resolves`) closes the issue on
-merge even when the PR implements only part of it. Two PRs on 2026-08-26 would
-have silently closed half-fixed issues.
+A closing keyword fires **only when the commit reaches the repository's
+default branch**. That splits into two separate traps, and a board hits one or
+the other depending on where its pull requests land.
+
+**Base is the default branch — the keyword fires too eagerly.** A PR body that
+says `Closes #N` (or `Fixes` / `Resolves`) closes the issue on merge even when
+the PR implements only part of it. Two PRs on 2026-08-26 would have silently
+closed half-fixed issues.
 
 Before allowing a closing keyword:
 
@@ -81,6 +86,21 @@ Before allowing a closing keyword:
 3. The Superboard PR template in `run.md` historically used `Resolves #<N>`.
    That is a closing keyword. Use it only when the diff satisfies every AC;
    otherwise replace it with `Part of` plus the full URL.
+
+**Base is not the default branch — the keyword does nothing at all.** On a
+board routed to `staging` (PolySimulator's default is `main`), a merged
+`Closes #N` creates no closing link and fires no close event. The issue stays
+open, the card stays in `Review`, and nothing warns you; this was found on
+[polysimulator#2430](https://github.com/Bavariance/polysimulator/issues/2430)
+and is recorded in
+[super-board#70](https://github.com/Wladefant/super-board/issues/70). Never
+assume a merge closed anything — reread the issue state. Write `Refs #N` plus
+the full issue URL, and close the issue explicitly once its acceptance
+criteria are evidenced. The closure normalizer that automates that explicit
+close is bound by the same rule as a human: it acts only on a merged
+non-default-base PR with exactly one unambiguously linked issue, and it writes
+an audit comment naming the merge commit, so a closure is always traceable to
+the merge that earned it.
 
 Never close an issue as a substitute for a merge. The runtime already forbids
 that path; a closing keyword is the remaining way a partial PR can still

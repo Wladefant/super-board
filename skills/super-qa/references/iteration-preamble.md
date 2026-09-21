@@ -307,7 +307,8 @@ acceptable; a fix can silently disable a feature to make a wrong spec pass.
    marks a pull request as safe to merge, because nothing merges it.
 
    PR body must include:
-   - Link to the GH issue (`Fixes #${ISSUE_N}`)
+   - Link to the GH issue (`Fixes #${ISSUE_N}`, which closes it only on a
+     default-branch merge; use `Refs #${ISSUE_N}` on a non-default base)
    - The exact failing assertion / signal type (objective or subjective)
    - Forensics excerpt (top-5 console errors / pageerrors / failing requests)
    - Files changed + why (1-2 sentences per file)
@@ -630,7 +631,10 @@ detection (do NOT batch at end of iter):
    `$ISSUE_N` and reference it everywhere downstream:
    - In `queue.md` line: `[b] /foo → BUG-N.M → #${ISSUE_N} (iter:N)`
    - In `iteration-N.md` Section 3 YAML: `gh_issue: ${ISSUE_N}`
-   - In any fix commit message: `fix(super-qa): ... (closes #${ISSUE_N})`
+   - In any fix commit message: `fix(super-qa): ... (closes #${ISSUE_N})` —
+     which closes the issue only once that commit reaches the repository's
+     default branch; on a non-default base the keyword is inert and the issue
+     needs an explicit `gh issue close` with evidence.
 
 3. **If the script exits non-zero:**
    - Exit 64/66/70: bad arguments — log a `loop-internal` failure to
