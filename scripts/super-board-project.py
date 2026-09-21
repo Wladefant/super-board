@@ -180,9 +180,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     f"🛑 super-board-project: built-in workflow "
                     f"#{finding.workflow_number} {finding.workflow_name!r} is enabled on "
                     f"{args.owner}/projects/{args.number} ({finding.reason_code}): "
-                    f"{finding.effect}. Disable it in the Projects UI — "
-                    f"⋯ → Workflows → {finding.workflow_name} → toggle off; GitHub exposes "
-                    f"no mutation for this setting.",
+                    f"{finding.effect}. Disable it in the Projects UI: the board's "
+                    f'"..." menu -> Workflows -> Default workflows -> '
+                    f"{finding.workflow_name} -> off. GitHub exposes no mutation for this "
+                    f"setting.",
                     file=sys.stderr,
                 )
             return EXIT_CONFIG
