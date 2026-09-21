@@ -503,6 +503,13 @@ describe("Telegram Harness Hot Reload", () => {
   test("Extension registers the operator question, message and dashboard tools", () => {
     const mockApi = createMockExtensionAPI();
     telegramSessionExtension(mockApi.api);
+    expect(mockApi.listeners.has("tool_call")).toBe(false);
+    for (const toolName of ["bash", "eval", "write", "read", "ssh", "github", "supabase", "launch"]) {
+      const results = (mockApi.listeners.get("tool_call") ?? []).map(handler =>
+        handler({ toolName, input: { category: "any", command: "inert test data" } }));
+      expect(results).toEqual([]);
+    }
+    expect(mockApi.userMessages).toEqual([]);
 
     expect([...mockApi.tools.keys()].sort()).toEqual(["telegram_dashboard", "telegram_message", "telegram_question"]);
     expect(mockApi.tools.get("telegram_question")?.parameterKeys).toContain("options");
@@ -604,11 +611,9 @@ describe("Telegram Harness Hot Reload", () => {
     const childHost = createMockExtensionAPI();
     const starts: string[] = [];
     let disposals = 0;
-    let turns = 0;
     const runtime = {
       onSessionStart: async (_event: unknown, ctx: ExtensionContext) => { starts.push(ctx.sessionManager.getSessionId()); },
       onSessionShutdown: async () => { disposals++; },
-      onTurnEnd: async () => { turns++; },
       getPoller: () => ({}),
     } as unknown as TelegramRuntime;
     setActiveRuntime(runtime);
@@ -620,11 +625,11 @@ describe("Telegram Harness Hot Reload", () => {
     await childHost.listeners.get("turn_end")![0]();
     await childHost.listeners.get("session_shutdown")![0]({});
     expect(starts).toEqual(["root-owner"]);
-    expect(turns).toBe(0);
     expect(disposals).toBe(0);
     expect(getActiveRuntime()).toBe(runtime);
     await rootHost.listeners.get("turn_end")![0]();
-    expect(turns).toBe(1);
+    await rootHost.listeners.get("session_shutdown")![0]({});
+    expect(disposals).toBe(1);
     setActiveRuntime(null);
   });
 

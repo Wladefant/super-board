@@ -34,9 +34,7 @@ export interface PollerCallbacks {
   onAbort: () => void;
   onRelease: () => Promise<void>;
   getStatusText: () => string;
-  onTelegramTurnStart: () => void;
   onHarnessCommand?: (text: string, chatId: string, userId?: string) => Promise<boolean>;
-  onApprovalCallback?: (data: string, userId: string, chatId: string, sessionId: string) => Promise<string>;
   onDecisionCallback?: (
     decisionId: string,
     choiceId: string,
@@ -986,25 +984,9 @@ export class TelegramPoller {
       const callbackToken = row.callback_data || row.text || "";
       const cbQueryId = row.callback_query_id || "";
       if (callbackToken.startsWith("ap:")) {
-        const sessionId = this.correlation?.getSessionId();
-        try {
-          if (!sessionId || !this.callbacks.onApprovalCallback) throw new Error("Approval handling is unavailable.");
-          const outcome = await this.callbacks.onApprovalCallback(callbackToken, fromId, chatId, sessionId);
-          if (cbQueryId) await this.answerCallbackQuery(cbQueryId, outcome);
-          if (typeof row.reply_to_message_id === "number") {
-            const isApproved = callbackToken.startsWith("ap:a:");
-            const d = new Date();
-            const timeStr = `${String(d.getUTCHours()).padStart(2, "0")}:${String(d.getUTCMinutes()).padStart(2, "0")} UTC`;
-            const buttonText = isApproved ? `✅ Approved by you at ${timeStr}` : "❌ Denied";
-            await this.clearCallbackButtons(chatId, row.reply_to_message_id, buttonText);
-          }
-          await this.sendTelegramMessage(chatId, escapeHtml(outcome));
-          this.db.run("UPDATE update_ledger SET status = 'COMPLETED', correlated_session_id = ? WHERE update_id = ?", [sessionId, row.update_id]);
-        } catch (error) {
-          const detail = error instanceof Error ? error.message : "Approval decision unavailable; nothing authorized.";
-          if (cbQueryId) await this.answerCallbackQuery(cbQueryId, detail, true);
-          this.db.run("UPDATE update_ledger SET status = 'REJECTED', error = 'APPROVAL_REJECTED' WHERE update_id = ?", [row.update_id]);
-        }
+        if (cbQueryId) await this.answerCallbackQuery(cbQueryId, "Telegram tool-call approvals are obsolete. Nothing was authorized or executed.", true);
+        if (typeof row.reply_to_message_id === "number") await this.clearCallbackButtons(chatId, row.reply_to_message_id);
+        this.db.run("UPDATE update_ledger SET status = 'REJECTED', error = 'OBSOLETE_TOOL_APPROVAL' WHERE update_id = ?", [row.update_id]);
         return;
       }
 
@@ -1067,7 +1049,6 @@ export class TelegramPoller {
         if (typeof row.reply_to_message_id === "number") await this.clearCallbackButtons(chatId, row.reply_to_message_id);
         return;
       }
-      this.callbacks.onTelegramTurnStart();
       await this.callbacks.onDecisionCallback(record.decisionId, record.choiceId,
         [`Callback identity: ${record.callbackToken}`, row.reply_to_text].filter(Boolean).join("\n"));
       // At-least-once across a crash between delivery and consumption: never
@@ -1258,7 +1239,6 @@ export class TelegramPoller {
       const steerText = rawText.replace(/^\/steer\s*/i, "").trim();
       if (steerText) {
         const attributed = attributeSender(fromId, steerText);
-        this.callbacks.onTelegramTurnStart();
         if (this.callbacks.isIdle()) this.callbacks.onUserMessage(attributed);
         else this.callbacks.onSteer(attributed);
         this.db.run("UPDATE update_ledger SET status = 'COMPLETED' WHERE update_id = ?", [row.update_id]);
@@ -1279,7 +1259,6 @@ export class TelegramPoller {
     //    idle starts a turn; busy text uses the native steering queue so an
     //    authorized operator message reaches continuous work at the next safe
     //    tool boundary instead of waiting for the session to stop.
-    this.callbacks.onTelegramTurnStart();
 
     let deliveredText = rawText;
     if (typeof row.reply_to_message_id === "number" && !isTopicRoot) {

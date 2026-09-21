@@ -1,7 +1,7 @@
 /**
  * runtime.ts — Dynamic Telegram Runtime implementation for Veyyon.
  *
- * Encapsulates the stateful bot coordinator, poller, dangerous tool guard,
+ * Encapsulates the stateful bot coordinator, poller,
  * and correlation bridges. Instantiated dynamically by the thin extension loader
  * in index.ts so that code updates can be hot-reloaded in-process.
  */
@@ -14,15 +14,12 @@ import type {
   MessageUpdateEvent,
   SessionShutdownEvent,
   SessionStartEvent,
-  ToolCallEvent,
 } from "@veyyon/coding-agent";
 import { BotPoolCoordinator } from "./coordinator";
-import { DangerousToolGuard, approveOperation } from "./guard";
-import { decideApproval, parseApprovalCallback, approvalOutcome } from "./approvals";
 import { TelegramPoller, type PollerCallbacks, type PollerOptions } from "./poller";
 import { chunkMessage, escapeHtml, markdownToTelegramHtml } from "./sanitizer";
 import type { AccessConfig, DiscoveredSlot, MessageCorrelationBridge } from "./types";
-import { handleInstalledCommand, renderApprovalRequest } from "./harness/installed-commands";
+import { handleInstalledCommand } from "./harness/installed-commands";
 import { BunCommandRunner, type CommandRunner } from "./harness/command-runner";
 import { latestSessionPng } from "./harness/session-artifacts";
 import { OperatorQuestionService, questionOperator } from "./harness/operator-questions";
@@ -43,7 +40,6 @@ export interface ActiveRootState {
   slotId: string;
   pi: ExtensionAPI;
   poller: TelegramPoller;
-  guard: DangerousToolGuard;
   coordinator: BotPoolCoordinator;
   activeSlot: DiscoveredSlot;
   questions?: OperatorQuestionService;
@@ -170,7 +166,6 @@ export class TelegramRuntime {
   private outboundQueue: Promise<void> = Promise.resolve();
 
   private poller: TelegramPoller | null = null;
-  private guard: DangerousToolGuard | null = null;
   private coordinator: BotPoolCoordinator | null = null;
   private activeSlot: DiscoveredSlot | null = null;
   private accessConfig: AccessConfig | null = null;
@@ -393,7 +388,6 @@ export class TelegramRuntime {
     this.coordinator = coordinator;
     this.activeSlot = activeSlot;
     this.sessionId = newSessionId;
-    this.guard = new DangerousToolGuard(activeSlot.stateDir);
     this.accessConfig = coordinator.readAccessConfig(activeSlot.stateDir);
     if (isDaemonClient && daemonRoute) {
       this.accessConfig = {
@@ -447,7 +441,6 @@ export class TelegramRuntime {
       isIdle: () => ctx.isIdle(),
       getSessionFile: () => ctx.sessionManager.getSessionFile(),
       onUserMessage: (text: string) => {
-        if (this.guard) this.guard.startTelegramTurn();
         if (ctx.isIdle()) {
           this.pi.sendUserMessage(text);
         } else {
@@ -455,11 +448,9 @@ export class TelegramRuntime {
         }
       },
       onFollowUp: (text: string) => {
-        if (this.guard) this.guard.startTelegramTurn();
         this.pi.sendUserMessage(text, { deliverAs: "followUp" });
       },
       onSteer: (text: string) => {
-        if (this.guard) this.guard.startTelegramTurn();
         this.pi.sendUserMessage(text, { deliverAs: "steer" });
       },
       // Abort only. The poller owns the operator-facing cancellation reply, so
@@ -479,12 +470,6 @@ export class TelegramRuntime {
           model: ctx.model?.id,
           stateDir: activeSlot.stateDir,
         }),
-        approve: async token => {
-          if (!userId) throw new Error("Authenticated actor is missing.");
-          const record = approveOperation(activeSlot.stateDir, token, { sessionId: currentSessionId(), userId, chatId });
-          await this.pi.sendUserMessage(approvalOutcome(record), ctx.isIdle() ? undefined : { deliverAs: "steer" });
-          return record;
-        },
         send: async html => {
           if (!this.poller) throw new Error("Poller unavailable");
           const sent = await this.poller.sendTelegramMessage(chatId, html);
@@ -498,7 +483,6 @@ export class TelegramRuntime {
           return sessionFile ? latestSessionPng(sessionFile) : null;
         },
         inbound: async (message, idle) => {
-          if (this.guard) this.guard.startTelegramTurn();
           if (idle) this.pi.sendUserMessage(message);
           else this.pi.sendUserMessage(message, { deliverAs: "steer" });
         },
@@ -510,16 +494,6 @@ export class TelegramRuntime {
           }
         },
       }, runner),
-      onApprovalCallback: async (data: string, userId: string, chatId: string, sessionId: string) => {
-        const selection = parseApprovalCallback(data);
-        if (!selection || sessionId !== currentSessionId()) throw new Error("Invalid or foreign-session approval callback.");
-        const record = decideApproval(activeSlot.stateDir, selection.token, selection.decision, { sessionId, userId, chatId });
-        await this.pi.sendUserMessage(approvalOutcome(record), ctx.isIdle() ? undefined : { deliverAs: "steer" });
-        return approvalOutcome(record);
-      },
-      onTelegramTurnStart: () => {
-        if (this.guard) this.guard.startTelegramTurn();
-      },
       // The service is constructed after the poller it writes through, so the
       // receiver is resolved per answer rather than captured at wiring time.
       onQuestionAnswer: async (decisionId: string, eventId: string, answer: { choice?: string; text?: string }) => {
@@ -527,7 +501,6 @@ export class TelegramRuntime {
         await this.questions.answer(decisionId, eventId, answer);
       },
       onDecisionCallback: async (decisionId: string, choiceId: string, context?: string) => {
-        if (this.guard) this.guard.startTelegramTurn();
         const decisionSessionId = currentSessionId();
         const canonicalResolved = await this.coordinator?.applyDecisionAnswer(
           decisionSessionId,
@@ -619,7 +592,6 @@ export class TelegramRuntime {
       slotId: activeSlot.slotId,
       pi: this.pi,
       poller,
-      guard: this.guard,
       coordinator,
       activeSlot,
       questions,
@@ -718,66 +690,6 @@ export class TelegramRuntime {
     this.sentTelegramMessageIds = [];
     this.streamedChunks = [];
     this.accumulatedAssistantText = "";
-  }
-
-  public async onToolCall(event: ToolCallEvent, ctx: ExtensionContext): Promise<{ block: boolean; reason: string; subject?: { kind: "path" | "command"; value: string }; disposition?: "approval-required" | "refused" } | void> {
-    // Only the guard and the session identity are required to judge a call. A channel that
-    // never attached (bad access.json, stopped poller, disposed runtime) must not turn the
-    // gate off: it costs the operator the approval card, not the block.
-    if (!this.guard || !this.sessionId) return;
-
-    const evaluation = this.guard.evaluateToolCall(
-      event.toolName,
-      event.input as Record<string, unknown>,
-      undefined,
-      {
-        sessionId: this.sessionId,
-        requester: ctx.agentId ?? "Main (interactive root agent)",
-        task: String(
-          event.input.i ??
-          event.input.task ??
-          event.input.description ??
-          event.input.title ??
-          `Run ${event.toolName}; no task description supplied`
-        ),
-        cwd: ctx.cwd,
-        toolCallId: event.toolCallId,
-      },
-    );
-
-    if (evaluation.allowed) return;
-
-    const chatId = this.poller?.getPrimaryChatId();
-    let cardDelivered = false;
-    if (chatId && evaluation.approval) {
-      const card = renderApprovalRequest(evaluation.approval);
-      try {
-        const chunks = chunkMessage(card.text);
-        for (let n = 0; n < chunks.length; n++) {
-          const sent = await this.poller?.sendTelegramMessage(chatId, chunks[n], "HTML", n === chunks.length - 1 ? card.replyMarkup : undefined);
-          if (!sent?.ok) break;
-          cardDelivered = n === chunks.length - 1;
-        }
-      } catch {}
-    }
-
-    const reason = evaluation.reason ?? "Sensitive operation requires operator approval.";
-    return {
-      block: true,
-      subject: evaluation.subject,
-      disposition: evaluation.disposition,
-      reason: evaluation.approval && !cardDelivered
-        ? `${reason} The Telegram approval card could not be delivered; the exact operation remains blocked pending approval. Restore the session's Telegram route before retrying.`
-        : reason,
-    };
-  }
-
-  public async onAgentEnd(): Promise<void> {
-    if (this.guard) this.guard.endTurn();
-  }
-
-  public async onTurnEnd(): Promise<void> {
-    if (this.guard) this.guard.endTurn();
   }
 
   public async onSessionShutdown(_event: SessionShutdownEvent): Promise<void> {

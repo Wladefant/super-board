@@ -94,7 +94,6 @@ function fixture(options: QuestionFixtureOptions = {}) {
       onFollowUp: () => {},
       onAbort: () => {},
       onRelease: async () => {},
-      onTelegramTurnStart: () => {},
       getStatusText: () => "test",
       onLedgerFailure: () => {},
       onQuestionAnswer: options.omitQuestionAnswerCallback

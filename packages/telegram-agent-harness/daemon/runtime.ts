@@ -16,7 +16,6 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { randomUUID } from "node:crypto";
 import { OperatorQuestionService, questionOperator } from "../src/operator-questions";
-import { decideApproval, parseApprovalCallback, approvalOutcome } from "../extension/approvals";
 import {
   BotPoolCoordinator,
   getDefaultManifestPath,
@@ -383,7 +382,6 @@ export class TelegramDaemon {
         await this.stopSlot(slot.slotId);
       },
       getStatusText: () => router.statusText(currentTarget()),
-      onTelegramTurnStart: () => {},
       onHarnessCommand: async (text: string, chatId: string, userId?: string) => {
         // The poller hands over the chat it read the update from; the topic within it
         // is the one it is dispatching right now.
@@ -478,17 +476,6 @@ export class TelegramDaemon {
           message => this.log(message),
         );
         await questions.answer(decisionId, eventId, answer);
-      },
-      onApprovalCallback: async (data: string, userId: string, chatId: string, sessionId: string) => {
-        const target = currentTarget();
-        const selection = parseApprovalCallback(data);
-        if (!selection || router.boundSession(target) !== sessionId || target.chatId !== chatId) {
-          throw new Error("Invalid or foreign-session approval callback.");
-        }
-        const record = decideApproval(slot.stateDir, selection.token, selection.decision, { sessionId, userId, chatId });
-        const outcome = approvalOutcome(record);
-        await router.deliver(target, outcome, "auto");
-        return outcome;
       },
       onDecisionCallback: async (decisionId: string, choiceId: string, context?: string) => {
         if (decisionId.startsWith("attach:")) {

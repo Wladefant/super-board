@@ -1,7 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { authenticateInitData, authenticateAppSession, issueAppSession } from "./miniapp-auth";
-import { decideApproval, pendingApprovals } from "../extension/approvals";
 
 export interface MiniAppRequest { id: string; path: string; method: string; initData: string; appSession?: string; body: string }
 export interface MiniAppOptions {
@@ -42,18 +41,10 @@ export async function miniAppRequest(request: MiniAppRequest, options: MiniAppOp
         sessions,
         status: options.status(),
         dashboard: options.dashboard(user, session),
-        approvals: session ? pendingApprovals(options.stateDir, session) : null,
       });
     }
     if (reqPath === "/api/approval" && request.method === "POST") {
-      const body = JSON.parse(request.body || "{}");
-      const targetSession = (typeof body.sessionId === "string" && body.sessionId)
-        ? options.session(user, { sessionId: body.sessionId })
-        : session;
-      if (!targetSession) return respond(409, { error: "Chat or requested topic is not bound to an active session." });
-      if (body.decision !== "approved" && body.decision !== "denied") return respond(400, { error: "Invalid decision" });
-      const result = decideApproval(options.stateDir, body.token, body.decision, { sessionId: targetSession, userId: user, chatId: user });
-      return respond(200, { state: result.state });
+      return respond(410, { error: "Telegram tool-call approvals have been removed. No operation was authorized or executed." });
     }
     return respond(404, { error: "Not found" });
   } catch { return respond(409, { error: "Request unavailable, expired, already decided, or not authorized for this session." }); }

@@ -13,7 +13,6 @@ import {
 } from "../daemon/session-control";
 import { TelegramPoller } from "../extension/poller";
 import { FakeForumApiClient } from "./daemon-forum.test";
-import { describeApproval, evaluateApproval, approvalCallback } from "../extension/approvals";
 import type { MessageCorrelationBridge } from "../extension/types";
 
 const OPERATOR_ID = "1247617658";
@@ -192,7 +191,7 @@ describe("TelegramDaemon forum auto-attach runtime", () => {
 
     await daemon.stop();
   });
-  test("forum menu attaches through its owner and daemon approvals reject replay and foreign topics", async () => {
+  test("forum menu attaches through its authenticated owner and rejects replay", async () => {
     createManifest(true);
     const fake = fakeControl([
       { id: "owner-one", cwd: "C:/dev/one", workspace: "C:/dev/one", title: null, status: "Idle", modifiedAtMs: Date.now() },
@@ -235,13 +234,6 @@ describe("TelegramDaemon forum auto-attach runtime", () => {
       expect(fake.loaded).toContain(selection.record.choiceId);
       expect(correlation.consumeCallback?.(token)).toBe(true);
       expect(correlation.resolveCallback?.(token, OPERATOR_ID, FORUM_CHAT_ID).decision).toBe("reject_already_consumed");
-      const context = { sessionId: "owner-one", requester: "fixture", task: "disposable", cwd: "C:/dev/one" };
-      const approval = evaluateApproval(stateDir, "fixture-operation", describeApproval("bash", { command: "echo fixture" }, "dynamic_code", context));
-      thread = 102;
-      await expect(callbacks.onApprovalCallback!(approvalCallback(approval.token, "approved"), OPERATOR_ID, FORUM_CHAT_ID, "owner-one")).rejects.toThrow("foreign-session");
-      thread = 101;
-      await callbacks.onApprovalCallback!(approvalCallback(approval.token, "approved"), OPERATOR_ID, FORUM_CHAT_ID, "owner-one");
-      await expect(callbacks.onApprovalCallback!(approvalCallback(approval.token, "approved"), OPERATOR_ID, FORUM_CHAT_ID, "owner-one")).rejects.toThrow("no permission changed");
     } finally {
       await daemon.stop();
     }

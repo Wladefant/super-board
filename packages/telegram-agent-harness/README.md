@@ -6,9 +6,13 @@ Universal, mobile-friendly Telegram operations surface for managing multi-agent 
 
 - **Standalone Machine Daemon**: Long-polls opted-in Telegram bot slots via a detached background service without requiring an open terminal window.
 - **Lease & Slot Management**: Transparent bot leasing from SQLite (`bot_pool.db`) preventing HTTP 409 poller collisions across sessions.
-- **Direct-Chat (DM) Mode**: 1-on-1 private chat with the operator for session steering, approvals, and questions.
+- **Direct-Chat (DM) Mode**: 1-on-1 private chat with the operator for session steering and questions.
 - **Supergroup Forum Topics Mode (Opt-In)**: Multiplexes multiple concurrent Veyyon sessions into a single Telegram Supergroup using native Telegram Forum Topics (`message_thread_id`).
 - **Superboard Mini App Integration**: In-app Telegram web dashboard for interactive queue and session monitoring.
+
+Telegram does not intercept, validate, or approve tool calls. Native Veyyon permissions remain independent and unchanged. Sender authentication, topic/session ownership, ordinary operator questions and consequential non-tool decisions remain enforced. Old tool-approval buttons report that the feature is obsolete without granting permission or executing work; the Mini App has no tool-approval section.
+
+After upgrading from a guard-bearing loader, reload the **static extension** in each original session using the host's `/reload-config` command. `/tg-reload` only replaces the dynamic runtime and cannot remove hooks registered by the old loader. Restart the standalone daemon through its existing supervisor when authorized to activate its stale-callback handling; installation alone does not replace code already in memory. Never resume a duplicate session.
 
 ---
 

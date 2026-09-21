@@ -40,7 +40,6 @@ function build(access: Record<string, unknown>, options: Record<string, unknown>
     onAbort: () => {},
     onRelease: async () => {},
     getStatusText: () => "probe",
-    onTelegramTurnStart: () => {},
     onLedgerFailure: () => {},
     onDecisionCallback: async (id, choice) => {
       inbound.push({ text: `decision:${id}:${choice}`, threadId: poller.getActiveThreadId() });

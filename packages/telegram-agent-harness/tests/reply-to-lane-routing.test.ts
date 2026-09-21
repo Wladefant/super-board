@@ -58,7 +58,6 @@ function fixture(
       onFollowUp: () => {},
       onAbort: () => {},
       onRelease: async () => {},
-      onTelegramTurnStart: () => {},
       getStatusText: () => "test",
       onLedgerFailure: () => {},
     },

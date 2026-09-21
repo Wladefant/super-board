@@ -58,7 +58,7 @@ const poller = new TelegramPoller(coordinator.readRawTokenForSlot(claim.slot.sta
   onFollowUp: text => evidence("MAIN_FOLLOWUP_RECEIVED", text),
   onAbort: () => evidence("ABORT_REFUSED_IN_QA", null),
   onRelease: async () => evidence("RELEASE_REFUSED_IN_QA", null),
-  onTelegramTurnStart: () => {}, getStatusText: () => "Disposable interface QA",
+  getStatusText: () => "Disposable interface QA",
   onLedgerFailure: text => evidence("ERROR", text),
   onQuestionAnswer: async (id, event, answer) => { await service.answer(id, event, answer); evidence("QUESTION_INPUT", { id, ...answer }); },
 }, bridge);

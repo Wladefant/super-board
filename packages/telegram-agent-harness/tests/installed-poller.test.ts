@@ -11,7 +11,7 @@ test.skipIf(!installed)("installed routing keeps command, authorization and deci
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tg-command-test-"));
   const commands: string[] = [], inbound: string[] = [];
   const poller = new TelegramPoller("0:test-only", dir, { dmPolicy: "allowlist", allowFrom: ["1"] }, {
-    isIdle: () => true, onUserMessage: (text: string) => inbound.push(text), onFollowUp: () => {}, onSteer: () => {}, onAbort: () => {}, onRelease: async () => {}, getStatusText: () => "test", onTelegramTurnStart: () => {}, onLedgerFailure: () => {},
+    isIdle: () => true, onUserMessage: (text: string) => inbound.push(text), onFollowUp: () => {}, onSteer: () => {}, onAbort: () => {}, onRelease: async () => {}, getStatusText: () => "test", onLedgerFailure: () => {},
     onHarnessCommand: async (text: string) => { await Promise.resolve(); if (!/^\/(agents|usage|prompt|shot)(?:\s|$)/.test(text)) return false; commands.push(text); return true; },
   });
   try {

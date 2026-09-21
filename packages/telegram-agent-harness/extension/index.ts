@@ -18,7 +18,6 @@ import type {
   MessageUpdateEvent,
   SessionShutdownEvent,
   SessionStartEvent,
-  ToolCallEvent,
 } from "@veyyon/coding-agent";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -566,18 +565,8 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
     await activeRuntime?.onMessageEnd(event);
   });
 
-  pi.on("tool_call", async (event: ToolCallEvent, ctx: ExtensionContext) => {
-    return await activeRuntime?.onToolCall(event, ctx);
-  });
-
-  pi.on("agent_end", async () => {
-    if (!ownsRootLifecycle) return;
-    await activeRuntime?.onAgentEnd();
-  });
-
   pi.on("turn_end", async () => {
     if (!ownsRootLifecycle) return;
-    await activeRuntime?.onTurnEnd();
     await ensureChannelBound("turn_end");
   });
 

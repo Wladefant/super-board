@@ -481,7 +481,6 @@ describe("poller authorization for a forum supergroup", () => {
       onAbort: () => {},
       onRelease: async () => {},
       getStatusText: () => "test",
-      onTelegramTurnStart: () => {},
       onLedgerFailure: () => {},
     };
     const poller = new TelegramPoller(
