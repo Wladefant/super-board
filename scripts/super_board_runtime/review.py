@@ -187,6 +187,12 @@ _RETIRED_STATUS_RE = re.compile(rf"\b(?:{_RETIRED_ALTERNATION})\b")
 #: never prose for `scan_merge_prohibitions` — nothing around it can excuse it.
 #: Case-insensitive because `canonicalize_status` folds case: `"skipped"` is
 #: the same resurrection wearing a lowercase hat.
+#:
+#: Known gap: a write through a call whose name is not status-ish — such as
+#: `move_card(id, "Skipped")` — is not caught in code without AST analysis or
+#: whole-program dataflow. Prose/skill instructions ("moving a card to Blocked
+#: or Skipped") are caught by `_CANONICAL_STATUS_RE` context, but an un-annotated
+#: helper call in source code is not.
 _STATUS_ASSIGNMENT_RE = re.compile(
     rf"""(?:status|state|column)\w*["'`]?\s*(?:=>|[:=]=?)\s*["'`]*\s*"""
     rf"""(?:{_RETIRED_ALTERNATION})\b"""
@@ -508,6 +514,11 @@ def scan_retired_status(
          it, exactly as no paragraph excuses a command inside a code fence.
       3. Anything else is an occurrence only where the passage is about the
          status field AND does not name the value as retired.
+
+    Known gap: a write through a helper function whose name is not status-ish
+    (for example, `move_card(id, "Skipped")`) is not caught in source code
+    because the regex scanner operates on statement syntax rather than call-graph
+    dataflow.
     """
     root = Path(root)
     entries = load_allowlist(root) if allowlist is None else tuple(allowlist)
