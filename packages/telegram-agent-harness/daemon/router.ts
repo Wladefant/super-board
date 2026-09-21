@@ -17,6 +17,7 @@ import type {
 } from "./session-control";
 import { SessionControlUnavailableError } from "./session-control";
 import type { DaemonStore } from "./store";
+import { GuiHostFallbackManager } from "./gui-host-fallback";
 
 /**
  * Where a message came from, and where its answer goes: a chat, plus the forum topic
@@ -51,6 +52,7 @@ export interface SlotRouterOptions {
   log: (message: string) => void;
   /** Present only in forum mode. */
   topics?: TopicLifecycle;
+  fallbackManager?: GuiHostFallbackManager;
 }
 
 export interface DaemonCommandDescriptor {
@@ -94,9 +96,21 @@ export function getDaemonCommands(): DaemonCommandDescriptor[] {
 
 export class SlotRouter {
   private readonly options: SlotRouterOptions;
+  private readonly fallbackManager: GuiHostFallbackManager;
 
   constructor(options: SlotRouterOptions) {
     this.options = options;
+    this.fallbackManager =
+      options.fallbackManager ??
+      new GuiHostFallbackManager({
+        control: options.control,
+        log: options.log,
+      });
+  }
+
+  private withHostFallback<T>(target: RouteTarget, operation: () => Promise<T>): Promise<T> {
+    const replyFn = (text: string) => this.options.send(target, text);
+    return this.fallbackManager.withFallback(target.chatId, replyFn, operation);
   }
 
   private get slotId(): string {
@@ -139,40 +153,42 @@ export class SlotRouter {
    * caller should stay silent because the session itself will answer.
    */
   public async deliver(target: RouteTarget, text: string, mode: DeliveryMode = "auto"): Promise<string | null> {
-    const bound = this.boundSession(target);
-    if (bound) {
-      const outcome = await this.options.control.deliver(bound, text, mode);
-      return outcome === "started" ? null : `↪️ <b>Queued as a ${outcome === "steered" ? "steer" : "follow-up"}</b> for the running turn.`;
-    }
+    return this.withHostFallback(target, async () => {
+      const bound = this.boundSession(target);
+      if (bound) {
+        const outcome = await this.options.control.deliver(bound, text, mode);
+        return outcome === "started" ? null : `↪️ <b>Queued as a ${outcome === "steered" ? "steer" : "follow-up"}</b> for the running turn.`;
+      }
 
-    // A forum's General topic is the group's lobby, not one operator's chat. Binding
-    // a session there would pour every topic's traffic into one transcript.
-    if (this.options.topics && !target.topicId) {
-      return [
-        "ℹ️ <b>General is the lobby, not a session.</b>",
-        "Open one with <code>/new</code>, list what is running with <code>/sessions</code>, or write inside an existing session topic.",
-      ].join("\n");
-    }
+      // A forum's General topic is the group's lobby, not one operator's chat. Binding
+      // a session there would pour every topic's traffic into one transcript.
+      if (this.options.topics && !target.topicId) {
+        return [
+          "ℹ️ <b>General is the lobby, not a session.</b>",
+          "Open one with <code>/new</code>, list what is running with <code>/sessions</code>, or write inside an existing session topic.",
+        ].join("\n");
+      }
 
-    const workspace = this.options.slot.workspace;
-    if (!workspace) {
-      return [
-        "🚫 <b>No workspace is configured for this bot.</b>",
-        `Slot <code>${escapeHtml(this.slotId)}</code> declares no project directory that exists on this machine, so a session cannot be created for it.`,
-        "Use <code>/sessions</code> and <code>/attach &lt;id&gt;</code> to route this chat to a session that is already running.",
-      ].join("\n");
-    }
+      const workspace = this.options.slot.workspace;
+      if (!workspace) {
+        return [
+          "🚫 <b>No workspace is configured for this bot.</b>",
+          `Slot <code>${escapeHtml(this.slotId)}</code> declares no project directory that exists on this machine, so a session cannot be created for it.`,
+          "Use <code>/sessions</code> and <code>/attach &lt;id&gt;</code> to route this chat to a session that is already running.",
+        ].join("\n");
+      }
 
-    const sessionId = await this.options.control.ensureSession(workspace, `Telegram ${this.slotId}`);
-    await this.bind(target, sessionId, workspace);
-    await this.options.control.deliver(sessionId, text, mode);
-    return `🔗 <b>Routed to session</b> <code>${escapeHtml(sessionId)}</code> in <code>${escapeHtml(workspace)}</code>.`;
+      const sessionId = await this.options.control.ensureSession(workspace, `Telegram ${this.slotId}`);
+      await this.bind(target, sessionId, workspace);
+      await this.options.control.deliver(sessionId, text, mode);
+      return `🔗 <b>Routed to session</b> <code>${escapeHtml(sessionId)}</code> in <code>${escapeHtml(workspace)}</code>.`;
+    });
   }
 
   public async abort(target: RouteTarget): Promise<boolean> {
     const bound = this.boundSession(target);
     if (!bound) return false;
-    return this.options.control.abort(bound);
+    return this.withHostFallback(target, () => this.options.control.abort(bound));
   }
 
   public isBusy(target: RouteTarget): boolean {
@@ -218,7 +234,10 @@ export class SlotRouter {
     const [verb, ...rest] = text.trim().split(/\s+/);
     const argument = rest.join(" ").trim();
     try {
-      await this.options.send(target, await this.runCommand(verb.toLowerCase().replace(/@\w+$/, ""), argument, target));
+      const reply = await this.withHostFallback(target, () =>
+        this.runCommand(verb.toLowerCase().replace(/@\w+$/, ""), argument, target)
+      );
+      await this.options.send(target, reply);
     } catch (error) {
       const detail = error instanceof SessionControlUnavailableError
         ? `The Veyyon host is not reachable: ${error.message}`
