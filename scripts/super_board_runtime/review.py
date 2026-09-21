@@ -153,7 +153,16 @@ _MECHANISM_PATTERNS: tuple[tuple[str, re.Pattern[str], bool], ...] = (
     ),
     # Scoped to dispatcher / reviewer paths — see the module docstring.
     ("runtime-issue-closure", re.compile(r"""state_reason|state\s*[:=]\s*["']closed"""), True),
-    ("runtime-done-transition", re.compile(r"""[:=]\s*["']Done["']|\bstatus\s+Done\b"""), True),
+    (
+        "runtime-done-transition",
+        re.compile(
+            r"""["']?(?:status|state|column)\w*["']?\s*\]?\s*(?:=>|=(?![=~]))\s*["'`]*Done\b"""
+            r"""|(?<![!=<>])["']?(?:status|state|column)\w*["']?\s*:\s*["']?Done\b"""
+            r"""|\bstatus\s+Done\b"""
+            r"""|--status[=\s]+["']?Done\b"""
+        ),
+        True,
+    ),
 )
 
 #: The eight mechanisms, in scan order.
@@ -242,8 +251,8 @@ _LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]\s|\d+[.)]\s)")
 #: which is what keeps it from becoming a way to excuse a real command.
 _PROHIBITION_RE = re.compile(
     r"\bn[o']t\b|n't\b|"
-    r"\b(?:never|no|nor|neither|none|nothing|without|cannot|"
-    r"forbid\w*|prohibit\w*|disallow\w*|refus\w*|reject\w*|disabled?|instead\s+of)\b",
+    r"\b(?:never|no|nor|neither|none|nothing|without|cannot|zero|"
+    r"forbid\w*|prohibit\w*|disallow\w*|refus\w*|reject\w*|disabled?|instead\s+of|abort\w*)\b",
     re.IGNORECASE,
 )
 
@@ -379,6 +388,49 @@ def _is_retirement_mention(lines: Sequence[str], index: int, fenced: Sequence[bo
     )
 
 
+#: Negative boundary declarations for auto-merge.
+_AUTO_MERGE_NEGATIVE_BOUNDARY_RE = re.compile(
+    r"""["']?auto[-_]merge\w*["']?\s*(?::\s*\w+\s*)?[:=]\s*["']?false\b"""
+    r"""|boundaries\[["']auto[-_]merge\w*["']\]\s*=\s*False\b"""
+    r"""|\.get\(["']auto[-_]merge\w*["']\s*,\s*False\)"""
+    r"""|auto[-_]merge=false\b""",
+    re.IGNORECASE,
+)
+
+#: Assertions and checks asserting that auto-merge is prohibited / False.
+_AUTO_MERGE_ASSERTION_RE = re.compile(
+    r"""assert(?:_true|_false|Equal|Is|In)?\s*\(.*auto[-_]merge.*(?:False|is\s+False|\.error)\b"""
+    r"""|assert_false\s*\(.*auto[-_]merge"""
+    r"""|for\s+\w+\s+in\s+[^:\n]*auto[-_]merge""",
+    re.IGNORECASE,
+)
+
+#: Read-only mock snapshots in tests.
+_SNAPSHOT_MOCK_RE = re.compile(r"""["']?(?:github_)?snapshot\w*["']?\s*\]?\s*[:=]""")
+
+
+def _is_auto_merge_boundary_or_prohibition(
+    lines: Sequence[str], index: int, fenced: Sequence[bool]
+) -> bool:
+    """True when this line or statement declares auto-merge disallowed rather than enabling it.
+
+    In code this is a negative boundary: setting `auto_merge_allowed = False`
+    or asserting `assert_false(boundaries.auto_merge_allowed)`. In prose,
+    docstrings, comments, or error messages, it is an assertion of prohibition
+    ("no auto-merge", "zero auto-merge", "NEVER auto-merges").
+    """
+    line = lines[index]
+    if _AUTO_MERGE_NEGATIVE_BOUNDARY_RE.search(line) or _AUTO_MERGE_ASSERTION_RE.search(line):
+        return True
+    unfenced = [False] * len(lines)
+    scope = _statement_scope(lines, index, unfenced)
+    return bool(_PROHIBITION_RE.search(scope) and re.search(r"auto[-_]merge", scope, re.IGNORECASE))
+
+
+def _is_snapshot_read(text: str) -> bool:
+    """True when this line is constructing or reading a mock snapshot of external GitHub state."""
+    return bool(_SNAPSHOT_MOCK_RE.search(text))
+
 class MergeContractError(ValueError):
     """The human-merge contract is not satisfied. Maps to exit code 65."""
 
@@ -485,8 +537,17 @@ def scan_merge_prohibitions(
                 continue
             if _is_prohibition_statement(lines, number - 1, fenced):
                 continue
+            filtered = []
+            for mechanism in matched:
+                if mechanism == "auto-merge-enablement" and _is_auto_merge_boundary_or_prohibition(
+                    lines, number - 1, fenced
+                ):
+                    continue
+                if mechanism == "runtime-done-transition" and _is_snapshot_read(text):
+                    continue
+                filtered.append(mechanism)
             occurrences.extend(
-                MergeOccurrence(relative, number, mechanism) for mechanism in matched
+                MergeOccurrence(relative, number, mechanism) for mechanism in filtered
             )
 
     return MergeScanReport(tuple(occurrences), not occurrences)
