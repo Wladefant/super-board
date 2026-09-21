@@ -78,6 +78,57 @@ fragment superboardItems on ProjectV2Owner {
 }
 """
 
+#: The ONE query every caller uses to read a board's built-in workflows, in the
+#: same owner-agnostic shape as `PROJECT_ITEMS_QUERY` and for the same reason: a
+#: Superboard is owned by a user OR by an organization, and `user(login:)`
+#: resolves to null for the second one.
+#:
+#: The write side has no counterpart. `enabled` is read-only on
+#: `ProjectV2Workflow`, the only workflow mutation GitHub exposes is
+#: `deleteProjectV2Workflow`, and no mutation recreates a deleted built-in — so
+#: this query powers a detector, never a repair. Turning a workflow off stays a
+#: UI action an operator performs by hand.
+PROJECT_WORKFLOWS_QUERY = """query($owner: String!, $number: Int!) {
+  repositoryOwner(login: $owner) {
+    __typename
+    ... on User { ...superboardWorkflows }
+    ... on Organization { ...superboardWorkflows }
+  }
+}
+fragment superboardWorkflows on ProjectV2Owner {
+  projectV2(number: $number) {
+    id
+    title
+    workflows(first: 50) { nodes { id name number enabled } }
+  }
+}
+"""
+
+#: Built-in workflows that must never be enabled on a tracked board, keyed by
+#: normalized name and mapped to what each one does when it fires. The Shipnovo
+#: board ran with "Auto-close issue" on and closed five issues whose work was
+#: still in flight, every time a card reached Building.
+DESTRUCTIVE_PROJECT_WORKFLOWS = {
+    "auto-close issue": "closes the issue whose card reaches the trigger status",
+    "auto-archive items": "archives Done cards, which are the board's anti-loop memory",
+}
+
+#: The built-in workflows a tracked board is allowed to run, keyed by normalized
+#: name. The list is closed on purpose: GitHub adds and renames built-in
+#: workflows without asking, an unrecognized one is unreviewed rather than
+#: harmless, and the workflow that motivated this guard was a built-in nobody
+#: had decided to enable. An unrecognized workflow that is disabled is not
+#: reported.
+BENIGN_PROJECT_WORKFLOWS = (
+    "auto-add sub-issues to project",
+    "auto-add to project",
+    "item added to project",
+    "item closed",
+    "item reopened",
+    "pull request linked to issue",
+    "pull request merged",
+)
+
 #: The repository variable that arms the fallback auto-add workflow, and the
 #: exact value it must hold. Anything else leaves the workflow inert.
 FALLBACK_ENABLE_VARIABLE = "ENABLE_ADD_TO_PROJECT"
@@ -485,20 +536,203 @@ def evaluate_fallback_auto_add(
     return FallbackDecision(True, "insert-authorized", preflight=tuple(consulted))
 
 
+# ───────────────────────────── built-in workflow guard ─────────────────────────────
+
+
+def workflow_key(name: Any) -> str:
+    """Normalize a built-in workflow's display name for comparison."""
+    if not isinstance(name, str):
+        return ""
+    return " ".join(name.split()).casefold()
+
+
+@dataclass(frozen=True)
+class WorkflowFinding:
+    """One built-in workflow a tracked board must not be running as it is."""
+
+    workflow_name: str
+    workflow_number: Optional[int]
+    workflow_node_id: Optional[str]
+    reason_code: str
+    effect: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return dict(asdict(self))
+
+
+@dataclass(frozen=True)
+class WorkflowAudit:
+    """What a board's built-in workflows are, and which of them must not run."""
+
+    project_owner: str
+    project_number: int
+    project_title: Optional[str]
+    workflows: tuple[Mapping[str, Any], ...]
+    findings: tuple[WorkflowFinding, ...]
+
+    @property
+    def ok(self) -> bool:
+        return not self.findings
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "findings": [finding.to_dict() for finding in self.findings],
+            "ok": self.ok,
+            "project_number": self.project_number,
+            "project_owner": self.project_owner,
+            "project_title": self.project_title,
+            "workflows": [dict(workflow) for workflow in self.workflows],
+        }
+
+
+def project_workflows_from_graphql(raw: Any) -> dict[str, Any]:
+    """Read one `PROJECT_WORKFLOWS_QUERY` response.
+
+    Every refusal is `project_pages_from_graphql`'s refusal: a board we could not
+    read is never a board with nothing wrong on it. A GraphQL `errors` array, a
+    null `repositoryOwner`, a null `projectV2`, or a missing `workflows`
+    connection halts instead of reporting a clean audit.
+    """
+    if not isinstance(raw, Mapping):
+        raise MutationConflict(
+            "project-workflows-unreadable", "the Project workflow response was unreadable"
+        )
+    if raw.get("errors"):
+        raise MutationConflict(
+            "project-workflows-unreadable",
+            "the Project workflow query returned errors; refusing to report a board as clean",
+        )
+    data = raw.get("data")
+    owner = data.get("repositoryOwner") if isinstance(data, Mapping) else None
+    if not isinstance(owner, Mapping):
+        raise MutationConflict(
+            "project-owner-unresolved",
+            "the board owner did not resolve — check the owner login, and note that a "
+            "board may be owned by a user OR by an organization",
+        )
+    project = owner.get("projectV2")
+    if not isinstance(project, Mapping):
+        raise MutationConflict(
+            "project-not-found",
+            f"owner {owner.get('__typename') or 'unknown'} resolved but carries no such "
+            "Project; an absent board is not an empty one",
+        )
+    connection = project.get("workflows")
+    nodes = connection.get("nodes") if isinstance(connection, Mapping) else None
+    if not isinstance(nodes, list):
+        raise MutationConflict(
+            "project-workflows-unreadable",
+            "the Project resolved but carries no workflow connection; refusing to report a "
+            "board as clean",
+        )
+    return {
+        "project_node_id": project.get("id"),
+        "project_title": project.get("title"),
+        "workflows": [
+            {
+                "enabled": node.get("enabled"),
+                "name": node.get("name"),
+                "node_id": node.get("id"),
+                "number": node.get("number"),
+            }
+            for node in nodes
+            if isinstance(node, Mapping)
+        ],
+    }
+
+
+def audit_project_workflows(
+    raw: Any,
+    *,
+    project_owner: str,
+    project_number: int,
+) -> WorkflowAudit:
+    """Report every built-in workflow a tracked board must not be running.
+
+    Three findings, all of them loud:
+
+    * `destructive-workflow-enabled` — a workflow in
+      `DESTRUCTIVE_PROJECT_WORKFLOWS` is on. This is the Shipnovo failure:
+      "Auto-close issue" closed each issue whose card entered Building.
+    * `unreviewed-workflow-enabled` — an enabled workflow nobody decided about,
+      because GitHub shipped a new built-in or renamed an existing one. A
+      rename is exactly how a deny list by name goes quietly blind.
+    * `workflow-state-unreadable` — `enabled` did not read as a boolean, and an
+      unread state is not a disabled one.
+
+    A *disabled* workflow is never a finding, and neither is a workflow the API
+    does not return: GitHub omits built-ins that were never saved, so an absent
+    "Auto-close issue" is unconfigured rather than proven off. The read-back in
+    the setup runbook remains the only proof of a deliberate off.
+    """
+    read = project_workflows_from_graphql(raw)
+    findings: list[WorkflowFinding] = []
+    for workflow in read["workflows"]:
+        name = workflow["name"] if isinstance(workflow["name"], str) else ""
+        number = workflow["number"] if isinstance(workflow["number"], int) else None
+        key = workflow_key(name)
+        enabled = workflow["enabled"]
+        if not isinstance(enabled, bool):
+            findings.append(
+                WorkflowFinding(
+                    name,
+                    number,
+                    workflow["node_id"],
+                    "workflow-state-unreadable",
+                    "its enabled state did not read as a boolean",
+                )
+            )
+            continue
+        if not enabled:
+            continue
+        effect = DESTRUCTIVE_PROJECT_WORKFLOWS.get(key)
+        if effect is not None:
+            findings.append(
+                WorkflowFinding(
+                    name, number, workflow["node_id"], "destructive-workflow-enabled", effect
+                )
+            )
+        elif key not in BENIGN_PROJECT_WORKFLOWS:
+            findings.append(
+                WorkflowFinding(
+                    name,
+                    number,
+                    workflow["node_id"],
+                    "unreviewed-workflow-enabled",
+                    "no reviewed decision covers this built-in workflow",
+                )
+            )
+    return WorkflowAudit(
+        project_owner=project_owner,
+        project_number=project_number,
+        project_title=read["project_title"],
+        workflows=tuple(read["workflows"]),
+        findings=tuple(sorted(findings, key=lambda f: (f.workflow_number or 0, f.workflow_name))),
+    )
+
+
 __all__ = [
+    "BENIGN_PROJECT_WORKFLOWS",
+    "DESTRUCTIVE_PROJECT_WORKFLOWS",
     "FALLBACK_ENABLE_VALUE",
     "FALLBACK_ENABLE_VARIABLE",
     "MAX_PROJECT_PAGES",
     "PROJECT_ITEMS_QUERY",
+    "PROJECT_WORKFLOWS_QUERY",
     "CurrentState",
     "ExpectedState",
     "FallbackDecision",
     "MutationConflict",
     "MutationDecision",
     "ProjectSnapshot",
+    "WorkflowAudit",
+    "WorkflowFinding",
     "apply_project_mutation",
+    "audit_project_workflows",
     "compare_project_mutation",
     "evaluate_fallback_auto_add",
     "project_pages_from_graphql",
+    "project_workflows_from_graphql",
     "snapshot_project",
+    "workflow_key",
 ]

@@ -197,6 +197,15 @@ gh variable set ENABLE_SUPERBOARD_NORMALIZE --body "true"
   - **Auto-archive items**: **DISABLED**. Done cards are the system's visible history (anti-loop memory) — archiving hides them.
   - **Auto-close issue: DISABLED.** ⚠ SECOND, NASTIER VARIANT (found on BOTH boards 2026-07-25): "Auto-close issue" shipped ON with trigger **Status updated -> Building**, while "Item closed" pointed at **Building** and "Pull request merged" also pointed at **Building**, and "Item reopened" was OFF/unsaved. That combination is silently destructive in a way the HeyLolo loop is not: **dragging any card into Building auto-closed its issue**, and closed issues pinned themselves at Building. Cards do NOT bounce, so the corruption is invisible to the reconcile sweep's usual fingerprint - the sweep instead reports closed issues stranded in QA/Building/Review (20 of them here). Lesson: EVERY workflow ships mis-set or unsaved until proven otherwise - read back all seven targets, never just the one you suspect.
 - SMOKE-VERIFY the workflow wiring before finishing: close a seeded test issue → its card must land in **Done** (not any other column) within a minute; reopen it → card returns to **Backlog**. If either lands elsewhere, the workflow target is wrong — fix it now, not later.
+- API-VERIFY the destructive ones, every time the board is touched and at the start of a session that will move cards. The setting itself is UI-only — `enabled` is read-only on `ProjectV2Workflow`, GitHub's only workflow mutation is `deleteProjectV2Workflow`, and nothing recreates a deleted built-in — but the *state* reads over the API, so a recurrence does not need a browser to catch:
+
+  ```sh
+  scripts/super-board-project.py query --workflows > /tmp/workflows.graphql
+  gh api graphql -f owner=OWNER -F number=N -f "query=$(cat /tmp/workflows.graphql)" > /tmp/workflows.json
+  scripts/super-board-project.py workflows --owner OWNER --number N --raw /tmp/workflows.json
+  ```
+
+  Exit 0 means no built-in workflow on the board destroys work. Exit 65 names each one, why it is refused, and the click path to turn it off. An enabled built-in that is on neither the destructive list nor the reviewed-benign list is also refused (`unreviewed-workflow-enabled`), because GitHub adds and renames built-ins and a deny list by name goes blind on a rename. Note what it CANNOT tell you: GitHub omits built-ins that were never saved, so a workflow the audit does not list is unconfigured rather than proven off — the read-back above is still the only proof of a deliberate off.
 - GOTCHA: GitHub's visibility timer means Chrome must be FOREGROUNDED or the Authorize/Save buttons stay disabled.
 - Create the four standard custom fields (Projects UI → "+" / "New field" in the table header of any view):
   - **Effort (tokens)** — type Number. Rough per-card effort/size for burn-up and prioritization.

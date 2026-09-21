@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """super-board-project.py — Project snapshot, compare, apply, and reconcile.
 
-Six subcommands, one rule: **compare before mutate**. A mutation is authorized
+Seven subcommands, one rule: **compare before mutate**. A mutation is authorized
 by state reread at decision time, never by state captured during preflight.
 
     query      print the ONE board-items GraphQL query (both owner types)
     pages      convert a raw `gh api graphql` read into walkable pages
     snapshot   walk every page of the Project and write a complete inventory
+    workflows  refuse a board whose built-in workflows can destroy work
     compare    decide `apply` or `quarantine` for one planned mutation
     apply      write a decision that says `apply`, then read it back
     reconcile  compare a whole manifest and report what quarantined
@@ -23,13 +24,20 @@ overwrites whoever was right — so anything that moved quarantines with exit 3
 and zero writes.
 
 Usage:
-    super-board-project.py query
+    super-board-project.py query [--workflows]
     super-board-project.py pages     --raw FILE
     super-board-project.py snapshot  --owner OWNER --number N --payload FILE [--json]
+    super-board-project.py workflows --owner OWNER --number N --raw FILE
     super-board-project.py compare   --expected FILE --current FILE [--desired-status S]
     super-board-project.py apply     --expected FILE --current FILE --desired-status S
                                      [--execute]
     super-board-project.py reconcile --manifest FILE
+
+`workflows` reads `query --workflows` output and exits 65 naming every built-in
+workflow that must not be running — "Auto-close issue" on a tracked board closes
+the issue behind every card that reaches its trigger status. GitHub exposes no
+mutation for the setting, so the repair is an operator's click in the Projects
+UI and this subcommand is how a recurrence is caught.
 
 `--payload` reads a pre-fetched Project response instead of calling GitHub, so
 the whole pipeline is testable without touching a live board. `apply` writes
@@ -54,10 +62,12 @@ if str(_SCRIPTS) not in sys.path:
 from super_board_runtime import EXIT_CONFIG, EXIT_CONFLICT, EXIT_OK, EXIT_USAGE  # noqa: E402
 from super_board_runtime.project import (  # noqa: E402
     PROJECT_ITEMS_QUERY,
+    PROJECT_WORKFLOWS_QUERY,
     CurrentState,
     ExpectedState,
     MutationConflict,
     apply_project_mutation,
+    audit_project_workflows,
     compare_project_mutation,
     project_pages_from_graphql,
     snapshot_project,
@@ -75,7 +85,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = _Parser(prog="super-board-project.py", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("query", help="print the board-items query (user- and org-owned)")
+    query = sub.add_parser("query", help="print the board-items query (user- and org-owned)")
+    query.add_argument(
+        "--workflows",
+        action="store_true",
+        help="print the built-in workflow query instead of the board-items query",
+    )
 
     pages = sub.add_parser("pages", help="convert a raw graphql read into walkable pages")
     pages.add_argument(
@@ -86,6 +101,11 @@ def build_parser() -> argparse.ArgumentParser:
     snap.add_argument("--owner", required=True)
     snap.add_argument("--number", type=int, required=True)
     snap.add_argument("--payload", required=True, help="pre-fetched pages, as a JSON array")
+
+    flows = sub.add_parser("workflows", help="audit the board's built-in workflows")
+    flows.add_argument("--owner", required=True)
+    flows.add_argument("--number", type=int, required=True)
+    flows.add_argument("--raw", required=True, help="`gh api graphql` workflow read (JSON)")
 
     for name, helptext in (
         ("compare", "decide apply or quarantine for one mutation"),
@@ -132,8 +152,40 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         if args.command == "query":
-            print(PROJECT_ITEMS_QUERY.rstrip("\n"))
+            query = PROJECT_WORKFLOWS_QUERY if args.workflows else PROJECT_ITEMS_QUERY
+            print(query.rstrip("\n"))
             return EXIT_OK
+
+        if args.command == "workflows":
+            # A board whose workflows could not be read is not a board with
+            # nothing wrong on it, so both a refused read and a finding exit
+            # non-zero; only a clean audit prints to stdout.
+            try:
+                audit = audit_project_workflows(
+                    _read(args.raw), project_owner=args.owner, project_number=args.number
+                )
+            except MutationConflict as exc:
+                print(f"super-board-project: {exc}", file=sys.stderr)
+                print(
+                    json.dumps({"ok": False, "reason": exc.reason}, sort_keys=True),
+                    file=sys.stderr,
+                )
+                return EXIT_CONFIG
+            if audit.ok:
+                print(json.dumps(audit.to_dict(), sort_keys=True))
+                return EXIT_OK
+            print(json.dumps(audit.to_dict(), sort_keys=True), file=sys.stderr)
+            for finding in audit.findings:
+                print(
+                    f"🛑 super-board-project: built-in workflow "
+                    f"#{finding.workflow_number} {finding.workflow_name!r} is enabled on "
+                    f"{args.owner}/projects/{args.number} ({finding.reason_code}): "
+                    f"{finding.effect}. Disable it in the Projects UI — "
+                    f"⋯ → Workflows → {finding.workflow_name} → toggle off; GitHub exposes "
+                    f"no mutation for this setting.",
+                    file=sys.stderr,
+                )
+            return EXIT_CONFIG
 
         if args.command == "pages":
             # Nothing is printed before the conversion succeeds: a refusal must

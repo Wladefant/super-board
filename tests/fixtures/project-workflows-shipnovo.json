@@ -1,0 +1,51 @@
+{
+  "data": {
+    "repositoryOwner": {
+      "__typename": "User",
+      "projectV2": {
+        "id": "PVT_kwHOBL7E1c4Beofv",
+        "title": "Shipnovo",
+        "workflows": {
+          "nodes": [
+            {
+              "enabled": true,
+              "id": "PWF_lAHOBL7E1c4BeofvzgZukVA",
+              "name": "Auto-add sub-issues to project",
+              "number": 4
+            },
+            {
+              "enabled": true,
+              "id": "PWF_lAHOBL7E1c4BeofvzgZukU8",
+              "name": "Auto-close issue",
+              "number": 3
+            },
+            {
+              "enabled": true,
+              "id": "PWF_lAHOBL7E1c4BeofvzgZukVI",
+              "name": "Item added to project",
+              "number": 6
+            },
+            {
+              "enabled": true,
+              "id": "PWF_lAHOBL7E1c4BeofvzgZukU0",
+              "name": "Item closed",
+              "number": 1
+            },
+            {
+              "enabled": true,
+              "id": "PWF_lAHOBL7E1c4BeofvzgZukVE",
+              "name": "Pull request linked to issue",
+              "number": 5
+            },
+            {
+              "enabled": true,
+              "id": "PWF_lAHOBL7E1c4BeofvzgZukU4",
+              "name": "Pull request merged",
+              "number": 2
+            }
+          ]
+        }
+      }
+    }
+  }
+}
