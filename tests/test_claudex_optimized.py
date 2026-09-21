@@ -742,6 +742,119 @@ def test_recover_cli_redacts_and_uses_latest_correlated_response() -> None:
         assert json.loads(literal.stdout)["category"] == "success"
 
 
+def _parse_skill_frontmatter(content: str) -> dict[str, str]:
+    if not content.startswith("---"):
+        raise ValueError("Skill file does not start with frontmatter delimiter ---")
+    parts = content.split("---", 2)
+    if len(parts) < 3:
+        raise ValueError("Skill file missing closing frontmatter delimiter ---")
+    frontmatter: dict[str, str] = {}
+    for line in parts[1].strip().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" in line:
+            key, val = line.split(":", 1)
+            frontmatter[key.strip()] = val.strip().strip('"').strip("'")
+    return frontmatter
+
+
+def test_claudex_optimized_skill_frontmatter_contract() -> None:
+    skill_path = ROOT / "skills" / "claudex-optimized" / "SKILL.md"
+    assert skill_path.is_file(), f"Expected skill file at {skill_path}"
+    content = skill_path.read_text(encoding="utf-8")
+    frontmatter = _parse_skill_frontmatter(content)
+
+    assert frontmatter.get("name") == "claudex-optimized"
+    description = frontmatter.get("description", "")
+    assert description, "Frontmatter description must not be empty"
+    assert "claudex" in description.lower()
+    assert "Spark" in description or "spark" in description
+    assert "Luna/Terra/Sol" in description
+
+
+def test_claudex_optimized_skill_required_sections_contract() -> None:
+    skill_path = ROOT / "skills" / "claudex-optimized" / "SKILL.md"
+    content = skill_path.read_text(encoding="utf-8")
+    lines = [line.strip() for line in content.splitlines()]
+
+    required_top_sections = [
+        "# Claudex Optimized",
+        "## Safety boundary",
+        "## Surface routing (apply automatically, do not wait to be told)",
+        "## Commands",
+        "## Codex Spark subagent lane",
+        "## Persisted routing status",
+        "## Launcher contract",
+    ]
+    for section in required_top_sections:
+        assert section in lines, f"Missing required top-level section: {section}"
+
+    required_spark_subsections = [
+        "### Approved CLIProxyAPI Responses endpoint",
+        "### Environment-only credentials",
+        "### Preserved Luna/Terra/Sol mappings",
+        "### Sandbox and approval policies",
+        "### Sanitized probe verification",
+        "### Quota limitations and escalation behavior",
+    ]
+    for subsection in required_spark_subsections:
+        assert subsection in lines, f"Missing required Spark subsection: {subsection}"
+
+
+def test_claudex_optimized_skill_spark_exact_equality_pins() -> None:
+    skill_path = ROOT / "skills" / "claudex-optimized" / "SKILL.md"
+    content = skill_path.read_text(encoding="utf-8")
+
+    # Exact model pins
+    assert "gpt-5.3-codex-spark" in content
+    assert "gpt-5.6-luna" in content
+    assert "gpt-5.6-terra" in content
+    assert "gpt-5.6-sol" in content
+
+    # Exact CLIProxyAPI and provider pins
+    assert "cliproxyapi" in content
+    assert "CLIProxyAPI" in content
+    assert "http://127.0.0.1:8317/v1" in content
+    assert 'model_provider="cliproxyapi"' in content
+    assert 'model_providers.cliproxyapi.name="CLIProxyAPI"' in content
+    assert 'model_providers.cliproxyapi.base_url="http://127.0.0.1:8317/v1"' in content
+    assert 'model_providers.cliproxyapi.env_key="ANTHROPIC_AUTH_TOKEN"' in content
+    assert 'model_providers.cliproxyapi.wire_api="responses"' in content
+    assert "model_providers.cliproxyapi.requires_openai_auth=false" in content
+    assert "model_providers.cliproxyapi.supports_websockets=false" in content
+
+    # Explicit sandbox and approval policy pins
+    assert "-a never" in content
+    assert "-s read-only" in content
+    assert "-s workspace-write" in content
+
+    # Probe verification pins
+    assert "SPARK_OK" in content
+    assert "SPARK_AGENT_OK" in content
+    assert "CLAUDE_SPARK_OK" in content
+
+
+def test_claudex_optimized_skill_forbidden_content_and_invariants() -> None:
+    skill_path = ROOT / "skills" / "claudex-optimized" / "SKILL.md"
+    content = skill_path.read_text(encoding="utf-8")
+
+    # Credentials must remain environment-only; bearer token in TOML or args forbidden
+    assert "Never place the bearer token" in content
+    assert "ANTHROPIC_AUTH_TOKEN" in content
+
+    # Permissive danger-full-access sandbox is forbidden
+    assert "`danger-full-access` is strictly forbidden" in content
+
+    # Silent fallback is strictly prohibited
+    assert "Silent fallback to another model is strictly prohibited" in content
+    assert "Never silently fall back to another model" in content
+
+    # Standalone ChatGPT-account auth rejection is documented
+    assert "Standalone Codex ChatGPT-account authentication rejects Spark" in content
+    assert "Standalone Codex ChatGPT-account auth rejects Spark" in content
+
+
 def _run() -> int:
     tests = sorted((name, fn) for name, fn in globals().items() if name.startswith("test_") and callable(fn))
     passed = 0
