@@ -245,6 +245,7 @@ class IssueOrPullRequestSnapshot:
     #: The Project item's `updated_at` the event carried. Anything newer on the
     #: board is a decision made after ours and must not be overwritten.
     observed_project_updated_at: Optional[str] = None
+    comments: tuple[str, ...] = ()
 
     # Pull-request-only fields.
     base_branch: Optional[str] = None
@@ -1156,7 +1157,16 @@ MERGE_CLOSURE_QUERY = """query($owner: String!, $repo: String!, $number: Int!) {
       mergeCommit { oid }
       mergedBy { __typename login }
       closingIssuesReferences(first: 25) {
-        nodes { id number url state title }
+        nodes {
+          id
+          number
+          url
+          state
+          title
+          comments(last: 20) {
+            nodes { body }
+          }
+        }
         pageInfo { hasNextPage }
       }
     }
@@ -1288,6 +1298,28 @@ def resolve_merge_closure_target(
     return next(iter(distinct.values())), None
 
 
+def _extract_comments(source: Any) -> tuple[str, ...]:
+    if not source:
+        return ()
+    if isinstance(source, Mapping):
+        nodes = source.get("nodes")
+        if isinstance(nodes, Sequence):
+            return tuple(
+                str(n.get("body") or "")
+                for n in nodes
+                if isinstance(n, Mapping) and n.get("body")
+            )
+    if isinstance(source, Sequence) and not isinstance(source, (str, bytes)):
+        result: list[str] = []
+        for item in source:
+            if isinstance(item, str):
+                result.append(item)
+            elif isinstance(item, Mapping) and item.get("body"):
+                result.append(str(item.get("body")))
+        return tuple(result)
+    return ()
+
+
 def merge_closure_readback(
     response: Any, *, linked_issue_records: Sequence[Mapping[str, Any]] = ()
 ) -> IssueOrPullRequestSnapshot:
@@ -1348,6 +1380,7 @@ def merge_closure_readback(
         node_id = _clean(node.get("id"))
         url = _clean(node.get("url"))
         record = records.get(node_id or "") or records.get(url or "") or {}
+        comments = _extract_comments(node.get("comments")) or _extract_comments(record.get("comments"))
         linked.append(
             IssueOrPullRequestSnapshot(
                 kind="issue",
@@ -1359,6 +1392,7 @@ def merge_closure_readback(
                 title=_clean(node.get("title")),
                 completion_evidence=record.get("completion_evidence"),
                 observed_project_updated_at=_clean(record.get("observed_project_updated_at")),
+                comments=comments,
             )
         )
 
@@ -1386,11 +1420,75 @@ def merge_closure_readback(
     )
 
 
+#: Marker used to detect and prevent duplicate audit comments on idempotent resumes.
+MERGE_CLOSURE_AUDIT_MARKER = "<!-- super-board:merge-closure-audit -->"
+
+
+def has_merge_closure_audit_comment(issue: IssueOrPullRequestSnapshot) -> bool:
+    """True if the issue already carries our merge-closure audit comment."""
+    return any(
+        MERGE_CLOSURE_AUDIT_MARKER in comment
+        for comment in getattr(issue, "comments", ())
+        if isinstance(comment, str)
+    )
+
+
+def _format_evidence_reference(evidence: Optional[Mapping[str, Any]]) -> str:
+    if not isinstance(evidence, Mapping):
+        return str(evidence or "accepted-completion-evidence")
+    etype = _clean(evidence.get("type")) or "evidence"
+    eurl = _clean(evidence.get("url"))
+    if eurl:
+        return f"[{etype}]({eurl})"
+    return f"`{etype}`"
+
+
+def _merge_closure_audit_comment(
+    pull: IssueOrPullRequestSnapshot,
+    issue: IssueOrPullRequestSnapshot,
+    attestation: MergeAttestation,
+    environment: Mapping[str, str],
+) -> Optional[str]:
+    """Render and sanitize the markdown audit comment posted before closing."""
+    pr_url = _clean(pull.url) or "(unknown PR)"
+    pr_number = pull.number
+    pr_link = f"[#{pr_number}]({pr_url})" if pr_number else f"[{pr_url}]({pr_url})"
+
+    sha = _clean(attestation.merge_commit_sha) or "(unknown commit)"
+    if pr_url and "/pull/" in pr_url and sha != "(unknown commit)":
+        repo_url = pr_url.split("/pull/")[0]
+        commit_link = f"[`{sha}`]({repo_url}/commit/{sha})"
+    else:
+        commit_link = f"`{sha}`"
+
+    evidence_ref = _format_evidence_reference(issue.completion_evidence)
+
+    facts = [
+        MERGE_CLOSURE_AUDIT_MARKER,
+        "## Superboard Merge Closure Audit",
+        "Automated issue closure for non-default branch merge.",
+        f"- **Pull request**: {pr_link}",
+        f"- **Merge commit**: {commit_link}",
+        f"- **Merged by**: {attestation.merged_by or '(unknown)'}",
+        f"- **Merged at**: {attestation.merged_at or '(unknown)'}",
+        f"- **Base branch**: `{attestation.base_branch or '(unknown)'}` (default branch: `{attestation.default_branch or '(unknown)'}`)",
+        f"- **Completion evidence**: {evidence_ref}",
+    ]
+    rendered = render_payload(["\n".join(facts)])
+    try:
+        return sanitize_and_validate_publication(
+            rendered, environment, surface="closure-comment"
+        ).text
+    except UnsafePublication:
+        return None
+
+
 def normalize_merge_closure(
     pull: IssueOrPullRequestSnapshot,
     project: ProjectSnapshot,
     *,
     runtime_actors: Sequence[str] = (),
+    environment: Optional[Mapping[str, str]] = None,
 ) -> NormalizationPlan:
     """Plan the explicit close that a merge into a non-default branch never did.
 
@@ -1443,26 +1541,50 @@ def normalize_merge_closure(
         return replace(base, blocked_reason="merge-closure-evidence-missing")
 
     expected, current = _states(item, issue)
-    # No status operation, deliberately: closing the issue fires the board's own
-    # `Item closed` workflow, and a status write beside it would be a second
-    # writer racing the first one to the same column.
+    has_audit_comment = has_merge_closure_audit_comment(issue)
+    comment = (
+        None
+        if has_audit_comment
+        else _merge_closure_audit_comment(pull, issue, attestation, environment or {})
+    )
+    if not has_audit_comment and comment is None:
+        return replace(base, blocked_reason="closure-comment-unsafe")
+
+    operations: list[PlannedOperation] = []
+    if comment is not None:
+        operations.append(
+            _operation(
+                "closure-comment",
+                expected,
+                current,
+                {
+                    "body": comment,
+                    "surface": "closure-comment",
+                    "issue_url": issue.url,
+                },
+                comparable=True,
+            )
+        )
+    operations.append(
+        _operation(
+            "close",
+            expected,
+            current,
+            {
+                "issue_url": issue.url,
+                "state": "closed",
+                "state_reason": "completed",
+            },
+            comparable=True,
+        )
+    )
+
     return _finalize(
         replace(
             base,
             disposition="merge-closure",
-            operations=(
-                _operation(
-                    "close",
-                    expected,
-                    current,
-                    {
-                        "issue_url": issue.url,
-                        "state": "closed",
-                        "state_reason": "completed",
-                    },
-                    comparable=True,
-                ),
-            ),
+            operations=tuple(operations),
+            comment=comment,
         )
     )
 
@@ -1478,6 +1600,7 @@ __all__ = [
     "INTAKE_PULL_REQUEST_EVENTS",
     "LEGACY_ENVIRONMENT_ALIASES",
     "MERGE_CLOSURE_LINK_PAGE",
+    "MERGE_CLOSURE_AUDIT_MARKER",
     "MERGE_CLOSURE_QUERY",
     "MERGE_CLOSURE_REFUSALS",
     "PERIODIC_SWEEP_EVENT",
@@ -1500,6 +1623,7 @@ __all__ = [
     "classify_pull_request",
     "find_project_item",
     "handles_event",
+    "has_merge_closure_audit_comment",
     "merge_attestation",
     "merge_closure_readback",
     "normalize_closure",

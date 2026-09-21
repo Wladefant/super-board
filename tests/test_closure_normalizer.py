@@ -41,8 +41,10 @@ from super_board_runtime.normalize import (  # noqa: E402
     ACCEPTED_COMPLETION_EVIDENCE_TYPES,
     CLOSURE_DISPOSITIONS,
     IssueOrPullRequestSnapshot,
+    MERGE_CLOSURE_AUDIT_MARKER,
     MERGE_CLOSURE_REFUSALS,
     NormalizationError,
+    has_merge_closure_audit_comment,
     merge_closure_readback,
     normalize_closure,
     normalize_merge_closure,
@@ -517,9 +519,14 @@ class MergeClosureTests(unittest.TestCase):
                 self.assertEqual(plan.disposition, exp["disposition"])
                 self.assertEqual(plan.blocked_reason, exp["blocked_reason"])
                 self.assertEqual(_kinds(plan), exp["operations"])
-                if exp["operations"] == ["close"]:
-                    self.assertEqual(plan.operations[0].desired["state"], "closed")
-                    self.assertEqual(plan.operations[0].desired["state_reason"], "completed")
+                if "close" in exp["operations"]:
+                    close_op = next(op for op in plan.operations if op.kind == "close")
+                    self.assertEqual(close_op.desired["state"], "closed")
+                    self.assertEqual(close_op.desired["state_reason"], "completed")
+                if "closure-comment" in exp["operations"]:
+                    comment_op = next(op for op in plan.operations if op.kind == "closure-comment")
+                    self.assertEqual(comment_op.desired["surface"], "closure-comment")
+                    self.assertEqual(comment_op.desired["body"], plan.comment)
 
     def test_has_next_page_raises_truncated(self) -> None:
         resp = _apply_patch(
@@ -553,8 +560,9 @@ class MergeClosureTests(unittest.TestCase):
         resp = _apply_patch(MERGE_FIXTURES["base_response"], case.get("patch", {}))
         pull = merge_closure_readback(resp, linked_issue_records=case.get("linked_issue_records", ()))
         plan = normalize_merge_closure(pull, _project(_item()))
+        close_op = next(op for op in plan.operations if op.kind == "close")
         self.assertEqual(
-            plan.operations[0].desired,
+            close_op.desired,
             {
                 "issue_url": "https://github.com/Bavariance/polysimulator/issues/101",
                 "state": "closed",
@@ -579,5 +587,90 @@ class MergeClosureTests(unittest.TestCase):
         self.assertEqual(plan.blocked_reason, "board-decision-newer")
         self.assertTrue(plan.quarantined)
 
+
+    def test_audit_comment_payload_and_body_facts(self) -> None:
+        case = MERGE_FIXTURES["cases"][0]
+        resp = _apply_patch(MERGE_FIXTURES["base_response"], case.get("patch", {}))
+        pull = merge_closure_readback(resp, linked_issue_records=case.get("linked_issue_records", ()))
+        plan = normalize_merge_closure(pull, _project(_item()))
+        comment_op = next(op for op in plan.operations if op.kind == "closure-comment")
+        self.assertEqual(
+            comment_op.desired,
+            {
+                "body": plan.comment,
+                "surface": "closure-comment",
+                "issue_url": "https://github.com/Bavariance/polysimulator/issues/101",
+            },
+        )
+        body = plan.comment
+        self.assertIsNotNone(body)
+        self.assertIn(MERGE_CLOSURE_AUDIT_MARKER, body)
+        self.assertIn("dddddddddddddddddddddddddddddddddddddddd", body)
+        self.assertIn("https://github.com/Bavariance/polysimulator/commit/dddddddddddddddddddddddddddddddddddddddd", body)
+        self.assertIn("https://github.com/Bavariance/polysimulator/pull/202", body)
+        self.assertIn("human-dev", body)
+        self.assertIn("2026-08-02T12:00:00Z", body)
+        self.assertIn("staging", body)
+        self.assertIn("main", body)
+        self.assertIn("merged-pull-request", body)
+        again = sanitize_and_validate_publication(body, {}, surface="closure-comment")
+        self.assertEqual(again.text, body)
+        self.assertTrue(again.safe)
+
+    def test_operation_ordering_comment_before_close(self) -> None:
+        case = MERGE_FIXTURES["cases"][0]
+        resp = _apply_patch(MERGE_FIXTURES["base_response"], case.get("patch", {}))
+        pull = merge_closure_readback(resp, linked_issue_records=case.get("linked_issue_records", ()))
+        plan = normalize_merge_closure(pull, _project(_item()))
+        self.assertEqual(_kinds(plan), ["closure-comment", "close"])
+        self.assertEqual(plan.operations[0].kind, "closure-comment")
+        self.assertEqual(plan.operations[1].kind, "close")
+
+    def test_idempotence_already_closed_issue_plans_nothing(self) -> None:
+        case = next(c for c in MERGE_FIXTURES["cases"] if c["name"] == "default-base-already-closed")
+        resp = _apply_patch(MERGE_FIXTURES["base_response"], case.get("patch", {}))
+        pull = merge_closure_readback(resp, linked_issue_records=case.get("linked_issue_records", ()))
+        plan = normalize_merge_closure(pull, _project(_item()))
+        self.assertEqual(plan.operations, ())
+        self.assertIsNone(plan.comment)
+        self.assertEqual(plan.disposition, "merge-closure-validated")
+
+    def test_idempotence_resume_after_partial_failure_skips_duplicate_comment(self) -> None:
+        case = next(c for c in MERGE_FIXTURES["cases"] if c["name"] == "resume-after-partial-failure")
+        resp = _apply_patch(MERGE_FIXTURES["base_response"], case.get("patch", {}))
+        pull = merge_closure_readback(resp, linked_issue_records=case.get("linked_issue_records", ()))
+        plan = normalize_merge_closure(pull, _project(_item()))
+        self.assertEqual(_kinds(plan), ["close"])
+        self.assertIsNone(plan.comment)
+        self.assertEqual(plan.disposition, "merge-closure")
+        close_op = plan.operations[0]
+        self.assertEqual(close_op.desired["state"], "closed")
+        self.assertEqual(close_op.desired["state_reason"], "completed")
+
+    def test_refusal_passthrough_short_circuits_without_mutations(self) -> None:
+        refusal_cases = [c for c in MERGE_FIXTURES["cases"] if c["expect"]["blocked_reason"] is not None]
+        self.assertGreaterEqual(len(refusal_cases), 6)
+        for case in refusal_cases:
+            with self.subTest(case=case["name"]):
+                resp = _apply_patch(MERGE_FIXTURES["base_response"], case.get("patch", {}))
+                pull = merge_closure_readback(resp, linked_issue_records=case.get("linked_issue_records", ()))
+                plan = normalize_merge_closure(pull, _project(_item()))
+                self.assertEqual(plan.operations, ())
+                self.assertIsNone(plan.comment)
+                self.assertIsNone(plan.disposition)
+                self.assertEqual(plan.blocked_reason, case["expect"]["blocked_reason"])
+
+    def test_audit_comment_sanitizer_unsafe_fails_closed(self) -> None:
+        case = MERGE_FIXTURES["cases"][0]
+        resp = _apply_patch(MERGE_FIXTURES["base_response"], case.get("patch", {}))
+        pull = merge_closure_readback(resp, linked_issue_records=case.get("linked_issue_records", ()))
+        plan = normalize_merge_closure(
+            pull,
+            _project(_item()),
+            environment={"DEPLOY_SECRET": "staging"},
+        )
+        self.assertEqual(plan.operations, ())
+        self.assertEqual(plan.blocked_reason, "closure-comment-unsafe")
+        self.assertIsNone(plan.comment)
 if __name__ == "__main__":
     unittest.main(verbosity=2)
