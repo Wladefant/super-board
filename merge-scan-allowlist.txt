@@ -43,3 +43,6 @@ RELEASE-NOTES.md
 
 # 2. The retired `Skipped` status, handed to a canonicalizer to prove refusal.
 workflows/portable/test_project_adapter.py
+
+# 3. The negative boundary test, feeding auto_merge_allowed: True to prove refusal.
+workflows/portable/test_continuation_driver.py

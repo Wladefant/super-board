@@ -347,6 +347,91 @@ class ConfigAssignmentTests(unittest.TestCase):
                 self.assertEqual(report.occurrences[0].mechanism, "squash-or-merge-commit")
 
 
+
+class AutoMergeBoundaryAndDoneTransitionTests(unittest.TestCase):
+    """Negative boundary enforcement and read-only status inspections are not merge paths.
+
+    The contract defends the invariant that no auto-merge or rogue Done transition
+    can run outside human merge authorization. It must not flag:
+      - negative boundary assignments (e.g. `auto_merge_allowed = False`);
+      - boundary assertions and key checks;
+      - prohibition assertions in docstrings/comments;
+      - status comparisons (e.g. `== "Done"`), mapping dicts, or read-only snapshots.
+    It MUST catch:
+      - active auto-merge enablement (e.g. `auto_merge = True`, `enable_auto_merge()`);
+      - active status assignments to Done (e.g. `card["status"] = "Done"`, `item.status = "Done"`).
+    """
+
+    def _scan(self, name: str, body: str):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body, encoding="utf-8")
+            return scan_merge_prohibitions(Path(tmp), allowlist=())
+
+    def test_negative_boundaries_and_assertions_are_clean(self) -> None:
+        bodies = (
+            "auto_merge_allowed: bool = False\n",
+            "auto_merge_allowed = False\n",
+            'boundaries["auto_merge_allowed"] = False\n',
+            'res.boundaries.get("auto_merge_allowed", False)\n',
+            '{"auto_merge_allowed": false}\n',
+            "assert_false(packet.boundaries.auto_merge_allowed)\n",
+            'assert_true(bounds["auto_merge_allowed"] is False)\n',
+            'self.assertEqual(res.boundaries["auto_merge_allowed"], False)\n',
+            'for key in ("auto_merge_allowed", "auto_deploy_allowed"):\n    pass\n',
+            'self.assertIn("auto_merge_allowed", outcome.error)\n',
+            'f"  Auto-Merge Allowed: {packet.boundaries.auto_merge_allowed} (prohibited)"\n',
+            '"""If an adapter claims auto-merge is allowed, abort immediately."""\n',
+            '# strict no-auto-merge policy\n',
+        )
+        for body in bodies:
+            with self.subTest(body=body.strip()):
+                report = self._scan("workflows/portable/driver.py", body)
+                self.assertTrue(report.clean, f"expected clean: {body}")
+
+    def test_active_auto_merge_enablement_is_caught(self) -> None:
+        bodies = (
+            "enable_auto_merge()\n",
+            "auto_merge = True\n",
+            'boundaries["auto_merge_allowed"] = True\n',
+            'PAYLOAD = {"auto_merge": True}\n',
+        )
+        for body in bodies:
+            with self.subTest(body=body.strip()):
+                report = self._scan("workflows/portable/driver.py", body)
+                self.assertFalse(report.clean, f"expected violation: {body}")
+                self.assertEqual(report.occurrences[0].mechanism, "auto-merge-enablement")
+
+    def test_status_comparison_and_mock_snapshots_are_clean(self) -> None:
+        bodies = (
+            'if snapshot.get("project_status") == "Done":\n    pass\n',
+            'if canonical_status == "Done":\n    pass\n',
+            'if status == "Done":\n    pass\n',
+            'STATUS_MAP = {"done": "Done"}\n',
+            '{"id": "AC-1", "description": "Done", "status": "verified"}\n',
+            'record["github_snapshot"] = {"state": "CLOSED", "project_status": "Done"}\n',
+        )
+        for body in bodies:
+            with self.subTest(body=body.strip()):
+                report = self._scan("workflows/portable/driver.py", body)
+                self.assertTrue(report.clean, f"expected clean: {body}")
+
+    def test_status_assignment_to_done_is_caught(self) -> None:
+        bodies = (
+            'card["status"] = "Done"\n',
+            'item.status = "Done"\n',
+            'status = "Done"\n',
+            '{"status": "Done"}\n',
+            'status: "Done"\n',
+            'gh project item-edit --status Done\n',
+        )
+        for body in bodies:
+            with self.subTest(body=body.strip()):
+                report = self._scan("workflows/portable/driver.py", body)
+                self.assertFalse(report.clean, f"expected violation: {body}")
+                self.assertEqual(report.occurrences[0].mechanism, "runtime-done-transition")
+
 class AllowlistTests(unittest.TestCase):
     def test_the_allowlist_is_an_explicit_file(self) -> None:
         path = _REPO_ROOT / ALLOWLIST_FILENAME
