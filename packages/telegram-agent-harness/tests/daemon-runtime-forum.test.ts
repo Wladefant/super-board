@@ -13,6 +13,8 @@ import {
 } from "../daemon/session-control";
 import { TelegramPoller } from "../extension/poller";
 import { FakeForumApiClient } from "./daemon-forum.test";
+import { describeApproval, evaluateApproval, approvalCallback } from "../extension/approvals";
+import type { MessageCorrelationBridge } from "../extension/types";
 
 const OPERATOR_ID = "1247617658";
 const FORUM_CHAT_ID = "-10077889900";
@@ -189,5 +191,59 @@ describe("TelegramDaemon forum auto-attach runtime", () => {
     expect(slot?.forumManager?.options.store.getRoute("slot-runtime-forum", FORUM_CHAT_ID, "1")).toBeNull();
 
     await daemon.stop();
+  });
+  test("forum menu attaches through its owner and daemon approvals reject replay and foreign topics", async () => {
+    createManifest(true);
+    const fake = fakeControl([
+      { id: "owner-one", cwd: "C:/dev/one", workspace: "C:/dev/one", title: null, status: "Idle", modifiedAtMs: Date.now() },
+      { id: "owner-two", cwd: "C:/dev/two", workspace: "C:/dev/two", title: null, status: "Idle", modifiedAtMs: Date.now() },
+    ]);
+    const forumClient = new FakeForumApiClient();
+    let callbacks!: ConstructorParameters<typeof TelegramPoller>[3];
+    let correlation!: MessageCorrelationBridge;
+    let thread = 101;
+    const sent: Array<Parameters<TelegramPoller["sendTelegramMessage"]>> = [];
+    const daemon = new TelegramDaemon({
+      manifestPath, poolDbPath: path.join(tempDir, "pool.db"),
+      daemonDbPath: path.join(tempDir, "daemon.db"), channelsDir: path.join(tempDir, "channels"),
+      controlFactory: () => fake.control, forumClientFactory: () => forumClient,
+      pollerFactory: (_token, _state, _access, handlers, bridge) => {
+        callbacks = handlers;
+        correlation = bridge;
+        return Object.assign(dummyPoller(), {
+          getActiveThreadId: () => thread,
+          sendTelegramMessage: async (...args: Parameters<TelegramPoller["sendTelegramMessage"]>) => {
+            sent.push(args);
+            return { ok: true, result: { message_id: sent.length } };
+          },
+        });
+      },
+      log: () => {},
+    });
+    await daemon.start();
+    try {
+      expect(await callbacks.onHarnessCommand?.("/sessions@ExampleBot", FORUM_CHAT_ID, OPERATOR_ID)).toBe(true);
+      const menu = sent.find(args => args[1] === "Choose the running session to attach:");
+      const markup = menu?.[2];
+      if (!markup || typeof markup === "string" || !("inline_keyboard" in markup)) throw new Error("Missing attach buttons");
+      const token = markup.inline_keyboard[0][0].callback_data;
+      const selection = correlation.resolveCallback?.(token, OPERATOR_ID, FORUM_CHAT_ID);
+      expect(selection?.decision).toBe("deliver");
+      expect(correlation.resolveCallback?.(token, "unauthorized", FORUM_CHAT_ID).decision).toBe("reject_unauthorized");
+      if (!selection?.record) throw new Error("Missing stored callback");
+      await callbacks.onDecisionCallback?.(selection.record.decisionId, selection.record.choiceId);
+      expect(fake.loaded).toContain(selection.record.choiceId);
+      expect(correlation.consumeCallback?.(token)).toBe(true);
+      expect(correlation.resolveCallback?.(token, OPERATOR_ID, FORUM_CHAT_ID).decision).toBe("reject_already_consumed");
+      const context = { sessionId: "owner-one", requester: "fixture", task: "disposable", cwd: "C:/dev/one" };
+      const approval = evaluateApproval(stateDir, "fixture-operation", describeApproval("bash", { command: "echo fixture" }, "dynamic_code", context));
+      thread = 102;
+      await expect(callbacks.onApprovalCallback!(approvalCallback(approval.token, "approved"), OPERATOR_ID, FORUM_CHAT_ID, "owner-one")).rejects.toThrow("foreign-session");
+      thread = 101;
+      await callbacks.onApprovalCallback!(approvalCallback(approval.token, "approved"), OPERATOR_ID, FORUM_CHAT_ID, "owner-one");
+      await expect(callbacks.onApprovalCallback!(approvalCallback(approval.token, "approved"), OPERATOR_ID, FORUM_CHAT_ID, "owner-one")).rejects.toThrow("no permission changed");
+    } finally {
+      await daemon.stop();
+    }
   });
 });

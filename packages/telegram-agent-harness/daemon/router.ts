@@ -153,8 +153,8 @@ export class SlotRouter {
     {
       const bound = this.boundSession(target);
       if (bound) {
-        const outcome = await this.options.control.deliver(bound, text, mode);
-        return outcome === "started" ? null : `↪️ <b>Queued as a ${outcome === "steered" ? "steer" : "follow-up"}</b> for the running turn.`;
+        await this.options.control.deliver(bound, text, mode);
+        return null;
       }
 
       // A forum's General topic is the group's lobby, not one operator's chat. Binding

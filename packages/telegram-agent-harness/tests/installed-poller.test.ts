@@ -20,7 +20,7 @@ test.skipIf(!installed)("installed routing keeps command, authorization and deci
     await poller.processLedgerRow({ update_id: 2, text: "/agents", chat_id: "2", user_id: "2", sender_origin: "telegram_account" });
     expect(commands).toHaveLength(4);
     await poller.processLedgerRow({ update_id: 3, text: "Please revise option A", chat_id: "1", user_id: "1", sender_origin: "telegram_account" });
-    expect(inbound).toEqual(["[Telegram sender: 1; origin: telegram_account; human presence not attested]\nPlease revise option A"]);
+    expect(inbound).toEqual(["[Telegram sender: 1; origin: telegram_account]\nPlease revise option A"]);
   } finally { poller.stop(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 

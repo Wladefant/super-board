@@ -45,7 +45,7 @@ export function isProcessAlive(pid: number): boolean {
   }
 }
 
-function discoverOwners(configRoot?: string): Owner[] {
+export function discoverOwners(configRoot?: string): Owner[] {
   const root = configRoot ?? path.join(os.homedir(), process.env.VEYYON_CONFIG_DIR?.trim() || ".veyyon");
   const roots = [root];
   const profiles = path.join(root, "profiles");

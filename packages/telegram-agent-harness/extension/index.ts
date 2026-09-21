@@ -23,6 +23,8 @@ import type {
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Database } from "bun:sqlite";
+import { readMessageThreadId } from "./harness/channel-config";
 import { escapeHtml } from "./sanitizer";
 import {
   ACTIVE_LEASE_SYMBOL,
@@ -156,6 +158,51 @@ export function recordRouteUnbound(reason: string): void {
     lastKnownRoute = { unboundReason: reason, unboundAt: Date.now() };
   }
 }
+function findDaemonRoute(sessionId?: string, workspace?: string): { slotId: string; chatId: string; topicId: string; token: string } | null {
+  try {
+    const dbPath = path.join(os.homedir(), ".veyyon", "telegram", "daemon.db");
+    if (!fs.existsSync(dbPath)) return null;
+    const db = new Database(dbPath, { readonly: true });
+    try {
+      let row = sessionId
+        ? db.query<{ slot_id: string; chat_id: string; topic_id: string }, [string]>(
+            "SELECT slot_id, chat_id, topic_id FROM routes WHERE session_id = ? AND topic_id != '' LIMIT 1"
+          ).get(sessionId)
+        : null;
+      if (!row && workspace) {
+        const normWs = workspace.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+        const all = db.query<{ slot_id: string; chat_id: string; topic_id: string; workspace: string }, []>(
+          "SELECT slot_id, chat_id, topic_id, workspace FROM routes WHERE topic_id != ''"
+        ).all();
+        row = all.find(r => r.workspace && r.workspace.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase() === normWs) ?? null;
+      }
+      if (!row) return null;
+
+      const manifestPath = path.join(os.homedir(), ".veyyon", "telegram", "manifest.json");
+      if (!fs.existsSync(manifestPath)) return null;
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as { slots?: Array<{ slotId: string; stateDir: string }> };
+      const slot = manifest.slots?.find(s => s.slotId === row!.slot_id);
+      if (!slot) return null;
+      const envPath = path.join(slot.stateDir, ".env");
+      if (!fs.existsSync(envPath)) return null;
+      const envContent = fs.readFileSync(envPath, "utf8");
+      const match = /TELEGRAM_BOT_TOKEN=["']?([^"'\r\n]+)/.exec(envContent);
+      if (!match) return null;
+
+      return {
+        slotId: row.slot_id,
+        chatId: row.chat_id,
+        topicId: row.topic_id,
+        token: match[1].trim(),
+      };
+    } finally {
+      db.close();
+    }
+  } catch {
+    return null;
+  }
+}
+
 
 export function ownedRoot(): ActiveRootState | null {
   const runtime = activeRuntime;
@@ -386,6 +433,28 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
         }
       }
       if (!root) {
+        const fallbackRoute = findDaemonRoute(savedContext?.sessionId, savedContext?.cwd);
+        if (fallbackRoute) {
+          const res = await fetch(`https://api.telegram.org/bot${fallbackRoute.token}/sendMessage`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              chat_id: fallbackRoute.chatId,
+              message_thread_id: Number(fallbackRoute.topicId),
+              text: `<b>Agent · ${escapeHtml(params.lane_id)}</b>\n${params.text}`,
+              parse_mode: "HTML",
+            }),
+          });
+          const data = (await res.json()) as { ok?: boolean; result?: { message_id: number } };
+          if (data.ok && data.result) {
+            return {
+              content: [{
+                type: "text",
+                text: `Delivered message ${data.result.message_id} to topic #${fallbackRoute.topicId}; replies return with lane context.`,
+              }],
+            };
+          }
+        }
         const routeInfo = lastKnownRoute
           ? ` (last bound to chat ${lastKnownRoute.chatId ?? "unknown"}, slot ${lastKnownRoute.slotId ?? "unknown"}, unbound: ${lastKnownRoute.unboundReason ?? "unknown"})`
           : "";
@@ -395,12 +464,15 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
       const chat = root.poller.getPrimaryChatId();
       if (!chat) throw new Error("No authorized Telegram recipient");
       root.messageContext?.setLaneState(root.sessionId, params.lane_id, params.lane_state);
+      const threadId = root.poller.getActiveThreadId() ?? (root.activeSlot?.stateDir ? readMessageThreadId(root.activeSlot.stateDir) : undefined);
       const sent = await root.poller.sendTelegramMessage(
         chat,
         `<b>Agent · ${escapeHtml(params.lane_id)}</b>\n${params.text}`,
         undefined,
         undefined,
         { laneId: params.lane_id, laneState: params.lane_state },
+        undefined,
+        threadId,
       );
       if (!sent?.ok) throw new Error("Attributed message was not delivered");
       return { content: [{ type: "text", text: `Delivered message ${sent.result?.message_id}; replies return to Main with lane context.` }] };
@@ -430,7 +502,8 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
 
 export default function telegramSessionExtension(pi: ExtensionAPI): void {
   pi.setLabel("Telegram Alternate Channel");
-  currentApi = pi;
+  let ownsRootLifecycle = false;
+  currentApi ??= pi;
 
   // Guarded for the same reason session_switch is below: a host that does not offer
   // the tool-registration surface must still load the channel rather than fail to
@@ -443,6 +516,9 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
     );
   }
   pi.on("session_start", async (event: SessionStartEvent, ctx: ExtensionContext) => {
+    if (!isEligibleRootSession(ctx)) return;
+    ownsRootLifecycle = true;
+    currentApi = pi;
     savedContext = ctx;
     if (!activeRuntime) {
       try {
@@ -462,6 +538,7 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
 
   try {
     pi.on("session_switch", async (event: unknown, ctx: ExtensionContext) => {
+      if (!ownsRootLifecycle || !isEligibleRootSession(ctx)) return;
       savedContext = ctx;
       await activeRuntime?.onSessionSwitch(event, ctx);
     });
@@ -472,6 +549,7 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
   }
 
   pi.on("message_start", async (event: { message: { role: string } }) => {
+    if (!ownsRootLifecycle) return;
     if (event.message.role === "user") {
       await ensureChannelBound("message_start");
     }
@@ -479,10 +557,12 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("message_update", async (event: MessageUpdateEvent) => {
+    if (!ownsRootLifecycle) return;
     await activeRuntime?.onMessageUpdate(event);
   });
 
   pi.on("message_end", async (event: MessageEndEvent) => {
+    if (!ownsRootLifecycle) return;
     await activeRuntime?.onMessageEnd(event);
   });
 
@@ -491,15 +571,18 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("agent_end", async () => {
+    if (!ownsRootLifecycle) return;
     await activeRuntime?.onAgentEnd();
   });
 
   pi.on("turn_end", async () => {
+    if (!ownsRootLifecycle) return;
     await activeRuntime?.onTurnEnd();
     await ensureChannelBound("turn_end");
   });
 
   pi.on("session_shutdown", async (event: SessionShutdownEvent) => {
+    if (!ownsRootLifecycle) return;
     if (activeRuntime) {
       await activeRuntime.onSessionShutdown(event);
       activeRuntime = null;
@@ -509,6 +592,7 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
   pi.registerCommand("telegram", {
     description: "Inspect, release, or reload Telegram bot lease for this session",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
+      if (!ownsRootLifecycle || !isEligibleRootSession(ctx)) return;
       const trimmed = args.trim().toLowerCase();
       if (trimmed === "reload") {
         operatorReleased = false;
@@ -551,6 +635,7 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
   pi.registerCommand("tg-reload", {
     description: "Hot reload Telegram harness runtime in-process",
     handler: async (_args: string, ctx: ExtensionCommandContext) => {
+      if (!ownsRootLifecycle || !isEligibleRootSession(ctx)) return;
       operatorReleased = false;
       ctx.ui.notify("Reloading Telegram harness runtime...", "info");
       const res = await reload({ interactive: true });

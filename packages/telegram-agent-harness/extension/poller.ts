@@ -14,6 +14,7 @@ import {
 } from "./sanitizer";
 import { downloadInboundMedia, selectInboundMedia, type InboundMedia } from "./inbound-media";
 import { registerTelegramCommands, renderTelegramHelp } from "./command-registry";
+import { parseTelegramCommand } from "./command-parser";
 import type {
   AccessConfig,
   GroupAccessConfig,
@@ -61,7 +62,7 @@ export interface PollerCallbacks {
  * identity, so the provenance travels with the text rather than beside it.
  */
 function attributeSender(fromId: string, text: string): string {
-  return `[Telegram sender: ${fromId}; origin: telegram_account; human presence not attested]\n${text}`;
+  return `[Telegram sender: ${fromId}; origin: telegram_account]\n${text}`;
 }
 
 export interface PollerOptions {
@@ -92,6 +93,8 @@ export interface PollerOptions {
    * topic — must stay unset when this is given.
    */
   forumChatId?: string;
+  botUsername?: string;
+  slotId?: string;
 }
 
 const DEFAULT_POLLER_OPTIONS = {
@@ -183,6 +186,7 @@ export class TelegramPoller {
   private isRunning = false;
   private primaryChatId: string | null = null;
   private pendingDrain: Promise<void> | null = null;
+  private botUsername?: string;
   private nextOutboundAt = 0;
   private outboundReservation: Promise<void> = Promise.resolve();
   private dashboardUpdate: Promise<void> | null = null;
@@ -219,6 +223,7 @@ export class TelegramPoller {
     const threadId = typeof threadOrOptions === "number" ? threadOrOptions : undefined;
     const tuning = typeof threadOrOptions === "object" && threadOrOptions !== null ? threadOrOptions : options;
     this.options = { ...DEFAULT_POLLER_OPTIONS, ...(tuning || {}) };
+    this.botUsername = this.options.botUsername ? this.options.botUsername.trim().replace(/^@/, "").toLowerCase() : undefined;
     this.abortController = new AbortController();
     this.messageThreadId = threadId ?? this.options.messageThreadId;
     if (this.messageThreadId !== undefined && (!Number.isSafeInteger(this.messageThreadId) || this.messageThreadId <= 0)) {
@@ -328,6 +333,10 @@ export class TelegramPoller {
     return null;
   }
 
+  public setPrimaryChatId(chatId: string): void {
+    this.primaryChatId = chatId;
+  }
+
   /**
    * Forum topic of the update being handled right now, or undefined outside a topic
    * (a DM, or the supergroup's General topic). Read synchronously from a callback the
@@ -335,6 +344,9 @@ export class TelegramPoller {
    */
   public getActiveThreadId(): number | undefined {
     return this.activeThreadId;
+  }
+  public getMessageThreadId(): number | undefined {
+    return this.messageThreadId;
   }
   public updateAccess(config: AccessConfig): void {
     this.accessConfig = config;
@@ -622,7 +634,7 @@ export class TelegramPoller {
   private async runPollLoop(): Promise<void> {
     // The lease holder refreshes the operator's private menu on every startup.
     // Registration failure must not disconnect an otherwise usable input channel.
-    if (this.accessConfig.dmPolicy !== "disabled") {
+    if (this.accessConfig.dmPolicy !== "disabled" || this.options.forumChatId) {
       try {
         await registerTelegramCommands(
           this.botToken,
@@ -1172,7 +1184,27 @@ export class TelegramPoller {
     }
 
     // 4. Command handling
-    if (!row.media_json) rawText = rawText.replace(/^(\/\w+)@\w+(?=\s|$)/, "$1");
+    if (!row.media_json && rawText.startsWith("/")) {
+      if (rawText.includes("@") && !this.botUsername) {
+        try {
+          const meRes = await fetch(`https://api.telegram.org/bot${this.botToken}/getMe`, {
+            signal: AbortSignal.timeout(3000),
+          });
+          const me = (await meRes.json()) as { ok?: boolean; result?: { username?: string } };
+          if (me.ok && me.result?.username) {
+            this.botUsername = me.result.username.toLowerCase();
+          }
+        } catch {}
+      }
+      const parsed = parseTelegramCommand(rawText, this.botUsername, this.options.slotId);
+      if (parsed) {
+        if (!parsed.isAddressedToUs) {
+          this.db.run("UPDATE update_ledger SET status = 'COMPLETED' WHERE update_id = ?", [row.update_id]);
+          return;
+        }
+        rawText = parsed.rawCommand;
+      }
+    }
     if (!row.media_json && await this.callbacks.onHarnessCommand?.(rawText, chatId, fromId)) {
       this.db.run("UPDATE update_ledger SET status = 'COMPLETED' WHERE update_id = ?", [row.update_id]);
       return;

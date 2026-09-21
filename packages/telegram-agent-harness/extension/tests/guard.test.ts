@@ -15,6 +15,31 @@ afterEach(() => {
   fs.rmSync(stateDir, { recursive: true, force: true });
 });
 
+test("PowerShell static object syntax is not POSIX globbing and dynamic members stay gated", () => {
+  expect(guard.evaluateToolCall("bash", { command: 'pwsh -Command "[pscustomobject]@{ Count = 1; Ready = $true }"' })).toEqual({ allowed: true });
+  for (const command of [
+    'pwsh -Command "[System.IO.File]::ReadAllText($file)"',
+    'pwsh -Command "[pscustomobject]@{ Result = (Invoke-Expression $payload) }"',
+    'bash -c "[pscustomobject]@{ Count = 1 }"',
+    'pwsh -Command "[pscustomobject]@{ Count = 1 }; Remove-Item -Recurse -Force C:/"',
+  ]) expect(guard.evaluateToolCall("bash", { command }).allowed).toBe(false);
+});
+
+test("sensitive reads carry a path subject without disabling unrelated reads", () => {
+  const blocked = guard.evaluateToolCall("read", { path: "/workspace/.env" });
+  expect(blocked.allowed).toBe(false);
+  expect(blocked.subject).toEqual({ kind: "path", value: "/workspace/.env" });
+  expect(guard.evaluateToolCall("read", { path: "/workspace/src/main.ts" })).toEqual({ allowed: true });
+});
+
+test("command blocks carry the exact operation rather than a whole-tool subject", () => {
+  const input = { command: "git push --force origin main", cwd: "/workspace" };
+  const blocked = guard.evaluateToolCall("bash", input);
+  expect(blocked.subject).toEqual({
+    kind: "command", value: JSON.stringify({ toolName: "bash", input, cwd: "/workspace" }),
+  });
+});
+
 for (const tool of ["task", "write", "edit", "search", "todo", "irc"]) {
   test(`AC1: ${tool} treats instructions as data`, () => {
     const input = { prompt: "git push origin feat/93; truncation; psql; ssh; dokploy; stripe refunds create", content: "DROP TABLE x; git push --force origin main", input: "rm -rf temp", path: "docs/example.ts" };

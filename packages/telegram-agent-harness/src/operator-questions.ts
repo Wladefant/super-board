@@ -1,5 +1,17 @@
 import * as path from "node:path";
 import type { TelegramPoller } from "../extension/poller";
+import type { AccessConfig } from "../extension/types";
+
+/** A forum chat is not an operator account; callback ownership must name a user. */
+export function questionOperator(access: AccessConfig, chatId: string): string {
+  if (!chatId.startsWith("-") && access.allowFrom.includes(chatId)) return chatId;
+  const group = access.groups?.[chatId];
+  const operators = group
+    ? access.allowFrom.filter(id => !id.startsWith("-") && (!group.allowFrom || group.allowFrom.includes(id)))
+    : [];
+  if (operators.length !== 1) throw new Error("Question route requires exactly one authorized operator for this forum.");
+  return operators[0];
+}
 
 export interface OperatorQuestionInput {
   question: string;

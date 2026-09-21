@@ -165,7 +165,7 @@ test("reply to active lane injects provenance and routes to Main without dead wo
   // Provenance headers
   expect(delivered).toContain("[Concerning lane: worker-db; last reported state: active. Reply delivered to Main for dispatch, not directly to the lane.]");
   expect(delivered).toContain(`[Replying to Telegram post #${msgId}]`);
-  expect(delivered).toContain("[Telegram sender: 1; origin: telegram_account; human presence not attested]");
+  expect(delivered).toContain("[Telegram sender: 1; origin: telegram_account]");
   expect(delivered).toContain("Please run migrations");
 
   // Did NOT send an exited notice to Telegram

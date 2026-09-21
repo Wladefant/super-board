@@ -8,6 +8,8 @@ import { describeApproval, evaluateApproval, decideApproval, type ApprovalContex
 export interface ToolGuardEvaluation {
   allowed: boolean;
   reason?: string;
+  subject?: { kind: "path" | "command"; value: string };
+  disposition?: "approval-required" | "refused";
   category?: string;
   approvalHash?: string;
   approval?: ApprovalRecord;
@@ -561,18 +563,25 @@ export function commandCategory(words: string[], cwd = process.cwd(), depth = 0)
     && /^(secrets?|config)$/.test(args[0] ?? "") && /^(list|get|reveal|pull)$/.test(args[1] ?? "")) return "secrets";
   if (/^(sh|bash|zsh|ksh|dash|ash|fish|cmd|powershell|pwsh)$/.test(app)) {
     const found: (string | undefined)[] = [];
+    // Only PowerShell interprets this exact cast/hashtable form as inert data.
+    // Do not relax bracketed POSIX command names or .NET member expressions.
+    const inspectShell = (script: string): string | undefined => {
+      if (!/^(powershell|pwsh)$/.test(app)) return inspect(script);
+      const staticObject = /\[pscustomobject\]\s*@\{\s*(?:[A-Za-z_]\w*\s*=\s*(?:-?\d+(?:\.\d+)?|\$(?:true|false|null)|'[^']*')\s*;?\s*)*\}/gi;
+      return inspect(script.replace(staticObject, "Write-Output"));
+    };
     if (/^(powershell|pwsh)$/.test(app)) {
       const encoded = args.findIndex(arg => flagPrefixOf(arg, "encodedcommand"));
       if (encoded >= 0 && args[encoded + 1]) {
         const decoded = decodeBase64(args[encoded + 1]);
-        found.push(decoded ? inspect(decoded) : DYNAMIC_CATEGORY);
+        found.push(decoded ? inspectShell(decoded) : DYNAMIC_CATEGORY);
       }
     }
     // A POSIX shell takes -c anywhere in a combined cluster; only PowerShell abbreviates -Command.
     const script = args.findIndex(arg => /^(powershell|pwsh)$/.test(app)
       ? flagPrefixOf(arg, "command")
       : app === "cmd" ? /^[-/][ck]$/i.test(arg) : /^-[a-z]*c[a-z]*$/.test(arg));
-    if (script >= 0) found.push(inspect(args.slice(script + 1).join(" ").replace(/^(&\s*)?\{|\}$/g, "").trim()) ?? (args[script + 1] === undefined ? DYNAMIC_CATEGORY : undefined));
+    if (script >= 0) found.push(inspectShell(args.slice(script + 1).join(" ").replace(/^(?:&\s*)?\{([\s\S]*)\}$/, "$1").trim()) ?? (args[script + 1] === undefined ? DYNAMIC_CATEGORY : undefined));
     if (found.length) return selectCategory(found);
   }
   // Each interpreter spells "run this string" its own way: -c, -e/-E, -p/--print, -r, deno's `eval`
@@ -946,9 +955,15 @@ export class DangerousToolGuard {
       category = category ?? DYNAMIC_CATEGORY;
       unresolved = true;
     }
+    // Extension blocks must name the operation, never install a whole-tool denial.
+    // A single filesystem target can be fenced precisely by the native runtime.
+    const subject: NonNullable<ToolGuardEvaluation["subject"]> =
+      typeof input.path === "string" && input.path.trim() && !input.path.includes(";")
+        ? { kind: "path", value: input.path }
+        : { kind: "command", value: JSON.stringify({ toolName, input, cwd }) };
     if (!category) return { allowed: true };
     commands = commands.map(words => words.map(word => word.split(DYNAMIC).join("<dynamic>")));
-    if (category === "production_exclusion") return { allowed: false, category, reason: "Production is excluded for every transport; an approval cannot override this boundary." };
+    if (category === "production_exclusion") return { allowed: false, category, subject, reason: "Production is excluded for every transport; an approval cannot override this boundary." };
 
     const config = this.getGuardConfig();
     const isDenied = config.deny.includes(category);
@@ -963,11 +978,11 @@ export class DangerousToolGuard {
     try {
       const record = evaluateApproval(this.stateDir, computeApprovalHash(category, content), describeApproval(toolName, input, category, context, commands, unresolved));
       if (record.state === "consumed") return { allowed: true };
-      if (record.state === "denied") return { allowed: false, category, reason: "The operator explicitly denied this exact operation. Do not retry or work around it; continue independent work." };
-      return { allowed: false, category, approvalHash: record.token, approval: record,
+      if (record.state === "denied") return { allowed: false, category, subject, reason: "The operator explicitly denied this exact operation. Do not retry or work around it; continue independent work." };
+      return { allowed: false, category, subject, disposition: "approval-required", approvalHash: record.token, approval: record,
         reason: `Operation '${category}' requires exact operator approval. Await Approve or Deny in this session's Telegram bot; denial is explicit and must not be worked around. Typed fallback: /approve ${record.token}. Expires ${record.expiresAt}. After approval retry the identical call once. Local operator equivalent: bun "${path.join(import.meta.dir, "guard.ts")}" approve "${this.stateDir}" ${record.token} ${JSON.stringify(context.sessionId)}` };
     } catch {
-      return { allowed: false, category, reason: "Blocked — approval store is not writable, so this call was not approved. Restore write access before retrying." };
+      return { allowed: false, category, subject, reason: "Blocked — approval store is not writable, so this call was not approved. Restore write access before retrying." };
     }
   }
 }

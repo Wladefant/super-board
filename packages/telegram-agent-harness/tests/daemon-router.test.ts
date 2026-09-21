@@ -219,13 +219,13 @@ describe("inbound routing", () => {
     expect(router.boundSession(DM)).toBeNull();
   });
 
-  test("steer and follow-up modes are acknowledged distinctly and reach the bound session", async () => {
+  test("steer and follow-up modes stay silent without routine ack spam and reach the bound session", async () => {
     const fake = fakeControl([summary("sess-existing", "C:/dev/demo")]);
     const router = buildRouter({}, fake.control);
     await router.deliver(DM, "start");
 
-    expect(await router.deliver(DM, "redirect", "steer")).toContain("steer");
-    expect(await router.deliver(DM, "afterwards", "followUp")).toContain("follow-up");
+    expect(await router.deliver(DM, "redirect", "steer")).toBeNull();
+    expect(await router.deliver(DM, "afterwards", "followUp")).toBeNull();
     expect(fake.delivered.slice(1)).toEqual([
       { sessionId: "sess-existing", text: "redirect", mode: "steer" },
       { sessionId: "sess-existing", text: "afterwards", mode: "followUp" },
