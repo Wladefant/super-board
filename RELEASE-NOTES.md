@@ -1,6 +1,39 @@
 # Release notes
 
 
+## v2.3.1 — 2026-09-21
+
+`scan_retired_status` had the identical installed-tree defect as the merge gate
+fixed in v2.0.1: it relied entirely on `merge-scan-allowlist.txt` at the
+repository root, which is not part of the install payload. On an installed tree
+it flagged `lifecycle.py` and every document mentioning the retirement, and
+could never report clean.
+
+Fixed by introducing a definition-versus-use classifier and payload-safe
+exclusion:
+
+- **The registry module is excluded intrinsically.** `super_board_runtime/lifecycle.py`
+  carrying `RETIRED_STATUSES` is identified by package-relative path plus its
+  own declaration via `_is_module_source`, so the exclusion follows into
+  `.claude/bin/`.
+- **A status assignment is a use and nothing excuses it** (`status = "Skipped"`,
+  `{"status": "Skipped"}`, `--status skipped`, case-insensitive). A binding
+  whose name says retired is recognized as a declaration list, not a use.
+- **Everything else is a mention** unless the passage is about the status field
+  and does not call the value retired.
+- **One real resurrection removed:** `skills/super-build/SKILL.md:276` told
+  builders to move cards to `Skipped`. Removed in shipped skills.
+- **Allowlist pruned from 15 to 5 entries**, every remaining entry load-bearing.
+
+### Versioning
+
+This release restores behaviour promised by the safety gates and adds no new
+contracts or surfaces. Reconciled current release 2.3.0 + defect-fixes-only ⇒ **2.3.1**.
+
+**Tagging: not done here.** Creating the tag and publishing stay behind
+`authorize_release_publication` and its explicit operator approval.
+
+
 ## v2.3.0 — 2026-08-27
 
 The 2.2.0 playbook named ten classes. A review of

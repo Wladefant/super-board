@@ -136,6 +136,11 @@ class InstalledTreeTests(unittest.TestCase):
         detail = "\n".join(f"  {o.path}:{o.line} — {o.mechanism}" for o in report.occurrences)
         self.assertTrue(report.clean, f"active merge paths on an installed tree:\n{detail}")
 
+    def test_the_installed_payload_has_no_active_skipped_status(self) -> None:
+        report = scan_retired_status(self.tree / ".claude")
+        detail = "\n".join(f"  {o.path}:{o.line}" for o in report.occurrences)
+        self.assertTrue(report.clean, f"`Skipped` on an installed tree:\n{detail}")
+
     def test_an_active_merge_mechanism_in_the_installed_tree_is_caught(self) -> None:
         rogue = self.tree / ".claude" / "bin" / "rogue-lane.sh"
         rogue.write_text("#!/usr/bin/env bash\ngh pr merge \"$1\" --rebase\n", encoding="utf-8")
@@ -148,6 +153,28 @@ class InstalledTreeTests(unittest.TestCase):
             )
         finally:
             rogue.unlink()
+    def test_an_active_skipped_status_in_the_installed_tree_is_caught(self) -> None:
+        rogue = self.tree / ".claude" / "bin" / "rogue-lane.py"
+        rogue.write_text('card["status"] = "Skipped"\n', encoding="utf-8")
+        try:
+            report = scan_retired_status(self.tree / ".claude")
+            self.assertFalse(report.clean, "the retired-status gate stopped biting on an installed tree")
+            self.assertEqual(
+                [(o.path, o.line) for o in report.occurrences],
+                [("bin/rogue-lane.py", 1)],
+            )
+        finally:
+            rogue.unlink()
+
+    def test_a_retired_status_declaration_in_the_installed_tree_is_not_caught(self) -> None:
+        decl = self.tree / ".claude" / "bin" / "decl.py"
+        decl.write_text('RETIRED_STATUS = "Skipped"\n', encoding="utf-8")
+        try:
+            report = scan_retired_status(self.tree / ".claude")
+            self.assertTrue(report.clean, "a declaration list is not a use")
+        finally:
+            decl.unlink()
+
 
 
 class SelfExclusionTests(unittest.TestCase):
@@ -244,6 +271,50 @@ class ProhibitionStatementTests(unittest.TestCase):
         body = "Nothing here is permitted.\n\nEnable auto-merge once CI is green.\n"
         self.assertFalse(self._scan("lane.md", body).clean)
 
+
+class RetiredStatusDefinitionVersusUseTests(unittest.TestCase):
+    """A definition that legitimately names a retired status is not a use.
+
+    The retired-status gate hunts resurrection — a status being assigned,
+    transitioned to, or offered as a destination for a card. It must not flag:
+      - the module that defines the lifecycle and declares what is retired;
+      - a registry entry declaring retired statuses;
+      - a test fixture exercising the refusal of the retired value.
+    """
+
+    def test_only_the_real_use_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pkg = root / "bin" / "super_board_runtime"
+            pkg.mkdir(parents=True)
+            (pkg / "lifecycle.py").write_bytes(
+                (_REPO_ROOT / "scripts" / "super_board_runtime" / "lifecycle.py").read_bytes()
+            )
+            (root / "bin" / "board_options.py").write_text(
+                'RETIRED_BOARD_STATUSES = ("Skipped",)\n', encoding="utf-8"
+            )
+            (root / "bin" / "test_refusal.py").write_text(
+                'with pytest.raises(ValueError, match="retired"): canonicalize_status("Skipped")\n',
+                encoding="utf-8",
+            )
+            (root / "bin" / "lane.py").write_text(
+                'card["status"] = "Skipped"\n', encoding="utf-8"
+            )
+
+            report = scan_retired_status(root, allowlist=())
+            self.assertFalse(report.clean)
+            self.assertEqual(
+                [(o.path, o.line) for o in report.occurrences],
+                [("bin/lane.py", 1)],
+            )
+
+    def test_a_declaration_list_is_not_a_use(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "bin").mkdir(parents=True)
+            (root / "bin" / "decl.py").write_text('RETIRED_STATUS = "Skipped"\n', encoding="utf-8")
+            report = scan_retired_status(root, allowlist=())
+            self.assertTrue(report.clean, "a declaration list is not a use")
 
 class ConfigAssignmentTests(unittest.TestCase):
     """Assigning a config value is not a merge invocation.
