@@ -22,8 +22,14 @@
 import * as path from "node:path";
 import { escapeHtml } from "../extension/sanitizer";
 import type { DaemonSlot } from "./config";
-import type { GuiHostSessionControl } from "./session-control";
-import type { TopicLifecycle } from "./router";
+import type { DaemonSessionSummary, GuiHostSessionControl } from "./session-control";
+import {
+  getSessionWorkspace,
+  isTopLevelSession,
+  type RouteTarget,
+  type SlotRouter,
+  type TopicLifecycle,
+} from "./router";
 import type { DaemonStore } from "./store";
 
 export interface ForumTopic {
@@ -128,10 +134,43 @@ export class DefaultTelegramForumClient implements ForumApiClient {
   }
 }
 
-export function formatTopicName(sessionId: string, workspace: string, title?: string | null): string {
+export function normalizeWorkspace(workspace: string): string {
+  return workspace.replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+export function workspaceFolder(workspace: string): string {
+  const norm = normalizeWorkspace(workspace);
+  return norm.split("/").filter(Boolean).at(-1) ?? norm;
+}
+
+export function formatTopicName(
+  sessionId: string,
+  workspace: string,
+  title?: string | null,
+  ordinal?: number,
+): string {
   const folder = workspace.replace(/\\/g, "/").split("/").filter(Boolean).at(-1);
   const base = folder || title?.trim() || path.basename(workspace) || "Session";
-  return base.slice(0, 128);
+  const suffixed = ordinal && ordinal > 1 ? `${base} (${ordinal})` : base;
+  return suffixed.slice(0, 128);
+}
+
+export interface AutoAttachAction {
+  action: "create" | "rebind" | "skip";
+  sessionId: string;
+  workspace: string;
+  folder: string;
+  topicId?: number;
+  topicName?: string;
+  reason?: string;
+}
+
+export interface AutoAttachResult {
+  actions: AutoAttachAction[];
+  created: number;
+  rebound: number;
+  skipped: number;
+  errors: number;
 }
 
 export interface ForumManagerOptions {
@@ -160,6 +199,7 @@ export interface ForumManagerOptions {
 export class ForumManager implements TopicLifecycle {
   public readonly options: ForumManagerOptions;
   public readonly client: ForumApiClient;
+  private readonly workspaceBackoffs = new Map<string, { until: number; delayMs: number }>();
 
   constructor(options: ForumManagerOptions) {
     this.options = options;
@@ -187,7 +227,13 @@ export class ForumManager implements TopicLifecycle {
    * written here so the topic is routable the moment Telegram reports it, even if
    * the caller's own binding step fails.
    */
-  public async ensureTopic(sessionId: string, workspace: string, title?: string | null): Promise<number> {
+  public async ensureTopic(
+    sessionId: string,
+    workspace: string,
+    title?: string | null,
+    ordinal?: number,
+    liveSessionIds?: Set<string>,
+  ): Promise<number> {
     const existing = this.options.store
       .routesForSession(sessionId)
       .find(route => route.slotId === this.slotId && route.chatId === this.forumChatId && route.topicId !== "");
@@ -195,23 +241,47 @@ export class ForumManager implements TopicLifecycle {
       return Number(existing.topicId);
     }
 
-    const normTarget = workspace.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
-    const existingWorkspaceRoute = this.options.store
+    const normTarget = normalizeWorkspace(workspace).toLowerCase();
+    const folderTarget = workspaceFolder(workspace).toLowerCase();
+
+    const candidateRoutes = this.options.store
       .listRoutes(this.slotId)
-      .find(route => route.chatId === this.forumChatId && route.topicId !== "" &&
-        route.workspace.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase() === normTarget);
-    if (existingWorkspaceRoute) {
+      .filter(route => route.chatId === this.forumChatId && route.topicId !== "");
+
+    const deadWorkspaceRoute = candidateRoutes.find(route => {
+      const isDead = !liveSessionIds || !liveSessionIds.has(route.sessionId);
+      if (!isDead) return false;
+      return normalizeWorkspace(route.workspace).toLowerCase() === normTarget;
+    }) ?? candidateRoutes.find(route => {
+      const isDead = !liveSessionIds || !liveSessionIds.has(route.sessionId);
+      if (!isDead) return false;
+      return workspaceFolder(route.workspace).toLowerCase() === folderTarget;
+    });
+
+    if (deadWorkspaceRoute) {
       this.options.store.putRoute({
         slotId: this.slotId,
         chatId: this.forumChatId,
-        topicId: existingWorkspaceRoute.topicId,
+        topicId: deadWorkspaceRoute.topicId,
         sessionId,
         workspace,
       });
-      this.log(`Reused forum topic #${existingWorkspaceRoute.topicId} for workspace ${workspace} (rebound to session ${sessionId})`);
-      return Number(existingWorkspaceRoute.topicId);
+      const threadId = Number(deadWorkspaceRoute.topicId);
+      this.log(`Reused forum topic #${threadId} for workspace ${workspace} (rebound to session ${sessionId})`);
+
+      const note = `🔁 <b>Rebound to session</b> <code>${escapeHtml(sessionId)}</code>`;
+      await this.client.sendMessage(this.forumChatId, note, {
+        message_thread_id: threadId,
+        parse_mode: "HTML",
+      }).catch(err => {
+        this.log(`Could not send rebind note to topic #${threadId}: ${err instanceof Error ? err.message : String(err)}`);
+      });
+
+      return threadId;
     }
-    const created = await this.client.createForumTopic(this.forumChatId, formatTopicName(sessionId, workspace, title));
+
+    const topicName = formatTopicName(sessionId, workspace, title, ordinal);
+    const created = await this.client.createForumTopic(this.forumChatId, topicName);
     const threadId = created.message_thread_id;
 
     this.options.store.putRoute({
@@ -281,5 +351,252 @@ export class ForumManager implements TopicLifecycle {
       "",
       "Write inside a topic to steer its session, or open another with <code>/new</code>.",
     ].join("\n");
+  }
+  private isWorkspaceInBackoff(workspace: string): boolean {
+    const key = normalizeWorkspace(workspace).toLowerCase();
+    const entry = this.workspaceBackoffs.get(key);
+    if (!entry) return false;
+    if (Date.now() >= entry.until) {
+      this.workspaceBackoffs.delete(key);
+      return false;
+    }
+    return true;
+  }
+
+  private recordWorkspaceError(workspace: string, _error: unknown): void {
+    const key = normalizeWorkspace(workspace).toLowerCase();
+    const prev = this.workspaceBackoffs.get(key);
+    const delayMs = prev ? Math.min(prev.delayMs * 2, 120_000) : 20_000;
+    this.workspaceBackoffs.set(key, { until: Date.now() + delayMs, delayMs });
+  }
+
+  public clearWorkspaceBackoff(workspace: string): void {
+    const key = normalizeWorkspace(workspace).toLowerCase();
+    this.workspaceBackoffs.delete(key);
+  }
+
+  /**
+   * Auto-attaches live top-level Veyyon sessions to forum topics:
+   * - Rebinds existing topics whose bound session is dead
+   * - Creates new topics (with ordinals if multiple live in the same folder)
+   * - Idempotent, never closes topics or touches routes of live sessions
+   */
+  public async reconcileAutoAttach(
+    bindingTarget?: SlotRouter | ((target: RouteTarget, sessionId: string, workspace: string) => Promise<void>),
+    options?: { dryRun?: boolean },
+  ): Promise<AutoAttachResult> {
+    const dryRun = Boolean(options?.dryRun);
+    const actions: AutoAttachAction[] = [];
+    let createdCount = 0;
+    let reboundCount = 0;
+    let skippedCount = 0;
+    let errorCount = 0;
+
+    let wireSessions: DaemonSessionSummary[];
+    try {
+      wireSessions = await this.options.control.listSessions();
+    } catch (err) {
+      this.log(`Auto-attach reconcile skipped: cannot list wire sessions (${err instanceof Error ? err.message : String(err)})`);
+      return { actions: [], created: 0, rebound: 0, skipped: 0, errors: 1 };
+    }
+
+    // Source of truth = live wire sessions only, top-level with non-empty workspace
+    const liveSessions = wireSessions.filter(s => isTopLevelSession(s) && Boolean(getSessionWorkspace(s)));
+    const liveSessionIds = new Set(liveSessions.map(s => s.id));
+
+    const allRoutes = this.options.store
+      .listRoutes(this.slotId)
+      .filter(route => route.chatId === this.forumChatId && route.topicId !== "");
+    const routesBySessionId = new Map<string, typeof allRoutes[0]>();
+    for (const r of allRoutes) {
+      routesBySessionId.set(r.sessionId, r);
+    }
+
+    // Dead routes: routes whose bound session is NOT in liveSessionIds
+    const availableDeadRoutes = allRoutes.filter(r => !liveSessionIds.has(r.sessionId));
+
+    // Count live sessions per folder that already have a topic
+    const liveCountByFolder = new Map<string, number>();
+    for (const s of liveSessions) {
+      if (routesBySessionId.has(s.id)) {
+        const f = workspaceFolder(getSessionWorkspace(s)).toLowerCase();
+        liveCountByFolder.set(f, (liveCountByFolder.get(f) ?? 0) + 1);
+      }
+    }
+
+    const bind = async (target: RouteTarget, sessionId: string, workspace: string): Promise<void> => {
+      if (bindingTarget) {
+        if ("bind" in bindingTarget && typeof bindingTarget.bind === "function") {
+          await bindingTarget.bind(target, sessionId, workspace);
+        } else if (typeof bindingTarget === "function") {
+          await bindingTarget(target, sessionId, workspace);
+        }
+      } else {
+        this.options.store.putRoute({
+          slotId: this.slotId,
+          chatId: target.chatId,
+          topicId: target.topicId,
+          sessionId,
+          workspace,
+        });
+        await this.options.control.loadTranscript(sessionId).catch(() => undefined);
+      }
+    };
+
+    for (const session of liveSessions) {
+      const ws = getSessionWorkspace(session);
+      const folder = workspaceFolder(ws);
+      const folderKey = folder.toLowerCase();
+      const normWs = normalizeWorkspace(ws).toLowerCase();
+
+      // Session already has a route on this forum
+      const existingRoute = routesBySessionId.get(session.id);
+      if (existingRoute) {
+        actions.push({
+          action: "skip",
+          sessionId: session.id,
+          workspace: ws,
+          folder,
+          topicId: Number(existingRoute.topicId),
+          reason: `already bound to topic #${existingRoute.topicId}`,
+        });
+        skippedCount++;
+        continue;
+      }
+
+      // Check if a dead route exists for the same normalized workspace folder
+      const deadIndex = availableDeadRoutes.findIndex(r => normalizeWorkspace(r.workspace).toLowerCase() === normWs) !== -1
+        ? availableDeadRoutes.findIndex(r => normalizeWorkspace(r.workspace).toLowerCase() === normWs)
+        : availableDeadRoutes.findIndex(r => workspaceFolder(r.workspace).toLowerCase() === folderKey);
+
+      if (deadIndex >= 0) {
+        const deadRoute = availableDeadRoutes.splice(deadIndex, 1)[0];
+        const threadId = Number(deadRoute.topicId);
+
+        actions.push({
+          action: "rebind",
+          sessionId: session.id,
+          workspace: ws,
+          folder,
+          topicId: threadId,
+          reason: `rebound from dead session ${deadRoute.sessionId}`,
+        });
+
+        if (dryRun) {
+          reboundCount++;
+          continue;
+        }
+
+        if (this.isWorkspaceInBackoff(ws)) {
+          this.log(`Auto-attach skipping workspace ${ws} (session ${session.id}) due to active error backoff`);
+          continue;
+        }
+
+        try {
+          this.options.store.putRoute({
+            slotId: this.slotId,
+            chatId: this.forumChatId,
+            topicId: deadRoute.topicId,
+            sessionId: session.id,
+            workspace: ws,
+          });
+          routesBySessionId.set(session.id, {
+            slotId: this.slotId,
+            chatId: this.forumChatId,
+            topicId: deadRoute.topicId,
+            sessionId: session.id,
+            workspace: ws,
+          });
+
+          const note = `🔁 <b>Rebound to session</b> <code>${escapeHtml(session.id)}</code>`;
+          await this.client.sendMessage(this.forumChatId, note, {
+            message_thread_id: threadId,
+            parse_mode: "HTML",
+          }).catch(err => {
+            this.log(`Could not send rebind note to topic #${threadId}: ${err instanceof Error ? err.message : String(err)}`);
+          });
+
+          await bind({ chatId: this.forumChatId, topicId: deadRoute.topicId }, session.id, ws);
+          this.clearWorkspaceBackoff(ws);
+          this.log(`Reused forum topic #${threadId} for workspace ${ws} (rebound to session ${session.id})`);
+          reboundCount++;
+        } catch (err) {
+          errorCount++;
+          this.recordWorkspaceError(ws, err);
+          this.log(`Auto-attach rebind failed for workspace ${ws} (session ${session.id}): ${err instanceof Error ? err.message : String(err)}`);
+        }
+      } else {
+        // No dead route: create a new topic
+        const currentCount = liveCountByFolder.get(folderKey) ?? 0;
+        const ordinal = currentCount + 1;
+        liveCountByFolder.set(folderKey, ordinal);
+
+        const topicName = formatTopicName(session.id, ws, session.title, ordinal);
+
+        actions.push({
+          action: "create",
+          sessionId: session.id,
+          workspace: ws,
+          folder,
+          topicName,
+        });
+
+        if (dryRun) {
+          createdCount++;
+          continue;
+        }
+
+        if (this.isWorkspaceInBackoff(ws)) {
+          this.log(`Auto-attach skipping workspace ${ws} (session ${session.id}) due to active error backoff`);
+          continue;
+        }
+
+        try {
+          const created = await this.client.createForumTopic(this.forumChatId, topicName);
+          const threadId = created.message_thread_id;
+
+          this.options.store.putRoute({
+            slotId: this.slotId,
+            chatId: this.forumChatId,
+            topicId: String(threadId),
+            sessionId: session.id,
+            workspace: ws,
+          });
+          routesBySessionId.set(session.id, {
+            slotId: this.slotId,
+            chatId: this.forumChatId,
+            topicId: String(threadId),
+            sessionId: session.id,
+            workspace: ws,
+          });
+
+          const welcome = [
+            `🆕 <b>Veyyon session attached</b>`,
+            `Session: <code>${escapeHtml(session.id)}</code>`,
+            `Workspace: <code>${escapeHtml(ws)}</code>`,
+            ``,
+            `<i>Write in this topic to steer the session. <code>/detach close</code> closes it.</i>`,
+          ].join("\n");
+
+          await this.client.sendMessage(this.forumChatId, welcome, {
+            message_thread_id: threadId,
+            parse_mode: "HTML",
+          }).catch(err => {
+            this.log(`Could not send welcome message to topic #${threadId}: ${err instanceof Error ? err.message : String(err)}`);
+          });
+
+          await bind({ chatId: this.forumChatId, topicId: String(threadId) }, session.id, ws);
+          this.clearWorkspaceBackoff(ws);
+          this.log(`Created forum topic #${threadId} (${topicName}) for session ${session.id}`);
+          createdCount++;
+        } catch (err) {
+          errorCount++;
+          this.recordWorkspaceError(ws, err);
+          this.log(`Auto-attach failed to create topic for workspace ${ws} (session ${session.id}): ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    }
+
+    return { actions, created: createdCount, rebound: reboundCount, skipped: skippedCount, errors: errorCount };
   }
 }

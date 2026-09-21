@@ -30,6 +30,8 @@ export interface GuiHostFallbackOptions {
   restartCooldownMs?: number;
   /** Rate limit per chat for down notifications in ms; defaults to 600_000 (10 min). */
   chatNoticeCooldownMs?: number;
+  /** Callback invoked when GUI host recovery succeeds after an ECONNREFUSED. */
+  onHostRecovered?: () => void;
 }
 
 export class GuiHostFallbackManager {
@@ -58,7 +60,9 @@ export class GuiHostFallbackManager {
       }
 
       this.options.control.close();
-      return await operation();
+      const result = await operation();
+      this.options.onHostRecovered?.();
+      return result;
     }
   }
 

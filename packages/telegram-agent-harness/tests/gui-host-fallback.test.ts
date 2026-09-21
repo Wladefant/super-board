@@ -312,6 +312,6 @@ describe("SlotRouter with GuiHostFallbackManager", () => {
     fakeControl.failCount = 0;
     const commandResult = await router.handleCommand("/sessions", target);
     expect(commandResult).toBe(true);
-    expect(sentMessages.some(m => m.html.includes("Test Session"))).toBe(true);
+    expect(sentMessages.some(m => m.html.includes("work"))).toBe(true);
   });
 });

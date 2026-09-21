@@ -546,6 +546,27 @@ describe("routing commands", () => {
     expect(sent[0].html).not.toContain("sess-a");
     expect(sent[0].html).not.toContain("Demo");
   });
+  test("/sessions marks sessions that already have a topic with a pin emoji", async () => {
+    const fake = fakeControl([summary("sess-a", "C:/dev/demo"), summary("sess-b", "C:/dev/other")]);
+    const topics = fakeTopics();
+    const router = buildRouter({ mode: "forum", forumChatId: FORUM_CHAT }, fake.control, topics);
+
+    // sess-a has a topic in the forum
+    store.putRoute({
+      slotId: "slot-1",
+      chatId: FORUM_CHAT,
+      topicId: "9",
+      sessionId: "sess-a",
+      workspace: "C:/dev/demo",
+    });
+
+    expect(await router.handleCommand("/sessions", TOPIC_9)).toBe(true);
+    expect(sent[0].html).toBe(
+      "1. 📌 <b>demo</b> <code>C:/dev/demo</code>\n" +
+      "2. <b>other</b> <code>C:/dev/other</code>\n" +
+      "/attach <n> or /attach <folder>"
+    );
+  });
 
   test("/attach binds to an existing session by id prefix and loads its history", async () => {
     const fake = fakeControl([summary("sess-abcdef", "C:/dev/other", "Other")]);
