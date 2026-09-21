@@ -156,15 +156,15 @@ describe("ForumManager topic lifecycle", () => {
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
-  test("formatTopicName uses title or directory basename and caps length", () => {
-    expect(formatTopicName("session-1234567890", "C:/dev/my-project", "Feature X")).toBe("Feature X (session-)");
-    expect(formatTopicName("session-abcdef", "C:/dev/super-board", null)).toBe("super-board (session-)");
+  test("formatTopicName uses folder basename and caps length", () => {
+    expect(formatTopicName("session-1234567890", "C:/dev/my-project", "Feature X")).toBe("my-project");
+    expect(formatTopicName("session-abcdef", "C:/dev/super-board", null)).toBe("super-board");
   });
 
   test("ensureTopic creates a topic, records the route, and announces itself in the thread", async () => {
     const threadId = await manager.ensureTopic("sess-1", "C:/dev/proj", "Testing Topic");
     expect(threadId).toBeGreaterThan(0);
-    expect(client.topics.get(threadId)?.name).toContain("Testing Topic");
+    expect(client.topics.get(threadId)?.name).toBe("proj");
 
     const route = store.getRoute("slot-forum", FORUM_CHAT_ID, String(threadId));
     expect(route?.sessionId).toBe("sess-1");
@@ -178,6 +178,19 @@ describe("ForumManager topic lifecycle", () => {
   test("ensureTopic reuses the topic a session already owns", async () => {
     const first = await manager.ensureTopic("sess-1", "C:/dev/proj");
     expect(await manager.ensureTopic("sess-1", "C:/dev/proj")).toBe(first);
+    expect(client.topics.size).toBe(1);
+  });
+
+  test("session ends or restarts in same folder -> existing topic is reused and rebound", async () => {
+    const firstThread = await manager.ensureTopic("sess-1", "C:/dev/proj");
+    expect(firstThread).toBeGreaterThan(0);
+
+    // New session started in the same workspace folder rebinds the same topic
+    const secondThread = await manager.ensureTopic("sess-2", "C:/dev/proj");
+    expect(secondThread).toBe(firstThread);
+
+    const route = store.getRoute("slot-forum", FORUM_CHAT_ID, String(firstThread));
+    expect(route?.sessionId).toBe("sess-2");
     expect(client.topics.size).toBe(1);
   });
 
