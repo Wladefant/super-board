@@ -131,14 +131,15 @@ test("Contract ALLOWED examples all return allowed: true without approval", () =
   expect(guard.evaluateToolCall("ssh", { host: "test-host", command: "uptime" })).toEqual({ allowed: true });
 });
 
-test("eval dynamic process arguments no longer trigger category; plain code remains allowed", () => {
+test("eval dynamic process arguments need approval; plain code remains allowed", () => {
+  // Issue #97 F9: an executor whose argv is built at runtime is unprovable, so it is gated, never silently allowed.
   for (const [language, code] of [
     ["py", "subprocess.run(make_command())"],
     ["js", "Bun.spawn(commandFromNetwork)"],
     ["py", 'os.system(f"git {action}")'],
     ["js", 'execSync(`git ${action}`)'],
   ]) {
-    expect(guard.evaluateToolCall("eval", { language, code })).toEqual({ allowed: true });
+    expect(guard.evaluateToolCall("eval", { language, code }).category).toBe("dynamic_code");
   }
 
   for (const [language, code] of [
@@ -178,7 +179,8 @@ const invocations: Record<string, string[]> = {
   shared_db_ddl_dml: ["psql -c 'DROP TABLE x'", "alembic upgrade head", "alembic downgrade -1", "alembic stamp head", "supabase db reset", "supabase db push", "supabase db remote commit", "pg_restore dump.sql"],
   deployments: ["dokploy compose redeploy", "deploy prod", "deploy production", "fly deploy", "wrangler deploy", "wrangler publish"],
   cloudflare_stripe_mutations: ["wrangler secret put KEY", "stripe refunds create", "stripe charges create", "topup_main_reset 100"],
-  shell_destructive_os: ["rm -rf C:/", "rm -rf /", "rm -rf ../..", "format C:", "shutdown", "reboot", "dd if=image"],
+  // Issue #97 F20: dd is classified by what it overwrites, so the fixture names an output device, not an input file.
+  shell_destructive_os: ["rm -rf C:/", "rm -rf /", "rm -rf ../..", "format C:", "shutdown", "reboot", "dd if=/dev/zero of=/dev/sda", "rm -f /etc/passwd", "del C:\\Windows\\System32\\drivers\\etc\\hosts"],
   destructive_git: ["git -C repo push --force-with-lease origin main", "git push --delete origin main", "git push -f origin staging", "git push origin HEAD:main --force", "git push origin +HEAD:main", "git push origin :main", "git push --mirror origin", "git filter-branch --force", "git filter-repo --analyze"],
 };
 
@@ -286,7 +288,7 @@ test("local unlock instruction executes the real CLI without executing the refus
   expect(JSON.parse(result.stdout.toString()).approved).toBe(true);
   expect(guard.evaluateToolCall("bash", input)).toEqual({ allowed: true });
   expect(guard.evaluateToolCall("bash", input).allowed).toBe(false);
-});
+}, 15000); // Spawns a cold `bun guard.ts`, which exceeds the 5s default under a loaded full-suite run.
 
 test("a grant for one command cannot authorize another command, session or requester", () => {
   const input = { command: "rm -rf C:/" };
@@ -368,13 +370,17 @@ test("dedicated remote-process tool has transport-neutral production exclusion",
   }
 });
 
-test("review delta: production environment paths are protected without scanning file content", () => {
-  for (const origin of [false, true]) for (const file of [".env.prod", "backend/.env.prod", "C:\\app\\.env.prod", "/app/.env.prod"]) {
+test("review delta: environment and key paths are protected without scanning file content", () => {
+  // Issue #97 F14: the whole dotted .env family holds secrets, as do private keys and credential stores.
+  for (const origin of [false, true]) for (const file of [".env", ".env.prod", ".env.product", "backend/.env.local", "C:\\app\\.env.prod", "/app/.env.prod", "~/.ssh/id_ed25519", "deploy/key.pem", "config/credentials.json"]) {
     expect(guard.evaluateToolCall("write", { path: file, content: "example" }, origin).category).toBe("secrets");
     expect(guard.evaluateToolCall("read", { path: file }, origin).category).toBe("secrets");
   }
   expect(guard.evaluateToolCall("write", { path: "docs/config.txt", content: "Document backend/.env.prod here" })).toEqual({ allowed: true });
-  expect(guard.evaluateToolCall("write", { path: ".env.product", content: "example" })).toEqual({ allowed: true });
+  // A name that merely contains "env" is not an environment file.
+  for (const file of ["docs/environment.md", "src/my.env.example.ts", "tests/envelope.ts"]) {
+    expect(guard.evaluateToolCall("write", { path: file, content: "example" })).toEqual({ allowed: true });
+  }
 });
 
 test("review delta: shell builtins and process wrappers preserve execution boundaries", () => {
