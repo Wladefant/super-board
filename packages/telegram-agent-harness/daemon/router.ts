@@ -365,7 +365,16 @@ export class SlotRouter {
       const interactive = allSessions.filter(session => this.isTopLevelSession(session));
       const sessions = interactive.filter(session =>
         argument.toLowerCase() === "all" || this.visibleSession(session, now));
-      sessions.sort((a, b) => this.folder(this.workspace(a)).localeCompare(this.folder(this.workspace(b)))
+      const byWorkspace = new Map<string, DaemonSessionSummary>();
+      for (const session of sessions) {
+        const ws = this.workspace(session).toLowerCase();
+        const existing = byWorkspace.get(ws);
+        if (!existing || (session.modifiedAtMs ?? 0) > (existing.modifiedAtMs ?? 0)) {
+          byWorkspace.set(ws, session);
+        }
+      }
+      const dedupedSessions = Array.from(byWorkspace.values());
+      dedupedSessions.sort((a, b) => this.folder(this.workspace(a)).localeCompare(this.folder(this.workspace(b)))
         || this.workspace(a).localeCompare(this.workspace(b))
         || (b.modifiedAtMs ?? 0) - (a.modifiedAtMs ?? 0) || a.id.localeCompare(b.id));
       if (!sessions.length) {
@@ -374,7 +383,7 @@ export class SlotRouter {
       }
       const counts = new Map<string, number>();
       const labeled: { session: DaemonSessionSummary; folderName: string; displayName: string }[] = [];
-      for (const session of sessions) {
+      for (const session of dedupedSessions) {
         const base = this.folder(this.workspace(session)) || "session";
         const count = (counts.get(base.toLowerCase()) ?? 0) + 1;
         counts.set(base.toLowerCase(), count);
@@ -396,12 +405,21 @@ export class SlotRouter {
       const interactive = allSessions.filter(session => this.isTopLevelSession(session));
       const visible = interactive.filter(session => this.visibleSession(session, now));
       const targetPool = visible.length > 0 ? visible : interactive;
-      targetPool.sort((a, b) => this.folder(this.workspace(a)).localeCompare(this.folder(this.workspace(b)))
+      const byWorkspaceTarget = new Map<string, DaemonSessionSummary>();
+      for (const session of targetPool) {
+        const ws = this.workspace(session).toLowerCase();
+        const existing = byWorkspaceTarget.get(ws);
+        if (!existing || (session.modifiedAtMs ?? 0) > (existing.modifiedAtMs ?? 0)) {
+          byWorkspaceTarget.set(ws, session);
+        }
+      }
+      const dedupedTargetPool = Array.from(byWorkspaceTarget.values());
+      dedupedTargetPool.sort((a, b) => this.folder(this.workspace(a)).localeCompare(this.folder(this.workspace(b)))
         || this.workspace(a).localeCompare(this.workspace(b))
         || (b.modifiedAtMs ?? 0) - (a.modifiedAtMs ?? 0) || a.id.localeCompare(b.id));
       const counts = new Map<string, number>();
       const labeled: { session: DaemonSessionSummary; folderName: string; displayName: string }[] = [];
-      for (const session of targetPool) {
+      for (const session of dedupedTargetPool) {
         const base = this.folder(this.workspace(session)) || "session";
         const count = (counts.get(base.toLowerCase()) ?? 0) + 1;
         counts.set(base.toLowerCase(), count);
