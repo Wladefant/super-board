@@ -409,6 +409,27 @@ describe("outbound delivery", () => {
     expect(relayed).toEqual([{ target: DM, markdown: "the answer" }]);
   });
 
+  test("a replayed entry across router recreation is delivered exactly once", async () => {
+    const fake = fakeControl([summary("sess-a", "C:/dev/demo")]);
+    const router1 = buildRouter({}, fake.control);
+    await router1.deliver(DM, "start");
+
+    const event1 = { kind: "appended" as const, sessionId: "sess-a", entries: [{ entryId: "e1", text: "first delivery" }] };
+    await router1.onSessionEvent(event1);
+    expect(relayed).toEqual([{ target: DM, markdown: "first delivery" }]);
+
+    // Replay across a second router instance sharing the same store
+    const router2 = buildRouter({}, fake.control);
+    await router2.onSessionEvent(event1);
+    const event2 = { kind: "appended" as const, sessionId: "sess-a", entries: [{ entryId: "e2", text: "second delivery" }] };
+    await router2.onSessionEvent(event2);
+
+    expect(relayed).toEqual([
+      { target: DM, markdown: "first delivery" },
+      { target: DM, markdown: "second delivery" },
+    ]);
+  });
+
   test("binding a chat marks existing history delivered, so nothing is replayed", async () => {
     const fake = fakeControl([summary("sess-a", "C:/dev/demo")]);
     const router = buildRouter({}, fake.control);

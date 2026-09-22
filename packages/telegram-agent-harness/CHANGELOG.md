@@ -22,6 +22,7 @@
 
 ### Fixed
 - Replaced GUI host session resumption transport with authenticated live terminal IPC over local named pipes (`TerminalSessionControl`). Eliminates transcript concurrency and dual-writer conflicts on active terminal sessions (fixes veyyon#88). Inbound turns deliver directly to live terminal event loops; missing endpoints fail closed with explicit guidance rather than resuming via GUI host.
+- Eliminate duplicate Telegram outbound delivery by designating the standalone daemon as the authoritative transcript forwarding owner when a daemon route exists and suppressing in-session assistant output mirroring.
 - Mini App client 401 session reset: the client drops its cached session token, re-exchanges fresh Telegram initData via `/api/session`, retries once, and displays an explicit unavailable/re-open state if authentication fails.
 - `/sessions` groups entries by workspace folder and full path, with escaped 40-character latest-prompt excerpts, relative ages and numbered attach commands. Missing-workspace and finished-over-one-hour entries are hidden unless `/sessions all`; `/attach` accepts listing indices or unambiguous folder names as well as session IDs. Listing indices are saved per slot, chat and topic so host reordering and daemon restarts do not retarget them.
 - Preserve empty preference list for discovered Telegram bot slots lacking explicit configuration, restoring any-project eligibility default and removing hardcoded comment examples.

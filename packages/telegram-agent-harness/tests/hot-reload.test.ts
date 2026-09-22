@@ -42,6 +42,7 @@ interface MockPoller {
   stop: () => Promise<void>;
   getPrimaryChatId: () => string | null;
   sendTelegramMessage: (chatId: string, text: string) => Promise<{ ok: boolean; result?: { message_id: number } }>;
+  setPrimaryChatId?: (chatId: string) => void;
 }
 
 /**

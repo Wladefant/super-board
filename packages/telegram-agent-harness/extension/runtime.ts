@@ -174,6 +174,8 @@ export class TelegramRuntime {
   private messageContext: MessageContextStore | null = null;
   private dashboard: LiveDashboard | null = null;
   private isDisposed = false;
+  private isDaemonClient = false;
+  private cwd: string | null = null;
 
   constructor(pi: ExtensionAPI, options: TelegramRuntimeOptions = {}) {
     this.pi = pi;
@@ -247,7 +249,7 @@ export class TelegramRuntime {
 
   private async syncAssistantOutput(targetText: string): Promise<void> {
     return this.queueOutbound(async () => {
-      if (this.isDisposed || !this.poller || !targetText.trim()) return;
+      if (this.isDisposed || this.isDaemonManaged() || !this.poller || !targetText.trim()) return;
 
       const primaryChat = this.getPrimaryChatId();
       if (!primaryChat) return;
@@ -388,6 +390,8 @@ export class TelegramRuntime {
     this.coordinator = coordinator;
     this.activeSlot = activeSlot;
     this.sessionId = newSessionId;
+    this.cwd = ctx.cwd;
+    this.isDaemonClient = isDaemonClient;
     this.accessConfig = coordinator.readAccessConfig(activeSlot.stateDir);
     if (isDaemonClient && daemonRoute) {
       this.accessConfig = {
@@ -641,7 +645,24 @@ export class TelegramRuntime {
     this.repointLeaseOrRelinquish(root, switchedSessionId, ctx.cwd);
   }
 
+  private isDaemonManaged(): boolean {
+    if (this.isDaemonClient) return true;
+    if (this.activeSlot?.daemon === true) {
+      this.isDaemonClient = true;
+      return true;
+    }
+    if (this.coordinator && this.sessionId) {
+      const route = findDaemonRoute(this.coordinator, this.sessionId, this.cwd ?? undefined);
+      if (route) {
+        this.isDaemonClient = true;
+        return true;
+      }
+    }
+    return false;
+  }
+
   public async onMessageStart(event: { message: { role: string } }): Promise<void> {
+    if (this.isDaemonManaged()) return;
     if (event.message.role === "assistant") {
       this.accumulatedAssistantText = "";
       this.sentTelegramMessageIds = [];
@@ -651,6 +672,7 @@ export class TelegramRuntime {
 
   public async onMessageUpdate(event: MessageUpdateEvent): Promise<void> {
     if (event.message.role !== "assistant") return;
+    if (this.isDaemonManaged()) return;
     const streamEvent = event.assistantMessageEvent;
 
     if (streamEvent.type === "text_delta" && streamEvent.delta) {
@@ -671,6 +693,7 @@ export class TelegramRuntime {
 
   public async onMessageEnd(event: MessageEndEvent): Promise<void> {
     if (event.message.role !== "assistant") return;
+    if (this.isDaemonManaged()) return;
 
     if (this.streamDebounceTimer) {
       clearTimeout(this.streamDebounceTimer);
@@ -699,6 +722,8 @@ export class TelegramRuntime {
   public async dispose(): Promise<void> {
     if (this.isDisposed) return;
     this.isDisposed = true;
+    this.isDaemonClient = false;
+    this.cwd = null;
 
     try {
       if (this.streamDebounceTimer) {
