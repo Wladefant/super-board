@@ -29,8 +29,27 @@ export async function miniAppRequest(request: MiniAppRequest, options: MiniAppOp
   catch { return { id: request.id, status: 401, data: { error: "Open this app from Telegram again to authenticate." } }; }
   const respond = (status: number, data: unknown) => ({ id: request.id, status, data });
   try {
-    const requestedSessionId = queryParams?.get("sessionId") || undefined;
-    const requestedTopicId = queryParams?.get("topicId") || undefined;
+    let startTopicId: string | undefined;
+    let startSessionId: string | undefined;
+    if (request.initData) {
+      try {
+        const initParams = new URLSearchParams(request.initData);
+        const startParam = initParams.get("start_param")?.trim();
+        if (startParam) {
+          if (/^\d+$/.test(startParam)) {
+            startTopicId = startParam;
+          } else if (/^topic[_-](\d+)$/i.test(startParam)) {
+            startTopicId = startParam.replace(/^topic[_-]/i, "");
+          } else if (/^session[_-]/i.test(startParam)) {
+            startSessionId = startParam.replace(/^session[_-]/i, "");
+          } else {
+            startSessionId = startParam;
+          }
+        }
+      } catch {}
+    }
+    const requestedSessionId = queryParams?.get("sessionId") || startSessionId || undefined;
+    const requestedTopicId = queryParams?.get("topicId") || startTopicId || undefined;
     const session = options.session(user, { sessionId: requestedSessionId, topicId: requestedTopicId });
     if (reqPath === "/api/state" && request.method === "GET") {
       let sessions: unknown = null;
@@ -48,6 +67,21 @@ export async function miniAppRequest(request: MiniAppRequest, options: MiniAppOp
     }
     return respond(404, { error: "Not found" });
   } catch { return respond(409, { error: "Request unavailable, expired, already decided, or not authorized for this session." }); }
+}
+
+export function buildMiniAppUrl(baseUrl: string, context?: { topicId?: string; sessionId?: string }): string {
+  try {
+    const url = new URL(baseUrl);
+    if (context?.topicId) {
+      url.searchParams.set("topicId", context.topicId);
+    }
+    if (context?.sessionId) {
+      url.searchParams.set("sessionId", context.sessionId);
+    }
+    return url.toString();
+  } catch {
+    return baseUrl;
+  }
 }
 
 /** Config is local to a slot; the daemon owns reconnect and shutdown with its poller. */

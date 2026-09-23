@@ -25,7 +25,23 @@ async function refresh() {
   loading = true; byId('refresh').disabled = true;
   try {
     if (!app?.initData) throw new TerminalAuthError('Open Superboard from the Telegram bot menu to securely access your workspace.');
-    const data = await request('/api/state');
+    const searchParams = new URLSearchParams(window.location.search);
+    const startParam = (app?.initDataUnsafe?.start_param || '').trim();
+    let startTopic = '';
+    let startSession = '';
+    if (startParam) {
+      if (/^\d+$/.test(startParam)) startTopic = startParam;
+      else if (/^topic[_-](\d+)$/i.test(startParam)) startTopic = startParam.replace(/^topic[_-]/i, '');
+      else if (/^session[_-]/i.test(startParam)) startSession = startParam.replace(/^session[_-]/i, '');
+      else startSession = startParam;
+    }
+    const topicId = searchParams.get('topicId') || startTopic;
+    const sessionId = searchParams.get('sessionId') || startSession;
+    const q = new URLSearchParams();
+    if (topicId) q.set('topicId', topicId);
+    if (sessionId) q.set('sessionId', sessionId);
+    const qs = q.toString();
+    const data = await request(qs ? `/api/state?${qs}` : '/api/state');
     byId('notice').textContent = '';
     byId('connection').textContent = data.status?.polling ? 'Daemon connected · Bot polling' : 'Daemon connected · Bot polling unavailable';
     for (const id of SECTIONS) byId(id).replaceChildren();

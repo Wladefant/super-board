@@ -103,4 +103,16 @@ export async function registerTelegramCommands(
       throw new Error("Telegram command registration failed; the private-chat menu is not verified.");
     }
   }
+  if (forumChatId) {
+    try {
+      await fetch(`https://api.telegram.org/bot${botToken}/setMyCommands`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ commands, scope: { type: "all_group_chats" }, language_code: "" }),
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(5000)]) : AbortSignal.timeout(5000),
+      });
+    } catch {
+      // Best-effort scope fallback; chat-specific scope is primary
+    }
+  }
 }
