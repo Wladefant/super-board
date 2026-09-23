@@ -64,6 +64,9 @@ class GateApprovalPolicy:
     require_github_approval: bool = True
     require_head_bound_review_evidence: bool = True
     advisory_checks: List[str] = field(default_factory=list)
+    # Issue #195: small, low-risk diffs may skip independent review. Only named
+    # non-production policies opt in; the strict default never does.
+    allow_review_exemption: bool = False
     rationale: str = ""
 
     def matches(self, repo: str, base_ref: str) -> bool:
@@ -83,6 +86,7 @@ DEFAULT_GATE_POLICIES: List[GateApprovalPolicy] = [
         base_ref="staging",
         require_github_approval=False,
         require_head_bound_review_evidence=True,
+        allow_review_exemption=True,
         rationale=(
             "Automated staging integration runs under one authenticated identity, which is "
             "also the PR author, so a non-author GitHub approval is unobtainable. Exact-head "
@@ -94,6 +98,7 @@ DEFAULT_GATE_POLICIES: List[GateApprovalPolicy] = [
         base_ref="main",
         require_github_approval=False,
         require_head_bound_review_evidence=True,
+        allow_review_exemption=True,
         # Named individually, never a wildcard over all checks: these two jobs fail
         # identically on base main (ddb85b45, run 33019898958, same failing steps), so they
         # are inherited and a PR cannot regress them. Every other check still blocks.
@@ -289,6 +294,11 @@ def evaluate_review_requirement(pr_data: Dict[str, Any]) -> Tuple[bool, str]:
                 return True, f"auth path {path}"
             if MIGRATION_PATH_RE.search(norm_path):
                 return True, f"migration path {path}"
+
+    # `gh pr view --json files` returns at most 100 files; a capped list may hide
+    # high-risk paths and undercount lines, so it cannot justify an exemption.
+    if files is not None and len(files) >= 100:
+        return True, f"file list truncated at {len(files)} files, review required by default"
 
     total_lines: Optional[int] = None
     if files is not None:
@@ -542,7 +552,10 @@ def evaluate_pr_gate(
     if policy is None:
         policy = resolve_gate_policy(repo, base_ref)
 
-    review_required, review_decision_reason = evaluate_review_requirement(pr_data)
+    if policy.allow_review_exemption:
+        review_required, review_decision_reason = evaluate_review_requirement(pr_data)
+    else:
+        review_required, review_decision_reason = True, f"no review exemption for {repo}@{base_ref or 'unknown'}"
     review_decision = "required" if review_required else "exempt"
     decision_line = f"review: {review_decision} ({review_decision_reason})"
 

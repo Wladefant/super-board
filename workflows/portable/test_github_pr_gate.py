@@ -936,6 +936,7 @@ class TestGitHubPRGate(unittest.TestCase):
             base_ref="staging",
             require_github_approval=False,
             require_head_bound_review_evidence=True,
+            allow_review_exemption=True,
         )
         result = evaluate_pr_gate(pr, policy=policy)
         self.assertEqual(result.review_decision, "exempt")
@@ -959,6 +960,7 @@ class TestGitHubPRGate(unittest.TestCase):
             base_ref="staging",
             require_github_approval=False,
             require_head_bound_review_evidence=True,
+            allow_review_exemption=True,
         )
         # Without review: BLOCKED
         blocked = evaluate_pr_gate(pr, policy=policy)
@@ -996,6 +998,7 @@ class TestGitHubPRGate(unittest.TestCase):
             base_ref="staging",
             require_github_approval=False,
             require_head_bound_review_evidence=True,
+            allow_review_exemption=True,
         )
         result = evaluate_pr_gate(pr, policy=policy)
         self.assertEqual(result.review_decision, "required")
@@ -1030,6 +1033,7 @@ class TestGitHubPRGate(unittest.TestCase):
                     base_ref="staging",
                     require_github_approval=False,
                     require_head_bound_review_evidence=True,
+                    allow_review_exemption=True,
                 )
                 result = evaluate_pr_gate(pr, policy=policy)
                 self.assertEqual(result.review_decision, "required")
@@ -1054,6 +1058,7 @@ class TestGitHubPRGate(unittest.TestCase):
             base_ref="staging",
             require_github_approval=False,
             require_head_bound_review_evidence=True,
+            allow_review_exemption=True,
         )
         result = evaluate_pr_gate(pr, policy=policy)
         self.assertEqual(result.review_decision, "exempt")
@@ -1082,6 +1087,36 @@ class TestGitHubPRGate(unittest.TestCase):
         self.assertEqual(res_auth.review_decision_reason, "high-risk area label area:auth")
         self.assertEqual(res_auth.gate_verdict, "BLOCKED")
         print("  [PASS] Lockfile exclusion and high-risk label tests pass")
+
+    def test_review_exemption_is_scoped_and_fails_closed(self):
+        """Strict default policy never exempts; a capped 100-file list never exempts."""
+        pr = copy.deepcopy(self.mock_pr)
+        pr["reviews"] = []
+        pr["baseRefName"] = "main"
+        pr["labels"] = []
+        pr["files"] = [{"path": "src/ui/Button.tsx", "additions": 3, "deletions": 1}]
+        strict = GateApprovalPolicy(rationale="strict default")
+        res = evaluate_pr_gate(pr, policy=strict)
+        self.assertEqual(res.review_decision, "required")
+        self.assertEqual(res.gate_verdict, "BLOCKED")
+
+        pr_many = copy.deepcopy(self.mock_pr)
+        pr_many["reviews"] = []
+        pr_many["baseRefName"] = "staging"
+        pr_many["labels"] = []
+        pr_many["files"] = [{"path": f"frontend/c{i}.tsx", "additions": 1, "deletions": 0} for i in range(100)]
+        relaxed = GateApprovalPolicy(
+            repo="Bavariance/polysimulator",
+            base_ref="staging",
+            require_github_approval=False,
+            require_head_bound_review_evidence=True,
+            allow_review_exemption=True,
+        )
+        res_many = evaluate_pr_gate(pr_many, policy=relaxed)
+        self.assertEqual(res_many.review_decision, "required")
+        self.assertIn("truncated", res_many.review_decision_reason)
+        self.assertEqual(res_many.gate_verdict, "BLOCKED")
+        print("  [PASS] Review exemption scoped to named policies and fails closed on truncation")
 
 
 def main():
