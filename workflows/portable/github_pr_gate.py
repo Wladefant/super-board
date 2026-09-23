@@ -71,6 +71,10 @@ class GateApprovalPolicy:
         base_ok = self.base_ref in ("*", base_ref)
         return repo_ok and base_ok
 
+    @staticmethod
+    def is_production_protected(repo: str, base_ref: str) -> bool:
+        return base_ref in PRODUCTION_PROTECTED_BASES.get(repo, [])
+
 
 # Explicit policy table. The default entry is strict; every relaxation is named.
 DEFAULT_GATE_POLICIES: List[GateApprovalPolicy] = [
@@ -194,6 +198,115 @@ REVIEW_ARTIFACT_TYPE = "independent_automated_code_review"
 SHA40_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 SOURCE_URI_RE = re.compile(r"^(agent|history)://([A-Za-z0-9][A-Za-z0-9_.:-]*)$")
 MAX_REVIEW_FUTURE_SKEW_SECONDS = 60
+
+HIGH_RISK_DOMAINS = {"money", "billing", "auth", "concurrency", "migration"}
+
+MONEY_PATH_RE = re.compile(
+    r"(^|[/_.-])(money|billing|wallets?|ledgers?|payments?|stripe)([/_.-]|$)",
+    re.IGNORECASE,
+)
+AUTH_PATH_RE = re.compile(
+    r"(^|[/_.-])(auth|tokens?|rls|permissions?)([/_.-]|$)",
+    re.IGNORECASE,
+)
+MIGRATION_PATH_RE = re.compile(
+    r"alembic/|migrations?/|(^|[/_.-])(alembic|migrations?)([/_.-]|$)",
+    re.IGNORECASE,
+)
+
+LOCKFILE_NAMES = {
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "bun.lockb",
+    "bun.lock",
+    "poetry.lock",
+    "pipfile.lock",
+    "cargo.lock",
+    "composer.lock",
+    "go.sum",
+    "flake.lock",
+}
+
+
+def is_lockfile_or_generated(path: str) -> bool:
+    norm = path.replace("\\", "/").lower()
+    filename = norm.rsplit("/", 1)[-1]
+    if filename in LOCKFILE_NAMES:
+        return True
+    if filename.endswith(".lock") or filename.endswith(".lockb"):
+        return True
+    if (
+        filename.endswith(".min.js")
+        or filename.endswith(".min.css")
+        or filename.endswith(".map")
+    ):
+        return True
+    if (
+        ".generated." in filename
+        or filename.endswith("_pb2.py")
+        or filename.endswith("_pb2_grpc.py")
+    ):
+        return True
+    if "/generated/" in norm or norm.startswith("generated/"):
+        return True
+    return False
+
+
+def evaluate_review_requirement(pr_data: Dict[str, Any]) -> Tuple[bool, str]:
+    """
+    Evaluate whether a PR requires independent review per issue #195.
+
+    A PR REQUIRES one independent review iff ANY of:
+      (a) high-risk domain: label `risk:high`, or any label/area among money, billing,
+          auth, concurrency, migration; OR changed paths match money/billing/wallet/ledger/
+          payment/stripe, auth/token/rls/permission, alembic/ or migrations/
+      (b) total changed lines (additions+deletions, excluding lockfiles and generated files) > 250.
+    Otherwise review is EXEMPT: gate passes on green CI plus browser QA evidence.
+
+    Returns:
+      (review_required: bool, reason: str)
+    """
+    labels = pr_data.get("labels") or []
+    for label in labels:
+        name = label.get("name") if isinstance(label, dict) else str(label)
+        name_lower = name.lower().strip()
+        if name_lower == "risk:high":
+            return True, f"high-risk label {name}"
+        if name_lower in HIGH_RISK_DOMAINS:
+            return True, f"high-risk domain label {name}"
+        if name_lower.startswith("area:") and name_lower.split(":", 1)[1] in HIGH_RISK_DOMAINS:
+            return True, f"high-risk area label {name}"
+
+    files = pr_data.get("files")
+    if files is not None:
+        for f in files:
+            path = f.get("path") if isinstance(f, dict) else str(f)
+            norm_path = path.replace("\\", "/")
+            if MONEY_PATH_RE.search(norm_path):
+                return True, f"money path {path}"
+            if AUTH_PATH_RE.search(norm_path):
+                return True, f"auth path {path}"
+            if MIGRATION_PATH_RE.search(norm_path):
+                return True, f"migration path {path}"
+
+    total_lines: Optional[int] = None
+    if files is not None:
+        total_lines = 0
+        for f in files:
+            path = f.get("path", "") if isinstance(f, dict) else str(f)
+            if not is_lockfile_or_generated(path):
+                if isinstance(f, dict):
+                    total_lines += int(f.get("additions") or 0) + int(f.get("deletions") or 0)
+    elif pr_data.get("additions") is not None or pr_data.get("deletions") is not None:
+        total_lines = int(pr_data.get("additions") or 0) + int(pr_data.get("deletions") or 0)
+
+    if total_lines is not None:
+        if total_lines > 250:
+            return True, f"{total_lines} lines changed > 250"
+        return False, f"{total_lines} lines, no high-risk paths"
+
+    return True, "diff/files data missing, review required by default"
 
 
 def validate_review_artifact(
@@ -320,6 +433,9 @@ class PRGateEvaluation:
     github_approval_required: bool = True
     approval_policy_rationale: str = ""
     native_required_contexts: Optional[List[str]] = None
+    review_decision: str = "required"
+    review_decision_reason: str = ""
+    decision_line: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -327,11 +443,13 @@ class PRGateEvaluation:
     def to_compact_markdown(self) -> str:
         failing_str = ", ".join(self.failing_checks) if self.failing_checks else "None"
         pending_str = ", ".join(self.pending_checks) if self.pending_checks else "None"
+        decision_line = self.decision_line or f"review: {self.review_decision} ({self.review_decision_reason})"
         return (
             f"### Deterministic PR Gate Evaluation: PR #{self.pr_number} ({self.gate_verdict})\n"
             f"- **Head SHA:** `{self.head_sha[:8]}` (Base: `{self.base_sha[:8]}`)\n"
             f"- **State:** `{self.state}` (Draft: `{self.is_draft}`)\n"
             f"- **CI Status:** `{self.ci_verdict}` (Failing: {failing_str}, Pending: {pending_str})\n"
+            f"- **Review:** `{decision_line}`\n"
             f"- **Approval:** `{self.approval_verdict}` (By: `{self.approved_by or 'None'}`, "
             f"GitHub approval required: `{self.github_approval_required}`)\n"
             f"- **Advisory failures:** {', '.join(self.advisory_failing_checks) or 'None'}\n"
@@ -377,7 +495,7 @@ def fetch_pr_json(pr_number: int, repo: str = "Bavariance/polysimulator", timeou
         "--repo",
         repo,
         "--json",
-        "number,state,isDraft,headRefOid,baseRefName,reviews,statusCheckRollup,author",
+        "number,state,isDraft,headRefOid,baseRefName,reviews,statusCheckRollup,author,labels,files,additions,deletions",
     ]
 
     res = _run_gh(cmd, timeout_sec)
@@ -424,6 +542,10 @@ def evaluate_pr_gate(
     if policy is None:
         policy = resolve_gate_policy(repo, base_ref)
 
+    review_required, review_decision_reason = evaluate_review_requirement(pr_data)
+    review_decision = "required" if review_required else "exempt"
+    decision_line = f"review: {review_decision} ({review_decision_reason})"
+
     pr_number = int(pr_data.get("number") or 0)
     state = str(pr_data.get("state") or "UNKNOWN").upper()
     is_draft = bool(pr_data.get("isDraft", False))
@@ -468,6 +590,9 @@ def evaluate_pr_gate(
                 )
             ),
             checked_at_utc=now_utc,
+            review_decision=review_decision,
+            review_decision_reason=review_decision_reason,
+            decision_line=decision_line,
         )
 
     # 1. Draft Check
@@ -490,6 +615,9 @@ def evaluate_pr_gate(
             gate_verdict="BLOCKED",
             verdict_reason="PR is marked as Draft. Ready for review must be set before promotion.",
             checked_at_utc=now_utc,
+            review_decision=review_decision,
+            review_decision_reason=review_decision_reason,
+            decision_line=decision_line,
         )
 
     # 2. PR Open Check
@@ -512,6 +640,9 @@ def evaluate_pr_gate(
             gate_verdict="BLOCKED",
             verdict_reason=f"PR state is '{state}', expected 'OPEN'.",
             checked_at_utc=now_utc,
+            review_decision=review_decision,
+            review_decision_reason=review_decision_reason,
+            decision_line=decision_line,
         )
 
     # 3. Status Checks Rollup Verification
@@ -713,41 +844,63 @@ def evaluate_pr_gate(
     elif review_invalidated:
         gate_verdict = "BLOCKED"
         verdict_reason = f"Automated review artifact rejected: {invalidation_reason}"
-    elif approval_verdict == "SELF_APPROVED_ONLY":
-        gate_verdict = "BLOCKED"
-        verdict_reason = f"Self-approval rejected (PR author {pr_author}); independent review required."
-    elif policy.require_github_approval and not valid_github_approvers:
-        gate_verdict = "BLOCKED"
-        verdict_reason = f"No GitHub APPROVED review pinned to commit {head_sha[:8]}."
-    elif (
-        not policy.require_github_approval
-        and policy.require_head_bound_review_evidence
-        and not has_head_bound_review_evidence
-    ):
-        gate_verdict = "BLOCKED"
-        verdict_reason = (
-            f"GitHub approval is not required for {repo}@{base_ref or 'unknown'}, but no "
-            f"independent head-bound review evidence exists for commit {head_sha[:8]}."
-        )
-    else:
-        gate_verdict = "PASSED"
-        if policy.require_github_approval:
+    elif review_required:
+        if approval_verdict == "SELF_APPROVED_ONLY":
+            gate_verdict = "BLOCKED"
             verdict_reason = (
-                f"All required CI checks succeeded and independent GitHub approval verified for head "
-                f"{head_sha[:8]} (approved by {approved_by})."
+                f"Self-approval rejected (PR author {pr_author}); independent review required "
+                f"({review_decision_reason})."
+            )
+        elif policy.require_github_approval and not valid_github_approvers:
+            gate_verdict = "BLOCKED"
+            verdict_reason = (
+                f"No GitHub APPROVED review pinned to commit {head_sha[:8]} "
+                f"(review required: {review_decision_reason})."
+            )
+        elif (
+            not policy.require_github_approval
+            and policy.require_head_bound_review_evidence
+            and not has_head_bound_review_evidence
+        ):
+            gate_verdict = "BLOCKED"
+            verdict_reason = (
+                f"GitHub approval is not required for {repo}@{base_ref or 'unknown'}, but no "
+                f"independent head-bound review evidence exists for commit {head_sha[:8]} "
+                f"(review required: {review_decision_reason})."
             )
         else:
-            evidence_kind = (
-                "GitHub approval" if valid_github_approvers else "automated review artifact"
-            )
+            gate_verdict = "PASSED"
+            if policy.require_github_approval:
+                verdict_reason = (
+                    f"All required CI checks succeeded and independent GitHub approval verified for head "
+                    f"{head_sha[:8]} (approved by {approved_by})."
+                )
+            else:
+                evidence_kind = (
+                    "GitHub approval" if valid_github_approvers else "automated review artifact"
+                )
+                verdict_reason = (
+                    f"All required CI checks succeeded and independent head/base-bound {evidence_kind} "
+                    f"verified for head {head_sha[:8]} (reviewer {approved_by}); GitHub approval not "
+                    f"required for {repo}@{base_ref or 'unknown'}."
+                )
+            if advisory_failing_checks:
+                verdict_reason += f" Advisory (non-blocking) failures: {', '.join(advisory_failing_checks)}."
+    else:
+        # Review is EXEMPT.
+        if policy.is_production_protected(repo, base_ref) and not valid_github_approvers:
+            gate_verdict = "BLOCKED"
             verdict_reason = (
-                f"All required CI checks succeeded and independent head/base-bound {evidence_kind} "
-                f"verified for head {head_sha[:8]} (reviewer {approved_by}); GitHub approval not "
-                f"required for {repo}@{base_ref or 'unknown'}."
+                f"Production-protected base {repo}@{base_ref} strictly requires independent "
+                f"human GitHub approval; review exemption does not apply to production."
             )
-        if advisory_failing_checks:
-            verdict_reason += f" Advisory (non-blocking) failures: {', '.join(advisory_failing_checks)}."
-
+        else:
+            gate_verdict = "PASSED"
+            verdict_reason = (
+                f"All required CI checks succeeded; independent review is exempt ({review_decision_reason})."
+            )
+            if advisory_failing_checks:
+                verdict_reason += f" Advisory (non-blocking) failures: {', '.join(advisory_failing_checks)}."
     verdict_reason += " Content freshness: " + json.dumps(content_review, sort_keys=True)
     return PRGateEvaluation(
         pr_number=pr_number,
@@ -772,6 +925,9 @@ def evaluate_pr_gate(
         github_approval_required=policy.require_github_approval,
         approval_policy_rationale=policy.rationale,
         native_required_contexts=native_required_contexts,
+        review_decision=review_decision,
+        review_decision_reason=review_decision_reason,
+        decision_line=decision_line,
     )
 
 
@@ -866,8 +1022,8 @@ def main():
     if args.json:
         print(json.dumps(eval_result.to_dict(), indent=2))
     else:
+        print(eval_result.decision_line)
         print(eval_result.to_compact_markdown())
-
     if eval_result.gate_verdict != "PASSED":
         sys.exit(2)
 

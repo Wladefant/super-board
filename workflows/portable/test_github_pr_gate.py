@@ -45,7 +45,9 @@ from github_pr_gate import (
     GateApprovalPolicy,
     PRGateEvaluation,
     evaluate_pr_gate,
+    evaluate_review_requirement,
     fetch_pr_json,
+    is_lockfile_or_generated,
     parse_pr_ref,
     resolve_gate_policy,
 )
@@ -916,6 +918,170 @@ class TestGitHubPRGate(unittest.TestCase):
         with patch("github_pr_gate._run_gh", return_value=denied):
             with self.assertRaisesRegex(RuntimeError, "HTTP 403"):
                 fetch_pr_json(pr_number=1, repo="example/fixture")
+
+    # -------------------------------------------------------------------------
+    # TEST 20: Risk-Based Review Exemption & High-Risk Requirements (Issue #195)
+    # -------------------------------------------------------------------------
+    def test_exempt_small_ui_pr_passes_without_review(self):
+        """Exempt small UI PR (<50 lines, no high-risk labels/paths) passes gate without review."""
+        pr = copy.deepcopy(self.mock_pr)
+        pr["reviews"] = []
+        pr["baseRefName"] = "staging"
+        pr["labels"] = [{"name": "area:ui"}]
+        pr["files"] = [
+            {"path": "frontend/components/Navbar.tsx", "additions": 30, "deletions": 10}
+        ]
+        policy = GateApprovalPolicy(
+            repo="Bavariance/polysimulator",
+            base_ref="staging",
+            require_github_approval=False,
+            require_head_bound_review_evidence=True,
+        )
+        result = evaluate_pr_gate(pr, policy=policy)
+        self.assertEqual(result.review_decision, "exempt")
+        self.assertEqual(result.review_decision_reason, "40 lines, no high-risk paths")
+        self.assertEqual(result.decision_line, "review: exempt (40 lines, no high-risk paths)")
+        self.assertEqual(result.gate_verdict, "PASSED")
+        self.assertIn("independent review is exempt", result.verdict_reason)
+        print("  [PASS] Exempt small UI PR passes without review")
+
+    def test_300_line_pr_requires_review(self):
+        """300-line PR (>250 lines changed) requires review: blocked without review, passes with review."""
+        pr = copy.deepcopy(self.mock_pr)
+        pr["reviews"] = []
+        pr["baseRefName"] = "staging"
+        pr["labels"] = []
+        pr["files"] = [
+            {"path": "frontend/components/DataTable.tsx", "additions": 200, "deletions": 100}
+        ]
+        policy = GateApprovalPolicy(
+            repo="Bavariance/polysimulator",
+            base_ref="staging",
+            require_github_approval=False,
+            require_head_bound_review_evidence=True,
+        )
+        # Without review: BLOCKED
+        blocked = evaluate_pr_gate(pr, policy=policy)
+        self.assertEqual(blocked.review_decision, "required")
+        self.assertEqual(blocked.review_decision_reason, "300 lines changed > 250")
+        self.assertEqual(blocked.decision_line, "review: required (300 lines changed > 250)")
+        self.assertEqual(blocked.gate_verdict, "BLOCKED")
+        self.assertIn("review required: 300 lines changed > 250", blocked.verdict_reason)
+
+        # With independent review: PASSED
+        pr["reviews"] = [
+            {
+                "author": {"login": "independent-reviewer"},
+                "state": "APPROVED",
+                "submittedAt": "2026-09-05T08:15:00Z",
+                "commit": {"oid": self.head_sha},
+            }
+        ]
+        passed = evaluate_pr_gate(pr, policy=policy)
+        self.assertEqual(passed.gate_verdict, "PASSED")
+        self.assertEqual(passed.review_decision, "required")
+        print("  [PASS] 300-line PR requires review (blocked without review, passes with review)")
+
+    def test_10_line_alembic_migration_requires_review(self):
+        """10-line alembic migration requires review despite small line count."""
+        pr = copy.deepcopy(self.mock_pr)
+        pr["reviews"] = []
+        pr["baseRefName"] = "staging"
+        pr["labels"] = []
+        pr["files"] = [
+            {"path": "alembic/versions/20260923_001_add_index.py", "additions": 8, "deletions": 2}
+        ]
+        policy = GateApprovalPolicy(
+            repo="Bavariance/polysimulator",
+            base_ref="staging",
+            require_github_approval=False,
+            require_head_bound_review_evidence=True,
+        )
+        result = evaluate_pr_gate(pr, policy=policy)
+        self.assertEqual(result.review_decision, "required")
+        self.assertEqual(
+            result.review_decision_reason,
+            "migration path alembic/versions/20260923_001_add_index.py",
+        )
+        self.assertEqual(
+            result.decision_line,
+            "review: required (migration path alembic/versions/20260923_001_add_index.py)",
+        )
+        self.assertEqual(result.gate_verdict, "BLOCKED")
+        self.assertIn("migration path alembic/versions/20260923_001_add_index.py", result.verdict_reason)
+        print("  [PASS] 10-line alembic migration requires review")
+
+    def test_money_path_requires_review(self):
+        """Money path (billing, wallet, ledger, payment, stripe) requires review."""
+        for path in (
+            "backend/app/billing/charge.py",
+            "backend/app/models/wallet.py",
+            "backend/app/ledger/balance.py",
+            "backend/app/payment/stripe_webhook.py",
+        ):
+            with self.subTest(path=path):
+                pr = copy.deepcopy(self.mock_pr)
+                pr["reviews"] = []
+                pr["baseRefName"] = "staging"
+                pr["labels"] = []
+                pr["files"] = [{"path": path, "additions": 5, "deletions": 2}]
+                policy = GateApprovalPolicy(
+                    repo="Bavariance/polysimulator",
+                    base_ref="staging",
+                    require_github_approval=False,
+                    require_head_bound_review_evidence=True,
+                )
+                result = evaluate_pr_gate(pr, policy=policy)
+                self.assertEqual(result.review_decision, "required")
+                self.assertEqual(result.review_decision_reason, f"money path {path}")
+                self.assertEqual(result.decision_line, f"review: required (money path {path})")
+                self.assertEqual(result.gate_verdict, "BLOCKED")
+        print("  [PASS] Money path requires review (billing, wallet, ledger, payment/stripe)")
+
+    def test_lockfile_exclusion_and_high_risk_labels(self):
+        """Lockfiles are excluded from changed lines count; risk:high and area labels require review."""
+        # Lockfile exclusion: 1000 lines lockfile + 20 lines UI is exempt (< 250 non-lockfile lines)
+        pr = copy.deepcopy(self.mock_pr)
+        pr["reviews"] = []
+        pr["baseRefName"] = "staging"
+        pr["labels"] = []
+        pr["files"] = [
+            {"path": "package-lock.json", "additions": 800, "deletions": 200},
+            {"path": "frontend/components/Button.tsx", "additions": 15, "deletions": 5},
+        ]
+        policy = GateApprovalPolicy(
+            repo="Bavariance/polysimulator",
+            base_ref="staging",
+            require_github_approval=False,
+            require_head_bound_review_evidence=True,
+        )
+        result = evaluate_pr_gate(pr, policy=policy)
+        self.assertEqual(result.review_decision, "exempt")
+        self.assertEqual(result.review_decision_reason, "20 lines, no high-risk paths")
+        self.assertEqual(result.gate_verdict, "PASSED")
+
+        # label risk:high requires review even on 10 lines
+        pr_risk = copy.deepcopy(self.mock_pr)
+        pr_risk["reviews"] = []
+        pr_risk["baseRefName"] = "staging"
+        pr_risk["labels"] = [{"name": "risk:high"}]
+        pr_risk["files"] = [{"path": "frontend/components/Button.tsx", "additions": 5, "deletions": 2}]
+        res_risk = evaluate_pr_gate(pr_risk, policy=policy)
+        self.assertEqual(res_risk.review_decision, "required")
+        self.assertEqual(res_risk.review_decision_reason, "high-risk label risk:high")
+        self.assertEqual(res_risk.gate_verdict, "BLOCKED")
+
+        # area:auth requires review even on 10 lines
+        pr_auth = copy.deepcopy(self.mock_pr)
+        pr_auth["reviews"] = []
+        pr_auth["baseRefName"] = "staging"
+        pr_auth["labels"] = [{"name": "area:auth"}]
+        pr_auth["files"] = [{"path": "frontend/components/Button.tsx", "additions": 5, "deletions": 2}]
+        res_auth = evaluate_pr_gate(pr_auth, policy=policy)
+        self.assertEqual(res_auth.review_decision, "required")
+        self.assertEqual(res_auth.review_decision_reason, "high-risk area label area:auth")
+        self.assertEqual(res_auth.gate_verdict, "BLOCKED")
+        print("  [PASS] Lockfile exclusion and high-risk label tests pass")
 
 
 def main():
