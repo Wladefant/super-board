@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Database } from "bun:sqlite";
 import { TelegramPoller } from "../extension/poller";
-import { OperatorQuestionService, type QuestionRoute } from "../src/operator-questions";
+import { OperatorQuestionService, questionOperator, type QuestionRoute } from "../src/operator-questions";
 import type { MessageCorrelationBridge, OutboundMessageCorrelation, TelegramUpdate } from "../extension/types";
 
 const originalFetch = globalThis.fetch;
@@ -12,6 +12,15 @@ const cleanup: Array<() => void> = [];
 afterEach(() => {
   globalThis.fetch = originalFetch;
   for (const close of cleanup.splice(0)) close();
+});
+
+test("forum questions bind the authorized user, never the group identity", () => {
+  const access = { dmPolicy: "allowlist", allowFrom: ["123", "456"], groups: { "-100": { allowFrom: ["123"] } } };
+  expect(questionOperator(access, "-100")).toBe("123");
+  expect(questionOperator(access, "456")).toBe("456");
+  expect(() => questionOperator(access, "-999")).toThrow("exactly one authorized operator");
+  expect(() => questionOperator({ ...access, groups: { "-100": {} } }, "-100")).toThrow("exactly one authorized operator");
+  expect(() => questionOperator({ ...access, groups: { "-100": { allowFrom: ["789"] } } }, "-100")).toThrow("exactly one authorized operator");
 });
 
 interface QuestionFixtureOptions {
@@ -85,7 +94,6 @@ function fixture(options: QuestionFixtureOptions = {}) {
       onFollowUp: () => {},
       onAbort: () => {},
       onRelease: async () => {},
-      onTelegramTurnStart: () => {},
       getStatusText: () => "test",
       onLedgerFailure: () => {},
       onQuestionAnswer: options.omitQuestionAnswerCallback

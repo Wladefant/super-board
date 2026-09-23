@@ -12,12 +12,11 @@ import { availableCommands } from "../extension/command-registry";
 import type { DaemonSlot } from "./config";
 import type {
   DeliveryMode,
-  GuiHostSessionControl,
+  TerminalSessionControl,
   SessionEvent,
 } from "./session-control";
 import { SessionControlUnavailableError } from "./session-control";
 import type { DaemonStore } from "./store";
-import { GuiHostFallbackManager } from "./gui-host-fallback";
 
 /**
  * Where a message came from, and where its answer goes: a chat, plus the forum topic
@@ -53,15 +52,14 @@ export interface TopicLifecycle {
 export interface SlotRouterOptions {
   slot: DaemonSlot;
   store: DaemonStore;
-  control: GuiHostSessionControl;
+  control: TerminalSessionControl;
   /** Router UI text, already valid Telegram HTML. */
   send: (target: RouteTarget, html: string) => Promise<void>;
   /** Agent prose, still markdown; the transport renders and chunks it. */
-  relay: (target: RouteTarget, markdown: string) => Promise<void>;
+  relay: (target: RouteTarget, markdown: string, sessionId: string) => Promise<void>;
   log: (message: string) => void;
   /** Present only in forum mode. */
   topics?: TopicLifecycle;
-  fallbackManager?: GuiHostFallbackManager;
 }
 
 export interface DaemonCommandDescriptor {
@@ -105,22 +103,11 @@ export function getDaemonCommands(): DaemonCommandDescriptor[] {
 
 export class SlotRouter {
   private readonly options: SlotRouterOptions;
-  private readonly fallbackManager: GuiHostFallbackManager;
 
   constructor(options: SlotRouterOptions) {
     this.options = options;
-    this.fallbackManager =
-      options.fallbackManager ??
-      new GuiHostFallbackManager({
-        control: options.control,
-        log: options.log,
-      });
   }
 
-  private withHostFallback<T>(target: RouteTarget, operation: () => Promise<T>): Promise<T> {
-    const replyFn = (text: string) => this.options.send(target, text);
-    return this.fallbackManager.withFallback(target.chatId, replyFn, operation);
-  }
 
   private get slotId(): string {
     return this.options.slot.slotId;
@@ -163,11 +150,11 @@ export class SlotRouter {
    * caller should stay silent because the session itself will answer.
    */
   public async deliver(target: RouteTarget, text: string, mode: DeliveryMode = "auto"): Promise<string | null> {
-    return this.withHostFallback(target, async () => {
+    {
       const bound = this.boundSession(target);
       if (bound) {
-        const outcome = await this.options.control.deliver(bound, text, mode);
-        return outcome === "started" ? null : `↪️ <b>Queued as a ${outcome === "steered" ? "steer" : "follow-up"}</b> for the running turn.`;
+        await this.options.control.deliver(bound, text, mode);
+        return null;
       }
 
       // A forum's General topic is the group's lobby, not one operator's chat. Binding
@@ -192,13 +179,13 @@ export class SlotRouter {
       await this.bind(target, sessionId, workspace);
       await this.options.control.deliver(sessionId, text, mode);
       return `🔗 <b>Routed to session</b> <code>${escapeHtml(sessionId)}</code> in <code>${escapeHtml(workspace)}</code>.`;
-    });
+    }
   }
 
   public async abort(target: RouteTarget): Promise<boolean> {
     const bound = this.boundSession(target);
     if (!bound) return false;
-    return this.withHostFallback(target, () => this.options.control.abort(bound));
+    return this.options.control.abort(bound);
   }
 
   public isBusy(target: RouteTarget): boolean {
@@ -244,9 +231,7 @@ export class SlotRouter {
     const [verb, ...rest] = text.trim().split(/\s+/);
     const argument = rest.join(" ").trim();
     try {
-      const reply = await this.withHostFallback(target, () =>
-        this.runCommand(verb.toLowerCase().replace(/@\w+$/, ""), argument, target)
-      );
+      const reply = await this.runCommand(verb.toLowerCase().replace(/@\w+$/, ""), argument, target);
       await this.options.send(target, reply);
     } catch (error) {
       const detail = error instanceof SessionControlUnavailableError
@@ -296,22 +281,7 @@ export class SlotRouter {
   }
 
   private async listAllSessions(): Promise<DaemonSessionSummary[]> {
-    const wireSessions = await this.options.control.listSessions();
-    const control = this.options.control;
-    if ("discoverDiskSessions" in control && typeof control.discoverDiskSessions === "function") {
-      const diskSessions = control.discoverDiskSessions();
-      if (!diskSessions.length) return wireSessions;
-      const map = new Map<string, DaemonSessionSummary>();
-      for (const s of diskSessions) {
-        map.set(s.id, s);
-      }
-      for (const s of wireSessions) {
-        const existing = map.get(s.id);
-        map.set(s.id, { ...existing, ...s });
-      }
-      return Array.from(map.values());
-    }
-    return wireSessions;
+    return await this.options.control.listSessions();
   }
 
   private visibleSession(session: { cwd: string; workspace: string; status: string; modifiedAtMs: number | null }, now: number): boolean {
@@ -359,15 +329,7 @@ export class SlotRouter {
       const interactive = allSessions.filter(session => this.isTopLevelSession(session));
       const sessions = interactive.filter(session =>
         argument.toLowerCase() === "all" || this.visibleSession(session, now));
-      const byWorkspace = new Map<string, DaemonSessionSummary>();
-      for (const session of sessions) {
-        const ws = this.workspace(session).toLowerCase();
-        const existing = byWorkspace.get(ws);
-        if (!existing || (session.modifiedAtMs ?? 0) > (existing.modifiedAtMs ?? 0)) {
-          byWorkspace.set(ws, session);
-        }
-      }
-      const dedupedSessions = Array.from(byWorkspace.values());
+      const dedupedSessions = [...sessions];
       dedupedSessions.sort((a, b) => this.folder(this.workspace(a)).localeCompare(this.folder(this.workspace(b)))
         || this.workspace(a).localeCompare(this.workspace(b))
         || (b.modifiedAtMs ?? 0) - (a.modifiedAtMs ?? 0) || a.id.localeCompare(b.id));
@@ -404,15 +366,7 @@ export class SlotRouter {
       const interactive = allSessions.filter(session => this.isTopLevelSession(session));
       const visible = interactive.filter(session => this.visibleSession(session, now));
       const targetPool = visible.length > 0 ? visible : interactive;
-      const byWorkspaceTarget = new Map<string, DaemonSessionSummary>();
-      for (const session of targetPool) {
-        const ws = this.workspace(session).toLowerCase();
-        const existing = byWorkspaceTarget.get(ws);
-        if (!existing || (session.modifiedAtMs ?? 0) > (existing.modifiedAtMs ?? 0)) {
-          byWorkspaceTarget.set(ws, session);
-        }
-      }
-      const dedupedTargetPool = Array.from(byWorkspaceTarget.values());
+      const dedupedTargetPool = [...targetPool];
       dedupedTargetPool.sort((a, b) => this.folder(this.workspace(a)).localeCompare(this.folder(this.workspace(b)))
         || this.workspace(a).localeCompare(this.workspace(b))
         || (b.modifiedAtMs ?? 0) - (a.modifiedAtMs ?? 0) || a.id.localeCompare(b.id));
@@ -502,7 +456,7 @@ export class SlotRouter {
         if (!this.options.store.claimDelivery(event.sessionId, entry.entryId, SlotRouter.claimKey(route))) continue;
         if (event.kind === "history") continue;
         try {
-          await this.options.relay({ chatId: route.chatId, topicId: route.topicId }, entry.text);
+          await this.options.relay({ chatId: route.chatId, topicId: route.topicId }, entry.text, event.sessionId);
         } catch (error) {
           this.options.log(
             `Slot ${this.slotId}: delivery of entry ${entry.entryId} to chat ${route.chatId} failed: ${error instanceof Error ? error.message : String(error)}`,

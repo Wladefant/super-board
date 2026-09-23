@@ -13,6 +13,9 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as os from "node:os";
+import { randomUUID } from "node:crypto";
+import { OperatorQuestionService, questionOperator } from "../src/operator-questions";
 import {
   BotPoolCoordinator,
   getDefaultManifestPath,
@@ -32,12 +35,11 @@ import {
 } from "./config";
 import { getDaemonCommands, SlotRouter, type RouteTarget } from "./router";
 import {
-  GuiHostSessionControl,
-  resolveGuiHostEndpoint,
+  TerminalSessionControl,
+  discoverOwners,
   type SessionEvent,
 } from "./session-control";
 import { DaemonStore } from "./store";
-import { GuiHostFallbackManager } from "./gui-host-fallback";
 import { connectMiniApp, miniAppUrl } from "./miniapp";
 import { ForumManager, type ForumApiClient, type AutoAttachResult } from "./forum";
 
@@ -53,7 +55,7 @@ export interface DaemonSlotReport {
 export interface DaemonStatusReport {
   pid: number;
   startedAt: number;
-  endpoint: string | null;
+  transport: "terminal-ipc";
   slots: DaemonSlotReport[];
 }
 
@@ -62,8 +64,6 @@ export interface DaemonRuntimeOptions {
   manifestPath?: string;
   daemonDbPath?: string;
   channelsDir?: string;
-  /** Overrides endpoint discovery; null means "no host reachable". */
-  endpoint?: string | null;
   log?: (message: string) => void;
   /** Injected in tests so no real Bot API call or GUI host connection is made. */
   pollerFactory?: (
@@ -77,11 +77,7 @@ export interface DaemonRuntimeOptions {
   controlFactory?: (
     onEvent: (event: SessionEvent) => void,
     onLog: (message: string) => void,
-  ) => GuiHostSessionControl;
-  fallbackManagerFactory?: (
-    control: GuiHostSessionControl,
-    log: (message: string) => void,
-  ) => GuiHostFallbackManager;
+  ) => TerminalSessionControl;
   /** Injected in tests to fake Bot API calls for forum supergroup topics. */
   forumClientFactory?: (token: string, forumChatId: string) => ForumApiClient;
 }
@@ -100,8 +96,7 @@ export class TelegramDaemon {
   private readonly options: DaemonRuntimeOptions;
   private readonly coordinator: BotPoolCoordinator;
   private readonly store: DaemonStore;
-  private readonly control: GuiHostSessionControl;
-  private readonly fallbackManager: GuiHostFallbackManager;
+  private readonly control: TerminalSessionControl;
   private readonly active: ActiveSlot[] = [];
 
   public getActiveSlot(slotId: string): ActiveSlot | undefined {
@@ -116,25 +111,11 @@ export class TelegramDaemon {
     this.options = options;
     this.coordinator = new BotPoolCoordinator(options.poolDbPath, options.manifestPath, options.channelsDir);
     this.store = new DaemonStore(options.daemonDbPath);
-    const endpoint = options.endpoint !== undefined ? options.endpoint : resolveGuiHostEndpoint();
     this.control = options.controlFactory
       ? options.controlFactory(event => this.fanOut(event), message => this.log(message))
-      : new GuiHostSessionControl({
-          endpoint,
+      : new TerminalSessionControl({
           onEvent: event => this.fanOut(event),
           onLog: message => this.log(message),
-        });
-    this.fallbackManager = options.fallbackManagerFactory
-      ? options.fallbackManagerFactory(this.control, message => this.log(message))
-      : new GuiHostFallbackManager({
-          control: this.control,
-          endpoint,
-          log: message => this.log(message),
-          onHostRecovered: () => {
-            void this.reconcileAllAutoAttach().catch(err => {
-              this.log(`Auto-attach reconciliation after host recovery failed: ${err instanceof Error ? err.message : String(err)}`);
-            });
-          },
         });
   }
   /**
@@ -305,7 +286,7 @@ export class TelegramDaemon {
     const report: DaemonStatusReport = {
       pid: process.pid,
       startedAt: this.startedAt,
-      endpoint: this.control.endpoint,
+      transport: "terminal-ipc",
       slots,
     };
     this.writeStatus(report);
@@ -346,10 +327,13 @@ export class TelegramDaemon {
       // so it routes as the chat itself — same key a direct chat uses.
       topicId: forumChatId ? String(poller.getActiveThreadId() ?? "") : "",
     });
-    const sendTo = async (target: RouteTarget, text: string, parseMode?: "HTML"): Promise<void> => {
+    const sendTo = async (target: RouteTarget, text: string, parseMode?: "HTML", sessionId?: string): Promise<void> => {
       const threadId = target.topicId ? Number(target.topicId) : undefined;
       for (const chunk of chunkMessage(text)) {
-        await poller.sendTelegramMessage(target.chatId, chunk, parseMode, undefined, undefined, undefined, threadId);
+        const result = await poller.sendTelegramMessage(target.chatId, chunk, parseMode, undefined, {
+          sessionId: sessionId ?? router.boundSession(target) ?? leaseSessionId,
+        }, undefined, threadId);
+        if (!result?.ok) throw new Error("Telegram rejected the outbound message");
       }
     };
     const router = new SlotRouter({
@@ -357,10 +341,9 @@ export class TelegramDaemon {
       store: this.store,
       control: this.control,
       send: (target, html) => sendTo(target, html, "HTML"),
-      relay: (target, markdown) => sendTo(target, markdown),
+      relay: (target, markdown, sessionId) => sendTo(target, markdown, undefined, sessionId),
       log: message => this.log(message),
       topics: forumManager,
-      fallbackManager: this.fallbackManager,
     });
 
     const sessionIdForChat = (): string => router.boundSession(currentTarget()) ?? leaseSessionId;
@@ -399,7 +382,6 @@ export class TelegramDaemon {
         await this.stopSlot(slot.slotId);
       },
       getStatusText: () => router.statusText(currentTarget()),
-      onTelegramTurnStart: () => {},
       onHarnessCommand: async (text: string, chatId: string, userId?: string) => {
         // The poller hands over the chat it read the update from; the topic within it
         // is the one it is dispatching right now.
@@ -407,21 +389,64 @@ export class TelegramDaemon {
         const send = async (html: string): Promise<void> => sendTo(target, html, "HTML");
         if (/^\/app(?:@\w+)?\s*$/i.test(text)) {
           const url = miniAppUrl(slot.stateDir);
+          const threadId = target.topicId ? Number(target.topicId) : undefined;
           if (url) {
-            await poller.sendTelegramMessage(chatId, "Open your Superboard dashboard", {
-              inline_keyboard: [[{ text: "Open Superboard", web_app: { url } }]],
-            });
-          } else await poller.sendTelegramMessage(chatId, "Mini App is not configured for this bot.");
+            await poller.sendTelegramMessage(
+              chatId,
+              "Open your Superboard dashboard",
+              { inline_keyboard: [[{ text: "Open Superboard", web_app: { url } }]] },
+              undefined,
+              undefined,
+              undefined,
+              threadId,
+            );
+          } else {
+            await poller.sendTelegramMessage(
+              chatId,
+              "Mini App is not configured for this bot.",
+              "HTML",
+              undefined,
+              undefined,
+              undefined,
+              threadId,
+            );
+          }
           return true;
         }
-        if (await router.handleCommand(text, target)) return true;
+        if (await router.handleCommand(text, target)) {
+          if (/^\/sessions(?:@\w+)?(?:\s+all)?\s*$/i.test(text) && userId) {
+            const ids = this.store.getSessionListing(slot.slotId, target.chatId, target.topicId);
+            const live = await this.control.listSessions();
+            const now = Date.now() / 1000;
+            const keyboard = ids.flatMap(id => {
+              const session = live.find(candidate => candidate.id === id);
+              if (!session) return [];
+              const token = randomUUID();
+              const recorded = this.coordinator.recordDecisionCallback({
+                callbackToken: token, decisionId: `attach:${target.topicId}`, choiceId: id,
+                sessionId: router.boundSession(target) ?? leaseSessionId,
+                chatId: target.chatId, userId, questionHash: target.topicId,
+                expiresAt: now + 300, createdAt: now, consumedAt: null,
+              });
+              const folder = (session.workspace || session.cwd || id).replace(/\\/g, "/").split("/").filter(Boolean).at(-1) ?? id;
+              return recorded ? [[{ text: `Attach ${folder}`, callback_data: token }]] : [];
+            });
+            if (keyboard.length) await poller.sendTelegramMessage(chatId, "Choose the running session to attach:", {
+              inline_keyboard: keyboard,
+            }, undefined, undefined, undefined, target.topicId ? Number(target.topicId) : undefined);
+          }
+          return true;
+        }
         return handleInstalledCommand(text, {
-          session: () => ({
-            id: router.boundSession(target) ?? leaseSessionId,
-            cwd: slot.workspace ?? "",
-            idle: !router.isBusy(target),
-            stateDir: slot.stateDir,
-          }),
+          session: () => {
+            const route = target.topicId ? this.store.getRoute(slot.slotId, target.chatId, target.topicId) : null;
+            return {
+              id: router.boundSession(target) ?? leaseSessionId,
+              cwd: route?.workspace || slot.workspace || "",
+              idle: !router.isBusy(target),
+              stateDir: slot.stateDir,
+            };
+          },
           send,
           photo: (file, caption) => poller.sendTelegramPhoto(chatId, file, caption),
           mediaGroup: (files, caption) => poller.sendMediaGroup(chatId, files, caption),
@@ -442,7 +467,26 @@ export class TelegramDaemon {
           },
         }, runner);
       },
+      onQuestionAnswer: async (decisionId: string, eventId: string, answer: { choice?: string; text?: string }) => {
+        const target = currentTarget();
+        const sessionId = router.boundSession(target);
+        if (!sessionId) throw new Error("Question receiver unavailable: this topic has no session owner.");
+        const questions = new OperatorQuestionService(
+          poller,
+          () => ({ session_id: sessionId, chat_id: target.chatId, user_id: questionOperator(this.coordinator.readAccessConfig(slot.stateDir), target.chatId) }),
+          path.join(os.homedir(), ".veyyon", "workflows", "decisions.json"),
+          this.options.poolDbPath ?? process.env.VEYYON_POOL_DB ?? path.join(os.homedir(), ".veyyon", "telegram", "bot_pool.db"),
+          message => this.log(message),
+        );
+        await questions.answer(decisionId, eventId, answer);
+      },
       onDecisionCallback: async (decisionId: string, choiceId: string, context?: string) => {
+        if (decisionId.startsWith("attach:")) {
+          const target = currentTarget();
+          if (decisionId !== `attach:${target.topicId}`) throw new Error("Attach selection belongs to another topic.");
+          await router.handleCommand(`/attach ${choiceId}`, target);
+          return;
+        }
         await router.deliver(
           currentTarget(),
           `Decision recorded from Telegram: question=${decisionId} choice=${choiceId}\n${context ?? ""}`.trim(),
@@ -460,6 +504,7 @@ export class TelegramDaemon {
     const pollerOptions = {
       commands: getDaemonCommands(),
       isDaemon: true,
+      slotId: slot.slotId,
       ...(forumChatId ? { forumChatId } : {}),
     };
 
@@ -469,11 +514,50 @@ export class TelegramDaemon {
 
     const stopMiniApp = connectMiniApp({
       stateDir: slot.stateDir, token, allowedUsers: access.allowFrom,
-      session: userId => router.boundSession({ chatId: userId, topicId: "" }),
-      sessions: () => this.control.listSessions(),
+      session: (userId, context) => {
+        const routes = this.store.listRoutes(slot.slotId);
+        if (context?.sessionId) {
+          const match = routes.find(r => r.sessionId === context.sessionId);
+          if (match) return match.sessionId;
+        }
+        if (context?.topicId) {
+          const match = routes.find(r => r.topicId === context.topicId);
+          if (match) return match.sessionId;
+        }
+        const direct = router.boundSession({ chatId: userId, topicId: "" });
+        if (direct) return direct;
+        if (forumChatId && access.allowFrom.includes(userId)) {
+          const liveOwnerIds = new Set(discoverOwners().map(o => o.sessionId));
+          const liveForumRoute = routes.find(r => r.chatId === forumChatId && r.topicId !== "" && liveOwnerIds.has(r.sessionId));
+          if (liveForumRoute) return liveForumRoute.sessionId;
+          const fallbackForumRoute = routes.find(r => r.chatId === forumChatId && r.topicId !== "");
+          if (fallbackForumRoute) return fallbackForumRoute.sessionId;
+        }
+        return null;
+      },
+      sessions: async () => {
+        const liveSessions = await this.control.listSessions().catch(() => []);
+        const liveMap = new Map(liveSessions.map(s => [s.id, s]));
+        const routes = this.store.listRoutes(slot.slotId);
+        return routes.map(r => {
+          const live = liveMap.get(r.sessionId);
+          return {
+            id: r.sessionId,
+            topicId: r.topicId || null,
+            chatId: r.chatId,
+            workspace: r.workspace,
+            cwd: r.workspace,
+            title: r.topicId ? `Topic #${r.topicId}` : null,
+            status: live ? (this.control.isBusy(r.sessionId) ? "Running" : "Idle") : "Inactive",
+            live: Boolean(live),
+            isSubagent: false,
+            kind: "interactive" as const,
+          };
+        });
+      },
       status: () => ({ polling: poller.running, slot: slot.slotId }),
-      dashboard: userId => {
-        const session = router.boundSession({ chatId: userId, topicId: "" });
+      dashboard: (userId, sessionId) => {
+        const session = sessionId ?? router.boundSession({ chatId: userId, topicId: "" });
         const raw = session ? poller.getMeta(`dashboard-snapshot:${session}`) : null;
         try { return raw ? JSON.parse(raw) : null; } catch { return null; }
       },
@@ -592,7 +676,7 @@ export class TelegramDaemon {
     return {
       pid: process.pid,
       startedAt: this.startedAt,
-      endpoint: this.control.endpoint,
+      transport: "terminal-ipc",
       slots: this.active.map(entry => ({
         slotId: entry.slot.slotId,
         botId: entry.slot.botId,

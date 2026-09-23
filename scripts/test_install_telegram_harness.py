@@ -49,7 +49,7 @@ class TestInstallTelegramHarness(unittest.TestCase):
         self.assertEqual(code, EXIT_OK)
 
         # Assert key extension and harness files exist
-        self.assertTrue((self.target / "guard.ts").is_file())
+        self.assertFalse((self.target / "guard.ts").exists())
         self.assertTrue((self.target / "index.ts").is_file())
         self.assertTrue((self.target / "sanitizer.ts").is_file())
         self.assertTrue((self.target / "harness" / "index.ts").is_file())
@@ -105,13 +105,13 @@ class TestInstallTelegramHarness(unittest.TestCase):
         bridge_content = "# bridge script runtime"
         (self.target / "veyyon_telegram_bridge.py").write_text(bridge_content, encoding="utf-8")
 
-        guard_js_content = "// js guard runtime"
+        guard_js_content = "// retired legacy tool guard"
         (self.target / "veyyon_telegram_guard.js").write_text(guard_js_content, encoding="utf-8")
 
         notify_state_content = '{"last_id": 42}'
         (self.target / "telegram_notify_state.json").write_text(notify_state_content, encoding="utf-8")
 
-        # Create an old version of guard.ts to be overwritten
+        # Create an old version of guard.ts to be removed after backup
         old_guard_content = "// OLD DEPRECATED GUARD VERSION 1.0"
         (self.target / "guard.ts").write_text(old_guard_content, encoding="utf-8")
 
@@ -130,11 +130,11 @@ class TestInstallTelegramHarness(unittest.TestCase):
         self.assertEqual((self.target / "bot_pool.db-shm").read_bytes(), b"SHM_BYTES")
         self.assertEqual((self.target / "veyyon-telegram.ps1").read_text(encoding="utf-8"), ps1_content)
         self.assertEqual((self.target / "veyyon_telegram_bridge.py").read_text(encoding="utf-8"), bridge_content)
-        self.assertEqual((self.target / "veyyon_telegram_guard.js").read_text(encoding="utf-8"), guard_js_content)
+        self.assertFalse((self.target / "veyyon_telegram_guard.js").exists())
         self.assertEqual((self.target / "telegram_notify_state.json").read_text(encoding="utf-8"), notify_state_content)
 
-        # Assert guard.ts was updated to new source content
-        self.assertNotEqual((self.target / "guard.ts").read_text(encoding="utf-8"), old_guard_content)
+        # Retired tool-call validation must not remain executable after upgrade.
+        self.assertFalse((self.target / "guard.ts").exists())
 
         # Assert backup was created
         backups_parent = self.target / ".backups"
@@ -176,9 +176,9 @@ class TestInstallTelegramHarness(unittest.TestCase):
             ])
         self.assertEqual(check_code, EXIT_DRIFT)
         output = buf.getvalue()
-        self.assertIn("guard.ts (modified)", output)
+        self.assertIn("guard.ts (retired module)", output)
 
-        # 3. Restore guard.ts and delete another file
+        # 3. Remove retired guard.ts and delete another file
         install_module.main([
             "--source-root", str(self.source_root),
             "--target", str(self.target),
@@ -214,7 +214,7 @@ class TestInstallTelegramHarness(unittest.TestCase):
             ])
         self.assertEqual(code, EXIT_OK)
         output = buf.getvalue()
-        self.assertIn("[dry-run] Would overwrite: guard.ts", output)
+        self.assertIn("[dry-run] Would remove retired module: guard.ts", output)
         self.assertIn("[dry-run] Would write manifest:", output)
 
         # Target should NOT be modified
@@ -283,7 +283,7 @@ class TestInstallTelegramHarness(unittest.TestCase):
             "--allow-dirty",
         ])
         self.assertEqual(code2, EXIT_OK)
-        self.assertTrue((target2 / "tests" / "guard.test.ts").is_file())
+        self.assertFalse((target2 / "tests" / "guard.test.ts").exists())
         self.assertFalse((target2 / "harness" / "tests").exists())
 
         # Case 3: target already has harness/tests/

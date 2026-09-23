@@ -6,7 +6,6 @@ import { createHmac } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { evaluateApproval, describeApproval, pendingApprovals } from "../extension/approvals";
 import { createClient, getUnavailableState, UNAVAILABLE_MESSAGE, REOPEN_MESSAGE, SECTIONS, TerminalAuthError, isTerminalAuthError } from "../miniapp/client.js";
 import { SERVED_FILES } from "../miniapp/relay";
 import { readFileSync } from "node:fs";
@@ -116,19 +115,16 @@ test("authenticated actors cannot read or decide another private chat's pending 
     sessions: async () => [], dashboard: (user: string) => ({ owner: user }), status: () => ({}),
   };
   try {
-    const approval = evaluateApproval(dir, "bob-operation", describeApproval("bash", { command: "echo safe" }, "shell", { sessionId: routes[bob], requester: "bob-agent", task: "test", cwd: dir }));
     const aliceSession = issueAppSession(alice, token);
     const state = await miniAppRequest({ id: "1", path: "/api/state", method: "GET", initData: "", appSession: aliceSession, body: "" }, options);
     expect(state.status).toBe(200);
-    expect(state.data).toMatchObject({ session: "alice-session", approvals: [], dashboard: { owner: alice } });
-    const decision = { token: approval.token, decision: "denied" };
+    expect(state.data).toMatchObject({ session: "alice-session", dashboard: { owner: alice } });
+    expect(state.data).not.toHaveProperty("approvals");
+    const decision = { token: "obsolete", decision: "denied" };
     const wrongActor = await miniAppRequest({ id: "2", path: "/api/approval", method: "POST", initData: "", appSession: aliceSession, body: JSON.stringify(decision) }, options);
-    expect(wrongActor.status).toBe(409);
-    expect(pendingApprovals(dir, routes[bob])).toHaveLength(1);
+    expect(wrongActor.status).toBe(410);
     const rightActor = await miniAppRequest({ id: "3", path: "/api/approval", method: "POST", initData: "", appSession: issueAppSession(bob, token), body: JSON.stringify(decision) }, options);
-    expect(rightActor.status).toBe(200);
-    expect(pendingApprovals(dir, routes[bob])).toHaveLength(0);
-    expect((await miniAppRequest({ id: "4", path: "/api/approval", method: "POST", initData: "", appSession: issueAppSession(bob, token), body: JSON.stringify(decision) }, options)).status).toBe(409);
+    expect(rightActor.status).toBe(410);
     for (const [path, method] of [["/api/unknown", "GET"], ["/api/state", "POST"], ["/api/approval", "GET"]]) {
       expect((await miniAppRequest({ id: "5", path, method, initData: "", appSession: aliceSession, body: "" }, options)).status).toBe(404);
     }
@@ -193,87 +189,23 @@ describe("Mini App client 401 session reset and unavailable state", () => {
     expect(calls[2].headers["x-miniapp-session"]).toBe("session-token-1");
   });
 
-  test("401 on /api/approval drops cached session, re-runs /api/session, and retries approval decision once", async () => {
-    const calls: { path: string; body?: unknown; headers: Record<string, string> }[] = [];
-    const client = createClient(() => "fresh-launch-data", async (path: string, init?: RequestInit) => {
-      const headers = (init?.headers ?? {}) as Record<string, string>;
-      calls.push({ path, body: init?.body, headers });
 
-      if (path === "/api/session") {
-        return Response.json({ appSession: "new-approval-session" });
-      }
-      if (path === "/api/approval") {
-        if (headers["x-miniapp-session"] === "stale-approval-session") {
-          return Response.json({ error: "Open this app from Telegram again to authenticate." }, { status: 401 });
-        }
-        if (headers["x-miniapp-session"] === "new-approval-session") {
-          return Response.json({ state: "approved" });
-        }
-      }
-      return Response.json({ error: "Unexpected" }, { status: 500 });
-    });
-
-    client.setSession("stale-approval-session");
-    const decision = { token: "appr-token-123", decision: "approved" };
-    const res = await client("/api/approval", decision);
-    expect(res).toEqual({ state: "approved" });
-    expect(client.getSession()).toBe("new-approval-session");
-
-    expect(calls).toHaveLength(3);
-    expect(calls[0]).toMatchObject({ path: "/api/approval", headers: { "x-miniapp-session": "stale-approval-session" } });
-    expect(calls[1]).toMatchObject({ path: "/api/session", headers: { "x-telegram-init-data": "fresh-launch-data" } });
-    expect(calls[2]).toMatchObject({ path: "/api/approval", headers: { "x-miniapp-session": "new-approval-session" } });
-    expect(JSON.parse(String(calls[2].body))).toEqual(decision);
-  });
-
-  test("double-401 on /api/approval drops cached session and throws TerminalAuthError without unbounded retry", async () => {
-    const calls: { path: string; headers: Record<string, string> }[] = [];
-    const client = createClient(() => "launch-data-approval", async (path: string, init?: RequestInit) => {
-      const headers = (init?.headers ?? {}) as Record<string, string>;
-      calls.push({ path, headers });
-
-      if (path === "/api/session") return Response.json({ appSession: "new-approval-session-attempt" });
-      if (path === "/api/approval") {
-        return Response.json({ error: "Open this app from Telegram again to authenticate." }, { status: 401 });
-      }
-      return Response.json({ error: "Unexpected" }, { status: 500 });
-    });
-
-    client.setSession("stale-approval-session");
-
-    let caughtError: unknown;
-    try {
-      await client("/api/approval", { token: "tok-1", decision: "approved" });
-    } catch (err) {
-      caughtError = err;
-    }
-
-    expect(caughtError).toBeInstanceOf(TerminalAuthError);
-    expect(isTerminalAuthError(caughtError)).toBe(true);
-    expect((caughtError as Error).message).toBe("Open this app from Telegram again to authenticate.");
-    expect(client.getSession()).toBe("");
-    expect(calls.map(c => c.path)).toEqual(["/api/approval", "/api/session", "/api/approval"]);
-    expect(calls[0].headers["x-miniapp-session"]).toBe("stale-approval-session");
-    expect(calls[1].headers["x-telegram-init-data"]).toBe("launch-data-approval");
-    expect(calls[2].headers["x-miniapp-session"]).toBe("new-approval-session-attempt");
-  });
-
-  test("non-401 errors on /api/approval throw standard Error and do not clear session", async () => {
+  test("non-401 state errors throw standard Error and do not clear session", async () => {
     const client = createClient(() => "launch-data", async (path: string) => {
-      if (path === "/api/approval") return Response.json({ error: "Approval expired" }, { status: 400 });
+      if (path === "/api/state") return Response.json({ error: "State unavailable" }, { status: 400 });
       return Response.json({});
     });
     client.setSession("valid-session");
     let caughtError: unknown;
     try {
-      await client("/api/approval", { token: "tok-expired", decision: "approved" });
+      await client("/api/state");
     } catch (err) {
       caughtError = err;
     }
     expect(caughtError).toBeInstanceOf(Error);
     expect(caughtError).not.toBeInstanceOf(TerminalAuthError);
     expect(isTerminalAuthError(caughtError)).toBe(false);
-    expect((caughtError as Error).message).toBe("Approval expired");
+    expect((caughtError as Error).message).toBe("State unavailable");
     expect(client.getSession()).toBe("valid-session");
   });
 

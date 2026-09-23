@@ -18,7 +18,7 @@ import {
   SessionControlUnavailableError,
   type DaemonSessionSummary,
   type DeliveryMode,
-  type GuiHostSessionControl,
+  type TerminalSessionControl,
 } from "../daemon/session-control";
 import { DaemonStore } from "../daemon/store";
 
@@ -29,7 +29,7 @@ interface Delivered {
 }
 
 interface FakeControl {
-  control: GuiHostSessionControl;
+  control: TerminalSessionControl;
   delivered: Delivered[];
   created: { workspace: string; title: string }[];
   loaded: string[];
@@ -85,7 +85,7 @@ function fakeControl(sessions: DaemonSessionSummary[] = [], options: { unavailab
     close: () => {},
   };
 
-  return { control: control as unknown as GuiHostSessionControl, delivered, created, loaded, aborted, busy };
+  return { control: control as unknown as TerminalSessionControl, delivered, created, loaded, aborted, busy };
 }
 
 function summary(id: string, cwd: string, title: string | null = null): DaemonSessionSummary {
@@ -141,7 +141,7 @@ let relayed: { target: RouteTarget; markdown: string }[];
 
 function buildRouter(
   slot: Partial<DaemonSlot>,
-  control: GuiHostSessionControl,
+  control: TerminalSessionControl,
   topics?: TopicLifecycle,
 ): SlotRouter {
   return new SlotRouter({
@@ -219,13 +219,13 @@ describe("inbound routing", () => {
     expect(router.boundSession(DM)).toBeNull();
   });
 
-  test("steer and follow-up modes are acknowledged distinctly and reach the bound session", async () => {
+  test("steer and follow-up modes stay silent without routine ack spam and reach the bound session", async () => {
     const fake = fakeControl([summary("sess-existing", "C:/dev/demo")]);
     const router = buildRouter({}, fake.control);
     await router.deliver(DM, "start");
 
-    expect(await router.deliver(DM, "redirect", "steer")).toContain("steer");
-    expect(await router.deliver(DM, "afterwards", "followUp")).toContain("follow-up");
+    expect(await router.deliver(DM, "redirect", "steer")).toBeNull();
+    expect(await router.deliver(DM, "afterwards", "followUp")).toBeNull();
     expect(fake.delivered.slice(1)).toEqual([
       { sessionId: "sess-existing", text: "redirect", mode: "steer" },
       { sessionId: "sess-existing", text: "afterwards", mode: "followUp" },
@@ -407,6 +407,27 @@ describe("outbound delivery", () => {
     await router.onSessionEvent(event);
 
     expect(relayed).toEqual([{ target: DM, markdown: "the answer" }]);
+  });
+
+  test("a replayed entry across router recreation is delivered exactly once", async () => {
+    const fake = fakeControl([summary("sess-a", "C:/dev/demo")]);
+    const router1 = buildRouter({}, fake.control);
+    await router1.deliver(DM, "start");
+
+    const event1 = { kind: "appended" as const, sessionId: "sess-a", entries: [{ entryId: "e1", text: "first delivery" }] };
+    await router1.onSessionEvent(event1);
+    expect(relayed).toEqual([{ target: DM, markdown: "first delivery" }]);
+
+    // Replay across a second router instance sharing the same store
+    const router2 = buildRouter({}, fake.control);
+    await router2.onSessionEvent(event1);
+    const event2 = { kind: "appended" as const, sessionId: "sess-a", entries: [{ entryId: "e2", text: "second delivery" }] };
+    await router2.onSessionEvent(event2);
+
+    expect(relayed).toEqual([
+      { target: DM, markdown: "first delivery" },
+      { target: DM, markdown: "second delivery" },
+    ]);
   });
 
   test("binding a chat marks existing history delivered, so nothing is replayed", async () => {

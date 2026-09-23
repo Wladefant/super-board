@@ -6,14 +6,14 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { GuiHostFallbackManager } from "../daemon/gui-host-fallback";
 import { TelegramDaemon } from "../daemon/runtime";
 import {
   type DaemonSessionSummary,
-  type GuiHostSessionControl,
+  type TerminalSessionControl,
 } from "../daemon/session-control";
 import { TelegramPoller } from "../extension/poller";
 import { FakeForumApiClient } from "./daemon-forum.test";
+import type { MessageCorrelationBridge } from "../extension/types";
 
 const OPERATOR_ID = "1247617658";
 const FORUM_CHAT_ID = "-10077889900";
@@ -63,11 +63,9 @@ describe("TelegramDaemon forum auto-attach runtime", () => {
   function fakeControl(sessions: DaemonSessionSummary[] = []) {
     const liveSessions = [...sessions];
     const loaded: string[] = [];
-    const control: GuiHostSessionControl = {
-      endpoint: "tcp:127.0.0.1:7699",
+    const control = {
       isBusy: () => false,
       listSessions: async () => liveSessions,
-      discoverDiskSessions: () => [],
       findSession: async (ws: string) => liveSessions.find(s => s.workspace === ws) ?? null,
       createSession: async () => "created-id",
       ensureSession: async () => "ensured-id",
@@ -76,9 +74,8 @@ describe("TelegramDaemon forum auto-attach runtime", () => {
       loadTranscript: async (id: string) => {
         loaded.push(id);
       },
-      usage: async () => null,
       close: () => {},
-    };
+    } as unknown as TerminalSessionControl;
     return { control, liveSessions, loaded };
   }
 
@@ -130,62 +127,30 @@ describe("TelegramDaemon forum auto-attach runtime", () => {
     await daemon.stop();
   });
 
-  test("reconciles on demand and wires fallback manager recovery", async () => {
+  test("reconciles newly registered owners on demand without a GUI recovery fallback", async () => {
     createManifest(true);
-
     const fake = fakeControl();
     const forumClient = new FakeForumApiClient();
-    let hostRecoveredHandler: (() => void) | undefined;
-
     const daemon = new TelegramDaemon({
       manifestPath,
       poolDbPath: path.join(tempDir, "pool.db"),
       daemonDbPath: path.join(tempDir, "daemon.db"),
       channelsDir: path.join(tempDir, "channels"),
       controlFactory: () => fake.control,
-      fallbackManagerFactory: (control, log) => {
-        const fallback = new GuiHostFallbackManager(control, {
-          log,
-          onHostRecovered: () => {
-            if (hostRecoveredHandler) hostRecoveredHandler();
-          },
-        });
-        return fallback;
-      },
       forumClientFactory: () => forumClient,
       pollerFactory: () => dummyPoller(),
       log: () => {},
     });
-
     await daemon.start();
     expect(forumClient.topics.size).toBe(0);
-
-    // Wire trigger
-    hostRecoveredHandler = () => {
-      void daemon.reconcileAllAutoAttach();
-    };
-
-    // New session arrives
     fake.liveSessions.push({
-      id: "recovered-sess",
-      cwd: "C:/dev/recovered",
-      workspace: "C:/dev/recovered",
-      title: null,
-      status: "Idle",
-      modifiedAtMs: Date.now(),
+      id: "recovered-sess", cwd: "C:/dev/recovered", workspace: "C:/dev/recovered",
+      title: null, status: "Idle", modifiedAtMs: Date.now(),
     });
-
-    // Simulate recovery event
-    hostRecoveredHandler();
-    // Allow microtasks to settle
-    await Promise.resolve();
     await daemon.reconcileAllAutoAttach();
-
     expect(forumClient.topics.size).toBe(1);
-    const topic = [...forumClient.topics.values()][0];
-    expect(topic.name).toBe("recovered");
+    expect([...forumClient.topics.values()][0].name).toBe("recovered");
     expect(fake.loaded).toContain("recovered-sess");
-
     await daemon.stop();
   });
   test("explicitly detached session is skipped by auto-attach reconciliation", async () => {
@@ -225,5 +190,52 @@ describe("TelegramDaemon forum auto-attach runtime", () => {
     expect(slot?.forumManager?.options.store.getRoute("slot-runtime-forum", FORUM_CHAT_ID, "1")).toBeNull();
 
     await daemon.stop();
+  });
+  test("forum menu attaches through its authenticated owner and rejects replay", async () => {
+    createManifest(true);
+    const fake = fakeControl([
+      { id: "owner-one", cwd: "C:/dev/one", workspace: "C:/dev/one", title: null, status: "Idle", modifiedAtMs: Date.now() },
+      { id: "owner-two", cwd: "C:/dev/two", workspace: "C:/dev/two", title: null, status: "Idle", modifiedAtMs: Date.now() },
+    ]);
+    const forumClient = new FakeForumApiClient();
+    let callbacks!: ConstructorParameters<typeof TelegramPoller>[3];
+    let correlation!: MessageCorrelationBridge;
+    let thread = 101;
+    const sent: Array<Parameters<TelegramPoller["sendTelegramMessage"]>> = [];
+    const daemon = new TelegramDaemon({
+      manifestPath, poolDbPath: path.join(tempDir, "pool.db"),
+      daemonDbPath: path.join(tempDir, "daemon.db"), channelsDir: path.join(tempDir, "channels"),
+      controlFactory: () => fake.control, forumClientFactory: () => forumClient,
+      pollerFactory: (_token, _state, _access, handlers, bridge) => {
+        callbacks = handlers;
+        correlation = bridge;
+        return Object.assign(dummyPoller(), {
+          getActiveThreadId: () => thread,
+          sendTelegramMessage: async (...args: Parameters<TelegramPoller["sendTelegramMessage"]>) => {
+            sent.push(args);
+            return { ok: true, result: { message_id: sent.length } };
+          },
+        });
+      },
+      log: () => {},
+    });
+    await daemon.start();
+    try {
+      expect(await callbacks.onHarnessCommand?.("/sessions@ExampleBot", FORUM_CHAT_ID, OPERATOR_ID)).toBe(true);
+      const menu = sent.find(args => args[1] === "Choose the running session to attach:");
+      const markup = menu?.[2];
+      if (!markup || typeof markup === "string" || !("inline_keyboard" in markup)) throw new Error("Missing attach buttons");
+      const token = markup.inline_keyboard[0][0].callback_data;
+      const selection = correlation.resolveCallback?.(token, OPERATOR_ID, FORUM_CHAT_ID);
+      expect(selection?.decision).toBe("deliver");
+      expect(correlation.resolveCallback?.(token, "unauthorized", FORUM_CHAT_ID).decision).toBe("reject_unauthorized");
+      if (!selection?.record) throw new Error("Missing stored callback");
+      await callbacks.onDecisionCallback?.(selection.record.decisionId, selection.record.choiceId);
+      expect(fake.loaded).toContain(selection.record.choiceId);
+      expect(correlation.consumeCallback?.(token)).toBe(true);
+      expect(correlation.resolveCallback?.(token, OPERATOR_ID, FORUM_CHAT_ID).decision).toBe("reject_already_consumed");
+    } finally {
+      await daemon.stop();
+    }
   });
 });

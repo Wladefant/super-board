@@ -42,6 +42,7 @@ interface MockPoller {
   stop: () => Promise<void>;
   getPrimaryChatId: () => string | null;
   sendTelegramMessage: (chatId: string, text: string) => Promise<{ ok: boolean; result?: { message_id: number } }>;
+  setPrimaryChatId?: (chatId: string) => void;
 }
 
 /**
@@ -471,6 +472,14 @@ describe("Telegram Harness Hot Reload", () => {
   test("Extension registers tg-reload and telegram reload commands", async () => {
     const mockApi = createMockExtensionAPI();
     telegramSessionExtension(mockApi.api);
+    setActiveRuntime({
+      onSessionStart: async () => {},
+      getPrimaryChatId: () => null,
+      dispose: async () => {},
+    } as unknown as TelegramRuntime);
+    const rootContext = createMockContext();
+    await mockApi.listeners.get("session_start")![0]({}, rootContext);
+    setSavedContext(null); // This fixture tests command dispatch, not lease acquisition.
 
     expect(mockApi.commands.has("tg-reload")).toBe(true);
     expect(mockApi.commands.has("telegram")).toBe(true);
@@ -478,6 +487,7 @@ describe("Telegram Harness Hot Reload", () => {
     const tgReload = mockApi.commands.get("tg-reload");
     const notifications: { msg: string; level: string }[] = [];
     const commandCtx = {
+      ...rootContext,
       ui: {
         notify: (msg: string, level: string) => {
           notifications.push({ msg, level });
@@ -494,6 +504,13 @@ describe("Telegram Harness Hot Reload", () => {
   test("Extension registers the operator question, message and dashboard tools", () => {
     const mockApi = createMockExtensionAPI();
     telegramSessionExtension(mockApi.api);
+    expect(mockApi.listeners.has("tool_call")).toBe(false);
+    for (const toolName of ["bash", "eval", "write", "read", "ssh", "github", "supabase", "launch"]) {
+      const results = (mockApi.listeners.get("tool_call") ?? []).map(handler =>
+        handler({ toolName, input: { category: "any", command: "inert test data" } }));
+      expect(results).toEqual([]);
+    }
+    expect(mockApi.userMessages).toEqual([]);
 
     expect([...mockApi.tools.keys()].sort()).toEqual(["telegram_dashboard", "telegram_message", "telegram_question"]);
     expect(mockApi.tools.get("telegram_question")?.parameterKeys).toContain("options");
@@ -588,6 +605,33 @@ describe("Telegram Harness Hot Reload", () => {
     expect(await runtime.initSession(ctx)).toBe(true);
     expect(acquireCount).toBe(1); // Must NOT re-acquire lease
     await runtime.dispose();
+  });
+
+  test("child lifecycle cannot replace or dispose the root Telegram runtime", async () => {
+    const rootHost = createMockExtensionAPI();
+    const childHost = createMockExtensionAPI();
+    const starts: string[] = [];
+    let disposals = 0;
+    const runtime = {
+      onSessionStart: async (_event: unknown, ctx: ExtensionContext) => { starts.push(ctx.sessionManager.getSessionId()); },
+      onSessionShutdown: async () => { disposals++; },
+      getPoller: () => ({}),
+    } as unknown as TelegramRuntime;
+    setActiveRuntime(runtime);
+    telegramSessionExtension(rootHost.api);
+    await rootHost.listeners.get("session_start")![0]({}, createMockContext("root-owner"));
+    telegramSessionExtension(childHost.api);
+    const child = { ...createMockContext("child"), isSubagent: true, taskDepth: 1, parentTaskPrefix: "child" };
+    await childHost.listeners.get("session_start")![0]({}, child);
+    await childHost.listeners.get("turn_end")![0]();
+    await childHost.listeners.get("session_shutdown")![0]({});
+    expect(starts).toEqual(["root-owner"]);
+    expect(disposals).toBe(0);
+    expect(getActiveRuntime()).toBe(runtime);
+    await rootHost.listeners.get("turn_end")![0]();
+    await rootHost.listeners.get("session_shutdown")![0]({});
+    expect(disposals).toBe(1);
+    setActiveRuntime(null);
   });
 
   test("telegram_message provides detailed error and supports rebind: true when route is lost", async () => {

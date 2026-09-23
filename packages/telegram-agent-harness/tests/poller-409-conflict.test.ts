@@ -25,7 +25,6 @@ test("HTTP 409 conflict triggers bounded backoff, warning diagnosis, and termina
     onAbort: () => {},
     onRelease: async () => {},
     getStatusText: () => "status",
-    onTelegramTurnStart: () => {},
     onLedgerFailure: () => {},
     onConflict: (diagnosis: string, attempt: number) => {
       conflictDiagnoses.push(diagnosis);

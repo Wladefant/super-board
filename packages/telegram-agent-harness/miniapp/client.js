@@ -1,6 +1,6 @@
 export const UNAVAILABLE_MESSAGE = 'Unavailable until a secure connection is established.';
 export const REOPEN_MESSAGE = 'Open this app from Telegram again to authenticate.';
-export const SECTIONS = ['sessions', 'approvals', 'lanes', 'blockers', 'queue'];
+export const SECTIONS = ['sessions', 'lanes', 'blockers', 'queue'];
 
 export function getUnavailableState(notice = REOPEN_MESSAGE) {
   return {
@@ -9,7 +9,6 @@ export function getUnavailableState(notice = REOPEN_MESSAGE) {
     freshness: 'Unavailable',
     sections: {
       sessions: UNAVAILABLE_MESSAGE,
-      approvals: UNAVAILABLE_MESSAGE,
       lanes: UNAVAILABLE_MESSAGE,
       blockers: UNAVAILABLE_MESSAGE,
       queue: UNAVAILABLE_MESSAGE,

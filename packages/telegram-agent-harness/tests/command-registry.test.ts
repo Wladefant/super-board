@@ -55,7 +55,7 @@ test("real poller startup registers before polling and still polls after registr
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tg-start-registry-"));
     const calls: string[] = [], failures: string[] = [];
     const poller = new TelegramPoller("1:test", dir, { dmPolicy: "allowlist", allowFrom: ["101"] }, {
-      isIdle: () => true, onUserMessage: () => {}, onFollowUp: () => {}, onSteer: () => {}, onAbort: () => {}, onRelease: async () => {}, getStatusText: () => "status", onTelegramTurnStart: () => {}, onLedgerFailure: message => failures.push(message),
+      isIdle: () => true, onUserMessage: () => {}, onFollowUp: () => {}, onSteer: () => {}, onAbort: () => {}, onRelease: async () => {}, getStatusText: () => "status", onLedgerFailure: message => failures.push(message),
     });
     globalThis.fetch = (async (url) => {
       if (String(url).endsWith("setMyCommands")) { calls.push("register"); return Response.json({ ok: registrationOk }); }
@@ -106,7 +106,7 @@ test("command boundaries, native idle/busy delivery and release preserve the dur
   let idle = true, aborts = 0, released = false, updateId = 0;
   const poller = new TelegramPoller("1:test", dir, { dmPolicy: "allowlist", allowFrom: ["101"] }, {
     isIdle: () => idle, onUserMessage: text => user.push(text), onFollowUp: () => {}, onSteer: text => steer.push(text), onAbort: () => { aborts++; },
-    onRelease: async () => { released = true; poller.stop(); }, getStatusText: () => "status", onTelegramTurnStart: () => {}, onLedgerFailure: message => { throw new Error(message); },
+    onRelease: async () => { released = true; poller.stop(); }, getStatusText: () => "status", onLedgerFailure: message => { throw new Error(message); },
     onHarnessCommand: async () => false,
   });
   globalThis.fetch = (async (_url, init) => { replies.push(JSON.parse(String(init?.body)).text); return Response.json({ ok: true, result: { message_id: replies.length, chat: { id: 101 } } }); }) as typeof fetch;
@@ -126,7 +126,7 @@ test("command boundaries, native idle/busy delivery and release preserve the dur
     await deliver("/cancel");
     // Plain and explicit /steer text both arrive stamped with the sending Telegram
     // account, so neither route can be read as an attested operator instruction.
-    const stamp = "[Telegram sender: 101; origin: telegram_account; human presence not attested]";
+    const stamp = "[Telegram sender: 101; origin: telegram_account]";
     expect(user).toEqual([`${stamp}\nidle plain`, `${stamp}\nidle explicit`]);
     expect(steer).toEqual([`${stamp}\nbusy plain`, `${stamp}\nbusy explicit`]);
     expect(aborts).toBe(1);
@@ -163,7 +163,7 @@ test("poller with isDaemon: true responds to /help with daemon routing commands"
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tg-daemon-help-"));
   const replies: string[] = [];
   const poller = new TelegramPoller("1:test", dir, { dmPolicy: "allowlist", allowFrom: ["101"] }, {
-    isIdle: () => true, onUserMessage: () => {}, onFollowUp: () => {}, onSteer: () => {}, onAbort: () => {}, onRelease: async () => {}, getStatusText: () => "test", onTelegramTurnStart: () => {}, onLedgerFailure: () => {},
+    isIdle: () => true, onUserMessage: () => {}, onFollowUp: () => {}, onSteer: () => {}, onAbort: () => {}, onRelease: async () => {}, getStatusText: () => "test", onLedgerFailure: () => {},
   }, null, { isDaemon: true });
 
   poller.sendTelegramMessage = async (_chatId, html) => {

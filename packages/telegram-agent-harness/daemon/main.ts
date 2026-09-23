@@ -17,9 +17,7 @@ import {
 import { claimDaemonPidFile, TelegramDaemon } from "./runtime";
 import { BotPoolCoordinator, getDefaultManifestPath, getProcessIdentity } from "../extension/coordinator";
 import {
-  guiHostAgentDirs,
-  GuiHostSessionControl,
-  resolveGuiHostEndpoint,
+  TerminalSessionControl,
   type DaemonSessionSummary,
 } from "./session-control";
 import { ForumManager } from "./forum";
@@ -68,15 +66,15 @@ async function run(): Promise<number> {
   let handedOver = report.slots.some(slot => slot.polling);
   let retrying = false;
   let nextRetryAt = Date.now() + CLAIM_RETRY_MS;
-  await new Promise<void>(resolve => {
-    const timer = setInterval(() => {
-      const polling = daemon.status().slots.some(slot => slot.polling);
-      if (polling) handedOver = true;
-      if (stopped || (handedOver && !polling && !daemon.hasPendingSlots())) {
-        clearInterval(timer);
-        resolve();
-        return;
-      }
+  const { promise, resolve } = Promise.withResolvers<void>();
+  const timer = setInterval(() => {
+    const polling = daemon.status().slots.some(slot => slot.polling);
+    if (polling) handedOver = true;
+    if (stopped || (handedOver && !polling && !daemon.hasPendingSlots())) {
+      clearInterval(timer);
+      resolve();
+      return;
+    }
       if (!daemon.hasPendingSlots() || retrying || Date.now() < nextRetryAt) return;
       retrying = true;
       void daemon
@@ -88,8 +86,8 @@ async function run(): Promise<number> {
           nextRetryAt = Date.now() + CLAIM_RETRY_MS;
           retrying = false;
         });
-    }, 1_000);
-  });
+  }, 1_000);
+  await promise;
   await (stopped ?? daemon.stop());
   return 0;
 }
@@ -99,7 +97,7 @@ function status(): number {
   const pid = fs.existsSync(pidPath) ? Number.parseInt(fs.readFileSync(pidPath, "utf8").trim(), 10) : NaN;
   const alive = Number.isFinite(pid) && pid > 0 && getProcessIdentity(pid).alive;
   console.log(`daemon: ${alive ? `running (pid ${pid})` : "not running"}`);
-  console.log(`gui host endpoint: ${resolveGuiHostEndpoint() ?? "not discovered"}`);
+  console.log("session transport: authenticated live terminal IPC (no GUI fallback)");
   console.log(`opted-in slots: ${[...readDaemonSlotIds()].join(", ") || "none"}`);
   if (fs.existsSync(getDaemonStatusPath())) {
     console.log(fs.readFileSync(getDaemonStatusPath(), "utf8").trimEnd());
@@ -122,19 +120,11 @@ function stop(): number {
 /** Reports whether this machine is configured for the daemon, without starting it. */
 function check(): number {
   const slots = [...readDaemonSlotIds()];
-  const endpoint = resolveGuiHostEndpoint();
   console.log(`opted-in slots: ${slots.join(", ") || "none"}`);
-  console.log(`gui host endpoint: ${endpoint ?? "not discovered"}`);
+  console.log("session transport: authenticated live terminal IPC");
   if (slots.length === 0) {
     console.error('No slot opted in. Add "daemon": true to a slot in ~/.veyyon/telegram/manifest.json.');
     return 78;
-  }
-  if (!endpoint) {
-    console.error(
-      "No GUI host endpoint discovered; the daemon can poll but cannot drive sessions. " +
-        `Start one with \`veyyon gui tcp:127.0.0.1:7699\`. Searched: ${guiHostAgentDirs().join(", ")}`,
-    );
-    return 70;
   }
   return 0;
 }
@@ -151,19 +141,8 @@ async function reconcileOnce(dryRun = true): Promise<number> {
     return 0;
   }
 
-  const endpoint = resolveGuiHostEndpoint();
-  if (!endpoint) {
-    console.error(
-      "No GUI host endpoint discovered; cannot list live sessions. " +
-        `Searched: ${guiHostAgentDirs().join(", ")}`,
-    );
-    coordinator.close();
-    return 70;
-  }
-
   const store = new DaemonStore(getDaemonDbPath());
-  const control = new GuiHostSessionControl({
-    endpoint,
+  const control = new TerminalSessionControl({
     onEvent: () => {},
     onLog: () => {},
   });
@@ -172,14 +151,14 @@ async function reconcileOnce(dryRun = true): Promise<number> {
   try {
     wireSessions = await control.listSessions();
   } catch (err) {
-    console.error(`Failed to list live sessions from GUI host at ${endpoint}: ${err instanceof Error ? err.message : String(err)}`);
+    console.error(`Failed to list live terminal owners: ${err instanceof Error ? err.message : String(err)}`);
     control.close();
     store.close();
     coordinator.close();
     return 1;
   }
 
-  console.log(`[Auto-attach ${dryRun ? "DRY RUN" : "LIVE"}] Host: ${endpoint} | Live wire sessions: ${wireSessions.length}`);
+  console.log(`[Auto-attach ${dryRun ? "DRY RUN" : "LIVE"}] Live terminal owners: ${wireSessions.length}`);
 
   for (const slot of forumSlots) {
     const isEnabled = slot.autoAttach !== false;
@@ -233,7 +212,7 @@ const isDryRun = rawArgs.includes("--dry-run");
 
 let exitCode = 0;
 if (isReconcileOnce) {
-  exitCode = await reconcileOnce(isDryRun || !rawArgs.includes("--live"));
+  exitCode = await reconcileOnce(true);
 } else {
   const verb = rawArgs[0] ?? "run";
   exitCode = verb === "run"

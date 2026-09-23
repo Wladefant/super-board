@@ -1,4 +1,4 @@
-import { createClient, UNAVAILABLE_MESSAGE, REOPEN_MESSAGE, SECTIONS, getUnavailableState, TerminalAuthError, isTerminalAuthError } from './client.js';
+import { createClient, REOPEN_MESSAGE, SECTIONS, getUnavailableState, TerminalAuthError } from './client.js';
 const app = window.Telegram?.WebApp;
 app?.ready(); app?.expand();
 const byId = id => document.getElementById(id);
@@ -32,27 +32,6 @@ async function refresh() {
     if (!data.sessions) empty('sessions', 'Session host unavailable.');
     else if (!data.sessions.length) empty('sessions', 'No sessions reported by the host.');
     else for (const session of data.sessions) card('sessions', session.title || session.id, session.cwd || session.workspace || '', session.id === data.session ? 'Attached to this chat' : session.id);
-    if (!data.approvals) empty('approvals', 'Attach this chat to a session using /attach before reviewing approvals.');
-    else if (!data.approvals.length) empty('approvals', 'No pending approvals for the attached session.');
-    else for (const approval of data.approvals) {
-      const node = card('approvals', approval.requester || 'Approval request', [approval.command, approval.target, approval.reason, approval.task].filter(Boolean).join('\n'), `Expires ${new Date(approval.expiresAt).toLocaleTimeString()}`);
-      for (const [text, decision] of [['Yes', 'approved'], ['No', 'denied']]) {
-        const button = document.createElement('button'); button.textContent = text; button.disabled = decision === 'approved' && !approval.approvable;
-        button.onclick = async () => {
-          node.querySelectorAll('button').forEach(b => { b.disabled = true; });
-          try { await request('/api/approval', { token: approval.token, decision }); await refresh(); }
-          catch (error) {
-            if (isTerminalAuthError(error)) {
-              unavailable(error.message || REOPEN_MESSAGE);
-              return;
-            }
-            byId('notice').textContent = error.message;
-            await refresh();
-          }
-        };
-        node.append(button);
-      }
-    }
     const snapshot = data.dashboard;
     const stale = !snapshot || Date.now() - snapshot.observedAt > 300000;
     byId('freshness').textContent = stale ? 'Stale / unavailable' : `Reported ${new Date(snapshot.observedAt).toLocaleTimeString()}`;

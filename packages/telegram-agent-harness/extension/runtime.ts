@@ -1,7 +1,7 @@
 /**
  * runtime.ts — Dynamic Telegram Runtime implementation for Veyyon.
  *
- * Encapsulates the stateful bot coordinator, poller, dangerous tool guard,
+ * Encapsulates the stateful bot coordinator, poller,
  * and correlation bridges. Instantiated dynamically by the thin extension loader
  * in index.ts so that code updates can be hot-reloaded in-process.
  */
@@ -14,23 +14,33 @@ import type {
   MessageUpdateEvent,
   SessionShutdownEvent,
   SessionStartEvent,
-  ToolCallEvent,
 } from "@veyyon/coding-agent";
 import { BotPoolCoordinator } from "./coordinator";
-import { DangerousToolGuard, approveOperation } from "./guard";
-import { decideApproval, parseApprovalCallback, approvalOutcome } from "./approvals";
 import { TelegramPoller, type PollerCallbacks, type PollerOptions } from "./poller";
 import { chunkMessage, escapeHtml, markdownToTelegramHtml } from "./sanitizer";
 import type { AccessConfig, DiscoveredSlot, MessageCorrelationBridge } from "./types";
-import { handleInstalledCommand, renderApprovalRequest } from "./harness/installed-commands";
+import { handleInstalledCommand } from "./harness/installed-commands";
 import { BunCommandRunner, type CommandRunner } from "./harness/command-runner";
 import { latestSessionPng } from "./harness/session-artifacts";
 import { OperatorQuestionService } from "./harness/operator-questions";
+
+/** A forum chat is not an operator account; callback ownership must name a user. */
+function questionOperator(access: AccessConfig, chatId: string): string {
+  if (!chatId.startsWith("-") && access.allowFrom.includes(chatId)) return chatId;
+  const group = access.groups?.[chatId];
+  const operators = group
+    ? access.allowFrom.filter(id => !id.startsWith("-") && (!group.allowFrom || group.allowFrom.includes(id)))
+    : [];
+  if (operators.length !== 1) throw new Error("Question route requires exactly one authorized operator for this forum.");
+  return operators[0];
+}
 import { MessageContextStore } from "./harness/message-context";
 import { LiveDashboard, type DashboardSnapshot } from "./harness/live-dashboard";
 import { readMessageThreadId } from "./harness/channel-config";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Database } from "bun:sqlite";
+import * as fs from "node:fs";
 
 export const ACTIVE_ROOT_SYMBOL = Symbol.for("veyyon.telegram.active_root");
 export const ACTIVE_LEASE_SYMBOL = Symbol.for("veyyon.telegram.active_lease");
@@ -41,7 +51,6 @@ export interface ActiveRootState {
   slotId: string;
   pi: ExtensionAPI;
   poller: TelegramPoller;
-  guard: DangerousToolGuard;
   coordinator: BotPoolCoordinator;
   activeSlot: DiscoveredSlot;
   questions?: OperatorQuestionService;
@@ -73,6 +82,58 @@ export function isEligibleRootSession(ctx: ExtensionContext): boolean {
     !ctx.parentTaskPrefix,
   );
 }
+interface DaemonRouteInfo {
+  slot: DiscoveredSlot;
+  token: string;
+  chatId: string;
+  topicId: string;
+}
+
+function findDaemonRoute(
+  coordinator: BotPoolCoordinator,
+  sessionId?: string,
+  workspace?: string,
+): DaemonRouteInfo | null {
+  try {
+    const dbPath = process.env.VEYYON_TELEGRAM_DAEMON_DB || path.join(os.homedir(), ".veyyon", "telegram", "daemon.db");
+    if (!fs.existsSync(dbPath)) return null;
+    const db = new Database(dbPath, { readonly: true });
+    try {
+      let row = sessionId
+        ? db.query<{ slot_id: string; chat_id: string; topic_id: string }, [string]>(
+            "SELECT slot_id, chat_id, topic_id FROM routes WHERE session_id = ? AND topic_id != '' LIMIT 1",
+          ).get(sessionId)
+        : null;
+      if (!row && workspace) {
+        const normWs = workspace.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+        const all = db.query<{ slot_id: string; chat_id: string; topic_id: string; workspace: string }, []>(
+          "SELECT slot_id, chat_id, topic_id, workspace FROM routes WHERE topic_id != ''",
+        ).all();
+        row = all.find(r => r.workspace && r.workspace.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase() === normWs) ?? null;
+      }
+      if (!row) return null;
+
+      const slots = coordinator.syncSlots();
+      const slot = slots.find(s => s.slotId === row!.slot_id);
+      if (!slot) return null;
+
+      const token = coordinator.readRawTokenForSlot(slot.stateDir);
+      if (!token) return null;
+
+      return {
+        slot,
+        token,
+        chatId: row.chat_id,
+        topicId: row.topic_id,
+      };
+    } finally {
+      db.close();
+    }
+  } catch {
+    return null;
+  }
+}
+
 
 export function getStatusSummary(ctx: ExtensionContext, slot: DiscoveredSlot | null, sessionId: string): string {
   const modelName = ctx.model?.id ?? "default";
@@ -116,7 +177,6 @@ export class TelegramRuntime {
   private outboundQueue: Promise<void> = Promise.resolve();
 
   private poller: TelegramPoller | null = null;
-  private guard: DangerousToolGuard | null = null;
   private coordinator: BotPoolCoordinator | null = null;
   private activeSlot: DiscoveredSlot | null = null;
   private accessConfig: AccessConfig | null = null;
@@ -125,6 +185,8 @@ export class TelegramRuntime {
   private messageContext: MessageContextStore | null = null;
   private dashboard: LiveDashboard | null = null;
   private isDisposed = false;
+  private isDaemonClient = false;
+  private cwd: string | null = null;
 
   constructor(pi: ExtensionAPI, options: TelegramRuntimeOptions = {}) {
     this.pi = pi;
@@ -198,7 +260,7 @@ export class TelegramRuntime {
 
   private async syncAssistantOutput(targetText: string): Promise<void> {
     return this.queueOutbound(async () => {
-      if (this.isDisposed || !this.poller || !targetText.trim()) return;
+      if (this.isDisposed || this.isDaemonManaged() || !this.poller || !targetText.trim()) return;
 
       const primaryChat = this.getPrimaryChatId();
       if (!primaryChat) return;
@@ -260,6 +322,15 @@ export class TelegramRuntime {
 
   public async initSession(ctx: ExtensionContext, opts?: { isReload?: boolean }): Promise<boolean> {
     if (!isEligibleRootSession(ctx)) {
+      this.pi.logger?.warn(`[Telegram Runtime] Session ineligible: ${JSON.stringify({
+        hasUI: ctx.hasUI,
+        isSubagent: ctx.isSubagent,
+        taskDepth: ctx.taskDepth,
+        parentTaskPrefix: ctx.parentTaskPrefix,
+        sessionId: ctx.sessionManager.getSessionId(),
+        cwd: ctx.cwd,
+        runtimeUrl: import.meta.url,
+      })}`);
       return false;
     }
 
@@ -283,11 +354,13 @@ export class TelegramRuntime {
         delete globalState[ACTIVE_ROOT_SYMBOL];
         delete globalState[ACTIVE_LEASE_SYMBOL];
       } else if (existingRoot.sessionId === newSessionId) {
+        this.pi.logger?.warn(`[Telegram Runtime] Session already owned by runtime ${existingRoot.instanceId}; requested ${this.instanceId}, session ${newSessionId}.`);
         if (existingRoot.activeSlot && existingRoot.sessionId !== newSessionId) {
           this.repointLeaseOrRelinquish(existingRoot, newSessionId, ctx.cwd);
         }
         return false;
       } else {
+        this.pi.logger?.warn(`[Telegram Runtime] Root ownership conflict: active session ${existingRoot.sessionId}, requested ${newSessionId}.`);
         return false;
       }
     }
@@ -295,29 +368,48 @@ export class TelegramRuntime {
     const coordinator = this.options.coordinatorFactory ? this.options.coordinatorFactory() : new BotPoolCoordinator();
     const claim = await coordinator.acquireLease(newSessionId, ctx.cwd, process.pid);
 
+    let activeSlot: DiscoveredSlot;
+    let token: string;
+    let isDaemonClient = false;
+    let daemonRoute: DaemonRouteInfo | null = null;
+
     if (!claim.ok || !claim.slot) {
-      this.pi.logger?.warn(
-        `Telegram bot lease not acquired for session ${newSessionId}: ${claim.reason || "Pool busy"}`,
-      );
-      coordinator.close();
-      return false;
-    }
-
-    const activeSlot = claim.slot;
-    const token = coordinator.readRawTokenForSlot(activeSlot.stateDir);
-
-    if (!token) {
-      coordinator.releaseLease(activeSlot.slotId, newSessionId, process.pid);
-      coordinator.close();
-      this.pi.logger?.warn(`Telegram bot token missing for slot ${activeSlot.slotId}. Released lease.`);
-      return false;
+      daemonRoute = findDaemonRoute(coordinator, newSessionId, ctx.cwd);
+      if (daemonRoute) {
+        isDaemonClient = true;
+        activeSlot = daemonRoute.slot;
+        token = daemonRoute.token;
+      } else {
+        this.pi.logger?.warn(
+          `Telegram bot lease not acquired for session ${newSessionId}: ${claim.reason || "Pool busy"}`,
+        );
+        coordinator.close();
+        return false;
+      }
+    } else {
+      activeSlot = claim.slot;
+      const rawToken = coordinator.readRawTokenForSlot(activeSlot.stateDir);
+      if (!rawToken) {
+        coordinator.releaseLease(activeSlot.slotId, newSessionId, process.pid);
+        coordinator.close();
+        this.pi.logger?.warn(`Telegram bot token missing for slot ${activeSlot.slotId}. Released lease.`);
+        return false;
+      }
+      token = rawToken;
     }
 
     this.coordinator = coordinator;
     this.activeSlot = activeSlot;
     this.sessionId = newSessionId;
-    this.guard = new DangerousToolGuard(activeSlot.stateDir);
+    this.cwd = ctx.cwd;
+    this.isDaemonClient = isDaemonClient;
     this.accessConfig = coordinator.readAccessConfig(activeSlot.stateDir);
+    if (isDaemonClient && daemonRoute) {
+      this.accessConfig = {
+        ...this.accessConfig,
+        allowFrom: [daemonRoute.chatId, ...this.accessConfig.allowFrom],
+      };
+    }
 
     const poolPath = process.env.VEYYON_POOL_DB || path.join(os.homedir(), ".veyyon", "telegram", "bot_pool.db");
     // Lane provenance is extra columns on the coordinator's own correlation rows. If the
@@ -364,7 +456,6 @@ export class TelegramRuntime {
       isIdle: () => ctx.isIdle(),
       getSessionFile: () => ctx.sessionManager.getSessionFile(),
       onUserMessage: (text: string) => {
-        if (this.guard) this.guard.startTelegramTurn();
         if (ctx.isIdle()) {
           this.pi.sendUserMessage(text);
         } else {
@@ -372,11 +463,9 @@ export class TelegramRuntime {
         }
       },
       onFollowUp: (text: string) => {
-        if (this.guard) this.guard.startTelegramTurn();
         this.pi.sendUserMessage(text, { deliverAs: "followUp" });
       },
       onSteer: (text: string) => {
-        if (this.guard) this.guard.startTelegramTurn();
         this.pi.sendUserMessage(text, { deliverAs: "steer" });
       },
       // Abort only. The poller owns the operator-facing cancellation reply, so
@@ -396,12 +485,6 @@ export class TelegramRuntime {
           model: ctx.model?.id,
           stateDir: activeSlot.stateDir,
         }),
-        approve: async token => {
-          if (!userId) throw new Error("Authenticated actor is missing.");
-          const record = approveOperation(activeSlot.stateDir, token, { sessionId: currentSessionId(), userId, chatId });
-          await this.pi.sendUserMessage(approvalOutcome(record), ctx.isIdle() ? undefined : { deliverAs: "steer" });
-          return record;
-        },
         send: async html => {
           if (!this.poller) throw new Error("Poller unavailable");
           const sent = await this.poller.sendTelegramMessage(chatId, html);
@@ -415,7 +498,6 @@ export class TelegramRuntime {
           return sessionFile ? latestSessionPng(sessionFile) : null;
         },
         inbound: async (message, idle) => {
-          if (this.guard) this.guard.startTelegramTurn();
           if (idle) this.pi.sendUserMessage(message);
           else this.pi.sendUserMessage(message, { deliverAs: "steer" });
         },
@@ -427,16 +509,6 @@ export class TelegramRuntime {
           }
         },
       }, runner),
-      onApprovalCallback: async (data: string, userId: string, chatId: string, sessionId: string) => {
-        const selection = parseApprovalCallback(data);
-        if (!selection || sessionId !== currentSessionId()) throw new Error("Invalid or foreign-session approval callback.");
-        const record = decideApproval(activeSlot.stateDir, selection.token, selection.decision, { sessionId, userId, chatId });
-        await this.pi.sendUserMessage(approvalOutcome(record), ctx.isIdle() ? undefined : { deliverAs: "steer" });
-        return approvalOutcome(record);
-      },
-      onTelegramTurnStart: () => {
-        if (this.guard) this.guard.startTelegramTurn();
-      },
       // The service is constructed after the poller it writes through, so the
       // receiver is resolved per answer rather than captured at wiring time.
       onQuestionAnswer: async (decisionId: string, eventId: string, answer: { choice?: string; text?: string }) => {
@@ -444,7 +516,6 @@ export class TelegramRuntime {
         await this.questions.answer(decisionId, eventId, answer);
       },
       onDecisionCallback: async (decisionId: string, choiceId: string, context?: string) => {
-        if (this.guard) this.guard.startTelegramTurn();
         const decisionSessionId = currentSessionId();
         const canonicalResolved = await this.coordinator?.applyDecisionAnswer(
           decisionSessionId,
@@ -478,24 +549,37 @@ export class TelegramRuntime {
     };
 
     let messageThreadId: number | undefined;
-    try {
-      messageThreadId = readMessageThreadId(activeSlot.stateDir);
-    } catch (err: unknown) {
-      coordinator.releaseLease(activeSlot.slotId, newSessionId, process.pid);
-      coordinator.close();
-      messageContext?.close();
-      this.messageContext = null;
-      this.coordinator = null;
-      this.pi.logger?.warn(
-        `Telegram slot ${activeSlot.slotId} not attached: ${err instanceof Error ? err.message : String(err)}. Fix access.json before the channel can bind to its topic.`,
-      );
-      return false;
+    if (isDaemonClient && daemonRoute?.topicId) {
+      messageThreadId = Number(daemonRoute.topicId);
+    } else {
+      try {
+        messageThreadId = readMessageThreadId(activeSlot.stateDir);
+      } catch (err: unknown) {
+        if (!isDaemonClient) {
+          coordinator.releaseLease(activeSlot.slotId, newSessionId, process.pid);
+          coordinator.close();
+          messageContext?.close();
+          this.messageContext = null;
+          this.coordinator = null;
+          this.pi.logger?.warn(
+            `Telegram slot ${activeSlot.slotId} not attached: ${err instanceof Error ? err.message : String(err)}. Fix access.json before the channel can bind to its topic.`,
+          );
+          return false;
+        }
+      }
     }
-    const pollerOptions: PollerOptions | undefined = messageThreadId === undefined ? undefined : { messageThreadId };
+    const pollerOptions: PollerOptions | undefined = {
+      ...(messageThreadId !== undefined ? { messageThreadId } : {}),
+      slotId: activeSlot.slotId,
+    };
 
     const poller = this.options.pollerFactory
       ? this.options.pollerFactory(token, activeSlot.stateDir, this.accessConfig, pollerCallbacks, correlationBridge, pollerOptions)
       : new TelegramPoller(token, activeSlot.stateDir, this.accessConfig, pollerCallbacks, correlationBridge, pollerOptions);
+
+    if (isDaemonClient && daemonRoute) {
+      poller.setPrimaryChatId(daemonRoute.chatId);
+    }
 
     this.poller = poller;
 
@@ -504,7 +588,7 @@ export class TelegramRuntime {
       () => {
         const chat = poller.getPrimaryChatId();
         if (!chat) throw new Error("No authorized operator chat for this session");
-        return { session_id: currentSessionId(), chat_id: chat, user_id: chat };
+        return { session_id: currentSessionId(), chat_id: chat, user_id: questionOperator(this.accessConfig, chat) };
       },
       path.join(os.homedir(), ".veyyon", "workflows", "decisions.json"),
       poolPath,
@@ -523,7 +607,6 @@ export class TelegramRuntime {
       slotId: activeSlot.slotId,
       pi: this.pi,
       poller,
-      guard: this.guard,
       coordinator,
       activeSlot,
       questions,
@@ -531,15 +614,15 @@ export class TelegramRuntime {
       dashboard,
     };
 
-    questions.start();
-    dashboard.start();
 
     globalState[ACTIVE_LEASE_SYMBOL] = {
       slotId: activeSlot.slotId,
       sessionId: newSessionId,
     };
 
-    void poller.start();
+    if (!isDaemonClient) {
+      void poller.start();
+    }
 
     if (!opts?.isReload) {
       const primaryChatId = poller.getPrimaryChatId();
@@ -573,7 +656,24 @@ export class TelegramRuntime {
     this.repointLeaseOrRelinquish(root, switchedSessionId, ctx.cwd);
   }
 
+  private isDaemonManaged(): boolean {
+    if (this.isDaemonClient) return true;
+    if (this.activeSlot?.daemon === true) {
+      this.isDaemonClient = true;
+      return true;
+    }
+    if (this.coordinator && this.sessionId) {
+      const route = findDaemonRoute(this.coordinator, this.sessionId, this.cwd ?? undefined);
+      if (route) {
+        this.isDaemonClient = true;
+        return true;
+      }
+    }
+    return false;
+  }
+
   public async onMessageStart(event: { message: { role: string } }): Promise<void> {
+    if (this.isDaemonManaged()) return;
     if (event.message.role === "assistant") {
       this.accumulatedAssistantText = "";
       this.sentTelegramMessageIds = [];
@@ -583,6 +683,7 @@ export class TelegramRuntime {
 
   public async onMessageUpdate(event: MessageUpdateEvent): Promise<void> {
     if (event.message.role !== "assistant") return;
+    if (this.isDaemonManaged()) return;
     const streamEvent = event.assistantMessageEvent;
 
     if (streamEvent.type === "text_delta" && streamEvent.delta) {
@@ -603,6 +704,7 @@ export class TelegramRuntime {
 
   public async onMessageEnd(event: MessageEndEvent): Promise<void> {
     if (event.message.role !== "assistant") return;
+    if (this.isDaemonManaged()) return;
 
     if (this.streamDebounceTimer) {
       clearTimeout(this.streamDebounceTimer);
@@ -624,64 +726,6 @@ export class TelegramRuntime {
     this.accumulatedAssistantText = "";
   }
 
-  public async onToolCall(event: ToolCallEvent, ctx: ExtensionContext): Promise<{ block: boolean; reason: string } | void> {
-    // Only the guard and the session identity are required to judge a call. A channel that
-    // never attached (bad access.json, stopped poller, disposed runtime) must not turn the
-    // gate off: it costs the operator the approval card, not the block.
-    if (!this.guard || !this.sessionId) return;
-
-    const evaluation = this.guard.evaluateToolCall(
-      event.toolName,
-      event.input as Record<string, unknown>,
-      undefined,
-      {
-        sessionId: this.sessionId,
-        requester: ctx.agentId ?? "Main (interactive root agent)",
-        task: String(
-          event.input.i ??
-          event.input.task ??
-          event.input.description ??
-          event.input.title ??
-          `Run ${event.toolName}; no task description supplied`
-        ),
-        cwd: ctx.cwd,
-        toolCallId: event.toolCallId,
-      },
-    );
-
-    if (evaluation.allowed) return;
-
-    const chatId = this.poller?.getPrimaryChatId();
-    let cardDelivered = false;
-    if (chatId && evaluation.approval) {
-      const card = renderApprovalRequest(evaluation.approval);
-      try {
-        const chunks = chunkMessage(card.text);
-        for (let n = 0; n < chunks.length; n++) {
-          const sent = await this.poller?.sendTelegramMessage(chatId, chunks[n], "HTML", n === chunks.length - 1 ? card.replyMarkup : undefined);
-          if (!sent?.ok) break;
-          cardDelivered = n === chunks.length - 1;
-        }
-      } catch {}
-    }
-
-    const reason = evaluation.reason ?? "Sensitive operation requires operator approval.";
-    return {
-      block: true,
-      reason: evaluation.approval && !cardDelivered
-        ? `${reason} The Telegram approval card could not be delivered, so no approval is pending; ask the operator to approve out of band or narrow the operation.`
-        : reason,
-    };
-  }
-
-  public async onAgentEnd(): Promise<void> {
-    if (this.guard) this.guard.endTurn();
-  }
-
-  public async onTurnEnd(): Promise<void> {
-    if (this.guard) this.guard.endTurn();
-  }
-
   public async onSessionShutdown(_event: SessionShutdownEvent): Promise<void> {
     await this.dispose();
   }
@@ -689,6 +733,8 @@ export class TelegramRuntime {
   public async dispose(): Promise<void> {
     if (this.isDisposed) return;
     this.isDisposed = true;
+    this.isDaemonClient = false;
+    this.cwd = null;
 
     try {
       if (this.streamDebounceTimer) {
