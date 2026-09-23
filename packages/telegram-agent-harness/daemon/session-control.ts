@@ -45,7 +45,7 @@ export function isProcessAlive(pid: number): boolean {
   }
 }
 
-export function discoverOwners(configRoot?: string): Owner[] {
+export function discoverConfigRoots(configRoot?: string): string[] {
   const root = configRoot ?? path.join(os.homedir(), process.env.VEYYON_CONFIG_DIR?.trim() || ".veyyon");
   const roots = [root];
   const profiles = path.join(root, "profiles");
@@ -54,6 +54,59 @@ export function discoverOwners(configRoot?: string): Owner[] {
       if (profile.isDirectory()) roots.push(path.join(profiles, profile.name));
     }
   }
+  return roots;
+}
+
+export function resolveSessionsRoots(configRoot?: string): string[] {
+  const roots = discoverConfigRoots(configRoot);
+  const sessionRoots: string[] = [];
+  for (const root of roots) {
+    const agentSessions = path.join(root, "agent", "sessions");
+    if (fs.existsSync(agentSessions)) sessionRoots.push(agentSessions);
+    const directSessions = path.join(root, "sessions");
+    if (fs.existsSync(directSessions)) sessionRoots.push(directSessions);
+  }
+  return sessionRoots;
+}
+
+export function findSessionFile(sessionId: string, sessionsRoots?: string[]): string | null {
+  const roots = sessionsRoots ?? resolveSessionsRoots();
+  for (const sessionsRoot of roots) {
+    if (!fs.existsSync(sessionsRoot)) continue;
+    try {
+      const entries = fs.readdirSync(sessionsRoot, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.isDirectory()) {
+          const projectDir = path.join(sessionsRoot, entry.name);
+          try {
+            const files = fs.readdirSync(projectDir);
+            for (const file of files) {
+              if (file.endsWith(".jsonl") && (file.endsWith(`_${sessionId}.jsonl`) || file === `${sessionId}.jsonl`)) {
+                return path.join(projectDir, file);
+              }
+            }
+          } catch {}
+        } else if (entry.isFile()) {
+          if (entry.name.endsWith(".jsonl") && (entry.name.endsWith(`_${sessionId}.jsonl`) || entry.name === `${sessionId}.jsonl`)) {
+            return path.join(sessionsRoot, entry.name);
+          }
+        }
+      }
+    } catch {}
+  }
+  return null;
+}
+
+export function getProjectKeyFromSessionPath(sessionPath?: string | null): string | null {
+  if (!sessionPath) return null;
+  const norm = sessionPath.replace(/\\/g, "/").replace(/\/+$/, "");
+  const parts = norm.split("/").filter(Boolean);
+  if (parts.length < 2) return null;
+  return parts[parts.length - 2] ?? null;
+}
+
+export function discoverOwners(configRoot?: string): Owner[] {
+  const roots = discoverConfigRoots(configRoot);
   const owners: Owner[] = [];
   for (const profileRoot of roots) {
     const directory = path.join(profileRoot, "run", "terminals");
@@ -157,6 +210,7 @@ export class TerminalSessionControl {
   private connections = new Map<string, Promise<TerminalConnection>>();
   private streaming = new Set<string>();
   constructor(private readonly options: SessionControlOptions) {}
+  get configRoot(): string | undefined { return this.options.configRoot; }
   isBusy(sessionId: string): boolean { return this.streaming.has(sessionId); }
   async listSessions(): Promise<DaemonSessionSummary[]> {
     const owners = discoverOwners(this.options.configRoot);

@@ -22,7 +22,13 @@
 import * as path from "node:path";
 import { escapeHtml } from "../extension/sanitizer";
 import type { DaemonSlot } from "./config";
-import type { DaemonSessionSummary, TerminalSessionControl } from "./session-control";
+import {
+  findSessionFile,
+  getProjectKeyFromSessionPath,
+  resolveSessionsRoots,
+  type DaemonSessionSummary,
+  type TerminalSessionControl,
+} from "./session-control";
 import {
   getSessionWorkspace,
   isTopLevelSession,
@@ -183,6 +189,8 @@ export interface ForumManagerOptions {
   fetch?: typeof fetch;
   client?: ForumApiClient;
   log?: (message: string) => void;
+  configRoot?: string;
+  sessionsRoots?: string[];
 }
 
 /**
@@ -386,8 +394,22 @@ export class ForumManager implements TopicLifecycle {
     for (const r of allRoutes) {
       routesBySessionId.set(r.sessionId, r);
     }
+    // Dead routes: candidate routes for this slot/chat with non-empty topicId whose sessionId is NOT live
+    const availableDeadRoutes = allRoutes.filter(r => r.topicId !== "" && !liveSessionIds.has(r.sessionId));
+    availableDeadRoutes.sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
 
-
+    // Cache session file -> project key lookups per reconcile
+    const sessionsRoots = this.options.sessionsRoots ?? resolveSessionsRoots(this.options.configRoot ?? this.options.control.configRoot);
+    const deadSessionProjectKeyCache = new Map<string, string | null>();
+    const getDeadRouteProjectKey = (sessionId: string): string | null => {
+      if (deadSessionProjectKeyCache.has(sessionId)) {
+        return deadSessionProjectKeyCache.get(sessionId)!;
+      }
+      const file = findSessionFile(sessionId, sessionsRoots);
+      const key = getProjectKeyFromSessionPath(file);
+      deadSessionProjectKeyCache.set(sessionId, key);
+      return key;
+    };
     // Count live sessions per folder that already have a topic
     const liveCountByFolder = new Map<string, number>();
     for (const s of liveSessions) {
@@ -420,7 +442,8 @@ export class ForumManager implements TopicLifecycle {
       const ws = getSessionWorkspace(session);
       const folder = workspaceFolder(ws);
       const folderKey = folder.toLowerCase();
-
+      const normWs = normalizeWorkspace(ws).toLowerCase();
+      const liveProjectKey = getProjectKeyFromSessionPath(session.path);
       // Session was explicitly detached — skip auto-attach until explicitly re-attached
       if (this.isDetached(session.id)) {
         actions.push({
@@ -449,7 +472,93 @@ export class ForumManager implements TopicLifecycle {
         skippedCount++;
         continue;
       }
+      // Match dead route in priority order:
+      // (a) same project key = parent directory basename of the session file
+      // (b) same normalized full workspace path, case-insensitive, with \ and / treated the same
+      // (c) same workspace folder basename
+      // If several match, the most recently updated is selected because availableDeadRoutes is sorted by recency descending.
+      let deadIndex = -1;
+      if (liveProjectKey) {
+        deadIndex = availableDeadRoutes.findIndex(r => {
+          const deadKey = getDeadRouteProjectKey(r.sessionId);
+          return deadKey !== null && deadKey.toLowerCase() === liveProjectKey.toLowerCase();
+        });
+      }
+      if (deadIndex === -1) {
+        deadIndex = availableDeadRoutes.findIndex(
+          r => normalizeWorkspace(r.workspace).toLowerCase() === normWs,
+        );
+      }
+      if (deadIndex === -1) {
+        deadIndex = availableDeadRoutes.findIndex(
+          r => workspaceFolder(r.workspace).toLowerCase() === folderKey,
+        );
+      }
+      if (deadIndex === -1) {
+        deadIndex = availableDeadRoutes.findIndex(
+          r => workspaceFolder(r.workspace).toLowerCase().replace(/[-_]/g, "") === folderKey.replace(/[-_]/g, ""),
+        );
+      }
 
+      if (deadIndex >= 0) {
+        const deadRoute = availableDeadRoutes.splice(deadIndex, 1)[0];
+        const threadId = Number(deadRoute.topicId);
+
+        actions.push({
+          action: "rebind",
+          sessionId: session.id,
+          workspace: ws,
+          folder,
+          topicId: threadId,
+          reason: `rebound from dead session ${deadRoute.sessionId}`,
+        });
+
+        if (dryRun) {
+          reboundCount++;
+          continue;
+        }
+
+        if (this.isWorkspaceInBackoff(ws)) {
+          this.log(`Auto-attach skipping workspace ${ws} (session ${session.id}) due to active error backoff`);
+          continue;
+        }
+
+        try {
+          this.options.store.putRoute({
+            slotId: this.slotId,
+            chatId: this.forumChatId,
+            topicId: deadRoute.topicId,
+            sessionId: session.id,
+            workspace: ws,
+          });
+          routesBySessionId.set(session.id, {
+            slotId: this.slotId,
+            chatId: this.forumChatId,
+            topicId: deadRoute.topicId,
+            sessionId: session.id,
+            workspace: ws,
+            createdAt: deadRoute.createdAt ?? Date.now(),
+            updatedAt: Date.now(),
+          });
+
+          const note = `🔁 <b>Rebound to session</b> <code>${escapeHtml(session.id)}</code>`;
+          await this.client.sendMessage(this.forumChatId, note, {
+            message_thread_id: threadId,
+            parse_mode: "HTML",
+          }).catch(err => {
+            this.log(`Could not send rebind note to topic #${threadId}: ${err instanceof Error ? err.message : String(err)}`);
+          });
+
+          await bind({ chatId: this.forumChatId, topicId: deadRoute.topicId }, session.id, ws);
+          this.clearWorkspaceBackoff(ws);
+          this.log(`Reused forum topic #${threadId} for workspace ${ws} (rebound to session ${session.id})`);
+          reboundCount++;
+        } catch (err) {
+          errorCount++;
+          this.recordWorkspaceError(ws, err);
+          this.log(`Auto-attach rebind failed for workspace ${ws} (session ${session.id}): ${err instanceof Error ? err.message : String(err)}`);
+        }
+      } else {
         // No dead route: create a new topic
         const currentCount = liveCountByFolder.get(folderKey) ?? 0;
         const ordinal = currentCount + 1;
@@ -518,6 +627,7 @@ export class ForumManager implements TopicLifecycle {
           this.recordWorkspaceError(ws, err);
           this.log(`Auto-attach failed to create topic for workspace ${ws} (session ${session.id}): ${err instanceof Error ? err.message : String(err)}`);
         }
+      }
     }
 
     return { actions, created: createdCount, rebound: reboundCount, skipped: skippedCount, errors: errorCount };

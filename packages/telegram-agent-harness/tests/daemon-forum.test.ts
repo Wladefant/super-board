@@ -155,6 +155,7 @@ describe("ForumManager topic lifecycle", () => {
       store,
       control: fake.control,
       client,
+      sessionsRoots: [path.join(tempDir, "sessions")],
     });
   });
 
@@ -289,23 +290,174 @@ describe("ForumManager topic lifecycle", () => {
     expect(welcome?.text).toContain("live-sess-1");
   });
 
-  test("missing owner endpoint never authorizes reassigning its topic to another session", async () => {
+  test("auto-attach: new session with same project dir reuses dead route topic even with different cwd folder", async () => {
+    const sessionsDir = path.join(tempDir, "sessions", "-OneDrive-Desktop-ing");
+    fs.mkdirSync(sessionsDir, { recursive: true });
+    fs.writeFileSync(path.join(sessionsDir, "2026-08-26T19-33-36-208Z_01a03f90-4b50-7252-8f78-aeb9462e7319.jsonl"), "");
+
     store.putRoute({
-      slotId: "slot-forum", chatId: FORUM_CHAT_ID, topicId: "77",
-      sessionId: "temporarily-unavailable-owner", workspace: "C:/dev/my-project",
+      slotId: "slot-forum",
+      chatId: FORUM_CHAT_ID,
+      topicId: "48",
+      sessionId: "01a03f90-4b50-7252-8f78-aeb9462e7319",
+      workspace: "E:/wt-lane-802",
     });
-    client.topics.set(77, { name: "my-project", closed: false });
+    client.topics.set(48, { name: "ING", closed: false });
+
+    const liveSessionFile = path.join(sessionsDir, "2026-09-23T07-54-29-796Z_01a0cd42-4e24-7697-a49c-0c5c1ce6f404.jsonl");
+    fs.writeFileSync(liveSessionFile, "");
+
     fake.sessions.push({
-      id: "live-sess-2", cwd: "C:/dev/my-project", workspace: "C:/dev/my-project",
-      title: "New Session", status: "Idle", modifiedAtMs: Date.now(),
+      id: "01a0cd42-4e24-7697-a49c-0c5c1ce6f404",
+      cwd: "E:/wt-fresh-basis",
+      workspace: "E:/wt-fresh-basis",
+      path: liveSessionFile,
+      title: null,
+      status: "Idle",
+      modifiedAtMs: Date.now(),
     });
+
+    const res = await manager.reconcileAutoAttach();
+    expect(res.rebound).toBe(1);
+    expect(res.created).toBe(0);
+    expect(client.topics.size).toBe(1);
+    expect(client.topics.get(48)?.name).toBe("ING");
+
+    const route = store.getRoute("slot-forum", FORUM_CHAT_ID, "48");
+    expect(route?.sessionId).toBe("01a0cd42-4e24-7697-a49c-0c5c1ce6f404");
+    expect(route?.workspace).toBe("E:/wt-fresh-basis");
+    expect(fake.loaded).toContain("01a0cd42-4e24-7697-a49c-0c5c1ce6f404");
+
+    const note = client.sentMessages.find(m => m.messageThreadId === 48);
+    expect(note?.text).toContain("Rebound to session");
+    expect(note?.text).toContain("01a0cd42-4e24-7697-a49c-0c5c1ce6f404");
+  });
+
+  test("auto-attach: route bound to still-live session is never stolen", async () => {
+    store.putRoute({
+      slotId: "slot-forum",
+      chatId: FORUM_CHAT_ID,
+      topicId: "10",
+      sessionId: "live-sess-1",
+      workspace: "C:/dev/proj",
+    });
+    client.topics.set(10, { name: "proj", closed: false });
+
+    fake.sessions.push(
+      {
+        id: "live-sess-1",
+        cwd: "C:/dev/proj",
+        workspace: "C:/dev/proj",
+        title: "First",
+        status: "Idle",
+        modifiedAtMs: Date.now(),
+      },
+      {
+        id: "live-sess-2",
+        cwd: "C:/dev/proj",
+        workspace: "C:/dev/proj",
+        title: "Second",
+        status: "Idle",
+        modifiedAtMs: Date.now(),
+      },
+    );
+
+    const res = await manager.reconcileAutoAttach();
+    expect(res.rebound).toBe(0);
+    expect(res.created).toBe(1);
+    expect(res.skipped).toBe(1);
+
+    expect(store.getRoute("slot-forum", FORUM_CHAT_ID, "10")?.sessionId).toBe("live-sess-1");
+    expect(client.topics.size).toBe(2);
+    expect(fake.loaded).toContain("live-sess-2");
+  });
+
+  test("auto-attach: with no match, a new topic is created", async () => {
+    store.putRoute({
+      slotId: "slot-forum",
+      chatId: FORUM_CHAT_ID,
+      topicId: "20",
+      sessionId: "dead-sess-unrelated",
+      workspace: "C:/dev/completely-unrelated-project",
+    });
+    client.topics.set(20, { name: "unrelated", closed: false });
+
+    fake.sessions.push({
+      id: "live-sess-new",
+      cwd: "C:/dev/my-brand-new-project",
+      workspace: "C:/dev/my-brand-new-project",
+      title: null,
+      status: "Idle",
+      modifiedAtMs: Date.now(),
+    });
+
     const res = await manager.reconcileAutoAttach();
     expect(res.created).toBe(1);
     expect(res.rebound).toBe(0);
     expect(client.topics.size).toBe(2);
-    expect(store.getRoute("slot-forum", FORUM_CHAT_ID, "77")?.sessionId).toBe("temporarily-unavailable-owner");
-    expect(client.sentMessages.some(m => m.messageThreadId === 77)).toBe(false);
-    expect(fake.loaded).toContain("live-sess-2");
+    expect(store.getRoute("slot-forum", FORUM_CHAT_ID, "20")?.sessionId).toBe("dead-sess-unrelated");
+  });
+
+  test("auto-attach: backslash vs forward-slash workspace still matches", async () => {
+    store.putRoute({
+      slotId: "slot-forum",
+      chatId: FORUM_CHAT_ID,
+      topicId: "30",
+      sessionId: "dead-sess-slash",
+      workspace: "C:\\dev\\slash-proj\\sub",
+    });
+    client.topics.set(30, { name: "sub", closed: false });
+
+    fake.sessions.push({
+      id: "live-sess-slash",
+      cwd: "C:/dev/slash-proj/sub",
+      workspace: "C:/dev/slash-proj/sub",
+      title: null,
+      status: "Idle",
+      modifiedAtMs: Date.now(),
+    });
+
+    const res = await manager.reconcileAutoAttach();
+    expect(res.rebound).toBe(1);
+    expect(res.created).toBe(0);
+    expect(client.topics.size).toBe(1);
+    const route = store.getRoute("slot-forum", FORUM_CHAT_ID, "30");
+    expect(route?.sessionId).toBe("live-sess-slash");
+    expect(route?.workspace).toBe("C:/dev/slash-proj/sub");
+  });
+
+  test("auto-attach: picks most recently updated dead route when several match", async () => {
+    store.putRoute({
+      slotId: "slot-forum",
+      chatId: FORUM_CHAT_ID,
+      topicId: "40",
+      sessionId: "dead-older",
+      workspace: "C:/dev/recency-test",
+    });
+    store.putRoute({
+      slotId: "slot-forum",
+      chatId: FORUM_CHAT_ID,
+      topicId: "41",
+      sessionId: "dead-newer",
+      workspace: "C:/dev/recency-test",
+    });
+    client.topics.set(40, { name: "older", closed: false });
+    client.topics.set(41, { name: "newer", closed: false });
+
+    fake.sessions.push({
+      id: "live-recency",
+      cwd: "C:/dev/recency-test",
+      workspace: "C:/dev/recency-test",
+      title: null,
+      status: "Idle",
+      modifiedAtMs: Date.now(),
+    });
+
+    const res = await manager.reconcileAutoAttach();
+    expect(res.rebound).toBe(1);
+    expect(res.created).toBe(0);
+    expect(store.getRoute("slot-forum", FORUM_CHAT_ID, "41")?.sessionId).toBe("live-recency");
+    expect(store.getRoute("slot-forum", FORUM_CHAT_ID, "40")?.sessionId).toBe("dead-older");
   });
 
   test("auto-attach: two live sessions in same folder -> ordinal topic for second", async () => {
