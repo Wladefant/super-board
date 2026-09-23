@@ -40,7 +40,7 @@ import {
   type SessionEvent,
 } from "./session-control";
 import { DaemonStore } from "./store";
-import { connectMiniApp, miniAppUrl } from "./miniapp";
+import { connectMiniApp, miniAppUrl, buildMiniAppUrl } from "./miniapp";
 import { ForumManager, type ForumApiClient, type AutoAttachResult } from "./forum";
 
 export interface DaemonSlotReport {
@@ -388,9 +388,14 @@ export class TelegramDaemon {
         const target: RouteTarget = { chatId, topicId: currentTarget().topicId };
         const send = async (html: string): Promise<void> => sendTo(target, html, "HTML");
         if (/^\/app(?:@\w+)?\s*$/i.test(text)) {
-          const url = miniAppUrl(slot.stateDir);
+          const rawUrl = miniAppUrl(slot.stateDir);
           const threadId = target.topicId ? Number(target.topicId) : undefined;
-          if (url) {
+          if (rawUrl) {
+            const boundSession = router.boundSession(target);
+            const url = buildMiniAppUrl(rawUrl, {
+              topicId: target.topicId || undefined,
+              sessionId: boundSession || undefined,
+            });
             await poller.sendTelegramMessage(
               chatId,
               "Open your Superboard dashboard",

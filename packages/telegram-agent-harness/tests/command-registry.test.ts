@@ -11,7 +11,7 @@ const originalFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = originalFetch; });
 
 interface RegisteredCommand { command: string; description: string }
-interface Registration { scope: { type: string; chat_id: string }; commands: RegisteredCommand[] }
+interface Registration { scope: { type: string; chat_id?: string }; commands: RegisteredCommand[] }
 
 test("private registration exposes exactly the supported help surface, without group scopes", async () => {
   const calls: Registration[] = [];
@@ -98,6 +98,21 @@ test("daemon registration includes /sessions, /new, /attach from daemon router",
   expect(registeredNames).toContain("detach");
   expect(registeredNames).toContain("where");
   expect(registeredNames).toContain("status");
+});
+
+test("forum registration includes chat scope for forumChatId and all_group_chats scope", async () => {
+  const calls: Registration[] = [];
+  globalThis.fetch = (async (_url, init) => {
+    calls.push(JSON.parse(String(init?.body)));
+    return Response.json({ ok: true, result: true });
+  }) as typeof fetch;
+
+  await registerTelegramCommands("1:test", ["101"], true, undefined, undefined, "-1004422647618");
+  expect(calls.map(call => call.scope)).toEqual([
+    { type: "chat", chat_id: "101" },
+    { type: "chat", chat_id: "-1004422647618" },
+    { type: "all_group_chats" },
+  ]);
 });
 
 test("command boundaries, native idle/busy delivery and release preserve the durable ledger", async () => {

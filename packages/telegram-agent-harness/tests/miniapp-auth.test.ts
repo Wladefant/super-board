@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { authenticateInitData, authenticateAppSession, issueAppSession } from "../daemon/miniapp-auth";
 import { authorizedRelay, startRelay } from "../miniapp/relay";
-import { miniAppRequest, connectMiniApp } from "../daemon/miniapp";
+import { miniAppRequest, connectMiniApp, buildMiniAppUrl } from "../daemon/miniapp";
 import { createHmac } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -58,6 +58,76 @@ test("daemon API rejects forged auth before reading state or deciding approval",
     expect(result.status).toBe(401);
   }
   expect(touched).toBe(false);
+});
+
+test("buildMiniAppUrl adds topicId and sessionId search parameters", () => {
+  const base = "https://superboard.example.com";
+  expect(buildMiniAppUrl(base, { topicId: "14", sessionId: "sess-123" }))
+    .toBe("https://superboard.example.com/?topicId=14&sessionId=sess-123");
+  expect(buildMiniAppUrl(base, { topicId: "48" }))
+    .toBe("https://superboard.example.com/?topicId=48");
+  expect(buildMiniAppUrl(base, { sessionId: "sess-abc" }))
+    .toBe("https://superboard.example.com/?sessionId=sess-abc");
+  expect(buildMiniAppUrl(base)).toBe("https://superboard.example.com/");
+});
+
+test("miniAppRequest forwards requested topicId and sessionId from query params and start_param to session resolver", async () => {
+  let observedContext: { sessionId?: string; topicId?: string } | undefined;
+  const options = {
+    stateDir: "unused", token, allowedUsers: users,
+    session: (_user: string, ctx?: { sessionId?: string; topicId?: string }) => {
+      observedContext = ctx;
+      return "resolved-session-id";
+    },
+    sessions: async () => [],
+    dashboard: () => null,
+    status: () => ({}),
+  };
+  const appSession = issueAppSession(users[0], token);
+
+  // 1. From query string (?topicId=14&sessionId=sess-1)
+  await miniAppRequest({
+    id: "r1",
+    path: "/api/state?topicId=14&sessionId=sess-1",
+    method: "GET",
+    initData: "",
+    appSession,
+    body: "",
+  }, options);
+  expect(observedContext).toEqual({ topicId: "14", sessionId: "sess-1" });
+
+  // 2. From start_param in initData (e.g. topic_58)
+  await miniAppRequest({
+    id: "r2",
+    path: "/api/state",
+    method: "GET",
+    initData: "start_param=topic_58",
+    appSession,
+    body: "",
+  }, options);
+  expect(observedContext).toEqual({ topicId: "58", sessionId: undefined });
+
+  // 3. From start_param with raw number (e.g. 876)
+  await miniAppRequest({
+    id: "r3",
+    path: "/api/state",
+    method: "GET",
+    initData: "start_param=876",
+    appSession,
+    body: "",
+  }, options);
+  expect(observedContext).toEqual({ topicId: "876", sessionId: undefined });
+
+  // 4. From start_param with session_xxx
+  await miniAppRequest({
+    id: "r4",
+    path: "/api/state",
+    method: "GET",
+    initData: "start_param=session_01a0-test",
+    appSession,
+    body: "",
+  }, options);
+  expect(observedContext).toEqual({ topicId: undefined, sessionId: "01a0-test" });
 });
 
 test("relay forwards signed API state and rejects forged browser credentials", async () => {

@@ -698,4 +698,28 @@ describe("routing commands", () => {
     expect(help).toContain("/app");
     expect(help).toContain("/reload");
   });
+
+  test("routing commands accept @bot mentions and answer to the target topic thread", async () => {
+    const sessions = [summary("sess-1", "C:/dev/alpha")];
+    const router = buildRouter({}, fakeControl(sessions).control, fakeTopics());
+    await router.bind(TOPIC_14, "sess-1", "C:/dev/alpha");
+
+    // /where@superboarddevbot inside TOPIC_14
+    expect(SlotRouter.isRoutingCommand("/where@superboarddevbot")).toBe(true);
+    expect(await router.handleCommand("/where@superboarddevbot", TOPIC_14)).toBe(true);
+    expect(sent.at(-1)?.target).toEqual(TOPIC_14);
+    expect(sent.at(-1)?.html).toContain("Topic: <b>#14</b>");
+    expect(sent.at(-1)?.html).toContain("Session: <code>sess-1</code>");
+
+    // /sessions@superboarddevbot inside TOPIC_14
+    expect(SlotRouter.isRoutingCommand("/sessions@superboarddevbot")).toBe(true);
+    expect(await router.handleCommand("/sessions@superboarddevbot", TOPIC_14)).toBe(true);
+    expect(sent.at(-1)?.target).toEqual(TOPIC_14);
+    expect(sent.at(-1)?.html).toContain("<b>alpha</b>");
+
+    // /topics@superboarddevbot inside TOPIC_14
+    expect(SlotRouter.isRoutingCommand("/topics@superboarddevbot")).toBe(true);
+    expect(await router.handleCommand("/topics@superboarddevbot", TOPIC_14)).toBe(true);
+    expect(sent.at(-1)?.target).toEqual(TOPIC_14);
+  });
 });
