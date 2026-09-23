@@ -22,7 +22,18 @@ import type { AccessConfig, DiscoveredSlot, MessageCorrelationBridge } from "./t
 import { handleInstalledCommand } from "./harness/installed-commands";
 import { BunCommandRunner, type CommandRunner } from "./harness/command-runner";
 import { latestSessionPng } from "./harness/session-artifacts";
-import { OperatorQuestionService, questionOperator } from "./harness/operator-questions";
+import { OperatorQuestionService } from "./harness/operator-questions";
+
+/** A forum chat is not an operator account; callback ownership must name a user. */
+function questionOperator(access: AccessConfig, chatId: string): string {
+  if (!chatId.startsWith("-") && access.allowFrom.includes(chatId)) return chatId;
+  const group = access.groups?.[chatId];
+  const operators = group
+    ? access.allowFrom.filter(id => !id.startsWith("-") && (!group.allowFrom || group.allowFrom.includes(id)))
+    : [];
+  if (operators.length !== 1) throw new Error("Question route requires exactly one authorized operator for this forum.");
+  return operators[0];
+}
 import { MessageContextStore } from "./harness/message-context";
 import { LiveDashboard, type DashboardSnapshot } from "./harness/live-dashboard";
 import { readMessageThreadId } from "./harness/channel-config";

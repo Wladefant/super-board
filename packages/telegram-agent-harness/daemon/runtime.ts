@@ -438,12 +438,15 @@ export class TelegramDaemon {
           return true;
         }
         return handleInstalledCommand(text, {
-          session: () => ({
-            id: router.boundSession(target) ?? leaseSessionId,
-            cwd: slot.workspace ?? "",
-            idle: !router.isBusy(target),
-            stateDir: slot.stateDir,
-          }),
+          session: () => {
+            const route = target.topicId ? this.store.getRoute(slot.slotId, target.chatId, target.topicId) : null;
+            return {
+              id: router.boundSession(target) ?? leaseSessionId,
+              cwd: route?.workspace || slot.workspace || "",
+              idle: !router.isBusy(target),
+              stateDir: slot.stateDir,
+            };
+          },
           send,
           photo: (file, caption) => poller.sendTelegramPhoto(chatId, file, caption),
           mediaGroup: (files, caption) => poller.sendMediaGroup(chatId, files, caption),
