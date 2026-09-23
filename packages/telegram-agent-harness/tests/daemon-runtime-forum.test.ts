@@ -238,4 +238,48 @@ describe("TelegramDaemon forum auto-attach runtime", () => {
       await daemon.stop();
     }
   });
+  test("/app inside a forum topic replies in that topic thread with topic context in Mini App URL", async () => {
+    createManifest(true);
+    fs.writeFileSync(
+      path.join(stateDir, "miniapp.json"),
+      JSON.stringify({ url: "https://miniapp.example.com", secret: "a".repeat(64) }),
+    );
+    const fake = fakeControl([
+      { id: "owner-topic", cwd: "C:/dev/topic", workspace: "C:/dev/topic", title: null, status: "Idle", modifiedAtMs: Date.now() },
+    ]);
+    const forumClient = new FakeForumApiClient();
+    let callbacks!: ConstructorParameters<typeof TelegramPoller>[3];
+    let thread = 101;
+    const sent: Array<Parameters<TelegramPoller["sendTelegramMessage"]>> = [];
+    const daemon = new TelegramDaemon({
+      manifestPath, poolDbPath: path.join(tempDir, "pool.db"),
+      daemonDbPath: path.join(tempDir, "daemon.db"), channelsDir: path.join(tempDir, "channels"),
+      controlFactory: () => fake.control, forumClientFactory: () => forumClient,
+      pollerFactory: (_token, _state, _access, handlers) => {
+        callbacks = handlers;
+        return Object.assign(dummyPoller(), {
+          getActiveThreadId: () => thread,
+          sendTelegramMessage: async (...args: Parameters<TelegramPoller["sendTelegramMessage"]>) => {
+            sent.push(args);
+            return { ok: true, result: { message_id: sent.length } };
+          },
+        });
+      },
+      log: () => {},
+    });
+    await daemon.start();
+    try {
+      expect(await callbacks.onHarnessCommand?.("/app@ExampleBot", FORUM_CHAT_ID, OPERATOR_ID)).toBe(true);
+      const appMsg = sent.find(args => args[1] === "Open your Superboard dashboard");
+      expect(appMsg).toBeDefined();
+      expect(appMsg?.[6]).toBe(101);
+      const markup = appMsg?.[2];
+      if (!markup || typeof markup === "string" || !("inline_keyboard" in markup)) throw new Error("Missing app button");
+      const webAppUrl = markup.inline_keyboard[0][0].web_app?.url;
+      expect(webAppUrl).toContain("topicId=101");
+      expect(webAppUrl).toBe("https://miniapp.example.com/?topicId=101&sessionId=owner-topic");
+    } finally {
+      await daemon.stop();
+    }
+  });
 });
