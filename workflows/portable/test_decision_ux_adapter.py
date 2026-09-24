@@ -847,6 +847,8 @@ class TestTelegramCallbackResolutionAndSessionProvenance(unittest.TestCase):
         data = self.mgr._load_data_unlocked()
         data["decisions"]["DEC-CB-1"]["session"] = "session-alpha-100"
         data["decisions"]["DEC-CB-1"]["session_id"] = "session-alpha-100"
+        data["decisions"]["DEC-CB-1"]["created_at"] = "2026-09-08T11:00:00+00:00"
+        data["decisions"]["DEC-CB-1"]["question_posted_at"] = "2026-09-08T11:00:00+00:00"
         self.mgr._save_data_unlocked(data)
 
     def tearDown(self):
