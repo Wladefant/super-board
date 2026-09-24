@@ -37,6 +37,8 @@ import { getDaemonCommands, SlotRouter, type RouteTarget } from "./router";
 import {
   TerminalSessionControl,
   discoverOwners,
+  findSessionFile,
+  resolveSessionsRoots,
   type SessionEvent,
 } from "./session-control";
 import { DaemonStore } from "./store";
@@ -363,6 +365,13 @@ export class TelegramDaemon {
     const runner = new BunCommandRunner();
     const callbacks = {
       isIdle: () => !router.isBusy(currentTarget()),
+      // Inbound photos/documents are saved beside the routed session's transcript,
+      // so the session that receives the message can read the attachment.
+      getSessionFile: () => {
+        const sessionId = router.boundSession(currentTarget());
+        if (!sessionId) return undefined;
+        return findSessionFile(sessionId, resolveSessionsRoots(this.control.configRoot)) ?? undefined;
+      },
       onUserMessage: (text: string) => {
         void this.acknowledge(router, currentTarget(), text, "auto");
       },

@@ -282,4 +282,36 @@ describe("TelegramDaemon forum auto-attach runtime", () => {
       await daemon.stop();
     }
   });
+  test("inbound attachments resolve the transcript directory of the session bound to the topic", async () => {
+    createManifest(true);
+    const configRoot = path.join(tempDir, "veyyon-config");
+    const transcript = path.join(configRoot, "sessions", "-dev-topic", "2026-09-24T00-00-00-000Z_owner-topic.jsonl");
+    fs.mkdirSync(path.dirname(transcript), { recursive: true });
+    fs.writeFileSync(transcript, "");
+    const fake = fakeControl([
+      { id: "owner-topic", cwd: "C:/dev/topic", workspace: "C:/dev/topic", title: null, status: "Idle", modifiedAtMs: Date.now() },
+    ]);
+    Object.assign(fake.control, { configRoot });
+    const forumClient = new FakeForumApiClient();
+    let callbacks!: ConstructorParameters<typeof TelegramPoller>[3];
+    let thread = 101;
+    const daemon = new TelegramDaemon({
+      manifestPath, poolDbPath: path.join(tempDir, "pool.db"),
+      daemonDbPath: path.join(tempDir, "daemon.db"), channelsDir: path.join(tempDir, "channels"),
+      controlFactory: () => fake.control, forumClientFactory: () => forumClient,
+      pollerFactory: (_token, _state, _access, handlers) => {
+        callbacks = handlers;
+        return Object.assign(dummyPoller(), { getActiveThreadId: () => thread });
+      },
+      log: () => {},
+    });
+    await daemon.start();
+    try {
+      expect(callbacks.getSessionFile?.()).toBe(transcript);
+      thread = 999;
+      expect(callbacks.getSessionFile?.()).toBeUndefined();
+    } finally {
+      await daemon.stop();
+    }
+  });
 });
