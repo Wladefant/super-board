@@ -101,6 +101,11 @@ If you cannot satisfy any gate (test fails, lint won't pass, typecheck error you
 
 The orchestrator will halt or route according to the Super Build skill, remove/adjust the `loop:in-progress` label, post a failure comment with the log tail on the issue, and notify the user. Your worktree stays intact for human inspection when needed.
 
+### Repeat-failure limit & learning (operator 2026-09-24)
+- Try a failing command or approach at most 2–3 times; on the 3rd failure, stop that approach immediately and switch to a materially different alternative.
+- Write the failure (command, error, attempt count, alternative chosen) in a comment on the work item's GitHub issue.
+- Save the lesson in the same turn with `learn` or `retain` (for facts) or a managed skill (for procedures); check prior lessons (`recall`) before touching the same tool or area. Never loop failing commands.
+
 ## Working environment
 
 - You are in a git worktree at `.worktrees/issue-<N>` on branch `loop/issue-<N>`.

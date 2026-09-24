@@ -782,6 +782,7 @@ STOP. Do NOT advance to a next iteration.
   dispatcher will see the `wip:` and the close-out and treat it as a
   successful iter (not exit 5 — exit 5 is for missing close-out commits
   that the dispatcher infers were time-clipped).
+- **Repeat-failure limit & learning (operator 2026-09-24):** Try a failing command or approach at most 2–3 times; on the 3rd failure, stop that approach immediately and switch to a materially different alternative. Write the failure (command, error, attempt count, alternative chosen) in a comment on the work item's GitHub issue, and save the lesson in the same turn with `learn` or `retain` (for facts) or a managed skill (for procedures). Check prior lessons (`recall`) before touching the same tool or area.
 
 ## HUMAN GATE (do not trip on routine work)
 
