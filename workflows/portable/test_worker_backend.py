@@ -869,6 +869,8 @@ class TestCheckExpectationContract(_Fixture):
         self.assertIn("negative_control", prompt)
         self.assertIn("At least one \"verification\" check must have exited 0", prompt)
         self.assertIn("Never adjust one so it looks expected", prompt)
+        self.assertIn("Repeat-failure limit", prompt)
+        self.assertIn("Mandatory failure write-down", prompt)
 
 
 class TestHeadBinding(_Fixture):

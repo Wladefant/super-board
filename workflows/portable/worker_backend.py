@@ -1172,6 +1172,13 @@ def build_stage_prompt(req: Any, schema: Dict[str, Any]) -> str:
         "you observed.",
         "- Never merge, never push, never deploy. Committing locally is allowed for the build "
         "stage only.",
+        "- Repeat-failure limit (operator 2026-09-24): Try a failing command/approach at most "
+        "2–3 times; on the 3rd failure, stop that approach immediately and switch to a materially "
+        "different alternative.",
+        "- Mandatory failure write-down: Record the failure (command, error, attempts, alternative "
+        "chosen) in a comment on the work item's GitHub issue.",
+        "- Mandatory lesson capture: Persist the lesson in the same turn with `learn` or `retain` "
+        "(or managed skill); check prior lessons (`recall`) before touching the same tool or area.",
     ]
     return "\n".join(lines)
 
