@@ -281,6 +281,19 @@
         "human_inputs (question_id, category, target, question, resolution_guidance)",
         "agent_actions (target, category, missing_prerequisites, next_action)"
       ]
+    },
+    "gardener.py": {
+      "role": "Automated dead code, unused export, and tech debt analysis (Knip + Vulture) generating bounded cleanup task specifications for cheap lanes",
+      "owner": "GardenerRole",
+      "cli_command": "python gardener.py [--dry-run] [--repo-root <path>] [--min-confidence 80] [--max-items 15] [--json] [--markdown]",
+      "inputs": [
+        "frontend/ (TypeScript / Next.js)",
+        "backend/ (FastAPI / Python)"
+      ],
+      "outputs": [
+        "GardenerReport (JSON, Markdown, or terminal summary)",
+        "CleanupTaskSpec (bounded Spark/Flash subagent task specification)"
+      ]
     }
   },
   "adapters": {
@@ -350,9 +363,11 @@
       "WORKER_EXECUTION.md",
       "diagnostics.py",
       "session_crash_monitor.py",
-      "quota_snapshot.py"
+      "quota_snapshot.py",
+      "gardener.py"
     ],
     "optional_files": [
+      "test_gardener.py",
       "test_quota_snapshot.py",
       "usage_snapshot_cache.json",
       "test_github_work_item.py",
