@@ -1,4 +1,7 @@
 """Installer contract: exact parity, missing-source preflight, no state mutation."""
+import ast
+import contextlib
+import io
 import tempfile
 import json
 import unittest
@@ -44,6 +47,37 @@ class Installation(unittest.TestCase):
             synchronize(self.source, self.profile, self.runtime)
         self.assertFalse(self.profile.exists())
         self.assertEqual({p.name for p in self.runtime.iterdir()}, {"state.json", "manifest.json"})
+
+    def test_router_modules_are_installed_and_drift_checked(self):
+        self.assertTrue(synchronize(self.source, self.profile, self.runtime))
+        for name in ("model_routing.py", "balance_loader.py", "routing_smoke_test.py"):
+            with self.subTest(name=name):
+                installed = self.runtime / name
+                self.assertEqual(installed.read_bytes(), (self.source / "workflows/portable" / name).read_bytes())
+                installed.write_bytes(b"stale router")
+                report = io.StringIO()
+                with contextlib.redirect_stdout(report):
+                    self.assertFalse(synchronize(self.source, self.profile, self.runtime, check=True))
+                self.assertIn(f"DRIFT: {name}", report.getvalue())
+                self.assertEqual(installed.read_bytes(), b"stale router")
+                self.assertTrue(synchronize(self.source, self.profile, self.runtime))
+
+    def test_router_import_closure_is_installed(self):
+        # A routing module the installed router imports but the installer skips leaves the
+        # runtime running a stale copy while --check still reports MATCH.
+        portable = Path(__file__).resolve().parent
+        local = {path.stem for path in portable.glob("*.py")}
+        closure, pending = set(), ["routing_smoke_test", "model_routing"]
+        while pending:
+            module = pending.pop()
+            if module in closure:
+                continue
+            closure.add(module)
+            for node in ast.walk(ast.parse((portable / f"{module}.py").read_text(encoding="utf-8"))):
+                names = [alias.name for alias in node.names] if isinstance(node, ast.Import) else (
+                    [node.module] if isinstance(node, ast.ImportFrom) and node.module else [])
+                pending.extend(name.split(".")[0] for name in names if name.split(".")[0] in local)
+        self.assertEqual({f"{module}.py" for module in closure} - set(RUNTIME_FILES), set())
 
 
 if __name__ == "__main__":
