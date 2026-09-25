@@ -43,6 +43,7 @@ from balance_loader import (
     load_snapshot,
     parse_usage_json,
 )
+from quota_snapshot import load_snapshot as load_quota_snapshot
 
 
 class TaskType(str, Enum):
@@ -178,6 +179,11 @@ GO_PACE_WINDOW = "weekly"
 # shares one group so they are ranked by pace rather than by declared order.
 PACE_GROUP_GO_FREE = "go-free"
 PACE_GROUP_GO_PAID = "go-paid"
+# Strong rungs (review and high-risk worker) and execution rungs are pacing groups too, so a
+# Codex window about to expire is spent ahead of an Antigravity daily window that resets
+# tonight anyway, while an ordinary day still prefers the cheap abundant tiers.
+PACE_GROUP_STRONG = "strong"
+PACE_GROUP_EXEC = "exec"
 
 # First-class Chinese-model worker slots (#214, operator 2026-09-25): credential-gated,
 # activated automatically once veyyon holds a credential for the provider (env var or a
@@ -578,22 +584,30 @@ def balance_provider_for(model: str) -> str:
     return provider
 
 
-def _pace_gate_rung(rung: _Rung, pace: Optional[WindowPace]) -> _Rung:
-    """Close a rung whose window is spent or would be spent too early.
+def _pace_gate_rung(rung: _Rung, pace: Optional[WindowPace],
+                    blocked_reason: Optional[str] = None) -> _Rung:
+    """Close a rung whose provider is spent, exhausted by cache, or would be spent too early.
 
-    Two hard exclusions apply to every rung, whether or not it shares a pace group:
-    a window at 100% used is exhausted and must never be chosen (operator 2026-09-25: three
+    Three hard exclusions apply to every rung, whether or not it shares a pace group:
+    the exhaustion cache says the provider's reset is still ahead (operator 2026-09-25: three
     lanes were dispatched onto an exhausted Antigravity Opus window and died on a 429 within
-    3 s), and a window that is ahead of pace once it is at least PACE_THROTTLE_USED_FLOOR
-    consumed would be exhausted before its reset.
+    3 s), the window reports itself fully used, or it is ahead of pace once it is at least
+    PACE_THROTTLE_USED_FLOOR consumed and would be exhausted before its reset. The ahead-of-pace
+    hold-back exempts the terminal reserve rungs (`cooldown=True`): `_climb` reaches them only
+    after every on-pace tier above is closed, so the choice there is between drawing the last
+    of a window or failing the task outright.
     """
-    if pace is None or not rung.available:
+    if not rung.available:
+        return rung
+    if blocked_reason:
+        return replace(rung, available=False, reason=f"{rung.reason} Blocked: {blocked_reason}.")
+    if pace is None:
         return rung
     if pace.remaining_fraction <= 0.0 or pace.used_fraction >= 1.0:
         return replace(rung, available=False, reason=(
             f"{rung.reason} Blocked: {pace.provider} {pace.window_id} is exhausted "
             f"({pace.used_fraction * 100:.0f}% used)."))
-    if pace.throttled:
+    if pace.throttled and not rung.cooldown:
         return replace(rung, available=False, reason=(
             f"{rung.reason} Throttled: {pace.provider} {pace.window_id} is ahead of pace "
             f"({pace.pace_ratio:.2f}x, {pace.used_fraction * 100:.0f}% used), so spending it now "
@@ -601,23 +615,25 @@ def _pace_gate_rung(rung: _Rung, pace: Optional[WindowPace]) -> _Rung:
     return rung
 
 
-def _apply_pace_rules(rungs: List[_Rung], pace_of_model) -> List[_Rung]:
-    """Gate every rung on its window's pace, then order each `pace_group` by it.
+def _apply_pace_rules(rungs: List[_Rung], pace_of_model, blocked_for_model=None) -> List[_Rung]:
+    """Gate every rung on its provider's exhaustion and pace, then order each pace group.
 
-    The gate runs first and applies to all rungs: a rung whose provider window is exhausted or
-    ahead of pace is closed, so the ladder climbs past it instead of dispatching work that
-    would fail. Then each `pace_group` — a run of consecutive rungs that are interchangeable
-    for the task — is ordered so an expiring window comes first (spend it or lose it) and the
-    furthest behind pace follows. Rungs outside a group keep their declared order, so
-    capability remains the primary axis and pacing never promotes a weaker model over a
-    stronger one.
+    The gate runs first and applies to all rungs: a rung whose provider is recorded as
+    exhausted, whose window is fully used, or that is ahead of pace is closed, so the ladder
+    climbs past it instead of dispatching work that would fail. Then each `pace_group` — a run
+    of consecutive rungs that are interchangeable for the task — is ordered so an expiring
+    window comes first (spend it or lose it) and the furthest behind pace follows. Rungs
+    outside a group keep their declared order, so capability remains the primary axis and
+    pacing never promotes a weaker model over a stronger one.
     """
+    blocked_for_model = blocked_for_model or (lambda _model: None)
     ordered: List[_Rung] = []
     index = 0
     while index < len(rungs):
         group = rungs[index].pace_group
         if group is None:
-            ordered.append(_pace_gate_rung(rungs[index], pace_of_model(rungs[index].model)))
+            rung = rungs[index]
+            ordered.append(_pace_gate_rung(rung, pace_of_model(rung.model), blocked_for_model(rung.model)))
             index += 1
             continue
         end = index
@@ -626,8 +642,11 @@ def _apply_pace_rules(rungs: List[_Rung], pace_of_model) -> List[_Rung]:
         ranked = []
         for position, rung in enumerate(rungs[index:end]):
             pace = pace_of_model(rung.model)
-            ranked.append((_pace_gate_rung(rung, pace), pace, position))
+            ranked.append((_pace_gate_rung(rung, pace, blocked_for_model(rung.model)), pace, position))
         ranked.sort(key=lambda entry: (
+            # A promoted rung outranks everything else in its group: the account-level window
+            # would otherwise expire unused, which no cheaper tier can compensate for.
+            0 if entry[0].promotion else 1,
             0 if (entry[1] is not None and entry[1].expiring) else 1,
             -(entry[1].pace_ratio if entry[1] is not None else 1.0),
             entry[2],
@@ -664,7 +683,8 @@ class ResetAwareModelSelector:
       - Safe 429/cooldown/unknown handling
     """
 
-    def __init__(self, snapshot: Optional[Any] = None, credentialed_providers: Optional[Set[str]] = None):
+    def __init__(self, snapshot: Optional[Any] = None, credentialed_providers: Optional[Set[str]] = None,
+                 quota_snapshot: Optional[Any] = None):
         if snapshot is not None and isinstance(snapshot, BalanceAdapter):
             self.snapshot = snapshot.fetch_snapshot()
         elif snapshot is not None and hasattr(snapshot, "to_normalized"):
@@ -676,6 +696,34 @@ class ResetAwareModelSelector:
         self.credentialed_providers: Set[str] = (
             detect_credentialed_providers() if credentialed_providers is None else set(credentialed_providers)
         )
+        # Exhaustion cache. `veyyon usage` is far too slow to read before every dispatch
+        # (operator 2026-09-25), so eligibility is read from a local snapshot that a 429 or a
+        # periodic usage read refreshes. Tests inject their own snapshot here.
+        self._quota_snapshot = quota_snapshot
+
+    def quota_snapshot(self):
+        """The exhaustion cache, loaded once per selector. A missing file yields an empty one."""
+        if self._quota_snapshot is None:
+            self._quota_snapshot = load_quota_snapshot()
+        return self._quota_snapshot
+
+    def provider_exhaustion_reason(self, model: str) -> Optional[str]:
+        """Why `model`'s provider is ineligible, or None when it may be used.
+
+        A provider whose recorded reset time is still in the future is skipped entirely:
+        three lanes were dispatched onto an exhausted Antigravity Opus window and died on a
+        429 within 3 s. Once that reset time passes the same provider is eligible again with
+        no further bookkeeping.
+        """
+        snapshot = self.quota_snapshot()
+        if snapshot is None:
+            return None
+        provider = balance_provider_for(model)
+        if snapshot.is_eligible(provider):
+            return None
+        until = snapshot.provider_exhausted_until(provider)
+        return (f"{provider} is exhausted until {until.isoformat()}" if until is not None
+                else f"{provider} is exhausted")
 
     def set_snapshot(self, snapshot: Any):
         if snapshot is not None and isinstance(snapshot, BalanceAdapter):
@@ -950,24 +998,33 @@ class ResetAwareModelSelector:
         )
         evidence_packet_required = risk_level in (RiskLevel.MEDIUM, RiskLevel.HIGH) or task_type == TaskType.STRONG_REVIEW
 
-        codex_promo = _Rung(
-            MODEL_CODEX_ASTRA, codex_near_reset_surplus,
-            f"Codex pro weekly window resets in {codex_pro_hrs:.1f}h at {codex_pro_headroom:.2f}x pace "
-            "headroom; promoted Codex Astra to spend allowance that would otherwise expire.",
-            promotion=True,
-        )
+        def codex_promoted(model: str, label: str, group: str) -> _Rung:
+            """Promote an expiring Codex window so its allowance is spent instead of lost."""
+            return _Rung(
+                model, codex_near_reset_surplus,
+                f"Codex pro weekly window resets in {codex_pro_hrs:.1f}h at {codex_pro_headroom:.2f}x pace "
+                f"headroom; promoted {label} to spend allowance that would otherwise expire.",
+                promotion=True, pace_group=group,
+            )
+
+        # A promoted rung leads its pace group, so an expiring Codex window is spent ahead of the
+        # interchangeable cheap tiers that share that group, and every other day loses to them.
+        codex_promo = codex_promoted(MODEL_CODEX_ASTRA, "Codex Astra", PACE_GROUP_STRONG)
         astra_on_pace = _Rung(
             MODEL_CODEX_ASTRA, codex_usable,
             f"Codex Astra medium ({codex_pro_headroom:.2f}x pace headroom).",
+            pace_group=PACE_GROUP_STRONG,
         )
         astra_emergency = _Rung(
             MODEL_CODEX_ASTRA, codex_meta["is_available"],
             "only Codex ahead of pace remains; spending its emergency reserve.",
-            cooldown=True,
+            cooldown=True, pace_group=PACE_GROUP_STRONG,
         )
+        codex_fast_promo = codex_promoted(MODEL_CODEX_FAST, "Codex Fast", PACE_GROUP_EXEC)
         ag_opus = _Rung(
             MODEL_AG_CLAUDE_OPUS, ag_claude_ok,
             f"Antigravity Claude Opus 4.6 (free daily window, expires before any weekly window). {ag_claude_note}.",
+            pace_group=PACE_GROUP_STRONG,
         )
         glm = _Rung(MODEL_ZAI_GLM, zai_ok, "Z.AI GLM-5.3 (credentialed Coding Plan).")
         deepseek_pro = _Rung(MODEL_DEEPSEEK_PRO, deepseek_ok, "DeepSeek V4 Pro (pay-per-token, 1M context).")
@@ -1094,17 +1151,18 @@ class ResetAwareModelSelector:
             final_fallbacks = [MODEL_CODEX_ASTRA, MODEL_GEMINI_PRO]
 
         elif task_type == TaskType.STRONG_REVIEW and risk_level == RiskLevel.MEDIUM:
-            # CASE C: MEDIUM-RISK REVIEW — worker tiers only, never paid Anthropic. Go,
-            # Z.AI and DeepSeek come before Codex and Opus.
+            # CASE C: MEDIUM-RISK REVIEW — worker tiers only, never paid Anthropic. Antigravity
+            # Opus leads (its free daily window resets nightly, so it is spent first), then
+            # Z.AI, the paid Go reviewer and DeepSeek V4 Pro; Codex and Opus follow those.
             label = "Medium-risk review"
             rungs = [
                 go_glm53_flash,
                 glm,
-                deepseek_pro,
                 ag_opus,
-                go_glm53,
                 codex_promo,
                 astra_on_pace,
+                go_glm53,
+                deepseek_pro,
                 _Rung(MODEL_GEMINI_FLASH, google_ok, "Gemini 3.8 Flash; direct Anthropic reserved for the orchestrator."),
                 _Rung(MODEL_DEEPSEEK_FLASH, deepseek_ok, "overflow to DeepSeek V4.1 Flash.", cooldown=True),
             ]
@@ -1124,16 +1182,28 @@ class ResetAwareModelSelector:
             final_fallbacks = [MODEL_DEEPSEEK_FLASH]
 
         elif task_type == TaskType.DEEP_REASONING:
-            # CASE E: LOW/MEDIUM DEEP REASONING — worker tiers only, never paid Anthropic.
+            # CASE E: DEEP REASONING — worker tiers only, never paid Anthropic. The Go and Z.AI
+            # tiers lead. Low risk then keeps the cheapest sufficient lane (Gemini 3.8 Flash,
+            # whose rung carries the orchestrator-reserve note), while medium and high risk spend
+            # the stronger Antigravity Claude window instead: it is small, but it expires within
+            # 5h, so it is spent rather than lost. A promoted (expiring) Codex window takes the
+            # band from whichever of the two leads it, and Codex on pace still follows every
+            # cheaper tier.
             label = "Deep reasoning"
+            band_group = PACE_GROUP_EXEC if risk_level == RiskLevel.LOW else PACE_GROUP_STRONG
+            flash_rung = _Rung(
+                MODEL_GEMINI_FLASH, google_ok,
+                "abundant Gemini 3.8 Flash; direct Anthropic reserved for the orchestrator.",
+                pace_group=band_group,
+            )
+            codex_rung = codex_promoted(MODEL_CODEX_ASTRA, "Codex Astra", band_group)
+            band = ([flash_rung, codex_rung, deepseek_pro, ag_opus] if risk_level == RiskLevel.LOW
+                    else [ag_opus, codex_rung, deepseek_pro, flash_rung])
             rungs = [
                 go_glm53_flash,
                 go_glm53,
                 glm,
-                _Rung(MODEL_GEMINI_FLASH, google_ok, "abundant Gemini 3.8 Flash; direct Anthropic reserved for the orchestrator."),
-                deepseek_pro,
-                ag_opus,
-                codex_promo,
+                *band,
                 astra_on_pace,
                 _Rung(MODEL_DEEPSEEK_FLASH, deepseek_ok, "Gemini and Codex unavailable; DeepSeek V4.1 Flash overflow.", cooldown=True),
             ]
@@ -1157,17 +1227,20 @@ class ResetAwareModelSelector:
 
         else:
             # CASE G: ROUTINE EXECUTION (low/medium implementation, mapping, routine QA). The
-            # free Go model first, then the primary abundant Antigravity lane, then the cheap
-            # Go worker, Z.AI overflow and Codex (whose expiring surplus is promoted).
+            # free Go model first, then the primary abundant Antigravity lane, then the paid Go
+            # workers and Z.AI overflow. Codex follows them: on pace it is the last subscription
+            # lane, and with its window about to expire the promoted rung leads the band instead
+            # of letting the allowance go to waste.
             label = "Routine execution"
             rungs = [
                 go_bunny,
                 _Rung(MODEL_GEMINI_FLASH, google_ok,
-                      "primary abundant execution lane: Gemini 3.8 Flash (Ultra daily allowance).", as_fallback=False),
+                      "primary abundant execution lane: Gemini 3.8 Flash (Ultra daily allowance).",
+                      as_fallback=False, pace_group=PACE_GROUP_EXEC),
+                codex_fast_promo,
                 go_glm53_flash,
                 go_gpt6_luna,
                 _Rung(MODEL_ZAI_GLM, zai_ok, "overflow to Z.AI GLM-5.3 (credentialed).", cooldown=True),
-                codex_promo,
                 _Rung(MODEL_CODEX_FAST, codex_usable,
                       "Google Antigravity in cooldown; Codex Fast (subscription headroom).", cooldown=True, as_fallback=False),
                 _Rung(MODEL_DEEPSEEK_FLASH, deepseek_ok, "overflow to DeepSeek V4.1 Flash.", cooldown=True),
@@ -1181,7 +1254,7 @@ class ResetAwareModelSelector:
         # window is exhausted before its reset and none expires unspent. Then every ladder
         # drops a rung whose verified window cannot hold the context, so GLM-5.3 (131,072
         # tokens) is never picked or offered as a fallback above its window.
-        rungs = _apply_pace_rules(rungs, self.pace_of_model)
+        rungs = _apply_pace_rules(rungs, self.pace_of_model, self.provider_exhaustion_reason)
         rungs = [rung for rung in rungs if context_tokens <= VERIFIED_CONTEXT_WINDOWS[rung.model]]
         chosen, fallback_model = _climb(rungs, last_resort, final_fallbacks)
 
