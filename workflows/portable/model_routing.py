@@ -140,7 +140,9 @@ def _stored_credential_providers(paths: List[str]) -> Set[str]:
         if not os.path.isfile(path):
             continue
         try:
-            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            # timeout=0: a store held under a write lock is skipped at once instead of
+            # blocking selector construction for SQLite's default 5 s busy timeout.
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0)
             try:
                 rows = conn.execute(
                     "SELECT DISTINCT provider FROM auth_credentials WHERE disabled_cause IS NULL"
@@ -639,15 +641,31 @@ class ResetAwareModelSelector:
         )
 
         if context_tokens > 180000 or task_type == TaskType.DEEP_CONTEXT:
-            # CASE A: DEEP CONTEXT (> 180k tokens): 1M-context tiers only.
+            # CASE A: DEEP CONTEXT (> 180k tokens, or a DEEP_CONTEXT task). The 1M-context tiers
+            # come first; then every cheap tier whose verified window holds the context, in the
+            # high-risk worker ladder's order. Fable is reached only when all of them are out.
             label = f"Deep context ({context_tokens} tokens)"
+            cheap_rungs = [
+                glm,
+                astra_on_pace,
+                _Rung(MODEL_CODEX_FAST, codex_usable, "1M-context tiers unavailable; Codex Fast (400k window, on pace).",
+                      cooldown=True),
+                ag_opus,
+                astra_emergency,
+                _Rung(MODEL_CODEX_FAST, codex_meta["is_available"],
+                      "only Codex ahead of pace holds this context; spending its emergency reserve.", cooldown=True),
+            ]
             rungs = [
                 _Rung(MODEL_GEMINI_PRO, google_ok, "Gemini 3.1 Pro (1M-token window)."),
                 _Rung(MODEL_DEEPSEEK_PRO, deepseek_ok, "Gemini unavailable; DeepSeek V4 Pro (1M-token window).", cooldown=True),
                 _Rung(MODEL_MINIMAX_M3, minimax_ok, "MiniMax-M3 (1M-token window, credentialed).", cooldown=True),
-                fable_last_resort,
+                *(rung for rung in cheap_rungs if VERIFIED_CONTEXT_WINDOWS[rung.model] >= context_tokens),
+                _Rung(MODEL_CLAUDE_FABLE, anthropic_worker_ok,
+                      f"every cheap tier whose window holds {context_tokens} tokens is unavailable; last resort on "
+                      f"Anthropic slack ({anthropic_headroom:.2f}x behind pace, orchestrator reserve untouched).",
+                      cooldown=True, as_fallback=False),
             ]
-            last_resort = _Rung(MODEL_DEEPSEEK_PRO, True, "all 1M-context tiers unavailable; pay-per-token DeepSeek V4 Pro.", cooldown=True)
+            last_resort = _Rung(MODEL_DEEPSEEK_PRO, True, "every deep-context tier unavailable; pay-per-token DeepSeek V4 Pro.", cooldown=True)
             final_fallbacks = [MODEL_OR_DEEPSEEK_FLASH]
 
         elif task_type == TaskType.STRONG_REVIEW and is_rework_critical:

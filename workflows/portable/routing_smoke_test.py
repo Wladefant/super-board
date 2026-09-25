@@ -28,6 +28,7 @@ import itertools
 import json
 import os
 import sys
+import time
 import unittest
 from unittest import mock
 
@@ -1157,6 +1158,17 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             conn.commit()
             conn.close()
             self.assertEqual(detect_credentialed_providers(auth_store_paths=[store]), {MINIMAX_PROVIDER})
+            # A store held under an exclusive lock is skipped at once (timeout=0), not after
+            # SQLite's default 5 s busy timeout.
+            holder = sqlite3.connect(store)
+            holder.execute("BEGIN EXCLUSIVE")
+            try:
+                started = time.monotonic()
+                self.assertEqual(detect_credentialed_providers(auth_store_paths=[store, store]), set())
+                self.assertLess(time.monotonic() - started, 1.0)
+            finally:
+                holder.rollback()
+                holder.close()
 
         # Uncredentialed (hermetic setUp): never selected or offered as a fallback.
         selector = self._selector(self._usage_with_ag_families())
@@ -1198,8 +1210,18 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
     def test_worker_lanes_never_spend_orchestrator_reserve(self):
         print("\n--- TEST 33: Worker Lanes Never Take Paid Anthropic While Cheap Tiers Exist ---")
         # Anthropic has maximum slack (0% used, 20h left) — the most tempting case — plus the
-        # states named in review 5317588095: reserve active with Antigravity Claude spent and
-        # Codex throttled, Anthropic surplus near reset, and Google down.
+        # states named in reviews 5317588095 and 5317952644: reserve active with Antigravity
+        # Claude spent and Codex throttled, Anthropic surplus near reset, Google down, and
+        # Google + DeepSeek out with Codex on pace (the deep-context gap).
+        def deepseek_out(usage):
+            report = copy.deepcopy(usage["reports"][0])
+            report["provider"] = "deepseek"
+            report["limits"] = report["limits"][:1]
+            report["limits"][0]["id"] = "deepseek:default:daily"
+            report["metadata"] = {"limitReached": True, "allowed": False}
+            usage["reports"].append(report)
+            return usage
+
         google_down = self._usage_with_ag_families(anthropic_week_used=0.0, anthropic_week_reset_hrs=20)
         google_down["reports"][0]["metadata"]["limitReached"] = True
         google_down["reports"][0]["metadata"]["allowed"] = False
@@ -1214,6 +1236,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             "anthropic_surplus_near_reset": self._usage_with_ag_families(
                 anthropic_week_used=0.10, anthropic_week_reset_hrs=6),
             "google_down": google_down,
+            "google_deepseek_out_codex_on_pace": deepseek_out(copy.deepcopy(google_down)),
         }
         variants = [
             {},
@@ -1230,7 +1253,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
                         for variant in variants:
                             is_review_lane = task_type == TaskType.STRONG_REVIEW and (
                                 risk == RiskLevel.HIGH or variant)
-                            for ctx in (10000, 220000):
+                            for ctx in (10000, 200000, 220000, 240000):
                                 rec = selector.select_model(
                                     task_type=task_type, risk_level=risk, context_tokens=ctx, **variant)
                                 where = f"[{label}/{sorted(creds)}] {task_type.value}/{risk.value}/{variant}/{ctx}"
@@ -1241,8 +1264,28 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
                                     continue  # the high-risk REVIEW lane may spend Anthropic slack
                                 self.assertNotIn("anthropic/", rec.selected_model, where)
                                 self.assertNotIn("anthropic/", rec.fallback_model, where)
-        print(f"  [PASS] {checked} worker routes (task x risk x rework/domain x context x credentials x 5 quota "
-              "states): none selects or falls back to paid Anthropic; every fallback crosses providers.")
+        print(f"  [PASS] {checked} worker routes (task x risk x rework/domain x 4 context sizes x credentials x "
+              f"{len(scenarios)} quota states): none selects or falls back to paid Anthropic; every fallback crosses providers.")
+
+        # The deep-context gap (review 5317952644 A'): with both 1M-context cheap tiers out,
+        # Codex on pace holds 200k/240k, and credentialed GLM holds a 10k DEEP_CONTEXT task.
+        gap = ResetAwareModelSelector(parse_usage_json(scenarios["google_deepseek_out_codex_on_pace"],
+                                                       current_time_ms=self.mock_now_ms))
+        for ctx in (200000, 240000):
+            rec = gap.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.MEDIUM, context_tokens=ctx)
+            self.assertEqual(rec.selected_model, MODEL_CODEX_ASTRA, ctx)
+            self.assertFalse(rec.quota_metrics["codex_pro_throttled"])
+        gap_glm = ResetAwareModelSelector(parse_usage_json(scenarios["google_deepseek_out_codex_on_pace"],
+                                                           current_time_ms=self.mock_now_ms),
+                                          credentialed_providers={ZAI_PROVIDER})
+        self.assertEqual(gap_glm.select_model(task_type=TaskType.DEEP_CONTEXT, risk_level=RiskLevel.LOW,
+                                              context_tokens=10000).selected_model, MODEL_ZAI_GLM)
+        # 500k exceeds every non-1M window (Codex Fast 400k): only then may Fable fire on slack.
+        rec_500k = gap.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.MEDIUM, context_tokens=500000)
+        self.assertEqual(rec_500k.selected_model, MODEL_CLAUDE_FABLE)
+        self.assertIn("whose window holds 500000 tokens is unavailable", rec_500k.reasoning)
+        print(f"  [PASS] Google + DeepSeek out, Codex on pace: 200k/240k -> {MODEL_CODEX_ASTRA}, DEEP_CONTEXT/10k -> "
+              f"{MODEL_ZAI_GLM} (credentialed); Fable only at 500k, beyond every cheap window.")
 
         # When every cheap tier is out, the high-risk worker ladder reaches Fable as its last
         # rung, and only on slack behind pace.
@@ -1251,12 +1294,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             if rep["provider"] in ("google-antigravity", "openai-codex"):
                 rep["metadata"]["limitReached"] = True
                 rep["metadata"]["allowed"] = False
-        deepseek_report = copy.deepcopy(usage_out["reports"][0])
-        deepseek_report["provider"] = "deepseek"
-        deepseek_report["limits"] = deepseek_report["limits"][:1]
-        deepseek_report["limits"][0]["id"] = "deepseek:default:daily"
-        deepseek_report["metadata"] = {"limitReached": True, "allowed": False}
-        usage_out["reports"].append(deepseek_report)
+        deepseek_out(usage_out)
         rec_last = self._selector(usage_out).select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.HIGH)
         self.assertEqual(rec_last.selected_model, MODEL_CLAUDE_FABLE)
         self.assertTrue(rec_last.cooldown_fallback)
