@@ -40,6 +40,7 @@ EXPORT_FILES = [
     "preflight.py",
     "balance_loader.py",
     "model_routing.py",
+    "quota_snapshot.py",
     "github_plan_renderer.py",
     "github_plan_templates.py",
     "usage_fixture.json",

@@ -349,10 +349,11 @@
       "recurrence_guard.py",
       "WORKER_EXECUTION.md",
       "diagnostics.py",
-      "telegram_workflow.py",
-      "session_crash_monitor.py"
+      "session_crash_monitor.py",
+      "quota_snapshot.py"
     ],
     "optional_files": [
+      "test_quota_snapshot.py",
       "usage_snapshot_cache.json",
       "test_github_work_item.py",
       "test_install_github_native.py",

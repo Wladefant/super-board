@@ -24,9 +24,10 @@ import argparse
 import datetime
 import json
 import os
+import re
 import sqlite3
 import sys
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -43,6 +44,7 @@ from balance_loader import (
     load_snapshot,
     parse_usage_json,
 )
+from quota_snapshot import load_snapshot as load_quota_snapshot
 
 
 class TaskType(str, Enum):
@@ -100,26 +102,89 @@ MODEL_DEEPSEEK_PRO = "deepseek/deepseek-v4-pro"
 # (5.6% vs 0.5%) but its only free upstream returned 429 on every attempt 2026-09-25.
 MODEL_OR_FREE_ADVISORY = "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
 
-# OpenCode Go provider (operator 2026-09-25): 35 models, €10 prepaid balance with
-# weekly/monthly usage limits.  space-bunny-free is a temporary UNLIMITED free model
-# (1M context, multimodal, cost $0) that goes FIRST wherever it can serve.  Tool-call
-# smoke test results (2026-09-25): space-bunny-free ✅ 4s, glm-5.3 ✅ 8s,
-# glm-5.3-flash ✅ 52s, qwen3.8-flash ✅ 9s, qwen3.8-max ✅ 11s, gpt-6-luna ✅ 4s,
-# mimo-v2.6-pro ✅ 9s.  FAILED: deepseek-v4.1-flash ❌ (requiresReasoningContentForToolCalls
-# but provider doesn't replay reasoning; use direct deepseek provider instead),
-# muse-spark-1.3-contributor ❌ (timeout, no tool response).
-MODEL_GO_BUNNY = "opencode-go/space-bunny-free"        # FREE unlimited, 1M ctx, multimodal
-MODEL_GO_GLM53 = "opencode-go/glm-5.3"                 # TB4 41.9%, $1.4/$4.4
-MODEL_GO_GLM53_FLASH = "opencode-go/glm-5.3-flash"     # TB4 32.8%, $0.15/$0.50
-MODEL_GO_QWEN38_FLASH = "opencode-go/qwen3.8-flash"    # TB4 25.3%, $0.15/$0.47
-MODEL_GO_QWEN38_MAX = "opencode-go/qwen3.8-max"        # TB4 38.9%, $2/$6
-MODEL_GO_GPT6_LUNA = "opencode-go/gpt-6-luna"           # TB4 12.6%, $0.1/$0.5
-MODEL_GO_MIMO26_PRO = "opencode-go/mimo-v2.6-pro"       # ?, $0.435/$0.87, multimodal
-# Not routed (tool calling failed in smoke test):
-# MODEL_GO_DS_FLASH = "opencode-go/deepseek-v4.1-flash"  # TB4 26.8% but tool calls fail
-# MODEL_GO_MUSE_SPARK = "opencode-go/muse-spark-1.3-contributor"  # TB4 33.3% but timeout
+# OpenCode Go provider (operator 2026-09-25).  Specs verified from the vendor page
+# https://opencode.ai/docs/go/ and cross-checked against the local catalog row
+# `opencode-go:models-v1:iqgqa0x44ieo` in ~/.veyyon/profiles/default/agent/models.db
+# (rev 11, 35 models) on 2026-09-25.  Go is a $10/month SUBSCRIPTION, not a prepaid
+# balance and not five separate plans.  Two independent limits apply:
+#
+#   1. A per-model monthly DOLLAR cap, enforced through three nested rolling windows:
+#      5h = 20% of that cap, week = 50%, month = 100%.  A lane costing more than the 5h
+#      slice cannot run at all (glm-5.3's $3 5h slice is smaller than one lane).
+#   2. The provider-level spend veyyon can observe, reported in USD for those same three
+#      windows (`veyyon usage --json`, 2026-09-25: rolling-5h limit $12.00, weekly
+#      $30.00, monthly $60.00, unit "usd", metadata {"planType": "OpenCode Go",
+#      "source": "veyyon-observed-request-costs"}).  Those totals are the Tier-1 shape,
+#      i.e. the largest monthly cap on the menu, so per-model budgets are computed from
+#      that aggregate and are a deliberately conservative lower bound.
+#
+# Measured lane cost = one task lane at the median lane shape from 3,535 local session
+# traces (2026-09-25: 775,488 input / 9,244,043 cache-read / 44,114 output tokens)
+# priced at the documented per-1M rates.  Whole lanes per window follow.
+#
+#   model                monthly cap   $/lane   lanes/month   lanes/week   lanes/5h
+#   space-bunny-free     unlimited     0        unlimited     unlimited    unlimited
+#   glm-5.3-flash        $60           0.4157   ~144          ~72          ~28
+#   qwen3.8-flash        $30           0.2850   ~105          ~52          ~21
+#   gpt-6-luna           $15           0.1920   ~78           ~39          ~15
+#   mimo-v2.6-pro        $15           0.4092   ~36           ~18          ~7
+#   glm-5.3              $15           3.6832   ~4            ~2           ~0.8
+#   qwen3.8-max          $15           4.1267   ~3            ~1           ~0.7
+#
+# The Go WORKHORSE is therefore glm-5.3-flash ($60 cap), NOT glm-5.3: the flagship-tier
+# model carries the SMALLEST monthly cap ($15, ~4 lanes a month) and is reserved for the
+# highest-value high-risk review.  space-bunny-free is free and unlimited for a limited
+# time and goes first wherever it can serve.
+#
+# Tool-call smoke test (2026-09-25): space-bunny-free ok 4s, glm-5.3 ok 8s,
+# glm-5.3-flash ok 52s, qwen3.8-flash ok 9s, qwen3.8-max ok 11s, gpt-6-luna ok 4s,
+# mimo-v2.6-pro ok 9s.  FAILED, so NOT routed: deepseek-v4.1-flash
+# (`requiresReasoningContentForToolCalls`, but this provider does not replay reasoning;
+# the direct `deepseek` provider works) and muse-spark-1.3-contributor (timeout).
+MODEL_GO_BUNNY = "opencode-go/space-bunny-free"       # free + unlimited, 1M ctx, multimodal
+MODEL_GO_GLM53_FLASH = "opencode-go/glm-5.3-flash"    # $60 cap, .15/.50/.03  <- workhorse
+MODEL_GO_QWEN38_FLASH = "opencode-go/qwen3.8-flash"   # $30 cap, .15/.47/.016
+MODEL_GO_GPT6_LUNA = "opencode-go/gpt-6-luna"         # $15 cap, .10/.50/.01
+MODEL_GO_MIMO26_PRO = "opencode-go/mimo-v2.6-pro"     # $15 cap, .435/.87/.003625
+MODEL_GO_GLM53 = "opencode-go/glm-5.3"                # $15 cap, 1.40/4.40/.26  <- rare
+MODEL_GO_QWEN38_MAX = "opencode-go/qwen3.8-max"       # $15 cap, 2.00/6.00/.25   <- rare
+# Catalog context windows: glm-5.3, glm-5.3-flash, qwen3.8-flash and qwen3.8-max are
+# 1,000,000; mimo-v2.6-pro and space-bunny-free are 1,048,576; gpt-6-luna is 1,050,000.
 
 OPENCODE_GO_PROVIDER = "opencode-go"
+
+# Per-model OpenCode Go allowance: monthly dollar cap, the fraction of it each rolling
+# window may spend, and the measured cost of one task lane (see the table above).
+GO_MONTHLY_CAP_USD: Dict[str, float] = {
+    MODEL_GO_GLM53_FLASH: 60.0,
+    MODEL_GO_QWEN38_FLASH: 30.0,
+    MODEL_GO_GPT6_LUNA: 15.0,
+    MODEL_GO_MIMO26_PRO: 15.0,
+    MODEL_GO_GLM53: 15.0,
+    MODEL_GO_QWEN38_MAX: 15.0,
+}
+GO_WINDOW_FRACTION: Dict[str, float] = {"rolling-5h": 0.20, "weekly": 0.50, "monthly": 1.00}
+GO_LANE_COST_USD: Dict[str, float] = {
+    MODEL_GO_GLM53_FLASH: 0.4157,
+    MODEL_GO_QWEN38_FLASH: 0.2850,
+    MODEL_GO_GPT6_LUNA: 0.1920,
+    MODEL_GO_MIMO26_PRO: 0.4092,
+    MODEL_GO_GLM53: 3.6832,
+    MODEL_GO_QWEN38_MAX: 4.1267,
+}
+# The pacing window that must both last and be spent: the week is what a subscription
+# schedules against, with the 5h and month windows as its inner and outer bounds.
+GO_PACE_WINDOW = "weekly"
+# Rungs in one pace group are interchangeable for the task, so pacing orders them: the free
+# uncapped Go model never competes for allowance and stands alone, and every capped Go model
+# shares one group so they are ranked by pace rather than by declared order.
+PACE_GROUP_GO_FREE = "go-free"
+PACE_GROUP_GO_PAID = "go-paid"
+# Strong rungs (review and high-risk worker) and execution rungs are pacing groups too, so a
+# Codex window about to expire is spent ahead of an Antigravity daily window that resets
+# tonight anyway, while an ordinary day still prefers the cheap abundant tiers.
+PACE_GROUP_STRONG = "strong"
+PACE_GROUP_EXEC = "exec"
 
 # First-class Chinese-model worker slots (#214, operator 2026-09-25): credential-gated,
 # activated automatically once veyyon holds a credential for the provider (env var or a
@@ -139,8 +204,12 @@ MINIMAX_PROVIDER = "minimax-code"
 CREDENTIAL_ENV_BY_PROVIDER: Dict[str, str] = {
     ZAI_PROVIDER: "ZAI_API_KEY",
     MINIMAX_PROVIDER: "MINIMAX_CODE_API_KEY",
-    OPENCODE_GO_PROVIDER: "",  # always credentialed if the provider exists in the auth store
 }
+# Providers whose credential lives ONLY in the veyyon auth store: OpenCode Go is bound to
+# an API key saved by `/login`, so there is no environment variable to look for.  Naming
+# an env var for such a provider (as an empty string) made it credentialed on every
+# machine, which is how the first version of this table leaked Go into hermetic runs.
+STORE_CREDENTIAL_PROVIDERS: Tuple[str, ...] = (OPENCODE_GO_PROVIDER,)
 
 
 def _auth_store_paths() -> List[str]:
@@ -200,10 +269,13 @@ ROLE_MODEL_PINS: Dict[str, str] = {
     "codex-worker": MODEL_CODEX_ASTRA,
     "codex-reviewer": MODEL_CODEX_ASTRA,
     "ag-opus": MODEL_AG_CLAUDE_OPUS,
+    # One role per routed Go model, so a dispatched role can never silently run another
+    # model. opencode-go/qwen3.8-flash, /qwen3.8-max and /mimo-v2.6-pro stay catalog-verified
+    # and unrouted until they have a matching `modelRoles` entry of their own.
     "go-task": MODEL_GO_BUNNY,
+    "go-deep": MODEL_GO_GLM53_FLASH,
     "go-review": MODEL_GO_GLM53,
-    "go-deep": MODEL_GO_GLM53,
-    "go-bulk": MODEL_GO_BUNNY,
+    "go-bulk": MODEL_GO_GPT6_LUNA,
 }
 
 # Weekly subscription windows are paced, not capped (operator 2026-09-25): each must
@@ -232,6 +304,23 @@ ANTHROPIC_BOTTLENECK_MAX_USED = 0.80
 AG_FAMILY_MIN_REMAINING = 0.10
 AG_ANTHROPIC_PROVIDER = "google-antigravity:anthropic"
 AG_OPENAI_PROVIDER = "google-antigravity:openai"
+ANTIGRAVITY_PROVIDER = "google-antigravity"
+CODEX_PROVIDER = "openai-codex"
+# Every subscription window is paced, not capped (operator 2026-09-25): it must last its
+# whole duration AND be spent by its reset.  `pace_ratio` is remaining allowance over
+# remaining time (1.0 = linear spend), computed per window by `window_pace`:
+#   pace_ratio > 1  -> behind pace: allowance would expire unused, so prefer this provider;
+#   pace_ratio < 1  -> ahead of pace: it would exhaust before its reset, so throttle it
+#                      once the window is at least PACE_THROTTLE_USED_FLOOR consumed.
+# Within a capability tier `_apply_pace_rules` orders rungs by how far behind pace they
+# run, so the provider with the most expiring allowance goes first and the one closest to
+# its cap goes last; a throttled provider is dropped from the tier entirely.
+PACE_THROTTLE_RATIO = 0.90
+PACE_THROTTLE_USED_FLOOR = 0.50
+PACE_PREFER_DELTA = 0.05
+# Floor for the remaining-time fraction: a window about to reset still has a finite pace
+# ratio (remaining allowance over this floor), which is what marks it as expiring.
+PACE_MIN_TIME_FRACTION = 0.01
 
 # Catalog-verified model context windows (models.db authoritative, no fabricated context sizes)
 VERIFIED_CONTEXT_WINDOWS: Dict[str, int] = {
@@ -285,13 +374,11 @@ def model_to_agent_role(model_id: str, task_type: TaskType, risk_level: RiskLeve
     # OpenCode Go models
     if model_id.startswith("opencode-go/"):
         if model_id == MODEL_GO_BUNNY:
-            if task_type == TaskType.TINY_TASK:
-                return "go-bulk"
-            if task_type == TaskType.STRONG_REVIEW:
-                return "go-review"
             return "go-task"
-        if model_id in (MODEL_GO_GLM53, MODEL_GO_QWEN38_MAX):
-            return "go-review" if task_type == TaskType.STRONG_REVIEW else "go-deep"
+        if model_id == MODEL_GO_GLM53_FLASH:
+            return "go-deep"
+        if model_id == MODEL_GO_GLM53:
+            return "go-review"
         if model_id == MODEL_GO_GPT6_LUNA:
             return "go-bulk"
         return "go-task"
@@ -418,23 +505,204 @@ class _Rung:
     # False keeps a rung primary-only: it is taken when everything above it is out, but it
     # is never offered as the fallback of a cheaper rung (e.g. paid Anthropic in worker ladders).
     as_fallback: bool = True
+    # Rungs that are interchangeable for the task share a `pace_group`; `_apply_pace_rules`
+    # then orders them by the pace of the provider that would serve each one (and drops the
+    # ones that are ahead of pace). None keeps the declared order, so capability remains the
+    # primary axis and pacing only ever reorders equals.
+    pace_group: Optional[str] = None
 
 
-def _climb(rungs: List[_Rung], last_resort: _Rung, final_fallbacks: List[str]) -> Tuple[_Rung, str]:
+@dataclass(frozen=True)
+class WindowPace:
+    """How one subscription window is spending relative to its own clock."""
+    provider: str
+    window_id: str
+    duration_hours: float
+    hours_to_reset: float
+    remaining_fraction: float
+    used_fraction: float
+    time_remaining_fraction: float
+    pace_ratio: float
+    behind_pace: bool
+    ahead_of_pace: bool
+    throttled: bool
+    expiring: bool
+
+
+def window_pace(provider: str, window_id: str, duration_hours: float, hours_to_reset: float,
+                remaining_fraction: float, used_fraction: Optional[float] = None) -> WindowPace:
+    """Pace one window: `pace_ratio` = remaining allowance / remaining time (1.0 = linear).
+
+    < 1.0 is ahead of pace (it would run out before its reset), so once the window is at
+    least PACE_THROTTLE_USED_FLOOR consumed it is `throttled` and its rungs are dropped.
+    > 1.0 is behind pace: the allowance would expire unused, so `prefer_furthest_behind_pace`
+    spends it first.  At or above SURPLUS_PACE_HEADROOM within SURPLUS_WINDOW_HOURS of the
+    reset it is `expiring`, which outranks plain pace so nothing is left on the table.
+    `used_fraction` is derived from `remaining_fraction` unless the report carries its own.
+    """
+    duration = duration_hours if duration_hours and duration_hours > 0 else 24.0
+    time_remaining = min(1.0, max(PACE_MIN_TIME_FRACTION, hours_to_reset / duration))
+    remaining = min(1.0, max(0.0, remaining_fraction))
+    used = min(1.0, max(0.0, 1.0 - remaining if used_fraction is None else used_fraction))
+    ratio = remaining / time_remaining
+    return WindowPace(
+        provider=provider,
+        window_id=window_id,
+        duration_hours=duration,
+        hours_to_reset=max(0.0, hours_to_reset),
+        remaining_fraction=remaining,
+        used_fraction=used,
+        time_remaining_fraction=time_remaining,
+        pace_ratio=ratio,
+        behind_pace=ratio >= 1.0 + PACE_PREFER_DELTA,
+        ahead_of_pace=ratio <= 1.0 - PACE_PREFER_DELTA,
+        throttled=ratio < PACE_THROTTLE_RATIO and used >= PACE_THROTTLE_USED_FLOOR,
+        expiring=(ratio >= SURPLUS_PACE_HEADROOM
+                  and 0.0 < hours_to_reset <= SURPLUS_WINDOW_HOURS
+                  and remaining > 0.0),
+    )
+
+
+def prefer_furthest_behind_pace(paces: List[WindowPace]) -> Optional[WindowPace]:
+    """The window to spend next: an expiring one first, then the furthest behind pace.
+
+    Callers pass only the windows of models that are already capable of the task, so this is
+    "the provider furthest behind pace among capable models" and never a capability decision.
+    """
+    if not paces:
+        return None
+    return max(paces, key=lambda pace: (pace.expiring, pace.pace_ratio, -pace.hours_to_reset))
+
+
+def balance_provider_for(model: str) -> str:
+    """Snapshot provider that holds `model`'s allowance. Antigravity splits by model family.
+
+    Codex models map to 'openai-codex' (the snapshot provider) so quota checks
+    and pacing hit the right provider entry.
+    """
+    if re.search(r"(?:^|[/._-])codex(?:$|[/._-])", model, re.IGNORECASE) or model.startswith("openai-codex/"):
+        return CODEX_PROVIDER
+    provider = model_to_provider(model)
+    if provider == ANTIGRAVITY_PROVIDER:
+        family = model.split("/", 1)[1] if "/" in model else ""
+        if family.startswith("claude"):
+            return AG_ANTHROPIC_PROVIDER
+        if family.startswith("gpt"):
+            return AG_OPENAI_PROVIDER
+    return provider
+
+def _pace_gate_rung(rung: _Rung, pace: Optional[WindowPace],
+                    blocked_reason: Optional[str] = None) -> _Rung:
+    """Close a rung whose provider is spent, exhausted by cache, or would be spent too early.
+
+    Three hard exclusions apply to every rung, whether or not it shares a pace group:
+    the exhaustion cache says the provider's reset is still ahead (operator 2026-09-25: three
+    lanes were dispatched onto an exhausted Antigravity Opus window and died on a 429 within
+    3 s), the window reports itself fully used, or it is ahead of pace once it is at least
+    PACE_THROTTLE_USED_FLOOR consumed and would be exhausted before its reset. The ahead-of-pace
+    hold-back exempts the terminal reserve rungs (`cooldown=True`): `_climb` reaches them only
+    after every on-pace tier above is closed, so the choice there is between drawing the last
+    of a window or failing the task outright.
+    """
+    if not rung.available:
+        return rung
+    if blocked_reason:
+        return replace(rung, available=False, reason=f"{rung.reason} Blocked: {blocked_reason}.")
+    if pace is None:
+        return rung
+    if pace.remaining_fraction <= 0.0 or pace.used_fraction >= 1.0:
+        return replace(rung, available=False, reason=(
+            f"{rung.reason} Blocked: {pace.provider} {pace.window_id} is exhausted "
+            f"({pace.used_fraction * 100:.0f}% used)."))
+    if pace.throttled and not rung.cooldown:
+        return replace(rung, available=False, reason=(
+            f"{rung.reason} Throttled: {pace.provider} {pace.window_id} is ahead of pace "
+            f"({pace.pace_ratio:.2f}x, {pace.used_fraction * 100:.0f}% used), so spending it now "
+            "would exhaust it before its reset."))
+    return rung
+
+
+def _apply_pace_rules(rungs: List[_Rung], pace_of_model, blocked_for_model=None) -> List[_Rung]:
+    """Gate every rung on its provider's exhaustion and pace, then order each pace group.
+
+    The gate runs first and applies to all rungs: a rung whose provider is recorded as
+    exhausted, whose window is fully used, or that is ahead of pace is closed, so the ladder
+    climbs past it instead of dispatching work that would fail. Then each `pace_group` — a run
+    of consecutive rungs that are interchangeable for the task — is ordered so an expiring
+    window comes first (spend it or lose it) and the furthest behind pace follows. Rungs
+    outside a group keep their declared order, so capability remains the primary axis and
+    pacing never promotes a weaker model over a stronger one.
+    """
+    blocked_for_model = blocked_for_model or (lambda _model: None)
+    ordered: List[_Rung] = []
+    index = 0
+    while index < len(rungs):
+        group = rungs[index].pace_group
+        if group is None:
+            rung = rungs[index]
+            ordered.append(_pace_gate_rung(rung, pace_of_model(rung.model), blocked_for_model(rung.model)))
+            index += 1
+            continue
+        end = index
+        while end < len(rungs) and rungs[end].pace_group == group:
+            end += 1
+        ranked = []
+        for position, rung in enumerate(rungs[index:end]):
+            pace = pace_of_model(rung.model)
+            ranked.append((_pace_gate_rung(rung, pace, blocked_for_model(rung.model)), pace, position))
+        ranked.sort(key=lambda entry: (
+            # A promoted rung outranks everything else in its group: the account-level window
+            # would otherwise expire unused, which no cheaper tier can compensate for.
+            0 if entry[0].promotion else 1,
+            0 if (entry[1] is not None and entry[1].expiring) else 1,
+            -(entry[1].pace_ratio if entry[1] is not None else 1.0),
+            entry[2],
+        ))
+        ordered.extend(rung for rung, _, _ in ranked)
+        index = end
+    return ordered
+
+
+def _climb(
+    rungs: List[_Rung],
+    last_resort: _Rung,
+    final_fallbacks: List[str],
+    is_eligible: Optional[Any] = None,
+) -> Tuple[_Rung, str]:
     """Pick the first available rung, and as its fallback the next available rung below it
     that may serve as a fallback and sits on another provider/credential. With no such rung,
-    the ladder's last resort, then the first cross-provider entry of `final_fallbacks`, is used."""
+    the ladder's last resort, then the first cross-provider entry of `final_fallbacks`, is used.
+    All fallback candidates (including last_resort and final_fallbacks) must pass is_eligible."""
+    eligible_check = is_eligible or (lambda _m: True)
+
     index = next((i for i, rung in enumerate(rungs) if rung.available), None)
-    chosen = last_resort if index is None else rungs[index]
+    if index is None:
+        if last_resort.available and eligible_check(last_resort.model):
+            chosen = last_resort
+        else:
+            chosen_candidate = None
+            for m in final_fallbacks:
+                if eligible_check(m):
+                    chosen_candidate = _Rung(m, True, "final fallback")
+                    break
+            if chosen_candidate is None:
+                raise ValueError("no eligible model or fallback available in ladder")
+            chosen = chosen_candidate
+    else:
+        chosen = rungs[index]
+
     provider = model_to_provider(chosen.model)
     below = [] if index is None else rungs[index + 1:]
     for rung in below:
         if rung.available and rung.as_fallback and model_to_provider(rung.model) != provider:
-            return chosen, rung.model
+            if eligible_check(rung.model):
+                return chosen, rung.model
+
     for model in (last_resort.model, *final_fallbacks):
-        if model_to_provider(model) != provider:
+        if model_to_provider(model) != provider and eligible_check(model):
             return chosen, model
-    raise ValueError(f"no cross-provider fallback for {chosen.model}")
+
+    raise ValueError(f"no eligible cross-provider fallback for {chosen.model}")
 
 
 class ResetAwareModelSelector:
@@ -447,7 +715,8 @@ class ResetAwareModelSelector:
       - Safe 429/cooldown/unknown handling
     """
 
-    def __init__(self, snapshot: Optional[Any] = None, credentialed_providers: Optional[Set[str]] = None):
+    def __init__(self, snapshot: Optional[Any] = None, credentialed_providers: Optional[Set[str]] = None,
+                 quota_snapshot: Optional[Any] = None):
         if snapshot is not None and isinstance(snapshot, BalanceAdapter):
             self.snapshot = snapshot.fetch_snapshot()
         elif snapshot is not None and hasattr(snapshot, "to_normalized"):
@@ -459,6 +728,34 @@ class ResetAwareModelSelector:
         self.credentialed_providers: Set[str] = (
             detect_credentialed_providers() if credentialed_providers is None else set(credentialed_providers)
         )
+        # Exhaustion cache. `veyyon usage` is far too slow to read before every dispatch
+        # (operator 2026-09-25), so eligibility is read from a local snapshot that a 429 or a
+        # periodic usage read refreshes. Tests inject their own snapshot here.
+        self._quota_snapshot = quota_snapshot
+
+    def quota_snapshot(self):
+        """The exhaustion cache, loaded once per selector. A missing file yields an empty one."""
+        if self._quota_snapshot is None:
+            self._quota_snapshot = load_quota_snapshot()
+        return self._quota_snapshot
+
+    def provider_exhaustion_reason(self, model: str) -> Optional[str]:
+        """Why `model`'s provider is ineligible, or None when it may be used.
+
+        A provider whose recorded reset time is still in the future is skipped entirely:
+        three lanes were dispatched onto an exhausted Antigravity Opus window and died on a
+        429 within 3 s. Once that reset time passes the same provider is eligible again with
+        no further bookkeeping.
+        """
+        snapshot = self.quota_snapshot()
+        if snapshot is None:
+            return None
+        provider = balance_provider_for(model)
+        if snapshot.is_eligible(provider):
+            return None
+        until = snapshot.provider_exhausted_until(provider)
+        return (f"{provider} is exhausted until {until.isoformat()}" if until is not None
+                else f"{provider} is exhausted")
 
     def set_snapshot(self, snapshot: Any):
         if snapshot is not None and isinstance(snapshot, BalanceAdapter):
@@ -467,6 +764,62 @@ class ResetAwareModelSelector:
             self.snapshot = snapshot.to_normalized()
         else:
             self.snapshot = snapshot
+    def pace_by_provider(self) -> Dict[str, WindowPace]:
+        """Governing pace per provider: its most constrained window (lowest pace ratio)."""
+        paces: Dict[str, WindowPace] = {}
+        for name, provider in (getattr(self.snapshot, "providers", {}) or {}).items():
+            windows = [
+                window_pace(name, window.id, window.duration_seconds / 3600.0,
+                            window.seconds_to_reset / 3600.0, window.remaining_fraction,
+                            window.used_fraction)
+                for window in provider.windows
+                if window.duration_seconds and window.duration_seconds > 0
+                and not window.is_cooldown and window.status != "exhausted"
+            ]
+            if not windows:
+                windows = [
+                    window_pace(name, window.id, window.duration_seconds / 3600.0,
+                                window.seconds_to_reset / 3600.0, window.remaining_fraction,
+                                window.used_fraction)
+                    for window in provider.windows
+                    if window.duration_seconds and window.duration_seconds > 0
+                ]
+            if windows:
+                paces[name] = min(windows, key=lambda pace: (pace.pace_ratio, pace.hours_to_reset))
+        return paces
+
+    def pace_of_provider(self, provider: str) -> Optional[WindowPace]:
+        return self.pace_by_provider().get(provider)
+
+    def pace_of_model(self, model: str) -> Optional[WindowPace]:
+        """Pace of the window that actually holds `model`'s allowance."""
+        return self.pace_by_provider().get(balance_provider_for(model))
+
+    def go_window_lanes(self, model: str) -> Dict[str, float]:
+        """Whole Go lanes of `model` left in each rolling window, given observed spend."""
+        return {window: self._go_lanes_in(model, window) for window in GO_WINDOW_FRACTION}
+
+    def go_lanes_remaining(self, model: str, window_id: str = GO_PACE_WINDOW) -> float:
+        """Whole lanes of `model` that fit its pacing window right now.
+
+        The cap is the model's own monthly cap scaled to the window (5h 20%, week 50%,
+        month 100%); the spend is the provider-level USD veyyon observed, charged in full to
+        this model, which makes the result a lower bound. space-bunny-free is uncapped.
+        """
+        return self._go_lanes_in(model, window_id)
+
+    def _go_lanes_in(self, model: str, window_id: str) -> float:
+        cap = GO_MONTHLY_CAP_USD.get(model)
+        cost = GO_LANE_COST_USD.get(model)
+        if cap is None or not cost:
+            return float("inf")
+        provider = (getattr(self.snapshot, "providers", {}) or {}).get(OPENCODE_GO_PROVIDER)
+        window = next((w for w in getattr(provider, "windows", []) if w.id == window_id), None)
+        spent = 0.0
+        if window is not None and window.total_limit is not None and window.remaining_units is not None:
+            spent = max(0.0, window.total_limit - window.remaining_units)
+        return max(0.0, (cap * GO_WINDOW_FRACTION[window_id] - spent) / cost)
+
     def evaluate_provider(self, provider: str) -> Dict[str, Any]:
         """Extract quota metrics and health for a given provider."""
         if not self.snapshot:
@@ -631,20 +984,23 @@ class ResetAwareModelSelector:
         deepseek_ok = deepseek_meta["is_available"]
         google_ok = google_meta["is_available"]
 
-        # OpenCode Go: credentialed via auth store, space-bunny-free is always available
-        # (cost $0), paid Go models are available if the provider is credentialed AND not
-        # in cooldown.  Pacing: Go has weekly/monthly limits — prefer it when its headroom
-        # is furthest behind pace (most allowance remaining vs time), throttle when ahead.
+        # OpenCode Go is a $10/month subscription whose per-model monthly caps are enforced
+        # through 5h/week/month windows (GO_MONTHLY_CAP_USD / GO_WINDOW_FRACTION).  A paid Go
+        # model is offered only while a whole lane of ITS measured cost still fits the pacing
+        # window, so glm-5.3 keeps its $15 cap for high-value review instead of leading every
+        # ladder.  space-bunny-free is free and uncapped, so it only needs the credential.
         go_credentialed = OPENCODE_GO_PROVIDER in credentialed
         go_available = go_credentialed and go_meta["is_available"]
-        # space-bunny-free is free and unlimited: always available if credentialed
         go_bunny_ok = go_credentialed
-        # Paid Go models: available if credentialed and provider not in cooldown
-        go_paid_ok = go_available
-        # Go pacing: burn_headroom > 1.0 means behind pace (spending slower than linear),
-        # so the provider has surplus to burn.  Prefer Go when headroom > 1.0.
-        go_headroom = go_meta.get("burn_headroom", 1.0)
-        go_behind_pace = go_headroom >= 1.0  # behind pace = surplus to burn
+        go_lanes = {model: self.go_lanes_remaining(model) for model in GO_MONTHLY_CAP_USD}
+        go_pace = self.pace_of_provider(OPENCODE_GO_PROVIDER)
+        go_headroom = go_pace.pace_ratio if go_pace else 1.0
+        go_behind_pace = bool(go_pace and go_pace.behind_pace)
+
+        def go_ok(model: str) -> bool:
+            """Credentialed, provider healthy, and a whole lane of it left this week."""
+            return go_available and go_lanes.get(model, 0.0) >= 1.0
+
 
         quota_metrics = {
             "google_remaining": google_meta["remaining_fraction"],
@@ -669,6 +1025,9 @@ class ResetAwareModelSelector:
             "go_bunny_ok": go_bunny_ok,
             "go_headroom": go_headroom,
             "go_behind_pace": go_behind_pace,
+            "go_pace_window": GO_PACE_WINDOW,
+            "go_lanes_remaining": go_lanes,
+            "go_window_lanes": {model: self.go_window_lanes(model) for model in GO_MONTHLY_CAP_USD},
         }
 
         # 5. Rework-aware routing: force a strong first pass for critical domains or after rework.
@@ -680,24 +1039,33 @@ class ResetAwareModelSelector:
         )
         evidence_packet_required = risk_level in (RiskLevel.MEDIUM, RiskLevel.HIGH) or task_type == TaskType.STRONG_REVIEW
 
-        codex_promo = _Rung(
-            MODEL_CODEX_ASTRA, codex_near_reset_surplus,
-            f"Codex pro weekly window resets in {codex_pro_hrs:.1f}h at {codex_pro_headroom:.2f}x pace "
-            "headroom; promoted Codex Astra to spend allowance that would otherwise expire.",
-            promotion=True,
-        )
+        def codex_promoted(model: str, label: str, group: str) -> _Rung:
+            """Promote an expiring Codex window so its allowance is spent instead of lost."""
+            return _Rung(
+                model, codex_near_reset_surplus,
+                f"Codex pro weekly window resets in {codex_pro_hrs:.1f}h at {codex_pro_headroom:.2f}x pace "
+                f"headroom; promoted {label} to spend allowance that would otherwise expire.",
+                promotion=True, pace_group=group,
+            )
+
+        # A promoted rung leads its pace group, so an expiring Codex window is spent ahead of the
+        # interchangeable cheap tiers that share that group, and every other day loses to them.
+        codex_promo = codex_promoted(MODEL_CODEX_ASTRA, "Codex Astra", PACE_GROUP_STRONG)
         astra_on_pace = _Rung(
             MODEL_CODEX_ASTRA, codex_usable,
             f"Codex Astra medium ({codex_pro_headroom:.2f}x pace headroom).",
+            pace_group=PACE_GROUP_STRONG,
         )
         astra_emergency = _Rung(
             MODEL_CODEX_ASTRA, codex_meta["is_available"],
             "only Codex ahead of pace remains; spending its emergency reserve.",
-            cooldown=True,
+            cooldown=True, pace_group=PACE_GROUP_STRONG,
         )
+        codex_fast_promo = codex_promoted(MODEL_CODEX_FAST, "Codex Fast", PACE_GROUP_EXEC)
         ag_opus = _Rung(
             MODEL_AG_CLAUDE_OPUS, ag_claude_ok,
             f"Antigravity Claude Opus 4.6 (free daily window, expires before any weekly window). {ag_claude_note}.",
+            pace_group=PACE_GROUP_STRONG,
         )
         glm = _Rung(MODEL_ZAI_GLM, zai_ok, "Z.AI GLM-5.3 (credentialed Coding Plan).")
         deepseek_pro = _Rung(MODEL_DEEPSEEK_PRO, deepseek_ok, "DeepSeek V4 Pro (pay-per-token, 1M context).")
@@ -710,54 +1078,59 @@ class ResetAwareModelSelector:
             cooldown=True, as_fallback=False,
         )
 
-        # OpenCode Go reusable rungs: space-bunny-free first (free unlimited),
-        # then paid Go models ranked by TB4% and cost per task.
+        # OpenCode Go rungs, allowance-gated and pace-ordered.  glm-5.3-flash is the Go
+        # workhorse ($60 cap, ~144 lanes/month); glm-5.3 is the rare precision reviewer ($15
+        # cap, ~4 lanes/month, and one median lane already consumes most of a 5h window, so it
+        # can serve at most one lane per 5h); GPT-6 Luna is the cheap bulk filler ($15 cap).
+        # space-bunny-free is free and unlimited and leads wherever it is good enough.
         go_bunny = _Rung(
             MODEL_GO_BUNNY, go_bunny_ok,
-            "OpenCode Go space-bunny-free (free unlimited, 1M ctx, multimodal).",
-        )
-        go_glm53 = _Rung(
-            MODEL_GO_GLM53, go_paid_ok and go_behind_pace,
-            f"OpenCode Go GLM-5.3 (TB4 41.9%, {go_headroom:.2f}x pace headroom).",
+            "OpenCode Go space-bunny-free (free, uncapped, 1M ctx, multimodal).",
+            pace_group=PACE_GROUP_GO_FREE,
         )
         go_glm53_flash = _Rung(
-            MODEL_GO_GLM53_FLASH, go_paid_ok,
-            "OpenCode Go GLM-5.3-Flash (TB4 32.8%, $0.033/lane).",
-        )
-        go_qwen38_flash = _Rung(
-            MODEL_GO_QWEN38_FLASH, go_paid_ok,
-            "OpenCode Go Qwen3.8 Flash (TB4 25.3%, $0.030/lane).",
-        )
-        go_qwen38_max = _Rung(
-            MODEL_GO_QWEN38_MAX, go_paid_ok and go_behind_pace,
-            f"OpenCode Go Qwen3.8 Max (TB4 38.9%, {go_headroom:.2f}x pace headroom).",
+            MODEL_GO_GLM53_FLASH, go_ok(MODEL_GO_GLM53_FLASH),
+            f"OpenCode Go GLM-5.3-Flash (Go workhorse: $60 cap, ~144 lanes/month, "
+            f"{go_lanes[MODEL_GO_GLM53_FLASH]:.0f} lanes left this week).",
+            pace_group=PACE_GROUP_GO_PAID,
         )
         go_gpt6_luna = _Rung(
-            MODEL_GO_GPT6_LUNA, go_paid_ok,
-            "OpenCode Go GPT-6 Luna (TB4 12.6%, $0.029/lane, cheapest paid Go).",
+            MODEL_GO_GPT6_LUNA, go_ok(MODEL_GO_GPT6_LUNA),
+            f"OpenCode Go GPT-6 Luna (cheap bulk filler: $15 cap, ~78 lanes/month, "
+            f"{go_lanes[MODEL_GO_GPT6_LUNA]:.0f} lanes left this week).",
+            pace_group=PACE_GROUP_GO_PAID,
+        )
+        go_glm53 = _Rung(
+            MODEL_GO_GLM53, go_ok(MODEL_GO_GLM53),
+            f"OpenCode Go GLM-5.3 (rare precision reviewer: $15 cap, ~4 lanes/month, "
+            f"{go_lanes[MODEL_GO_GLM53]:.0f} lanes left this week).",
+            pace_group=PACE_GROUP_GO_PAID,
         )
 
         if context_tokens > 180000 or task_type == TaskType.DEEP_CONTEXT:
-            # CASE A: DEEP CONTEXT (> 180k tokens, or a DEEP_CONTEXT task). The 1M-context tiers
-            # come first; then every cheap tier whose verified window holds the context, in the
-            # high-risk worker ladder's order. Fable is reached only when all of them are out.
-            # MiniMax-M3 (TB4 2.0%) is bulk/triage (tiny tasks) and the 1M-context overflow for
-            # low-risk deep-context reads only: implementation, review, reasoning and any
-            # rework or high-risk deep-context read skip it and climb to Codex Astra.
+            # CASE A: DEEP CONTEXT (> 180k tokens, or a DEEP_CONTEXT task). Every 1M-context
+            # tier in cost order: free first, then the Ultra daily window, then the cheap Go
+            # models, then pay-per-token DeepSeek V4 Pro, then MiniMax-M3 for bulk and
+            # low-risk reads only. Codex and Opus follow those; Fable is reached only when all
+            # of them are out. Implementation, review, reasoning and any rework or high-risk
+            # deep-context read skip MiniMax and climb on.
             label = f"Deep context ({context_tokens} tokens)"
             rungs = [
                 go_bunny,
                 _Rung(MODEL_GEMINI_PRO, google_ok, "Gemini 3.1 Pro (1M-token window)."),
                 go_glm53_flash,
+                go_gpt6_luna,
+                _Rung(MODEL_DEEPSEEK_PRO, deepseek_ok, "DeepSeek V4 Pro (pay-per-token, 1M context).", cooldown=True),
                 _Rung(MODEL_MINIMAX_M3,
                       minimax_ok and (task_type == TaskType.TINY_TASK
                                       or (task_type == TaskType.DEEP_CONTEXT and not is_rework_critical)),
                       "MiniMax-M3 (1M-token window, credentialed; low-risk deep-context/bulk overflow).", cooldown=True),
                 glm,
+                ag_opus,
+                codex_promo,
                 astra_on_pace,
                 _Rung(MODEL_CODEX_FAST, codex_usable, "1M-context tiers unavailable; Codex Fast (400k window, on pace).",
                       cooldown=True),
-                ag_opus,
                 astra_emergency,
                 _Rung(MODEL_CODEX_FAST, codex_meta["is_available"],
                       "only Codex ahead of pace holds this context; spending its emergency reserve.", cooldown=True),
@@ -772,21 +1145,20 @@ class ResetAwareModelSelector:
                                else [MODEL_OR_DEEPSEEK_FLASH])
 
         elif task_type == TaskType.STRONG_REVIEW and is_rework_critical:
-            # CASE B1: HIGH-RISK REVIEW ladder. The one worker lane where paid Anthropic
-            # (Fable) is a regular rung: slack behind pace first, the orchestrator reserve only
-            # after Codex on pace is out. Flash, DeepSeek Flash and free models never qualify.
+            # CASE B1: HIGH-RISK REVIEW. Go and Antigravity are tried before Codex, and paid
+            # Anthropic (Fable) is a regular rung: slack behind pace first, the orchestrator
+            # reserve only after Codex on pace is out. This is the one ladder where Codex and
+            # Opus may sit at the end, because a high-risk review must not stop at a cheap
+            # tier. Flash, DeepSeek Flash and free models never qualify.
             label = "High-risk review"
             rungs = [
-                codex_promo,
-                ag_opus,
-                # Go GLM-5.3 as cross-family reviewer (TB4 41.9%) — only when Go has surplus
                 go_glm53,
+                ag_opus,
+                codex_promo,
                 _Rung(MODEL_CLAUDE_FABLE, anthropic_worker_ok,
                       f"Claude Fable: the Anthropic weekly window runs {anthropic_headroom:.2f}x behind pace, "
                       "so slack beyond the orchestrator's share is spent on review."),
                 astra_on_pace,
-                # Go Qwen3.8 Max (TB4 38.9%) as cross-family second opinion
-                go_qwen38_max,
                 _Rung(MODEL_CLAUDE_FABLE, anthropic_meta["is_available"],
                       "no review allowance left elsewhere; drawing on the Anthropic orchestrator reserve.",
                       cooldown=True, as_fallback=False),
@@ -798,23 +1170,21 @@ class ResetAwareModelSelector:
             final_fallbacks = [MODEL_DEEPSEEK_PRO, MODEL_CODEX_ASTRA]
 
         elif is_rework_critical and task_type in (TaskType.ROUTINE_EXECUTION, TaskType.DEEP_REASONING):
-            # CASE B2: HIGH-RISK WORKER ladder (implementation first pass, deep reasoning), in the
-            # operator's order: GLM-5.3 (credentialed) -> Codex Astra medium -> DeepSeek V4 Pro ->
-            # Antigravity Opus -> Fable last resort. Expiring Codex surplus is promoted to the top.
-            # Codex ahead of pace and Gemini Pro are emergency rungs, still ahead of Fable.
+            # CASE B2: HIGH-RISK WORKER (implementation first pass, deep reasoning): cheap Go
+            # first, then Z.AI GLM-5.3, the rare Go reviewer, DeepSeek V4 Pro and Antigravity
+            # Opus. Codex follows them, and its expiring surplus is promoted once the cheaper
+            # tiers are out. Fable stays the last resort.
             label = ("High-risk implementation first pass" if task_type == TaskType.ROUTINE_EXECUTION
                      else "High-risk deep reasoning")
             rungs = [
-                codex_promo,
+                go_glm53_flash,
                 glm,
-                # Go GLM-5.3 (TB4 41.9%) is the first Go rung before Codex Astra
                 go_glm53,
-                astra_on_pace,
                 deepseek_pro,
                 ag_opus,
+                codex_promo,
+                astra_on_pace,
                 astra_emergency,
-                # Go Qwen3.8 Max (TB4 38.9%) — different family from GLM
-                go_qwen38_max,
                 _Rung(MODEL_GEMINI_PRO, google_ok, "strong worker tiers unavailable; emergency Gemini Pro.", cooldown=True),
                 fable_last_resort,
             ]
@@ -822,92 +1192,108 @@ class ResetAwareModelSelector:
             final_fallbacks = [MODEL_CODEX_ASTRA, MODEL_GEMINI_PRO]
 
         elif task_type == TaskType.STRONG_REVIEW and risk_level == RiskLevel.MEDIUM:
-            # CASE C: MEDIUM-RISK REVIEW — worker tiers only, never paid Anthropic.
+            # CASE C: MEDIUM-RISK REVIEW — worker tiers only, never paid Anthropic or Antigravity Opus
+            # (Opus is reserved for high-risk work only). Z.AI and Go lead, then Codex and DeepSeek.
             label = "Medium-risk review"
             rungs = [
-                codex_promo,
-                ag_opus,
-                # Go cross-family reviewer: GLM when impl was non-GLM, Qwen when impl was GLM
-                go_glm53,
-                astra_on_pace,
-                glm,
-                _Rung(MODEL_GEMINI_FLASH, google_ok, "Gemini 3.8 Flash; direct Anthropic reserved for the orchestrator."),
-                go_qwen38_max,
                 go_glm53_flash,
+                glm,
+                codex_promo,
+                astra_on_pace,
+                go_glm53,
+                deepseek_pro,
+                _Rung(MODEL_GEMINI_FLASH, google_ok, "Gemini 3.8 Flash; direct Anthropic reserved for the orchestrator."),
                 _Rung(MODEL_DEEPSEEK_FLASH, deepseek_ok, "overflow to DeepSeek V4.1 Flash.", cooldown=True),
             ]
             last_resort = _Rung(MODEL_OR_DEEPSEEK_FLASH, True, "all review tiers unavailable; OpenRouter DeepSeek Flash.", cooldown=True)
             final_fallbacks = [MODEL_DEEPSEEK_FLASH]
 
         elif task_type == TaskType.STRONG_REVIEW:
-            # CASE D: LOW-RISK REVIEW — Flash 3.8 is safe and fast.
+            # CASE D: LOW-RISK REVIEW — the free Go model and a cheap Go worker are enough.
             label = "Low-risk review"
             rungs = [
                 go_bunny,
-                _Rung(MODEL_GEMINI_FLASH, google_ok, "Gemini 3.8 Flash fast review execution."),
                 go_glm53_flash,
+                _Rung(MODEL_GEMINI_FLASH, google_ok, "Gemini 3.8 Flash fast review execution."),
                 _Rung(MODEL_DEEPSEEK_FLASH, deepseek_ok, "Gemini unavailable; DeepSeek V4.1 Flash.", cooldown=True),
             ]
             last_resort = _Rung(MODEL_OR_DEEPSEEK_FLASH, True, "OpenRouter DeepSeek Flash.", cooldown=True)
             final_fallbacks = [MODEL_DEEPSEEK_FLASH]
 
         elif task_type == TaskType.DEEP_REASONING:
-            # CASE E: LOW/MEDIUM DEEP REASONING — worker tiers only, never paid Anthropic.
+            # CASE E: DEEP REASONING (LOW and MEDIUM risk; HIGH risk routes via CASE B2 high-risk worker ladder).
+            # Leads with opencode-go GLM-5.3 (then DeepSeek, then Gemini 3.8 Flash, or promoted Codex when expiring).
             label = "Deep reasoning"
+            band_group = PACE_GROUP_EXEC if risk_level == RiskLevel.LOW else PACE_GROUP_STRONG
+            flash_rung = _Rung(
+                MODEL_GEMINI_FLASH, google_ok,
+                "abundant Gemini 3.8 Flash; direct Anthropic reserved for the orchestrator.",
+                pace_group=band_group,
+            )
+            codex_rung = codex_promoted(MODEL_CODEX_ASTRA, "Codex Astra", band_group)
+            if codex_rung.promotion:
+                band = [codex_rung, deepseek_pro, flash_rung]
+            else:
+                band = [deepseek_pro, flash_rung]
             rungs = [
-                codex_promo,
-                ag_opus,
                 go_glm53,
-                _Rung(MODEL_GEMINI_FLASH, google_ok, "abundant Gemini 3.8 Flash; direct Anthropic reserved for the orchestrator."),
-                _Rung(MODEL_CODEX_ASTRA, codex_usable, "Gemini unavailable; Codex Astra medium (on pace).", cooldown=True),
-                _Rung(MODEL_ZAI_GLM, zai_ok, "Gemini and Codex unavailable; Z.AI GLM-5.3.", cooldown=True),
-                go_qwen38_max,
+                *band,
                 go_glm53_flash,
+                glm,
+                astra_on_pace,
                 _Rung(MODEL_DEEPSEEK_FLASH, deepseek_ok, "Gemini and Codex unavailable; DeepSeek V4.1 Flash overflow.", cooldown=True),
             ]
             last_resort = _Rung(MODEL_OR_DEEPSEEK_FLASH, True, "all reasoning tiers unavailable; OpenRouter DeepSeek Flash.", cooldown=True)
             final_fallbacks = [MODEL_DEEPSEEK_FLASH]
+
         elif task_type == TaskType.TINY_TASK:
             # CASE F: TINY TASK / BULK TRIAGE (compaction, commits, classification).
             label = "Lightweight / bulk triage task"
             rungs = [
                 go_bunny,
-                _Rung(MODEL_GEMINI_LITE, google_ok, "Gemini 3.1 Flash Lite."),
                 go_gpt6_luna,
+                go_glm53_flash,
+                _Rung(MODEL_GEMINI_LITE, google_ok, "Gemini 3.1 Flash Lite."),
                 _Rung(MODEL_ZAI_GLM_FLASH, zai_ok, "Z.AI GLM-5.3-Flash (credentialed).", cooldown=True),
                 _Rung(MODEL_MINIMAX_M3, minimax_ok, "MiniMax-M3 (credentialed, bulk/triage only).", cooldown=True),
-                go_qwen38_flash,
                 _Rung(MODEL_DEEPSEEK_FLASH, deepseek_ok, "DeepSeek V4.1 Flash.", cooldown=True),
             ]
             last_resort = _Rung(MODEL_OR_DEEPSEEK_FLASH, True, "OpenRouter DeepSeek Flash.", cooldown=True)
             final_fallbacks = [MODEL_DEEPSEEK_FLASH]
 
         else:
-            # CASE G: ROUTINE EXECUTION (low/medium implementation, mapping, routine QA).
-            # Gemini Flash is the abundant default; GLM-5.3 (credentialed) or DeepSeek Flash
-            # is the overflow and the fallback.
+            # CASE G: ROUTINE EXECUTION (low/medium implementation, mapping, routine QA). The
+            # free Go model first, then the primary abundant Antigravity lane, then the paid Go
+            # workers and Z.AI overflow. Codex follows them: on pace it is the last subscription
+            # lane, and with its window about to expire the promoted rung leads the band instead
+            # of letting the allowance go to waste.
             label = "Routine execution"
             rungs = [
                 go_bunny,
-                _Rung(MODEL_CODEX_FAST, codex_near_reset_surplus and risk_level != RiskLevel.LOW,
-                      f"Codex pro allowance expiring in {codex_pro_hrs:.1f}h ({codex_pro_headroom:.2f}x pace "
-                      "headroom); promoted Codex Fast to burn surplus capacity.", promotion=True),
                 _Rung(MODEL_GEMINI_FLASH, google_ok,
-                      "primary abundant execution lane: Gemini 3.8 Flash (Ultra daily allowance).", as_fallback=False),
+                      "primary abundant execution lane: Gemini 3.8 Flash (Ultra daily allowance).",
+                      as_fallback=False, pace_group=PACE_GROUP_EXEC),
+                codex_fast_promo,
                 go_glm53_flash,
-                go_qwen38_flash,
+                go_gpt6_luna,
+                _Rung(MODEL_ZAI_GLM, zai_ok, "overflow to Z.AI GLM-5.3 (credentialed).", cooldown=True),
                 _Rung(MODEL_CODEX_FAST, codex_usable,
                       "Google Antigravity in cooldown; Codex Fast (subscription headroom).", cooldown=True, as_fallback=False),
-                _Rung(MODEL_ZAI_GLM, zai_ok, "overflow to Z.AI GLM-5.3 (credentialed).", cooldown=True),
                 _Rung(MODEL_DEEPSEEK_FLASH, deepseek_ok, "overflow to DeepSeek V4.1 Flash.", cooldown=True),
             ]
             last_resort = _Rung(MODEL_OR_DEEPSEEK_FLASH, True, "all execution tiers unavailable; OpenRouter DeepSeek Flash.", cooldown=True)
             final_fallbacks = [MODEL_DEEPSEEK_FLASH]
 
-        # Every ladder drops a rung whose verified window cannot hold the context, so GLM-5.3
-        # (131,072 tokens) is never picked or offered as a fallback above its window.
+
+        # Pacing first: inside each capability group it promotes the provider that is furthest
+        # behind pace (or about to expire) and closes the ones that are ahead of pace, so no
+        # window is exhausted before its reset and none expires unspent. Then every ladder
+        # drops a rung whose verified window cannot hold the context, so GLM-5.3 (131,072
+        # tokens) is never picked or offered as a fallback above its window.
+        rungs = _apply_pace_rules(rungs, self.pace_of_model, self.provider_exhaustion_reason)
         rungs = [rung for rung in rungs if context_tokens <= VERIFIED_CONTEXT_WINDOWS[rung.model]]
-        chosen, fallback_model = _climb(rungs, last_resort, final_fallbacks)
+        is_eligible_fn = lambda m: self.provider_exhaustion_reason(m) is None
+        chosen, fallback_model = _climb(rungs, last_resort, final_fallbacks, is_eligible=is_eligible_fn)
 
         # Free OpenRouter second opinion for reviews: advisory only (1000 req/day free tier),
         # never a merge gate, never an approval, never a replacement for the review above.
