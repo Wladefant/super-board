@@ -27,10 +27,13 @@ import copy
 import itertools
 import json
 import os
+import shutil
 import sys
 import time
+import tempfile
 import unittest
 from unittest import mock
+from pathlib import Path
 
 # Ensure workflows directory is in python path
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -54,6 +57,12 @@ from balance_loader import (
     ms_to_iso_utc,
     parse_usage_json,
     sanitize_string,
+)
+from quota_snapshot import (
+    QuotaSnapshot,
+    QuotaWindowEntry,
+    apply_quota_error,
+    load_snapshot as load_quota_file,
 )
 from model_routing import (
     EvidencePacket,
@@ -90,6 +99,9 @@ from model_routing import (
     model_to_provider,
 )
 
+def tmp_quota_path() -> "Path":
+    """A private snapshot path for one test, never the operator's live cache."""
+    return Path(tempfile.mkdtemp(prefix="quota-snapshot-test-")) / "quota-snapshot.json"
 
 class TestBalanceLoaderAndRouting(unittest.TestCase):
 
@@ -106,6 +118,12 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         self.addCleanup(env_patch.stop)
         for var in (*CREDENTIAL_ENV_BY_PROVIDER.values(), "MINIMAX_API_KEY"):
             os.environ.pop(var, None)
+
+        # Hermetic exhaustion cache: the live ~/.veyyon/run/quota-snapshot.json is not test
+        # input, so every selector sees an empty cache unless a test injects one.
+        quota_patch = mock.patch("model_routing.load_quota_snapshot", return_value=QuotaSnapshot())
+        quota_patch.start()
+        self.addCleanup(quota_patch.stop)
 
         # Base realistic mock JSON simulating live veyyon usage output
         self.mock_now_ms = 1788598659263  # 2026-09-05T08:57:39Z
@@ -321,11 +339,12 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         self.assertIn("Gemini 3.8 Flash", rec_routine.reasoning)
         print(f"  [PASS] Routine execution defaults to: {rec_routine.selected_model}")
 
-        # Deep reasoning keeps direct Anthropic for the orchestrator and routes to Gemini 3.8 Flash
+        # Operator DEEP_REASONING ladder policy (#214): LOW and MEDIUM lead with OpenCode Go
+        # GLM-5.3, then DeepSeek V4 Pro, then Gemini 3.8 Flash; direct Anthropic is preserved
+        # for the orchestrator. When Go is uncredentialed in hermetic tests, DeepSeek V4 Pro leads.
         rec_reason = selector.select_model(task_type=TaskType.DEEP_REASONING, risk_level=RiskLevel.LOW)
-        self.assertEqual(rec_reason.selected_model, MODEL_GEMINI_FLASH)
-        self.assertIn("direct Anthropic reserved for the orchestrator", rec_reason.reasoning)
-        print(f"  [PASS] Deep reasoning preserved Anthropic: {rec_reason.selected_model}")
+        self.assertEqual(rec_reason.selected_model, MODEL_DEEPSEEK_PRO)
+        print(f"  [PASS] Deep reasoning preserved Anthropic (routed to {rec_reason.selected_model})")
 
     # -------------------------------------------------------------------------
     # TEST 6: Cooldown & Rate Limit Safety Failover
@@ -575,18 +594,19 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         selector = ResetAwareModelSelector(snapshot)
 
         # Routine execution with rework_count=1 escalates to the high-risk worker ladder
-        # (Flash barred): GLM-5.3 (credentialed) -> Codex Astra medium -> DeepSeek V4 Pro ->
+        # (Flash barred): GLM-5.3 (credentialed) -> DeepSeek V4 Pro -> Codex Astra medium ->
         # Antigravity Opus -> Fable last resort. Paid Anthropic is never a worker primary or
-        # fallback while a cheap tier has headroom.
+        # fallback while a cheap tier has headroom (operator 2026-09-25: the cheap tiers precede
+        # the subscription Codex window in worker ladders; Codex leads only in strong review).
         rec = selector.select_model(
             task_type=TaskType.ROUTINE_EXECUTION,
             risk_level=RiskLevel.LOW,
             rework_count=1,
         )
         self.assertNotEqual(rec.selected_model, MODEL_GEMINI_FLASH)
-        # Default fixture: no Z.AI credential, Codex on pace, Anthropic with slack.
-        self.assertEqual(rec.selected_model, MODEL_CODEX_ASTRA)
-        self.assertEqual(rec.fallback_model, MODEL_DEEPSEEK_PRO)
+        # Default fixture: no Z.AI or OpenCode Go credential, Codex on pace, Anthropic with slack.
+        self.assertEqual(rec.selected_model, MODEL_DEEPSEEK_PRO)
+        self.assertEqual(rec.fallback_model, MODEL_CODEX_ASTRA)
         self.assertNotIn("anthropic/", rec.fallback_model)
         self.assertIn("high-risk implementation", rec.reasoning.lower())
         print(f"  [PASS] Rework escalation: {rec.selected_model} (fallback: {rec.fallback_model}, cross-provider)")
@@ -595,7 +615,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         glm_selector = ResetAwareModelSelector(snapshot, credentialed_providers={ZAI_PROVIDER})
         rec_glm = glm_selector.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.LOW, rework_count=1)
         self.assertEqual(rec_glm.selected_model, MODEL_ZAI_GLM)
-        self.assertEqual(rec_glm.fallback_model, MODEL_CODEX_ASTRA)
+        self.assertEqual(rec_glm.fallback_model, MODEL_DEEPSEEK_PRO)
         print(f"  [PASS] Credentialed GLM-5.3 leads the ladder: {rec_glm.selected_model} (fallback {rec_glm.fallback_model})")
 
     # -------------------------------------------------------------------------
@@ -614,7 +634,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             domain_tags=["auth", "state_machine"],
         )
         self.assertNotEqual(rec.selected_model, MODEL_GEMINI_FLASH)
-        self.assertEqual(rec.selected_model, MODEL_CODEX_ASTRA)
+        self.assertEqual(rec.selected_model, MODEL_DEEPSEEK_PRO)
         self.assertNotIn("anthropic/", rec.fallback_model)
         # Cross-provider fallback
         self.assertNotEqual(model_to_provider(rec.selected_model),
@@ -781,6 +801,80 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             set_window(usage["reports"][1]["limits"][1], anthropic_week_used, anthropic_week_reset_hrs)
         return usage
 
+    @staticmethod
+    def _quota_with(provider: str, until_utc: str, window_id: str = "daily") -> QuotaSnapshot:
+        """An exhaustion cache marking one provider/window spent until `until_utc`."""
+        entry = QuotaWindowEntry(
+            provider=provider, window_id=window_id, used_fraction=1.0,
+            exhausted_until=until_utc, fetched_at="2026-09-25T00:00:00Z", source="429",
+        )
+        return QuotaSnapshot(updated_at="2026-09-25T00:00:00Z", entries={f"{provider}|{window_id}": entry})
+
+    # -------------------------------------------------------------------------
+    # TEST 34: An exhausted window is never selected, and re-arms after its reset
+    # -------------------------------------------------------------------------
+    def test_exhausted_window_never_selected(self):
+        print("\n--- TEST 34: Exhausted Window Never Selected ---")
+        usage = self._usage_with_ag_families(anthropic_used=0.0)
+        plain = self._selector(usage)
+        self.assertEqual(plain.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH).selected_model,
+                         MODEL_AG_CLAUDE_OPUS)
+
+        # Three lanes died on a 429 within 3 s after being dispatched onto the exhausted
+        # Antigravity Opus window, so a cache entry with a future reset must remove it.
+        exhausted = ResetAwareModelSelector(
+            parse_usage_json(usage, current_time_ms=self.mock_now_ms),
+            quota_snapshot=self._quota_with("google-antigravity:anthropic", "2099-01-01T00:00:00Z"),
+        )
+        self.assertFalse(exhausted.quota_snapshot().is_eligible("google-antigravity:anthropic"))
+        self.assertEqual(
+            exhausted.provider_exhaustion_reason(MODEL_AG_CLAUDE_OPUS),
+            "google-antigravity:anthropic is exhausted until 2099-01-01T00:00:00+00:00",
+        )
+        for task_type, risk in ((TaskType.STRONG_REVIEW, RiskLevel.HIGH),
+                                (TaskType.STRONG_REVIEW, RiskLevel.MEDIUM),
+                                (TaskType.ROUTINE_EXECUTION, RiskLevel.HIGH),
+                                (TaskType.DEEP_REASONING, RiskLevel.HIGH)):
+            rec = exhausted.select_model(task_type=task_type, risk_level=risk)
+            self.assertNotEqual(rec.selected_model, MODEL_AG_CLAUDE_OPUS, f"{task_type}/{risk}")
+            self.assertNotEqual(rec.fallback_model, MODEL_AG_CLAUDE_OPUS, f"{task_type}/{risk}")
+
+        # The same entry with a reset that has already passed re-arms the provider with no
+        # extra bookkeeping: the reset timestamp is the only state that matters.
+        rearmed = ResetAwareModelSelector(
+            parse_usage_json(usage, current_time_ms=self.mock_now_ms),
+            quota_snapshot=self._quota_with("google-antigravity:anthropic", "2020-01-01T00:00:00Z"),
+        )
+        self.assertIsNone(rearmed.provider_exhaustion_reason(MODEL_AG_CLAUDE_OPUS))
+        self.assertEqual(rearmed.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH).selected_model,
+                         MODEL_AG_CLAUDE_OPUS)
+
+        # An unrelated provider's window is untouched by the entry.
+        self.assertTrue(exhausted.quota_snapshot().is_eligible("openai-codex"))
+        print("  [PASS] Exhausted Antigravity Opus skipped on every ladder; re-armed after its reset, siblings unaffected.")
+
+    # -------------------------------------------------------------------------
+    # TEST 35: A 429 body updates the exhaustion cache the router reads
+    # -------------------------------------------------------------------------
+    def test_quota_429_body_blocks_provider(self):
+        print("\n--- TEST 35: 429 Body Updates the Router's Cache ---")
+        cache = tmp_quota_path()
+        self.addCleanup(shutil.rmtree, cache.parent, ignore_errors=True)
+        body = json.dumps({"error": {"code": 429, "status": "RESOURCE_EXHAUSTED",
+                                     "message": "quota exceeded; resets at 2099-01-01T00:00:00Z",
+                                     "details": [{"@type": "type.googleapis.com/google.rpc.RetryInfo",
+                                                  "retryDelay": "3s"}]}})
+        reset = apply_quota_error("google-antigravity:anthropic", "daily", body, path=cache)
+        self.assertIsNotNone(reset)
+        self.assertEqual(reset.exhausted_until, "2099-01-01T00:00:00Z")
+        reloaded = load_quota_file(cache)
+        self.assertFalse(reloaded.is_eligible("google-antigravity:anthropic"))
+        usage = self._usage_with_ag_families(anthropic_used=0.0)
+        selector = ResetAwareModelSelector(parse_usage_json(usage, current_time_ms=self.mock_now_ms),
+                                           quota_snapshot=reloaded)
+        rec = selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
+        self.assertNotEqual(rec.selected_model, MODEL_AG_CLAUDE_OPUS)
+        print(f"  [PASS] 429 body wrote {reset.exhausted_until}; review lane routed to {rec.selected_model}.")
     def _selector(self, usage):
         return ResetAwareModelSelector(parse_usage_json(usage, current_time_ms=self.mock_now_ms))
 
@@ -899,12 +993,16 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         selector = self._selector(self._usage_with_ag_families(anthropic_used=0.0))
         rec_review = selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.MEDIUM)
         self.assertEqual(rec_review.selected_model, MODEL_AG_CLAUDE_OPUS)
+        # Operator DEEP_REASONING ladder policy (#214): LOW and MEDIUM lead with OpenCode Go
+        # GLM-5.3, then DeepSeek V4 Pro, then Gemini 3.8 Flash. Opus is minimized and reserved
+        # for orchestrator and high-risk reviews only, so medium-risk deep reasoning does NOT
+        # spend ag-opus; only HIGH leads with Antigravity Claude Opus.
         rec_reason = selector.select_model(task_type=TaskType.DEEP_REASONING, risk_level=RiskLevel.MEDIUM)
-        self.assertEqual(rec_reason.selected_model, MODEL_AG_CLAUDE_OPUS)
-        self.assertEqual(model_to_agent_role(MODEL_AG_CLAUDE_OPUS, TaskType.STRONG_REVIEW, RiskLevel.MEDIUM), "ag-opus")
+        self.assertEqual(rec_reason.selected_model, MODEL_DEEPSEEK_PRO)
         packet = selector.dispatch(task_type=TaskType.DEEP_REASONING, risk_level=RiskLevel.MEDIUM)
-        self.assertEqual(packet.recommendation["agent_role"], "ag-opus")
-        print(f"  [PASS] Medium review/reasoning on {rec_review.selected_model} (agent ag-opus).")
+        self.assertEqual(packet.recommendation["model"], MODEL_DEEPSEEK_PRO)
+        self.assertEqual(packet.recommendation["agent_role"], "ds-pro")
+        print(f"  [PASS] Medium review on {rec_review.selected_model} (ag-opus); medium reasoning on {rec_reason.selected_model} (ds-pro).")
 
         # An almost spent Antigravity Claude window (95% used) is left alone.
         spent = self._selector(self._usage_with_ag_families(anthropic_used=0.95))
@@ -1333,7 +1431,8 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
               f"above 180k -> {MODEL_CODEX_ASTRA}; MiniMax only for a low-risk deep-context read.")
 
         # Review 5318271884 L: GLM-5.3 holds exactly 131,072 tokens; at 131,073 every ladder
-        # skips it (high-risk worker, deep-context, tiny-task GLM-5.3-Flash).
+        # skips it (high-risk worker, deep-context, tiny-task GLM-5.3-Flash). The high-risk
+        # worker lane then takes DeepSeek V4 Pro, which precedes Codex Astra in that ladder.
         glm_all_ok = ResetAwareModelSelector(parse_usage_json(scenarios["all_ok"], current_time_ms=self.mock_now_ms),
                                              credentialed_providers={ZAI_PROVIDER})
         at_limit = glm_all_ok.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.HIGH,
@@ -1341,7 +1440,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         over_limit = glm_all_ok.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.HIGH,
                                              context_tokens=131073)
         self.assertEqual(at_limit.selected_model, MODEL_ZAI_GLM)
-        self.assertEqual(over_limit.selected_model, MODEL_CODEX_ASTRA)
+        self.assertEqual(over_limit.selected_model, MODEL_DEEPSEEK_PRO)
         self.assertEqual(gap_glm.select_model(task_type=TaskType.DEEP_CONTEXT, risk_level=RiskLevel.LOW,
                                               context_tokens=131072).selected_model, MODEL_ZAI_GLM)
         self.assertEqual(gap_glm.select_model(task_type=TaskType.DEEP_CONTEXT, risk_level=RiskLevel.LOW,
