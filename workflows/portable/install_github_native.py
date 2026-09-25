@@ -23,6 +23,8 @@ RUNTIME_FILES = (
     "install_github_native.py", "test_install_github_native.py", "PORTABLE.md",
     # Model router: coordinator.py and superboard_adapter.py import it at runtime.
     "model_routing.py", "balance_loader.py", "routing_smoke_test.py",
+    # Lane quality telemetry: session mining and model comparison.
+    "lane_quality.py", "test_lane_quality.py",
 )
 POLICY = Path("policies/default/AGENTS.md")
 
