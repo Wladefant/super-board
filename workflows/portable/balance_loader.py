@@ -5,7 +5,10 @@ Location: ~/.veyyon/workflows/balance_loader.py
 
 Provides read-only, sanitized subscription usage metrics, quota tracking,
 multi-window constraint evaluation, and reset timestamps across providers:
-  - Google Antigravity (Ultra daily window: Google, OpenAI, Anthropic limits)
+  - Google Antigravity (daily windows, one per model family: Google/Gemini,
+    Anthropic, OpenAI). Each family is its own allowance, so the parser exposes
+    them as separate providers: `google-antigravity` (Gemini family),
+    `google-antigravity:anthropic` and `google-antigravity:openai`.
   - Anthropic (Claude 5h and 7d multi-window constraints)
   - OpenAI Codex (Pro 7d, 5h Spark, 7d Spark, Free 30d, resetCredits)
   - xAI Grok (Dormant status tracking)
@@ -31,6 +34,47 @@ from typing import Any, Dict, List, Optional, Tuple
 
 DEFAULT_STALE_THRESHOLD_SECONDS = 3600.0  # 1 hour
 DEFAULT_SNAPSHOT_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "usage_snapshot_cache.json")
+
+# A multi-day subscription window at or above this used fraction is throttled:
+# the account is kept for emergencies instead of being chosen as a default lane.
+THROTTLE_USED_FRACTION = 0.80
+
+ANTIGRAVITY_PROVIDER = "google-antigravity"
+
+
+def antigravity_family_provider(limit_id: str) -> str:
+    """Map an Antigravity limit id (`google-antigravity:<family>:<tier>:<window>`) to its provider key.
+
+    The Gemini family keeps the bare `google-antigravity` key; every other family
+    (anthropic, openai) becomes `google-antigravity:<family>`.
+    """
+    parts = limit_id.split(":")
+    if len(parts) >= 3 and parts[0] == ANTIGRAVITY_PROVIDER and parts[1] and parts[1] != "google":
+        return f"{ANTIGRAVITY_PROVIDER}:{parts[1]}"
+    return ANTIGRAVITY_PROVIDER
+
+
+def report_headroom_key(report: "SubscriptionReport") -> Tuple[float, float]:
+    """Sort key for choosing between accounts: most unused allowance first, then the sooner reset."""
+    btn = report.bottleneck_window
+    if btn is None:
+        return (1.0, 0.0)
+    return (btn.amount.remaining_fraction, -btn.hours_to_reset)
+
+
+def best_ok_report(reports: List["SubscriptionReport"]) -> Optional["SubscriptionReport"]:
+    """The usable account with the most unused allowance (ties: soonest reset).
+
+    Plan tier is deliberately not a preference: a 92%-used pro account must not
+    win over an untouched free account on the same provider.
+    """
+    ok = [r for r in reports if r.status == "ok"]
+    return max(ok, key=report_headroom_key) if ok else None
+
+
+def is_throttled_window(window: "UsageWindow") -> bool:
+    """A multi-day window (>24h) whose used fraction reached the throttle threshold."""
+    return window.duration_ms > 86400000 and window.amount.used_fraction >= THROTTLE_USED_FRACTION
 
 
 def ms_to_iso_utc(timestamp_ms: Optional[int]) -> str:
@@ -213,40 +257,49 @@ class SanitizedUsageSnapshot:
     def to_normalized(self) -> NormalizedBalanceSnapshot:
         """Converts Veyyon usage snapshot into harness-agnostic NormalizedBalanceSnapshot."""
         prov_balances: Dict[str, NormalizedProviderBalance] = {}
-        for sub in self.subscriptions:
-            p_name = sub.provider
+        providers_in_order = list(dict.fromkeys(sub.provider for sub in self.subscriptions))
+        for p_name in providers_in_order:
+            reports = self.get_provider_reports(p_name)
+            # The account the router would actually draw on; windows are reported for every account.
+            sub = best_ok_report(reports) or reports[0]
             rem_frac, hrs_reset, btn_label, status = self.get_effective_allowance(p_name)
-            norm_windows = []
-            for w in sub.limits:
-                norm_windows.append(
-                    NormalizedWindow(
-                        id=w.id,
-                        label=w.label,
-                        duration_seconds=w.duration_ms / 1000.0,
-                        resets_at_utc=w.resets_at_utc,
-                        seconds_to_reset=w.seconds_to_reset,
-                        remaining_fraction=w.amount.remaining_fraction,
-                        used_fraction=w.amount.used_fraction,
-                        remaining_units=w.amount.remaining,
-                        total_limit=w.amount.limit,
-                        unit=w.amount.unit,
-                        status=w.status,
-                        is_cooldown=w.is_cooldown,
-                    )
+            norm_windows = [
+                NormalizedWindow(
+                    id=w.id,
+                    label=w.label,
+                    duration_seconds=w.duration_ms / 1000.0,
+                    resets_at_utc=w.resets_at_utc,
+                    seconds_to_reset=w.seconds_to_reset,
+                    remaining_fraction=w.amount.remaining_fraction,
+                    used_fraction=w.amount.used_fraction,
+                    remaining_units=w.amount.remaining,
+                    total_limit=w.amount.limit,
+                    unit=w.amount.unit,
+                    status=w.status,
+                    is_cooldown=w.is_cooldown,
                 )
+                for report in reports
+                for w in report.limits
+            ]
             btn_dur_hrs = (sub.bottleneck_window.duration_ms / 3600000.0) if sub.bottleneck_window else 24.0
             cycle_dur_hrs = (sub.primary_window.duration_ms / 3600000.0) if sub.primary_window else 168.0
 
-            # Pro weekly metrics for Codex (specifically tracking the 7d allowance window)
+            # Pro weekly metrics for Codex: the 7d window of the pro account, whichever
+            # account is currently the default lane. Sol/Astra promotion and the
+            # pro throttle read this window, never the free account's 30d window.
             pro_rem = None
             pro_hrs = None
             pro_dur = None
             if p_name == "openai-codex":
-                for w in sub.limits:
-                    if w.duration_ms >= 500000000 and (sub.plan_type == "pro" or "7" in w.id):
-                        pro_rem = w.amount.remaining_fraction
-                        pro_hrs = w.hours_to_reset
-                        pro_dur = w.duration_ms / 3600000.0
+                pro_first = sorted(reports, key=lambda r: r.plan_type != "pro")
+                for report in pro_first:
+                    for w in report.limits:
+                        if w.duration_ms >= 500000000 and (report.plan_type == "pro" or "7" in w.id):
+                            pro_rem = w.amount.remaining_fraction
+                            pro_hrs = w.hours_to_reset
+                            pro_dur = w.duration_ms / 3600000.0
+                            break
+                    if pro_rem is not None:
                         break
 
             prim_label = sub.primary_window.label if sub.primary_window else btn_label
@@ -308,19 +361,8 @@ class SanitizedUsageSnapshot:
             # Unknown provider: safe neutral baseline (0.5), not 0 or inf
             return (0.5, 999.0, "unknown", "unknown")
 
-        # Pick the best account if multiple (e.g. pro vs free for Codex)
-        # Prefer 'pro' or higher plan type, or account with highest remaining allowance
-        best_report = None
-        for r in reports:
-            if r.status != "ok":
-                continue
-            if best_report is None:
-                best_report = r
-            elif r.plan_type == "pro" and best_report.plan_type != "pro":
-                best_report = r
-            elif r.bottleneck_window and best_report.bottleneck_window:
-                if r.bottleneck_window.amount.remaining_fraction > best_report.bottleneck_window.amount.remaining_fraction:
-                    best_report = r
+        # Pick the account with the most unused allowance (ties: sooner reset).
+        best_report = best_ok_report(reports)
 
         if best_report is None:
             # All accounts in non-ok status
@@ -353,14 +395,7 @@ class SanitizedUsageSnapshot:
             if provider in self.dormant_providers:
                 return (0.0, 0.0, "dormant", "dormant")
             return (0.5, 999.0, "unknown", "unknown")
-        best_report = None
-        for r in reports:
-            if r.status != "ok":
-                continue
-            if best_report is None:
-                best_report = r
-            elif r.plan_type == "pro" and best_report.plan_type != "pro":
-                best_report = r
+        best_report = best_ok_report(reports)
         if not best_report or not best_report.primary_window:
             return self.get_effective_allowance(provider)
         prim = best_report.primary_window
@@ -397,7 +432,7 @@ def parse_usage_json(
     reports_list = data.get("reports", [])
     for rep in reports_list:
         provider = rep.get("provider", "unknown")
-        seen_providers.add(provider)
+        seen_providers.add(provider)  # provisional; Antigravity is replaced by its family keys below
         fetched_at_ms = int(rep.get("fetchedAt") or current_time_ms)
         fetched_at_utc = ms_to_iso_utc(fetched_at_ms)
         age_seconds = max(0.0, (current_time_ms - fetched_at_ms) / 1000.0)
@@ -477,34 +512,49 @@ def parse_usage_json(
             )
             parsed_limits.append(uw)
 
-        bottleneck = None
-        primary_win = None
-        if parsed_limits:
-            bottleneck = min(
-                parsed_limits,
-                key=lambda w: (w.amount.remaining_fraction, w.seconds_to_reset),
-            )
-            # Primary cycle window: the macro window with the longest duration (e.g. 7d or 30d or daily)
-            primary_win = max(parsed_limits, key=lambda w: w.duration_ms)
-            if bottleneck.is_cooldown and status == "ok":
-                status = bottleneck.status
+        # Antigravity reports one daily window per model family in a single report.
+        # Each family is a separate allowance, so each becomes its own provider;
+        # otherwise one exhausted family would starve the others via the bottleneck.
+        if provider == ANTIGRAVITY_PROVIDER and parsed_limits:
+            seen_providers.discard(provider)
+            groups: Dict[str, List[UsageWindow]] = {}
+            for uw in parsed_limits:
+                groups.setdefault(antigravity_family_provider(uw.id), []).append(uw)
+        else:
+            groups = {provider: parsed_limits}
 
-        sub_report = SubscriptionReport(
-            provider=provider,
-            account_id_redacted=account_id,
-            email_redacted=email,
-            plan_type=plan_type,
-            fetched_at_ms=fetched_at_ms,
-            fetched_at_utc=fetched_at_utc,
-            age_seconds=age_seconds,
-            is_stale=is_stale,
-            status=status,
-            limits=parsed_limits,
-            bottleneck_window=bottleneck,
-            primary_window=primary_win,
-            reset_credits=rep.get("resetCredits"),
-        )
-        subscriptions.append(sub_report)
+        for group_provider, group_limits in groups.items():
+            seen_providers.add(group_provider)
+            group_status = status
+            bottleneck = None
+            primary_win = None
+            if group_limits:
+                bottleneck = min(
+                    group_limits,
+                    key=lambda w: (w.amount.remaining_fraction, w.seconds_to_reset),
+                )
+                # Primary cycle window: the macro window with the longest duration (e.g. 7d or 30d or daily)
+                primary_win = max(group_limits, key=lambda w: w.duration_ms)
+                if bottleneck.is_cooldown and group_status == "ok":
+                    group_status = bottleneck.status
+
+            subscriptions.append(
+                SubscriptionReport(
+                    provider=group_provider,
+                    account_id_redacted=account_id,
+                    email_redacted=email,
+                    plan_type=plan_type,
+                    fetched_at_ms=fetched_at_ms,
+                    fetched_at_utc=fetched_at_utc,
+                    age_seconds=age_seconds,
+                    is_stale=is_stale,
+                    status=group_status,
+                    limits=group_limits,
+                    bottleneck_window=bottleneck,
+                    primary_window=primary_win,
+                    reset_credits=rep.get("resetCredits"),
+                )
+            )
 
     dormant = ["xai-oauth"] if "xai-oauth" not in seen_providers else []
     active = sorted(list(seen_providers))

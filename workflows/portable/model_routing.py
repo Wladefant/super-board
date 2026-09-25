@@ -72,6 +72,31 @@ MODEL_CODEX_ASTRA = "openai-codex/gpt-6-astra:high"
 
 MODEL_GROK_DORMANT = "xai-oauth/grok-4.6:high"
 
+# Antigravity serves Claude and GPT families on their own daily windows, separate from
+# Gemini's (live-tested 2026-09-25). They reset daily, so unused headroom expires sooner
+# than any Anthropic/Codex weekly window and is spent first where risk policy allows.
+MODEL_AG_CLAUDE_OPUS = "google-antigravity/claude-opus-4-6"
+MODEL_AG_CLAUDE_SONNET = "google-antigravity/claude-sonnet-4-6"
+MODEL_AG_GPT_OSS = "google-antigravity/gpt-oss-120b"
+
+# Cheap pay-per-token overflow worker: DeepSeek direct API (DeepSeek-V4.1-Flash,
+# $0.30/$1.20 per 1M peak, half off-peak), with its OpenRouter twin as fallback.
+MODEL_DEEPSEEK_FLASH = "deepseek/deepseek-flash:high"
+MODEL_OR_DEEPSEEK_FLASH = "openrouter/deepseek/deepseek-v4.1-flash@deepinfra"
+
+# Second-opinion reviewer on the OpenRouter free quota (1,000 requests/day). Advisory
+# only: it never approves, blocks or replaces the required review. Nemotron 3 Ultra free
+# serves reliably with tools; Qwen3.8 27B free has the best free Terminal-Bench 4.0 score
+# (5.6% vs 0.5%) but its only free upstream returned 429 on every attempt 2026-09-25.
+MODEL_OR_FREE_ADVISORY = "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
+
+# Codex pro 7d window at >= 80% used is held back for emergencies (profile policy).
+CODEX_PRO_THROTTLE_REMAINING = 0.20
+# An Antigravity family below this remaining fraction is left alone for the day.
+AG_FAMILY_MIN_REMAINING = 0.10
+AG_ANTHROPIC_PROVIDER = "google-antigravity:anthropic"
+AG_OPENAI_PROVIDER = "google-antigravity:openai"
+
 # Catalog-verified model context windows (models.db authoritative, no fabricated context sizes)
 VERIFIED_CONTEXT_WINDOWS: Dict[str, int] = {
     MODEL_GEMINI_FLASH: 1048576,
@@ -82,6 +107,10 @@ VERIFIED_CONTEXT_WINDOWS: Dict[str, int] = {
     MODEL_CODEX_FAST: 400000,
     MODEL_CODEX_SOL: 372000,
     MODEL_CODEX_ASTRA: 272000,
+    MODEL_AG_CLAUDE_OPUS: 250000,
+    MODEL_AG_CLAUDE_SONNET: 250000,
+    MODEL_AG_GPT_OSS: 131072,
+    MODEL_DEEPSEEK_FLASH: 1048576,
 }
 
 
@@ -107,6 +136,13 @@ class HarnessDispatchPacket:
 
 def model_to_agent_role(model_id: str, task_type: TaskType, risk_level: RiskLevel) -> str:
     """Map model and task type to standard canonical agent role."""
+    if model_id.startswith(("deepseek/", "openrouter/deepseek/")):
+        return "ds-task"
+    if model_id.endswith(":free"):
+        return "extra-review"
+    if model_id.startswith("google-antigravity/") and ("claude" in model_id or "gpt-oss" in model_id):
+        # Antigravity Claude/GPT run on their own daily window; the ag-opus agent pins it.
+        return "ag-opus"
     if "flash-lite" in model_id:
         return "compactor"
     if "flash" in model_id:
@@ -127,6 +163,10 @@ def model_to_agent_role(model_id: str, task_type: TaskType, risk_level: RiskLeve
 
 def model_to_provider(model_id: str) -> str:
     """Map model ID to canonical provider name."""
+    if model_id.startswith("openrouter/"):
+        return "openrouter"
+    if model_id.startswith("deepseek/"):
+        return "deepseek"
     if "google" in model_id:
         return "google"
     if "anthropic" in model_id:
@@ -152,6 +192,8 @@ class RoutingRecommendation:
     provider_statuses: Dict[str, str]
     quota_metrics: Dict[str, Any]
     evidence_packet_required: bool
+    # Non-blocking second opinion; never a merge gate or approval.
+    advisory_model: Optional[str] = None
 
 
 @dataclass
@@ -297,9 +339,13 @@ class ResetAwareModelSelector:
         google_meta = self.evaluate_provider("google-antigravity")
         anthropic_meta = self.evaluate_provider("anthropic")
         codex_meta = self.evaluate_provider("openai-codex")
+        ag_anthropic_meta = self.evaluate_provider(AG_ANTHROPIC_PROVIDER)
+        ag_openai_meta = self.evaluate_provider(AG_OPENAI_PROVIDER)
 
         provider_statuses = {
             "google-antigravity": google_meta["status"],
+            AG_ANTHROPIC_PROVIDER: ag_anthropic_meta["status"],
+            AG_OPENAI_PROVIDER: ag_openai_meta["status"],
             "anthropic": anthropic_meta["status"],
             "openai-codex": codex_meta["status"],
             "xai-oauth": "dormant",
@@ -308,6 +354,8 @@ class ResetAwareModelSelector:
         quota_metrics = {
             "google_remaining": google_meta["remaining_fraction"],
             "google_reset_hrs": google_meta["hours_to_reset"],
+            "ag_anthropic_remaining": ag_anthropic_meta["remaining_fraction"],
+            "ag_anthropic_reset_hrs": ag_anthropic_meta["hours_to_reset"],
             "anthropic_remaining": anthropic_meta["remaining_fraction"],
             "anthropic_reset_hrs": anthropic_meta["hours_to_reset"],
             "codex_remaining": codex_meta["remaining_fraction"],
@@ -326,6 +374,23 @@ class ResetAwareModelSelector:
             and codex_pro_hrs <= 48.0
             and codex_pro_rem >= 0.25
             and codex_pro_headroom >= 1.25
+        )
+
+        # Codex pro at >= 80% of its 7d window is throttled: kept for emergencies only,
+        # never chosen while another capable lane has allowance.
+        codex_throttled = codex_meta["is_available"] and codex_pro_rem <= CODEX_PRO_THROTTLE_REMAINING
+        codex_usable = codex_meta["is_available"] and not codex_throttled
+        quota_metrics["codex_pro_throttled"] = codex_throttled
+
+        # Antigravity Claude runs on a free daily window. Only a window the snapshot
+        # actually reports counts; an unreported family is not assumed to exist.
+        ag_claude_ok = (
+            ag_anthropic_meta["status"] == "ok"
+            and ag_anthropic_meta["remaining_fraction"] >= AG_FAMILY_MIN_REMAINING
+        )
+        ag_claude_note = (
+            f"Antigravity Claude daily window: {ag_anthropic_meta['remaining_fraction']*100:.1f}% unused, "
+            f"resets in {ag_anthropic_meta['hours_to_reset']:.1f}h"
         )
 
         # 3. Check Anthropic Preservation Need using 7d cycle window (not 5h rolling window!)
@@ -383,10 +448,23 @@ class ResetAwareModelSelector:
                     selected_model = MODEL_CLAUDE_FABLE
                     fallback_model = MODEL_CLAUDE_OPUS if codex_meta["is_available"] else MODEL_CODEX_SOL
                     reasoning = "High-risk review assigned to Claude Fable 5.1 (Flash 3.8 barred as sole quality gate; fallback Opus)."
-                elif codex_meta["is_available"]:
+                elif codex_usable:
                     selected_model = MODEL_CODEX_SOL
                     fallback_model = MODEL_CODEX_ASTRA
                     reasoning = "Anthropic unavailable; routing high-risk review to Codex Sol (fallback Astra)."
+                elif ag_claude_ok:
+                    selected_model = MODEL_AG_CLAUDE_OPUS
+                    fallback_model = MODEL_CODEX_SOL if codex_meta["is_available"] else MODEL_GEMINI_PRO
+                    cooldown_fallback = True
+                    reasoning = (
+                        "Anthropic unavailable and Codex pro throttled (>=80% of 7d used); high-risk review "
+                        f"on Antigravity Claude Opus 4.6. {ag_claude_note}."
+                    )
+                elif codex_meta["is_available"]:
+                    selected_model = MODEL_CODEX_SOL
+                    fallback_model = MODEL_GEMINI_PRO
+                    cooldown_fallback = True
+                    reasoning = "Only throttled Codex pro remains; spending its emergency reserve on high-risk review (Flash barred)."
                 else:
                     selected_model = MODEL_GEMINI_PRO
                     fallback_model = MODEL_GEMINI_PRO
@@ -398,6 +476,13 @@ class ResetAwareModelSelector:
                     fallback_model = MODEL_CLAUDE_FABLE if anthropic_meta["is_available"] else MODEL_GEMINI_FLASH
                     promotion_applied = True
                     reasoning = "Medium-risk review: Promoted Codex Sol near reset to consume surplus capacity."
+                elif ag_claude_ok:
+                    selected_model = MODEL_AG_CLAUDE_OPUS
+                    fallback_model = MODEL_CLAUDE_FABLE if anthropic_meta["is_available"] else MODEL_GEMINI_FLASH
+                    reasoning = (
+                        "Medium-risk review on Antigravity Claude Opus 4.6: its daily window expires unused "
+                        f"long before the Anthropic weekly window. {ag_claude_note}."
+                    )
                 elif anthropic_meta["is_available"] and not anthropic_distant_reset:
                     selected_model = MODEL_CLAUDE_FABLE
                     fallback_model = MODEL_GEMINI_FLASH
@@ -417,7 +502,7 @@ class ResetAwareModelSelector:
             if is_rework_critical:
                 # High-risk reasoning: Flash 3.8 is STRICTLY FORBIDDEN as primary or fallback!
                 # Strong first-pass reasoning: Sol, Astra, or Opus.
-                if codex_near_reset_surplus or codex_meta["is_available"]:
+                if codex_near_reset_surplus or codex_usable:
                     selected_model = MODEL_CODEX_SOL
                     fallback_model = MODEL_CLAUDE_OPUS if anthropic_meta["is_available"] else MODEL_CODEX_ASTRA
                     if codex_near_reset_surplus:
@@ -428,8 +513,18 @@ class ResetAwareModelSelector:
                     )
                 elif anthropic_meta["is_available"]:
                     selected_model = MODEL_CLAUDE_OPUS
-                    fallback_model = MODEL_CLAUDE_FABLE
+                    fallback_model = MODEL_AG_CLAUDE_OPUS if ag_claude_ok else MODEL_CLAUDE_FABLE
                     reasoning = "High-risk deep reasoning: assigned to Claude Opus 5 (Flash barred from high-risk reasoning)."
+                elif ag_claude_ok:
+                    selected_model = MODEL_AG_CLAUDE_OPUS
+                    fallback_model = MODEL_CODEX_SOL if codex_meta["is_available"] else MODEL_GEMINI_PRO
+                    cooldown_fallback = True
+                    reasoning = f"High-risk deep reasoning on Antigravity Claude Opus 4.6 (Flash barred). {ag_claude_note}."
+                elif codex_meta["is_available"]:
+                    selected_model = MODEL_CODEX_SOL
+                    fallback_model = MODEL_GEMINI_PRO
+                    cooldown_fallback = True
+                    reasoning = "Only throttled Codex pro remains; spending its emergency reserve on high-risk reasoning (Flash barred)."
                 else:
                     selected_model = MODEL_GEMINI_PRO
                     fallback_model = MODEL_GEMINI_PRO
@@ -445,6 +540,10 @@ class ResetAwareModelSelector:
                         f"Deep reasoning: Codex weekly window resets in {codex_meta['hours_to_reset']:.1f}h "
                         f"with {codex_meta['remaining_fraction']*100:.1f}% allowance. Promoted Codex Sol to prevent waste."
                     )
+                elif ag_claude_ok:
+                    selected_model = MODEL_AG_CLAUDE_OPUS
+                    fallback_model = MODEL_GEMINI_FLASH
+                    reasoning = f"Deep reasoning on Antigravity Claude Opus 4.6 before paid Anthropic. {ag_claude_note}."
                 elif anthropic_meta["is_available"] and not anthropic_distant_reset:
                     selected_model = MODEL_CLAUDE_OPUS
                     fallback_model = MODEL_GEMINI_FLASH
@@ -477,7 +576,7 @@ class ResetAwareModelSelector:
             if is_rework_critical:
                 # Rework-aware high-risk first-pass implementation (state machines, auth, money, migrations, concurrency)
                 # First pass with a weak model risks invariant failure & expensive rework. Use strong first-pass!
-                if codex_meta["is_available"]:
+                if codex_usable:
                     selected_model = MODEL_CODEX_SOL
                     fallback_model = MODEL_CLAUDE_OPUS if anthropic_meta["is_available"] else MODEL_CODEX_ASTRA
                     if codex_near_reset_surplus:
@@ -488,8 +587,18 @@ class ResetAwareModelSelector:
                     )
                 elif anthropic_meta["is_available"]:
                     selected_model = MODEL_CLAUDE_OPUS
-                    fallback_model = MODEL_CLAUDE_FABLE
+                    fallback_model = MODEL_AG_CLAUDE_OPUS if ag_claude_ok else MODEL_CLAUDE_FABLE
                     reasoning = "High-risk implementation first pass: routed to Claude Opus 5 to prevent rework."
+                elif ag_claude_ok:
+                    selected_model = MODEL_AG_CLAUDE_OPUS
+                    fallback_model = MODEL_CODEX_SOL if codex_meta["is_available"] else MODEL_GEMINI_PRO
+                    cooldown_fallback = True
+                    reasoning = f"High-risk implementation first pass on Antigravity Claude Opus 4.6. {ag_claude_note}."
+                elif codex_meta["is_available"]:
+                    selected_model = MODEL_CODEX_SOL
+                    fallback_model = MODEL_GEMINI_PRO
+                    cooldown_fallback = True
+                    reasoning = "Only throttled Codex pro remains; spending its emergency reserve on high-risk implementation."
                 else:
                     selected_model = MODEL_GEMINI_PRO
                     fallback_model = MODEL_GEMINI_PRO
@@ -509,22 +618,27 @@ class ResetAwareModelSelector:
                 )
             elif google_meta["is_available"]:
                 selected_model = MODEL_GEMINI_FLASH
-                fallback_model = MODEL_CODEX_FAST if codex_meta["is_available"] else MODEL_GEMINI_LITE
-                reasoning = "Primary abundant execution lane: Gemini 3.8 Flash (Ultra daily allowance)."
-            elif codex_meta["is_available"]:
+                fallback_model = MODEL_DEEPSEEK_FLASH
+                reasoning = (
+                    "Primary abundant execution lane: Gemini 3.8 Flash (Ultra daily allowance); "
+                    "DeepSeek V4.1 Flash is the overflow tier."
+                )
+            elif codex_usable:
                 selected_model = MODEL_CODEX_FAST
-                fallback_model = MODEL_CLAUDE_FABLE if anthropic_meta["is_available"] else MODEL_GEMINI_LITE
+                fallback_model = MODEL_DEEPSEEK_FLASH
                 cooldown_fallback = True
-                reasoning = "Google Antigravity in cooldown; falling back to Codex Fast for execution."
-            elif anthropic_meta["is_available"]:
-                selected_model = MODEL_CLAUDE_FABLE
-                fallback_model = MODEL_GEMINI_FLASH
-                cooldown_fallback = True
-                reasoning = "Emergency fallback to Anthropic for execution."
+                reasoning = "Google Antigravity in cooldown; falling back to Codex Fast (subscription headroom) for execution."
             else:
-                selected_model = MODEL_GEMINI_FLASH
-                fallback_model = MODEL_GEMINI_LITE
-                reasoning = "Default execution lane."
+                # Subscription lanes are exhausted, in cooldown or throttled: the cheap
+                # pay-per-token tier takes routine work instead of burning Anthropic.
+                selected_model = MODEL_DEEPSEEK_FLASH
+                fallback_model = MODEL_OR_DEEPSEEK_FLASH
+                cooldown_fallback = True
+                reasoning = "Gemini Flash and Codex unavailable or throttled; overflow to DeepSeek V4.1 Flash (direct API, OpenRouter fallback)."
+
+        # Free OpenRouter second opinion for reviews: advisory only (1000 req/day free tier),
+        # never a merge gate, never an approval, never a replacement for the review above.
+        advisory_model = MODEL_OR_FREE_ADVISORY if task_type == TaskType.STRONG_REVIEW else None
 
         return RoutingRecommendation(
             task_type=task_type.value,
@@ -539,6 +653,7 @@ class ResetAwareModelSelector:
             provider_statuses=provider_statuses,
             quota_metrics=quota_metrics,
             evidence_packet_required=evidence_packet_required,
+            advisory_model=advisory_model,
         )
 
     def dispatch(

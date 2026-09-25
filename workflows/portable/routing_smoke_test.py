@@ -16,6 +16,9 @@ Verifies:
   10. High-risk review quality gate: Flash 3.8 barred as sole quality gate
   11. Deep context filtering: > 180k tokens routes to Gemini 3.1 Pro
   12. Token-saving review protocol: Compact EvidencePacket (< 1.5 KB)
+  22-25. Allowance-aware routing: Codex pro throttled at >=80% used, Antigravity
+      Claude daily window spent before paid Anthropic, DeepSeek V4.1 Flash overflow,
+      free OpenRouter reviewer attached as advisory only
 """
 
 import copy
@@ -61,6 +64,10 @@ from model_routing import (
     MODEL_GEMINI_FLASH,
     MODEL_GEMINI_LITE,
     MODEL_GEMINI_PRO,
+    MODEL_AG_CLAUDE_OPUS,
+    MODEL_DEEPSEEK_FLASH,
+    MODEL_OR_DEEPSEEK_FLASH,
+    MODEL_OR_FREE_ADVISORY,
     model_to_agent_role,
     model_to_provider,
 )
@@ -673,6 +680,149 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         self.assertTrue(rec_structural.cooldown_fallback)
         print(f"  [PASS] Structural failure retry strictly barred Flash under cooldown: {rec_structural.selected_model}")
 
+    # -------------------------------------------------------------------------
+    # Helpers for the allowance-aware tests (TESTS 22-25)
+    # -------------------------------------------------------------------------
+    def _usage_with_ag_families(self, anthropic_used=0.0, openai_used=0.0, codex_used=0.03):
+        """Live-shaped usage: Antigravity reports one daily window per family; Codex pro 7d at `codex_used`."""
+        usage = copy.deepcopy(self.mock_usage_dict)
+        ag = usage["reports"][0]
+        for family, used in (("anthropic", anthropic_used), ("openai", openai_used)):
+            ag["limits"].append({
+                "id": f"google-antigravity:{family}:default:daily",
+                "label": f"Usage ({family})",
+                "window": {
+                    "id": "daily",
+                    "label": "Daily",
+                    "durationMs": 86400000,
+                    "resetsAt": self.mock_now_ms + 17700000,  # ~4.9h
+                },
+                "amount": {
+                    "unit": "percent",
+                    "remainingFraction": 1.0 - used,
+                    "usedFraction": used,
+                    "remaining": (1.0 - used) * 100,
+                    "used": used * 100,
+                    "limit": 100.0,
+                },
+                "status": "ok",
+            })
+        codex = usage["reports"][2]["limits"][0]["amount"]
+        codex.update({
+            "remainingFraction": 1.0 - codex_used,
+            "usedFraction": codex_used,
+            "remaining": (1.0 - codex_used) * 100,
+            "used": codex_used * 100,
+        })
+        return usage
+
+    def _selector(self, usage):
+        return ResetAwareModelSelector(parse_usage_json(usage, current_time_ms=self.mock_now_ms))
+
+    # -------------------------------------------------------------------------
+    # TEST 22: Codex pro at 92% of its 7d window is throttled
+    # -------------------------------------------------------------------------
+    def test_codex_pro_throttled_at_92_percent(self):
+        print("\n--- TEST 22: Codex Pro Throttled at 92% Used ---")
+        usage = self._usage_with_ag_families(codex_used=0.92)
+        # Anthropic unavailable, so before the throttle rule Codex Sol took high-risk work.
+        for rep in usage["reports"]:
+            if rep["provider"] == "anthropic":
+                rep["metadata"]["limitReached"] = True
+                rep["metadata"]["allowed"] = False
+        selector = self._selector(usage)
+
+        for task_type in (TaskType.STRONG_REVIEW, TaskType.DEEP_REASONING, TaskType.ROUTINE_EXECUTION):
+            rec = selector.select_model(task_type=task_type, risk_level=RiskLevel.HIGH)
+            self.assertNotIn("openai-codex/", rec.selected_model, f"{task_type}: throttled Codex chosen")
+            self.assertEqual(rec.selected_model, MODEL_AG_CLAUDE_OPUS)
+            self.assertNotEqual(rec.fallback_model, MODEL_GEMINI_FLASH)
+        self.assertTrue(rec.quota_metrics["codex_pro_throttled"])
+
+        # Routine low-risk work with Gemini in cooldown must not burn throttled Codex either.
+        for lim in usage["reports"][0]["limits"]:
+            if lim["id"].startswith("google-antigravity:google"):
+                lim["status"] = "rate_limited"
+        rec_routine = self._selector(usage).select_model(
+            task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.LOW
+        )
+        self.assertNotIn("openai-codex/", rec_routine.selected_model)
+        print(f"  [PASS] Codex pro at 92% throttled; high-risk work routed to {MODEL_AG_CLAUDE_OPUS}.")
+
+        # Below the threshold (79% used) Codex remains a normal strong lane.
+        usage_ok = self._usage_with_ag_families(codex_used=0.79)
+        for rep in usage_ok["reports"]:
+            if rep["provider"] == "anthropic":
+                rep["metadata"]["limitReached"] = True
+                rep["metadata"]["allowed"] = False
+        rec_ok = self._selector(usage_ok).select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
+        self.assertEqual(rec_ok.selected_model, MODEL_CODEX_SOL)
+        self.assertFalse(rec_ok.quota_metrics["codex_pro_throttled"])
+        print(f"  [PASS] Codex pro at 79% still selected: {rec_ok.selected_model}")
+
+    # -------------------------------------------------------------------------
+    # TEST 23: Antigravity Claude daily window is spent before paid Anthropic
+    # -------------------------------------------------------------------------
+    def test_antigravity_claude_chosen(self):
+        print("\n--- TEST 23: Antigravity Claude Chosen Before Paid Anthropic ---")
+        selector = self._selector(self._usage_with_ag_families(anthropic_used=0.0))
+        rec_review = selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.MEDIUM)
+        self.assertEqual(rec_review.selected_model, MODEL_AG_CLAUDE_OPUS)
+        rec_reason = selector.select_model(task_type=TaskType.DEEP_REASONING, risk_level=RiskLevel.MEDIUM)
+        self.assertEqual(rec_reason.selected_model, MODEL_AG_CLAUDE_OPUS)
+        self.assertEqual(model_to_agent_role(MODEL_AG_CLAUDE_OPUS, TaskType.STRONG_REVIEW, RiskLevel.MEDIUM), "ag-opus")
+        packet = selector.dispatch(task_type=TaskType.DEEP_REASONING, risk_level=RiskLevel.MEDIUM)
+        self.assertEqual(packet.recommendation["agent_role"], "ag-opus")
+        print(f"  [PASS] Medium review/reasoning on {rec_review.selected_model} (agent ag-opus).")
+
+        # An almost spent Antigravity Claude window (95% used) is left alone.
+        spent = self._selector(self._usage_with_ag_families(anthropic_used=0.95))
+        rec_spent = spent.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.MEDIUM)
+        self.assertNotEqual(rec_spent.selected_model, MODEL_AG_CLAUDE_OPUS)
+        # A snapshot that does not report the family at all never assumes it exists.
+        absent = ResetAwareModelSelector(parse_usage_json(self.mock_usage_dict, current_time_ms=self.mock_now_ms))
+        rec_absent = absent.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.MEDIUM)
+        self.assertNotEqual(rec_absent.selected_model, MODEL_AG_CLAUDE_OPUS)
+        print(f"  [PASS] Spent/unreported Antigravity Claude skipped: {rec_spent.selected_model}, {rec_absent.selected_model}")
+
+    # -------------------------------------------------------------------------
+    # TEST 24: DeepSeek V4.1 Flash takes overflow instead of paid Anthropic
+    # -------------------------------------------------------------------------
+    def test_deepseek_overflow(self):
+        print("\n--- TEST 24: DeepSeek V4.1 Flash Overflow ---")
+        selector = self._selector(self._usage_with_ag_families())
+        rec_normal = selector.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.LOW)
+        self.assertEqual(rec_normal.selected_model, MODEL_GEMINI_FLASH)
+        self.assertEqual(rec_normal.fallback_model, MODEL_DEEPSEEK_FLASH)
+
+        usage = self._usage_with_ag_families(codex_used=0.92)
+        for lim in usage["reports"][0]["limits"]:
+            if lim["id"].startswith("google-antigravity:google"):
+                lim["status"] = "rate_limited"
+        rec = self._selector(usage).select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.LOW)
+        self.assertEqual(rec.selected_model, MODEL_DEEPSEEK_FLASH)
+        self.assertEqual(rec.fallback_model, MODEL_OR_DEEPSEEK_FLASH)
+        self.assertNotIn("anthropic/", rec.selected_model)
+        self.assertTrue(rec.cooldown_fallback)
+        self.assertEqual(model_to_agent_role(rec.selected_model, TaskType.ROUTINE_EXECUTION, RiskLevel.LOW), "ds-task")
+        print(f"  [PASS] Gemini cooldown + throttled Codex overflowed to {rec.selected_model} (fallback {rec.fallback_model}).")
+
+    # -------------------------------------------------------------------------
+    # TEST 25: Free advisory reviewer is attached to reviews only, never as the gate
+    # -------------------------------------------------------------------------
+    def test_advisory_model_on_reviews_only(self):
+        print("\n--- TEST 25: Advisory Free Reviewer ---")
+        selector = self._selector(self._usage_with_ag_families())
+        for risk in (RiskLevel.LOW, RiskLevel.MEDIUM, RiskLevel.HIGH):
+            rec = selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=risk)
+            self.assertEqual(rec.advisory_model, MODEL_OR_FREE_ADVISORY)
+            self.assertNotEqual(rec.selected_model, MODEL_OR_FREE_ADVISORY)
+            self.assertNotEqual(rec.fallback_model, MODEL_OR_FREE_ADVISORY)
+        rec_exec = selector.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.LOW)
+        self.assertIsNone(rec_exec.advisory_model)
+        self.assertEqual(model_to_agent_role(MODEL_OR_FREE_ADVISORY, TaskType.STRONG_REVIEW, RiskLevel.LOW), "extra-review")
+        print(f"  [PASS] Reviews carry advisory {MODEL_OR_FREE_ADVISORY}; it is never the selected or fallback reviewer.")
+
 def main():
     print("=" * 70)
     print("RUNNING VEYYON BALANCE LOADER & MODEL ROUTING SMOKE TEST SUITE")
@@ -682,7 +832,7 @@ def main():
     result = runner.run(suite)
     if result.wasSuccessful():
         print("\n" + "=" * 70)
-        print("ALL 21 TESTS PASSED PERFECTLY")
+        print(f"ALL {result.testsRun} TESTS PASSED PERFECTLY")
         print("=" * 70)
     else:
         print("\n" + "=" * 70)
