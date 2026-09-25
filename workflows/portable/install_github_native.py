@@ -21,6 +21,8 @@ RUNTIME_FILES = (
     "test_review_content.py", "test_review_content_gate.py",
     "github_plan_renderer.py", "github_plan_templates.py", "test_github_publication.py",
     "install_github_native.py", "test_install_github_native.py", "PORTABLE.md",
+    # Model router: coordinator.py and superboard_adapter.py import it at runtime.
+    "model_routing.py", "balance_loader.py", "routing_smoke_test.py",
 )
 POLICY = Path("policies/default/AGENTS.md")
 

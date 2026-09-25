@@ -339,6 +339,8 @@ python workflows/portable/install_github_native.py --source-root <checkout> --ch
 
 The installer replaces only enumerated policy/code files atomically and verifies exact bytes. `--check` is read-only and returns nonzero on drift. Preserve the PR/commit URL in the migration issue comment, use that checkout to check parity, and change source through another PR before reinstalling. No session restart, process operation, state deletion or unrelated configuration replacement occurs.
 
+The enumeration (`RUNTIME_FILES`) includes the model router (`model_routing.py`, its `balance_loader.py` dependency and `routing_smoke_test.py`). `coordinator.py` and `superboard_adapter.py` import the router at runtime, so `--check` also reports router drift. The profile `config.yml` is never installed; its role pins remain a manual step.
+
 The installed manifest is updated only for GitHub authority and the owned module/export entries, preserving other integrations. The parity check validates those fields without replacing unrelated metadata.
 
 Migration evidence: [GitHub-native enforcement issue](https://github.com/Wladefant/super-board/issues/114).
