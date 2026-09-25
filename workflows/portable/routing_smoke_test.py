@@ -1223,6 +1223,10 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             usage["reports"].append(report)
             return usage
 
+        def codex_out(usage):
+            usage["reports"][2]["metadata"].update({"limitReached": True, "allowed": False})
+            return usage
+
         google_down = self._usage_with_ag_families(anthropic_week_used=0.0, anthropic_week_reset_hrs=20)
         google_down["reports"][0]["metadata"]["limitReached"] = True
         google_down["reports"][0]["metadata"]["allowed"] = False
@@ -1238,6 +1242,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
                 anthropic_week_used=0.10, anthropic_week_reset_hrs=6),
             "google_down": google_down,
             "google_deepseek_out_codex_on_pace": deepseek_out(copy.deepcopy(google_down)),
+            "google_codex_out": codex_out(copy.deepcopy(google_down)),
         }
         variants = [
             {},
@@ -1271,13 +1276,20 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
                                 if not minimax_allowed:
                                     self.assertNotIn("minimax-code/", rec.selected_model, where)
                                     self.assertNotIn("minimax-code/", rec.fallback_model, where)
+                                # Review 5318407088 M: high-risk, rework and money routes never fall
+                                # back to a Flash tier, at any context size. (A TINY_TASK up to 180k is the
+                                # bulk Flash-Lite lane by design; above 180k it is Case A and covered.)
+                                if (risk == RiskLevel.HIGH or variant) and (
+                                        task_type != TaskType.TINY_TASK or ctx > 180000):
+                                    self.assertNotIn("flash", rec.fallback_model, where)
                                 if is_review_lane and ctx <= 180000:
                                     continue  # the high-risk REVIEW lane may spend Anthropic slack
                                 self.assertNotIn("anthropic/", rec.selected_model, where)
                                 self.assertNotIn("anthropic/", rec.fallback_model, where)
         print(f"  [PASS] {checked} worker routes (task x risk x rework/domain x 6 context sizes x credentials x "
               f"{len(scenarios)} quota states): none selects or falls back to paid Anthropic, to a model whose window "
-              "is below the context, or to MiniMax outside low-risk bulk/deep-context work; every fallback crosses providers.")
+              "is below the context, or to MiniMax outside low-risk bulk/deep-context work; no high-risk, rework or "
+              "money route falls back to a Flash tier; every fallback crosses providers.")
 
         # The deep-context gap (review 5317952644 A'): with both 1M-context cheap tiers out,
         # Codex on pace holds 200k/240k, and credentialed GLM holds a 10k DEEP_CONTEXT task.

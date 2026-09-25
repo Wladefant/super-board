@@ -669,7 +669,9 @@ class ResetAwareModelSelector:
                       cooldown=True, as_fallback=False),
             ]
             last_resort = _Rung(MODEL_DEEPSEEK_PRO, True, "every deep-context tier unavailable; pay-per-token DeepSeek V4 Pro.", cooldown=True)
-            final_fallbacks = [MODEL_OR_DEEPSEEK_FLASH]
+            # High-risk, rework and money work never falls back to a Flash tier (as in B2).
+            final_fallbacks = ([MODEL_GEMINI_PRO, MODEL_CODEX_FAST] if is_rework_critical
+                               else [MODEL_OR_DEEPSEEK_FLASH])
 
         elif task_type == TaskType.STRONG_REVIEW and is_rework_critical:
             # CASE B1: HIGH-RISK REVIEW ladder. The one worker lane where paid Anthropic
