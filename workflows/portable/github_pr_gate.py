@@ -692,22 +692,21 @@ def evaluate_pr_gate(
             return check_name in native_required_contexts
         return True
 
-    # Deduplicate status_rollup by check name: preserve latest check run
+    # Deduplicate status_rollup by check name: preserve latest check run. GitHub
+    # reports an unfinished run's completedAt as the 0001-01-01 sentinel, so that
+    # value must fall back to the start time; otherwise a pending re-run would sort
+    # before the older finished run it supersedes and be silently dropped.
+    def _check_sort_key(chk: dict) -> str:
+        comp = chk.get("completedAt")
+        if comp and not str(comp).startswith("0001"):
+            return str(comp)
+        return str(chk.get("startedAt") or chk.get("createdAt") or "")
+
     deduped_status_rollup: Dict[str, dict] = {}
     for check in status_rollup:
         c_name = check.get("name") or check.get("context") or "unknown_check"
-        c_time = check.get("completedAt") or check.get("startedAt") or check.get("createdAt") or ""
-        if c_name not in deduped_status_rollup:
+        if c_name not in deduped_status_rollup or _check_sort_key(check) > _check_sort_key(deduped_status_rollup[c_name]):
             deduped_status_rollup[c_name] = check
-        else:
-            prev_time = (
-                deduped_status_rollup[c_name].get("completedAt")
-                or deduped_status_rollup[c_name].get("startedAt")
-                or deduped_status_rollup[c_name].get("createdAt")
-                or ""
-            )
-            if str(c_time) > str(prev_time):
-                deduped_status_rollup[c_name] = check
 
     for check in deduped_status_rollup.values():
         # Check either CheckRun or StatusContext
