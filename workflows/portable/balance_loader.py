@@ -35,10 +35,6 @@ from typing import Any, Dict, List, Optional, Tuple
 DEFAULT_STALE_THRESHOLD_SECONDS = 3600.0  # 1 hour
 DEFAULT_SNAPSHOT_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "usage_snapshot_cache.json")
 
-# A multi-day subscription window at or above this used fraction is throttled:
-# the account is kept for emergencies instead of being chosen as a default lane.
-THROTTLE_USED_FRACTION = 0.80
-
 ANTIGRAVITY_PROVIDER = "google-antigravity"
 
 
@@ -70,11 +66,6 @@ def best_ok_report(reports: List["SubscriptionReport"]) -> Optional["Subscriptio
     """
     ok = [r for r in reports if r.status == "ok"]
     return max(ok, key=report_headroom_key) if ok else None
-
-
-def is_throttled_window(window: "UsageWindow") -> bool:
-    """A multi-day window (>24h) whose used fraction reached the throttle threshold."""
-    return window.duration_ms > 86400000 and window.amount.used_fraction >= THROTTLE_USED_FRACTION
 
 
 def ms_to_iso_utc(timestamp_ms: Optional[int]) -> str:
@@ -173,6 +164,8 @@ class NormalizedProviderBalance:
     bottleneck_hours_to_reset: float = 0.0
     bottleneck_duration_hours: float = 24.0
     cycle_duration_hours: float = 168.0
+    # Remaining fraction of the SAME primary window as cycle_hours_to_reset; pacing needs both from one window.
+    cycle_remaining_fraction: Optional[float] = None
     primary_window_id: str = ""
     pro_weekly_remaining_fraction: Optional[float] = None
     pro_weekly_hours_to_reset: Optional[float] = None
@@ -217,7 +210,7 @@ class NormalizedBalanceSnapshot:
             if provider in self.dormant_providers:
                 return (0.0, 0.0, "dormant", "dormant")
             return (0.5, 999.0, "unknown", "unknown")
-        cycle_rem = norm_prov.pro_weekly_remaining_fraction if norm_prov.pro_weekly_remaining_fraction is not None else norm_prov.effective_remaining_fraction
+        cycle_rem = norm_prov.cycle_remaining_fraction if norm_prov.cycle_remaining_fraction is not None else norm_prov.effective_remaining_fraction
         return (
             cycle_rem,
             norm_prov.cycle_hours_to_reset,
@@ -317,6 +310,7 @@ class SanitizedUsageSnapshot:
                 bottleneck_hours_to_reset=btn_hrs,
                 bottleneck_duration_hours=btn_dur_hrs,
                 cycle_duration_hours=cycle_dur_hrs,
+                cycle_remaining_fraction=sub.primary_window.amount.remaining_fraction if sub.primary_window else None,
                 primary_window_id=prim_label,
                 pro_weekly_remaining_fraction=pro_rem,
                 pro_weekly_hours_to_reset=pro_hrs,

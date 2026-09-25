@@ -16,9 +16,11 @@ Verifies:
   10. High-risk review quality gate: Flash 3.8 barred as sole quality gate
   11. Deep context filtering: > 180k tokens routes to Gemini 3.1 Pro
   12. Token-saving review protocol: Compact EvidencePacket (< 1.5 KB)
-  22-25. Allowance-aware routing: Codex pro throttled at >=80% used, Antigravity
-      Claude daily window spent before paid Anthropic, DeepSeek V4.1 Flash overflow,
-      free OpenRouter reviewer attached as advisory only
+  22-26. Allowance-aware routing: Codex pro paced over its 7d window (held back ahead
+      of pace, promoted when surplus would expire), Antigravity Claude daily window spent
+      before paid Anthropic, DeepSeek V4.1 Flash overflow, free OpenRouter reviewer
+      attached as advisory only, direct Anthropic reserved for the orchestrator except
+      slack behind pace
 """
 
 import copy
@@ -681,10 +683,19 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         print(f"  [PASS] Structural failure retry strictly barred Flash under cooldown: {rec_structural.selected_model}")
 
     # -------------------------------------------------------------------------
-    # Helpers for the allowance-aware tests (TESTS 22-25)
+    # Helpers for the allowance-aware tests (TESTS 22-26)
     # -------------------------------------------------------------------------
-    def _usage_with_ag_families(self, anthropic_used=0.0, openai_used=0.0, codex_used=0.03):
-        """Live-shaped usage: Antigravity reports one daily window per family; Codex pro 7d at `codex_used`."""
+    def _usage_with_ag_families(
+        self,
+        anthropic_used=0.0,
+        openai_used=0.0,
+        codex_used=0.03,
+        codex_reset_hrs=None,
+        anthropic_week_used=None,
+        anthropic_week_reset_hrs=None,
+    ):
+        """Live-shaped usage: Antigravity reports one daily window per family; Codex pro and
+        direct Anthropic 7d windows can be moved to any used fraction / reset distance."""
         usage = copy.deepcopy(self.mock_usage_dict)
         ag = usage["reports"][0]
         for family, used in (("anthropic", anthropic_used), ("openai", openai_used)):
@@ -707,58 +718,121 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
                 },
                 "status": "ok",
             })
-        codex = usage["reports"][2]["limits"][0]["amount"]
-        codex.update({
-            "remainingFraction": 1.0 - codex_used,
-            "usedFraction": codex_used,
-            "remaining": (1.0 - codex_used) * 100,
-            "used": codex_used * 100,
-        })
+
+        def set_window(limit, used, reset_hrs):
+            limit["amount"].update({
+                "remainingFraction": 1.0 - used,
+                "usedFraction": used,
+                "remaining": (1.0 - used) * 100,
+                "used": used * 100,
+            })
+            if reset_hrs is not None:
+                limit["window"]["resetsAt"] = self.mock_now_ms + int(reset_hrs * 3600 * 1000)
+
+        set_window(usage["reports"][2]["limits"][0], codex_used, codex_reset_hrs)
+        if anthropic_week_used is not None:
+            set_window(usage["reports"][1]["limits"][1], anthropic_week_used, anthropic_week_reset_hrs)
         return usage
 
     def _selector(self, usage):
         return ResetAwareModelSelector(parse_usage_json(usage, current_time_ms=self.mock_now_ms))
 
-    # -------------------------------------------------------------------------
-    # TEST 22: Codex pro at 92% of its 7d window is throttled
-    # -------------------------------------------------------------------------
-    def test_codex_pro_throttled_at_92_percent(self):
-        print("\n--- TEST 22: Codex Pro Throttled at 92% Used ---")
-        usage = self._usage_with_ag_families(codex_used=0.92)
-        # Anthropic unavailable, so before the throttle rule Codex Sol took high-risk work.
+    @staticmethod
+    def _block_anthropic(usage):
         for rep in usage["reports"]:
             if rep["provider"] == "anthropic":
                 rep["metadata"]["limitReached"] = True
                 rep["metadata"]["allowed"] = False
-        selector = self._selector(usage)
 
+    # -------------------------------------------------------------------------
+    # TEST 22: Codex pro is paced: held back ahead of pace, spent fully before reset
+    # -------------------------------------------------------------------------
+    def test_codex_pro_paced_over_the_week(self):
+        print("\n--- TEST 22: Codex Pro Paced Over the Week ---")
+        # 92% used with 145h of 168h still to go: far ahead of pace, would run dry mid-week.
+        usage = self._usage_with_ag_families(codex_used=0.92, codex_reset_hrs=145)
+        self._block_anthropic(usage)
+        selector = self._selector(usage)
         for task_type in (TaskType.STRONG_REVIEW, TaskType.DEEP_REASONING, TaskType.ROUTINE_EXECUTION):
             rec = selector.select_model(task_type=task_type, risk_level=RiskLevel.HIGH)
-            self.assertNotIn("openai-codex/", rec.selected_model, f"{task_type}: throttled Codex chosen")
-            self.assertEqual(rec.selected_model, MODEL_AG_CLAUDE_OPUS)
+            self.assertEqual(rec.selected_model, MODEL_AG_CLAUDE_OPUS, f"{task_type}: ahead-of-pace Codex chosen")
             self.assertNotEqual(rec.fallback_model, MODEL_GEMINI_FLASH)
         self.assertTrue(rec.quota_metrics["codex_pro_throttled"])
 
-        # Routine low-risk work with Gemini in cooldown must not burn throttled Codex either.
+        # Routine work with Gemini in cooldown must not drain ahead-of-pace Codex either.
         for lim in usage["reports"][0]["limits"]:
             if lim["id"].startswith("google-antigravity:google"):
                 lim["status"] = "rate_limited"
-        rec_routine = self._selector(usage).select_model(
-            task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.LOW
-        )
+        rec_routine = self._selector(usage).select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.LOW)
         self.assertNotIn("openai-codex/", rec_routine.selected_model)
-        print(f"  [PASS] Codex pro at 92% throttled; high-risk work routed to {MODEL_AG_CLAUDE_OPUS}.")
+        print(f"  [PASS] 92% used with 145h left: Codex held back; high-risk work on {MODEL_AG_CLAUDE_OPUS}.")
 
-        # Below the threshold (79% used) Codex remains a normal strong lane.
-        usage_ok = self._usage_with_ag_families(codex_used=0.79)
-        for rep in usage_ok["reports"]:
-            if rep["provider"] == "anthropic":
-                rep["metadata"]["limitReached"] = True
-                rep["metadata"]["allowed"] = False
-        rec_ok = self._selector(usage_ok).select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
-        self.assertEqual(rec_ok.selected_model, MODEL_CODEX_SOL)
-        self.assertFalse(rec_ok.quota_metrics["codex_pro_throttled"])
-        print(f"  [PASS] Codex pro at 79% still selected: {rec_ok.selected_model}")
+        # The same 92% with 6h left is behind pace: the last 8% would expire unused, so it
+        # is promoted ahead of every other strong lane, including Antigravity Claude.
+        usage_end = self._usage_with_ag_families(codex_used=0.92, codex_reset_hrs=6)
+        rec_end = self._selector(usage_end).select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
+        self.assertFalse(rec_end.quota_metrics["codex_pro_throttled"])
+        self.assertTrue(rec_end.promotion_applied)
+        self.assertEqual(rec_end.selected_model, MODEL_CODEX_SOL)
+        print(f"  [PASS] 92% used with 6h left: remaining Codex spent before reset on {rec_end.selected_model}.")
+
+        # Exactly on pace (50% used, 84h left) is neither throttled nor promoted.
+        usage_pace = self._usage_with_ag_families(anthropic_used=0.95, codex_used=0.49, codex_reset_hrs=84)
+        self._block_anthropic(usage_pace)
+        rec_pace = self._selector(usage_pace).select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
+        self.assertFalse(rec_pace.quota_metrics["codex_pro_throttled"])
+        self.assertFalse(rec_pace.promotion_applied)
+        self.assertEqual(rec_pace.selected_model, MODEL_CODEX_SOL)
+        print(f"  [PASS] On-pace Codex remains a normal strong lane: {rec_pace.selected_model}")
+
+    # -------------------------------------------------------------------------
+    # TEST 26: Direct Anthropic is the Opus orchestrator's weekly budget
+    # -------------------------------------------------------------------------
+    def test_anthropic_orchestrator_reserve(self):
+        print("\n--- TEST 26: Anthropic Orchestrator Reserve ---")
+        # 64% of the week used with 72h left (57% elapsed): ahead of pace, so workers leave it
+        # to the orchestrator even for high-risk review while Codex is on pace.
+        usage = self._usage_with_ag_families(anthropic_used=0.95, anthropic_week_used=0.64, anthropic_week_reset_hrs=72)
+        rec = self._selector(usage).select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
+        self.assertTrue(rec.quota_metrics["anthropic_orchestrator_reserve"])
+        self.assertEqual(rec.selected_model, MODEL_CODEX_SOL)
+        self.assertNotIn("anthropic/", rec.fallback_model)
+        print(f"  [PASS] Ahead-of-pace Anthropic reserved; high-risk review on {rec.selected_model}.")
+
+        # The reserve is an emergency lane only when nothing else strong can take the work.
+        usage_last = self._usage_with_ag_families(
+            anthropic_used=0.95, codex_used=0.92, codex_reset_hrs=145,
+            anthropic_week_used=0.64, anthropic_week_reset_hrs=72,
+        )
+        rec_last = self._selector(usage_last).select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
+        self.assertEqual(rec_last.selected_model, MODEL_CLAUDE_FABLE)
+        self.assertTrue(rec_last.cooldown_fallback)
+        self.assertIn("orchestrator reserve", rec_last.reasoning)
+        print(f"  [PASS] Reserve drawn only as last resort: {rec_last.selected_model}")
+
+        # 30% used with 20h left: most of the week would expire unused, so workers take it,
+        # medium-risk work included.
+        usage_surplus = self._usage_with_ag_families(anthropic_used=0.95, anthropic_week_used=0.30, anthropic_week_reset_hrs=20)
+        selector = self._selector(usage_surplus)
+        self.assertFalse(selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
+                         .quota_metrics["anthropic_orchestrator_reserve"])
+        self.assertEqual(
+            selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH).selected_model,
+            MODEL_CLAUDE_FABLE,
+        )
+        self.assertEqual(
+            selector.select_model(task_type=TaskType.DEEP_REASONING, risk_level=RiskLevel.MEDIUM).selected_model,
+            MODEL_CLAUDE_OPUS,
+        )
+        print("  [PASS] Anthropic surplus near reset spent by workers (Fable review, Opus reasoning).")
+
+        # Stale Anthropic data never counts as slack.
+        stale = self._usage_with_ag_families(anthropic_used=0.95, anthropic_week_used=0.0, anthropic_week_reset_hrs=20)
+        stale["reports"][1]["fetchedAt"] = self.mock_now_ms - 2 * 3600 * 1000
+        rec_stale = self._selector(stale).select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
+        self.assertTrue(rec_stale.quota_metrics["anthropic_orchestrator_reserve"])
+        self.assertEqual(rec_stale.selected_model, MODEL_CODEX_SOL)
+        print(f"  [PASS] Stale Anthropic snapshot kept in reserve; routed to {rec_stale.selected_model}.")
 
     # -------------------------------------------------------------------------
     # TEST 23: Antigravity Claude daily window is spent before paid Anthropic
