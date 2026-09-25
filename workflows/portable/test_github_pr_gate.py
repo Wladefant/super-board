@@ -42,6 +42,7 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 from github_pr_gate import (
+    DEPLOY_CRITICAL_CHECKS,
     GateApprovalPolicy,
     PRGateEvaluation,
     evaluate_pr_gate,
@@ -1117,6 +1118,116 @@ class TestGitHubPRGate(unittest.TestCase):
         self.assertIn("truncated", res_many.review_decision_reason)
         self.assertEqual(res_many.gate_verdict, "BLOCKED")
         print("  [PASS] Review exemption scoped to named policies and fails closed on truncation")
+    # ── Deploy-critical check tests (incident #5535 prevention) ──────────
+    #
+    # Every fixture below is review-exempt under the REAL PolySimulator staging policy
+    # (small low-risk diff, resolve_gate_policy), so the only thing that can hold the
+    # gate is CI. The bare waived_policy() fixture does not opt into review exemption,
+    # which makes a no-review PR BLOCKED for missing review evidence regardless of CI
+    # and would let a PENDING/PASSED assertion pass or fail for the wrong reason.
+
+    def _exempt_staging_pr(self, checks):
+        """Return a review-exempt staging PR with the given status check rollup."""
+        pr = copy.deepcopy(self.mock_pr)
+        pr["statusCheckRollup"] = checks
+        pr["baseRefName"] = "staging"
+        pr["files"] = [{"path": "frontend/foo.tsx", "additions": 10, "deletions": 5}]
+        pr["labels"] = []
+        pr["reviews"] = []
+        return pr
+
+    def _evaluate_staging(self, pr):
+        policy = resolve_gate_policy("Bavariance/polysimulator", "staging")
+        self.assertTrue(policy.allow_review_exemption)
+        res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy)
+        self.assertEqual(res.review_decision, "exempt", res.review_decision_reason)
+        return res
+
+    def _six_min_ago(self):
+        """Return an ISO timestamp 6 minutes in the past."""
+        return (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def test_deploy_critical_names_match(self):
+        self.assertIn("build-and-boot", DEPLOY_CRITICAL_CHECKS)
+
+    def test_deploy_critical_pending_never_passes(self):
+        """build-and-boot pending for 6 minutes keeps the gate PENDING; it is never timed out."""
+        six_min = self._six_min_ago()
+        for status in ("QUEUED", "IN_PROGRESS", "PENDING"):
+            with self.subTest(status=status):
+                res = self._evaluate_staging(self._exempt_staging_pr([
+                    {"name": "build-and-boot", "status": status, "conclusion": "", "startedAt": six_min, "createdAt": six_min},
+                    {"name": "lint-and-typecheck", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": six_min},
+                ]))
+                self.assertEqual(res.ci_verdict, "PENDING")
+                self.assertEqual(res.gate_verdict, "PENDING")
+                self.assertEqual(res.pending_checks, ["build-and-boot"])
+                self.assertNotIn("timed out", res.verdict_reason.lower())
+
+    def test_deploy_critical_failure_blocks(self):
+        """build-and-boot failure is a hard BLOCKED even on a review-exempt PR."""
+        res = self._evaluate_staging(self._exempt_staging_pr([
+            {"name": "build-and-boot", "status": "COMPLETED", "conclusion": "FAILURE", "completedAt": "2026-09-25T19:00:00Z"},
+            {"name": "lint-and-typecheck", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-09-25T19:00:00Z"},
+        ]))
+        self.assertEqual(res.ci_verdict, "FAILURE")
+        self.assertEqual(res.gate_verdict, "BLOCKED")
+        self.assertIn("build-and-boot", res.failing_checks)
+
+    def test_deploy_critical_success_passes(self):
+        """build-and-boot success lets a review-exempt PR pass."""
+        res = self._evaluate_staging(self._exempt_staging_pr([
+            {"name": "build-and-boot", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-09-25T19:00:00Z"},
+            {"name": "lint-and-typecheck", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-09-25T19:00:00Z"},
+        ]))
+        self.assertEqual(res.ci_verdict, "SUCCESS")
+        self.assertEqual(res.gate_verdict, "PASSED")
+
+    def test_non_critical_pending_times_out_but_critical_stays(self):
+        """A lint pending 6 minutes times out, but a co-pending build-and-boot keeps the gate PENDING."""
+        six_min = self._six_min_ago()
+        res = self._evaluate_staging(self._exempt_staging_pr([
+            {"name": "build-and-boot", "status": "IN_PROGRESS", "conclusion": "", "startedAt": six_min, "createdAt": six_min},
+            {"name": "lint-and-typecheck", "status": "IN_PROGRESS", "conclusion": "", "startedAt": six_min, "createdAt": six_min},
+        ]))
+        self.assertEqual(res.ci_verdict, "PENDING")
+        self.assertEqual(res.gate_verdict, "PENDING")
+        self.assertEqual(res.pending_checks, ["build-and-boot"])
+        self.assertIn("timed out", res.verdict_reason.lower())
+
+    def test_only_non_critical_pending_times_out_and_passes(self):
+        """An unrelated check pending 6 minutes times out and the gate passes on local gates."""
+        six_min = self._six_min_ago()
+        res = self._evaluate_staging(self._exempt_staging_pr([
+            {"name": "build-and-boot", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": six_min},
+            {"name": "lint-and-typecheck", "status": "IN_PROGRESS", "conclusion": "", "startedAt": six_min, "createdAt": six_min},
+        ]))
+        self.assertEqual(res.ci_verdict, "SUCCESS")
+        self.assertEqual(res.gate_verdict, "PASSED")
+        self.assertIn("lint-and-typecheck", res.verdict_reason)
+        self.assertIn("timed out", res.verdict_reason.lower())
+
+    def test_non_critical_pending_under_timeout_stays_pending(self):
+        """A non-critical check pending under 5 minutes is still waited on."""
+        recent = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        res = self._evaluate_staging(self._exempt_staging_pr([
+            {"name": "build-and-boot", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": recent},
+            {"name": "lint-and-typecheck", "status": "IN_PROGRESS", "conclusion": "", "startedAt": recent, "createdAt": recent},
+        ]))
+        self.assertEqual(res.gate_verdict, "PENDING")
+        self.assertEqual(res.pending_checks, ["lint-and-typecheck"])
+
+    def test_pending_rerun_of_deploy_critical_supersedes_older_success(self):
+        """A re-run build-and-boot (completedAt = GitHub's 0001 sentinel) outranks its older success."""
+        six_min = self._six_min_ago()
+        res = self._evaluate_staging(self._exempt_staging_pr([
+            {"name": "build-and-boot", "status": "COMPLETED", "conclusion": "SUCCESS",
+             "startedAt": "2026-09-25T18:00:00Z", "completedAt": "2026-09-25T18:10:00Z"},
+            {"name": "build-and-boot", "status": "IN_PROGRESS", "conclusion": "",
+             "startedAt": six_min, "completedAt": "0001-01-01T00:00:00Z"},
+        ]))
+        self.assertEqual(res.gate_verdict, "PENDING")
+        self.assertEqual(res.pending_checks, ["build-and-boot"])
 
 
 def main():
