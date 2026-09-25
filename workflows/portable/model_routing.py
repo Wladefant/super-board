@@ -304,6 +304,7 @@ AG_FAMILY_MIN_REMAINING = 0.10
 AG_ANTHROPIC_PROVIDER = "google-antigravity:anthropic"
 AG_OPENAI_PROVIDER = "google-antigravity:openai"
 ANTIGRAVITY_PROVIDER = "google-antigravity"
+CODEX_PROVIDER = "openai-codex"
 # Every subscription window is paced, not capped (operator 2026-09-25): it must last its
 # whole duration AND be spent by its reset.  `pace_ratio` is remaining allowance over
 # remaining time (1.0 = linear spend), computed per window by `window_pace`:
@@ -573,7 +574,13 @@ def prefer_furthest_behind_pace(paces: List[WindowPace]) -> Optional[WindowPace]
 
 
 def balance_provider_for(model: str) -> str:
-    """Snapshot provider that holds `model`'s allowance. Antigravity splits by model family."""
+    """Snapshot provider that holds `model`'s allowance. Antigravity splits by model family.
+
+    Codex models map to 'openai-codex' (the snapshot provider) so quota checks
+    and pacing hit the right provider entry.
+    """
+    if "codex" in model or model.startswith("openai-codex/"):
+        return CODEX_PROVIDER
     provider = model_to_provider(model)
     if provider == ANTIGRAVITY_PROVIDER:
         family = model.split("/", 1)[1] if "/" in model else ""
@@ -582,7 +589,6 @@ def balance_provider_for(model: str) -> str:
         if family.startswith("gpt"):
             return AG_OPENAI_PROVIDER
     return provider
-
 
 def _pace_gate_rung(rung: _Rung, pace: Optional[WindowPace],
                     blocked_reason: Optional[str] = None) -> _Rung:
@@ -1182,13 +1188,10 @@ class ResetAwareModelSelector:
             final_fallbacks = [MODEL_DEEPSEEK_FLASH]
 
         elif task_type == TaskType.DEEP_REASONING:
-            # CASE E: DEEP REASONING — worker tiers only, never paid Anthropic. The Go and Z.AI
-            # tiers lead. Low risk then keeps the cheapest sufficient lane (Gemini 3.8 Flash,
-            # whose rung carries the orchestrator-reserve note), while medium and high risk spend
-            # the stronger Antigravity Claude window instead: it is small, but it expires within
-            # 5h, so it is spent rather than lost. A promoted (expiring) Codex window takes the
-            # band from whichever of the two leads it, and Codex on pace still follows every
-            # cheaper tier.
+            # CASE E: DEEP REASONING — decision from Main on the DEEP_REASONING ladder:
+            # - LOW and MEDIUM lead with opencode-go GLM-5.3 (then DeepSeek, then Gemini 3.8 Flash);
+            # - only HIGH leads with Antigravity Claude Opus (ag-opus), and only while the
+            #   quota snapshot does not mark it exhausted.
             label = "Deep reasoning"
             band_group = PACE_GROUP_EXEC if risk_level == RiskLevel.LOW else PACE_GROUP_STRONG
             flash_rung = _Rung(
@@ -1197,13 +1200,18 @@ class ResetAwareModelSelector:
                 pace_group=band_group,
             )
             codex_rung = codex_promoted(MODEL_CODEX_ASTRA, "Codex Astra", band_group)
-            band = ([flash_rung, codex_rung, deepseek_pro, ag_opus] if risk_level == RiskLevel.LOW
-                    else [ag_opus, codex_rung, deepseek_pro, flash_rung])
+            if risk_level == RiskLevel.HIGH:
+                band = [ag_opus, codex_rung, deepseek_pro, flash_rung]
+            elif codex_rung.promotion:
+                band = [codex_rung, deepseek_pro, flash_rung]
+            else:
+                band = [deepseek_pro, flash_rung]
+
             rungs = [
-                go_glm53_flash,
                 go_glm53,
-                glm,
                 *band,
+                go_glm53_flash,
+                glm,
                 astra_on_pace,
                 _Rung(MODEL_DEEPSEEK_FLASH, deepseek_ok, "Gemini and Codex unavailable; DeepSeek V4.1 Flash overflow.", cooldown=True),
             ]

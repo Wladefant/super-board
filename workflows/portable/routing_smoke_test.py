@@ -339,11 +339,12 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         self.assertIn("Gemini 3.8 Flash", rec_routine.reasoning)
         print(f"  [PASS] Routine execution defaults to: {rec_routine.selected_model}")
 
-        # Deep reasoning keeps direct Anthropic for the orchestrator and routes to Gemini 3.8 Flash
+        # Operator DEEP_REASONING ladder policy (#214): LOW and MEDIUM lead with OpenCode Go
+        # GLM-5.3, then DeepSeek V4 Pro, then Gemini 3.8 Flash; direct Anthropic is preserved
+        # for the orchestrator. When Go is uncredentialed in hermetic tests, DeepSeek V4 Pro leads.
         rec_reason = selector.select_model(task_type=TaskType.DEEP_REASONING, risk_level=RiskLevel.LOW)
-        self.assertEqual(rec_reason.selected_model, MODEL_GEMINI_FLASH)
-        self.assertIn("direct Anthropic reserved for the orchestrator", rec_reason.reasoning)
-        print(f"  [PASS] Deep reasoning preserved Anthropic: {rec_reason.selected_model}")
+        self.assertEqual(rec_reason.selected_model, MODEL_DEEPSEEK_PRO)
+        print(f"  [PASS] Deep reasoning preserved Anthropic (routed to {rec_reason.selected_model})")
 
     # -------------------------------------------------------------------------
     # TEST 6: Cooldown & Rate Limit Safety Failover
@@ -992,12 +993,16 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         selector = self._selector(self._usage_with_ag_families(anthropic_used=0.0))
         rec_review = selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.MEDIUM)
         self.assertEqual(rec_review.selected_model, MODEL_AG_CLAUDE_OPUS)
+        # Operator DEEP_REASONING ladder policy (#214): LOW and MEDIUM lead with OpenCode Go
+        # GLM-5.3, then DeepSeek V4 Pro, then Gemini 3.8 Flash. Opus is minimized and reserved
+        # for orchestrator and high-risk reviews only, so medium-risk deep reasoning does NOT
+        # spend ag-opus; only HIGH leads with Antigravity Claude Opus.
         rec_reason = selector.select_model(task_type=TaskType.DEEP_REASONING, risk_level=RiskLevel.MEDIUM)
-        self.assertEqual(rec_reason.selected_model, MODEL_AG_CLAUDE_OPUS)
-        self.assertEqual(model_to_agent_role(MODEL_AG_CLAUDE_OPUS, TaskType.STRONG_REVIEW, RiskLevel.MEDIUM), "ag-opus")
+        self.assertEqual(rec_reason.selected_model, MODEL_DEEPSEEK_PRO)
         packet = selector.dispatch(task_type=TaskType.DEEP_REASONING, risk_level=RiskLevel.MEDIUM)
-        self.assertEqual(packet.recommendation["agent_role"], "ag-opus")
-        print(f"  [PASS] Medium review/reasoning on {rec_review.selected_model} (agent ag-opus).")
+        self.assertEqual(packet.recommendation["model"], MODEL_DEEPSEEK_PRO)
+        self.assertEqual(packet.recommendation["agent_role"], "ds-pro")
+        print(f"  [PASS] Medium review on {rec_review.selected_model} (ag-opus); medium reasoning on {rec_reason.selected_model} (ds-pro).")
 
         # An almost spent Antigravity Claude window (95% used) is left alone.
         spent = self._selector(self._usage_with_ag_families(anthropic_used=0.95))

@@ -519,3 +519,157 @@ def test_parse_quota_error_durations_and_non_quota():
     assert parse_quota_error('{"error": "invalid_request"}', now=now) is None
     assert parse_quota_error("", now=now) is None
     assert parse_quota_error(None, now=now) is None  # type: ignore
+
+
+# ---------------------------------------------------------------------------
+# TEST 9: OpenCode Go quota window parsing & boundary tests
+# ---------------------------------------------------------------------------
+def test_opencode_go_quota_windows_boundaries(tmp_path: Path):
+    """Verify OpenCode Go quota windows ($12/5h, $30/week, $60/month) and boundary behavior."""
+    from balance_loader import identify_opencode_go_window, parse_opencode_go_to_quota_snapshot
+
+    # Boundary test for window identification
+    assert identify_opencode_go_window("opencode-go:5h") == ("rolling-5h", 12.0)
+    assert identify_opencode_go_window("opencode-go:rolling-5h") == ("rolling-5h", 12.0)
+    assert identify_opencode_go_window("limit_1", duration_ms=5 * 3600 * 1000) == ("rolling-5h", 12.0)
+    assert identify_opencode_go_window("limit_1", duration_ms=6 * 3600 * 1000) == ("rolling-5h", 12.0)
+
+    assert identify_opencode_go_window("opencode-go:week") == ("weekly", 30.0)
+    assert identify_opencode_go_window("opencode-go:7d") == ("weekly", 30.0)
+    assert identify_opencode_go_window("limit_2", duration_ms=7 * 24 * 3600 * 1000) == ("weekly", 30.0)
+
+    assert identify_opencode_go_window("opencode-go:month") == ("monthly", 60.0)
+    assert identify_opencode_go_window("opencode-go:30d") == ("monthly", 60.0)
+    assert identify_opencode_go_window("limit_3", duration_ms=30 * 24 * 3600 * 1000) == ("monthly", 60.0)
+
+    assert identify_opencode_go_window("unknown_window") == ("default", 12.0)
+    snap_path = tmp_path / "quota-snapshot.json"
+    now = datetime(2026, 9, 25, 12, 0, 0, tzinfo=timezone.utc)
+    resets_ms = int(datetime(2026, 9, 25, 17, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
+
+    # 1. Under limits across all windows -> eligible
+    payload_under = {
+        "generatedAt": int(now.timestamp() * 1000),
+        "reports": [
+            {
+                "provider": "opencode-go",
+                "fetchedAt": int(now.timestamp() * 1000),
+                "limits": [
+                    {
+                        "id": "opencode-go:rolling-5h",
+                        "label": "5 Hour",
+                        "window": {"id": "rolling-5h", "durationMs": 18000000, "resetsAt": resets_ms},
+                        "amount": {"used": 11.99, "limit": 12.0},
+                        "status": "ok",
+                    },
+                    {
+                        "id": "opencode-go:weekly",
+                        "label": "Weekly",
+                        "window": {"id": "weekly", "durationMs": 604800000, "resetsAt": resets_ms},
+                        "amount": {"used": 29.50, "limit": 30.0},
+                        "status": "ok",
+                    },
+                    {
+                        "id": "opencode-go:monthly",
+                        "label": "Monthly",
+                        "window": {"id": "monthly", "durationMs": 2592000000, "resetsAt": resets_ms},
+                        "amount": {"used": 59.00, "limit": 60.0},
+                        "status": "ok",
+                    },
+                ],
+            }
+        ],
+    }
+    snap_under = parse_opencode_go_to_quota_snapshot(payload_under, path=snap_path, now=now)
+    assert snap_under.is_eligible("opencode-go", now=now) is True
+
+    # 2. Exceeding 5h limit ($12.00) -> provider exhausted
+    payload_5h_exhausted = {
+        "generatedAt": int(now.timestamp() * 1000),
+        "reports": [
+            {
+                "provider": "opencode-go",
+                "fetchedAt": int(now.timestamp() * 1000),
+                "limits": [
+                    {
+                        "id": "opencode-go:rolling-5h",
+                        "label": "5 Hour",
+                        "window": {"id": "rolling-5h", "durationMs": 18000000, "resetsAt": resets_ms},
+                        "amount": {"used": 12.00, "limit": 12.0},
+                        "status": "ok",
+                    },
+                    {
+                        "id": "opencode-go:weekly",
+                        "label": "Weekly",
+                        "window": {"id": "weekly", "durationMs": 604800000, "resetsAt": resets_ms},
+                        "amount": {"used": 15.00, "limit": 30.0},
+                        "status": "ok",
+                    },
+                ],
+            }
+        ],
+    }
+    snap_5h = parse_opencode_go_to_quota_snapshot(payload_5h_exhausted, path=snap_path, now=now)
+    assert snap_5h.is_eligible("opencode-go", now=now) is False
+
+    # 3. Exceeding weekly limit ($30.00) -> provider exhausted
+    payload_week_exhausted = {
+        "generatedAt": int(now.timestamp() * 1000),
+        "reports": [
+            {
+                "provider": "opencode-go",
+                "fetchedAt": int(now.timestamp() * 1000),
+                "limits": [
+                    {
+                        "id": "opencode-go:rolling-5h",
+                        "label": "5 Hour",
+                        "window": {"id": "rolling-5h", "durationMs": 18000000, "resetsAt": resets_ms},
+                        "amount": {"used": 5.00, "limit": 12.0},
+                        "status": "ok",
+                    },
+                    {
+                        "id": "opencode-go:weekly",
+                        "label": "Weekly",
+                        "window": {"id": "weekly", "durationMs": 604800000, "resetsAt": resets_ms},
+                        "amount": {"used": 30.00, "limit": 30.0},
+                        "status": "ok",
+                    },
+                ],
+            }
+        ],
+    }
+    snap_week = parse_opencode_go_to_quota_snapshot(payload_week_exhausted, path=snap_path, now=now)
+    assert snap_week.is_eligible("opencode-go", now=now) is False
+
+    # 4. Exceeding monthly limit ($60.00) -> provider exhausted
+    payload_month_exhausted = {
+        "generatedAt": int(now.timestamp() * 1000),
+        "reports": [
+            {
+                "provider": "opencode-go",
+                "fetchedAt": int(now.timestamp() * 1000),
+                "limits": [
+                    {
+                        "id": "opencode-go:rolling-5h",
+                        "label": "5 Hour",
+                        "window": {"id": "rolling-5h", "durationMs": 18000000, "resetsAt": resets_ms},
+                        "amount": {"used": 5.00, "limit": 12.0},
+                        "status": "ok",
+                    },
+                    {
+                        "id": "opencode-go:monthly",
+                        "label": "Monthly",
+                        "window": {"id": "monthly", "durationMs": 2592000000, "resetsAt": resets_ms},
+                        "amount": {"used": 60.00, "limit": 60.0},
+                        "status": "ok",
+                    },
+                ],
+            }
+        ],
+    }
+    snap_month = parse_opencode_go_to_quota_snapshot(payload_month_exhausted, path=snap_path, now=now)
+    assert snap_month.is_eligible("opencode-go", now=now) is False
+
+    # 5. Boundary reset: once reset time is reached/passed, provider becomes eligible again
+    after_reset = datetime(2026, 9, 25, 17, 0, 1, tzinfo=timezone.utc)
+    assert snap_5h.is_eligible("opencode-go", now=after_reset) is True

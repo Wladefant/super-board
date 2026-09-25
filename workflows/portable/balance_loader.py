@@ -30,14 +30,43 @@ import shutil
 import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 DEFAULT_STALE_THRESHOLD_SECONDS = 3600.0  # 1 hour
 DEFAULT_SNAPSHOT_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "usage_snapshot_cache.json")
 
 ANTIGRAVITY_PROVIDER = "google-antigravity"
+OPENCODE_GO_PROVIDER = "opencode-go"
+
+# OpenCode Go subscription limit windows: $12 per 5h, $30 per week, $60 per month.
+OPENCODE_GO_WINDOW_LIMITS: Dict[str, Tuple[float, int]] = {
+    "rolling-5h": (12.0, 5 * 3600 * 1000),      # 18_000_000 ms
+    "weekly": (30.0, 7 * 86400 * 1000),         # 604_800_000 ms
+    "monthly": (60.0, 30 * 86400 * 1000),       # 2_592_000_000 ms
+}
 
 
+def identify_opencode_go_window(
+    limit_id: str,
+    label: str = "",
+    duration_ms: int = 0,
+    window_id: str = "",
+) -> Tuple[str, float]:
+    """Identify the OpenCode Go limit window and its USD limit.
+
+    Windows:
+    - 5 hours: $12.00
+    - Weekly (7 days): $30.00
+    - Monthly (30 days): $60.00
+    """
+    key = f"{limit_id} {label} {window_id}".lower()
+    if "5h" in key or "rolling-5h" in key or (0 < duration_ms <= 21600000):  # <= 6h
+        return "rolling-5h", 12.0
+    if "week" in key or "7d" in key or (21600000 < duration_ms <= 1209600000):  # <= 14d
+        return "weekly", 30.0
+    if "month" in key or "30d" in key or duration_ms > 1209600000:
+        return "monthly", 60.0
+    return "default", 12.0
 def antigravity_family_provider(limit_id: str) -> str:
     """Map an Antigravity limit id (`google-antigravity:<family>:<tier>:<window>`) to its provider key.
 
@@ -246,6 +275,11 @@ class SanitizedUsageSnapshot:
     capacity: Dict[str, Any] = field(default_factory=dict)
     active_providers: List[str] = field(default_factory=list)
     dormant_providers: List[str] = field(default_factory=list)
+
+    def to_quota_snapshot(self, now: Optional[datetime.datetime] = None) -> Any:
+        """Converts sanitized usage snapshot into QuotaSnapshot schema."""
+        from quota_snapshot import update_from_usage_json
+        return update_from_usage_json(self, now=now)
 
     def to_normalized(self) -> NormalizedBalanceSnapshot:
         """Converts Veyyon usage snapshot into harness-agnostic NormalizedBalanceSnapshot."""
@@ -478,10 +512,24 @@ def parse_usage_json(
                 used_frac = (used / limit_val) if limit_val > 0 else 0.0
             else:
                 used_frac = float(used_frac)
-
             lim_status = lim.get("status", "ok")
             is_cooldown = lim_status != "ok" or status != "ok"
 
+            if provider == OPENCODE_GO_PROVIDER or provider == "opencode-go":
+                win_id_raw = win_meta.get("id", "")
+                go_win_name, go_limit = identify_opencode_go_window(lim_id, label, dur_ms, win_id_raw)
+                unit = "usd"
+                raw_limit = amt_meta.get("limit")
+                if raw_limit is not None and float(raw_limit) > 0 and float(raw_limit) != 100.0:
+                    limit_val = float(raw_limit)
+                else:
+                    limit_val = go_limit
+                remaining = float(amt_meta.get("remaining", max(0.0, limit_val - used)))
+                used_frac = (used / limit_val) if limit_val > 0 else 0.0
+                rem_frac = max(0.0, (remaining / limit_val)) if limit_val > 0 else 0.0
+                if used >= limit_val and limit_val > 0:
+                    lim_status = "limit_reached"
+                    is_cooldown = True
             amt = UsageAmount(
                 used=used,
                 limit=limit_val,
@@ -806,6 +854,23 @@ def main():
     else:
         print(format_snapshot_table(snapshot))
 
+
+def parse_opencode_go_to_quota_snapshot(
+    payload: Union[dict, str, SanitizedUsageSnapshot],
+    *,
+    path: Optional[Any] = None,
+    now: Optional[datetime.datetime] = None,
+) -> Any:
+    """Parse OpenCode Go limits from usage payload into QuotaSnapshot schema.
+
+    Enforces OpenCode Go windows:
+    - 5 hours: $12.00
+    - Weekly: $30.00
+    - Monthly: $60.00
+    Any window with used >= limit (or status != ok) marks provider exhausted until that window resets.
+    """
+    from quota_snapshot import update_from_usage_json
+    return update_from_usage_json(payload, path=path, now=now)
 
 if __name__ == "__main__":
     main()

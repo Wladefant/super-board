@@ -548,13 +548,15 @@ def update_from_usage_json(
     snapshot = load_snapshot(path)
 
     current_time_ms = int(now_dt.timestamp() * 1000)
-    try:
-        sanitized = parse_usage_json(payload, current_time_ms=current_time_ms)
-    except Exception:
-        return snapshot
-
-    # Extract raw window and amount mappings if available
-    raw_dict = json.loads(payload) if isinstance(payload, str) else payload
+    if hasattr(payload, "subscriptions"):
+        sanitized = payload
+        raw_dict = {}
+    else:
+        try:
+            sanitized = parse_usage_json(payload, current_time_ms=current_time_ms)
+        except Exception:
+            return snapshot
+        raw_dict = json.loads(payload) if isinstance(payload, str) else (payload if isinstance(payload, dict) else {})
     raw_window_map: Dict[str, str] = {}
     raw_amount_map: Dict[str, dict] = {}
     if isinstance(raw_dict, dict):
@@ -579,11 +581,15 @@ def update_from_usage_json(
                 wid = lid.split(":")[-1] if ":" in lid else lid
             if not wid:
                 wid = "default"
-
+            if provider == "opencode-go":
+                from balance_loader import identify_opencode_go_window
+                wid, _ = identify_opencode_go_window(lid, getattr(lim, "label", ""), getattr(lim, "duration_ms", 0), wid)
             # Determine used_fraction: prefer usedFraction, fallback to 1 - remainingFraction
             used_frac: Optional[float] = None
             raw_amt = raw_amount_map.get(lid, {})
-            if "usedFraction" in raw_amt:
+            if provider == "opencode-go" and hasattr(lim, "amount") and lim.amount is not None:
+                used_frac = float(lim.amount.used_fraction)
+            elif "usedFraction" in raw_amt:
                 used_frac = float(raw_amt["usedFraction"])
             elif "remainingFraction" in raw_amt:
                 used_frac = float(1.0 - float(raw_amt["remainingFraction"]))
@@ -599,7 +605,7 @@ def update_from_usage_json(
             used_frac = max(0.0, min(1.0, used_frac))
             key = f"{provider}|{wid}"
             existing = snapshot.entries.get(key)
-            if existing and existing.is_exhausted(now_dt):
+            if existing and existing.source == "429" and existing.is_exhausted(now_dt):
                 exhausted_until = existing.exhausted_until
                 source = existing.source
             else:
