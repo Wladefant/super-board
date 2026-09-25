@@ -24,6 +24,7 @@ import argparse
 import datetime
 import json
 import os
+import re
 import sqlite3
 import sys
 from dataclasses import asdict, dataclass, field, replace
@@ -579,7 +580,7 @@ def balance_provider_for(model: str) -> str:
     Codex models map to 'openai-codex' (the snapshot provider) so quota checks
     and pacing hit the right provider entry.
     """
-    if "codex" in model or model.startswith("openai-codex/"):
+    if re.search(r"(?:^|[/._-])codex(?:$|[/._-])", model, re.IGNORECASE) or model.startswith("openai-codex/"):
         return CODEX_PROVIDER
     provider = model_to_provider(model)
     if provider == ANTIGRAVITY_PROVIDER:
@@ -662,21 +663,46 @@ def _apply_pace_rules(rungs: List[_Rung], pace_of_model, blocked_for_model=None)
     return ordered
 
 
-def _climb(rungs: List[_Rung], last_resort: _Rung, final_fallbacks: List[str]) -> Tuple[_Rung, str]:
+def _climb(
+    rungs: List[_Rung],
+    last_resort: _Rung,
+    final_fallbacks: List[str],
+    is_eligible: Optional[Any] = None,
+) -> Tuple[_Rung, str]:
     """Pick the first available rung, and as its fallback the next available rung below it
     that may serve as a fallback and sits on another provider/credential. With no such rung,
-    the ladder's last resort, then the first cross-provider entry of `final_fallbacks`, is used."""
+    the ladder's last resort, then the first cross-provider entry of `final_fallbacks`, is used.
+    All fallback candidates (including last_resort and final_fallbacks) must pass is_eligible."""
+    eligible_check = is_eligible or (lambda _m: True)
+
     index = next((i for i, rung in enumerate(rungs) if rung.available), None)
-    chosen = last_resort if index is None else rungs[index]
+    if index is None:
+        if last_resort.available and eligible_check(last_resort.model):
+            chosen = last_resort
+        else:
+            chosen_candidate = None
+            for m in final_fallbacks:
+                if eligible_check(m):
+                    chosen_candidate = _Rung(m, True, "final fallback")
+                    break
+            if chosen_candidate is None:
+                raise ValueError("no eligible model or fallback available in ladder")
+            chosen = chosen_candidate
+    else:
+        chosen = rungs[index]
+
     provider = model_to_provider(chosen.model)
     below = [] if index is None else rungs[index + 1:]
     for rung in below:
         if rung.available and rung.as_fallback and model_to_provider(rung.model) != provider:
-            return chosen, rung.model
+            if eligible_check(rung.model):
+                return chosen, rung.model
+
     for model in (last_resort.model, *final_fallbacks):
-        if model_to_provider(model) != provider:
+        if model_to_provider(model) != provider and eligible_check(model):
             return chosen, model
-    raise ValueError(f"no cross-provider fallback for {chosen.model}")
+
+    raise ValueError(f"no eligible cross-provider fallback for {chosen.model}")
 
 
 class ResetAwareModelSelector:
@@ -748,7 +774,16 @@ class ResetAwareModelSelector:
                             window.used_fraction)
                 for window in provider.windows
                 if window.duration_seconds and window.duration_seconds > 0
+                and not window.is_cooldown and window.status != "exhausted"
             ]
+            if not windows:
+                windows = [
+                    window_pace(name, window.id, window.duration_seconds / 3600.0,
+                                window.seconds_to_reset / 3600.0, window.remaining_fraction,
+                                window.used_fraction)
+                    for window in provider.windows
+                    if window.duration_seconds and window.duration_seconds > 0
+                ]
             if windows:
                 paces[name] = min(windows, key=lambda pace: (pace.pace_ratio, pace.hours_to_reset))
         return paces
@@ -1157,14 +1192,12 @@ class ResetAwareModelSelector:
             final_fallbacks = [MODEL_CODEX_ASTRA, MODEL_GEMINI_PRO]
 
         elif task_type == TaskType.STRONG_REVIEW and risk_level == RiskLevel.MEDIUM:
-            # CASE C: MEDIUM-RISK REVIEW — worker tiers only, never paid Anthropic. Antigravity
-            # Opus leads (its free daily window resets nightly, so it is spent first), then
-            # Z.AI, the paid Go reviewer and DeepSeek V4 Pro; Codex and Opus follow those.
+            # CASE C: MEDIUM-RISK REVIEW — worker tiers only, never paid Anthropic or Antigravity Opus
+            # (Opus is reserved for high-risk work only). Z.AI and Go lead, then Codex and DeepSeek.
             label = "Medium-risk review"
             rungs = [
                 go_glm53_flash,
                 glm,
-                ag_opus,
                 codex_promo,
                 astra_on_pace,
                 go_glm53,
@@ -1188,10 +1221,8 @@ class ResetAwareModelSelector:
             final_fallbacks = [MODEL_DEEPSEEK_FLASH]
 
         elif task_type == TaskType.DEEP_REASONING:
-            # CASE E: DEEP REASONING — decision from Main on the DEEP_REASONING ladder:
-            # - LOW and MEDIUM lead with opencode-go GLM-5.3 (then DeepSeek, then Gemini 3.8 Flash);
-            # - only HIGH leads with Antigravity Claude Opus (ag-opus), and only while the
-            #   quota snapshot does not mark it exhausted.
+            # CASE E: DEEP REASONING (LOW and MEDIUM risk; HIGH risk routes via CASE B2 high-risk worker ladder).
+            # Leads with opencode-go GLM-5.3 (then DeepSeek, then Gemini 3.8 Flash, or promoted Codex when expiring).
             label = "Deep reasoning"
             band_group = PACE_GROUP_EXEC if risk_level == RiskLevel.LOW else PACE_GROUP_STRONG
             flash_rung = _Rung(
@@ -1200,13 +1231,10 @@ class ResetAwareModelSelector:
                 pace_group=band_group,
             )
             codex_rung = codex_promoted(MODEL_CODEX_ASTRA, "Codex Astra", band_group)
-            if risk_level == RiskLevel.HIGH:
-                band = [ag_opus, codex_rung, deepseek_pro, flash_rung]
-            elif codex_rung.promotion:
+            if codex_rung.promotion:
                 band = [codex_rung, deepseek_pro, flash_rung]
             else:
                 band = [deepseek_pro, flash_rung]
-
             rungs = [
                 go_glm53,
                 *band,
@@ -1264,7 +1292,8 @@ class ResetAwareModelSelector:
         # tokens) is never picked or offered as a fallback above its window.
         rungs = _apply_pace_rules(rungs, self.pace_of_model, self.provider_exhaustion_reason)
         rungs = [rung for rung in rungs if context_tokens <= VERIFIED_CONTEXT_WINDOWS[rung.model]]
-        chosen, fallback_model = _climb(rungs, last_resort, final_fallbacks)
+        is_eligible_fn = lambda m: self.provider_exhaustion_reason(m) is None
+        chosen, fallback_model = _climb(rungs, last_resort, final_fallbacks, is_eligible=is_eligible_fn)
 
         # Free OpenRouter second opinion for reviews: advisory only (1000 req/day free tier),
         # never a merge gate, never an approval, never a replacement for the review above.

@@ -16,13 +16,16 @@ Covers:
 
 from __future__ import annotations
 
+import copy
+import importlib
 import json
 import os
+import shutil
 import sys
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
-
 import pytest
 
 # Ensure workflows/portable is on sys.path
@@ -673,3 +676,166 @@ def test_opencode_go_quota_windows_boundaries(tmp_path: Path):
     # 5. Boundary reset: once reset time is reached/passed, provider becomes eligible again
     after_reset = datetime(2026, 9, 25, 17, 0, 1, tzinfo=timezone.utc)
     assert snap_5h.is_eligible("opencode-go", now=after_reset) is True
+
+
+# ---------------------------------------------------------------------------
+# TEST 10: 20-thread concurrency test (no WinError 5, no lost updates)
+# ---------------------------------------------------------------------------
+def test_concurrent_writes_20_threads(tmp_path: Path):
+    """20 concurrent threads writing to quota snapshot do not raise or lose updates."""
+    snap_path = tmp_path / "quota-snapshot-concurrent.json"
+    errors = []
+
+    def worker(i: int):
+        try:
+            mark_exhausted(
+                provider=f"prov_{i}",
+                window_id="daily",
+                exhausted_until="2099-01-01T00:00:00Z",
+                path=snap_path,
+            )
+        except Exception as e:
+            errors.append((i, e))
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(errors) == 0, f"Concurrent workers raised exceptions: {errors}"
+    loaded = load_snapshot(snap_path)
+    assert loaded.load_error is None
+    assert len(loaded.entries) == 20, f"Expected 20 entries, found {len(loaded.entries)}"
+    for i in range(20):
+        assert f"prov_{i}|daily" in loaded.entries
+        assert loaded.is_eligible(f"prov_{i}") is False
+
+
+# ---------------------------------------------------------------------------
+# TEST 11: Exported bundle imports (finding F1)
+# ---------------------------------------------------------------------------
+def test_manifest_exported_bundle_imports(tmp_path: Path):
+    """The exported bundle contains quota_snapshot.py and all modules import cleanly."""
+    src_dir = Path(__file__).resolve().parent
+    manifest_path = src_dir / "manifest.json"
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest_data = json.load(f)
+
+    required_files = manifest_data.get("export", {}).get("required_files", [])
+    assert "quota_snapshot.py" in required_files, "quota_snapshot.py missing from export.required_files"
+
+    # Copy all required files to an isolated tmp export directory
+    export_dir = tmp_path / "exported_bundle"
+    export_dir.mkdir(parents=True, exist_ok=True)
+    for rel_path in required_files:
+        src_file = src_dir / rel_path
+        dst_file = export_dir / rel_path
+        dst_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src_file, dst_file)
+
+    # Verify every Python module in the export imports cleanly
+    orig_sys_path = list(sys.path)
+    sys.path.insert(0, str(export_dir))
+    try:
+        importlib.invalidate_caches()
+        for rel_path in required_files:
+            if rel_path.endswith(".py") and not rel_path.startswith("fixtures/"):
+                mod_name = Path(rel_path).stem
+                mod = importlib.import_module(mod_name)
+                assert mod is not None
+    finally:
+        sys.path = orig_sys_path
+
+
+# ---------------------------------------------------------------------------
+# TEST 12: Two-account Google Antigravity (finding F3)
+# ---------------------------------------------------------------------------
+def test_two_account_google_antigravity(tmp_path: Path):
+    """Two google-antigravity accounts: an exhausted account must not block the provider."""
+    from balance_loader import parse_usage_json
+    from model_routing import ResetAwareModelSelector, TaskType, RiskLevel, MODEL_GEMINI_FLASH
+
+    snap_path = tmp_path / "quota-snapshot-ag.json"
+    now_ms = 1788598659263
+    now_dt = datetime.fromtimestamp(now_ms / 1000.0, tz=timezone.utc)
+    resets_ms = now_ms + int(4.5 * 3600 * 1000)
+
+    rep_exhausted = {
+        "provider": "google-antigravity",
+        "fetchedAt": now_ms,
+        "limits": [{
+            "id": "google-antigravity:google:default:daily",
+            "label": "Usage (Google)",
+            "window": {"id": "daily", "durationMs": 86400000, "resetsAt": resets_ms},
+            "amount": {"unit": "percent", "remainingFraction": 0.0, "usedFraction": 1.0, "remaining": 0.0, "used": 100.0, "limit": 100.0},
+            "status": "exhausted",
+        }],
+        "metadata": {"email": "user1@example.com", "accountId": "acc_google_1"},
+    }
+    rep_fresh = {
+        "provider": "google-antigravity",
+        "fetchedAt": now_ms,
+        "limits": [{
+            "id": "google-antigravity:google:default:daily",
+            "label": "Usage (Google)",
+            "window": {"id": "daily", "durationMs": 86400000, "resetsAt": resets_ms + 3600000},
+            "amount": {"unit": "percent", "remainingFraction": 0.95, "usedFraction": 0.05, "remaining": 95.0, "used": 5.0, "limit": 100.0},
+            "status": "ok",
+        }],
+        "metadata": {"email": "user2@example.com", "accountId": "acc_google_2"},
+    }
+
+    # Order 1: exhausted first, fresh second
+    payload_order1 = {"generatedAt": now_ms, "reports": [rep_exhausted, rep_fresh]}
+    snap1 = update_from_usage_json(payload_order1, path=snap_path, now=now_dt)
+    assert snap1.is_eligible("google-antigravity", now=now_dt) is True
+
+    # Order 2: fresh first, exhausted second (order independence)
+    snap_path_order2 = tmp_path / "quota-snapshot-ag-2.json"
+    payload_order2 = {"generatedAt": now_ms, "reports": [rep_fresh, rep_exhausted]}
+    snap2 = update_from_usage_json(payload_order2, path=snap_path_order2, now=now_dt)
+    assert snap2.is_eligible("google-antigravity", now=now_dt) is True
+
+    # Model selector must choose Gemini Flash, not throttle or fall back
+    parsed_usage = parse_usage_json(payload_order1, current_time_ms=now_ms)
+    selector = ResetAwareModelSelector(parsed_usage, quota_snapshot=snap1)
+    rec = selector.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.LOW)
+    assert rec.selected_model == MODEL_GEMINI_FLASH
+
+    # When both accounts are exhausted, the provider is ineligible
+    rep_exhausted_2 = copy.deepcopy(rep_fresh)
+    rep_exhausted_2["limits"][0]["amount"] = {"unit": "percent", "remainingFraction": 0.0, "usedFraction": 1.0, "remaining": 0.0, "used": 100.0, "limit": 100.0}
+    rep_exhausted_2["limits"][0]["status"] = "exhausted"
+    snap_path_both = tmp_path / "quota-snapshot-ag-both.json"
+    snap_both = update_from_usage_json({"generatedAt": now_ms, "reports": [rep_exhausted, rep_exhausted_2]}, path=snap_path_both, now=now_dt)
+    assert snap_both.is_eligible("google-antigravity", now=now_dt) is False
+
+
+# ---------------------------------------------------------------------------
+# TEST 13: limit_reached without reset time counts as ineligible (finding F6)
+# ---------------------------------------------------------------------------
+def test_limit_reached_without_reset_time_ineligible(tmp_path: Path):
+    """A window with status limit_reached but no reset time is marked exhausted with conservative TTL."""
+    snap_path = tmp_path / "quota-snapshot-f6.json"
+    now_dt = datetime(2026, 9, 25, 12, 0, 0, tzinfo=timezone.utc)
+    now_ms = int(now_dt.timestamp() * 1000)
+    payload = {
+        "generatedAt": now_ms,
+        "reports": [{
+            "provider": "opencode-go",
+            "fetchedAt": now_ms,
+            "limits": [{
+                "id": "opencode-go:rolling-5h",
+                "label": "5 Hour",
+                "window": {"id": "rolling-5h", "durationMs": 18000000, "resetsAt": 0},
+                "amount": {"used": 12.0, "limit": 12.0},
+                "status": "limit_reached",
+            }],
+        }]
+    }
+    snap = update_from_usage_json(payload, path=snap_path, now=now_dt)
+    assert snap.is_eligible("opencode-go", now=now_dt) is False
+    entry = snap.entry("opencode-go", "rolling-5h")
+    assert entry is not None
+    assert entry.exhausted_until == "2026-09-25T17:00:00Z"

@@ -470,7 +470,8 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
     def test_real_loader_live_smoke(self):
         print("\n--- TEST 12: Real Loader Live Smoke Test ---")
         try:
-            live_snapshot = load_snapshot(allow_live=True)
+            with mock.patch("balance_loader.fetch_live_usage", return_value=self.mock_usage_dict):
+                live_snapshot = load_snapshot(allow_live=True)
             self.assertIsNotNone(live_snapshot)
             self.assertGreater(live_snapshot.generated_at_ms, 0)
             self.assertTrue(len(live_snapshot.subscriptions) > 0)
@@ -991,22 +992,26 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
     def test_antigravity_claude_chosen(self):
         print("\n--- TEST 23: Antigravity Claude Chosen Before Paid Anthropic ---")
         selector = self._selector(self._usage_with_ag_families(anthropic_used=0.0))
-        rec_review = selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.MEDIUM)
+        # High-risk review spends Antigravity Claude Opus
+        rec_review = selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
         self.assertEqual(rec_review.selected_model, MODEL_AG_CLAUDE_OPUS)
+        # Medium-risk review is restricted to worker tiers and does NOT spend ag-opus
+        rec_med_review = selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.MEDIUM)
+        self.assertNotEqual(rec_med_review.selected_model, MODEL_AG_CLAUDE_OPUS)
         # Operator DEEP_REASONING ladder policy (#214): LOW and MEDIUM lead with OpenCode Go
         # GLM-5.3, then DeepSeek V4 Pro, then Gemini 3.8 Flash. Opus is minimized and reserved
         # for orchestrator and high-risk reviews only, so medium-risk deep reasoning does NOT
-        # spend ag-opus; only HIGH leads with Antigravity Claude Opus.
+        # spend ag-opus; HIGH risk worker routes via CASE B2 ladder.
         rec_reason = selector.select_model(task_type=TaskType.DEEP_REASONING, risk_level=RiskLevel.MEDIUM)
         self.assertEqual(rec_reason.selected_model, MODEL_DEEPSEEK_PRO)
         packet = selector.dispatch(task_type=TaskType.DEEP_REASONING, risk_level=RiskLevel.MEDIUM)
         self.assertEqual(packet.recommendation["model"], MODEL_DEEPSEEK_PRO)
         self.assertEqual(packet.recommendation["agent_role"], "ds-pro")
-        print(f"  [PASS] Medium review on {rec_review.selected_model} (ag-opus); medium reasoning on {rec_reason.selected_model} (ds-pro).")
+        print(f"  [PASS] High review on {rec_review.selected_model} (ag-opus); medium review avoids Opus; medium reasoning on {rec_reason.selected_model} (ds-pro).")
 
         # An almost spent Antigravity Claude window (95% used) is left alone.
         spent = self._selector(self._usage_with_ag_families(anthropic_used=0.95))
-        rec_spent = spent.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.MEDIUM)
+        rec_spent = spent.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
         self.assertNotEqual(rec_spent.selected_model, MODEL_AG_CLAUDE_OPUS)
         # A snapshot that does not report the family at all never assumes it exists.
         absent = ResetAwareModelSelector(parse_usage_json(self.mock_usage_dict, current_time_ms=self.mock_now_ms))

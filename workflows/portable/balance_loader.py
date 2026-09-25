@@ -518,16 +518,33 @@ def parse_usage_json(
             if provider == OPENCODE_GO_PROVIDER or provider == "opencode-go":
                 win_id_raw = win_meta.get("id", "")
                 go_win_name, go_limit = identify_opencode_go_window(lim_id, label, dur_ms, win_id_raw)
-                unit = "usd"
+                raw_unit = amt_meta.get("unit")
                 raw_limit = amt_meta.get("limit")
-                if raw_limit is not None and float(raw_limit) > 0 and float(raw_limit) != 100.0:
+                if raw_unit:
+                    unit = str(raw_unit).lower()
+                elif raw_limit is not None and float(raw_limit) == 100.0:
+                    unit = "percent"
+                else:
+                    unit = "usd"
+
+                if raw_limit is not None and float(raw_limit) > 0:
                     limit_val = float(raw_limit)
                 else:
-                    limit_val = go_limit
+                    limit_val = go_limit if unit == "usd" else 100.0
+
+                if "usedFraction" in amt_meta:
+                    used_frac = float(amt_meta["usedFraction"])
+                else:
+                    used_frac = (used / limit_val) if limit_val > 0 else 0.0
+
+                if "remainingFraction" in amt_meta:
+                    rem_frac = float(amt_meta["remainingFraction"])
+                else:
+                    rem_frac = max(0.0, (limit_val - used) / limit_val) if limit_val > 0 else 0.0
+
                 remaining = float(amt_meta.get("remaining", max(0.0, limit_val - used)))
-                used_frac = (used / limit_val) if limit_val > 0 else 0.0
-                rem_frac = max(0.0, (remaining / limit_val)) if limit_val > 0 else 0.0
-                if used >= limit_val and limit_val > 0:
+
+                if (used >= limit_val and limit_val > 0) or used_frac >= 1.0:
                     lim_status = "limit_reached"
                     is_cooldown = True
             amt = UsageAmount(

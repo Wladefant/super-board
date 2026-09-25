@@ -12,16 +12,32 @@ before every dispatch.
 
 from __future__ import annotations
 
+import email.utils
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import threading
+import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
+
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
+
+_THREAD_LOCK = threading.RLock()
 
 # Ensure sibling modules in workflows/portable are importable
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -29,9 +45,9 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 try:
-    from balance_loader import parse_usage_json
+    from balance_loader import parse_usage_json, sanitize_string
 except ImportError:
-    from .balance_loader import parse_usage_json
+    from .balance_loader import parse_usage_json, sanitize_string
 
 DEFAULT_SNAPSHOT_PATH = Path(
     os.environ.get(
@@ -52,22 +68,105 @@ def _resolve_snapshot_path(path: Optional[Union[Path, str]] = None) -> Path:
     return Path(path) if path is not None else SNAPSHOT_PATH
 
 
+class QuotaSnapshotLoadError(Exception):
+    """Base error for snapshot load failures."""
+    pass
+
+
+class QuotaSnapshotCorruptError(QuotaSnapshotLoadError):
+    """Snapshot file on disk is corrupt or invalid JSON."""
+    pass
+
+
+class QuotaSnapshotLockError(QuotaSnapshotLoadError):
+    """Snapshot lock could not be acquired or file is locked."""
+    pass
+
+
+@contextmanager
+def snapshot_file_lock(path: Union[Path, str] = SNAPSHOT_PATH, timeout: float = 15.0):
+    """Cross-process and intra-process lock around snapshot read-modify-write."""
+    resolved = _resolve_snapshot_path(path)
+    lock_path = Path(str(resolved) + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with _THREAD_LOCK:
+        lock_file = None
+        start = time.time()
+        acquired = False
+        while not acquired:
+            try:
+                lock_file = open(lock_path, "a+b")
+                if msvcrt is not None:
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                    acquired = True
+                elif fcntl is not None:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                else:
+                    acquired = True
+            except (OSError, PermissionError):
+                if lock_file is not None:
+                    try:
+                        lock_file.close()
+                    except Exception:
+                        pass
+                    lock_file = None
+                if time.time() - start >= timeout:
+                    raise QuotaSnapshotLockError(
+                        f"Could not acquire cross-process lock on {lock_path} within {timeout}s"
+                    )
+                time.sleep(0.02)
+        try:
+            yield
+        finally:
+            if lock_file is not None:
+                try:
+                    if msvcrt is not None:
+                        lock_file.seek(0)
+                        msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                    elif fcntl is not None:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                except Exception:
+                    pass
+                try:
+                    lock_file.close()
+                except Exception:
+                    pass
+
 def _parse_iso_utc(ts_str: Optional[str]) -> Optional[datetime]:
-    """Parse an ISO-8601 UTC timestamp into a timezone-aware datetime."""
+    """Parse an ISO-8601 UTC timestamp (including offsets like +02:00) or HTTP-date."""
     if not ts_str:
         return None
     s = ts_str.strip()
     if not s:
         return None
-    if s.endswith("Z") or s.endswith("z"):
-        s = s[:-1] + "+00:00"
+    # Check for HTTP-date format (e.g. 'Wed, 21 Oct 2026 07:28:00 GMT')
+    if "," in s:
+        try:
+            dt = email.utils.parsedate_to_datetime(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            pass
+    clean_s = s
+    if clean_s.endswith("Z") or clean_s.endswith("z"):
+        clean_s = clean_s[:-1] + "+00:00"
     try:
-        dt = datetime.fromisoformat(s)
+        dt = datetime.fromisoformat(clean_s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
     except Exception:
-        return None
+        try:
+            dt = email.utils.parsedate_to_datetime(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            return None
 
 
 def _format_iso_utc(dt: datetime) -> str:
@@ -80,7 +179,7 @@ def _format_iso_utc(dt: datetime) -> str:
 
 
 def _parse_duration_seconds(val: Any) -> Optional[float]:
-    """Parse relative duration values (e.g. '3s', '1.5s', '250ms', '2m', '1h', bare numbers)."""
+    """Parse relative duration values, including compound durations (e.g. '1h30m', '250ms', '2m', '1h', bare numbers)."""
     if val is None:
         return None
     if isinstance(val, (int, float)):
@@ -93,31 +192,23 @@ def _parse_duration_seconds(val: Any) -> Optional[float]:
         s = val.strip().lower()
         if not s:
             return None
-        if s.endswith("ms"):
-            try:
-                return float(s[:-2]) / 1000.0
-            except ValueError:
-                return None
-        if s.endswith("s"):
-            try:
-                return float(s[:-1])
-            except ValueError:
-                return None
-        if s.endswith("m"):
-            try:
-                return float(s[:-1]) * 60.0
-            except ValueError:
-                return None
-        if s.endswith("h"):
-            try:
-                return float(s[:-1]) * 3600.0
-            except ValueError:
-                return None
-        if s.endswith("d"):
-            try:
-                return float(s[:-1]) * 86400.0
-            except ValueError:
-                return None
+        matches = list(re.finditer(r"([0-9]+(?:\.[0-9]+)?)\s*(d|days?|h|hours?|hrs?|ms|millis?|milliseconds?|m|mins?|minutes?|s|secs?|seconds?)", s))
+        if matches:
+            total = 0.0
+            for m in matches:
+                amt = float(m.group(1))
+                unit = m.group(2)
+                if unit.startswith("d"):
+                    total += amt * 86400.0
+                elif unit.startswith("h"):
+                    total += amt * 3600.0
+                elif unit.startswith("ms"):
+                    total += amt / 1000.0
+                elif unit.startswith("m"):
+                    total += amt * 60.0
+                elif unit.startswith("s"):
+                    total += amt
+            return total
         try:
             return float(s)
         except ValueError:
@@ -129,11 +220,11 @@ def _parse_duration_seconds(val: Any) -> Optional[float]:
 class QuotaWindowEntry:
     provider: str
     window_id: str
+    account: str = "default"
     used_fraction: float = 0.0
     exhausted_until: Optional[str] = None  # ISO-8601 UTC, e.g. "2026-09-25T20:38:56Z"
     fetched_at: str = ""
     source: str = "usage"  # "usage" | "429"
-
     def is_exhausted(self, now: Optional[datetime] = None) -> bool:
         """Check if this entry has an exhausted_until timestamp strictly in the future."""
         if not self.exhausted_until:
@@ -151,30 +242,35 @@ class QuotaWindowEntry:
 class QuotaSnapshot:
     schema_version: int = 1
     updated_at: str = ""
-    entries: Dict[str, QuotaWindowEntry] = field(default_factory=dict)  # key f"{provider}|{window_id}"
+    entries: Dict[str, QuotaWindowEntry] = field(default_factory=dict)  # key f"{provider}|{account}|{window_id}"
+    load_error: Optional[str] = None
 
-    def entry(self, provider: str, window_id: Optional[str] = None) -> Optional[QuotaWindowEntry]:
-        """Look up an entry by provider and optional window_id."""
-        if window_id is not None:
-            key = f"{provider}|{window_id}"
+    def entry(
+        self,
+        provider: str,
+        window_id: Optional[str] = None,
+        account: Optional[str] = None,
+    ) -> Optional[QuotaWindowEntry]:
+        """Look up an entry by provider and optional window_id and account."""
+        if account is not None and window_id is not None:
+            key = f"{provider}|{account}|{window_id}"
             if key in self.entries:
                 return self.entries[key]
-            # Handle potential window_id prefix/suffix variance (e.g. daily vs provider:pro:daily)
-            if ":" in window_id:
-                short_win = window_id.split(":")[-1]
-                short_key = f"{provider}|{short_win}"
-                if short_key in self.entries:
-                    return self.entries[short_key]
-            for e in self.entries.values():
-                if e.provider == provider and (e.window_id == window_id or e.window_id == window_id.split(":")[-1]):
-                    return e
-            return None
+            short_win = window_id.split(":")[-1] if ":" in window_id else window_id
+            short_key = f"{provider}|{account}|{short_win}"
+            if short_key in self.entries:
+                return self.entries[short_key]
 
-        # When window_id is omitted, find all entries for provider
         matching = [e for e in self.entries.values() if e.provider == provider]
+        if account is not None:
+            matching = [e for e in matching if e.account == account]
+        if window_id is not None:
+            short_win = window_id.split(":")[-1] if ":" in window_id else window_id
+            matching = [e for e in matching if e.window_id == window_id or e.window_id == short_win]
+
         if not matching:
             return None
-        # If any window is exhausted, prefer the exhausted entry with latest reset
+
         exhausted = [e for e in matching if e.is_exhausted()]
         if exhausted:
             return max(
@@ -202,24 +298,37 @@ class QuotaSnapshot:
     ) -> bool:
         """Check whether provider is eligible to serve requests.
 
-        Returns False when ANY entry for that provider has exhausted_until strictly in the future.
-        When window_id is given, only that window is consulted.
+        Order-independent multi-account logic (F3):
+        A provider is eligible if ANY account for that provider is eligible.
+        An account is eligible if none of its windows are currently exhausted.
+        When window_id is given, only that window is consulted for each account.
+        If no entries exist for the provider, returns True.
         """
         now_dt = now or datetime.now(timezone.utc)
         if now_dt.tzinfo is None:
             now_dt = now_dt.replace(tzinfo=timezone.utc)
 
-        if window_id is not None:
-            ent = self.entry(provider, window_id)
-            if ent is None:
-                return True
-            return not ent.is_exhausted(now_dt)
-
         matching = [e for e in self.entries.values() if e.provider == provider]
+        if not matching:
+            return True
+
+        by_account: Dict[str, List[QuotaWindowEntry]] = {}
         for e in matching:
-            if e.is_exhausted(now_dt):
-                return False
-        return True
+            by_account.setdefault(e.account, []).append(e)
+
+        for acc, entries in by_account.items():
+            if window_id is not None:
+                short_wid = window_id.split(":")[-1] if ":" in window_id else window_id
+                acc_win_entries = [e for e in entries if e.window_id == window_id or e.window_id == short_wid]
+                if not acc_win_entries:
+                    return True
+                if not any(e.is_exhausted(now_dt) for e in acc_win_entries):
+                    return True
+            else:
+                if not any(e.is_exhausted(now_dt) for e in entries):
+                    return True
+
+        return False
 
     def to_dict(self) -> dict:
         """Serialize snapshot to dictionary."""
@@ -246,6 +355,10 @@ class QuotaSnapshot:
                 if isinstance(v, dict):
                     provider = str(v.get("provider", ""))
                     window_id = str(v.get("window_id", ""))
+                    account = str(v.get("account", "default"))
+                    if k.count("|") >= 2:
+                        parts = k.split("|", 2)
+                        provider, account, window_id = parts[0], parts[1], parts[2]
                     used_fraction = float(v.get("used_fraction", 0.0))
                     exhausted_until = v.get("exhausted_until")
                     if exhausted_until is not None:
@@ -255,6 +368,7 @@ class QuotaSnapshot:
                     entries[k] = QuotaWindowEntry(
                         provider=provider,
                         window_id=window_id,
+                        account=account,
                         used_fraction=used_fraction,
                         exhausted_until=exhausted_until,
                         fetched_at=fetched_at,
@@ -267,26 +381,55 @@ class QuotaSnapshot:
         )
 
 
-def load_snapshot(path: Union[Path, str] = SNAPSHOT_PATH) -> QuotaSnapshot:
-    """Load snapshot from disk. Missing or corrupt file returns empty snapshot without raising."""
+def load_snapshot(
+    path: Union[Path, str] = SNAPSHOT_PATH,
+    *,
+    raise_on_error: bool = False,
+) -> QuotaSnapshot:
+    """Load snapshot from disk.
+
+    Distinguishes a missing file (returns clean empty snapshot) from a corrupt
+    or locked file. If raise_on_error is True, raises QuotaSnapshotCorruptError or
+    QuotaSnapshotLockError on failures. If False, returns QuotaSnapshot with
+    load_error populated so callers can detect read failures and avoid saving over.
+    """
     resolved = _resolve_snapshot_path(path)
     if not resolved.is_file():
         return QuotaSnapshot()
+
+    content: Optional[str] = None
+    read_err: Optional[Exception] = None
+    for attempt in range(10):
+        try:
+            with open(resolved, "r", encoding="utf-8") as f:
+                content = f.read()
+            read_err = None
+            break
+        except (PermissionError, OSError) as e:
+            read_err = e
+            time.sleep(0.02)
+
+    if read_err is not None:
+        if raise_on_error:
+            raise QuotaSnapshotLockError(f"Failed to read snapshot file {resolved}: {read_err}") from read_err
+        return QuotaSnapshot(load_error=f"locked: {read_err}")
+
+    if not content or not content.strip():
+        return QuotaSnapshot()
+
     try:
-        with open(resolved, "r", encoding="utf-8") as f:
-            content = f.read()
-        if not content.strip():
-            return QuotaSnapshot()
         payload = json.loads(content)
         if not isinstance(payload, dict):
-            return QuotaSnapshot()
+            raise ValueError(f"Snapshot payload is not a JSON object: {type(payload)}")
         return QuotaSnapshot.from_dict(payload)
-    except Exception:
-        return QuotaSnapshot()
+    except Exception as e:
+        if raise_on_error:
+            raise QuotaSnapshotCorruptError(f"Snapshot file {resolved} is corrupt: {e}") from e
+        return QuotaSnapshot(load_error=f"corrupt: {e}")
 
 
 def save_snapshot(snapshot: QuotaSnapshot, path: Union[Path, str] = SNAPSHOT_PATH) -> Path:
-    """Atomically save snapshot to disk via temp file + os.replace."""
+    """Atomically save snapshot to disk via temp file + os.replace, retrying on PermissionError."""
     resolved = _resolve_snapshot_path(path)
     resolved.parent.mkdir(parents=True, exist_ok=True)
 
@@ -301,8 +444,19 @@ def save_snapshot(snapshot: QuotaSnapshot, path: Union[Path, str] = SNAPSHOT_PAT
         ) as tmp:
             tmp_path = Path(tmp.name)
             json.dump(snapshot.to_dict(), tmp, indent=2)
-        os.replace(tmp_path, resolved)
-        tmp_path = None
+
+        max_retries = 25
+        backoff = 0.02
+        for attempt in range(max_retries):
+            try:
+                os.replace(tmp_path, resolved)
+                tmp_path = None
+                return resolved
+            except PermissionError:
+                if attempt == max_retries - 1:
+                    raise
+                time.sleep(backoff)
+                backoff = min(0.2, backoff * 1.5)
         return resolved
     finally:
         if tmp_path is not None and tmp_path.exists():
@@ -317,34 +471,53 @@ def mark_exhausted(
     window_id: str,
     exhausted_until: str,
     *,
+    account: str = "default",
     used_fraction: float = 1.0,
     source: str = "429",
     path: Union[Path, str] = SNAPSHOT_PATH,
     now: Optional[datetime] = None,
 ) -> QuotaSnapshot:
     """Record a provider window as exhausted until the given ISO-8601 UTC timestamp."""
-    snapshot = load_snapshot(path)
-    now_dt = now or datetime.now(timezone.utc)
-    if now_dt.tzinfo is None:
-        now_dt = now_dt.replace(tzinfo=timezone.utc)
-    now_iso = _format_iso_utc(now_dt)
+    with snapshot_file_lock(path):
+        snapshot = load_snapshot(path, raise_on_error=True)
+        if snapshot.load_error:
+            raise QuotaSnapshotLoadError(f"Cannot mark exhausted: snapshot read failed: {snapshot.load_error}")
 
-    parsed_until = _parse_iso_utc(exhausted_until)
-    normalized_until = _format_iso_utc(parsed_until) if parsed_until else exhausted_until
+        now_dt = now or datetime.now(timezone.utc)
+        if now_dt.tzinfo is None:
+            now_dt = now_dt.replace(tzinfo=timezone.utc)
+        now_iso = _format_iso_utc(now_dt)
 
-    key = f"{provider}|{window_id}"
-    entry = QuotaWindowEntry(
-        provider=provider,
-        window_id=window_id,
-        used_fraction=float(used_fraction),
-        exhausted_until=normalized_until,
-        fetched_at=now_iso,
-        source=source,
-    )
-    snapshot.entries[key] = entry
-    snapshot.updated_at = now_iso
-    save_snapshot(snapshot, path)
-    return snapshot
+        parsed_until = _parse_iso_utc(exhausted_until)
+        normalized_until = _format_iso_utc(parsed_until) if parsed_until else exhausted_until
+
+        key = f"{provider}|{account}|{window_id}" if account and account != "default" else f"{provider}|{window_id}"
+        entry = QuotaWindowEntry(
+            provider=provider,
+            window_id=window_id,
+            account=account,
+            used_fraction=float(used_fraction),
+            exhausted_until=normalized_until,
+            fetched_at=now_iso,
+            source=source,
+        )
+
+        matching_keys = [
+            k for k, e in snapshot.entries.items()
+            if e.provider == provider and (e.window_id == window_id or e.window_id == window_id.split(":")[-1])
+        ]
+        if account != "default" or not matching_keys:
+            snapshot.entries[key] = entry
+        else:
+            for k in matching_keys:
+                snapshot.entries[k].exhausted_until = normalized_until
+                snapshot.entries[k].source = source
+                snapshot.entries[k].used_fraction = float(used_fraction)
+                snapshot.entries[k].fetched_at = now_iso
+
+        snapshot.updated_at = now_iso
+        save_snapshot(snapshot, path)
+        return snapshot
 
 
 @dataclass
@@ -358,12 +531,12 @@ def parse_quota_error(body: str, now: Optional[datetime] = None) -> Optional[Quo
     """Parse 429 / quota error body to extract reset timestamp or relative retry delay.
 
     Prefers in order:
-      1. Absolute reset timestamp: keys quotaResetTimeStamp, quota_reset_time_stamp,
-         quotaResetTimestamp, resets_at, resetsAt, reset_at, exhausted_until,
-         or any ISO-8601 UTC instant in error.message (e.g. "resets at 2026-09-25T20:38:56Z").
-      2. Relative delay: keys quotaResetDelay, retryDelay, retry_after, retryAfter,
-         retry_delay_seconds (accepts "3s", "1.5s", "250ms", "2m", "1h", bare numbers,
-         and Google RetryInfo in error.details[]).
+      1. Absolute reset timestamp from explicitly reset-named keys or phrases:
+         keys quotaresettimestamp, quota_reset_time_stamp, resets_at, resetsat, reset_at,
+         reset_time, exhausted_until, or retry_after (if HTTP-date). Past timestamps rejected.
+      2. Relative delay: keys quotaresetdelay, retrydelay, retry_delay, retry_after,
+         retryafter, retry_delay_seconds (accepts compound durations like '1h30m', '250ms',
+         '2m', '1h', bare numbers, and Google RetryInfo in error.details[]).
       3. Returns None when no usable reset info is present.
     """
     if not body or not isinstance(body, str):
@@ -373,7 +546,6 @@ def parse_quota_error(body: str, now: Optional[datetime] = None) -> Optional[Quo
     if now_dt.tzinfo is None:
         now_dt = now_dt.replace(tzinfo=timezone.utc)
 
-    # 1. Absolute reset timestamp
     parsed_json: Optional[Any] = None
     try:
         parsed_json = json.loads(body)
@@ -386,69 +558,9 @@ def parse_quota_error(body: str, now: Optional[datetime] = None) -> Optional[Quo
         "resets_at",
         "resetsat",
         "reset_at",
+        "reset_time",
         "exhausted_until",
     }
-
-    def _extract_abs_ts_from_json(obj: Any) -> Optional[str]:
-        if isinstance(obj, dict):
-            # Direct key check
-            for k, v in obj.items():
-                if k.lower() in abs_keys and isinstance(v, (str, int, float)):
-                    if isinstance(v, (int, float)):
-                        if v > 1e11:  # ms
-                            return _format_iso_utc(datetime.fromtimestamp(v / 1000.0, tz=timezone.utc))
-                        elif v > 1e9:  # s
-                            return _format_iso_utc(datetime.fromtimestamp(v, tz=timezone.utc))
-                    return str(v)
-            # Message / error fields for ISO instant
-            for k, v in obj.items():
-                if ("message" in k.lower() or "error" in k.lower() or "detail" in k.lower()) and isinstance(v, str):
-                    m = re.search(r"(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|\+00:00))", v, re.IGNORECASE)
-                    if m:
-                        return m.group(1)
-            # Recurse
-            for v in obj.values():
-                res = _extract_abs_ts_from_json(v)
-                if res:
-                    return res
-        elif isinstance(obj, list):
-            for item in obj:
-                res = _extract_abs_ts_from_json(item)
-                if res:
-                    return res
-        return None
-
-    abs_ts_str: Optional[str] = None
-    if parsed_json is not None:
-        abs_ts_str = _extract_abs_ts_from_json(parsed_json)
-
-    if not abs_ts_str:
-        # Search plain string for reset patterns
-        patterns = [
-            r"(?:quota[_-]?reset[_-]?(?:time[_-]?stamp)?|resets?(?:[_-]at|\s+at)?|exhausted[_-]until)[\"':\s=]+(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|\+00:00))",
-            r"resets?\s+at\s+(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|\+00:00))",
-            r"\b(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|\+00:00))\b",
-        ]
-        is_quota_related = bool(re.search(r"quota|rate[_-]?limit|exceeded|exhausted|resets?|429", body, re.IGNORECASE))
-        active_patterns = patterns if is_quota_related else patterns[:2]
-        for p in active_patterns:
-            m = re.search(p, body, re.IGNORECASE)
-            if m:
-                abs_ts_str = m.group(1)
-                break
-
-    if abs_ts_str:
-        dt = _parse_iso_utc(abs_ts_str)
-        if dt is not None:
-            delay_sec = max(0.0, (dt - now_dt).total_seconds())
-            iso_utc = _format_iso_utc(dt)
-            return QuotaReset(
-                exhausted_until=iso_utc,
-                retry_after_seconds=delay_sec,
-                raw=body,
-            )
-
-    # 2. Relative delay
     rel_keys = {
         "quotaresetdelay",
         "quota_reset_delay",
@@ -459,6 +571,58 @@ def parse_quota_error(body: str, now: Optional[datetime] = None) -> Optional[Quo
         "retry_delay_seconds",
     }
 
+    # 1. Absolute reset timestamp from json
+    def _extract_abs_ts_from_json(obj: Any) -> Optional[datetime]:
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k.lower() in abs_keys and isinstance(v, (str, int, float)):
+                    if isinstance(v, (int, float)):
+                        if v > 1e11:  # ms
+                            return datetime.fromtimestamp(v / 1000.0, tz=timezone.utc)
+                        elif v > 1e9:  # s
+                            return datetime.fromtimestamp(v, tz=timezone.utc)
+                    return _parse_iso_utc(str(v))
+                if k.lower() in ("retry_after", "retryafter") and isinstance(v, str) and "," in v:
+                    return _parse_iso_utc(v)
+            for v in obj.values():
+                res = _extract_abs_ts_from_json(v)
+                if res is not None:
+                    return res
+        elif isinstance(obj, list):
+            for item in obj:
+                res = _extract_abs_ts_from_json(item)
+                if res is not None:
+                    return res
+        return None
+
+    abs_dt = _extract_abs_ts_from_json(parsed_json) if parsed_json is not None else None
+    if abs_dt is None:
+        m_abs = re.search(
+            r"(?:quota[_-]?reset[_-]?(?:time[_-]?stamp)?|resets?(?:[_-]at|\s+at)|exhausted[_-]until)[\"':\s=]+(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2}))",
+            body,
+            re.IGNORECASE,
+        )
+        if m_abs:
+            abs_dt = _parse_iso_utc(m_abs.group(1))
+
+    if abs_dt is None:
+        m_http = re.search(
+            r"(?:retry[_-]?after|resets?\s+at)[\"':\s=]+([A-Za-z]{3},\s+\d{1,2}\s+[A-Za-z]{3}\s+\d{4}\s+\d{2}:\d{2}:\d{2}\s+GMT)",
+            body,
+            re.IGNORECASE,
+        )
+        if m_http:
+            abs_dt = _parse_iso_utc(m_http.group(1))
+
+    if abs_dt is not None and abs_dt > now_dt:
+        delay_sec = max(0.0, (abs_dt - now_dt).total_seconds())
+        return QuotaReset(
+            exhausted_until=_format_iso_utc(abs_dt),
+            retry_after_seconds=delay_sec,
+            raw=body,
+        )
+
+    # 2. Relative delay from json or regex
     def _extract_rel_delay_from_json(obj: Any) -> Optional[float]:
         if isinstance(obj, dict):
             type_val = str(obj.get("@type", ""))
@@ -482,30 +646,24 @@ def parse_quota_error(body: str, now: Optional[datetime] = None) -> Optional[Quo
                     return res
         return None
 
-    delay_sec: Optional[float] = None
-    if parsed_json is not None:
-        delay_sec = _extract_rel_delay_from_json(parsed_json)
-
+    delay_sec = _extract_rel_delay_from_json(parsed_json) if parsed_json is not None else None
     if delay_sec is None:
-        m = re.search(
-            r"(?:quota[_-]?reset[_-]?delay|retry[_-]?delay(?:[_-]seconds)?|retry[_-]?after)[\"':\s=]+([0-9]+(?:\.[0-9]+)?(?:ms|s|m|h)?)",
+        m_rel = re.search(
+            r"(?:quota[_-]?reset[_-]?delay|retry[_-]?delay(?:[_-]seconds)?|retry[_-]?after)[\"':\s=]+([0-9]+(?:\.[0-9]+)?(?:\s*(?:d|h|m|s|ms|millis|hours?|mins?|secs?))?(?:\s*[0-9]+(?:\.[0-9]+)?\s*(?:d|h|m|s|ms|millis|hours?|mins?|secs?))*)",
             body,
             re.IGNORECASE,
         )
-        if m:
-            delay_sec = _parse_duration_seconds(m.group(1))
+        if m_rel:
+            delay_sec = _parse_duration_seconds(m_rel.group(1))
 
-    if delay_sec is not None:
-        delay_sec = max(0.0, float(delay_sec))
+    if delay_sec is not None and delay_sec >= 0.0:
         exhausted_dt = now_dt + timedelta(seconds=delay_sec)
-        iso_utc = _format_iso_utc(exhausted_dt)
         return QuotaReset(
-            exhausted_until=iso_utc,
+            exhausted_until=_format_iso_utc(exhausted_dt),
             retry_after_seconds=delay_sec,
             raw=body,
         )
 
-    # 3. No usable reset info
     return None
 
 
@@ -514,6 +672,7 @@ def apply_quota_error(
     window_id: str,
     body: str,
     *,
+    account: str = "default",
     path: Union[Path, str] = SNAPSHOT_PATH,
     now: Optional[datetime] = None,
 ) -> Optional[QuotaReset]:
@@ -525,6 +684,7 @@ def apply_quota_error(
         provider=provider,
         window_id=window_id,
         exhausted_until=reset.exhausted_until,
+        account=account,
         used_fraction=1.0,
         source="429",
         path=path,
@@ -545,8 +705,6 @@ def update_from_usage_json(
         now_dt = now_dt.replace(tzinfo=timezone.utc)
     now_iso = _format_iso_utc(now_dt)
 
-    snapshot = load_snapshot(path)
-
     current_time_ms = int(now_dt.timestamp() * 1000)
     if hasattr(payload, "subscriptions"):
         sanitized = payload
@@ -555,85 +713,115 @@ def update_from_usage_json(
         try:
             sanitized = parse_usage_json(payload, current_time_ms=current_time_ms)
         except Exception:
-            return snapshot
+            return load_snapshot(path)
         raw_dict = json.loads(payload) if isinstance(payload, str) else (payload if isinstance(payload, dict) else {})
-    raw_window_map: Dict[str, str] = {}
-    raw_amount_map: Dict[str, dict] = {}
-    if isinstance(raw_dict, dict):
-        for rep in raw_dict.get("reports", []):
-            if isinstance(rep, dict):
-                for lim in rep.get("limits", []):
-                    if isinstance(lim, dict):
-                        lid = lim.get("id")
-                        wid = lim.get("window", {}).get("id") if isinstance(lim.get("window"), dict) else None
-                        if lid and wid:
-                            raw_window_map[lid] = wid
-                        if lid and isinstance(lim.get("amount"), dict):
-                            raw_amount_map[lid] = lim["amount"]
-    for sub in sanitized.subscriptions:
-        provider = sub.provider
-        fetched_at = sub.fetched_at_utc or now_iso
 
-        for lim in sub.limits:
-            lid = lim.id
-            wid = raw_window_map.get(lid)
-            if not wid:
-                wid = lid.split(":")[-1] if ":" in lid else lid
-            if not wid:
-                wid = "default"
-            if provider == "opencode-go":
-                from balance_loader import identify_opencode_go_window
-                wid, _ = identify_opencode_go_window(lid, getattr(lim, "label", ""), getattr(lim, "duration_ms", 0), wid)
-            # Determine used_fraction: prefer usedFraction, fallback to 1 - remainingFraction
-            used_frac: Optional[float] = None
-            raw_amt = raw_amount_map.get(lid, {})
-            if provider == "opencode-go" and hasattr(lim, "amount") and lim.amount is not None:
-                used_frac = float(lim.amount.used_fraction)
-            elif "usedFraction" in raw_amt:
-                used_frac = float(raw_amt["usedFraction"])
-            elif "remainingFraction" in raw_amt:
-                used_frac = float(1.0 - float(raw_amt["remainingFraction"]))
-            elif hasattr(lim, "amount") and lim.amount is not None:
-                if getattr(lim.amount, "used_fraction", None) is not None and lim.amount.used_fraction > 0.0:
-                    used_frac = float(lim.amount.used_fraction)
-                elif getattr(lim.amount, "remaining_fraction", None) is not None:
-                    used_frac = float(1.0 - lim.amount.remaining_fraction)
-                elif getattr(lim.amount, "used_fraction", None) is not None:
-                    used_frac = float(lim.amount.used_fraction)
-            if used_frac is None:
-                used_frac = 0.0
-            used_frac = max(0.0, min(1.0, used_frac))
-            key = f"{provider}|{wid}"
-            existing = snapshot.entries.get(key)
-            if existing and existing.source == "429" and existing.is_exhausted(now_dt):
-                exhausted_until = existing.exhausted_until
-                source = existing.source
-            else:
-                lim_status = getattr(lim, "status", "ok")
-                is_limited = lim_status in ("limit_reached", "rate_limited", "cooldown", "not_allowed") or used_frac >= 1.0
-                resets_utc = getattr(lim, "resets_at_utc", "")
-                resets_ms = getattr(lim, "resets_at_ms", 0)
-                if is_limited and resets_utc and resets_ms > 0:
-                    exhausted_until = resets_utc
-                    source = "usage"
+    with snapshot_file_lock(path):
+        snapshot = load_snapshot(path, raise_on_error=True)
+        if snapshot.load_error:
+            raise QuotaSnapshotLoadError(f"Cannot update from usage: snapshot read failed: {snapshot.load_error}")
+
+        raw_window_map: Dict[Tuple[str, str], str] = {}
+        raw_amount_map: Dict[Tuple[str, str], dict] = {}
+        if isinstance(raw_dict, dict):
+            for rep in raw_dict.get("reports", []):
+                if isinstance(rep, dict):
+                    rep_meta = rep.get("metadata", {}) or {}
+                    rep_acc = (
+                        sanitize_string(rep_meta.get("accountId"))
+                        or sanitize_string(rep_meta.get("email"))
+                        or "default"
+                    )
+                    for lim in rep.get("limits", []):
+                        if isinstance(lim, dict):
+                            lid = lim.get("id")
+                            wid = lim.get("window", {}).get("id") if isinstance(lim.get("window"), dict) else None
+                            if lid:
+                                if wid:
+                                    raw_window_map[(rep_acc, lid)] = wid
+                                    raw_window_map[("default", lid)] = wid
+                                if isinstance(lim.get("amount"), dict):
+                                    raw_amount_map[(rep_acc, lid)] = lim["amount"]
+                                    raw_amount_map[("default", lid)] = lim["amount"]
+
+        for sub in sanitized.subscriptions:
+            provider = sub.provider
+            account = getattr(sub, "account_id_redacted", None) or getattr(sub, "email_redacted", None) or "default"
+            fetched_at = sub.fetched_at_utc or now_iso
+
+            for lim in sub.limits:
+                lid = lim.id
+                wid = raw_window_map.get((account, lid)) or raw_window_map.get(("default", lid))
+                if not wid:
+                    wid = lid.split(":")[-1] if ":" in lid else lid
+                if not wid:
+                    wid = "default"
+                if provider == "opencode-go":
+                    from balance_loader import identify_opencode_go_window
+                    wid, _ = identify_opencode_go_window(lid, getattr(lim, "label", ""), getattr(lim, "duration_ms", 0), wid)
+
+                # Determine used_fraction
+                used_frac: Optional[float] = None
+                raw_amt = raw_amount_map.get((account, lid)) or raw_amount_map.get(("default", lid), {})
+                if hasattr(lim, "amount") and lim.amount is not None:
+                    if getattr(lim.amount, "used_fraction", None) is not None and lim.amount.used_fraction > 0.0:
+                        used_frac = float(lim.amount.used_fraction)
+                    elif getattr(lim.amount, "remaining_fraction", None) is not None:
+                        used_frac = float(1.0 - lim.amount.remaining_fraction)
+                    elif getattr(lim.amount, "used_fraction", None) is not None:
+                        used_frac = float(lim.amount.used_fraction)
+                if used_frac is None:
+                    if "usedFraction" in raw_amt:
+                        used_frac = float(raw_amt["usedFraction"])
+                    elif "remainingFraction" in raw_amt:
+                        used_frac = float(1.0 - float(raw_amt["remainingFraction"]))
+                if used_frac is None:
+                    used_frac = 0.0
+                used_frac = max(0.0, min(1.0, used_frac))
+                if account and account != "default":
+                    key = f"{provider}|{account}|{wid}"
                 else:
-                    exhausted_until = None
-                    source = "usage"
+                    key = f"{provider}|{wid}"
+                existing = snapshot.entries.get(key)
+                if not existing and key != f"{provider}|{wid}":
+                    existing = snapshot.entries.get(f"{provider}|{wid}")
 
-            entry = QuotaWindowEntry(
-                provider=provider,
-                window_id=wid,
-                used_fraction=used_frac,
-                exhausted_until=exhausted_until,
-                fetched_at=fetched_at,
-                source=source,
-            )
-            snapshot.entries[key] = entry
+                if existing and existing.source == "429" and existing.is_exhausted(now_dt):
+                    exhausted_until = existing.exhausted_until
+                    source = existing.source
+                else:
+                    lim_status = getattr(lim, "status", "ok")
+                    is_limited = lim_status in ("limit_reached", "rate_limited", "cooldown", "not_allowed") or used_frac >= 1.0
+                    resets_utc = getattr(lim, "resets_at_utc", "")
+                    resets_ms = getattr(lim, "resets_at_ms", 0)
+                    if is_limited:
+                        if resets_utc and resets_ms > 0:
+                            exhausted_until = resets_utc
+                            source = "usage"
+                        else:
+                            # F6: limit_reached without reset time -> conservative default window
+                            dur_ms = getattr(lim, "duration_ms", 0)
+                            window_delta = timedelta(milliseconds=dur_ms) if dur_ms and dur_ms > 0 else timedelta(hours=5)
+                            exhausted_until = _format_iso_utc(now_dt + window_delta)
+                            source = "usage"
+                    else:
+                        exhausted_until = None
+                        source = "usage"
 
-    snapshot.updated_at = now_iso
-    save_snapshot(snapshot, path)
-    return snapshot
+                entry = QuotaWindowEntry(
+                    provider=provider,
+                    window_id=wid,
+                    account=account,
+                    used_fraction=used_frac,
+                    exhausted_until=exhausted_until,
+                    fetched_at=fetched_at,
+                    source=source,
+                )
+                snapshot.entries[key] = entry
 
+        snapshot.updated_at = now_iso
+        save_snapshot(snapshot, path)
+        return snapshot
 
 def refresh_from_usage(
     *,
