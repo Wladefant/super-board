@@ -100,6 +100,27 @@ MODEL_DEEPSEEK_PRO = "deepseek/deepseek-v4-pro"
 # (5.6% vs 0.5%) but its only free upstream returned 429 on every attempt 2026-09-25.
 MODEL_OR_FREE_ADVISORY = "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
 
+# OpenCode Go provider (operator 2026-09-25): 35 models, €10 prepaid balance with
+# weekly/monthly usage limits.  space-bunny-free is a temporary UNLIMITED free model
+# (1M context, multimodal, cost $0) that goes FIRST wherever it can serve.  Tool-call
+# smoke test results (2026-09-25): space-bunny-free ✅ 4s, glm-5.3 ✅ 8s,
+# glm-5.3-flash ✅ 52s, qwen3.8-flash ✅ 9s, qwen3.8-max ✅ 11s, gpt-6-luna ✅ 4s,
+# mimo-v2.6-pro ✅ 9s.  FAILED: deepseek-v4.1-flash ❌ (requiresReasoningContentForToolCalls
+# but provider doesn't replay reasoning; use direct deepseek provider instead),
+# muse-spark-1.3-contributor ❌ (timeout, no tool response).
+MODEL_GO_BUNNY = "opencode-go/space-bunny-free"        # FREE unlimited, 1M ctx, multimodal
+MODEL_GO_GLM53 = "opencode-go/glm-5.3"                 # TB4 41.9%, $1.4/$4.4
+MODEL_GO_GLM53_FLASH = "opencode-go/glm-5.3-flash"     # TB4 32.8%, $0.15/$0.50
+MODEL_GO_QWEN38_FLASH = "opencode-go/qwen3.8-flash"    # TB4 25.3%, $0.15/$0.47
+MODEL_GO_QWEN38_MAX = "opencode-go/qwen3.8-max"        # TB4 38.9%, $2/$6
+MODEL_GO_GPT6_LUNA = "opencode-go/gpt-6-luna"           # TB4 12.6%, $0.1/$0.5
+MODEL_GO_MIMO26_PRO = "opencode-go/mimo-v2.6-pro"       # ?, $0.435/$0.87, multimodal
+# Not routed (tool calling failed in smoke test):
+# MODEL_GO_DS_FLASH = "opencode-go/deepseek-v4.1-flash"  # TB4 26.8% but tool calls fail
+# MODEL_GO_MUSE_SPARK = "opencode-go/muse-spark-1.3-contributor"  # TB4 33.3% but timeout
+
+OPENCODE_GO_PROVIDER = "opencode-go"
+
 # First-class Chinese-model worker slots (#214, operator 2026-09-25): credential-gated,
 # activated automatically once veyyon holds a credential for the provider (env var or a
 # stored `/login` credential in the auth store). No code change turns them on.
@@ -118,6 +139,7 @@ MINIMAX_PROVIDER = "minimax-code"
 CREDENTIAL_ENV_BY_PROVIDER: Dict[str, str] = {
     ZAI_PROVIDER: "ZAI_API_KEY",
     MINIMAX_PROVIDER: "MINIMAX_CODE_API_KEY",
+    OPENCODE_GO_PROVIDER: "",  # always credentialed if the provider exists in the auth store
 }
 
 
@@ -156,12 +178,12 @@ def _stored_credential_providers(paths: List[str]) -> Set[str]:
 
 
 def detect_credentialed_providers(auth_store_paths: Optional[List[str]] = None) -> Set[str]:
-    """Credential-gated providers (Z.AI, MiniMax Code) veyyon can authenticate right now."""
+    """Credential-gated providers (Z.AI, MiniMax Code, OpenCode Go) veyyon can authenticate right now."""
     stored = _stored_credential_providers(_auth_store_paths() if auth_store_paths is None else auth_store_paths)
     return {
         provider
         for provider, env_var in CREDENTIAL_ENV_BY_PROVIDER.items()
-        if os.environ.get(env_var, "").strip() or provider in stored
+        if (env_var and os.environ.get(env_var, "").strip()) or provider in stored
     }
 
 
@@ -178,6 +200,10 @@ ROLE_MODEL_PINS: Dict[str, str] = {
     "codex-worker": MODEL_CODEX_ASTRA,
     "codex-reviewer": MODEL_CODEX_ASTRA,
     "ag-opus": MODEL_AG_CLAUDE_OPUS,
+    "go-task": MODEL_GO_BUNNY,
+    "go-review": MODEL_GO_GLM53,
+    "go-deep": MODEL_GO_GLM53,
+    "go-bulk": MODEL_GO_BUNNY,
 }
 
 # Weekly subscription windows are paced, not capped (operator 2026-09-25): each must
@@ -223,6 +249,14 @@ VERIFIED_CONTEXT_WINDOWS: Dict[str, int] = {
     MODEL_ZAI_GLM: 131072,
     MODEL_ZAI_GLM_FLASH: 131072,
     MODEL_MINIMAX_M3: 1000000,
+    # OpenCode Go models (catalog-verified 2026-09-25)
+    MODEL_GO_BUNNY: 1048576,
+    MODEL_GO_GLM53: 1000000,
+    MODEL_GO_GLM53_FLASH: 1000000,
+    MODEL_GO_QWEN38_FLASH: 1000000,
+    MODEL_GO_QWEN38_MAX: 1000000,
+    MODEL_GO_GPT6_LUNA: 1050000,
+    MODEL_GO_MIMO26_PRO: 1048576,
 }
 
 
@@ -248,6 +282,19 @@ class HarnessDispatchPacket:
 
 def model_to_agent_role(model_id: str, task_type: TaskType, risk_level: RiskLevel) -> str:
     """Map model and task type to the canonical agent role that runs that model."""
+    # OpenCode Go models
+    if model_id.startswith("opencode-go/"):
+        if model_id == MODEL_GO_BUNNY:
+            if task_type == TaskType.TINY_TASK:
+                return "go-bulk"
+            if task_type == TaskType.STRONG_REVIEW:
+                return "go-review"
+            return "go-task"
+        if model_id in (MODEL_GO_GLM53, MODEL_GO_QWEN38_MAX):
+            return "go-review" if task_type == TaskType.STRONG_REVIEW else "go-deep"
+        if model_id == MODEL_GO_GPT6_LUNA:
+            return "go-bulk"
+        return "go-task"
     if model_id.startswith("openai-codex/"):
         return "codex-reviewer" if task_type == TaskType.STRONG_REVIEW else "codex-worker"
     if model_id.endswith(":free"):
@@ -299,6 +346,8 @@ def model_to_provider(model_id: str) -> str:
         return "anthropic"
     if "openai" in model_id or "codex" in model_id:
         return "openai"
+    if model_id.startswith("opencode-go/"):
+        return "opencode-go"
     if "xai" in model_id or "grok" in model_id:
         return "xai"
     return "unknown"
@@ -517,6 +566,7 @@ class ResetAwareModelSelector:
         ag_anthropic_meta = self.evaluate_provider(AG_ANTHROPIC_PROVIDER)
         ag_openai_meta = self.evaluate_provider(AG_OPENAI_PROVIDER)
         deepseek_meta = self.evaluate_provider("deepseek")
+        go_meta = self.evaluate_provider("opencode-go")
 
         provider_statuses = {
             "google-antigravity": google_meta["status"],
@@ -525,6 +575,7 @@ class ResetAwareModelSelector:
             "anthropic": anthropic_meta["status"],
             "openai-codex": codex_meta["status"],
             "deepseek": deepseek_meta["status"],
+            "opencode-go": go_meta["status"],
             "xai-oauth": "dormant",
         }
 
@@ -580,6 +631,21 @@ class ResetAwareModelSelector:
         deepseek_ok = deepseek_meta["is_available"]
         google_ok = google_meta["is_available"]
 
+        # OpenCode Go: credentialed via auth store, space-bunny-free is always available
+        # (cost $0), paid Go models are available if the provider is credentialed AND not
+        # in cooldown.  Pacing: Go has weekly/monthly limits — prefer it when its headroom
+        # is furthest behind pace (most allowance remaining vs time), throttle when ahead.
+        go_credentialed = OPENCODE_GO_PROVIDER in credentialed
+        go_available = go_credentialed and go_meta["is_available"]
+        # space-bunny-free is free and unlimited: always available if credentialed
+        go_bunny_ok = go_credentialed
+        # Paid Go models: available if credentialed and provider not in cooldown
+        go_paid_ok = go_available
+        # Go pacing: burn_headroom > 1.0 means behind pace (spending slower than linear),
+        # so the provider has surplus to burn.  Prefer Go when headroom > 1.0.
+        go_headroom = go_meta.get("burn_headroom", 1.0)
+        go_behind_pace = go_headroom >= 1.0  # behind pace = surplus to burn
+
         quota_metrics = {
             "google_remaining": google_meta["remaining_fraction"],
             "google_reset_hrs": google_meta["hours_to_reset"],
@@ -599,6 +665,10 @@ class ResetAwareModelSelector:
             "codex_lane_reset_hrs": codex_meta["hours_to_reset"],
             "zai_available": zai_ok,
             "minimax_available": minimax_ok,
+            "go_available": go_available,
+            "go_bunny_ok": go_bunny_ok,
+            "go_headroom": go_headroom,
+            "go_behind_pace": go_behind_pace,
         }
 
         # 5. Rework-aware routing: force a strong first pass for critical domains or after rework.
@@ -640,6 +710,33 @@ class ResetAwareModelSelector:
             cooldown=True, as_fallback=False,
         )
 
+        # OpenCode Go reusable rungs: space-bunny-free first (free unlimited),
+        # then paid Go models ranked by TB4% and cost per task.
+        go_bunny = _Rung(
+            MODEL_GO_BUNNY, go_bunny_ok,
+            "OpenCode Go space-bunny-free (free unlimited, 1M ctx, multimodal).",
+        )
+        go_glm53 = _Rung(
+            MODEL_GO_GLM53, go_paid_ok and go_behind_pace,
+            f"OpenCode Go GLM-5.3 (TB4 41.9%, {go_headroom:.2f}x pace headroom).",
+        )
+        go_glm53_flash = _Rung(
+            MODEL_GO_GLM53_FLASH, go_paid_ok,
+            "OpenCode Go GLM-5.3-Flash (TB4 32.8%, $0.033/lane).",
+        )
+        go_qwen38_flash = _Rung(
+            MODEL_GO_QWEN38_FLASH, go_paid_ok,
+            "OpenCode Go Qwen3.8 Flash (TB4 25.3%, $0.030/lane).",
+        )
+        go_qwen38_max = _Rung(
+            MODEL_GO_QWEN38_MAX, go_paid_ok and go_behind_pace,
+            f"OpenCode Go Qwen3.8 Max (TB4 38.9%, {go_headroom:.2f}x pace headroom).",
+        )
+        go_gpt6_luna = _Rung(
+            MODEL_GO_GPT6_LUNA, go_paid_ok,
+            "OpenCode Go GPT-6 Luna (TB4 12.6%, $0.029/lane, cheapest paid Go).",
+        )
+
         if context_tokens > 180000 or task_type == TaskType.DEEP_CONTEXT:
             # CASE A: DEEP CONTEXT (> 180k tokens, or a DEEP_CONTEXT task). The 1M-context tiers
             # come first; then every cheap tier whose verified window holds the context, in the
@@ -649,8 +746,9 @@ class ResetAwareModelSelector:
             # rework or high-risk deep-context read skip it and climb to Codex Astra.
             label = f"Deep context ({context_tokens} tokens)"
             rungs = [
+                go_bunny,
                 _Rung(MODEL_GEMINI_PRO, google_ok, "Gemini 3.1 Pro (1M-token window)."),
-                _Rung(MODEL_DEEPSEEK_PRO, deepseek_ok, "Gemini unavailable; DeepSeek V4 Pro (1M-token window).", cooldown=True),
+                go_glm53_flash,
                 _Rung(MODEL_MINIMAX_M3,
                       minimax_ok and (task_type == TaskType.TINY_TASK
                                       or (task_type == TaskType.DEEP_CONTEXT and not is_rework_critical)),
@@ -681,10 +779,14 @@ class ResetAwareModelSelector:
             rungs = [
                 codex_promo,
                 ag_opus,
+                # Go GLM-5.3 as cross-family reviewer (TB4 41.9%) — only when Go has surplus
+                go_glm53,
                 _Rung(MODEL_CLAUDE_FABLE, anthropic_worker_ok,
                       f"Claude Fable: the Anthropic weekly window runs {anthropic_headroom:.2f}x behind pace, "
                       "so slack beyond the orchestrator's share is spent on review."),
                 astra_on_pace,
+                # Go Qwen3.8 Max (TB4 38.9%) as cross-family second opinion
+                go_qwen38_max,
                 _Rung(MODEL_CLAUDE_FABLE, anthropic_meta["is_available"],
                       "no review allowance left elsewhere; drawing on the Anthropic orchestrator reserve.",
                       cooldown=True, as_fallback=False),
@@ -705,10 +807,14 @@ class ResetAwareModelSelector:
             rungs = [
                 codex_promo,
                 glm,
+                # Go GLM-5.3 (TB4 41.9%) is the first Go rung before Codex Astra
+                go_glm53,
                 astra_on_pace,
                 deepseek_pro,
                 ag_opus,
                 astra_emergency,
+                # Go Qwen3.8 Max (TB4 38.9%) — different family from GLM
+                go_qwen38_max,
                 _Rung(MODEL_GEMINI_PRO, google_ok, "strong worker tiers unavailable; emergency Gemini Pro.", cooldown=True),
                 fable_last_resort,
             ]
@@ -721,9 +827,13 @@ class ResetAwareModelSelector:
             rungs = [
                 codex_promo,
                 ag_opus,
+                # Go cross-family reviewer: GLM when impl was non-GLM, Qwen when impl was GLM
+                go_glm53,
                 astra_on_pace,
                 glm,
                 _Rung(MODEL_GEMINI_FLASH, google_ok, "Gemini 3.8 Flash; direct Anthropic reserved for the orchestrator."),
+                go_qwen38_max,
+                go_glm53_flash,
                 _Rung(MODEL_DEEPSEEK_FLASH, deepseek_ok, "overflow to DeepSeek V4.1 Flash.", cooldown=True),
             ]
             last_resort = _Rung(MODEL_OR_DEEPSEEK_FLASH, True, "all review tiers unavailable; OpenRouter DeepSeek Flash.", cooldown=True)
@@ -733,7 +843,9 @@ class ResetAwareModelSelector:
             # CASE D: LOW-RISK REVIEW — Flash 3.8 is safe and fast.
             label = "Low-risk review"
             rungs = [
+                go_bunny,
                 _Rung(MODEL_GEMINI_FLASH, google_ok, "Gemini 3.8 Flash fast review execution."),
+                go_glm53_flash,
                 _Rung(MODEL_DEEPSEEK_FLASH, deepseek_ok, "Gemini unavailable; DeepSeek V4.1 Flash.", cooldown=True),
             ]
             last_resort = _Rung(MODEL_OR_DEEPSEEK_FLASH, True, "OpenRouter DeepSeek Flash.", cooldown=True)
@@ -745,21 +857,26 @@ class ResetAwareModelSelector:
             rungs = [
                 codex_promo,
                 ag_opus,
+                go_glm53,
                 _Rung(MODEL_GEMINI_FLASH, google_ok, "abundant Gemini 3.8 Flash; direct Anthropic reserved for the orchestrator."),
                 _Rung(MODEL_CODEX_ASTRA, codex_usable, "Gemini unavailable; Codex Astra medium (on pace).", cooldown=True),
                 _Rung(MODEL_ZAI_GLM, zai_ok, "Gemini and Codex unavailable; Z.AI GLM-5.3.", cooldown=True),
+                go_qwen38_max,
+                go_glm53_flash,
                 _Rung(MODEL_DEEPSEEK_FLASH, deepseek_ok, "Gemini and Codex unavailable; DeepSeek V4.1 Flash overflow.", cooldown=True),
             ]
             last_resort = _Rung(MODEL_OR_DEEPSEEK_FLASH, True, "all reasoning tiers unavailable; OpenRouter DeepSeek Flash.", cooldown=True)
             final_fallbacks = [MODEL_DEEPSEEK_FLASH]
-
         elif task_type == TaskType.TINY_TASK:
             # CASE F: TINY TASK / BULK TRIAGE (compaction, commits, classification).
             label = "Lightweight / bulk triage task"
             rungs = [
+                go_bunny,
                 _Rung(MODEL_GEMINI_LITE, google_ok, "Gemini 3.1 Flash Lite."),
+                go_gpt6_luna,
                 _Rung(MODEL_ZAI_GLM_FLASH, zai_ok, "Z.AI GLM-5.3-Flash (credentialed).", cooldown=True),
                 _Rung(MODEL_MINIMAX_M3, minimax_ok, "MiniMax-M3 (credentialed, bulk/triage only).", cooldown=True),
+                go_qwen38_flash,
                 _Rung(MODEL_DEEPSEEK_FLASH, deepseek_ok, "DeepSeek V4.1 Flash.", cooldown=True),
             ]
             last_resort = _Rung(MODEL_OR_DEEPSEEK_FLASH, True, "OpenRouter DeepSeek Flash.", cooldown=True)
@@ -771,11 +888,14 @@ class ResetAwareModelSelector:
             # is the overflow and the fallback.
             label = "Routine execution"
             rungs = [
+                go_bunny,
                 _Rung(MODEL_CODEX_FAST, codex_near_reset_surplus and risk_level != RiskLevel.LOW,
                       f"Codex pro allowance expiring in {codex_pro_hrs:.1f}h ({codex_pro_headroom:.2f}x pace "
                       "headroom); promoted Codex Fast to burn surplus capacity.", promotion=True),
                 _Rung(MODEL_GEMINI_FLASH, google_ok,
                       "primary abundant execution lane: Gemini 3.8 Flash (Ultra daily allowance).", as_fallback=False),
+                go_glm53_flash,
+                go_qwen38_flash,
                 _Rung(MODEL_CODEX_FAST, codex_usable,
                       "Google Antigravity in cooldown; Codex Fast (subscription headroom).", cooldown=True, as_fallback=False),
                 _Rung(MODEL_ZAI_GLM, zai_ok, "overflow to Z.AI GLM-5.3 (credentialed).", cooldown=True),
