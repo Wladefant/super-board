@@ -233,6 +233,17 @@ LOCKFILE_NAMES = {
     "flake.lock",
 }
 
+# Deploy-critical checks that must NEVER be timed out. When one of these is
+# pending, the gate returns PENDING/BLOCKED — it never falls through to local
+# verification gates. The 5-minute CI timeout (AGENTS.md §6) applies only to
+# checks NOT in this list.  Names are matched with fnmatch so wildcards work.
+DEPLOY_CRITICAL_CHECKS: List[str] = [
+    "build-and-boot",
+    "build-and-boot *",
+    "backend build*",
+    "docker build*",
+]
+
 
 def is_lockfile_or_generated(path: str) -> bool:
     norm = path.replace("\\", "/").lower()
@@ -715,6 +726,37 @@ def evaluate_pr_gate(
             if is_blocking(c_name):
                 pending_checks.append(c_name)
 
+    # Per AGENTS.md §6: Never wait more than 5 minutes on CI — EXCEPT for
+    # deploy-critical checks (build-and-boot, backend build, docker build).
+    # Those must complete; the gate stays PENDING until they finish or fail.
+    def _is_deploy_critical(name: str) -> bool:
+        for pattern in DEPLOY_CRITICAL_CHECKS:
+            if fnmatch.fnmatch(name, pattern):
+                return True
+        return False
+
+    ci_timed_out_checks: List[str] = []
+    if pending_checks and not failing_checks:
+        now_utc_dt = datetime.datetime.now(datetime.timezone.utc)
+        oldest_non_critical_sec = 0.0
+        for check in deduped_status_rollup.values():
+            c_name = check.get("name") or check.get("context") or "unknown_check"
+            if c_name in pending_checks and not _is_deploy_critical(c_name):
+                start = check.get("startedAt") or check.get("createdAt")
+                if start:
+                    try:
+                        t = datetime.datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+                        age = (now_utc_dt - t).total_seconds()
+                        if age > oldest_non_critical_sec:
+                            oldest_non_critical_sec = age
+                    except Exception:
+                        pass
+        if oldest_non_critical_sec >= 300:
+            # Time out only the non-deploy-critical checks.
+            timed = [c for c in pending_checks if not _is_deploy_critical(c)]
+            ci_timed_out_checks = timed
+            pending_checks = [c for c in pending_checks if _is_deploy_critical(c)]
+
     if failing_checks:
         ci_verdict = "FAILURE"
     elif pending_checks:
@@ -914,6 +956,8 @@ def evaluate_pr_gate(
             )
             if advisory_failing_checks:
                 verdict_reason += f" Advisory (non-blocking) failures: {', '.join(advisory_failing_checks)}."
+    if ci_timed_out_checks:
+        verdict_reason += f" CI timed out after >=5m queued with 0 failures per AGENTS.md §6 (non-deploy-critical): {', '.join(ci_timed_out_checks)}."
     verdict_reason += " Content freshness: " + json.dumps(content_review, sort_keys=True)
     return PRGateEvaluation(
         pr_number=pr_number,

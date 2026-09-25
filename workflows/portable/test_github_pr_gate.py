@@ -42,6 +42,7 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 from github_pr_gate import (
+    DEPLOY_CRITICAL_CHECKS,
     GateApprovalPolicy,
     PRGateEvaluation,
     evaluate_pr_gate,
@@ -1117,6 +1118,106 @@ class TestGitHubPRGate(unittest.TestCase):
         self.assertIn("truncated", res_many.review_decision_reason)
         self.assertEqual(res_many.gate_verdict, "BLOCKED")
         print("  [PASS] Review exemption scoped to named policies and fails closed on truncation")
+    # ── Deploy-critical check tests (incident #5535 prevention) ──────────
+
+    def _make_pending_pr(self, checks):
+        """Return a mock PR with given status check rollup entries."""
+        pr = copy.deepcopy(self.mock_pr)
+        pr["statusCheckRollup"] = checks
+        pr["baseRefName"] = "staging"
+        return pr
+
+    def _six_min_ago(self):
+        """Return an ISO timestamp 6 minutes in the past."""
+        return (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def test_deploy_critical_pending_blocks_even_after_timeout(self):
+        """build-and-boot pending for 6 minutes blocks; it is never timed out."""
+        six_min = self._six_min_ago()
+        pr = self._make_pending_pr([
+            {"name": "build-and-boot", "status": "QUEUED", "conclusion": "", "startedAt": six_min, "createdAt": six_min},
+            {"name": "lint-and-typecheck", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": six_min},
+        ])
+        policy = self.waived_policy()
+        res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy)
+        self.assertEqual(res.ci_verdict, "PENDING")
+        self.assertEqual(res.gate_verdict, "PENDING")
+        self.assertIn("build-and-boot", res.pending_checks)
+        print("  [PASS] deploy-critical build-and-boot pending 6 min blocks gate")
+
+    def test_deploy_critical_failure_blocks(self):
+        """build-and-boot failure is a hard BLOCKED."""
+        pr = self._make_pending_pr([
+            {"name": "build-and-boot", "status": "COMPLETED", "conclusion": "FAILURE", "completedAt": "2026-09-25T19:00:00Z"},
+            {"name": "lint-and-typecheck", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-09-25T19:00:00Z"},
+        ])
+        policy = self.waived_policy()
+        res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy)
+        self.assertEqual(res.ci_verdict, "FAILURE")
+        self.assertEqual(res.gate_verdict, "BLOCKED")
+        self.assertIn("build-and-boot", res.failing_checks)
+        print("  [PASS] deploy-critical build-and-boot failure blocks gate")
+
+    def test_deploy_critical_success_passes(self):
+        """build-and-boot success lets the gate pass (review-exempt path)."""
+        pr = self._make_pending_pr([
+            {"name": "build-and-boot", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-09-25T19:00:00Z"},
+            {"name": "lint-and-typecheck", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-09-25T19:00:00Z"},
+        ])
+        # Make it review-exempt by having <250 lines and low-risk
+        pr["files"] = [{"path": "frontend/foo.tsx", "additions": 10, "deletions": 5}]
+        pr["labels"] = []
+        pr["reviews"] = []
+        policy = GateApprovalPolicy(
+            repo="Bavariance/polysimulator", base_ref="staging",
+            require_github_approval=False, require_head_bound_review_evidence=True,
+            allow_review_exemption=True,
+        )
+        res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy)
+        self.assertEqual(res.ci_verdict, "SUCCESS")
+        self.assertEqual(res.gate_verdict, "PASSED")
+        print("  [PASS] deploy-critical build-and-boot success passes gate")
+
+    def test_non_critical_pending_times_out_but_critical_stays(self):
+        """A pending unrelated lint for 6 minutes times out on local gates,
+        but a co-pending build-and-boot keeps the gate PENDING."""
+        six_min = self._six_min_ago()
+        pr = self._make_pending_pr([
+            {"name": "build-and-boot", "status": "IN_PROGRESS", "conclusion": "", "startedAt": six_min, "createdAt": six_min},
+            {"name": "lint-and-typecheck", "status": "IN_PROGRESS", "conclusion": "", "startedAt": six_min, "createdAt": six_min},
+        ])
+        policy = self.waived_policy()
+        res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy)
+        # lint should be timed out, build-and-boot should remain pending
+        self.assertEqual(res.ci_verdict, "PENDING")
+        self.assertEqual(res.gate_verdict, "PENDING")
+        self.assertIn("build-and-boot", res.pending_checks)
+        self.assertNotIn("lint-and-typecheck", res.pending_checks)
+        self.assertIn("timed out", res.verdict_reason.lower())
+        print("  [PASS] non-critical lint times out but deploy-critical build-and-boot keeps gate PENDING")
+
+    def test_only_non_critical_pending_times_out_and_passes(self):
+        """When only a non-deploy-critical check is pending for 6 min,
+        it times out and the gate can proceed."""
+        six_min = self._six_min_ago()
+        pr = self._make_pending_pr([
+            {"name": "build-and-boot", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": six_min},
+            {"name": "lint-and-typecheck", "status": "IN_PROGRESS", "conclusion": "", "startedAt": six_min, "createdAt": six_min},
+        ])
+        # Make it review-exempt
+        pr["files"] = [{"path": "frontend/foo.tsx", "additions": 10, "deletions": 5}]
+        pr["labels"] = []
+        pr["reviews"] = []
+        policy = GateApprovalPolicy(
+            repo="Bavariance/polysimulator", base_ref="staging",
+            require_github_approval=False, require_head_bound_review_evidence=True,
+            allow_review_exemption=True,
+        )
+        res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy)
+        self.assertEqual(res.ci_verdict, "SUCCESS")
+        self.assertEqual(res.gate_verdict, "PASSED")
+        self.assertIn("timed out", res.verdict_reason.lower())
+        print("  [PASS] only non-critical pending check times out and gate passes")
 
 
 def main():
