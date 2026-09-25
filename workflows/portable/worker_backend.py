@@ -1096,6 +1096,17 @@ STAGE_BRIEFS = {
         "\"artifacts\" with role \"verified_existing\". Commit only real changes. Report commands "
         "actually run under \"checks\" with their real exit codes."
     ),
+    "spec": (
+        "You are the SPEC worker (low-effort stage, 0–12k thinking tokens). Define the exact "
+        "architectural boundaries, concrete interface contracts, acceptance criteria, and explicit "
+        "non-goals for this work item. Do NOT write implementation logic or modify existing business "
+        "logic. Document the design contract and rule out scope creep before scaffolding begins."
+    ),
+    "scaffold": (
+        "You are the SCAFFOLD worker (low-effort stage). Lay out the skeleton interfaces, types, "
+        "module stubs, and initial test fixtures. Do NOT implement complex business logic. Ensure the "
+        "scaffold compiles, passes typecheck, and establishes the structural foundation for implementation."
+    ),
     "qa": (
         "You are the QA worker, independent of whoever built this. Do NOT modify the tree and do "
         "NOT commit. Verify the request against the repository at {repo_root} by executing real "
@@ -1108,7 +1119,29 @@ STAGE_BRIEFS = {
         "substantiate your reading, and report them under \"checks\". Return verdict \"fail\" if the "
         "change is not sound."
     ),
+    "verify": (
+        "You are the VERIFY worker (high-effort adversarial verification stage, 32k+ thinking tokens). "
+        "Perform deep, exhaustive verification against the candidate head at {repo_root}. Execute real "
+        "commands, run adversarial negative controls, exercise regression scenarios, and assert boundary "
+        "conditions. Report every command under \"checks\" with its real exit code and observable proof. "
+        "Return verdict \"fail\" if verification does not hold."
+    ),
 }
+
+STAGE_EFFORT_MAP: Dict[str, str] = {
+    "spec": "low",
+    "scaffold": "low",
+    "build": "medium",
+    "implement": "medium",
+    "qa": "high",
+    "review": "high",
+    "verify": "high",
+}
+
+
+def get_stage_effort(stage: str, default: str = "medium") -> str:
+    """Return the calibrated thinking effort level for a given workflow stage (Issue #228)."""
+    return STAGE_EFFORT_MAP.get(str(stage or "").lower(), default)
 
 
 def build_stage_prompt(req: Any, schema: Dict[str, Any]) -> str:
