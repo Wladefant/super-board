@@ -24,10 +24,12 @@ Verifies:
 """
 
 import copy
+import itertools
 import json
 import os
 import sys
 import unittest
+from unittest import mock
 
 # Ensure workflows directory is in python path
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -59,9 +61,7 @@ from model_routing import (
     RiskLevel,
     TaskType,
     MODEL_CLAUDE_FABLE,
-    MODEL_CLAUDE_OPUS,
     MODEL_CODEX_FAST,
-    MODEL_CODEX_SOL,
     MODEL_CODEX_ASTRA,
     MODEL_GEMINI_FLASH,
     MODEL_GEMINI_LITE,
@@ -78,9 +78,12 @@ from model_routing import (
     MODEL_MINIMAX_M3,
     CODEX_PACE_MIN_HEADROOM,
     CODEX_PACE_USED_FLOOR,
-    ANTHROPIC_5H_MAX_USED,
-    ZAI_CREDENTIAL_ENV,
-    MINIMAX_CREDENTIAL_ENV,
+    ANTHROPIC_BOTTLENECK_MAX_USED,
+    CREDENTIAL_ENV_BY_PROVIDER,
+    MINIMAX_PROVIDER,
+    ROLE_MODEL_PINS,
+    ZAI_PROVIDER,
+    detect_credentialed_providers,
     model_to_agent_role,
     model_to_provider,
 )
@@ -89,6 +92,19 @@ from model_routing import (
 class TestBalanceLoaderAndRouting(unittest.TestCase):
 
     def setUp(self):
+        # Hermetic credentials: no Z.AI/MiniMax key from the caller's environment and no
+        # veyyon auth store on disk, so every selector below sees zero credential-gated
+        # providers unless a test pins them explicitly. Only the auth-store lookup is
+        # redirected; VEYYON_CONFIG_DIR stays intact so the live `veyyon usage` smoke works.
+        store_patch = mock.patch("model_routing._auth_store_paths", return_value=[])
+        store_patch.start()
+        self.addCleanup(store_patch.stop)
+        env_patch = mock.patch.dict(os.environ)
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+        for var in (*CREDENTIAL_ENV_BY_PROVIDER.values(), "MINIMAX_API_KEY"):
+            os.environ.pop(var, None)
+
         # Base realistic mock JSON simulating live veyyon usage output
         self.mock_now_ms = 1788598659263  # 2026-09-05T08:57:39Z
         self.mock_usage_dict = {
@@ -247,18 +263,18 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         snapshot = parse_usage_json(near_reset_dict, current_time_ms=self.mock_now_ms)
         selector = ResetAwareModelSelector(snapshot)
 
-        # A) High-Risk Review: should promote Codex Sol to prevent allowance expiration!
+        # A) High-Risk Review: should promote Codex Astra to prevent allowance expiration!
         rec_review = selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
         self.assertTrue(rec_review.promotion_applied)
-        self.assertEqual(rec_review.selected_model, MODEL_CODEX_SOL)
-        self.assertIn("Promoted Codex Sol", rec_review.reasoning)
-        print(f"  [PASS] High-risk review promoted Codex Sol: {rec_review.selected_model}")
+        self.assertEqual(rec_review.selected_model, MODEL_CODEX_ASTRA)
+        self.assertIn("promoted Codex Astra", rec_review.reasoning)
+        print(f"  [PASS] High-risk review promoted Codex Astra: {rec_review.selected_model}")
 
-        # B) Deep Reasoning: should promote Codex Sol
+        # B) Deep Reasoning: should promote Codex Astra
         rec_reasoning = selector.select_model(task_type=TaskType.DEEP_REASONING, risk_level=RiskLevel.MEDIUM)
         self.assertTrue(rec_reasoning.promotion_applied)
-        self.assertEqual(rec_reasoning.selected_model, MODEL_CODEX_SOL)
-        print(f"  [PASS] Deep reasoning promoted Codex Sol: {rec_reasoning.selected_model}")
+        self.assertEqual(rec_reasoning.selected_model, MODEL_CODEX_ASTRA)
+        print(f"  [PASS] Deep reasoning promoted Codex Astra: {rec_reasoning.selected_model}")
 
         # C) Routine Execution (capable task): should promote Codex Fast
         rec_exec = selector.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.MEDIUM)
@@ -303,10 +319,10 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         self.assertIn("Gemini 3.8 Flash", rec_routine.reasoning)
         print(f"  [PASS] Routine execution defaults to: {rec_routine.selected_model}")
 
-        # Deep reasoning with distant Anthropic reset preserves Anthropic and routes to Gemini 3.8 Flash
+        # Deep reasoning keeps direct Anthropic for the orchestrator and routes to Gemini 3.8 Flash
         rec_reason = selector.select_model(task_type=TaskType.DEEP_REASONING, risk_level=RiskLevel.LOW)
         self.assertEqual(rec_reason.selected_model, MODEL_GEMINI_FLASH)
-        self.assertIn("Preserving distant-reset Anthropic", rec_reason.reasoning)
+        self.assertIn("direct Anthropic reserved for the orchestrator", rec_reason.reasoning)
         print(f"  [PASS] Deep reasoning preserved Anthropic: {rec_reason.selected_model}")
 
     # -------------------------------------------------------------------------
@@ -556,23 +572,29 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         snapshot = parse_usage_json(self.mock_usage_dict, current_time_ms=self.mock_now_ms)
         selector = ResetAwareModelSelector(snapshot)
 
-        # Routine execution with rework_count=1 must escalate to a strong model (Flash barred).
-        # Opus is reserved for high-risk REVIEW only; implementation gets Fable or Codex Sol.
+        # Routine execution with rework_count=1 escalates to the high-risk worker ladder
+        # (Flash barred): GLM-5.3 (credentialed) -> Codex Astra medium -> DeepSeek V4 Pro ->
+        # Antigravity Opus -> Fable last resort. Paid Anthropic is never a worker primary or
+        # fallback while a cheap tier has headroom.
         rec = selector.select_model(
             task_type=TaskType.ROUTINE_EXECUTION,
             risk_level=RiskLevel.LOW,
             rework_count=1,
         )
         self.assertNotEqual(rec.selected_model, MODEL_GEMINI_FLASH)
-        # With default fixture (Anthropic ok, Codex usable, no AG): Fable via strong_ladder
-        self.assertEqual(rec.selected_model, MODEL_CLAUDE_FABLE,
-                         "High-risk implementation must use Fable (not Opus) as the Anthropic worker model")
-        # Cross-provider fallback: anthropic → codex
-        self.assertEqual(rec.fallback_model, MODEL_CODEX_SOL)
-        self.assertNotEqual(model_to_provider(rec.selected_model),
-                            model_to_provider(rec.fallback_model))
-        self.assertIn("prevent invariant rework", rec.reasoning.lower())
+        # Default fixture: no Z.AI credential, Codex on pace, Anthropic with slack.
+        self.assertEqual(rec.selected_model, MODEL_CODEX_ASTRA)
+        self.assertEqual(rec.fallback_model, MODEL_DEEPSEEK_PRO)
+        self.assertNotIn("anthropic/", rec.fallback_model)
+        self.assertIn("high-risk implementation", rec.reasoning.lower())
         print(f"  [PASS] Rework escalation: {rec.selected_model} (fallback: {rec.fallback_model}, cross-provider)")
+
+        # A credentialed Z.AI GLM Coding Plan is the ladder's first rung.
+        glm_selector = ResetAwareModelSelector(snapshot, credentialed_providers={ZAI_PROVIDER})
+        rec_glm = glm_selector.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.LOW, rework_count=1)
+        self.assertEqual(rec_glm.selected_model, MODEL_ZAI_GLM)
+        self.assertEqual(rec_glm.fallback_model, MODEL_CODEX_ASTRA)
+        print(f"  [PASS] Credentialed GLM-5.3 leads the ladder: {rec_glm.selected_model} (fallback {rec_glm.fallback_model})")
 
     # -------------------------------------------------------------------------
     # TEST 18: Domain Tags Escalation (C9 Invariant)
@@ -583,15 +605,15 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         selector = ResetAwareModelSelector(snapshot)
 
         # High-risk domain tags: auth, state_machine, money, concurrency, migrations
-        # Opus is reserved for high-risk REVIEW only; implementation gets Fable or Codex Sol.
+        # Same high-risk worker ladder as rework; never paid Anthropic while cheap tiers exist.
         rec = selector.select_model(
             task_type=TaskType.ROUTINE_EXECUTION,
             risk_level=RiskLevel.LOW,
             domain_tags=["auth", "state_machine"],
         )
         self.assertNotEqual(rec.selected_model, MODEL_GEMINI_FLASH)
-        self.assertEqual(rec.selected_model, MODEL_CLAUDE_FABLE,
-                         "High-risk domain tags must route implementation to Fable, not Opus")
+        self.assertEqual(rec.selected_model, MODEL_CODEX_ASTRA)
+        self.assertNotIn("anthropic/", rec.fallback_model)
         # Cross-provider fallback
         self.assertNotEqual(model_to_provider(rec.selected_model),
                             model_to_provider(rec.fallback_model))
@@ -635,13 +657,13 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         rec_rev = selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
         self.assertNotEqual(rec_rev.selected_model, MODEL_GEMINI_FLASH)
         self.assertNotEqual(rec_rev.fallback_model, MODEL_GEMINI_FLASH)
-        self.assertIn(rec_rev.fallback_model, (MODEL_CLAUDE_OPUS, MODEL_CLAUDE_FABLE, MODEL_CODEX_SOL, MODEL_CODEX_ASTRA, MODEL_GEMINI_PRO, MODEL_DEEPSEEK_PRO))
+        self.assertIn(rec_rev.fallback_model, (MODEL_CLAUDE_FABLE, MODEL_CODEX_ASTRA, MODEL_GEMINI_PRO, MODEL_DEEPSEEK_PRO))
 
         # B) High-risk deep reasoning
         rec_reason = selector.select_model(task_type=TaskType.DEEP_REASONING, risk_level=RiskLevel.HIGH)
         self.assertNotEqual(rec_reason.selected_model, MODEL_GEMINI_FLASH)
         self.assertNotEqual(rec_reason.fallback_model, MODEL_GEMINI_FLASH)
-        self.assertIn(rec_reason.fallback_model, (MODEL_CLAUDE_OPUS, MODEL_CLAUDE_FABLE, MODEL_CODEX_SOL, MODEL_CODEX_ASTRA, MODEL_GEMINI_PRO, MODEL_DEEPSEEK_PRO))
+        self.assertIn(rec_reason.fallback_model, (MODEL_CODEX_ASTRA, MODEL_GEMINI_PRO, MODEL_DEEPSEEK_PRO, MODEL_AG_CLAUDE_OPUS))
         print(f"  [PASS] High-risk reasoning and review fallback strictly strong model: {rec_reason.fallback_model} (Flash barred).")
 
     # -------------------------------------------------------------------------
@@ -650,10 +672,9 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
     def test_codex_roles_and_structural_retry_invariants(self):
         print("\n--- TEST 21: Codex Agent Roles & Structural Failure Retry ---")
         # 1. Verify model_to_agent_role assigns actual Codex agent roles from roster
-        self.assertEqual(model_to_agent_role(MODEL_CODEX_SOL, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "codex-reviewer")
-        self.assertEqual(model_to_agent_role(MODEL_CODEX_SOL, TaskType.ROUTINE_EXECUTION, RiskLevel.HIGH), "codex-worker")
-        self.assertEqual(model_to_agent_role(MODEL_CODEX_FAST, TaskType.ROUTINE_EXECUTION, RiskLevel.LOW), "codex-worker")
         self.assertEqual(model_to_agent_role(MODEL_CODEX_ASTRA, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "codex-reviewer")
+        self.assertEqual(model_to_agent_role(MODEL_CODEX_ASTRA, TaskType.ROUTINE_EXECUTION, RiskLevel.HIGH), "codex-worker")
+        self.assertEqual(model_to_agent_role(MODEL_CODEX_FAST, TaskType.ROUTINE_EXECUTION, RiskLevel.LOW), "codex-worker")
 
         # 2. Verify dispatch packet with promoted Codex assigns actual Codex agent role
         mock_codex_promoted = copy.deepcopy(self.mock_usage_dict)
@@ -672,7 +693,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             risk_level=RiskLevel.HIGH,
             head_sha="abcdef123456",
         )
-        self.assertEqual(packet_review.recommendation["model"], MODEL_CODEX_SOL)
+        self.assertEqual(packet_review.recommendation["model"], MODEL_CODEX_ASTRA)
         self.assertEqual(packet_review.recommendation["agent_role"], "codex-reviewer")
         print(f"  [PASS] Codex review dispatch role: {packet_review.recommendation['agent_role']}")
 
@@ -684,8 +705,9 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         self.assertEqual(packet_worker.recommendation["agent_role"], "codex-worker")
         print(f"  [PASS] Codex worker dispatch role: {packet_worker.recommendation['agent_role']}")
 
-        # 3. Flash NOT structural-failure retry:
-        # When all strong models are in cooldown, routine execution with rework_count=1 MUST route to Gemini Pro, NEVER Flash!
+        # 3. Flash NOT structural-failure retry: with every subscription tier in cooldown,
+        # routine execution with rework_count=1 goes to pay-per-token DeepSeek V4 Pro (the
+        # ladder's next rung), NEVER Flash and never paid Anthropic.
         mock_all_cooldown = copy.deepcopy(self.mock_usage_dict)
         for rep in mock_all_cooldown["reports"]:
             rep["metadata"]["limitReached"] = True
@@ -697,12 +719,13 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             risk_level=RiskLevel.LOW,
             rework_count=1,
         )
-        self.assertNotEqual(rec_structural.selected_model, MODEL_GEMINI_FLASH)
-        self.assertEqual(rec_structural.selected_model, MODEL_GEMINI_PRO)
+        self.assertEqual(rec_structural.selected_model, MODEL_DEEPSEEK_PRO)
+        self.assertEqual(model_to_agent_role(rec_structural.selected_model, TaskType.ROUTINE_EXECUTION, RiskLevel.HIGH), "ds-pro")
         self.assertNotEqual(rec_structural.fallback_model, MODEL_GEMINI_FLASH)
-        self.assertEqual(rec_structural.fallback_model, MODEL_DEEPSEEK_PRO)
-        self.assertTrue(rec_structural.cooldown_fallback)
-        print(f"  [PASS] Structural failure retry strictly barred Flash under cooldown: {rec_structural.selected_model}")
+        self.assertNotIn("flash", rec_structural.fallback_model)
+        self.assertNotIn("anthropic/", rec_structural.fallback_model)
+        print(f"  [PASS] Structural failure retry strictly barred Flash under cooldown: {rec_structural.selected_model} "
+              f"(fallback {rec_structural.fallback_model})")
 
     # -------------------------------------------------------------------------
     # Helpers for the allowance-aware tests (TESTS 22-26)
@@ -775,9 +798,17 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         usage = self._usage_with_ag_families(codex_used=0.92, codex_reset_hrs=145)
         self._block_anthropic(usage)
         selector = self._selector(usage)
-        for task_type in (TaskType.STRONG_REVIEW, TaskType.DEEP_REASONING, TaskType.ROUTINE_EXECUTION):
+        # High-risk review climbs to Antigravity Opus; the high-risk worker ladder (GLM ->
+        # Astra -> DeepSeek V4 Pro -> ag-opus -> Fable) lands on DeepSeek V4 Pro.
+        expected = {
+            TaskType.STRONG_REVIEW: MODEL_AG_CLAUDE_OPUS,
+            TaskType.DEEP_REASONING: MODEL_DEEPSEEK_PRO,
+            TaskType.ROUTINE_EXECUTION: MODEL_DEEPSEEK_PRO,
+        }
+        for task_type, model in expected.items():
             rec = selector.select_model(task_type=task_type, risk_level=RiskLevel.HIGH)
-            self.assertEqual(rec.selected_model, MODEL_AG_CLAUDE_OPUS, f"{task_type}: ahead-of-pace Codex chosen")
+            self.assertEqual(rec.selected_model, model, f"{task_type}: ahead-of-pace Codex chosen")
+            self.assertNotIn("openai-codex/", rec.selected_model)
             self.assertNotEqual(rec.fallback_model, MODEL_GEMINI_FLASH)
         self.assertTrue(rec.quota_metrics["codex_pro_throttled"])
 
@@ -787,7 +818,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
                 lim["status"] = "rate_limited"
         rec_routine = self._selector(usage).select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.LOW)
         self.assertNotIn("openai-codex/", rec_routine.selected_model)
-        print(f"  [PASS] 92% used with 145h left: Codex held back; high-risk work on {MODEL_AG_CLAUDE_OPUS}.")
+        print("  [PASS] 92% used with 145h left: Codex held back; high-risk review on ag-opus, workers on DeepSeek V4 Pro.")
 
         # The same 92% with 6h left is behind pace: the last 8% would expire unused, so it
         # is promoted ahead of every other strong lane, including Antigravity Claude.
@@ -795,7 +826,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         rec_end = self._selector(usage_end).select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
         self.assertFalse(rec_end.quota_metrics["codex_pro_throttled"])
         self.assertTrue(rec_end.promotion_applied)
-        self.assertEqual(rec_end.selected_model, MODEL_CODEX_SOL)
+        self.assertEqual(rec_end.selected_model, MODEL_CODEX_ASTRA)
         print(f"  [PASS] 92% used with 6h left: remaining Codex spent before reset on {rec_end.selected_model}.")
 
         # Exactly on pace (50% used, 84h left) is neither throttled nor promoted.
@@ -804,11 +835,11 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         rec_pace = self._selector(usage_pace).select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
         self.assertFalse(rec_pace.quota_metrics["codex_pro_throttled"])
         self.assertFalse(rec_pace.promotion_applied)
-        self.assertEqual(rec_pace.selected_model, MODEL_CODEX_SOL)
+        self.assertEqual(rec_pace.selected_model, MODEL_CODEX_ASTRA)
         print(f"  [PASS] On-pace Codex remains a normal strong lane: {rec_pace.selected_model}")
 
     # -------------------------------------------------------------------------
-    # TEST 26: Direct Anthropic is the Opus orchestrator's weekly budget
+    # TEST 26: Direct Anthropic is the Fable orchestrator's weekly budget
     # -------------------------------------------------------------------------
     def test_anthropic_orchestrator_reserve(self):
         print("\n--- TEST 26: Anthropic Orchestrator Reserve ---")
@@ -817,7 +848,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         usage = self._usage_with_ag_families(anthropic_used=0.95, anthropic_week_used=0.64, anthropic_week_reset_hrs=72)
         rec = self._selector(usage).select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
         self.assertTrue(rec.quota_metrics["anthropic_orchestrator_reserve"])
-        self.assertEqual(rec.selected_model, MODEL_CODEX_SOL)
+        self.assertEqual(rec.selected_model, MODEL_CODEX_ASTRA)
         self.assertNotIn("anthropic/", rec.fallback_model)
         print(f"  [PASS] Ahead-of-pace Anthropic reserved; high-risk review on {rec.selected_model}.")
 
@@ -832,8 +863,9 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         self.assertIn("orchestrator reserve", rec_last.reasoning)
         print(f"  [PASS] Reserve drawn only as last resort: {rec_last.selected_model}")
 
-        # 30% used with 20h left: most of the week would expire unused, so workers take it,
-        # medium-risk work included.
+        # 30% used with 20h left: most of the week would expire unused, so the high-risk
+        # REVIEW lane spends it. Worker lanes still never take paid Anthropic while a cheap
+        # tier has headroom (operator 2026-09-25), surplus or not.
         usage_surplus = self._usage_with_ag_families(anthropic_used=0.95, anthropic_week_used=0.30, anthropic_week_reset_hrs=20)
         selector = self._selector(usage_surplus)
         self.assertFalse(selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
@@ -842,18 +874,19 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH).selected_model,
             MODEL_CLAUDE_FABLE,
         )
-        self.assertEqual(
-            selector.select_model(task_type=TaskType.DEEP_REASONING, risk_level=RiskLevel.MEDIUM).selected_model,
-            MODEL_CLAUDE_FABLE,  # Opus reserved for high-risk review; reasoning surplus goes to Fable
-        )
-        print("  [PASS] Anthropic surplus near reset spent by workers (Fable review, Fable reasoning).")
+        for task_type, risk in ((TaskType.DEEP_REASONING, RiskLevel.MEDIUM), (TaskType.DEEP_REASONING, RiskLevel.HIGH),
+                                (TaskType.ROUTINE_EXECUTION, RiskLevel.HIGH), (TaskType.STRONG_REVIEW, RiskLevel.MEDIUM)):
+            rec_worker = selector.select_model(task_type=task_type, risk_level=risk)
+            self.assertNotIn("anthropic/", rec_worker.selected_model, f"{task_type}/{risk}")
+            self.assertNotIn("anthropic/", rec_worker.fallback_model, f"{task_type}/{risk}")
+        print("  [PASS] Anthropic surplus near reset spent by high-risk review only; worker lanes stay on cheap tiers.")
 
         # Stale Anthropic data never counts as slack.
         stale = self._usage_with_ag_families(anthropic_used=0.95, anthropic_week_used=0.0, anthropic_week_reset_hrs=20)
         stale["reports"][1]["fetchedAt"] = self.mock_now_ms - 2 * 3600 * 1000
         rec_stale = self._selector(stale).select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
         self.assertTrue(rec_stale.quota_metrics["anthropic_orchestrator_reserve"])
-        self.assertEqual(rec_stale.selected_model, MODEL_CODEX_SOL)
+        self.assertEqual(rec_stale.selected_model, MODEL_CODEX_ASTRA)
         print(f"  [PASS] Stale Anthropic snapshot kept in reserve; routed to {rec_stale.selected_model}.")
 
     # -------------------------------------------------------------------------
@@ -989,14 +1022,21 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         snapshot = parse_usage_json(usage, current_time_ms=self.mock_now_ms)
         selector = ResetAwareModelSelector(snapshot)
 
-        # The best_ok_report should pick the free account (most remaining),
-        # but pacing should use the pro metrics.
+        # The free account (most remaining) serves the default Codex lane, but pacing and the
+        # reported Codex metrics must come from the nearly spent pro window: a free account at
+        # 0% used must never mask it.
         rec = selector.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.LOW)
-        # Pro is throttled (92% used > 50% floor, headroom < 0.90), but free is ok
-        # The router should still function — Gemini Flash is the default routine lane
         self.assertEqual(rec.selected_model, MODEL_GEMINI_FLASH)
-        print(f"  [PASS] Two-account Codex: routine execution on {rec.selected_model}, "
-              f"codex_pro_throttled={rec.quota_metrics.get('codex_pro_throttled')}")
+        self.assertTrue(rec.quota_metrics["codex_pro_throttled"])
+        self.assertAlmostEqual(rec.quota_metrics["codex_remaining"], 0.08, places=6)
+        self.assertLess(rec.quota_metrics["codex_pro_headroom"], CODEX_PACE_MIN_HEADROOM)
+        self.assertAlmostEqual(rec.burn_headroom, rec.quota_metrics["codex_pro_headroom"])
+        # Throttled pro Codex is not handed high-risk review while ag-opus has headroom.
+        rec_review = selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
+        self.assertEqual(rec_review.selected_model, MODEL_AG_CLAUDE_OPUS)
+        print(f"  [PASS] Two-account Codex: metrics from pro window (remaining "
+              f"{rec.quota_metrics['codex_remaining']:.2f}, throttled={rec.quota_metrics['codex_pro_throttled']}), "
+              f"lane remaining {rec.quota_metrics['codex_lane_remaining']:.2f}; review on {rec_review.selected_model}")
 
     # -------------------------------------------------------------------------
     # TEST 29: Anthropic 5h window protection (Finding 3)
@@ -1070,41 +1110,165 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         self.assertEqual(model_to_agent_role(MODEL_AG_GPT_OSS, TaskType.ROUTINE_EXECUTION, RiskLevel.LOW), "ag-gpt")
         # AG Opus → ag-opus
         self.assertEqual(model_to_agent_role(MODEL_AG_CLAUDE_OPUS, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "ag-opus")
-        # DeepSeek Pro → ds-task
-        self.assertEqual(model_to_agent_role(MODEL_DEEPSEEK_PRO, TaskType.ROUTINE_EXECUTION, RiskLevel.HIGH), "ds-task")
+        # DeepSeek V4 Pro → ds-pro (ds-task is pinned to DeepSeek Flash)
+        self.assertEqual(model_to_agent_role(MODEL_DEEPSEEK_PRO, TaskType.ROUTINE_EXECUTION, RiskLevel.HIGH), "ds-pro")
+        self.assertEqual(model_to_agent_role(MODEL_DEEPSEEK_FLASH, TaskType.ROUTINE_EXECUTION, RiskLevel.LOW), "ds-task")
         # Chinese providers
         self.assertEqual(model_to_agent_role(MODEL_ZAI_GLM, TaskType.ROUTINE_EXECUTION, RiskLevel.LOW), "zai-task")
-        self.assertEqual(model_to_agent_role(MODEL_ZAI_GLM_FLASH, TaskType.ROUTINE_EXECUTION, RiskLevel.LOW), "zai-task")
+        self.assertEqual(model_to_agent_role(MODEL_ZAI_GLM_FLASH, TaskType.TINY_TASK, RiskLevel.LOW), "zai-flash")
         self.assertEqual(model_to_agent_role(MODEL_MINIMAX_M3, TaskType.ROUTINE_EXECUTION, RiskLevel.LOW), "minimax-task")
         # Provider mapping
         self.assertEqual(model_to_provider(MODEL_ZAI_GLM), "zai")
         self.assertEqual(model_to_provider(MODEL_MINIMAX_M3), "minimax")
         self.assertEqual(model_to_provider(MODEL_AG_CLAUDE_OPUS), "google-antigravity")
         self.assertEqual(model_to_provider(MODEL_DEEPSEEK_PRO), "deepseek")
-        print("  [PASS] All role and provider mappings correct (ag-sonnet, ag-gpt, zai-task, minimax-task).")
+        # Every role this router emits for a pinned model resolves back to that role, so a
+        # dispatched role never silently runs a different model.
+        for role, model in ROLE_MODEL_PINS.items():
+            task_type = TaskType.STRONG_REVIEW if role == "codex-reviewer" else TaskType.ROUTINE_EXECUTION
+            self.assertEqual(model_to_agent_role(model, task_type, RiskLevel.HIGH), role, f"{role} pin {model}")
+        print("  [PASS] All role and provider mappings correct (ag-sonnet, ag-gpt, ds-pro, zai-task, zai-flash, minimax-task).")
 
     # -------------------------------------------------------------------------
     # TEST 32: Chinese providers disabled by default, enabled by credential
     # -------------------------------------------------------------------------
     def test_chinese_providers_disabled_by_default(self):
-        print("\n--- TEST 32: Chinese Providers Disabled by Default ---")
-        # Verify the credential env vars are defined
-        self.assertEqual(ZAI_CREDENTIAL_ENV, "ZAI_API_KEY")
-        self.assertEqual(MINIMAX_CREDENTIAL_ENV, "MINIMAX_API_KEY")
-        # Without env vars set, model constants exist but are not routed to
-        self.assertTrue(MODEL_ZAI_GLM.startswith("zai/"))
-        self.assertTrue(MODEL_MINIMAX_M3.startswith("minimax-code/"))
-        # The router never selects these models today (no provider in the snapshot),
-        # so they activate only when the operator buys a subscription and sets the env var.
+        print("\n--- TEST 32: Chinese Providers Credential-Gated ---")
+        # MiniMax Token Plan is provider `minimax-code`, read from MINIMAX_CODE_API_KEY;
+        # MINIMAX_API_KEY belongs to the different `minimax` provider and enables nothing.
+        self.assertEqual(CREDENTIAL_ENV_BY_PROVIDER, {ZAI_PROVIDER: "ZAI_API_KEY", MINIMAX_PROVIDER: "MINIMAX_CODE_API_KEY"})
+        self.assertEqual(detect_credentialed_providers(auth_store_paths=[]), set())
+        with mock.patch.dict(os.environ, {"MINIMAX_API_KEY": "x"}):
+            self.assertEqual(detect_credentialed_providers(auth_store_paths=[]), set())
+        with mock.patch.dict(os.environ, {"MINIMAX_CODE_API_KEY": "x", "ZAI_API_KEY": "x"}):
+            self.assertEqual(detect_credentialed_providers(auth_store_paths=[]), {ZAI_PROVIDER, MINIMAX_PROVIDER})
+
+        # A stored `/login` credential enables the provider; a disabled one does not.
+        import sqlite3
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            store = os.path.join(tmp, "agent.db")
+            conn = sqlite3.connect(store)
+            conn.execute("CREATE TABLE auth_credentials (provider TEXT, data TEXT, disabled_cause TEXT)")
+            conn.executemany("INSERT INTO auth_credentials VALUES (?, ?, ?)", [
+                (MINIMAX_PROVIDER, "redacted", None),
+                (ZAI_PROVIDER, "redacted", "revoked"),
+            ])
+            conn.commit()
+            conn.close()
+            self.assertEqual(detect_credentialed_providers(auth_store_paths=[store]), {MINIMAX_PROVIDER})
+
+        # Uncredentialed (hermetic setUp): never selected or offered as a fallback.
         selector = self._selector(self._usage_with_ag_families())
         for task_type in TaskType:
             for risk in RiskLevel:
                 rec = selector.select_model(task_type=task_type, risk_level=risk)
-                self.assertNotIn("zai/", rec.selected_model)
-                self.assertNotIn("minimax-code/", rec.selected_model)
-                self.assertNotIn("zai/", rec.fallback_model)
-                self.assertNotIn("minimax-code/", rec.fallback_model)
-        print("  [PASS] Chinese providers (zai, minimax-code) never selected without credentials in snapshot.")
+                for model in (rec.selected_model, rec.fallback_model):
+                    self.assertNotIn("zai/", model)
+                    self.assertNotIn("minimax-code/", model)
+
+        # Credentialed: GLM-5.3 leads the high-risk worker ladder; GLM-5.3-Flash and MiniMax-M3
+        # take bulk/triage when Gemini Lite is out; MiniMax never implements or reviews.
+        usage = self._usage_with_ag_families()
+        creds = {ZAI_PROVIDER, MINIMAX_PROVIDER}
+        both = ResetAwareModelSelector(parse_usage_json(usage, current_time_ms=self.mock_now_ms), credentialed_providers=creds)
+        self.assertEqual(both.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.HIGH).selected_model, MODEL_ZAI_GLM)
+        self.assertEqual(both.select_model(task_type=TaskType.DEEP_REASONING, risk_level=RiskLevel.HIGH).selected_model, MODEL_ZAI_GLM)
+        tiny = both.select_model(task_type=TaskType.TINY_TASK, risk_level=RiskLevel.LOW)
+        self.assertEqual((tiny.selected_model, tiny.fallback_model), (MODEL_GEMINI_LITE, MODEL_ZAI_GLM_FLASH))
+        for lim in usage["reports"][0]["limits"]:
+            if lim["id"].startswith("google-antigravity:google"):
+                lim["status"] = "rate_limited"
+        gemini_out = ResetAwareModelSelector(parse_usage_json(usage, current_time_ms=self.mock_now_ms), credentialed_providers=creds)
+        tiny_out = gemini_out.select_model(task_type=TaskType.TINY_TASK, risk_level=RiskLevel.LOW)
+        self.assertEqual((tiny_out.selected_model, tiny_out.fallback_model), (MODEL_ZAI_GLM_FLASH, MODEL_MINIMAX_M3))
+        minimax_only = ResetAwareModelSelector(parse_usage_json(usage, current_time_ms=self.mock_now_ms),
+                                               credentialed_providers={MINIMAX_PROVIDER})
+        self.assertEqual(minimax_only.select_model(task_type=TaskType.TINY_TASK, risk_level=RiskLevel.LOW).selected_model,
+                         MODEL_MINIMAX_M3)
+        for task_type in (TaskType.ROUTINE_EXECUTION, TaskType.DEEP_REASONING, TaskType.STRONG_REVIEW):
+            for risk in RiskLevel:
+                self.assertNotIn("minimax-code/", minimax_only.select_model(task_type=task_type, risk_level=risk).selected_model)
+        print("  [PASS] Z.AI/MiniMax Code routed only when credentialed (env or stored); MiniMax limited to bulk/triage.")
+
+    # -------------------------------------------------------------------------
+    # TEST 33: Paid Anthropic is never a worker primary or fallback while a cheap tier has
+    # headroom — including the low-risk review, low/medium reasoning and deep-context lanes.
+    # -------------------------------------------------------------------------
+    def test_worker_lanes_never_spend_orchestrator_reserve(self):
+        print("\n--- TEST 33: Worker Lanes Never Take Paid Anthropic While Cheap Tiers Exist ---")
+        # Anthropic has maximum slack (0% used, 20h left) — the most tempting case — plus the
+        # states named in review 5317588095: reserve active with Antigravity Claude spent and
+        # Codex throttled, Anthropic surplus near reset, and Google down.
+        google_down = self._usage_with_ag_families(anthropic_week_used=0.0, anthropic_week_reset_hrs=20)
+        google_down["reports"][0]["metadata"]["limitReached"] = True
+        google_down["reports"][0]["metadata"]["allowed"] = False
+        scenarios = {
+            "all_ok": self._usage_with_ag_families(anthropic_week_used=0.0, anthropic_week_reset_hrs=20),
+            "ag_spent_codex_throttled": self._usage_with_ag_families(
+                anthropic_used=0.95, codex_used=0.92, codex_reset_hrs=145,
+                anthropic_week_used=0.0, anthropic_week_reset_hrs=20),
+            "reserve_active": self._usage_with_ag_families(
+                anthropic_used=0.95, codex_used=0.92, codex_reset_hrs=145,
+                anthropic_week_used=0.64, anthropic_week_reset_hrs=72),
+            "anthropic_surplus_near_reset": self._usage_with_ag_families(
+                anthropic_week_used=0.10, anthropic_week_reset_hrs=6),
+            "google_down": google_down,
+        }
+        variants = [
+            {},
+            {"rework_count": 1},
+            {"domain_tags": ["money", "auth"]},
+        ]
+        checked = 0
+        for label, usage in scenarios.items():
+            snapshot = parse_usage_json(usage, current_time_ms=self.mock_now_ms)
+            for creds in (set(), {ZAI_PROVIDER, MINIMAX_PROVIDER}):
+                selector = ResetAwareModelSelector(snapshot, credentialed_providers=creds)
+                for task_type in TaskType:
+                    for risk in RiskLevel:
+                        for variant in variants:
+                            is_review_lane = task_type == TaskType.STRONG_REVIEW and (
+                                risk == RiskLevel.HIGH or variant)
+                            for ctx in (10000, 220000):
+                                rec = selector.select_model(
+                                    task_type=task_type, risk_level=risk, context_tokens=ctx, **variant)
+                                where = f"[{label}/{sorted(creds)}] {task_type.value}/{risk.value}/{variant}/{ctx}"
+                                self.assertNotEqual(
+                                    model_to_provider(rec.selected_model), model_to_provider(rec.fallback_model), where)
+                                checked += 1
+                                if is_review_lane and ctx <= 180000:
+                                    continue  # the high-risk REVIEW lane may spend Anthropic slack
+                                self.assertNotIn("anthropic/", rec.selected_model, where)
+                                self.assertNotIn("anthropic/", rec.fallback_model, where)
+        print(f"  [PASS] {checked} worker routes (task x risk x rework/domain x context x credentials x 5 quota "
+              "states): none selects or falls back to paid Anthropic; every fallback crosses providers.")
+
+        # When every cheap tier is out, the high-risk worker ladder reaches Fable as its last
+        # rung, and only on slack behind pace.
+        usage_out = self._usage_with_ag_families(anthropic_used=0.95, anthropic_week_used=0.0, anthropic_week_reset_hrs=20)
+        for rep in usage_out["reports"]:
+            if rep["provider"] in ("google-antigravity", "openai-codex"):
+                rep["metadata"]["limitReached"] = True
+                rep["metadata"]["allowed"] = False
+        deepseek_report = copy.deepcopy(usage_out["reports"][0])
+        deepseek_report["provider"] = "deepseek"
+        deepseek_report["limits"] = deepseek_report["limits"][:1]
+        deepseek_report["limits"][0]["id"] = "deepseek:default:daily"
+        deepseek_report["metadata"] = {"limitReached": True, "allowed": False}
+        usage_out["reports"].append(deepseek_report)
+        rec_last = self._selector(usage_out).select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.HIGH)
+        self.assertEqual(rec_last.selected_model, MODEL_CLAUDE_FABLE)
+        self.assertTrue(rec_last.cooldown_fallback)
+        self.assertIn("last resort", rec_last.reasoning)
+        # Ahead of pace, the orchestrator reserve is never touched: pay-per-token last resort.
+        usage_reserve = copy.deepcopy(usage_out)
+        set_week = usage_reserve["reports"][1]["limits"][1]
+        set_week["amount"].update({"remainingFraction": 0.36, "usedFraction": 0.64, "remaining": 36.0, "used": 64.0})
+        set_week["window"]["resetsAt"] = self.mock_now_ms + 72 * 3600 * 1000
+        rec_reserve = self._selector(usage_reserve).select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.HIGH)
+        self.assertNotIn("anthropic/", rec_reserve.selected_model)
+        print(f"  [PASS] Every cheap tier out: {rec_last.selected_model} on slack; reserve kept -> {rec_reserve.selected_model}.")
 
 def main():
     print("=" * 70)

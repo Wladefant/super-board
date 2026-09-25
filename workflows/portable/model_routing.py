@@ -24,6 +24,7 @@ import argparse
 import datetime
 import json
 import os
+import sqlite3
 import sys
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -49,7 +50,7 @@ class TaskType(str, Enum):
     DEEP_REASONING = "deep_reasoning"        # Architecture, complex invariants, concurrency, algorithmic debugging
     STRONG_REVIEW = "strong_review"          # High-stakes code review, invariant audits, QA signoff
     DEEP_CONTEXT = "deep_context"            # Context spans > 180k tokens, large diff analysis
-    TINY_TASK = "tiny_task"                  # Commit summaries, compaction, lightweight formatting
+    TINY_TASK = "tiny_task"                  # Commit summaries, compaction, formatting, bulk triage/classification
 
 
 class RiskLevel(str, Enum):
@@ -63,18 +64,23 @@ MODEL_GEMINI_FLASH = "google-antigravity/gemini-3.8-flash:high"
 MODEL_GEMINI_LITE = "google-antigravity/gemini-3.1-flash-lite"
 MODEL_GEMINI_PRO = "google-antigravity/gemini-3.1-pro"
 
+# Paid direct Anthropic: the Main orchestrator's budget and the high-risk REVIEW lane.
+# Never a worker primary or worker fallback while any cheap tier has headroom (operator
+# 2026-09-25). In worker ladders Fable is the very last rung, and only on slack behind
+# pace (ANTHROPIC_WORKER_MIN_HEADROOM), never on the orchestrator's reserve.
 MODEL_CLAUDE_FABLE = "anthropic/claude-fable-5-1"
-MODEL_CLAUDE_OPUS = "anthropic/claude-opus-5:high"
 
 MODEL_CODEX_FAST = "openai-codex/gpt-5.3-codex"
-MODEL_CODEX_SOL = "openai-codex/gpt-5.6-sol:high"
-MODEL_CODEX_ASTRA = "openai-codex/gpt-6-astra:high"
+# The operator's Codex worker/review tier is Astra medium (profile `codex-worker` and
+# `codex-reviewer` pins). Sol is costlier than Astra and bound to no role, so it is not routed.
+MODEL_CODEX_ASTRA = "openai-codex/gpt-6-astra:medium"
 
 MODEL_GROK_DORMANT = "xai-oauth/grok-4.6:high"
 
 # Antigravity serves Claude and GPT families on their own daily windows, separate from
 # Gemini's (live-tested 2026-09-25). They reset daily, so unused headroom expires sooner
-# than any Anthropic/Codex weekly window and is spent first where risk policy allows.
+# than any Anthropic/Codex weekly window. They are a permitted cheap worker tier (operator
+# ruling): `ag-opus` may take worker work while its window is above AG_FAMILY_MIN_REMAINING.
 MODEL_AG_CLAUDE_OPUS = "google-antigravity/claude-opus-4-6"
 MODEL_AG_CLAUDE_SONNET = "google-antigravity/claude-sonnet-4-6"
 MODEL_AG_GPT_OSS = "google-antigravity/gpt-oss-120b"
@@ -83,9 +89,10 @@ MODEL_AG_GPT_OSS = "google-antigravity/gpt-oss-120b"
 # $0.30/$1.20 per 1M peak, half off-peak), with its OpenRouter twin as fallback.
 MODEL_DEEPSEEK_FLASH = "deepseek/deepseek-flash:high"
 MODEL_OR_DEEPSEEK_FLASH = "openrouter/deepseek/deepseek-v4.1-flash"
-# DeepSeek V4.1-Pro: stronger than Flash (TB4 ~38%), pay-per-token ($2/$8 per 1M).
-# Used for high-risk implementation when Codex is throttled and Anthropic is reserved.
-MODEL_DEEPSEEK_PRO = "deepseek/deepseek-pro:high"
+# DeepSeek V4 Pro (catalog id `deepseek/deepseek-v4-pro`, 1M context, pay-per-token):
+# the strong pay-per-token worker rung. It must run through the `ds-pro` role, never
+# `ds-task` (pinned to DeepSeek Flash), or a high-risk task silently runs on Flash.
+MODEL_DEEPSEEK_PRO = "deepseek/deepseek-v4-pro"
 
 # Second-opinion reviewer on the OpenRouter free quota (1,000 requests/day). Advisory
 # only: it never approves, blocks or replaces the required review. Nemotron 3 Ultra free
@@ -94,44 +101,105 @@ MODEL_DEEPSEEK_PRO = "deepseek/deepseek-pro:high"
 MODEL_OR_FREE_ADVISORY = "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
 
 # First-class Chinese-model worker slots (#214, operator 2026-09-25): credential-gated,
-# activated automatically when the env var is set.  No code change to turn them on.
-# - Z.AI GLM Coding Plan: GLM-5.3 (TB4 41.9%), GLM-5.3-Flash (TB4 32.8%).
-#   When active, GLM-5.3 ranks above DeepSeek Flash for medium-risk implementation.
-#   Env: ZAI_API_KEY.  Endpoint: https://api.z.ai/api/coding/paas/v4
-# - MiniMax Token Plan: MiniMax-M3 (TB4 2.0%), triage/bulk/docs only.
-#   Env: MINIMAX_API_KEY.  Endpoint: https://api.minimax.io/v1
+# activated automatically once veyyon holds a credential for the provider (env var or a
+# stored `/login` credential in the auth store). No code change turns them on.
+# - Z.AI GLM Coding Plan (provider `zai`, env ZAI_API_KEY): GLM-5.3 (TB4 41.9%) is the
+#   first rung of the high-risk worker ladder and the routine overflow; GLM-5.3-Flash
+#   (TB4 32.8%) takes bulk/triage (TINY_TASK).
+# - MiniMax Token Plan (provider `minimax-code`, env MINIMAX_CODE_API_KEY; `minimax`
+#   reads MINIMAX_API_KEY and is a different provider): MiniMax-M3 (TB4 2.0%) takes
+#   bulk/triage and 1M-context overflow only, never implementation or review.
 MODEL_ZAI_GLM = "zai/glm-5.3:high"
 MODEL_ZAI_GLM_FLASH = "zai/glm-5.3-flash:high"
 MODEL_MINIMAX_M3 = "minimax-code/minimax-m3"
 
-ZAI_CREDENTIAL_ENV = "ZAI_API_KEY"
-MINIMAX_CREDENTIAL_ENV = "MINIMAX_API_KEY"
+ZAI_PROVIDER = "zai"
+MINIMAX_PROVIDER = "minimax-code"
+CREDENTIAL_ENV_BY_PROVIDER: Dict[str, str] = {
+    ZAI_PROVIDER: "ZAI_API_KEY",
+    MINIMAX_PROVIDER: "MINIMAX_CODE_API_KEY",
+}
 
-def _chinese_provider_available(env_var: str) -> bool:
-    """Check if a Chinese-model provider is enabled (credential env var is set and non-empty)."""
-    return bool(os.environ.get(env_var, "").strip())
+
+def _auth_store_paths() -> List[str]:
+    """veyyon credential stores: the machine-wide shared store and the active profile's own
+    store (used when `profileSharing: false`). `VEYYON_CONFIG_DIR` relocates the root."""
+    root = os.environ.get("VEYYON_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".veyyon")
+    profile = os.environ.get("VEYYON_PROFILE") or "default"
+    return [
+        os.path.join(root, "shared-auth", "agent.db"),
+        os.path.join(root, "profiles", profile, "agent", "agent.db"),
+    ]
+
+
+def _stored_credential_providers(paths: List[str]) -> Set[str]:
+    """Provider ids with an enabled stored credential. Reads only the `provider` column,
+    read-only; credential payloads are never selected."""
+    found: Set[str] = set()
+    for path in paths:
+        if not os.path.isfile(path):
+            continue
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            try:
+                rows = conn.execute(
+                    "SELECT DISTINCT provider FROM auth_credentials WHERE disabled_cause IS NULL"
+                ).fetchall()
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            continue
+        found.update(row[0] for row in rows)
+    return found
+
+
+def detect_credentialed_providers(auth_store_paths: Optional[List[str]] = None) -> Set[str]:
+    """Credential-gated providers (Z.AI, MiniMax Code) veyyon can authenticate right now."""
+    stored = _stored_credential_providers(_auth_store_paths() if auth_store_paths is None else auth_store_paths)
+    return {
+        provider
+        for provider, env_var in CREDENTIAL_ENV_BY_PROVIDER.items()
+        if os.environ.get(env_var, "").strip() or provider in stored
+    }
+
+
+# Model each router-emitted role must pin as its FIRST model, for roles this router
+# introduced. The router recommends a role alongside the model; a role pinned to another
+# model would silently run that model instead. Operator applies these to the profile
+# (see policies/default/AGENTS.md "Worker role pins"); the router never edits config.
+ROLE_MODEL_PINS: Dict[str, str] = {
+    "ds-pro": MODEL_DEEPSEEK_PRO,
+    "zai-task": MODEL_ZAI_GLM,
+    "zai-flash": MODEL_ZAI_GLM_FLASH,
+    "minimax-task": MODEL_MINIMAX_M3,
+    "gemini-pro": MODEL_GEMINI_PRO,
+    "codex-worker": MODEL_CODEX_ASTRA,
+    "codex-reviewer": MODEL_CODEX_ASTRA,
+    "ag-opus": MODEL_AG_CLAUDE_OPUS,
+}
 
 # Weekly subscription windows are paced, not capped (operator 2026-09-25): each must
 # last the whole week AND be spent fully by its reset. Pace headroom is remaining
 # fraction / remaining time fraction (1.0 = linear spend).
-# - Below CODEX_PACE_MIN_HEADROOM the Codex pro window is spending ahead of pace and is
-#   held back for emergencies until the clock catches up.
-# - Tolerance band: Codex is throttled only when projected use would exceed 100% by
-#   more than CODEX_PACE_TOLERANCE (10%) AND the window is at least CODEX_PACE_USED_FLOOR
-#   (50%) consumed; early-week single tasks do not lock Codex out.
+# - Codex pro throttle: Codex is held back for emergencies only when BOTH
+#   headroom < CODEX_PACE_MIN_HEADROOM (0.90, i.e. a 10% tolerance below linear pace)
+#   AND at least CODEX_PACE_USED_FLOOR (50%) of the window is consumed.
+#   The used floor is deliberate: below 50% used Codex is never throttled, whatever
+#   the burn rate (e.g. 49% used with 150h left is 0.57x pace and still usable), so a
+#   few early-week tasks cannot lock Codex out; the throttle engages from the midpoint.
 # - At or above SURPLUS_PACE_HEADROOM within SURPLUS_WINDOW_HOURS of reset, the unused
 #   allowance would expire, so it is promoted onto work it can do.
-# - Direct Anthropic is the Opus orchestrator's budget. Worker lanes may draw on it only
-#   while it runs at least ANTHROPIC_WORKER_MIN_HEADROOM behind pace, so the orchestrator
-#   keeps a linear share for the entire week.
-# - The 5h Anthropic window is protected by ANTHROPIC_5H_MAX_USED: workers stay off
-#   the 5h window once it exceeds this fraction, regardless of 7d pace.
-CODEX_PACE_MIN_HEADROOM = 0.90  # throttle only when headroom < 0.90 (10% tolerance)
-CODEX_PACE_USED_FLOOR = 0.50     # AND at least 50% of the window consumed
+# - Direct Anthropic is the orchestrator's budget. Worker ladders may reach Fable only as
+#   their last rung and only while it runs at least ANTHROPIC_WORKER_MIN_HEADROOM behind
+#   pace, so the orchestrator keeps a linear share for the entire week.
+# - ANTHROPIC_BOTTLENECK_MAX_USED guards the tightest Anthropic window (normally the 5h
+#   one): no worker or review slack is taken once it is past this fraction used.
+CODEX_PACE_MIN_HEADROOM = 0.90
+CODEX_PACE_USED_FLOOR = 0.50
 SURPLUS_PACE_HEADROOM = 1.25
 SURPLUS_WINDOW_HOURS = 48.0
 ANTHROPIC_WORKER_MIN_HEADROOM = 1.10
-ANTHROPIC_5H_MAX_USED = 0.80     # workers leave the 5h window alone past 80%
+ANTHROPIC_BOTTLENECK_MAX_USED = 0.80
 # An Antigravity family below this remaining fraction is left alone for the day.
 AG_FAMILY_MIN_REMAINING = 0.10
 AG_ANTHROPIC_PROVIDER = "google-antigravity:anthropic"
@@ -143,15 +211,13 @@ VERIFIED_CONTEXT_WINDOWS: Dict[str, int] = {
     MODEL_GEMINI_LITE: 1048576,
     MODEL_GEMINI_PRO: 1048576,
     MODEL_CLAUDE_FABLE: 1000000,
-    MODEL_CLAUDE_OPUS: 1000000,
     MODEL_CODEX_FAST: 400000,
-    MODEL_CODEX_SOL: 372000,
     MODEL_CODEX_ASTRA: 272000,
     MODEL_AG_CLAUDE_OPUS: 250000,
     MODEL_AG_CLAUDE_SONNET: 250000,
     MODEL_AG_GPT_OSS: 131072,
     MODEL_DEEPSEEK_FLASH: 1048576,
-    MODEL_DEEPSEEK_PRO: 1048576,
+    MODEL_DEEPSEEK_PRO: 1000000,
     MODEL_ZAI_GLM: 131072,
     MODEL_ZAI_GLM_FLASH: 131072,
     MODEL_MINIMAX_M3: 1000000,
@@ -179,15 +245,23 @@ class HarnessDispatchPacket:
 
 
 def model_to_agent_role(model_id: str, task_type: TaskType, risk_level: RiskLevel) -> str:
-    """Map model and task type to standard canonical agent role."""
-    if model_id.startswith(("deepseek/", "openrouter/deepseek/")):
-        return "ds-task"
+    """Map model and task type to the canonical agent role that runs that model."""
+    if model_id.startswith("openai-codex/"):
+        return "codex-reviewer" if task_type == TaskType.STRONG_REVIEW else "codex-worker"
     if model_id.endswith(":free"):
         return "extra-review"
+    if model_id == MODEL_DEEPSEEK_PRO:
+        return "ds-pro"
+    if model_id.startswith(("deepseek/", "openrouter/deepseek/")):
+        return "ds-task"
+    if model_id == MODEL_ZAI_GLM_FLASH:
+        return "zai-flash"
     if model_id.startswith("zai/"):
         return "zai-task"
     if model_id.startswith("minimax-code/"):
         return "minimax-task"
+    if model_id == MODEL_GEMINI_PRO:
+        return "gemini-pro"
     if model_id.startswith("google-antigravity/"):
         if "claude-opus" in model_id:
             return "ag-opus"
@@ -199,18 +273,8 @@ def model_to_agent_role(model_id: str, task_type: TaskType, risk_level: RiskLeve
         return "compactor"
     if "flash" in model_id:
         return "qa-verifier" if task_type == TaskType.STRONG_REVIEW and risk_level == RiskLevel.LOW else "task"
-    if "pro" in model_id:
-        return "task"
-    if "fable" in model_id:
+    if model_id.startswith("anthropic/"):
         return "reviewer"
-    if "opus" in model_id:
-        return "thinker" if task_type == TaskType.DEEP_REASONING else "reviewer"
-    if "sol" in model_id:
-        return "codex-reviewer" if task_type == TaskType.STRONG_REVIEW else "codex-worker"
-    if "astra" in model_id:
-        return "orchestrator" if task_type not in (TaskType.STRONG_REVIEW, TaskType.ROUTINE_EXECUTION) else ("codex-reviewer" if task_type == TaskType.STRONG_REVIEW else "codex-worker")
-    if "codex" in model_id:
-        return "codex-reviewer" if task_type == TaskType.STRONG_REVIEW else "codex-worker"
     return "task"
 
 def model_to_provider(model_id: str) -> str:
@@ -292,6 +356,36 @@ class EvidencePacket:
         )
 
 
+@dataclass(frozen=True)
+class _Rung:
+    """One step of a routing ladder."""
+    model: str
+    available: bool
+    reason: str
+    promotion: bool = False
+    cooldown: bool = False
+    # False keeps a rung primary-only: it is taken when everything above it is out, but it
+    # is never offered as the fallback of a cheaper rung (e.g. paid Anthropic in worker ladders).
+    as_fallback: bool = True
+
+
+def _climb(rungs: List[_Rung], last_resort: _Rung, final_fallbacks: List[str]) -> Tuple[_Rung, str]:
+    """Pick the first available rung, and as its fallback the next available rung below it
+    that may serve as a fallback and sits on another provider/credential. With no such rung,
+    the ladder's last resort, then the first cross-provider entry of `final_fallbacks`, is used."""
+    index = next((i for i, rung in enumerate(rungs) if rung.available), None)
+    chosen = last_resort if index is None else rungs[index]
+    provider = model_to_provider(chosen.model)
+    below = [] if index is None else rungs[index + 1:]
+    for rung in below:
+        if rung.available and rung.as_fallback and model_to_provider(rung.model) != provider:
+            return chosen, rung.model
+    for model in (last_resort.model, *final_fallbacks):
+        if model_to_provider(model) != provider:
+            return chosen, model
+    raise ValueError(f"no cross-provider fallback for {chosen.model}")
+
+
 class ResetAwareModelSelector:
     """
     Deterministic selector implementing:
@@ -302,13 +396,18 @@ class ResetAwareModelSelector:
       - Safe 429/cooldown/unknown handling
     """
 
-    def __init__(self, snapshot: Optional[Any] = None):
+    def __init__(self, snapshot: Optional[Any] = None, credentialed_providers: Optional[Set[str]] = None):
         if snapshot is not None and isinstance(snapshot, BalanceAdapter):
             self.snapshot = snapshot.fetch_snapshot()
         elif snapshot is not None and hasattr(snapshot, "to_normalized"):
             self.snapshot = snapshot.to_normalized()
         else:
             self.snapshot = snapshot
+        # Credential-gated providers (Z.AI, MiniMax Code); detected from env and the veyyon
+        # auth stores unless the caller pins the set (tests, dry runs).
+        self.credentialed_providers: Set[str] = (
+            detect_credentialed_providers() if credentialed_providers is None else set(credentialed_providers)
+        )
 
     def set_snapshot(self, snapshot: Any):
         if snapshot is not None and isinstance(snapshot, BalanceAdapter):
@@ -365,7 +464,7 @@ class ResetAwareModelSelector:
         cycle_time_ratio = max(0.01, min(1.0, cycle_hrs / cycle_dur))
         cycle_headroom = cycle_rem / cycle_time_ratio
 
-        # Pro weekly allowance for Codex (specifically tracking the 7d window for Sol/Astra promotion)
+        # Pro weekly allowance for Codex (the 7d window that paces and promotes Codex Astra)
         pro_rem = cycle_rem
         pro_hrs = cycle_hrs
         if norm_prov and hasattr(norm_prov, "pro_weekly_remaining_fraction") and norm_prov.pro_weekly_remaining_fraction is not None:
@@ -404,6 +503,10 @@ class ResetAwareModelSelector:
     ) -> RoutingRecommendation:
         """
         Determines the optimal model based on capability, context tokens, risk, and quota metrics.
+
+        Every lane is an ordered ladder of rungs. The first available rung is the primary;
+        the fallback is the next available rung that is allowed as a fallback and sits on a
+        different provider/credential, so one outage never takes out both.
         """
         # 1. Inspect provider metrics
         google_meta = self.evaluate_provider("google-antigravity")
@@ -411,6 +514,7 @@ class ResetAwareModelSelector:
         codex_meta = self.evaluate_provider("openai-codex")
         ag_anthropic_meta = self.evaluate_provider(AG_ANTHROPIC_PROVIDER)
         ag_openai_meta = self.evaluate_provider(AG_OPENAI_PROVIDER)
+        deepseek_meta = self.evaluate_provider("deepseek")
 
         provider_statuses = {
             "google-antigravity": google_meta["status"],
@@ -418,26 +522,18 @@ class ResetAwareModelSelector:
             AG_OPENAI_PROVIDER: ag_openai_meta["status"],
             "anthropic": anthropic_meta["status"],
             "openai-codex": codex_meta["status"],
+            "deepseek": deepseek_meta["status"],
             "xai-oauth": "dormant",
         }
 
-        quota_metrics = {
-            "google_remaining": google_meta["remaining_fraction"],
-            "google_reset_hrs": google_meta["hours_to_reset"],
-            "ag_anthropic_remaining": ag_anthropic_meta["remaining_fraction"],
-            "ag_anthropic_reset_hrs": ag_anthropic_meta["hours_to_reset"],
-            "anthropic_remaining": anthropic_meta["remaining_fraction"],
-            "anthropic_reset_hrs": anthropic_meta["hours_to_reset"],
-            "codex_remaining": codex_meta["remaining_fraction"],
-            "codex_reset_hrs": codex_meta["hours_to_reset"],
-            "codex_burn_headroom": codex_meta["burn_headroom"],
-        }
-
         # 2. Codex pro 7d window (Spark excluded): promote while it would expire unused,
-        # hold back while it is being spent ahead of pace.
+        # hold back while it is being spent ahead of pace. Reported Codex metrics come from
+        # this pro window, not from whichever account is the default lane (a free account
+        # at 0% used would otherwise mask a nearly spent pro window).
+        codex_pro_remaining = codex_meta.get("pro_remaining", codex_meta["remaining_fraction"])
         codex_pro_hrs = codex_meta.get("pro_hours_to_reset", codex_meta["hours_to_reset"])
         codex_pro_headroom = codex_meta.get("pro_headroom", codex_meta["burn_headroom"])
-        codex_pro_used = 1.0 - codex_meta.get("pro_remaining", codex_meta["remaining_fraction"])
+        codex_pro_used = 1.0 - codex_pro_remaining
 
         codex_near_reset_surplus = (
             allow_codex_promotion
@@ -445,16 +541,12 @@ class ResetAwareModelSelector:
             and codex_pro_hrs <= SURPLUS_WINDOW_HOURS
             and codex_pro_headroom >= SURPLUS_PACE_HEADROOM
         )
-        # Tolerance band: throttle only when headroom < 0.90 AND at least 50% consumed.
-        # This prevents a single task early in the week from making Codex emergency-only.
         codex_throttled = (
             codex_meta["is_available"]
             and codex_pro_headroom < CODEX_PACE_MIN_HEADROOM
             and codex_pro_used >= CODEX_PACE_USED_FLOOR
         )
         codex_usable = codex_meta["is_available"] and not codex_throttled
-        quota_metrics["codex_pro_headroom"] = codex_pro_headroom
-        quota_metrics["codex_pro_throttled"] = codex_throttled
 
         # Antigravity Claude runs on a free daily window. Only a window the snapshot
         # actually reports counts; an unreported family is not assumed to exist.
@@ -467,280 +559,209 @@ class ResetAwareModelSelector:
             f"resets in {ag_anthropic_meta['hours_to_reset']:.1f}h"
         )
 
-        # 3. Direct Anthropic 7d window is the Opus orchestrator's budget. Workers only get
-        # the slack behind pace; stale or unknown data never counts as slack.
-        # Gate on BOTH the 5h and 7d windows: the 5h window is protected by an explicit
-        # floor so workers cannot drain it beyond ANTHROPIC_5H_MAX_USED.
-        anthropic_cycle_hrs = anthropic_meta.get("cycle_hours_to_reset", anthropic_meta["hours_to_reset"])
+        # 3. Direct Anthropic 7d window is the orchestrator's budget. Slack exists only while
+        # it runs behind pace AND its tightest window (normally 5h) is below the used cap;
+        # stale or unknown data never counts as slack.
         anthropic_headroom = anthropic_meta.get("cycle_headroom", 1.0)
-        anthropic_5h_used = 1.0 - anthropic_meta["remaining_fraction"]
-        anthropic_5h_ok = anthropic_5h_used < ANTHROPIC_5H_MAX_USED
+        anthropic_bottleneck_used = 1.0 - anthropic_meta["remaining_fraction"]
         anthropic_worker_ok = (
             anthropic_meta["status"] == "ok"
             and anthropic_headroom >= ANTHROPIC_WORKER_MIN_HEADROOM
-            and anthropic_5h_ok
+            and anthropic_bottleneck_used < ANTHROPIC_BOTTLENECK_MAX_USED
         )
-        # Low/medium work takes Anthropic only when its surplus is about to expire.
-        anthropic_surplus = (
-            anthropic_worker_ok
-            and anthropic_cycle_hrs <= SURPLUS_WINDOW_HOURS
-            and anthropic_headroom >= SURPLUS_PACE_HEADROOM
-        )
-        quota_metrics["anthropic_headroom"] = anthropic_headroom
-        quota_metrics["anthropic_5h_used"] = anthropic_5h_used
-        quota_metrics["anthropic_orchestrator_reserve"] = not anthropic_worker_ok
 
-        # 3b. Chinese-model worker slots: credential-gated, first-class when active.
-        zai_available = _chinese_provider_available(ZAI_CREDENTIAL_ENV)
-        minimax_available = _chinese_provider_available(MINIMAX_CREDENTIAL_ENV)
-        # When Z.AI is available, GLM-5.3 (TB4 41.9%) ranks above DeepSeek Flash (TB4 26.8%)
-        # for medium-risk work. It is the preferred overflow for implementation.
-        overflow_model = MODEL_ZAI_GLM if zai_available else MODEL_DEEPSEEK_FLASH
-        overflow_fallback = MODEL_DEEPSEEK_FLASH if zai_available else MODEL_OR_DEEPSEEK_FLASH
-        quota_metrics["zai_available"] = zai_available
-        quota_metrics["minimax_available"] = minimax_available
+        # 4. Credential-gated and pay-per-token tiers. A credentialed provider still yields
+        # to a cooldown or rate limit the snapshot reports for it.
+        credentialed = self.credentialed_providers
+        zai_ok = ZAI_PROVIDER in credentialed and self.evaluate_provider(ZAI_PROVIDER)["is_available"]
+        minimax_ok = MINIMAX_PROVIDER in credentialed and self.evaluate_provider(MINIMAX_PROVIDER)["is_available"]
+        deepseek_ok = deepseek_meta["is_available"]
+        google_ok = google_meta["is_available"]
 
-        # 4. Rework-Aware Routing: Force strong first-pass for critical domains or after invariant rework
+        quota_metrics = {
+            "google_remaining": google_meta["remaining_fraction"],
+            "google_reset_hrs": google_meta["hours_to_reset"],
+            "ag_anthropic_remaining": ag_anthropic_meta["remaining_fraction"],
+            "ag_anthropic_reset_hrs": ag_anthropic_meta["hours_to_reset"],
+            "anthropic_remaining": anthropic_meta["remaining_fraction"],
+            "anthropic_reset_hrs": anthropic_meta["hours_to_reset"],
+            "anthropic_headroom": anthropic_headroom,
+            "anthropic_bottleneck_used": anthropic_bottleneck_used,
+            "anthropic_orchestrator_reserve": not anthropic_worker_ok,
+            "codex_remaining": codex_pro_remaining,
+            "codex_reset_hrs": codex_pro_hrs,
+            "codex_burn_headroom": codex_pro_headroom,
+            "codex_pro_headroom": codex_pro_headroom,
+            "codex_pro_throttled": codex_throttled,
+            "codex_lane_remaining": codex_meta["remaining_fraction"],
+            "codex_lane_reset_hrs": codex_meta["hours_to_reset"],
+            "zai_available": zai_ok,
+            "minimax_available": minimax_ok,
+        }
+
+        # 5. Rework-aware routing: force a strong first pass for critical domains or after rework.
         HIGH_RISK_DOMAINS = {"state_machine", "auth", "money", "concurrency", "migration", "schema", "invariants"}
         is_rework_critical = (
             risk_level == RiskLevel.HIGH
             or rework_count >= 1
             or (domain_tags is not None and any(t in HIGH_RISK_DOMAINS for t in domain_tags))
         )
-        selected_model: str
-        fallback_model: str
-        reasoning: str
-        promotion_applied = False
-        cooldown_fallback = False
         evidence_packet_required = risk_level in (RiskLevel.MEDIUM, RiskLevel.HIGH) or task_type == TaskType.STRONG_REVIEW
 
-        def strong_ladder(anthropic_model: str, label: str) -> Tuple[str, str, str, bool, bool]:
-            """High-risk ladder: (selected, fallback, reasoning, promotion, cooldown).
+        codex_promo = _Rung(
+            MODEL_CODEX_ASTRA, codex_near_reset_surplus,
+            f"Codex pro weekly window resets in {codex_pro_hrs:.1f}h at {codex_pro_headroom:.2f}x pace "
+            "headroom; promoted Codex Astra to spend allowance that would otherwise expire.",
+            promotion=True,
+        )
+        astra_on_pace = _Rung(
+            MODEL_CODEX_ASTRA, codex_usable,
+            f"Codex Astra medium ({codex_pro_headroom:.2f}x pace headroom).",
+        )
+        astra_emergency = _Rung(
+            MODEL_CODEX_ASTRA, codex_meta["is_available"],
+            "only Codex ahead of pace remains; spending its emergency reserve.",
+            cooldown=True,
+        )
+        ag_opus = _Rung(
+            MODEL_AG_CLAUDE_OPUS, ag_claude_ok,
+            f"Antigravity Claude Opus 4.6 (free daily window, expires before any weekly window). {ag_claude_note}.",
+        )
+        glm = _Rung(MODEL_ZAI_GLM, zai_ok, "Z.AI GLM-5.3 (credentialed Coding Plan).")
+        deepseek_pro = _Rung(MODEL_DEEPSEEK_PRO, deepseek_ok, "DeepSeek V4 Pro (pay-per-token, 1M context).")
+        # Worker ladders reach paid Anthropic only when every cheap tier above is out, only
+        # on slack behind pace, and never as a fallback.
+        fable_last_resort = _Rung(
+            MODEL_CLAUDE_FABLE, anthropic_worker_ok,
+            f"every cheap tier is unavailable; last resort on Anthropic slack ({anthropic_headroom:.2f}x behind pace, "
+            "orchestrator reserve untouched).",
+            cooldown=True, as_fallback=False,
+        )
 
-            Order spends what expires first: Codex surplus about to reset, then the free
-            Antigravity Claude daily window, then Anthropic slack behind pace, then Codex
-            on pace; the orchestrator's Anthropic reserve and Codex ahead of pace only as
-            emergencies. Flash, DeepSeek and free models never qualify.
-
-            Every fallback pair crosses a provider/credential boundary (Antigravity to
-            Codex or DeepSeek; Anthropic to Codex; Codex to Anthropic or DeepSeek).
-            """
-            if codex_near_reset_surplus:
-                # Codex Sol → cross-provider fallback
-                fallback = anthropic_model if anthropic_worker_ok else (
-                    MODEL_AG_CLAUDE_OPUS if ag_claude_ok else MODEL_DEEPSEEK_PRO
-                )
-                return (
-                    MODEL_CODEX_SOL, fallback,
-                    f"{label}: Codex pro weekly window resets in {codex_pro_hrs:.1f}h at "
-                    f"{codex_pro_headroom:.2f}x pace headroom. Promoted Codex Sol to spend allowance "
-                    "that would otherwise expire.",
-                    True, False,
-                )
-            if ag_claude_ok:
-                # AG Claude → cross-provider fallback (Codex or DeepSeek, never AG/Anthropic)
-                if codex_usable:
-                    fallback = MODEL_CODEX_SOL
-                elif anthropic_worker_ok:
-                    fallback = anthropic_model
-                else:
-                    fallback = MODEL_DEEPSEEK_PRO
-                return (
-                    MODEL_AG_CLAUDE_OPUS, fallback,
-                    f"{label} on Antigravity Claude Opus 4.6: its daily window expires before any "
-                    f"weekly window. {ag_claude_note}.",
-                    False, False,
-                )
-            if anthropic_worker_ok:
-                # Anthropic → cross-provider fallback (Codex, not another Anthropic model)
-                fallback = MODEL_CODEX_SOL if codex_usable else MODEL_DEEPSEEK_PRO
-                return (
-                    anthropic_model, fallback,
-                    f"{label} on {anthropic_model}: the Anthropic weekly window runs "
-                    f"{anthropic_headroom:.2f}x behind pace, so slack beyond the orchestrator's share is spent.",
-                    False, False,
-                )
-            if codex_usable:
-                # Codex Sol → cross-provider fallback (DeepSeek Pro, not another Codex model)
-                return (
-                    MODEL_CODEX_SOL, MODEL_DEEPSEEK_PRO,
-                    f"{label} on Codex Sol ({codex_pro_headroom:.2f}x pace headroom); direct Anthropic "
-                    "stays reserved for the Opus orchestrator.",
-                    False, False,
-                )
-            if anthropic_meta["is_available"]:
-                # Emergency: Anthropic reserve → cross-provider fallback (Codex or DeepSeek)
-                fallback = MODEL_CODEX_SOL if codex_meta["is_available"] else MODEL_DEEPSEEK_PRO
-                return (
-                    anthropic_model, fallback,
-                    f"{label}: no worker allowance left; drawing on the Anthropic orchestrator reserve.",
-                    False, True,
-                )
-            if codex_meta["is_available"]:
-                return (
-                    MODEL_CODEX_SOL, MODEL_DEEPSEEK_PRO,
-                    f"{label}: only Codex pro ahead of pace remains; spending its emergency reserve (Flash barred).",
-                    False, True,
-                )
-            return (
-                MODEL_GEMINI_PRO, MODEL_DEEPSEEK_PRO,
-                f"{label}: all strong models unavailable or in cooldown; emergency fallback to Gemini Pro "
-                "(Flash barred from high-risk work and structural failure retry).",
-                False, True,
-            )
-
-        # CASE A: DEEP CONTEXT (> 180k tokens)
         if context_tokens > 180000 or task_type == TaskType.DEEP_CONTEXT:
-            # Multi-provider deep context support: Gemini 3.1 Pro (2M) or Claude Opus (200k)
-            if google_meta["is_available"]:
-                selected_model = MODEL_GEMINI_PRO
-                # Cross-provider: google → anthropic (or deepseek)
-                fallback_model = MODEL_CLAUDE_FABLE if anthropic_meta["is_available"] else MODEL_DEEPSEEK_PRO
-                reasoning = f"Context size {context_tokens} tokens routed to Gemini 3.1 Pro ({VERIFIED_CONTEXT_WINDOWS.get(MODEL_GEMINI_PRO, '1M')} token window)."
-            elif anthropic_meta["is_available"]:
-                selected_model = MODEL_CLAUDE_FABLE
-                # Cross-provider: anthropic → codex (or deepseek)
-                fallback_model = MODEL_CODEX_SOL if codex_usable else MODEL_DEEPSEEK_PRO
-                reasoning = f"Context size {context_tokens} tokens routed to Claude Fable ({VERIFIED_CONTEXT_WINDOWS.get(MODEL_CLAUDE_FABLE, '200k')} token window)."
-            else:
-                selected_model = MODEL_GEMINI_FLASH
-                fallback_model = MODEL_DEEPSEEK_FLASH
-                cooldown_fallback = True
-                reasoning = "Emergency deep-context fallback."
+            # CASE A: DEEP CONTEXT (> 180k tokens): 1M-context tiers only.
+            label = f"Deep context ({context_tokens} tokens)"
+            rungs = [
+                _Rung(MODEL_GEMINI_PRO, google_ok, "Gemini 3.1 Pro (1M-token window)."),
+                _Rung(MODEL_DEEPSEEK_PRO, deepseek_ok, "Gemini unavailable; DeepSeek V4 Pro (1M-token window).", cooldown=True),
+                _Rung(MODEL_MINIMAX_M3, minimax_ok, "MiniMax-M3 (1M-token window, credentialed).", cooldown=True),
+                fable_last_resort,
+            ]
+            last_resort = _Rung(MODEL_DEEPSEEK_PRO, True, "all 1M-context tiers unavailable; pay-per-token DeepSeek V4 Pro.", cooldown=True)
+            final_fallbacks = [MODEL_OR_DEEPSEEK_FLASH]
 
-        # CASE B: STRONG REVIEW — Opus/ag-opus allowed here for HIGH risk only
+        elif task_type == TaskType.STRONG_REVIEW and is_rework_critical:
+            # CASE B1: HIGH-RISK REVIEW ladder. The one worker lane where paid Anthropic
+            # (Fable) is a regular rung: slack behind pace first, the orchestrator reserve only
+            # after Codex on pace is out. Flash, DeepSeek Flash and free models never qualify.
+            label = "High-risk review"
+            rungs = [
+                codex_promo,
+                ag_opus,
+                _Rung(MODEL_CLAUDE_FABLE, anthropic_worker_ok,
+                      f"Claude Fable: the Anthropic weekly window runs {anthropic_headroom:.2f}x behind pace, "
+                      "so slack beyond the orchestrator's share is spent on review."),
+                astra_on_pace,
+                _Rung(MODEL_CLAUDE_FABLE, anthropic_meta["is_available"],
+                      "no review allowance left elsewhere; drawing on the Anthropic orchestrator reserve.",
+                      cooldown=True, as_fallback=False),
+                astra_emergency,
+                _Rung(MODEL_GEMINI_PRO, google_ok, "all strong reviewers unavailable; emergency Gemini Pro.", cooldown=True),
+                _Rung(MODEL_DEEPSEEK_PRO, deepseek_ok, "all strong reviewers unavailable; emergency DeepSeek V4 Pro.", cooldown=True),
+            ]
+            last_resort = _Rung(MODEL_GEMINI_PRO, True, "all strong models unavailable or in cooldown; emergency Gemini Pro.", cooldown=True)
+            final_fallbacks = [MODEL_DEEPSEEK_PRO, MODEL_CODEX_ASTRA]
+
+        elif is_rework_critical and task_type in (TaskType.ROUTINE_EXECUTION, TaskType.DEEP_REASONING):
+            # CASE B2: HIGH-RISK WORKER ladder (implementation first pass, deep reasoning), in the
+            # operator's order: GLM-5.3 (credentialed) -> Codex Astra medium -> DeepSeek V4 Pro ->
+            # Antigravity Opus -> Fable last resort. Expiring Codex surplus is promoted to the top.
+            # Codex ahead of pace and Gemini Pro are emergency rungs, still ahead of Fable.
+            label = ("High-risk implementation first pass" if task_type == TaskType.ROUTINE_EXECUTION
+                     else "High-risk deep reasoning")
+            rungs = [
+                codex_promo,
+                glm,
+                astra_on_pace,
+                deepseek_pro,
+                ag_opus,
+                astra_emergency,
+                _Rung(MODEL_GEMINI_PRO, google_ok, "strong worker tiers unavailable; emergency Gemini Pro.", cooldown=True),
+                fable_last_resort,
+            ]
+            last_resort = _Rung(MODEL_DEEPSEEK_PRO, True, "all worker tiers unavailable; pay-per-token DeepSeek V4 Pro.", cooldown=True)
+            final_fallbacks = [MODEL_CODEX_ASTRA, MODEL_GEMINI_PRO]
+
+        elif task_type == TaskType.STRONG_REVIEW and risk_level == RiskLevel.MEDIUM:
+            # CASE C: MEDIUM-RISK REVIEW — worker tiers only, never paid Anthropic.
+            label = "Medium-risk review"
+            rungs = [
+                codex_promo,
+                ag_opus,
+                astra_on_pace,
+                glm,
+                _Rung(MODEL_GEMINI_FLASH, google_ok, "Gemini 3.8 Flash; direct Anthropic reserved for the orchestrator."),
+                _Rung(MODEL_DEEPSEEK_FLASH, deepseek_ok, "overflow to DeepSeek V4.1 Flash.", cooldown=True),
+            ]
+            last_resort = _Rung(MODEL_OR_DEEPSEEK_FLASH, True, "all review tiers unavailable; OpenRouter DeepSeek Flash.", cooldown=True)
+            final_fallbacks = [MODEL_DEEPSEEK_FLASH]
+
         elif task_type == TaskType.STRONG_REVIEW:
-            if is_rework_critical:
-                # High-risk review: strong models only; Flash is barred as primary or fallback gate.
-                # Opus IS allowed for high-risk review (the one place workers may use it).
-                selected_model, fallback_model, reasoning, promotion_applied, cooldown_fallback = strong_ladder(
-                    MODEL_CLAUDE_FABLE, "High-risk review"
-                )
-            elif risk_level == RiskLevel.MEDIUM:
-                if codex_near_reset_surplus:
-                    selected_model = MODEL_CODEX_SOL
-                    # Cross-provider: codex → AG or deepseek
-                    fallback_model = MODEL_AG_CLAUDE_OPUS if ag_claude_ok else MODEL_DEEPSEEK_FLASH
-                    promotion_applied = True
-                    reasoning = "Medium-risk review: Promoted Codex Sol near reset to consume surplus capacity."
-                elif ag_claude_ok:
-                    selected_model = MODEL_AG_CLAUDE_OPUS
-                    # Cross-provider: AG → codex or deepseek (never AG → AG)
-                    fallback_model = MODEL_CODEX_SOL if codex_usable else MODEL_DEEPSEEK_FLASH
-                    reasoning = (
-                        "Medium-risk review on Antigravity Claude Opus 4.6: its daily window expires unused "
-                        f"long before any weekly window. {ag_claude_note}."
-                    )
-                elif anthropic_surplus:
-                    selected_model = MODEL_CLAUDE_FABLE
-                    # Cross-provider: anthropic → codex or deepseek
-                    fallback_model = MODEL_CODEX_SOL if codex_usable else MODEL_DEEPSEEK_FLASH
-                    reasoning = "Medium-risk review: Anthropic weekly surplus expires soon, routing to Claude Fable."
-                elif codex_usable:
-                    selected_model = MODEL_CODEX_SOL
-                    # Cross-provider: codex → deepseek
-                    fallback_model = MODEL_DEEPSEEK_FLASH
-                    reasoning = "Medium-risk review on Codex Sol (on pace); direct Anthropic reserved for the orchestrator."
-                else:
-                    selected_model = MODEL_GEMINI_FLASH
-                    fallback_model = MODEL_DEEPSEEK_FLASH
-                    reasoning = "Medium-risk review on Gemini 3.8 Flash; direct Anthropic reserved for the orchestrator."
-            else:
-                # Low-risk review: Flash 3.8 is safe and fast
-                # Cross-provider: google → deepseek (never google → anthropic for workers)
-                selected_model = MODEL_GEMINI_FLASH
-                fallback_model = MODEL_DEEPSEEK_FLASH
-                reasoning = "Low-risk review: Gemini 3.8 Flash fast review execution."
+            # CASE D: LOW-RISK REVIEW — Flash 3.8 is safe and fast.
+            label = "Low-risk review"
+            rungs = [
+                _Rung(MODEL_GEMINI_FLASH, google_ok, "Gemini 3.8 Flash fast review execution."),
+                _Rung(MODEL_DEEPSEEK_FLASH, deepseek_ok, "Gemini unavailable; DeepSeek V4.1 Flash.", cooldown=True),
+            ]
+            last_resort = _Rung(MODEL_OR_DEEPSEEK_FLASH, True, "OpenRouter DeepSeek Flash.", cooldown=True)
+            final_fallbacks = [MODEL_DEEPSEEK_FLASH]
 
-        # CASE C: DEEP REASONING / ARCHITECTURE — no Opus for workers
         elif task_type == TaskType.DEEP_REASONING:
-            if is_rework_critical:
-                # High-risk reasoning: Codex Astra/Sol, NOT Opus (Opus reserved for high-risk review only).
-                selected_model, fallback_model, reasoning, promotion_applied, cooldown_fallback = strong_ladder(
-                    MODEL_CLAUDE_FABLE, "High-risk deep reasoning"
-                )
-            else:
-                # Medium or Low risk reasoning:
-                if codex_near_reset_surplus:
-                    selected_model = MODEL_CODEX_SOL
-                    # Cross-provider: codex → AG or deepseek
-                    fallback_model = MODEL_AG_CLAUDE_OPUS if ag_claude_ok else MODEL_DEEPSEEK_FLASH
-                    promotion_applied = True
-                    reasoning = (
-                        f"Deep reasoning: Codex weekly window resets in {codex_meta['hours_to_reset']:.1f}h "
-                        f"with {codex_meta['remaining_fraction']*100:.1f}% allowance. Promoted Codex Sol to prevent waste."
-                    )
-                elif ag_claude_ok:
-                    selected_model = MODEL_AG_CLAUDE_OPUS
-                    # Cross-provider: AG → codex or deepseek
-                    fallback_model = MODEL_CODEX_SOL if codex_usable else MODEL_DEEPSEEK_FLASH
-                    reasoning = f"Deep reasoning on Antigravity Claude Opus 4.6 before paid Anthropic. {ag_claude_note}."
-                elif anthropic_surplus:
-                    selected_model = MODEL_CLAUDE_FABLE
-                    # Cross-provider: anthropic → codex or deepseek
-                    fallback_model = MODEL_CODEX_SOL if codex_usable else MODEL_DEEPSEEK_FLASH
-                    reasoning = "Deep reasoning on Claude Fable: Anthropic weekly surplus expires soon."
-                elif google_meta["is_available"]:
-                    # Preserve distant Anthropic, use abundant Gemini Flash for low-medium risk
-                    selected_model = MODEL_GEMINI_FLASH
-                    fallback_model = MODEL_CODEX_SOL if codex_usable else MODEL_DEEPSEEK_FLASH
-                    reasoning = (
-                        "Deep reasoning: Preserving distant-reset Anthropic capacity "
-                        f"({anthropic_meta['hours_to_reset']:.1f}h to reset); using abundant Gemini 3.8 Flash."
-                    )
-                elif codex_usable:
-                    selected_model = MODEL_CODEX_SOL
-                    fallback_model = MODEL_DEEPSEEK_FLASH
-                    cooldown_fallback = True
-                    reasoning = "Gemini unavailable; deep reasoning on Codex Sol (on pace), Anthropic reserved for the orchestrator."
-                else:
-                    selected_model = MODEL_DEEPSEEK_FLASH
-                    fallback_model = MODEL_OR_DEEPSEEK_FLASH
-                    cooldown_fallback = True
-                    reasoning = "Gemini and Codex unavailable or ahead of pace; deep reasoning overflow to DeepSeek V4.1 Flash."
-        # CASE D: TINY TASK (Compaction / Commits)
-        elif task_type == TaskType.TINY_TASK:
-            selected_model = MODEL_GEMINI_LITE
-            # Cross-provider: google → deepseek
-            fallback_model = MODEL_DEEPSEEK_FLASH
-            reasoning = "Lightweight background / compaction task routed to Gemini 3.1 Flash Lite."
+            # CASE E: LOW/MEDIUM DEEP REASONING — worker tiers only, never paid Anthropic.
+            label = "Deep reasoning"
+            rungs = [
+                codex_promo,
+                ag_opus,
+                _Rung(MODEL_GEMINI_FLASH, google_ok, "abundant Gemini 3.8 Flash; direct Anthropic reserved for the orchestrator."),
+                _Rung(MODEL_CODEX_ASTRA, codex_usable, "Gemini unavailable; Codex Astra medium (on pace).", cooldown=True),
+                _Rung(MODEL_ZAI_GLM, zai_ok, "Gemini and Codex unavailable; Z.AI GLM-5.3.", cooldown=True),
+                _Rung(MODEL_DEEPSEEK_FLASH, deepseek_ok, "Gemini and Codex unavailable; DeepSeek V4.1 Flash overflow.", cooldown=True),
+            ]
+            last_resort = _Rung(MODEL_OR_DEEPSEEK_FLASH, True, "all reasoning tiers unavailable; OpenRouter DeepSeek Flash.", cooldown=True)
+            final_fallbacks = [MODEL_DEEPSEEK_FLASH]
 
-        # CASE E: ROUTINE EXECUTION (Implementation, Mapping, Routine QA) — no Opus
+        elif task_type == TaskType.TINY_TASK:
+            # CASE F: TINY TASK / BULK TRIAGE (compaction, commits, classification).
+            label = "Lightweight / bulk triage task"
+            rungs = [
+                _Rung(MODEL_GEMINI_LITE, google_ok, "Gemini 3.1 Flash Lite."),
+                _Rung(MODEL_ZAI_GLM_FLASH, zai_ok, "Z.AI GLM-5.3-Flash (credentialed).", cooldown=True),
+                _Rung(MODEL_MINIMAX_M3, minimax_ok, "MiniMax-M3 (credentialed, bulk/triage only).", cooldown=True),
+                _Rung(MODEL_DEEPSEEK_FLASH, deepseek_ok, "DeepSeek V4.1 Flash.", cooldown=True),
+            ]
+            last_resort = _Rung(MODEL_OR_DEEPSEEK_FLASH, True, "OpenRouter DeepSeek Flash.", cooldown=True)
+            final_fallbacks = [MODEL_DEEPSEEK_FLASH]
+
         else:
-            if is_rework_critical:
-                # High-risk first pass (state machines, auth, money, migrations, concurrency):
-                # Codex Astra/Sol or DeepSeek Pro; Opus reserved for high-risk review only.
-                selected_model, fallback_model, reasoning, promotion_applied, cooldown_fallback = strong_ladder(
-                    MODEL_CLAUDE_FABLE, "High-risk implementation first pass (to prevent invariant rework)"
-                )
-            elif codex_near_reset_surplus and risk_level != RiskLevel.LOW:
-                # Promote Codex Fast for capable implementation when Codex capacity is expiring
-                selected_model = MODEL_CODEX_FAST
-                fallback_model = overflow_model  # GLM-5.3 if available, else DeepSeek Flash
-                promotion_applied = True
-                reasoning = (
-                    f"Routine execution: Codex Pro allowance expiring in {codex_pro_hrs:.1f}h "
-                    f"({codex_pro_headroom:.2f}x pace headroom). Promoted Codex Fast to burn surplus capacity."
-                )
-            elif google_meta["is_available"]:
-                selected_model = MODEL_GEMINI_FLASH
-                fallback_model = overflow_model  # GLM-5.3 if available, else DeepSeek Flash
-                reasoning = (
-                    "Primary abundant execution lane: Gemini 3.8 Flash (Ultra daily allowance); "
-                    f"{overflow_model} is the overflow tier."
-                )
-            elif codex_usable:
-                selected_model = MODEL_CODEX_FAST
-                fallback_model = overflow_model
-                cooldown_fallback = True
-                reasoning = "Google Antigravity in cooldown; falling back to Codex Fast (subscription headroom) for execution."
-            else:
-                # Subscription lanes are exhausted, in cooldown or throttled: the cheap
-                # pay-per-token tier (or GLM-5.3 if available) takes routine work.
-                selected_model = overflow_model
-                fallback_model = overflow_fallback
-                cooldown_fallback = True
-                reasoning = f"Gemini Flash and Codex unavailable or throttled; overflow to {overflow_model}."
+            # CASE G: ROUTINE EXECUTION (low/medium implementation, mapping, routine QA).
+            # Gemini Flash is the abundant default; GLM-5.3 (credentialed) or DeepSeek Flash
+            # is the overflow and the fallback.
+            label = "Routine execution"
+            rungs = [
+                _Rung(MODEL_CODEX_FAST, codex_near_reset_surplus and risk_level != RiskLevel.LOW,
+                      f"Codex pro allowance expiring in {codex_pro_hrs:.1f}h ({codex_pro_headroom:.2f}x pace "
+                      "headroom); promoted Codex Fast to burn surplus capacity.", promotion=True),
+                _Rung(MODEL_GEMINI_FLASH, google_ok,
+                      "primary abundant execution lane: Gemini 3.8 Flash (Ultra daily allowance).", as_fallback=False),
+                _Rung(MODEL_CODEX_FAST, codex_usable,
+                      "Google Antigravity in cooldown; Codex Fast (subscription headroom).", cooldown=True, as_fallback=False),
+                _Rung(MODEL_ZAI_GLM, zai_ok, "overflow to Z.AI GLM-5.3 (credentialed).", cooldown=True),
+                _Rung(MODEL_DEEPSEEK_FLASH, deepseek_ok, "overflow to DeepSeek V4.1 Flash.", cooldown=True),
+            ]
+            last_resort = _Rung(MODEL_OR_DEEPSEEK_FLASH, True, "all execution tiers unavailable; OpenRouter DeepSeek Flash.", cooldown=True)
+            final_fallbacks = [MODEL_DEEPSEEK_FLASH]
+
+        chosen, fallback_model = _climb(rungs, last_resort, final_fallbacks)
 
         # Free OpenRouter second opinion for reviews: advisory only (1000 req/day free tier),
         # never a merge gate, never an approval, never a replacement for the review above.
@@ -750,12 +771,12 @@ class ResetAwareModelSelector:
             task_type=task_type.value,
             risk_level=risk_level.value,
             context_tokens=context_tokens,
-            selected_model=selected_model,
+            selected_model=chosen.model,
             fallback_model=fallback_model,
-            reasoning=reasoning,
-            burn_headroom=codex_meta["burn_headroom"],
-            promotion_applied=promotion_applied,
-            cooldown_fallback=cooldown_fallback,
+            reasoning=f"{label}: {chosen.reason}",
+            burn_headroom=codex_pro_headroom,
+            promotion_applied=chosen.promotion,
+            cooldown_fallback=chosen.cooldown,
             provider_statuses=provider_statuses,
             quota_metrics=quota_metrics,
             evidence_packet_required=evidence_packet_required,
