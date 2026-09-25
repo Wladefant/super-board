@@ -25,6 +25,8 @@ Verifies:
 
 import copy
 import itertools
+import socket
+import yaml
 import json
 import os
 import shutil
@@ -73,6 +75,7 @@ from model_routing import (
     MODEL_CLAUDE_FABLE,
     MODEL_CODEX_FAST,
     MODEL_CODEX_ASTRA,
+    MODEL_CODEX_SPARK,
     MODEL_GEMINI_FLASH,
     MODEL_GEMINI_LITE,
     MODEL_GEMINI_PRO,
@@ -86,6 +89,9 @@ from model_routing import (
     MODEL_ZAI_GLM,
     MODEL_ZAI_GLM_FLASH,
     MODEL_MINIMAX_M3,
+    MODEL_CHATGPT_WEB,
+    CHATGPT_WEB_PROVIDER,
+    chatgpt_web_bridge_available,
     CODEX_PACE_MIN_HEADROOM,
     CODEX_PACE_USED_FLOOR,
     ANTHROPIC_BOTTLENECK_MAX_USED,
@@ -124,6 +130,13 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         quota_patch = mock.patch("model_routing.load_quota_snapshot", return_value=QuotaSnapshot())
         quota_patch.start()
         self.addCleanup(quota_patch.stop)
+
+        # Hermetic bridge state: the live chatgpt-web bridge on 127.0.0.1:17841 is not test
+        # input, so every selector here sees it closed unless a test pins it explicitly with
+        # `chatgpt_web_bridge=True`.
+        bridge_patch = mock.patch("model_routing.chatgpt_web_bridge_available", return_value=False)
+        bridge_patch.start()
+        self.addCleanup(bridge_patch.stop)
 
         # Base realistic mock JSON simulating live veyyon usage output
         self.mock_now_ms = 1788598659263  # 2026-09-05T08:57:39Z
@@ -1227,10 +1240,13 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         self.assertEqual(model_to_provider(MODEL_MINIMAX_M3), "minimax")
         self.assertEqual(model_to_provider(MODEL_AG_CLAUDE_OPUS), "google-antigravity")
         self.assertEqual(model_to_provider(MODEL_DEEPSEEK_PRO), "deepseek")
+        self.assertEqual(model_to_provider(MODEL_CHATGPT_WEB), CHATGPT_WEB_PROVIDER)
         # Every role this router emits for a pinned model resolves back to that role, so a
-        # dispatched role never silently runs a different model.
+        # dispatched role never silently runs a different model. The review roles are
+        # resolved as reviews, because that is the only way the router emits them.
+        review_pins = {"codex-reviewer", "web-thinker"}
         for role, model in ROLE_MODEL_PINS.items():
-            task_type = TaskType.STRONG_REVIEW if role == "codex-reviewer" else TaskType.ROUTINE_EXECUTION
+            task_type = TaskType.STRONG_REVIEW if role in review_pins else TaskType.ROUTINE_EXECUTION
             self.assertEqual(model_to_agent_role(model, task_type, RiskLevel.HIGH), role, f"{role} pin {model}")
         print("  [PASS] All role and provider mappings correct (ag-sonnet, ag-gpt, ds-pro, zai-task, zai-flash, minimax-task).")
 
@@ -1479,6 +1495,290 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         rec_reserve = self._selector(usage_reserve).select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.HIGH)
         self.assertNotIn("anthropic/", rec_reserve.selected_model)
         print(f"  [PASS] Every cheap tier out: {rec_last.selected_model} on slack; reserve kept -> {rec_reserve.selected_model}.")
+
+    # -------------------------------------------------------------------------
+    # TEST 36: ChatGPT Web is gated on bridge health, never on a guessed allowance
+    # -------------------------------------------------------------------------
+    def test_chatgpt_web_bridge_precondition_and_ladder_placement(self):
+        print("\n--- TEST 36: ChatGPT Web Bridge Gating & Ladder Placement ---")
+        # The probe itself: a live loopback listener reads as up, a dead port as down. A dead
+        # bridge fails through the same OSError path, so a missing daemon can never hang a
+        # selector or be mistaken for available capacity.
+        listener = socket.socket()
+        self.addCleanup(listener.close)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        self.assertTrue(chatgpt_web_bridge_available(port=listener.getsockname()[1], timeout=1.0))
+        self.assertFalse(chatgpt_web_bridge_available(port=1, timeout=0.25))
+
+        usage = self._usage_with_ag_families(anthropic_used=0.0)
+        up = ResetAwareModelSelector(parse_usage_json(usage, current_time_ms=self.mock_now_ms),
+                                     chatgpt_web_bridge=True)
+        down = ResetAwareModelSelector(parse_usage_json(usage, current_time_ms=self.mock_now_ms),
+                                       chatgpt_web_bridge=False)
+
+        # Bridge up, free Antigravity Opus window fully available: the bridge still gates the
+        # critical diff, because it is cross-family to both writer families.
+        critical = up.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
+        self.assertEqual(critical.selected_model, MODEL_CHATGPT_WEB)
+        self.assertTrue(critical.quota_metrics["chatgpt_web_bridge_up"])
+        self.assertEqual(critical.provider_statuses[CHATGPT_WEB_PROVIDER], "ok")
+        self.assertEqual(model_to_agent_role(critical.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH),
+                         "web-thinker")
+        self.assertNotEqual(model_to_provider(critical.selected_model), model_to_provider(critical.fallback_model))
+
+        # Hard reasoning and the high-risk implementation first pass also lead with it.
+        self.assertEqual(up.select_model(TaskType.DEEP_REASONING, RiskLevel.MEDIUM).selected_model,
+                         MODEL_CHATGPT_WEB)
+        self.assertEqual(up.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.HIGH,
+                                         domain_tags=["money"]).selected_model, MODEL_CHATGPT_WEB)
+
+        # Standard-diff overflow: with every OpenCode Go rung out, a medium-risk review
+        # overflows to the bridge rather than to a Gemini model.
+        self.assertEqual(up.select_model(TaskType.STRONG_REVIEW, RiskLevel.MEDIUM).selected_model,
+                         MODEL_CHATGPT_WEB)
+
+        # Bridge down: the same ladders fall through to the next tier, and no chatgpt-web rung
+        # is ever selected or offered as a fallback anywhere.
+        self.assertEqual(down.select_model(TaskType.STRONG_REVIEW, RiskLevel.HIGH).selected_model,
+                         MODEL_AG_CLAUDE_OPUS)
+        for task_type in TaskType:
+            for risk in RiskLevel:
+                rec = down.select_model(task_type=task_type, risk_level=risk)
+                self.assertNotIn(MODEL_CHATGPT_WEB, (rec.selected_model, rec.fallback_model),
+                                 f"{task_type}/{risk} must fall through while the bridge is down")
+                self.assertFalse(rec.quota_metrics["chatgpt_web_bridge_up"])
+                self.assertEqual(rec.provider_statuses[CHATGPT_WEB_PROVIDER], "down")
+
+        # Its catalog window is respected: above it the rung is dropped, never dispatched blind.
+        self.assertEqual(VERIFIED_CONTEXT_WINDOWS[MODEL_CHATGPT_WEB], 111193)
+        wide = up.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH,
+                               context_tokens=VERIFIED_CONTEXT_WINDOWS[MODEL_CHATGPT_WEB] + 1)
+        self.assertNotEqual(wide.selected_model, MODEL_CHATGPT_WEB)
+        self.assertNotEqual(wide.fallback_model, MODEL_CHATGPT_WEB)
+        print("  [PASS] Bridge gates critical review, hard reasoning/implementation and standard "
+              "overflow; a dead bridge falls through on every ladder.")
+
+    # -------------------------------------------------------------------------
+    # TEST 37: Gemini never reviews — not as a pick, not as a fallback, at any risk or context
+    # -------------------------------------------------------------------------
+    def test_gemini_never_reviews(self):
+        print("\n--- TEST 37: Gemini Never Reviews (Family Independence) ---")
+        gemini = (MODEL_GEMINI_FLASH, MODEL_GEMINI_PRO, MODEL_GEMINI_LITE)
+        usage = self._usage_with_ag_families(anthropic_used=0.0)
+        for bridge in (True, False):
+            selector = ResetAwareModelSelector(parse_usage_json(usage, current_time_ms=self.mock_now_ms),
+                                               chatgpt_web_bridge=bridge)
+            for risk in RiskLevel:
+                for context in (10000, 200000):
+                    rec = selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=risk,
+                                                context_tokens=context)
+                    self.assertNotIn(rec.selected_model, gemini, f"bridge={bridge} {risk} {context}")
+                    self.assertNotIn(rec.fallback_model, gemini, f"bridge={bridge} {risk} {context}")
+        # The second opinion stays a free OpenRouter model: advisory, never a gate.
+        advisory = self._selector(usage).select_model(TaskType.STRONG_REVIEW, RiskLevel.MEDIUM)
+        self.assertEqual(advisory.advisory_model, MODEL_OR_FREE_ADVISORY)
+        print("  [PASS] No review ladder selects or falls back to a Gemini model; advisory stays free/non-gating.")
+
+    # -------------------------------------------------------------------------
+    # TEST 38: The installed profile config actually implements Option A
+    # -------------------------------------------------------------------------
+    def test_profile_config_implements_option_a(self):
+        print("\n--- TEST 38: Profile Config Implements Option A ---")
+        config_path = Path(os.path.expanduser("~/.veyyon/profiles/default/agent/config.yml"))
+        if not config_path.exists():
+            self.skipTest(f"profile config not installed at {config_path}")
+        parsed = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        model_roles = parsed.get("modelRoles") or {}
+        agents = (parsed.get("agent") or {}).get("agents") or {}
+
+        def chains(entry):
+            """Every `model` value of a spawnable agent, nested agents included."""
+            found, node = [], entry or {}
+            while isinstance(node, dict):
+                if node.get("model"):
+                    found.append(node["model"])
+                node = node.get("agents")
+            return found
+
+        # 1. Every router-emitted role exists and leads with the model the router pins, so a
+        # dispatched role can never silently run a different model.
+        for role, model in ROLE_MODEL_PINS.items():
+            chain = (agents.get(role) or {}).get("model") or model_roles.get(role)
+            self.assertIsNotNone(chain, f"{role} is not defined as a role or agent")
+            self.assertEqual(str(chain).split(",")[0].strip(), model, f"{role} must lead with {model}")
+
+        # 2. Paid Anthropic Opus is retired from every worker and reviewer chain; the
+        # interactive orchestrator (`modelRoles.default`) is explicitly out of scope.
+        paid_opus = "anthropic/claude-opus-5-5"
+        for role, chain in model_roles.items():
+            if role == "default":
+                continue
+            self.assertNotIn(paid_opus, str(chain), f"modelRoles.{role} must not run paid Opus")
+        for name, entry in agents.items():
+            for chain in chains(entry):
+                self.assertNotIn(paid_opus, str(chain), f"agents.{name} must not run paid Opus")
+        for pattern, chain in (parsed.get("retry") or {}).get("fallbackChains", {}).items():
+            self.assertNotIn(paid_opus, str(chain), f"retry.fallbackChains.{pattern} must not run paid Opus")
+
+        # 3. No review lane runs a Gemini model, and the shared Antigravity fallback chain no
+        # longer substitutes one: a Google-family outage takes every Gemini model with it, and
+        # a Gemini fallback would review a Gemini-authored diff.
+        for role in ("reviewer", "ag-opus", "go-review", "web-thinker", "codex-reviewer",
+                     "extra-review", "or-review"):
+            chain = (agents.get(role) or {}).get("model") or model_roles.get(role) or ""
+            self.assertNotIn("gemini", str(chain).lower(), f"review lane {role} must not run Gemini")
+        antigravity_chain = (parsed.get("retry") or {}).get("fallbackChains", {}).get("google-antigravity/*", [])
+        self.assertNotIn("gemini", str(antigravity_chain).lower(),
+                         "the Antigravity fallback chain must not substitute a Gemini model")
+
+        # 4. The critical-diff reviewer gates on the bridge first, then free Opus, then the
+        # cross-family Chinese reviewers, then DeepSeek.
+        critical_chain = str((agents.get("reviewer") or {}).get("model", ""))
+        self.assertEqual(critical_chain.split(",")[0].strip(), MODEL_CHATGPT_WEB)
+        for expected in ("google-antigravity/claude-opus-4-6", "opencode-go/glm-5.3",
+                         "opencode-go/qwen3.8-max", "deepseek/"):
+            self.assertIn(expected, critical_chain, f"critical review chain must offer {expected}")
+
+        # 5. The standard-diff reviewer is the cross-family Chinese chain with a DeepSeek
+        # fallback for the OpenCode Go limit, and the hard writer is GLM-5.3 or DeepSeek.
+        standard_chain = str(model_roles.get("go-review", ""))
+        self.assertEqual(standard_chain.split(",")[0].strip(), "opencode-go/glm-5.3")
+        self.assertIn("opencode-go/qwen3.8-max", standard_chain)
+        self.assertIn("deepseek/", standard_chain)
+        hard_writer = str(model_roles.get("go-deep", "")).split(",")
+        self.assertIn("opencode-go/glm-5.3", hard_writer)
+        self.assertTrue(any(m.startswith(("opencode-go/glm-5.3", "deepseek/")) for m in hard_writer),
+                        "the hard writer chain must be GLM-5.3 or DeepSeek V4 Pro")
+
+        # 6. A chatgpt-web lane has somewhere to go when the bridge is down.
+        web_chain = (parsed.get("retry") or {}).get("fallbackChains", {}).get("chatgpt-web/*", [])
+        self.assertTrue(any(not str(m).startswith("chatgpt-web/") for m in web_chain),
+                        "chatgpt-web lanes need a cross-provider fallback for a dead bridge")
+        print(f"  [PASS] {len(ROLE_MODEL_PINS)} role pins, zero paid Opus, zero Gemini review "
+              "lanes, bridge-first critical chain and Chinese standard chain verified in the "
+              "installed profile config.")
+
+    # -------------------------------------------------------------------------
+    # TEST 39: Nested sub-agents are enabled for every spawnable Chinese-model lane
+    # -------------------------------------------------------------------------
+    def test_nested_subagents_enabled_for_cheap_lanes(self):
+        print("\n--- TEST 39: Nested Sub-Agents On For Every Spawnable Cheap Lane ---")
+        config_path = Path(os.path.expanduser("~/.veyyon/profiles/default/agent/config.yml"))
+        if not config_path.exists():
+            self.skipTest(f"profile config not installed at {config_path}")
+        parsed = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        settings = parsed.get("agent") or {}
+        agents = settings.get("agents") or {}
+
+        def chain(record):
+            """The nested Agents chain: [self, agents, agents.agents, ...], as veyyon walks it."""
+            links, node = [], record
+            while isinstance(node, dict) and len(links) <= 64:
+                links.append(node)
+                node = node.get("agents")
+            return links
+
+        def lane_depth(record, session_depth):
+            """Mirror of veyyon's laneDepthOf: a level with `enabled: false` caps the depth."""
+            if "agents" not in record and "maxNestedSpawnDepth" in record:
+                return record["maxNestedSpawnDepth"]
+            links = chain(record)
+            for level, link in enumerate(links[1:], start=1):
+                if link.get("enabled") is False:
+                    return level - 1
+            if session_depth < 0:
+                return session_depth
+            return max(len(links) - 1, session_depth)
+
+        # Session-level spawn permission: with `agent.enabled` off the task tool disappears and
+        # no lane can delegate at all, so the whole nested policy hangs on this one setting.
+        self.assertTrue(settings.get("enabled", True), "agent.enabled must grant spawn permission")
+        session_depth = settings.get("maxNestedSpawnDepth", 0)
+        self.assertGreaterEqual(session_depth, 1, "the session must allow at least one nested level")
+
+        # Every lane the router routes Chinese/cheap work to is spawnable AND may spawn its own
+        # children with `agents: enabled: true`, so a lead lane can fan sub-slices out instead of
+        # working serially.
+        for role, child_model in (
+            ("task", True), ("qa-verifier", True), ("spark", False), ("reviewer", True),
+            ("ag-opus", True), ("ds-task", True), ("go-task", True), ("go-review", True),
+            ("go-deep", True), ("go-bulk", True),
+        ):
+            record = agents.get(role)
+            self.assertIsNotNone(record, f"{role} must exist as a spawnable agent")
+            self.assertTrue(record.get("enabled", True), f"{role} must be enabled in the roster")
+            level1 = record.get("agents")
+            self.assertIsInstance(level1, dict, f"{role} must declare a nested Agents chain")
+            self.assertIsNot(level1.get("enabled"), False, f"{role} must permit child lanes")
+            self.assertGreaterEqual(lane_depth(record, session_depth), 1,
+                                    f"{role} must be able to spawn at least one nested level")
+            if child_model:
+                self.assertTrue(str(level1.get("model", "")).strip(),
+                                f"{role} must name the model chain its children default to")
+
+        # Children run the cheapest adequate lane: one of the free/Flash/DeepSeek-Flash rungs,
+        # never paid Opus and never a paid Anthropic model anywhere in a child chain.
+        cheap_prefixes = ("google-antigravity/gemini-3.8-flash", "deepseek/", "openai-codex/gpt-5.3-codex-spark",
+                          "opencode-go/", "openrouter/deepseek/")
+        for role in ("task", "qa-verifier", "reviewer", "ag-opus", "ds-task", "go-task",
+                     "go-review", "go-deep", "go-bulk"):
+            child_chain = str(agents[role]["agents"].get("model", ""))
+            self.assertNotIn("anthropic/", child_chain, f"{role} children must not run paid Anthropic")
+            self.assertNotIn("opus", child_chain.lower(), f"{role} children must not run Opus")
+            for model in (m.strip() for m in child_chain.split(",") if m.strip()):
+                self.assertTrue(model.startswith(cheap_prefixes),
+                                f"{role} child default {model} is not a cheap adequate lane")
+
+        # The two lanes that deliberately stay parent-only are named here, so a future edit that
+        # silently stops every other lane from nesting fails this test instead of going unnoticed.
+        parent_only = {role for role, record in agents.items()
+                       if isinstance(record, dict) and lane_depth(record, session_depth) == 0}
+        self.assertEqual(parent_only, {"web-thinker"},
+                         "only the bridge thinker lane is deliberately parent-only")
+        print(f"  [PASS] agent.enabled grants spawning; {len(agents)} roster entries; every cheap "
+              f"Chinese lane nests to depth {session_depth} with cheap child chains; "
+              f"parent-only lanes: {sorted(parent_only)}.")
+
+    # -------------------------------------------------------------------------
+    # TEST 40: Every child-lane default maps to an enabled, spawnable roster entry
+    # -------------------------------------------------------------------------
+    def test_child_lane_defaults_resolve_to_enabled_roles(self):
+        print("\n--- TEST 40: Child-Lane Defaults Resolve To Enabled Agent Types ---")
+        config_path = Path(os.path.expanduser("~/.veyyon/profiles/default/agent/config.yml"))
+        if not config_path.exists():
+            self.skipTest(f"profile config not installed at {config_path}")
+        agents = ((yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}).get("agent") or {}).get("agents") or {}
+
+        # The nested Agents chain names the model a child lane runs by default. If that model
+        # maps to a role that is not in the roster, or is disabled in it, the parent's fan-out
+        # fails at spawn time — the drift this test exists to catch.
+        checked = set()
+        for role, record in agents.items():
+            level1 = (record or {}).get("agents")
+            if not isinstance(level1, dict):
+                continue
+            for model in (m.strip() for m in str(level1.get("model", "")).split(",") if m.strip()):
+                checked.add((role, model))
+        self.assertTrue(checked, "no nested Agents chain declares a child model")
+        for parent, model in sorted(checked):
+            for task_type, risk in ((TaskType.ROUTINE_EXECUTION, RiskLevel.LOW),
+                                    (TaskType.STRONG_REVIEW, RiskLevel.MEDIUM)):
+                child_role = model_to_agent_role(model, task_type, risk)
+                entry = agents.get(child_role)
+                self.assertIsNotNone(
+                    entry, f"{parent} child default {model} maps to unknown role {child_role} ({task_type})")
+                self.assertTrue(
+                    entry.get("enabled", True),
+                    f"{parent} child default {model} maps to disabled role {child_role} ({task_type})")
+
+        # The Spark allowance is its own enabled lane: routing its model to the Astral Codex
+        # roles would dispatch a disabled agent for a free, permitted lane.
+        self.assertEqual(model_to_agent_role(MODEL_CODEX_SPARK, TaskType.ROUTINE_EXECUTION, RiskLevel.LOW),
+                         "spark")
+        self.assertEqual(ROLE_MODEL_PINS["spark"], MODEL_CODEX_SPARK)
+        print(f"  [PASS] {len(checked)} child-lane defaults across {len(agents)} roster entries all "
+              "resolve to enabled agent types for writer and review children; Spark maps to `spark`.")
 
 def main():
     print("=" * 70)
