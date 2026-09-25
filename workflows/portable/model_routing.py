@@ -82,7 +82,7 @@ MODEL_AG_GPT_OSS = "google-antigravity/gpt-oss-120b"
 # Cheap pay-per-token overflow worker: DeepSeek direct API (DeepSeek-V4.1-Flash,
 # $0.30/$1.20 per 1M peak, half off-peak), with its OpenRouter twin as fallback.
 MODEL_DEEPSEEK_FLASH = "deepseek/deepseek-flash:high"
-MODEL_OR_DEEPSEEK_FLASH = "openrouter/deepseek/deepseek-v4.1-flash@deepinfra"
+MODEL_OR_DEEPSEEK_FLASH = "openrouter/deepseek/deepseek-v4.1-flash"
 
 # Second-opinion reviewer on the OpenRouter free quota (1,000 requests/day). Advisory
 # only: it never approves, blocks or replaces the required review. Nemotron 3 Ultra free
