@@ -83,6 +83,7 @@ from model_routing import (
     CREDENTIAL_ENV_BY_PROVIDER,
     MINIMAX_PROVIDER,
     ROLE_MODEL_PINS,
+    VERIFIED_CONTEXT_WINDOWS,
     ZAI_PROVIDER,
     detect_credentialed_providers,
     model_to_agent_role,
@@ -1253,19 +1254,30 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
                         for variant in variants:
                             is_review_lane = task_type == TaskType.STRONG_REVIEW and (
                                 risk == RiskLevel.HIGH or variant)
-                            for ctx in (10000, 200000, 220000, 240000):
+                            for ctx in (10000, 131072, 131073, 200000, 220000, 240000):
                                 rec = selector.select_model(
                                     task_type=task_type, risk_level=risk, context_tokens=ctx, **variant)
                                 where = f"[{label}/{sorted(creds)}] {task_type.value}/{risk.value}/{variant}/{ctx}"
                                 self.assertNotEqual(
                                     model_to_provider(rec.selected_model), model_to_provider(rec.fallback_model), where)
                                 checked += 1
+                                # Review 5318271884 L: no pick or fallback exceeds its verified window.
+                                for model in (rec.selected_model, rec.fallback_model):
+                                    self.assertLessEqual(ctx, VERIFIED_CONTEXT_WINDOWS.get(model, ctx), f"{where} {model}")
+                                # Review 5318271884 K: MiniMax-M3 is bulk/triage (tiny tasks) and low-risk
+                                # deep-context overflow only; never implementation, review or reasoning.
+                                minimax_allowed = task_type == TaskType.TINY_TASK or (
+                                    task_type == TaskType.DEEP_CONTEXT and risk != RiskLevel.HIGH and not variant)
+                                if not minimax_allowed:
+                                    self.assertNotIn("minimax-code/", rec.selected_model, where)
+                                    self.assertNotIn("minimax-code/", rec.fallback_model, where)
                                 if is_review_lane and ctx <= 180000:
                                     continue  # the high-risk REVIEW lane may spend Anthropic slack
                                 self.assertNotIn("anthropic/", rec.selected_model, where)
                                 self.assertNotIn("anthropic/", rec.fallback_model, where)
-        print(f"  [PASS] {checked} worker routes (task x risk x rework/domain x 4 context sizes x credentials x "
-              f"{len(scenarios)} quota states): none selects or falls back to paid Anthropic; every fallback crosses providers.")
+        print(f"  [PASS] {checked} worker routes (task x risk x rework/domain x 6 context sizes x credentials x "
+              f"{len(scenarios)} quota states): none selects or falls back to paid Anthropic, to a model whose window "
+              "is below the context, or to MiniMax outside low-risk bulk/deep-context work; every fallback crosses providers.")
 
         # The deep-context gap (review 5317952644 A'): with both 1M-context cheap tiers out,
         # Codex on pace holds 200k/240k, and credentialed GLM holds a 10k DEEP_CONTEXT task.
@@ -1286,6 +1298,50 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         self.assertIn("whose window holds 500000 tokens is unavailable", rec_500k.reasoning)
         print(f"  [PASS] Google + DeepSeek out, Codex on pace: 200k/240k -> {MODEL_CODEX_ASTRA}, DEEP_CONTEXT/10k -> "
               f"{MODEL_ZAI_GLM} (credentialed); Fable only at 500k, beyond every cheap window.")
+
+        # Review 5318271884 K: with Gemini Pro and DeepSeek V4 Pro out and MiniMax credentialed,
+        # high-risk implementation, review and money reasoning above 180k go to Codex Astra on
+        # pace; only a low-risk deep-context read may use the MiniMax overflow.
+        gap_minimax = ResetAwareModelSelector(parse_usage_json(scenarios["google_deepseek_out_codex_on_pace"],
+                                                               current_time_ms=self.mock_now_ms),
+                                              credentialed_providers={MINIMAX_PROVIDER})
+        for task_type, ctx, extra in (
+            (TaskType.ROUTINE_EXECUTION, 200000, {"risk_level": RiskLevel.HIGH}),
+            (TaskType.STRONG_REVIEW, 200000, {"risk_level": RiskLevel.HIGH}),
+            (TaskType.DEEP_REASONING, 250000, {"risk_level": RiskLevel.MEDIUM, "domain_tags": ["money"]}),
+            (TaskType.ROUTINE_EXECUTION, 200000, {"risk_level": RiskLevel.LOW}),
+            (TaskType.DEEP_CONTEXT, 10000, {"risk_level": RiskLevel.HIGH}),
+        ):
+            rec = gap_minimax.select_model(task_type=task_type, context_tokens=ctx, **extra)
+            self.assertEqual(rec.selected_model, MODEL_CODEX_ASTRA, f"{task_type.value}/{ctx}/{extra}")
+            self.assertNotIn("minimax-code/", rec.fallback_model)
+        self.assertEqual(gap_minimax.select_model(task_type=TaskType.DEEP_CONTEXT, risk_level=RiskLevel.LOW,
+                                                  context_tokens=200000).selected_model, MODEL_MINIMAX_M3)
+        print(f"  [PASS] Gemini Pro + DeepSeek V4 Pro out, MiniMax credentialed: high-risk impl/review/money reasoning "
+              f"above 180k -> {MODEL_CODEX_ASTRA}; MiniMax only for a low-risk deep-context read.")
+
+        # Review 5318271884 L: GLM-5.3 holds exactly 131,072 tokens; at 131,073 every ladder
+        # skips it (high-risk worker, deep-context, tiny-task GLM-5.3-Flash).
+        glm_all_ok = ResetAwareModelSelector(parse_usage_json(scenarios["all_ok"], current_time_ms=self.mock_now_ms),
+                                             credentialed_providers={ZAI_PROVIDER})
+        at_limit = glm_all_ok.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.HIGH,
+                                           context_tokens=131072)
+        over_limit = glm_all_ok.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.HIGH,
+                                             context_tokens=131073)
+        self.assertEqual(at_limit.selected_model, MODEL_ZAI_GLM)
+        self.assertEqual(over_limit.selected_model, MODEL_CODEX_ASTRA)
+        self.assertEqual(gap_glm.select_model(task_type=TaskType.DEEP_CONTEXT, risk_level=RiskLevel.LOW,
+                                              context_tokens=131072).selected_model, MODEL_ZAI_GLM)
+        self.assertEqual(gap_glm.select_model(task_type=TaskType.DEEP_CONTEXT, risk_level=RiskLevel.LOW,
+                                              context_tokens=131073).selected_model, MODEL_CODEX_ASTRA)
+        glm_google_down = ResetAwareModelSelector(parse_usage_json(google_down, current_time_ms=self.mock_now_ms),
+                                                  credentialed_providers={ZAI_PROVIDER})
+        self.assertEqual(glm_google_down.select_model(task_type=TaskType.TINY_TASK, context_tokens=131072).selected_model,
+                         MODEL_ZAI_GLM_FLASH)
+        self.assertNotEqual(glm_google_down.select_model(task_type=TaskType.TINY_TASK, context_tokens=131073).selected_model,
+                            MODEL_ZAI_GLM_FLASH)
+        print(f"  [PASS] GLM window fit: 131,072 -> {MODEL_ZAI_GLM}; 131,073 -> {over_limit.selected_model} "
+              "(high-risk worker, deep-context and tiny-task ladders).")
 
         # When every cheap tier is out, the high-risk worker ladder reaches Fable as its last
         # rung, and only on slack behind pace.

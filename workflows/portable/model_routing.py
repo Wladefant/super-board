@@ -644,8 +644,17 @@ class ResetAwareModelSelector:
             # CASE A: DEEP CONTEXT (> 180k tokens, or a DEEP_CONTEXT task). The 1M-context tiers
             # come first; then every cheap tier whose verified window holds the context, in the
             # high-risk worker ladder's order. Fable is reached only when all of them are out.
+            # MiniMax-M3 (TB4 2.0%) is bulk/triage (tiny tasks) and the 1M-context overflow for
+            # low-risk deep-context reads only: implementation, review, reasoning and any
+            # rework or high-risk deep-context read skip it and climb to Codex Astra.
             label = f"Deep context ({context_tokens} tokens)"
-            cheap_rungs = [
+            rungs = [
+                _Rung(MODEL_GEMINI_PRO, google_ok, "Gemini 3.1 Pro (1M-token window)."),
+                _Rung(MODEL_DEEPSEEK_PRO, deepseek_ok, "Gemini unavailable; DeepSeek V4 Pro (1M-token window).", cooldown=True),
+                _Rung(MODEL_MINIMAX_M3,
+                      minimax_ok and (task_type == TaskType.TINY_TASK
+                                      or (task_type == TaskType.DEEP_CONTEXT and not is_rework_critical)),
+                      "MiniMax-M3 (1M-token window, credentialed; low-risk deep-context/bulk overflow).", cooldown=True),
                 glm,
                 astra_on_pace,
                 _Rung(MODEL_CODEX_FAST, codex_usable, "1M-context tiers unavailable; Codex Fast (400k window, on pace).",
@@ -654,12 +663,6 @@ class ResetAwareModelSelector:
                 astra_emergency,
                 _Rung(MODEL_CODEX_FAST, codex_meta["is_available"],
                       "only Codex ahead of pace holds this context; spending its emergency reserve.", cooldown=True),
-            ]
-            rungs = [
-                _Rung(MODEL_GEMINI_PRO, google_ok, "Gemini 3.1 Pro (1M-token window)."),
-                _Rung(MODEL_DEEPSEEK_PRO, deepseek_ok, "Gemini unavailable; DeepSeek V4 Pro (1M-token window).", cooldown=True),
-                _Rung(MODEL_MINIMAX_M3, minimax_ok, "MiniMax-M3 (1M-token window, credentialed).", cooldown=True),
-                *(rung for rung in cheap_rungs if VERIFIED_CONTEXT_WINDOWS[rung.model] >= context_tokens),
                 _Rung(MODEL_CLAUDE_FABLE, anthropic_worker_ok,
                       f"every cheap tier whose window holds {context_tokens} tokens is unavailable; last resort on "
                       f"Anthropic slack ({anthropic_headroom:.2f}x behind pace, orchestrator reserve untouched).",
@@ -779,6 +782,9 @@ class ResetAwareModelSelector:
             last_resort = _Rung(MODEL_OR_DEEPSEEK_FLASH, True, "all execution tiers unavailable; OpenRouter DeepSeek Flash.", cooldown=True)
             final_fallbacks = [MODEL_DEEPSEEK_FLASH]
 
+        # Every ladder drops a rung whose verified window cannot hold the context, so GLM-5.3
+        # (131,072 tokens) is never picked or offered as a fallback above its window.
+        rungs = [rung for rung in rungs if context_tokens <= VERIFIED_CONTEXT_WINDOWS[rung.model]]
         chosen, fallback_model = _climb(rungs, last_resort, final_fallbacks)
 
         # Free OpenRouter second opinion for reviews: advisory only (1000 req/day free tier),
