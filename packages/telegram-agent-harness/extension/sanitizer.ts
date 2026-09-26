@@ -114,10 +114,15 @@ export function extractMentionedRepos(text: string): Set<string> {
 /**
  * Converts Markdown to Telegram-compatible HTML.
  * Preserves pre-existing valid HTML tags (such as <a href="...">, <b>, <blockquote>) without
- * double-escaping, auto-links bare URLs, issue/PR references, and commit SHAs, converts tables
- * to bullet lists, and safely escapes all literal user text characters (<, >, &).
+ * double-escaping, auto-links bare URLs, issue/PR references, and commit SHAs, renders tables
+ * as monospace <pre> blocks (Telegram has no table entity), folds long quotes and <details>
+ * into expandable blockquotes, and safely escapes all literal user text characters (<, >, &).
+ *
+ * `defaultRepo` is the session's own repository. It is required for a bare `#N` to link at all:
+ * when the session's repository cannot be resolved the reference stays unlinked rather than
+ * pointing at an unrelated project.
  */
-export function markdownToTelegramHtml(markdown: string, defaultRepo = "Bavariance/polysimulator"): string {
+export function markdownToTelegramHtml(markdown: string, defaultRepo?: string): string {
   if (!markdown) return "";
 
   const placeholders: string[] = [];
@@ -128,7 +133,7 @@ export function markdownToTelegramHtml(markdown: string, defaultRepo = "Bavarian
     return key;
   }
   const allRepos = extractMentionedRepos(markdown);
-  const projectRepo = resolveRepoSlug(defaultRepo) || (defaultRepo?.includes("/") ? defaultRepo : null);
+  const projectRepo = resolveRepoSlug(defaultRepo);
   if (projectRepo) {
     allRepos.add(projectRepo);
   }
@@ -142,6 +147,9 @@ export function markdownToTelegramHtml(markdown: string, defaultRepo = "Bavarian
     const attr = trimmedLang ? ` class="language-${escapeHtml(trimmedLang)}"` : "";
     return addPlaceholder(`<pre><code${attr}>${escapeHtml(code.replace(/\n$/, ""))}</code></pre>`);
   });
+
+  // 2b. Tables: Telegram has no table entity, so render aligned monospace <pre> blocks
+  text = convertTablesToPre(text, addPlaceholder);
 
   // 3. Inline code: `code`
   text = text.replace(/`([^`\n]+)`/g, (_m, code) => {
@@ -167,9 +175,6 @@ export function markdownToTelegramHtml(markdown: string, defaultRepo = "Bavarian
 
   // 7. Escape remaining user text (<, >, &)
   text = escapeHtml(text);
-
-  // 8. Tables: convert to bullet lines
-  text = convertTablesToBullets(text);
 
   // 9. Headers: # Header -> <b>Header</b>
   text = text.replace(/^(#{1,6})\s+(.+)$/gm, (_m, _hashes, title) => `<b>${title.trim()}</b>`);
@@ -198,7 +203,7 @@ export function markdownToTelegramHtml(markdown: string, defaultRepo = "Bavarian
       const targetRepo = explicitRepo.includes("/") ? explicitRepo : resolveRepoSlug(explicitRepo);
       if (targetRepo) {
         const textBefore = fullText.slice(0, offset);
-        const isPr = /\b(?:PR|pull\s*request|pull)\s*:?\s*$/i.test(textBefore);
+        const isPr = /\b(?:PRs?|pull\s*requests?|pulls?)\s*:?\s*$/i.test(textBefore);
         const kind = isPr ? "pull" : "issues";
         return addPlaceholder(`<a href="https://github.com/${targetRepo}/${kind}/${num}">${match}</a>`);
       }
@@ -215,12 +220,12 @@ export function markdownToTelegramHtml(markdown: string, defaultRepo = "Bavarian
 
     // 2. Repo named in the same sentence/line
     // 2a. Preceding repo name on same line: e.g. "super-board #121", "polysimulator PR #5157"
-    const mPre = beforeOnLine.match(/\b([a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)?)\s*(?:\||:)?\s*(?:(?:PR|pull\s*request|pull|issue)s?\s*:?\s*)?$/i);
+    const mPre = beforeOnLine.match(/\b([a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)?)\s*(?:\||:)?\s*(?:(?:PRs?|pull\s*requests?|pulls?|issues?)\s*:?\s*)?$/i);
     if (mPre) {
       const cand = mPre[1];
       const resolved = resolveRepoSlug(cand) || (cand.includes("/") ? cand : null);
       if (resolved) {
-        const isPr = /\b(?:PR|pull\s*request|pull)\s*:?\s*$/i.test(beforeOnLine);
+        const isPr = /\b(?:PRs?|pull\s*requests?|pulls?)\b/i.test(beforeOnLine);
         const kind = isPr ? "pull" : "issues";
         return addPlaceholder(`<a href="https://github.com/${resolved}/${kind}/${num}">${match}</a>`);
       }
@@ -233,7 +238,7 @@ export function markdownToTelegramHtml(markdown: string, defaultRepo = "Bavarian
       const cand = rawCand.split(/\s+/)[0];
       const resolved = resolveRepoSlug(cand) || (cand.includes("/") ? cand : null);
       if (resolved) {
-        const isPr = /\b(?:PR|pull\s*request|pull)\b/i.test(beforeOnLine + " " + rawCand);
+        const isPr = /\b(?:PRs?|pull\s*requests?|pulls?)\b/i.test(beforeOnLine + " " + rawCand);
         const kind = isPr ? "pull" : "issues";
         return addPlaceholder(`<a href="https://github.com/${resolved}/${kind}/${num}">${match}</a>`);
       }
@@ -246,7 +251,7 @@ export function markdownToTelegramHtml(markdown: string, defaultRepo = "Bavarian
     }
 
     if (allRepos.size === 1 && projectRepo && allRepos.has(projectRepo)) {
-      const isPr = /\b(?:PR|pull\s*request|pull)\s*:?\s*$/i.test(beforeOnLine);
+      const isPr = /\b(?:PRs?|pull\s*requests?|pulls?)\s*:?\s*(?:#\d+[\s,;]*)*$/i.test(beforeOnLine);
       const kind = isPr ? "pull" : "issues";
       return addPlaceholder(`<a href="https://github.com/${projectRepo}/${kind}/${num}">${match}</a>`);
     }
@@ -278,38 +283,110 @@ export function markdownToTelegramHtml(markdown: string, defaultRepo = "Bavarian
   return text;
 }
 
-function convertTablesToBullets(src: string): string {
+/** GFM separator row (`|---|:--:|`); the lookahead insists on a pipe so a lone `---` rule is not a table. */
+const TABLE_SEPARATOR = /^(?=.*\|)\s*\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)*\|?\s*$/;
+
+function renderTable(rows: string[][]): string {
+  const columns = Math.max(...rows.map(row => row.length));
+  const widths = Array.from({ length: columns }, (_, col) =>
+    Math.max(1, ...rows.map(row => [...(row[col] ?? "")].length)));
+  const format = (row: string[]) =>
+    widths.map((width, col) => {
+      const cell = row[col] ?? "";
+      return cell + " ".repeat(width - [...cell].length);
+    }).join(" | ").trimEnd();
+  const [header, ...body] = rows;
+  return [format(header), widths.map(width => "-".repeat(width)).join("-+-"), ...body.map(format)].join("\n");
+}
+
+/**
+ * Links and issue/PR references inside a table: `[label](url)`, bare URLs, `owner/repo#N`,
+ * a known short slug, or a bare `#N`. A quote is excluded from every URL body, since the
+ * later link pass cannot carry one and would leave the raw Markdown on the reference line.
+ */
+const TABLE_REFERENCE = /\[[^\]\n]+\]\(https?:\/\/[^\s)"'>]+\)|https?:\/\/[^\s|)"'>]+|(?:[A-Za-z0-9_.-]+\/)?[A-Za-z0-9_.-]*#\d+/g;
+
+/**
+ * A table cell reduced to its literal text. Inline code keeps its content verbatim, so a cell
+ * such as `` `<i>` `` keeps `<i>` instead of losing it to the tag strip, and formatting markers
+ * outside code are dropped because a Telegram `<pre>` block cannot carry other entities. An
+ * entity the source already escaped is decoded once here, so the single escape pass over the
+ * finished block cannot escape it a second time.
+ */
+const DECODED_ENTITIES: Record<string, string> = {
+  "&amp;": "&",
+  "&lt;": "<",
+  "&gt;": ">",
+  "&quot;": '"',
+  "&apos;": "'",
+};
+
+function tableCellText(cell: string): string {
+  return cell
+    .trim()
+    .replace(/\\\|/g, "|")
+    .split(/(`[^`]*`)/g)
+    .map((part, index) => index % 2 === 1
+      ? part.slice(1, -1)
+      : part
+        .replace(/\[([^\]\n]+)\]\([^)\s]+\)/g, "$1")
+        .replace(/\*\*([^*]+)\*\*/g, "$1")
+        .replace(/__([^_]+)__/g, "$1")
+        .replace(/~~([^~]+)~~/g, "$1")
+        .replace(/<\/?(?:b|strong|i|em|u|s|code)>/gi, ""))
+    .join("")
+    .replace(/&(?:amp|lt|gt|quot|apos);/gi, entity => DECODED_ENTITIES[entity.toLowerCase()] ?? entity);
+}
+
+/**
+ * The reference tokens a table carries for the line below its block: `[label](url)`, bare URLs,
+ * `owner/repo#N`, a known short slug, or a bare `#N`. A `word#N` whose word names no known
+ * project keeps only its `#N`, so a cell such as `Lane#3` is not listed as a reference the
+ * link pass would refuse. A URL the pattern stopped short of is dropped rather than listed
+ * as its prefix, which would link somewhere the cell never named.
+ */
+function tableReferences(rows: string[]): string[] {
+  const source = rows.join("\n");
+  const tokens = new Set<string>();
+  for (const match of source.matchAll(TABLE_REFERENCE)) {
+    if (source[match.index + match[0].length] === '"') continue;
+    const token = match[0];
+    const shortSlug = /^([A-Za-z0-9_.-]+)#(\d+)$/.exec(token);
+    tokens.add(shortSlug && !PROJECT_SLUG_MAP[shortSlug[1].toLowerCase()] ? `#${shortSlug[2]}` : token);
+  }
+  return [...tokens];
+}
+
+/**
+ * Replaces GitHub-flavoured Markdown tables (header row, separator row, body rows) with
+ * an aligned <pre> block. Runs on raw Markdown after fenced code is protected, so the
+ * cell text is escaped exactly once. The table's links and issue/PR references follow on
+ * one line below it, where the later passes make them clickable.
+ */
+function convertTablesToPre(src: string, addPlaceholder: (val: string) => string): string {
   const lines = src.split("\n");
   const out: string[] = [];
   let i = 0;
   while (i < lines.length) {
     const line = lines[i];
-    if (line.includes("|") && (line.trim().startsWith("|") || line.trim().endsWith("|"))) {
-      if (i + 1 < lines.length && /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$/.test(lines[i + 1])) {
-        const headerCells = line.trim().replace(/^\||\|$/g, "").split("|").map(c => c.trim());
-        i += 2;
-        const tableRows: string[] = [];
-        while (i < lines.length && lines[i].includes("|") && lines[i].trim() !== "") {
-          const rowCells = lines[i].trim().replace(/^\||\|$/g, "").split("|").map(c => c.trim());
-          const parts: string[] = [];
-          for (let hIdx = 0; hIdx < rowCells.length; hIdx++) {
-            const cell = rowCells[hIdx];
-            if (cell) {
-              if (hIdx < headerCells.length && headerCells[hIdx]) {
-                parts.push(`<b>${headerCells[hIdx]}:</b> ${cell}`);
-              } else {
-                parts.push(cell);
-              }
-            }
-          }
-          if (parts.length > 0) {
-            tableRows.push("• " + parts.join(" | "));
-          }
-          i++;
-        }
-        out.push(...tableRows);
-        continue;
+    if (line.includes("|") && i + 1 < lines.length && TABLE_SEPARATOR.test(lines[i + 1])) {
+      const rowLines = [line];
+      i += 2;
+      while (i < lines.length && lines[i].includes("|") && lines[i].trim() !== "") {
+        if (!TABLE_SEPARATOR.test(lines[i])) rowLines.push(lines[i]);
+        i++;
       }
+      const rows = rowLines.map(row =>
+        row
+          .trim()
+          .replace(/^\|/, "")
+          .replace(/(?<!\\)\|$/, "")
+          .split(/(?<!\\)\|/)
+          .map(cell => tableCellText(cell)));
+      out.push(addPlaceholder(`<pre>${escapeHtml(renderTable(rows))}</pre>`));
+      const references = tableReferences(rowLines);
+      if (references.length > 0) out.push(references.join(" · "));
+      continue;
     }
     out.push(line);
     i++;
@@ -317,34 +394,43 @@ function convertTablesToBullets(src: string): string {
   return out.join("\n");
 }
 
+/** A plain quote longer than either bound is folded into an expandable blockquote. */
+const EXPANDABLE_QUOTE_LINES = 4;
+const EXPANDABLE_QUOTE_CHARS = 400;
+const EXPANDABLE_MARKER = /^\s*>\s*\[(?:expandable|!NOTE|!COLLAPSIBLE|!DETAILS)\]/i;
+
 function convertBlockquotesToHtml(src: string, addPlaceholder: (val: string) => string): string {
+  // <details><summary>S</summary>body</details> -> expandable quote led by the bold summary
+  src = src.replace(/<details\b[^>]*>\s*(?:<summary>([\s\S]*?)<\/summary>)?([\s\S]*?)<\/details>/gi, (_m, summary: string | undefined, body: string) => {
+    const title = summary?.trim();
+    const lines = body.trim().split("\n");
+    return (title ? [`**${title}**`, ...lines] : lines).map(l => `>> ${l}`).join("\n");
+  });
+
   const lines = src.split("\n");
   const out: string[] = [];
   let i = 0;
   while (i < lines.length) {
     const line = lines[i];
-    if (/^\s*>>\s*/.test(line) || /^\s*>\s*\[(?:expandable|!NOTE|!COLLAPSIBLE)\]/i.test(line)) {
+    if (/^\s*>>/.test(line) || EXPANDABLE_MARKER.test(line)) {
       const bqLines: string[] = [];
-      if (/^\s*>\s*\[(?:expandable|!NOTE|!COLLAPSIBLE)\]/i.test(line)) {
-        i++;
-      }
-      while (i < lines.length && /^\s*>{1,2}\s*/.test(lines[i])) {
+      if (EXPANDABLE_MARKER.test(line)) i++;
+      while (i < lines.length && /^\s*>{1,2}/.test(lines[i])) {
         bqLines.push(lines[i].replace(/^\s*>{1,2}\s?/, ""));
         i++;
       }
-      const openTag = addPlaceholder("<blockquote expandable>");
-      const closeTag = addPlaceholder("</blockquote>");
-      out.push(`${openTag}\n${bqLines.join("\n")}\n${closeTag}`);
+      out.push(`${addPlaceholder("<blockquote expandable>")}\n${bqLines.join("\n")}\n${addPlaceholder("</blockquote>")}`);
       continue;
-    } else if (/^\s*>\s*/.test(line)) {
+    }
+    if (/^\s*>/.test(line)) {
       const bqLines: string[] = [];
-      while (i < lines.length && /^\s*>\s*/.test(lines[i]) && !/^\s*>>/.test(lines[i])) {
+      while (i < lines.length && /^\s*>/.test(lines[i]) && !/^\s*>>/.test(lines[i])) {
         bqLines.push(lines[i].replace(/^\s*>\s?/, ""));
         i++;
       }
-      const openTag = addPlaceholder("<blockquote>");
-      const closeTag = addPlaceholder("</blockquote>");
-      out.push(`${openTag}\n${bqLines.join("\n")}\n${closeTag}`);
+      const body = bqLines.join("\n");
+      const expandable = bqLines.length > EXPANDABLE_QUOTE_LINES || body.length > EXPANDABLE_QUOTE_CHARS;
+      out.push(`${addPlaceholder(expandable ? "<blockquote expandable>" : "<blockquote>")}\n${body}\n${addPlaceholder("</blockquote>")}`);
       continue;
     }
     out.push(line);
@@ -489,10 +575,48 @@ export function chunkMessage(text: string, maxChunkSize = 4000): string[] {
  * Formats a caption for Telegram photo or media group uploads (1024 char limit).
  * Converts Markdown to Telegram HTML and truncates safely with balanced tags.
  */
-export function formatTelegramCaption(caption: string, maxLen = 1024, defaultRepo = "Bavariance/polysimulator"): string {
+export function formatTelegramCaption(caption: string, maxLen = 1024, defaultRepo?: string): string {
   if (!caption) return "";
   const formatted = markdownToTelegramHtml(caption, defaultRepo);
   if (formatted.length <= maxLen) return formatted;
   const chunks = chunkMessage(formatted, maxLen);
   return chunks[0] || "";
+}
+
+/**
+ * Comparable form of a Telegram delivery: markup, entities, URLs and punctuation removed,
+ * leaving lowercase words separated by single spaces. The final reply and a
+ * telegram_message carry the same prose, so equal content normalizes to equal strings.
+ */
+export function normalizeForDedupe(text: string): string {
+  if (!text) return "";
+  return text
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&(?:[a-z]+|#\d+|#x[0-9a-f]+);/gi, " ")
+    .replace(/https?:\/\/\S+/g, " ")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim()
+    .toLowerCase();
+}
+
+/** A contained passage shorter than this is too generic ("done", "merged") to call a repeat. */
+const REPEAT_MIN_CONTAINED_CHARS = 20;
+
+/**
+ * True when `candidate` is the same delivery as `earlier`: the identical text after markup,
+ * entities, URLs and punctuation are normalized away, or a passage of it long enough to be
+ * the same prose. Matching is exact, never a similarity score: a reply that changes one status
+ * word or one issue number is new output and must reach the operator, so the cost of an
+ * occasional repeated line is preferred to the cost of a swallowed answer.
+ *
+ * Containment is word-bounded. Normalization leaves exactly one space between words and trims
+ * the ends, so padding both sides makes `includes` match whole words only: "now 12" no longer
+ * swallows "now 1", and "pr 1224 merged" no longer swallows "224 merged".
+ */
+export function isRepeatDelivery(candidate: string, earlier: string): boolean {
+  const next = normalizeForDedupe(candidate);
+  const prior = normalizeForDedupe(earlier);
+  if (!next || !prior) return false;
+  if (next === prior) return true;
+  return next.length >= REPEAT_MIN_CONTAINED_CHARS && ` ${prior} `.includes(` ${next} `);
 }

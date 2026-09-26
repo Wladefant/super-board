@@ -25,6 +25,30 @@ import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+try:
+    from verify import validate_verify_receipt
+except ImportError:
+    def validate_verify_receipt(
+        receipt: Dict[str, Any],
+        head_sha: str,
+        expected_pr: Optional[int] = None,
+        expected_repo: Optional[str] = None,
+    ) -> Tuple[bool, Optional[str]]:
+        if not isinstance(receipt, dict):
+            return False, "Receipt payload is not a valid JSON object."
+        if receipt.get("schema_version") != "verify-receipt/v1":
+            return False, f"Invalid receipt schema_version '{receipt.get('schema_version')}', expected 'verify-receipt/v1'."
+        receipt_head = str(receipt.get("head_sha") or "")
+        if receipt_head != head_sha:
+            return False, f"Receipt head {receipt_head[:8]} does not match expected head {head_sha[:8]}."
+        if expected_pr is not None and receipt.get("pr_number") is not None:
+            if int(receipt["pr_number"]) != expected_pr:
+                return False, f"Receipt PR #{receipt['pr_number']} does not match expected PR #{expected_pr}."
+        status = str(receipt.get("status") or "").upper()
+        if status != "PASSED":
+            summary = receipt.get("summary") or "Scenario checks failed."
+            return False, f"Verification receipt status is '{status}': {summary}"
+        return True, None
 
 
 @dataclass
@@ -67,6 +91,7 @@ class GateApprovalPolicy:
     # Issue #195: small, low-risk diffs may skip independent review. Only named
     # non-production policies opt in; the strict default never does.
     allow_review_exemption: bool = False
+    require_verify_receipt: bool = False
     rationale: str = ""
 
     def matches(self, repo: str, base_ref: str) -> bool:
@@ -111,6 +136,17 @@ DEFAULT_GATE_POLICIES: List[GateApprovalPolicy] = [
             "authenticated identity constraint; head-bound independent review evidence required. "
             "The two claudex jobs are advisory because they fail identically on base main and "
             "are not caused by any PR."
+        ),
+    ),
+    GateApprovalPolicy(
+        repo="Wladefant/veyyon",
+        base_ref="main",
+        require_github_approval=False,
+        require_head_bound_review_evidence=True,
+        allow_review_exemption=True,
+        rationale=(
+            "Single authenticated identity on veyyon main; exact-head independent automated "
+            "review evidence is required instead of an unobtainable non-author GitHub approval."
         ),
     ),
     GateApprovalPolicy(rationale="Default: independent non-author GitHub approval required."),
@@ -330,6 +366,183 @@ def evaluate_review_requirement(pr_data: Dict[str, Any]) -> Tuple[bool, str]:
     return True, "diff/files data missing, review required by default"
 
 
+# --------------------------------------------------------------- browser QA
+# A unit test cannot see a pill that jumps, a strip that blanks, or an order
+# that fills against the wrong side. PolySimulator staging therefore demands a
+# browser-QA receipt on the PR itself before any merge whose diff reaches a
+# surface a user touches: every `frontend/` file (the UI) and the backend
+# order/trading paths the UI drives. Verdicts: EXEMPT (not a staging UI/trading
+# PR), PASSED, REQUIRED (no receipt, or one that does not bind this diff).
+# Lanes post the marker as a plain line, a bold line (`**QA-RECEIPT: PASS**`) and inside
+# list items, so leading markdown decoration is tolerated; the identity requirement is
+# what actually gates, and a decorated line cannot satisfy it on its own.
+QA_RECEIPT_MARKER_RE = re.compile(r"^[ \t>*_`#|\-]*QA-RECEIPT:\s*PASS\b", re.IGNORECASE | re.MULTILINE)
+QA_RECEIPT_MIN_IMAGES = 2
+SHA_TOKEN_RE = re.compile(r"\b[0-9a-fA-F]{40}\b")
+# Evidence images that actually render on a PR: uploaded attachments and commit-pinned
+# raw URLs (pinned to a full commit SHA). Release-asset URLs are excluded on purpose —
+# GitHub's image proxy 404s them in a private repo
+# (Bavariance/polysimulator PR #5630, 2026-09-27), and raw.githubusercontent.com,
+# unpinned raw paths and relative paths never resolve either.
+EVIDENCE_IMAGE_RE = re.compile(
+    r"https://github\.com/user-attachments/assets/"
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+    r"|https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/raw/[0-9a-fA-F]{40}/[^\s)\"'>]+"
+)
+UI_PATH_RE = re.compile(r"^frontend/", re.IGNORECASE)
+ORDER_TRADING_PATH_RE = re.compile(
+    r"^backend/.*[/_.-](orders?|trades?|trading|matching|settlement|positions?|fills?)([/_.-]|$)",
+    re.IGNORECASE,
+)
+TEST_PATH_RE = re.compile(
+    r"(^|/)(tests?|__tests__|__mocks__)(/|$)"
+    r"|(^|/)test_[^/]*$"
+    r"|_test\.(py|ts|tsx|js|jsx)$"
+    r"|\.(test|spec)\.(ts|tsx|js|jsx)$",
+    re.IGNORECASE,
+)
+
+
+def is_test_path(path: str) -> bool:
+    """
+    Test files ship nothing, so they cannot regress a compiled or served surface.
+
+    They still count as a trigger whenever the change also touches product code —
+    this only keeps a test-only diff from demanding browser QA it cannot use.
+    """
+    return bool(TEST_PATH_RE.search(path))
+
+
+def evaluate_qa_receipt_requirement(
+    pr_data: Dict[str, Any], repo: str, base_ref: str
+) -> Tuple[bool, str]:
+    """
+    Whether this PR must carry a browser-QA receipt: PolySimulator `staging` only,
+    and only when the changed paths reach the UI or an order/trading path.
+
+    Like the review-exemption rule, an empty or absent `files` list cannot name a
+    UI path, so it cannot trigger the requirement; a list capped at 100 may hide
+    one and therefore does trigger it.
+
+    Test files are skipped: a test-only diff changes no shipped surface, while a
+    change that also touches product code still triggers on that file.
+    """
+    if repo != "Bavariance/polysimulator" or base_ref != "staging":
+        return False, f"no QA receipt requirement for {repo}@{base_ref or 'unknown'}"
+    files = pr_data.get("files")
+    if files is None:
+        return False, "no file list supplied, QA receipt not required"
+    if len(files) >= 100:
+        return True, f"file list truncated at {len(files)} files, QA receipt required by default"
+    for f in files:
+        path = f.get("path", "") if isinstance(f, dict) else str(f)
+        norm_path = path.replace("\\", "/")
+        if is_test_path(norm_path):
+            continue
+        if UI_PATH_RE.match(norm_path):
+            return True, f"UI path {path}"
+        if ORDER_TRADING_PATH_RE.match(norm_path):
+            return True, f"order/trading path {path}"
+    return False, "no UI or order/trading paths"
+
+
+def evaluate_qa_receipt(
+    pr_data: Dict[str, Any],
+    *,
+    repo: str,
+    base_ref: str,
+    head_sha: str,
+    cwd: Optional[str] = None,
+) -> Tuple[str, str, Optional[str]]:
+    """
+    Verify the browser-QA receipt that a staging UI/order change must carry.
+
+    One PR comment (or review body) has to hold all three of: a `QA-RECEIPT:
+    PASS` marker line, the head's content identity, and at least two
+    `github.com/user-attachments` images. The identity may be written as the head
+    SHA, its patch-id, or its stripped-diff sha256 — the two content forms
+    survive a sync-only push, so a merge of `staging` never invalidates QA that
+    still describes the same diff.
+
+    When the marker line itself carries a 40-hex token (`QA-RECEIPT: PASS
+    <served-sha>`), that token is the revision QA ran against and it is the only
+    one that can bind: a receipt served from another revision reads as missing,
+    never as PASS.
+
+    Returns (verdict, reason, comment_url). FAILED is never returned: the gate either
+    cannot find a receipt (REQUIRED) or has one it can bind (PASSED).
+    """
+    required, requirement_reason = evaluate_qa_receipt_requirement(pr_data, repo, base_ref)
+    if not required:
+        return "EXEMPT", requirement_reason, None
+
+    # The content forms need a real checkout of the head; a checkout that cannot
+    # supply them narrows what a receipt may name, it never blocks one that names
+    # the head SHA outright.
+    identity_forms = [head_sha]
+    identity_error = None
+    try:
+        from review_content import content_identity
+        identity_forms.extend(content_identity(head_sha, "origin/" + base_ref, cwd))
+    except (ValueError, subprocess.CalledProcessError) as exc:
+        identity_error = str(exc)
+    accepted = {form.lower() for form in identity_forms if form}
+    saw_marker = False
+    saw_identity = False
+    images = 0
+    for source in (
+        list(pr_data.get("comments") or []) + list(pr_data.get("reviews") or [])
+    ):
+        body = str(source.get("body") or "")
+        marker = QA_RECEIPT_MARKER_RE.search(body)
+        if not marker:
+            continue
+        # A 40-hex token beside the marker is the revision the QA actually ran
+        # against, and it decides on its own: a receipt for another revision is
+        # missing evidence, even when the head SHA is quoted elsewhere in the
+        # same comment. A bare marker keeps the comment-wide reading.
+        line_end = body.find("\n", marker.start())
+        marker_tokens = {
+            token.lower()
+            for token in SHA_TOKEN_RE.findall(body[marker.start(): line_end if line_end != -1 else len(body)])
+        }
+        candidates = marker_tokens or {token.lower() for token in SHA_TOKEN_RE.findall(body)}
+        found = {token for token in candidates if token in accepted}
+        attachments = len(EVIDENCE_IMAGE_RE.findall(body))
+        if found and attachments >= QA_RECEIPT_MIN_IMAGES:
+            return (
+                "PASSED",
+                f"browser QA receipt binds head {head_sha[:8]} ({requirement_reason})",
+                str(source.get("html_url") or source.get("url") or "") or None,
+            )
+        saw_marker = True
+        saw_identity = saw_identity or bool(found)
+        images = max(images, attachments)
+
+    if not saw_marker:
+        return (
+            "REQUIRED",
+            f"QA receipt required ({requirement_reason}): no PR comment carries a "
+            "'QA-RECEIPT: PASS' marker.",
+            None,
+        )
+    if not saw_identity:
+        forms = ", ".join(identity_forms) or "none resolved"
+        return (
+            "REQUIRED",
+            f"QA receipt required ({requirement_reason}): the receipt names no identity for "
+            f"this head (accepted identity tokens: {forms}"
+            f"{'; identity lookup failed: ' + identity_error if identity_error else ''}).",
+            None,
+        )
+    return (
+        "REQUIRED",
+        f"QA receipt required ({requirement_reason}): the receipt carries {images} "
+        f"GitHub-hosted evidence image(s), {QA_RECEIPT_MIN_IMAGES} required.",
+        None,
+    )
+
+
 def validate_review_artifact(
     record: Dict[str, Any],
     *,
@@ -457,6 +670,12 @@ class PRGateEvaluation:
     review_decision: str = "required"
     review_decision_reason: str = ""
     decision_line: str = ""
+    verify_receipt_verdict: Optional[str] = None
+    verify_receipt_reason: Optional[str] = None
+    verify_receipt: Optional[Dict[str, Any]] = None
+    qa_receipt_verdict: Optional[str] = None
+    qa_receipt_reason: Optional[str] = None
+    qa_receipt_url: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -476,6 +695,10 @@ class PRGateEvaluation:
             f"- **Advisory failures:** {', '.join(self.advisory_failing_checks) or 'None'}\n"
             f"- **Review Reused:** `{self.review_reused}` (Invalidated: `{self.review_invalidated}`"
             f"{f' - {self.invalidation_reason}' if self.invalidation_reason else ''})\n"
+            f"- **Verification:** `{self.verify_receipt_verdict or 'EXEMPT'}`"
+            f"{f' - {self.verify_receipt_reason}' if self.verify_receipt_reason else ''}\n"
+            f"- **Browser QA:** `{self.qa_receipt_verdict or 'EXEMPT'}`"
+            f"{f' - {self.qa_receipt_reason}' if self.qa_receipt_reason else ''}\n"
             f"- **Verdict:** **{self.gate_verdict}** — {self.verdict_reason}\n"
         )
 
@@ -528,8 +751,12 @@ def fetch_pr_json(pr_number: int, repo: str = "Bavariance/polysimulator", timeou
     reviews = _run_gh(["gh", "api", f"repos/{repo}/pulls/{pr_number}/reviews?per_page=100", "--paginate"], timeout_sec)
     if reviews.returncode:
         raise RuntimeError("Unable to fetch complete PR reviews")
+    comments = _run_gh(["gh", "api", f"repos/{repo}/issues/{pr_number}/comments?per_page=100", "--paginate"], timeout_sec)
+    if comments.returncode:
+        raise RuntimeError("Unable to fetch complete PR comments")
     from review_content import json_pages
     data["reviews"] = [review for page in json_pages(reviews.stdout) for review in page]
+    data["comments"] = [comment for page in json_pages(comments.stdout) for comment in page]
     subprocess.run(["git", "fetch", "origin", f"+refs/heads/{data['baseRefName']}:refs/remotes/origin/{data['baseRefName']}"], check=True)
     from review_content import target_shas
     for sha in target_shas(data["reviews"], data["headRefOid"]):
@@ -547,6 +774,8 @@ def evaluate_pr_gate(
     expected_head_sha: Optional[str] = None,
     policy: Optional[GateApprovalPolicy] = None,
     native_required_contexts: Optional[List[str]] = None,
+    verify_receipt: Optional[Dict[str, Any]] = None,
+    require_verify_receipt: Optional[bool] = None,
 ) -> PRGateEvaluation:
     """
     Deterministically evaluates GitHub PR status gate without LLM churn.
@@ -557,6 +786,10 @@ def evaluate_pr_gate(
     `policy` decides whether a non-author GitHub APPROVED review is mandatory for this
     repo/base. Named automated branches still require a content-bound GitHub review.
     Legacy local review metadata is advisory cache data and cannot grant approval.
+
+    Independently of review policy, a PolySimulator `staging` PR whose diff reaches
+    `frontend/` or an order/trading path is BLOCKED unless a PR comment carries a
+    browser QA receipt for this diff; see `evaluate_qa_receipt`.
     """
     now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     base_ref = str(pr_data.get("baseRefName") or (pr_data.get("base") or {}).get("ref") or "")
@@ -781,9 +1014,15 @@ def evaluate_pr_gate(
                 and str(review.get("state") or "").upper() == "APPROVED"
             )
         ]
+        staging_waiver = (
+            (repo == "Bavariance/polysimulator" and base_ref == "staging")
+            or (repo == "Wladefant/super-board" and base_ref == "main")
+            or (repo == "Wladefant/veyyon" and base_ref == "main")
+            or (not policy.require_github_approval and policy.require_head_bound_review_evidence)
+        )
         content_review = evaluate_content(
             eligible_reviews, head_sha, pr_author, base="origin/" + base_ref,
-            staging=repo == "Bavariance/polysimulator" and base_ref == "staging",
+            staging=staging_waiver,
         )
     except (ValueError, subprocess.CalledProcessError) as exc:
         content_review = {"passed": False, "reason": str(exc)}
@@ -882,6 +1121,59 @@ def evaluate_pr_gate(
 
     has_head_bound_review_evidence = content_review["passed"]
 
+    # 4B. Verification Receipt (verify-receipt/v1) Evaluation
+    effective_require_verify_receipt = (
+        require_verify_receipt
+        if require_verify_receipt is not None
+        else policy.require_verify_receipt
+    )
+
+    if effective_require_verify_receipt and verify_receipt is None:
+        standard_verify_paths = [
+            os.path.join(".veyyon", "verify", f"receipt-{head_sha}.json"),
+            os.path.join("workflows", "portable", "receipts", f"verify-{head_sha}.json"),
+            os.path.join(f"verify-receipt-{head_sha}.json"),
+            os.path.join("verify-receipt.json"),
+            os.path.expanduser(f"~/.veyyon/verify/receipt-{head_sha}.json"),
+        ]
+        for v_path in standard_verify_paths:
+            if os.path.exists(v_path):
+                try:
+                    with open(v_path, "r", encoding="utf-8") as vf:
+                        c_data = json.load(vf)
+                        if isinstance(c_data, dict) and c_data.get("schema_version") == "verify-receipt/v1":
+                            verify_receipt = c_data
+                            break
+                except Exception:
+                    continue
+
+    verify_receipt_verdict: Optional[str] = None
+    verify_receipt_reason: Optional[str] = None
+    verify_receipt_blocked = False
+
+    if effective_require_verify_receipt and verify_receipt is None:
+        verify_receipt_blocked = True
+        verify_receipt_verdict = "MISSING"
+        verify_receipt_reason = f"Verification receipt missing for commit {head_sha[:8]}: PR is not ready for promotion."
+    elif verify_receipt is not None:
+        is_valid_vr, vr_err = validate_verify_receipt(
+            verify_receipt, head_sha=head_sha, expected_pr=pr_number, expected_repo=repo
+        )
+        if not is_valid_vr:
+            verify_receipt_blocked = True
+            verify_receipt_verdict = "FAILED"
+            verify_receipt_reason = f"Verification receipt rejected: {vr_err}"
+        else:
+            verify_receipt_verdict = "PASSED"
+            verify_receipt_reason = verify_receipt.get("summary") or "All scenario checks passed."
+    else:
+        verify_receipt_verdict = "EXEMPT"
+        verify_receipt_reason = "No verification receipt required by policy."
+    # 4C. Browser QA Receipt (staging UI / order-trading paths)
+    qa_receipt_verdict, qa_receipt_reason, qa_receipt_url = evaluate_qa_receipt(
+        pr_data, repo=repo, base_ref=base_ref, head_sha=head_sha
+    )
+    qa_receipt_blocked = qa_receipt_verdict == "REQUIRED"
     # 5. Final Gate Verdict
     if ci_verdict == "FAILURE":
         gate_verdict = "BLOCKED"
@@ -898,6 +1190,12 @@ def evaluate_pr_gate(
     elif review_invalidated:
         gate_verdict = "BLOCKED"
         verdict_reason = f"Automated review artifact rejected: {invalidation_reason}"
+    elif verify_receipt_blocked:
+        gate_verdict = "BLOCKED"
+        verdict_reason = f"{verify_receipt_reason}"
+    elif qa_receipt_blocked:
+        gate_verdict = "BLOCKED"
+        verdict_reason = f"{qa_receipt_reason}"
     elif review_required:
         if approval_verdict == "SELF_APPROVED_ONLY":
             gate_verdict = "BLOCKED"
@@ -958,6 +1256,10 @@ def evaluate_pr_gate(
     if ci_timed_out_checks:
         verdict_reason += f" CI timed out after >=5m queued with 0 failures per AGENTS.md §6 (non-deploy-critical): {', '.join(ci_timed_out_checks)}."
     verdict_reason += " Content freshness: " + json.dumps(content_review, sort_keys=True)
+    if verify_receipt_verdict and verify_receipt_verdict != "EXEMPT":
+        verdict_reason += f" Verification receipt: {verify_receipt_verdict}."
+    if qa_receipt_verdict and qa_receipt_verdict != "EXEMPT":
+        verdict_reason += f" Browser QA receipt: {qa_receipt_verdict}."
     return PRGateEvaluation(
         pr_number=pr_number,
         repo=repo,
@@ -984,6 +1286,12 @@ def evaluate_pr_gate(
         review_decision=review_decision,
         review_decision_reason=review_decision_reason,
         decision_line=decision_line,
+        verify_receipt_verdict=verify_receipt_verdict,
+        verify_receipt_reason=verify_receipt_reason,
+        verify_receipt=verify_receipt,
+        qa_receipt_verdict=qa_receipt_verdict,
+        qa_receipt_reason=qa_receipt_reason,
+        qa_receipt_url=qa_receipt_url,
     )
 
 
@@ -1041,6 +1349,16 @@ def main():
             "Trusted workflow evidence only; not a cryptographic identity assertion."
         ),
     )
+    parser.add_argument(
+        "--verify-receipt",
+        default=None,
+        help="Path to a verify-receipt/v1 JSON verification receipt",
+    )
+    parser.add_argument(
+        "--require-verify-receipt",
+        action="store_true",
+        help="Require a valid verification receipt; missing or failed receipt blocks gate",
+    )
     parser.add_argument("--json", action="store_true", help="Output evaluation as JSON")
     args = parser.parse_args()
 
@@ -1063,6 +1381,13 @@ def main():
         if args.review_record:
             with open(args.review_record, "r", encoding="utf-8") as review_file:
                 review_artifact = json.load(review_file)
+        verify_receipt_data = None
+        if args.verify_receipt:
+            if not os.path.exists(args.verify_receipt):
+                sys.stderr.write(f"Verification receipt file not found: {args.verify_receipt}\n")
+                sys.exit(2)
+            with open(args.verify_receipt, "r", encoding="utf-8") as vf:
+                verify_receipt_data = json.load(vf)
         eval_result = evaluate_pr_gate(
             pr_data=pr_data,
             repo=repo,
@@ -1070,6 +1395,8 @@ def main():
             review_artifact=review_artifact,
             policy=policy,
             native_required_contexts=fetch_required_contexts(repo, base_ref) if base_ref else None,
+            verify_receipt=verify_receipt_data,
+            require_verify_receipt=args.require_verify_receipt or bool(args.verify_receipt),
         )
     except Exception as e:
         sys.stderr.write(f"PR Gate evaluation failed: {e}\n")

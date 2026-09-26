@@ -9,6 +9,7 @@ import {
   formatTelegramCaption,
   getTokenFingerprint,
   markdownToTelegramHtml,
+  isRepeatDelivery,
   redactSecrets,
 } from "../extension/sanitizer";
 
@@ -139,7 +140,7 @@ describe("Sanitizer & Security Utilities", () => {
 
   test("requirement 3.2: nested formatting inside blockquote", () => {
     const md = "> Quote with **bold text**, *italic*, `code`, and bare #4799";
-    const result = markdownToTelegramHtml(md);
+    const result = markdownToTelegramHtml(md, "Bavariance/polysimulator");
     expect(result).toContain("<blockquote>");
     expect(result).toContain("</blockquote>");
     expect(result).toContain("<b>bold text</b>");
@@ -150,14 +151,14 @@ describe("Sanitizer & Security Utilities", () => {
 
   test("requirement 3.3: expandable blockquote", () => {
     const md = ">> Expandable quote with **important** note and #4440";
-    const result = markdownToTelegramHtml(md);
+    const result = markdownToTelegramHtml(md, "Bavariance/polysimulator");
     expect(result).toContain("<blockquote expandable>");
     expect(result).toContain("</blockquote>");
     expect(result).toContain("<b>important</b>");
     expect(result).toContain('<a href="https://github.com/Bavariance/polysimulator/issues/4440">#4440</a>');
 
     const htmlInput = "<blockquote expandable>\nExisting blockquote with **bold** and #4440\n</blockquote>";
-    const resultHtml = markdownToTelegramHtml(htmlInput);
+    const resultHtml = markdownToTelegramHtml(htmlInput, "Bavariance/polysimulator");
     expect(resultHtml).toContain("<blockquote expandable>");
     expect(resultHtml).toContain("</blockquote>");
     expect(resultHtml).toContain("<b>bold</b>");
@@ -165,7 +166,7 @@ describe("Sanitizer & Security Utilities", () => {
 
   test("requirement 3.4: formatTelegramCaption limits to 1024 chars safely with balanced tags", () => {
     const longCaption = "Header: **bold** and #4799. " + "Extra detailed note for media. ".repeat(60);
-    const caption = formatTelegramCaption(longCaption, 1024);
+    const caption = formatTelegramCaption(longCaption, 1024, "Bavariance/polysimulator");
     expect(caption.length).toBeLessThanOrEqual(1024);
     expect(caption).toContain("<b>bold</b>");
     expect(caption).toContain('<a href="https://github.com/Bavariance/polysimulator/issues/4799">#4799</a>');
@@ -187,7 +188,7 @@ describe("Sanitizer & Security Utilities", () => {
     const longBq = "Intro line.\n\n<blockquote expandable>\n" + "Repeated line with **bold** and #4799.\n".repeat(120) + "</blockquote>\n\nOutro line.";
     expect(longBq.length).toBeGreaterThan(4500);
 
-    const html = markdownToTelegramHtml(longBq);
+    const html = markdownToTelegramHtml(longBq, "Bavariance/polysimulator");
     const chunks = chunkMessage(html, 2000);
     expect(chunks.length).toBeGreaterThanOrEqual(2);
 
@@ -199,19 +200,133 @@ describe("Sanitizer & Security Utilities", () => {
     }
   });
 
-  test("tables convert to bullet lists", () => {
+  test("tables render as an aligned monospace block with their references linked below", () => {
     const mdTable = [
       "| Task | Owner | Status |",
       "| --- | --- | --- |",
-      "| #4799 | wladefant | Merged |",
-      "| #4440 | erik | Review |",
+      "| #4799 | **wladefant** | Merged |",
+      "| #4440 | erik | [Review](https://example.com/r?a=1&b=2) |",
     ].join("\n");
 
-    const result = markdownToTelegramHtml(mdTable);
-    expect(result).toContain("• <b>Task:</b>");
-    expect(result).toContain("<b>Owner:</b>");
+    const result = markdownToTelegramHtml(mdTable, "Bavariance/polysimulator");
+    expect(result).toContain([
+      "<pre>Task  | Owner     | Status",
+      "------+-----------+-------",
+      "#4799 | wladefant | Merged",
+      "#4440 | erik      | Review</pre>",
+    ].join("\n"));
+    expect(result).not.toContain("<b>");
     expect(result).toContain('<a href="https://github.com/Bavariance/polysimulator/issues/4799">#4799</a>');
     expect(result).toContain('<a href="https://github.com/Bavariance/polysimulator/issues/4440">#4440</a>');
+    expect(result).toContain('<a href="https://example.com/r?a=1&amp;b=2">Review</a>');
+  });
+
+  test("a table reference keeps its short-slug qualifier", () => {
+    const table = [
+      "| Task | Status |",
+      "| --- | --- |",
+      "| polysimulator#9 | Open |",
+      "| Lane#3 | Done |",
+    ].join("\n");
+
+    const result = markdownToTelegramHtml(table);
+    // The short slug survives, so the reference does not lose its repository.
+    const referenceLine = result.split("\n").at(-1) ?? "";
+    expect(referenceLine).toContain('<a href="https://github.com/Bavariance/polysimulator/issues/9">polysimulator#9</a>');
+    // A word that names no project is not a qualifier: that reference stays a bare #N.
+    expect(referenceLine).toBe('<a href="https://github.com/Bavariance/polysimulator/issues/9">polysimulator#9</a> · #3');
+  });
+
+  test("table cells escape HTML once, keep inline code, and a lone horizontal rule is not a table", () => {
+    const result = markdownToTelegramHtml("| a<b | c&d |\n| --- | --- |\n| x | y |");
+    expect(result).toContain("<pre>a&lt;b | c&amp;d\n----+----\nx   | y</pre>");
+
+    // Inline code is content: `<i>` stays visible instead of being deleted as a tag, and an
+    // entity the source already escaped is not escaped a second time.
+    const literal = markdownToTelegramHtml("| cell |\n| --- |\n| `<i>` &amp; done |");
+    expect(literal).toContain("&lt;i&gt; &amp; done</pre>");
+
+    const rule = markdownToTelegramHtml("before | after\n---\ntext");
+    expect(rule).not.toContain("<pre>");
+  });
+
+  test("a cell URL the pattern cannot carry is not listed as its truncated prefix", () => {
+    // An unencoded quote inside the URL stops the reference pattern mid-address. Listing what
+    // it did match would link somewhere the cell never named, so the reference is dropped.
+    const result = markdownToTelegramHtml('| cell |\n| --- |\n| [l](https://example.com/a"2") |');
+    expect(result).toBe("<pre>cell\n----\nl</pre>");
+  });
+
+  test("long quotes and <details> fold into expandable blockquotes; short quotes stay plain", () => {
+    expect(markdownToTelegramHtml("> short quote")).toBe("<blockquote>\nshort quote\n</blockquote>");
+
+    const long = Array.from({ length: 6 }, (_, i) => `> line ${i + 1}`).join("\n");
+    expect(markdownToTelegramHtml(long)).toStartWith("<blockquote expandable>\nline 1");
+
+    const details = markdownToTelegramHtml("<details><summary>Evidence</summary>\nrun 1 passed\nrun 2 passed\n</details>");
+    expect(details).toBe("<blockquote expandable>\n<b>Evidence</b>\nrun 1 passed\nrun 2 passed\n</blockquote>");
+  });
+
+  test("owner/repo#N links to that repo and bare #N links to the session repo passed in", () => {
+    const qualified = markdownToTelegramHtml("Merged Wladefant/veyyon#19.", "Wladefant/super-board");
+    expect(qualified).toContain('<a href="https://github.com/Wladefant/veyyon/issues/19">Wladefant/veyyon#19</a>');
+
+    const bare = markdownToTelegramHtml("Merged PR #224 and PR #225.", "Wladefant/super-board");
+    expect(bare).toContain('<a href="https://github.com/Wladefant/super-board/pull/224">#224</a>');
+    expect(bare).toContain('<a href="https://github.com/Wladefant/super-board/pull/225">#225</a>');
+
+    // A second repository in the message makes a bare #N ambiguous, so it is left unlinked.
+    const mixed = markdownToTelegramHtml("Merged Wladefant/veyyon#19 and PR #224.", "Wladefant/super-board");
+    expect(mixed).toContain("and PR #224.");
+  });
+
+  test("a delivery repeats an earlier one when it is the same text or a passage of it", () => {
+    const earlier = "**Merged** [#224](https://github.com/Wladefant/super-board/pull/224): Telegram tables now render as monospace blocks.";
+    expect(isRepeatDelivery("Merged #224: Telegram tables now render as monospace blocks.", earlier)).toBe(true);
+    expect(isRepeatDelivery("Telegram tables now render as monospace blocks.", earlier)).toBe(true);
+  });
+
+  test("a delivery that changes a status word or an issue number is not a repeat", () => {
+    // Long enough that word overlap alone would call these the same delivery.
+    const running = "Checks on the order flow are still running and the ledger entries have not been verified yet, so the balances for the staging wallet remain unconfirmed today.";
+    const failed = "Checks on the order flow failed and the ledger entries have not been verified yet, so the balances for the staging wallet remain unconfirmed today.";
+    expect(isRepeatDelivery(failed, running)).toBe(false);
+    expect(isRepeatDelivery(running, running)).toBe(true);
+
+    const merged224 = "Merged PR 224 into staging after CI went green on every check across all three operating systems today.";
+    const merged225 = "Merged PR 225 into staging after CI went green on every check across all three operating systems today.";
+    expect(isRepeatDelivery(merged225, merged224)).toBe(false);
+    expect(isRepeatDelivery(merged224, merged225)).toBe(false);
+  });
+
+  test("a contained passage counts as a repeat only on word boundaries", () => {
+    // A passage that starts or ends mid-number is a different sentence, not a repeat. The
+    // unbounded `prior.includes(next)` swallowed both of these; each pair asserts its own
+    // substring relation so the test cannot silently stop exercising the boundary.
+    const now12 = "The order book is thinner now 12 contracts from the touch than it was at the open.";
+    const now1 = "The order book is thinner now 1";
+    expect(now12.includes(now1)).toBe(true);
+    expect(isRepeatDelivery(now1, now12)).toBe(false);
+
+    const pr1224 = "The ledger shows PR 1224 merged after the daemon restarted cleanly.";
+    const pr224 = "224 merged after the daemon restarted cleanly.";
+    expect(pr1224.includes(pr224)).toBe(true);
+    expect(isRepeatDelivery(pr224, pr1224)).toBe(false);
+
+    // A whole-word passage is still a repeat, so the fix cannot pass by never matching.
+    expect(isRepeatDelivery("merged after the daemon restarted cleanly.", pr1224)).toBe(true);
+  });
+
+  test("a delivery that adds material, or a short generic one, is not a repeat", () => {
+    const earlier = "Merged #224: Telegram tables now render as monospace blocks.";
+    const extended = `${earlier}\n\nNext: CI for #225 is red on the lint step; fixing the import order before re-running.`;
+    expect(isRepeatDelivery(extended, earlier)).toBe(false);
+    expect(isRepeatDelivery("Merged", earlier)).toBe(false);
+    expect(isRepeatDelivery("", earlier)).toBe(false);
+  });
+
+  test("a bare #N stays unlinked when the session repository is unknown", () => {
+    expect(markdownToTelegramHtml("Merged #224.")).toBe("Merged #224.");
   });
   test("issue/PR linkification adheres to multi-repo disambiguation rules", () => {
     // 1. Single repo context auto-links bare #N

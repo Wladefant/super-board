@@ -31,6 +31,13 @@ interface RouteRow {
   updated_at: number;
 }
 
+/**
+ * How far back a `telegram_message` still counts as this turn's delivery for relay dedupe.
+ * Every operator message calls {@link DaemonStore.beginTurn}, which drops the turn that
+ * ended, so this only bounds a single long turn — and backstops a session that went quiet.
+ */
+export const AGENT_MESSAGE_DEDUPE_WINDOW_MS = 60 * 60 * 1000;
+
 export class DaemonStore {
   private db: Database;
 
@@ -38,6 +45,9 @@ export class DaemonStore {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = new Database(dbPath);
     this.db.run("PRAGMA journal_mode = WAL;");
+    // The extension process opens this database on every telegram_message, so a write can
+    // collide with the daemon's; wait for the lock instead of losing the dedupe record.
+    this.db.run("PRAGMA busy_timeout = 5000;");
     this.db.run(`
       CREATE TABLE IF NOT EXISTS routes (
         slot_id TEXT NOT NULL,
@@ -63,6 +73,12 @@ export class DaemonStore {
       slot_id TEXT NOT NULL, chat_id TEXT NOT NULL, topic_id TEXT NOT NULL,
       session_ids TEXT NOT NULL, PRIMARY KEY (slot_id, chat_id, topic_id)
     )`);
+    // telegram_message texts the session's extension delivered, so the relay can hold back
+    // a final reply that only repeats what the operator already has.
+    this.db.run(`CREATE TABLE IF NOT EXISTS agent_messages (
+      session_id TEXT NOT NULL, text TEXT NOT NULL, sent_at INTEGER NOT NULL
+    )`);
+    this.db.run("CREATE INDEX IF NOT EXISTS agent_messages_session ON agent_messages (session_id, sent_at)");
   }
 
   public putSessionListing(slotId: string, chatId: string, topicId: string, ids: string[]): void {
@@ -152,6 +168,33 @@ export class DaemonStore {
       .query<{ count: number }, [string]>("SELECT COUNT(*) AS count FROM delivered_entries WHERE session_id = ?")
       .get(sessionId);
     return row?.count ?? 0;
+  }
+
+  /** Records text telegram_message delivered for a session, for the relay's repeat check. */
+  public recordAgentMessage(sessionId: string, text: string): void {
+    const now = Date.now();
+    // Prune on insert as well as on read: a session that goes quiet never reaches the read
+    // path, and its rows would otherwise sit in the table until the daemon's next event.
+    this.db.run("DELETE FROM agent_messages WHERE sent_at < ?", [now - AGENT_MESSAGE_DEDUPE_WINDOW_MS]);
+    this.db.run("INSERT INTO agent_messages (session_id, text, sent_at) VALUES (?, ?, ?)", [sessionId, text, now]);
+  }
+
+  /**
+   * Starts a new operator turn for a session, dropping the turn that ended. Relayed prose is
+   * compared only with `telegram_message` texts sent during the same turn, so the answer to a
+   * follow-up is never held back for resembling what the previous question was answered with.
+   */
+  public beginTurn(sessionId: string): void {
+    this.db.run("DELETE FROM agent_messages WHERE session_id = ?", [sessionId]);
+  }
+
+  /** Texts telegram_message delivered for a session since `sinceMs`, within the current turn. */
+  public recentAgentMessages(sessionId: string, sinceMs: number): string[] {
+    this.db.run("DELETE FROM agent_messages WHERE sent_at < ?", [sinceMs]);
+    return this.db
+      .query<{ text: string }, [string, number]>("SELECT text FROM agent_messages WHERE session_id = ? AND sent_at >= ?")
+      .all(sessionId, sinceMs)
+      .map(row => row.text);
   }
 
   public close(): void {

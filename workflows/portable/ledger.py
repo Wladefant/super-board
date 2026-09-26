@@ -37,11 +37,12 @@ import datetime
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import threading
 import time
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 VALID_STATES = [
     "pending",
@@ -209,6 +210,99 @@ def match_decision_option(answer: str, option: str) -> bool:
 
     return False
 
+def fetch_github_sub_issues(
+    repo: str,
+    issue_number: int,
+    runner: Optional[Callable[[List[str]], Tuple[int, str, str]]] = None,
+    timeout_sec: int = 10,
+) -> List[Dict[str, Any]]:
+    """Fetch native sub-issues for an issue via GitHub CLI / REST API.
+    Fails closed: raises RuntimeError on query failure or invalid response.
+    Returns empty list only when issue has zero sub-issues."""
+    if not repo or not issue_number or issue_number <= 0:
+        raise ValueError(f"Invalid repository '{repo}' or issue number '{issue_number}'")
+    cmd_args = ["api", "--paginate", "-q", ".[]", f"repos/{repo}/issues/{issue_number}/sub_issues?per_page=100"]
+    if runner is not None:
+        rc, stdout, stderr = runner(cmd_args)
+        if rc != 0:
+            err_msg = stderr.strip() if stderr else stdout.strip()
+            raise RuntimeError(f"gh api sub_issues failed with exit {rc}: {err_msg}")
+        output = stdout
+    else:
+        try:
+            res = subprocess.run(["gh"] + cmd_args, capture_output=True, text=True, timeout=timeout_sec)
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"gh api sub_issues timed out after {timeout_sec}s for {repo}#{issue_number}") from e
+        except Exception as e:
+            raise RuntimeError(f"gh api sub_issues invocation failed for {repo}#{issue_number}: {e}") from e
+        if res.returncode != 0:
+            err_msg = res.stderr.strip() or res.stdout.strip()
+            raise RuntimeError(f"gh api sub_issues failed with exit {res.returncode}: {err_msg}")
+        output = res.stdout
+
+    trimmed = output.strip()
+    if not trimmed:
+        return []
+
+    results: List[Dict[str, Any]] = []
+    if trimmed.startswith("["):
+        try:
+            import re
+            matches = re.findall(r"\[.*?\](?=\s*\[|\s*$)", trimmed, flags=re.DOTALL)
+            if matches:
+                for m in matches:
+                    arr = json.loads(m)
+                    if isinstance(arr, list):
+                        results.extend(arr)
+            else:
+                data = json.loads(trimmed)
+                if isinstance(data, list):
+                    results.extend(data)
+                elif isinstance(data, dict):
+                    results.append(data)
+        except Exception as e:
+            raise RuntimeError(f"Failed to parse sub-issues JSON for {repo}#{issue_number}: {e}") from e
+    else:
+        for line in trimmed.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    results.append(obj)
+            except Exception as e:
+                raise RuntimeError(f"Failed to parse sub-issues NDJSON for {repo}#{issue_number}: {e}") from e
+
+    return [
+        {
+            "number": item.get("number"),
+            "title": item.get("title", ""),
+            "state": item.get("state", "open"),
+        }
+        for item in results
+        if isinstance(item, dict) and item.get("number")
+    ]
+
+
+def check_parent_sub_issues_guard(
+    repo: str,
+    issue_number: int,
+    checker: Optional[Callable[[str, int], List[Dict[str, Any]]]] = None,
+    runner: Optional[Callable[[List[str]], Tuple[int, str, str]]] = None,
+) -> List[Dict[str, Any]]:
+    """Return list of open sub-issues for a parent issue.
+    Returns empty list if there are no open sub-issues.
+    Fails closed: raises RuntimeError/ValueError on fetch failure."""
+    if checker is not None:
+        subs = checker(repo, issue_number)
+    else:
+        subs = fetch_github_sub_issues(repo, issue_number, runner=runner)
+    if not isinstance(subs, list):
+        raise ValueError(f"Sub-issues check for {repo}#{issue_number} returned invalid type: {type(subs)}")
+    open_subs = [s for s in subs if str(s.get("state", "")).lower() == "open"]
+    return open_subs
+
 
 def normalize_acceptance_criteria(
     acceptance_criteria: Any, head: Optional[str] = None
@@ -374,7 +468,9 @@ class RequestLedger:
         self,
         ledger_path: Optional[str] = None,
         state_dir: Optional[str] = None,
+        sub_issues_checker: Optional[Callable[[str, int], List[Dict[str, Any]]]] = None,
     ):
+        self.sub_issues_checker = sub_issues_checker
         if ledger_path:
             self.ledger_path = os.path.abspath(ledger_path)
         elif state_dir:
@@ -497,6 +593,8 @@ class RequestLedger:
         superboard_card: Optional[str] = None,
         superboard_status: Optional[str] = None,
         labels: Optional[List[str]] = None,
+        parent_req_id: Optional[str] = None,
+        sub_requests: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         if not req_id or not req_id.strip():
             raise ValueError("Request ID cannot be empty.")
@@ -560,6 +658,8 @@ class RequestLedger:
                 "acceptance_criteria": norm_criteria,
                 "owner": owner,
                 "dependencies": deps,
+                "parent_req_id": parent_req_id,
+                "sub_requests": list(sub_requests or []),
                 "head": head,
                 "evidence": [],
                 "authorization": {
@@ -628,6 +728,9 @@ class RequestLedger:
         clear_decision_blocker: Optional[str] = None,
         actor: Optional[str] = None,
         remove_criterion: Optional[str] = None,
+        parent_req_id: Optional[str] = None,
+        sub_requests: Optional[List[str]] = None,
+        sub_issues_checker: Optional[Callable[[str, int], List[Dict[str, Any]]]] = None,
         reason: str = "Update",
     ) -> Dict[str, Any]:
         try:
@@ -655,6 +758,15 @@ class RequestLedger:
                     "proof_url": None,
                     "proof_verified": False,
                 }
+            if "sub_requests" not in req:
+                req["sub_requests"] = []
+            if "parent_req_id" not in req:
+                req["parent_req_id"] = None
+
+            if parent_req_id is not None:
+                req["parent_req_id"] = parent_req_id
+            if sub_requests is not None:
+                req["sub_requests"] = list(sub_requests)
             if "superboard" not in req:
                 req["superboard"] = {
                     "project_number": DEFAULT_SUPERBOARD_PROJECT_NUM,
@@ -1170,6 +1282,42 @@ class RequestLedger:
                             f"Set proof via --github-proof <url> and --verify-github-proof."
                         )
 
+                    # Inviolable Parent-Close Guard: Refuse to close parent requests with open sub-requests or open native sub-issues
+                    open_child_reqs = []
+                    for child_id in req.get("sub_requests", []):
+                        child = data["requests"].get(child_id)
+                        if not child or child.get("state") != "done":
+                            open_child_reqs.append(f"{child_id} ({child.get('state') if child else 'missing'})")
+                    for r_id, r in data["requests"].items():
+                        if r.get("parent_req_id") == req_id and r_id not in req.get("sub_requests", []):
+                            if r.get("state") != "done":
+                                open_child_reqs.append(f"{r_id} ({r.get('state')})")
+                    if open_child_reqs:
+                        raise ValueError(
+                            f"Cannot transition '{req_id}' to 'done': Request has open sub-request(s): "
+                            + ", ".join(open_child_reqs)
+                        )
+
+                    gh_info = req.get("github", {})
+                    issue_num = gh_info.get("issue_number")
+                    gh_repo = gh_info.get("repo") or DEFAULT_REPO
+                    if issue_num:
+                        effective_checker = sub_issues_checker or self.sub_issues_checker
+                        # Inviolable Parent-Close Guard: Live lookup required; do not trust stale cached snapshot
+                        try:
+                            open_subs = check_parent_sub_issues_guard(
+                                gh_repo, int(issue_num), checker=effective_checker
+                            )
+                        except Exception as e:
+                            raise ValueError(
+                                f"Cannot transition '{req_id}' to 'done': Failed to verify parent sub-issues for #{issue_num} ({e}). Guard fails closed."
+                            )
+                        if open_subs:
+                            sub_desc = [f"#{s['number']}: {s.get('title', '')} ({s.get('state', 'open')})" for s in open_subs]
+                            raise ValueError(
+                                f"Cannot transition '{req_id}' to 'done': Parent issue #{issue_num} has {len(open_subs)} open sub-issue(s): "
+                                + "; ".join(sub_desc)
+                            )
                 req["state"] = target_state
                 req["history"].append({
                     "timestamp": now,
@@ -1368,6 +1516,18 @@ class RequestLedger:
                     expected_repo = gh.get("repo") or DEFAULT_REPO
                     if not (gh.get("proof_verified") and validate_github_url(gh.get("proof_url"), expected_repo=expected_repo)):
                         issues.append(f"State is 'done' but missing verified well-formed GitHub proof URL for '{expected_repo}'.")
+                    # Check open sub-requests
+                    open_children = []
+                    for child_id in req.get("sub_requests", []):
+                        child = data["requests"].get(child_id)
+                        if not child or child.get("state") != "done":
+                            open_children.append(f"{child_id} ({child.get('state') if child else 'missing'})")
+                    for r_id, r in data["requests"].items():
+                        if r.get("parent_req_id") == req_id and r_id not in req.get("sub_requests", []):
+                            if r.get("state") != "done":
+                                open_children.append(f"{r_id} ({r.get('state')})")
+                    if open_children:
+                        issues.append(f"State is 'done' but request has open sub-request(s): {', '.join(open_children)}")
             else:
                 if unverified_crit:
                     warnings.append(f"Pending criteria ({len(unverified_crit)}/{len(req.get('acceptance_criteria', []))}): {unverified_crit}")
@@ -1861,7 +2021,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_add.add_argument("--superboard-card", default=None, help="Superboard item/card ID")
     p_add.add_argument("--superboard-status", default="Backlog", help="Superboard status column")
     p_add.add_argument("--labels", default="", help="Comma-separated labels")
-
+    p_add.add_argument("--parent-req-id", default=None, help="Parent request ID")
+    p_add.add_argument("--sub-requests", default=None, help="Comma-separated sub-request IDs")
     # UPDATE
     p_upd = subparsers.add_parser("update", help="Update a request in the ledger")
     p_upd.add_argument("id", help="Request ID")
@@ -1875,7 +2036,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_upd.add_argument("--next-action", help="Update next action description")
     p_upd.add_argument("--actor", default=None, help="Actor recording the change (no default operator trust)")
     p_upd.add_argument("--reason", default="Update", help="Reason for change")
-
+    p_upd.add_argument("--parent-req-id", default=None, help="Update parent request ID")
+    p_upd.add_argument("--sub-requests", default=None, help="Update comma-separated sub-request IDs")
     # Criterion update flags
     p_upd.add_argument("--criterion-id", help="Criterion ID to update")
     p_upd.add_argument("--criterion-status", choices=["pending", "in_progress", "verified", "failed"])
@@ -2010,6 +2172,8 @@ def main():
                 superboard_card=args.superboard_card,
                 superboard_status=args.superboard_status,
                 labels=lbls,
+                parent_req_id=args.parent_req_id,
+                sub_requests=[s.strip() for s in args.sub_requests.split(",") if s.strip()] if args.sub_requests else None,
             )
             print(f"[OK] Added request '{req['id']}' in state '{req['state']}' (type='{req['task_type']}')")
 
@@ -2125,6 +2289,8 @@ def main():
                 actor=args.actor,
                 reason=args.reason,
                 remove_criterion=args.remove_criterion,
+                parent_req_id=args.parent_req_id,
+                sub_requests=[s.strip() for s in args.sub_requests.split(",") if s.strip()] if args.sub_requests is not None else None,
             )
             print(f"[OK] Updated request '{req['id']}': state='{req['state']}', owner='{req['owner']}'")
 

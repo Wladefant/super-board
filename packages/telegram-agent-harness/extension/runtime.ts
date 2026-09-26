@@ -17,7 +17,8 @@ import type {
 } from "@veyyon/coding-agent";
 import { BotPoolCoordinator } from "./coordinator";
 import { TelegramPoller, type PollerCallbacks, type PollerOptions } from "./poller";
-import { chunkMessage, escapeHtml, markdownToTelegramHtml } from "./sanitizer";
+import { resolveGithubRepo } from "./github-repo";
+import { chunkMessage, escapeHtml, isRepeatDelivery, markdownToTelegramHtml, normalizeForDedupe } from "./sanitizer";
 import type { AccessConfig, DiscoveredSlot, MessageCorrelationBridge } from "./types";
 import { handleInstalledCommand } from "./harness/installed-commands";
 import { BunCommandRunner, type CommandRunner } from "./harness/command-runner";
@@ -175,6 +176,8 @@ export class TelegramRuntime {
   private streamedChunks: string[] = [];
   private accumulatedAssistantText = "";
   private outboundQueue: Promise<void> = Promise.resolve();
+  /** Markdown delivered to Telegram since the last user message: telegram_message texts and forwarded replies. */
+  private turnDeliveries: string[] = [];
 
   private poller: TelegramPoller | null = null;
   private coordinator: BotPoolCoordinator | null = null;
@@ -258,28 +261,61 @@ export class TelegramRuntime {
     return next;
   }
 
-  private async syncAssistantOutput(targetText: string): Promise<void> {
+  /** Records Markdown just delivered to Telegram, so the rest of this user turn never repeats it. */
+  public recordTurnDelivery(text: string): void {
+    this.turnDeliveries.push(text);
+  }
+
+  /**
+   * Mirrors one assistant message into Telegram, streaming edits in place. `final` marks the
+   * message_end pass: it is recorded as a turn delivery and ends the message's edit window.
+   * Until anything of the message is on Telegram, text the turn already delivered is held
+   * back, so a final reply never repeats a telegram_message the operator already has.
+   */
+  private syncAssistantOutput(targetText: string, final: boolean): Promise<void> {
     return this.queueOutbound(async () => {
-      if (this.isDisposed || this.isDaemonManaged() || !this.poller || !targetText.trim()) return;
+      try {
+        if (this.isDisposed || this.isDaemonManaged() || !this.poller || !targetText.trim()) return;
 
-      const primaryChat = this.getPrimaryChatId();
-      if (!primaryChat) return;
+        const primaryChat = this.getPrimaryChatId();
+        if (!primaryChat) return;
 
-      const fullHtml = markdownToTelegramHtml(targetText);
-      const chunks = chunkMessage(fullHtml, 3800);
-      for (let i = 0; i < chunks.length; i++) {
-        const chunk = chunks[i];
-        if (i < this.sentTelegramMessageIds.length) {
-          if (chunk !== this.streamedChunks[i]) {
-            await this.poller.editTelegramMessage(primaryChat, this.sentTelegramMessageIds[i], chunk);
-            this.streamedChunks[i] = chunk;
+        if (this.sentTelegramMessageIds.length === 0 && this.turnDeliveries.length > 0) {
+          if (final && this.turnDeliveries.some(earlier => isRepeatDelivery(targetText, earlier))) {
+            this.pi.logger?.info?.(`[Telegram] Final reply not forwarded: it repeats a delivery from this turn (${targetText.length} chars).`);
+            return;
           }
-        } else {
-          const res = await this.poller.sendTelegramMessage(primaryChat, chunk);
-          if (res?.ok && typeof res.result?.message_id === "number") {
-            this.sentTelegramMessageIds.push(res.result.message_id);
-            this.streamedChunks.push(chunk);
+          if (!final) {
+            // A streamed prefix of already-delivered text waits for message_end to decide.
+            const partial = normalizeForDedupe(targetText);
+            if (this.turnDeliveries.some(earlier => normalizeForDedupe(earlier).includes(partial))) return;
           }
+        }
+
+        // Converted once here; the poller receives finished HTML so nothing is re-parsed as Markdown.
+        // Bare #N links to the session's own repository; outside a GitHub checkout the default applies.
+        const fullHtml = markdownToTelegramHtml(targetText, this.cwd ? resolveGithubRepo(this.cwd) : undefined);
+        const chunks = chunkMessage(fullHtml, 3800);
+        for (let i = 0; i < chunks.length; i++) {
+          const chunk = chunks[i];
+          if (i < this.sentTelegramMessageIds.length) {
+            if (chunk !== this.streamedChunks[i]) {
+              await this.poller.editTelegramMessage(primaryChat, this.sentTelegramMessageIds[i], chunk, "HTML");
+              this.streamedChunks[i] = chunk;
+            }
+          } else {
+            const res = await this.poller.sendTelegramMessage(primaryChat, chunk, "HTML");
+            if (res?.ok && typeof res.result?.message_id === "number") {
+              this.sentTelegramMessageIds.push(res.result.message_id);
+              this.streamedChunks.push(chunk);
+            }
+          }
+        }
+        if (final && this.sentTelegramMessageIds.length > 0) this.recordTurnDelivery(targetText);
+      } finally {
+        if (final) {
+          this.sentTelegramMessageIds = [];
+          this.streamedChunks = [];
         }
       }
     });
@@ -673,6 +709,7 @@ export class TelegramRuntime {
   }
 
   public async onMessageStart(event: { message: { role: string } }): Promise<void> {
+    if (event.message.role === "user") this.turnDeliveries = [];
     if (this.isDaemonManaged()) return;
     if (event.message.role === "assistant") {
       this.accumulatedAssistantText = "";
@@ -692,7 +729,7 @@ export class TelegramRuntime {
       if (!this.streamDebounceTimer) {
         this.streamDebounceTimer = setTimeout(async () => {
           this.streamDebounceTimer = null;
-          await this.syncAssistantOutput(this.accumulatedAssistantText);
+          await this.syncAssistantOutput(this.accumulatedAssistantText, false);
         }, 1500);
 
         if (typeof this.streamDebounceTimer.unref === "function") {
@@ -717,12 +754,8 @@ export class TelegramRuntime {
       .map(c => c.text)
       .join("\n");
 
-    if (fullText.trim()) {
-      await this.syncAssistantOutput(fullText);
-    }
-
-    this.sentTelegramMessageIds = [];
-    this.streamedChunks = [];
+    // The final pass resets the message's edit window itself, inside the outbound queue.
+    await this.syncAssistantOutput(fullText, true);
     this.accumulatedAssistantText = "";
   }
 

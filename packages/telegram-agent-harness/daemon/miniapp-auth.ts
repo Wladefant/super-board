@@ -1,4 +1,7 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { Database } from "bun:sqlite";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
 
 /** Validate raw Telegram initData, never the untrusted initDataUnsafe object. */
 export function authenticateInitData(raw: string, token: string, allowedUsers: readonly string[], now = Date.now()): string {
@@ -24,20 +27,36 @@ export function authenticateInitData(raw: string, token: string, allowedUsers: r
   return String(user.id);
 }
 
-/** App sessions are purpose-bound; Telegram launch credentials are exchanged once. */
+/** Purpose-bound v2 sessions have unique identities for independent revocation. */
 export function issueAppSession(user: string, token: string, now = Date.now()): string {
-  const payload = `${user}.${Math.floor(now / 1000)}`;
+  const payload = `${user}.${Math.floor(now / 1000)}.${randomBytes(16).toString("hex")}`;
   const signature = createHmac("sha256", token).update(`miniapp-session:${payload}`).digest("hex");
   return `${payload}.${signature}`;
 }
 
 export function authenticateAppSession(session: string, token: string, allowedUsers: readonly string[], now = Date.now()): string {
-  const match = /^(\d+)\.(\d+)\.([a-f0-9]{64})$/.exec(session);
+  const match = /^(\d+)\.(\d+)\.([a-f0-9]{32})\.([a-f0-9]{64})$/.exec(session);
   if (!match) throw new Error("Unauthorized");
-  const [, user, issued, signature] = match;
+  const [, user, issued, nonce, signature] = match;
   const age = now / 1000 - Number(issued);
   if (age < -30 || age > 28800 || !allowedUsers.includes(user)) throw new Error("Unauthorized");
-  const expected = createHmac("sha256", token).update(`miniapp-session:${user}.${issued}`).digest();
+  const expected = createHmac("sha256", token).update(`miniapp-session:${user}.${issued}.${nonce}`).digest();
   if (!timingSafeEqual(expected, Buffer.from(signature, "hex"))) throw new Error("Unauthorized");
   return user;
+}
+
+/** Persist only digests, never bearer credentials; expired entries cannot revive. */
+export function appSessionRevocation(stateDir: string, session: string, revoke = false): boolean {
+  mkdirSync(stateDir, { recursive: true });
+  const db = new Database(join(stateDir, "miniapp-revocations.sqlite"));
+  try {
+    db.exec("CREATE TABLE IF NOT EXISTS revoked (digest TEXT PRIMARY KEY, expires INTEGER NOT NULL)");
+    db.query("DELETE FROM revoked WHERE expires < ?").run(Date.now());
+    const digest = createHash("sha256").update(session).digest("hex");
+    if (revoke) {
+      const issued = Number(session.split(".")[1]);
+      db.query("INSERT OR IGNORE INTO revoked VALUES (?, ?)").run(digest, (issued + 28800) * 1000);
+    }
+    return Boolean(db.query("SELECT 1 FROM revoked WHERE digest = ?").get(digest));
+  } finally { db.close(); }
 }
