@@ -42,6 +42,7 @@ interface MockPoller {
   stop: () => Promise<void>;
   getPrimaryChatId: () => string | null;
   sendTelegramMessage: (chatId: string, text: string) => Promise<{ ok: boolean; result?: { message_id: number } }>;
+  setPrimaryChatId?: (chatId: string) => void;
 }
 
 /**
@@ -210,6 +211,84 @@ describe("Telegram Harness Hot Reload", () => {
       expect(pollerStopped).toBe(true);
       expect(leaseReleased).toBe(true);
     } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test("a final reply that repeats this turn's telegram_message is not forwarded again", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "runtime-dedupe-"));
+    const previousDaemonDb = process.env.VEYYON_TELEGRAM_DAEMON_DB;
+    // No daemon database, so the runtime forwards replies itself instead of deferring to a daemon route.
+    process.env.VEYYON_TELEGRAM_DAEMON_DB = path.join(tmpDir, "absent-daemon.db");
+    const sent: string[] = [];
+    let runtime: TelegramRuntime | null = null;
+    try {
+      const slot: DiscoveredSlot = { slotId: "slot-dedupe", botId: "123456", stateDir: tmpDir };
+      const coordinator: MockCoordinator = {
+        acquireLease: async () => ({ ok: true, slot }),
+        releaseLease: () => true,
+        close: () => {},
+        readRawTokenForSlot: () => "0000000000:TEST_TOKEN",
+        readAccessConfig: () => ({ dmPolicy: "allowlist", allowFrom: ["1001"] }),
+        recordOutboundMessage: () => {},
+        resolveReplyRouting: () => ({ decision: "deliver" }),
+        validateDecisionCallback: () => ({ decision: "deliver" }),
+        consumeDecisionCallback: () => true,
+        applyDecisionAnswer: async () => true,
+        getPoolStatus: () => ({ totalSlots: 1, freeSlots: 0 }),
+      };
+      const poller: MockPoller = {
+        start: async () => {},
+        stop: async () => {},
+        getPrimaryChatId: () => "1001",
+        sendTelegramMessage: async (_chatId, text) => {
+          sent.push(text);
+          return { ok: true, result: { message_id: sent.length } };
+        },
+      };
+      runtime = new TelegramRuntime(createMockExtensionAPI().api, {
+        coordinatorFactory: () => coordinator as unknown as never,
+        pollerFactory: () => poller as unknown as never,
+      });
+      expect(await runtime.initSession(createMockContext("sess-dedupe"))).toBe(true);
+      // Drop the session-connected notice; only forwarded replies matter below.
+      sent.length = 0;
+
+      const reply = (text: string): Parameters<TelegramRuntime["onMessageEnd"]>[0] => {
+        // Only role and text content are read by the runtime; the rest of the event is irrelevant here.
+        const event = { message: { role: "assistant", content: [{ type: "text", text }] } };
+        return event as unknown as Parameters<TelegramRuntime["onMessageEnd"]>[0];
+      };
+      const report = "Merged PR 224: Telegram tables now render as monospace blocks.";
+
+      await runtime.onMessageStart({ message: { role: "user" } });
+      runtime.recordTurnDelivery(report);
+      await runtime.onMessageStart({ message: { role: "assistant" } });
+      await runtime.onMessageEnd(reply(report));
+      expect(sent).toEqual([]);
+
+      await runtime.onMessageStart({ message: { role: "assistant" } });
+      await runtime.onMessageEnd(reply("Next I will sync the fork."));
+      expect(sent).toHaveLength(1);
+      expect(sent[0]).toContain("Next I will sync the fork.");
+
+      // A new user turn starts a fresh delivery record, so the same text is forwarded again.
+      await runtime.onMessageStart({ message: { role: "user" } });
+      await runtime.onMessageStart({ message: { role: "assistant" } });
+      await runtime.onMessageEnd(reply(report));
+      expect(sent).toHaveLength(2);
+
+      // A reply that names a different PR is new output, not a repeat of this turn's delivery.
+      await runtime.onMessageStart({ message: { role: "user" } });
+      runtime.recordTurnDelivery("Merged PR 224 into staging after CI went green on every check across all three operating systems today.");
+      await runtime.onMessageStart({ message: { role: "assistant" } });
+      await runtime.onMessageEnd(reply("Merged PR 225 into staging after CI went green on every check across all three operating systems today."));
+      expect(sent).toHaveLength(3);
+      expect(sent[2]).toContain("Merged PR 225");
+    } finally {
+      await runtime?.dispose();
+      if (previousDaemonDb === undefined) delete process.env.VEYYON_TELEGRAM_DAEMON_DB;
+      else process.env.VEYYON_TELEGRAM_DAEMON_DB = previousDaemonDb;
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
@@ -471,6 +550,14 @@ describe("Telegram Harness Hot Reload", () => {
   test("Extension registers tg-reload and telegram reload commands", async () => {
     const mockApi = createMockExtensionAPI();
     telegramSessionExtension(mockApi.api);
+    setActiveRuntime({
+      onSessionStart: async () => {},
+      getPrimaryChatId: () => null,
+      dispose: async () => {},
+    } as unknown as TelegramRuntime);
+    const rootContext = createMockContext();
+    await mockApi.listeners.get("session_start")![0]({}, rootContext);
+    setSavedContext(null); // This fixture tests command dispatch, not lease acquisition.
 
     expect(mockApi.commands.has("tg-reload")).toBe(true);
     expect(mockApi.commands.has("telegram")).toBe(true);
@@ -478,6 +565,7 @@ describe("Telegram Harness Hot Reload", () => {
     const tgReload = mockApi.commands.get("tg-reload");
     const notifications: { msg: string; level: string }[] = [];
     const commandCtx = {
+      ...rootContext,
       ui: {
         notify: (msg: string, level: string) => {
           notifications.push({ msg, level });
@@ -494,6 +582,13 @@ describe("Telegram Harness Hot Reload", () => {
   test("Extension registers the operator question, message and dashboard tools", () => {
     const mockApi = createMockExtensionAPI();
     telegramSessionExtension(mockApi.api);
+    expect(mockApi.listeners.has("tool_call")).toBe(false);
+    for (const toolName of ["bash", "eval", "write", "read", "ssh", "github", "supabase", "launch"]) {
+      const results = (mockApi.listeners.get("tool_call") ?? []).map(handler =>
+        handler({ toolName, input: { category: "any", command: "inert test data" } }));
+      expect(results).toEqual([]);
+    }
+    expect(mockApi.userMessages).toEqual([]);
 
     expect([...mockApi.tools.keys()].sort()).toEqual(["telegram_dashboard", "telegram_message", "telegram_question"]);
     expect(mockApi.tools.get("telegram_question")?.parameterKeys).toContain("options");
@@ -588,6 +683,33 @@ describe("Telegram Harness Hot Reload", () => {
     expect(await runtime.initSession(ctx)).toBe(true);
     expect(acquireCount).toBe(1); // Must NOT re-acquire lease
     await runtime.dispose();
+  });
+
+  test("child lifecycle cannot replace or dispose the root Telegram runtime", async () => {
+    const rootHost = createMockExtensionAPI();
+    const childHost = createMockExtensionAPI();
+    const starts: string[] = [];
+    let disposals = 0;
+    const runtime = {
+      onSessionStart: async (_event: unknown, ctx: ExtensionContext) => { starts.push(ctx.sessionManager.getSessionId()); },
+      onSessionShutdown: async () => { disposals++; },
+      getPoller: () => ({}),
+    } as unknown as TelegramRuntime;
+    setActiveRuntime(runtime);
+    telegramSessionExtension(rootHost.api);
+    await rootHost.listeners.get("session_start")![0]({}, createMockContext("root-owner"));
+    telegramSessionExtension(childHost.api);
+    const child = { ...createMockContext("child"), isSubagent: true, taskDepth: 1, parentTaskPrefix: "child" };
+    await childHost.listeners.get("session_start")![0]({}, child);
+    await childHost.listeners.get("turn_end")![0]();
+    await childHost.listeners.get("session_shutdown")![0]({});
+    expect(starts).toEqual(["root-owner"]);
+    expect(disposals).toBe(0);
+    expect(getActiveRuntime()).toBe(runtime);
+    await rootHost.listeners.get("turn_end")![0]();
+    await rootHost.listeners.get("session_shutdown")![0]({});
+    expect(disposals).toBe(1);
+    setActiveRuntime(null);
   });
 
   test("telegram_message provides detailed error and supports rebind: true when route is lost", async () => {

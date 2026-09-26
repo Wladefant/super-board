@@ -8,14 +8,20 @@
 
 import * as fs from "node:fs";
 import {
+  getDaemonDbPath,
   getDaemonPidPath,
   getDaemonStatusPath,
   readDaemonSlotIds,
+  resolveDaemonSlots,
 } from "./config";
 import { claimDaemonPidFile, TelegramDaemon } from "./runtime";
-import { getProcessIdentity } from "../extension/coordinator";
-import { guiHostAgentDirs, resolveGuiHostEndpoint } from "./session-control";
-
+import { BotPoolCoordinator, getDefaultManifestPath, getProcessIdentity } from "../extension/coordinator";
+import {
+  TerminalSessionControl,
+  type DaemonSessionSummary,
+} from "./session-control";
+import { ForumManager } from "./forum";
+import { DaemonStore } from "./store";
 /**
  * How often `run` retries a slot someone else is holding. Seconds, not minutes: the
  * handover happens the moment an interactive session exits, and the gap is a window
@@ -60,15 +66,15 @@ async function run(): Promise<number> {
   let handedOver = report.slots.some(slot => slot.polling);
   let retrying = false;
   let nextRetryAt = Date.now() + CLAIM_RETRY_MS;
-  await new Promise<void>(resolve => {
-    const timer = setInterval(() => {
-      const polling = daemon.status().slots.some(slot => slot.polling);
-      if (polling) handedOver = true;
-      if (stopped || (handedOver && !polling && !daemon.hasPendingSlots())) {
-        clearInterval(timer);
-        resolve();
-        return;
-      }
+  const { promise, resolve } = Promise.withResolvers<void>();
+  const timer = setInterval(() => {
+    const polling = daemon.status().slots.some(slot => slot.polling);
+    if (polling) handedOver = true;
+    if (stopped || (handedOver && !polling && !daemon.hasPendingSlots())) {
+      clearInterval(timer);
+      resolve();
+      return;
+    }
       if (!daemon.hasPendingSlots() || retrying || Date.now() < nextRetryAt) return;
       retrying = true;
       void daemon
@@ -80,8 +86,8 @@ async function run(): Promise<number> {
           nextRetryAt = Date.now() + CLAIM_RETRY_MS;
           retrying = false;
         });
-    }, 1_000);
-  });
+  }, 1_000);
+  await promise;
   await (stopped ?? daemon.stop());
   return 0;
 }
@@ -91,7 +97,7 @@ function status(): number {
   const pid = fs.existsSync(pidPath) ? Number.parseInt(fs.readFileSync(pidPath, "utf8").trim(), 10) : NaN;
   const alive = Number.isFinite(pid) && pid > 0 && getProcessIdentity(pid).alive;
   console.log(`daemon: ${alive ? `running (pid ${pid})` : "not running"}`);
-  console.log(`gui host endpoint: ${resolveGuiHostEndpoint() ?? "not discovered"}`);
+  console.log("session transport: authenticated live terminal IPC (no GUI fallback)");
   console.log(`opted-in slots: ${[...readDaemonSlotIds()].join(", ") || "none"}`);
   if (fs.existsSync(getDaemonStatusPath())) {
     console.log(fs.readFileSync(getDaemonStatusPath(), "utf8").trimEnd());
@@ -114,31 +120,109 @@ function stop(): number {
 /** Reports whether this machine is configured for the daemon, without starting it. */
 function check(): number {
   const slots = [...readDaemonSlotIds()];
-  const endpoint = resolveGuiHostEndpoint();
   console.log(`opted-in slots: ${slots.join(", ") || "none"}`);
-  console.log(`gui host endpoint: ${endpoint ?? "not discovered"}`);
+  console.log("session transport: authenticated live terminal IPC");
   if (slots.length === 0) {
     console.error('No slot opted in. Add "daemon": true to a slot in ~/.veyyon/telegram/manifest.json.');
     return 78;
   }
-  if (!endpoint) {
-    console.error(
-      "No GUI host endpoint discovered; the daemon can poll but cannot drive sessions. " +
-        `Start one with \`veyyon gui tcp:127.0.0.1:7699\`. Searched: ${guiHostAgentDirs().join(", ")}`,
-    );
-    return 70;
-  }
   return 0;
 }
 
-const verb = process.argv[2] ?? "run";
-const exitCode = verb === "run"
-  ? await run()
-  : verb === "status"
-    ? status()
-    : verb === "stop"
-      ? stop()
-      : verb === "check"
-        ? check()
-        : (console.error(`Unknown verb '${verb}'. Use run, status, stop or check.`), 64);
+async function reconcileOnce(dryRun = true): Promise<number> {
+  const manifestPath = getDefaultManifestPath();
+  const coordinator = new BotPoolCoordinator(undefined, manifestPath);
+  const slots = resolveDaemonSlots(coordinator, manifestPath);
+  const forumSlots = slots.filter(s => s.mode === "forum" && s.forumChatId);
+
+  if (forumSlots.length === 0) {
+    console.log("No forum-mode slots configured in manifest.");
+    coordinator.close();
+    return 0;
+  }
+
+  const store = new DaemonStore(getDaemonDbPath());
+  const control = new TerminalSessionControl({
+    onEvent: () => {},
+    onLog: () => {},
+  });
+
+  let wireSessions: DaemonSessionSummary[] = [];
+  try {
+    wireSessions = await control.listSessions();
+  } catch (err) {
+    console.error(`Failed to list live terminal owners: ${err instanceof Error ? err.message : String(err)}`);
+    control.close();
+    store.close();
+    coordinator.close();
+    return 1;
+  }
+
+  console.log(`[Auto-attach ${dryRun ? "DRY RUN" : "LIVE"}] Live terminal owners: ${wireSessions.length}`);
+
+  for (const slot of forumSlots) {
+    const isEnabled = slot.autoAttach !== false;
+    console.log(`\nSlot: ${slot.slotId} (forumChatId: ${slot.forumChatId}, autoAttach: ${isEnabled})`);
+    if (!isEnabled) {
+      console.log("  Auto-attach is disabled (autoAttach: false). Skipping slot.");
+      continue;
+    }
+
+    const manager = new ForumManager({
+      slot,
+      token: "dry-run-token",
+      forumChatId: slot.forumChatId!,
+      store,
+      control,
+      client: {
+        createForumTopic: async (_chatId, name) => ({ message_thread_id: 9999, name }),
+        closeForumTopic: async () => true,
+        reopenForumTopic: async () => true,
+        sendMessage: async () => ({ ok: true, result: { message_id: 9999 } }),
+      },
+      log: msg => console.log(`  ${msg}`),
+    });
+
+    const result = await manager.reconcileAutoAttach(undefined, { dryRun });
+    if (result.actions.length === 0) {
+      console.log("  No live top-level sessions found.");
+    } else {
+      for (const a of result.actions) {
+        if (a.action === "create") {
+          console.log(`  [CREATE] session: ${a.sessionId} | folder: "${a.folder}" | topic: "${a.topicName}" | workspace: ${a.workspace}`);
+        } else if (a.action === "rebind") {
+          console.log(`  [REBIND] session: ${a.sessionId} | folder: "${a.folder}" | topic #${a.topicId} | workspace: ${a.workspace} (${a.reason})`);
+        } else {
+          console.log(`  [SKIP]   session: ${a.sessionId} | folder: "${a.folder}" | topic #${a.topicId} | workspace: ${a.workspace} (${a.reason})`);
+        }
+      }
+      console.log(`  Summary: ${result.created} created, ${result.rebound} rebound, ${result.skipped} skipped, ${result.errors} errors`);
+    }
+  }
+
+  control.close();
+  store.close();
+  coordinator.close();
+  return 0;
+}
+
+const rawArgs = process.argv.slice(2);
+const isReconcileOnce = rawArgs.includes("--reconcile-once") || rawArgs.includes("reconcile");
+const isDryRun = rawArgs.includes("--dry-run");
+
+let exitCode = 0;
+if (isReconcileOnce) {
+  exitCode = await reconcileOnce(true);
+} else {
+  const verb = rawArgs[0] ?? "run";
+  exitCode = verb === "run"
+    ? await run()
+    : verb === "status"
+      ? status()
+      : verb === "stop"
+        ? stop()
+        : verb === "check"
+          ? check()
+          : (console.error(`Unknown verb '${verb}'. Use run, status, stop, check or --reconcile-once --dry-run.`), 64);
+}
 process.exit(exitCode);

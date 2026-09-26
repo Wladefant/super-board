@@ -30,7 +30,7 @@ A harness-agnostic, pure Python standard library multi-agent coordination core l
 5. **No Credential Exposure:**
    * Quota, balance, and probe utilities sanitize and redact all account identifiers, emails, project refs, and tokens.
 6. **Head-Bound Evidence Invalidation:**
-   * Execution-checkpoint proofs remain head-bound. The installed `github_pr_gate.py` and `review_content.py` retain stable patch-id **and** whitespace-sensitive stripped-diff sha256, valid ancestor delta chains, the staging COMMENT-review waiver and anti-self-approval. Native review timestamps additionally bind fresh CI/security invalidation: unchanged content never permits a newly broken or newly vulnerable candidate through the gate. Legacy local review metadata cannot grant approval.
+   * Execution-checkpoint proofs remain head-bound. The installed `github_pr_gate.py` and `review_content.py` retain stable patch-id **and** whitespace-sensitive stripped-diff sha256, valid ancestor delta chains, the COMMENT-review approval waiver on named single-author branches (`Bavariance/polysimulator@staging`, `Wladefant/super-board@main`, and `Wladefant/veyyon@main`) and anti-self-approval. Native review timestamps additionally bind fresh CI/security invalidation: unchanged content never permits a newly broken or newly vulnerable candidate through the gate. Legacy local review metadata cannot grant approval.
 
 ---
 
@@ -50,6 +50,7 @@ A harness-agnostic, pure Python standard library multi-agent coordination core l
 | **`github_pr_gate.py`** | `FinalizeExecutableRouting` | Deterministic GitHub PR status and review gate verifying CI, GitHub approvals, or source-backed independent automated review artifacts on named non-production branches. | `python github_pr_gate.py --pr <pr_url_or_number> [--head-sha <sha>] [--review-record <artifact.json>] [--policy-config <policy.json>] [--json]` | Live GitHub PR via `gh`, native required-check contexts, optional `portable-review/v1` artifact | `PRGateEvaluation` (`PASSED`, `BLOCKED`, `PENDING`) with detailed gate breakdown |
 | **`diagnostics.py`** | `PackagePortableCoordinator` | Unified aggregate system, service, provider, request and host resource diagnostics. Exposes where problems lie, what is missing, distinguishes access from health and stale from failed, and asks user only when true authorization/preference/credential needed with deduplicatable question IDs. | `python diagnostics.py [--state-dir <dir>] [--strict] [--json] [--summary]` (or `python coordinator.py --diagnostics`) | `ledger.json`, `decisions.json`, `preflight_evidence/`, usage snapshots | `DiagnosticReport` (JSON or terminal summary), `human_inputs`, `agent_actions` |
 | **`recurrence_guard.py`** | `ImplementRecurrenceGuard` | Durable failure recurrence persistence and corrective-action gates. Stable `project+environment+operation+error_class` signatures with unique observation ids, so duplicate ingestion is not recurrence and an intended negative control is retained without counting. First occurrence keeps diagnosis/owner/next action; second refuses unchanged blind retry until a systemic corrective action is recorded; third escalates once per epoch through the existing deduplicated notification contract. Records only — executes nothing and satisfies no authorization or head-bound QA/review gate. | `python recurrence_guard.py [--state-dir <dir>] [--summary] [observe \| check-retry \| record-corrective-action \| supersede-observation \| resolve \| list \| show \| escalations]` | `recurrence.json`, `ledger.json`, observed failure text from a native worker outcome, the continuation driver, CI, a deployment or a tool | `IntakeResult`, `RetryDecision` (CLI exit 3 when a retry is refused), `NotificationEvent` payloads with their dedup signatures, ledger evidence/blocker/next_action |
+| **`verify.py`** | `VerificationGate` | Verification CLI and smoke test gate classifying modified surfaces (`docs`, `backend`, `frontend`, `workflow`), executing scenario checks, and emitting head-bound `verify-receipt/v1` JSON artifacts. | `python verify.py [--pr <number|url>] [--files <path...>] [--head-sha <sha>] [--receipt-out <path>] [--json]` | Changed files, unified diffs, PR metadata, scenario QA receipts | `VerificationReceipt` (`verify-receipt/v1`), `ScenarioCheckResult`, gate evaluation |
 
 ### Automated review artifact contract
 
@@ -57,10 +58,11 @@ A harness-agnostic, pure Python standard library multi-agent coordination core l
 must bind the repository, PR number, full head SHA, full base SHA, and live PR author. The
 reviewer must be a distinct automation actor, and `source` must name that same actor through
 an `agent://` or `history://` transcript URI with a SHA-256 digest. Outcomes are exactly
-`approved` or `changes_requested`; the latter always blocks. A valid artifact can replace
-the GitHub Approve button only where the resolved named policy sets
-`require_github_approval` to false. Production-protected bases retain mandatory independent
-GitHub `APPROVED` review.
+approved or `changes_requested`; the latter always blocks. A valid artifact or automated
+COMMENT review verdict can replace the GitHub Approve button only where the resolved named
+policy sets `require_github_approval` to false (`Bavariance/polysimulator@staging`,
+`Wladefant/super-board@main`, and `Wladefant/veyyon@main`). Production-protected bases retain
+mandatory independent GitHub `APPROVED` review.
 
 This local gate treats the artifact as advisory trusted-workflow evidence. Schema,
 provenance shape, actor separation, and exact-head/base bindings are validated, but this is
@@ -68,6 +70,19 @@ not a cryptographic identity guarantee; the supplying workflow must authenticate
 the referenced transcript. An author `COMMENTED` review is never represented as GitHub
 approval.
 
+
+### Verification receipt contract (`verify-receipt/v1`)
+
+`--verify-receipt` in `github_pr_gate.py` reads a head-bound `verify-receipt/v1` JSON artifact
+emitted by `verify.py`. The receipt classifies all changed files across four primary surfaces:
+- `docs`: Markdown syntax linting and UTF-8 encoding validation.
+- `backend`: Python syntax compilation, test receipt ingestion, or targeted test execution.
+- `frontend`: Mandates head-bound dual-viewport (desktop 1440px/1920px & mobile 320px/390px) browser QA receipts.
+- `workflow`: Python syntax compilation and targeted workflow verification.
+
+A valid receipt must bind the exact 40-character head SHA and report `status: "PASSED"`.
+When `require_verify_receipt` is enabled in the gate approval policy (or `--require-verify-receipt`
+flag is passed), missing or failing receipts block the gate.
 ---
 
 ## 3. Single Bounded Coordinator Command
@@ -338,6 +353,8 @@ python workflows/portable/install_github_native.py --source-root <checkout> --ch
 ```
 
 The installer replaces only enumerated policy/code files atomically and verifies exact bytes. `--check` is read-only and returns nonzero on drift. Preserve the PR/commit URL in the migration issue comment, use that checkout to check parity, and change source through another PR before reinstalling. No session restart, process operation, state deletion or unrelated configuration replacement occurs.
+
+The enumeration (`RUNTIME_FILES`) includes the model router (`model_routing.py`, its `balance_loader.py` dependency and `routing_smoke_test.py`). `coordinator.py` and `superboard_adapter.py` import the router at runtime, so `--check` also reports router drift. The profile `config.yml` is never installed; its role pins remain a manual step.
 
 The installed manifest is updated only for GitHub authority and the owned module/export entries, preserving other integrations. The parity check validates those fields without replacing unrelated metadata.
 

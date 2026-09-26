@@ -281,6 +281,45 @@
         "human_inputs (question_id, category, target, question, resolution_guidance)",
         "agent_actions (target, category, missing_prerequisites, next_action)"
       ]
+    },
+    "gardener.py": {
+      "role": "Automated dead code, unused export, and tech debt analysis (Knip + Vulture) generating bounded cleanup task specifications for cheap lanes",
+      "owner": "GardenerRole",
+      "cli_command": "python gardener.py [--dry-run] [--repo-root <path>] [--min-confidence 80] [--max-items 15] [--json] [--markdown]",
+      "inputs": [
+        "frontend/ (TypeScript / Next.js)",
+        "backend/ (FastAPI / Python)"
+      ],
+      "outputs": [
+        "GardenerReport (JSON, Markdown, or terminal summary)",
+        "CleanupTaskSpec (bounded Spark/Flash subagent task specification)"
+      ]
+    },
+    "adoption_audit.py": {
+      "role": "Enforce adopt-or-reject policy and prevent premature closure of parent issues with open sub-issues",
+      "owner": "AdoptionAuditRole",
+      "cli_command": "python adoption_audit.py [--repo <owner/repo>] [--issue <number>] [--auto-reopen] [--dry-run] [--json] [--markdown]",
+      "inputs": [
+        "GitHub Issues (kind:research, kind:governance, sub-issues API)"
+      ],
+      "outputs": [
+        "AuditResult (JSON or Markdown summary, non-zero exit on findings)"
+      ]
+    },
+    "verify.py": {
+      "role": "Verification CLI and smoke test gate classifying modified surfaces (docs, backend, frontend, workflow), executing scenario checks, and emitting head-bound verify-receipt/v1 JSON artifacts",
+      "owner": "VerificationGate",
+      "cli_command": "python verify.py [--pr <number|url>] [--files <path...>] [--head-sha <40-hex>] [--receipt-out <path>] [--json]",
+      "inputs": [
+        "Changed file list or unified diff",
+        "PR metadata and comments (via gh CLI or API payload)",
+        "Browser QA receipts, unit test outputs, or docs syntax"
+      ],
+      "outputs": [
+        "VerificationReceipt (JSON or compact markdown, schema verify-receipt/v1)",
+        "ScenarioCheckResult (per surface: docs_lint, browser_qa_receipt, backend_unit_tests, workflow_unit_tests)",
+        "Deploy-critical change detection"
+      ]
     }
   },
   "adapters": {
@@ -349,10 +388,15 @@
       "recurrence_guard.py",
       "WORKER_EXECUTION.md",
       "diagnostics.py",
-      "telegram_workflow.py",
-      "session_crash_monitor.py"
+      "session_crash_monitor.py",
+      "quota_snapshot.py",
+      "gardener.py",
+      "adoption_audit.py"
     ],
     "optional_files": [
+      "test_adoption_audit.py",
+      "test_gardener.py",
+      "test_quota_snapshot.py",
       "usage_snapshot_cache.json",
       "test_github_work_item.py",
       "test_install_github_native.py",

@@ -40,6 +40,7 @@ EXPORT_FILES = [
     "preflight.py",
     "balance_loader.py",
     "model_routing.py",
+    "quota_snapshot.py",
     "github_plan_renderer.py",
     "github_plan_templates.py",
     "usage_fixture.json",
@@ -222,8 +223,6 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
         "--head", synthetic_head,
         "--labels", "area:harness,local_doc",
         "--next-action", "Draft documentation updates",
-        "--issue-number", "4555",
-        "--issue-url", "https://github.com/Bavariance/polysimulator/issues/4555",
     ]
     res = subprocess.run(add_local_cmd, capture_output=True, text=True)
     assert_true(res.returncode == 0, f"Added synthetic local_doc request: {res.stderr}")
@@ -380,8 +379,6 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
         "--labels", "runtime,ui",
         "--head", synthetic_head,
         "--next-action", "Run staging smoke verification",
-        "--issue-number", "4556",
-        "--issue-url", "https://github.com/Bavariance/polysimulator/issues/4556",
     ]
     res = subprocess.run(add_deploy_cmd, capture_output=True, text=True)
     assert_true(res.returncode == 0, f"Added synthetic deployable request: {res.stderr}")

@@ -1,12 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import { authenticateInitData, authenticateAppSession, issueAppSession } from "../daemon/miniapp-auth";
 import { authorizedRelay, startRelay } from "../miniapp/relay";
-import { miniAppRequest, connectMiniApp } from "../daemon/miniapp";
+import { miniAppRequest, connectMiniApp, buildMiniAppUrl } from "../daemon/miniapp";
 import { createHmac } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { evaluateApproval, describeApproval, pendingApprovals } from "../extension/approvals";
+import { createClient, getUnavailableState, UNAVAILABLE_MESSAGE, REOPEN_MESSAGE, SECTIONS, TerminalAuthError, isTerminalAuthError } from "../miniapp/client.js";
+import { SERVED_FILES } from "../miniapp/relay";
+import { readFileSync } from "node:fs";
 
 const raw = 'query_id=test-query&user=%7B%22id%22%3A1247617658%2C%22first_name%22%3A%22Test%22%7D&auth_date=1700000000&hash=7d6f11c05a1930f4d8e1ff0735d05997656bfa3f819d27e52d2b180491c13cda';
 const token = "123456:test-token";
@@ -56,6 +58,76 @@ test("daemon API rejects forged auth before reading state or deciding approval",
     expect(result.status).toBe(401);
   }
   expect(touched).toBe(false);
+});
+
+test("buildMiniAppUrl adds topicId and sessionId search parameters", () => {
+  const base = "https://superboard.example.com";
+  expect(buildMiniAppUrl(base, { topicId: "14", sessionId: "sess-123" }))
+    .toBe("https://superboard.example.com/?topicId=14&sessionId=sess-123");
+  expect(buildMiniAppUrl(base, { topicId: "48" }))
+    .toBe("https://superboard.example.com/?topicId=48");
+  expect(buildMiniAppUrl(base, { sessionId: "sess-abc" }))
+    .toBe("https://superboard.example.com/?sessionId=sess-abc");
+  expect(buildMiniAppUrl(base)).toBe("https://superboard.example.com/");
+});
+
+test("miniAppRequest forwards requested topicId and sessionId from query params and start_param to session resolver", async () => {
+  let observedContext: { sessionId?: string; topicId?: string } | undefined;
+  const options = {
+    stateDir: "unused", token, allowedUsers: users,
+    session: (_user: string, ctx?: { sessionId?: string; topicId?: string }) => {
+      observedContext = ctx;
+      return "resolved-session-id";
+    },
+    sessions: async () => [],
+    dashboard: () => null,
+    status: () => ({}),
+  };
+  const appSession = issueAppSession(users[0], token);
+
+  // 1. From query string (?topicId=14&sessionId=sess-1)
+  await miniAppRequest({
+    id: "r1",
+    path: "/api/state?topicId=14&sessionId=sess-1",
+    method: "GET",
+    initData: "",
+    appSession,
+    body: "",
+  }, options);
+  expect(observedContext).toEqual({ topicId: "14", sessionId: "sess-1" });
+
+  // 2. From start_param in initData (e.g. topic_58)
+  await miniAppRequest({
+    id: "r2",
+    path: "/api/state",
+    method: "GET",
+    initData: "start_param=topic_58",
+    appSession,
+    body: "",
+  }, options);
+  expect(observedContext).toEqual({ topicId: "58", sessionId: undefined });
+
+  // 3. From start_param with raw number (e.g. 876)
+  await miniAppRequest({
+    id: "r3",
+    path: "/api/state",
+    method: "GET",
+    initData: "start_param=876",
+    appSession,
+    body: "",
+  }, options);
+  expect(observedContext).toEqual({ topicId: "876", sessionId: undefined });
+
+  // 4. From start_param with session_xxx
+  await miniAppRequest({
+    id: "r4",
+    path: "/api/state",
+    method: "GET",
+    initData: "start_param=session_01a0-test",
+    appSession,
+    body: "",
+  }, options);
+  expect(observedContext).toEqual({ topicId: undefined, sessionId: "01a0-test" });
 });
 
 test("relay forwards signed API state and rejects forged browser credentials", async () => {
@@ -113,19 +185,16 @@ test("authenticated actors cannot read or decide another private chat's pending 
     sessions: async () => [], dashboard: (user: string) => ({ owner: user }), status: () => ({}),
   };
   try {
-    const approval = evaluateApproval(dir, "bob-operation", describeApproval("bash", { command: "echo safe" }, "shell", { sessionId: routes[bob], requester: "bob-agent", task: "test", cwd: dir }));
     const aliceSession = issueAppSession(alice, token);
     const state = await miniAppRequest({ id: "1", path: "/api/state", method: "GET", initData: "", appSession: aliceSession, body: "" }, options);
     expect(state.status).toBe(200);
-    expect(state.data).toMatchObject({ session: "alice-session", approvals: [], dashboard: { owner: alice } });
-    const decision = { token: approval.token, decision: "denied" };
+    expect(state.data).toMatchObject({ session: "alice-session", dashboard: { owner: alice } });
+    expect(state.data).not.toHaveProperty("approvals");
+    const decision = { token: "obsolete", decision: "denied" };
     const wrongActor = await miniAppRequest({ id: "2", path: "/api/approval", method: "POST", initData: "", appSession: aliceSession, body: JSON.stringify(decision) }, options);
-    expect(wrongActor.status).toBe(409);
-    expect(pendingApprovals(dir, routes[bob])).toHaveLength(1);
+    expect(wrongActor.status).toBe(410);
     const rightActor = await miniAppRequest({ id: "3", path: "/api/approval", method: "POST", initData: "", appSession: issueAppSession(bob, token), body: JSON.stringify(decision) }, options);
-    expect(rightActor.status).toBe(200);
-    expect(pendingApprovals(dir, routes[bob])).toHaveLength(0);
-    expect((await miniAppRequest({ id: "4", path: "/api/approval", method: "POST", initData: "", appSession: issueAppSession(bob, token), body: JSON.stringify(decision) }, options)).status).toBe(409);
+    expect(rightActor.status).toBe(410);
     for (const [path, method] of [["/api/unknown", "GET"], ["/api/state", "POST"], ["/api/approval", "GET"]]) {
       expect((await miniAppRequest({ id: "5", path, method, initData: "", appSession: aliceSession, body: "" }, options)).status).toBe(404);
     }
@@ -146,4 +215,191 @@ test("anonymous flood never consumes relay forwarding slots", async () => {
     expect(response.status).toBe(200);
     expect(forwarded).toBe(1);
   } finally { ws.close(); server.stop(true); }
+});
+
+describe("Mini App client 401 session reset and unavailable state", () => {
+  test("401 on /api/state drops cached session, re-runs /api/session with fresh initData, and retries original request once", async () => {
+    const calls: { path: string; method?: string; headers: Record<string, string> }[] = [];
+    let initDataCounter = 0;
+    const getInitData = () => `init-data-version-${++initDataCounter}`;
+
+    let sessionCount = 0;
+    const transport = async (path: string, init?: RequestInit) => {
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      calls.push({ path, method: init?.method, headers });
+
+      if (path === "/api/session") {
+        return Response.json({ appSession: `session-token-${++sessionCount}` });
+      }
+
+      if (path === "/api/state") {
+        if (headers["x-miniapp-session"] === "initial-stale-session") {
+          return Response.json({ error: "Open this app from Telegram again to authenticate." }, { status: 401 });
+        }
+        if (headers["x-miniapp-session"] === "session-token-1") {
+          return Response.json({ observedAt: 1700000000, sessions: [{ id: "s1" }] });
+        }
+      }
+      return Response.json({ error: "Unexpected" }, { status: 500 });
+    };
+
+    const client = createClient(getInitData, transport);
+    client.setSession("initial-stale-session");
+
+    const result = await client("/api/state");
+    expect(result).toEqual({ observedAt: 1700000000, sessions: [{ id: "s1" }] });
+    expect(client.getSession()).toBe("session-token-1");
+
+    expect(calls).toHaveLength(3);
+    expect(calls[0].path).toBe("/api/state");
+    expect(calls[0].headers["x-miniapp-session"]).toBe("initial-stale-session");
+    expect(calls[1].path).toBe("/api/session");
+    expect(calls[1].headers["x-telegram-init-data"]).toBe("init-data-version-1");
+    expect(calls[2].path).toBe("/api/state");
+    expect(calls[2].headers["x-miniapp-session"]).toBe("session-token-1");
+  });
+
+
+  test("non-401 state errors throw standard Error and do not clear session", async () => {
+    const client = createClient(() => "launch-data", async (path: string) => {
+      if (path === "/api/state") return Response.json({ error: "State unavailable" }, { status: 400 });
+      return Response.json({});
+    });
+    client.setSession("valid-session");
+    let caughtError: unknown;
+    try {
+      await client("/api/state");
+    } catch (err) {
+      caughtError = err;
+    }
+    expect(caughtError).toBeInstanceOf(Error);
+    expect(caughtError).not.toBeInstanceOf(TerminalAuthError);
+    expect(isTerminalAuthError(caughtError)).toBe(false);
+    expect((caughtError as Error).message).toBe("State unavailable");
+    expect(client.getSession()).toBe("valid-session");
+  });
+
+  test("double-401 drops session and renders explicit unavailable / re-open from Telegram state when retry fails", async () => {
+    const calls: string[] = [];
+    const client = createClient(() => "launch-data", async (path: string) => {
+      calls.push(path);
+      if (path === "/api/session") return Response.json({ appSession: "session-attempt-2" });
+      if (path === "/api/state") {
+        return Response.json({ error: "Open this app from Telegram again to authenticate." }, { status: 401 });
+      }
+      return Response.json({ error: "Unexpected" }, { status: 500 });
+    });
+
+    client.setSession("session-attempt-1");
+
+    let caughtError: Error | undefined;
+    try {
+      await client("/api/state");
+    } catch (err) {
+      caughtError = err as Error;
+    }
+
+    expect(caughtError).toBeDefined();
+    expect(caughtError?.message).toBe("Open this app from Telegram again to authenticate.");
+    expect(caughtError).toBeInstanceOf(TerminalAuthError);
+    expect(isTerminalAuthError(caughtError)).toBe(true);
+    expect(calls).toEqual(["/api/state", "/api/session", "/api/state"]);
+    expect(client.getSession()).toBe("");
+
+    const unavailableState = getUnavailableState(caughtError?.message);
+    expect(unavailableState.connection).toBe("Not connected");
+    expect(unavailableState.notice).toBe("Open this app from Telegram again to authenticate.");
+    expect(unavailableState.freshness).toBe("Unavailable");
+    for (const section of SECTIONS) {
+      expect(unavailableState.sections[section]).toBe(UNAVAILABLE_MESSAGE);
+      expect(unavailableState.sections[section]).toBe("Unavailable until a secure connection is established.");
+    }
+  });
+
+  test("double-401 drops session and renders explicit unavailable state when re-session exchange returns 401", async () => {
+    const calls: string[] = [];
+    const client = createClient(() => "expired-launch-data", async (path: string) => {
+      calls.push(path);
+      if (path === "/api/state") {
+        return Response.json({ error: "Open this app from Telegram again to authenticate." }, { status: 401 });
+      }
+      if (path === "/api/session") {
+        return Response.json({ error: "Open this app from Telegram again to authenticate." }, { status: 401 });
+      }
+      return Response.json({ error: "Unexpected" }, { status: 500 });
+    });
+
+    client.setSession("dead-session");
+
+    let caughtError: Error | undefined;
+    try {
+      await client("/api/state");
+    } catch (err) {
+      caughtError = err as Error;
+    }
+
+    expect(caughtError).toBeDefined();
+    expect(caughtError?.message).toBe("Open this app from Telegram again to authenticate.");
+    expect(calls).toEqual(["/api/state", "/api/session"]);
+    expect(caughtError).toBeInstanceOf(TerminalAuthError);
+    expect(isTerminalAuthError(caughtError)).toBe(true);
+    expect(client.getSession()).toBe("");
+
+    const unavailableState = getUnavailableState(caughtError?.message);
+    expect(unavailableState.connection).toBe("Not connected");
+    expect(unavailableState.notice).toBe("Open this app from Telegram again to authenticate.");
+    expect(unavailableState.freshness).toBe("Unavailable");
+    for (const section of SECTIONS) {
+      expect(unavailableState.sections[section]).toBe(UNAVAILABLE_MESSAGE);
+    }
+  });
+
+  test("401 handler safely handles non-JSON error responses and clears session", async () => {
+    const calls: string[] = [];
+    const client = createClient(() => "launch", async (path: string) => {
+      calls.push(path);
+      if (path === "/api/session") return Response.json({ appSession: "session-ok" });
+      if (path === "/api/state") return new Response("Unauthorized plain text", { status: 401 });
+      return Response.json({});
+    });
+    client.setSession("stale");
+
+    let caughtError: Error | undefined;
+    try {
+      await client("/api/state");
+    } catch (err) {
+      caughtError = err as Error;
+    }
+    expect(caughtError).toBeDefined();
+    expect(caughtError?.message).toBe(REOPEN_MESSAGE);
+    expect(client.getSession()).toBe("");
+    expect(calls).toEqual(["/api/state", "/api/session", "/api/state"]);
+  });
+
+  test("relay serves client.js and all assets without path leak, and Dockerfile copies them", async () => {
+    const secret = "e".repeat(64);
+    const server = startRelay(secret, 0);
+    try {
+      for (const [route, file] of Object.entries(SERVED_FILES)) {
+        const res = await fetch(`http://localhost:${server.port}${route}`);
+        expect(res.status).toBe(200);
+        expect(res.headers.get("cache-control")).toBe("no-store");
+        expect(res.headers.get("content-security-policy")).toContain("default-src 'none'");
+        const body = await res.text();
+        expect(body.length).toBeGreaterThan(0);
+        expect(body).not.toContain("ENOENT");
+      }
+      const missing = await fetch(`http://localhost:${server.port}/unknown-script.js`);
+      expect(missing.status).toBe(404);
+    } finally {
+      server.stop(true);
+    }
+
+    const dockerfile = readFileSync(new URL("../miniapp/Dockerfile", import.meta.url), "utf8");
+    const copyLine = dockerfile.split("\n").find(l => l.startsWith("COPY "));
+    expect(copyLine).toBeDefined();
+    for (const file of Object.values(SERVED_FILES)) {
+      expect(copyLine).toContain(file);
+    }
+  });
 });

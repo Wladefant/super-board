@@ -223,7 +223,7 @@ is_valid = (calculated_hash == received_hash)
 | **Decision Callbacks** | `types.ts`, `poller.ts`, `coordinator.ts` | - Validates tokens from inline button callbacks against `decision_callbacks` table.<br>- Consumes token, updates Telegram message to "Decision Resolved", and executes `decision_workflow.py resolve-callback`. |
 | **Long Poller & Ingest Ledger** | `poller.ts` | - Transactional update ledger (`update_ledger` table in WAL mode).<br>- Monotonic offset tracking with redrive of pending updates.<br>- Allowlist DM policy enforcement (`accessConfig.allowFrom`).<br>- Inbound routing: idle sessions receive user messages; busy sessions receive steering inputs. |
 | **Message Streaming** | `index.ts` | - Multi-chunk message splitter (`chunkMessage` at 3800 chars).<br>- Debounced in-place message editing (1500ms debounce) for live assistant generation. |
-| **Security & Tool Guard** | `guard.ts`, `sanitizer.ts` | - `DangerousToolGuard` blocks high-risk operations (git push, delete, secret access) initiated from remote Telegram turns.<br>- `redactSecrets` filters tokens and sensitive patterns before dispatch. |
+| **Authentication & Sanitization** | `poller.ts`, `sanitizer.ts` | Sender allowlists and session/topic ownership remain enforced; secret redaction remains. Telegram tool-call guard and approval interception were removed at operator request; native permissions are unchanged. |
 
 ### 3.2 Critical Gaps in Existing Implementation
 

@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { Database } from "bun:sqlite";
 import { TelegramPoller } from "../extension/poller";
 import { MessageContextStore } from "../src/message-context";
-import type { MessageCorrelationBridge, OutboundMessageCorrelation, TelegramUpdate } from "../extension/types";
+import type { MessageCorrelationBridge, OutboundMessageCorrelation, TelegramUpdate, ChannelAccessConfig, PollerOptions } from "../extension/types";
 
 const originalFetch = globalThis.fetch;
 const cleanup: Array<() => void> = [];
@@ -14,7 +14,10 @@ afterEach(() => {
   for (const close of cleanup.splice(0)) close();
 });
 
-function fixture() {
+function fixture(
+  accessOverrides?: Partial<ChannelAccessConfig>,
+  optionsOverrides?: Partial<PollerOptions>,
+) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tg-reply-lane-"));
   const calls: Array<{ method: string; body: Record<string, unknown>; at: number }> = [];
   const messages = new Map<number, OutboundMessageCorrelation>();
@@ -47,7 +50,7 @@ function fixture() {
   const poller = new TelegramPoller(
     "0:disposable-test",
     dir,
-    { allowFrom: ["1"], dmPolicy: "allowlist" },
+    { allowFrom: ["1"], dmPolicy: "allowlist", groups: { "-1004422647618": {} }, ...accessOverrides },
     {
       isIdle: () => isSessionIdle,
       onUserMessage: text => userTurns.push(text),
@@ -55,12 +58,11 @@ function fixture() {
       onFollowUp: () => {},
       onAbort: () => {},
       onRelease: async () => {},
-      onTelegramTurnStart: () => {},
       getStatusText: () => "test",
       onLedgerFailure: () => {},
     },
     bridge,
-    { outboundPaceMs: 0 },
+    { outboundPaceMs: 0, ...optionsOverrides },
   );
 
   globalThis.fetch = (async (url, init) => {
@@ -89,6 +91,18 @@ function fixture() {
       reply_to_message: { message_id: replyToId, date: 0, chat: { id: 1 } },
     },
   });
+  const forumMessage = (threadId: number, text: string, replyToId?: number, updateId = 8000 + Math.floor(Math.random() * 1000)): TelegramUpdate => ({
+    update_id: updateId,
+    message: {
+      message_id: updateId,
+      message_thread_id: threadId,
+      chat: { id: -1004422647618, type: "supergroup" },
+      from: { id: 1, is_bot: false, first_name: "Operator" },
+      date: Date.now() / 1000,
+      text,
+      ...(replyToId ? { reply_to_message: { message_id: replyToId, date: 0, chat: { id: -1004422647618 } } } : {}),
+    },
+  });
 
   return {
     dir,
@@ -98,6 +112,7 @@ function fixture() {
     userTurns,
     steerTurns,
     reply,
+    forumMessage,
     setIdle: (idle: boolean) => { isSessionIdle = idle; },
     setLaneState: (laneId: string, state: "active" | "exited" | "unknown") => {
       for (const msg of messages.values()) {
@@ -149,7 +164,7 @@ test("reply to active lane injects provenance and routes to Main without dead wo
   // Provenance headers
   expect(delivered).toContain("[Concerning lane: worker-db; last reported state: active. Reply delivered to Main for dispatch, not directly to the lane.]");
   expect(delivered).toContain(`[Replying to Telegram post #${msgId}]`);
-  expect(delivered).toContain("[Telegram sender: 1; origin: telegram_account; human presence not attested]");
+  expect(delivered).toContain("[Telegram sender: 1; origin: telegram_account]");
   expect(delivered).toContain("Please run migrations");
 
   // Did NOT send an exited notice to Telegram
@@ -299,4 +314,59 @@ test("lane provenance persists in MessageContextStore SQLite database across ins
   reopened.close();
 
   fs.rmSync(dir, { recursive: true, force: true });
+});
+test("forum topic message pointing to topic creation root message routes to bound session without reply correlation rejection", async () => {
+  const f = fixture();
+  // In Telegram forum topics, standard messages often carry reply_to_message pointing to the topic creation root message (message_id === message_thread_id)
+  f.poller.ingestUpdates([f.forumMessage(14, "hello from operator", 14)]);
+  await f.poller.redrivePendingUpdates();
+
+  expect(f.userTurns).toHaveLength(1);
+  expect(f.userTurns[0]).toContain("hello from operator");
+  expect(f.userTurns[0]).not.toContain("[Replying to Telegram post #14]");
+  expect(f.calls.some(c => String(c.body.text).includes("Reply not routed"))).toBe(false);
+});
+
+test("forum topic message with forum_topic_created object routes as regular topic message", async () => {
+  const f = fixture();
+  const update: TelegramUpdate = {
+    update_id: 8901,
+    message: {
+      message_id: 8901,
+      message_thread_id: 58,
+      chat: { id: -1004422647618, type: "supergroup" },
+      from: { id: 1, is_bot: false, first_name: "Operator" },
+      date: Date.now() / 1000,
+      text: "investigate latency",
+      reply_to_message: { message_id: 58, date: 0, chat: { id: -1004422647618 }, forum_topic_created: { name: "polysimulator" } },
+    },
+  };
+  f.poller.ingestUpdates([update]);
+  await f.poller.redrivePendingUpdates();
+
+  expect(f.userTurns).toHaveLength(1);
+  expect(f.userTurns[0]).toContain("investigate latency");
+  expect(f.userTurns[0]).not.toContain("[Replying to Telegram post #58]");
+  expect(f.calls.some(c => String(c.body.text).includes("Reply not routed"))).toBe(false);
+});
+
+test("reply to unindexed message in forum topic delivers to bound session instead of rejecting with reply not routed", async () => {
+  const f = fixture();
+  // Replying to an older unindexed message (e.g. from before daemon restart or another user) inside topic #48
+  f.poller.ingestUpdates([f.forumMessage(48, "continuing discussion", 99999)]);
+  await f.poller.redrivePendingUpdates();
+
+  expect(f.userTurns).toHaveLength(1);
+  expect(f.userTurns[0]).toContain("continuing discussion");
+  expect(f.calls.some(c => String(c.body.text).includes("Reply not routed"))).toBe(false);
+});
+
+test("reply to unindexed message in direct chat (DM) is rejected with reply not routed", async () => {
+  const f = fixture();
+  // In DM, unindexed reply targets cannot be routed safely because multiple sessions could exist
+  f.poller.ingestUpdates([f.reply(99999, "hello in dm")]);
+  await f.poller.redrivePendingUpdates();
+
+  expect(f.userTurns).toHaveLength(0);
+  expect(f.calls.some(c => String(c.body.text).includes("Reply not routed"))).toBe(true);
 });

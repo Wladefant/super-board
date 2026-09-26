@@ -7,17 +7,16 @@
  * outbound transcript text is attributed from.
  */
 
-import { escapeHtml } from "../extension/sanitizer";
+import { escapeHtml, isRepeatDelivery } from "../extension/sanitizer";
 import { availableCommands } from "../extension/command-registry";
 import type { DaemonSlot } from "./config";
 import type {
   DeliveryMode,
-  GuiHostSessionControl,
+  TerminalSessionControl,
   SessionEvent,
 } from "./session-control";
 import { SessionControlUnavailableError } from "./session-control";
-import type { DaemonStore } from "./store";
-import { GuiHostFallbackManager } from "./gui-host-fallback";
+import { AGENT_MESSAGE_DEDUPE_WINDOW_MS, type DaemonStore } from "./store";
 
 /**
  * Where a message came from, and where its answer goes: a chat, plus the forum topic
@@ -36,23 +35,31 @@ export interface RouteTarget {
  * exist before a session can be bound to it.
  */
 export interface TopicLifecycle {
-  ensureTopic(sessionId: string, workspace: string, title?: string | null): Promise<number>;
+  ensureTopic(
+    sessionId: string,
+    workspace: string,
+    title?: string | null,
+    ordinal?: number,
+    liveSessionIds?: Set<string>,
+  ): Promise<number>;
   closeTopic(messageThreadId: number): Promise<boolean>;
   listTopicsText(currentTopicId: string): string;
+  markDetached?(sessionId: string): void;
+  isDetached?(sessionId: string): boolean;
+  clearDetached?(sessionId: string): void;
 }
 
 export interface SlotRouterOptions {
   slot: DaemonSlot;
   store: DaemonStore;
-  control: GuiHostSessionControl;
+  control: TerminalSessionControl;
   /** Router UI text, already valid Telegram HTML. */
   send: (target: RouteTarget, html: string) => Promise<void>;
   /** Agent prose, still markdown; the transport renders and chunks it. */
-  relay: (target: RouteTarget, markdown: string) => Promise<void>;
+  relay: (target: RouteTarget, markdown: string, sessionId: string) => Promise<void>;
   log: (message: string) => void;
   /** Present only in forum mode. */
   topics?: TopicLifecycle;
-  fallbackManager?: GuiHostFallbackManager;
 }
 
 export interface DaemonCommandDescriptor {
@@ -96,22 +103,11 @@ export function getDaemonCommands(): DaemonCommandDescriptor[] {
 
 export class SlotRouter {
   private readonly options: SlotRouterOptions;
-  private readonly fallbackManager: GuiHostFallbackManager;
 
   constructor(options: SlotRouterOptions) {
     this.options = options;
-    this.fallbackManager =
-      options.fallbackManager ??
-      new GuiHostFallbackManager({
-        control: options.control,
-        log: options.log,
-      });
   }
 
-  private withHostFallback<T>(target: RouteTarget, operation: () => Promise<T>): Promise<T> {
-    const replyFn = (text: string) => this.options.send(target, text);
-    return this.fallbackManager.withFallback(target.chatId, replyFn, operation);
-  }
 
   private get slotId(): string {
     return this.options.slot.slotId;
@@ -144,7 +140,24 @@ export class SlotRouter {
       sessionId,
       workspace,
     });
-    await this.options.control.loadTranscript(sessionId);
+    this.options.topics?.clearDetached?.(sessionId);
+    await this.options.control.loadTranscript(sessionId).catch(() => undefined);
+  }
+
+  /**
+   * Opens a new operator turn for `sessionId`, dropping the texts recorded for the turn that
+   * ended. A locked ledger must never stand between the operator and their own message, so a
+   * failure here is logged and the delivery proceeds: a stale recorded text can cost a
+   * repeated line, while a throw here would lose the message.
+   */
+  private openTurn(sessionId: string): void {
+    try {
+      this.options.store.beginTurn(sessionId);
+    } catch (error) {
+      this.options.log(
+        `Slot ${this.slotId}: beginTurn for ${sessionId} failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   /**
@@ -153,11 +166,14 @@ export class SlotRouter {
    * caller should stay silent because the session itself will answer.
    */
   public async deliver(target: RouteTarget, text: string, mode: DeliveryMode = "auto"): Promise<string | null> {
-    return this.withHostFallback(target, async () => {
+    {
       const bound = this.boundSession(target);
       if (bound) {
-        const outcome = await this.options.control.deliver(bound, text, mode);
-        return outcome === "started" ? null : `↪️ <b>Queued as a ${outcome === "steered" ? "steer" : "follow-up"}</b> for the running turn.`;
+        // The operator's message opens a new turn; a telegram_message from the previous turn
+        // must not suppress the answer to this one.
+        this.openTurn(bound);
+        await this.options.control.deliver(bound, text, mode);
+        return null;
       }
 
       // A forum's General topic is the group's lobby, not one operator's chat. Binding
@@ -180,15 +196,16 @@ export class SlotRouter {
 
       const sessionId = await this.options.control.ensureSession(workspace, `Telegram ${this.slotId}`);
       await this.bind(target, sessionId, workspace);
+      this.openTurn(sessionId);
       await this.options.control.deliver(sessionId, text, mode);
       return `🔗 <b>Routed to session</b> <code>${escapeHtml(sessionId)}</code> in <code>${escapeHtml(workspace)}</code>.`;
-    });
+    }
   }
 
   public async abort(target: RouteTarget): Promise<boolean> {
     const bound = this.boundSession(target);
     if (!bound) return false;
-    return this.withHostFallback(target, () => this.options.control.abort(bound));
+    return this.options.control.abort(bound);
   }
 
   public isBusy(target: RouteTarget): boolean {
@@ -234,9 +251,7 @@ export class SlotRouter {
     const [verb, ...rest] = text.trim().split(/\s+/);
     const argument = rest.join(" ").trim();
     try {
-      const reply = await this.withHostFallback(target, () =>
-        this.runCommand(verb.toLowerCase().replace(/@\w+$/, ""), argument, target)
-      );
+      const reply = await this.runCommand(verb.toLowerCase().replace(/@\w+$/, ""), argument, target);
       await this.options.send(target, reply);
     } catch (error) {
       const detail = error instanceof SessionControlUnavailableError
@@ -282,46 +297,11 @@ export class SlotRouter {
   }
 
   private isTopLevelSession(session: DaemonSessionSummary): boolean {
-    if (session.isSubagent) return false;
-    if (session.parentPath || session.parentId) return false;
-    if (session.kind === "subagent") return false;
-    const record = session as unknown as Record<string, unknown>;
-    if (record.spawner) return false;
-    if (record.parent_path || record.parent_id) return false;
-    if (session.path) {
-      const normalized = session.path.replace(/\\/g, "/");
-      const filename = normalized.split("/").at(-1) ?? "";
-      if (!/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.-]+Z_[a-f0-9-]+\.jsonl$/i.test(filename)) {
-        return false;
-      }
-      const parentDir = normalized.split("/").slice(-2, -1)[0] ?? "";
-      if (/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.-]+Z_[a-f0-9-]+$/i.test(parentDir)) {
-        return false;
-      }
-    }
-    if (/^(sub[-_]|agent[-_]|worker[-_])/i.test(session.id) || (session.title && /^subagent/i.test(session.title))) {
-      return false;
-    }
-    return true;
+    return isTopLevelSession(session);
   }
 
   private async listAllSessions(): Promise<DaemonSessionSummary[]> {
-    const wireSessions = await this.options.control.listSessions();
-    const control = this.options.control;
-    if ("discoverDiskSessions" in control && typeof control.discoverDiskSessions === "function") {
-      const diskSessions = control.discoverDiskSessions();
-      if (!diskSessions.length) return wireSessions;
-      const map = new Map<string, DaemonSessionSummary>();
-      for (const s of diskSessions) {
-        map.set(s.id, s);
-      }
-      for (const s of wireSessions) {
-        const existing = map.get(s.id);
-        map.set(s.id, { ...existing, ...s });
-      }
-      return Array.from(map.values());
-    }
-    return wireSessions;
+    return await this.options.control.listSessions();
   }
 
   private visibleSession(session: { cwd: string; workspace: string; status: string; modifiedAtMs: number | null }, now: number): boolean {
@@ -342,6 +322,10 @@ export class SlotRouter {
       const topics = this.options.topics;
       if (topics && !target.topicId) return "ℹ️ <b>Run /detach inside the topic you want to close.</b>";
       const shouldClose = argument.trim().toLowerCase() === "close";
+      const bound = this.boundSession(target);
+      if (bound && topics?.markDetached) {
+        topics.markDetached(bound);
+      }
       const removed = this.options.store.deleteRoute(this.slotId, target.chatId, target.topicId);
       if (topics) {
         if (shouldClose) {
@@ -365,15 +349,7 @@ export class SlotRouter {
       const interactive = allSessions.filter(session => this.isTopLevelSession(session));
       const sessions = interactive.filter(session =>
         argument.toLowerCase() === "all" || this.visibleSession(session, now));
-      const byWorkspace = new Map<string, DaemonSessionSummary>();
-      for (const session of sessions) {
-        const ws = this.workspace(session).toLowerCase();
-        const existing = byWorkspace.get(ws);
-        if (!existing || (session.modifiedAtMs ?? 0) > (existing.modifiedAtMs ?? 0)) {
-          byWorkspace.set(ws, session);
-        }
-      }
-      const dedupedSessions = Array.from(byWorkspace.values());
+      const dedupedSessions = [...sessions];
       dedupedSessions.sort((a, b) => this.folder(this.workspace(a)).localeCompare(this.folder(this.workspace(b)))
         || this.workspace(a).localeCompare(this.workspace(b))
         || (b.modifiedAtMs ?? 0) - (a.modifiedAtMs ?? 0) || a.id.localeCompare(b.id));
@@ -391,9 +367,14 @@ export class SlotRouter {
         labeled.push({ session, folderName: base, displayName });
       }
       this.options.store.putSessionListing(this.slotId, target.chatId, target.topicId, labeled.map(item => item.session.id));
-      const lines = labeled.map((item, index) =>
-        `${index + 1}. <b>${escapeHtml(item.displayName)}</b> <code>${escapeHtml(this.workspace(item.session))}</code>`
-      );
+      const lines = labeled.map((item, index) => {
+        const hasTopic = Boolean(
+          this.options.topics &&
+          this.options.store.routesForSession(item.session.id).some(r => r.slotId === this.slotId && r.topicId !== "")
+        );
+        const pin = hasTopic ? "📌 " : "";
+        return `${index + 1}. ${pin}<b>${escapeHtml(item.displayName)}</b> <code>${escapeHtml(this.workspace(item.session))}</code>`;
+      });
       lines.push("/attach <n> or /attach <folder>");
       return lines.join("\n");
     }
@@ -405,15 +386,7 @@ export class SlotRouter {
       const interactive = allSessions.filter(session => this.isTopLevelSession(session));
       const visible = interactive.filter(session => this.visibleSession(session, now));
       const targetPool = visible.length > 0 ? visible : interactive;
-      const byWorkspaceTarget = new Map<string, DaemonSessionSummary>();
-      for (const session of targetPool) {
-        const ws = this.workspace(session).toLowerCase();
-        const existing = byWorkspaceTarget.get(ws);
-        if (!existing || (session.modifiedAtMs ?? 0) > (existing.modifiedAtMs ?? 0)) {
-          byWorkspaceTarget.set(ws, session);
-        }
-      }
-      const dedupedTargetPool = Array.from(byWorkspaceTarget.values());
+      const dedupedTargetPool = [...targetPool];
       dedupedTargetPool.sort((a, b) => this.folder(this.workspace(a)).localeCompare(this.folder(this.workspace(b)))
         || this.workspace(a).localeCompare(this.workspace(b))
         || (b.modifiedAtMs ?? 0) - (a.modifiedAtMs ?? 0) || a.id.localeCompare(b.id));
@@ -498,12 +471,21 @@ export class SlotRouter {
   public async onSessionEvent(event: SessionEvent): Promise<void> {
     if (event.kind === "streaming") return;
     const routes = this.options.store.routesForSession(event.sessionId).filter(route => route.slotId === this.slotId);
+    if (routes.length === 0) return;
+    const agentMessages = event.kind === "appended"
+      ? this.options.store.recentAgentMessages(event.sessionId, Date.now() - AGENT_MESSAGE_DEDUPE_WINDOW_MS)
+      : [];
     for (const route of routes) {
       for (const entry of event.entries) {
         if (!this.options.store.claimDelivery(event.sessionId, entry.entryId, SlotRouter.claimKey(route))) continue;
         if (event.kind === "history") continue;
+        // telegram_message already put this text in front of the operator during this turn.
+        if (agentMessages.some(sent => isRepeatDelivery(entry.text, sent))) {
+          this.options.log(`Slot ${this.slotId}: entry ${entry.entryId} not relayed; it repeats a telegram_message from this session.`);
+          continue;
+        }
         try {
-          await this.options.relay({ chatId: route.chatId, topicId: route.topicId }, entry.text);
+          await this.options.relay({ chatId: route.chatId, topicId: route.topicId }, entry.text, event.sessionId);
         } catch (error) {
           this.options.log(
             `Slot ${this.slotId}: delivery of entry ${entry.entryId} to chat ${route.chatId} failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -512,4 +494,32 @@ export class SlotRouter {
       }
     }
   }
+}
+export function isTopLevelSession(session: DaemonSessionSummary): boolean {
+  if (session.isSubagent) return false;
+  if (session.parentPath || session.parentId) return false;
+  if (session.kind === "subagent") return false;
+  const record = session as unknown as Record<string, unknown>;
+  if (record.spawner) return false;
+  if (record.parent_path || record.parent_id) return false;
+  if (session.path) {
+    const normalized = session.path.replace(/\\/g, "/");
+    const filename = normalized.split("/").at(-1) ?? "";
+    if (!/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.-]+Z_[a-f0-9-]+\.jsonl$/i.test(filename)) {
+      return false;
+    }
+    const parentDir = normalized.split("/").slice(-2, -1)[0] ?? "";
+    if (/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.-]+Z_[a-f0-9-]+$/i.test(parentDir)) {
+      return false;
+    }
+  }
+  if (/^(sub[-_]|agent[-_]|worker[-_])/i.test(session.id) || (session.title && /^subagent/i.test(session.title))) {
+    return false;
+  }
+  return true;
+}
+
+export function getSessionWorkspace(session: { cwd?: string; workspace?: string }): string {
+  const value = session.cwd || (/^(?:[A-Za-z]:[\\/]|\/)/.test(session.workspace ?? "") ? (session.workspace ?? "") : "");
+  return value.replace(/\\/g, "/").replace(/\/+$/, "");
 }

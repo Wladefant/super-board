@@ -45,7 +45,6 @@ PROTECTED_PATTERNS = (
     "daemon/run/*",
     "*.ps1",
     "veyyon_telegram_bridge.py",
-    "veyyon_telegram_guard.js",
     "telegram_notify_state.json",
     ".backups",
     ".backups/*",
@@ -62,6 +61,9 @@ INSTALLER_OWNED = (
     "veyyon-telegram-daemon.ps1",
     "veyyon-gui-host.ps1",
 )
+
+# Retired executable modules, removed on upgrade rather than left callable on disk.
+RETIRED_TOOL_APPROVAL_FILES = ("guard.ts", "guard-eval.ts", "approvals.ts", "veyyon_telegram_guard.js", "tests/guard.test.ts", "tests/guard-eval.test.ts")
 
 # Import specifiers rewritten when a daemon module is installed. The installed tree
 # flattens the package: extension/*.ts lands at the target root and src/*.ts under
@@ -344,6 +346,10 @@ def run_check(items: List[SyncItem], target: Path) -> int:
             if hashlib.sha256(expected).hexdigest() != sha256_file(target_file):
                 drift_list.append(f"{item.rel_target} (modified)")
 
+    for retired in RETIRED_TOOL_APPROVAL_FILES:
+        if (target / retired).exists():
+            drift_list.append(f"{retired} (retired module)")
+
     if drift_list:
         print(f"DRIFT: {len(drift_list)} file(s) differ from source:")
         for entry in sorted(drift_list):
@@ -365,7 +371,7 @@ def run_install(
     old_sha = get_installed_sha(target)
 
     # Check if any target files exist to be overwritten
-    has_existing_files = any((target / item.rel_target).exists() for item in items)
+    has_existing_files = any((target / rel).exists() for rel in [*(item.rel_target for item in items), *RETIRED_TOOL_APPROVAL_FILES])
 
     if dry_run:
         print(f"[dry-run] Target directory: {target}")
@@ -377,6 +383,9 @@ def run_install(
             dest = target / item.rel_target
             action = "overwrite" if dest.exists() else "create"
             print(f"[dry-run] Would {action}: {item.rel_target}")
+        for retired in RETIRED_TOOL_APPROVAL_FILES:
+            if (target / retired).exists():
+                print(f"[dry-run] Would remove retired module: {retired}")
         print(f"[dry-run] Would write manifest: {target}/install-manifest.json")
         return EXIT_OK
 
@@ -400,6 +409,9 @@ def run_install(
             "path": item.rel_target,
             "sha256": file_hash,
         })
+
+    for retired in RETIRED_TOOL_APPROVAL_FILES:
+        (target / retired).unlink(missing_ok=True)
 
     # 3. Write install-manifest.json
     installed_files_record.sort(key=lambda x: x["path"])

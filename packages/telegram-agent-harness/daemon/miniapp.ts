@@ -1,20 +1,26 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { authenticateInitData, authenticateAppSession, issueAppSession, appSessionRevocation } from "./miniapp-auth";
-import { decideApproval, pendingApprovals } from "../extension/approvals";
 
 export interface MiniAppRequest { id: string; path: string; method: string; initData: string; appSession?: string; body: string }
 export interface MiniAppOptions {
   stateDir: string; token: string; allowedUsers: string[];
-  session: (userId: string) => string | null;
+  session: (userId: string, context?: { sessionId?: string; topicId?: string }) => string | null;
   sessions: () => Promise<unknown>;
-  dashboard: (userId: string) => unknown;
+  dashboard: (userId: string, sessionId?: string | null) => unknown;
   status: () => unknown;
 }
 export async function miniAppRequest(request: MiniAppRequest, options: MiniAppOptions) {
   let user: string;
+  let reqPath = request.path;
+  let queryParams: URLSearchParams | undefined;
+  const qIndex = reqPath.indexOf("?");
+  if (qIndex >= 0) {
+    queryParams = new URLSearchParams(reqPath.slice(qIndex + 1));
+    reqPath = reqPath.slice(0, qIndex);
+  }
   try {
-    if (request.path === "/api/session" && request.method === "POST") {
+    if (reqPath === "/api/session" && request.method === "POST") {
       user = authenticateInitData(request.initData, options.token, options.allowedUsers);
       return { id: request.id, status: 200, data: { appSession: issueAppSession(user, options.token), expiresIn: 28800 } };
     }
@@ -24,26 +30,63 @@ export async function miniAppRequest(request: MiniAppRequest, options: MiniAppOp
   catch { return { id: request.id, status: 401, data: { error: "Open this app from Telegram again to authenticate." } }; }
   const respond = (status: number, data: unknown) => ({ id: request.id, status, data });
   try {
-    if (request.path === "/api/logout" && request.method === "POST") {
+    if (reqPath === "/api/logout" && request.method === "POST") {
       appSessionRevocation(options.stateDir, request.appSession!, true);
       return respond(200, { revoked: true });
     }
-    const session = options.session(user);
-    if (request.path === "/api/state" && request.method === "GET") {
+    let startTopicId: string | undefined;
+    let startSessionId: string | undefined;
+    if (request.initData) {
+      try {
+        const initParams = new URLSearchParams(request.initData);
+        const startParam = initParams.get("start_param")?.trim();
+        if (startParam) {
+          if (/^\d+$/.test(startParam)) {
+            startTopicId = startParam;
+          } else if (/^topic[_-](\d+)$/i.test(startParam)) {
+            startTopicId = startParam.replace(/^topic[_-]/i, "");
+          } else if (/^session[_-]/i.test(startParam)) {
+            startSessionId = startParam.replace(/^session[_-]/i, "");
+          } else {
+            startSessionId = startParam;
+          }
+        }
+      } catch {}
+    }
+    const requestedSessionId = queryParams?.get("sessionId") || startSessionId || undefined;
+    const requestedTopicId = queryParams?.get("topicId") || startTopicId || undefined;
+    const session = options.session(user, { sessionId: requestedSessionId, topicId: requestedTopicId });
+    if (reqPath === "/api/state" && request.method === "GET") {
       let sessions: unknown = null;
       try { sessions = await options.sessions(); } catch { /* unavailable is explicit in the response */ }
-      return respond(200, { observedAt: Date.now(), session, sessions, status: options.status(), dashboard: options.dashboard(user), approvals: session ? pendingApprovals(options.stateDir, session) : null });
+      return respond(200, {
+        observedAt: Date.now(),
+        session,
+        sessions,
+        status: options.status(),
+        dashboard: options.dashboard(user, session),
+      });
     }
-    if (request.path === "/api/approval" && request.method === "POST") {
-      if (!session) return respond(409, { error: "Chat is not bound to a session." });
-      let body: { token?: string; decision?: string } | null = null;
-      try { body = JSON.parse(request.body); } catch { return respond(400, { error: "Invalid request body" }); }
-      if (!body || typeof body !== "object" || (body.decision !== "approved" && body.decision !== "denied")) return respond(400, { error: "Invalid decision" });
-      const result = decideApproval(options.stateDir, body.token, body.decision, { sessionId: session, userId: user, chatId: user });
-      return respond(200, { state: result.state });
+    if (reqPath === "/api/approval" && request.method === "POST") {
+      return respond(410, { error: "Telegram tool-call approvals have been removed. No operation was authorized or executed." });
     }
     return respond(404, { error: "Not found" });
   } catch { return respond(409, { error: "Request unavailable, expired, already decided, or not authorized for this session." }); }
+}
+
+export function buildMiniAppUrl(baseUrl: string, context?: { topicId?: string; sessionId?: string }): string {
+  try {
+    const url = new URL(baseUrl);
+    if (context?.topicId) {
+      url.searchParams.set("topicId", context.topicId);
+    }
+    if (context?.sessionId) {
+      url.searchParams.set("sessionId", context.sessionId);
+    }
+    return url.toString();
+  } catch {
+    return baseUrl;
+  }
 }
 
 /** Config is local to a slot; the daemon owns reconnect and shutdown with its poller. */

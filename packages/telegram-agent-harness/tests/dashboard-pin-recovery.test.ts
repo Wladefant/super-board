@@ -48,7 +48,6 @@ function fixture(options: DashboardFixtureOptions = {}) {
       onFollowUp: () => {},
       onAbort: () => {},
       onRelease: async () => {},
-      onTelegramTurnStart: () => {},
       getStatusText: () => "test",
       onLedgerFailure: () => {},
     },

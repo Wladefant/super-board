@@ -1096,6 +1096,23 @@ STAGE_BRIEFS = {
         "\"artifacts\" with role \"verified_existing\". Commit only real changes. Report commands "
         "actually run under \"checks\" with their real exit codes."
     ),
+    "spec": (
+        "You are the SPEC worker (low-effort stage, 0–12k thinking tokens). Define the exact "
+        "architectural boundaries, concrete interface contracts, acceptance criteria, and explicit "
+        "non-goals for this work item. Do NOT write implementation logic or modify existing business "
+        "logic. Document the design contract and rule out scope creep before scaffolding begins."
+    ),
+    "scaffold": (
+        "You are the SCAFFOLD worker (low-effort stage). Lay out the skeleton interfaces, types, "
+        "module stubs, and initial test fixtures. Do NOT implement complex business logic. Ensure the "
+        "scaffold compiles, passes typecheck, and establishes the structural foundation for implementation."
+    ),
+    "implement": (
+        "You are the IMPLEMENT worker (medium-effort stage). Implement the core business logic for "
+        "this work item against the repository at {repo_root}. Cut over every call site cleanly: no "
+        "leftover dead shims, aliases, or commented-out predecessors. Verify compilation/typecheck "
+        "before yielding and report commands actually run under \"checks\" with their real exit codes."
+    ),
     "qa": (
         "You are the QA worker, independent of whoever built this. Do NOT modify the tree and do "
         "NOT commit. Verify the request against the repository at {repo_root} by executing real "
@@ -1108,14 +1125,41 @@ STAGE_BRIEFS = {
         "substantiate your reading, and report them under \"checks\". Return verdict \"fail\" if the "
         "change is not sound."
     ),
+    "verify": (
+        "You are the VERIFY worker (high-effort adversarial verification stage, 32k+ thinking tokens). "
+        "Perform deep, exhaustive verification against the candidate head at {repo_root}. Execute real "
+        "commands, run adversarial negative controls, exercise regression scenarios, and assert boundary "
+        "conditions. Report every command under \"checks\" with its real exit code and observable proof. "
+        "Return verdict \"fail\" if verification does not hold."
+    ),
 }
+
+STAGE_EFFORT_MAP: Dict[str, str] = {
+    "spec": "low",
+    "scaffold": "low",
+    "build": "medium",
+    "implement": "medium",
+    "qa": "high",
+    "review": "high",
+    "verify": "high",
+}
+
+
+def get_stage_effort(stage: str, default: str = "medium") -> str:
+    """Return the calibrated thinking effort level for a given workflow stage (Issue #228)."""
+    return STAGE_EFFORT_MAP.get(str(stage or "").lower(), default)
 
 
 def build_stage_prompt(req: Any, schema: Dict[str, Any]) -> str:
     """
-    Compose the stage prompt. An explicit prompt on the request is used verbatim
-    as the task statement; the stage brief and result contract are always added
-    so a backend cannot be talked out of returning structured evidence.
+    Compose the stage prompt.
+
+    Static Prompt Prefix Caching Discipline (operator 2026-09-26, #228):
+    The stage brief, result contract schema, exit enforcement rules, and
+    standard 3-heading handoff structure form an immutable static prefix placed
+    strictly before any dynamic work item fields (request ID, expected commit,
+    task, and criteria). This enables 90-96% Anthropic prompt cache hit rates
+    across multi-agent fan-outs.
     """
     stage = str(_field(req, "stage", "build"))
     repo_root = str(_field(req, "repo_root", ""))
@@ -1127,25 +1171,11 @@ def build_stage_prompt(req: Any, schema: Dict[str, Any]) -> str:
 
     brief = STAGE_BRIEFS.get(stage, STAGE_BRIEFS["build"]).format(repo_root=repo_root)
 
+    # 1. Static immutable prefix: Stage brief, Result contract schema, rules,
+    # and standardized handoff contract. Placing this identical prefix first
+    # ensures prompt cache reads hit the 90-96% tier ($0.20/M).
     lines = [
         brief,
-        "",
-        f"Request id: {request_id}",
-        f"Stage: {stage}",
-        f"Task type: {task_type}",
-        f"Repository root: {repo_root}",
-        f"Expected head commit: {head_sha}",
-    ]
-    if task:
-        lines += ["", "TASK", task]
-    if criteria:
-        lines += ["", "ACCEPTANCE CRITERIA"]
-        for c in criteria:
-            if isinstance(c, Mapping):
-                c = c.get("criterion", "")
-            lines.append(f"- {c}")
-
-    lines += [
         "",
         "RESULT CONTRACT",
         "Your final answer must be a single JSON object matching this schema exactly:",
@@ -1172,7 +1202,38 @@ def build_stage_prompt(req: Any, schema: Dict[str, Any]) -> str:
         "you observed.",
         "- Never merge, never push, never deploy. Committing locally is allowed for the build "
         "stage only.",
+        "- Repeat-failure limit (operator 2026-09-24): Try a failing command/approach at most "
+        "2–3 times; on the 3rd failure, stop that approach immediately and switch to a materially "
+        "different alternative.",
+        "- Mandatory failure write-down: Record the failure (command, error, attempts, alternative "
+        "chosen) in a comment on the work item's GitHub issue.",
+        "- Mandatory lesson capture: Persist the lesson in the same turn with `learn` or `retain` "
+        "(or managed skill); check prior lessons (`recall`) before touching the same tool or area.",
+        "- Standard 3-heading handoff protocol (operator 2026-09-26, #228): Structure completion "
+        "summaries under three headings in priority order: "
+        "'## 1. Blocked on me / Needs from you' (blockers, missing permissions, decisions), "
+        "'## 2. Changed' (exact files/URLs modified or created), and "
+        "'## 3. Found / Evidence' (test verification, reproduction proof, unconfirmed items).",
+        "- Feature map navigation (operator 2026-09-26, #244): Before broad repository searching "
+        "or guessing file locations, consult FEATURE_MAP.json (or run `python workflows/portable/feature_map.py query <term>`) "
+        "to resolve entry files, tests, owning issues, and risk levels.",
+        "",
+        "# DYNAMIC WORK ITEM PARAMETERS",
+        f"Request id: {request_id}",
+        f"Stage: {stage}",
+        f"Task type: {task_type}",
+        f"Repository root: {repo_root}",
+        f"Expected head commit: {head_sha}",
     ]
+    if task:
+        lines += ["", "TASK", task]
+    if criteria:
+        lines += ["", "ACCEPTANCE CRITERIA"]
+        for c in criteria:
+            if isinstance(c, Mapping):
+                c = c.get("criterion", "")
+            lines.append(f"- {c}")
+
     return "\n".join(lines)
 
 

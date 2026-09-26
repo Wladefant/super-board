@@ -18,7 +18,7 @@ import {
   SessionControlUnavailableError,
   type DaemonSessionSummary,
   type DeliveryMode,
-  type GuiHostSessionControl,
+  type TerminalSessionControl,
 } from "../daemon/session-control";
 import { DaemonStore } from "../daemon/store";
 
@@ -29,7 +29,7 @@ interface Delivered {
 }
 
 interface FakeControl {
-  control: GuiHostSessionControl;
+  control: TerminalSessionControl;
   delivered: Delivered[];
   created: { workspace: string; title: string }[];
   loaded: string[];
@@ -85,7 +85,7 @@ function fakeControl(sessions: DaemonSessionSummary[] = [], options: { unavailab
     close: () => {},
   };
 
-  return { control: control as unknown as GuiHostSessionControl, delivered, created, loaded, aborted, busy };
+  return { control: control as unknown as TerminalSessionControl, delivered, created, loaded, aborted, busy };
 }
 
 function summary(id: string, cwd: string, title: string | null = null): DaemonSessionSummary {
@@ -96,15 +96,18 @@ function summary(id: string, cwd: string, title: string | null = null): DaemonSe
 interface FakeTopics extends TopicLifecycle {
   opened: { sessionId: string; workspace: string }[];
   closed: number[];
+  detached: Set<string>;
 }
 
 function fakeTopics(): FakeTopics {
   const opened: { sessionId: string; workspace: string }[] = [];
   const closed: number[] = [];
+  const detached = new Set<string>();
   const threads = new Map<string, number>();
   return {
     opened,
     closed,
+    detached,
     ensureTopic: async (sessionId: string, workspace: string) => {
       const existing = threads.get(sessionId);
       if (existing !== undefined) return existing;
@@ -118,6 +121,9 @@ function fakeTopics(): FakeTopics {
       return true;
     },
     listTopicsText: (currentTopicId: string) => `topics@${currentTopicId}`,
+    markDetached: (sessionId: string) => { detached.add(sessionId); },
+    isDetached: (sessionId: string) => detached.has(sessionId),
+    clearDetached: (sessionId: string) => { detached.delete(sessionId); },
   };
 }
 
@@ -135,8 +141,9 @@ let relayed: { target: RouteTarget; markdown: string }[];
 
 function buildRouter(
   slot: Partial<DaemonSlot>,
-  control: GuiHostSessionControl,
+  control: TerminalSessionControl,
   topics?: TopicLifecycle,
+  overrides: { log?: (message: string) => void } = {},
 ): SlotRouter {
   return new SlotRouter({
     slot: {
@@ -158,7 +165,7 @@ function buildRouter(
     relay: async (target, markdown) => {
       relayed.push({ target, markdown });
     },
-    log: () => {},
+    log: overrides.log ?? (() => {}),
   });
 }
 
@@ -193,6 +200,24 @@ describe("inbound routing", () => {
     ]);
   });
 
+  test("a ledger that cannot open the turn still delivers the operator's message", async () => {
+    const fake = fakeControl();
+    const logs: string[] = [];
+    const router = buildRouter({}, fake.control, undefined, { log: message => logs.push(message) });
+
+    await router.deliver(DM, "first message");
+    store.beginTurn = () => {
+      throw new Error("SQLITE_BUSY: database is locked");
+    };
+
+    // The turn's bookkeeping failed, but the operator's message is not lost.
+    expect(await router.deliver(DM, "second message")).toBeNull();
+    expect(fake.delivered.map(d => d.text)).toEqual(["first message", "second message"]);
+    const failures = logs.filter(message => message.includes("beginTurn"));
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toContain("SQLITE_BUSY");
+  });
+
   test("an existing session for the workspace is reused instead of starting a second one", async () => {
     const fake = fakeControl([summary("sess-existing", "C:/dev/demo")]);
     const router = buildRouter({}, fake.control);
@@ -213,13 +238,13 @@ describe("inbound routing", () => {
     expect(router.boundSession(DM)).toBeNull();
   });
 
-  test("steer and follow-up modes are acknowledged distinctly and reach the bound session", async () => {
+  test("steer and follow-up modes stay silent without routine ack spam and reach the bound session", async () => {
     const fake = fakeControl([summary("sess-existing", "C:/dev/demo")]);
     const router = buildRouter({}, fake.control);
     await router.deliver(DM, "start");
 
-    expect(await router.deliver(DM, "redirect", "steer")).toContain("steer");
-    expect(await router.deliver(DM, "afterwards", "followUp")).toContain("follow-up");
+    expect(await router.deliver(DM, "redirect", "steer")).toBeNull();
+    expect(await router.deliver(DM, "afterwards", "followUp")).toBeNull();
     expect(fake.delivered.slice(1)).toEqual([
       { sessionId: "sess-existing", text: "redirect", mode: "steer" },
       { sessionId: "sess-existing", text: "afterwards", mode: "followUp" },
@@ -349,6 +374,32 @@ describe("forum topic routing", () => {
     expect(router.boundSession(TOPIC_9)).toBeNull();
     expect(sent.at(-1)?.html).toContain("Topic #9 detached and closed");
   });
+  test("bind handles loadTranscript rejection gracefully (e.g. >32MB transcript)", async () => {
+    const fake = fakeControl([summary("sess-huge", "C:/dev/demo")]);
+    // Override loadTranscript to reject as if transcript exceeds 32MB buffer
+    fake.control.loadTranscript = async () => {
+      throw new Error("Payload too large (>32MB)");
+    };
+    const router = buildRouter({}, fake.control, fakeTopics());
+    // bind should not throw
+    await expect(router.bind(TOPIC_9, "sess-huge", "C:/dev/demo")).resolves.toBeUndefined();
+    expect(router.boundSession(TOPIC_9)).toBe("sess-huge");
+  });
+
+  test("/detach marks session as detached on TopicLifecycle and /attach clears it", async () => {
+    const fake = fakeControl([summary("sess-a", "C:/dev/a")]);
+    const topics = fakeTopics();
+    const router = buildRouter({}, fake.control, topics);
+    await router.bind(TOPIC_9, "sess-a", "C:/dev/a");
+    expect(topics.detached.has("sess-a")).toBe(false);
+
+    await router.handleCommand("/detach", TOPIC_9);
+    expect(topics.detached.has("sess-a")).toBe(true);
+
+    await router.handleCommand("/attach sess-a", TOPIC_9);
+    expect(topics.detached.has("sess-a")).toBe(false);
+  });
+
 
   test("/where names the topic a message came from", async () => {
     const fake = fakeControl([summary("sess-a", "C:/dev/a")]);
@@ -375,6 +426,27 @@ describe("outbound delivery", () => {
     await router.onSessionEvent(event);
 
     expect(relayed).toEqual([{ target: DM, markdown: "the answer" }]);
+  });
+
+  test("a replayed entry across router recreation is delivered exactly once", async () => {
+    const fake = fakeControl([summary("sess-a", "C:/dev/demo")]);
+    const router1 = buildRouter({}, fake.control);
+    await router1.deliver(DM, "start");
+
+    const event1 = { kind: "appended" as const, sessionId: "sess-a", entries: [{ entryId: "e1", text: "first delivery" }] };
+    await router1.onSessionEvent(event1);
+    expect(relayed).toEqual([{ target: DM, markdown: "first delivery" }]);
+
+    // Replay across a second router instance sharing the same store
+    const router2 = buildRouter({}, fake.control);
+    await router2.onSessionEvent(event1);
+    const event2 = { kind: "appended" as const, sessionId: "sess-a", entries: [{ entryId: "e2", text: "second delivery" }] };
+    await router2.onSessionEvent(event2);
+
+    expect(relayed).toEqual([
+      { target: DM, markdown: "first delivery" },
+      { target: DM, markdown: "second delivery" },
+    ]);
   });
 
   test("binding a chat marks existing history delivered, so nothing is replayed", async () => {
@@ -419,6 +491,79 @@ describe("outbound delivery", () => {
 
     await router.onSessionEvent({ kind: "streaming", sessionId: "sess-a", active: true });
     expect(relayed).toEqual([]);
+  });
+
+  test("a final reply that repeats this session's telegram_message is not relayed again", async () => {
+    const fake = fakeControl([summary("sess-a", "C:/dev/demo")]);
+    const router = buildRouter({}, fake.control);
+    await router.deliver(DM, "start");
+    store.recordAgentMessage("sess-a", "**Merged** #224: tables now render as monospace blocks in Telegram.");
+    store.recordAgentMessage("sess-other", "Unrelated lane finished and its report is posted on the issue.");
+
+    await router.onSessionEvent({
+      kind: "appended",
+      sessionId: "sess-a",
+      entries: [
+        { entryId: "e1", text: "Merged #224: tables now render as monospace blocks in Telegram." },
+        { entryId: "e2", text: "Unrelated lane finished and its report is posted on the issue." },
+      ],
+    });
+
+    // e1 repeats this session's message; e2 only matches another session's, so it goes out.
+    expect(relayed).toEqual([{ target: DM, markdown: "Unrelated lane finished and its report is posted on the issue." }]);
+  });
+
+  test("a final reply that extends the telegram_message with new material is still relayed", async () => {
+    const fake = fakeControl([summary("sess-a", "C:/dev/demo")]);
+    const router = buildRouter({}, fake.control);
+    await router.deliver(DM, "start");
+    store.recordAgentMessage("sess-a", "Merged #224: tables now render as monospace blocks in Telegram.");
+
+    const final = "Merged #224: tables now render as monospace blocks in Telegram.\n\nStill open: #225 needs a rebase-free sync with main and a green lint run.";
+    await router.onSessionEvent({ kind: "appended", sessionId: "sess-a", entries: [{ entryId: "e1", text: final }] });
+    expect(relayed).toEqual([{ target: DM, markdown: final }]);
+  });
+
+  test("a follow-up turn's answer is relayed even when it repeats the previous turn's telegram_message", async () => {
+    const fake = fakeControl([summary("sess-a", "C:/dev/demo")]);
+    const router = buildRouter({}, fake.control);
+    await router.deliver(DM, "start");
+    const answer = "Merged #224: tables now render as monospace blocks in Telegram.";
+    store.recordAgentMessage("sess-a", answer);
+
+    await router.onSessionEvent({ kind: "appended", sessionId: "sess-a", entries: [{ entryId: "e1", text: answer }] });
+    expect(relayed).toEqual([]);
+
+    // A new operator message opens a new turn, so the same answer is not held back there.
+    await router.deliver(DM, "say that again");
+    await router.onSessionEvent({ kind: "appended", sessionId: "sess-a", entries: [{ entryId: "e2", text: answer }] });
+    expect(relayed).toEqual([{ target: DM, markdown: answer }]);
+  });
+
+  test("a relayed answer whose status or issue number changed is not held back", async () => {
+    const fake = fakeControl([summary("sess-a", "C:/dev/demo")]);
+    const router = buildRouter({}, fake.control);
+    await router.deliver(DM, "start");
+    const merged224 = "Merged PR 224 into staging after CI went green on every check across all three operating systems today.";
+    const merged225 = "Merged PR 225 into staging after CI went green on every check across all three operating systems today.";
+    const running = "Checks on the order flow are still running and the ledger entries have not been verified yet, so the balances for the staging wallet remain unconfirmed today.";
+    const failed = "Checks on the order flow failed and the ledger entries have not been verified yet, so the balances for the staging wallet remain unconfirmed today.";
+    store.recordAgentMessage("sess-a", merged224);
+    store.recordAgentMessage("sess-a", running);
+
+    await router.onSessionEvent({
+      kind: "appended",
+      sessionId: "sess-a",
+      entries: [
+        { entryId: "e1", text: merged225 },
+        { entryId: "e2", text: failed },
+      ],
+    });
+
+    expect(relayed).toEqual([
+      { target: DM, markdown: merged225 },
+      { target: DM, markdown: failed },
+    ]);
   });
 });
 
@@ -546,6 +691,27 @@ describe("routing commands", () => {
     expect(sent[0].html).not.toContain("sess-a");
     expect(sent[0].html).not.toContain("Demo");
   });
+  test("/sessions marks sessions that already have a topic with a pin emoji", async () => {
+    const fake = fakeControl([summary("sess-a", "C:/dev/demo"), summary("sess-b", "C:/dev/other")]);
+    const topics = fakeTopics();
+    const router = buildRouter({ mode: "forum", forumChatId: FORUM_CHAT }, fake.control, topics);
+
+    // sess-a has a topic in the forum
+    store.putRoute({
+      slotId: "slot-1",
+      chatId: FORUM_CHAT,
+      topicId: "9",
+      sessionId: "sess-a",
+      workspace: "C:/dev/demo",
+    });
+
+    expect(await router.handleCommand("/sessions", TOPIC_9)).toBe(true);
+    expect(sent[0].html).toBe(
+      "1. 📌 <b>demo</b> <code>C:/dev/demo</code>\n" +
+      "2. <b>other</b> <code>C:/dev/other</code>\n" +
+      "/attach <n> or /attach <folder>"
+    );
+  });
 
   test("/attach binds to an existing session by id prefix and loads its history", async () => {
     const fake = fakeControl([summary("sess-abcdef", "C:/dev/other", "Other")]);
@@ -623,5 +789,29 @@ describe("routing commands", () => {
     expect(help).toContain("/detach");
     expect(help).toContain("/app");
     expect(help).toContain("/reload");
+  });
+
+  test("routing commands accept @bot mentions and answer to the target topic thread", async () => {
+    const sessions = [summary("sess-1", "C:/dev/alpha")];
+    const router = buildRouter({}, fakeControl(sessions).control, fakeTopics());
+    await router.bind(TOPIC_14, "sess-1", "C:/dev/alpha");
+
+    // /where@superboarddevbot inside TOPIC_14
+    expect(SlotRouter.isRoutingCommand("/where@superboarddevbot")).toBe(true);
+    expect(await router.handleCommand("/where@superboarddevbot", TOPIC_14)).toBe(true);
+    expect(sent.at(-1)?.target).toEqual(TOPIC_14);
+    expect(sent.at(-1)?.html).toContain("Topic: <b>#14</b>");
+    expect(sent.at(-1)?.html).toContain("Session: <code>sess-1</code>");
+
+    // /sessions@superboarddevbot inside TOPIC_14
+    expect(SlotRouter.isRoutingCommand("/sessions@superboarddevbot")).toBe(true);
+    expect(await router.handleCommand("/sessions@superboarddevbot", TOPIC_14)).toBe(true);
+    expect(sent.at(-1)?.target).toEqual(TOPIC_14);
+    expect(sent.at(-1)?.html).toContain("<b>alpha</b>");
+
+    // /topics@superboarddevbot inside TOPIC_14
+    expect(SlotRouter.isRoutingCommand("/topics@superboarddevbot")).toBe(true);
+    expect(await router.handleCommand("/topics@superboarddevbot", TOPIC_14)).toBe(true);
+    expect(sent.at(-1)?.target).toEqual(TOPIC_14);
   });
 });

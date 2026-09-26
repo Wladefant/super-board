@@ -188,6 +188,7 @@ export interface TelegramUpdate {
       caption?: string;
       photo?: Array<{ file_id: string; file_unique_id: string }>;
       document?: { file_id: string; file_name?: string; mime_type?: string };
+      forum_topic_created?: { name: string; icon_color?: number; icon_custom_emoji_id?: string };
     };
   };
   callback_query?: TelegramCallbackQuery;

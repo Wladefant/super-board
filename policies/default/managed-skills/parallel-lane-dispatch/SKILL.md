@@ -1,22 +1,27 @@
 ---
 name: parallel-lane-dispatch
-description: "Use when dispatching several subagent lanes for issue triage, review sweeps or any fan-out whose task texts look alike; avoids the harness 'Refused N parallel ... agents' rejection and the wasted turns of retrying it."
+description: "Use when dispatching subagent lanes for triage, review sweeps, or verification fan-outs whose task prompts look alike; prevents harness batch refusals ('Refused N parallel ... agents') and wasted turns."
 ---
 
-# Parallel lane dispatch without harness refusals
+# Parallel Lane Dispatch
 
-## Symptom
-`task(tasks=[...])` with 3+ lanes returns `Refused N parallel triage agents. Homogeneous triage is a batched lookup/classification task...`. It triggers on similar-looking task bodies (same verbs, same acceptance text), regardless of whether the lanes actually need per-item code verification. Retrying with regrouped batches in the SAME call shape is refused again (observed twice, 2026-09-14).
+Modular guide for dispatching parallel lanes without triggering harness batch refusals.
+
+## Navigation
+- **Gotchas & Failure Modes**: Read `gotchas.md` first before retrying any refused batch dispatch.
+- **Reference Patterns**: See `references/batch-patterns.md` for domain partitioning and batch examples.
+
+## When to Use This Skill
+- Dispatching 3+ subagent lanes for triage, issue review, or bulk verification.
+- Harness returns: `Refused N parallel triage agents. Homogeneous triage is a batched lookup/classification task...`.
+- Sweeping across multiple repositories, packages, or documentation files.
 
 ## Procedure
-1. Decide the fan-out by DOMAIN, not by number range (e.g. Paket / ADO / UI / Tooling / Docs). Write each lane's `# Target` with its own file areas and its own decision rules.
-2. Write the per-lane input lists to `local://<name>.md` first (one write per lane) so each task body stays short and distinct.
-3. Dispatch ONE `task` call per lane, consecutive turns. Do not put them in one `tasks=[]` array. Five single calls were accepted immediately.
-4. If a single call is still refused, the work really is a lookup: fetch the whole record set yourself in one API call and send the complete set to ONE lane.
-5. Never repeat a refused batch shape. One refusal = switch strategy in the next turn.
-
-## When a true batch is fine
-Independent implementation slices with different files/contracts (e.g. port-a-fix lane + release-tooling lane) pass in one `tasks=[]` call; the refusal is specific to look-alike classification lanes.
+1. **Partition by Domain:** Divide fan-out by functional domain (e.g. Package / ADO / UI / Tooling / Docs), not arbitrary numbers or index ranges. Each lane must define its own `# Target`, distinct file boundaries, and domain-specific decision rules.
+2. **Externalize Inputs:** Write per-lane input lists to `local://<name>.md` beforehand so task bodies remain concise and structurally distinct.
+3. **Sequential Single-Lane Dispatch:** Whenever lanes perform per-item code verification, dispatch as separate single `task` calls in consecutive turns rather than a single `task(tasks=[...])` array.
+4. **Fallback to Single Lookup:** If single-lane dispatch is still refused, treat the work as a pure classification lookup: fetch the dataset in one call and delegate to a single triage lane.
+5. **Never Repeat Refused Shapes:** One refusal = switch strategy immediately in the next turn.
 
 ## Tracking
-Harness/policy follow-up: https://github.com/Wladefant/super-board/issues/135
+- Incident & policy root cause: https://github.com/Wladefant/super-board/issues/135

@@ -1,18 +1,110 @@
-export function createClient(initData, transport = fetch) {
+export const UNAVAILABLE_MESSAGE = 'Unavailable until a secure connection is established.';
+export const REOPEN_MESSAGE = 'Open this app from Telegram again to authenticate.';
+export const SECTIONS = ['sessions', 'lanes', 'blockers', 'queue'];
+
+export function getUnavailableState(notice = REOPEN_MESSAGE) {
+  return {
+    connection: 'Not connected',
+    notice: notice || REOPEN_MESSAGE,
+    freshness: 'Unavailable',
+    sections: {
+      sessions: UNAVAILABLE_MESSAGE,
+      lanes: UNAVAILABLE_MESSAGE,
+      blockers: UNAVAILABLE_MESSAGE,
+      queue: UNAVAILABLE_MESSAGE,
+    },
+  };
+}
+
+export class TerminalAuthError extends Error {
+  constructor(message = REOPEN_MESSAGE) {
+    super(message);
+    this.name = 'TerminalAuthError';
+    this.isTerminalAuth = true;
+  }
+}
+
+export function isTerminalAuthError(error) {
+  return error instanceof TerminalAuthError || error?.name === 'TerminalAuthError' || Boolean(error?.isTerminalAuth);
+}
+
+export function createClient(getInitData, transport = fetch) {
   let appSession = '';
-  return async function request(path, body) {
-    if (!appSession) {
-      const auth = await transport('/api/session', { method: 'POST', headers: { 'x-telegram-init-data': initData() } });
-      const session = await auth.json();
-      if (!auth.ok) throw new Error(session.error || 'Authentication unavailable');
-      appSession = session.appSession;
+
+  async function obtainSession() {
+    const rawInit = typeof getInitData === 'function' ? getInitData() : (getInitData || '');
+    const auth = await transport('/api/session', {
+      method: 'POST',
+      headers: { 'x-telegram-init-data': rawInit || '' },
+    });
+    let data;
+    try {
+      data = await auth.json();
+    } catch {
+      data = {};
     }
-    const response = await transport(path, { method: body ? 'POST' : 'GET', headers: { 'x-miniapp-session': appSession, 'Content-Type': 'application/json' }, ...(body ? { body: JSON.stringify(body) } : {}) });
-    // Clear before decoding: even a proxy-generated 401 invalidates this session.
-    // Never replay mutations: the caller must explicitly retry after authentication.
-    if (response.status === 401 || (path === '/api/logout' && response.ok)) appSession = '';
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || 'Connection unavailable');
+    if (!auth.ok || !data?.appSession) {
+      appSession = '';
+      throw new TerminalAuthError(data?.error || REOPEN_MESSAGE);
+    }
+    appSession = data.appSession;
+    return appSession;
+  }
+
+  async function send(path, body) {
+    if (!appSession && path !== '/api/session') {
+      await obtainSession();
+    }
+    return transport(path, {
+      method: body ? 'POST' : 'GET',
+      headers: {
+        ...(appSession ? { 'x-miniapp-session': appSession } : {}),
+        'Content-Type': 'application/json',
+      },
+      ...(body ? { body: typeof body === 'string' ? body : JSON.stringify(body) } : {}),
+    });
+  }
+
+  const client = async function request(path, body) {
+    let response = await send(path, body);
+
+    if (response.status === 401 && path !== '/api/session') {
+      // Clear before decoding: even a proxy-generated 401 invalidates this session.
+      appSession = '';
+      // Never replay mutations: the caller must explicitly retry after authentication.
+      if (!body) {
+        await obtainSession();
+        response = await send(path, body);
+        if (response.status === 401) {
+          appSession = '';
+        }
+      }
+    }
+
+    if (path === '/api/logout' && response.ok) {
+      appSession = '';
+    }
+
+    let data;
+    try {
+      data = await response.json();
+    } catch {
+      data = {};
+    }
+
+    if (!response.ok) {
+      if (response.status === 401) {
+        throw new TerminalAuthError(data?.error || REOPEN_MESSAGE);
+      }
+      throw new Error(data?.error || 'Connection unavailable');
+    }
+
     return data;
   };
+
+  client.getSession = () => appSession;
+  client.clearSession = () => { appSession = ''; };
+  client.setSession = (s) => { appSession = s; };
+
+  return client;
 }

@@ -116,7 +116,7 @@ test('even correctly signed duplicate launch fields are rejected', () => {
   expect(() => authenticateInitData(p.toString(), token, ['111'], 1700000000000)).toThrow();
 });
 
-test('approval rejects malformed JSON and non-object payloads with 400', async () => {
+test('approval endpoint returns 410 as approvals have been removed', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'miniapp-json-'));
   const token = '123:disposable-token';
   const options = {
@@ -132,24 +132,20 @@ test('approval rejects malformed JSON and non-object payloads with 400', async (
   const call = (body: string) => miniAppRequest({ id: 'test', path: '/api/approval', method: 'POST', initData: '', appSession, body }, options);
   try {
     const malformed = await call('not valid json');
-    expect(malformed.status).toBe(400);
-    expect(malformed.data).toEqual({ error: 'Invalid request body' });
+    expect(malformed.status).toBe(410);
+    expect(malformed.data).toEqual({ error: 'Telegram tool-call approvals have been removed. No operation was authorized or executed.' });
 
     const nullBody = await call('null');
-    expect(nullBody.status).toBe(400);
-    expect(nullBody.data).toEqual({ error: 'Invalid decision' });
+    expect(nullBody.status).toBe(410);
 
     const numberBody = await call('123');
-    expect(numberBody.status).toBe(400);
-    expect(numberBody.data).toEqual({ error: 'Invalid decision' });
+    expect(numberBody.status).toBe(410);
 
     const emptyObj = await call('{}');
-    expect(emptyObj.status).toBe(400);
-    expect(emptyObj.data).toEqual({ error: 'Invalid decision' });
+    expect(emptyObj.status).toBe(410);
 
     const invalidDecision = await call(JSON.stringify({ decision: 'maybe', token: 'a'.repeat(64) }));
-    expect(invalidDecision.status).toBe(400);
-    expect(invalidDecision.data).toEqual({ error: 'Invalid decision' });
+    expect(invalidDecision.status).toBe(410);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

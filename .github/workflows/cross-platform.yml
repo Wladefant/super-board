@@ -66,6 +66,11 @@ jobs:
       - name: status — parser fixture tests
         run: python -B tests/test_status_parse.py
 
+      - name: host status monitor tests
+        run: python -B tests/test_host_status.py
+      - name: host status monitor live execution
+        run: python -B workflows/portable/host_status.py --json
+
       - name: claudex — compile zero-quota helpers
         run: python -c "from pathlib import Path; paths=[Path('skills/claudex-optimized/scripts/preflight.py'),Path('skills/claudex-optimized/scripts/probe-routing.py')]; [compile(p.read_text(encoding='utf-8'), str(p), 'exec') for p in paths]"
 
@@ -193,5 +198,23 @@ jobs:
       - name: github pr gate
         run: python -B workflows/portable/test_github_pr_gate.py
 
+      - name: verification cli and gate
+        run: python -B workflows/portable/test_verify.py
+
       - name: telegram notifier
         run: python -B workflows/portable/test_telegram_notifier.py
+
+      - name: feature map validator
+        run: python -B workflows/portable/test_feature_map.py
+
+      - name: feature map live validation
+        run: python -B workflows/portable/feature_map.py validate
+
+      - name: build slot arbiter
+        run: python -B workflows/portable/test_build_slot.py
+      - name: outer loop intake
+        run: python -B workflows/portable/test_outer_loop_intake.py
+      - name: host status monitor
+        run: python -B tests/test_host_status.py
+      - name: host status monitor live execution
+        run: python -B workflows/portable/host_status.py --json

@@ -1,6 +1,6 @@
 ---
 name: claudex-optimized
-description: "Audit and operate the process-local Claude Code-to-Codex launcher: Luna/Terra/Sol aliases, deferred tool search, 272K preflight, redacted recovery, fixture-safe setup, and zero-quota routing probes. Use for claudex status, routing, preflight, recovery, setup, sync, or routing tests."
+description: "Audit and operate the process-local Claude Code-to-Codex launcher: Luna/Terra/Sol aliases, Codex Spark subagent lane, deferred tool search, 272K preflight, redacted recovery, fixture-safe setup, and zero-quota routing probes. Use for claudex status, routing, preflight, recovery, setup, sync, or routing tests."
 ---
 
 # Claudex Optimized
@@ -15,6 +15,10 @@ This is a **user-level** skill whose canonical source is `skills/claudex-optimiz
 - Antigravity is an official-surface handoff only. Never invoke, authenticate, scrape, proxy, or reuse Antigravity/Gemini CLI OAuth through a third-party harness. Supported API-key or Vertex routes are separate metered products, not Ultra subscription capacity.
 - Read thresholds, roles, tool profiles, and forbidden targets from `references/policy.json`.
 - Do not claim live alias routing is verified unless fresh proxy evidence proves initial and resumed Haiku/Luna, Sonnet/Terra, and Opus/Sol routes.
+- Existing Luna (`gpt-5.6-luna`), Terra (`gpt-5.6-terra`), and Sol (`gpt-5.6-sol`) mappings remain unchanged. The Codex Spark subagent lane (`gpt-5.3-codex-spark`) is an explicit bounded route and must not alter existing alias mappings or provider credentials.
+- Standalone Codex ChatGPT-account authentication rejects Spark; Spark must route strictly through the approved local CLIProxyAPI Responses endpoint.
+- Credentials must remain environment-only (`ANTHROPIC_AUTH_TOKEN`). Never place bearer tokens, API keys, or raw credentials in TOML configuration files or command-line arguments.
+- Silent fallback to another model is strictly prohibited. If Spark fails, is unavailable, or exhausts quota, report the failure or escalate explicitly.
 
 ## Surface routing (apply automatically, do not wait to be told)
 
@@ -40,6 +44,7 @@ Run `scripts/audit.ps1`. Report only its redacted junction, branch/dirty state, 
 
 Classify the task using `policy.json`:
 
+- Spark (`gpt-5.3-codex-spark`) for fast, bounded exploration, lightweight test triage, or small-diff tasks where lower latency is advantageous and outputs are verified against ground truth.
 - Luna / `research-readonly` for inventory, extraction, simple tests, or bounded research.
 - Terra / `implementation-local` for ordinary implementation, QA, docs, or medium research.
 - Sol only for hard implementation, architecture support, conflicting evidence, or a failed lower-tier validation.
@@ -98,6 +103,106 @@ Without the exact approval flag, refuse. With it, run the matching direct comman
 ### `test aliases [--approve-live-model-calls]`
 
 Without the exact approval flag, refuse. With it, run `live-aliases`, which is only an orchestrator: it executes `live-alias-luna`, `live-alias-terra`, and `live-alias-sol` serially as three independent Claude CLI processes, with a short bounded cooldown between live processes. It never uses the earlier combined three-alias controller prompt. Aggregate verification succeeds only if every independent probe passes. The capture proves routed models at gateway ingress. If CLIProxyAPI does not expose provider resolution in ordinary response metadata, report that the upstream provider remains unverified; never enable proxy debug or overclaim.
+
+## Codex Spark subagent lane
+
+The canonical `claudex-optimized` skill documents a bounded `gpt-5.3-codex-spark` subagent lane for fast, lightweight exploration and triage.
+
+### Approved CLIProxyAPI Responses endpoint
+
+CLIProxyAPI exposes a separate `gpt-5.3-codex-spark` quota pool, running through the approved local CLIProxyAPI Responses endpoint. Standalone Codex ChatGPT-account auth rejects Spark; that was the wrong route. Spark runs through CLIProxyAPI with custom provider `cliproxyapi`:
+
+- `model_provider="cliproxyapi"`
+- `model_providers.cliproxyapi.name="CLIProxyAPI"`
+- `model_providers.cliproxyapi.base_url="http://127.0.0.1:8317/v1"`
+- `model_providers.cliproxyapi.env_key="ANTHROPIC_AUTH_TOKEN"`
+- `model_providers.cliproxyapi.wire_api="responses"`
+- `model_providers.cliproxyapi.requires_openai_auth=false`
+- `model_providers.cliproxyapi.supports_websockets=false`
+
+Direct Claude Code invocations (`claude -p --model gpt-5.3-codex-spark --output-format json "<prompt>"`) also route directly through the approved local gateway.
+
+### Environment-only credentials
+
+Credentials remain strictly environment-only via `ANTHROPIC_AUTH_TOKEN`. Never place the bearer token, API key, or credentials in TOML files, command arguments, or transcripts.
+
+### Preserved Luna/Terra/Sol mappings
+
+Existing Luna (`gpt-5.6-luna`), Terra (`gpt-5.6-terra`), and Sol (`gpt-5.6-sol`) mappings remain completely unchanged. Spark is an explicit subagent lane (`gpt-5.3-codex-spark`), not an alias replacement.
+
+### Sandbox and approval policies
+
+Read-only and workspace-write profiles have explicit sandbox and approval policies:
+
+- **Read-only profile**:
+  - Approval policy: `-a never` for unattended subagent execution (or `-a untrusted` for interactive review).
+  - Sandbox policy: `-s read-only` (strictly restricts filesystem access to read-only; no workspace mutations).
+  - Disposable command pattern:
+
+```powershell
+codex -a never -s read-only -m gpt-5.3-codex-spark `
+  -c 'model_provider="cliproxyapi"' `
+  -c 'model_providers.cliproxyapi.name="CLIProxyAPI"' `
+  -c 'model_providers.cliproxyapi.base_url="http://127.0.0.1:8317/v1"' `
+  -c 'model_providers.cliproxyapi.env_key="ANTHROPIC_AUTH_TOKEN"' `
+  -c 'model_providers.cliproxyapi.wire_api="responses"' `
+  -c 'model_providers.cliproxyapi.requires_openai_auth=false' `
+  -c 'model_providers.cliproxyapi.supports_websockets=false' `
+  exec --ignore-user-config --ephemeral --skip-git-repo-check '<prompt>'
+```
+
+- **Workspace-write profile**:
+  - Approval policy: `-a never` for unattended subagent execution (or `-a untrusted` for interactive review).
+  - Sandbox policy: `-s workspace-write` (filesystem write operations strictly bounded to the target repository workspace; `danger-full-access` is strictly forbidden).
+  - Disposable command pattern:
+
+```powershell
+codex -a never -s workspace-write -m gpt-5.3-codex-spark `
+  -c 'model_provider="cliproxyapi"' `
+  -c 'model_providers.cliproxyapi.name="CLIProxyAPI"' `
+  -c 'model_providers.cliproxyapi.base_url="http://127.0.0.1:8317/v1"' `
+  -c 'model_providers.cliproxyapi.env_key="ANTHROPIC_AUTH_TOKEN"' `
+  -c 'model_providers.cliproxyapi.wire_api="responses"' `
+  -c 'model_providers.cliproxyapi.requires_openai_auth=false' `
+  -c 'model_providers.cliproxyapi.supports_websockets=false' `
+  exec --ignore-user-config --ephemeral --skip-git-repo-check '<prompt>'
+```
+
+### Sanitized probe verification
+
+A sanitized probe verifies gateway model, terminal success, and no fallback:
+
+- Direct Claude Code probe:
+
+```powershell
+claude -p --model gpt-5.3-codex-spark --output-format json "Reply with exactly CLAUDE_SPARK_OK and nothing else. Do not use tools."
+```
+
+  Verified response metadata confirms `result: "CLAUDE_SPARK_OK"`, `model: "gpt-5.3-codex-spark"`, `canonical_model: "gpt-5.3-codex-spark"`, provider `firstParty`, terminal success, and no fallback.
+
+- Codex CLI probe:
+
+```powershell
+codex -a never -s read-only -m gpt-5.3-codex-spark `
+  -c 'model_provider="cliproxyapi"' `
+  -c 'model_providers.cliproxyapi.name="CLIProxyAPI"' `
+  -c 'model_providers.cliproxyapi.base_url="http://127.0.0.1:8317/v1"' `
+  -c 'model_providers.cliproxyapi.env_key="ANTHROPIC_AUTH_TOKEN"' `
+  -c 'model_providers.cliproxyapi.wire_api="responses"' `
+  -c 'model_providers.cliproxyapi.requires_openai_auth=false' `
+  -c 'model_providers.cliproxyapi.supports_websockets=false' `
+  exec --ignore-user-config --ephemeral --skip-git-repo-check 'Reply with exactly SPARK_OK and nothing else.'
+```
+
+  Verified response confirms `SPARK_OK` (or agent output `SPARK_AGENT_OK`), gateway model `gpt-5.3-codex-spark`, terminal success, and no fallback.
+- Probe logs and records must be sanitized: capture gateway model, timing, and terminal status; never record raw prompts, bearer tokens, or local workstation paths.
+
+### Quota limitations and escalation behavior
+
+- **Separate quota pool**: CLIProxyAPI exposes a separate quota and rate-limit window for `gpt-5.3-codex-spark` distinct from the primary Luna/Terra/Sol allowance.
+- **Grounding and accuracy trade-offs**: Spark offers faster execution (~19% faster wall-clock and ~35% faster TTFT than Luna), but scored 2/3 facts in benchmarks (e.g. confabulating build cache issues instead of concrete path-separator assertions). Output verification against ground truth is required before unattended implementation use.
+- **Escalation behavior**: If Spark encounters rate limits (HTTP 429), quota exhaustion, or fails accuracy/grounding verification, escalate to Terra (`gpt-5.6-terra`) for implementation/QA or Sol (`gpt-5.6-sol`) for complex architecture and reasoning.
+- **Strict no-fallback rule**: Never silently fall back to another model. If Spark is unavailable or fails, halt or escalate explicitly with observable evidence.
 
 ## Persisted routing status
 

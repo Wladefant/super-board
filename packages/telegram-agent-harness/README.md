@@ -6,7 +6,7 @@ Universal, mobile-friendly Telegram operations surface for managing multi-agent 
 
 - **Standalone Machine Daemon**: Long-polls opted-in Telegram bot slots via a detached background service without requiring an open terminal window.
 - **Lease & Slot Management**: Transparent bot leasing from SQLite (`bot_pool.db`) preventing HTTP 409 poller collisions across sessions.
-- **Direct-Chat (DM) Mode**: 1-on-1 private chat with the operator for session steering, approvals, and questions.
+- **Direct-Chat (DM) Mode**: 1-on-1 private chat with the operator for session steering and questions.
 - **Supergroup Forum Topics Mode (Opt-In)**: Multiplexes multiple concurrent Veyyon sessions into a single Telegram Supergroup using native Telegram Forum Topics (`message_thread_id`).
 - **Superboard Mini App Integration**: In-app Telegram web dashboard for interactive queue and session monitoring.
 
@@ -30,6 +30,10 @@ Expired Telegram launch credentials require reopening the app from Telegram.
 The new session format intentionally rejects old bearer credentials, so deploying
 the relay and local Mini App API requires coordinated installation; mismatched
 versions fail closed. No installation or daemon restart is implicit in this change.
+
+Telegram does not intercept, validate, or approve tool calls. Native Veyyon permissions remain independent and unchanged. Sender authentication, topic/session ownership, ordinary operator questions and consequential non-tool decisions remain enforced. Old tool-approval buttons report that the feature is obsolete without granting permission or executing work; the Mini App has no tool-approval section.
+
+After upgrading from a guard-bearing loader, reload the **static extension** in each original session using the host's `/reload-config` command. `/tg-reload` only replaces the dynamic runtime and cannot remove hooks registered by the old loader. Restart the standalone daemon through its existing supervisor when authorized to activate its stale-callback handling; installation alone does not replace code already in memory. Never resume a duplicate session.
 
 ---
 
@@ -65,6 +69,15 @@ Forum mode allows an operator to manage multiple concurrent Veyyon sessions insi
    ```bash
    bun daemon/main.ts run
    ```
+
+### Automatic Topics (Auto-Attach)
+In forum mode, the daemon automatically creates and binds Telegram forum topics for live top-level Veyyon sessions:
+- **Live terminal IPC source of truth**: Discovers live interactive terminal sessions via local named pipe endpoints (`TerminalSessionControl`). Historical disk sessions never trigger topic creation.
+- **Folder naming & ordinals**: Topics are named after the workspace folder (e.g. `super-board`). When multiple live sessions share a folder, subsequent topics receive an ordinal suffix (`super-board (2)`, `super-board (3)`).
+- **Dead-route rebinding**: If a topic exists for a workspace whose bound session has exited, starting a new session in that folder automatically rebinds the existing topic and posts a `🔁 Rebound to session <id>` note.
+- **Lifecycle & interval**: Runs on daemon startup, upon terminal owner discovery, and periodically every 10 seconds (`autoAttachIntervalMs`, default 10,000 ms). Can be disabled per slot with `"autoAttach": false`.
+- **Session listing indicator**: `/sessions` marks sessions that already have an attached forum topic with a `📌` indicator.
+- **Dry run**: Test or inspect actions without contacting Telegram via `bun daemon/main.ts --reconcile-once --dry-run`.
 
 ### Commands in Forum Mode
 - `/topics` — List active topics and bound session status (`idle` / `running`)

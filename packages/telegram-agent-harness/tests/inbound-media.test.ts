@@ -29,13 +29,13 @@ for (const idle of [true, false]) test.skipIf(!installed)(`photo persisted and d
  const { TelegramPoller } = await import(pathToFileURL(path.join(installed!, "poller.ts")).href);
  const dir = root(); const calls = mockDownload(); const delivered: string[] = [];
  const poller = new TelegramPoller("test-token", dir, { dmPolicy: "allowlist", allowFrom: ["123"] }, {
- isIdle: () => idle, getSessionFile: () => path.join(dir,"session.jsonl"), onUserMessage: (t: string) => { expect(idle).toBe(true); delivered.push(t); }, onSteer: (t: string) => { expect(idle).toBe(false); delivered.push(t); }, onFollowUp: () => {}, onAbort: () => {}, onRelease: async () => {}, getStatusText: () => "", onTelegramTurnStart: () => {}, onLedgerFailure: (t: string) => { throw new Error(t); }
+ isIdle: () => idle, getSessionFile: () => path.join(dir,"session.jsonl"), onUserMessage: (t: string) => { expect(idle).toBe(true); delivered.push(t); }, onSteer: (t: string) => { expect(idle).toBe(false); delivered.push(t); }, onFollowUp: () => {}, onAbort: () => {}, onRelease: async () => {}, getStatusText: () => "", onLedgerFailure: (t: string) => { throw new Error(t); }
  });
  pollers.push(poller);
  poller.ingestUpdates([{ update_id: 42, message: { message_id: 3, chat: { id: 123, type: "private" }, from: { id: 123, is_bot: false }, date: 0, caption: "/cancel", photo: [{ file_id: "largest", file_unique_id: "unique", width: 10, height: 10 }] } }]);
  await poller.redrivePendingUpdates();
  const target = path.join(dir,"local","telegram-inbound","42.jpg");
- expect(delivered).toEqual([`[Telegram sender: 123; origin: telegram_account; human presence not attested]\n[Telegram image from operator | /cancel] attachment: ${target}`]);
+ expect(delivered).toEqual([`[Telegram sender: 123; origin: telegram_account]\n[Telegram image from operator | /cancel] attachment: ${target}`]);
  expect(fs.readFileSync(target)).toEqual(Buffer.from([255,216,255,217]));
  const db = new Database(path.join(dir,"veyyon_bridge_state.db"));
  try { expect((db.query<{ media_json: string }, []>("select media_json from update_ledger").get())?.media_json).toContain("largest"); } finally { db.close(); }

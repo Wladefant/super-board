@@ -56,7 +56,6 @@ function newPoller(): TelegramPoller {
     onSteer: () => {},
     onAbort: () => {},
     onRelease: async () => {},
-    onTelegramTurnStart: () => {},
     getStatusText: () => "integration",
     onLedgerFailure: message => { throw new Error(message); },
   }, bridge, { maxConflictRetries: 2, initialConflictBackoffMs: 250, maxConflictBackoffMs: 500 });

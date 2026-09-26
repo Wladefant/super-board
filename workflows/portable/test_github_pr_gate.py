@@ -42,10 +42,13 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 from github_pr_gate import (
+    DEPLOY_CRITICAL_CHECKS,
     GateApprovalPolicy,
     PRGateEvaluation,
     evaluate_pr_gate,
+    evaluate_review_requirement,
     fetch_pr_json,
+    is_lockfile_or_generated,
     parse_pr_ref,
     resolve_gate_policy,
 )
@@ -551,6 +554,9 @@ class TestGitHubPRGate(unittest.TestCase):
             resolve_gate_policy("Bavariance/polysimulator", "staging").require_github_approval
         )
         self.assertFalse(resolve_gate_policy("Wladefant/super-board", "main").require_github_approval)
+        self.assertFalse(resolve_gate_policy("Wladefant/veyyon", "main").require_github_approval)
+        self.assertTrue(resolve_gate_policy("Wladefant/veyyon", "staging").require_github_approval)
+        self.assertTrue(resolve_gate_policy("Wladefant/veyyon", "feature-branch").require_github_approval)
         # Production base and unknown repositories stay strict.
         self.assertTrue(resolve_gate_policy("Bavariance/polysimulator", "main").require_github_approval)
         self.assertTrue(resolve_gate_policy("some/other-repo", "staging").require_github_approval)
@@ -916,6 +922,416 @@ class TestGitHubPRGate(unittest.TestCase):
         with patch("github_pr_gate._run_gh", return_value=denied):
             with self.assertRaisesRegex(RuntimeError, "HTTP 403"):
                 fetch_pr_json(pr_number=1, repo="example/fixture")
+
+    # -------------------------------------------------------------------------
+    # TEST 20: Risk-Based Review Exemption & High-Risk Requirements (Issue #195)
+    # -------------------------------------------------------------------------
+    def test_exempt_small_ui_pr_passes_without_review(self):
+        """Exempt small UI PR (<50 lines, no high-risk labels/paths) passes gate without review."""
+        pr = copy.deepcopy(self.mock_pr)
+        pr["reviews"] = []
+        pr["baseRefName"] = "staging"
+        pr["labels"] = [{"name": "area:ui"}]
+        pr["files"] = [
+            {"path": "frontend/components/Navbar.tsx", "additions": 30, "deletions": 10}
+        ]
+        policy = GateApprovalPolicy(
+            repo="Bavariance/polysimulator",
+            base_ref="staging",
+            require_github_approval=False,
+            require_head_bound_review_evidence=True,
+            allow_review_exemption=True,
+        )
+        result = evaluate_pr_gate(pr, policy=policy)
+        self.assertEqual(result.review_decision, "exempt")
+        self.assertEqual(result.review_decision_reason, "40 lines, no high-risk paths")
+        self.assertEqual(result.decision_line, "review: exempt (40 lines, no high-risk paths)")
+        self.assertEqual(result.gate_verdict, "PASSED")
+        self.assertIn("independent review is exempt", result.verdict_reason)
+        print("  [PASS] Exempt small UI PR passes without review")
+
+    def test_300_line_pr_requires_review(self):
+        """300-line PR (>250 lines changed) requires review: blocked without review, passes with review."""
+        pr = copy.deepcopy(self.mock_pr)
+        pr["reviews"] = []
+        pr["baseRefName"] = "staging"
+        pr["labels"] = []
+        pr["files"] = [
+            {"path": "frontend/components/DataTable.tsx", "additions": 200, "deletions": 100}
+        ]
+        policy = GateApprovalPolicy(
+            repo="Bavariance/polysimulator",
+            base_ref="staging",
+            require_github_approval=False,
+            require_head_bound_review_evidence=True,
+            allow_review_exemption=True,
+        )
+        # Without review: BLOCKED
+        blocked = evaluate_pr_gate(pr, policy=policy)
+        self.assertEqual(blocked.review_decision, "required")
+        self.assertEqual(blocked.review_decision_reason, "300 lines changed > 250")
+        self.assertEqual(blocked.decision_line, "review: required (300 lines changed > 250)")
+        self.assertEqual(blocked.gate_verdict, "BLOCKED")
+        self.assertIn("review required: 300 lines changed > 250", blocked.verdict_reason)
+
+        # With independent review: PASSED
+        pr["reviews"] = [
+            {
+                "author": {"login": "independent-reviewer"},
+                "state": "APPROVED",
+                "submittedAt": "2026-09-05T08:15:00Z",
+                "commit": {"oid": self.head_sha},
+            }
+        ]
+        passed = evaluate_pr_gate(pr, policy=policy)
+        self.assertEqual(passed.gate_verdict, "PASSED")
+        self.assertEqual(passed.review_decision, "required")
+        print("  [PASS] 300-line PR requires review (blocked without review, passes with review)")
+
+    def test_10_line_alembic_migration_requires_review(self):
+        """10-line alembic migration requires review despite small line count."""
+        pr = copy.deepcopy(self.mock_pr)
+        pr["reviews"] = []
+        pr["baseRefName"] = "staging"
+        pr["labels"] = []
+        pr["files"] = [
+            {"path": "alembic/versions/20260923_001_add_index.py", "additions": 8, "deletions": 2}
+        ]
+        policy = GateApprovalPolicy(
+            repo="Bavariance/polysimulator",
+            base_ref="staging",
+            require_github_approval=False,
+            require_head_bound_review_evidence=True,
+            allow_review_exemption=True,
+        )
+        result = evaluate_pr_gate(pr, policy=policy)
+        self.assertEqual(result.review_decision, "required")
+        self.assertEqual(
+            result.review_decision_reason,
+            "migration path alembic/versions/20260923_001_add_index.py",
+        )
+        self.assertEqual(
+            result.decision_line,
+            "review: required (migration path alembic/versions/20260923_001_add_index.py)",
+        )
+        self.assertEqual(result.gate_verdict, "BLOCKED")
+        self.assertIn("migration path alembic/versions/20260923_001_add_index.py", result.verdict_reason)
+        print("  [PASS] 10-line alembic migration requires review")
+
+    def test_money_path_requires_review(self):
+        """Money path (billing, wallet, ledger, payment, stripe) requires review."""
+        for path in (
+            "backend/app/billing/charge.py",
+            "backend/app/models/wallet.py",
+            "backend/app/ledger/balance.py",
+            "backend/app/payment/stripe_webhook.py",
+        ):
+            with self.subTest(path=path):
+                pr = copy.deepcopy(self.mock_pr)
+                pr["reviews"] = []
+                pr["baseRefName"] = "staging"
+                pr["labels"] = []
+                pr["files"] = [{"path": path, "additions": 5, "deletions": 2}]
+                policy = GateApprovalPolicy(
+                    repo="Bavariance/polysimulator",
+                    base_ref="staging",
+                    require_github_approval=False,
+                    require_head_bound_review_evidence=True,
+                    allow_review_exemption=True,
+                )
+                result = evaluate_pr_gate(pr, policy=policy)
+                self.assertEqual(result.review_decision, "required")
+                self.assertEqual(result.review_decision_reason, f"money path {path}")
+                self.assertEqual(result.decision_line, f"review: required (money path {path})")
+                self.assertEqual(result.gate_verdict, "BLOCKED")
+        print("  [PASS] Money path requires review (billing, wallet, ledger, payment/stripe)")
+
+    def test_lockfile_exclusion_and_high_risk_labels(self):
+        """Lockfiles are excluded from changed lines count; risk:high and area labels require review."""
+        # Lockfile exclusion: 1000 lines lockfile + 20 lines UI is exempt (< 250 non-lockfile lines)
+        pr = copy.deepcopy(self.mock_pr)
+        pr["reviews"] = []
+        pr["baseRefName"] = "staging"
+        pr["labels"] = []
+        pr["files"] = [
+            {"path": "package-lock.json", "additions": 800, "deletions": 200},
+            {"path": "frontend/components/Button.tsx", "additions": 15, "deletions": 5},
+        ]
+        policy = GateApprovalPolicy(
+            repo="Bavariance/polysimulator",
+            base_ref="staging",
+            require_github_approval=False,
+            require_head_bound_review_evidence=True,
+            allow_review_exemption=True,
+        )
+        result = evaluate_pr_gate(pr, policy=policy)
+        self.assertEqual(result.review_decision, "exempt")
+        self.assertEqual(result.review_decision_reason, "20 lines, no high-risk paths")
+        self.assertEqual(result.gate_verdict, "PASSED")
+
+        # label risk:high requires review even on 10 lines
+        pr_risk = copy.deepcopy(self.mock_pr)
+        pr_risk["reviews"] = []
+        pr_risk["baseRefName"] = "staging"
+        pr_risk["labels"] = [{"name": "risk:high"}]
+        pr_risk["files"] = [{"path": "frontend/components/Button.tsx", "additions": 5, "deletions": 2}]
+        res_risk = evaluate_pr_gate(pr_risk, policy=policy)
+        self.assertEqual(res_risk.review_decision, "required")
+        self.assertEqual(res_risk.review_decision_reason, "high-risk label risk:high")
+        self.assertEqual(res_risk.gate_verdict, "BLOCKED")
+
+        # area:auth requires review even on 10 lines
+        pr_auth = copy.deepcopy(self.mock_pr)
+        pr_auth["reviews"] = []
+        pr_auth["baseRefName"] = "staging"
+        pr_auth["labels"] = [{"name": "area:auth"}]
+        pr_auth["files"] = [{"path": "frontend/components/Button.tsx", "additions": 5, "deletions": 2}]
+        res_auth = evaluate_pr_gate(pr_auth, policy=policy)
+        self.assertEqual(res_auth.review_decision, "required")
+        self.assertEqual(res_auth.review_decision_reason, "high-risk area label area:auth")
+        self.assertEqual(res_auth.gate_verdict, "BLOCKED")
+        print("  [PASS] Lockfile exclusion and high-risk label tests pass")
+
+    def test_review_exemption_is_scoped_and_fails_closed(self):
+        """Strict default policy never exempts; a capped 100-file list never exempts."""
+        pr = copy.deepcopy(self.mock_pr)
+        pr["reviews"] = []
+        pr["baseRefName"] = "main"
+        pr["labels"] = []
+        pr["files"] = [{"path": "src/ui/Button.tsx", "additions": 3, "deletions": 1}]
+        strict = GateApprovalPolicy(rationale="strict default")
+        res = evaluate_pr_gate(pr, policy=strict)
+        self.assertEqual(res.review_decision, "required")
+        self.assertEqual(res.gate_verdict, "BLOCKED")
+
+        pr_many = copy.deepcopy(self.mock_pr)
+        pr_many["reviews"] = []
+        pr_many["baseRefName"] = "staging"
+        pr_many["labels"] = []
+        pr_many["files"] = [{"path": f"frontend/c{i}.tsx", "additions": 1, "deletions": 0} for i in range(100)]
+        relaxed = GateApprovalPolicy(
+            repo="Bavariance/polysimulator",
+            base_ref="staging",
+            require_github_approval=False,
+            require_head_bound_review_evidence=True,
+            allow_review_exemption=True,
+        )
+        res_many = evaluate_pr_gate(pr_many, policy=relaxed)
+        self.assertEqual(res_many.review_decision, "required")
+        self.assertIn("truncated", res_many.review_decision_reason)
+        self.assertEqual(res_many.gate_verdict, "BLOCKED")
+        print("  [PASS] Review exemption scoped to named policies and fails closed on truncation")
+    # ── Deploy-critical check tests (incident #5535 prevention) ──────────
+    #
+    # Every fixture below is review-exempt under the REAL PolySimulator staging policy
+    # (small low-risk diff, resolve_gate_policy), so the only thing that can hold the
+    # gate is CI. The bare waived_policy() fixture does not opt into review exemption,
+    # which makes a no-review PR BLOCKED for missing review evidence regardless of CI
+    # and would let a PENDING/PASSED assertion pass or fail for the wrong reason.
+
+    def _exempt_staging_pr(self, checks):
+        """Return a review-exempt staging PR with the given status check rollup."""
+        pr = copy.deepcopy(self.mock_pr)
+        pr["statusCheckRollup"] = checks
+        pr["baseRefName"] = "staging"
+        pr["files"] = [{"path": "frontend/foo.tsx", "additions": 10, "deletions": 5}]
+        pr["labels"] = []
+        pr["reviews"] = []
+        return pr
+
+    def _evaluate_staging(self, pr):
+        policy = resolve_gate_policy("Bavariance/polysimulator", "staging")
+        self.assertTrue(policy.allow_review_exemption)
+        res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy)
+        self.assertEqual(res.review_decision, "exempt", res.review_decision_reason)
+        return res
+
+    def _six_min_ago(self):
+        """Return an ISO timestamp 6 minutes in the past."""
+        return (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def test_deploy_critical_names_match(self):
+        self.assertIn("build-and-boot", DEPLOY_CRITICAL_CHECKS)
+
+    def test_deploy_critical_pending_never_passes(self):
+        """build-and-boot pending for 6 minutes keeps the gate PENDING; it is never timed out."""
+        six_min = self._six_min_ago()
+        for status in ("QUEUED", "IN_PROGRESS", "PENDING"):
+            with self.subTest(status=status):
+                res = self._evaluate_staging(self._exempt_staging_pr([
+                    {"name": "build-and-boot", "status": status, "conclusion": "", "startedAt": six_min, "createdAt": six_min},
+                    {"name": "lint-and-typecheck", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": six_min},
+                ]))
+                self.assertEqual(res.ci_verdict, "PENDING")
+                self.assertEqual(res.gate_verdict, "PENDING")
+                self.assertEqual(res.pending_checks, ["build-and-boot"])
+                self.assertNotIn("timed out", res.verdict_reason.lower())
+
+    def test_deploy_critical_failure_blocks(self):
+        """build-and-boot failure is a hard BLOCKED even on a review-exempt PR."""
+        res = self._evaluate_staging(self._exempt_staging_pr([
+            {"name": "build-and-boot", "status": "COMPLETED", "conclusion": "FAILURE", "completedAt": "2026-09-25T19:00:00Z"},
+            {"name": "lint-and-typecheck", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-09-25T19:00:00Z"},
+        ]))
+        self.assertEqual(res.ci_verdict, "FAILURE")
+        self.assertEqual(res.gate_verdict, "BLOCKED")
+        self.assertIn("build-and-boot", res.failing_checks)
+
+    def test_deploy_critical_success_passes(self):
+        """build-and-boot success lets a review-exempt PR pass."""
+        res = self._evaluate_staging(self._exempt_staging_pr([
+            {"name": "build-and-boot", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-09-25T19:00:00Z"},
+            {"name": "lint-and-typecheck", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": "2026-09-25T19:00:00Z"},
+        ]))
+        self.assertEqual(res.ci_verdict, "SUCCESS")
+        self.assertEqual(res.gate_verdict, "PASSED")
+
+    def test_non_critical_pending_times_out_but_critical_stays(self):
+        """A lint pending 6 minutes times out, but a co-pending build-and-boot keeps the gate PENDING."""
+        six_min = self._six_min_ago()
+        res = self._evaluate_staging(self._exempt_staging_pr([
+            {"name": "build-and-boot", "status": "IN_PROGRESS", "conclusion": "", "startedAt": six_min, "createdAt": six_min},
+            {"name": "lint-and-typecheck", "status": "IN_PROGRESS", "conclusion": "", "startedAt": six_min, "createdAt": six_min},
+        ]))
+        self.assertEqual(res.ci_verdict, "PENDING")
+        self.assertEqual(res.gate_verdict, "PENDING")
+        self.assertEqual(res.pending_checks, ["build-and-boot"])
+        self.assertIn("timed out", res.verdict_reason.lower())
+
+    def test_only_non_critical_pending_times_out_and_passes(self):
+        """An unrelated check pending 6 minutes times out and the gate passes on local gates."""
+        six_min = self._six_min_ago()
+        res = self._evaluate_staging(self._exempt_staging_pr([
+            {"name": "build-and-boot", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": six_min},
+            {"name": "lint-and-typecheck", "status": "IN_PROGRESS", "conclusion": "", "startedAt": six_min, "createdAt": six_min},
+        ]))
+        self.assertEqual(res.ci_verdict, "SUCCESS")
+        self.assertEqual(res.gate_verdict, "PASSED")
+        self.assertIn("lint-and-typecheck", res.verdict_reason)
+        self.assertIn("timed out", res.verdict_reason.lower())
+
+    def test_non_critical_pending_under_timeout_stays_pending(self):
+        """A non-critical check pending under 5 minutes is still waited on."""
+        recent = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        res = self._evaluate_staging(self._exempt_staging_pr([
+            {"name": "build-and-boot", "status": "COMPLETED", "conclusion": "SUCCESS", "completedAt": recent},
+            {"name": "lint-and-typecheck", "status": "IN_PROGRESS", "conclusion": "", "startedAt": recent, "createdAt": recent},
+        ]))
+        self.assertEqual(res.gate_verdict, "PENDING")
+        self.assertEqual(res.pending_checks, ["lint-and-typecheck"])
+
+    def test_pending_rerun_of_deploy_critical_supersedes_older_success(self):
+        """A re-run build-and-boot (completedAt = GitHub's 0001 sentinel) outranks its older success."""
+        six_min = self._six_min_ago()
+        res = self._evaluate_staging(self._exempt_staging_pr([
+            {"name": "build-and-boot", "status": "COMPLETED", "conclusion": "SUCCESS",
+             "startedAt": "2026-09-25T18:00:00Z", "completedAt": "2026-09-25T18:10:00Z"},
+            {"name": "build-and-boot", "status": "IN_PROGRESS", "conclusion": "",
+             "startedAt": six_min, "completedAt": "0001-01-01T00:00:00Z"},
+        ]))
+        self.assertEqual(res.gate_verdict, "PENDING")
+        self.assertEqual(res.pending_checks, ["build-and-boot"])
+
+    def test_veyyon_main_waiver_author_comment_review(self):
+        print("\n--- TEST 20: Veyyon Main Waiver & Negative Controls ---")
+        pr_author = "feature-developer"
+        base_pr = {
+            "number": 130,
+            "state": "OPEN",
+            "isDraft": False,
+            "headRefOid": self.head_sha,
+            "baseRefOid": self.base_sha,
+            "baseRefName": "main",
+            "author": {"login": pr_author},
+            "statusCheckRollup": [
+                {
+                    "name": "test-suite",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                    "completedAt": "2026-09-05T08:00:00Z",
+                }
+            ],
+            # Review required by default (no file data or labels)
+            "reviews": [],
+        }
+
+        # 1. POSITIVE TEST: author COMMENT review with APPROVE + matching content on veyyon@main passes
+        passing_pr = copy.deepcopy(base_pr)
+        passing_pr["reviews"] = [
+            {
+                "author": {"login": pr_author},
+                "state": "COMMENTED",
+                "body": f"APPROVE {self.head_sha}\n\nAutomated review against clean head.",
+                "submittedAt": "2026-09-05T08:15:00Z",
+            }
+        ]
+        result = evaluate_pr_gate(passing_pr, repo="Wladefant/veyyon")
+        self.assertEqual(result.gate_verdict, "PASSED")
+        self.assertEqual(result.approval_verdict, "AUTOMATED_REVIEW_APPROVED")
+        self.assertEqual(result.approved_by, pr_author)
+        self.assertFalse(result.github_approval_required)
+        print("  [PASS] Author COMMENT with APPROVE + matching content on veyyon@main passes")
+
+        # 2. NEGATIVE CONTROL: without a verdict does not pass (author COMMENT without verdict doesn't count)
+        no_verdict_pr = copy.deepcopy(base_pr)
+        no_verdict_pr["reviews"] = [
+            {
+                "author": {"login": pr_author},
+                "state": "COMMENTED",
+                "body": f"Reviewing commit {self.head_sha} - notes and comments without verdict.",
+                "submittedAt": "2026-09-05T08:15:00Z",
+            }
+        ]
+        res_no_verdict = evaluate_pr_gate(no_verdict_pr, repo="Wladefant/veyyon")
+        self.assertEqual(res_no_verdict.gate_verdict, "BLOCKED")
+        self.assertEqual(res_no_verdict.approval_verdict, "SELF_APPROVED_ONLY")
+        print("  [PASS] Negative control: author COMMENT without verdict blocked")
+
+        # 3. NEGATIVE CONTROL: other content (mismatched SHA / diff) does not pass
+        mismatched_content_pr = copy.deepcopy(base_pr)
+        mismatched_content_pr["reviews"] = [
+            {
+                "author": {"login": pr_author},
+                "state": "COMMENTED",
+                "body": f"APPROVE {self.base_sha}\n\nReviewed base commit, not head.",
+                "submittedAt": "2026-09-05T08:15:00Z",
+            }
+        ]
+        res_mismatched = evaluate_pr_gate(mismatched_content_pr, repo="Wladefant/veyyon")
+        self.assertEqual(res_mismatched.gate_verdict, "BLOCKED")
+        self.assertNotEqual(res_mismatched.gate_verdict, "PASSED")
+        print("  [PASS] Negative control: author review for other content blocked")
+
+        # 4. NEGATIVE CONTROL: another veyyon branch (not main) does not pass
+        other_branch_pr = copy.deepcopy(base_pr)
+        other_branch_pr["baseRefName"] = "feature-branch"
+        other_branch_pr["reviews"] = [
+            {
+                "author": {"login": pr_author},
+                "state": "COMMENTED",
+                "body": f"APPROVE {self.head_sha}\n\nAutomated review.",
+                "submittedAt": "2026-09-05T08:15:00Z",
+            }
+        ]
+        res_other_branch = evaluate_pr_gate(other_branch_pr, repo="Wladefant/veyyon")
+        self.assertEqual(res_other_branch.gate_verdict, "BLOCKED")
+        self.assertTrue(res_other_branch.github_approval_required)
+        print("  [PASS] Negative control: author review on non-main veyyon branch blocked")
+
+        # 5. NEGATIVE CONTROL: another repo does not pass
+        other_repo_pr = copy.deepcopy(base_pr)
+        other_repo_pr["reviews"] = [
+            {
+                "author": {"login": pr_author},
+                "state": "COMMENTED",
+                "body": f"APPROVE {self.head_sha}\n\nAutomated review.",
+                "submittedAt": "2026-09-05T08:15:00Z",
+            }
+        ]
+        res_other_repo = evaluate_pr_gate(other_repo_pr, repo="other-org/other-repo")
+        self.assertEqual(res_other_repo.gate_verdict, "BLOCKED")
+        self.assertTrue(res_other_repo.github_approval_required)
+        print("  [PASS] Negative control: author review on another repo blocked")
 
 
 def main():

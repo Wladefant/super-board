@@ -13,7 +13,7 @@ import { BotPoolCoordinator } from "../extension/coordinator";
 import type { TelegramPoller } from "../extension/poller";
 import { readDaemonSlotIds, resolveDaemonSlots } from "../daemon/config";
 import { claimDaemonPidFile, TelegramDaemon, type DaemonRuntimeOptions } from "../daemon/runtime";
-import type { GuiHostSessionControl } from "../daemon/session-control";
+import type { TerminalSessionControl } from "../daemon/session-control";
 
 const OPERATOR_CHAT = "1247617658";
 
@@ -93,7 +93,6 @@ function daemon(overrides: DaemonRuntimeOptions = {}): TelegramDaemon {
     manifestPath,
     channelsDir,
     daemonDbPath: path.join(root, "daemon.db"),
-    endpoint: null,
     log: () => {},
     pollerFactory: (_token, stateDir) => {
       const poller = new FakePoller(stateDir);
@@ -105,7 +104,7 @@ function daemon(overrides: DaemonRuntimeOptions = {}): TelegramDaemon {
         endpoint: "tcp:127.0.0.1:1",
         isBusy: () => false,
         close: () => {},
-      }) as unknown as GuiHostSessionControl,
+      }) as unknown as TerminalSessionControl,
     ...overrides,
   });
   daemons.push(instance);

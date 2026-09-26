@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Database } from "bun:sqlite";
 import { TelegramPoller } from "../extension/poller";
-import { OperatorQuestionService, type QuestionRoute } from "../src/operator-questions";
+import { OperatorQuestionService, questionOperator, type QuestionRoute } from "../src/operator-questions";
 import type { MessageCorrelationBridge, OutboundMessageCorrelation, TelegramUpdate } from "../extension/types";
 
 const originalFetch = globalThis.fetch;
@@ -12,6 +12,15 @@ const cleanup: Array<() => void> = [];
 afterEach(() => {
   globalThis.fetch = originalFetch;
   for (const close of cleanup.splice(0)) close();
+});
+
+test("forum questions bind the authorized user, never the group identity", () => {
+  const access = { dmPolicy: "allowlist", allowFrom: ["123", "456"], groups: { "-100": { allowFrom: ["123"] } } };
+  expect(questionOperator(access, "-100")).toBe("123");
+  expect(questionOperator(access, "456")).toBe("456");
+  expect(() => questionOperator(access, "-999")).toThrow("exactly one authorized operator");
+  expect(() => questionOperator({ ...access, groups: { "-100": {} } }, "-100")).toThrow("exactly one authorized operator");
+  expect(() => questionOperator({ ...access, groups: { "-100": { allowFrom: ["789"] } } }, "-100")).toThrow("exactly one authorized operator");
 });
 
 interface QuestionFixtureOptions {
@@ -85,7 +94,6 @@ function fixture(options: QuestionFixtureOptions = {}) {
       onFollowUp: () => {},
       onAbort: () => {},
       onRelease: async () => {},
-      onTelegramTurnStart: () => {},
       getStatusText: () => "test",
       onLedgerFailure: () => {},
       onQuestionAnswer: options.omitQuestionAnswerCallback
@@ -325,6 +333,27 @@ test("multimodal answer: choice callback followed by free text combines into com
   const unmutated = await f.service.get(questionId);
   expect(unmutated.answer?.text).toBe("Max 5 retries with 500ms backoff");
   expect(unmutated.answer?.choice_id).toBe("opt-a");
+}, 20_000);
+
+test("the first send of a question card is finished HTML, not run through the Markdown renderer", async () => {
+  const f = fixture();
+  // The card is rendered once by the decision store. The send path used to pass it through
+  // `markdownToTelegramHtml` with no session repository, which invented one for a bare `#N`
+  // and made the first send disagree with every later edit of the same card.
+  const pending = await f.service.ask({
+    question: "Retry #224 strategy",
+    recommendation: "opt-a",
+    options: [{ id: "opt-a", label: "Exponential" }, { id: "opt-b", label: "Linear" }],
+  });
+  expect(pending.decision_id).toMatch(/^tq:/);
+
+  const sendCall = f.calls.find(c => c.method === "sendMessage");
+  expect(sendCall).toBeDefined();
+  expect(sendCall?.body.parse_mode).toBe("HTML");
+  // The reference travelled through untouched: present in the card, never linkified.
+  expect(sendCall?.body.text).toContain("#224");
+  expect(sendCall?.body.text).not.toContain("github.com/Bavariance/polysimulator/issues/224");
+  expect(sendCall?.body.text).not.toContain("<a href=");
 }, 20_000);
 
 test("question cannot be accessed or answered from an unrelated session route", async () => {

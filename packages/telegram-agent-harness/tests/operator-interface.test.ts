@@ -34,7 +34,7 @@ function fixture(thread?: number) {
   };
   const poller = new TelegramPoller("0:disposable-test", dir, { allowFrom: ["1"], dmPolicy: "allowlist" }, {
     isIdle: () => true, onUserMessage: text => turns.push(text), onSteer: text => turns.push(text), onFollowUp: text => turns.push(text),
-    onAbort: () => turns.push("ABORT"), onRelease: async () => { turns.push("RELEASE"); }, onTelegramTurnStart: () => {},
+    onAbort: () => turns.push("ABORT"), onRelease: async () => { turns.push("RELEASE"); },
     getStatusText: () => "test", onLedgerFailure: () => {},
     onQuestionAnswer: async (id, event, answer) => { answers.push({ id, event, answer }); },
   }, bridge, { messageThreadId: thread });

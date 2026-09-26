@@ -29,7 +29,6 @@ function createFixture() {
       onAbort: () => {},
       onRelease: async () => {},
       getStatusText: () => "test",
-      onTelegramTurnStart: () => {},
       onLedgerFailure: () => {},
     },
     {
