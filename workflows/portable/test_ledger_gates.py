@@ -786,6 +786,57 @@ sys.exit(0)
         self.assertIn("DEC-REC-01", active["req-rec-blocked-dec"]["decision_blockers"])
         self.assertTrue(active["req-rec-blocked-dec"]["blocked"])
 
+    def test_parent_close_guard_refuses_when_sub_issues_or_sub_requests_open(self):
+        """Parent requests refuse to close to 'done' when sub-requests or native sub-issues are open."""
+        # 1. Setup parent and child requests
+        self._add("req-parent", state="review", task_type="local_doc")
+        self._verify_criteria("req-parent")
+        self.ledger.update_request(
+            req_id="req-parent",
+            sub_requests=["req-child-1"],
+            github_update={"proof_url": "https://github.com/Bavariance/polysimulator/pull/1", "proof_verified": True},
+        )
+
+        self._add("req-child-1", state="implementation", task_type="local_doc")
+        self.ledger.update_request(req_id="req-child-1", parent_req_id="req-parent")
+
+        # Parent close refused because req-child-1 is in 'implementation'
+        with self.assertRaises(ValueError) as ctx:
+            self.ledger.update_request(req_id="req-parent", state="done")
+        self.assertIn("open sub-request(s)", str(ctx.exception))
+        self.assertIn("req-child-1", str(ctx.exception))
+
+        # Advance and close child request
+        self.ledger.update_request(req_id="req-child-1", state="QA")
+        self._verify_criteria("req-child-1")
+        self._advance_after_stage("req-child-1", "QA", "review")
+        self.ledger.update_request(
+            req_id="req-child-1",
+            github_update={"proof_url": "https://github.com/Bavariance/polysimulator/pull/1", "proof_verified": True},
+            state="done",
+        )
+        self.assertEqual(self.ledger.get_request("req-child-1")["state"], "done")
+
+        # 2. GitHub native sub-issues guard refusal
+        mock_open_sub_issues = [{"number": 101, "title": "Open child issue", "state": "open"}]
+        checker = lambda repo, issue_num: mock_open_sub_issues
+
+        self.ledger.update_request(
+            req_id="req-parent",
+            github_update={"issue_number": 50, "proof_url": "https://github.com/Bavariance/polysimulator/pull/1", "proof_verified": True},
+        )
+
+        with self.assertRaises(ValueError) as ctx:
+            self.ledger.update_request(req_id="req-parent", state="done", sub_issues_checker=checker)
+        self.assertIn("open sub-issue(s)", str(ctx.exception))
+        self.assertIn("#101", str(ctx.exception))
+
+        # 3. Allowed close when all sub-issues are closed
+        mock_closed_sub_issues = [{"number": 101, "title": "Open child issue", "state": "closed"}]
+        checker_closed = lambda repo, issue_num: mock_closed_sub_issues
+
+        res = self.ledger.update_request(req_id="req-parent", state="done", sub_issues_checker=checker_closed)
+        self.assertEqual(res["state"], "done")
 def run_tests():
     print("=" * 70)
     print("RUNNING LEDGER LIFECYCLE GATE REGRESSIONS")

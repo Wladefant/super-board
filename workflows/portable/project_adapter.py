@@ -31,6 +31,30 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 
+def fetch_github_sub_issues(repo: str, issue_number: int) -> List[Dict[str, Any]]:
+    """
+    Fetch sub-issues for a parent issue using GitHub REST API.
+    Returns list of dicts: [{"number": int, "title": str, "state": str}].
+    """
+    try:
+        cmd = ["gh", "api", f"repos/{repo}/issues/{issue_number}/sub_issues"]
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if proc.returncode == 0 and proc.stdout:
+            data = json.loads(proc.stdout)
+            if isinstance(data, list):
+                return [
+                    {
+                        "number": item.get("number"),
+                        "title": item.get("title", ""),
+                        "state": item.get("state", "open"),
+                    }
+                    for item in data
+                    if isinstance(item, dict) and item.get("number")
+                ]
+    except Exception:
+        pass
+    return []
+
 # ---------------------------------------------------------------------------
 # Data Models
 # ---------------------------------------------------------------------------
@@ -126,6 +150,7 @@ class ProjectConfig:
         dry_run: bool = False,
         ledger_record: Optional[Dict[str, Any]] = None,
         graphql_runner: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None,
+        sub_issues_checker: Optional[Callable[[str, int], List[Dict[str, Any]]]] = None,
     ) -> "SuperboardLifecycleOutcome":
         """
         Update GitHub Project V2 card status for this project.
@@ -133,7 +158,7 @@ class ProjectConfig:
           .update_lifecycle(request_id, state, head_sha, evidence_url) -> outcome
           exposing attributes: .ok (bool), .blocked_reason (str|None), .board_url (str|None)
         """
-        updater = SuperboardProjectUpdater(self, graphql_runner=graphql_runner)
+        updater = SuperboardProjectUpdater(self, graphql_runner=graphql_runner, sub_issues_checker=sub_issues_checker)
         return updater.update_lifecycle(
             request_id=request_id,
             state=state,
@@ -142,6 +167,7 @@ class ProjectConfig:
             issue_number=issue_number,
             dry_run=dry_run,
             ledger_record=ledger_record,
+            sub_issues_checker=sub_issues_checker,
         )
 
 
@@ -715,10 +741,11 @@ class SuperboardProjectUpdater:
         config: Optional[ProjectConfig] = None,
         *,
         graphql_runner: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None,
+        sub_issues_checker: Optional[Callable[[str, int], List[Dict[str, Any]]]] = None,
     ):
         self.config = config or get_current_project_config()
         self.graphql_runner = graphql_runner or default_graphql_runner
-
+        self.sub_issues_checker = sub_issues_checker
     def _parse_repo(self) -> Tuple[bool, str, str, Optional[str]]:
         """Validate and parse repo into (owner, repo_name). Returns (ok, owner, repo, err)."""
         repo = (self.config.repo or "").strip()
@@ -827,6 +854,7 @@ class SuperboardProjectUpdater:
         issue_number: Optional[int] = None,
         dry_run: bool = False,
         ledger_record: Optional[Dict[str, Any]] = None,
+        sub_issues_checker: Optional[Callable[[str, int], List[Dict[str, Any]]]] = None,
     ) -> SuperboardLifecycleOutcome:
         """
         Public duck-typed lifecycle update method conforming to the frozen contract:
@@ -907,6 +935,28 @@ class SuperboardProjectUpdater:
                     github_writes=0,
                 )
 
+            # 4b. Inviolable Parent-Close Gate: Refuse to transition parent issues to Done if they have open sub-issues
+            effective_checker = sub_issues_checker or self.sub_issues_checker
+            open_subs: List[Dict[str, Any]] = []
+            if effective_checker is not None:
+                subs = effective_checker(f"{owner}/{repo_name}", target_issue)
+                open_subs = [s for s in subs if str(s.get("state", "")).lower() == "open"]
+            else:
+                subs = fetch_github_sub_issues(f"{owner}/{repo_name}", target_issue)
+                open_subs = [s for s in subs if str(s.get("state", "")).lower() == "open"]
+
+            if open_subs:
+                sub_desc = [f"#{s['number']}: {s.get('title', '')} ({s.get('state', 'open')})" for s in open_subs]
+                return SuperboardLifecycleOutcome(
+                    ok=False,
+                    blocked_reason=(
+                        f"Cannot transition parent issue #{target_issue} to 'Done': "
+                        f"Issue has {len(open_subs)} open sub-issue(s): " + "; ".join(sub_desc)
+                    ),
+                    board_url=board_url,
+                    dry_run=dry_run,
+                    github_writes=0,
+                )
         # 5. Dynamic schema discovery
         try:
             schema = self.get_board_schema(project_owner, project_number)
@@ -1065,6 +1115,7 @@ def update_project_lifecycle(
     dry_run: bool = False,
     ledger_record: Optional[Dict[str, Any]] = None,
     graphql_runner: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None,
+    sub_issues_checker: Optional[Callable[[str, int], List[Dict[str, Any]]]] = None,
 ) -> SuperboardLifecycleOutcome:
     """Convenience functional wrapper around SuperboardProjectUpdater."""
     cfg = config or get_current_project_config()
@@ -1077,6 +1128,7 @@ def update_project_lifecycle(
         dry_run=dry_run,
         ledger_record=ledger_record,
         graphql_runner=graphql_runner,
+        sub_issues_checker=sub_issues_checker,
     )
 
 

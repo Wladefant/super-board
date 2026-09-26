@@ -12,6 +12,24 @@
  */
 
 const fs = require('fs');
+const { execSync } = require('child_process');
+
+function fetchSubIssues(repo, issueNumber) {
+  try {
+    const stdout = execSync(`gh api repos/${repo}/issues/${issueNumber}/sub_issues`, {
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 10000,
+    });
+    const parsed = JSON.parse(stdout);
+    if (Array.isArray(parsed)) {
+      return parsed.filter(item => item && item.number);
+    }
+  } catch (e) {
+    // If gh api fails (e.g. no sub-issues, endpoint not available, or network error)
+  }
+  return [];
+}
 
 const ALLOWED_KINDS = [
   'kind:bug',
@@ -48,7 +66,7 @@ function parseEventPayload() {
   return JSON.parse(raw);
 }
 
-function evaluatePR(pr) {
+function evaluatePR(pr, options = {}) {
   const failures = [];
   const passes = [];
 
@@ -85,16 +103,38 @@ function evaluatePR(pr) {
   }
 
   // 2. Linked Issue
-  const issueRefRegex = /(?:fixes|closes|resolves|refs)\s+(?:https:\/\/github\.com\/[^\s/]+\/[^\s/]+\/issues\/|#|[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+#)(\d+)/i;
+  const issueRefRegex = /(?:fixes|closes|resolves|refs|part of)\s+(?:https:\/\/github\.com\/([^\s/]+\/[^\s/]+)\/issues\/|#|([a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+)#)(\d+)/i;
   const issueMatch = body.match(issueRefRegex);
   if (!issueMatch) {
     failures.push({
       check: 'Linked Issue',
-      message: 'PR description does not contain a valid closing keyword linking an issue.',
-      remedy: `Add an issue reference under "## Linked Issue" using format: Fixes #123 or Closes Wladefant/super-board#123.\nExample: gh pr edit ${prNumber} --body "$(cat <<'EOF'\n## Linked Issue\nFixes #123\n\n$(gh pr view ${prNumber} --json body -q .body)\nEOF\n)"`,
+      message: 'PR description does not contain a valid issue reference (Fixes, Closes, Resolves, Refs, Part of).',
+      remedy: `Add an issue reference under "## Linked Issue" using format: Fixes #123 (leaf issue) or Refs #123 / Part of #123 (parent issue).\nExample: gh pr edit ${prNumber} --body "$(cat <<'EOF'\n## Linked Issue\nFixes #123\n\n$(gh pr view ${prNumber} --json body -q .body)\nEOF\n)"`,
     });
   } else {
     passes.push(`Linked issue: ${issueMatch[0]}`);
+  }
+
+  // 2b. Parent-Close Guard: Reject closing keywords (Fixes, Closes, Resolves) on parent issues with open sub-issues
+  const closingKeywordRegex = /\b(fixes|closes|resolves)\s+(?:https:\/\/github\.com\/([^\s/]+\/[^\s/]+)\/issues\/|#|([a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+)#)(\d+)/gi;
+  let closingMatch;
+  const defaultRepo = (pr.base && pr.base.repo && pr.base.repo.full_name) || process.env.GITHUB_REPOSITORY || 'Wladefant/super-board';
+  const getSubIssues = (options && options.subIssuesFetcher) || ((r, n) => fetchSubIssues(r, n));
+
+  while ((closingMatch = closingKeywordRegex.exec(body)) !== null) {
+    const kw = closingMatch[1];
+    const targetRepo = closingMatch[2] || closingMatch[3] || defaultRepo;
+    const targetIssueNum = parseInt(closingMatch[4], 10);
+    const subIssues = getSubIssues(targetRepo, targetIssueNum) || [];
+    const openSubIssues = subIssues.filter(s => String(s.state || 'open').toLowerCase() === 'open');
+    if (openSubIssues.length > 0) {
+      const openDesc = openSubIssues.map(s => `#${s.number}: ${s.title || ''} (${s.state || 'open'})`).join('; ');
+      failures.push({
+        check: 'Parent Issue Closing Keyword Guard',
+        message: `PR uses closing keyword '${kw}' targeting parent issue #${targetIssueNum}, which has ${openSubIssues.length} open sub-issue(s): ${openDesc}.`,
+        remedy: `Parent issues cannot be closed while sub-issues remain open. Change closing keyword '${kw} #${targetIssueNum}' to a non-closing reference ('Refs #${targetIssueNum}' or 'Part of #${targetIssueNum}').`,
+      });
+    }
   }
 
   // 3. Milestone
@@ -180,4 +220,4 @@ if (require.main === module) {
   run();
 }
 
-module.exports = { evaluatePR };
+module.exports = { evaluatePR, fetchSubIssues };
