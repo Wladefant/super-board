@@ -1,5 +1,6 @@
 FROM oven/bun:1.3.1-alpine
 WORKDIR /app
+ENV NODE_ENV=production
 COPY relay.ts index.html app.js client.js style.css ./
 USER bun
 EXPOSE 3000

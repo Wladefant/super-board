@@ -51,6 +51,8 @@ from github_pr_gate import (
     is_lockfile_or_generated,
     parse_pr_ref,
     resolve_gate_policy,
+    validate_local_tests_record,
+    is_build_and_boot_critical_diff,
 )
 
 
@@ -165,6 +167,52 @@ class TestGitHubPRGate(unittest.TestCase):
             require_github_approval=False,
             require_head_bound_review_evidence=True,
         )
+
+    QA_RECEIPT_URL = "https://github.com/Bavariance/polysimulator/pull/4545#issuecomment-900000001"
+
+    def staging_policy(self):
+        return GateApprovalPolicy(
+            repo="Bavariance/polysimulator",
+            base_ref="staging",
+            require_github_approval=False,
+            require_head_bound_review_evidence=True,
+            allow_review_exemption=True,
+        )
+
+    def qa_receipt_comment(self, *, named=None, identity=None, images=2, marker="PASS", served=None, extra=""):
+        """A browser-QA receipt in the shape lanes post on a PR, for `named` (default: the head).
+
+        `served` mirrors the printer's `QA-RECEIPT: PASS <served-sha>` form: the revision QA
+        ran against, which the gate binds to on its own.
+        """
+        named = named or self.head_sha
+        identity = named if identity is None else identity
+        lines = []
+        if marker:
+            suffix = f" {served}" if served else ""
+            lines.append(f"QA-RECEIPT: {marker}{suffix}")
+        lines.append(f"Browser QA on {named} (identity {identity}).")
+        lines.extend(
+            f"![shot-{i}](https://github.com/user-attachments/assets/{i:08d}-1111-2222-3333-{i:012d})"
+            for i in range(images)
+        )
+        if extra:
+            lines.append(extra)
+        return {"body": "\n".join(lines), "html_url": self.QA_RECEIPT_URL}
+
+    def staging_ui_pr(self, receipt=None, *, files=None, comments=None):
+        """A review-exempt staging PR whose diff reaches the order ticket UI."""
+        pr = copy.deepcopy(self.mock_pr)
+        pr["reviews"] = []
+        pr["baseRefName"] = "staging"
+        pr["labels"] = []
+        pr["files"] = files or [
+            {"path": "frontend/components/OrderTicket.tsx", "additions": 8, "deletions": 3}
+        ]
+        if comments is None:
+            comments = [receipt] if receipt else []
+        pr["comments"] = comments
+        return pr
 
     def test_unresolvable_live_head_never_approves(self):
         for head in ("", "short", "g" * 40):
@@ -554,6 +602,9 @@ class TestGitHubPRGate(unittest.TestCase):
             resolve_gate_policy("Bavariance/polysimulator", "staging").require_github_approval
         )
         self.assertFalse(resolve_gate_policy("Wladefant/super-board", "main").require_github_approval)
+        self.assertFalse(resolve_gate_policy("Wladefant/veyyon", "main").require_github_approval)
+        self.assertTrue(resolve_gate_policy("Wladefant/veyyon", "staging").require_github_approval)
+        self.assertTrue(resolve_gate_policy("Wladefant/veyyon", "feature-branch").require_github_approval)
         # Production base and unknown repositories stay strict.
         self.assertTrue(resolve_gate_policy("Bavariance/polysimulator", "main").require_github_approval)
         self.assertTrue(resolve_gate_policy("some/other-repo", "staging").require_github_approval)
@@ -824,6 +875,9 @@ class TestGitHubPRGate(unittest.TestCase):
                     "if args and args[0] == 'api' and '/reviews' in args[1]:\n"
                     "    print(json.dumps(json.load(open(os.environ['GATE_FIXTURE_PR'], encoding='utf-8'))['reviews']))\n"
                     "    raise SystemExit(0)\n"
+                    "if args and args[0] == 'api' and '/comments' in args[1]:\n"
+                    "    print(json.dumps(json.load(open(os.environ['GATE_FIXTURE_PR'], encoding='utf-8')).get('comments', [])))\n"
+                    "    raise SystemExit(0)\n"
                     "if args and args[0] == 'api' and '/pulls/74' in args[1]:\n"
                     "    print(os.environ['GATE_FIXTURE_BASE'])\n"
                     "    raise SystemExit(0)\n"
@@ -932,13 +986,8 @@ class TestGitHubPRGate(unittest.TestCase):
         pr["files"] = [
             {"path": "frontend/components/Navbar.tsx", "additions": 30, "deletions": 10}
         ]
-        policy = GateApprovalPolicy(
-            repo="Bavariance/polysimulator",
-            base_ref="staging",
-            require_github_approval=False,
-            require_head_bound_review_evidence=True,
-            allow_review_exemption=True,
-        )
+        policy = self.staging_policy()
+        pr["comments"] = [self.qa_receipt_comment()]
         result = evaluate_pr_gate(pr, policy=policy)
         self.assertEqual(result.review_decision, "exempt")
         self.assertEqual(result.review_decision_reason, "40 lines, no high-risk paths")
@@ -956,13 +1005,8 @@ class TestGitHubPRGate(unittest.TestCase):
         pr["files"] = [
             {"path": "frontend/components/DataTable.tsx", "additions": 200, "deletions": 100}
         ]
-        policy = GateApprovalPolicy(
-            repo="Bavariance/polysimulator",
-            base_ref="staging",
-            require_github_approval=False,
-            require_head_bound_review_evidence=True,
-            allow_review_exemption=True,
-        )
+        policy = self.staging_policy()
+        pr["comments"] = [self.qa_receipt_comment()]
         # Without review: BLOCKED
         blocked = evaluate_pr_gate(pr, policy=policy)
         self.assertEqual(blocked.review_decision, "required")
@@ -1054,13 +1098,8 @@ class TestGitHubPRGate(unittest.TestCase):
             {"path": "package-lock.json", "additions": 800, "deletions": 200},
             {"path": "frontend/components/Button.tsx", "additions": 15, "deletions": 5},
         ]
-        policy = GateApprovalPolicy(
-            repo="Bavariance/polysimulator",
-            base_ref="staging",
-            require_github_approval=False,
-            require_head_bound_review_evidence=True,
-            allow_review_exemption=True,
-        )
+        policy = self.staging_policy()
+        pr["comments"] = [self.qa_receipt_comment()]
         result = evaluate_pr_gate(pr, policy=policy)
         self.assertEqual(result.review_decision, "exempt")
         self.assertEqual(result.review_decision_reason, "20 lines, no high-risk paths")
@@ -1072,10 +1111,12 @@ class TestGitHubPRGate(unittest.TestCase):
         pr_risk["baseRefName"] = "staging"
         pr_risk["labels"] = [{"name": "risk:high"}]
         pr_risk["files"] = [{"path": "frontend/components/Button.tsx", "additions": 5, "deletions": 2}]
+        pr_risk["comments"] = [self.qa_receipt_comment()]
         res_risk = evaluate_pr_gate(pr_risk, policy=policy)
         self.assertEqual(res_risk.review_decision, "required")
         self.assertEqual(res_risk.review_decision_reason, "high-risk label risk:high")
         self.assertEqual(res_risk.gate_verdict, "BLOCKED")
+        self.assertEqual(res_risk.qa_receipt_verdict, "PASSED")
 
         # area:auth requires review even on 10 lines
         pr_auth = copy.deepcopy(self.mock_pr)
@@ -1083,10 +1124,12 @@ class TestGitHubPRGate(unittest.TestCase):
         pr_auth["baseRefName"] = "staging"
         pr_auth["labels"] = [{"name": "area:auth"}]
         pr_auth["files"] = [{"path": "frontend/components/Button.tsx", "additions": 5, "deletions": 2}]
+        pr_auth["comments"] = [self.qa_receipt_comment()]
         res_auth = evaluate_pr_gate(pr_auth, policy=policy)
         self.assertEqual(res_auth.review_decision, "required")
         self.assertEqual(res_auth.review_decision_reason, "high-risk area label area:auth")
         self.assertEqual(res_auth.gate_verdict, "BLOCKED")
+        self.assertEqual(res_auth.qa_receipt_verdict, "PASSED")
         print("  [PASS] Lockfile exclusion and high-risk label tests pass")
 
     def test_review_exemption_is_scoped_and_fails_closed(self):
@@ -1134,6 +1177,8 @@ class TestGitHubPRGate(unittest.TestCase):
         pr["files"] = [{"path": "frontend/foo.tsx", "additions": 10, "deletions": 5}]
         pr["labels"] = []
         pr["reviews"] = []
+        # The QA receipt is a given here: these fixtures isolate CI behaviour.
+        pr["comments"] = [self.qa_receipt_comment()]
         return pr
 
     def _evaluate_staging(self, pr):
@@ -1207,6 +1252,76 @@ class TestGitHubPRGate(unittest.TestCase):
         self.assertIn("lint-and-typecheck", res.verdict_reason)
         self.assertIn("timed out", res.verdict_reason.lower())
 
+    def test_local_tests_record_queued_passes(self):
+        """queued + valid record -> pass: deploy-critical checks release on matching local test record."""
+        pr = self._exempt_staging_pr([
+            {"name": "build-and-boot", "status": "QUEUED", "conclusion": ""},
+        ])
+        record = {
+            "head_sha": pr["headRefOid"],
+            "commands": ["pytest backend/tests"],
+            "passed": 10,
+            "failed": 0,
+        }
+        policy = resolve_gate_policy("Bavariance/polysimulator", "staging")
+        res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy, local_tests_record=record)
+        self.assertEqual(res.ci_verdict, "SUCCESS")
+        self.assertEqual(res.gate_verdict, "PASSED")
+        self.assertIn("build-and-boot", res.released_checks)
+        self.assertIn("released: local tests recorded", res.verdict_reason.lower())
+
+    def test_local_tests_record_stale_sha_pending(self):
+        """queued + record for a stale sha -> pending: mismatched head SHA does not release checks."""
+        pr = self._exempt_staging_pr([
+            {"name": "build-and-boot", "status": "QUEUED", "conclusion": ""},
+        ])
+        record = {
+            "head_sha": "0000000000000000000000000000000000000000",
+            "commands": ["pytest backend/tests"],
+            "passed": 10,
+            "failed": 0,
+        }
+        policy = resolve_gate_policy("Bavariance/polysimulator", "staging")
+        res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy, local_tests_record=record)
+        self.assertEqual(res.ci_verdict, "PENDING")
+        self.assertEqual(res.gate_verdict, "PENDING")
+        self.assertEqual(res.pending_checks, ["build-and-boot"])
+
+    def test_local_tests_record_dockerfile_changed_pending(self):
+        """queued + record + Dockerfile changed -> pending: build-and-boot stays blocking when Dockerfile touched."""
+        pr = self._exempt_staging_pr([
+            {"name": "build-and-boot", "status": "QUEUED", "conclusion": ""},
+        ])
+        pr["files"] = [{"path": "backend/Dockerfile", "additions": 1, "deletions": 0}]
+        record = {
+            "head_sha": pr["headRefOid"],
+            "commands": ["pytest backend/tests"],
+            "passed": 10,
+            "failed": 0,
+        }
+        policy = resolve_gate_policy("Bavariance/polysimulator", "staging")
+        res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy, local_tests_record=record)
+        self.assertEqual(res.ci_verdict, "PENDING")
+        self.assertEqual(res.gate_verdict, "PENDING")
+        self.assertEqual(res.pending_checks, ["build-and-boot"])
+
+    def test_local_tests_record_failed_blocks(self):
+        """failed + record -> blocked: a check that ran and failed always blocks."""
+        pr = self._exempt_staging_pr([
+            {"name": "build-and-boot", "status": "COMPLETED", "conclusion": "FAILURE"},
+        ])
+        record = {
+            "head_sha": pr["headRefOid"],
+            "commands": ["pytest backend/tests"],
+            "passed": 10,
+            "failed": 0,
+        }
+        policy = resolve_gate_policy("Bavariance/polysimulator", "staging")
+        res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy, local_tests_record=record)
+        self.assertEqual(res.ci_verdict, "FAILURE")
+        self.assertEqual(res.gate_verdict, "BLOCKED")
+        self.assertIn("build-and-boot", res.failing_checks)
+
     def test_non_critical_pending_under_timeout_stays_pending(self):
         """A non-critical check pending under 5 minutes is still waited on."""
         recent = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1229,6 +1344,369 @@ class TestGitHubPRGate(unittest.TestCase):
         self.assertEqual(res.gate_verdict, "PENDING")
         self.assertEqual(res.pending_checks, ["build-and-boot"])
 
+    def test_veyyon_main_waiver_author_comment_review(self):
+        print("\n--- TEST 20: Veyyon Main Waiver & Negative Controls ---")
+        pr_author = "feature-developer"
+        base_pr = {
+            "number": 130,
+            "state": "OPEN",
+            "isDraft": False,
+            "headRefOid": self.head_sha,
+            "baseRefOid": self.base_sha,
+            "baseRefName": "main",
+            "author": {"login": pr_author},
+            "statusCheckRollup": [
+                {
+                    "name": "test-suite",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                    "completedAt": "2026-09-05T08:00:00Z",
+                }
+            ],
+            # Review required by default (no file data or labels)
+            "reviews": [],
+        }
+
+        # 1. POSITIVE TEST: author COMMENT review with APPROVE + matching content on veyyon@main passes
+        passing_pr = copy.deepcopy(base_pr)
+        passing_pr["reviews"] = [
+            {
+                "author": {"login": pr_author},
+                "state": "COMMENTED",
+                "body": f"APPROVE {self.head_sha}\n\nAutomated review against clean head.",
+                "submittedAt": "2026-09-05T08:15:00Z",
+            }
+        ]
+        result = evaluate_pr_gate(passing_pr, repo="Wladefant/veyyon")
+        self.assertEqual(result.gate_verdict, "PASSED")
+        self.assertEqual(result.approval_verdict, "AUTOMATED_REVIEW_APPROVED")
+        self.assertEqual(result.approved_by, pr_author)
+        self.assertFalse(result.github_approval_required)
+        print("  [PASS] Author COMMENT with APPROVE + matching content on veyyon@main passes")
+
+        # 2. NEGATIVE CONTROL: without a verdict does not pass (author COMMENT without verdict doesn't count)
+        no_verdict_pr = copy.deepcopy(base_pr)
+        no_verdict_pr["reviews"] = [
+            {
+                "author": {"login": pr_author},
+                "state": "COMMENTED",
+                "body": f"Reviewing commit {self.head_sha} - notes and comments without verdict.",
+                "submittedAt": "2026-09-05T08:15:00Z",
+            }
+        ]
+        res_no_verdict = evaluate_pr_gate(no_verdict_pr, repo="Wladefant/veyyon")
+        self.assertEqual(res_no_verdict.gate_verdict, "BLOCKED")
+        self.assertEqual(res_no_verdict.approval_verdict, "SELF_APPROVED_ONLY")
+        print("  [PASS] Negative control: author COMMENT without verdict blocked")
+
+        # 3. NEGATIVE CONTROL: other content (mismatched SHA / diff) does not pass
+        mismatched_content_pr = copy.deepcopy(base_pr)
+        mismatched_content_pr["reviews"] = [
+            {
+                "author": {"login": pr_author},
+                "state": "COMMENTED",
+                "body": f"APPROVE {self.base_sha}\n\nReviewed base commit, not head.",
+                "submittedAt": "2026-09-05T08:15:00Z",
+            }
+        ]
+        res_mismatched = evaluate_pr_gate(mismatched_content_pr, repo="Wladefant/veyyon")
+        self.assertEqual(res_mismatched.gate_verdict, "BLOCKED")
+        self.assertNotEqual(res_mismatched.gate_verdict, "PASSED")
+        print("  [PASS] Negative control: author review for other content blocked")
+
+        # 4. NEGATIVE CONTROL: another veyyon branch (not main) does not pass
+        other_branch_pr = copy.deepcopy(base_pr)
+        other_branch_pr["baseRefName"] = "feature-branch"
+        other_branch_pr["reviews"] = [
+            {
+                "author": {"login": pr_author},
+                "state": "COMMENTED",
+                "body": f"APPROVE {self.head_sha}\n\nAutomated review.",
+                "submittedAt": "2026-09-05T08:15:00Z",
+            }
+        ]
+        res_other_branch = evaluate_pr_gate(other_branch_pr, repo="Wladefant/veyyon")
+        self.assertEqual(res_other_branch.gate_verdict, "BLOCKED")
+        self.assertTrue(res_other_branch.github_approval_required)
+        print("  [PASS] Negative control: author review on non-main veyyon branch blocked")
+
+        # 5. NEGATIVE CONTROL: another repo does not pass
+        other_repo_pr = copy.deepcopy(base_pr)
+        other_repo_pr["reviews"] = [
+            {
+                "author": {"login": pr_author},
+                "state": "COMMENTED",
+                "body": f"APPROVE {self.head_sha}\n\nAutomated review.",
+                "submittedAt": "2026-09-05T08:15:00Z",
+            }
+        ]
+        res_other_repo = evaluate_pr_gate(other_repo_pr, repo="other-org/other-repo")
+        self.assertEqual(res_other_repo.gate_verdict, "BLOCKED")
+        self.assertTrue(res_other_repo.github_approval_required)
+        print("  [PASS] Negative control: author review on another repo blocked")
+
+    # -------------------------------------------------------------------------
+    # TEST 21: Browser QA receipt on staging UI / order-trading diffs
+    # -------------------------------------------------------------------------
+    def test_staging_ui_pr_without_qa_receipt_is_blocked(self):
+        """Negative control: green CI and an exempt review still never pass a UI diff with no QA receipt."""
+        result = evaluate_pr_gate(self.staging_ui_pr(comments=[]), policy=self.staging_policy())
+        self.assertEqual(result.ci_verdict, "SUCCESS")
+        self.assertEqual(result.review_decision, "exempt")
+        self.assertEqual(result.qa_receipt_verdict, "REQUIRED")
+        self.assertEqual(result.gate_verdict, "BLOCKED")
+        self.assertIsNone(result.qa_receipt_url)
+        self.assertIn("QA receipt required (UI path frontend/components/OrderTicket.tsx)", result.verdict_reason)
+        self.assertIn("no PR comment carries a 'QA-RECEIPT: PASS' marker", result.verdict_reason)
+        print("  [PASS] UI diff without a QA receipt is BLOCKED despite green CI and exempt review")
+
+    def test_staging_ui_pr_with_qa_receipt_passes(self):
+        """Positive control: the same diff passes once a receipt binds it and shows two images."""
+        receipt = self.qa_receipt_comment()
+        result = evaluate_pr_gate(self.staging_ui_pr(receipt), policy=self.staging_policy())
+        self.assertEqual(result.qa_receipt_verdict, "PASSED")
+        self.assertEqual(result.qa_receipt_url, self.QA_RECEIPT_URL)
+        self.assertEqual(result.gate_verdict, "PASSED")
+        self.assertIn("Browser QA receipt: PASSED", result.verdict_reason)
+        self.assertEqual(result.to_dict()["qa_receipt_verdict"], "PASSED")
+        self.assertIn("Browser QA", result.to_compact_markdown())
+        print("  [PASS] UI diff with a head-bound QA receipt passes and reports the receipt URL")
+
+    def test_qa_receipt_marker_and_image_count_are_required(self):
+        """Negative controls: no marker, and fewer than two rendered images, each stay BLOCKED."""
+        cases = [
+            (self.qa_receipt_comment(marker=None), "no PR comment carries a 'QA-RECEIPT: PASS' marker"),
+            (self.qa_receipt_comment(images=0), "0 GitHub-hosted evidence image(s), 2 required"),
+            (self.qa_receipt_comment(images=1), "1 GitHub-hosted evidence image(s), 2 required"),
+        ]
+        for comment, expected in cases:
+            with self.subTest(expected=expected):
+                result = evaluate_pr_gate(self.staging_ui_pr(comments=[comment]), policy=self.staging_policy())
+                self.assertEqual(result.qa_receipt_verdict, "REQUIRED")
+                self.assertEqual(result.gate_verdict, "BLOCKED")
+                self.assertIn(expected, result.verdict_reason)
+        # An image on a prohibited host is not evidence, however many are pasted.
+        raw = "![a](https://raw.githubusercontent.com/o/r/deadbeef/shot.png)"
+        result = evaluate_pr_gate(
+            self.staging_ui_pr(comments=[self.qa_receipt_comment(images=0, extra=raw)]),
+            policy=self.staging_policy(),
+        )
+        self.assertEqual(result.qa_receipt_verdict, "REQUIRED")
+        self.assertIn("0 GitHub-hosted evidence image(s)", result.verdict_reason)
+        print("  [PASS] Negative controls: marker, image count and image host all enforced")
+        # Commit-pinned raw URLs are the second form policy allows, so two of them are evidence.
+        pinned = "\n".join([
+            "**QA-RECEIPT: PASS**",
+            f"- **Head SHA**: `{self.head_sha}`",
+            f"![desktop](https://github.com/Bavariance/polysimulator/raw/{self.head_sha}/docs/qa/a.png)",
+            f"![mobile](https://github.com/Bavariance/polysimulator/raw/{self.head_sha}/docs/qa/b.png)",
+        ])
+        result = evaluate_pr_gate(
+            self.staging_ui_pr(comments=[{"body": pinned, "html_url": self.QA_RECEIPT_URL}]),
+            policy=self.staging_policy(),
+        )
+        self.assertEqual(result.qa_receipt_verdict, "PASSED")
+        # Hosts that do not render are not evidence, however many are pasted: a release asset
+        # 404s in a private repo through GitHub's image proxy (PR #5630, 2026-09-27), and an
+        # unpinned raw path or a relative path never resolves.
+        for label, refs in (
+            ("release-asset", [
+                "![a](https://github.com/Bavariance/polysimulator/releases/download/qa-evidence-tag/a.png)",
+                "![b](https://github.com/Bavariance/polysimulator/releases/download/qa-evidence-tag/b.png)",
+            ]),
+            ("unpinned+relative", [
+                "![a](https://github.com/o/r/raw/main/docs/qa/a.png)",
+                "![b](docs/qa/b.png)",
+            ]),
+        ):
+            with self.subTest(hosts=label):
+                body = "\n".join([
+                    "**QA-RECEIPT: PASS**",
+                    f"- **Head SHA**: `{self.head_sha}`",
+                    *refs,
+                ])
+                result = evaluate_pr_gate(
+                    self.staging_ui_pr(comments=[{"body": body, "html_url": self.QA_RECEIPT_URL}]),
+                    policy=self.staging_policy(),
+                )
+                self.assertEqual(result.qa_receipt_verdict, "REQUIRED")
+                self.assertIn("0 GitHub-hosted evidence image(s)", result.verdict_reason)
+        print("  [PASS] Evidence hosts: attachments and commit-pinned raw count; release assets, unpinned and relative do not")
+
+    def test_qa_receipt_for_another_revision_is_blocked(self):
+        """Negative control: a receipt written before a further edit never binds the new head."""
+        stale = self.qa_receipt_comment(named="a" * 40, identity="b" * 40)
+        result = evaluate_pr_gate(self.staging_ui_pr(comments=[stale]), policy=self.staging_policy())
+        self.assertEqual(result.qa_receipt_verdict, "REQUIRED")
+        self.assertEqual(result.gate_verdict, "BLOCKED")
+        self.assertIn("names no identity for this head", result.verdict_reason)
+        # The same receipt becomes valid once it names the live head.
+        self.assertEqual(
+            evaluate_pr_gate(
+                self.staging_ui_pr(comments=[self.qa_receipt_comment()]), policy=self.staging_policy()
+            ).qa_receipt_verdict,
+            "PASSED",
+        )
+        print("  [PASS] Negative control: receipt bound to another revision is BLOCKED")
+
+    def test_qa_receipt_served_from_another_revision_is_blocked(self):
+        """Negative control: a PASS receipt for the served revision is missing evidence, not a pass."""
+        from review_content import content_identity
+
+        patch_id, _ = content_identity(self.head_sha, "origin/staging")
+        # The marker line decides. QA ran against `served`, so the head SHA printed in the same
+        # comment (the printer's "Commit SHA" field) is not evidence for the diff under review:
+        # a deploy that lags the head was never the thing QA exercised.
+        stale = self.qa_receipt_comment(served="c" * 40)
+        result = evaluate_pr_gate(self.staging_ui_pr(comments=[stale]), policy=self.staging_policy())
+        self.assertEqual(result.qa_receipt_verdict, "REQUIRED")
+        self.assertEqual(result.gate_verdict, "BLOCKED")
+        self.assertIn("names no identity for this head", result.verdict_reason)
+        # Served from the head itself, or from the same content at an older head, it passes.
+        for served in (self.head_sha, patch_id):
+            with self.subTest(served=served[:12]):
+                case = self.staging_ui_pr(comments=[self.qa_receipt_comment(served=served)])
+                self.assertEqual(
+                    evaluate_pr_gate(case, policy=self.staging_policy()).qa_receipt_verdict, "PASSED"
+                )
+        # A FAIL marker beside the head still requires QA.
+        failed = self.staging_ui_pr(comments=[self.qa_receipt_comment(marker="FAIL", served=self.head_sha)])
+        self.assertEqual(
+            evaluate_pr_gate(failed, policy=self.staging_policy()).qa_receipt_verdict, "REQUIRED"
+        )
+        print("  [PASS] Negative control: receipt served from another revision is BLOCKED")
+
+    def test_qa_receipt_in_the_shape_lanes_actually_post(self):
+        """Positive control: the bold marker and `Head SHA` field real PRs carry do bind the receipt."""
+        head_field = f"- **Head SHA**: `{self.head_sha}`"
+        for marker in ("**QA-RECEIPT: PASS**", "> QA-RECEIPT: PASS", "- QA-RECEIPT: PASS"):
+            with self.subTest(marker=marker):
+                body = "\n".join([
+                    "## Pre-Merge Browser QA Receipt — PASS",
+                    "",
+                    marker,
+                    "",
+                    head_field,
+                    "- **Viewports Tested**: Desktop (1440x900), Mobile (390x844)",
+                    "![desktop](https://github.com/user-attachments/assets/11111111-2222-3333-4444-555555555555)",
+                    "![mobile](https://github.com/user-attachments/assets/66666666-7777-8888-9999-aaaaaaaaaaaa)",
+                ])
+                receipt = {"body": body, "html_url": self.QA_RECEIPT_URL}
+                result = evaluate_pr_gate(self.staging_ui_pr(comments=[receipt]), policy=self.staging_policy())
+                self.assertEqual(result.qa_receipt_verdict, "PASSED")
+                self.assertEqual(result.qa_receipt_url, self.QA_RECEIPT_URL)
+        # The same receipt declaring FAIL is never a pass, decoration or not.
+        failed = "\n".join([
+            "# QA-RECEIPT: FAIL",
+            head_field,
+            "![desktop](https://github.com/user-attachments/assets/11111111-2222-3333-4444-555555555555)",
+            "![mobile](https://github.com/user-attachments/assets/66666666-7777-8888-9999-aaaaaaaaaaaa)",
+        ])
+        result = evaluate_pr_gate(
+            self.staging_ui_pr(comments=[{"body": failed, "html_url": self.QA_RECEIPT_URL}]),
+            policy=self.staging_policy(),
+        )
+        self.assertEqual(result.qa_receipt_verdict, "REQUIRED")
+        self.assertEqual(result.gate_verdict, "BLOCKED")
+        print("  [PASS] Bold, quoted and list-item receipt markers bind; a FAIL marker never does")
+
+    def test_qa_receipt_accepts_content_identity_and_review_bodies(self):
+        """A receipt may name the patch-id (survives a sync merge) and may live in a review body."""
+        from review_content import content_identity
+
+        patch_id, digest = content_identity(self.head_sha, "origin/staging")
+        self.assertTrue(patch_id)
+        for identity in (patch_id, digest):
+            with self.subTest(identity=identity[:12]):
+                receipt = self.qa_receipt_comment(identity=identity)
+                pr = self.staging_ui_pr(comments=[receipt])
+                self.assertEqual(
+                    evaluate_pr_gate(pr, policy=self.staging_policy()).qa_receipt_verdict, "PASSED"
+                )
+        as_review = self.staging_ui_pr(comments=[])
+        as_review["reviews"] = [{
+            "author": {"login": "qa-lane"},
+            "state": "COMMENTED",
+            "body": self.qa_receipt_comment()["body"],
+        }]
+        result = evaluate_pr_gate(as_review, policy=self.staging_policy())
+        self.assertEqual(result.qa_receipt_verdict, "PASSED")
+        print("  [PASS] Receipt accepted via patch-id, diff sha256 and review body")
+
+    def test_order_trading_paths_require_a_qa_receipt(self):
+        """Every order/trading backend path demands browser QA; unrelated paths do not."""
+        for path in (
+            "backend/app/api_v1/orders.py",
+            "backend/app/matching_engine.py",
+            "backend/app/order_pipeline/pipeline.py",
+            "backend/app/api_v1/settlement.py",
+        ):
+            with self.subTest(path=path):
+                result = evaluate_pr_gate(
+                    self.staging_ui_pr(files=[{"path": path, "additions": 3, "deletions": 1}]),
+                    policy=self.staging_policy(),
+                )
+                self.assertEqual(result.qa_receipt_verdict, "REQUIRED")
+                self.assertEqual(result.gate_verdict, "BLOCKED")
+                self.assertIn(f"order/trading path {path}", result.qa_receipt_reason)
+        for path in (
+            "backend/app/api_v1/markets.py",
+            "backend/app/models/user.py",
+            "docs/runbook.md",
+            # Tests ship nothing, so a test-only diff must not demand browser QA,
+            # however loudly its filename names orders or settlement.
+            "backend/tests/test_orders.py",
+            "backend/tests/test_market_detail_stale_settlement.py",
+            "frontend/components/__tests__/OrderTicket.test.tsx",
+            "frontend/components/OrderTicket.spec.tsx",
+        ):
+            with self.subTest(exempt=path):
+                result = evaluate_pr_gate(
+                    self.staging_ui_pr(files=[{"path": path, "additions": 3, "deletions": 1}]),
+                    policy=self.staging_policy(),
+                )
+                self.assertEqual(result.qa_receipt_verdict, "EXEMPT", result.qa_receipt_reason)
+                self.assertEqual(result.gate_verdict, "PASSED")
+        # A diff that ships code as well as tests still triggers on the code.
+        mixed = evaluate_pr_gate(
+            self.staging_ui_pr(files=[
+                {"path": "backend/tests/test_orders.py", "additions": 4, "deletions": 1},
+                {"path": "backend/app/api_v1/orders.py", "additions": 2, "deletions": 0},
+            ]),
+            policy=self.staging_policy(),
+        )
+        self.assertEqual(mixed.qa_receipt_verdict, "REQUIRED")
+        self.assertIn("order/trading path backend/app/api_v1/orders.py", mixed.qa_receipt_reason)
+        print("  [PASS] Order/trading paths require QA; test-only and unrelated paths stay exempt")
+
+    def test_qa_receipt_scope_is_staging_only_and_fails_closed_when_truncated(self):
+        """A capped 100-file list cannot prove a diff is UI-free; another repo is out of scope."""
+        many = [
+            {"path": f"backend/app/api_v1/module_{i}.py", "additions": 1, "deletions": 0}
+            for i in range(100)
+        ]
+        result = evaluate_pr_gate(
+            self.staging_ui_pr(files=many, comments=[]), policy=self.staging_policy()
+        )
+        self.assertEqual(result.qa_receipt_verdict, "REQUIRED")
+        self.assertIn("truncated at 100 files", result.qa_receipt_reason)
+        self.assertEqual(result.gate_verdict, "BLOCKED")
+
+        pr = self.staging_ui_pr(comments=[])
+        pr["baseRefName"] = "main"
+        main_result = evaluate_pr_gate(
+            pr,
+            policy=GateApprovalPolicy(
+                repo="Bavariance/polysimulator",
+                base_ref="main",
+                require_github_approval=False,
+                require_head_bound_review_evidence=True,
+                allow_review_exemption=True,
+            ),
+        )
+        self.assertEqual(main_result.qa_receipt_verdict, "EXEMPT")
+        self.assertIn("no QA receipt requirement for Bavariance/polysimulator@main", main_result.qa_receipt_reason)
+        print("  [PASS] QA receipt requirement is staging-scoped and fails closed on a truncated file list")
 
 def main():
     print("=" * 70)

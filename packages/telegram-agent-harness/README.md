@@ -10,6 +10,27 @@ Universal, mobile-friendly Telegram operations surface for managing multi-agent 
 - **Supergroup Forum Topics Mode (Opt-In)**: Multiplexes multiple concurrent Veyyon sessions into a single Telegram Supergroup using native Telegram Forum Topics (`message_thread_id`).
 - **Superboard Mini App Integration**: In-app Telegram web dashboard for interactive queue and session monitoring.
 
+### Mini App session lifecycle
+
+The relay serves the browser modules and forwards authenticated requests to the
+local Mini App API. Raw Telegram `initData` is validated server-side following
+[Telegram's validation contract](https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app);
+client-provided user IDs are not authorization.
+
+App sessions carry a random identity signed together with the actor and issuance
+time. `POST /api/logout` revokes only the authenticated bearer session, persisting
+its digest until absolute expiry in the slot-local revocation registry. Other
+sessions remain valid. This is not actor-wide revocation: a still-valid Telegram
+launch credential can establish a new session. Removing an actor from the
+server allowlist rejects all that actor's sessions.
+
+HTTP 401 clears the browser's cached session even when the response is not JSON.
+The next explicit request attempts a fresh exchange; mutations are never replayed.
+Expired Telegram launch credentials require reopening the app from Telegram.
+The new session format intentionally rejects old bearer credentials, so deploying
+the relay and local Mini App API requires coordinated installation; mismatched
+versions fail closed. No installation or daemon restart is implicit in this change.
+
 Telegram does not intercept, validate, or approve tool calls. Native Veyyon permissions remain independent and unchanged. Sender authentication, topic/session ownership, ordinary operator questions and consequential non-tool decisions remain enforced. Old tool-approval buttons report that the feature is obsolete without granting permission or executing work; the Mini App has no tool-approval section.
 
 After upgrading from a guard-bearing loader, reload the **static extension** in each original session using the host's `/reload-config` command. `/tg-reload` only replaces the dynamic runtime and cannot remove hooks registered by the old loader. Restart the standalone daemon through its existing supervisor when authorized to activate its stale-callback handling; installation alone does not replace code already in memory. Never resume a duplicate session.

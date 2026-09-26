@@ -30,7 +30,7 @@ A harness-agnostic, pure Python standard library multi-agent coordination core l
 5. **No Credential Exposure:**
    * Quota, balance, and probe utilities sanitize and redact all account identifiers, emails, project refs, and tokens.
 6. **Head-Bound Evidence Invalidation:**
-   * Execution-checkpoint proofs remain head-bound. The installed `github_pr_gate.py` and `review_content.py` retain stable patch-id **and** whitespace-sensitive stripped-diff sha256, valid ancestor delta chains, the staging COMMENT-review waiver and anti-self-approval. Native review timestamps additionally bind fresh CI/security invalidation: unchanged content never permits a newly broken or newly vulnerable candidate through the gate. Legacy local review metadata cannot grant approval.
+   * Execution-checkpoint proofs remain head-bound. The installed `github_pr_gate.py` and `review_content.py` retain stable patch-id **and** whitespace-sensitive stripped-diff sha256, valid ancestor delta chains, the COMMENT-review approval waiver on named single-author branches (`Bavariance/polysimulator@staging`, `Wladefant/super-board@main`, and `Wladefant/veyyon@main`) and anti-self-approval. Native review timestamps additionally bind fresh CI/security invalidation: unchanged content never permits a newly broken or newly vulnerable candidate through the gate. Legacy local review metadata cannot grant approval.
 
 ---
 
@@ -58,10 +58,11 @@ A harness-agnostic, pure Python standard library multi-agent coordination core l
 must bind the repository, PR number, full head SHA, full base SHA, and live PR author. The
 reviewer must be a distinct automation actor, and `source` must name that same actor through
 an `agent://` or `history://` transcript URI with a SHA-256 digest. Outcomes are exactly
-`approved` or `changes_requested`; the latter always blocks. A valid artifact can replace
-the GitHub Approve button only where the resolved named policy sets
-`require_github_approval` to false. Production-protected bases retain mandatory independent
-GitHub `APPROVED` review.
+approved or `changes_requested`; the latter always blocks. A valid artifact or automated
+COMMENT review verdict can replace the GitHub Approve button only where the resolved named
+policy sets `require_github_approval` to false (`Bavariance/polysimulator@staging`,
+`Wladefant/super-board@main`, and `Wladefant/veyyon@main`). Production-protected bases retain
+mandatory independent GitHub `APPROVED` review.
 
 This local gate treats the artifact as advisory trusted-workflow evidence. Schema,
 provenance shape, actor separation, and exact-head/base bindings are validated, but this is

@@ -1,0 +1,45 @@
+name: Workaround Comment Lint
+
+# Rejects band-aid comments added without a tracking issue, so one lane's
+# shortcut cannot become the next lane's precedent.
+#
+# Deliberate: `github.base_ref` reaches the shell only through `env`, never by
+# interpolating `${{ }}` into the `run:` body.
+#
+# Source: https://github.com/Wladefant/super-board/issues/245
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: workaround-comments-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  workaround-comments:
+    name: Workaround comments cite an issue
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # The gate diffs the head against the merge base with the target
+          # branch, so the base branch's history must be present locally.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Linter unit tests
+        run: python -B workflows/portable/test_workaround_comments.py
+
+      - name: Lint comments this pull request adds
+        env:
+          BASE_REF: origin/${{ github.base_ref }}
+        run: python -B workflows/portable/workaround_comments.py --base "$BASE_REF"

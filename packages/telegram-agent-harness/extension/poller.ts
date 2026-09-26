@@ -450,7 +450,8 @@ export class TelegramPoller {
       laneId?: string;
       laneState?: "active" | "exited" | "unknown";
     },
-    defaultRepo = "Bavariance/polysimulator",
+    /** Session repository for bare `#N`. Omit it and the reference stays unlinked. */
+    defaultRepo?: string,
     /**
      * Forum topic to post into, for a send that is not a reply to the update being
      * handled — relaying a session's output into its own topic, above all. Omitted
@@ -532,11 +533,14 @@ export class TelegramPoller {
     chatId: string | number,
     messageId: number,
     text: string,
-    _parseMode?: "HTML" | "Markdown",
-    defaultRepo = "Bavariance/polysimulator",
+    parseMode?: "HTML" | "Markdown",
+    /** Session repository for bare `#N`. Omit it and the reference stays unlinked. */
+    defaultRepo?: string,
     replyMarkup?: Record<string, unknown>,
   ): Promise<TelegramSendMessageResponse | null> {
-    const formatted = markdownToTelegramHtml(redactSecrets(text), defaultRepo);
+    // "HTML" is finished markup, exactly as in sendTelegramMessage; anything else is Markdown.
+    const sanitized = redactSecrets(text);
+    const formatted = parseMode === "HTML" ? sanitized : markdownToTelegramHtml(sanitized, defaultRepo);
     if (!formatted.trim()) return null;
 
     try {

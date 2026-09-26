@@ -133,8 +133,8 @@ Poll BashOutput on each in-flight shell. As each finishes:
 
 **On dispatcher exit 0 (success):**
 - `cd <repo-root>`
-- `git merge --no-ff loop/issue-N -m "merge: loop/issue-N (closes #N)"`
-- `gh issue close N --comment "Closed by /super-build in $(git rev-parse --short HEAD)"`
+- `git merge --no-ff loop/issue-N -m "merge: loop/issue-N (closes #N)"` (for parent issues with open sub-issues, use `refs #N` instead; closing keywords are rejected)
+- `gh issue close N --comment "Closed by /super-build in $(git rev-parse --short HEAD)"` (only for leaf issues or parents whose sub-issues are all closed; parent close with open sub-issues is refused)
 - `gh issue edit N --remove-label loop:in-progress`
 - `git worktree remove .worktrees/issue-N`
 - `git branch -D loop/issue-N`

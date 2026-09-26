@@ -21,6 +21,7 @@
 - `daemon/main.ts run` waits out a slot that is held instead of exiting 75. A token claimed by an interactive session frees itself when that session exits or its operator runs `/telegram release`, and a detached daemon that gave up at startup is not there to notice; it now retries every 10s (`VEYYON_TELEGRAM_CLAIM_RETRY_MS`) and logs a skip only when the reason changes. Exiting on release is unchanged once a slot has actually been polled, so `/release` still stops the daemon.
 
 ### Fixed
+- Mini App sessions support persistent per-session revocation and unique signed identities; expired clients clear credentials without replaying mutations, and the relay evicts least-recently-used rate-limit buckets.
 - Replaced GUI host session resumption transport with authenticated live terminal IPC over local named pipes (`TerminalSessionControl`). Eliminates transcript concurrency and dual-writer conflicts on active terminal sessions (fixes veyyon#88). Inbound turns deliver directly to live terminal event loops; missing endpoints fail closed with explicit guidance rather than resuming via GUI host.
 - Eliminate duplicate Telegram outbound delivery by designating the standalone daemon as the authoritative transcript forwarding owner when a daemon route exists and suppressing in-session assistant output mirroring.
 - Mini App client 401 session reset: the client drops its cached session token, re-exchanges fresh Telegram initData via `/api/session`, retries once, and displays an explicit unavailable/re-open state if authentication fails.
