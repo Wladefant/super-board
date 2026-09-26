@@ -73,6 +73,7 @@ from model_routing import (
     RiskLevel,
     TaskType,
     MODEL_CLAUDE_FABLE,
+    MODEL_CLAUDE_OPUS_55,
     MODEL_CODEX_FAST,
     MODEL_CODEX_ASTRA,
     MODEL_CODEX_SPARK,
@@ -92,6 +93,8 @@ from model_routing import (
     MODEL_CHATGPT_WEB,
     CHATGPT_WEB_PROVIDER,
     chatgpt_web_bridge_available,
+    CODEX_ENABLED,
+    codex_available,
     CODEX_PACE_MIN_HEADROOM,
     CODEX_PACE_USED_FLOOR,
     ANTHROPIC_BOTTLENECK_MAX_USED,
@@ -103,6 +106,8 @@ from model_routing import (
     detect_credentialed_providers,
     model_to_agent_role,
     model_to_provider,
+    resolve_role_model,
+    is_agent_role_available,
 )
 
 def tmp_quota_path() -> "Path":
@@ -137,6 +142,13 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         bridge_patch = mock.patch("model_routing.chatgpt_web_bridge_available", return_value=False)
         bridge_patch.start()
         self.addCleanup(bridge_patch.stop)
+        # Hermetic codex account state for quota/pacing fixtures:
+        # tests 3, 6, 21, 22, 28, 30 specifically exercise Codex quota math, pacing and promotion.
+        # By default in tests, mock codex_available as True so quota fixtures evaluate properly;
+        # test_codex_unroutable_and_fallthrough_when_disabled exercises the live unroutable state.
+        codex_patch = mock.patch("model_routing.codex_available", return_value=True)
+        codex_patch.start()
+        self.addCleanup(codex_patch.stop)
 
         # Base realistic mock JSON simulating live veyyon usage output
         self.mock_now_ms = 1788598659263  # 2026-09-05T08:57:39Z
@@ -889,6 +901,63 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         rec = selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
         self.assertNotEqual(rec.selected_model, MODEL_AG_CLAUDE_OPUS)
         print(f"  [PASS] 429 body wrote {reset.exhausted_until}; review lane routed to {rec.selected_model}.")
+
+    # -------------------------------------------------------------------------
+    # TEST: Review routing: routine reviews (>250 lines) default to ag-opus,
+    # migration/money first-pass escalates to reviewer (Opus 5.5), and ag-opus
+    # exhaustion falls back to reviewer (never Flash).
+    # (Operator ruling 2026-09-26 ~13:25Z: "I mean only hard, super hard work, right?
+    # Don't move everything in there").
+    # -------------------------------------------------------------------------
+    def test_review_routing_ag_opus_default_and_super_hard_escalation(self):
+        print("\n--- TEST: Review Routing ag-opus Default and Super-Hard Escalation ---")
+        usage = self._usage_with_ag_families(anthropic_used=0.0)
+        selector = self._selector(usage)
+
+        # 1. Routine review above 250 lines resolves to ag-opus (Opus 4.6 on free daily window)
+        rec_routine = selector.select_model(
+            task_type=TaskType.STRONG_REVIEW,
+            risk_level=RiskLevel.HIGH,
+            diff_lines=300,
+        )
+        self.assertEqual(rec_routine.selected_model, MODEL_AG_CLAUDE_OPUS)
+        self.assertEqual(model_to_agent_role(rec_routine.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "ag-opus")
+
+        # 2. Migration first-pass review resolves to reviewer (Claude Opus 5.5)
+        rec_migration = selector.select_model(
+            task_type=TaskType.STRONG_REVIEW,
+            risk_level=RiskLevel.HIGH,
+            domain_tags=["migration"],
+            rework_count=0,
+        )
+        self.assertEqual(rec_migration.selected_model, MODEL_CLAUDE_OPUS_55)
+        self.assertEqual(model_to_agent_role(rec_migration.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "reviewer")
+
+        # 3. Money first-pass review resolves to reviewer (Claude Opus 5.5)
+        rec_money = selector.select_model(
+            task_type=TaskType.STRONG_REVIEW,
+            risk_level=RiskLevel.HIGH,
+            domain_tags=["money"],
+            rework_count=0,
+        )
+        self.assertEqual(rec_money.selected_model, MODEL_CLAUDE_OPUS_55)
+        self.assertEqual(model_to_agent_role(rec_money.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "reviewer")
+
+        # 4. ag-opus exhaustion falls back to reviewer (Opus 5.5) and never to Flash
+        exhausted = ResetAwareModelSelector(
+            parse_usage_json(usage, current_time_ms=self.mock_now_ms),
+            quota_snapshot=self._quota_with("google-antigravity:anthropic", "2099-01-01T00:00:00Z"),
+        )
+        rec_exhausted = exhausted.select_model(
+            task_type=TaskType.STRONG_REVIEW,
+            risk_level=RiskLevel.HIGH,
+            diff_lines=300,
+        )
+        self.assertEqual(rec_exhausted.selected_model, MODEL_CLAUDE_OPUS_55)
+        self.assertEqual(model_to_agent_role(rec_exhausted.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "reviewer")
+        self.assertNotIn("flash", rec_exhausted.selected_model.lower())
+        self.assertNotIn("flash", rec_exhausted.fallback_model.lower())
+        print("  [PASS] Routine review (>250 lines) -> ag-opus; migration/money -> reviewer; ag-opus exhaustion -> reviewer (never Flash).")
     def _selector(self, usage):
         return ResetAwareModelSelector(parse_usage_json(usage, current_time_ms=self.mock_now_ms))
 
@@ -982,7 +1051,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
                          .quota_metrics["anthropic_orchestrator_reserve"])
         self.assertEqual(
             selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH).selected_model,
-            MODEL_CLAUDE_FABLE,
+            MODEL_CLAUDE_OPUS_55,
         )
         for task_type, risk in ((TaskType.DEEP_REASONING, RiskLevel.MEDIUM), (TaskType.DEEP_REASONING, RiskLevel.HIGH),
                                 (TaskType.ROUTINE_EXECUTION, RiskLevel.HIGH), (TaskType.STRONG_REVIEW, RiskLevel.MEDIUM)):
@@ -1246,6 +1315,9 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         # resolved as reviews, because that is the only way the router emits them.
         review_pins = {"codex-reviewer", "web-thinker"}
         for role, model in ROLE_MODEL_PINS.items():
+            if role == "astra-ux":
+                # Specialized UX role; router emits ag-opus for MODEL_AG_CLAUDE_OPUS
+                continue
             task_type = TaskType.STRONG_REVIEW if role in review_pins else TaskType.ROUTINE_EXECUTION
             self.assertEqual(model_to_agent_role(model, task_type, RiskLevel.HIGH), role, f"{role} pin {model}")
         print("  [PASS] All role and provider mappings correct (ag-sonnet, ag-gpt, ds-pro, zai-task, zai-flash, minimax-task).")
@@ -1606,16 +1678,22 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         for role, model in ROLE_MODEL_PINS.items():
             chain = (agents.get(role) or {}).get("model") or model_roles.get(role)
             self.assertIsNotNone(chain, f"{role} is not defined as a role or agent")
-            self.assertEqual(str(chain).split(",")[0].strip(), model, f"{role} must lead with {model}")
+            leading = str(chain).split(",")[0].strip()
+            if role in ("codex-worker", "codex-reviewer"):
+                self.assertIn(leading, (model, "openai-codex/gpt-5.6-sol:high"), f"{role} must lead with {model} or Sol")
+            else:
+                self.assertEqual(leading, model, f"{role} must lead with {model}")
 
-        # 2. Paid Anthropic Opus is retired from every worker and reviewer chain; the
-        # interactive orchestrator (`modelRoles.default`) is explicitly out of scope.
+        # 2. Paid Anthropic Opus is reserved for gating review (`reviewer`); worker chains must not run paid Opus;
+        # the interactive orchestrator (`modelRoles.default`) is explicitly out of scope.
         paid_opus = "anthropic/claude-opus-5-5"
         for role, chain in model_roles.items():
-            if role == "default":
+            if role in ("default", "reviewer", "astra-ux"):
                 continue
             self.assertNotIn(paid_opus, str(chain), f"modelRoles.{role} must not run paid Opus")
         for name, entry in agents.items():
+            if name in ("reviewer", "astra-ux"):
+                continue
             for chain in chains(entry):
                 self.assertNotIn(paid_opus, str(chain), f"agents.{name} must not run paid Opus")
         for pattern, chain in (parsed.get("retry") or {}).get("fallbackChains", {}).items():
@@ -1633,12 +1711,16 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
                          "the Antigravity fallback chain must not substitute a Gemini model")
 
         # 4. The critical-diff reviewer gates on the bridge first, then free Opus, then the
-        # cross-family Chinese reviewers, then DeepSeek.
+        # cross-family Chinese reviewers, then DeepSeek. Gating roles (reviewer, ag-opus) NEVER lead with chatgpt-web.
         critical_chain = str((agents.get("reviewer") or {}).get("model", ""))
-        self.assertEqual(critical_chain.split(",")[0].strip(), MODEL_CHATGPT_WEB)
+        self.assertEqual(critical_chain.split(",")[0].strip(), "anthropic/claude-opus-5-5:high")
         for expected in ("google-antigravity/claude-opus-4-6", "opencode-go/glm-5.3",
                          "opencode-go/qwen3.8-max", "deepseek/"):
             self.assertIn(expected, critical_chain, f"critical review chain must offer {expected}")
+        for gating_role in ("reviewer", "ag-opus"):
+            first_model = str((agents.get(gating_role) or {}).get("model", "")).split(",")[0].strip()
+            self.assertFalse(first_model.startswith("chatgpt-web"),
+                             f"Gating role '{gating_role}' must never lead with chatgpt-web (got {first_model})")
 
         # 5. The standard-diff reviewer is the cross-family Chinese chain with a DeepSeek
         # fallback for the OpenCode Go limit, and the hard writer is GLM-5.3 or DeepSeek.
@@ -1780,6 +1862,291 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         print(f"  [PASS] {len(checked)} child-lane defaults across {len(agents)} roster entries all "
               "resolve to enabled agent types for writer and review children; Spark maps to `spark`.")
 
+    # -------------------------------------------------------------------------
+    # TEST 41: Codex manual switch — skipped when False, routed when True
+    # -------------------------------------------------------------------------
+    def test_codex_manual_switch_both_states(self):
+        print("\n--- TEST 41: Codex Manual Switch: Skipped when False, Routed when True ---")
+        # Invariant: CODEX_ENABLED is False by default (manual switch, operator 2026-09-26)
+        self.assertFalse(CODEX_ENABLED, "CODEX_ENABLED must default to False")
+
+        # ---------------------------------------------------------------------
+        # STATE 1: Skipped when CODEX_ENABLED = False (or codex_available() == False)
+        # ---------------------------------------------------------------------
+        snapshot = parse_usage_json(self.mock_usage_dict, current_time_ms=self.mock_now_ms)
+        selector_off = ResetAwareModelSelector(snapshot, codex_account=False)
+
+        self.assertFalse(selector_off.codex_account_available())
+
+        # Strong review (high-risk or routine) must NEVER select openai-codex or Flash;
+        # falls through to ag-opus or reviewer (Opus 5.5).
+        rec_review = selector_off.select_model(
+            task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH, allow_codex_promotion=True
+        )
+        self.assertEqual(rec_review.provider_statuses["openai-codex"], "unavailable")
+        self.assertFalse(rec_review.selected_model.startswith("openai-codex/"))
+        self.assertFalse(rec_review.fallback_model.startswith("openai-codex/"))
+        self.assertNotIn("flash", rec_review.selected_model.lower())
+        self.assertNotIn("flash", rec_review.fallback_model.lower())
+        self.assertIn(rec_review.selected_model, (MODEL_AG_CLAUDE_OPUS, MODEL_CLAUDE_OPUS_55, MODEL_CLAUDE_FABLE))
+        self.assertIn(model_to_agent_role(rec_review.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH),
+                      ("ag-opus", "reviewer"))
+
+        # With Antigravity Claude available in snapshot: falls through to ag-opus
+        snap_ag = parse_usage_json(self._usage_with_ag_families(), current_time_ms=self.mock_now_ms)
+        sel_ag_off = ResetAwareModelSelector(snap_ag, codex_account=False)
+        rec_ag_rev = sel_ag_off.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
+        self.assertEqual(rec_ag_rev.selected_model, MODEL_AG_CLAUDE_OPUS)
+        self.assertEqual(model_to_agent_role(rec_ag_rev.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "ag-opus")
+        # Routine execution / implementation falls through to task (Gemini Flash).
+        rec_exec = selector_off.select_model(
+            task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.MEDIUM, allow_codex_promotion=True
+        )
+        self.assertFalse(rec_exec.selected_model.startswith("openai-codex/"))
+        self.assertFalse(rec_exec.fallback_model.startswith("openai-codex/"))
+        self.assertEqual(rec_exec.selected_model, MODEL_GEMINI_FLASH)
+        self.assertEqual(model_to_agent_role(rec_exec.selected_model, TaskType.ROUTINE_EXECUTION, RiskLevel.MEDIUM), "task")
+
+        # Dispatch packets: codex-* dispatch does NOT reach openai-codex
+        packet_review = selector_off.dispatch(
+            task_type=TaskType.STRONG_REVIEW,
+            risk_level=RiskLevel.HIGH,
+            allow_codex_promotion=True,
+            head_sha="a" * 40,
+            base_sha="b" * 40,
+            changed_files=["core/auth.py"],
+        )
+        self.assertFalse(packet_review.recommendation["model"].startswith("openai-codex/"))
+        self.assertFalse(packet_review.recommendation["fallback_model"].startswith("openai-codex/"))
+        self.assertIn(packet_review.recommendation["agent_role"], ("ag-opus", "reviewer"))
+        self.assertNotIn("flash", packet_review.recommendation["model"].lower())
+
+        packet_worker = selector_off.dispatch(
+            task_type=TaskType.ROUTINE_EXECUTION,
+            risk_level=RiskLevel.MEDIUM,
+            allow_codex_promotion=True,
+            head_sha="a" * 40,
+            base_sha="b" * 40,
+            changed_files=["app/main.py"],
+        )
+        self.assertFalse(packet_worker.recommendation["model"].startswith("openai-codex/"))
+        self.assertFalse(packet_worker.recommendation["fallback_model"].startswith("openai-codex/"))
+        self.assertEqual(packet_worker.recommendation["model"], MODEL_GEMINI_FLASH)
+        self.assertEqual(packet_worker.recommendation["agent_role"], "task")
+
+        # Across ALL task types and risk levels, openai-codex is never selected
+        for task_type in TaskType:
+            for risk in RiskLevel:
+                rec = selector_off.select_model(task_type=task_type, risk_level=risk, allow_codex_promotion=True)
+                self.assertFalse(
+                    rec.selected_model.startswith("openai-codex/"),
+                    f"{task_type}/{risk} selected {rec.selected_model} when Codex is disabled"
+                )
+                self.assertFalse(
+                    rec.fallback_model.startswith("openai-codex/"),
+                    f"{task_type}/{risk} fallback {rec.fallback_model} when Codex is disabled"
+                )
+
+        # Verify model_to_agent_role when codex is disabled maps codex models to sound fallbacks
+        with mock.patch("model_routing.codex_available", return_value=False):
+            self.assertEqual(model_to_agent_role(MODEL_CODEX_ASTRA, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "reviewer")
+            self.assertEqual(model_to_agent_role(MODEL_CODEX_ASTRA, TaskType.ROUTINE_EXECUTION, RiskLevel.HIGH), "task")
+            self.assertEqual(model_to_agent_role(MODEL_CODEX_FAST, TaskType.ROUTINE_EXECUTION, RiskLevel.LOW), "task")
+            # Default unconfigured selector uses live codex_available() -> False
+            default_sel = ResetAwareModelSelector(snapshot)
+            self.assertFalse(default_sel.codex_account_available())
+            disp_rev = default_sel.dispatch(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
+            self.assertFalse(disp_rev.recommendation["model"].startswith("openai-codex/"))
+            self.assertIn(disp_rev.recommendation["agent_role"], ("ag-opus", "reviewer"))
+            disp_work = default_sel.dispatch(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.MEDIUM)
+            self.assertFalse(disp_work.recommendation["model"].startswith("openai-codex/"))
+            self.assertEqual(disp_work.recommendation["agent_role"], "task")
+
+        # ---------------------------------------------------------------------
+        # STATE 2: Routed again when CODEX_ENABLED = True (switched back on)
+        # ---------------------------------------------------------------------
+        with mock.patch("model_routing.codex_available", return_value=True):
+            selector_on = ResetAwareModelSelector(snapshot, codex_account=True)
+            self.assertTrue(selector_on.codex_account_available())
+
+            # Near reset with surplus allowance: promotes Codex Astra / Fast
+            near_reset_dict = copy.deepcopy(self.mock_usage_dict)
+            codex_lim = near_reset_dict["reports"][2]["limits"][0]
+            codex_lim["window"]["resetsAt"] = self.mock_now_ms + (18 * 3600 * 1000)
+            codex_lim["amount"]["remainingFraction"] = 0.70
+            codex_lim["amount"]["remaining"] = 70.0
+            on_snap = parse_usage_json(near_reset_dict, current_time_ms=self.mock_now_ms)
+            on_sel_surplus = ResetAwareModelSelector(on_snap, codex_account=True)
+
+            on_review = on_sel_surplus.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
+            self.assertEqual(on_review.selected_model, MODEL_CODEX_ASTRA)
+            self.assertTrue(on_review.promotion_applied)
+
+            on_exec = on_sel_surplus.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.MEDIUM)
+            self.assertEqual(on_exec.selected_model, MODEL_CODEX_FAST)
+            self.assertTrue(on_exec.promotion_applied)
+
+            # Dispatch packets map to actual Codex agent roles when enabled
+            on_pkt_rev = on_sel_surplus.dispatch(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
+            self.assertEqual(on_pkt_rev.recommendation["model"], MODEL_CODEX_ASTRA)
+            self.assertEqual(on_pkt_rev.recommendation["agent_role"], "codex-reviewer")
+
+            on_pkt_work = on_sel_surplus.dispatch(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.MEDIUM)
+            self.assertEqual(on_pkt_work.recommendation["model"], MODEL_CODEX_FAST)
+            self.assertEqual(on_pkt_work.recommendation["agent_role"], "codex-worker")
+
+            # Role mapper maps to codex-* roles when enabled
+            self.assertEqual(model_to_agent_role(MODEL_CODEX_ASTRA, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "codex-reviewer")
+            self.assertEqual(model_to_agent_role(MODEL_CODEX_ASTRA, TaskType.ROUTINE_EXECUTION, RiskLevel.HIGH), "codex-worker")
+            # Agent roles available when Codex enabled
+            self.assertTrue(is_agent_role_available("codex-worker"))
+            self.assertTrue(is_agent_role_available("codex-reviewer"))
+            self.assertTrue(is_agent_role_available("thinker"))
+            self.assertTrue(is_agent_role_available("sol"))
+            self.assertTrue(is_agent_role_available("task"))
+
+        # ---------------------------------------------------------------------
+        # NEGATIVE CONTROL:
+        # 1. Identical near-reset surplus fixture that promoted Codex in State 2
+        #    MUST NOT route to or promote Codex when codex_account=False / CODEX_ENABLED=False.
+        # 2. Rejection of Codex agent roles when disabled (never codex-reviewer / codex-worker).
+        # 3. Environment override negative control (VEYYON_CODEX_ENABLED="0" overrides CODEX_ENABLED=True).
+        # 4. No automatic re-enable by date (pure manual control).
+        # ---------------------------------------------------------------------
+        with mock.patch("model_routing.codex_available", return_value=False):
+            neg_sel_surplus = ResetAwareModelSelector(on_snap, codex_account=False)
+            self.assertFalse(neg_sel_surplus.codex_account_available())
+
+            # Stimulus identical to State 2 (near reset with surplus allowance):
+            # In State 2 this returned MODEL_CODEX_ASTRA with promotion_applied=True.
+            # In Negative Control, it MUST NOT select Codex Astra or any Codex model:
+            neg_rev = neg_sel_surplus.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH, allow_codex_promotion=True)
+            self.assertFalse(neg_rev.selected_model.startswith("openai-codex/"))
+            self.assertFalse(neg_rev.promotion_applied, "Promotion must not be applied to Codex when disabled")
+            self.assertNotIn("flash", neg_rev.selected_model.lower(), "High-risk review must never fall back to Flash")
+            self.assertIn(neg_rev.selected_model, (MODEL_AG_CLAUDE_OPUS, MODEL_CLAUDE_OPUS_55, MODEL_CLAUDE_FABLE))
+            self.assertNotEqual(neg_rev.selected_model, MODEL_CODEX_ASTRA)
+
+            # In State 2 routine execution returned MODEL_CODEX_FAST with promotion_applied=True.
+            # In Negative Control, it MUST NOT select Codex Fast or any Codex model:
+            neg_exec = neg_sel_surplus.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.MEDIUM, allow_codex_promotion=True)
+            self.assertFalse(neg_exec.selected_model.startswith("openai-codex/"))
+            self.assertFalse(neg_exec.promotion_applied, "Promotion must not be applied to Codex when disabled")
+            self.assertEqual(neg_exec.selected_model, MODEL_GEMINI_FLASH)
+            self.assertNotEqual(neg_exec.selected_model, MODEL_CODEX_FAST)
+
+            # Negative control on agent role mappings:
+            # When disabled, openai-codex models MUST NEVER map to codex-reviewer or codex-worker
+            self.assertNotEqual(model_to_agent_role(MODEL_CODEX_ASTRA, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "codex-reviewer")
+            self.assertNotEqual(model_to_agent_role(MODEL_CODEX_ASTRA, TaskType.ROUTINE_EXECUTION, RiskLevel.MEDIUM), "codex-worker")
+            self.assertNotEqual(model_to_agent_role(MODEL_CODEX_FAST, TaskType.ROUTINE_EXECUTION, RiskLevel.LOW), "codex-worker")
+            # When disabled, is_agent_role_available MUST return False for Codex roles
+            self.assertFalse(is_agent_role_available("codex-worker"))
+            self.assertFalse(is_agent_role_available("codex-reviewer"))
+            self.assertFalse(is_agent_role_available("thinker"))
+            self.assertFalse(is_agent_role_available("sol"))
+            self.assertTrue(is_agent_role_available("task"))
+            self.assertTrue(is_agent_role_available("reviewer"))
+            self.assertTrue(is_agent_role_available("ag-opus"))
+            self.assertTrue(is_agent_role_available("ds-task"))
+            self.assertTrue(is_agent_role_available("go-task"))
+
+        # Negative control on environment override:
+        with mock.patch("model_routing.CODEX_ENABLED", True):
+            with mock.patch.dict(os.environ, {"VEYYON_CODEX_ENABLED": "0"}):
+                self.assertFalse(codex_available(), "VEYYON_CODEX_ENABLED=0 must force disabled even if CODEX_ENABLED=True")
+            with mock.patch.dict(os.environ, {"VEYYON_CODEX_ENABLED": "false"}):
+                self.assertFalse(codex_available(), "VEYYON_CODEX_ENABLED=false must force disabled even if CODEX_ENABLED=True")
+            with mock.patch.dict(os.environ, {"VEYYON_CODEX_ENABLED": "no"}):
+                self.assertFalse(codex_available(), "VEYYON_CODEX_ENABLED=no must force disabled even if CODEX_ENABLED=True")
+
+        # Negative control: no automatic re-enable by date (manual switch only)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(codex_available(), "codex_available() must be False regardless of time when CODEX_ENABLED=False")
+
+        # Profile config invariant: when CODEX_ENABLED is False, Codex agent roles must be disabled
+        if not CODEX_ENABLED:
+            config_path = os.path.expanduser("~/.veyyon/profiles/default/agent/config.yml")
+            if os.path.exists(config_path):
+                import yaml
+                with open(config_path, "r", encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f)
+                prof_agents = (cfg.get("agent") or {}).get("agents") or {}
+                for codex_role in ("codex-worker", "codex-reviewer", "thinker", "sol"):
+                    entry = prof_agents.get(codex_role)
+                    if entry:
+                        self.assertFalse(
+                            entry.get("enabled", True),
+                            f"{codex_role} must have enabled: false in config.yml when CODEX_ENABLED=False",
+                        )
+        print("  [PASS] All states verified: off (skipped), on (routed), plus negative control.")
+
+
+    # -------------------------------------------------------------------------
+    # TEST 42: astra-ux role pin — non-Codex UX model while CODEX_ENABLED=False
+    # -------------------------------------------------------------------------
+    def test_astra_ux_never_resolves_to_codex_while_disabled(self):
+        print("\n--- TEST 42: astra-ux Role Pin Non-Codex when CODEX_ENABLED=False ---")
+        # Invariant: while CODEX_ENABLED is False (or Codex account unavailable),
+        # astra-ux must never resolve to an openai-codex/ model (e.g. gpt-6-astra).
+        self.assertFalse(CODEX_ENABLED, "CODEX_ENABLED must default to False")
+        self.assertIn("astra-ux", ROLE_MODEL_PINS)
+        pinned_model = ROLE_MODEL_PINS["astra-ux"]
+        self.assertFalse(pinned_model.startswith("openai-codex/"),
+                         f"astra-ux pin must not be a Codex model, got {pinned_model}")
+        self.assertEqual(pinned_model, MODEL_AG_CLAUDE_OPUS,
+                         f"astra-ux must pin {MODEL_AG_CLAUDE_OPUS}")
+
+        # resolve_role_model must return MODEL_AG_CLAUDE_OPUS
+        resolved = resolve_role_model("astra-ux")
+        self.assertEqual(resolved, MODEL_AG_CLAUDE_OPUS)
+        self.assertFalse(resolved.startswith("openai-codex/"))
+
+        # Check installed profile configuration if present
+        config_path = Path(os.path.expanduser("~/.veyyon/profiles/default/agent/config.yml"))
+        if config_path.exists():
+            parsed = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            agents = (parsed.get("agent") or {}).get("agents") or {}
+            model_roles = parsed.get("modelRoles") or {}
+            chain = (agents.get("astra-ux") or {}).get("model") or model_roles.get("astra-ux")
+            if chain is not None:
+                leading = str(chain).split(",")[0].strip()
+                self.assertFalse(leading.startswith("openai-codex/"),
+                                 f"astra-ux leading model in config.yml must not be Codex: {leading}")
+                self.assertEqual(leading, pinned_model,
+                                 f"astra-ux leading model {leading} must match pin {pinned_model}")
+                if "astra-ux" in agents:
+                    self.assertTrue(agents["astra-ux"].get("enabled", True), "astra-ux must be enabled")
+
+        # ---------------------------------------------------------------------
+        # NEGATIVE CONTROL:
+        # 1. The old failing configuration (MODEL_CODEX_ASTRA) is an openai-codex/ model.
+        # 2. When CODEX_ENABLED=False (codex_available() is False), resolve_role_model
+        #    MUST refuse to resolve any Codex role (returns None, never openai-codex/*).
+        # 3. If astra-ux were mocked with the old failing Codex pin, resolve_role_model
+        #    blocks it when codex_available() is False.
+        # ---------------------------------------------------------------------
+        with mock.patch("model_routing.codex_available", return_value=False):
+            old_failing_model = MODEL_CODEX_ASTRA  # "openai-codex/gpt-6-astra:medium"
+            self.assertTrue(old_failing_model.startswith("openai-codex/"))
+            self.assertNotEqual(ROLE_MODEL_PINS["astra-ux"], old_failing_model)
+
+            # Codex roles resolve to None when Codex is disabled
+            self.assertIsNone(resolve_role_model("codex-worker"))
+            self.assertIsNone(resolve_role_model("codex-reviewer"))
+
+            # Mock astra-ux temporarily pointing to the old failing Codex model:
+            # resolve_role_model MUST NOT resolve to it while Codex is disabled:
+            with mock.patch.dict(ROLE_MODEL_PINS, {"astra-ux": old_failing_model}):
+                neg_resolved = resolve_role_model("astra-ux")
+                self.assertIsNone(neg_resolved,
+                                  "Negative control: astra-ux with Codex model must resolve to None when CODEX_ENABLED=False")
+
+        # When Codex is enabled, a role pinned to MODEL_AG_CLAUDE_OPUS still resolves to it
+        with mock.patch("model_routing.codex_available", return_value=True):
+            self.assertEqual(resolve_role_model("astra-ux"), MODEL_AG_CLAUDE_OPUS)
+
+        print("  [PASS] astra-ux resolves to non-Codex model, negative control verified.")
 def main():
     print("=" * 70)
     print("RUNNING VEYYON BALANCE LOADER & MODEL ROUTING SMOKE TEST SUITE")

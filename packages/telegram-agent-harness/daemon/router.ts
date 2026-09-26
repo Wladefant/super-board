@@ -7,7 +7,7 @@
  * outbound transcript text is attributed from.
  */
 
-import { escapeHtml } from "../extension/sanitizer";
+import { escapeHtml, isRepeatDelivery } from "../extension/sanitizer";
 import { availableCommands } from "../extension/command-registry";
 import type { DaemonSlot } from "./config";
 import type {
@@ -16,7 +16,7 @@ import type {
   SessionEvent,
 } from "./session-control";
 import { SessionControlUnavailableError } from "./session-control";
-import type { DaemonStore } from "./store";
+import { AGENT_MESSAGE_DEDUPE_WINDOW_MS, type DaemonStore } from "./store";
 
 /**
  * Where a message came from, and where its answer goes: a chat, plus the forum topic
@@ -145,6 +145,22 @@ export class SlotRouter {
   }
 
   /**
+   * Opens a new operator turn for `sessionId`, dropping the texts recorded for the turn that
+   * ended. A locked ledger must never stand between the operator and their own message, so a
+   * failure here is logged and the delivery proceeds: a stale recorded text can cost a
+   * repeated line, while a throw here would lose the message.
+   */
+  private openTurn(sessionId: string): void {
+    try {
+      this.options.store.beginTurn(sessionId);
+    } catch (error) {
+      this.options.log(
+        `Slot ${this.slotId}: beginTurn for ${sessionId} failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  /**
    * Delivers operator text to the target's session, creating and binding one when
    * the target is unrouted. Returns the text to acknowledge with, or null when the
    * caller should stay silent because the session itself will answer.
@@ -153,6 +169,9 @@ export class SlotRouter {
     {
       const bound = this.boundSession(target);
       if (bound) {
+        // The operator's message opens a new turn; a telegram_message from the previous turn
+        // must not suppress the answer to this one.
+        this.openTurn(bound);
         await this.options.control.deliver(bound, text, mode);
         return null;
       }
@@ -177,6 +196,7 @@ export class SlotRouter {
 
       const sessionId = await this.options.control.ensureSession(workspace, `Telegram ${this.slotId}`);
       await this.bind(target, sessionId, workspace);
+      this.openTurn(sessionId);
       await this.options.control.deliver(sessionId, text, mode);
       return `🔗 <b>Routed to session</b> <code>${escapeHtml(sessionId)}</code> in <code>${escapeHtml(workspace)}</code>.`;
     }
@@ -451,10 +471,19 @@ export class SlotRouter {
   public async onSessionEvent(event: SessionEvent): Promise<void> {
     if (event.kind === "streaming") return;
     const routes = this.options.store.routesForSession(event.sessionId).filter(route => route.slotId === this.slotId);
+    if (routes.length === 0) return;
+    const agentMessages = event.kind === "appended"
+      ? this.options.store.recentAgentMessages(event.sessionId, Date.now() - AGENT_MESSAGE_DEDUPE_WINDOW_MS)
+      : [];
     for (const route of routes) {
       for (const entry of event.entries) {
         if (!this.options.store.claimDelivery(event.sessionId, entry.entryId, SlotRouter.claimKey(route))) continue;
         if (event.kind === "history") continue;
+        // telegram_message already put this text in front of the operator during this turn.
+        if (agentMessages.some(sent => isRepeatDelivery(entry.text, sent))) {
+          this.options.log(`Slot ${this.slotId}: entry ${entry.entryId} not relayed; it repeats a telegram_message from this session.`);
+          continue;
+        }
         try {
           await this.options.relay({ chatId: route.chatId, topicId: route.topicId }, entry.text, event.sessionId);
         } catch (error) {
