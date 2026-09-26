@@ -66,6 +66,9 @@ jobs:
       - name: status — parser fixture tests
         run: python -B tests/test_status_parse.py
 
+      - name: host status monitor tests
+        run: python -B tests/test_host_status.py
+
       - name: claudex — compile zero-quota helpers
         run: python -c "from pathlib import Path; paths=[Path('skills/claudex-optimized/scripts/preflight.py'),Path('skills/claudex-optimized/scripts/probe-routing.py')]; [compile(p.read_text(encoding='utf-8'), str(p), 'exec') for p in paths]"
 
@@ -209,3 +212,5 @@ jobs:
         run: python -B workflows/portable/test_build_slot.py
       - name: outer loop intake
         run: python -B workflows/portable/test_outer_loop_intake.py
+      - name: host status monitor
+        run: python -B tests/test_host_status.py
