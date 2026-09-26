@@ -831,6 +831,13 @@ class Coordinator:
             evidence_packet_required=rec.evidence_packet_required,
         )
 
+        # Live-object handoff (not a dataclass field): the adapter reuses this exact
+        # selection in its dispatch instead of running every provider ladder a second
+        # time. asdict() skips non-field attributes, so the serialized packet schema
+        # and every external JSON consumer stay unchanged; a consumer that rebuilds
+        # packets from JSON finds no committed_rec and falls back to re-selection.
+        routing_info.committed_rec = rec
+
         # Status is READY for execution
         action_desc = req_next_action or f"Execute {req_state} steps for request '{req_id}'"
         next_action_str = (
