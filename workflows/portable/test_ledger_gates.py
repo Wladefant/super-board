@@ -920,6 +920,43 @@ sys.exit(0)
             self.ledger.update_request(req_id="req-stale-cache-parent", state="done", sub_issues_checker=live_checker)
         self.assertIn("open sub-issue(s)", str(ctx.exception))
         self.assertIn("#102", str(ctx.exception))
+
+    def test_dangling_parent_req_id_does_not_bypass_sub_issue_guard(self):
+        """A dangling parent_req_id is not an exemption: the live sub-issue guard still runs and fires."""
+        self._add("req-dangling-parent-ref", state="review", task_type="local_doc")
+        self._verify_criteria("req-dangling-parent-ref")
+        self.ledger.update_request(
+            req_id="req-dangling-parent-ref",
+            parent_req_id="req-parent-that-does-not-exist",
+            github_update={"issue_number": 777, "proof_url": "https://github.com/Bavariance/polysimulator/pull/1", "proof_verified": True},
+        )
+        # The referenced parent is genuinely dangling: no such request exists in the ledger
+        with self.assertRaises(KeyError):
+            self.ledger.get_request("req-parent-that-does-not-exist")
+
+        calls = []
+
+        def open_sub_issue_checker(repo, issue_num):
+            calls.append((repo, issue_num))
+            return [{"number": 555, "title": "Open child issue", "state": "open"}]
+
+        with self.assertRaises(ValueError) as ctx:
+            self.ledger.update_request(
+                req_id="req-dangling-parent-ref", state="done", sub_issues_checker=open_sub_issue_checker
+            )
+        self.assertIn("open sub-issue(s)", str(ctx.exception))
+        self.assertIn("#555", str(ctx.exception))
+        # The live lookup ran for this request: parent_req_id granted no bypass
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1], 777)
+        self.assertEqual(self.ledger.get_request("req-dangling-parent-ref")["state"], "review")
+
+        # Positive control: the same dangling parent closes once no sub-issue is open
+        res = self.ledger.update_request(
+            req_id="req-dangling-parent-ref", state="done", sub_issues_checker=lambda repo, issue_num: []
+        )
+        self.assertEqual(res["state"], "done")
+
 def run_tests():
     print("=" * 70)
     print("RUNNING LEDGER LIFECYCLE GATE REGRESSIONS")
