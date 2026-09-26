@@ -215,6 +215,84 @@ describe("Telegram Harness Hot Reload", () => {
     }
   });
 
+  test("a final reply that repeats this turn's telegram_message is not forwarded again", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "runtime-dedupe-"));
+    const previousDaemonDb = process.env.VEYYON_TELEGRAM_DAEMON_DB;
+    // No daemon database, so the runtime forwards replies itself instead of deferring to a daemon route.
+    process.env.VEYYON_TELEGRAM_DAEMON_DB = path.join(tmpDir, "absent-daemon.db");
+    const sent: string[] = [];
+    let runtime: TelegramRuntime | null = null;
+    try {
+      const slot: DiscoveredSlot = { slotId: "slot-dedupe", botId: "123456", stateDir: tmpDir };
+      const coordinator: MockCoordinator = {
+        acquireLease: async () => ({ ok: true, slot }),
+        releaseLease: () => true,
+        close: () => {},
+        readRawTokenForSlot: () => "0000000000:TEST_TOKEN",
+        readAccessConfig: () => ({ dmPolicy: "allowlist", allowFrom: ["1001"] }),
+        recordOutboundMessage: () => {},
+        resolveReplyRouting: () => ({ decision: "deliver" }),
+        validateDecisionCallback: () => ({ decision: "deliver" }),
+        consumeDecisionCallback: () => true,
+        applyDecisionAnswer: async () => true,
+        getPoolStatus: () => ({ totalSlots: 1, freeSlots: 0 }),
+      };
+      const poller: MockPoller = {
+        start: async () => {},
+        stop: async () => {},
+        getPrimaryChatId: () => "1001",
+        sendTelegramMessage: async (_chatId, text) => {
+          sent.push(text);
+          return { ok: true, result: { message_id: sent.length } };
+        },
+      };
+      runtime = new TelegramRuntime(createMockExtensionAPI().api, {
+        coordinatorFactory: () => coordinator as unknown as never,
+        pollerFactory: () => poller as unknown as never,
+      });
+      expect(await runtime.initSession(createMockContext("sess-dedupe"))).toBe(true);
+      // Drop the session-connected notice; only forwarded replies matter below.
+      sent.length = 0;
+
+      const reply = (text: string): Parameters<TelegramRuntime["onMessageEnd"]>[0] => {
+        // Only role and text content are read by the runtime; the rest of the event is irrelevant here.
+        const event = { message: { role: "assistant", content: [{ type: "text", text }] } };
+        return event as unknown as Parameters<TelegramRuntime["onMessageEnd"]>[0];
+      };
+      const report = "Merged PR 224: Telegram tables now render as monospace blocks.";
+
+      await runtime.onMessageStart({ message: { role: "user" } });
+      runtime.recordTurnDelivery(report);
+      await runtime.onMessageStart({ message: { role: "assistant" } });
+      await runtime.onMessageEnd(reply(report));
+      expect(sent).toEqual([]);
+
+      await runtime.onMessageStart({ message: { role: "assistant" } });
+      await runtime.onMessageEnd(reply("Next I will sync the fork."));
+      expect(sent).toHaveLength(1);
+      expect(sent[0]).toContain("Next I will sync the fork.");
+
+      // A new user turn starts a fresh delivery record, so the same text is forwarded again.
+      await runtime.onMessageStart({ message: { role: "user" } });
+      await runtime.onMessageStart({ message: { role: "assistant" } });
+      await runtime.onMessageEnd(reply(report));
+      expect(sent).toHaveLength(2);
+
+      // A reply that names a different PR is new output, not a repeat of this turn's delivery.
+      await runtime.onMessageStart({ message: { role: "user" } });
+      runtime.recordTurnDelivery("Merged PR 224 into staging after CI went green on every check across all three operating systems today.");
+      await runtime.onMessageStart({ message: { role: "assistant" } });
+      await runtime.onMessageEnd(reply("Merged PR 225 into staging after CI went green on every check across all three operating systems today."));
+      expect(sent).toHaveLength(3);
+      expect(sent[2]).toContain("Merged PR 225");
+    } finally {
+      await runtime?.dispose();
+      if (previousDaemonDb === undefined) delete process.env.VEYYON_TELEGRAM_DAEMON_DB;
+      else process.env.VEYYON_TELEGRAM_DAEMON_DB = previousDaemonDb;
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
   test("reload disposes old runtime, re-imports, re-acquires lease, and notifies operator", async () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "hot-reload-test-"));
     const manifestPath = path.join(tmpDir, "install-manifest.json");

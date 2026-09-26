@@ -15,8 +15,14 @@ Commands:
 
 Invariants:
     - Atomic acquisition via os.mkdir('~/.veyyon/run/build-slot.lock').
-    - Lock metadata contains owner, pid, and acquired_at timestamp.
-    - Waiting lanes are tracked in a FIFO queue file ('~/.veyyon/run/build-slot.queue.json').
+    - Lock metadata contains owner, pid, token, and acquired_at timestamp.
+    - Waiting lanes are tracked in a FIFO queue file ('~/.veyyon/run/build-slot.queue.json')
+      with unique tokens to differentiate in-process waiters sharing a parent PID.
+    - Queue entries emit periodic heartbeats (heartbeat_at); entries with dead PIDs or
+      heartbeats older than 60s are automatically reclaimed.
+    - Legacy queue entries without heartbeats fall back to enqueued_at age > 30m.
+    - Acquire wait loops write heartbeats before queue cleaning, re-enqueue if pruned,
+      and clean up queue entries via try/finally on timeout, exit, or exception.
     - Release by non-owner is strictly refused.
     - Stale locks (owner PID dead, or older than --stale-after [default 30m]) are reclaimed
       with a logged notice.
@@ -36,6 +42,7 @@ import tempfile
 import time
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
+import uuid
 
 logger = logging.getLogger("build_slot")
 
@@ -47,8 +54,10 @@ INFO_FILE_NAME = "info.json"
 
 DEFAULT_STALE_AFTER_SECONDS = 30 * 60  # 30 minutes
 DEFAULT_POLL_INTERVAL_SECONDS = 5.0
+DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 10.0  # update queue entry heartbeat every <=15s
+DEFAULT_QUEUE_STALE_HEARTBEAT_SECONDS = 60.0  # reclaim if heartbeat older than 60s
+DEFAULT_QUEUE_STALE_FALLBACK_SECONDS = 30 * 60  # 30 minutes fallback for legacy entries without heartbeat
 RAM_GUARD_THRESHOLD_PERCENT = 85.0
-
 
 def get_system_ram_percent() -> Optional[float]:
     """
@@ -154,6 +163,22 @@ def is_pid_alive(pid: int) -> bool:
             return False
 
 
+def _parse_timestamp(val: Any) -> Optional[float]:
+    """Parses numeric epoch or ISO timestamp string into epoch seconds."""
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        try:
+            return float(val)
+        except ValueError:
+            pass
+        try:
+            return datetime.datetime.fromisoformat(val).timestamp()
+        except Exception:
+            pass
+    return None
+
+
 @contextmanager
 def _queue_atomic_lock(run_dir: str, timeout: float = 10.0, retry_interval: float = 0.05):
     """
@@ -203,12 +228,16 @@ class BuildSlotManager:
         self,
         run_dir: Optional[str] = None,
         is_pid_alive_fn=None,
+        queue_stale_heartbeat_after: float = DEFAULT_QUEUE_STALE_HEARTBEAT_SECONDS,
+        queue_stale_fallback_after: float = DEFAULT_QUEUE_STALE_FALLBACK_SECONDS,
     ):
         self.run_dir = os.path.abspath(run_dir or DEFAULT_RUN_DIR)
         self.lock_dir = os.path.join(self.run_dir, LOCK_DIR_NAME)
         self.info_file = os.path.join(self.lock_dir, INFO_FILE_NAME)
         self.queue_file = os.path.join(self.run_dir, QUEUE_FILE_NAME)
         self.is_pid_alive = is_pid_alive_fn or is_pid_alive
+        self.queue_stale_heartbeat_after = queue_stale_heartbeat_after
+        self.queue_stale_fallback_after = queue_stale_fallback_after
         os.makedirs(self.run_dir, exist_ok=True)
 
     def _read_lock_info(self) -> Optional[Dict[str, Any]]:
@@ -248,13 +277,14 @@ class BuildSlotManager:
                 "corrupt": True,
             }
 
-    def _write_lock_info(self, owner: str, pid: int) -> None:
+    def _write_lock_info(self, owner: str, pid: int, token: Optional[str] = None) -> None:
         """Writes info.json inside the newly created lock directory."""
         now = time.time()
         now_iso = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat()
         info = {
             "owner": owner,
             "pid": pid,
+            "token": token,
             "acquired_at": now_iso,
             "acquired_at_epoch": now,
         }
@@ -281,7 +311,18 @@ class BuildSlotManager:
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(queue, f, indent=2)
-            os.replace(temp_path, self.queue_file)
+            # On Windows, os.replace can transiently raise PermissionError if another handle is open
+            last_err = None
+            for _ in range(10):
+                try:
+                    os.replace(temp_path, self.queue_file)
+                    last_err = None
+                    break
+                except (PermissionError, OSError) as e:
+                    last_err = e
+                    time.sleep(0.01)
+            if last_err is not None:
+                raise last_err
         except Exception:
             if os.path.exists(temp_path):
                 try:
@@ -290,70 +331,222 @@ class BuildSlotManager:
                     pass
             raise
 
-    def clean_queue(self) -> List[Dict[str, Any]]:
+    def _is_entry_stale(
+        self,
+        item: Dict[str, Any],
+        now: float,
+        stale_heartbeat_after: float,
+        stale_fallback_after: float,
+    ) -> Tuple[bool, str]:
         """
-        Removes dead PIDs from the queue to maintain FIFO integrity.
+        Evaluates whether a queue entry is stale.
+        Rule: removed when its PID is dead OR heartbeat_at is older than 60s
+        (entries without heartbeat_at from older versions: fall back to enqueued_at age > 30 min).
+        """
+        pid = item.get("pid", 0)
+        if pid > 0 and not self.is_pid_alive(pid):
+            return True, f"PID {pid} is dead"
+
+        hb_val = item.get("heartbeat_at")
+        if hb_val is not None:
+            hb_epoch = _parse_timestamp(hb_val)
+            if hb_epoch is not None:
+                hb_age = now - hb_epoch
+                if hb_age > stale_heartbeat_after:
+                    return True, f"heartbeat expired ({hb_age:.1f}s > {stale_heartbeat_after:.1f}s)"
+            else:
+                return True, "corrupt heartbeat_at timestamp"
+        else:
+            enq_val = item.get("enqueued_at")
+            if enq_val is not None:
+                enq_epoch = _parse_timestamp(enq_val)
+                if enq_epoch is not None:
+                    enq_age = now - enq_epoch
+                    if enq_age > stale_fallback_after:
+                        return True, f"legacy entry enqueued_at expired ({enq_age:.1f}s > {stale_fallback_after:.1f}s)"
+                else:
+                    return True, "corrupt enqueued_at timestamp"
+            else:
+                return True, "missing heartbeat_at and enqueued_at"
+
+        return False, ""
+
+    def _clean_queue_locked(
+        self,
+        queue: List[Dict[str, Any]],
+        now: float,
+        stale_heartbeat_after: float,
+        stale_fallback_after: float,
+    ) -> Tuple[List[Dict[str, Any]], bool]:
+        """Filters out stale entries while holding queue atomic lock."""
+        new_queue = []
+        changed = False
+        for item in queue:
+            stale, reason = self._is_entry_stale(item, now, stale_heartbeat_after, stale_fallback_after)
+            if stale:
+                changed = True
+                logger.info(
+                    "Pruned queue entry '%s' (token=%s, PID=%s): %s",
+                    item.get("name"),
+                    item.get("token"),
+                    item.get("pid"),
+                    reason,
+                )
+                continue
+            new_queue.append(item)
+        return new_queue, changed
+
+    def clean_queue(
+        self,
+        stale_heartbeat_after: Optional[float] = None,
+        stale_fallback_after: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Removes dead PIDs and stale entries (heartbeat expired or legacy age exceeded)
+        from the queue to maintain FIFO integrity.
         Returns the updated queue.
         """
+        hb_limit = stale_heartbeat_after if stale_heartbeat_after is not None else self.queue_stale_heartbeat_after
+        fb_limit = stale_fallback_after if stale_fallback_after is not None else self.queue_stale_fallback_after
+
         with _queue_atomic_lock(self.run_dir):
             queue = self._read_queue()
-            new_queue = []
-            changed = False
-            for item in queue:
-                pid = item.get("pid", 0)
-                if pid > 0 and not self.is_pid_alive(pid):
-                    changed = True
-                    logger.info("Pruned dead PID %d (%s) from build slot queue", pid, item.get("name"))
-                    continue
-                new_queue.append(item)
+            new_queue, changed = self._clean_queue_locked(queue, time.time(), hb_limit, fb_limit)
             if changed:
                 self._write_queue(new_queue)
             return new_queue
 
-    def enqueue(self, name: str, pid: int) -> int:
+    def enqueue(
+        self,
+        name: str,
+        pid: int,
+        token: Optional[str] = None,
+        stale_heartbeat_after: Optional[float] = None,
+    ) -> int:
         """
-        Adds (name, pid) to the queue if not already present.
+        Adds (name, pid, token) to the queue if not already present.
         Returns the 0-indexed position in queue.
         """
+        hb_limit = stale_heartbeat_after if stale_heartbeat_after is not None else self.queue_stale_heartbeat_after
         with _queue_atomic_lock(self.run_dir):
             queue = self._read_queue()
-            # Prune dead PIDs first
-            valid_queue = [q for q in queue if q.get("pid") == pid or self.is_pid_alive(q.get("pid", 0))]
-
-            # Check if (name, pid) already exists
-            existing_idx = next(
-                (i for i, item in enumerate(valid_queue) if item.get("name") == name and item.get("pid") == pid),
-                None,
+            now = time.time()
+            valid_queue, changed = self._clean_queue_locked(
+                queue, now, hb_limit, self.queue_stale_fallback_after
             )
+            if token is not None:
+                existing_idx = next(
+                    (i for i, item in enumerate(valid_queue) if item.get("token") == token),
+                    None,
+                )
+                if existing_idx is None:
+                    # Check if there is an untokenized entry for (name, pid) to bind to
+                    legacy_idx = next(
+                        (
+                            i
+                            for i, item in enumerate(valid_queue)
+                            if item.get("name") == name and item.get("pid") == pid and not item.get("token")
+                        ),
+                        None,
+                    )
+                    if legacy_idx is not None:
+                        valid_queue[legacy_idx]["token"] = token
+                        valid_queue[legacy_idx]["heartbeat_at"] = now
+                        valid_queue[legacy_idx]["heartbeat_at_iso"] = datetime.datetime.fromtimestamp(
+                            now, datetime.timezone.utc
+                        ).isoformat()
+                        self._write_queue(valid_queue)
+                        return legacy_idx
+            else:
+                existing_idx = next(
+                    (i for i, item in enumerate(valid_queue) if item.get("name") == name and item.get("pid") == pid),
+                    None,
+                )
+
             if existing_idx is not None:
-                if len(valid_queue) != len(queue):
+                if changed or len(valid_queue) != len(queue):
                     self._write_queue(valid_queue)
                 return existing_idx
 
-            now = time.time()
             now_iso = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat()
             entry = {
                 "name": name,
                 "pid": pid,
+                "token": token,
                 "enqueued_at": now,
                 "enqueued_at_iso": now_iso,
+                "heartbeat_at": now,
+                "heartbeat_at_iso": now_iso,
             }
             valid_queue.append(entry)
             self._write_queue(valid_queue)
             return len(valid_queue) - 1
 
-    def dequeue(self, name: str, pid: Optional[int] = None) -> None:
-        """Removes (name, pid) or any entry matching name from the queue."""
+    def dequeue(
+        self,
+        name: Optional[str] = None,
+        pid: Optional[int] = None,
+        token: Optional[str] = None,
+    ) -> None:
+        """Removes entry matching token, or (name, pid) if token is not provided."""
         with _queue_atomic_lock(self.run_dir):
             queue = self._read_queue()
             new_queue = []
             for item in queue:
-                if item.get("name") == name:
-                    if pid is None or item.get("pid") == pid:
+                if token is not None:
+                    if item.get("token") == token:
                         continue
+                    if not item.get("token") and name is not None and item.get("name") == name:
+                        if pid is None or item.get("pid") == pid:
+                            continue
+                else:
+                    if name is not None and item.get("name") == name:
+                        if pid is None or item.get("pid") == pid:
+                            continue
                 new_queue.append(item)
             if len(new_queue) != len(queue):
                 self._write_queue(new_queue)
+
+    def heartbeat(
+        self,
+        token: Optional[str] = None,
+        name: Optional[str] = None,
+        pid: Optional[int] = None,
+    ) -> bool:
+        """
+        Updates the heartbeat_at timestamp for the queue entry identified by token
+        (or name + pid if token is not provided/matched).
+        Returns True if an entry was found and updated, False otherwise.
+        """
+        if token is None and name is None:
+            return False
+
+        with _queue_atomic_lock(self.run_dir):
+            queue = self._read_queue()
+            now = time.time()
+            now_iso = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat()
+            updated = False
+            for item in queue:
+                matched = False
+                if token is not None and item.get("token") == token:
+                    matched = True
+                elif token is not None and not item.get("token") and name is not None and item.get("name") == name:
+                    if pid is None or item.get("pid") == pid:
+                        matched = True
+                        item["token"] = token
+                elif token is None and name is not None and item.get("name") == name:
+                    if pid is None or item.get("pid") == pid:
+                        matched = True
+
+                if matched:
+                    item["heartbeat_at"] = now
+                    item["heartbeat_at_iso"] = now_iso
+                    updated = True
+                    break
+
+            if updated:
+                self._write_queue(queue)
+            return updated
 
     def check_stale_and_reclaim(self, stale_after: float = DEFAULT_STALE_AFTER_SECONDS) -> bool:
         """
@@ -422,6 +615,9 @@ class BuildSlotManager:
         poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
         force: bool = False,
         pid: Optional[int] = None,
+        token: Optional[str] = None,
+        heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+        queue_stale_heartbeat_after: Optional[float] = None,
     ) -> bool:
         """
         Acquires the build slot lock for 'name'.
@@ -430,7 +626,19 @@ class BuildSlotManager:
         """
         if pid is None:
             pid = os.getpid()
-
+        explicit_token = token is not None
+        if token is None:
+            token = str(uuid.uuid4())
+        effective_heartbeat_threshold = (
+            queue_stale_heartbeat_after
+            if queue_stale_heartbeat_after is not None
+            else self.queue_stale_heartbeat_after
+        )
+        if poll_interval >= effective_heartbeat_threshold:
+            raise ValueError(
+                f"poll_interval ({poll_interval}s) must be less than "
+                f"queue_stale_heartbeat_after ({effective_heartbeat_threshold}s)"
+            )
         # 1. RAM Guard Check
         ram_pct = get_system_ram_percent()
         if ram_pct is not None and ram_pct >= RAM_GUARD_THRESHOLD_PERCENT:
@@ -451,23 +659,43 @@ class BuildSlotManager:
                 print(notice, file=sys.stderr)
                 logger.warning(notice)
 
-        # 2. Register in FIFO Queue
-        self.enqueue(name, pid)
         start_time = time.time()
+        last_heartbeat = start_time
+        acquired = False
 
         try:
+            # 2. Register in FIFO Queue inside try so finally always cleans up
+            self.enqueue(name, pid, token=token, stale_heartbeat_after=effective_heartbeat_threshold)
+
             while True:
+                # Update heartbeat first if due (every <= 15s)
+                now = time.time()
+                if now - last_heartbeat >= heartbeat_interval:
+                    hb_ok = self.heartbeat(token=token, name=name, pid=pid)
+                    last_heartbeat = now
+                    if not hb_ok:
+                        notice = (
+                            f"[NOTICE] Queue entry for '{name}' (PID {pid}, token {token}) "
+                            f"was missing during heartbeat; re-enqueuing."
+                        )
+                        print(notice, file=sys.stderr)
+                        logger.warning(notice)
+                        self.enqueue(
+                            name, pid, token=token, stale_heartbeat_after=effective_heartbeat_threshold
+                        )
                 # Check and reclaim any stale lock
                 self.check_stale_and_reclaim(stale_after=stale_after)
 
-                # Clean dead PIDs from queue
-                queue = self.clean_queue()
+                # Clean dead PIDs / stale heartbeats from queue
+                queue = self.clean_queue(stale_heartbeat_after=effective_heartbeat_threshold)
 
                 # Check if current caller is at the head of the FIFO queue
                 is_head_of_queue = False
                 if queue:
                     head = queue[0]
-                    if head.get("name") == name and head.get("pid") == pid:
+                    if head.get("token"):
+                        is_head_of_queue = (head.get("token") == token)
+                    elif head.get("name") == name and head.get("pid") == pid:
                         is_head_of_queue = True
 
                 # If lock does not exist and we are head of queue, attempt atomic os.mkdir
@@ -476,8 +704,9 @@ class BuildSlotManager:
                         try:
                             os.mkdir(self.lock_dir)
                             # Atomic creation succeeded! We own the lock.
-                            self._write_lock_info(owner=name, pid=pid)
-                            self.dequeue(name, pid)
+                            self._write_lock_info(owner=name, pid=pid, token=token)
+                            acquired = True
+                            self.dequeue(name, pid, token=token)
                             msg = f"Acquired build slot lock for '{name}' (PID {pid})"
                             print(msg)
                             logger.info(msg)
@@ -491,11 +720,14 @@ class BuildSlotManager:
                     # Lock exists; check if we already own it (re-entrant / idempotent)
                     info = self._read_lock_info()
                     if info and info.get("owner") == name and info.get("pid") == pid:
-                        self.dequeue(name, pid)
-                        msg = f"Build slot lock already held by '{name}' (PID {pid})"
-                        print(msg)
-                        return True
-
+                        lock_token = info.get("token")
+                        # Only reject re-entrancy if the caller explicitly passed a token and it differs from the lock's token
+                        if not (explicit_token and lock_token and lock_token != token):
+                            acquired = True
+                            self.dequeue(name, pid, token=token)
+                            msg = f"Build slot lock already held by '{name}' (PID {pid})"
+                            print(msg)
+                            return True
                 # Check timeout
                 if timeout is not None:
                     elapsed = time.time() - start_time
@@ -505,20 +737,25 @@ class BuildSlotManager:
                         logger.error(msg)
                         return False
 
-                time.sleep(poll_interval)
+                time.sleep(min(poll_interval, heartbeat_interval))
         finally:
             # If we exited without holding the lock, remove self from queue
-            if not self.is_held_by(name, pid):
-                self.dequeue(name, pid)
+            if not acquired:
+                try:
+                    self.dequeue(name, pid, token=token)
+                except Exception as e:
+                    logger.warning("Failed to dequeue on cleanup: %s", e)
 
-    def is_held_by(self, name: str, pid: Optional[int] = None) -> bool:
-        """Returns True if the lock is held by 'name' (and optionally pid)."""
+    def is_held_by(self, name: str, pid: Optional[int] = None, token: Optional[str] = None) -> bool:
+        """Returns True if the lock is held by 'name' (and optionally pid / token)."""
         info = self._read_lock_info()
         if not info:
             return False
         if info.get("owner") != name:
             return False
         if pid is not None and info.get("pid") != pid:
+            return False
+        if token is not None and info.get("token") is not None and info.get("token") != token:
             return False
         return True
 
@@ -592,6 +829,7 @@ class BuildSlotManager:
             lock_status["locked"] = True
             lock_status["owner"] = info.get("owner")
             lock_status["pid"] = info.get("pid")
+            lock_status["token"] = info.get("token")
             lock_status["acquired_at"] = info.get("acquired_at")
 
             acquired_epoch = info.get("acquired_at_epoch")
@@ -613,11 +851,17 @@ class BuildSlotManager:
         for item in queue:
             enqueued_epoch = item.get("enqueued_at", now)
             wait_time = max(0.0, now - enqueued_epoch)
+            hb_val = item.get("heartbeat_at")
+            hb_epoch = _parse_timestamp(hb_val) if hb_val is not None else None
+            hb_age = round(max(0.0, now - hb_epoch), 1) if hb_epoch is not None else None
             queue_status.append({
                 "name": item.get("name"),
                 "pid": item.get("pid"),
+                "token": item.get("token"),
                 "enqueued_at": item.get("enqueued_at_iso"),
                 "wait_seconds": round(wait_time, 1),
+                "heartbeat_at": item.get("heartbeat_at_iso"),
+                "heartbeat_age_seconds": hb_age,
             })
 
         # 4. System RAM
@@ -659,8 +903,9 @@ def format_status_human(stat: Dict[str, Any]) -> str:
     queue = stat.get("queue", [])
     lines.append(f"FIFO Queue:  {len(queue)} waiting")
     for i, q in enumerate(queue):
-        lines.append(f"  [{i + 1}] {q.get('name')} (PID {q.get('pid')}, waiting {q.get('wait_seconds', 0):.1f}s)")
-
+        hb_age = q.get("heartbeat_age_seconds")
+        hb_str = f", hb: {hb_age:.1f}s ago" if hb_age is not None else ""
+        lines.append(f"  [{i + 1}] {q.get('name')} (PID {q.get('pid')}, waiting {q.get('wait_seconds', 0):.1f}s{hb_str})")
     return "\n".join(lines)
 
 
@@ -694,6 +939,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help=f"Seconds to sleep between retry polls (default: {DEFAULT_POLL_INTERVAL_SECONDS}s)",
     )
     p_acq.add_argument(
+        "--token",
+        default=None,
+        help="Explicit token for queue/lock disambiguation (default: auto-generated uuid4)",
+    )
+    p_acq.add_argument(
         "--force",
         action="store_true",
         help="Bypass the RAM guard (proceed even if system RAM >= 85%%)",
@@ -713,7 +963,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     p_stat.add_argument("--json", action="store_true", help="Output status as structured JSON")
 
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.command == "acquire" and args.poll_interval >= DEFAULT_QUEUE_STALE_HEARTBEAT_SECONDS:
+        parser.error(
+            f"--poll-interval ({args.poll_interval}s) must be less than "
+            f"queue_stale_heartbeat_after ({DEFAULT_QUEUE_STALE_HEARTBEAT_SECONDS}s)"
+        )
+    return args
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -735,6 +991,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             poll_interval=args.poll_interval,
             force=args.force,
             pid=caller_pid,
+            token=args.token,
         )
         return 0 if success else 1
 

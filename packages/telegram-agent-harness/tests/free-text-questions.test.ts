@@ -335,6 +335,27 @@ test("multimodal answer: choice callback followed by free text combines into com
   expect(unmutated.answer?.choice_id).toBe("opt-a");
 }, 20_000);
 
+test("the first send of a question card is finished HTML, not run through the Markdown renderer", async () => {
+  const f = fixture();
+  // The card is rendered once by the decision store. The send path used to pass it through
+  // `markdownToTelegramHtml` with no session repository, which invented one for a bare `#N`
+  // and made the first send disagree with every later edit of the same card.
+  const pending = await f.service.ask({
+    question: "Retry #224 strategy",
+    recommendation: "opt-a",
+    options: [{ id: "opt-a", label: "Exponential" }, { id: "opt-b", label: "Linear" }],
+  });
+  expect(pending.decision_id).toMatch(/^tq:/);
+
+  const sendCall = f.calls.find(c => c.method === "sendMessage");
+  expect(sendCall).toBeDefined();
+  expect(sendCall?.body.parse_mode).toBe("HTML");
+  // The reference travelled through untouched: present in the card, never linkified.
+  expect(sendCall?.body.text).toContain("#224");
+  expect(sendCall?.body.text).not.toContain("github.com/Bavariance/polysimulator/issues/224");
+  expect(sendCall?.body.text).not.toContain("<a href=");
+}, 20_000);
+
 test("question cannot be accessed or answered from an unrelated session route", async () => {
   const f = fixture({
     route: { session_id: "session-alpha", chat_id: "1", user_id: "1" },

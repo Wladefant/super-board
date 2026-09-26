@@ -23,6 +23,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Database } from "bun:sqlite";
+import { getDaemonDbPath } from "../daemon/config";
+import { DaemonStore } from "../daemon/store";
 import { readMessageThreadId } from "./harness/channel-config";
 import { escapeHtml } from "./sanitizer";
 import {
@@ -199,6 +201,24 @@ function findDaemonRoute(sessionId?: string, workspace?: string): { slotId: stri
     }
   } catch {
     return null;
+  }
+}
+
+/**
+ * Records a telegram_message text in the daemon ledger when the daemon relays this
+ * session, so its relay holds back a final reply that repeats it.
+ */
+function recordDaemonAgentMessage(sessionId: string | undefined, text: string): void {
+  if (!sessionId || !fs.existsSync(getDaemonDbPath())) return;
+  try {
+    const store = new DaemonStore();
+    try {
+      if (store.routesForSession(sessionId).length > 0) store.recordAgentMessage(sessionId, text);
+    } finally {
+      store.close();
+    }
+  } catch (err: unknown) {
+    currentApi?.logger?.warn(`Telegram dedupe record failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
@@ -446,6 +466,8 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
           });
           const data = (await res.json()) as { ok?: boolean; result?: { message_id: number } };
           if (data.ok && data.result) {
+            activeRuntime?.recordTurnDelivery(params.text);
+            recordDaemonAgentMessage(savedContext?.sessionId, params.text);
             return {
               content: [{
                 type: "text",
@@ -474,6 +496,8 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
         threadId,
       );
       if (!sent?.ok) throw new Error("Attributed message was not delivered");
+      activeRuntime?.recordTurnDelivery(params.text);
+      recordDaemonAgentMessage(root.sessionId, params.text);
       return { content: [{ type: "text", text: `Delivered message ${sent.result?.message_id}; replies return to Main with lane context.` }] };
     },
   });
