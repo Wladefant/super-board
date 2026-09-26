@@ -25,6 +25,30 @@ import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+try:
+    from verify import validate_verify_receipt
+except ImportError:
+    def validate_verify_receipt(
+        receipt: Dict[str, Any],
+        head_sha: str,
+        expected_pr: Optional[int] = None,
+        expected_repo: Optional[str] = None,
+    ) -> Tuple[bool, Optional[str]]:
+        if not isinstance(receipt, dict):
+            return False, "Receipt payload is not a valid JSON object."
+        if receipt.get("schema_version") != "verify-receipt/v1":
+            return False, f"Invalid receipt schema_version '{receipt.get('schema_version')}', expected 'verify-receipt/v1'."
+        receipt_head = str(receipt.get("head_sha") or "")
+        if receipt_head != head_sha:
+            return False, f"Receipt head {receipt_head[:8]} does not match expected head {head_sha[:8]}."
+        if expected_pr is not None and receipt.get("pr_number") is not None:
+            if int(receipt["pr_number"]) != expected_pr:
+                return False, f"Receipt PR #{receipt['pr_number']} does not match expected PR #{expected_pr}."
+        status = str(receipt.get("status") or "").upper()
+        if status != "PASSED":
+            summary = receipt.get("summary") or "Scenario checks failed."
+            return False, f"Verification receipt status is '{status}': {summary}"
+        return True, None
 
 
 @dataclass
@@ -67,6 +91,7 @@ class GateApprovalPolicy:
     # Issue #195: small, low-risk diffs may skip independent review. Only named
     # non-production policies opt in; the strict default never does.
     allow_review_exemption: bool = False
+    require_verify_receipt: bool = False
     rationale: str = ""
 
     def matches(self, repo: str, base_ref: str) -> bool:
@@ -457,6 +482,9 @@ class PRGateEvaluation:
     review_decision: str = "required"
     review_decision_reason: str = ""
     decision_line: str = ""
+    verify_receipt_verdict: Optional[str] = None
+    verify_receipt_reason: Optional[str] = None
+    verify_receipt: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -476,6 +504,8 @@ class PRGateEvaluation:
             f"- **Advisory failures:** {', '.join(self.advisory_failing_checks) or 'None'}\n"
             f"- **Review Reused:** `{self.review_reused}` (Invalidated: `{self.review_invalidated}`"
             f"{f' - {self.invalidation_reason}' if self.invalidation_reason else ''})\n"
+            f"- **Verification:** `{self.verify_receipt_verdict or 'EXEMPT'}`"
+            f"{f' - {self.verify_receipt_reason}' if self.verify_receipt_reason else ''}\n"
             f"- **Verdict:** **{self.gate_verdict}** — {self.verdict_reason}\n"
         )
 
@@ -547,6 +577,8 @@ def evaluate_pr_gate(
     expected_head_sha: Optional[str] = None,
     policy: Optional[GateApprovalPolicy] = None,
     native_required_contexts: Optional[List[str]] = None,
+    verify_receipt: Optional[Dict[str, Any]] = None,
+    require_verify_receipt: Optional[bool] = None,
 ) -> PRGateEvaluation:
     """
     Deterministically evaluates GitHub PR status gate without LLM churn.
@@ -882,6 +914,54 @@ def evaluate_pr_gate(
 
     has_head_bound_review_evidence = content_review["passed"]
 
+    # 4B. Verification Receipt (verify-receipt/v1) Evaluation
+    effective_require_verify_receipt = (
+        require_verify_receipt
+        if require_verify_receipt is not None
+        else policy.require_verify_receipt
+    )
+
+    if effective_require_verify_receipt and verify_receipt is None:
+        standard_verify_paths = [
+            os.path.join(".veyyon", "verify", f"receipt-{head_sha}.json"),
+            os.path.join("workflows", "portable", "receipts", f"verify-{head_sha}.json"),
+            os.path.join(f"verify-receipt-{head_sha}.json"),
+            os.path.join("verify-receipt.json"),
+            os.path.expanduser(f"~/.veyyon/verify/receipt-{head_sha}.json"),
+        ]
+        for v_path in standard_verify_paths:
+            if os.path.exists(v_path):
+                try:
+                    with open(v_path, "r", encoding="utf-8") as vf:
+                        c_data = json.load(vf)
+                        if isinstance(c_data, dict) and c_data.get("schema_version") == "verify-receipt/v1":
+                            verify_receipt = c_data
+                            break
+                except Exception:
+                    continue
+
+    verify_receipt_verdict: Optional[str] = None
+    verify_receipt_reason: Optional[str] = None
+    verify_receipt_blocked = False
+
+    if effective_require_verify_receipt and verify_receipt is None:
+        verify_receipt_blocked = True
+        verify_receipt_verdict = "MISSING"
+        verify_receipt_reason = f"Verification receipt missing for commit {head_sha[:8]}: PR is not ready for promotion."
+    elif verify_receipt is not None:
+        is_valid_vr, vr_err = validate_verify_receipt(
+            verify_receipt, head_sha=head_sha, expected_pr=pr_number, expected_repo=repo
+        )
+        if not is_valid_vr:
+            verify_receipt_blocked = True
+            verify_receipt_verdict = "FAILED"
+            verify_receipt_reason = f"Verification receipt rejected: {vr_err}"
+        else:
+            verify_receipt_verdict = "PASSED"
+            verify_receipt_reason = verify_receipt.get("summary") or "All scenario checks passed."
+    else:
+        verify_receipt_verdict = "EXEMPT"
+        verify_receipt_reason = "No verification receipt required by policy."
     # 5. Final Gate Verdict
     if ci_verdict == "FAILURE":
         gate_verdict = "BLOCKED"
@@ -898,6 +978,9 @@ def evaluate_pr_gate(
     elif review_invalidated:
         gate_verdict = "BLOCKED"
         verdict_reason = f"Automated review artifact rejected: {invalidation_reason}"
+    elif verify_receipt_blocked:
+        gate_verdict = "BLOCKED"
+        verdict_reason = f"{verify_receipt_reason}"
     elif review_required:
         if approval_verdict == "SELF_APPROVED_ONLY":
             gate_verdict = "BLOCKED"
@@ -958,6 +1041,8 @@ def evaluate_pr_gate(
     if ci_timed_out_checks:
         verdict_reason += f" CI timed out after >=5m queued with 0 failures per AGENTS.md §6 (non-deploy-critical): {', '.join(ci_timed_out_checks)}."
     verdict_reason += " Content freshness: " + json.dumps(content_review, sort_keys=True)
+    if verify_receipt_verdict and verify_receipt_verdict != "EXEMPT":
+        verdict_reason += f" Verification receipt: {verify_receipt_verdict}."
     return PRGateEvaluation(
         pr_number=pr_number,
         repo=repo,
@@ -984,6 +1069,9 @@ def evaluate_pr_gate(
         review_decision=review_decision,
         review_decision_reason=review_decision_reason,
         decision_line=decision_line,
+        verify_receipt_verdict=verify_receipt_verdict,
+        verify_receipt_reason=verify_receipt_reason,
+        verify_receipt=verify_receipt,
     )
 
 
@@ -1041,6 +1129,16 @@ def main():
             "Trusted workflow evidence only; not a cryptographic identity assertion."
         ),
     )
+    parser.add_argument(
+        "--verify-receipt",
+        default=None,
+        help="Path to a verify-receipt/v1 JSON verification receipt",
+    )
+    parser.add_argument(
+        "--require-verify-receipt",
+        action="store_true",
+        help="Require a valid verification receipt; missing or failed receipt blocks gate",
+    )
     parser.add_argument("--json", action="store_true", help="Output evaluation as JSON")
     args = parser.parse_args()
 
@@ -1063,6 +1161,13 @@ def main():
         if args.review_record:
             with open(args.review_record, "r", encoding="utf-8") as review_file:
                 review_artifact = json.load(review_file)
+        verify_receipt_data = None
+        if args.verify_receipt:
+            if not os.path.exists(args.verify_receipt):
+                sys.stderr.write(f"Verification receipt file not found: {args.verify_receipt}\n")
+                sys.exit(2)
+            with open(args.verify_receipt, "r", encoding="utf-8") as vf:
+                verify_receipt_data = json.load(vf)
         eval_result = evaluate_pr_gate(
             pr_data=pr_data,
             repo=repo,
@@ -1070,6 +1175,8 @@ def main():
             review_artifact=review_artifact,
             policy=policy,
             native_required_contexts=fetch_required_contexts(repo, base_ref) if base_ref else None,
+            verify_receipt=verify_receipt_data,
+            require_verify_receipt=args.require_verify_receipt or bool(args.verify_receipt),
         )
     except Exception as e:
         sys.stderr.write(f"PR Gate evaluation failed: {e}\n")
