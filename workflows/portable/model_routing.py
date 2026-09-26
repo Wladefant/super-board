@@ -337,6 +337,10 @@ ROLE_MODEL_PINS: Dict[str, str] = {
     "codex-worker": MODEL_CODEX_ASTRA,
     "codex-reviewer": MODEL_CODEX_ASTRA,
     "ag-opus": MODEL_AG_CLAUDE_OPUS,
+    # The astra-ux role was repointed to google-antigravity/claude-opus-4-6 (ag-opus Opus 4.6 route)
+    # because gpt-6-astra is unsupported on Codex with ChatGPT accounts and Codex is disabled
+    # while CODEX_ENABLED=False (super-board#279).
+    "astra-ux": MODEL_AG_CLAUDE_OPUS,
     # The free Spark allowance has its own enabled roster entry and its own model, so a lane
     # routed onto Spark must be dispatched as `spark`, never as a Codex Astral role.
     "spark": MODEL_CODEX_SPARK,
@@ -352,6 +356,20 @@ ROLE_MODEL_PINS: Dict[str, str] = {
     "web-task": MODEL_CHATGPT_WEB,
     "web-thinker": MODEL_CHATGPT_WEB,
 }
+
+
+def resolve_role_model(role: str) -> Optional[str]:
+    """Resolve an agent role to its authoritative primary model pin.
+
+    Returns the model ID pinned in ROLE_MODEL_PINS for the role.
+    If the role maps to an openai-codex/ model while Codex is disabled
+    (codex_available() is False), returns None to prevent resolving to
+    an unavailable Codex model.
+    """
+    model = ROLE_MODEL_PINS.get(role)
+    if model and model.startswith("openai-codex/") and not codex_available():
+        return None
+    return model
 
 # Weekly subscription windows are paced, not capped (operator 2026-09-25): each must
 # last the whole week AND be spent fully by its reset. Pace headroom is remaining
