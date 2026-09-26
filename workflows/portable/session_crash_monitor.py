@@ -677,6 +677,15 @@ class CrashMonitorStateLedger:
             self._save_locked(data)
             return True
 
+    def is_corrupt(self) -> bool:
+        """Check if the durable state file exists and is corrupt/unparseable."""
+        if not self.state_file.exists():
+            return False
+        lock = FileLock(str(self.lock_path))
+        with lock:
+            data = self._load_locked()
+            return bool(data.get("corrupt"))
+
 
 def format_crash_alert_text(
     session_id: str,
@@ -1715,14 +1724,20 @@ class SessionCrashMonitor:
         if claimed:
             resume = self.auto_resume_death(target, exit_code, observed_reason)
         else:
+            is_corrupt = self.state_ledger.is_corrupt()
+            claim_reason = (
+                "crash monitor state file is corrupt; refusing to claim death or overwrite state"
+                if is_corrupt
+                else (
+                    "another supervisor already claimed this death; "
+                    "resuming exactly once means not resuming again"
+                )
+            )
             resume = {
                 "enabled": bool(self.auto_resume),
                 "attempted": False,
                 "launched": False,
-                "reason": (
-                    "another supervisor already claimed this death; "
-                    "resuming exactly once means not resuming again"
-                ),
+                "reason": claim_reason,
                 "pane_id": self.target_pane_id,
                 "command": build_resume_command(self.resume_argv),
                 "live_owner_pid": None,

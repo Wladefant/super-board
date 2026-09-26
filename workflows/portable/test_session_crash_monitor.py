@@ -1132,11 +1132,17 @@ class TestCrashMonitorStateLedger(unittest.TestCase):
     def test_corrupt_state_file_fails_closed(self):
         self.state_file.write_text("NOT_VALID_JSON{{{", encoding="utf-8")
         ledger = CrashMonitorStateLedger(self.state_file)
+        self.assertTrue(ledger.is_corrupt())
         # Must return False rather than overwriting the corrupt file or crashing
         self.assertFalse(
             ledger.claim_termination("s1", 1000, "2026-09-01T00:00:00Z", {"pid": 111})
         )
         # Content remains untouched
         self.assertEqual(self.state_file.read_text(encoding="utf-8"), "NOT_VALID_JSON{{{")
+
+    def test_valid_state_file_is_not_corrupt(self):
+        self.state_file.write_text("{}", encoding="utf-8")
+        ledger = CrashMonitorStateLedger(self.state_file)
+        self.assertFalse(ledger.is_corrupt())
 if __name__ == "__main__":
     unittest.main()
