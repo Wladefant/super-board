@@ -72,8 +72,12 @@ MODEL_GEMINI_PRO = "google-antigravity/gemini-3.1-pro"
 # 2026-09-25). In worker ladders Fable is the very last rung, and only on slack behind
 # pace (ANTHROPIC_WORKER_MIN_HEADROOM), never on the orchestrator's reserve.
 MODEL_CLAUDE_FABLE = "anthropic/claude-fable-5-1"
-# Opus 5.5 reviewer tier (profile reviewer pin) for super-hard work.
-MODEL_ANTHROPIC_OPUS = "anthropic/claude-opus-5-5:high"
+# Paid direct Anthropic Opus 5.5: reserved strictly for super-hard work (money, billing,
+# ledger, migration first-pass reviews, cross-cutting architectural changes, or when ag-opus
+# quota is exhausted; operator ruling 2026-09-26 ~13:25Z: "I mean only hard, super hard work, right?
+# Don't move everything in there"). Never used for routine implementation, sync, merge, triage or small reviews.
+MODEL_CLAUDE_OPUS_55 = "anthropic/claude-opus-5-5:high"
+MODEL_ANTHROPIC_OPUS = MODEL_CLAUDE_OPUS_55
 
 MODEL_CODEX_FAST = "openai-codex/gpt-5.3-codex"
 # The operator's Codex worker/review tier is Sol high (profile `codex-worker` and
@@ -383,6 +387,7 @@ VERIFIED_CONTEXT_WINDOWS: Dict[str, int] = {
     MODEL_AG_GPT_OSS: 131072,
     MODEL_DEEPSEEK_FLASH: 1048576,
     MODEL_DEEPSEEK_PRO: 1000000,
+    MODEL_CLAUDE_OPUS_55: 1000000,
     MODEL_ZAI_GLM: 131072,
     MODEL_ZAI_GLM_FLASH: 131072,
     MODEL_MINIMAX_M3: 1000000,
@@ -980,6 +985,7 @@ class ResetAwareModelSelector:
         allow_codex_promotion: bool = True,
         rework_count: int = 0,
         domain_tags: Optional[List[str]] = None,
+        diff_lines: Optional[int] = None,
     ) -> RoutingRecommendation:
         """
         Determines the optimal model based on capability, context tokens, risk, and quota metrics.
@@ -1109,12 +1115,30 @@ class ResetAwareModelSelector:
             "chatgpt_web_bridge_up": chatgpt_web_up,
         }
 
-        # 5. Rework-aware routing: force a strong first pass for critical domains or after rework.
+        # 5. Rework-aware routing: force a strong first pass for critical domains, large diffs (>250 lines) or after rework.
         HIGH_RISK_DOMAINS = {"state_machine", "auth", "money", "concurrency", "migration", "schema", "invariants"}
         is_rework_critical = (
             risk_level == RiskLevel.HIGH
             or rework_count >= 1
             or (domain_tags is not None and any(t in HIGH_RISK_DOMAINS for t in domain_tags))
+            or (diff_lines is not None and diff_lines > 250)
+        )
+        is_first_pass = (rework_count <= 0)
+        has_arch_tag = bool(domain_tags and any(t.lower() in {"architecture", "architectural", "cross-cutting"} for t in domain_tags))
+        has_money_or_migration = bool(domain_tags and any(
+            t.lower() in {"money", "billing", "wallet", "ledger", "payment", "stripe", "migration", "migrations", "alembic"}
+            for t in domain_tags
+        ))
+        is_super_hard_review = (
+            task_type == TaskType.STRONG_REVIEW
+            and (
+                has_arch_tag
+                or (has_money_or_migration and is_first_pass)
+            )
+        )
+        is_ag_opus_exhausted = (
+            self.provider_exhaustion_reason(MODEL_AG_CLAUDE_OPUS) is not None
+            or (ag_anthropic_meta["status"] == "ok" and not ag_claude_ok)
         )
         evidence_packet_required = risk_level in (RiskLevel.MEDIUM, RiskLevel.HIGH) or task_type == TaskType.STRONG_REVIEW
 
@@ -1145,6 +1169,13 @@ class ResetAwareModelSelector:
             MODEL_AG_CLAUDE_OPUS, ag_claude_ok,
             f"Antigravity Claude Opus 4.6 (free daily window, expires before any weekly window). {ag_claude_note}.",
             pace_group=PACE_GROUP_STRONG,
+        )
+        opus_55_available = anthropic_meta["is_available"] and (self.provider_exhaustion_reason(MODEL_CLAUDE_OPUS_55) is None)
+        opus_55 = _Rung(
+            MODEL_CLAUDE_OPUS_55, opus_55_available,
+            "Claude Opus 5.5 (anthropic/claude-opus-5-5:high): reserved strictly for super-hard work "
+            "(money/billing/ledger/migration first-pass reviews, cross-cutting architectural changes, or ag-opus exhaustion; "
+            'operator ruling 2026-09-26 ~13:25Z: "I mean only hard, super hard work, right? Don\'t move everything in there").',
         )
         glm = _Rung(MODEL_ZAI_GLM, zai_ok, "Z.AI GLM-5.3 (credentialed Coding Plan).")
         deepseek_pro = _Rung(MODEL_DEEPSEEK_PRO, deepseek_ok, "DeepSeek V4 Pro (pay-per-token, 1M context).")
@@ -1239,34 +1270,70 @@ class ResetAwareModelSelector:
                                else [MODEL_OR_DEEPSEEK_FLASH])
 
         elif task_type == TaskType.STRONG_REVIEW and is_rework_critical:
-            # CASE B1: HIGH-RISK REVIEW, gated first by ChatGPT web while its bridge is up
-            # (cross-family to both writer families), then an expiring Codex surplus — a
-            # promoted rung leads the strong group, because that weekly allowance is lost at
-            # reset — then the free Antigravity Opus daily window, then the cross-family
-            # Chinese reviewers, whose go-review chain walks GLM-5.3, Qwen3.8 Max and
-            # GLM-5.3-Flash. Paid Anthropic follows: Fable on slack, and the orchestrator
-            # reserve only once Codex on pace is out. Pay-per-token DeepSeek V4 Pro is the
-            # emergency tail. A high-risk review must not stop at a cheap tier, and no Gemini
-            # rung exists here, because Gemini never reviews a Gemini-authored diff.
-            label = "High-risk review"
-            rungs = [
-                chatgpt_web,
-                codex_promo,
-                ag_opus,
-                go_glm53,
-                _Rung(MODEL_CLAUDE_FABLE, anthropic_worker_ok,
-                      f"Claude Fable: the Anthropic weekly window runs {anthropic_headroom:.2f}x behind pace, "
-                      "so slack beyond the orchestrator's share is spent on review."),
-                astra_on_pace,
-                _Rung(MODEL_CLAUDE_FABLE, anthropic_meta["is_available"],
-                      "no review allowance left elsewhere; drawing on the Anthropic orchestrator reserve.",
-                      cooldown=True, as_fallback=False),
-                astra_emergency,
-                _Rung(MODEL_DEEPSEEK_PRO, deepseek_ok, "all strong reviewers unavailable; emergency DeepSeek V4 Pro.", cooldown=True),
-            ]
-            last_resort = _Rung(MODEL_DEEPSEEK_PRO, True, "all strong models unavailable or in cooldown; pay-per-token DeepSeek V4 Pro.", cooldown=True)
-            final_fallbacks = [MODEL_CODEX_ASTRA, MODEL_DEEPSEEK_PRO]
-
+            # CASE B1: HIGH-RISK REVIEW.
+            # Operator ruling (2026-09-26 ~13:25Z): "I mean only hard, super hard work, right?
+            # Don't move everything in there". Opus 5.5 (the `reviewer` lane, anthropic/claude-opus-5-5:high)
+            # is reserved strictly for super-hard work: money, billing, ledger, migration first-pass reviews,
+            # cross-cutting architectural changes, or when ag-opus quota is exhausted.
+            # Routine gating reviews default to ag-opus (Opus 4.6 on free Antigravity daily window).
+            if is_super_hard_review:
+                label = "Super-hard review (Opus 5.5)"
+                rungs = [
+                    opus_55,
+                    ag_opus,
+                    chatgpt_web,
+                    codex_promo,
+                    go_glm53,
+                    _Rung(MODEL_CLAUDE_FABLE, anthropic_worker_ok,
+                          f"Claude Fable: the Anthropic weekly window runs {anthropic_headroom:.2f}x behind pace, "
+                          "so slack beyond the orchestrator's share is spent on review."),
+                    astra_on_pace,
+                    _Rung(MODEL_CLAUDE_FABLE, anthropic_meta["is_available"],
+                          "no review allowance left elsewhere; drawing on the Anthropic orchestrator reserve.",
+                          cooldown=True, as_fallback=False),
+                    astra_emergency,
+                    _Rung(MODEL_DEEPSEEK_PRO, deepseek_ok, "all strong reviewers unavailable; emergency DeepSeek V4 Pro.", cooldown=True),
+                ]
+                last_resort = _Rung(MODEL_DEEPSEEK_PRO, True, "all strong models unavailable or in cooldown; pay-per-token DeepSeek V4 Pro.", cooldown=True)
+                final_fallbacks = [MODEL_CLAUDE_OPUS_55, MODEL_AG_CLAUDE_OPUS, MODEL_CODEX_ASTRA, MODEL_DEEPSEEK_PRO]
+            elif is_ag_opus_exhausted:
+                # ag-opus exhaustion fallback for routine review: escalates to reviewer (Opus 5.5) on slack,
+                # then astra_on_pace, then drawing on the orchestrator reserve (never Flash).
+                label = "High-risk review (ag-opus exhausted fallback)"
+                rungs = [
+                    chatgpt_web,
+                    codex_promo,
+                    _Rung(MODEL_CLAUDE_OPUS_55, opus_55_available and anthropic_worker_ok,
+                          "Claude Opus 5.5: ag-opus exhausted; drawing on Anthropic slack for high-risk review."),
+                    go_glm53,
+                    astra_on_pace,
+                    _Rung(MODEL_CLAUDE_FABLE, anthropic_meta["is_available"],
+                          "no review allowance left elsewhere; drawing on the Anthropic orchestrator reserve.",
+                          cooldown=True, as_fallback=False),
+                    astra_emergency,
+                    _Rung(MODEL_DEEPSEEK_PRO, deepseek_ok, "all strong reviewers unavailable; emergency DeepSeek V4 Pro.", cooldown=True),
+                ]
+                last_resort = _Rung(MODEL_DEEPSEEK_PRO, True, "all strong models unavailable or in cooldown; pay-per-token DeepSeek V4 Pro.", cooldown=True)
+                final_fallbacks = [MODEL_CLAUDE_OPUS_55, MODEL_CODEX_ASTRA, MODEL_DEEPSEEK_PRO]
+            else:
+                label = "High-risk review"
+                rungs = [
+                    chatgpt_web,
+                    codex_promo,
+                    ag_opus,
+                    go_glm53,
+                    _Rung(MODEL_CLAUDE_FABLE, anthropic_worker_ok,
+                          f"Claude Fable: the Anthropic weekly window runs {anthropic_headroom:.2f}x behind pace, "
+                          "so slack beyond the orchestrator's share is spent on review."),
+                    astra_on_pace,
+                    _Rung(MODEL_CLAUDE_FABLE, anthropic_meta["is_available"],
+                          "no review allowance left elsewhere; drawing on the Anthropic orchestrator reserve.",
+                          cooldown=True, as_fallback=False),
+                    astra_emergency,
+                    _Rung(MODEL_DEEPSEEK_PRO, deepseek_ok, "all strong reviewers unavailable; emergency DeepSeek V4 Pro.", cooldown=True),
+                ]
+                last_resort = _Rung(MODEL_DEEPSEEK_PRO, True, "all strong models unavailable or in cooldown; pay-per-token DeepSeek V4 Pro.", cooldown=True)
+                final_fallbacks = [MODEL_CODEX_ASTRA, MODEL_DEEPSEEK_PRO]
         elif is_rework_critical and task_type in (TaskType.ROUTINE_EXECUTION, TaskType.DEEP_REASONING):
             # CASE B2: HIGH-RISK WORKER (implementation first pass, deep reasoning): the Go
             # workhorse first, then ChatGPT web while its bridge is up — a hard
