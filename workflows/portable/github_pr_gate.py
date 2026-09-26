@@ -278,6 +278,11 @@ DEPLOY_CRITICAL_CHECKS: List[str] = [
     "build-and-boot *",
     "backend build*",
     "docker build*",
+    "No new workaround or band-aid comments*",
+    "Anti-pattern structural linting (ast-grep)*",
+    "No new fabricated render values*",
+    "workaround-comments*",
+    "ast-grep*",
 ]
 
 
@@ -303,6 +308,100 @@ def is_lockfile_or_generated(path: str) -> bool:
     if "/generated/" in norm or norm.startswith("generated/"):
         return True
     return False
+
+DEPENDENCY_FIELDS: Tuple[str, ...] = (
+    "dependencies",
+    "devDependencies",
+    "peerDependencies",
+    "optionalDependencies",
+    "bundledDependencies",
+    "bundleDependencies",
+    "overrides",
+    "resolutions",
+)
+
+
+def validate_local_tests_record(
+    record: Dict[str, Any],
+    head_sha: str,
+) -> Tuple[bool, str]:
+    """Validate a local tests record against the evaluated PR head commit."""
+    if not isinstance(record, dict):
+        return False, "local tests record must be a JSON object"
+    rec_sha = str(record.get("head_sha") or "")
+    if not rec_sha or rec_sha.lower() != head_sha.lower():
+        return False, f"head_sha mismatch: record has {rec_sha[:8]}, evaluated head is {head_sha[:8]}"
+    failed = record.get("failed")
+    if not isinstance(failed, int) or failed != 0:
+        return False, f"local tests record has failures: failed={failed}"
+    passed = record.get("passed")
+    if not isinstance(passed, int) or passed < 0:
+        return False, f"local tests record invalid passed count: {passed}"
+    if not isinstance(record.get("commands"), list):
+        return False, "local tests record commands must be a list"
+    return True, "valid local tests record"
+
+
+def package_json_dependencies_changed(
+    f: Any,
+    base_commit: Optional[str] = None,
+    head_sha: Optional[str] = None,
+) -> bool:
+    """Check whether a package.json change modified dependency fields."""
+    if isinstance(f, dict):
+        if "dependency_fields_changed" in f:
+            return bool(f["dependency_fields_changed"])
+        if "patch" in f and isinstance(f["patch"], str):
+            patch_text = f["patch"]
+            dep_pattern = re.compile(r'["\']?(' + "|".join(DEPENDENCY_FIELDS) + r')["\']?\s*:')
+            for line in patch_text.splitlines():
+                if line.startswith(("+", "-")) and not line.startswith(("+++", "---")):
+                    if dep_pattern.search(line):
+                        return True
+            return False
+    path = f.get("path") if isinstance(f, dict) else str(f)
+    if base_commit and head_sha and path:
+        try:
+            b_out = subprocess.run(["git", "show", f"{base_commit}:{path}"], capture_output=True, text=True, check=True).stdout
+            h_out = subprocess.run(["git", "show", f"{head_sha}:{path}"], capture_output=True, text=True, check=True).stdout
+            b_json = json.loads(b_out)
+            h_json = json.loads(h_out)
+            for k in DEPENDENCY_FIELDS:
+                if b_json.get(k) != h_json.get(k):
+                    return True
+            return False
+        except Exception:
+            pass
+    return True
+
+
+def is_build_and_boot_critical_diff(
+    pr_data: Dict[str, Any],
+    base_commit: Optional[str] = None,
+    head_sha: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """Check if diff touches Dockerfile*, requirements*.txt, lockfiles, or package.json deps."""
+    files = pr_data.get("files") or []
+    for f in files:
+        path = f.get("path") if isinstance(f, dict) else str(f)
+        norm = path.replace("\\", "/").lower()
+        filename = norm.rsplit("/", 1)[-1]
+        if fnmatch.fnmatch(filename, "dockerfile*"):
+            return True, f"Dockerfile changed ({path})"
+        if fnmatch.fnmatch(filename, "requirements*.txt"):
+            return True, f"requirements file changed ({path})"
+        if (
+            fnmatch.fnmatch(filename, "*lock*.json")
+            or filename in ("yarn.lock", "pnpm-lock.yaml")
+            or filename.endswith(".lock")
+            or filename.endswith(".lockb")
+            or filename in LOCKFILE_NAMES
+        ):
+            return True, f"lockfile changed ({path})"
+        if filename == "package.json":
+            if package_json_dependencies_changed(f, base_commit=base_commit, head_sha=head_sha):
+                return True, f"package.json dependencies changed ({path})"
+    return False, ""
 
 
 def evaluate_review_requirement(pr_data: Dict[str, Any]) -> Tuple[bool, str]:
@@ -676,6 +775,8 @@ class PRGateEvaluation:
     qa_receipt_verdict: Optional[str] = None
     qa_receipt_reason: Optional[str] = None
     qa_receipt_url: Optional[str] = None
+    released_checks: List[str] = field(default_factory=list)
+    local_tests_record: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -683,12 +784,13 @@ class PRGateEvaluation:
     def to_compact_markdown(self) -> str:
         failing_str = ", ".join(self.failing_checks) if self.failing_checks else "None"
         pending_str = ", ".join(self.pending_checks) if self.pending_checks else "None"
+        released_str = f", Released: {', '.join(self.released_checks)} (local tests recorded)" if self.released_checks else ""
         decision_line = self.decision_line or f"review: {self.review_decision} ({self.review_decision_reason})"
         return (
             f"### Deterministic PR Gate Evaluation: PR #{self.pr_number} ({self.gate_verdict})\n"
             f"- **Head SHA:** `{self.head_sha[:8]}` (Base: `{self.base_sha[:8]}`)\n"
             f"- **State:** `{self.state}` (Draft: `{self.is_draft}`)\n"
-            f"- **CI Status:** `{self.ci_verdict}` (Failing: {failing_str}, Pending: {pending_str})\n"
+            f"- **CI Status:** `{self.ci_verdict}` (Failing: {failing_str}, Pending: {pending_str}{released_str})\n"
             f"- **Review:** `{decision_line}`\n"
             f"- **Approval:** `{self.approval_verdict}` (By: `{self.approved_by or 'None'}`, "
             f"GitHub approval required: `{self.github_approval_required}`)\n"
@@ -776,6 +878,7 @@ def evaluate_pr_gate(
     native_required_contexts: Optional[List[str]] = None,
     verify_receipt: Optional[Dict[str, Any]] = None,
     require_verify_receipt: Optional[bool] = None,
+    local_tests_record: Optional[Dict[str, Any]] = None,
 ) -> PRGateEvaluation:
     """
     Deterministically evaluates GitHub PR status gate without LLM churn.
@@ -988,6 +1091,29 @@ def evaluate_pr_gate(
             timed = [c for c in pending_checks if not _is_deploy_critical(c)]
             ci_timed_out_checks = timed
             pending_checks = [c for c in pending_checks if _is_deploy_critical(c)]
+
+    released_critical_checks: List[str] = []
+    is_valid_ltr = False
+    ltr_reason = ""
+    if local_tests_record is not None:
+        is_valid_ltr, ltr_reason = validate_local_tests_record(local_tests_record, head_sha)
+
+    if is_valid_ltr and not failing_checks:
+        bb_critical, bb_reason = is_build_and_boot_critical_diff(
+            pr_data, base_commit=base_sha, head_sha=head_sha
+        )
+        new_pending_checks: List[str] = []
+        for c_name in pending_checks:
+            is_crit = _is_deploy_critical(c_name)
+            is_bb = fnmatch.fnmatch(c_name, "build-and-boot*")
+            if is_crit:
+                if is_bb and bb_critical:
+                    new_pending_checks.append(c_name)
+                else:
+                    released_critical_checks.append(c_name)
+            else:
+                ci_timed_out_checks.append(c_name)
+        pending_checks = new_pending_checks
 
     if failing_checks:
         ci_verdict = "FAILURE"
@@ -1260,6 +1386,8 @@ def evaluate_pr_gate(
         verdict_reason += f" Verification receipt: {verify_receipt_verdict}."
     if qa_receipt_verdict and qa_receipt_verdict != "EXEMPT":
         verdict_reason += f" Browser QA receipt: {qa_receipt_verdict}."
+    if released_critical_checks:
+        verdict_reason += f" Deploy-critical checks released: local tests recorded ({', '.join(released_critical_checks)})."
     return PRGateEvaluation(
         pr_number=pr_number,
         repo=repo,
@@ -1292,6 +1420,8 @@ def evaluate_pr_gate(
         qa_receipt_verdict=qa_receipt_verdict,
         qa_receipt_reason=qa_receipt_reason,
         qa_receipt_url=qa_receipt_url,
+        released_checks=released_critical_checks,
+        local_tests_record=local_tests_record if is_valid_ltr else None,
     )
 
 
@@ -1359,6 +1489,11 @@ def main():
         action="store_true",
         help="Require a valid verification receipt; missing or failed receipt blocks gate",
     )
+    parser.add_argument(
+        "--local-tests-record",
+        default=None,
+        help="Path to a JSON file with local test results {head_sha, commands, passed, failed}",
+    )
     parser.add_argument("--json", action="store_true", help="Output evaluation as JSON")
     args = parser.parse_args()
 
@@ -1388,6 +1523,13 @@ def main():
                 sys.exit(2)
             with open(args.verify_receipt, "r", encoding="utf-8") as vf:
                 verify_receipt_data = json.load(vf)
+        local_tests_record_data = None
+        if args.local_tests_record:
+            if not os.path.exists(args.local_tests_record):
+                sys.stderr.write(f"Local tests record file not found: {args.local_tests_record}\n")
+                sys.exit(2)
+            with open(args.local_tests_record, "r", encoding="utf-8") as ltr_f:
+                local_tests_record_data = json.load(ltr_f)
         eval_result = evaluate_pr_gate(
             pr_data=pr_data,
             repo=repo,
@@ -1397,6 +1539,7 @@ def main():
             native_required_contexts=fetch_required_contexts(repo, base_ref) if base_ref else None,
             verify_receipt=verify_receipt_data,
             require_verify_receipt=args.require_verify_receipt or bool(args.verify_receipt),
+            local_tests_record=local_tests_record_data,
         )
     except Exception as e:
         sys.stderr.write(f"PR Gate evaluation failed: {e}\n")
