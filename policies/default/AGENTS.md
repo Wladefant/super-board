@@ -111,7 +111,7 @@ Every deliverable links its own GitHub issue and Superboard card (criteria, exac
 - **Supabase PATs are never read-only** (2026-09-20): a PAT carries full owner privileges; the staging PAT (`~/.veyyon/shared-auth/supabase_staging_management_pat.txt`) sees only `hgzyqmaanndcimnclxtv`; the production-capable PAT was purged and is forbidden; production read needs a Read-only org member's PAT verified by a 403 on a harmless PATCH (skill `supabase-readonly-production-access`).
 - **Write Lessons Down (2026-09-20):** record durable lessons in the same turn via `learn`/`retain`, managed skills, or policy PRs. Transcript-only learning is lost.
 - **Encode, Don't Memorize (Meta-Rule) (2026-09-26):** every operator behavioural decision is implemented in policy, skill, or code in the same cycle. Memory is only a cache. Never leave an operator decision as memory-only context.
-- **Main Crash Auto-Restart with Resume (2026-09-26):** when Main dies unexpectedly, an out-of-process supervisor (`session_crash_monitor.py`) relaunches it with `--resume <session_id>` on the same session, exactly once (verifying with `Get-CimInstance Win32_Process` that no active owner is already running), and a resumed Main re-dispatches interrupted lanes from history (owned by CrashAutoRestart).
+- **Main Crash Auto-Restart with Resume (2026-09-26):** when Main dies unexpectedly, an out-of-process supervisor (`session_crash_monitor.py`) relaunches it with `--resume <session_id>` on the same session, exactly once (verifying with `Get-CimInstance Win32_Process` that no active owner is already running), and a resumed Main re-dispatches interrupted lanes from history (owned by SupervisorBuildDs).
 
 ## 12. Quick Invocation Reference & Operational Tooling
 
