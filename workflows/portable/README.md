@@ -19,6 +19,7 @@ python ledger.py list
 python continuation_driver.py --help
 python worker_backend.py --list-backends
 python gardener.py --dry-run
+python outer_loop_intake.py --help
 python verify.py --help
 ```
 
@@ -31,3 +32,4 @@ Preserve `ledger.json`, `decisions.json`, `continuation_journal.json`, `worker_r
 The maintained source-bound ledger regression command is `python test_ledger_gates.py`; the repository CI lists the remaining portable contract suites. The older workstation `smoke_test.py` was preserved as an existing local file, not used as current acceptance evidence. Its historical transition fixtures do not satisfy the hardened evidence gates.
 The Gardener dead code and unused export regression command is `python test_gardener.py`.
 The Verification CLI and smoke test gate regression command is `python test_verify.py`.
+The Outer-Loop webhook intake regression command is `python test_outer_loop_intake.py`.

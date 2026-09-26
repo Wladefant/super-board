@@ -26,6 +26,9 @@ RUNTIME_FILES = (
     "quota_snapshot.py", "test_quota_snapshot.py",
     # Lane quality telemetry: session mining and model comparison.
     "lane_quality.py", "test_lane_quality.py",
+    # Feature map navigation and build slot arbiters.
+    "feature_map.py", "feature_map.schema.json", "test_feature_map.py",
+    "build_slot.py", "test_build_slot.py",
     # Verification CLI and smoke test gate.
     "verify.py", "test_verify.py",
 )
