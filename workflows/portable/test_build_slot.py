@@ -292,6 +292,27 @@ class TestBuildSlot(unittest.TestCase):
         )
         self.assertEqual(p_acq.returncode, 0)
 
+        # 3b. Re-acquire via CLI by same lane name and PID should print "already held" and return 0 (idempotent)
+        p_reacq = subprocess.run(
+            [
+                sys.executable,
+                script,
+                "--run-dir",
+                self.run_dir,
+                "acquire",
+                "cli-lane",
+                "--pid",
+                my_pid,
+                "--timeout",
+                "5",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(p_reacq.returncode, 0)
+        self.assertIn("already held", p_reacq.stdout)
+
         # 4. Status should show locked
         p_stat2 = subprocess.run(
             [sys.executable, script, "--run-dir", self.run_dir, "status"],
@@ -343,6 +364,7 @@ class TestBuildSlot(unittest.TestCase):
             "p_rel = subprocess.run([sys.executable, script, '--run-dir', run_dir, 'release', name])\n"
             "sys.exit(p_rel.returncode)\n"
         )
+        manager = BuildSlotManager(run_dir=self.run_dir)
         procs = []
         for i in range(1, 4):
             w_name = f"subproc-{i}"
@@ -351,7 +373,13 @@ class TestBuildSlot(unittest.TestCase):
                 env=env,
             )
             procs.append(p)
-            time.sleep(0.04)
+            # Wait until w_name has enqueued or acquired before launching next to guarantee arrival ordering
+            for _ in range(50):
+                q = manager._read_queue()
+                info = manager._read_lock_info()
+                if (info and info.get("owner") == w_name) or any(x.get("name") == w_name for x in q):
+                    break
+                time.sleep(0.02)
 
         for p in procs:
             ret = p.wait()
@@ -555,9 +583,25 @@ class TestBuildSlot(unittest.TestCase):
         self.assertTrue(manager.release(same_name))
         self.assertFalse(manager.is_held_by(same_name))
 
+    def test_tokenless_reentrant_acquire(self):
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        my_pid = os.getpid()
+
+        # 1. Token-less acquire (like CLI)
+        self.assertTrue(manager.acquire("my-lane", pid=my_pid, timeout=1.0))
+
+        # 2. Second token-less acquire with same name & PID must succeed immediately ("already held")
+        self.assertTrue(manager.acquire("my-lane", pid=my_pid, timeout=1.0))
+
+        # 3. Explicit DIFFERENT token under same name & PID must NOT succeed as re-entrant
+        res_diff_token = manager.acquire("my-lane", pid=my_pid, token="different-token", timeout=0.05, poll_interval=0.02)
+        self.assertFalse(res_diff_token)
+
+        self.assertTrue(manager.release("my-lane"))
+
     def test_poll_interval_validation(self):
         manager = BuildSlotManager(run_dir=self.run_dir, queue_stale_heartbeat_after=10.0)
-        # poll_interval >= queue_stale_heartbeat_after must raise ValueError
+        # Library: poll_interval >= queue_stale_heartbeat_after must raise ValueError
         with self.assertRaises(ValueError) as ctx:
             manager.acquire("test-lane", poll_interval=10.0)
         self.assertIn("must be less than queue_stale_heartbeat_after", str(ctx.exception))
@@ -565,6 +609,16 @@ class TestBuildSlot(unittest.TestCase):
         with self.assertRaises(ValueError) as ctx2:
             manager.acquire("test-lane", poll_interval=15.0)
         self.assertIn("must be less than queue_stale_heartbeat_after", str(ctx2.exception))
+
+        # CLI: --poll-interval >= DEFAULT_QUEUE_STALE_HEARTBEAT_SECONDS should exit with 2 (parser.error)
+        script = os.path.abspath(build_slot.__file__)
+        p = subprocess.run(
+            [sys.executable, script, "--run-dir", self.run_dir, "acquire", "test-lane", "--poll-interval", "65.0"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("must be less than queue_stale_heartbeat_after", p.stderr)
 
     def test_scaled_heartbeat_lapse_re_enqueue_and_fifo_preserved(self):
         scaled_threshold = 1.0  # 1.0s stands in for 60s
@@ -574,77 +628,92 @@ class TestBuildSlot(unittest.TestCase):
             queue_stale_heartbeat_after=scaled_threshold,
         )
 
-        # Blocker holds the lock
+        # 1. Blocker holds the lock
         self.assertTrue(manager.acquire("blocker", timeout=1.0, poll_interval=0.05))
 
         token_a = "tok-waiter-a"
         token_b = "tok-waiter-b"
-        now = time.time()
 
-        # Seed Waiter A in queue with a heartbeat that is already older than the scaled threshold (1.2s ago)
-        # This simulates a waiter that stalled or experienced a long sleep
-        seeded_queue = [
-            {
-                "name": "waiter-a",
-                "pid": 2001,
-                "token": token_a,
-                "enqueued_at": now - 2.0,
-                "enqueued_at_iso": datetime.datetime.fromtimestamp(now - 2.0, datetime.timezone.utc).isoformat(),
-                "heartbeat_at": now - 1.2,
-                "heartbeat_at_iso": datetime.datetime.fromtimestamp(now - 1.2, datetime.timezone.utc).isoformat(),
-            }
-        ]
-        manager._write_queue(seeded_queue)
-
-        # Because heartbeat runs BEFORE clean_queue in acquire(), polling waiter-a updates its
-        # heartbeat first, preventing waiter-a from being pruned by its own loop!
-        # Test this by running a short acquire for waiter-a
-        res_a = manager.acquire("waiter-a", pid=2001, token=token_a, timeout=0.08, poll_interval=0.02, heartbeat_interval=0.01)
-        self.assertFalse(res_a)  # blocker still holds lock
-
-        # Confirm waiter-a's entry was NOT pruned: it was kept and its heartbeat updated!
-        q = manager._read_queue()
-        # waiter-a is dequeued on exit of acquire by try/finally
-        # Now test the case where waiter-a was pruned by an external process while sleeping:
-        manager.enqueue("waiter-a", pid=2001, token=token_a)
-        # External process prunes the queue:
-        manager._write_queue([])
-        self.assertEqual(manager._read_queue(), [])
-
-        # Waiter A wakes up: heartbeat() returns False because entry is missing.
-        # acquire() detects False and immediately re-enqueues waiter-a with token_a!
-        # Enqueue waiter-b after waiter-a to verify FIFO ordering is preserved
-        import threading
         events = []
+        import threading
 
         def waiter_a_thread():
-            # Waiter A tries to acquire with timeout=1.5s
-            # Its entry was missing, so acquire will re-enqueue it with token_a
-            ok = manager.acquire("waiter-a", pid=2001, token=token_a, timeout=1.5, poll_interval=0.02, heartbeat_interval=0.02)
+            # Waiter A starts acquire loop while blocker holds lock
+            # heartbeat_interval is small (0.04s) so heartbeat fires quickly
+            ok = manager.acquire(
+                "waiter-a",
+                pid=2001,
+                token=token_a,
+                timeout=3.0,
+                poll_interval=0.02,
+                heartbeat_interval=0.04,
+                queue_stale_heartbeat_after=scaled_threshold,
+            )
             if ok:
                 events.append("waiter-a")
                 manager.release("waiter-a")
 
         def waiter_b_thread():
-            # Waiter B arrives shortly after Waiter A has re-enqueued
-            time.sleep(0.06)
-            ok = manager.acquire("waiter-b", pid=2002, token=token_b, timeout=1.5, poll_interval=0.02, heartbeat_interval=0.02)
+            ok = manager.acquire(
+                "waiter-b",
+                pid=2002,
+                token=token_b,
+                timeout=3.0,
+                poll_interval=0.02,
+                heartbeat_interval=0.04,
+                queue_stale_heartbeat_after=scaled_threshold,
+            )
             if ok:
                 events.append("waiter-b")
                 manager.release("waiter-b")
 
         t_a = threading.Thread(target=waiter_a_thread)
-        t_b = threading.Thread(target=waiter_b_thread)
-
         t_a.start()
+
+        # Wait until Waiter A has enqueued and is actively looping in acquire()
+        for _ in range(50):
+            q = manager._read_queue()
+            if any(x.get("token") == token_a for x in q):
+                break
+            time.sleep(0.01)
+        self.assertTrue(any(x.get("token") == token_a for x in manager._read_queue()), "Waiter A must have enqueued")
+
+        # Now simulate an external prune or lapse while Waiter A's acquire() is ALREADY LOOPING:
+        # Wipe the queue directly while waiter-a is waiting
+        manager._write_queue([])
+        self.assertEqual(manager._read_queue(), [])
+
+        # Waiter A is still looping in acquire(). On its next heartbeat iteration,
+        # self.heartbeat(token=token_a) will return False because the entry was wiped.
+        # acquire() MUST catch False and call self.enqueue(name, pid, token=token_a)!
+        # Wait up to 1.0s for Waiter A's token to REAPPEAR in the queue:
+        reappeared = False
+        for _ in range(50):
+            time.sleep(0.02)
+            q = manager._read_queue()
+            if any(x.get("token") == token_a for x in q):
+                reappeared = True
+                break
+
+        # CRITICAL ASSERTION (defends against mutation that deletes self.enqueue on False heartbeat):
+        self.assertTrue(reappeared, "Waiter A must re-enqueue its token when heartbeat() returns False while looping")
+
+        # Now start Waiter B in second thread
+        t_b = threading.Thread(target=waiter_b_thread)
         t_b.start()
 
-        # Let waiter A re-enqueue and waiter B enqueue behind it
-        time.sleep(0.12)
-        q_order = [x["name"] for x in manager.clean_queue()]
-        self.assertEqual(q_order, ["waiter-a", "waiter-b"], "Waiter A must be ahead of later arrival Waiter B")
+        # Wait until Waiter B is in queue
+        for _ in range(50):
+            q = manager._read_queue()
+            if any(x.get("token") == token_b for x in q):
+                break
+            time.sleep(0.01)
 
-        # Now blocker releases lock
+        # Confirm queue ordering: Waiter A is ahead of Waiter B
+        tokens_in_queue = [x.get("token") for x in manager.clean_queue(stale_heartbeat_after=scaled_threshold)]
+        self.assertEqual(tokens_in_queue, [token_a, token_b], "Waiter A must remain ahead of later arrival Waiter B")
+
+        # Release blocker lock
         self.assertTrue(manager.release("blocker"))
 
         t_a.join()
@@ -652,5 +721,7 @@ class TestBuildSlot(unittest.TestCase):
 
         # Both acquired and released; Waiter A acquired FIRST!
         self.assertEqual(events, ["waiter-a", "waiter-b"], "Waiter A must acquire before later arrival Waiter B")
+
+
 if __name__ == "__main__":
     unittest.main()
