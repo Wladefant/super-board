@@ -1214,6 +1214,9 @@ def build_stage_prompt(req: Any, schema: Dict[str, Any]) -> str:
         "'## 1. Blocked on me / Needs from you' (blockers, missing permissions, decisions), "
         "'## 2. Changed' (exact files/URLs modified or created), and "
         "'## 3. Found / Evidence' (test verification, reproduction proof, unconfirmed items).",
+        "- Feature map navigation (operator 2026-09-26, #244): Before broad repository searching "
+        "or guessing file locations, consult FEATURE_MAP.json (or run `python workflows/portable/feature_map.py query <term>`) "
+        "to resolve entry files, tests, owning issues, and risk levels.",
         "",
         "# DYNAMIC WORK ITEM PARAMETERS",
         f"Request id: {request_id}",

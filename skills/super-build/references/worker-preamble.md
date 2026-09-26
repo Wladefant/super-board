@@ -20,6 +20,10 @@ judgment calls; they do not make the work impossible. Record which ones
 resolved in your session output, then follow the degraded path in §1. What
 *does* halt is a hard human gate (§3) or an unsatisfiable build gate
 ("Failure mode" below).
+### Feature map navigation (operator 2026-09-26, #244)
+
+Before broad repository searching, grep/find sweeps, or guessing file locations, consult `FEATURE_MAP.json` (or execute `python workflows/portable/feature_map.py query <term>`). It maps features directly to entrypoint files, test suites, owning issues, and risk tiers.
+
 
 ## Decision policy (mandatory)
 

@@ -193,5 +193,19 @@ jobs:
       - name: github pr gate
         run: python -B workflows/portable/test_github_pr_gate.py
 
+      - name: verification cli and gate
+        run: python -B workflows/portable/test_verify.py
+
       - name: telegram notifier
         run: python -B workflows/portable/test_telegram_notifier.py
+
+      - name: feature map validator
+        run: python -B workflows/portable/test_feature_map.py
+
+      - name: feature map live validation
+        run: python -B workflows/portable/feature_map.py validate
+
+      - name: build slot arbiter
+        run: python -B workflows/portable/test_build_slot.py
+      - name: outer loop intake
+        run: python -B workflows/portable/test_outer_loop_intake.py

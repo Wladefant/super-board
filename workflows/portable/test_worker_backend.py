@@ -872,6 +872,7 @@ class TestCheckExpectationContract(_Fixture):
         self.assertIn("Repeat-failure limit", prompt)
         self.assertIn("Mandatory failure write-down", prompt)
         self.assertIn("Standard 3-heading handoff protocol", prompt)
+        self.assertIn("Feature map navigation", prompt)
 
     def test_static_prompt_prefix_precedes_dynamic_fields(self):
         """Static prompt prefix must precede variable fields to maximize prompt caching."""
