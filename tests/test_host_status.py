@@ -159,7 +159,7 @@ class TestFormatJson:
 
 
 class TestPortability:
-    def test_default_drive_windows(self, monkeypatch: Any = None) -> None:
+    def test_default_drive_windows(self) -> None:
         orig = platform.system
         try:
             platform.system = lambda: "Windows"  # type: ignore[assignment]
@@ -168,7 +168,7 @@ class TestPortability:
         finally:
             platform.system = orig  # type: ignore[assignment]
 
-    def test_default_drive_posix(self, monkeypatch: Any = None) -> None:
+    def test_default_drive_posix(self) -> None:
         orig = platform.system
         try:
             platform.system = lambda: "Linux"  # type: ignore[assignment]
@@ -329,6 +329,15 @@ class TestMainHermetic:
             except SystemExit as exc:
                 assert exc.code == 2
 
+    def test_main_nonexistent_drive_exits(self) -> None:
+        err_buf = io.StringIO()
+        with redirect_stderr(err_buf):
+            try:
+                host_status.main(["--drive", "NONEXISTENT_DRIVE_XZY:/bogus/path"])
+                assert False, "Should have exited with SystemExit"
+            except SystemExit as exc:
+                assert exc.code == 2
+        assert "host_status.py: error:" in err_buf.getvalue()
 
 def _run() -> int:
     """Standalone runner for CI environments without pytest."""

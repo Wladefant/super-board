@@ -171,7 +171,8 @@ def get_disk(drive: str | None = None) -> dict[str, Any]:
 
 # Thresholds:
 # RAM thresholds match the profile AGENTS.md policy (95% no_spawn, 90% wait, 85% reap).
-# Disk thresholds are local defaults / operator directive (20 GB no_spawn, 30 GB reap).
+# Disk thresholds are local defaults picked from the 2026-09-26 measurement (~36 GB free on C:)
+# and can be tuned as host storage changes; they are not set by standing policy.
 RAM_NO_SPAWN_PCT = 95
 RAM_WAIT_PCT = 90
 RAM_REAP_PCT = 85
@@ -272,7 +273,11 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv if argv is not None else sys.argv[1:])
 
     ram = get_ram()
-    disk = get_disk(args.drive)
+    try:
+        disk = get_disk(args.drive)
+    except OSError as exc:
+        print(f"host_status.py: error: {exc}", file=sys.stderr)
+        sys.exit(2)
     state, reasons = classify(ram["percent"], disk["free_gb"])
 
     if args.use_json:
