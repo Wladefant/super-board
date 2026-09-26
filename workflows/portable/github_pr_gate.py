@@ -813,9 +813,13 @@ def evaluate_pr_gate(
                 and str(review.get("state") or "").upper() == "APPROVED"
             )
         ]
+        staging_waiver = (
+            (repo == "Bavariance/polysimulator" and base_ref == "staging")
+            or (not policy.require_github_approval and policy.require_head_bound_review_evidence)
+        )
         content_review = evaluate_content(
             eligible_reviews, head_sha, pr_author, base="origin/" + base_ref,
-            staging=repo == "Bavariance/polysimulator" and base_ref == "staging",
+            staging=staging_waiver,
         )
     except (ValueError, subprocess.CalledProcessError) as exc:
         content_review = {"passed": False, "reason": str(exc)}
