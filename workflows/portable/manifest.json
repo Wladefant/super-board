@@ -185,7 +185,7 @@
     "session_crash_monitor.py": {
       "role": "Independent external supervisor for target Veyyon session instances. Binds sessionUUID + verified PID + creation time to detect unexpected terminations, distinguish planned restarts via marker suppression, handle PID reuse, deduplicate per owner termination, and deliver alerts through verified Telegram outbound routing without running an inbound poller.",
       "owner": "CrashTelegramMonitor",
-      "cli_command": "python session_crash_monitor.py [--session-id <uuid>] [--pid <pid>] [--state-file <path>] [--marker-path <path>] [--poll-interval <sec>] [--dry-run] [--test-telegram] [--status]",
+      "cli_command": "python session_crash_monitor.py [--session-id <uuid>] [--pid <pid>] [--state-file <path>] [--marker-path <path>] [--poll-interval <sec>] [--max-cycles <int>] [--auto-resume] [--herdr-bin <path>] [--no-herdr] [--registry-dir <path>] [--log-dir <path>] [--manifest-dir <path>] [--test-resume-relaunch] [--test-disposable-crash] [--test-telegram] [--status] [--dry-run]",
       "inputs": [
         "Operating system process probe (PID, creation time, exit code, command line)",
         "Planned restart marker JSON (session directory or workflows directory)",
@@ -198,7 +198,7 @@
       ],
       "boundaries": [
         "Strictly outbound supervisor: zero inbound poller or receiver ownership",
-        "No automatic restart of Main process",
+        "Single bounded auto-resume relaunch per session crash via herdr pane integration when --auto-resume is enabled; zero duplicate Main instances",
         "Distinguishes alive process (quiet/slow model/paused goal) from termination"
       ]
     },
