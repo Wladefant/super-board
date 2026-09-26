@@ -96,6 +96,26 @@ def best_ok_report(reports: List["SubscriptionReport"]) -> Optional["Subscriptio
     ok = [r for r in reports if r.status == "ok"]
     return max(ok, key=report_headroom_key) if ok else None
 
+def extract_account_name(
+    metadata: Optional[Dict[str, Any]],
+    account_id_redacted: str = "",
+    limits: Optional[List[Any]] = None,
+) -> str:
+    """Extract human-readable account identifier from report metadata or redacted id."""
+    meta = metadata or {}
+    email = str(meta.get("email") or "")
+    if email and "@" in email and "*" not in email:
+        return email.split("@")[0]
+    acct = meta.get("accountId")
+    if acct:
+        return str(acct)
+    if account_id_redacted:
+        return account_id_redacted
+    proj = meta.get("projectId")
+    if proj:
+        return str(proj)
+    return "default"
+
 
 def ms_to_iso_utc(timestamp_ms: Optional[int]) -> str:
     """Convert millisecond epoch timestamp to ISO 8601 UTC string."""
@@ -178,6 +198,7 @@ class NormalizedWindow:
     status: str
     is_cooldown: bool
     remaining_units: Optional[float] = None
+    account: str = "default"
     total_limit: Optional[float] = None
 
 
@@ -304,6 +325,7 @@ class SanitizedUsageSnapshot:
                     unit=w.amount.unit,
                     status=w.status,
                     is_cooldown=w.is_cooldown,
+                    account=extract_account_name(report.metadata, report.account_id_redacted, limits=report.limits),
                 )
                 for report in reports
                 for w in report.limits
@@ -612,6 +634,7 @@ def parse_usage_json(
                     bottleneck_window=bottleneck,
                     primary_window=primary_win,
                     reset_credits=rep.get("resetCredits"),
+                    metadata=meta,
                 )
             )
 
