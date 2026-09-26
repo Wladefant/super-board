@@ -195,3 +195,12 @@ jobs:
 
       - name: telegram notifier
         run: python -B workflows/portable/test_telegram_notifier.py
+
+      - name: feature map validator
+        run: python -B workflows/portable/test_feature_map.py
+
+      - name: feature map live validation
+        run: python -B workflows/portable/feature_map.py validate
+
+      - name: build slot arbiter
+        run: python -B workflows/portable/test_build_slot.py
