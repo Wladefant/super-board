@@ -77,8 +77,12 @@ MODEL_CLAUDE_FABLE = "anthropic/claude-fable-5-1"
 # quota is exhausted; operator ruling 2026-09-26 ~13:25Z: "I mean only hard, super hard work, right?
 # Don't move everything in there"). Never used for routine implementation, sync, merge, triage or small reviews.
 MODEL_CLAUDE_OPUS_55 = "anthropic/claude-opus-5-5:high"
+MODEL_ANTHROPIC_OPUS = MODEL_CLAUDE_OPUS_55
 
 MODEL_CODEX_FAST = "openai-codex/gpt-5.3-codex"
+# The operator's Codex worker/review tier is Sol high (profile `codex-worker` and
+# `codex-reviewer` pins). Astra is unsupported on ChatGPT accounts.
+MODEL_CODEX_SOL = "openai-codex/gpt-5.6-sol:high"
 MODEL_CODEX_ASTRA = "openai-codex/gpt-6-astra:medium"
 MODEL_CODEX_SPARK = "openai-codex/gpt-5.3-codex-spark:medium"
 # Manual account-availability switch (2026-09-26, operator ruling):
@@ -207,13 +211,17 @@ CHATGPT_WEB_BRIDGE_TIMEOUT = 0.5
 
 def chatgpt_web_bridge_available(host: str = CHATGPT_WEB_BRIDGE_HOST,
                                  port: int = CHATGPT_WEB_BRIDGE_PORT,
-                                 timeout: float = CHATGPT_WEB_BRIDGE_TIMEOUT) -> bool:
-    """True while the chatgpt-web bridge daemon accepts connections on its loopback port.
+                                 timeout: float = CHATGPT_WEB_BRIDGE_TIMEOUT,
+                                 force_probe: bool = False) -> bool:
+    """True while the chatgpt-web bridge daemon accepts connections AND is explicitly enabled.
 
-    The bridge is a local daemon, not a metered provider, so there is no allowance to read:
-    a listening port is the only honest readiness signal, and a closed one must close the
-    rung rather than dispatch a lane that cannot run.
+    Off by default (2026-09-26 ban): the unofficial ChatGPT Web bridge was banned after
+    high-volume requests triggered OpenAI anti-abuse invalidation and caused complete loss
+    of the ChatGPT Pro subscription. It remains off by default and can only be re-enabled
+    by explicit operator action (setting VEYYON_CHATGPT_WEB_ENABLED=1).
     """
+    if not force_probe and os.environ.get("VEYYON_CHATGPT_WEB_ENABLED", "").lower() not in ("1", "true", "yes"):
+        return False
     try:
         with socket.create_connection((host, port), timeout=timeout):
             return True
@@ -334,8 +342,10 @@ ROLE_MODEL_PINS: Dict[str, str] = {
     "zai-flash": MODEL_ZAI_GLM_FLASH,
     "minimax-task": MODEL_MINIMAX_M3,
     "gemini-pro": MODEL_GEMINI_PRO,
-    "codex-worker": MODEL_CODEX_ASTRA,
-    "codex-reviewer": MODEL_CODEX_ASTRA,
+    "codex-worker": MODEL_CODEX_SOL,
+    "codex-reviewer": MODEL_CODEX_SOL,
+    "thinker": MODEL_CODEX_SOL,
+    "reviewer": MODEL_ANTHROPIC_OPUS,
     "ag-opus": MODEL_AG_CLAUDE_OPUS,
     # The astra-ux role was repointed to google-antigravity/claude-opus-4-6 (ag-opus Opus 4.6 route)
     # because gpt-6-astra is unsupported on Codex with ChatGPT accounts and Codex is disabled
@@ -508,7 +518,11 @@ def model_to_agent_role(model_id: str, task_type: TaskType, risk_level: RiskLeve
             # The free Spark allowance has its own enabled roster entry (`spark`); the
             # codex-worker/codex-reviewer pair is pinned for the Astral tiers and disabled here.
             return "spark"
-        return "codex-reviewer" if task_type == TaskType.STRONG_REVIEW else "codex-worker"
+        if task_type == TaskType.STRONG_REVIEW:
+            return "codex-reviewer"
+        if task_type == TaskType.DEEP_REASONING:
+            return "thinker"
+        return "codex-worker"
     if model_id.endswith(":free"):
         return "extra-review"
     if model_id == MODEL_DEEPSEEK_PRO:
@@ -1313,7 +1327,6 @@ class ResetAwareModelSelector:
             label = f"Deep context ({context_tokens} tokens)"
             rungs = [
                 go_bunny,
-                chatgpt_web,
                 _Rung(MODEL_GEMINI_PRO, google_ok and task_type != TaskType.STRONG_REVIEW,
                       "Gemini 3.1 Pro (1M-token window; never a reviewer, since Gemini must not "
                       "review a Gemini-authored diff)."),
@@ -1358,7 +1371,6 @@ class ResetAwareModelSelector:
                 rungs = [
                     opus_55,
                     ag_opus,
-                    chatgpt_web,
                     codex_promo,
                     go_glm53,
                     _Rung(MODEL_CLAUDE_FABLE, anthropic_worker_ok,
@@ -1378,7 +1390,6 @@ class ResetAwareModelSelector:
                 # then astra_on_pace, then drawing on the orchestrator reserve (never Flash).
                 label = "High-risk review (ag-opus exhausted fallback)"
                 rungs = [
-                    chatgpt_web,
                     codex_promo,
                     _Rung(MODEL_CLAUDE_OPUS_55, opus_55_available and anthropic_worker_ok,
                           "Claude Opus 5.5: ag-opus exhausted; drawing on Anthropic slack for high-risk review."),
@@ -1395,7 +1406,6 @@ class ResetAwareModelSelector:
             else:
                 label = "High-risk review"
                 rungs = [
-                    chatgpt_web,
                     codex_promo,
                     ag_opus,
                     go_glm53,
@@ -1425,7 +1435,6 @@ class ResetAwareModelSelector:
                      else "High-risk deep reasoning")
             rungs = [
                 go_glm53_flash,
-                chatgpt_web,
                 glm,
                 go_glm53,
                 deepseek_pro,
@@ -1450,7 +1459,6 @@ class ResetAwareModelSelector:
             label = "Medium-risk review"
             rungs = [
                 go_glm53,
-                chatgpt_web,
                 codex_promo,
                 astra_on_pace,
                 glm,
@@ -1467,7 +1475,6 @@ class ResetAwareModelSelector:
             rungs = [
                 go_bunny,
                 go_glm53_flash,
-                chatgpt_web,
                 _Rung(MODEL_DEEPSEEK_FLASH, deepseek_ok, "Go and the bridge unavailable; DeepSeek V4.1 Flash.", cooldown=True),
             ]
             last_resort = _Rung(MODEL_OR_DEEPSEEK_FLASH, True, "OpenRouter DeepSeek Flash.", cooldown=True)
@@ -1491,7 +1498,6 @@ class ResetAwareModelSelector:
             else:
                 band = [deepseek_pro, flash_rung]
             rungs = [
-                chatgpt_web,
                 go_glm53,
                 *band,
                 go_glm53_flash,

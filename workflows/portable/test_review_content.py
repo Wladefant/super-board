@@ -88,6 +88,40 @@ class ContentReviews(unittest.TestCase):
         self.sync(True)
         self.assertFalse(self.check([self.review(self.reviewed)])['passed'])
 
+    def test_conflict_resolution_that_leaves_the_hunk_alone_keeps_freshness(self):
+        # #5543: a sync whose conflict was resolved *beside* the PR's own change
+        # kept the same changed lines, so the review still covers the head. Only a
+        # resolution that rewrites the reviewed hunk is a real delta.
+        nine = 'l1\nl2\nl3\nl4\n{}\nl6\nl7\nl8\nl9\n'
+        self.commit('app', nine.format('base'))
+        self.g('branch', '-f', 'staging')
+        self.g('update-ref', 'refs/remotes/origin/staging', self.g('rev-parse', 'HEAD'))
+        self.commit('app', nine.format('pr'))
+        reviewed = self.g('rev-parse', 'HEAD')
+        self.g('checkout', 'staging')
+        self.commit('app', nine.format('base').replace('l4\n', 'l4 staged\n'))
+        self.g('update-ref', 'refs/remotes/origin/staging', self.g('rev-parse', 'HEAD'))
+        self.g('checkout', 'feature')
+        merged = subprocess.run(['git', 'merge', '--no-ff', 'origin/staging', '-m', 'sync'],
+                                cwd=self.cwd, capture_output=True)
+        self.assertNotEqual(merged.returncode, 0, 'the base rewrote the line next to the PR hunk')
+        # Resolution keeps staging's neighbouring line and the PR's own changed line.
+        self.commit('app', nine.format('pr').replace('l4\n', 'l4 staged\n'))
+        head = self.g('rev-parse', 'HEAD')
+        # The neighbouring line moved, so the wide-context identity differs; the
+        # rule's identity does not, and the one review still covers this head.
+        self.assertNotEqual(wide_context_patch_id('origin/staging', reviewed, self.cwd),
+                            wide_context_patch_id('origin/staging', head, self.cwd))
+        self.assertEqual(content_identity(reviewed, cwd=self.cwd), content_identity(head, cwd=self.cwd))
+        self.assertTrue(self.check([self.review(reviewed)])['passed'])
+
+    def test_real_edit_to_a_pr_hunk_changes_the_identity(self):
+        before = content_identity(self.reviewed, cwd=self.cwd)
+        self.commit('app', 'fixed\n')
+        after = content_identity(self.g('rev-parse', 'HEAD'), cwd=self.cwd)
+        self.assertNotEqual(before, after)
+        self.assertFalse(self.check([self.review(self.reviewed)])['passed'])
+
     def test_fix_commit_breaks_freshness(self):
         self.commit('app', 'fixed\n')
         self.assertFalse(self.check([self.review(self.reviewed)])['passed'])
