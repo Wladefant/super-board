@@ -371,6 +371,20 @@ def resolve_role_model(role: str) -> Optional[str]:
         return None
     return model
 
+
+def is_agent_role_available(role: str) -> bool:
+    """Return True if an agent role is currently available to be dispatched.
+
+    Codex agent roles (codex-worker, codex-reviewer, thinker, sol) and any role
+    pinned to an openai-codex/ model are refused when codex_available() is False.
+    """
+    if role in ("codex-worker", "codex-reviewer", "thinker", "sol"):
+        return codex_available()
+    model = ROLE_MODEL_PINS.get(role)
+    if model and model.startswith("openai-codex/") and not codex_available():
+        return False
+    return True
+
 # Weekly subscription windows are paced, not capped (operator 2026-09-25): each must
 # last the whole week AND be spent fully by its reset. Pace headroom is remaining
 # fraction / remaining time fraction (1.0 = linear spend).
