@@ -1,4 +1,5 @@
 import { timingSafeEqual } from "node:crypto";
+import { pathToFileURL } from "node:url";
 import type { ServerWebSocket } from "bun";
 
 export function authorizedRelay(header: string | null, secret: string): boolean {
@@ -10,14 +11,18 @@ export function authorizedRelay(header: string | null, secret: string): boolean 
 
 export const SERVED_FILES: Record<string, string> = { "/": "index.html", "/app.js": "app.js", "/client.js": "client.js", "/style.css": "style.css" };
 
-export function startRelay(secret: string, port = 3000) {
+export function startRelay(secret: string, port = 3000, baseDir: URL | string = import.meta.url) {
   if (secret.length < 43) throw new Error("RELAY_SECRET must contain at least 43 characters");
   let daemon: ServerWebSocket<undefined> | undefined;
   const pending = new Map<string, { finish: (response: Response) => void; timer: Timer }>();
   const buckets = new Map<string, { tokens: number; at: number }>();
   const unavailable = () => Response.json({ error: "Local daemon unavailable" }, { status: 503 });
+  const base = typeof baseDir === "string"
+    ? (baseDir.startsWith("file:") ? baseDir : pathToFileURL(baseDir.endsWith("\\") || baseDir.endsWith("/") ? baseDir : baseDir + "/").href)
+    : baseDir;
   return Bun.serve<undefined>({
     port,
+    development: false,
     maxRequestBodySize: 16384,
     async fetch(request, server) {
       const url = new URL(request.url);
@@ -33,7 +38,7 @@ export function startRelay(secret: string, port = 3000) {
         const launch = new URLSearchParams(initData);
         const shaped = url.pathname === "/api/session"
           ? request.method === "POST" && initData.length <= 16384 && /^[a-f0-9]{64}$/.test(launch.get("hash") ?? "") && /^\d+$/.test(launch.get("auth_date") ?? "") && Boolean(launch.get("user"))
-          : /^\d+\.\d+\.[a-f0-9]{64}$/.test(appSession);
+          : /^\d+\.\d+\.[a-f0-9]{32}\.[a-f0-9]{64}$/.test(appSession);
         if (!shaped) return Response.json({ error: "Open this app from Telegram again to authenticate." }, { status: 401 });
         // Traefik appends the actual peer to X-Forwarded-For; never trust its first entry.
         const ip = request.headers.get("x-forwarded-for")?.split(",").at(-1)?.trim() || server.requestIP(request)?.address || "unknown";
@@ -45,6 +50,7 @@ export function startRelay(secret: string, port = 3000) {
           const oldest = buckets.keys().next().value;
           if (oldest) buckets.delete(oldest);
         }
+        buckets.delete(ip);
         buckets.set(ip, bucket);
         if (bucket.tokens < 1) return Response.json({ error: "Too many requests; retry shortly." }, { status: 429 });
         bucket.tokens--;
@@ -60,7 +66,7 @@ export function startRelay(secret: string, port = 3000) {
       }
       const file = SERVED_FILES[url.pathname];
       if (!file) return new Response("Not found", { status: 404 });
-      const asset = Bun.file(new URL(file, import.meta.url));
+      const asset = Bun.file(new URL(file, base));
       if (!(await asset.exists())) return new Response("Not found", { status: 404 });
       return new Response(asset, { headers: { "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "Content-Security-Policy": "default-src 'none'; script-src 'self' https://telegram.org; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'" } });
     },

@@ -69,15 +69,20 @@ export function createClient(getInitData, transport = fetch) {
     let response = await send(path, body);
 
     if (response.status === 401 && path !== '/api/session') {
-      // 401 on protected endpoint: drop cached session token,
-      // re-run /api/session with fresh Telegram.WebApp.initData,
-      // retry the original request once.
+      // Clear before decoding: even a proxy-generated 401 invalidates this session.
       appSession = '';
-      await obtainSession();
-      response = await send(path, body);
-      if (response.status === 401) {
-        appSession = '';
+      // Never replay mutations: the caller must explicitly retry after authentication.
+      if (!body) {
+        await obtainSession();
+        response = await send(path, body);
+        if (response.status === 401) {
+          appSession = '';
+        }
       }
+    }
+
+    if (path === '/api/logout' && response.ok) {
+      appSession = '';
     }
 
     let data;
