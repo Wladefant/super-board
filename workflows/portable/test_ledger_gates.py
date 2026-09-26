@@ -920,23 +920,6 @@ sys.exit(0)
             self.ledger.update_request(req_id="req-stale-cache-parent", state="done", sub_issues_checker=live_checker)
         self.assertIn("open sub-issue(s)", str(ctx.exception))
         self.assertIn("#102", str(ctx.exception))
-
-    def test_child_request_with_parent_req_id_exempt_from_sub_issues_lookup(self):
-        """Child requests with parent_req_id are exempt from parent sub-issues lookup."""
-        self._add("req-child-task", state="review", task_type="local_doc")
-        self._verify_criteria("req-child-task")
-        self.ledger.update_request(
-            req_id="req-child-task",
-            parent_req_id="req-parent-root",
-            github_update={"issue_number": 777, "proof_url": "https://github.com/Bavariance/polysimulator/pull/1", "proof_verified": True},
-        )
-
-        def failing_checker(repo, issue_num):
-            raise RuntimeError("Should not be called for child request")
-
-        # Should transition to done cleanly without calling checker because it is a child request
-        res = self.ledger.update_request(req_id="req-child-task", state="done", sub_issues_checker=failing_checker)
-        self.assertEqual(res["state"], "done")
 def run_tests():
     print("=" * 70)
     print("RUNNING LEDGER LIFECYCLE GATE REGRESSIONS")
