@@ -38,6 +38,7 @@ from project_adapter import (
     check_text_for_forbidden_patterns,
     create_generic_config,
     create_polysimulator_config,
+    fetch_github_sub_issues,
     get_current_project_config,
     update_project_lifecycle,
     validate_dokploy_compose_id,
@@ -588,6 +589,82 @@ class TestProjectAdapterLifecycle(unittest.TestCase):
         )
         self.assertTrue(outcome_ok.ok)
         self.assertEqual(outcome_ok.github_writes, 1)
+
+    def test_17_fetch_github_sub_issues_contracts_and_timeout(self):
+        """Verify fetch_github_sub_issues handles timeout, errors, and input validation."""
+        from unittest.mock import patch, MagicMock
+        import subprocess
+
+        # 1. Invalid input raises ValueError
+        with self.assertRaises(ValueError):
+            fetch_github_sub_issues("", 4543)
+        with self.assertRaises(ValueError):
+            fetch_github_sub_issues("owner/repo", 0)
+        with self.assertRaises(ValueError):
+            fetch_github_sub_issues("owner/repo", -5)
+
+        # 2. Timeout raises RuntimeError and passes timeout parameter
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(cmd="gh", timeout=5)):
+            with self.assertRaises(RuntimeError) as ctx:
+                fetch_github_sub_issues("owner/repo", 4543, timeout_sec=5)
+            self.assertIn("timed out after 5s", str(ctx.exception))
+
+        # 3. Non-zero exit code raises RuntimeError
+        mock_proc_fail = MagicMock()
+        mock_proc_fail.returncode = 1
+        mock_proc_fail.stderr = "gh: command failed (HTTP 403)"
+        mock_proc_fail.stdout = ""
+        with patch("subprocess.run", return_value=mock_proc_fail):
+            with self.assertRaises(RuntimeError) as ctx:
+                fetch_github_sub_issues("owner/repo", 4543)
+            self.assertIn("failed with exit 1", str(ctx.exception))
+            self.assertIn("403", str(ctx.exception))
+
+        # 4. Success parsing NDJSON
+        mock_proc_ok = MagicMock()
+        mock_proc_ok.returncode = 0
+        mock_proc_ok.stdout = '{"number": 10, "title": "Sub 10", "state": "open"}\n{"number": 20, "title": "Sub 20", "state": "closed"}'
+        with patch("subprocess.run", return_value=mock_proc_ok):
+            subs = fetch_github_sub_issues("owner/repo", 4543)
+            self.assertEqual(len(subs), 2)
+            self.assertEqual(subs[0]["number"], 10)
+            self.assertEqual(subs[0]["state"], "open")
+            self.assertEqual(subs[1]["number"], 20)
+            self.assertEqual(subs[1]["state"], "closed")
+
+    def test_18_parent_close_guard_fails_closed_on_lookup_error(self):
+        """Verify parent close guard fails closed when sub-issues lookup fails."""
+        cfg = create_polysimulator_config()
+        head = "a" * 40
+        verified_closure = {
+            "state": "done",
+            "head": head,
+            "acceptance_criteria": [{
+                "id": "AC-1",
+                "status": "verified",
+                "evidence": "observed pass",
+                "verified_head": head,
+            }],
+            "github": {
+                "proof_verified": True,
+                "proof_url": "https://github.com/Bavariance/polysimulator/issues/4543",
+            },
+        }
+
+        def failing_checker(repo, issue_num):
+            raise RuntimeError("API rate limit exceeded")
+
+        updater = SuperboardProjectUpdater(cfg, sub_issues_checker=failing_checker)
+        outcome = updater.update_lifecycle(
+            "req-4543",
+            "Done",
+            head_sha=head,
+            ledger_record=verified_closure,
+        )
+        self.assertFalse(outcome.ok)
+        self.assertIn("Inviolable parent-close guard fails closed", outcome.blocked_reason or "")
+        self.assertIn("Failed to verify sub-issues", outcome.blocked_reason or "")
+        self.assertEqual(outcome.github_writes, 0)
 def main():
     print("=" * 70)
     print("RUNNING PORTABLE PROJECT ADAPTER & SUPERBOARD UPDATER TEST SUITE")

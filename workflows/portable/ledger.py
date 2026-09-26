@@ -217,27 +217,72 @@ def fetch_github_sub_issues(
     timeout_sec: int = 10,
 ) -> List[Dict[str, Any]]:
     """Fetch native sub-issues for an issue via GitHub CLI / REST API.
-    Returns empty list if no sub-issues exist or on query failure."""
+    Fails closed: raises RuntimeError on query failure or invalid response.
+    Returns empty list only when issue has zero sub-issues."""
     if not repo or not issue_number or issue_number <= 0:
-        return []
+        raise ValueError(f"Invalid repository '{repo}' or issue number '{issue_number}'")
+    cmd_args = ["api", "--paginate", "-q", ".[]", f"repos/{repo}/issues/{issue_number}/sub_issues?per_page=100"]
     if runner is not None:
-        rc, stdout, _ = runner(["api", f"repos/{repo}/issues/{issue_number}/sub_issues"])
-        if rc != 0 or not stdout.strip():
-            return []
+        rc, stdout, stderr = runner(cmd_args)
+        if rc != 0:
+            err_msg = stderr.strip() if stderr else stdout.strip()
+            raise RuntimeError(f"gh api sub_issues failed with exit {rc}: {err_msg}")
+        output = stdout
+    else:
         try:
-            data = json.loads(stdout)
-            return data if isinstance(data, list) else []
-        except json.JSONDecodeError:
-            return []
-    try:
-        cmd = ["gh", "api", f"repos/{repo}/issues/{issue_number}/sub_issues"]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec)
-        if res.returncode != 0 or not res.stdout.strip():
-            return []
-        data = json.loads(res.stdout)
-        return data if isinstance(data, list) else []
-    except Exception:
+            res = subprocess.run(["gh"] + cmd_args, capture_output=True, text=True, timeout=timeout_sec)
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"gh api sub_issues timed out after {timeout_sec}s for {repo}#{issue_number}") from e
+        except Exception as e:
+            raise RuntimeError(f"gh api sub_issues invocation failed for {repo}#{issue_number}: {e}") from e
+        if res.returncode != 0:
+            err_msg = res.stderr.strip() or res.stdout.strip()
+            raise RuntimeError(f"gh api sub_issues failed with exit {res.returncode}: {err_msg}")
+        output = res.stdout
+
+    trimmed = output.strip()
+    if not trimmed:
         return []
+
+    results: List[Dict[str, Any]] = []
+    if trimmed.startswith("["):
+        try:
+            import re
+            matches = re.findall(r"\[.*?\](?=\s*\[|\s*$)", trimmed, flags=re.DOTALL)
+            if matches:
+                for m in matches:
+                    arr = json.loads(m)
+                    if isinstance(arr, list):
+                        results.extend(arr)
+            else:
+                data = json.loads(trimmed)
+                if isinstance(data, list):
+                    results.extend(data)
+                elif isinstance(data, dict):
+                    results.append(data)
+        except Exception as e:
+            raise RuntimeError(f"Failed to parse sub-issues JSON for {repo}#{issue_number}: {e}") from e
+    else:
+        for line in trimmed.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    results.append(obj)
+            except Exception as e:
+                raise RuntimeError(f"Failed to parse sub-issues NDJSON for {repo}#{issue_number}: {e}") from e
+
+    return [
+        {
+            "number": item.get("number"),
+            "title": item.get("title", ""),
+            "state": item.get("state", "open"),
+        }
+        for item in results
+        if isinstance(item, dict) and item.get("number")
+    ]
 
 
 def check_parent_sub_issues_guard(
@@ -247,11 +292,14 @@ def check_parent_sub_issues_guard(
     runner: Optional[Callable[[List[str]], Tuple[int, str, str]]] = None,
 ) -> List[Dict[str, Any]]:
     """Return list of open sub-issues for a parent issue.
-    Returns empty list if there are no open sub-issues."""
+    Returns empty list if there are no open sub-issues.
+    Fails closed: raises RuntimeError/ValueError on fetch failure."""
     if checker is not None:
         subs = checker(repo, issue_number)
     else:
         subs = fetch_github_sub_issues(repo, issue_number, runner=runner)
+    if not isinstance(subs, list):
+        raise ValueError(f"Sub-issues check for {repo}#{issue_number} returned invalid type: {type(subs)}")
     open_subs = [s for s in subs if str(s.get("state", "")).lower() == "open"]
     return open_subs
 
@@ -1255,12 +1303,14 @@ class RequestLedger:
                     gh_repo = gh_info.get("repo") or DEFAULT_REPO
                     if issue_num:
                         effective_checker = sub_issues_checker or self.sub_issues_checker
-                        cached_subs = req.get("github_cache", {}).get("snapshot", {}).get("sub_issues")
-                        if cached_subs and effective_checker is None:
-                            open_subs = [s for s in cached_subs if str(s.get("state", "")).lower() == "open"]
-                        else:
+                        # Inviolable Parent-Close Guard: Live lookup required; do not trust stale cached snapshot
+                        try:
                             open_subs = check_parent_sub_issues_guard(
                                 gh_repo, int(issue_num), checker=effective_checker
+                            )
+                        except Exception as e:
+                            raise ValueError(
+                                f"Cannot transition '{req_id}' to 'done': Failed to verify parent sub-issues for #{issue_num} ({e}). Guard fails closed."
                             )
                         if open_subs:
                             sub_desc = [f"#{s['number']}: {s.get('title', '')} ({s.get('state', 'open')})" for s in open_subs]

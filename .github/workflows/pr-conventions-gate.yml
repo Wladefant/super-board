@@ -15,6 +15,7 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  issues: read
 
 concurrency:
   group: pr-conventions-${{ github.event.pull_request.number || github.ref }}
@@ -34,3 +35,4 @@ jobs:
         env:
           GITHUB_EVENT_PATH: ${{ github.event_path }}
           GITHUB_ACTIONS: 'true'
+          GH_TOKEN: ${{ github.token }}

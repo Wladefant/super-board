@@ -35,6 +35,8 @@ from ledger import (
     VERIFICATION_COMPLETE_STATES,
     FileLock,
     RequestLedger,
+    check_parent_sub_issues_guard,
+    fetch_github_sub_issues,
     validate_github_url,
 )
 
@@ -837,6 +839,87 @@ sys.exit(0)
 
         res = self.ledger.update_request(req_id="req-parent", state="done", sub_issues_checker=checker_closed)
         self.assertEqual(res["state"], "done")
+
+    def test_fetch_github_sub_issues_contracts_and_fail_closed(self):
+        """fetch_github_sub_issues must fail closed (raise RuntimeError/ValueError) on query failures."""
+        # 1. Invalid input raises ValueError
+        with self.assertRaises(ValueError):
+            fetch_github_sub_issues("", 50)
+        with self.assertRaises(ValueError):
+            fetch_github_sub_issues("owner/repo", 0)
+        with self.assertRaises(ValueError):
+            fetch_github_sub_issues("owner/repo", -1)
+
+        # 2. Non-zero exit code fails closed (RuntimeError)
+        mock_fail_runner = lambda args: (1, "", "gh: authentication required (401)")
+        with self.assertRaises(RuntimeError) as ctx:
+            fetch_github_sub_issues("owner/repo", 50, runner=mock_fail_runner)
+        self.assertIn("401", str(ctx.exception))
+
+        # 3. Malformed JSON response fails closed (RuntimeError)
+        mock_bad_json_runner = lambda args: (0, "{not valid json", "")
+        with self.assertRaises(RuntimeError) as ctx:
+            fetch_github_sub_issues("owner/repo", 50, runner=mock_bad_json_runner)
+        self.assertIn("Failed to parse", str(ctx.exception))
+
+        # 4. Empty response returns [] (zero sub-issues)
+        mock_empty_runner = lambda args: (0, "", "")
+        subs = fetch_github_sub_issues("owner/repo", 50, runner=mock_empty_runner)
+        self.assertEqual(subs, [])
+
+        # 5. Paginated NDJSON response parses multiple sub-issues correctly
+        ndjson_output = '{"number": 101, "title": "Sub 1", "state": "open"}\n{"number": 102, "title": "Sub 2", "state": "closed"}'
+        mock_ndjson_runner = lambda args: (0, ndjson_output, "")
+        subs = fetch_github_sub_issues("owner/repo", 50, runner=mock_ndjson_runner)
+        self.assertEqual(len(subs), 2)
+        self.assertEqual(subs[0]["number"], 101)
+        self.assertEqual(subs[0]["state"], "open")
+        self.assertEqual(subs[1]["number"], 102)
+        self.assertEqual(subs[1]["state"], "closed")
+
+    def test_parent_close_guard_fails_closed_on_fetch_error(self):
+        """Parent request close refuses when sub-issues query fails (fail-closed)."""
+        self._add("req-fail-closed-parent", state="review", task_type="local_doc")
+        self._verify_criteria("req-fail-closed-parent")
+        self.ledger.update_request(
+            req_id="req-fail-closed-parent",
+            github_update={"issue_number": 99, "proof_url": "https://github.com/Bavariance/polysimulator/pull/1", "proof_verified": True},
+        )
+
+        def failing_checker(repo, issue_num):
+            raise RuntimeError("GitHub API network timeout")
+
+        with self.assertRaises(ValueError) as ctx:
+            self.ledger.update_request(req_id="req-fail-closed-parent", state="done", sub_issues_checker=failing_checker)
+        self.assertIn("Guard fails closed", str(ctx.exception))
+        self.assertIn("Failed to verify parent sub-issues", str(ctx.exception))
+
+    def test_parent_close_guard_does_not_trust_stale_cached_snapshot(self):
+        """Parent request close does not trust stale cached snapshot when live lookup detects open sub-issues."""
+        self._add("req-stale-cache-parent", state="review", task_type="local_doc")
+        self._verify_criteria("req-stale-cache-parent")
+        # Stale cache claiming sub-issues are all closed
+        stale_cache = {
+            "snapshot": {
+                "sub_issues": [{"number": 101, "title": "Closed in snapshot", "state": "closed"}],
+            }
+        }
+        self.ledger.update_request(
+            req_id="req-stale-cache-parent",
+            github_update={"issue_number": 88, "proof_url": "https://github.com/Bavariance/polysimulator/pull/1", "proof_verified": True},
+        )
+        # Inject github_cache into ledger record
+        with FileLock(self.ledger.lock_path):
+            data = self.ledger._load_data_unlocked()
+            data["requests"]["req-stale-cache-parent"]["github_cache"] = stale_cache
+            self.ledger._save_data_unlocked(data)
+        # Live checker reveals a newly opened sub-issue 102
+        live_checker = lambda repo, issue_num: [{"number": 102, "title": "New live open sub-issue", "state": "open"}]
+
+        with self.assertRaises(ValueError) as ctx:
+            self.ledger.update_request(req_id="req-stale-cache-parent", state="done", sub_issues_checker=live_checker)
+        self.assertIn("open sub-issue(s)", str(ctx.exception))
+        self.assertIn("#102", str(ctx.exception))
 def run_tests():
     print("=" * 70)
     print("RUNNING LEDGER LIFECYCLE GATE REGRESSIONS")

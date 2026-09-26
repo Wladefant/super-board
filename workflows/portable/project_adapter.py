@@ -31,29 +31,69 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 
-def fetch_github_sub_issues(repo: str, issue_number: int) -> List[Dict[str, Any]]:
+def fetch_github_sub_issues(repo: str, issue_number: int, timeout_sec: int = 10) -> List[Dict[str, Any]]:
     """
     Fetch sub-issues for a parent issue using GitHub REST API.
+    Fails closed: raises RuntimeError on subprocess error, timeout, or parse failure.
     Returns list of dicts: [{"number": int, "title": str, "state": str}].
     """
+    if not repo or not issue_number or issue_number <= 0:
+        raise ValueError(f"Invalid repository '{repo}' or issue number '{issue_number}'")
+    cmd = ["gh", "api", "--paginate", "-q", ".[]", f"repos/{repo}/issues/{issue_number}/sub_issues?per_page=100"]
     try:
-        cmd = ["gh", "api", f"repos/{repo}/issues/{issue_number}/sub_issues"]
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if proc.returncode == 0 and proc.stdout:
-            data = json.loads(proc.stdout)
-            if isinstance(data, list):
-                return [
-                    {
-                        "number": item.get("number"),
-                        "title": item.get("title", ""),
-                        "state": item.get("state", "open"),
-                    }
-                    for item in data
-                    if isinstance(item, dict) and item.get("number")
-                ]
-    except Exception:
-        pass
-    return []
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=timeout_sec)
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"gh api sub_issues timed out after {timeout_sec}s for {repo}#{issue_number}") from e
+    except Exception as e:
+        raise RuntimeError(f"gh api sub_issues invocation failed for {repo}#{issue_number}: {e}") from e
+
+    if proc.returncode != 0:
+        err_msg = proc.stderr.strip() if proc.stderr else proc.stdout.strip()
+        raise RuntimeError(f"gh api sub_issues failed with exit {proc.returncode}: {err_msg}")
+
+    trimmed = proc.stdout.strip()
+    if not trimmed:
+        return []
+
+    results: List[Dict[str, Any]] = []
+    if trimmed.startswith("["):
+        try:
+            import re
+            matches = re.findall(r"\[.*?\](?=\s*\[|\s*$)", trimmed, flags=re.DOTALL)
+            if matches:
+                for m in matches:
+                    arr = json.loads(m)
+                    if isinstance(arr, list):
+                        results.extend(arr)
+            else:
+                data = json.loads(trimmed)
+                if isinstance(data, list):
+                    results.extend(data)
+                elif isinstance(data, dict):
+                    results.append(data)
+        except Exception as e:
+            raise RuntimeError(f"Failed to parse sub-issues JSON for {repo}#{issue_number}: {e}") from e
+    else:
+        for line in trimmed.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    results.append(obj)
+            except Exception as e:
+                raise RuntimeError(f"Failed to parse sub-issues NDJSON for {repo}#{issue_number}: {e}") from e
+
+    return [
+        {
+            "number": item.get("number"),
+            "title": item.get("title", ""),
+            "state": item.get("state", "open"),
+        }
+        for item in results
+        if isinstance(item, dict) and item.get("number")
+    ]
 
 # ---------------------------------------------------------------------------
 # Data Models
@@ -938,13 +978,25 @@ class SuperboardProjectUpdater:
             # 4b. Inviolable Parent-Close Gate: Refuse to transition parent issues to Done if they have open sub-issues
             effective_checker = sub_issues_checker or self.sub_issues_checker
             open_subs: List[Dict[str, Any]] = []
-            if effective_checker is not None:
-                subs = effective_checker(f"{owner}/{repo_name}", target_issue)
+            try:
+                if effective_checker is not None:
+                    subs = effective_checker(f"{owner}/{repo_name}", target_issue)
+                else:
+                    subs = fetch_github_sub_issues(f"{owner}/{repo_name}", target_issue)
+                if not isinstance(subs, list):
+                    raise ValueError(f"Sub-issues check returned invalid type: {type(subs)}")
                 open_subs = [s for s in subs if str(s.get("state", "")).lower() == "open"]
-            else:
-                subs = fetch_github_sub_issues(f"{owner}/{repo_name}", target_issue)
-                open_subs = [s for s in subs if str(s.get("state", "")).lower() == "open"]
-
+            except Exception as e:
+                return SuperboardLifecycleOutcome(
+                    ok=False,
+                    blocked_reason=(
+                        f"Cannot transition parent issue #{target_issue} to 'Done': "
+                        f"Failed to verify sub-issues ({e}). Inviolable parent-close guard fails closed."
+                    ),
+                    board_url=board_url,
+                    dry_run=dry_run,
+                    github_writes=0,
+                )
             if open_subs:
                 sub_desc = [f"#{s['number']}: {s.get('title', '')} ({s.get('state', 'open')})" for s in open_subs]
                 return SuperboardLifecycleOutcome(

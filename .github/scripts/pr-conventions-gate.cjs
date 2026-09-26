@@ -15,20 +15,43 @@ const fs = require('fs');
 const { execSync } = require('child_process');
 
 function fetchSubIssues(repo, issueNumber) {
-  try {
-    const stdout = execSync(`gh api repos/${repo}/issues/${issueNumber}/sub_issues`, {
-      encoding: 'utf8',
-      stdio: ['pipe', 'pipe', 'pipe'],
-      timeout: 10000,
-    });
-    const parsed = JSON.parse(stdout);
-    if (Array.isArray(parsed)) {
-      return parsed.filter(item => item && item.number);
-    }
-  } catch (e) {
-    // If gh api fails (e.g. no sub-issues, endpoint not available, or network error)
+  if (!repo || !issueNumber || issueNumber <= 0) {
+    throw new Error(`Invalid repo (${repo}) or issue number (${issueNumber})`);
   }
-  return [];
+  try {
+    const stdout = execSync(
+      `gh api --paginate -q '.[]' "repos/${repo}/issues/${issueNumber}/sub_issues?per_page=100"`,
+      {
+        encoding: 'utf8',
+        stdio: ['pipe', 'pipe', 'pipe'],
+        timeout: 10000,
+      }
+    );
+    const trimmed = (stdout || '').trim();
+    if (!trimmed) {
+      return [];
+    }
+    if (trimmed.startsWith('[')) {
+      const results = [];
+      const matches = trimmed.match(/\[.*?\](?=\s*\[|\s*$)/gs);
+      if (matches) {
+        for (const m of matches) {
+          const arr = JSON.parse(m);
+          if (Array.isArray(arr)) results.push(...arr);
+        }
+      } else {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) results.push(...parsed);
+      }
+      return results.filter(item => item && item.number);
+    }
+    const lines = trimmed.split('\n').map(l => l.trim()).filter(Boolean);
+    const results = lines.map(l => JSON.parse(l));
+    return results.filter(item => item && item.number);
+  } catch (err) {
+    const msg = (err && (err.stderr ? err.stderr.toString().trim() : err.message)) || String(err);
+    throw new Error(`Failed to query sub-issues for ${repo}#${issueNumber}: ${msg}`);
+  }
 }
 
 const ALLOWED_KINDS = [
@@ -103,7 +126,7 @@ function evaluatePR(pr, options = {}) {
   }
 
   // 2. Linked Issue
-  const issueRefRegex = /(?:fixes|closes|resolves|refs|part of)\s+(?:https:\/\/github\.com\/([^\s/]+\/[^\s/]+)\/issues\/|#|([a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+)#)(\d+)/i;
+  const issueRefRegex = /(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved|refs|part of)(?:\s*:\s*|\s+)(?:https:\/\/github\.com\/([^\s/]+\/[^\s/]+)\/issues\/|#|([a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+)#)(\d+)/i;
   const issueMatch = body.match(issueRefRegex);
   if (!issueMatch) {
     failures.push({
@@ -115,8 +138,8 @@ function evaluatePR(pr, options = {}) {
     passes.push(`Linked issue: ${issueMatch[0]}`);
   }
 
-  // 2b. Parent-Close Guard: Reject closing keywords (Fixes, Closes, Resolves) on parent issues with open sub-issues
-  const closingKeywordRegex = /\b(fixes|closes|resolves)\s+(?:https:\/\/github\.com\/([^\s/]+\/[^\s/]+)\/issues\/|#|([a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+)#)(\d+)/gi;
+  // 2b. Parent-Close Guard: Reject closing keywords (close, fix, resolve, etc.) on parent issues with open sub-issues
+  const closingKeywordRegex = /\b(close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)(?:\s*:\s*|\s+)(?:https:\/\/github\.com\/([^\s/]+\/[^\s/]+)\/issues\/|#|([a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+)#)(\d+)/gi;
   let closingMatch;
   const defaultRepo = (pr.base && pr.base.repo && pr.base.repo.full_name) || process.env.GITHUB_REPOSITORY || 'Wladefant/super-board';
   const getSubIssues = (options && options.subIssuesFetcher) || ((r, n) => fetchSubIssues(r, n));
@@ -125,7 +148,20 @@ function evaluatePR(pr, options = {}) {
     const kw = closingMatch[1];
     const targetRepo = closingMatch[2] || closingMatch[3] || defaultRepo;
     const targetIssueNum = parseInt(closingMatch[4], 10);
-    const subIssues = getSubIssues(targetRepo, targetIssueNum) || [];
+    let subIssues;
+    try {
+      subIssues = getSubIssues(targetRepo, targetIssueNum);
+      if (!Array.isArray(subIssues)) {
+        throw new Error('sub-issues response must be an array');
+      }
+    } catch (err) {
+      failures.push({
+        check: 'Parent Issue Closing Keyword Guard',
+        message: `PR uses closing keyword '${kw}' targeting #${targetIssueNum} in ${targetRepo}, but sub-issue verification failed: ${err.message}. Guard fails closed.`,
+        remedy: `Parent-close guard fails closed when sub-issues cannot be verified. Ensure gh credentials have access to repository '${targetRepo}', or change closing keyword to a non-closing reference ('Refs #${targetIssueNum}' or 'Part of #${targetIssueNum}').`,
+      });
+      continue;
+    }
     const openSubIssues = subIssues.filter(s => String(s.state || 'open').toLowerCase() === 'open');
     if (openSubIssues.length > 0) {
       const openDesc = openSubIssues.map(s => `#${s.number}: ${s.title || ''} (${s.state || 'open'})`).join('; ');
