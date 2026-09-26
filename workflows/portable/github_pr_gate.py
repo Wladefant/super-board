@@ -366,6 +366,183 @@ def evaluate_review_requirement(pr_data: Dict[str, Any]) -> Tuple[bool, str]:
     return True, "diff/files data missing, review required by default"
 
 
+# --------------------------------------------------------------- browser QA
+# A unit test cannot see a pill that jumps, a strip that blanks, or an order
+# that fills against the wrong side. PolySimulator staging therefore demands a
+# browser-QA receipt on the PR itself before any merge whose diff reaches a
+# surface a user touches: every `frontend/` file (the UI) and the backend
+# order/trading paths the UI drives. Verdicts: EXEMPT (not a staging UI/trading
+# PR), PASSED, REQUIRED (no receipt, or one that does not bind this diff).
+# Lanes post the marker as a plain line, a bold line (`**QA-RECEIPT: PASS**`) and inside
+# list items, so leading markdown decoration is tolerated; the identity requirement is
+# what actually gates, and a decorated line cannot satisfy it on its own.
+QA_RECEIPT_MARKER_RE = re.compile(r"^[ \t>*_`#|\-]*QA-RECEIPT:\s*PASS\b", re.IGNORECASE | re.MULTILINE)
+QA_RECEIPT_MIN_IMAGES = 2
+SHA_TOKEN_RE = re.compile(r"\b[0-9a-fA-F]{40}\b")
+# Evidence images that render on a PR without a session cookie, exactly the forms
+# AGENTS.md §11 allows: uploaded attachments, release assets, and commit-pinned raw
+# URLs (the last only when pinned to a full commit SHA). raw.githubusercontent.com
+# and relative paths stay unrecognised.
+EVIDENCE_IMAGE_RE = re.compile(
+    r"https://github\.com/user-attachments/assets/"
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+    r"|https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/releases/download/[^\s)\"'>]+"
+    r"|https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/raw/[0-9a-fA-F]{40}/[^\s)\"'>]+"
+)
+UI_PATH_RE = re.compile(r"^frontend/", re.IGNORECASE)
+ORDER_TRADING_PATH_RE = re.compile(
+    r"^backend/.*[/_.-](orders?|trades?|trading|matching|settlement|positions?|fills?)([/_.-]|$)",
+    re.IGNORECASE,
+)
+TEST_PATH_RE = re.compile(
+    r"(^|/)(tests?|__tests__|__mocks__)(/|$)"
+    r"|(^|/)test_[^/]*$"
+    r"|_test\.(py|ts|tsx|js|jsx)$"
+    r"|\.(test|spec)\.(ts|tsx|js|jsx)$",
+    re.IGNORECASE,
+)
+
+
+def is_test_path(path: str) -> bool:
+    """
+    Test files ship nothing, so they cannot regress a compiled or served surface.
+
+    They still count as a trigger whenever the change also touches product code —
+    this only keeps a test-only diff from demanding browser QA it cannot use.
+    """
+    return bool(TEST_PATH_RE.search(path))
+
+
+def evaluate_qa_receipt_requirement(
+    pr_data: Dict[str, Any], repo: str, base_ref: str
+) -> Tuple[bool, str]:
+    """
+    Whether this PR must carry a browser-QA receipt: PolySimulator `staging` only,
+    and only when the changed paths reach the UI or an order/trading path.
+
+    Like the review-exemption rule, an empty or absent `files` list cannot name a
+    UI path, so it cannot trigger the requirement; a list capped at 100 may hide
+    one and therefore does trigger it.
+
+    Test files are skipped: a test-only diff changes no shipped surface, while a
+    change that also touches product code still triggers on that file.
+    """
+    if repo != "Bavariance/polysimulator" or base_ref != "staging":
+        return False, f"no QA receipt requirement for {repo}@{base_ref or 'unknown'}"
+    files = pr_data.get("files")
+    if files is None:
+        return False, "no file list supplied, QA receipt not required"
+    if len(files) >= 100:
+        return True, f"file list truncated at {len(files)} files, QA receipt required by default"
+    for f in files:
+        path = f.get("path", "") if isinstance(f, dict) else str(f)
+        norm_path = path.replace("\\", "/")
+        if is_test_path(norm_path):
+            continue
+        if UI_PATH_RE.match(norm_path):
+            return True, f"UI path {path}"
+        if ORDER_TRADING_PATH_RE.match(norm_path):
+            return True, f"order/trading path {path}"
+    return False, "no UI or order/trading paths"
+
+
+def evaluate_qa_receipt(
+    pr_data: Dict[str, Any],
+    *,
+    repo: str,
+    base_ref: str,
+    head_sha: str,
+    cwd: Optional[str] = None,
+) -> Tuple[str, str, Optional[str]]:
+    """
+    Verify the browser-QA receipt that a staging UI/order change must carry.
+
+    One PR comment (or review body) has to hold all three of: a `QA-RECEIPT:
+    PASS` marker line, the head's content identity, and at least two
+    `github.com/user-attachments` images. The identity may be written as the head
+    SHA, its patch-id, or its stripped-diff sha256 — the two content forms
+    survive a sync-only push, so a merge of `staging` never invalidates QA that
+    still describes the same diff.
+
+    When the marker line itself carries a 40-hex token (`QA-RECEIPT: PASS
+    <served-sha>`), that token is the revision QA ran against and it is the only
+    one that can bind: a receipt served from another revision reads as missing,
+    never as PASS.
+
+    Returns (verdict, reason, comment_url). FAILED is never returned: the gate either
+    cannot find a receipt (REQUIRED) or has one it can bind (PASSED).
+    """
+    required, requirement_reason = evaluate_qa_receipt_requirement(pr_data, repo, base_ref)
+    if not required:
+        return "EXEMPT", requirement_reason, None
+
+    # The content forms need a real checkout of the head; a checkout that cannot
+    # supply them narrows what a receipt may name, it never blocks one that names
+    # the head SHA outright.
+    identity_forms = [head_sha]
+    identity_error = None
+    try:
+        from review_content import content_identity
+        identity_forms.extend(content_identity(head_sha, "origin/" + base_ref, cwd))
+    except (ValueError, subprocess.CalledProcessError) as exc:
+        identity_error = str(exc)
+    accepted = {form.lower() for form in identity_forms if form}
+    saw_marker = False
+    saw_identity = False
+    images = 0
+    for source in (
+        list(pr_data.get("comments") or []) + list(pr_data.get("reviews") or [])
+    ):
+        body = str(source.get("body") or "")
+        marker = QA_RECEIPT_MARKER_RE.search(body)
+        if not marker:
+            continue
+        # A 40-hex token beside the marker is the revision the QA actually ran
+        # against, and it decides on its own: a receipt for another revision is
+        # missing evidence, even when the head SHA is quoted elsewhere in the
+        # same comment. A bare marker keeps the comment-wide reading.
+        line_end = body.find("\n", marker.start())
+        marker_tokens = {
+            token.lower()
+            for token in SHA_TOKEN_RE.findall(body[marker.start(): line_end if line_end != -1 else len(body)])
+        }
+        candidates = marker_tokens or {token.lower() for token in SHA_TOKEN_RE.findall(body)}
+        found = {token for token in candidates if token in accepted}
+        attachments = len(EVIDENCE_IMAGE_RE.findall(body))
+        if found and attachments >= QA_RECEIPT_MIN_IMAGES:
+            return (
+                "PASSED",
+                f"browser QA receipt binds head {head_sha[:8]} ({requirement_reason})",
+                str(source.get("html_url") or source.get("url") or "") or None,
+            )
+        saw_marker = True
+        saw_identity = saw_identity or bool(found)
+        images = max(images, attachments)
+
+    if not saw_marker:
+        return (
+            "REQUIRED",
+            f"QA receipt required ({requirement_reason}): no PR comment carries a "
+            "'QA-RECEIPT: PASS' marker.",
+            None,
+        )
+    if not saw_identity:
+        forms = ", ".join(identity_forms) or "none resolved"
+        return (
+            "REQUIRED",
+            f"QA receipt required ({requirement_reason}): the receipt names no identity for "
+            f"this head (accepted identity tokens: {forms}"
+            f"{'; identity lookup failed: ' + identity_error if identity_error else ''}).",
+            None,
+        )
+    return (
+        "REQUIRED",
+        f"QA receipt required ({requirement_reason}): the receipt carries {images} "
+        f"GitHub-hosted evidence image(s), {QA_RECEIPT_MIN_IMAGES} required.",
+        None,
+    )
+
+
 def validate_review_artifact(
     record: Dict[str, Any],
     *,
@@ -496,6 +673,9 @@ class PRGateEvaluation:
     verify_receipt_verdict: Optional[str] = None
     verify_receipt_reason: Optional[str] = None
     verify_receipt: Optional[Dict[str, Any]] = None
+    qa_receipt_verdict: Optional[str] = None
+    qa_receipt_reason: Optional[str] = None
+    qa_receipt_url: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -517,6 +697,8 @@ class PRGateEvaluation:
             f"{f' - {self.invalidation_reason}' if self.invalidation_reason else ''})\n"
             f"- **Verification:** `{self.verify_receipt_verdict or 'EXEMPT'}`"
             f"{f' - {self.verify_receipt_reason}' if self.verify_receipt_reason else ''}\n"
+            f"- **Browser QA:** `{self.qa_receipt_verdict or 'EXEMPT'}`"
+            f"{f' - {self.qa_receipt_reason}' if self.qa_receipt_reason else ''}\n"
             f"- **Verdict:** **{self.gate_verdict}** — {self.verdict_reason}\n"
         )
 
@@ -569,8 +751,12 @@ def fetch_pr_json(pr_number: int, repo: str = "Bavariance/polysimulator", timeou
     reviews = _run_gh(["gh", "api", f"repos/{repo}/pulls/{pr_number}/reviews?per_page=100", "--paginate"], timeout_sec)
     if reviews.returncode:
         raise RuntimeError("Unable to fetch complete PR reviews")
+    comments = _run_gh(["gh", "api", f"repos/{repo}/issues/{pr_number}/comments?per_page=100", "--paginate"], timeout_sec)
+    if comments.returncode:
+        raise RuntimeError("Unable to fetch complete PR comments")
     from review_content import json_pages
     data["reviews"] = [review for page in json_pages(reviews.stdout) for review in page]
+    data["comments"] = [comment for page in json_pages(comments.stdout) for comment in page]
     subprocess.run(["git", "fetch", "origin", f"+refs/heads/{data['baseRefName']}:refs/remotes/origin/{data['baseRefName']}"], check=True)
     from review_content import target_shas
     for sha in target_shas(data["reviews"], data["headRefOid"]):
@@ -600,6 +786,10 @@ def evaluate_pr_gate(
     `policy` decides whether a non-author GitHub APPROVED review is mandatory for this
     repo/base. Named automated branches still require a content-bound GitHub review.
     Legacy local review metadata is advisory cache data and cannot grant approval.
+
+    Independently of review policy, a PolySimulator `staging` PR whose diff reaches
+    `frontend/` or an order/trading path is BLOCKED unless a PR comment carries a
+    browser QA receipt for this diff; see `evaluate_qa_receipt`.
     """
     now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     base_ref = str(pr_data.get("baseRefName") or (pr_data.get("base") or {}).get("ref") or "")
@@ -979,6 +1169,11 @@ def evaluate_pr_gate(
     else:
         verify_receipt_verdict = "EXEMPT"
         verify_receipt_reason = "No verification receipt required by policy."
+    # 4C. Browser QA Receipt (staging UI / order-trading paths)
+    qa_receipt_verdict, qa_receipt_reason, qa_receipt_url = evaluate_qa_receipt(
+        pr_data, repo=repo, base_ref=base_ref, head_sha=head_sha
+    )
+    qa_receipt_blocked = qa_receipt_verdict == "REQUIRED"
     # 5. Final Gate Verdict
     if ci_verdict == "FAILURE":
         gate_verdict = "BLOCKED"
@@ -998,6 +1193,9 @@ def evaluate_pr_gate(
     elif verify_receipt_blocked:
         gate_verdict = "BLOCKED"
         verdict_reason = f"{verify_receipt_reason}"
+    elif qa_receipt_blocked:
+        gate_verdict = "BLOCKED"
+        verdict_reason = f"{qa_receipt_reason}"
     elif review_required:
         if approval_verdict == "SELF_APPROVED_ONLY":
             gate_verdict = "BLOCKED"
@@ -1060,6 +1258,8 @@ def evaluate_pr_gate(
     verdict_reason += " Content freshness: " + json.dumps(content_review, sort_keys=True)
     if verify_receipt_verdict and verify_receipt_verdict != "EXEMPT":
         verdict_reason += f" Verification receipt: {verify_receipt_verdict}."
+    if qa_receipt_verdict and qa_receipt_verdict != "EXEMPT":
+        verdict_reason += f" Browser QA receipt: {qa_receipt_verdict}."
     return PRGateEvaluation(
         pr_number=pr_number,
         repo=repo,
@@ -1089,6 +1289,9 @@ def evaluate_pr_gate(
         verify_receipt_verdict=verify_receipt_verdict,
         verify_receipt_reason=verify_receipt_reason,
         verify_receipt=verify_receipt,
+        qa_receipt_verdict=qa_receipt_verdict,
+        qa_receipt_reason=qa_receipt_reason,
+        qa_receipt_url=qa_receipt_url,
     )
 
 

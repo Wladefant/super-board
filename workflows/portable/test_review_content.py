@@ -5,6 +5,13 @@ import unittest
 from review_content import evaluate, git, content_identity, json_pages, target_shas
 
 
+def wide_context_patch_id(base, sha, cwd):
+    """The pre-rule identity: patch-id of the diff *with* its context lines."""
+    ancestor = git('merge-base', base, sha, cwd=cwd)
+    diff = subprocess.check_output(['git', 'diff', '--binary', ancestor + '..' + sha], cwd=cwd)
+    return git('patch-id', '--stable', cwd=cwd, input=diff).split()[0]
+
+
 class ContentReviews(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -51,6 +58,31 @@ class ContentReviews(unittest.TestCase):
     def test_sync_without_conflicts_keeps_freshness(self):
         self.sync()
         self.assertTrue(self.check([self.review(self.reviewed)])['passed'])
+
+    def test_sync_that_only_shifts_context_keeps_freshness(self):
+        # #5612: a sync merge that changed lines *next to* the PR's hunk, never in
+        # it, was re-reviewed three times because context lines entered the
+        # identity. The changed lines are all that may bind a review.
+        nine = 'l1\nl2\nl3\nl4\n{}\nl6\nl7\nl8\nl9\n'
+        self.commit('app', nine.format('base'))
+        self.g('branch', '-f', 'staging')
+        self.g('update-ref', 'refs/remotes/origin/staging', self.g('rev-parse', 'HEAD'))
+        self.commit('app', nine.format('pr'))
+        reviewed = self.g('rev-parse', 'HEAD')
+        self.g('checkout', 'staging')
+        self.commit('app', nine.format('base').replace('l2', 'l2 staged'))
+        self.g('update-ref', 'refs/remotes/origin/staging', self.g('rev-parse', 'HEAD'))
+        self.g('checkout', 'feature')
+        merged = subprocess.run(['git', 'merge', '--no-ff', 'origin/staging', '-m', 'sync'],
+                                cwd=self.cwd, capture_output=True)
+        self.assertEqual(merged.returncode, 0)
+        head = self.g('rev-parse', 'HEAD')
+        # Context lines are what moved: the wide-context identity differs, the
+        # rule's identity does not, so the one review still covers this head.
+        self.assertNotEqual(wide_context_patch_id('origin/staging', reviewed, self.cwd),
+                            wide_context_patch_id('origin/staging', head, self.cwd))
+        self.assertEqual(content_identity(reviewed, cwd=self.cwd), content_identity(head, cwd=self.cwd))
+        self.assertTrue(self.check([self.review(reviewed)])['passed'])
 
     def test_conflict_resolution_breaks_freshness(self):
         self.sync(True)
