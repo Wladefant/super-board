@@ -21,6 +21,7 @@ Live operator instructions in the active session override this file, profile doc
 - **Two-Strike Escalation:** On the same slice, escalate after the second failure (§13); preserve partial work.
 - **Parallel Dispatch (2026-09-14, #135):** homogeneous triage fan-out batches are refused. Partition by domain with distinct `# Target`s, externalize inputs to `local://`, single-`task` calls per item, never retry a refused batch shape (managed skill `parallel-lane-dispatch`).
 - **Four-Stage Loop (2026-09-26, #228):** Spec (low: boundaries, interfaces, acceptance criteria) → Scaffold (low: skeletons, types, fixtures) → Implement (medium: core logic, all call sites, no dead shims) → Verify (high, 32k+ thinking tokens: adversarial checks, negative controls, real scenarios).
+- **Feature Map Navigation (2026-09-26, #244):** Before broad repository searching or guessing file locations, lanes MUST consult `FEATURE_MAP.json` (or run `python workflows/portable/feature_map.py query <term>`) to locate entry files, test suites, owning issues, and risk levels for the target feature.
 
 ## 3. Operator Communication & Standing Decisions
 

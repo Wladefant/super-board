@@ -182,13 +182,14 @@ Threads are resolved via `gh api graphql` `resolveReviewThread` mutation when th
 1. Create worktree `.worktrees/issue-<N>-build/` off `config.base_branch`.
 2. Create branch `issue-<N>-<slug>` from `config.base_branch`.
 3. Read issue body + ALL comments + PROJECT.md.
-4. Implement smallest safe change covering ACs.
-5. Commit + push (always).
-6. Open draft PR linked to the issue with the PR description template.
-7. Post a 🔨 PR timeline comment with files/commits/summary.
-8. Post a short status comment on the issue with the PR URL.
-9. Clean up worktree. Keep branch + PR open.
-10. Move card Building → QA.
+4. Consult `FEATURE_MAP.json` (or `python workflows/portable/feature_map.py query <term>`) before searching the codebase to locate entry files, test suites, and risk tiers.
+5. Implement smallest safe change covering ACs.
+6. Commit + push (always).
+7. Open draft PR linked to the issue with the PR description template.
+8. Post a 🔨 PR timeline comment with files/commits/summary.
+9. Post a short status comment on the issue with the PR URL.
+10. Clean up worktree. Keep branch + PR open.
+11. Move card Building → QA.
 
 ### Builder (rebuild)
 
