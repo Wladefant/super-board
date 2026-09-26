@@ -72,6 +72,8 @@ MODEL_GEMINI_PRO = "google-antigravity/gemini-3.1-pro"
 # 2026-09-25). In worker ladders Fable is the very last rung, and only on slack behind
 # pace (ANTHROPIC_WORKER_MIN_HEADROOM), never on the orchestrator's reserve.
 MODEL_CLAUDE_FABLE = "anthropic/claude-fable-5-1"
+# Opus 5.5 reviewer tier (profile reviewer pin) for super-hard work.
+MODEL_ANTHROPIC_OPUS = "anthropic/claude-opus-5-5:high"
 
 MODEL_CODEX_FAST = "openai-codex/gpt-5.3-codex"
 # The operator's Codex worker/review tier is Sol high (profile `codex-worker` and
@@ -305,6 +307,8 @@ ROLE_MODEL_PINS: Dict[str, str] = {
     "gemini-pro": MODEL_GEMINI_PRO,
     "codex-worker": MODEL_CODEX_SOL,
     "codex-reviewer": MODEL_CODEX_SOL,
+    "thinker": MODEL_CODEX_SOL,
+    "reviewer": MODEL_ANTHROPIC_OPUS,
     "ag-opus": MODEL_AG_CLAUDE_OPUS,
     # The free Spark allowance has its own enabled roster entry and its own model, so a lane
     # routed onto Spark must be dispatched as `spark`, never as a Codex Astral role.
@@ -440,7 +444,11 @@ def model_to_agent_role(model_id: str, task_type: TaskType, risk_level: RiskLeve
             # The free Spark allowance has its own enabled roster entry (`spark`); the
             # codex-worker/codex-reviewer pair is pinned for the Astral tiers and disabled here.
             return "spark"
-        return "codex-reviewer" if task_type == TaskType.STRONG_REVIEW else "codex-worker"
+        if task_type == TaskType.STRONG_REVIEW:
+            return "codex-reviewer"
+        if task_type == TaskType.DEEP_REASONING:
+            return "thinker"
+        return "codex-worker"
     if model_id.endswith(":free"):
         return "extra-review"
     if model_id == MODEL_DEEPSEEK_PRO:
