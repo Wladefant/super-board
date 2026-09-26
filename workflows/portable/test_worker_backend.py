@@ -894,10 +894,15 @@ class TestCheckExpectationContract(_Fixture):
             ("verify", "high"),
         ]:
             self.assertEqual(worker_backend.get_stage_effort(stage), expected_effort)
-            if stage in worker_backend.STAGE_BRIEFS:
-                req = self._request(stage=stage)
-                prompt = worker_backend.build_stage_prompt(req, schema)
-                self.assertIn(worker_backend.STAGE_BRIEFS[stage].split()[2], prompt)
+            req = self._request(stage=stage)
+            prompt = worker_backend.build_stage_prompt(req, schema)
+            self.assertIn(worker_backend.STAGE_BRIEFS[stage].split()[2], prompt)
+        # Every effort-mapped stage must carry its own brief; a stage present in
+        # STAGE_EFFORT_MAP but absent from STAGE_BRIEFS silently inherits the
+        # BUILD worker brief, so the mapping must stay in lockstep.
+        self.assertEqual(
+            set(worker_backend.STAGE_EFFORT_MAP), set(worker_backend.STAGE_BRIEFS)
+        )
         self.assertEqual(worker_backend.get_stage_effort("unknown_stage", default="medium"), "medium")
 
 class TestHeadBinding(_Fixture):
