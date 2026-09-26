@@ -871,7 +871,15 @@ class TestCheckExpectationContract(_Fixture):
         self.assertIn("Never adjust one so it looks expected", prompt)
         self.assertIn("Repeat-failure limit", prompt)
         self.assertIn("Mandatory failure write-down", prompt)
+        self.assertIn("Standard 3-heading handoff protocol", prompt)
 
+    def test_static_prompt_prefix_precedes_dynamic_fields(self):
+        """Static prompt prefix must precede variable fields to maximize prompt caching."""
+        schema = agent_result_schema()
+        prompt = worker_backend.build_stage_prompt(self._request(), schema)
+        contract_pos = prompt.index("RESULT CONTRACT")
+        dynamic_pos = prompt.index("# DYNAMIC WORK ITEM PARAMETERS")
+        self.assertLess(contract_pos, dynamic_pos)
 
 class TestHeadBinding(_Fixture):
 

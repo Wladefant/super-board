@@ -1113,9 +1113,14 @@ STAGE_BRIEFS = {
 
 def build_stage_prompt(req: Any, schema: Dict[str, Any]) -> str:
     """
-    Compose the stage prompt. An explicit prompt on the request is used verbatim
-    as the task statement; the stage brief and result contract are always added
-    so a backend cannot be talked out of returning structured evidence.
+    Compose the stage prompt.
+
+    Static Prompt Prefix Caching Discipline (operator 2026-09-26, #228):
+    The stage brief, result contract schema, exit enforcement rules, and
+    standard 3-heading handoff structure form an immutable static prefix placed
+    strictly before any dynamic work item fields (request ID, expected commit,
+    task, and criteria). This enables 90-96% Anthropic prompt cache hit rates
+    across multi-agent fan-outs.
     """
     stage = str(_field(req, "stage", "build"))
     repo_root = str(_field(req, "repo_root", ""))
@@ -1127,25 +1132,11 @@ def build_stage_prompt(req: Any, schema: Dict[str, Any]) -> str:
 
     brief = STAGE_BRIEFS.get(stage, STAGE_BRIEFS["build"]).format(repo_root=repo_root)
 
+    # 1. Static immutable prefix: Stage brief, Result contract schema, rules,
+    # and standardized handoff contract. Placing this identical prefix first
+    # ensures prompt cache reads hit the 90-96% tier ($0.20/M).
     lines = [
         brief,
-        "",
-        f"Request id: {request_id}",
-        f"Stage: {stage}",
-        f"Task type: {task_type}",
-        f"Repository root: {repo_root}",
-        f"Expected head commit: {head_sha}",
-    ]
-    if task:
-        lines += ["", "TASK", task]
-    if criteria:
-        lines += ["", "ACCEPTANCE CRITERIA"]
-        for c in criteria:
-            if isinstance(c, Mapping):
-                c = c.get("criterion", "")
-            lines.append(f"- {c}")
-
-    lines += [
         "",
         "RESULT CONTRACT",
         "Your final answer must be a single JSON object matching this schema exactly:",
@@ -1179,7 +1170,28 @@ def build_stage_prompt(req: Any, schema: Dict[str, Any]) -> str:
         "chosen) in a comment on the work item's GitHub issue.",
         "- Mandatory lesson capture: Persist the lesson in the same turn with `learn` or `retain` "
         "(or managed skill); check prior lessons (`recall`) before touching the same tool or area.",
+        "- Standard 3-heading handoff protocol (operator 2026-09-26, #228): Structure completion "
+        "summaries under three headings in priority order: "
+        "'## 1. Blocked on me / Needs from you' (blockers, missing permissions, decisions), "
+        "'## 2. Changed' (exact files/URLs modified or created), and "
+        "'## 3. Found / Evidence' (test verification, reproduction proof, unconfirmed items).",
+        "",
+        "# DYNAMIC WORK ITEM PARAMETERS",
+        f"Request id: {request_id}",
+        f"Stage: {stage}",
+        f"Task type: {task_type}",
+        f"Repository root: {repo_root}",
+        f"Expected head commit: {head_sha}",
     ]
+    if task:
+        lines += ["", "TASK", task]
+    if criteria:
+        lines += ["", "ACCEPTANCE CRITERIA"]
+        for c in criteria:
+            if isinstance(c, Mapping):
+                c = c.get("criterion", "")
+            lines.append(f"- {c}")
+
     return "\n".join(lines)
 
 
