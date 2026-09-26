@@ -142,7 +142,7 @@ The Gardener continuously surveys recently closed bugs with merged pull requests
 - **Target Filtering:** Only closed bugs whose linked fix PR touches application code (`.py`, `.ts`, `.tsx`, `.js`) are evaluated. UI/copy/design redesigns and test-only fixes are automatically skipped.
 - **Anti-Pattern Extraction:** The runner parses the fix PR diff, extracts the exact removed code lines that caused the defect, and synthesizes candidate `ast-grep` or regex rules.
 - **Mechanical Proof:** The runner executes an automated proof confirming the candidate rule matches the pre-fix code and strictly rejects the post-fix code.
-- **No-Rule Rejection Gate:** If no mechanical rule can be proven (e.g. complex multi-file control-flow logic), the runner files NOTHING, records `no-rule: <reason>` in `C:/Users/wkiri/.veyyon/run/gardener/no_rules_state.json`, and posts a one-line comment on the bug issue (`gardener bug-to-lint: no-rule: <reason>`).
+- **No-Rule Rejection Gate:** If no mechanical rule can be proven (e.g. complex multi-file control-flow logic), the runner files NOTHING, records `no-rule: <reason>` in `C:/Users/wkiri/.veyyon/run/gardener/no_rules_state.json`, and posts a one-line comment on the bug issue (`gardener bug-to-lint: no-rule: <reason>`). All comment writes require `--live` (or explicit `--post-no-rule-comments`), are capped at 5 writes per run, and fail closed if issue view checks fail. In dry-run mode, comment actions are printed to stdout and never sent to GitHub.
 - **Issue Content:** Issues created for proven rules embed the concrete anti-pattern (removed code), fixed code (post-fix invariant), candidate rule pattern, and proof text.
 
 ### Per-Lane Post-Fix Dispatch Command
@@ -186,13 +186,19 @@ A dedicated test suite validates the scanner, classifier, spec generator, dedupl
 python workflows/portable/test_gardener.py
 ```
 
-Test coverage (28 automated unit tests):
+Test coverage (36 automated unit tests):
+- Next.js App Router entrypoint detection and framework boundary rules.
 - Knip classification for dead files, dead exports, dead types, and package dependencies.
 - Vulture classification for app imports, pytest fixtures, Alembic metadata, and unreachable code.
 - Priority-ordered bounded batch selection and contract formatting.
 - 9-point Superboard Issue Contract body formatting with deterministic fingerprint metadata.
 - Deduplication by fingerprint across open and closed issues.
-- Hard cap enforcement ($\le 5$ live issues created per run).
+- Hard cap enforcement ($\le 5$ live issues and $\le 5$ no-rule comments created per run).
+- Fail-closed deduplication checks when `gh issue view` fails.
 - Untracked workaround comments scanner with positive/negative keyword matching.
 - Host RAM safety check with mock threshold validation.
-- End-to-end pipeline execution with mock fixture reports.
+- End-to-end pipeline execution with mock fixture reports and zero subprocess leaks.
+- Diff parsing preserving unified diff hunks, SQL comments (`--`), and CLI flags.
+- Rejection reason categorization for empty, binary, and rename-only diffs.
+- Test and spec path filtering with path segment boundary matching.
+- Negative control test proving zero `gh` write operations during dry-run / no-live execution.

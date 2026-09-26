@@ -194,6 +194,29 @@ def is_test_file(rel_path: str) -> bool:
     )
 
 
+def is_test_or_spec_path(path_str: str) -> bool:
+    """Checks if a file path is a test, mock, fixture, or spec file using path segments and filename patterns."""
+    p = path_str.replace("\\", "/").lower()
+    parts = [seg for seg in p.split("/") if seg]
+    if not parts:
+        return False
+    # Check directory segments
+    test_dirs = {"tests", "test", "__tests__", "mocks", "mock", "fixtures", "specs", "spec", "testing"}
+    for d in parts[:-1]:
+        if d in test_dirs or d.startswith("test_") or d.endswith("_test"):
+            return True
+    # Check filename
+    fname = parts[-1]
+    stem, ext = os.path.splitext(fname)
+    if stem in ("test", "spec", "mock", "conftest", "fixture"):
+        return True
+    if stem.startswith(("test_", "mock_", "spec_", "conftest_", "fixture_")):
+        return True
+    if stem.endswith(("_test", "_spec", "_mock", ".test", ".spec", ".mock")):
+        return True
+    return False
+
+
 def classify_knip_issue(
     issue: Dict[str, Any],
     frontend_subpath: str = "frontend",
@@ -910,17 +933,27 @@ def scan_workaround_comments(
 # ==============================================================================
 
 def parse_pr_diff(diff_text: str) -> Dict[str, Dict[str, List[str]]]:
-    """Parses git diff into per-file removed lines and added lines."""
+    """Parses git diff into per-file removed lines and added lines tracking hunk state."""
     files: Dict[str, Dict[str, List[str]]] = {}
     curr_file = ""
+    in_hunk = False
+
     for line in diff_text.splitlines():
-        if line.startswith("diff --git a/"):
-            curr_file = line.split(" b/")[0].replace("diff --git a/", "")
-            files[curr_file] = {"removed": [], "added": []}
-        elif curr_file:
-            if line.startswith("-") and not line.startswith("---"):
+        if line.startswith("diff --git "):
+            in_hunk = False
+            parts = line.split(" b/", 1)
+            if len(parts) == 2:
+                curr_file = parts[1].strip()
+            else:
+                curr_file = line.replace("diff --git a/", "").strip()
+            if curr_file not in files:
+                files[curr_file] = {"removed": [], "added": []}
+        elif line.startswith("@@ "):
+            in_hunk = True
+        elif in_hunk and curr_file:
+            if line.startswith("-"):
                 files[curr_file]["removed"].append(line[1:])
-            elif line.startswith("+") and not line.startswith("+++"):
+            elif line.startswith("+"):
                 files[curr_file]["added"].append(line[1:])
     return files
 
@@ -935,14 +968,29 @@ def synthesize_mechanical_bug_rule(
     and proves that the rule matches the pre-fix code and rejects post-fix code.
     Returns (BugLintProposal, None) on success, or (None, failure_reason) on failure.
     """
+    if not diff_text or not diff_text.strip():
+        return None, "empty diff; no changes found in fix PR"
+
     diff_files = parse_pr_diff(diff_text)
+
+    # Check for binary-only diff
+    if re.search(r'Binary files.*differ|GIT binary patch', diff_text):
+        has_text_changes = any(changes["removed"] or changes["added"] for changes in diff_files.values())
+        if not has_text_changes:
+            return None, "binary-only diff; no text changes in application code"
+
+    # Check for rename-only diff without code modifications
+    if re.search(r'rename (?:from|to)|similarity index 100%', diff_text):
+        has_content_changes = any(changes["removed"] or changes["added"] for changes in diff_files.values())
+        if not has_content_changes:
+            return None, "file rename only without code modifications"
 
     # 1. Filter for application code files (.py, .ts, .tsx, .js) ignoring test/doc/config files
     app_files: Dict[str, Dict[str, List[str]]] = {}
     for fname, changes in diff_files.items():
         lower = fname.lower()
         if any(lower.endswith(ext) for ext in [".py", ".ts", ".tsx", ".js"]):
-            if not any(t in lower for t in ["test", "mock", "spec", "fixture", "conftest"]):
+            if not is_test_or_spec_path(fname):
                 app_files[fname] = changes
 
     if not app_files:
@@ -959,13 +1007,15 @@ def synthesize_mechanical_bug_rule(
         full_removed_text = "\n".join(changes["removed"])
         full_added_text = "\n".join(changes["added"])
         # Rule Check 1: Transaction / Autocommit keywords in DB prefix / hook
-        if "BEGIN;" in full_removed_text and ("_TRADE_GUC_PREFIX" in full_removed_text or "database.py" in fname):
+        if "BEGIN;" in full_removed_text and "_TRADE_GUC_PREFIX" in full_removed_text:
             rule_pattern = r'_TRADE_GUC_PREFIX\s*=\s*\([^)]*BEGIN;'
             rx = re.compile(rule_pattern)
-            pre_test = '_TRADE_GUC_PREFIX = ("BEGIN; ", "SET LOCAL synchronous_commit = off; ")'
-            post_test = '_TRADE_GUC_PREFIX = ("SET LOCAL synchronous_commit = off; ")'
-            if rx.search(pre_test) and not rx.search(post_test):
-                real_removed = "\n".join([l for l in changes["removed"] if "BEGIN;" in l or l.strip().startswith('"')]) or changes["removed"][0]
+            # Must match at least one real removed line and no added line from the parsed diff
+            matches_removed = any(rx.search(line) for line in changes["removed"]) or bool(rx.search(full_removed_text))
+            matches_added = any(rx.search(line) for line in changes["added"]) or bool(rx.search(full_added_text))
+            if matches_removed and not matches_added:
+                matching_removed = [l for l in changes["removed"] if rx.search(l) or "BEGIN;" in l]
+                real_removed = "\n".join(matching_removed) if matching_removed else changes["removed"][0]
                 real_added = "\n".join(changes["added"][:3]) if changes["added"] else "(statement removed)"
                 return BugLintProposal(
                     bug_number=bug_num,
@@ -1064,9 +1114,12 @@ def record_no_rule(
     reason: str,
     repo: str,
     state_dir: str,
-    post_comment: bool = True,
-) -> None:
-    """Records that no mechanical rule exists for a bug and optionally comments on GitHub."""
+    post_comment: bool = False,
+    live: bool = False,
+) -> bool:
+    """Records that no mechanical rule exists for a bug and optionally comments on GitHub with live gating.
+    Returns True if a comment was actually posted, False otherwise.
+    """
     state = load_no_rules_state(state_dir)
     bug_key = str(bug_num)
     state[bug_key] = {
@@ -1078,22 +1131,39 @@ def record_no_rule(
     save_no_rules_state(state, state_dir)
     print(f"[INFO] Bug #{bug_num}: no-rule: {reason}")
 
-    if post_comment:
-        try:
-            # Check if comment already exists on the issue
-            check_cmd = ["gh", "issue", "view", str(bug_num), "-R", repo, "--json", "comments"]
-            proc = subprocess.run(check_cmd, capture_output=True, text=True, timeout=30)
-            if proc.returncode == 0:
-                issue_data = json.loads(proc.stdout)
-                comments = [c.get("body", "") for c in issue_data.get("comments", [])]
-                if any("no-rule:" in c for c in comments):
-                    return
-            # Post comment
-            comment_body = f"gardener bug-to-lint: no-rule: {reason}"
-            comment_cmd = ["gh", "issue", "comment", str(bug_num), "-R", repo, "--body", comment_body]
-            subprocess.run(comment_cmd, capture_output=True, text=True, timeout=30)
-        except Exception as e:
-            print(f"[WARN] Failed to post no-rule comment on #{bug_num}: {e}", file=sys.stderr)
+    if not live:
+        print(f"[DRY-RUN] Would post comment to #{bug_num} on {repo}: gardener bug-to-lint: no-rule: {reason}")
+        return False
+
+    if not post_comment:
+        return False
+
+    try:
+        # Check if comment already exists on the issue (fail closed on any error)
+        check_cmd = ["gh", "issue", "view", str(bug_num), "-R", repo, "--json", "comments"]
+        proc = subprocess.run(check_cmd, capture_output=True, text=True, timeout=30)
+        if proc.returncode != 0:
+            print(f"[WARN] Failed to view issue #{bug_num} on {repo} (exit {proc.returncode}); skipping comment write to fail closed", file=sys.stderr)
+            return False
+        issue_data = json.loads(proc.stdout)
+        comments = [c.get("body", "") for c in issue_data.get("comments", []) if isinstance(c, dict)]
+        if any("no-rule:" in c for c in comments):
+            print(f"[INFO] Bug #{bug_num}: no-rule comment already exists; skipping duplicate")
+            return False
+    except Exception as e:
+        print(f"[WARN] Error during dedup check for #{bug_num} on {repo}: {e}; skipping comment write to fail closed", file=sys.stderr)
+        return False
+
+    try:
+        # Post comment
+        comment_body = f"gardener bug-to-lint: no-rule: {reason}"
+        comment_cmd = ["gh", "issue", "comment", str(bug_num), "-R", repo, "--body", comment_body]
+        subprocess.run(comment_cmd, capture_output=True, text=True, check=True, timeout=30)
+        print(f"[OK] Posted no-rule comment on #{bug_num}: {comment_body}")
+        return True
+    except Exception as e:
+        print(f"[WARN] Failed to post no-rule comment on #{bug_num}: {e}", file=sys.stderr)
+        return False
 
 
 def scan_closed_bug_issues(
@@ -1102,7 +1172,9 @@ def scan_closed_bug_issues(
     limit: int = 30,
     bug_numbers: Optional[List[int]] = None,
     state_dir: str = "C:/Users/wkiri/.veyyon/run/gardener",
-    post_no_rule_comments: bool = True,
+    post_no_rule_comments: bool = False,
+    live: bool = False,
+    max_comment_writes: int = 5,
 ) -> List[BugLintProposal]:
     """Scans closed bug issues in the repo, extracts verified mechanical anti-patterns,
     and proposes regression-guard lint rules. If no rule can be proven, records no-rule."""
@@ -1110,10 +1182,19 @@ def scan_closed_bug_issues(
 
     if bug_numbers:
         for bn in bug_numbers:
-            cmd = ["gh", "issue", "view", str(bn), "-R", repo, "--json", "number,title,body,closedAt,comments,state"]
+            cmd = ["gh", "issue", "view", str(bn), "-R", repo, "--json", "number,title,body,closedAt,comments,state,labels"]
             try:
                 proc = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
-                data.append(json.loads(proc.stdout))
+                item = json.loads(proc.stdout)
+                state = (item.get("state") or "").upper()
+                labels = [l.get("name", "") if isinstance(l, dict) else str(l) for l in item.get("labels", [])]
+                if state != "CLOSED":
+                    print(f"[WARN] Skipping issue #{bn}: state is '{state}', expected 'CLOSED'", file=sys.stderr)
+                    continue
+                if not any(lbl == "kind:bug" for lbl in labels):
+                    print(f"[WARN] Skipping issue #{bn}: missing required 'kind:bug' label", file=sys.stderr)
+                    continue
+                data.append(item)
             except Exception as e:
                 print(f"[WARN] Failed to fetch bug issue #{bn} from {repo}: {e}", file=sys.stderr)
     else:
@@ -1123,7 +1204,7 @@ def scan_closed_bug_issues(
             "--state", "closed",
             "--label", "kind:bug",
             "--limit", str(limit),
-            "--json", "number,title,body,closedAt,comments",
+            "--json", "number,title,body,closedAt,comments,state,labels",
         ]
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60)
@@ -1134,13 +1215,30 @@ def scan_closed_bug_issues(
 
     proposals: List[BugLintProposal] = []
     pr_ref_pattern = re.compile(
-        r'(?:https://github\.com/[^/]+/[^/]+/pull/|pull/|pr\s*#?|fixed in\s*#?|closed by\s*#?)(\d+)',
+        r'(?:https://github\.com/([^/]+/[^/]+)/pull/|pull/|pr\s*#?|fixed in\s*#?|closed by\s*#?)(\d+)',
         re.IGNORECASE,
     )
     skip_keywords = [
         "redesign", "ui-design", "copy", "color", "spacing", "padding",
         "margin", "font", "css", "layout", "alignment", "badge", "scoreboard", "header"
     ]
+
+    comments_written = 0
+
+    def _record_no_rule_gated(bn: int, title: str, rsn: str):
+        nonlocal comments_written
+        should_post = post_no_rule_comments and (comments_written < max_comment_writes)
+        did_post = record_no_rule(
+            bn,
+            title,
+            rsn,
+            repo,
+            state_dir,
+            post_comment=should_post,
+            live=live,
+        )
+        if did_post:
+            comments_written += 1
 
     for item in data:
         bug_num = item.get("number")
@@ -1150,43 +1248,48 @@ def scan_closed_bug_issues(
 
         # 1. Skip UI / design / copy redesigns
         if any(kw in bug_title.lower() for kw in skip_keywords):
-            record_no_rule(bug_num, bug_title, "UI/design/copy change without mechanical AST anti-pattern", repo, state_dir, post_comment=post_no_rule_comments)
+            _record_no_rule_gated(bug_num, bug_title, "UI/design/copy change without mechanical AST anti-pattern")
             continue
 
         # 2. Extract linked fix PR
         fix_pr_num = None
+        fix_pr_repo = repo
         for c in comments:
             c_body = c.get("body", "") if isinstance(c, dict) else str(c)
             match = pr_ref_pattern.search(c_body)
             if match:
-                fix_pr_num = int(match.group(1))
+                if match.group(1):
+                    fix_pr_repo = match.group(1)
+                fix_pr_num = int(match.group(2))
                 break
 
         if not fix_pr_num:
             match = pr_ref_pattern.search(body)
             if match:
-                fix_pr_num = int(match.group(1))
+                if match.group(1):
+                    fix_pr_repo = match.group(1)
+                fix_pr_num = int(match.group(2))
 
-        if not fix_pr_num or fix_pr_num == bug_num:
-            record_no_rule(bug_num, bug_title, "no linked fix PR found", repo, state_dir, post_comment=post_no_rule_comments)
+        if not fix_pr_num or (fix_pr_num == bug_num and fix_pr_repo == repo):
+            _record_no_rule_gated(bug_num, bug_title, "no linked fix PR found")
             continue
 
         # 3. Retrieve PR diff
         try:
-            diff_cmd = ["gh", "pr", "diff", str(fix_pr_num), "-R", repo]
+            diff_cmd = ["gh", "pr", "diff", str(fix_pr_num), "-R", fix_pr_repo]
             diff_proc = subprocess.run(diff_cmd, capture_output=True, text=True, check=True, timeout=60)
             diff_text = diff_proc.stdout
         except Exception as e:
-            record_no_rule(bug_num, bug_title, f"failed to retrieve fix PR diff: {e}", repo, state_dir, post_comment=post_no_rule_comments)
+            _record_no_rule_gated(bug_num, bug_title, f"failed to retrieve fix PR diff: {e}")
             continue
 
         # 4. Synthesize rule and prove against pre-fix and post-fix lines
         proposal, reason = synthesize_mechanical_bug_rule(bug_num, bug_title, fix_pr_num, diff_text)
         if proposal:
-            proposal.fix_pr_url = f"https://github.com/{repo}/pull/{fix_pr_num}"
+            proposal.fix_pr_url = f"https://github.com/{fix_pr_repo}/pull/{fix_pr_num}"
             proposals.append(proposal)
         else:
-            record_no_rule(bug_num, bug_title, reason or "no mechanical rule found", repo, state_dir, post_comment=post_no_rule_comments)
+            _record_no_rule_gated(bug_num, bug_title, reason or "no mechanical rule found")
 
     return proposals
 
@@ -1508,6 +1611,7 @@ def create_live_gardener_issues(
 
     if dry_run:
         for c in capped_eligible:
+            print(f"[DRY-RUN] Would create issue: '{c.title}' on {repo}")
             results.append({
                 "fingerprint": c.fingerprint,
                 "title": c.title,
@@ -1670,7 +1774,9 @@ def run_gardener(
     include_workaround_comments: bool = True,
     issue_repo: str = "Bavariance/polysimulator",
     bug_numbers: Optional[List[int]] = None,
-    post_no_rule_comments: bool = True,
+    post_no_rule_comments: bool = False,
+    live: bool = False,
+    state_dir: Optional[str] = None,
 ) -> GardenerReport:
     """Executes full gardener analysis pipeline."""
     timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1782,10 +1888,13 @@ def run_gardener(
     # 6. Bug to Lint-Rule Loop
     bug_proposals: List[BugLintProposal] = []
     try:
+        resolved_state_dir = state_dir or "C:/Users/wkiri/.veyyon/run/gardener"
         bug_proposals = scan_closed_bug_issues(
             repo=issue_repo,
             bug_numbers=bug_numbers,
+            state_dir=resolved_state_dir,
             post_no_rule_comments=post_no_rule_comments,
+            live=live,
         )
     except Exception as e:
         print(f"[WARN] Bug-to-lint scan notice: {e}", file=sys.stderr)
@@ -1943,6 +2052,12 @@ def main() -> int:
         help="Directory to save execution log output (default: None, or C:/Users/wkiri/.veyyon/run/gardener)",
     )
     parser.add_argument(
+        "--state-dir",
+        type=str,
+        default="C:/Users/wkiri/.veyyon/run/gardener",
+        help="Directory to save runner state files (default: C:/Users/wkiri/.veyyon/run/gardener)",
+    )
+    parser.add_argument(
         "--skip-ram-check",
         action="store_true",
         help="Bypass host RAM utilization safety check",
@@ -2010,6 +2125,9 @@ def main() -> int:
         include_workaround_comments=True,
         issue_repo=args.issue_repo,
         bug_numbers=args.bug or None,
+        post_no_rule_comments=args.live,
+        live=args.live,
+        state_dir=args.state_dir,
     )
 
     if args.live:
@@ -2020,7 +2138,14 @@ def main() -> int:
             dry_run=args.dry_run,
         )
         report.created_issues = created
-
+    else:
+        created = create_live_gardener_issues(
+            candidates=report.issue_candidates,
+            repo=args.issue_repo,
+            max_issues=args.max_new_issues,
+            dry_run=True,
+        )
+        report.created_issues = created
     if args.output_json:
         out_p = Path(args.output_json)
         out_p.parent.mkdir(parents=True, exist_ok=True)

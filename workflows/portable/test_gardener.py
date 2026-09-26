@@ -41,8 +41,10 @@ from gardener import (
     generate_gardener_issue_candidates,
     is_frontend_entrypoint,
     is_test_file,
+    is_test_or_spec_path,
     load_no_rules_state,
     parse_pr_diff,
+    record_no_rule,
     run_gardener,
     save_no_rules_state,
     scan_closed_bug_issues,
@@ -356,7 +358,10 @@ class TestGardenerTaskSpecAndReporting(unittest.TestCase):
         self.assertIn("BOUNDED CLEANUP TASK SPEC", text)
 
     def test_pipeline_with_fixture_files(self):
-        """Gardener pipeline must run end-to-end with pre-computed fixture report files."""
+        """Gardener pipeline must run end-to-end with pre-computed fixture report files without subprocess leaks."""
+        import subprocess as _subprocess
+        import unittest.mock as _mock
+
         with tempfile.TemporaryDirectory() as tmpdir:
             knip_file = Path(tmpdir) / "knip.json"
             vulture_file = Path(tmpdir) / "vulture.txt"
@@ -378,19 +383,26 @@ class TestGardenerTaskSpecAndReporting(unittest.TestCase):
                 f.write("backend/app/main.py:42: unused import 'old_lib' (90% confidence)\n")
                 f.write("backend/tests/test_x.py:10: unused variable 'mock_db' (100% confidence)\n")
 
-            report = run_gardener(
-                repo_root=Path(tmpdir),
-                knip_report_file=knip_file,
-                vulture_report_file=vulture_file,
-                max_items=5,
-            )
+            state_dir = Path(tmpdir) / "state"
+
+            def fake_run(cmd, **kwargs):
+                return _subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr="")
+
+            with _mock.patch("gardener.subprocess.run", side_effect=fake_run):
+                report = run_gardener(
+                    repo_root=Path(tmpdir),
+                    knip_report_file=knip_file,
+                    vulture_report_file=vulture_file,
+                    max_items=5,
+                    state_dir=str(state_dir),
+                    live=False,
+                )
 
             self.assertEqual(report.summary["total_findings"], 3)
             self.assertEqual(report.summary["total_safe_prune"], 2)
             self.assertEqual(report.summary["backend_test_fixtures"], 1)
             self.assertIsNotNone(report.task_spec)
             self.assertEqual(len(report.task_spec.target_items), 2)
-
 
     def test_run_knip_subprocess_contract(self):
         """run_knip must invoke the pinned knip via subprocess without a NameError,
@@ -634,9 +646,8 @@ index abc..def 100644
 --- a/backend/app/database.py
 +++ b/backend/app/database.py
 @@ -10,3 +10,2 @@
- _TRADE_GUC_PREFIX = (
--    "BEGIN; "
-     "SET LOCAL synchronous_commit = off; "
+-_TRADE_GUC_PREFIX = ("BEGIN; ", "SET LOCAL synchronous_commit = off; ")
++_TRADE_GUC_PREFIX = ("SET LOCAL synchronous_commit = off; ")
 """
         proposal, reason = synthesize_mechanical_bug_rule(
             bug_num=5370,
@@ -651,7 +662,27 @@ index abc..def 100644
         self.assertIn("BEGIN;", proposal.target_pattern)
         self.assertIn("Proven", proposal.proof_text)
         self.assertEqual(proposal.target_file, "backend/app/database.py")
+        import re
+        self.assertTrue(bool(re.search(proposal.target_pattern, proposal.anti_pattern_code)))
+        self.assertFalse(bool(re.search(proposal.target_pattern, proposal.fixed_code)))
 
+        # Negative check: diff removing BEGIN; without matching the regex must NOT produce a rule
+        unmatched_diff = """diff --git a/backend/app/database.py b/backend/app/database.py
+index abc..def 100644
+--- a/backend/app/database.py
++++ b/backend/app/database.py
+@@ -10,2 +10,2 @@
+-"BEGIN; "
++"SET LOCAL; "
+"""
+        unmatched_prop, unmatched_reason = synthesize_mechanical_bug_rule(
+            bug_num=5370,
+            bug_title="bug(db): trade_engine execute hook",
+            fix_pr_num=5385,
+            diff_text=unmatched_diff,
+        )
+        self.assertIsNone(unmatched_prop)
+        self.assertIsNotNone(unmatched_reason)
     def test_synthesize_mechanical_bug_rule_exception_swallowing(self):
         """Bare exception swallowing bug must synthesize a proven regex rule."""
         sample_diff = """diff --git a/backend/app/main.py b/backend/app/main.py
@@ -747,5 +778,274 @@ index abc..def 100644
         self.assertIn("### Proof of Mechanical Verification", body)
         self.assertIn("Proven: regex matches pre-fix and rejects post-fix", body)
 
+    def test_parse_pr_diff_preserves_sql_comments_and_cli_flags(self):
+        """parse_pr_diff must preserve lines starting with -- or ++ inside diff hunks (N1)."""
+        diff_text = """diff --git a/backend/app/db.py b/backend/app/db.py
+index 111..222 100644
+--- a/backend/app/db.py
++++ b/backend/app/db.py
+@@ -10,3 +10,3 @@
+-    -- SQL comment explaining transaction
+-    --dry-run
++    -- SQL comment updated
++    ++counter
+"""
+        files = parse_pr_diff(diff_text)
+        self.assertIn("backend/app/db.py", files)
+        removed = files["backend/app/db.py"]["removed"]
+        added = files["backend/app/db.py"]["added"]
+        self.assertIn("    -- SQL comment explaining transaction", removed)
+        self.assertIn("    --dry-run", removed)
+        self.assertIn("    -- SQL comment updated", added)
+        self.assertIn("    ++counter", added)
+
+    def test_synthesize_mechanical_bug_rule_reasons(self):
+        """synthesize_mechanical_bug_rule must give accurate reasons for empty, binary, and rename diffs (N3)."""
+        # Empty diff
+        _, reason_empty = synthesize_mechanical_bug_rule(1, "empty bug", 2, "")
+        self.assertEqual(reason_empty, "empty diff; no changes found in fix PR")
+
+        # Binary-only diff
+        bin_diff = """diff --git a/public/logo.png b/public/logo.png
+index 111..222 100644
+Binary files a/public/logo.png and b/public/logo.png differ
+"""
+        _, reason_bin = synthesize_mechanical_bug_rule(1, "bin bug", 2, bin_diff)
+        self.assertEqual(reason_bin, "binary-only diff; no text changes in application code")
+
+        # Rename-only diff
+        rename_diff = """diff --git a/backend/app/old_name.py b/backend/app/new_name.py
+similarity index 100%
+rename from backend/app/old_name.py
+rename to backend/app/new_name.py
+"""
+        _, reason_rename = synthesize_mechanical_bug_rule(1, "rename bug", 2, rename_diff)
+        self.assertEqual(reason_rename, "file rename only without code modifications")
+
+    def test_is_test_or_spec_path_app_files_not_excluded(self):
+        """Test and spec matching must operate on path segments and filename patterns, not substrings (N4)."""
+        # App files with 'test', 'spec', 'mock' as substrings MUST NOT be excluded
+        self.assertFalse(is_test_or_spec_path("backend/app/api_v1/latest_prices.py"))
+        self.assertFalse(is_test_or_spec_path("backend/app/attestation.py"))
+        self.assertFalse(is_test_or_spec_path("backend/app/inspector.py"))
+        self.assertFalse(is_test_or_spec_path("backend/app/special_handler.py"))
+
+        # Actual test/mock/spec files MUST be excluded
+        self.assertTrue(is_test_or_spec_path("backend/tests/test_search.py"))
+        self.assertTrue(is_test_or_spec_path("backend/tests/fixtures/data.py"))
+        self.assertTrue(is_test_or_spec_path("backend/app/conftest.py"))
+        self.assertTrue(is_test_or_spec_path("frontend/components/OldCard.test.tsx"))
+        self.assertTrue(is_test_or_spec_path("frontend/__tests__/setup.ts"))
+        self.assertTrue(is_test_or_spec_path("frontend/components/OldCard.spec.ts"))
+
+    def test_scan_closed_bug_issues_requires_closed_kind_bug(self):
+        """scan_closed_bug_issues --bug must require a CLOSED issue with kind:bug label (N6)."""
+        import subprocess as _subprocess
+        import unittest.mock as _mock
+
+        open_issue = {
+            "number": 101,
+            "title": "open bug",
+            "body": "Fixed in #102",
+            "state": "OPEN",
+            "labels": [{"name": "kind:bug"}],
+            "comments": [],
+        }
+        not_a_bug = {
+            "number": 102,
+            "title": "closed feature",
+            "body": "Fixed in #103",
+            "state": "CLOSED",
+            "labels": [{"name": "kind:feature"}],
+            "comments": [],
+        }
+        valid_bug = {
+            "number": 103,
+            "title": "closed bug with fix",
+            "body": "Fixed in #104",
+            "state": "CLOSED",
+            "labels": [{"name": "kind:bug"}],
+            "comments": [],
+        }
+
+        def fake_run(cmd, **kwargs):
+            cmd_s = [str(c) for c in cmd]
+            if "view" in cmd_s:
+                target = cmd_s[cmd_s.index("view") + 1]
+                if target == "101":
+                    return _subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(open_issue), stderr="")
+                if target == "102":
+                    return _subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(not_a_bug), stderr="")
+                if target == "103":
+                    return _subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(valid_bug), stderr="")
+            if "diff" in cmd_s:
+                return _subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return _subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr="")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with _mock.patch("gardener.subprocess.run", side_effect=fake_run):
+                p_open = scan_closed_bug_issues(bug_numbers=[101], state_dir=tmpdir, live=False)
+                self.assertEqual(p_open, [])
+                state = load_no_rules_state(tmpdir)
+                self.assertNotIn("101", state)
+
+                p_feature = scan_closed_bug_issues(bug_numbers=[102], state_dir=tmpdir, live=False)
+                self.assertEqual(p_feature, [])
+                state = load_no_rules_state(tmpdir)
+                self.assertNotIn("102", state)
+
+    def test_record_no_rule_dedup_fails_closed(self):
+        """record_no_rule must fail closed when gh issue view errors, skipping the comment write (B1)."""
+        import subprocess as _subprocess
+        import unittest.mock as _mock
+
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            if len(cmd) >= 3 and cmd[1] == "issue" and cmd[2] == "view":
+                return _subprocess.CompletedProcess(cmd, 1, stdout="", stderr="API rate limit or connection error")
+            return _subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with _mock.patch("gardener.subprocess.run", side_effect=fake_run):
+                posted = record_no_rule(
+                    bug_num=999,
+                    bug_title="test bug",
+                    reason="test reason",
+                    repo="test/repo",
+                    state_dir=tmpdir,
+                    post_comment=True,
+                    live=True,
+                )
+                self.assertFalse(posted, "Must return False and fail closed when view fails")
+                self.assertFalse(
+                    any(len(c) >= 3 and c[1:3] == ["issue", "comment"] for c in calls),
+                    "Must NOT execute gh issue comment when gh issue view fails closed",
+                )
+
+    def test_record_no_rule_comment_cap(self):
+        """scan_closed_bug_issues must cap comment writes per run at most 5 (B1)."""
+        import subprocess as _subprocess
+        import unittest.mock as _mock
+
+        comment_calls = []
+
+        def fake_run(cmd, **kwargs):
+            if len(cmd) >= 3 and cmd[1] == "issue" and cmd[2] == "comment":
+                comment_calls.append(list(cmd))
+                return _subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            if len(cmd) >= 3 and cmd[1] == "issue" and cmd[2] == "view":
+                return _subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"comments": []}), stderr="")
+            if len(cmd) >= 3 and cmd[1] == "pr" and cmd[2] == "diff":
+                return _subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return _subprocess.CompletedProcess(cmd, 0, stdout="[]", stderr="")
+
+        items = []
+        for i in range(1, 9):
+            items.append({
+                "number": 5000 + i,
+                "title": f"redesign badge {i}",
+                "body": f"Fixed in #{6000 + i}",
+                "state": "CLOSED",
+                "labels": [{"name": "kind:bug"}],
+                "comments": [],
+            })
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            def fake_list_run(cmd, **kwargs):
+                if "list" in cmd:
+                    return _subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(items), stderr="")
+                return fake_run(cmd, **kwargs)
+
+            with _mock.patch("gardener.subprocess.run", side_effect=fake_list_run):
+                scan_closed_bug_issues(
+                    state_dir=tmpdir,
+                    post_no_rule_comments=True,
+                    live=True,
+                    max_comment_writes=5,
+                )
+
+            self.assertEqual(len(comment_calls), 5, f"Expected exactly 5 comment writes (cap), got {len(comment_calls)}")
+
+    def test_no_rules_state_load_save(self):
+        """load_no_rules_state and save_no_rules_state must correctly persist and load state dicts (N7)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_initial = load_no_rules_state(tmpdir)
+            self.assertEqual(state_initial, {})
+
+            test_data = {"123": {"bug_number": 123, "reason": "test"}}
+            save_no_rules_state(test_data, tmpdir)
+
+            state_loaded = load_no_rules_state(tmpdir)
+            self.assertEqual(state_loaded, test_data)
+
+    def test_full_pipeline_no_live_zero_gh_writes(self):
+        """Negative control: running full gardener pipeline without --live must NEVER invoke gh write operations.
+        Simulates closed bug with no mechanical rule; on old head a88e06d2 this invoked `gh issue comment`.
+        On patched head, zero gh write invocations must be made.
+        """
+        import subprocess as _subprocess
+        import unittest.mock as _mock
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            knip_file = Path(tmpdir) / "knip.json"
+            vulture_file = Path(tmpdir) / "vulture.txt"
+            knip_file.write_text(json.dumps({"issues": []}), encoding="utf-8")
+            vulture_file.write_text("", encoding="utf-8")
+
+            bug_item = {
+                "number": 5533,
+                "title": "Up/Down round page: redesign scoreboard",
+                "body": "Fixed in #5534",
+                "closedAt": "2026-09-26T22:00:00Z",
+                "comments": [{"body": "Closed by #5534"}],
+                "state": "CLOSED",
+                "labels": [{"name": "kind:bug"}],
+            }
+
+            diff_text = """diff --git a/frontend/components/Scoreboard.tsx b/frontend/components/Scoreboard.tsx
+index 111..222 100644
+--- a/frontend/components/Scoreboard.tsx
++++ b/frontend/components/Scoreboard.tsx
+@@ -5,2 +5,2 @@
+ -const color = "red";
+ +const color = "blue";
+"""
+
+            gh_write_invocations = []
+
+            def fake_subprocess_run(cmd, **kwargs):
+                cmd_list = [str(c) for c in cmd]
+                if len(cmd_list) >= 3 and cmd_list[0] == "gh":
+                    sub = cmd_list[1]
+                    action = cmd_list[2]
+                    if (sub == "issue" and action in ("comment", "create", "edit", "close", "reopen", "delete")) or \
+                       (sub == "project" and action in ("item-add", "item-edit", "item-delete")):
+                        gh_write_invocations.append(cmd_list)
+                        return _subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+                if "issue" in cmd_list and "list" in cmd_list:
+                    return _subprocess.CompletedProcess(cmd, 0, stdout=json.dumps([bug_item]), stderr="")
+                if "issue" in cmd_list and "view" in cmd_list:
+                    return _subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(bug_item), stderr="")
+                if "pr" in cmd_list and "diff" in cmd_list:
+                    return _subprocess.CompletedProcess(cmd, 0, stdout=diff_text, stderr="")
+                return _subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+            with _mock.patch("gardener.subprocess.run", side_effect=fake_subprocess_run):
+                report = run_gardener(
+                    repo_root=Path(tmpdir),
+                    knip_report_file=knip_file,
+                    vulture_report_file=vulture_file,
+                    state_dir=str(Path(tmpdir) / "state"),
+                    live=False,
+                )
+
+            self.assertEqual(
+                gh_write_invocations,
+                [],
+                f"Expected 0 gh write invocations without --live, but found {len(gh_write_invocations)}: {gh_write_invocations}",
+            )
 if __name__ == "__main__":
     unittest.main()
