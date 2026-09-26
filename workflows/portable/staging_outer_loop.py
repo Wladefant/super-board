@@ -539,9 +539,21 @@ def create_github_issue(repo: str, incident: Incident) -> Optional[str]:
         res = subprocess.run(cmd, capture_output=True, text=True, check=True)
         return res.stdout.strip()
     except subprocess.CalledProcessError as e:
-        sys.stderr.write(f"Error creating GitHub issue: {e.stderr}\n")
-        return None
-
+        sys.stderr.write(f"Error creating GitHub issue with labels: {e.stderr}\n")
+        # Fallback to kind:incident if specific area/risk label is missing
+        fallback_cmd = [
+            "gh", "issue", "create",
+            "--repo", repo,
+            "--title", incident.title,
+            "--body", incident.body,
+            "--label", "kind:incident",
+        ]
+        try:
+            res = subprocess.run(fallback_cmd, capture_output=True, text=True, check=True)
+            return res.stdout.strip()
+        except subprocess.CalledProcessError as e2:
+            sys.stderr.write(f"Error creating GitHub issue with fallback labels: {e2.stderr}\n")
+            return None
 
 def add_github_comment(repo: str, issue_number: int, comment: str) -> bool:
     """Add a comment to an existing GitHub issue."""
