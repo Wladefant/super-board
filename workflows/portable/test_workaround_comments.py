@@ -1,19 +1,23 @@
 """Workaround-comment gate: an added unlinked marker fails, everything else passes."""
 import contextlib
 import io
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from workaround_comments import added_lines, comment_text, line_finding, lint, main
 
 
-def quiet_main(argv):
-    """Exit code of `main`, with its report swallowed so test output stays readable."""
-    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        return main(argv)
+def run_main(argv):
+    """Exit code and report of `main`, swallowed so test output stays readable."""
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+        code = main(argv)
+    return code, output.getvalue()
 
 
 class CommentDetection(unittest.TestCase):
@@ -184,17 +188,28 @@ class CommandLine(unittest.TestCase):
         self._git('-c', 'user.name=Comment Lint', '-c', 'user.email=lint@example.invalid',
                   'commit', '-m', message)
 
+    def diff_against_previous_commit(self):
+        return run_main(['--base', 'HEAD~1', '--repo-root', str(self.repo)])
+
     def test_unlinked_marker_exits_one(self):
         self.commit('app/main.py', 'value = 1\n# HACK: pinned until the sweep is batched\n', 'unlinked')
-        self.assertEqual(quiet_main(['--base', 'HEAD~1', '--repo-root', str(self.repo)]), 1)
+        self.assertEqual(self.diff_against_previous_commit()[0], 1)
 
     def test_linked_marker_exits_zero(self):
         self.commit('app/main.py', 'value = 1\n# HACK: pinned, see #245\n', 'linked')
-        self.assertEqual(quiet_main(['--base', 'HEAD~1', '--repo-root', str(self.repo)]), 0)
+        self.assertEqual(self.diff_against_previous_commit()[0], 0)
 
     def test_unresolvable_base_exits_two(self):
         self.commit('app/main.py', 'value = 2\n', 'clean change')
-        self.assertEqual(quiet_main(['--base', 'origin/does-not-exist', '--repo-root', str(self.repo)]), 2)
+        self.assertEqual(run_main(['--base', 'origin/does-not-exist', '--repo-root', str(self.repo)])[0], 2)
+
+    def test_finding_is_reported_as_a_github_annotation(self):
+        self.commit('app/main.py', 'value = 1\n# TODO: fix later\n', 'unlinked')
+        with mock.patch.dict(os.environ, {'GITHUB_ACTIONS': 'true'}):
+            code, report = self.diff_against_previous_commit()
+        self.assertEqual(code, 1)
+        self.assertIn('::error file=app/main.py,line=2::TODO comment cites no issue', report)
+        self.assertIn('app/main.py:2: TODO: # TODO: fix later', report)
 
 
 if __name__ == '__main__':
