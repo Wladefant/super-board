@@ -38,7 +38,7 @@ Do **not** use this as the primary implementation workflow. Route fixes to:
 - **Super Build** for feature/task implementation from GitHub Project `Ready` issues.
 - **Super QA** for functional bugs, broken behavior, failing Playwright paths, or missing QA coverage.
 - **`unassigned — needs a human`** for visual fidelity, layout, screenshots, wireframes, or design-system drift. This was Super UX's lane; there is no automated owner for it. Say so explicitly in the report rather than leaving the finding unrouted.
-- **Verdict-only expensive reviewers + cheap implementers (Decision 9):** Expensive review lanes (`codex-reviewer`, `reviewer`, `ag-opus`) post verdicts and findings only. They never implement fixes directly. Cheaper lanes (`task`/Flash, `ds-task`, Super Build) implement the fixes, sync and merge forward, and request a delta review (`delta-from: <sha>`) from the same reviewer. If Codex hits `usage_limit_reached`, the review role falls back to `reviewer`/`ag-opus`, never to Flash.
+- **Verdict-only expensive reviewers + cheap implementers (Decision 9):** Expensive review lanes (`codex-reviewer`, `reviewer`) post verdicts and findings only. They never implement fixes directly. Gating reviews use `reviewer` (direct Anthropic Opus 5); do not route gating reviews to `ag-opus` (Antigravity weekly pool low). Cheaper lanes (`task`/Flash, `ds-task`, Super Build) implement the fixes, sync and merge forward, and request a delta review (`delta-from: <sha>`) from the same reviewer. If Codex hits `usage_limit_reached`, the review role falls back directly to `reviewer`, never to Flash.
 
 There is also no orchestrator to hand your report to. Whoever invoked
 `/super-review` is the router — address the report to them.
