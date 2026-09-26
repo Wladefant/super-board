@@ -25,6 +25,8 @@ The orchestrator MUST NOT:
 
 If a problem surfaces during the run (bug in the dispatcher, missing skill, stuck card), the orchestrator should: (a) capture the symptom, (b) tell the user what they observed, (c) wait for explicit approval before touching anything. **Do not silently expand the task into "fix the dispatcher while you're at it" — that's the orchestrator becoming a worker.**
 
+**Fix, don't explain:** when a lane or session misroutes or errs, fix the steering source (stale worktree, workflow copy, agent description, memory) instead of only explaining it. Put the fix at the source immediately.
+
 When the user asks for diagnostics or a fix, prefer dispatching a focused `claude -p` worker (or named subagent) over doing the work in the orchestrator session, so the orchestrator's context stays small and the work stays inspectable in its own log.
 
 ## Intro shown when run starts
@@ -182,13 +184,14 @@ Threads are resolved via `gh api graphql` `resolveReviewThread` mutation when th
 1. Create worktree `.worktrees/issue-<N>-build/` off `config.base_branch`.
 2. Create branch `issue-<N>-<slug>` from `config.base_branch`.
 3. Read issue body + ALL comments + PROJECT.md.
-4. Implement smallest safe change covering ACs.
-5. Commit + push (always).
-6. Open draft PR linked to the issue with the PR description template.
-7. Post a 🔨 PR timeline comment with files/commits/summary.
-8. Post a short status comment on the issue with the PR URL.
-9. Clean up worktree. Keep branch + PR open.
-10. Move card Building → QA.
+4. Consult `FEATURE_MAP.json` (or `python workflows/portable/feature_map.py query <term>`) before searching the codebase to locate entry files, test suites, and risk tiers.
+5. Implement smallest safe change covering ACs.
+6. Commit + push (always).
+7. Open draft PR linked to the issue with the PR description template.
+8. Post a 🔨 PR timeline comment with files/commits/summary.
+9. Post a short status comment on the issue with the PR URL.
+10. Clean up worktree. Keep branch + PR open.
+11. Move card Building → QA.
 
 ### Builder (rebuild)
 
@@ -506,6 +509,7 @@ Before releasing the claim assignee and exiting, every worker MUST verify:
 - [ ] On failure handoff: `root-cause-hash:` line is present in the PR handoff comment (per "Root-cause hash" above).
 - [ ] On Block exit: the full template from `block-template.md` is populated on BOTH the issue and the PR (if a PR exists); the reason emoji is one of the nine in the vocabulary table (🔐 💳 🔑 ❓ 🛡 🧑 🤷 📦 🎨).
 - [ ] `gh-quota-on-exit:` line appended to PR handoff comment.
+- [ ] Encode-don't-memorize check: if any operator behavioural decision or requirement was clarified or decided during this issue, verify it is implemented in policy, skill, or code in the same cycle (never memory-only).
 
 A worker that cannot satisfy this checklist must NOT release its claim. It either fixes the gap and re-checks, or — if the gap itself is structural (e.g., GitHub API refusing to move the card) — it leaves the assignee in place and writes a halt comment so the runner's "no progress for 3 ticks" gate can fire deterministically.
 

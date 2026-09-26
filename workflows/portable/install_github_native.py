@@ -26,6 +26,11 @@ RUNTIME_FILES = (
     "quota_snapshot.py", "test_quota_snapshot.py",
     # Lane quality telemetry: session mining and model comparison.
     "lane_quality.py", "test_lane_quality.py",
+    # Feature map navigation and build slot arbiters.
+    "feature_map.py", "feature_map.schema.json", "test_feature_map.py",
+    "build_slot.py", "test_build_slot.py",
+    # Verification CLI and smoke test gate.
+    "verify.py", "test_verify.py",
 )
 POLICY = Path("policies/default/AGENTS.md")
 
@@ -42,8 +47,9 @@ def synchronize(source_root: Path, profile: Path, runtime: Path, check: bool = F
     manifest_path = runtime / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
     manifest.setdefault("authority", {}).update(source_manifest["authority"])
-    for name in ("github_work_item.py", "review_content.py", "install_github_native.py", "ledger.py"):
-        manifest.setdefault("modules", {})[name] = source_manifest["modules"][name]
+    for name in ("github_work_item.py", "review_content.py", "install_github_native.py", "ledger.py", "verify.py"):
+        if name in source_manifest.get("modules", {}):
+            manifest.setdefault("modules", {})[name] = source_manifest["modules"][name]
     required = manifest.setdefault("export", {}).setdefault("required_files", [])
     for name in ("github_work_item.py", "review_content.py"):
         if name not in required:
