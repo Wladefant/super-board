@@ -380,5 +380,35 @@ class TestGardenerTaskSpecAndReporting(unittest.TestCase):
             self.assertEqual(len(report.task_spec.target_items), 2)
 
 
+    def test_run_knip_subprocess_contract(self):
+        """run_knip must invoke the pinned knip via subprocess without a NameError,
+        pass shell=True only on Windows, and parse the returned JSON findings."""
+        import subprocess as _subprocess
+        import unittest.mock as _mock
+
+        from gardener import run_knip
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            frontend = Path(tmpdir) / "frontend"
+            frontend.mkdir()
+            (frontend / "package.json").write_text("{}", encoding="utf-8")
+
+            knip_payload = json.dumps({"issues": []})
+            captured = {}
+
+            def fake_run(cmd, **kwargs):
+                captured["cmd"] = cmd
+                captured["kwargs"] = kwargs
+                return _subprocess.CompletedProcess(cmd, 0, stdout=knip_payload, stderr="")
+
+            with _mock.patch("gardener.subprocess.run", side_effect=fake_run):
+                findings, error = run_knip(Path(tmpdir))
+
+            self.assertIsNone(error)
+            self.assertEqual(captured["cmd"][:4], ["npx", "--yes", "knip@6.38.0", "--reporter"])
+            self.assertEqual(captured["kwargs"]["shell"], os.name == "nt")
+            self.assertEqual(findings, [])
+
+
 if __name__ == "__main__":
     unittest.main()

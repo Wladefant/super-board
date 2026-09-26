@@ -312,6 +312,9 @@ def run_knip(
     # whatever knip npm serves at runtime; the pin keeps the network install
     # reproducible (offline / fixture mode via --knip-report-file needs no network).
     cmd = ["npx", "--yes", "knip@6.38.0", "--reporter", "json"]
+    # Windows: `npx` resolves to npx.cmd (a batch file) which subprocess.run
+    # cannot execute with shell=False, so the shell flag is load-bearing there.
+    use_shell = os.name == "nt"
 
     try:
         proc = subprocess.run(
