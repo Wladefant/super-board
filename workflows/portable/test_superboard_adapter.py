@@ -1286,7 +1286,6 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
         # Capture the coordinator's model BEFORE run_step advances the request
         # state (implementation → QA), which changes the routing classification.
         coordinator_model = adapter.coordinator.evaluate_step(request_id=req_id).routing.recommended_model
-
         res = adapter.run_step(request_id=req_id)
         recommendation = (res.dispatch_packet or {}).get("recommendation") or {}
 

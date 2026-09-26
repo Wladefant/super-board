@@ -881,6 +881,25 @@ class TestCheckExpectationContract(_Fixture):
         dynamic_pos = prompt.index("# DYNAMIC WORK ITEM PARAMETERS")
         self.assertLess(contract_pos, dynamic_pos)
 
+    def test_four_stage_feature_loop_briefs_and_effort_calibration(self):
+        """Four-stage feature loop stages (spec, scaffold, build/implement, verify/qa) must have briefs and calibrated effort."""
+        schema = agent_result_schema()
+        for stage, expected_effort in [
+            ("spec", "low"),
+            ("scaffold", "low"),
+            ("build", "medium"),
+            ("implement", "medium"),
+            ("qa", "high"),
+            ("review", "high"),
+            ("verify", "high"),
+        ]:
+            self.assertEqual(worker_backend.get_stage_effort(stage), expected_effort)
+            if stage in worker_backend.STAGE_BRIEFS:
+                req = self._request(stage=stage)
+                prompt = worker_backend.build_stage_prompt(req, schema)
+                self.assertIn(worker_backend.STAGE_BRIEFS[stage].split()[2], prompt)
+        self.assertEqual(worker_backend.get_stage_effort("unknown_stage", default="medium"), "medium")
+
 class TestHeadBinding(_Fixture):
 
     def _run(self, result_obj, **req_over):
