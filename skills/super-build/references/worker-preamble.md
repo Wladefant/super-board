@@ -91,6 +91,7 @@ resolved in your session output, then follow the degraded path in §1. What
    c. Stop. Do **NOT** run `gh issue close`, do **NOT** remove the `loop:in-progress` label, do **NOT** comment on the issue — the orchestrator handles all of that after merging your branch.
    d. Do **NOT** advance to another issue. The orchestrator handles dispatch.
    e. **Encode, don't memorize:** if an operator behavioural decision or requirement was clarified or decided during this issue, ensure it is encoded in policy, skill, or code in this cycle before closing. Memory is only a cache.
+   f. **Source-verified reporting (Decision 13):** paste raw command output next to every GitHub object claim (PR number, head SHA, comment URL) and log ID, and never state an ID not directly read from a tool result.
 
 ## Failure mode
 
