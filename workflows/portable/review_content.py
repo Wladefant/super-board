@@ -65,11 +65,17 @@ def is_ancestor(source, sha, cwd=None):
 
 
 def content_identity(sha, base='origin/staging', cwd=None):
+    """The changed lines of ``sha`` against its base, and nothing else.
+
+    ``-U0`` keeps context lines out: a sync merge that rewrites a line *next to*
+    a reviewed hunk leaves the hunk itself byte-identical, so the review still
+    covers the new head instead of demanding a re-review (#5612).
+    """
     if not re.fullmatch(r'[0-9a-fA-F]{40}', sha):
         raise ValueError('Review/head must name a full commit SHA')
     git('cat-file', '-e', sha + '^{commit}', cwd=cwd)
     ancestor = git('merge-base', base, sha, cwd=cwd)
-    diff = subprocess.check_output(['git', 'diff', '--binary', ancestor + '..' + sha], cwd=cwd)
+    diff = subprocess.check_output(['git', 'diff', '--binary', '-U0', ancestor + '..' + sha], cwd=cwd)
     result = git('patch-id', '--stable', cwd=cwd, input=diff)
     normalized = b''.join(line for line in diff.splitlines(keepends=True)
                           if not line.startswith((b'@@ ', b'index ')))
