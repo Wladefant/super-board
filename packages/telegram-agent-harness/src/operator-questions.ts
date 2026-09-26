@@ -152,8 +152,9 @@ export class OperatorQuestionService {
     if (edit && result.question.transport.message_id && !sent?.ok) {
       throw new Error("Selection saved. Reply to the original question to add context and submit your answer.");
     }
+    // The card text is finished HTML, exactly as the edit above treats it.
     if (!sent) sent = await this.poller.sendTelegramMessage(chat_id, result.card.text,
-      result.card.reply_markup, undefined, { decisionId: result.card.id });
+      "HTML", result.card.reply_markup, { decisionId: result.card.id });
     if (!sent?.ok || !sent.result?.message_id) throw new Error("Question persists, but Telegram delivery failed; it remains pending");
     await this.invoke("sent", { id: result.card.id, message_id: sent.result.message_id }, false);
   }

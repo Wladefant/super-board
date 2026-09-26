@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Database } from "bun:sqlite";
 import { DaemonStore } from "../daemon/store";
 
 let root: string;
@@ -78,5 +79,46 @@ describe("daemon routing ledger", () => {
     store = new DaemonStore(dbPath);
     expect(store.getRoute("slot-1", "555")?.sessionId).toBe("sess-a");
     expect(store.claimDelivery("sess-a", "entry-1", "555")).toBe(false);
+  });
+
+  test("telegram_message texts are returned per session and only inside the window", () => {
+    const before = Date.now();
+    store.recordAgentMessage("sess-a", "first");
+    store.recordAgentMessage("sess-b", "other session");
+    store.recordAgentMessage("sess-a", "second");
+
+    expect(store.recentAgentMessages("sess-a", before).sort()).toEqual(["first", "second"]);
+    expect(store.recentAgentMessages("sess-a", Date.now() + 1)).toEqual([]);
+    // The expired rows were pruned, so widening the window again does not bring them back.
+    expect(store.recentAgentMessages("sess-b", before)).toEqual([]);
+  });
+
+  test("a new turn drops the previous turn's telegram_message texts for that session only", () => {
+    store.recordAgentMessage("sess-a", "previous turn");
+    store.recordAgentMessage("sess-b", "other session");
+
+    store.beginTurn("sess-a");
+
+    expect(store.recentAgentMessages("sess-a", 0)).toEqual([]);
+    expect(store.recentAgentMessages("sess-b", 0)).toEqual(["other session"]);
+  });
+
+  test("recording a telegram_message prunes expired rows on the write, not only on a read", () => {
+    const raw = new Database(dbPath);
+    raw.run("INSERT INTO agent_messages (session_id, text, sent_at) VALUES (?, ?, ?)",
+      ["sess-a", "stale", Date.now() - 2 * 60 * 60 * 1000]);
+    raw.close();
+
+    // A session that goes quiet never reaches the read path, so the insert itself must bound
+    // the table rather than leaving the row until the daemon's next routed event.
+    store.recordAgentMessage("sess-b", "fresh");
+
+    const probe = new Database(dbPath);
+    const texts = probe
+      .query<{ text: string }, []>("SELECT text FROM agent_messages ORDER BY sent_at")
+      .all()
+      .map(row => row.text);
+    probe.close();
+    expect(texts).toEqual(["fresh"]);
   });
 });
