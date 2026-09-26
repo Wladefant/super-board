@@ -25,6 +25,7 @@ import datetime
 import json
 import os
 import re
+import socket
 import sqlite3
 import sys
 from dataclasses import asdict, dataclass, field, replace
@@ -76,6 +77,9 @@ MODEL_CODEX_FAST = "openai-codex/gpt-5.3-codex"
 # The operator's Codex worker/review tier is Astra medium (profile `codex-worker` and
 # `codex-reviewer` pins). Sol is costlier than Astra and bound to no role, so it is not routed.
 MODEL_CODEX_ASTRA = "openai-codex/gpt-6-astra:medium"
+# The free Spark window is separate from the Codex pro allowance and has its own enabled roster
+# entry (`spark`, medium effort), so it is pinned separately from the Astral worker roles.
+MODEL_CODEX_SPARK = "openai-codex/gpt-5.3-codex-spark:medium"
 
 MODEL_GROK_DORMANT = "xai-oauth/grok-4.6:high"
 
@@ -152,6 +156,37 @@ MODEL_GO_QWEN38_MAX = "opencode-go/qwen3.8-max"       # $15 cap, 2.00/6.00/.25  
 # 1,000,000; mimo-v2.6-pro and space-bunny-free are 1,048,576; gpt-6-luna is 1,050,000.
 
 OPENCODE_GO_PROVIDER = "opencode-go"
+
+# ChatGPT Web through the local codex-chatgpt-web bridge (operator 2026-09-25). The bridge is
+# a loopback daemon serving a ChatGPT subscription and is cross-family to BOTH writer
+# families Option A allows (Gemini Flash and GLM-5.3), so it is the primary gating reviewer
+# for critical diffs while it is up, a hard implementation/reasoning tier ahead of the paid
+# and scarce lanes, and the standard-review overflow when the OpenCode Go allowance is spent.
+# The provider has no entry in `veyyon usage`, so eligibility is a bridge-health precondition:
+# the loopback port is probed once per selector and a closed port closes the rung, so the
+# ladder falls through instead of dispatching a lane that would die on connect.
+MODEL_CHATGPT_WEB = "chatgpt-web/medium"          # roles web-task / web-thinker
+CHATGPT_WEB_PROVIDER = "chatgpt-web"
+CHATGPT_WEB_BRIDGE_HOST = "127.0.0.1"
+CHATGPT_WEB_BRIDGE_PORT = 17841
+CHATGPT_WEB_BRIDGE_TIMEOUT = 0.5
+
+
+def chatgpt_web_bridge_available(host: str = CHATGPT_WEB_BRIDGE_HOST,
+                                 port: int = CHATGPT_WEB_BRIDGE_PORT,
+                                 timeout: float = CHATGPT_WEB_BRIDGE_TIMEOUT) -> bool:
+    """True while the chatgpt-web bridge daemon accepts connections on its loopback port.
+
+    The bridge is a local daemon, not a metered provider, so there is no allowance to read:
+    a listening port is the only honest readiness signal, and a closed one must close the
+    rung rather than dispatch a lane that cannot run.
+    """
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
 
 # Per-model OpenCode Go allowance: monthly dollar cap, the fraction of it each rolling
 # window may spend, and the measured cost of one task lane (see the table above).
@@ -269,6 +304,9 @@ ROLE_MODEL_PINS: Dict[str, str] = {
     "codex-worker": MODEL_CODEX_ASTRA,
     "codex-reviewer": MODEL_CODEX_ASTRA,
     "ag-opus": MODEL_AG_CLAUDE_OPUS,
+    # The free Spark allowance has its own enabled roster entry and its own model, so a lane
+    # routed onto Spark must be dispatched as `spark`, never as a Codex Astral role.
+    "spark": MODEL_CODEX_SPARK,
     # One role per routed Go model, so a dispatched role can never silently run another
     # model. opencode-go/qwen3.8-flash, /qwen3.8-max and /mimo-v2.6-pro stay catalog-verified
     # and unrouted until they have a matching `modelRoles` entry of their own.
@@ -276,6 +314,10 @@ ROLE_MODEL_PINS: Dict[str, str] = {
     "go-deep": MODEL_GO_GLM53_FLASH,
     "go-review": MODEL_GO_GLM53,
     "go-bulk": MODEL_GO_GPT6_LUNA,
+    # ChatGPT Web serves from a local bridge rather than a metered provider, so both of its
+    # roles pin the same tier; model_to_agent_role splits them by task type.
+    "web-task": MODEL_CHATGPT_WEB,
+    "web-thinker": MODEL_CHATGPT_WEB,
 }
 
 # Weekly subscription windows are paced, not capped (operator 2026-09-25): each must
@@ -346,6 +388,9 @@ VERIFIED_CONTEXT_WINDOWS: Dict[str, int] = {
     MODEL_GO_QWEN38_MAX: 1000000,
     MODEL_GO_GPT6_LUNA: 1050000,
     MODEL_GO_MIMO26_PRO: 1048576,
+    # ChatGPT Web (catalog-verified 2026-09-26 from the profile model cache; all five bridge
+    # tiers report 111,193 except chatgpt-web/pro at 112,193)
+    MODEL_CHATGPT_WEB: 111193,
 }
 
 
@@ -381,8 +426,18 @@ def model_to_agent_role(model_id: str, task_type: TaskType, risk_level: RiskLeve
             return "go-review"
         if model_id == MODEL_GO_GPT6_LUNA:
             return "go-bulk"
+        if model_id == MODEL_GO_QWEN38_MAX:
+            # Chain-only member of go-review (Qwen takes the GLM-authored diffs, where GLM-5.3
+            # would be same-family); never routed as a model of its own.
+            return "go-review"
         return "go-task"
+    if model_id.startswith("chatgpt-web/"):
+        return "web-thinker" if task_type == TaskType.STRONG_REVIEW else "web-task"
     if model_id.startswith("openai-codex/"):
+        if "codex-spark" in model_id:
+            # The free Spark allowance has its own enabled roster entry (`spark`); the
+            # codex-worker/codex-reviewer pair is pinned for the Astral tiers and disabled here.
+            return "spark"
         return "codex-reviewer" if task_type == TaskType.STRONG_REVIEW else "codex-worker"
     if model_id.endswith(":free"):
         return "extra-review"
@@ -427,6 +482,8 @@ def model_to_provider(model_id: str) -> str:
         return "zai"
     if model_id.startswith("minimax-code/"):
         return "minimax"
+    if model_id.startswith("chatgpt-web/"):
+        return CHATGPT_WEB_PROVIDER
     if model_id.startswith("google-antigravity/"):
         return "google-antigravity"
     if "anthropic" in model_id:
@@ -716,7 +773,7 @@ class ResetAwareModelSelector:
     """
 
     def __init__(self, snapshot: Optional[Any] = None, credentialed_providers: Optional[Set[str]] = None,
-                 quota_snapshot: Optional[Any] = None):
+                 quota_snapshot: Optional[Any] = None, chatgpt_web_bridge: Optional[bool] = None):
         if snapshot is not None and isinstance(snapshot, BalanceAdapter):
             self.snapshot = snapshot.fetch_snapshot()
         elif snapshot is not None and hasattr(snapshot, "to_normalized"):
@@ -732,12 +789,21 @@ class ResetAwareModelSelector:
         # (operator 2026-09-25), so eligibility is read from a local snapshot that a 429 or a
         # periodic usage read refreshes. Tests inject their own snapshot here.
         self._quota_snapshot = quota_snapshot
+        # chatgpt-web readiness is a port probe, cached for the selector's lifetime; callers
+        # (tests, dry runs) may pin it either way.
+        self._chatgpt_web_bridge = chatgpt_web_bridge
 
     def quota_snapshot(self):
         """The exhaustion cache, loaded once per selector. A missing file yields an empty one."""
         if self._quota_snapshot is None:
             self._quota_snapshot = load_quota_snapshot()
         return self._quota_snapshot
+
+    def chatgpt_web_bridge_up(self) -> bool:
+        """Bridge-health precondition for every chatgpt-web rung, probed at most once."""
+        if self._chatgpt_web_bridge is None:
+            self._chatgpt_web_bridge = chatgpt_web_bridge_available()
+        return self._chatgpt_web_bridge
 
     def provider_exhaustion_reason(self, model: str) -> Optional[str]:
         """Why `model`'s provider is ineligible, or None when it may be used.
@@ -920,6 +986,7 @@ class ResetAwareModelSelector:
         ag_openai_meta = self.evaluate_provider(AG_OPENAI_PROVIDER)
         deepseek_meta = self.evaluate_provider("deepseek")
         go_meta = self.evaluate_provider("opencode-go")
+        chatgpt_web_up = self.chatgpt_web_bridge_up()
 
         provider_statuses = {
             "google-antigravity": google_meta["status"],
@@ -930,6 +997,7 @@ class ResetAwareModelSelector:
             "deepseek": deepseek_meta["status"],
             "opencode-go": go_meta["status"],
             "xai-oauth": "dormant",
+            CHATGPT_WEB_PROVIDER: "ok" if chatgpt_web_up else "down",
         }
 
         # 2. Codex pro 7d window (Spark excluded): promote while it would expire unused,
@@ -1028,6 +1096,7 @@ class ResetAwareModelSelector:
             "go_pace_window": GO_PACE_WINDOW,
             "go_lanes_remaining": go_lanes,
             "go_window_lanes": {model: self.go_window_lanes(model) for model in GO_MONTHLY_CAP_USD},
+            "chatgpt_web_bridge_up": chatgpt_web_up,
         }
 
         # 5. Rework-aware routing: force a strong first pass for critical domains or after rework.
@@ -1107,6 +1176,18 @@ class ResetAwareModelSelector:
             pace_group=PACE_GROUP_GO_PAID,
         )
 
+        # ChatGPT Web via the bridge: gated on the port probe above instead of an allowance,
+        # because there is no usage row to read. Cross-family to both writer families, so it
+        # gates a critical review without the intra-family self-preference the Chinese
+        # reviewers are ordered around.
+        chatgpt_web = _Rung(
+            MODEL_CHATGPT_WEB, chatgpt_web_up,
+            "ChatGPT web via the loopback bridge ("
+            + ("listening" if chatgpt_web_up else "not listening")
+            + f" on {CHATGPT_WEB_BRIDGE_HOST}:{CHATGPT_WEB_BRIDGE_PORT}): high-headroom "
+            "subscription tier, cross-family to Gemini and GLM writers.",
+        )
+
         if context_tokens > 180000 or task_type == TaskType.DEEP_CONTEXT:
             # CASE A: DEEP CONTEXT (> 180k tokens, or a DEEP_CONTEXT task). Every 1M-context
             # tier in cost order: free first, then the Ultra daily window, then the cheap Go
@@ -1117,7 +1198,10 @@ class ResetAwareModelSelector:
             label = f"Deep context ({context_tokens} tokens)"
             rungs = [
                 go_bunny,
-                _Rung(MODEL_GEMINI_PRO, google_ok, "Gemini 3.1 Pro (1M-token window)."),
+                chatgpt_web,
+                _Rung(MODEL_GEMINI_PRO, google_ok and task_type != TaskType.STRONG_REVIEW,
+                      "Gemini 3.1 Pro (1M-token window; never a reviewer, since Gemini must not "
+                      "review a Gemini-authored diff)."),
                 go_glm53_flash,
                 go_gpt6_luna,
                 _Rung(MODEL_DEEPSEEK_PRO, deepseek_ok, "DeepSeek V4 Pro (pay-per-token, 1M context).", cooldown=True),
@@ -1141,20 +1225,25 @@ class ResetAwareModelSelector:
             ]
             last_resort = _Rung(MODEL_DEEPSEEK_PRO, True, "every deep-context tier unavailable; pay-per-token DeepSeek V4 Pro.", cooldown=True)
             # High-risk, rework and money work never falls back to a Flash tier (as in B2).
-            final_fallbacks = ([MODEL_GEMINI_PRO, MODEL_CODEX_FAST] if is_rework_critical
+            final_fallbacks = ([MODEL_DEEPSEEK_PRO, MODEL_CODEX_FAST] if is_rework_critical
                                else [MODEL_OR_DEEPSEEK_FLASH])
 
         elif task_type == TaskType.STRONG_REVIEW and is_rework_critical:
-            # CASE B1: HIGH-RISK REVIEW. Go and Antigravity are tried before Codex, and paid
-            # Anthropic (Fable) is a regular rung: slack behind pace first, the orchestrator
-            # reserve only after Codex on pace is out. This is the one ladder where Codex and
-            # Opus may sit at the end, because a high-risk review must not stop at a cheap
-            # tier. Flash, DeepSeek Flash and free models never qualify.
+            # CASE B1: HIGH-RISK REVIEW, gated first by ChatGPT web while its bridge is up
+            # (cross-family to both writer families), then an expiring Codex surplus — a
+            # promoted rung leads the strong group, because that weekly allowance is lost at
+            # reset — then the free Antigravity Opus daily window, then the cross-family
+            # Chinese reviewers, whose go-review chain walks GLM-5.3, Qwen3.8 Max and
+            # GLM-5.3-Flash. Paid Anthropic follows: Fable on slack, and the orchestrator
+            # reserve only once Codex on pace is out. Pay-per-token DeepSeek V4 Pro is the
+            # emergency tail. A high-risk review must not stop at a cheap tier, and no Gemini
+            # rung exists here, because Gemini never reviews a Gemini-authored diff.
             label = "High-risk review"
             rungs = [
-                go_glm53,
-                ag_opus,
+                chatgpt_web,
                 codex_promo,
+                ag_opus,
+                go_glm53,
                 _Rung(MODEL_CLAUDE_FABLE, anthropic_worker_ok,
                       f"Claude Fable: the Anthropic weekly window runs {anthropic_headroom:.2f}x behind pace, "
                       "so slack beyond the orchestrator's share is spent on review."),
@@ -1163,66 +1252,72 @@ class ResetAwareModelSelector:
                       "no review allowance left elsewhere; drawing on the Anthropic orchestrator reserve.",
                       cooldown=True, as_fallback=False),
                 astra_emergency,
-                _Rung(MODEL_GEMINI_PRO, google_ok, "all strong reviewers unavailable; emergency Gemini Pro.", cooldown=True),
                 _Rung(MODEL_DEEPSEEK_PRO, deepseek_ok, "all strong reviewers unavailable; emergency DeepSeek V4 Pro.", cooldown=True),
             ]
-            last_resort = _Rung(MODEL_GEMINI_PRO, True, "all strong models unavailable or in cooldown; emergency Gemini Pro.", cooldown=True)
-            final_fallbacks = [MODEL_DEEPSEEK_PRO, MODEL_CODEX_ASTRA]
+            last_resort = _Rung(MODEL_DEEPSEEK_PRO, True, "all strong models unavailable or in cooldown; pay-per-token DeepSeek V4 Pro.", cooldown=True)
+            final_fallbacks = [MODEL_CODEX_ASTRA, MODEL_DEEPSEEK_PRO]
 
         elif is_rework_critical and task_type in (TaskType.ROUTINE_EXECUTION, TaskType.DEEP_REASONING):
-            # CASE B2: HIGH-RISK WORKER (implementation first pass, deep reasoning): cheap Go
-            # first, then Z.AI GLM-5.3, the rare Go reviewer, DeepSeek V4 Pro and Antigravity
-            # Opus. Codex follows them, and its expiring surplus is promoted once the cheaper
-            # tiers are out. Fable stays the last resort.
+            # CASE B2: HIGH-RISK WORKER (implementation first pass, deep reasoning): the Go
+            # workhorse first, then ChatGPT web while its bridge is up — a hard
+            # implementation/reasoning tier ahead of the scarce and paid lanes — then Z.AI
+            # GLM-5.3, the rare Go precision reviewer, and pay-per-token DeepSeek V4 Pro.
+            # Codex follows them and its expiring surplus is promoted once the cheaper tiers
+            # are out; Fable stays the last resort. Writers here are GLM-5.3 or DeepSeek V4
+            # Pro, never Opus, and Gemini Flash is not a high-risk writer either.
             label = ("High-risk implementation first pass" if task_type == TaskType.ROUTINE_EXECUTION
                      else "High-risk deep reasoning")
             rungs = [
                 go_glm53_flash,
+                chatgpt_web,
                 glm,
                 go_glm53,
                 deepseek_pro,
-                ag_opus,
                 codex_promo,
                 astra_on_pace,
                 astra_emergency,
-                _Rung(MODEL_GEMINI_PRO, google_ok, "strong worker tiers unavailable; emergency Gemini Pro.", cooldown=True),
                 fable_last_resort,
             ]
             last_resort = _Rung(MODEL_DEEPSEEK_PRO, True, "all worker tiers unavailable; pay-per-token DeepSeek V4 Pro.", cooldown=True)
-            final_fallbacks = [MODEL_CODEX_ASTRA, MODEL_GEMINI_PRO]
+            final_fallbacks = [MODEL_CODEX_ASTRA, MODEL_DEEPSEEK_PRO]
 
         elif task_type == TaskType.STRONG_REVIEW and risk_level == RiskLevel.MEDIUM:
-            # CASE C: MEDIUM-RISK REVIEW — worker tiers only, never paid Anthropic or Antigravity Opus
-            # (Opus is reserved for high-risk work only). Z.AI and Go lead, then Codex and DeepSeek.
+            # CASE C: MEDIUM-RISK REVIEW — standard diffs are reviewed by the cross-family
+            # Chinese models (the go-review chain: GLM-5.3, else Qwen3.8 Max, else
+            # GLM-5.3-Flash), with ChatGPT web as the overflow while Go is limited. Never
+            # paid Anthropic or Antigravity Opus, and never Gemini, which would review a
+            # Gemini-authored diff. Codex, Z.AI and DeepSeek follow.
             label = "Medium-risk review"
             rungs = [
-                go_glm53_flash,
-                glm,
+                go_glm53,
+                chatgpt_web,
                 codex_promo,
                 astra_on_pace,
-                go_glm53,
+                glm,
                 deepseek_pro,
-                _Rung(MODEL_GEMINI_FLASH, google_ok, "Gemini 3.8 Flash; direct Anthropic reserved for the orchestrator."),
                 _Rung(MODEL_DEEPSEEK_FLASH, deepseek_ok, "overflow to DeepSeek V4.1 Flash.", cooldown=True),
             ]
             last_resort = _Rung(MODEL_OR_DEEPSEEK_FLASH, True, "all review tiers unavailable; OpenRouter DeepSeek Flash.", cooldown=True)
             final_fallbacks = [MODEL_DEEPSEEK_FLASH]
 
         elif task_type == TaskType.STRONG_REVIEW:
-            # CASE D: LOW-RISK REVIEW — the free Go model and a cheap Go worker are enough.
+            # CASE D: LOW-RISK REVIEW — the free Go model and the cheap Go workhorse are
+            # enough; ChatGPT web and DeepSeek are the overflow. Never Gemini.
             label = "Low-risk review"
             rungs = [
                 go_bunny,
                 go_glm53_flash,
-                _Rung(MODEL_GEMINI_FLASH, google_ok, "Gemini 3.8 Flash fast review execution."),
-                _Rung(MODEL_DEEPSEEK_FLASH, deepseek_ok, "Gemini unavailable; DeepSeek V4.1 Flash.", cooldown=True),
+                chatgpt_web,
+                _Rung(MODEL_DEEPSEEK_FLASH, deepseek_ok, "Go and the bridge unavailable; DeepSeek V4.1 Flash.", cooldown=True),
             ]
             last_resort = _Rung(MODEL_OR_DEEPSEEK_FLASH, True, "OpenRouter DeepSeek Flash.", cooldown=True)
             final_fallbacks = [MODEL_DEEPSEEK_FLASH]
 
         elif task_type == TaskType.DEEP_REASONING:
             # CASE E: DEEP REASONING (LOW and MEDIUM risk; HIGH risk routes via CASE B2 high-risk worker ladder).
-            # Leads with opencode-go GLM-5.3 (then DeepSeek, then Gemini 3.8 Flash, or promoted Codex when expiring).
+            # Leads with ChatGPT web while its bridge is up (hard reasoning ahead of the scarce
+            # Go precision model), then opencode-go GLM-5.3, then DeepSeek V4 Pro, or promoted
+            # Codex when its window is expiring.
             label = "Deep reasoning"
             band_group = PACE_GROUP_EXEC if risk_level == RiskLevel.LOW else PACE_GROUP_STRONG
             flash_rung = _Rung(
@@ -1236,6 +1331,7 @@ class ResetAwareModelSelector:
             else:
                 band = [deepseek_pro, flash_rung]
             rungs = [
+                chatgpt_web,
                 go_glm53,
                 *band,
                 go_glm53_flash,
@@ -1331,18 +1427,28 @@ class ResetAwareModelSelector:
         test_results: Optional[str] = None,
         risk_summary: Optional[str] = None,
         reference_urls: Optional[List[str]] = None,
+        precomputed: Optional[RoutingRecommendation] = None,
     ) -> HarnessDispatchPacket:
         """
         Produce a complete, harness-agnostic dispatch packet ready for execution.
         Does not mutate any harness configuration or global state.
+
+        `precomputed` carries a selection an upstream authority already committed
+        (the coordinator commits one per evaluate_step). The coordinator is the single
+        routing authority, so its exact selection is reused instead of running every
+        provider ladder a second time; a plain dispatch() call keeps selecting on its own.
         """
-        rec = self.select_model(
-            task_type=task_type,
-            risk_level=risk_level,
-            context_tokens=context_tokens,
-            allow_codex_promotion=allow_codex_promotion,
-            rework_count=rework_count,
-            domain_tags=domain_tags,
+        rec = (
+            precomputed
+            if isinstance(precomputed, RoutingRecommendation)
+            else self.select_model(
+                task_type=task_type,
+                risk_level=risk_level,
+                context_tokens=context_tokens,
+                allow_codex_promotion=allow_codex_promotion,
+                rework_count=rework_count,
+                domain_tags=domain_tags,
+            )
         )
 
         agent_role = model_to_agent_role(rec.selected_model, task_type, risk_level)
