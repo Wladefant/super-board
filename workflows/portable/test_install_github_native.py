@@ -1,12 +1,13 @@
 """Installer contract: exact parity, missing-source preflight, no state mutation."""
 import ast
 import contextlib
+import hashlib
 import io
 import tempfile
 import json
 import unittest
 from pathlib import Path
-from install_github_native import POLICY, RUNTIME_FILES, synchronize
+from install_github_native import POLICY, RUNTIME_FILES, policy_state_path, synchronize
 
 
 class Installation(unittest.TestCase):
@@ -40,6 +41,34 @@ class Installation(unittest.TestCase):
         self.profile.write_bytes(b"unreviewed edit")
         self.assertFalse(synchronize(self.source, self.profile, self.runtime, check=True))
         self.assertEqual(self.profile.read_bytes(), b"unreviewed edit")
+
+    def test_live_policy_edits_are_refused_not_reverted(self):
+        """Negative control: the live profile keeps its rulings; the install refuses and explains."""
+        self.assertTrue(synchronize(self.source, self.profile, self.runtime))
+        expected = hashlib.sha256((self.source / POLICY).read_bytes()).hexdigest()
+        self.assertEqual(policy_state_path(self.profile).read_text(encoding="utf-8").strip(), expected)
+        self.profile.write_bytes(b"operator ruling added after the install\r\n")
+        report = io.StringIO()
+        with contextlib.redirect_stdout(report):
+            self.assertFalse(synchronize(self.source, self.profile, self.runtime))
+        self.assertIn("REFUSED", report.getvalue())
+        self.assertIn("-operator ruling added after the install", report.getvalue())
+        self.assertEqual(self.profile.read_bytes(), b"operator ruling added after the install\r\n")
+        self.assertEqual((self.runtime / "state.json").read_bytes(), b"operator state")
+        # --force-policy overwrites deliberately, and re-records the installed hash.
+        self.assertTrue(synchronize(self.source, self.profile, self.runtime, force_policy=True))
+        self.assertEqual(self.profile.read_bytes(), (self.source / POLICY).read_bytes())
+        self.assertEqual(policy_state_path(self.profile).read_text(encoding="utf-8").strip(), expected)
+        # A read-only check reports the drift, refuses nothing and writes nothing.
+        self.profile.write_bytes(b"second live ruling\r\n")
+        report = io.StringIO()
+        with contextlib.redirect_stdout(report):
+            self.assertFalse(synchronize(self.source, self.profile, self.runtime, check=True))
+        self.assertIn(f"DRIFT: {self.profile.name}", report.getvalue())
+        self.assertEqual(self.profile.read_bytes(), b"second live ruling\r\n")
+        # A live profile already holding the repository text installs without a refusal.
+        self.profile.write_bytes((self.source / POLICY).read_bytes())
+        self.assertTrue(synchronize(self.source, self.profile, self.runtime))
 
     def test_missing_source_never_partially_installs(self):
         (self.source / "workflows/portable" / RUNTIME_FILES[-1]).unlink()
