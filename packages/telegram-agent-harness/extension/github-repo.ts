@@ -8,7 +8,7 @@
 
 /**
  * Resolves `owner/repo` from a GitHub remote URL (https, ssh or scp-like form).
- * Returns null for any other host so a session outside GitHub keeps the configured default.
+ * Returns null for any other host, so a session outside GitHub links no bare `#N` at all.
  */
 export function parseGithubRepo(remoteUrl: string): string | null {
   const match = remoteUrl.trim().match(/github\.com[:/]+([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/i);
@@ -25,7 +25,8 @@ export function resolveGithubRepo(dir: string): string | undefined {
     const result = Bun.spawnSync(["git", "-C", dir, "remote", "get-url", "origin"], { stdout: "pipe", stderr: "ignore" });
     if (result.exitCode === 0) repo = parseGithubRepo(result.stdout.toString()) ?? undefined;
   } catch {
-    // No git binary or an unreadable directory: fall back to the configured default repo.
+    // No git binary or an unreadable directory: the session has no repository, so a bare
+    // `#N` in its prose stays unlinked rather than pointing at an unrelated project.
   }
   repoByDir.set(dir, repo);
   return repo;

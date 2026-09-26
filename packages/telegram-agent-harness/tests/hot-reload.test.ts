@@ -277,6 +277,14 @@ describe("Telegram Harness Hot Reload", () => {
       await runtime.onMessageStart({ message: { role: "assistant" } });
       await runtime.onMessageEnd(reply(report));
       expect(sent).toHaveLength(2);
+
+      // A reply that names a different PR is new output, not a repeat of this turn's delivery.
+      await runtime.onMessageStart({ message: { role: "user" } });
+      runtime.recordTurnDelivery("Merged PR 224 into staging after CI went green on every check across all three operating systems today.");
+      await runtime.onMessageStart({ message: { role: "assistant" } });
+      await runtime.onMessageEnd(reply("Merged PR 225 into staging after CI went green on every check across all three operating systems today."));
+      expect(sent).toHaveLength(3);
+      expect(sent[2]).toContain("Merged PR 225");
     } finally {
       await runtime?.dispose();
       if (previousDaemonDb === undefined) delete process.env.VEYYON_TELEGRAM_DAEMON_DB;

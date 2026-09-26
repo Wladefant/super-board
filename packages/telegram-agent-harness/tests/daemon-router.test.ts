@@ -504,6 +504,48 @@ describe("outbound delivery", () => {
     await router.onSessionEvent({ kind: "appended", sessionId: "sess-a", entries: [{ entryId: "e1", text: final }] });
     expect(relayed).toEqual([{ target: DM, markdown: final }]);
   });
+
+  test("a follow-up turn's answer is relayed even when it repeats the previous turn's telegram_message", async () => {
+    const fake = fakeControl([summary("sess-a", "C:/dev/demo")]);
+    const router = buildRouter({}, fake.control);
+    await router.deliver(DM, "start");
+    const answer = "Merged #224: tables now render as monospace blocks in Telegram.";
+    store.recordAgentMessage("sess-a", answer);
+
+    await router.onSessionEvent({ kind: "appended", sessionId: "sess-a", entries: [{ entryId: "e1", text: answer }] });
+    expect(relayed).toEqual([]);
+
+    // A new operator message opens a new turn, so the same answer is not held back there.
+    await router.deliver(DM, "say that again");
+    await router.onSessionEvent({ kind: "appended", sessionId: "sess-a", entries: [{ entryId: "e2", text: answer }] });
+    expect(relayed).toEqual([{ target: DM, markdown: answer }]);
+  });
+
+  test("a relayed answer whose status or issue number changed is not held back", async () => {
+    const fake = fakeControl([summary("sess-a", "C:/dev/demo")]);
+    const router = buildRouter({}, fake.control);
+    await router.deliver(DM, "start");
+    const merged224 = "Merged PR 224 into staging after CI went green on every check across all three operating systems today.";
+    const merged225 = "Merged PR 225 into staging after CI went green on every check across all three operating systems today.";
+    const running = "Checks on the order flow are still running and the ledger entries have not been verified yet, so the balances for the staging wallet remain unconfirmed today.";
+    const failed = "Checks on the order flow failed and the ledger entries have not been verified yet, so the balances for the staging wallet remain unconfirmed today.";
+    store.recordAgentMessage("sess-a", merged224);
+    store.recordAgentMessage("sess-a", running);
+
+    await router.onSessionEvent({
+      kind: "appended",
+      sessionId: "sess-a",
+      entries: [
+        { entryId: "e1", text: merged225 },
+        { entryId: "e2", text: failed },
+      ],
+    });
+
+    expect(relayed).toEqual([
+      { target: DM, markdown: merged225 },
+      { target: DM, markdown: failed },
+    ]);
+  });
 });
 
 describe("routing commands", () => {

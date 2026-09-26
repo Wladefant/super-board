@@ -31,6 +31,13 @@ interface RouteRow {
   updated_at: number;
 }
 
+/**
+ * How far back a `telegram_message` still counts as this turn's delivery for relay dedupe.
+ * Every operator message calls {@link DaemonStore.beginTurn}, which drops the turn that
+ * ended, so this only bounds a single long turn — and backstops a session that went quiet.
+ */
+export const AGENT_MESSAGE_DEDUPE_WINDOW_MS = 60 * 60 * 1000;
+
 export class DaemonStore {
   private db: Database;
 
@@ -38,6 +45,9 @@ export class DaemonStore {
     fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     this.db = new Database(dbPath);
     this.db.run("PRAGMA journal_mode = WAL;");
+    // The extension process opens this database on every telegram_message, so a write can
+    // collide with the daemon's; wait for the lock instead of losing the dedupe record.
+    this.db.run("PRAGMA busy_timeout = 5000;");
     this.db.run(`
       CREATE TABLE IF NOT EXISTS routes (
         slot_id TEXT NOT NULL,
@@ -162,10 +172,23 @@ export class DaemonStore {
 
   /** Records text telegram_message delivered for a session, for the relay's repeat check. */
   public recordAgentMessage(sessionId: string, text: string): void {
-    this.db.run("INSERT INTO agent_messages (session_id, text, sent_at) VALUES (?, ?, ?)", [sessionId, text, Date.now()]);
+    const now = Date.now();
+    // Prune on insert as well as on read: a session that goes quiet never reaches the read
+    // path, and its rows would otherwise sit in the table until the daemon's next event.
+    this.db.run("DELETE FROM agent_messages WHERE sent_at < ?", [now - AGENT_MESSAGE_DEDUPE_WINDOW_MS]);
+    this.db.run("INSERT INTO agent_messages (session_id, text, sent_at) VALUES (?, ?, ?)", [sessionId, text, now]);
   }
 
-  /** Texts telegram_message delivered for a session since `sinceMs`; older rows are pruned. */
+  /**
+   * Starts a new operator turn for a session, dropping the turn that ended. Relayed prose is
+   * compared only with `telegram_message` texts sent during the same turn, so the answer to a
+   * follow-up is never held back for resembling what the previous question was answered with.
+   */
+  public beginTurn(sessionId: string): void {
+    this.db.run("DELETE FROM agent_messages WHERE session_id = ?", [sessionId]);
+  }
+
+  /** Texts telegram_message delivered for a session since `sinceMs`, within the current turn. */
   public recentAgentMessages(sessionId: string, sinceMs: number): string[] {
     this.db.run("DELETE FROM agent_messages WHERE sent_at < ?", [sinceMs]);
     return this.db

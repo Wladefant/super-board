@@ -16,10 +16,7 @@ import type {
   SessionEvent,
 } from "./session-control";
 import { SessionControlUnavailableError } from "./session-control";
-import type { DaemonStore } from "./store";
-
-/** How far back a telegram_message still counts as this turn's delivery for relay dedupe. */
-const AGENT_MESSAGE_DEDUPE_WINDOW_MS = 60 * 60 * 1000;
+import { AGENT_MESSAGE_DEDUPE_WINDOW_MS, type DaemonStore } from "./store";
 
 /**
  * Where a message came from, and where its answer goes: a chat, plus the forum topic
@@ -156,6 +153,9 @@ export class SlotRouter {
     {
       const bound = this.boundSession(target);
       if (bound) {
+        // The operator's message opens a new turn; a telegram_message from the previous turn
+        // must not suppress the answer to this one.
+        this.options.store.beginTurn(bound);
         await this.options.control.deliver(bound, text, mode);
         return null;
       }
@@ -180,6 +180,7 @@ export class SlotRouter {
 
       const sessionId = await this.options.control.ensureSession(workspace, `Telegram ${this.slotId}`);
       await this.bind(target, sessionId, workspace);
+      this.options.store.beginTurn(sessionId);
       await this.options.control.deliver(sessionId, text, mode);
       return `🔗 <b>Routed to session</b> <code>${escapeHtml(sessionId)}</code> in <code>${escapeHtml(workspace)}</code>.`;
     }
@@ -462,7 +463,7 @@ export class SlotRouter {
       for (const entry of event.entries) {
         if (!this.options.store.claimDelivery(event.sessionId, entry.entryId, SlotRouter.claimKey(route))) continue;
         if (event.kind === "history") continue;
-        // telegram_message already put this text in front of the operator.
+        // telegram_message already put this text in front of the operator during this turn.
         if (agentMessages.some(sent => isRepeatDelivery(entry.text, sent))) {
           this.options.log(`Slot ${this.slotId}: entry ${entry.entryId} not relayed; it repeats a telegram_message from this session.`);
           continue;

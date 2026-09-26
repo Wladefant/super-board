@@ -117,8 +117,12 @@ export function extractMentionedRepos(text: string): Set<string> {
  * double-escaping, auto-links bare URLs, issue/PR references, and commit SHAs, renders tables
  * as monospace <pre> blocks (Telegram has no table entity), folds long quotes and <details>
  * into expandable blockquotes, and safely escapes all literal user text characters (<, >, &).
+ *
+ * `defaultRepo` is the session's own repository. It is required for a bare `#N` to link at all:
+ * when the session's repository cannot be resolved the reference stays unlinked rather than
+ * pointing at an unrelated project.
  */
-export function markdownToTelegramHtml(markdown: string, defaultRepo = "Bavariance/polysimulator"): string {
+export function markdownToTelegramHtml(markdown: string, defaultRepo?: string): string {
   if (!markdown) return "";
 
   const placeholders: string[] = [];
@@ -129,7 +133,7 @@ export function markdownToTelegramHtml(markdown: string, defaultRepo = "Bavarian
     return key;
   }
   const allRepos = extractMentionedRepos(markdown);
-  const projectRepo = resolveRepoSlug(defaultRepo) || (defaultRepo?.includes("/") ? defaultRepo : null);
+  const projectRepo = resolveRepoSlug(defaultRepo);
   if (projectRepo) {
     allRepos.add(projectRepo);
   }
@@ -295,15 +299,69 @@ function renderTable(rows: string[][]): string {
   return [format(header), widths.map(width => "-".repeat(width)).join("-+-"), ...body.map(format)].join("\n");
 }
 
-/** Links and issue/PR references inside a table: `[label](url)`, bare URLs, `owner/repo#N`, `#N`. */
-const TABLE_REFERENCE = /\[[^\]\n]+\]\([^)\s]+\)|https?:\/\/[^\s|)]+|(?:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)?#\d+/g;
+/**
+ * Links and issue/PR references inside a table: `[label](url)`, bare URLs, `owner/repo#N`,
+ * a known short slug, or a bare `#N`. A quote is excluded from every URL body, since the
+ * later link pass cannot carry one and would leave the raw Markdown on the reference line.
+ */
+const TABLE_REFERENCE = /\[[^\]\n]+\]\(https?:\/\/[^\s)"'>]+\)|https?:\/\/[^\s|)"'>]+|(?:[A-Za-z0-9_.-]+\/)?[A-Za-z0-9_.-]*#\d+/g;
+
+/**
+ * A table cell reduced to its literal text. Inline code keeps its content verbatim, so a cell
+ * such as `` `<i>` `` keeps `<i>` instead of losing it to the tag strip, and formatting markers
+ * outside code are dropped because a Telegram `<pre>` block cannot carry other entities. An
+ * entity the source already escaped is decoded once here, so the single escape pass over the
+ * finished block cannot escape it a second time.
+ */
+const DECODED_ENTITIES: Record<string, string> = {
+  "&amp;": "&",
+  "&lt;": "<",
+  "&gt;": ">",
+  "&quot;": '"',
+  "&apos;": "'",
+};
+
+function tableCellText(cell: string): string {
+  return cell
+    .trim()
+    .replace(/\\\|/g, "|")
+    .split(/(`[^`]*`)/g)
+    .map((part, index) => index % 2 === 1
+      ? part.slice(1, -1)
+      : part
+        .replace(/\[([^\]\n]+)\]\([^)\s]+\)/g, "$1")
+        .replace(/\*\*([^*]+)\*\*/g, "$1")
+        .replace(/__([^_]+)__/g, "$1")
+        .replace(/~~([^~]+)~~/g, "$1")
+        .replace(/<\/?(?:b|strong|i|em|u|s|code)>/gi, ""))
+    .join("")
+    .replace(/&(?:amp|lt|gt|quot|apos);/gi, entity => DECODED_ENTITIES[entity.toLowerCase()] ?? entity);
+}
+
+/**
+ * The reference tokens a table carries for the line below its block: `[label](url)`, bare URLs,
+ * `owner/repo#N`, a known short slug, or a bare `#N`. A `word#N` whose word names no known
+ * project keeps only its `#N`, so a cell such as `Lane#3` is not listed as a reference the
+ * link pass would refuse. A URL the pattern stopped short of is dropped rather than listed
+ * as its prefix, which would link somewhere the cell never named.
+ */
+function tableReferences(rows: string[]): string[] {
+  const source = rows.join("\n");
+  const tokens = new Set<string>();
+  for (const match of source.matchAll(TABLE_REFERENCE)) {
+    if (source[match.index + match[0].length] === '"') continue;
+    const token = match[0];
+    const shortSlug = /^([A-Za-z0-9_.-]+)#(\d+)$/.exec(token);
+    tokens.add(shortSlug && !PROJECT_SLUG_MAP[shortSlug[1].toLowerCase()] ? `#${shortSlug[2]}` : token);
+  }
+  return [...tokens];
+}
 
 /**
  * Replaces GitHub-flavoured Markdown tables (header row, separator row, body rows) with
  * an aligned <pre> block. Runs on raw Markdown after fenced code is protected, so the
- * cell text is escaped exactly once. Inline Markdown markers in cells are dropped because
- * Telegram's <pre> cannot contain other entities; the table's links and issue/PR
- * references follow on one line below it, where the later passes make them clickable.
+ * cell text is escaped exactly once. The table's links and issue/PR references follow on
+ * one line below it, where the later passes make them clickable.
  */
 function convertTablesToPre(src: string, addPlaceholder: (val: string) => string): string {
   const lines = src.split("\n");
@@ -324,18 +382,9 @@ function convertTablesToPre(src: string, addPlaceholder: (val: string) => string
           .replace(/^\|/, "")
           .replace(/(?<!\\)\|$/, "")
           .split(/(?<!\\)\|/)
-          .map(cell =>
-            cell
-              .trim()
-              .replace(/\\\|/g, "|")
-              .replace(/\[([^\]\n]+)\]\([^)\s]+\)/g, "$1")
-              .replace(/`([^`]*)`/g, "$1")
-              .replace(/\*\*([^*]+)\*\*/g, "$1")
-              .replace(/__([^_]+)__/g, "$1")
-              .replace(/~~([^~]+)~~/g, "$1")
-              .replace(/<\/?(?:b|strong|i|em|u|s|code)>/gi, "")));
+          .map(cell => tableCellText(cell)));
       out.push(addPlaceholder(`<pre>${escapeHtml(renderTable(rows))}</pre>`));
-      const references = [...new Set(rowLines.join("\n").match(TABLE_REFERENCE) ?? [])];
+      const references = tableReferences(rowLines);
       if (references.length > 0) out.push(references.join(" · "));
       continue;
     }
@@ -526,7 +575,7 @@ export function chunkMessage(text: string, maxChunkSize = 4000): string[] {
  * Formats a caption for Telegram photo or media group uploads (1024 char limit).
  * Converts Markdown to Telegram HTML and truncates safely with balanced tags.
  */
-export function formatTelegramCaption(caption: string, maxLen = 1024, defaultRepo = "Bavariance/polysimulator"): string {
+export function formatTelegramCaption(caption: string, maxLen = 1024, defaultRepo?: string): string {
   if (!caption) return "";
   const formatted = markdownToTelegramHtml(caption, defaultRepo);
   if (formatted.length <= maxLen) return formatted;
@@ -552,28 +601,18 @@ export function normalizeForDedupe(text: string): string {
 
 /** A contained passage shorter than this is too generic ("done", "merged") to call a repeat. */
 const REPEAT_MIN_CONTAINED_CHARS = 20;
-/** Rewording is only judged between texts with at least this many distinct words. */
-const REPEAT_MIN_WORDS = 8;
-const REPEAT_WORD_OVERLAP = 0.85;
 
 /**
- * True when `candidate` adds nothing to an `earlier` delivery: the same text, a passage of
- * it, or a near-verbatim rewording. A candidate that extends the earlier text with new
- * material is not a repeat, so a final reply that grows a mid-turn update still goes out.
+ * True when `candidate` is the same delivery as `earlier`: the identical text after markup,
+ * entities, URLs and punctuation are normalized away, or a passage of it long enough to be
+ * the same prose. Matching is exact, never a similarity score: a reply that changes one status
+ * word or one issue number is new output and must reach the operator, so the cost of an
+ * occasional repeated line is preferred to the cost of a swallowed answer.
  */
 export function isRepeatDelivery(candidate: string, earlier: string): boolean {
   const next = normalizeForDedupe(candidate);
   const prior = normalizeForDedupe(earlier);
   if (!next || !prior) return false;
   if (next === prior) return true;
-  if (next.length >= REPEAT_MIN_CONTAINED_CHARS && prior.includes(next)) return true;
-
-  const nextWords = new Set(next.split(" ").filter(w => w.length > 2));
-  const priorWords = new Set(prior.split(" ").filter(w => w.length > 2));
-  if (nextWords.size < REPEAT_MIN_WORDS || priorWords.size < REPEAT_MIN_WORDS) return false;
-  let shared = 0;
-  for (const word of nextWords) {
-    if (priorWords.has(word)) shared++;
-  }
-  return shared / (nextWords.size + priorWords.size - shared) >= REPEAT_WORD_OVERLAP;
+  return next.length >= REPEAT_MIN_CONTAINED_CHARS && prior.includes(next);
 }
