@@ -1298,10 +1298,11 @@ class RequestLedger:
                             + ", ".join(open_child_reqs)
                         )
 
+                    is_child_request = bool(req.get("parent_req_id"))
                     gh_info = req.get("github", {})
                     issue_num = gh_info.get("issue_number")
                     gh_repo = gh_info.get("repo") or DEFAULT_REPO
-                    if issue_num:
+                    if issue_num and not is_child_request:
                         effective_checker = sub_issues_checker or self.sub_issues_checker
                         # Inviolable Parent-Close Guard: Live lookup required; do not trust stale cached snapshot
                         try:
