@@ -74,8 +74,9 @@ MODEL_GEMINI_PRO = "google-antigravity/gemini-3.1-pro"
 MODEL_CLAUDE_FABLE = "anthropic/claude-fable-5-1"
 
 MODEL_CODEX_FAST = "openai-codex/gpt-5.3-codex"
-# The operator's Codex worker/review tier is Astra medium (profile `codex-worker` and
-# `codex-reviewer` pins). Sol is costlier than Astra and bound to no role, so it is not routed.
+# The operator's Codex worker/review tier is Sol high (profile `codex-worker` and
+# `codex-reviewer` pins). Astra is unsupported on ChatGPT accounts.
+MODEL_CODEX_SOL = "openai-codex/gpt-5.6-sol:high"
 MODEL_CODEX_ASTRA = "openai-codex/gpt-6-astra:medium"
 # The free Spark window is separate from the Codex pro allowance and has its own enabled roster
 # entry (`spark`, medium effort), so it is pinned separately from the Astral worker roles.
@@ -302,8 +303,8 @@ ROLE_MODEL_PINS: Dict[str, str] = {
     "zai-flash": MODEL_ZAI_GLM_FLASH,
     "minimax-task": MODEL_MINIMAX_M3,
     "gemini-pro": MODEL_GEMINI_PRO,
-    "codex-worker": MODEL_CODEX_ASTRA,
-    "codex-reviewer": MODEL_CODEX_ASTRA,
+    "codex-worker": MODEL_CODEX_SOL,
+    "codex-reviewer": MODEL_CODEX_SOL,
     "ag-opus": MODEL_AG_CLAUDE_OPUS,
     # The free Spark allowance has its own enabled roster entry and its own model, so a lane
     # routed onto Spark must be dispatched as `spark`, never as a Codex Astral role.

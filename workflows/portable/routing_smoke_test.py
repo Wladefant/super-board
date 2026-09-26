@@ -74,6 +74,7 @@ from model_routing import (
     TaskType,
     MODEL_CLAUDE_FABLE,
     MODEL_CODEX_FAST,
+    MODEL_CODEX_SOL,
     MODEL_CODEX_ASTRA,
     MODEL_CODEX_SPARK,
     MODEL_GEMINI_FLASH,
@@ -710,6 +711,8 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         # 1. Verify model_to_agent_role assigns actual Codex agent roles from roster
         self.assertEqual(model_to_agent_role(MODEL_CODEX_ASTRA, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "codex-reviewer")
         self.assertEqual(model_to_agent_role(MODEL_CODEX_ASTRA, TaskType.ROUTINE_EXECUTION, RiskLevel.HIGH), "codex-worker")
+        self.assertEqual(model_to_agent_role(MODEL_CODEX_SOL, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "codex-reviewer")
+        self.assertEqual(model_to_agent_role(MODEL_CODEX_SOL, TaskType.ROUTINE_EXECUTION, RiskLevel.HIGH), "codex-worker")
         self.assertEqual(model_to_agent_role(MODEL_CODEX_FAST, TaskType.ROUTINE_EXECUTION, RiskLevel.LOW), "codex-worker")
 
         # 2. Verify dispatch packet with promoted Codex assigns actual Codex agent role
