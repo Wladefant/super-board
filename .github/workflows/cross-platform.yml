@@ -195,3 +195,6 @@ jobs:
 
       - name: telegram notifier
         run: python -B workflows/portable/test_telegram_notifier.py
+
+      - name: outer loop intake
+        run: python -B workflows/portable/test_outer_loop_intake.py
