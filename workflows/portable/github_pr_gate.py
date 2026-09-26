@@ -455,6 +455,11 @@ def evaluate_qa_receipt(
     survive a sync-only push, so a merge of `staging` never invalidates QA that
     still describes the same diff.
 
+    When the marker line itself carries a 40-hex token (`QA-RECEIPT: PASS
+    <served-sha>`), that token is the revision QA ran against and it is the only
+    one that can bind: a receipt served from another revision reads as missing,
+    never as PASS.
+
     Returns (verdict, reason, comment_url). FAILED is never returned: the gate either
     cannot find a receipt (REQUIRED) or has one it can bind (PASSED).
     """
@@ -480,9 +485,20 @@ def evaluate_qa_receipt(
         list(pr_data.get("comments") or []) + list(pr_data.get("reviews") or [])
     ):
         body = str(source.get("body") or "")
-        if not QA_RECEIPT_MARKER_RE.search(body):
+        marker = QA_RECEIPT_MARKER_RE.search(body)
+        if not marker:
             continue
-        found = {token for token in (t.lower() for t in SHA_TOKEN_RE.findall(body)) if token in accepted}
+        # A 40-hex token beside the marker is the revision the QA actually ran
+        # against, and it decides on its own: a receipt for another revision is
+        # missing evidence, even when the head SHA is quoted elsewhere in the
+        # same comment. A bare marker keeps the comment-wide reading.
+        line_end = body.find("\n", marker.start())
+        marker_tokens = {
+            token.lower()
+            for token in SHA_TOKEN_RE.findall(body[marker.start(): line_end if line_end != -1 else len(body)])
+        }
+        candidates = marker_tokens or {token.lower() for token in SHA_TOKEN_RE.findall(body)}
+        found = {token for token in candidates if token in accepted}
         attachments = len(USER_ATTACHMENT_RE.findall(body))
         if found and attachments >= QA_RECEIPT_MIN_IMAGES:
             return (

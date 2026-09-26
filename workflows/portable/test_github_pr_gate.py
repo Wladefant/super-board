@@ -177,13 +177,18 @@ class TestGitHubPRGate(unittest.TestCase):
             allow_review_exemption=True,
         )
 
-    def qa_receipt_comment(self, *, named=None, identity=None, images=2, marker="PASS", extra=""):
-        """A browser-QA receipt in the shape lanes post on a PR, for `named` (default: the head)."""
+    def qa_receipt_comment(self, *, named=None, identity=None, images=2, marker="PASS", served=None, extra=""):
+        """A browser-QA receipt in the shape lanes post on a PR, for `named` (default: the head).
+
+        `served` mirrors the printer's `QA-RECEIPT: PASS <served-sha>` form: the revision QA
+        ran against, which the gate binds to on its own.
+        """
         named = named or self.head_sha
         identity = named if identity is None else identity
         lines = []
         if marker:
-            lines.append(f"QA-RECEIPT: {marker}")
+            suffix = f" {served}" if served else ""
+            lines.append(f"QA-RECEIPT: {marker}{suffix}")
         lines.append(f"Browser QA on {named} (identity {identity}).")
         lines.extend(
             f"![shot-{i}](https://github.com/user-attachments/assets/{i:08d}-1111-2222-3333-{i:012d})"
@@ -1433,6 +1438,33 @@ class TestGitHubPRGate(unittest.TestCase):
             "PASSED",
         )
         print("  [PASS] Negative control: receipt bound to another revision is BLOCKED")
+
+    def test_qa_receipt_served_from_another_revision_is_blocked(self):
+        """Negative control: a PASS receipt for the served revision is missing evidence, not a pass."""
+        from review_content import content_identity
+
+        patch_id, _ = content_identity(self.head_sha, "origin/staging")
+        # The marker line decides. QA ran against `served`, so the head SHA printed in the same
+        # comment (the printer's "Commit SHA" field) is not evidence for the diff under review:
+        # a deploy that lags the head was never the thing QA exercised.
+        stale = self.qa_receipt_comment(served="c" * 40)
+        result = evaluate_pr_gate(self.staging_ui_pr(comments=[stale]), policy=self.staging_policy())
+        self.assertEqual(result.qa_receipt_verdict, "REQUIRED")
+        self.assertEqual(result.gate_verdict, "BLOCKED")
+        self.assertIn("names no identity for this head", result.verdict_reason)
+        # Served from the head itself, or from the same content at an older head, it passes.
+        for served in (self.head_sha, patch_id):
+            with self.subTest(served=served[:12]):
+                case = self.staging_ui_pr(comments=[self.qa_receipt_comment(served=served)])
+                self.assertEqual(
+                    evaluate_pr_gate(case, policy=self.staging_policy()).qa_receipt_verdict, "PASSED"
+                )
+        # A FAIL marker beside the head still requires QA.
+        failed = self.staging_ui_pr(comments=[self.qa_receipt_comment(marker="FAIL", served=self.head_sha)])
+        self.assertEqual(
+            evaluate_pr_gate(failed, policy=self.staging_policy()).qa_receipt_verdict, "REQUIRED"
+        )
+        print("  [PASS] Negative control: receipt served from another revision is BLOCKED")
 
     def test_qa_receipt_accepts_content_identity_and_review_bodies(self):
         """A receipt may name the patch-id (survives a sync merge) and may live in a review body."""
