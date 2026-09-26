@@ -79,4 +79,16 @@ describe("daemon routing ledger", () => {
     expect(store.getRoute("slot-1", "555")?.sessionId).toBe("sess-a");
     expect(store.claimDelivery("sess-a", "entry-1", "555")).toBe(false);
   });
+
+  test("telegram_message texts are returned per session and only inside the window", () => {
+    const before = Date.now();
+    store.recordAgentMessage("sess-a", "first");
+    store.recordAgentMessage("sess-b", "other session");
+    store.recordAgentMessage("sess-a", "second");
+
+    expect(store.recentAgentMessages("sess-a", before).sort()).toEqual(["first", "second"]);
+    expect(store.recentAgentMessages("sess-a", Date.now() + 1)).toEqual([]);
+    // The expired rows were pruned, so widening the window again does not bring them back.
+    expect(store.recentAgentMessages("sess-b", before)).toEqual([]);
+  });
 });

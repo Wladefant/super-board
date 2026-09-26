@@ -7,7 +7,7 @@
  * outbound transcript text is attributed from.
  */
 
-import { escapeHtml } from "../extension/sanitizer";
+import { escapeHtml, isRepeatDelivery } from "../extension/sanitizer";
 import { availableCommands } from "../extension/command-registry";
 import type { DaemonSlot } from "./config";
 import type {
@@ -17,6 +17,9 @@ import type {
 } from "./session-control";
 import { SessionControlUnavailableError } from "./session-control";
 import type { DaemonStore } from "./store";
+
+/** How far back a telegram_message still counts as this turn's delivery for relay dedupe. */
+const AGENT_MESSAGE_DEDUPE_WINDOW_MS = 60 * 60 * 1000;
 
 /**
  * Where a message came from, and where its answer goes: a chat, plus the forum topic
@@ -451,10 +454,19 @@ export class SlotRouter {
   public async onSessionEvent(event: SessionEvent): Promise<void> {
     if (event.kind === "streaming") return;
     const routes = this.options.store.routesForSession(event.sessionId).filter(route => route.slotId === this.slotId);
+    if (routes.length === 0) return;
+    const agentMessages = event.kind === "appended"
+      ? this.options.store.recentAgentMessages(event.sessionId, Date.now() - AGENT_MESSAGE_DEDUPE_WINDOW_MS)
+      : [];
     for (const route of routes) {
       for (const entry of event.entries) {
         if (!this.options.store.claimDelivery(event.sessionId, entry.entryId, SlotRouter.claimKey(route))) continue;
         if (event.kind === "history") continue;
+        // telegram_message already put this text in front of the operator.
+        if (agentMessages.some(sent => isRepeatDelivery(entry.text, sent))) {
+          this.options.log(`Slot ${this.slotId}: entry ${entry.entryId} not relayed; it repeats a telegram_message from this session.`);
+          continue;
+        }
         try {
           await this.options.relay({ chatId: route.chatId, topicId: route.topicId }, entry.text, event.sessionId);
         } catch (error) {

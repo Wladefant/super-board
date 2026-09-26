@@ -22,6 +22,7 @@ import {
   getProcessIdentity,
 } from "../extension/coordinator";
 import { TelegramPoller } from "../extension/poller";
+import { resolveGithubRepo } from "../extension/github-repo";
 import { chunkMessage, escapeHtml } from "../extension/sanitizer";
 import type { AccessConfig, MessageCorrelationBridge } from "../extension/types";
 import { BunCommandRunner } from "../extension/harness/command-runner";
@@ -329,12 +330,12 @@ export class TelegramDaemon {
       // so it routes as the chat itself — same key a direct chat uses.
       topicId: forumChatId ? String(poller.getActiveThreadId() ?? "") : "",
     });
-    const sendTo = async (target: RouteTarget, text: string, parseMode?: "HTML", sessionId?: string): Promise<void> => {
+    const sendTo = async (target: RouteTarget, text: string, parseMode?: "HTML", sessionId?: string, defaultRepo?: string): Promise<void> => {
       const threadId = target.topicId ? Number(target.topicId) : undefined;
       for (const chunk of chunkMessage(text)) {
         const result = await poller.sendTelegramMessage(target.chatId, chunk, parseMode, undefined, {
           sessionId: sessionId ?? router.boundSession(target) ?? leaseSessionId,
-        }, undefined, threadId);
+        }, defaultRepo, threadId);
         if (!result?.ok) throw new Error("Telegram rejected the outbound message");
       }
     };
@@ -343,7 +344,11 @@ export class TelegramDaemon {
       store: this.store,
       control: this.control,
       send: (target, html) => sendTo(target, html, "HTML"),
-      relay: (target, markdown, sessionId) => sendTo(target, markdown, undefined, sessionId),
+      // Bare #N in relayed prose links to the bound session's own repository.
+      relay: (target, markdown, sessionId) => {
+        const workspace = this.store.getRoute(slot.slotId, target.chatId, target.topicId)?.workspace;
+        return sendTo(target, markdown, undefined, sessionId, workspace ? resolveGithubRepo(workspace) : undefined);
+      },
       log: message => this.log(message),
       topics: forumManager,
     });

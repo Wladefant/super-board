@@ -9,6 +9,7 @@ import {
   formatTelegramCaption,
   getTokenFingerprint,
   markdownToTelegramHtml,
+  isRepeatDelivery,
   redactSecrets,
 } from "../extension/sanitizer";
 
@@ -199,19 +200,71 @@ describe("Sanitizer & Security Utilities", () => {
     }
   });
 
-  test("tables convert to bullet lists", () => {
+  test("tables render as an aligned monospace block with their references linked below", () => {
     const mdTable = [
       "| Task | Owner | Status |",
       "| --- | --- | --- |",
-      "| #4799 | wladefant | Merged |",
-      "| #4440 | erik | Review |",
+      "| #4799 | **wladefant** | Merged |",
+      "| #4440 | erik | [Review](https://example.com/r?a=1&b=2) |",
     ].join("\n");
 
     const result = markdownToTelegramHtml(mdTable);
-    expect(result).toContain("• <b>Task:</b>");
-    expect(result).toContain("<b>Owner:</b>");
+    expect(result).toContain([
+      "<pre>Task  | Owner     | Status",
+      "------+-----------+-------",
+      "#4799 | wladefant | Merged",
+      "#4440 | erik      | Review</pre>",
+    ].join("\n"));
+    expect(result).not.toContain("<b>");
     expect(result).toContain('<a href="https://github.com/Bavariance/polysimulator/issues/4799">#4799</a>');
     expect(result).toContain('<a href="https://github.com/Bavariance/polysimulator/issues/4440">#4440</a>');
+    expect(result).toContain('<a href="https://example.com/r?a=1&amp;b=2">Review</a>');
+  });
+
+  test("table cells escape HTML once and a lone horizontal rule is not a table", () => {
+    const result = markdownToTelegramHtml("| a<b | c&d |\n| --- | --- |\n| x | y |");
+    expect(result).toContain("<pre>a&lt;b | c&amp;d\n----+----\nx   | y</pre>");
+
+    const rule = markdownToTelegramHtml("before | after\n---\ntext");
+    expect(rule).not.toContain("<pre>");
+  });
+
+  test("long quotes and <details> fold into expandable blockquotes; short quotes stay plain", () => {
+    expect(markdownToTelegramHtml("> short quote")).toBe("<blockquote>\nshort quote\n</blockquote>");
+
+    const long = Array.from({ length: 6 }, (_, i) => `> line ${i + 1}`).join("\n");
+    expect(markdownToTelegramHtml(long)).toStartWith("<blockquote expandable>\nline 1");
+
+    const details = markdownToTelegramHtml("<details><summary>Evidence</summary>\nrun 1 passed\nrun 2 passed\n</details>");
+    expect(details).toBe("<blockquote expandable>\n<b>Evidence</b>\nrun 1 passed\nrun 2 passed\n</blockquote>");
+  });
+
+  test("owner/repo#N links to that repo and bare #N links to the session repo passed in", () => {
+    const qualified = markdownToTelegramHtml("Merged Wladefant/veyyon#19.", "Wladefant/super-board");
+    expect(qualified).toContain('<a href="https://github.com/Wladefant/veyyon/issues/19">Wladefant/veyyon#19</a>');
+
+    const bare = markdownToTelegramHtml("Merged PR #224 and PR #225.", "Wladefant/super-board");
+    expect(bare).toContain('<a href="https://github.com/Wladefant/super-board/pull/224">#224</a>');
+    expect(bare).toContain('<a href="https://github.com/Wladefant/super-board/pull/225">#225</a>');
+
+    // A second repository in the message makes a bare #N ambiguous, so it is left unlinked.
+    const mixed = markdownToTelegramHtml("Merged Wladefant/veyyon#19 and PR #224.", "Wladefant/super-board");
+    expect(mixed).toContain("and PR #224.");
+  });
+
+  test("a delivery repeats an earlier one when it is the same text, a passage of it, or a reword", () => {
+    const earlier = "**Merged** [#224](https://github.com/Wladefant/super-board/pull/224): Telegram tables now render as monospace blocks.";
+    expect(isRepeatDelivery("Merged #224: Telegram tables now render as monospace blocks.", earlier)).toBe(true);
+    expect(isRepeatDelivery("Telegram tables now render as monospace blocks.", earlier)).toBe(true);
+    expect(isRepeatDelivery("Merged #224 today: Telegram tables now render as monospace blocks!", earlier)).toBe(true);
+  });
+
+  test("a delivery that adds material, or a short generic one, is not a repeat", () => {
+    const earlier = "Merged #224: Telegram tables now render as monospace blocks.";
+    const extended = `${earlier}\n\nNext: CI for #225 is red on the lint step; fixing the import order before re-running.`;
+    expect(isRepeatDelivery(extended, earlier)).toBe(false);
+    expect(isRepeatDelivery("Merged", earlier)).toBe(false);
+    expect(isRepeatDelivery("", earlier)).toBe(false);
   });
   test("issue/PR linkification adheres to multi-repo disambiguation rules", () => {
     // 1. Single repo context auto-links bare #N

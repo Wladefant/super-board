@@ -532,11 +532,13 @@ export class TelegramPoller {
     chatId: string | number,
     messageId: number,
     text: string,
-    _parseMode?: "HTML" | "Markdown",
+    parseMode?: "HTML" | "Markdown",
     defaultRepo = "Bavariance/polysimulator",
     replyMarkup?: Record<string, unknown>,
   ): Promise<TelegramSendMessageResponse | null> {
-    const formatted = markdownToTelegramHtml(redactSecrets(text), defaultRepo);
+    // "HTML" is finished markup, exactly as in sendTelegramMessage; anything else is Markdown.
+    const sanitized = redactSecrets(text);
+    const formatted = parseMode === "HTML" ? sanitized : markdownToTelegramHtml(sanitized, defaultRepo);
     if (!formatted.trim()) return null;
 
     try {

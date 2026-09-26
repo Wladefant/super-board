@@ -63,6 +63,12 @@ export class DaemonStore {
       slot_id TEXT NOT NULL, chat_id TEXT NOT NULL, topic_id TEXT NOT NULL,
       session_ids TEXT NOT NULL, PRIMARY KEY (slot_id, chat_id, topic_id)
     )`);
+    // telegram_message texts the session's extension delivered, so the relay can hold back
+    // a final reply that only repeats what the operator already has.
+    this.db.run(`CREATE TABLE IF NOT EXISTS agent_messages (
+      session_id TEXT NOT NULL, text TEXT NOT NULL, sent_at INTEGER NOT NULL
+    )`);
+    this.db.run("CREATE INDEX IF NOT EXISTS agent_messages_session ON agent_messages (session_id, sent_at)");
   }
 
   public putSessionListing(slotId: string, chatId: string, topicId: string, ids: string[]): void {
@@ -152,6 +158,20 @@ export class DaemonStore {
       .query<{ count: number }, [string]>("SELECT COUNT(*) AS count FROM delivered_entries WHERE session_id = ?")
       .get(sessionId);
     return row?.count ?? 0;
+  }
+
+  /** Records text telegram_message delivered for a session, for the relay's repeat check. */
+  public recordAgentMessage(sessionId: string, text: string): void {
+    this.db.run("INSERT INTO agent_messages (session_id, text, sent_at) VALUES (?, ?, ?)", [sessionId, text, Date.now()]);
+  }
+
+  /** Texts telegram_message delivered for a session since `sinceMs`; older rows are pruned. */
+  public recentAgentMessages(sessionId: string, sinceMs: number): string[] {
+    this.db.run("DELETE FROM agent_messages WHERE sent_at < ?", [sinceMs]);
+    return this.db
+      .query<{ text: string }, [string, number]>("SELECT text FROM agent_messages WHERE session_id = ? AND sent_at >= ?")
+      .all(sessionId, sinceMs)
+      .map(row => row.text);
   }
 
   public close(): void {

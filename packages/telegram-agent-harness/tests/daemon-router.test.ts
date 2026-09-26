@@ -473,6 +473,37 @@ describe("outbound delivery", () => {
     await router.onSessionEvent({ kind: "streaming", sessionId: "sess-a", active: true });
     expect(relayed).toEqual([]);
   });
+
+  test("a final reply that repeats this session's telegram_message is not relayed again", async () => {
+    const fake = fakeControl([summary("sess-a", "C:/dev/demo")]);
+    const router = buildRouter({}, fake.control);
+    await router.deliver(DM, "start");
+    store.recordAgentMessage("sess-a", "**Merged** #224: tables now render as monospace blocks in Telegram.");
+    store.recordAgentMessage("sess-other", "Unrelated lane finished and its report is posted on the issue.");
+
+    await router.onSessionEvent({
+      kind: "appended",
+      sessionId: "sess-a",
+      entries: [
+        { entryId: "e1", text: "Merged #224: tables now render as monospace blocks in Telegram." },
+        { entryId: "e2", text: "Unrelated lane finished and its report is posted on the issue." },
+      ],
+    });
+
+    // e1 repeats this session's message; e2 only matches another session's, so it goes out.
+    expect(relayed).toEqual([{ target: DM, markdown: "Unrelated lane finished and its report is posted on the issue." }]);
+  });
+
+  test("a final reply that extends the telegram_message with new material is still relayed", async () => {
+    const fake = fakeControl([summary("sess-a", "C:/dev/demo")]);
+    const router = buildRouter({}, fake.control);
+    await router.deliver(DM, "start");
+    store.recordAgentMessage("sess-a", "Merged #224: tables now render as monospace blocks in Telegram.");
+
+    const final = "Merged #224: tables now render as monospace blocks in Telegram.\n\nStill open: #225 needs a rebase-free sync with main and a green lint run.";
+    await router.onSessionEvent({ kind: "appended", sessionId: "sess-a", entries: [{ entryId: "e1", text: final }] });
+    expect(relayed).toEqual([{ target: DM, markdown: final }]);
+  });
 });
 
 describe("routing commands", () => {
