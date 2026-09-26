@@ -554,6 +554,9 @@ class TestGitHubPRGate(unittest.TestCase):
             resolve_gate_policy("Bavariance/polysimulator", "staging").require_github_approval
         )
         self.assertFalse(resolve_gate_policy("Wladefant/super-board", "main").require_github_approval)
+        self.assertFalse(resolve_gate_policy("Wladefant/veyyon", "main").require_github_approval)
+        self.assertTrue(resolve_gate_policy("Wladefant/veyyon", "staging").require_github_approval)
+        self.assertTrue(resolve_gate_policy("Wladefant/veyyon", "feature-branch").require_github_approval)
         # Production base and unknown repositories stay strict.
         self.assertTrue(resolve_gate_policy("Bavariance/polysimulator", "main").require_github_approval)
         self.assertTrue(resolve_gate_policy("some/other-repo", "staging").require_github_approval)
@@ -1228,6 +1231,107 @@ class TestGitHubPRGate(unittest.TestCase):
         ]))
         self.assertEqual(res.gate_verdict, "PENDING")
         self.assertEqual(res.pending_checks, ["build-and-boot"])
+
+    def test_veyyon_main_waiver_author_comment_review(self):
+        print("\n--- TEST 20: Veyyon Main Waiver & Negative Controls ---")
+        pr_author = "feature-developer"
+        base_pr = {
+            "number": 130,
+            "state": "OPEN",
+            "isDraft": False,
+            "headRefOid": self.head_sha,
+            "baseRefOid": self.base_sha,
+            "baseRefName": "main",
+            "author": {"login": pr_author},
+            "statusCheckRollup": [
+                {
+                    "name": "test-suite",
+                    "status": "COMPLETED",
+                    "conclusion": "SUCCESS",
+                    "completedAt": "2026-09-05T08:00:00Z",
+                }
+            ],
+            # Review required by default (no file data or labels)
+            "reviews": [],
+        }
+
+        # 1. POSITIVE TEST: author COMMENT review with APPROVE + matching content on veyyon@main passes
+        passing_pr = copy.deepcopy(base_pr)
+        passing_pr["reviews"] = [
+            {
+                "author": {"login": pr_author},
+                "state": "COMMENTED",
+                "body": f"APPROVE {self.head_sha}\n\nAutomated review against clean head.",
+                "submittedAt": "2026-09-05T08:15:00Z",
+            }
+        ]
+        result = evaluate_pr_gate(passing_pr, repo="Wladefant/veyyon")
+        self.assertEqual(result.gate_verdict, "PASSED")
+        self.assertEqual(result.approval_verdict, "AUTOMATED_REVIEW_APPROVED")
+        self.assertEqual(result.approved_by, pr_author)
+        self.assertFalse(result.github_approval_required)
+        print("  [PASS] Author COMMENT with APPROVE + matching content on veyyon@main passes")
+
+        # 2. NEGATIVE CONTROL: without a verdict does not pass (author COMMENT without verdict doesn't count)
+        no_verdict_pr = copy.deepcopy(base_pr)
+        no_verdict_pr["reviews"] = [
+            {
+                "author": {"login": pr_author},
+                "state": "COMMENTED",
+                "body": f"Reviewing commit {self.head_sha} - notes and comments without verdict.",
+                "submittedAt": "2026-09-05T08:15:00Z",
+            }
+        ]
+        res_no_verdict = evaluate_pr_gate(no_verdict_pr, repo="Wladefant/veyyon")
+        self.assertEqual(res_no_verdict.gate_verdict, "BLOCKED")
+        self.assertEqual(res_no_verdict.approval_verdict, "SELF_APPROVED_ONLY")
+        print("  [PASS] Negative control: author COMMENT without verdict blocked")
+
+        # 3. NEGATIVE CONTROL: other content (mismatched SHA / diff) does not pass
+        mismatched_content_pr = copy.deepcopy(base_pr)
+        mismatched_content_pr["reviews"] = [
+            {
+                "author": {"login": pr_author},
+                "state": "COMMENTED",
+                "body": f"APPROVE {self.base_sha}\n\nReviewed base commit, not head.",
+                "submittedAt": "2026-09-05T08:15:00Z",
+            }
+        ]
+        res_mismatched = evaluate_pr_gate(mismatched_content_pr, repo="Wladefant/veyyon")
+        self.assertEqual(res_mismatched.gate_verdict, "BLOCKED")
+        self.assertNotEqual(res_mismatched.gate_verdict, "PASSED")
+        print("  [PASS] Negative control: author review for other content blocked")
+
+        # 4. NEGATIVE CONTROL: another veyyon branch (not main) does not pass
+        other_branch_pr = copy.deepcopy(base_pr)
+        other_branch_pr["baseRefName"] = "feature-branch"
+        other_branch_pr["reviews"] = [
+            {
+                "author": {"login": pr_author},
+                "state": "COMMENTED",
+                "body": f"APPROVE {self.head_sha}\n\nAutomated review.",
+                "submittedAt": "2026-09-05T08:15:00Z",
+            }
+        ]
+        res_other_branch = evaluate_pr_gate(other_branch_pr, repo="Wladefant/veyyon")
+        self.assertEqual(res_other_branch.gate_verdict, "BLOCKED")
+        self.assertTrue(res_other_branch.github_approval_required)
+        print("  [PASS] Negative control: author review on non-main veyyon branch blocked")
+
+        # 5. NEGATIVE CONTROL: another repo does not pass
+        other_repo_pr = copy.deepcopy(base_pr)
+        other_repo_pr["reviews"] = [
+            {
+                "author": {"login": pr_author},
+                "state": "COMMENTED",
+                "body": f"APPROVE {self.head_sha}\n\nAutomated review.",
+                "submittedAt": "2026-09-05T08:15:00Z",
+            }
+        ]
+        res_other_repo = evaluate_pr_gate(other_repo_pr, repo="other-org/other-repo")
+        self.assertEqual(res_other_repo.gate_verdict, "BLOCKED")
+        self.assertTrue(res_other_repo.github_approval_required)
+        print("  [PASS] Negative control: author review on another repo blocked")
 
 
 def main():

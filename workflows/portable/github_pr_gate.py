@@ -138,6 +138,17 @@ DEFAULT_GATE_POLICIES: List[GateApprovalPolicy] = [
             "are not caused by any PR."
         ),
     ),
+    GateApprovalPolicy(
+        repo="Wladefant/veyyon",
+        base_ref="main",
+        require_github_approval=False,
+        require_head_bound_review_evidence=True,
+        allow_review_exemption=True,
+        rationale=(
+            "Single authenticated identity on veyyon main; exact-head independent automated "
+            "review evidence is required instead of an unobtainable non-author GitHub approval."
+        ),
+    ),
     GateApprovalPolicy(rationale="Default: independent non-author GitHub approval required."),
 ]
 
@@ -815,6 +826,8 @@ def evaluate_pr_gate(
         ]
         staging_waiver = (
             (repo == "Bavariance/polysimulator" and base_ref == "staging")
+            or (repo == "Wladefant/super-board" and base_ref == "main")
+            or (repo == "Wladefant/veyyon" and base_ref == "main")
             or (not policy.require_github_approval and policy.require_head_bound_review_evidence)
         )
         content_review = evaluate_content(
