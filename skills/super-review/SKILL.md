@@ -38,6 +38,7 @@ Do **not** use this as the primary implementation workflow. Route fixes to:
 - **Super Build** for feature/task implementation from GitHub Project `Ready` issues.
 - **Super QA** for functional bugs, broken behavior, failing Playwright paths, or missing QA coverage.
 - **`unassigned — needs a human`** for visual fidelity, layout, screenshots, wireframes, or design-system drift. This was Super UX's lane; there is no automated owner for it. Say so explicitly in the report rather than leaving the finding unrouted.
+- **Verdict-only expensive reviewers + cheap implementers (Decision 9):** Expensive review lanes (`codex-reviewer`, `reviewer`, `ag-opus`) post verdicts and findings only. They never implement fixes directly. Cheaper lanes (`task`/Flash, `ds-task`, Super Build) implement the fixes, sync and merge forward, and request a delta review (`delta-from: <sha>`) from the same reviewer. If Codex hits `usage_limit_reached`, the review role falls back to `reviewer`/`ag-opus`, never to Flash.
 
 There is also no orchestrator to hand your report to. Whoever invoked
 `/super-review` is the router — address the report to them.
@@ -83,7 +84,7 @@ If the input is ambiguous, default to reviewing the current branch against its u
    - If a blocker is an implementation task, hand it to **Super Build**.
    - If a blocker is a functional regression, hand it to **Super QA**.
    - If a blocker is visual/design fidelity, mark it `unassigned — needs a human`. There is no Super UX skill to hand it to.
-   - If the user explicitly authorizes Super Review to fix, make the smallest safe patch, verify it, and clearly report that review also changed code.
+   - **Decision 9 split:** Reviewers post verdicts and findings only; paired cheap executor lanes (Flash `task`, `ds-task`, Super Build) implement the fixes and then request a delta review (`delta-from: <sha>`). Review lanes do not implement code fixes directly.
 
 5. **Verify evidence**
    - Run the smallest meaningful verification for the touched area.

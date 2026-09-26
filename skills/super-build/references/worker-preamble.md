@@ -90,6 +90,7 @@ resolved in your session output, then follow the degraded path in §1. What
       - **Do not edit the issue body.** Acceptance-criterion checkboxes are the orchestrator's source of truth; rewriting them to "look done" is gaming the contract.
    c. Stop. Do **NOT** run `gh issue close`, do **NOT** remove the `loop:in-progress` label, do **NOT** comment on the issue — the orchestrator handles all of that after merging your branch.
    d. Do **NOT** advance to another issue. The orchestrator handles dispatch.
+   e. **Encode, don't memorize:** if an operator behavioural decision or requirement was clarified or decided during this issue, ensure it is encoded in policy, skill, or code in this cycle before closing. Memory is only a cache.
 
 ## Failure mode
 

@@ -25,6 +25,8 @@ The orchestrator MUST NOT:
 
 If a problem surfaces during the run (bug in the dispatcher, missing skill, stuck card), the orchestrator should: (a) capture the symptom, (b) tell the user what they observed, (c) wait for explicit approval before touching anything. **Do not silently expand the task into "fix the dispatcher while you're at it" — that's the orchestrator becoming a worker.**
 
+**Fix, don't explain:** when a lane or session misroutes or errs, fix the steering source (stale worktree, workflow copy, agent description, memory) instead of only explaining it. Put the fix at the source immediately.
+
 When the user asks for diagnostics or a fix, prefer dispatching a focused `claude -p` worker (or named subagent) over doing the work in the orchestrator session, so the orchestrator's context stays small and the work stays inspectable in its own log.
 
 ## Intro shown when run starts
@@ -506,6 +508,7 @@ Before releasing the claim assignee and exiting, every worker MUST verify:
 - [ ] On failure handoff: `root-cause-hash:` line is present in the PR handoff comment (per "Root-cause hash" above).
 - [ ] On Block exit: the full template from `block-template.md` is populated on BOTH the issue and the PR (if a PR exists); the reason emoji is one of the nine in the vocabulary table (🔐 💳 🔑 ❓ 🛡 🧑 🤷 📦 🎨).
 - [ ] `gh-quota-on-exit:` line appended to PR handoff comment.
+- [ ] Encode-don't-memorize check: if any operator behavioural decision or requirement was clarified or decided during this issue, verify it is implemented in policy, skill, or code in the same cycle (never memory-only).
 
 A worker that cannot satisfy this checklist must NOT release its claim. It either fixes the gap and re-checks, or — if the gap itself is structural (e.g., GitHub API refusing to move the card) — it leaves the assignee in place and writes a halt comment so the runner's "no progress for 3 ticks" gate can fire deterministically.
 
