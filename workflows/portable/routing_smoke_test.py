@@ -73,6 +73,7 @@ from model_routing import (
     RiskLevel,
     TaskType,
     MODEL_CLAUDE_FABLE,
+    MODEL_CLAUDE_OPUS_55,
     MODEL_CODEX_FAST,
     MODEL_CODEX_ASTRA,
     MODEL_CODEX_SPARK,
@@ -889,6 +890,63 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         rec = selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
         self.assertNotEqual(rec.selected_model, MODEL_AG_CLAUDE_OPUS)
         print(f"  [PASS] 429 body wrote {reset.exhausted_until}; review lane routed to {rec.selected_model}.")
+
+    # -------------------------------------------------------------------------
+    # TEST: Review routing: routine reviews (>250 lines) default to ag-opus,
+    # migration/money first-pass escalates to reviewer (Opus 5.5), and ag-opus
+    # exhaustion falls back to reviewer (never Flash).
+    # (Operator ruling 2026-09-26 ~13:25Z: "I mean only hard, super hard work, right?
+    # Don't move everything in there").
+    # -------------------------------------------------------------------------
+    def test_review_routing_ag_opus_default_and_super_hard_escalation(self):
+        print("\n--- TEST: Review Routing ag-opus Default and Super-Hard Escalation ---")
+        usage = self._usage_with_ag_families(anthropic_used=0.0)
+        selector = self._selector(usage)
+
+        # 1. Routine review above 250 lines resolves to ag-opus (Opus 4.6 on free daily window)
+        rec_routine = selector.select_model(
+            task_type=TaskType.STRONG_REVIEW,
+            risk_level=RiskLevel.HIGH,
+            diff_lines=300,
+        )
+        self.assertEqual(rec_routine.selected_model, MODEL_AG_CLAUDE_OPUS)
+        self.assertEqual(model_to_agent_role(rec_routine.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "ag-opus")
+
+        # 2. Migration first-pass review resolves to reviewer (Claude Opus 5.5)
+        rec_migration = selector.select_model(
+            task_type=TaskType.STRONG_REVIEW,
+            risk_level=RiskLevel.HIGH,
+            domain_tags=["migration"],
+            rework_count=0,
+        )
+        self.assertEqual(rec_migration.selected_model, MODEL_CLAUDE_OPUS_55)
+        self.assertEqual(model_to_agent_role(rec_migration.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "reviewer")
+
+        # 3. Money first-pass review resolves to reviewer (Claude Opus 5.5)
+        rec_money = selector.select_model(
+            task_type=TaskType.STRONG_REVIEW,
+            risk_level=RiskLevel.HIGH,
+            domain_tags=["money"],
+            rework_count=0,
+        )
+        self.assertEqual(rec_money.selected_model, MODEL_CLAUDE_OPUS_55)
+        self.assertEqual(model_to_agent_role(rec_money.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "reviewer")
+
+        # 4. ag-opus exhaustion falls back to reviewer (Opus 5.5) and never to Flash
+        exhausted = ResetAwareModelSelector(
+            parse_usage_json(usage, current_time_ms=self.mock_now_ms),
+            quota_snapshot=self._quota_with("google-antigravity:anthropic", "2099-01-01T00:00:00Z"),
+        )
+        rec_exhausted = exhausted.select_model(
+            task_type=TaskType.STRONG_REVIEW,
+            risk_level=RiskLevel.HIGH,
+            diff_lines=300,
+        )
+        self.assertEqual(rec_exhausted.selected_model, MODEL_CLAUDE_OPUS_55)
+        self.assertEqual(model_to_agent_role(rec_exhausted.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "reviewer")
+        self.assertNotIn("flash", rec_exhausted.selected_model.lower())
+        self.assertNotIn("flash", rec_exhausted.fallback_model.lower())
+        print("  [PASS] Routine review (>250 lines) -> ag-opus; migration/money -> reviewer; ag-opus exhaustion -> reviewer (never Flash).")
     def _selector(self, usage):
         return ResetAwareModelSelector(parse_usage_json(usage, current_time_ms=self.mock_now_ms))
 
@@ -982,7 +1040,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
                          .quota_metrics["anthropic_orchestrator_reserve"])
         self.assertEqual(
             selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH).selected_model,
-            MODEL_CLAUDE_FABLE,
+            MODEL_CLAUDE_OPUS_55,
         )
         for task_type, risk in ((TaskType.DEEP_REASONING, RiskLevel.MEDIUM), (TaskType.DEEP_REASONING, RiskLevel.HIGH),
                                 (TaskType.ROUTINE_EXECUTION, RiskLevel.HIGH), (TaskType.STRONG_REVIEW, RiskLevel.MEDIUM)):
@@ -1606,16 +1664,22 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         for role, model in ROLE_MODEL_PINS.items():
             chain = (agents.get(role) or {}).get("model") or model_roles.get(role)
             self.assertIsNotNone(chain, f"{role} is not defined as a role or agent")
-            self.assertEqual(str(chain).split(",")[0].strip(), model, f"{role} must lead with {model}")
+            leading = str(chain).split(",")[0].strip()
+            if role in ("codex-worker", "codex-reviewer"):
+                self.assertIn(leading, (model, "openai-codex/gpt-5.6-sol:high"), f"{role} must lead with {model} or Sol")
+            else:
+                self.assertEqual(leading, model, f"{role} must lead with {model}")
 
-        # 2. Paid Anthropic Opus is retired from every worker and reviewer chain; the
-        # interactive orchestrator (`modelRoles.default`) is explicitly out of scope.
+        # 2. Paid Anthropic Opus is reserved for gating review (`reviewer`); worker chains must not run paid Opus;
+        # the interactive orchestrator (`modelRoles.default`) is explicitly out of scope.
         paid_opus = "anthropic/claude-opus-5-5"
         for role, chain in model_roles.items():
-            if role == "default":
+            if role in ("default", "reviewer"):
                 continue
             self.assertNotIn(paid_opus, str(chain), f"modelRoles.{role} must not run paid Opus")
         for name, entry in agents.items():
+            if name == "reviewer":
+                continue
             for chain in chains(entry):
                 self.assertNotIn(paid_opus, str(chain), f"agents.{name} must not run paid Opus")
         for pattern, chain in (parsed.get("retry") or {}).get("fallbackChains", {}).items():
@@ -1633,12 +1697,16 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
                          "the Antigravity fallback chain must not substitute a Gemini model")
 
         # 4. The critical-diff reviewer gates on the bridge first, then free Opus, then the
-        # cross-family Chinese reviewers, then DeepSeek.
+        # cross-family Chinese reviewers, then DeepSeek. Gating roles (reviewer, ag-opus) NEVER lead with chatgpt-web.
         critical_chain = str((agents.get("reviewer") or {}).get("model", ""))
-        self.assertEqual(critical_chain.split(",")[0].strip(), MODEL_CHATGPT_WEB)
+        self.assertEqual(critical_chain.split(",")[0].strip(), "anthropic/claude-opus-5-5:high")
         for expected in ("google-antigravity/claude-opus-4-6", "opencode-go/glm-5.3",
                          "opencode-go/qwen3.8-max", "deepseek/"):
             self.assertIn(expected, critical_chain, f"critical review chain must offer {expected}")
+        for gating_role in ("reviewer", "ag-opus"):
+            first_model = str((agents.get(gating_role) or {}).get("model", "")).split(",")[0].strip()
+            self.assertFalse(first_model.startswith("chatgpt-web"),
+                             f"Gating role '{gating_role}' must never lead with chatgpt-web (got {first_model})")
 
         # 5. The standard-diff reviewer is the cross-family Chinese chain with a DeepSeek
         # fallback for the OpenCode Go limit, and the hard writer is GLM-5.3 or DeepSeek.
