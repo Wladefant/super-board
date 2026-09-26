@@ -51,6 +51,8 @@ from github_pr_gate import (
     is_lockfile_or_generated,
     parse_pr_ref,
     resolve_gate_policy,
+    validate_local_tests_record,
+    is_build_and_boot_critical_diff,
 )
 
 
@@ -1249,6 +1251,76 @@ class TestGitHubPRGate(unittest.TestCase):
         self.assertEqual(res.gate_verdict, "PASSED")
         self.assertIn("lint-and-typecheck", res.verdict_reason)
         self.assertIn("timed out", res.verdict_reason.lower())
+
+    def test_local_tests_record_queued_passes(self):
+        """queued + valid record -> pass: deploy-critical checks release on matching local test record."""
+        pr = self._exempt_staging_pr([
+            {"name": "build-and-boot", "status": "QUEUED", "conclusion": ""},
+        ])
+        record = {
+            "head_sha": pr["headRefOid"],
+            "commands": ["pytest backend/tests"],
+            "passed": 10,
+            "failed": 0,
+        }
+        policy = resolve_gate_policy("Bavariance/polysimulator", "staging")
+        res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy, local_tests_record=record)
+        self.assertEqual(res.ci_verdict, "SUCCESS")
+        self.assertEqual(res.gate_verdict, "PASSED")
+        self.assertIn("build-and-boot", res.released_checks)
+        self.assertIn("released: local tests recorded", res.verdict_reason.lower())
+
+    def test_local_tests_record_stale_sha_pending(self):
+        """queued + record for a stale sha -> pending: mismatched head SHA does not release checks."""
+        pr = self._exempt_staging_pr([
+            {"name": "build-and-boot", "status": "QUEUED", "conclusion": ""},
+        ])
+        record = {
+            "head_sha": "0000000000000000000000000000000000000000",
+            "commands": ["pytest backend/tests"],
+            "passed": 10,
+            "failed": 0,
+        }
+        policy = resolve_gate_policy("Bavariance/polysimulator", "staging")
+        res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy, local_tests_record=record)
+        self.assertEqual(res.ci_verdict, "PENDING")
+        self.assertEqual(res.gate_verdict, "PENDING")
+        self.assertEqual(res.pending_checks, ["build-and-boot"])
+
+    def test_local_tests_record_dockerfile_changed_pending(self):
+        """queued + record + Dockerfile changed -> pending: build-and-boot stays blocking when Dockerfile touched."""
+        pr = self._exempt_staging_pr([
+            {"name": "build-and-boot", "status": "QUEUED", "conclusion": ""},
+        ])
+        pr["files"] = [{"path": "backend/Dockerfile", "additions": 1, "deletions": 0}]
+        record = {
+            "head_sha": pr["headRefOid"],
+            "commands": ["pytest backend/tests"],
+            "passed": 10,
+            "failed": 0,
+        }
+        policy = resolve_gate_policy("Bavariance/polysimulator", "staging")
+        res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy, local_tests_record=record)
+        self.assertEqual(res.ci_verdict, "PENDING")
+        self.assertEqual(res.gate_verdict, "PENDING")
+        self.assertEqual(res.pending_checks, ["build-and-boot"])
+
+    def test_local_tests_record_failed_blocks(self):
+        """failed + record -> blocked: a check that ran and failed always blocks."""
+        pr = self._exempt_staging_pr([
+            {"name": "build-and-boot", "status": "COMPLETED", "conclusion": "FAILURE"},
+        ])
+        record = {
+            "head_sha": pr["headRefOid"],
+            "commands": ["pytest backend/tests"],
+            "passed": 10,
+            "failed": 0,
+        }
+        policy = resolve_gate_policy("Bavariance/polysimulator", "staging")
+        res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy, local_tests_record=record)
+        self.assertEqual(res.ci_verdict, "FAILURE")
+        self.assertEqual(res.gate_verdict, "BLOCKED")
+        self.assertIn("build-and-boot", res.failing_checks)
 
     def test_non_critical_pending_under_timeout_stays_pending(self):
         """A non-critical check pending under 5 minutes is still waited on."""
