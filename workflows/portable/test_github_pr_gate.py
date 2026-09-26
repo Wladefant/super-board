@@ -1422,33 +1422,44 @@ class TestGitHubPRGate(unittest.TestCase):
         self.assertEqual(result.qa_receipt_verdict, "REQUIRED")
         self.assertIn("0 GitHub-hosted evidence image(s)", result.verdict_reason)
         print("  [PASS] Negative controls: marker, image count and image host all enforced")
-        # Release assets and commit-pinned raw URLs are the other two forms policy allows, so a
-        # receipt built the way live lanes build them (#5630) is evidence, not a blocked merge.
-        hosted = "\n".join([
+        # Commit-pinned raw URLs are the second form policy allows, so two of them are evidence.
+        pinned = "\n".join([
             "**QA-RECEIPT: PASS**",
             f"- **Head SHA**: `{self.head_sha}`",
-            "![desktop](https://github.com/Bavariance/polysimulator/releases/download/qa-evidence-tag/a.png)",
-            f"![mobile](https://github.com/Bavariance/polysimulator/raw/{self.head_sha}/docs/qa/mobile.png)",
-        ])
-        for body in (hosted,):
-            with self.subTest(hosts="release-asset + commit-pinned"):
-                receipt = {"body": body, "html_url": self.QA_RECEIPT_URL}
-                result = evaluate_pr_gate(self.staging_ui_pr(comments=[receipt]), policy=self.staging_policy())
-                self.assertEqual(result.qa_receipt_verdict, "PASSED")
-        # An unpinned raw path and a relative path stay unrecognised.
-        unpinned = "\n".join([
-            "**QA-RECEIPT: PASS**",
-            f"- **Head SHA**: `{self.head_sha}`",
-            "![a](https://github.com/o/r/raw/main/docs/qa/a.png)",
-            "![b](docs/qa/b.png)",
+            f"![desktop](https://github.com/Bavariance/polysimulator/raw/{self.head_sha}/docs/qa/a.png)",
+            f"![mobile](https://github.com/Bavariance/polysimulator/raw/{self.head_sha}/docs/qa/b.png)",
         ])
         result = evaluate_pr_gate(
-            self.staging_ui_pr(comments=[{"body": unpinned, "html_url": self.QA_RECEIPT_URL}]),
+            self.staging_ui_pr(comments=[{"body": pinned, "html_url": self.QA_RECEIPT_URL}]),
             policy=self.staging_policy(),
         )
-        self.assertEqual(result.qa_receipt_verdict, "REQUIRED")
-        self.assertIn("0 GitHub-hosted evidence image(s)", result.verdict_reason)
-        print("  [PASS] Evidence hosts: attachments, release assets and commit-pinned raw accepted; others not")
+        self.assertEqual(result.qa_receipt_verdict, "PASSED")
+        # Hosts that do not render are not evidence, however many are pasted: a release asset
+        # 404s in a private repo through GitHub's image proxy (PR #5630, 2026-09-27), and an
+        # unpinned raw path or a relative path never resolves.
+        for label, refs in (
+            ("release-asset", [
+                "![a](https://github.com/Bavariance/polysimulator/releases/download/qa-evidence-tag/a.png)",
+                "![b](https://github.com/Bavariance/polysimulator/releases/download/qa-evidence-tag/b.png)",
+            ]),
+            ("unpinned+relative", [
+                "![a](https://github.com/o/r/raw/main/docs/qa/a.png)",
+                "![b](docs/qa/b.png)",
+            ]),
+        ):
+            with self.subTest(hosts=label):
+                body = "\n".join([
+                    "**QA-RECEIPT: PASS**",
+                    f"- **Head SHA**: `{self.head_sha}`",
+                    *refs,
+                ])
+                result = evaluate_pr_gate(
+                    self.staging_ui_pr(comments=[{"body": body, "html_url": self.QA_RECEIPT_URL}]),
+                    policy=self.staging_policy(),
+                )
+                self.assertEqual(result.qa_receipt_verdict, "REQUIRED")
+                self.assertIn("0 GitHub-hosted evidence image(s)", result.verdict_reason)
+        print("  [PASS] Evidence hosts: attachments and commit-pinned raw count; release assets, unpinned and relative do not")
 
     def test_qa_receipt_for_another_revision_is_blocked(self):
         """Negative control: a receipt written before a further edit never binds the new head."""

@@ -379,14 +379,14 @@ def evaluate_review_requirement(pr_data: Dict[str, Any]) -> Tuple[bool, str]:
 QA_RECEIPT_MARKER_RE = re.compile(r"^[ \t>*_`#|\-]*QA-RECEIPT:\s*PASS\b", re.IGNORECASE | re.MULTILINE)
 QA_RECEIPT_MIN_IMAGES = 2
 SHA_TOKEN_RE = re.compile(r"\b[0-9a-fA-F]{40}\b")
-# Evidence images that render on a PR without a session cookie, exactly the forms
-# AGENTS.md §11 allows: uploaded attachments, release assets, and commit-pinned raw
-# URLs (the last only when pinned to a full commit SHA). raw.githubusercontent.com
-# and relative paths stay unrecognised.
+# Evidence images that actually render on a PR: uploaded attachments and commit-pinned
+# raw URLs (pinned to a full commit SHA). Release-asset URLs are excluded on purpose —
+# GitHub's image proxy 404s them in a private repo
+# (Bavariance/polysimulator PR #5630, 2026-09-27), and raw.githubusercontent.com,
+# unpinned raw paths and relative paths never resolve either.
 EVIDENCE_IMAGE_RE = re.compile(
     r"https://github\.com/user-attachments/assets/"
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
-    r"|https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/releases/download/[^\s)\"'>]+"
     r"|https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/raw/[0-9a-fA-F]{40}/[^\s)\"'>]+"
 )
 UI_PATH_RE = re.compile(r"^frontend/", re.IGNORECASE)
