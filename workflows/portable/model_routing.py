@@ -87,6 +87,7 @@ MODEL_GROK_DORMANT = "xai-oauth/grok-4.6:high"
 # Gemini's (live-tested 2026-09-25). They reset daily, so unused headroom expires sooner
 # than any Anthropic/Codex weekly window. They are a permitted cheap worker tier (operator
 # ruling): `ag-opus` may take worker work while its window is above AG_FAMILY_MIN_REMAINING.
+# Opus worker and review roles default to medium effort (Issue #228, operator 2026-09-26).
 MODEL_AG_CLAUDE_OPUS = "google-antigravity/claude-opus-4-6"
 MODEL_AG_CLAUDE_SONNET = "google-antigravity/claude-sonnet-4-6"
 MODEL_AG_GPT_OSS = "google-antigravity/gpt-oss-120b"
