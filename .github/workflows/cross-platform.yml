@@ -193,6 +193,9 @@ jobs:
       - name: github pr gate
         run: python -B workflows/portable/test_github_pr_gate.py
 
+      - name: verification cli and gate
+        run: python -B workflows/portable/test_verify.py
+
       - name: telegram notifier
         run: python -B workflows/portable/test_telegram_notifier.py
 
