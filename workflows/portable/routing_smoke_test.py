@@ -106,6 +106,7 @@ from model_routing import (
     detect_credentialed_providers,
     model_to_agent_role,
     model_to_provider,
+    resolve_role_model,
 )
 
 def tmp_quota_path() -> "Path":
@@ -1313,6 +1314,9 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         # resolved as reviews, because that is the only way the router emits them.
         review_pins = {"codex-reviewer", "web-thinker"}
         for role, model in ROLE_MODEL_PINS.items():
+            if role == "astra-ux":
+                # Specialized UX role; router emits ag-opus for MODEL_AG_CLAUDE_OPUS
+                continue
             task_type = TaskType.STRONG_REVIEW if role in review_pins else TaskType.ROUTINE_EXECUTION
             self.assertEqual(model_to_agent_role(model, task_type, RiskLevel.HIGH), role, f"{role} pin {model}")
         print("  [PASS] All role and provider mappings correct (ag-sonnet, ag-gpt, ds-pro, zai-task, zai-flash, minimax-task).")
@@ -1683,11 +1687,11 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         # the interactive orchestrator (`modelRoles.default`) is explicitly out of scope.
         paid_opus = "anthropic/claude-opus-5-5"
         for role, chain in model_roles.items():
-            if role in ("default", "reviewer"):
+            if role in ("default", "reviewer", "astra-ux"):
                 continue
             self.assertNotIn(paid_opus, str(chain), f"modelRoles.{role} must not run paid Opus")
         for name, entry in agents.items():
-            if name == "reviewer":
+            if name in ("reviewer", "astra-ux"):
                 continue
             for chain in chains(entry):
                 self.assertNotIn(paid_opus, str(chain), f"agents.{name} must not run paid Opus")
@@ -2042,8 +2046,74 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         # Negative control: no automatic re-enable by date (manual switch only)
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertFalse(codex_available(), "codex_available() must be False regardless of time when CODEX_ENABLED=False")
-
         print("  [PASS] All states verified: off (skipped), on (routed), plus negative control.")
+
+
+    # -------------------------------------------------------------------------
+    # TEST 42: astra-ux role pin — non-Codex UX model while CODEX_ENABLED=False
+    # -------------------------------------------------------------------------
+    def test_astra_ux_never_resolves_to_codex_while_disabled(self):
+        print("\n--- TEST 42: astra-ux Role Pin Non-Codex when CODEX_ENABLED=False ---")
+        # Invariant: while CODEX_ENABLED is False (or Codex account unavailable),
+        # astra-ux must never resolve to an openai-codex/ model (e.g. gpt-6-astra).
+        self.assertFalse(CODEX_ENABLED, "CODEX_ENABLED must default to False")
+        self.assertIn("astra-ux", ROLE_MODEL_PINS)
+        pinned_model = ROLE_MODEL_PINS["astra-ux"]
+        self.assertFalse(pinned_model.startswith("openai-codex/"),
+                         f"astra-ux pin must not be a Codex model, got {pinned_model}")
+        self.assertEqual(pinned_model, MODEL_AG_CLAUDE_OPUS,
+                         f"astra-ux must pin {MODEL_AG_CLAUDE_OPUS}")
+
+        # resolve_role_model must return MODEL_AG_CLAUDE_OPUS
+        resolved = resolve_role_model("astra-ux")
+        self.assertEqual(resolved, MODEL_AG_CLAUDE_OPUS)
+        self.assertFalse(resolved.startswith("openai-codex/"))
+
+        # Check installed profile configuration if present
+        config_path = Path(os.path.expanduser("~/.veyyon/profiles/default/agent/config.yml"))
+        if config_path.exists():
+            parsed = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            agents = (parsed.get("agent") or {}).get("agents") or {}
+            model_roles = parsed.get("modelRoles") or {}
+            chain = (agents.get("astra-ux") or {}).get("model") or model_roles.get("astra-ux")
+            if chain is not None:
+                leading = str(chain).split(",")[0].strip()
+                self.assertFalse(leading.startswith("openai-codex/"),
+                                 f"astra-ux leading model in config.yml must not be Codex: {leading}")
+                self.assertEqual(leading, pinned_model,
+                                 f"astra-ux leading model {leading} must match pin {pinned_model}")
+                if "astra-ux" in agents:
+                    self.assertTrue(agents["astra-ux"].get("enabled", True), "astra-ux must be enabled")
+
+        # ---------------------------------------------------------------------
+        # NEGATIVE CONTROL:
+        # 1. The old failing configuration (MODEL_CODEX_ASTRA) is an openai-codex/ model.
+        # 2. When CODEX_ENABLED=False (codex_available() is False), resolve_role_model
+        #    MUST refuse to resolve any Codex role (returns None, never openai-codex/*).
+        # 3. If astra-ux were mocked with the old failing Codex pin, resolve_role_model
+        #    blocks it when codex_available() is False.
+        # ---------------------------------------------------------------------
+        with mock.patch("model_routing.codex_available", return_value=False):
+            old_failing_model = MODEL_CODEX_ASTRA  # "openai-codex/gpt-6-astra:medium"
+            self.assertTrue(old_failing_model.startswith("openai-codex/"))
+            self.assertNotEqual(ROLE_MODEL_PINS["astra-ux"], old_failing_model)
+
+            # Codex roles resolve to None when Codex is disabled
+            self.assertIsNone(resolve_role_model("codex-worker"))
+            self.assertIsNone(resolve_role_model("codex-reviewer"))
+
+            # Mock astra-ux temporarily pointing to the old failing Codex model:
+            # resolve_role_model MUST NOT resolve to it while Codex is disabled:
+            with mock.patch.dict(ROLE_MODEL_PINS, {"astra-ux": old_failing_model}):
+                neg_resolved = resolve_role_model("astra-ux")
+                self.assertIsNone(neg_resolved,
+                                  "Negative control: astra-ux with Codex model must resolve to None when CODEX_ENABLED=False")
+
+        # When Codex is enabled, a role pinned to MODEL_AG_CLAUDE_OPUS still resolves to it
+        with mock.patch("model_routing.codex_available", return_value=True):
+            self.assertEqual(resolve_role_model("astra-ux"), MODEL_AG_CLAUDE_OPUS)
+
+        print("  [PASS] astra-ux resolves to non-Codex model, negative control verified.")
 def main():
     print("=" * 70)
     print("RUNNING VEYYON BALANCE LOADER & MODEL ROUTING SMOKE TEST SUITE")
