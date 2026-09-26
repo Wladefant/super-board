@@ -15,8 +15,14 @@ Commands:
 
 Invariants:
     - Atomic acquisition via os.mkdir('~/.veyyon/run/build-slot.lock').
-    - Lock metadata contains owner, pid, and acquired_at timestamp.
-    - Waiting lanes are tracked in a FIFO queue file ('~/.veyyon/run/build-slot.queue.json').
+    - Lock metadata contains owner, pid, token, and acquired_at timestamp.
+    - Waiting lanes are tracked in a FIFO queue file ('~/.veyyon/run/build-slot.queue.json')
+      with unique tokens to differentiate in-process waiters sharing a parent PID.
+    - Queue entries emit periodic heartbeats (heartbeat_at); entries with dead PIDs or
+      heartbeats older than 60s are automatically reclaimed.
+    - Legacy queue entries without heartbeats fall back to enqueued_at age > 30m.
+    - Acquire wait loops write heartbeats before queue cleaning, re-enqueue if pruned,
+      and clean up queue entries via try/finally on timeout, exit, or exception.
     - Release by non-owner is strictly refused.
     - Stale locks (owner PID dead, or older than --stale-after [default 30m]) are reclaimed
       with a logged notice.
@@ -271,13 +277,14 @@ class BuildSlotManager:
                 "corrupt": True,
             }
 
-    def _write_lock_info(self, owner: str, pid: int) -> None:
+    def _write_lock_info(self, owner: str, pid: int, token: Optional[str] = None) -> None:
         """Writes info.json inside the newly created lock directory."""
         now = time.time()
         now_iso = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat()
         info = {
             "owner": owner,
             "pid": pid,
+            "token": token,
             "acquired_at": now_iso,
             "acquired_at_epoch": now,
         }
@@ -592,6 +599,7 @@ class BuildSlotManager:
         pid: Optional[int] = None,
         token: Optional[str] = None,
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
+        queue_stale_heartbeat_after: Optional[float] = None,
     ) -> bool:
         """
         Acquires the build slot lock for 'name'.
@@ -603,6 +611,16 @@ class BuildSlotManager:
         if token is None:
             token = str(uuid.uuid4())
 
+        effective_heartbeat_threshold = (
+            queue_stale_heartbeat_after
+            if queue_stale_heartbeat_after is not None
+            else self.queue_stale_heartbeat_after
+        )
+        if poll_interval >= effective_heartbeat_threshold:
+            raise ValueError(
+                f"poll_interval ({poll_interval}s) must be less than "
+                f"queue_stale_heartbeat_after ({effective_heartbeat_threshold}s)"
+            )
         # 1. RAM Guard Check
         ram_pct = get_system_ram_percent()
         if ram_pct is not None and ram_pct >= RAM_GUARD_THRESHOLD_PERCENT:
@@ -623,25 +641,34 @@ class BuildSlotManager:
                 print(notice, file=sys.stderr)
                 logger.warning(notice)
 
-        # 2. Register in FIFO Queue
-        self.enqueue(name, pid, token=token)
         start_time = time.time()
         last_heartbeat = start_time
         acquired = False
 
         try:
+            # 2. Register in FIFO Queue inside try so finally always cleans up
+            self.enqueue(name, pid, token=token)
+
             while True:
+                # Update heartbeat first if due (every <= 15s)
+                now = time.time()
+                if now - last_heartbeat >= heartbeat_interval:
+                    hb_ok = self.heartbeat(token=token, name=name, pid=pid)
+                    last_heartbeat = now
+                    if not hb_ok:
+                        notice = (
+                            f"[NOTICE] Queue entry for '{name}' (PID {pid}, token {token}) "
+                            f"was missing during heartbeat; re-enqueuing."
+                        )
+                        print(notice, file=sys.stderr)
+                        logger.warning(notice)
+                        self.enqueue(name, pid, token=token)
+
                 # Check and reclaim any stale lock
                 self.check_stale_and_reclaim(stale_after=stale_after)
 
                 # Clean dead PIDs / stale heartbeats from queue
                 queue = self.clean_queue()
-
-                # Write heartbeat if needed (every <= 15s)
-                now = time.time()
-                if now - last_heartbeat >= heartbeat_interval:
-                    self.heartbeat(token=token, name=name, pid=pid)
-                    last_heartbeat = now
 
                 # Check if current caller is at the head of the FIFO queue
                 is_head_of_queue = False
@@ -658,7 +685,7 @@ class BuildSlotManager:
                         try:
                             os.mkdir(self.lock_dir)
                             # Atomic creation succeeded! We own the lock.
-                            self._write_lock_info(owner=name, pid=pid)
+                            self._write_lock_info(owner=name, pid=pid, token=token)
                             acquired = True
                             self.dequeue(name, pid, token=token)
                             msg = f"Acquired build slot lock for '{name}' (PID {pid})"
@@ -674,12 +701,13 @@ class BuildSlotManager:
                     # Lock exists; check if we already own it (re-entrant / idempotent)
                     info = self._read_lock_info()
                     if info and info.get("owner") == name and info.get("pid") == pid:
-                        acquired = True
-                        self.dequeue(name, pid, token=token)
-                        msg = f"Build slot lock already held by '{name}' (PID {pid})"
-                        print(msg)
-                        return True
-
+                        lock_token = info.get("token")
+                        if lock_token is None or lock_token == token:
+                            acquired = True
+                            self.dequeue(name, pid, token=token)
+                            msg = f"Build slot lock already held by '{name}' (PID {pid})"
+                            print(msg)
+                            return True
                 # Check timeout
                 if timeout is not None:
                     elapsed = time.time() - start_time
@@ -689,7 +717,7 @@ class BuildSlotManager:
                         logger.error(msg)
                         return False
 
-                time.sleep(poll_interval)
+                time.sleep(min(poll_interval, heartbeat_interval))
         finally:
             # If we exited without holding the lock, remove self from queue
             if not acquired:
@@ -698,14 +726,16 @@ class BuildSlotManager:
                 except Exception as e:
                     logger.warning("Failed to dequeue on cleanup: %s", e)
 
-    def is_held_by(self, name: str, pid: Optional[int] = None) -> bool:
-        """Returns True if the lock is held by 'name' (and optionally pid)."""
+    def is_held_by(self, name: str, pid: Optional[int] = None, token: Optional[str] = None) -> bool:
+        """Returns True if the lock is held by 'name' (and optionally pid / token)."""
         info = self._read_lock_info()
         if not info:
             return False
         if info.get("owner") != name:
             return False
         if pid is not None and info.get("pid") != pid:
+            return False
+        if token is not None and info.get("token") is not None and info.get("token") != token:
             return False
         return True
 
@@ -779,6 +809,7 @@ class BuildSlotManager:
             lock_status["locked"] = True
             lock_status["owner"] = info.get("owner")
             lock_status["pid"] = info.get("pid")
+            lock_status["token"] = info.get("token")
             lock_status["acquired_at"] = info.get("acquired_at")
 
             acquired_epoch = info.get("acquired_at_epoch")
