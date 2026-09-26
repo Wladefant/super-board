@@ -1,0 +1,118 @@
+{
+  "$schema": "workflows/portable/feature_map.schema.json",
+  "version": "1.0.0",
+  "repository": "Wladefant/super-board",
+  "description": "Machine-readable feature map for agent navigation in super-board",
+  "features": {
+    "routing": {
+      "name": "Model Routing & Usage Telemetry",
+      "description": "Calibrated model routing ladders, role-to-model pins, provider pacing, allowance tracking, and fallback policies for agent lanes.",
+      "entry_files": [
+        "workflows/portable/model_routing.py",
+        "workflows/portable/balance_loader.py",
+        "workflows/portable/quota_snapshot.py"
+      ],
+      "tests": [
+        "workflows/portable/routing_smoke_test.py",
+        "workflows/portable/test_quota_snapshot.py"
+      ],
+      "owning_issue": "https://github.com/Wladefant/super-board/issues/210",
+      "risk": "high",
+      "components": [
+        "ModelRouter",
+        "RoleModelPins",
+        "PacingGuard",
+        "QuotaTracker"
+      ],
+      "cli_command": "python -B workflows/portable/routing_smoke_test.py",
+      "docs": [
+        "workflows/portable/PORTABLE.md"
+      ]
+    },
+    "gate": {
+      "name": "Pull Request Gate & Content-Bound Review",
+      "description": "GitHub PR qualification, content-bound review verification (patch-id and diff sha256), approval waivers, and deploy-critical CI checks.",
+      "entry_files": [
+        "workflows/portable/github_pr_gate.py",
+        "workflows/portable/review_content.py",
+        "workflows/portable/github_work_item.py"
+      ],
+      "tests": [
+        "workflows/portable/test_github_pr_gate.py",
+        "workflows/portable/test_review_content.py",
+        "workflows/portable/test_review_content_gate.py",
+        "workflows/portable/test_github_work_item.py"
+      ],
+      "owning_issue": "https://github.com/Wladefant/super-board/issues/195",
+      "risk": "high",
+      "components": [
+        "GitHubPrGate",
+        "ContentBoundReview",
+        "ReviewFreshnessCheck",
+        "DeployCriticalChecks"
+      ],
+      "cli_command": "python -B workflows/portable/test_github_pr_gate.py"
+    },
+    "ledger": {
+      "name": "Durable Request Ledger & Gates",
+      "description": "Machine-local crash-resilient request ledger, state machine transitions, acceptance criteria tracking, and synchronization with GitHub Issues / Project 5.",
+      "entry_files": [
+        "workflows/portable/ledger.py",
+        "workflows/portable/superboard_adapter.py",
+        "workflows/portable/project_adapter.py"
+      ],
+      "tests": [
+        "workflows/portable/test_ledger_gates.py",
+        "workflows/portable/test_superboard_adapter.py",
+        "workflows/portable/test_project_adapter.py"
+      ],
+      "owning_issue": "https://github.com/Wladefant/super-board/issues/74",
+      "risk": "medium",
+      "components": [
+        "RequestLedger",
+        "SuperboardAdapter",
+        "ProjectAdapter",
+        "StateTransitionGate"
+      ],
+      "cli_command": "python -B workflows/portable/test_ledger_gates.py"
+    },
+    "gardener": {
+      "name": "Gardener Code Pruning & Debt Weeding",
+      "description": "Automated scans for dead code, unused exports, and tech debt (Knip for TypeScript, Vulture for Python) with bounded cleanup task specification generation.",
+      "entry_files": [
+        "workflows/portable/gardener.py"
+      ],
+      "tests": [
+        "workflows/portable/test_gardener.py"
+      ],
+      "owning_issue": "https://github.com/Wladefant/super-board/issues/227",
+      "risk": "low",
+      "components": [
+        "GardenerRunner",
+        "KnipScanner",
+        "VultureScanner",
+        "CleanupTaskSpecGenerator"
+      ],
+      "cli_command": "python -B workflows/portable/test_gardener.py"
+    },
+    "build_slot": {
+      "name": "Build & Browser Slot Arbiter",
+      "description": "Host-level resource arbiter managing exclusive access to heavy tasks (next build, dev Chromium) with FIFO queuing, RAM threshold guards, and stale lock reclamation.",
+      "entry_files": [
+        "workflows/portable/build_slot.py"
+      ],
+      "tests": [
+        "workflows/portable/test_build_slot.py"
+      ],
+      "owning_issue": "https://github.com/Wladefant/super-board/issues/227",
+      "risk": "medium",
+      "components": [
+        "BuildSlotManager",
+        "RamGuard",
+        "FifoQueue",
+        "StaleLockReclaimer"
+      ],
+      "cli_command": "python -B workflows/portable/test_build_slot.py"
+    }
+  }
+}

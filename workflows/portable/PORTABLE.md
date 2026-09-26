@@ -50,6 +50,7 @@ A harness-agnostic, pure Python standard library multi-agent coordination core l
 | **`github_pr_gate.py`** | `FinalizeExecutableRouting` | Deterministic GitHub PR status and review gate verifying CI, GitHub approvals, or source-backed independent automated review artifacts on named non-production branches. | `python github_pr_gate.py --pr <pr_url_or_number> [--head-sha <sha>] [--review-record <artifact.json>] [--policy-config <policy.json>] [--json]` | Live GitHub PR via `gh`, native required-check contexts, optional `portable-review/v1` artifact | `PRGateEvaluation` (`PASSED`, `BLOCKED`, `PENDING`) with detailed gate breakdown |
 | **`diagnostics.py`** | `PackagePortableCoordinator` | Unified aggregate system, service, provider, request and host resource diagnostics. Exposes where problems lie, what is missing, distinguishes access from health and stale from failed, and asks user only when true authorization/preference/credential needed with deduplicatable question IDs. | `python diagnostics.py [--state-dir <dir>] [--strict] [--json] [--summary]` (or `python coordinator.py --diagnostics`) | `ledger.json`, `decisions.json`, `preflight_evidence/`, usage snapshots | `DiagnosticReport` (JSON or terminal summary), `human_inputs`, `agent_actions` |
 | **`recurrence_guard.py`** | `ImplementRecurrenceGuard` | Durable failure recurrence persistence and corrective-action gates. Stable `project+environment+operation+error_class` signatures with unique observation ids, so duplicate ingestion is not recurrence and an intended negative control is retained without counting. First occurrence keeps diagnosis/owner/next action; second refuses unchanged blind retry until a systemic corrective action is recorded; third escalates once per epoch through the existing deduplicated notification contract. Records only — executes nothing and satisfies no authorization or head-bound QA/review gate. | `python recurrence_guard.py [--state-dir <dir>] [--summary] [observe \| check-retry \| record-corrective-action \| supersede-observation \| resolve \| list \| show \| escalations]` | `recurrence.json`, `ledger.json`, observed failure text from a native worker outcome, the continuation driver, CI, a deployment or a tool | `IntakeResult`, `RetryDecision` (CLI exit 3 when a retry is refused), `NotificationEvent` payloads with their dedup signatures, ledger evidence/blocker/next_action |
+| **`verify.py`** | `VerificationGate` | Verification CLI and smoke test gate classifying modified surfaces (`docs`, `backend`, `frontend`, `workflow`), executing scenario checks, and emitting head-bound `verify-receipt/v1` JSON artifacts. | `python verify.py [--pr <number|url>] [--files <path...>] [--head-sha <sha>] [--receipt-out <path>] [--json]` | Changed files, unified diffs, PR metadata, scenario QA receipts | `VerificationReceipt` (`verify-receipt/v1`), `ScenarioCheckResult`, gate evaluation |
 
 ### Automated review artifact contract
 
@@ -68,6 +69,19 @@ not a cryptographic identity guarantee; the supplying workflow must authenticate
 the referenced transcript. An author `COMMENTED` review is never represented as GitHub
 approval.
 
+
+### Verification receipt contract (`verify-receipt/v1`)
+
+`--verify-receipt` in `github_pr_gate.py` reads a head-bound `verify-receipt/v1` JSON artifact
+emitted by `verify.py`. The receipt classifies all changed files across four primary surfaces:
+- `docs`: Markdown syntax linting and UTF-8 encoding validation.
+- `backend`: Python syntax compilation, test receipt ingestion, or targeted test execution.
+- `frontend`: Mandates head-bound dual-viewport (desktop 1440px/1920px & mobile 320px/390px) browser QA receipts.
+- `workflow`: Python syntax compilation and targeted workflow verification.
+
+A valid receipt must bind the exact 40-character head SHA and report `status: "PASSED"`.
+When `require_verify_receipt` is enabled in the gate approval policy (or `--require-verify-receipt`
+flag is passed), missing or failing receipts block the gate.
 ---
 
 ## 3. Single Bounded Coordinator Command

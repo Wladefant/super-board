@@ -305,6 +305,21 @@
       "outputs": [
         "AuditResult (JSON or Markdown summary, non-zero exit on findings)"
       ]
+    },
+    "verify.py": {
+      "role": "Verification CLI and smoke test gate classifying modified surfaces (docs, backend, frontend, workflow), executing scenario checks, and emitting head-bound verify-receipt/v1 JSON artifacts",
+      "owner": "VerificationGate",
+      "cli_command": "python verify.py [--pr <number|url>] [--files <path...>] [--head-sha <40-hex>] [--receipt-out <path>] [--json]",
+      "inputs": [
+        "Changed file list or unified diff",
+        "PR metadata and comments (via gh CLI or API payload)",
+        "Browser QA receipts, unit test outputs, or docs syntax"
+      ],
+      "outputs": [
+        "VerificationReceipt (JSON or compact markdown, schema verify-receipt/v1)",
+        "ScenarioCheckResult (per surface: docs_lint, browser_qa_receipt, backend_unit_tests, workflow_unit_tests)",
+        "Deploy-critical change detection"
+      ]
     }
   },
   "adapters": {

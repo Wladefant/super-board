@@ -193,6 +193,7 @@ const lanePrompt = (lane, card) => [
   `Base branch: ${card.selectedBaseBranch || card.selected_base_branch} (declared route — never infer another one).`,
   `Issue node: ${card.issueNodeId || card.issue_node_id || 'unknown'}.`,
   `Nested spawning is disabled — do not task/spawn_subagent; a nested spawn dies with a preamble and no work.`,
+  `Feature map: consult FEATURE_MAP.json (or run workflows/portable/feature_map.py query <term>) before searching repo to resolve entry files, tests, and owning issues.`,
   `Harvest bot findings from all three surfaces (issue comments, inline review comments, PR review objects) before independent review.`,
   `Never use Closes/Fixes/Resolves unless every acceptance criterion is met; otherwise Part of plus the full issue URL.`,
   `Never move a card to Done on inference. Push early. Own your worktree.`,
