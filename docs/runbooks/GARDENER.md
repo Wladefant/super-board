@@ -103,6 +103,14 @@ python workflows/portable/gardener.py --dry-run \
 - `--max-items`: Maximum pruning candidates in generated task spec (default: `15`).
 - `--target-lane`: Cheap model lane for cleanup execution: `spark`, `task`, or `flash` (default: `spark`).
 - `--dry-run`: Read-only execution; prints findings summary and task spec without mutating files.
+- `--live`: Create live GitHub issues for top prioritized candidates and enroll them into Superboard Project 5.
+- `--issue-repo`: Target GitHub repository for created issues (default: `Bavariance/polysimulator`).
+- `--max-new-issues`: Maximum number of live GitHub issues to create per run (default: 5, hard-capped at 5).
+- `--scan-bugs-only`: Fast mode; bypasses heavy Knip/Vulture scan and executes closed-bug-to-lint-rule scan only.
+- `--bug <N>`: Target specific closed bug issue number(s) to process for regression guard rule proposal (repeatable, e.g. `--bug 5370`).
+- `--install-tasks`: Installs recurring Windows Task Scheduler (`schtasks`) jobs for daily full scan and hourly bug scan.
+- `--log-dir`: Directory for saving execution logs and `.cmd` wrapper scripts (default: `C:/Users/wkiri/.veyyon/run/gardener`).
+- `--skip-ram-check`: Bypasses host RAM utilization safety check (by default, halts when host RAM $\ge 90\%$).
 - `--markdown`: Output full Markdown document to stdout.
 - `--json`: Output raw JSON report to stdout.
 - `--output-json <path>`: Write JSON report to specified file.
@@ -112,17 +120,79 @@ python workflows/portable/gardener.py --dry-run \
 
 ---
 
-## 6. Verification & Automated Tests
+## 6. Live Issue Dispatching & Superboard Integration
 
-A dedicated test suite validates the scanner, classifier, and spec generator:
+When executed with `--live`, the Gardener converts scan findings and bug-to-lint proposals into authoritative GitHub issues strictly adhering to the 9-point Superboard Issue Contract (`## Scope`, `## Acceptance Criteria`, `## Dependencies & Parent`, `## Owner`, `## State & Blockers`, `## Branch/PR/Exact Head`, `## Evidence`, `## Next Action`, `## Authorization`):
+
+1. **Deterministic Deduplication:** Each issue embeds a comment `<!-- fingerprint: gardener:<category>:<hash> -->`. The Gardener checks open and closed issues in the target repo before creation, never recreating or reopening an existing or rejected issue.
+2. **Hard Capping:** At most 5 issues are created per execution run (`--max-new-issues 5`).
+3. **Metadata & Labels:**
+   - Label: `kind:gardener`
+   - Area: `area:frontend`, `area:api`, or `area:workflow`
+   - Risk: `risk:low`
+   - Milestone: Active open milestone (e.g. `Staging Stabilization & DDL Gate`)
+   - Assignee: `Wladefant`
+   - Project: Automatically enrolled into Wladefant Project 5 (`PVT_kwHOBL7E1c4Bd5R1`).
+
+---
+
+## 7. Bug-to-Lint-Rule Loop (Poteto Ratchets)
+
+The Gardener continuously surveys recently closed bugs with merged pull requests (`gh issue list --state closed --label kind:bug`) or targets a specific bug via `--bug <N>`:
+- **Target Filtering:** Only closed bugs whose linked fix PR touches application code (`.py`, `.ts`, `.tsx`, `.js`) are evaluated. UI/copy/design redesigns and test-only fixes are automatically skipped.
+- **Anti-Pattern Extraction:** The runner parses the fix PR diff, extracts the exact removed code lines that caused the defect, and synthesizes candidate `ast-grep` or regex rules.
+- **Mechanical Proof:** The runner executes an automated proof confirming the candidate rule matches the pre-fix code and strictly rejects the post-fix code.
+- **No-Rule Rejection Gate:** If no mechanical rule can be proven (e.g. complex multi-file control-flow logic), the runner files NOTHING, records `no-rule: <reason>` in `C:/Users/wkiri/.veyyon/run/gardener/no_rules_state.json`, and posts a one-line comment on the bug issue (`gardener bug-to-lint: no-rule: <reason>`).
+- **Issue Content:** Issues created for proven rules embed the concrete anti-pattern (removed code), fixed code (post-fix invariant), candidate rule pattern, and proof text.
+
+### Per-Lane Post-Fix Dispatch Command
+When an agent lane completes a bug fix, it can invoke the gardener directly for the resolved issue:
+```bash
+python ~/.veyyon/workflows/gardener.py --scan-bugs-only --bug <N> --live --issue-repo Bavariance/polysimulator
+```
+
+## 8. Windows Task Scheduler Recurring Automation
+
+The Gardener is configured to execute autonomously via Windows Task Scheduler without requiring human intervention or orchestrator presence:
+
+```bash
+# Install or update scheduled tasks
+python workflows/portable/gardener.py --install-tasks --repo-root C:/Users/wkiri/development/wt-polysim-gardener-staging
+
+# Query task status
+schtasks /query /tn SuperboardGardenerDaily /fo LIST
+schtasks /query /tn SuperboardGardenerBugLintHourly /fo LIST
+
+# Manually trigger hourly bug scan
+schtasks /run /tn SuperboardGardenerBugLintHourly
+```
+
+Tasks:
+1. **`SuperboardGardenerDaily`**: Runs daily at 03:00 UTC. Executes full Knip + Vulture + workaround comments scan and creates up to 5 issues.
+2. **`SuperboardGardenerBugLintHourly`**: Runs hourly. Executes fast closed-bug-to-lint scan and creates lint-guard issues.
+
+Both tasks log execution output to `C:/Users/wkiri/.veyyon/run/gardener/gardener_<timestamp>.log`.
+
+### Host RAM Safety Guard
+Before executing any scan, `gardener.py` queries `host_status.py --json`. If host RAM utilization is $\ge 90\%$ (the `no_spawn` / `wait` threshold), the runner logs a warning and exits cleanly without spawning heavy analysis processes.
+
+---
+
+## 9. Verification & Automated Tests
+
+A dedicated test suite validates the scanner, classifier, spec generator, deduplication, capping, and automation:
 
 ```bash
 python workflows/portable/test_gardener.py
 ```
 
-Test coverage:
-- Next.js App Router entrypoint detection & config file whitelisting.
+Test coverage (28 automated unit tests):
 - Knip classification for dead files, dead exports, dead types, and package dependencies.
 - Vulture classification for app imports, pytest fixtures, Alembic metadata, and unreachable code.
 - Priority-ordered bounded batch selection and contract formatting.
+- 9-point Superboard Issue Contract body formatting with deterministic fingerprint metadata.
+- Deduplication by fingerprint across open and closed issues.
+- Hard cap enforcement ($\le 5$ live issues created per run).
+- Untracked workaround comments scanner with positive/negative keyword matching.
+- Host RAM safety check with mock threshold validation.
 - End-to-end pipeline execution with mock fixture reports.
