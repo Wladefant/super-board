@@ -29,6 +29,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from contextlib import redirect_stderr, redirect_stdout
 
 # Ensure workflows/portable is on sys.path
@@ -360,6 +361,161 @@ class TestBuildSlot(unittest.TestCase):
             lines = [line.strip().split(":")[0] for line in f if line.strip()]
 
         self.assertEqual(lines, ["subproc-1", "subproc-2", "subproc-3"])
+
+    def test_queue_reclaim_heartbeat_and_negative_control(self):
+        # Living PIDs: is_pid_alive returns True
+        manager = BuildSlotManager(run_dir=self.run_dir, is_pid_alive_fn=lambda p: True)
+        now = time.time()
+
+        # Seed queue with:
+        # 1. Stale heartbeat entry under living PID (heartbeat 65s ago) -> must be reclaimed
+        # 2. Fresh heartbeat entry under living PID (heartbeat 5s ago) -> must NOT be reclaimed (negative control)
+        # 3. Legacy entry without heartbeat_at older than 30m (enqueued 1850s ago) -> must be reclaimed
+        # 4. Legacy entry without heartbeat_at newer than 30m (enqueued 300s ago) -> must NOT be reclaimed
+        seeded_queue = [
+            {
+                "name": "stale-hb-lane",
+                "pid": 2001,
+                "token": "tok-stale",
+                "enqueued_at": now - 100.0,
+                "enqueued_at_iso": datetime.datetime.fromtimestamp(now - 100.0, datetime.timezone.utc).isoformat(),
+                "heartbeat_at": now - 65.0,
+                "heartbeat_at_iso": datetime.datetime.fromtimestamp(now - 65.0, datetime.timezone.utc).isoformat(),
+            },
+            {
+                "name": "fresh-hb-lane",
+                "pid": 2002,
+                "token": "tok-fresh",
+                "enqueued_at": now - 20.0,
+                "enqueued_at_iso": datetime.datetime.fromtimestamp(now - 20.0, datetime.timezone.utc).isoformat(),
+                "heartbeat_at": now - 5.0,
+                "heartbeat_at_iso": datetime.datetime.fromtimestamp(now - 5.0, datetime.timezone.utc).isoformat(),
+            },
+            {
+                "name": "legacy-stale-lane",
+                "pid": 2003,
+                "token": None,
+                "enqueued_at": now - 1850.0,
+                "enqueued_at_iso": datetime.datetime.fromtimestamp(now - 1850.0, datetime.timezone.utc).isoformat(),
+            },
+            {
+                "name": "legacy-fresh-lane",
+                "pid": 2004,
+                "token": None,
+                "enqueued_at": now - 300.0,
+                "enqueued_at_iso": datetime.datetime.fromtimestamp(now - 300.0, datetime.timezone.utc).isoformat(),
+            },
+        ]
+        manager._write_queue(seeded_queue)
+
+        # Run clean_queue
+        cleaned = manager.clean_queue()
+        names = [x["name"] for x in cleaned]
+
+        # Stale heartbeat reclaimed
+        self.assertNotIn("stale-hb-lane", names)
+        # Fresh heartbeat preserved (negative control!)
+        self.assertIn("fresh-hb-lane", names)
+        # Legacy stale (> 30m) reclaimed
+        self.assertNotIn("legacy-stale-lane", names)
+        # Legacy fresh (<= 30m) preserved
+        self.assertIn("legacy-fresh-lane", names)
+
+        self.assertEqual(names, ["fresh-hb-lane", "legacy-fresh-lane"])
+
+    def test_acquire_timeout_leaves_no_entry_behind(self):
+        manager = BuildSlotManager(run_dir=self.run_dir)
+
+        # Lock is held by owner-lane
+        self.assertTrue(manager.acquire("owner-lane", timeout=1.0))
+        self.assertTrue(manager.is_held_by("owner-lane"))
+
+        # Waiter lane tries to acquire with short timeout -> fails on timeout
+        res = manager.acquire("waiter-lane", timeout=0.05, poll_interval=0.02)
+        self.assertFalse(res)
+
+        # Confirm queue has NO entry left behind for waiter-lane
+        queue = manager._read_queue()
+        waiter_entries = [q for q in queue if q.get("name") == "waiter-lane"]
+        self.assertEqual(waiter_entries, [])
+
+        # Confirm release cleans up owner
+        self.assertTrue(manager.release("owner-lane"))
+        self.assertEqual(manager._read_queue(), [])
+
+    def test_acquire_exception_leaves_no_entry_behind(self):
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        self.assertTrue(manager.acquire("blocker-lane", timeout=1.0))
+
+        # Force an exception / KeyboardInterrupt during acquire loop while waiting
+        with mock.patch.object(time, "sleep", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                manager.acquire("interrupted-lane", timeout=10.0, poll_interval=0.02)
+
+        # Confirm interrupted-lane was dequeued by token in finally
+        queue = manager._read_queue()
+        self.assertEqual([q for q in queue if q.get("name") == "interrupted-lane"], [])
+        self.assertTrue(manager.release("blocker-lane"))
+    def test_in_process_lanes_same_pid_fifo_and_stale_reclaim(self):
+        main_pid = 35296
+        manager = BuildSlotManager(run_dir=self.run_dir, is_pid_alive_fn=lambda p: True)
+
+        now = time.time()
+        # Simulate lane-1 and lane-2 enqueued by Veyyon Main (same PID 35296)
+        lane1_token = "tok-lane-1"
+        lane2_token = "tok-lane-2"
+        seeded_queue = [
+            {
+                "name": "lane-1",
+                "pid": main_pid,
+                "token": lane1_token,
+                "enqueued_at": now - 80.0,
+                "enqueued_at_iso": datetime.datetime.fromtimestamp(now - 80.0, datetime.timezone.utc).isoformat(),
+                "heartbeat_at": now - 70.0,  # Dead waiter: heartbeat stopped 70s ago
+                "heartbeat_at_iso": datetime.datetime.fromtimestamp(now - 70.0, datetime.timezone.utc).isoformat(),
+            },
+            {
+                "name": "lane-2",
+                "pid": main_pid,
+                "token": lane2_token,
+                "enqueued_at": now - 10.0,
+                "enqueued_at_iso": datetime.datetime.fromtimestamp(now - 10.0, datetime.timezone.utc).isoformat(),
+                "heartbeat_at": now - 2.0,  # Active waiter: heartbeat fresh
+                "heartbeat_at_iso": datetime.datetime.fromtimestamp(now - 2.0, datetime.timezone.utc).isoformat(),
+            },
+        ]
+        manager._write_queue(seeded_queue)
+
+        # Before reclaim: lane-1 is at head
+        q_before = manager._read_queue()
+        self.assertEqual([x["name"] for x in q_before], ["lane-1", "lane-2"])
+
+        # Reclaim runs: lane-1 is pruned despite living PID 35296; lane-2 is kept
+        q_after = manager.clean_queue()
+        self.assertEqual([x["name"] for x in q_after], ["lane-2"])
+
+        # lane-2 can now acquire the lock
+        self.assertTrue(manager.acquire("lane-2", pid=main_pid, token=lane2_token, timeout=1.0, poll_interval=0.02))
+        self.assertTrue(manager.is_held_by("lane-2", pid=main_pid))
+        self.assertTrue(manager.release("lane-2"))
+        self.assertEqual(manager.clean_queue(), [])
+
+    def test_acquire_loop_writes_heartbeat(self):
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        self.assertTrue(manager.acquire("blocker-lane", timeout=1.0))
+
+        heartbeat_calls = []
+        orig_heartbeat = manager.heartbeat
+
+        def tracked_heartbeat(*args, **kwargs):
+            heartbeat_calls.append((args, kwargs))
+            return orig_heartbeat(*args, **kwargs)
+
+        manager.heartbeat = tracked_heartbeat
+        res = manager.acquire("waiter-hb-lane", timeout=0.15, poll_interval=0.02, heartbeat_interval=0.04)
+        self.assertFalse(res)
+        self.assertGreater(len(heartbeat_calls), 0, "Acquire waiting loop must write heartbeats")
+        self.assertTrue(manager.release("blocker-lane"))
 
 
 if __name__ == "__main__":
