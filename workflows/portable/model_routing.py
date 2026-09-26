@@ -1427,18 +1427,28 @@ class ResetAwareModelSelector:
         test_results: Optional[str] = None,
         risk_summary: Optional[str] = None,
         reference_urls: Optional[List[str]] = None,
+        precomputed: Optional[RoutingRecommendation] = None,
     ) -> HarnessDispatchPacket:
         """
         Produce a complete, harness-agnostic dispatch packet ready for execution.
         Does not mutate any harness configuration or global state.
+
+        `precomputed` carries a selection an upstream authority already committed
+        (the coordinator commits one per evaluate_step). The coordinator is the single
+        routing authority, so its exact selection is reused instead of running every
+        provider ladder a second time; a plain dispatch() call keeps selecting on its own.
         """
-        rec = self.select_model(
-            task_type=task_type,
-            risk_level=risk_level,
-            context_tokens=context_tokens,
-            allow_codex_promotion=allow_codex_promotion,
-            rework_count=rework_count,
-            domain_tags=domain_tags,
+        rec = (
+            precomputed
+            if isinstance(precomputed, RoutingRecommendation)
+            else self.select_model(
+                task_type=task_type,
+                risk_level=risk_level,
+                context_tokens=context_tokens,
+                allow_codex_promotion=allow_codex_promotion,
+                rework_count=rework_count,
+                domain_tags=domain_tags,
+            )
         )
 
         agent_role = model_to_agent_role(rec.selected_model, task_type, risk_level)
