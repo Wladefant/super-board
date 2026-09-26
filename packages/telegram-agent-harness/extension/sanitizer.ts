@@ -608,11 +608,15 @@ const REPEAT_MIN_CONTAINED_CHARS = 20;
  * the same prose. Matching is exact, never a similarity score: a reply that changes one status
  * word or one issue number is new output and must reach the operator, so the cost of an
  * occasional repeated line is preferred to the cost of a swallowed answer.
+ *
+ * Containment is word-bounded. Normalization leaves exactly one space between words and trims
+ * the ends, so padding both sides makes `includes` match whole words only: "now 12" no longer
+ * swallows "now 1", and "pr 1224 merged" no longer swallows "224 merged".
  */
 export function isRepeatDelivery(candidate: string, earlier: string): boolean {
   const next = normalizeForDedupe(candidate);
   const prior = normalizeForDedupe(earlier);
   if (!next || !prior) return false;
   if (next === prior) return true;
-  return next.length >= REPEAT_MIN_CONTAINED_CHARS && prior.includes(next);
+  return next.length >= REPEAT_MIN_CONTAINED_CHARS && ` ${prior} `.includes(` ${next} `);
 }

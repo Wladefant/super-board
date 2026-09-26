@@ -143,6 +143,7 @@ function buildRouter(
   slot: Partial<DaemonSlot>,
   control: TerminalSessionControl,
   topics?: TopicLifecycle,
+  overrides: { log?: (message: string) => void } = {},
 ): SlotRouter {
   return new SlotRouter({
     slot: {
@@ -164,7 +165,7 @@ function buildRouter(
     relay: async (target, markdown) => {
       relayed.push({ target, markdown });
     },
-    log: () => {},
+    log: overrides.log ?? (() => {}),
   });
 }
 
@@ -197,6 +198,24 @@ describe("inbound routing", () => {
       { sessionId: "sess-new-1", text: "first message", mode: "auto" },
       { sessionId: "sess-new-1", text: "second message", mode: "auto" },
     ]);
+  });
+
+  test("a ledger that cannot open the turn still delivers the operator's message", async () => {
+    const fake = fakeControl();
+    const logs: string[] = [];
+    const router = buildRouter({}, fake.control, undefined, { log: message => logs.push(message) });
+
+    await router.deliver(DM, "first message");
+    store.beginTurn = () => {
+      throw new Error("SQLITE_BUSY: database is locked");
+    };
+
+    // The turn's bookkeeping failed, but the operator's message is not lost.
+    expect(await router.deliver(DM, "second message")).toBeNull();
+    expect(fake.delivered.map(d => d.text)).toEqual(["first message", "second message"]);
+    const failures = logs.filter(message => message.includes("beginTurn"));
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toContain("SQLITE_BUSY");
   });
 
   test("an existing session for the workspace is reused instead of starting a second one", async () => {

@@ -299,6 +299,24 @@ describe("Sanitizer & Security Utilities", () => {
     expect(isRepeatDelivery(merged224, merged225)).toBe(false);
   });
 
+  test("a contained passage counts as a repeat only on word boundaries", () => {
+    // A passage that starts or ends mid-number is a different sentence, not a repeat. The
+    // unbounded `prior.includes(next)` swallowed both of these; each pair asserts its own
+    // substring relation so the test cannot silently stop exercising the boundary.
+    const now12 = "The order book is thinner now 12 contracts from the touch than it was at the open.";
+    const now1 = "The order book is thinner now 1";
+    expect(now12.includes(now1)).toBe(true);
+    expect(isRepeatDelivery(now1, now12)).toBe(false);
+
+    const pr1224 = "The ledger shows PR 1224 merged after the daemon restarted cleanly.";
+    const pr224 = "224 merged after the daemon restarted cleanly.";
+    expect(pr1224.includes(pr224)).toBe(true);
+    expect(isRepeatDelivery(pr224, pr1224)).toBe(false);
+
+    // A whole-word passage is still a repeat, so the fix cannot pass by never matching.
+    expect(isRepeatDelivery("merged after the daemon restarted cleanly.", pr1224)).toBe(true);
+  });
+
   test("a delivery that adds material, or a short generic one, is not a repeat", () => {
     const earlier = "Merged #224: Telegram tables now render as monospace blocks.";
     const extended = `${earlier}\n\nNext: CI for #225 is red on the lint step; fixing the import order before re-running.`;

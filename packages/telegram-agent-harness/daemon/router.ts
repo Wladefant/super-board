@@ -145,6 +145,22 @@ export class SlotRouter {
   }
 
   /**
+   * Opens a new operator turn for `sessionId`, dropping the texts recorded for the turn that
+   * ended. A locked ledger must never stand between the operator and their own message, so a
+   * failure here is logged and the delivery proceeds: a stale recorded text can cost a
+   * repeated line, while a throw here would lose the message.
+   */
+  private openTurn(sessionId: string): void {
+    try {
+      this.options.store.beginTurn(sessionId);
+    } catch (error) {
+      this.options.log(
+        `Slot ${this.slotId}: beginTurn for ${sessionId} failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  /**
    * Delivers operator text to the target's session, creating and binding one when
    * the target is unrouted. Returns the text to acknowledge with, or null when the
    * caller should stay silent because the session itself will answer.
@@ -155,7 +171,7 @@ export class SlotRouter {
       if (bound) {
         // The operator's message opens a new turn; a telegram_message from the previous turn
         // must not suppress the answer to this one.
-        this.options.store.beginTurn(bound);
+        this.openTurn(bound);
         await this.options.control.deliver(bound, text, mode);
         return null;
       }
@@ -180,7 +196,7 @@ export class SlotRouter {
 
       const sessionId = await this.options.control.ensureSession(workspace, `Telegram ${this.slotId}`);
       await this.bind(target, sessionId, workspace);
-      this.options.store.beginTurn(sessionId);
+      this.openTurn(sessionId);
       await this.options.control.deliver(sessionId, text, mode);
       return `🔗 <b>Routed to session</b> <code>${escapeHtml(sessionId)}</code> in <code>${escapeHtml(workspace)}</code>.`;
     }
