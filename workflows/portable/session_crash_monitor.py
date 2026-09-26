@@ -392,7 +392,8 @@ class ProcessProbe:
 
     def is_veyyon_process(self, pid: int) -> bool:
         """Whether the live process at `pid` is a Veyyon executable image."""
-        return (self.get_image_name(pid) or "").lower() in {"veyyon", "veyyon.exe"}
+        img = (self.get_image_name(pid) or "").lower()
+        return img == "veyyon" or img.startswith("veyyon.exe")
 
     def discover_session_pid(self, session_id: str) -> Optional[int]:
         """Discovers a running process holding this session: registry first.
@@ -412,8 +413,8 @@ class ProcessProbe:
                     "powershell",
                     "-NoProfile",
                     "-Command",
-                    'Get-CimInstance Win32_Process -Filter "Name=\'veyyon.exe\'" | '
-                    f"Where-Object {{ $_.CommandLine -like '*{ps_session_id}*' }} | "
+                    "Get-CimInstance Win32_Process | "
+                    f"Where-Object {{ ($_.Name -like 'veyyon.exe*' -or $_.Name -eq 'veyyon') -and $_.CommandLine -like '*{ps_session_id}*' }} | "
                     "Select-Object -ExpandProperty ProcessId",
                 ]
                 res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
@@ -568,16 +569,28 @@ class CrashMonitorStateLedger:
                     data.setdefault("resume_claims", {})
                     return data
         except Exception:
-            pass
+            return {
+                "schema": "veyyon/crash-monitor-state/v1",
+                "updated_utc": utc_now_iso(),
+                "recorded_terminations": {},
+                "unsent_events": [],
+                "active_supervisors": {},
+                "resume_claims": {},
+                "corrupt": True,
+            }
         return {
             "schema": "veyyon/crash-monitor-state/v1",
             "updated_utc": utc_now_iso(),
             "recorded_terminations": {},
             "unsent_events": [],
             "active_supervisors": {},
+            "resume_claims": {},
+            "corrupt": True,
         }
 
     def _save_locked(self, data: Dict[str, Any]) -> None:
+        if data.get("corrupt"):
+            return
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
         data["updated_utc"] = utc_now_iso()
         temp_file = self.state_file.with_suffix(".tmp")
@@ -655,6 +668,8 @@ class CrashMonitorStateLedger:
         lock = FileLock(str(self.lock_path))
         with lock:
             data = self._load_locked()
+            if data.get("corrupt"):
+                return False
             claims = data.setdefault("resume_claims", {})
             if key in claims:
                 return False
@@ -1478,7 +1493,9 @@ class SessionCrashMonitor:
                             else f"pane relaunch failed: {detail}"
                         )
 
-        manifest = self.build_manifest(target, exit_code, observed_reason, result)
+        manifest = self.build_manifest(
+            target, exit_code, observed_reason, result if self.auto_resume else None
+        )
         result["interrupted_lane_count"] = manifest["interrupted_lane_count"]
         result["manifest_path"] = None
         if self.manifest_dir is not None:
@@ -1695,25 +1712,34 @@ class SessionCrashMonitor:
         )
 
         resume: Optional[Dict[str, Any]] = None
-        if self.auto_resume:
-            if claimed:
-                resume = self.auto_resume_death(target, exit_code, observed_reason)
-            else:
-                resume = {
-                    "enabled": True,
-                    "attempted": False,
-                    "launched": False,
-                    "reason": (
-                        "another supervisor already claimed this death; "
-                        "resuming exactly once means not resuming again"
-                    ),
-                    "pane_id": self.target_pane_id,
-                    "command": build_resume_command(self.resume_argv),
-                    "live_owner_pid": None,
-                    "launched_at_utc": None,
-                    "manifest_path": None,
-                }
-
+        if claimed:
+            resume = self.auto_resume_death(target, exit_code, observed_reason)
+        else:
+            resume = {
+                "enabled": bool(self.auto_resume),
+                "attempted": False,
+                "launched": False,
+                "reason": (
+                    "another supervisor already claimed this death; "
+                    "resuming exactly once means not resuming again"
+                ),
+                "pane_id": self.target_pane_id,
+                "command": build_resume_command(self.resume_argv),
+                "live_owner_pid": None,
+                "launched_at_utc": None,
+                "manifest_path": None,
+            }
+            manifest = self.build_manifest(
+                target, exit_code, observed_reason, resume if self.auto_resume else None
+            )
+            resume["interrupted_lane_count"] = manifest["interrupted_lane_count"]
+            if self.manifest_dir is not None:
+                try:
+                    resume["manifest_path"] = str(
+                        write_interrupted_lane_manifest(manifest, self.manifest_dir)
+                    )
+                except OSError as exc:
+                    resume["manifest_error"] = f"{type(exc).__name__}: {exc}"
         receipt = self.deliver_alert(
             pid=target.pid,
             creation_time_utc=target.creation_time_utc,
@@ -1738,7 +1764,11 @@ class SessionCrashMonitor:
                 "reason": receipt.reason,
                 "message_id": getattr(receipt, "message_id", None),
             },
-            "auto_resume": resume,
+            "auto_resume": resume if self.auto_resume else None,
+            "manifest_path": resume.get("manifest_path") if resume else None,
+            "interrupted_lane_count": (
+                resume.get("interrupted_lane_count", 0) if resume else 0
+            ),
         }
         self.state_ledger.record_termination(
             self.session_id, target.pid, target.creation_time_utc, record
@@ -1749,7 +1779,8 @@ class SessionCrashMonitor:
             "classification": "UNEXPECTED_TERMINATION",
             "record": record,
             "receipt": asdict(receipt),
-            "auto_resume": resume,
+            "auto_resume": resume if self.auto_resume else None,
+            "manifest_path": resume.get("manifest_path") if resume else None,
         }
 
     def run(self, max_cycles: Optional[int] = None) -> int:
