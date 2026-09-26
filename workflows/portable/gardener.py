@@ -8,7 +8,7 @@ References:
   - Adopt / Adapt / Build Master Matrix: Idea 5 (The Gardener Role)
 
 Tools integrated:
-  - Frontend: Knip (`npx knip --reporter json`) in Next.js / TypeScript frontend.
+  - Frontend: Knip (`npx --yes knip@6.38.0 --reporter json`) in Next.js / TypeScript frontend.
   - Backend:  Vulture (`python -m vulture backend/ --min-confidence 80`) in FastAPI backend.
 
 Responsibilities:
@@ -299,7 +299,7 @@ def classify_knip_issue(
 def run_knip(
     repo_root: Path, frontend_subpath: str = "frontend"
 ) -> Tuple[List[ToolFinding], Optional[str]]:
-    """Runs `npx knip --reporter json` inside the frontend directory and parses findings."""
+    """Runs pinned `npx --yes knip@6.38.0 --reporter json` inside the frontend dir and parses findings."""
     frontend_dir = repo_root / frontend_subpath
     if not frontend_dir.is_dir():
         return [], f"Frontend directory not found: {frontend_dir}"
@@ -308,8 +308,10 @@ def run_knip(
     if not package_json.is_file():
         return [], f"No package.json found in {frontend_dir}"
 
-    cmd = ["npx", "--yes", "knip", "--reporter", "json"]
-    use_shell = os.name == "nt"
+    # Pinned exact version: `--yes` with an unpinned spec would fetch and execute
+    # whatever knip npm serves at runtime; the pin keeps the network install
+    # reproducible (offline / fixture mode via --knip-report-file needs no network).
+    cmd = ["npx", "--yes", "knip@6.38.0", "--reporter", "json"]
 
     try:
         proc = subprocess.run(
@@ -596,15 +598,16 @@ def generate_cleanup_task_spec(
     # Combine in order of safety
     pool = dead_files + backend_imports + dead_exports + dead_types + unreachable
 
-    # Deduplicate by file + symbol + kind
+    # Deduplicate by file + symbol + kind; enforce the bound BEFORE appending so
+    # max_items=0 yields an empty spec instead of one off-by-one candidate.
     seen: Set[str] = set()
     for item in pool:
+        if len(safe_candidates) >= max_items:
+            break
         key = f"{item.file}:{item.symbol}:{item.kind}"
         if key not in seen:
             seen.add(key)
             safe_candidates.append(item)
-        if len(safe_candidates) >= max_items:
-            break
 
     target_items_data = [
         {
@@ -909,8 +912,6 @@ def auto_detect_repo_root() -> Path:
     candidates = [
         cwd.parent / "polysimulator",
         cwd.parent / "wt-polysim-gardener-staging",
-        Path("C:/Users/wkiri/development/wt-polysim-gardener-staging"),
-        Path("C:/Users/wkiri/development/polysimulator"),
     ]
     for c in candidates:
         if c.is_dir() and (c / "frontend").is_dir() and (c / "backend").is_dir():
