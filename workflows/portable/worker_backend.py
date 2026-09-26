@@ -1107,6 +1107,12 @@ STAGE_BRIEFS = {
         "module stubs, and initial test fixtures. Do NOT implement complex business logic. Ensure the "
         "scaffold compiles, passes typecheck, and establishes the structural foundation for implementation."
     ),
+    "implement": (
+        "You are the IMPLEMENT worker (medium-effort stage). Implement the core business logic for "
+        "this work item against the repository at {repo_root}. Cut over every call site cleanly: no "
+        "leftover dead shims, aliases, or commented-out predecessors. Verify compilation/typecheck "
+        "before yielding and report commands actually run under \"checks\" with their real exit codes."
+    ),
     "qa": (
         "You are the QA worker, independent of whoever built this. Do NOT modify the tree and do "
         "NOT commit. Verify the request against the repository at {repo_root} by executing real "
