@@ -1994,7 +1994,56 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             self.assertEqual(model_to_agent_role(MODEL_CODEX_ASTRA, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "codex-reviewer")
             self.assertEqual(model_to_agent_role(MODEL_CODEX_ASTRA, TaskType.ROUTINE_EXECUTION, RiskLevel.HIGH), "codex-worker")
 
-        print("  [PASS] Both states verified: skipped when CODEX_ENABLED=False, routed when CODEX_ENABLED=True.")
+        # ---------------------------------------------------------------------
+        # NEGATIVE CONTROL:
+        # 1. Identical near-reset surplus fixture that promoted Codex in State 2
+        #    MUST NOT route to or promote Codex when codex_account=False / CODEX_ENABLED=False.
+        # 2. Rejection of Codex agent roles when disabled (never codex-reviewer / codex-worker).
+        # 3. Environment override negative control (VEYYON_CODEX_ENABLED="0" overrides CODEX_ENABLED=True).
+        # 4. No automatic re-enable by date (pure manual control).
+        # ---------------------------------------------------------------------
+        with mock.patch("model_routing.codex_available", return_value=False):
+            neg_sel_surplus = ResetAwareModelSelector(on_snap, codex_account=False)
+            self.assertFalse(neg_sel_surplus.codex_account_available())
+
+            # Stimulus identical to State 2 (near reset with surplus allowance):
+            # In State 2 this returned MODEL_CODEX_ASTRA with promotion_applied=True.
+            # In Negative Control, it MUST NOT select Codex Astra or any Codex model:
+            neg_rev = neg_sel_surplus.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH, allow_codex_promotion=True)
+            self.assertFalse(neg_rev.selected_model.startswith("openai-codex/"))
+            self.assertFalse(neg_rev.promotion_applied, "Promotion must not be applied to Codex when disabled")
+            self.assertNotIn("flash", neg_rev.selected_model.lower(), "High-risk review must never fall back to Flash")
+            self.assertIn(neg_rev.selected_model, (MODEL_AG_CLAUDE_OPUS, MODEL_CLAUDE_OPUS_55, MODEL_CLAUDE_FABLE))
+            self.assertNotEqual(neg_rev.selected_model, MODEL_CODEX_ASTRA)
+
+            # In State 2 routine execution returned MODEL_CODEX_FAST with promotion_applied=True.
+            # In Negative Control, it MUST NOT select Codex Fast or any Codex model:
+            neg_exec = neg_sel_surplus.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.MEDIUM, allow_codex_promotion=True)
+            self.assertFalse(neg_exec.selected_model.startswith("openai-codex/"))
+            self.assertFalse(neg_exec.promotion_applied, "Promotion must not be applied to Codex when disabled")
+            self.assertEqual(neg_exec.selected_model, MODEL_GEMINI_FLASH)
+            self.assertNotEqual(neg_exec.selected_model, MODEL_CODEX_FAST)
+
+            # Negative control on agent role mappings:
+            # When disabled, openai-codex models MUST NEVER map to codex-reviewer or codex-worker
+            self.assertNotEqual(model_to_agent_role(MODEL_CODEX_ASTRA, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "codex-reviewer")
+            self.assertNotEqual(model_to_agent_role(MODEL_CODEX_ASTRA, TaskType.ROUTINE_EXECUTION, RiskLevel.MEDIUM), "codex-worker")
+            self.assertNotEqual(model_to_agent_role(MODEL_CODEX_FAST, TaskType.ROUTINE_EXECUTION, RiskLevel.LOW), "codex-worker")
+
+        # Negative control on environment override:
+        with mock.patch("model_routing.CODEX_ENABLED", True):
+            with mock.patch.dict(os.environ, {"VEYYON_CODEX_ENABLED": "0"}):
+                self.assertFalse(codex_available(), "VEYYON_CODEX_ENABLED=0 must force disabled even if CODEX_ENABLED=True")
+            with mock.patch.dict(os.environ, {"VEYYON_CODEX_ENABLED": "false"}):
+                self.assertFalse(codex_available(), "VEYYON_CODEX_ENABLED=false must force disabled even if CODEX_ENABLED=True")
+            with mock.patch.dict(os.environ, {"VEYYON_CODEX_ENABLED": "no"}):
+                self.assertFalse(codex_available(), "VEYYON_CODEX_ENABLED=no must force disabled even if CODEX_ENABLED=True")
+
+        # Negative control: no automatic re-enable by date (manual switch only)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(codex_available(), "codex_available() must be False regardless of time when CODEX_ENABLED=False")
+
+        print("  [PASS] All states verified: off (skipped), on (routed), plus negative control.")
 def main():
     print("=" * 70)
     print("RUNNING VEYYON BALANCE LOADER & MODEL ROUTING SMOKE TEST SUITE")
