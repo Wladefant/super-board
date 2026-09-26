@@ -24,7 +24,7 @@ class CommentDetection(unittest.TestCase):
     def test_unlinked_marker_is_a_finding(self):
         for path, line, marker in (
             ('app/main.py', '    # HACK: retry loop papers over the cold sweep', 'HACK'),
-            ('web/app.js', '  // workaround: fallback when the backend 503s', 'WORKAROUND'),
+            ('web/app.js', '  // WORKAROUND: fallback when the backend 503s', 'WORKAROUND'),
             ('db/views.sql', '-- FIXME: index build cancelled by the pooler', 'FIXME'),
             ('web/index.html', '<!-- TODO: rebuild this table -->', 'TODO'),
         ):
@@ -42,6 +42,27 @@ class CommentDetection(unittest.TestCase):
         ):
             with self.subTest(line=line):
                 self.assertIsNone(line_finding(path, 3, line))
+
+    def test_case_sensitivity_and_prose_headers(self):
+        # Prose headers and lowercase words are not findings
+        for line in (
+            '# Workaround Comment Scanner',
+            '# untracked workaround',
+        ):
+            with self.subTest(line=line):
+                self.assertIsNone(line_finding('a.py', 1, line))
+
+        # Uppercase markers without issues are findings
+        finding1 = line_finding('a.py', 1, '# WORKAROUND: x')
+        self.assertIsNotNone(finding1)
+        self.assertEqual(finding1['marker'], 'WORKAROUND')
+
+        finding2 = line_finding('a.js', 1, '// TODO fix')
+        self.assertIsNotNone(finding2)
+        self.assertEqual(finding2['marker'], 'TODO')
+
+        # Uppercase marker with issue reference is clean
+        self.assertIsNone(line_finding('a.py', 1, '# HACK: #12'))
 
     def test_code_and_prose_are_not_comments(self):
         for path, line in (
