@@ -79,12 +79,39 @@ MODEL_CLAUDE_FABLE = "anthropic/claude-fable-5-1"
 MODEL_CLAUDE_OPUS_55 = "anthropic/claude-opus-5-5:high"
 
 MODEL_CODEX_FAST = "openai-codex/gpt-5.3-codex"
-# The operator's Codex worker/review tier is Astra medium (profile `codex-worker` and
-# `codex-reviewer` pins). Sol is costlier than Astra and bound to no role, so it is not routed.
 MODEL_CODEX_ASTRA = "openai-codex/gpt-6-astra:medium"
-# The free Spark window is separate from the Codex pro allowance and has its own enabled roster
-# entry (`spark`, medium effort), so it is pinned separately from the Astral worker roles.
 MODEL_CODEX_SPARK = "openai-codex/gpt-5.3-codex-spark:medium"
+# Manual account-availability switch (2026-09-26, operator ruling):
+# The operator confirmed Codex is off because he has no account, and will buy one again in
+# about a week (~2026-10-03). This is a temporary switch-off, not a removal.
+# Every Codex pin and ladder entry is preserved in place. While CODEX_ENABLED is False (the
+# default), all openai-codex rungs are skipped across all ladders.
+# Codex comes back only when someone flips this switch by hand after the operator confirms
+# the new account works (set CODEX_ENABLED = True, or set VEYYON_CODEX_ENABLED=1).
+CODEX_ENABLED: bool = False
+CODEX_DISABLED_REASON: str = (
+    "Operator has no active Codex account (~2026-10-03 target for new subscription); "
+    "CODEX_ENABLED switch is False."
+)
+
+
+def codex_available() -> bool:
+    """Return True if Codex account is active and available to serve requests.
+
+    Temporary manual switch-off (2026-09-26):
+    Codex is disabled by default via CODEX_ENABLED = False until an account is purchased
+    and confirmed working (~2026-10-03).
+    - If VEYYON_CODEX_ENABLED environment variable is explicitly set:
+      "1"/"true"/"yes" forces ON; "0"/"false"/"no" forces OFF.
+    - Otherwise, controlled strictly by the manual CODEX_ENABLED boolean switch.
+    """
+    env_override = os.environ.get("VEYYON_CODEX_ENABLED", "").lower()
+    if env_override in ("1", "true", "yes"):
+        return True
+    if env_override in ("0", "false", "no"):
+        return False
+    return CODEX_ENABLED
+
 
 MODEL_GROK_DORMANT = "xai-oauth/grok-4.6:high"
 
@@ -441,6 +468,10 @@ def model_to_agent_role(model_id: str, task_type: TaskType, risk_level: RiskLeve
     if model_id.startswith("chatgpt-web/"):
         return "web-thinker" if task_type == TaskType.STRONG_REVIEW else "web-task"
     if model_id.startswith("openai-codex/"):
+        if not codex_available():
+            # Codex account withdrawn (2026-09-26): reviews fall through to reviewer (Opus 5.5 /
+            # ag-opus, never Flash), implementation falls through to task (Flash).
+            return "reviewer" if task_type == TaskType.STRONG_REVIEW else "task"
         if "codex-spark" in model_id:
             # The free Spark allowance has its own enabled roster entry (`spark`); the
             # codex-worker/codex-reviewer pair is pinned for the Astral tiers and disabled here.
@@ -780,7 +811,8 @@ class ResetAwareModelSelector:
     """
 
     def __init__(self, snapshot: Optional[Any] = None, credentialed_providers: Optional[Set[str]] = None,
-                 quota_snapshot: Optional[Any] = None, chatgpt_web_bridge: Optional[bool] = None):
+                 quota_snapshot: Optional[Any] = None, chatgpt_web_bridge: Optional[bool] = None,
+                 codex_account: Optional[bool] = None):
         if snapshot is not None and isinstance(snapshot, BalanceAdapter):
             self.snapshot = snapshot.fetch_snapshot()
         elif snapshot is not None and hasattr(snapshot, "to_normalized"):
@@ -799,6 +831,10 @@ class ResetAwareModelSelector:
         # chatgpt-web readiness is a port probe, cached for the selector's lifetime; callers
         # (tests, dry runs) may pin it either way.
         self._chatgpt_web_bridge = chatgpt_web_bridge
+        # Codex account readiness is its own precondition, because a withdrawn account is not
+        # visible in the usage snapshot at all. Cached for the selector's lifetime and
+        # pinnable by callers (tests, dry runs), exactly like the bridge probe.
+        self._codex_account = codex_account
 
     def quota_snapshot(self):
         """The exhaustion cache, loaded once per selector. A missing file yields an empty one."""
@@ -811,6 +847,12 @@ class ResetAwareModelSelector:
         if self._chatgpt_web_bridge is None:
             self._chatgpt_web_bridge = chatgpt_web_bridge_available()
         return self._chatgpt_web_bridge
+
+    def codex_account_available(self) -> bool:
+        """Account precondition for every Codex rung, resolved at most once per selector."""
+        if self._codex_account is None:
+            self._codex_account = codex_available()
+        return self._codex_account
 
     def provider_exhaustion_reason(self, model: str) -> Optional[str]:
         """Why `model`'s provider is ineligible, or None when it may be used.
@@ -995,13 +1037,14 @@ class ResetAwareModelSelector:
         deepseek_meta = self.evaluate_provider("deepseek")
         go_meta = self.evaluate_provider("opencode-go")
         chatgpt_web_up = self.chatgpt_web_bridge_up()
+        codex_account_up = self.codex_account_available()
 
         provider_statuses = {
             "google-antigravity": google_meta["status"],
             AG_ANTHROPIC_PROVIDER: ag_anthropic_meta["status"],
             AG_OPENAI_PROVIDER: ag_openai_meta["status"],
             "anthropic": anthropic_meta["status"],
-            "openai-codex": codex_meta["status"],
+            "openai-codex": codex_meta["status"] if codex_account_up else "unavailable",
             "deepseek": deepseek_meta["status"],
             "opencode-go": go_meta["status"],
             "xai-oauth": "dormant",
@@ -1017,18 +1060,24 @@ class ResetAwareModelSelector:
         codex_pro_headroom = codex_meta.get("pro_headroom", codex_meta["burn_headroom"])
         codex_pro_used = 1.0 - codex_pro_remaining
 
+        # The reported window is only half the gate: with the account withdrawn the snapshot
+        # still reports a healthy Codex window, and a ladder built from that alone would
+        # dispatch a lane that cannot run. `codex_ok` requires the account too, and every
+        # Codex rung below is built from it.
+        codex_ok = codex_account_up and codex_meta["is_available"]
+
         codex_near_reset_surplus = (
             allow_codex_promotion
-            and codex_meta["is_available"]
+            and codex_ok
             and codex_pro_hrs <= SURPLUS_WINDOW_HOURS
             and codex_pro_headroom >= SURPLUS_PACE_HEADROOM
         )
         codex_throttled = (
-            codex_meta["is_available"]
+            codex_ok
             and codex_pro_headroom < CODEX_PACE_MIN_HEADROOM
             and codex_pro_used >= CODEX_PACE_USED_FLOOR
         )
-        codex_usable = codex_meta["is_available"] and not codex_throttled
+        codex_usable = codex_ok and not codex_throttled
 
         # Antigravity Claude runs on a free daily window. Only a window the snapshot
         # actually reports counts; an unreported family is not assumed to exist.
@@ -1105,6 +1154,7 @@ class ResetAwareModelSelector:
             "go_lanes_remaining": go_lanes,
             "go_window_lanes": {model: self.go_window_lanes(model) for model in GO_MONTHLY_CAP_USD},
             "chatgpt_web_bridge_up": chatgpt_web_up,
+            "codex_account_up": codex_account_up,
         }
 
         # 5. Rework-aware routing: force a strong first pass for critical domains, large diffs (>250 lines) or after rework.
@@ -1152,7 +1202,7 @@ class ResetAwareModelSelector:
             pace_group=PACE_GROUP_STRONG,
         )
         astra_emergency = _Rung(
-            MODEL_CODEX_ASTRA, codex_meta["is_available"],
+            MODEL_CODEX_ASTRA, codex_ok,
             "only Codex ahead of pace remains; spending its emergency reserve.",
             cooldown=True, pace_group=PACE_GROUP_STRONG,
         )
@@ -1249,7 +1299,7 @@ class ResetAwareModelSelector:
                 _Rung(MODEL_CODEX_FAST, codex_usable, "1M-context tiers unavailable; Codex Fast (400k window, on pace).",
                       cooldown=True),
                 astra_emergency,
-                _Rung(MODEL_CODEX_FAST, codex_meta["is_available"],
+                _Rung(MODEL_CODEX_FAST, codex_ok,
                       "only Codex ahead of pace holds this context; spending its emergency reserve.", cooldown=True),
                 _Rung(MODEL_CLAUDE_FABLE, anthropic_worker_ok,
                       f"every cheap tier whose window holds {context_tokens} tokens is unavailable; last resort on "
@@ -1257,8 +1307,11 @@ class ResetAwareModelSelector:
                       cooldown=True, as_fallback=False),
             ]
             last_resort = _Rung(MODEL_DEEPSEEK_PRO, True, "every deep-context tier unavailable; pay-per-token DeepSeek V4 Pro.", cooldown=True)
-            # High-risk, rework and money work never falls back to a Flash tier (as in B2).
-            final_fallbacks = ([MODEL_DEEPSEEK_PRO, MODEL_CODEX_FAST] if is_rework_critical
+            # High-risk, rework and money work never falls back to a Flash tier (as in B2), and
+            # the escape slot has to hold the contexts this ladder reaches, so the 131k Z.AI
+            # windows and the 250k Antigravity window cannot take it. Go GLM-5.3 (1M, the rare
+            # precision lane) replaces Codex Fast's dead 400k slot.
+            final_fallbacks = ([MODEL_DEEPSEEK_PRO, MODEL_GO_GLM53] if is_rework_critical
                                else [MODEL_OR_DEEPSEEK_FLASH])
 
         elif task_type == TaskType.STRONG_REVIEW and is_rework_critical:
@@ -1287,7 +1340,7 @@ class ResetAwareModelSelector:
                     _Rung(MODEL_DEEPSEEK_PRO, deepseek_ok, "all strong reviewers unavailable; emergency DeepSeek V4 Pro.", cooldown=True),
                 ]
                 last_resort = _Rung(MODEL_DEEPSEEK_PRO, True, "all strong models unavailable or in cooldown; pay-per-token DeepSeek V4 Pro.", cooldown=True)
-                final_fallbacks = [MODEL_CLAUDE_OPUS_55, MODEL_AG_CLAUDE_OPUS, MODEL_CODEX_ASTRA, MODEL_DEEPSEEK_PRO]
+                final_fallbacks = [MODEL_CLAUDE_OPUS_55, MODEL_AG_CLAUDE_OPUS, MODEL_DEEPSEEK_PRO]
             elif is_ag_opus_exhausted:
                 # ag-opus exhaustion fallback for routine review: escalates to reviewer (Opus 5.5) on slack,
                 # then astra_on_pace, then drawing on the orchestrator reserve (never Flash).
@@ -1306,7 +1359,7 @@ class ResetAwareModelSelector:
                     _Rung(MODEL_DEEPSEEK_PRO, deepseek_ok, "all strong reviewers unavailable; emergency DeepSeek V4 Pro.", cooldown=True),
                 ]
                 last_resort = _Rung(MODEL_DEEPSEEK_PRO, True, "all strong models unavailable or in cooldown; pay-per-token DeepSeek V4 Pro.", cooldown=True)
-                final_fallbacks = [MODEL_CLAUDE_OPUS_55, MODEL_CODEX_ASTRA, MODEL_DEEPSEEK_PRO]
+                final_fallbacks = [MODEL_CLAUDE_OPUS_55, MODEL_DEEPSEEK_PRO]
             else:
                 label = "High-risk review"
                 rungs = [
@@ -1325,7 +1378,9 @@ class ResetAwareModelSelector:
                     _Rung(MODEL_DEEPSEEK_PRO, deepseek_ok, "all strong reviewers unavailable; emergency DeepSeek V4 Pro.", cooldown=True),
                 ]
                 last_resort = _Rung(MODEL_DEEPSEEK_PRO, True, "all strong models unavailable or in cooldown; pay-per-token DeepSeek V4 Pro.", cooldown=True)
-                final_fallbacks = [MODEL_CODEX_ASTRA, MODEL_DEEPSEEK_PRO]
+                # Codex Astra's escape slot belongs to the reviewer (Opus 5.5) while Codex is
+                # unroutable, so high-risk review work lands on reviewer or ag-opus.
+                final_fallbacks = [MODEL_CLAUDE_OPUS_55, MODEL_DEEPSEEK_PRO]
         elif is_rework_critical and task_type in (TaskType.ROUTINE_EXECUTION, TaskType.DEEP_REASONING):
             # CASE B2: HIGH-RISK WORKER (implementation first pass, deep reasoning): the Go
             # workhorse first, then ChatGPT web while its bridge is up — a hard
@@ -1348,7 +1403,11 @@ class ResetAwareModelSelector:
                 fable_last_resort,
             ]
             last_resort = _Rung(MODEL_DEEPSEEK_PRO, True, "all worker tiers unavailable; pay-per-token DeepSeek V4 Pro.", cooldown=True)
-            final_fallbacks = [MODEL_CODEX_ASTRA, MODEL_DEEPSEEK_PRO]
+            # The escape has to be non-Flash, non-free, off the paid Anthropic reserve, and
+            # cross-provider to every rung above it: ag-opus while its free daily window holds,
+            # then the Go precision lane, then pay-per-token DeepSeek V4 Pro. Listing only
+            # ag-opus dead-ends the ladder the moment that one window is exhausted.
+            final_fallbacks = [MODEL_AG_CLAUDE_OPUS, MODEL_GO_GLM53, MODEL_DEEPSEEK_PRO]
 
         elif task_type == TaskType.STRONG_REVIEW and risk_level == RiskLevel.MEDIUM:
             # CASE C: MEDIUM-RISK REVIEW — standard diffs are reviewed by the cross-family
