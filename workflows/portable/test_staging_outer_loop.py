@@ -252,6 +252,173 @@ class TestStagingOuterLoopDedupe(unittest.TestCase):
             state_data2 = json.loads(state_file.read_text(encoding="utf-8"))
             self.assertIn("dep-new-003", state_data2["last_seen_deployment_ids"])
 
+    @patch("staging_outer_loop.send_telegram_alert")
+    @patch("staging_outer_loop.add_github_comment")
+    @patch("staging_outer_loop.create_github_issue")
+    @patch("staging_outer_loop.find_open_issue_by_key")
+    def test_deployment_running_on_poll_1_then_error_on_poll_2_creates_exactly_one_issue(
+        self,
+        mock_find_issue,
+        mock_create_issue,
+        mock_add_comment,
+        mock_send_tg,
+    ):
+        """A deployment seen as 'running' on poll 1 must not be marked alerted, and must alert when 'error' on poll 2."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "state.json"
+            now = datetime(2026, 9, 26, 22, 0, 0, tzinfo=timezone.utc)
+            mock_find_issue.return_value = None
+
+            # Poll 1: deployment is running
+            fixture_poll1 = {
+                "deployments": [
+                    {
+                        "deploymentId": "dep-flight-001",
+                        "status": "running",
+                        "title": "In-flight build",
+                        "description": "Commit: aaaa",
+                        "createdAt": "2026-09-26T22:00:00.000Z",
+                    }
+                ],
+                "containers": [],
+            }
+            rc1 = run_outer_loop(
+                state_path=state_file,
+                inject_fixture=json.dumps(fixture_poll1),
+                now_utc=now,
+                seed_first_run=True,
+            )
+            self.assertEqual(rc1, 0)
+            mock_create_issue.assert_not_called()
+            mock_send_tg.assert_not_called()
+
+            # Verify dep-flight-001 is NOT in alerted_deploy_ids
+            state_data1 = json.loads(state_file.read_text(encoding="utf-8"))
+            self.assertNotIn("dep-flight-001", state_data1.get("alerted_deploy_ids", []))
+
+            # Poll 2: 5 minutes later, deployment turned to error
+            fixture_poll2 = {
+                "deployments": [
+                    {
+                        "deploymentId": "dep-flight-001",
+                        "status": "error",
+                        "title": "In-flight build failed",
+                        "description": "Commit: aaaa",
+                        "errorMessage": "Command failed with exit code 1",
+                        "createdAt": "2026-09-26T22:00:00.000Z",
+                        "finishedAt": "2026-09-26T22:04:00.000Z",
+                    }
+                ],
+                "containers": [],
+            }
+            mock_create_issue.return_value = "https://github.com/Bavariance/polysimulator/issues/9005"
+            mock_send_tg.return_value = True
+
+            rc2 = run_outer_loop(
+                state_path=state_file,
+                inject_fixture=json.dumps(fixture_poll2),
+                now_utc=now + timedelta(minutes=5),
+                seed_first_run=True,
+            )
+            self.assertEqual(rc2, 0)
+            mock_create_issue.assert_called_once()
+            mock_send_tg.assert_called_once()
+
+            # Verify dep-flight-001 is now in alerted_deploy_ids
+            state_data2 = json.loads(state_file.read_text(encoding="utf-8"))
+            self.assertIn("dep-flight-001", state_data2.get("alerted_deploy_ids", []))
+
+            # Poll 3: 5 minutes later, deployment still in Dokploy list as error
+            mock_create_issue.reset_mock()
+            mock_send_tg.reset_mock()
+            rc3 = run_outer_loop(
+                state_path=state_file,
+                inject_fixture=json.dumps(fixture_poll2),
+                now_utc=now + timedelta(minutes=10),
+                seed_first_run=True,
+            )
+            self.assertEqual(rc3, 0)
+            # Must NOT create a second issue
+            mock_create_issue.assert_not_called()
+            mock_send_tg.assert_not_called()
+
+    @patch("staging_outer_loop.send_telegram_alert")
+    @patch("staging_outer_loop.add_github_comment")
+    @patch("staging_outer_loop.create_github_issue")
+    @patch("staging_outer_loop.find_open_issue_by_key")
+    def test_issue_creation_failure_retries_on_next_poll_until_success(
+        self,
+        mock_find_issue,
+        mock_create_issue,
+        mock_add_comment,
+        mock_send_tg,
+    ):
+        """When issue creation fails, the ID must not be marked alerted, allowing retry on the next poll."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "state.json"
+            now = datetime(2026, 9, 26, 22, 0, 0, tzinfo=timezone.utc)
+            fixture_dep = {
+                "deployments": [
+                    {
+                        "deploymentId": "dep-retry-001",
+                        "status": "error",
+                        "title": "Build failure with gh outage",
+                        "description": "Commit: bbbb",
+                        "errorMessage": "Exit 1",
+                        "createdAt": "2026-09-26T22:00:00.000Z",
+                        "finishedAt": "2026-09-26T22:01:00.000Z",
+                    }
+                ],
+                "containers": [],
+            }
+            mock_find_issue.return_value = None
+
+            # Poll 1: create_github_issue fails (returns None due to GitHub outage/rate limit)
+            mock_create_issue.return_value = None
+
+            rc1 = run_outer_loop(
+                state_path=state_file,
+                inject_fixture=json.dumps(fixture_dep),
+                now_utc=now,
+            )
+            self.assertEqual(rc1, 0)
+            mock_create_issue.assert_called_once()
+            mock_send_tg.assert_not_called()
+
+            # Verify dep-retry-001 is NOT in alerted_deploy_ids because creation failed
+            state_data1 = json.loads(state_file.read_text(encoding="utf-8"))
+            self.assertNotIn("dep-retry-001", state_data1.get("alerted_deploy_ids", []))
+
+            # Poll 2: 5 minutes later, GitHub is back up and create succeeds
+            mock_create_issue.reset_mock()
+            mock_create_issue.return_value = "https://github.com/Bavariance/polysimulator/issues/9006"
+            mock_send_tg.return_value = True
+
+            rc2 = run_outer_loop(
+                state_path=state_file,
+                inject_fixture=json.dumps(fixture_dep),
+                now_utc=now + timedelta(minutes=5),
+            )
+            self.assertEqual(rc2, 0)
+            mock_create_issue.assert_called_once()
+            mock_send_tg.assert_called_once()
+
+            # Verify dep-retry-001 IS now in alerted_deploy_ids
+            state_data2 = json.loads(state_file.read_text(encoding="utf-8"))
+            self.assertIn("dep-retry-001", state_data2.get("alerted_deploy_ids", []))
+
+            # Poll 3: next poll skips because already alerted
+            mock_create_issue.reset_mock()
+            mock_send_tg.reset_mock()
+            rc3 = run_outer_loop(
+                state_path=state_file,
+                inject_fixture=json.dumps(fixture_dep),
+                now_utc=now + timedelta(minutes=10),
+            )
+            self.assertEqual(rc3, 0)
+            mock_create_issue.assert_not_called()
+            mock_send_tg.assert_not_called()
+
     @patch("staging_outer_loop.add_github_comment")
     @patch("staging_outer_loop.create_github_issue")
     @patch("staging_outer_loop.find_open_issue_by_key")

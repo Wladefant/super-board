@@ -275,11 +275,11 @@ def check_deploy_failures(
     deployments: List[Dict[str, Any]],
     client_or_fixture: Any,
     tail_lines: int = 60,
-    seen_deployment_ids: Optional[Set[str]] = None,
+    alerted_deploy_ids: Optional[Set[str]] = None,
 ) -> List[Incident]:
     """
     Detect deployments with status == 'error', sorted by parsed createdAt descending.
-    Ignores deployments whose IDs have already been seen/recorded in seen_deployment_ids.
+    Ignores deployments whose IDs have already been alerted/recorded in alerted_deploy_ids.
     """
     def sort_key(d: Dict[str, Any]) -> float:
         dt = parse_datetime(d.get("createdAt"))
@@ -291,7 +291,7 @@ def check_deploy_failures(
     for dep in sorted_deps:
         if dep.get("status") == "error":
             dep_id = dep.get("deploymentId") or "unknown"
-            if seen_deployment_ids is not None and dep_id in seen_deployment_ids:
+            if alerted_deploy_ids is not None and dep_id in alerted_deploy_ids:
                 continue
 
             key = f"deploy:{dep_id}"
@@ -622,7 +622,7 @@ def load_state(state_path: Path) -> Dict[str, Any]:
             return json.loads(state_path.read_text(encoding="utf-8"))
         except Exception:
             pass
-    return {"last_seen_deployment_ids": [], "commented_keys": {}, "initialized": False}
+    return {"alerted_deploy_ids": [], "last_seen_deployment_ids": [], "commented_keys": {}, "initialized": False}
 
 
 def save_state(state_path: Path, state: Dict[str, Any]) -> None:
@@ -685,7 +685,7 @@ def run_outer_loop(
     # Load state
     state_existed = state_path.exists()
     state = load_state(state_path)
-    last_seen_deps = set(state.get("last_seen_deployment_ids", []))
+    alerted_deploy_ids = set(state.get("alerted_deploy_ids", state.get("last_seen_deployment_ids", [])))
     commented_keys = state.get("commented_keys", {})
     initialized = state.get("initialized", state_existed)
 
@@ -693,14 +693,19 @@ def run_outer_loop(
     deployments = client.get_deployments()
     containers = client.get_containers(app_name)
 
-    all_current_dep_ids = {d.get("deploymentId") for d in deployments if d.get("deploymentId")}
-
     # On first run (uninitialized state) when seed_first_run is active:
-    # Seed existing deployment IDs into state without alerting for historical/pre-existing errors
+    # Seed historical terminal (done/error) deployments into alerted_deploy_ids so we don't alert on past errors.
+    # Note: Any in-flight "running" deployments are NOT seeded, so if they fail, they will alert!
     if not initialized and seed_first_run:
-        print(f"First run detected: seeding {len(all_current_dep_ids)} deployment IDs without alerting.")
-        last_seen_deps = all_current_dep_ids
-        state["last_seen_deployment_ids"] = list(last_seen_deps)
+        historical_terminal_ids = {
+            d.get("deploymentId")
+            for d in deployments
+            if d.get("deploymentId") and d.get("status") in ("done", "error")
+        }
+        print(f"First run detected: seeding {len(historical_terminal_ids)} historical terminal deployment IDs into alerted set.")
+        alerted_deploy_ids.update(historical_terminal_ids)
+        state["alerted_deploy_ids"] = list(alerted_deploy_ids)
+        state["last_seen_deployment_ids"] = list(alerted_deploy_ids)
         state["initialized"] = True
         state["commented_keys"] = commented_keys
         state["last_run_utc"] = now_utc.isoformat()
@@ -708,7 +713,7 @@ def run_outer_loop(
             save_state(state_path, state)
 
     incidents: List[Incident] = []
-    incidents.extend(check_deploy_failures(deployments, client, seen_deployment_ids=last_seen_deps))
+    incidents.extend(check_deploy_failures(deployments, client, alerted_deploy_ids=alerted_deploy_ids))
     incidents.extend(check_runtime_error_spikes(containers, client, now_utc=now_utc))
     incidents.extend(check_container_down(containers, now_utc=now_utc))
 
@@ -726,8 +731,10 @@ def run_outer_loop(
             issue_num = existing.get("number")
             issue_url = existing.get("url") or f"https://github.com/{repo}/issues/{issue_num}"
 
-            # Deploy failures are static; never comment on existing issues
+            # Deploy failures are static; never comment on existing issues, but ensure recorded as alerted
             if inc.signal == "deploy_failed":
+                dep_id = inc.key.replace("deploy:", "", 1)
+                alerted_deploy_ids.add(dep_id)
                 print(f"Dedupe: Skipping comment for deploy failure {inc.key} on issue #{issue_num} (deployments are static).")
                 skipped_count += 1
                 continue
@@ -761,20 +768,26 @@ def run_outer_loop(
             if dry_run:
                 print(f"[DRY-RUN] Would create issue in {repo}: title='{inc.title}', key='{inc.key}'")
                 send_telegram_alert(inc.summary, f"https://github.com/{repo}/issues/<new>", dry_run=True)
+                if inc.signal == "deploy_failed":
+                    dep_id = inc.key.replace("deploy:", "", 1)
+                    alerted_deploy_ids.add(dep_id)
                 created_count += 1
             else:
                 issue_url = create_github_issue(repo, inc)
                 if issue_url:
                     print(f"Created new incident issue: {issue_url} for key {inc.key}")
                     send_telegram_alert(inc.summary, issue_url, dry_run=False)
+                    if inc.signal == "deploy_failed":
+                        dep_id = inc.key.replace("deploy:", "", 1)
+                        alerted_deploy_ids.add(dep_id)
                     created_count += 1
                 else:
-                    sys.stderr.write(f"Failed to create incident issue for key {inc.key}\n")
+                    sys.stderr.write(f"Failed to create incident issue for key {inc.key}; will retry on next poll\n")
 
     # Update state
     if not dry_run:
-        all_dep_ids = [d.get("deploymentId") for d in deployments if d.get("deploymentId")]
-        state["last_seen_deployment_ids"] = list(set(last_seen_deps).union(all_dep_ids))
+        state["alerted_deploy_ids"] = list(alerted_deploy_ids)
+        state["last_seen_deployment_ids"] = list(alerted_deploy_ids)
         state["initialized"] = True
         state["commented_keys"] = commented_keys
         state["last_run_utc"] = now_utc.isoformat()
