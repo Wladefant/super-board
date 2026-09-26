@@ -374,11 +374,25 @@ def evaluate_review_requirement(pr_data: Dict[str, Any]) -> Tuple[bool, str]:
 # order/trading paths the UI drives. Verdicts: EXEMPT (not a staging UI/trading
 # PR), PASSED, REQUIRED (no receipt, or one that does not bind this diff).
 # Lanes post the marker as a plain line, a bold line (`**QA-RECEIPT: PASS**`) and inside
-# list items, so leading markdown decoration is tolerated; the identity requirement is
-# what actually gates, and a decorated line cannot satisfy it on its own.
-QA_RECEIPT_MARKER_RE = re.compile(r"^[ \t>*_`#|\-]*QA-RECEIPT:\s*PASS\b", re.IGNORECASE | re.MULTILINE)
+# list items, so leading markdown decoration is tolerated; the served revision on the marker
+# line is what binds, and a decorated line carrying none cannot bind on its own.
+QA_RECEIPT_MARKER_RE = re.compile(
+    r"^[ \t>*_`#|\-]*QA-RECEIPT:\s*(?P<state>PASS|FAIL|FAILED|RETRACTED|RETRACT)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+# A receipt states a verdict, and a later verdict overrides an earlier one (AGENTS.md §4).
+QA_RECEIPT_FAILED_STATES = frozenset({"FAIL", "FAILED", "RETRACT", "RETRACTED"})
 QA_RECEIPT_MIN_IMAGES = 2
 SHA_TOKEN_RE = re.compile(r"\b[0-9a-fA-F]{40}\b")
+# The served revision has to follow the verdict, separated only by markdown decoration: a SHA
+# buried in the prose of the same line is a quotation, not a claim about what QA ran against,
+# and cannot bind (Bavariance/polysimulator#5589). The head's stripped-diff sha256 is accepted
+# too, and no 40-hex word sits inside a 64-hex string, so the pattern spans both.
+QA_RECEIPT_SERVED_RE = re.compile(
+    r"QA-RECEIPT:\s*(?:PASS|FAIL|FAILED|RETRACTED|RETRACT)\b[ \t>*_`|:\-–—]*"
+    r"(?P<served>[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\b",
+    re.IGNORECASE,
+)
 # Evidence images that actually render on a PR: uploaded attachments and commit-pinned
 # raw URLs (pinned to a full commit SHA). Release-asset URLs are excluded on purpose —
 # GitHub's image proxy 404s them in a private repo
@@ -446,6 +460,29 @@ def evaluate_qa_receipt_requirement(
     return False, "no UI or order/trading paths"
 
 
+def _receipt_timestamp(source: Dict[str, Any]) -> str:
+    """
+    When a comment or review was posted, for newest-first receipt evaluation.
+
+    GitHub's REST payloads use `created_at` for comments and `submitted_at` for
+    reviews; the CLI's camelCase shape is accepted too. A source with no readable
+    timestamp sorts oldest rather than being dropped.
+    """
+    for key in ("submitted_at", "submittedAt", "created_at", "createdAt"):
+        value = source.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def _receipt_line_tokens(body: str, start: int) -> List[str]:
+    """The served revision named on the marker line, if the verdict is followed by one."""
+    end = body.find("\n", start)
+    line = body[start : end if end != -1 else len(body)]
+    match = QA_RECEIPT_SERVED_RE.search(line)
+    return [match.group("served").lower()] if match else []
+
+
 def evaluate_qa_receipt(
     pr_data: Dict[str, Any],
     *,
@@ -457,88 +494,141 @@ def evaluate_qa_receipt(
     """
     Verify the browser-QA receipt that a staging UI/order change must carry.
 
-    One PR comment (or review body) has to hold all three of: a `QA-RECEIPT:
-    PASS` marker line, the head's content identity, and at least two
-    `github.com/user-attachments` images. The identity may be written as the head
-    SHA, its patch-id, or its stripped-diff sha256 — the two content forms
-    survive a sync-only push, so a merge of `staging` never invalidates QA that
-    still describes the same diff.
+    One PR comment (or review body) has to hold all three of: a `QA-RECEIPT: PASS`
+    marker line, the served revision on that line, and at least two rendered
+    evidence images. The served token may be the head SHA, the head's patch-id or
+    its stripped-diff sha256 (the two content forms survive a sync-only push), or
+    any other commit whose content identity equals the head's — a receipt written
+    against a pre-sync head still describes the same diff.
 
-    When the marker line itself carries a 40-hex token (`QA-RECEIPT: PASS
-    <served-sha>`), that token is the revision QA ran against and it is the only
-    one that can bind: a receipt served from another revision reads as missing,
-    never as PASS.
+    Only the marker line names the revision. A receipt that quotes some other SHA
+    in its prose, the head SHA included, cannot bind through it: a receipt produced
+    against a revision that was not serving the head is missing evidence, not a
+    pass, which is the failure mode behind Bavariance/polysimulator#5589.
 
-    Returns (verdict, reason, comment_url). FAILED is never returned: the gate either
-    cannot find a receipt (REQUIRED) or has one it can bind (PASSED).
+    Receipts are evaluated newest first and the newest one that binds this diff
+    decides: a later `FAIL` or `RETRACTED` overrides an earlier `PASS`, and a
+    receipt with too few images stays missing evidence rather than falling back to
+    an older, fuller one.
+
+    Returns (verdict, reason, comment_url). FAILED is never returned: the gate
+    either cannot find a receipt (REQUIRED) or has one it can bind (PASSED).
     """
     required, requirement_reason = evaluate_qa_receipt_requirement(pr_data, repo, base_ref)
     if not required:
         return "EXEMPT", requirement_reason, None
 
+    from review_content import content_identity
+
+    base = "origin/" + base_ref
     # The content forms need a real checkout of the head; a checkout that cannot
     # supply them narrows what a receipt may name, it never blocks one that names
     # the head SHA outright.
     identity_forms = [head_sha]
+    head_identity = set()
     identity_error = None
     try:
-        from review_content import content_identity
-        identity_forms.extend(content_identity(head_sha, "origin/" + base_ref, cwd))
+        head_identity = {form.lower() for form in content_identity(head_sha, base, cwd) if form}
+        identity_forms.extend(sorted(head_identity))
     except (ValueError, subprocess.CalledProcessError) as exc:
         identity_error = str(exc)
     accepted = {form.lower() for form in identity_forms if form}
-    saw_marker = False
-    saw_identity = False
-    images = 0
-    for source in (
-        list(pr_data.get("comments") or []) + list(pr_data.get("reviews") or [])
-    ):
-        body = str(source.get("body") or "")
-        marker = QA_RECEIPT_MARKER_RE.search(body)
-        if not marker:
-            continue
-        # A 40-hex token beside the marker is the revision the QA actually ran
-        # against, and it decides on its own: a receipt for another revision is
-        # missing evidence, even when the head SHA is quoted elsewhere in the
-        # same comment. A bare marker keeps the comment-wide reading.
-        line_end = body.find("\n", marker.start())
-        marker_tokens = {
-            token.lower()
-            for token in SHA_TOKEN_RE.findall(body[marker.start(): line_end if line_end != -1 else len(body)])
-        }
-        candidates = marker_tokens or {token.lower() for token in SHA_TOKEN_RE.findall(body)}
-        found = {token for token in candidates if token in accepted}
-        attachments = len(EVIDENCE_IMAGE_RE.findall(body))
-        if found and attachments >= QA_RECEIPT_MIN_IMAGES:
-            return (
-                "PASSED",
-                f"browser QA receipt binds head {head_sha[:8]} ({requirement_reason})",
-                str(source.get("html_url") or source.get("url") or "") or None,
-            )
-        saw_marker = True
-        saw_identity = saw_identity or bool(found)
-        images = max(images, attachments)
+    resolved: Dict[str, bool] = {}
 
-    if not saw_marker:
+    def binds(token: str) -> bool:
+        """
+        Whether a 40-hex token names this diff.
+
+        The head SHA and the head's own identity forms bind directly. Any other
+        token has to be a commit whose content identity matches the head's, which
+        is what keeps a receipt served from a pre-sync head valid. A token that is
+        not a commit here — a patch-id quoted from another revision, or something
+        this checkout cannot resolve — never binds.
+        """
+        if token in accepted:
+            return True
+        if token not in resolved:
+            match = False
+            if head_identity:
+                try:
+                    forms = {form.lower() for form in content_identity(token, base, cwd) if form}
+                    match = bool(forms & head_identity)
+                except (ValueError, subprocess.CalledProcessError):
+                    match = False
+            resolved[token] = match
+        return resolved[token]
+
+    declarations = []
+    for source in list(pr_data.get("comments") or []) + list(pr_data.get("reviews") or []):
+        body = str(source.get("body") or "")
+        for marker in QA_RECEIPT_MARKER_RE.finditer(body):
+            declarations.append(
+                {
+                    "posted": _receipt_timestamp(source),
+                    "state": marker.group("state").upper(),
+                    "tokens": _receipt_line_tokens(body, marker.start()),
+                    "images": len(EVIDENCE_IMAGE_RE.findall(body)),
+                    "url": str(source.get("html_url") or source.get("url") or ""),
+                    "body": body,
+                }
+            )
+    declarations.sort(key=lambda item: item["posted"], reverse=True)
+
+    saw_pass_marker = False
+    saw_pass_served = False
+    for declaration in declarations:
+        tokens = set(declaration["tokens"])
+        if declaration["state"] in QA_RECEIPT_FAILED_STATES:
+            # A negative verdict is believed wherever it can bind: refusing a
+            # retraction because it named the revision in prose rather than on the
+            # marker line would read a withdrawn receipt as a pass.
+            tokens |= {token.lower() for token in SHA_TOKEN_RE.findall(declaration["body"])}
+        else:
+            saw_pass_marker = True
+            saw_pass_served = saw_pass_served or bool(declaration["tokens"])
+        if not any(binds(token) for token in tokens):
+            continue
+        if declaration["state"] in QA_RECEIPT_FAILED_STATES:
+            return (
+                "REQUIRED",
+                f"QA receipt required ({requirement_reason}): the newest receipt binding this "
+                f"diff is {declaration['state']}.",
+                declaration["url"] or None,
+            )
+        if declaration["images"] < QA_RECEIPT_MIN_IMAGES:
+            return (
+                "REQUIRED",
+                f"QA receipt required ({requirement_reason}): the receipt carries "
+                f"{declaration['images']} GitHub-hosted evidence image(s), "
+                f"{QA_RECEIPT_MIN_IMAGES} required.",
+                declaration["url"] or None,
+            )
+        return (
+            "PASSED",
+            f"browser QA receipt binds head {head_sha[:8]} ({requirement_reason})",
+            declaration["url"] or None,
+        )
+
+    if not declarations:
         return (
             "REQUIRED",
             f"QA receipt required ({requirement_reason}): no PR comment carries a "
             "'QA-RECEIPT: PASS' marker.",
             None,
         )
-    if not saw_identity:
-        forms = ", ".join(identity_forms) or "none resolved"
+    if saw_pass_marker and not saw_pass_served:
         return (
             "REQUIRED",
-            f"QA receipt required ({requirement_reason}): the receipt names no identity for "
-            f"this head (accepted identity tokens: {forms}"
-            f"{'; identity lookup failed: ' + identity_error if identity_error else ''}).",
+            f"QA receipt required ({requirement_reason}): the marker names no served revision; "
+            "a 'QA-RECEIPT: PASS <served-sha>' line is required.",
             None,
         )
+    forms = ", ".join(identity_forms) or "none resolved"
     return (
         "REQUIRED",
-        f"QA receipt required ({requirement_reason}): the receipt carries {images} "
-        f"GitHub-hosted evidence image(s), {QA_RECEIPT_MIN_IMAGES} required.",
+        f"QA receipt required ({requirement_reason}): the receipt names no identity for "
+        f"this head (accepted identity tokens: {forms}"
+        f"{'; identity lookup failed: ' + identity_error if identity_error else ''}).",
         None,
     )
 

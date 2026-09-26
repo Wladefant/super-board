@@ -86,6 +86,18 @@ class TestGitHubPRGate(unittest.TestCase):
         git("add", ".")
         git("commit", "-m", "feature")
         cls.head_sha = git("rev-parse", "HEAD")
+        # Fixtures for the sync-only push: `sync-merge` carries the same diff as the feature
+        # head one commit later, `other-diff` carries a different diff.
+        git("checkout", "-b", "sync-merge", cls.head_sha)
+        git("merge", "--no-ff", "-m", "sync staging into feature", "origin/staging")
+        cls.synced_sha = git("rev-parse", "HEAD")
+        git("checkout", "-b", "other-diff", cls.base_sha)
+        with open("change.txt", "w", encoding="utf-8") as source:
+            source.write("something else\n")
+        git("add", ".")
+        git("commit", "-m", "other")
+        cls.other_sha = git("rev-parse", "HEAD")
+        git("checkout", "feature")
 
     def setUp(self):
         self.mock_pr = {
@@ -177,14 +189,19 @@ class TestGitHubPRGate(unittest.TestCase):
             allow_review_exemption=True,
         )
 
-    def qa_receipt_comment(self, *, named=None, identity=None, images=2, marker="PASS", served=None, extra=""):
+    def qa_receipt_comment(
+        self, *, named=None, identity=None, images=2, marker="PASS", served=None, extra="", when=None
+    ):
         """A browser-QA receipt in the shape lanes post on a PR, for `named` (default: the head).
 
         `served` mirrors the printer's `QA-RECEIPT: PASS <served-sha>` form: the revision QA
-        ran against, which the gate binds to on its own.
+        ran against, written on the marker line, which is the only token that can bind the
+        receipt. It defaults to `named`, the revision the receipt is about. `when` supplies the
+        comment's `created_at`, so newest-first evaluation can be exercised.
         """
         named = named or self.head_sha
         identity = named if identity is None else identity
+        served = named if served is None else served
         lines = []
         if marker:
             suffix = f" {served}" if served else ""
@@ -196,7 +213,10 @@ class TestGitHubPRGate(unittest.TestCase):
         )
         if extra:
             lines.append(extra)
-        return {"body": "\n".join(lines), "html_url": self.QA_RECEIPT_URL}
+        comment = {"body": "\n".join(lines), "html_url": self.QA_RECEIPT_URL}
+        if when:
+            comment["created_at"] = when
+        return comment
 
     def staging_ui_pr(self, receipt=None, *, files=None, comments=None):
         """A review-exempt staging PR whose diff reaches the order ticket UI."""
@@ -1424,7 +1444,7 @@ class TestGitHubPRGate(unittest.TestCase):
         print("  [PASS] Negative controls: marker, image count and image host all enforced")
         # Commit-pinned raw URLs are the second form policy allows, so two of them are evidence.
         pinned = "\n".join([
-            "**QA-RECEIPT: PASS**",
+            f"**QA-RECEIPT: PASS {self.head_sha}**",
             f"- **Head SHA**: `{self.head_sha}`",
             f"![desktop](https://github.com/Bavariance/polysimulator/raw/{self.head_sha}/docs/qa/a.png)",
             f"![mobile](https://github.com/Bavariance/polysimulator/raw/{self.head_sha}/docs/qa/b.png)",
@@ -1449,7 +1469,7 @@ class TestGitHubPRGate(unittest.TestCase):
         ):
             with self.subTest(hosts=label):
                 body = "\n".join([
-                    "**QA-RECEIPT: PASS**",
+                    f"**QA-RECEIPT: PASS {self.head_sha}**",
                     f"- **Head SHA**: `{self.head_sha}`",
                     *refs,
                 ])
@@ -1507,7 +1527,11 @@ class TestGitHubPRGate(unittest.TestCase):
     def test_qa_receipt_in_the_shape_lanes_actually_post(self):
         """Positive control: the bold marker and `Head SHA` field real PRs carry do bind the receipt."""
         head_field = f"- **Head SHA**: `{self.head_sha}`"
-        for marker in ("**QA-RECEIPT: PASS**", "> QA-RECEIPT: PASS", "- QA-RECEIPT: PASS"):
+        for marker in (
+            f"**QA-RECEIPT: PASS {self.head_sha}**",
+            f"> QA-RECEIPT: PASS {self.head_sha}",
+            f"- QA-RECEIPT: PASS {self.head_sha}",
+        ):
             with self.subTest(marker=marker):
                 body = "\n".join([
                     "## Pre-Merge Browser QA Receipt — PASS",
@@ -1536,7 +1560,21 @@ class TestGitHubPRGate(unittest.TestCase):
         )
         self.assertEqual(result.qa_receipt_verdict, "REQUIRED")
         self.assertEqual(result.gate_verdict, "BLOCKED")
-        print("  [PASS] Bold, quoted and list-item receipt markers bind; a FAIL marker never does")
+        # A decorated marker naming no served revision is not a receipt: the head SHA quoted
+        # in the prose below it cannot bind one (Bavariance/polysimulator#5589).
+        bare = "\n".join([
+            "**QA-RECEIPT: PASS**",
+            head_field,
+            "![desktop](https://github.com/user-attachments/assets/11111111-2222-3333-4444-555555555555)",
+            "![mobile](https://github.com/user-attachments/assets/66666666-7777-8888-9999-aaaaaaaaaaaa)",
+        ])
+        result = evaluate_pr_gate(
+            self.staging_ui_pr(comments=[{"body": bare, "html_url": self.QA_RECEIPT_URL}]),
+            policy=self.staging_policy(),
+        )
+        self.assertEqual(result.qa_receipt_verdict, "REQUIRED")
+        self.assertIn("names no served revision", result.verdict_reason)
+        print("  [PASS] Decorated markers bind with a served revision; a bare one and a FAIL never do")
 
     def test_qa_receipt_accepts_content_identity_and_review_bodies(self):
         """A receipt may name the patch-id (survives a sync merge) and may live in a review body."""
@@ -1546,7 +1584,7 @@ class TestGitHubPRGate(unittest.TestCase):
         self.assertTrue(patch_id)
         for identity in (patch_id, digest):
             with self.subTest(identity=identity[:12]):
-                receipt = self.qa_receipt_comment(identity=identity)
+                receipt = self.qa_receipt_comment(served=identity)
                 pr = self.staging_ui_pr(comments=[receipt])
                 self.assertEqual(
                     evaluate_pr_gate(pr, policy=self.staging_policy()).qa_receipt_verdict, "PASSED"
@@ -1560,6 +1598,101 @@ class TestGitHubPRGate(unittest.TestCase):
         result = evaluate_pr_gate(as_review, policy=self.staging_policy())
         self.assertEqual(result.qa_receipt_verdict, "PASSED")
         print("  [PASS] Receipt accepted via patch-id, diff sha256 and review body")
+
+    def test_qa_receipt_marker_must_name_the_served_revision(self):
+        """Negative control (#5589): a bare marker quoting the head in prose never binds."""
+        body = "\n".join([
+            "QA-RECEIPT: PASS",
+            f"- **Commit SHA**: `{self.head_sha}`",
+            "- **Base URL:** https://staging.polysimulator.com",
+            "![desktop](https://github.com/user-attachments/assets/11111111-2222-3333-4444-555555555555)",
+            "![mobile](https://github.com/user-attachments/assets/66666666-7777-8888-9999-aaaaaaaaaaaa)",
+        ])
+        result = evaluate_pr_gate(
+            self.staging_ui_pr(comments=[{"body": body, "html_url": self.QA_RECEIPT_URL}]),
+            policy=self.staging_policy(),
+        )
+        self.assertEqual(result.qa_receipt_verdict, "REQUIRED")
+        self.assertEqual(result.gate_verdict, "BLOCKED")
+        self.assertIn("names no served revision", result.verdict_reason)
+        # Naming the served revision on the marker line is what turns it into a receipt.
+        named = body.replace("QA-RECEIPT: PASS", f"QA-RECEIPT: PASS {self.head_sha}", 1)
+        result = evaluate_pr_gate(
+            self.staging_ui_pr(comments=[{"body": named, "html_url": self.QA_RECEIPT_URL}]),
+            policy=self.staging_policy(),
+        )
+        self.assertEqual(result.qa_receipt_verdict, "PASSED")
+        # A SHA quoted inside prose on the marker line is the same quotation, so it needs the
+        # verdict immediately beside it: "PASS — the head commit <sha> was exercised" never binds.
+        prose = body.replace(
+            "QA-RECEIPT: PASS",
+            f"QA-RECEIPT: PASS — the head commit `{self.head_sha}` was exercised",
+            1,
+        )
+        result = evaluate_pr_gate(
+            self.staging_ui_pr(comments=[{"body": prose, "html_url": self.QA_RECEIPT_URL}]),
+            policy=self.staging_policy(),
+        )
+        self.assertEqual(result.qa_receipt_verdict, "REQUIRED")
+        self.assertIn("names no served revision", result.verdict_reason)
+        print("  [PASS] A marker naming no served revision never binds the head quoted in its prose")
+
+    def test_later_receipt_verdict_overrides_an_earlier_pass(self):
+        """The newest receipt that binds this diff decides, in either list order."""
+        older = self.qa_receipt_comment(when="2026-09-26T22:00:00Z")
+        later_fail = self.qa_receipt_comment(marker="FAIL", when="2026-09-26T22:30:00Z")
+        for order in ([older, later_fail], [later_fail, older]):
+            with self.subTest(order=[c["body"].splitlines()[0] for c in order]):
+                result = evaluate_pr_gate(
+                    self.staging_ui_pr(comments=order), policy=self.staging_policy()
+                )
+                self.assertEqual(result.qa_receipt_verdict, "REQUIRED")
+                self.assertEqual(result.gate_verdict, "BLOCKED")
+                self.assertIn("the newest receipt binding this diff is FAIL", result.verdict_reason)
+        retracted = self.qa_receipt_comment(marker="RETRACTED", when="2026-09-26T23:00:00Z")
+        result = evaluate_pr_gate(
+            self.staging_ui_pr(comments=[older, retracted]), policy=self.staging_policy()
+        )
+        self.assertEqual(result.qa_receipt_verdict, "REQUIRED")
+        self.assertIn("is RETRACTED", result.verdict_reason)
+        # QA that ran again and passed afterwards is the newest verdict, and does pass.
+        reran = self.qa_receipt_comment(when="2026-09-27T00:00:00Z")
+        result = evaluate_pr_gate(
+            self.staging_ui_pr(comments=[older, later_fail, reran]), policy=self.staging_policy()
+        )
+        self.assertEqual(result.qa_receipt_verdict, "PASSED")
+        # A negative verdict for another revision does not touch this diff's receipt.
+        elsewhere = self.qa_receipt_comment(
+            marker="FAIL", named="d" * 40, identity="d" * 40, when="2026-09-27T01:00:00Z"
+        )
+        result = evaluate_pr_gate(
+            self.staging_ui_pr(comments=[older, elsewhere]), policy=self.staging_policy()
+        )
+        self.assertEqual(result.qa_receipt_verdict, "PASSED")
+        print("  [PASS] A later FAIL or RETRACTED overrides an earlier PASS, for its own diff only")
+
+    def test_qa_receipt_served_from_a_pre_sync_head_still_binds(self):
+        """A sync-only push moves the head without changing its diff, so its QA stands."""
+        from review_content import content_identity
+
+        self.assertEqual(
+            set(content_identity(self.synced_sha, "origin/staging")),
+            set(content_identity(self.head_sha, "origin/staging")),
+        )
+        premerge = self.qa_receipt_comment(served=self.head_sha, named=self.synced_sha)
+        case = self.staging_ui_pr(comments=[premerge])
+        case["headRefOid"] = self.synced_sha
+        self.assertEqual(
+            evaluate_pr_gate(case, policy=self.staging_policy()).qa_receipt_verdict, "PASSED"
+        )
+        # A served revision with a different diff is still missing evidence for this one.
+        other = self.qa_receipt_comment(served=self.other_sha, named=self.synced_sha)
+        case_other = self.staging_ui_pr(comments=[other])
+        case_other["headRefOid"] = self.synced_sha
+        result = evaluate_pr_gate(case_other, policy=self.staging_policy())
+        self.assertEqual(result.qa_receipt_verdict, "REQUIRED")
+        self.assertEqual(result.gate_verdict, "BLOCKED")
+        print("  [PASS] A receipt served from a pre-sync head binds the post-sync head by content")
 
     def test_order_trading_paths_require_a_qa_receipt(self):
         """Every order/trading backend path demands browser QA; unrelated paths do not."""
