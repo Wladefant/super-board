@@ -385,6 +385,23 @@ ORDER_TRADING_PATH_RE = re.compile(
     r"^backend/.*[/_.-](orders?|trades?|trading|matching|settlement|positions?|fills?)([/_.-]|$)",
     re.IGNORECASE,
 )
+TEST_PATH_RE = re.compile(
+    r"(^|/)(tests?|__tests__|__mocks__)(/|$)"
+    r"|(^|/)test_[^/]*$"
+    r"|_test\.(py|ts|tsx|js|jsx)$"
+    r"|\.(test|spec)\.(ts|tsx|js|jsx)$",
+    re.IGNORECASE,
+)
+
+
+def is_test_path(path: str) -> bool:
+    """
+    Test files ship nothing, so they cannot regress a compiled or served surface.
+
+    They still count as a trigger whenever the change also touches product code —
+    this only keeps a test-only diff from demanding browser QA it cannot use.
+    """
+    return bool(TEST_PATH_RE.search(path))
 
 
 def evaluate_qa_receipt_requirement(
@@ -397,6 +414,9 @@ def evaluate_qa_receipt_requirement(
     Like the review-exemption rule, an empty or absent `files` list cannot name a
     UI path, so it cannot trigger the requirement; a list capped at 100 may hide
     one and therefore does trigger it.
+
+    Test files are skipped: a test-only diff changes no shipped surface, while a
+    change that also touches product code still triggers on that file.
     """
     if repo != "Bavariance/polysimulator" or base_ref != "staging":
         return False, f"no QA receipt requirement for {repo}@{base_ref or 'unknown'}"
@@ -408,6 +428,8 @@ def evaluate_qa_receipt_requirement(
     for f in files:
         path = f.get("path", "") if isinstance(f, dict) else str(f)
         norm_path = path.replace("\\", "/")
+        if is_test_path(norm_path):
+            continue
         if UI_PATH_RE.match(norm_path):
             return True, f"UI path {path}"
         if ORDER_TRADING_PATH_RE.match(norm_path):

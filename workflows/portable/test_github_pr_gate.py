@@ -1473,15 +1473,35 @@ class TestGitHubPRGate(unittest.TestCase):
                 self.assertEqual(result.qa_receipt_verdict, "REQUIRED")
                 self.assertEqual(result.gate_verdict, "BLOCKED")
                 self.assertIn(f"order/trading path {path}", result.qa_receipt_reason)
-        for path in ("backend/app/api_v1/markets.py", "backend/app/models/user.py", "docs/runbook.md"):
+        for path in (
+            "backend/app/api_v1/markets.py",
+            "backend/app/models/user.py",
+            "docs/runbook.md",
+            # Tests ship nothing, so a test-only diff must not demand browser QA,
+            # however loudly its filename names orders or settlement.
+            "backend/tests/test_orders.py",
+            "backend/tests/test_market_detail_stale_settlement.py",
+            "frontend/components/__tests__/OrderTicket.test.tsx",
+            "frontend/components/OrderTicket.spec.tsx",
+        ):
             with self.subTest(exempt=path):
                 result = evaluate_pr_gate(
                     self.staging_ui_pr(files=[{"path": path, "additions": 3, "deletions": 1}]),
                     policy=self.staging_policy(),
                 )
-                self.assertEqual(result.qa_receipt_verdict, "EXEMPT")
+                self.assertEqual(result.qa_receipt_verdict, "EXEMPT", result.qa_receipt_reason)
                 self.assertEqual(result.gate_verdict, "PASSED")
-        print("  [PASS] Order/trading paths require QA; unrelated backend paths stay exempt")
+        # A diff that ships code as well as tests still triggers on the code.
+        mixed = evaluate_pr_gate(
+            self.staging_ui_pr(files=[
+                {"path": "backend/tests/test_orders.py", "additions": 4, "deletions": 1},
+                {"path": "backend/app/api_v1/orders.py", "additions": 2, "deletions": 0},
+            ]),
+            policy=self.staging_policy(),
+        )
+        self.assertEqual(mixed.qa_receipt_verdict, "REQUIRED")
+        self.assertIn("order/trading path backend/app/api_v1/orders.py", mixed.qa_receipt_reason)
+        print("  [PASS] Order/trading paths require QA; test-only and unrelated paths stay exempt")
 
     def test_qa_receipt_scope_is_staging_only_and_fails_closed_when_truncated(self):
         """A capped 100-file list cannot prove a diff is UI-free; another repo is out of scope."""
