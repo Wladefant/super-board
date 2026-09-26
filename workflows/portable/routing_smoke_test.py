@@ -107,6 +107,7 @@ from model_routing import (
     model_to_agent_role,
     model_to_provider,
     resolve_role_model,
+    is_agent_role_available,
 )
 
 def tmp_quota_path() -> "Path":
@@ -1997,6 +1998,12 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             # Role mapper maps to codex-* roles when enabled
             self.assertEqual(model_to_agent_role(MODEL_CODEX_ASTRA, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "codex-reviewer")
             self.assertEqual(model_to_agent_role(MODEL_CODEX_ASTRA, TaskType.ROUTINE_EXECUTION, RiskLevel.HIGH), "codex-worker")
+            # Agent roles available when Codex enabled
+            self.assertTrue(is_agent_role_available("codex-worker"))
+            self.assertTrue(is_agent_role_available("codex-reviewer"))
+            self.assertTrue(is_agent_role_available("thinker"))
+            self.assertTrue(is_agent_role_available("sol"))
+            self.assertTrue(is_agent_role_available("task"))
 
         # ---------------------------------------------------------------------
         # NEGATIVE CONTROL:
@@ -2033,6 +2040,16 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             self.assertNotEqual(model_to_agent_role(MODEL_CODEX_ASTRA, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "codex-reviewer")
             self.assertNotEqual(model_to_agent_role(MODEL_CODEX_ASTRA, TaskType.ROUTINE_EXECUTION, RiskLevel.MEDIUM), "codex-worker")
             self.assertNotEqual(model_to_agent_role(MODEL_CODEX_FAST, TaskType.ROUTINE_EXECUTION, RiskLevel.LOW), "codex-worker")
+            # When disabled, is_agent_role_available MUST return False for Codex roles
+            self.assertFalse(is_agent_role_available("codex-worker"))
+            self.assertFalse(is_agent_role_available("codex-reviewer"))
+            self.assertFalse(is_agent_role_available("thinker"))
+            self.assertFalse(is_agent_role_available("sol"))
+            self.assertTrue(is_agent_role_available("task"))
+            self.assertTrue(is_agent_role_available("reviewer"))
+            self.assertTrue(is_agent_role_available("ag-opus"))
+            self.assertTrue(is_agent_role_available("ds-task"))
+            self.assertTrue(is_agent_role_available("go-task"))
 
         # Negative control on environment override:
         with mock.patch("model_routing.CODEX_ENABLED", True):
@@ -2046,6 +2063,22 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         # Negative control: no automatic re-enable by date (manual switch only)
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertFalse(codex_available(), "codex_available() must be False regardless of time when CODEX_ENABLED=False")
+
+        # Profile config invariant: when CODEX_ENABLED is False, Codex agent roles must be disabled
+        if not CODEX_ENABLED:
+            config_path = os.path.expanduser("~/.veyyon/profiles/default/agent/config.yml")
+            if os.path.exists(config_path):
+                import yaml
+                with open(config_path, "r", encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f)
+                prof_agents = (cfg.get("agent") or {}).get("agents") or {}
+                for codex_role in ("codex-worker", "codex-reviewer", "thinker", "sol"):
+                    entry = prof_agents.get(codex_role)
+                    if entry:
+                        self.assertFalse(
+                            entry.get("enabled", True),
+                            f"{codex_role} must have enabled: false in config.yml when CODEX_ENABLED=False",
+                        )
         print("  [PASS] All states verified: off (skipped), on (routed), plus negative control.")
 
 
