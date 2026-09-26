@@ -41,8 +41,13 @@ from gardener import (
     generate_gardener_issue_candidates,
     is_frontend_entrypoint,
     is_test_file,
+    load_no_rules_state,
+    parse_pr_diff,
     run_gardener,
+    save_no_rules_state,
+    scan_closed_bug_issues,
     scan_workaround_comments,
+    synthesize_mechanical_bug_rule,
 )
 
 
@@ -606,6 +611,141 @@ class TestGardenerIssueCreationAndAutomation(unittest.TestCase):
             self.assertTrue(is_safe)
             self.assertAlmostEqual(pct, 65.0)
             self.assertIn("< threshold", msg)
+
+    def test_parse_pr_diff(self):
+        """parse_pr_diff must accurately extract added and removed lines per file."""
+        sample_diff = """diff --git a/backend/app/database.py b/backend/app/database.py
+index abc..def 100644
+--- a/backend/app/database.py
++++ b/backend/app/database.py
+@@ -10,2 +10,2 @@
+-"BEGIN; "
++"SET LOCAL; "
+"""
+        files = parse_pr_diff(sample_diff)
+        self.assertIn("backend/app/database.py", files)
+        self.assertEqual(files["backend/app/database.py"]["removed"], ['"BEGIN; "'])
+        self.assertEqual(files["backend/app/database.py"]["added"], ['"SET LOCAL; "'])
+
+    def test_synthesize_mechanical_bug_rule_transaction_hook(self):
+        """Transaction hook BEGIN-prefix bug must synthesize a proven regex rule."""
+        sample_diff = """diff --git a/backend/app/database.py b/backend/app/database.py
+index abc..def 100644
+--- a/backend/app/database.py
++++ b/backend/app/database.py
+@@ -10,3 +10,2 @@
+ _TRADE_GUC_PREFIX = (
+-    "BEGIN; "
+     "SET LOCAL synchronous_commit = off; "
+"""
+        proposal, reason = synthesize_mechanical_bug_rule(
+            bug_num=5370,
+            bug_title="bug(db): trade_engine BEGIN-prefix hook never commits",
+            fix_pr_num=5385,
+            diff_text=sample_diff,
+        )
+        self.assertIsNone(reason)
+        self.assertIsNotNone(proposal)
+        self.assertEqual(proposal.bug_number, 5370)
+        self.assertEqual(proposal.rule_type, "regex")
+        self.assertIn("BEGIN;", proposal.target_pattern)
+        self.assertIn("Proven", proposal.proof_text)
+        self.assertEqual(proposal.target_file, "backend/app/database.py")
+
+    def test_synthesize_mechanical_bug_rule_exception_swallowing(self):
+        """Bare exception swallowing bug must synthesize a proven regex rule."""
+        sample_diff = """diff --git a/backend/app/main.py b/backend/app/main.py
+index abc..def 100644
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -20,3 +20,4 @@
+-    except Exception:
+-        pass
++    except Exception as e:
++        logger.warning("Failed: %s", e)
+"""
+        proposal, reason = synthesize_mechanical_bug_rule(
+            bug_num=5396,
+            bug_title="fix(daemon): release WS lease on exit",
+            fix_pr_num=5398,
+            diff_text=sample_diff,
+        )
+        self.assertIsNone(reason)
+        self.assertIsNotNone(proposal)
+        self.assertIn("except", proposal.target_pattern)
+        self.assertIn("pass", proposal.target_pattern)
+        self.assertIn("Proven", proposal.proof_text)
+
+    def test_synthesize_mechanical_bug_rule_lock_bypass(self):
+        """Mutex/wallet lock=False bypass must synthesize a proven pattern rule."""
+        sample_diff = """diff --git a/backend/app/api_v1/trading.py b/backend/app/api_v1/trading.py
+index abc..def 100644
+--- a/backend/app/api_v1/trading.py
++++ b/backend/app/api_v1/trading.py
+@@ -50,2 +50,2 @@
+-_api_wallet = get_or_seed_api_wallet(db, user.id, lock=False)
++_api_wallet = get_or_seed_api_wallet(db, user.id, lock=True)
+"""
+        proposal, reason = synthesize_mechanical_bug_rule(
+            bug_num=5365,
+            bug_title="fix(trading): limit-order cancel refund row",
+            fix_pr_num=5367,
+            diff_text=sample_diff,
+        )
+        self.assertIsNone(reason)
+        self.assertIn("lock", proposal.target_pattern)
+        self.assertIn("False", proposal.target_pattern)
+
+    def test_synthesize_mechanical_bug_rule_skip_tests_and_non_code(self):
+        """Fixes that touch only tests, configs, or docs must return a no-rule reason."""
+        sample_diff = """diff --git a/backend/tests/test_search.py b/backend/tests/test_search.py
+index abc..def 100644
+--- a/backend/tests/test_search.py
++++ b/backend/tests/test_search.py
+@@ -10,2 +10,2 @@
+-assert count == 16000
++assert count == 16400
+"""
+        proposal, reason = synthesize_mechanical_bug_rule(
+            bug_num=5495,
+            bug_title="bug(ci): issues auto-close",
+            fix_pr_num=5479,
+            diff_text=sample_diff,
+        )
+        self.assertIsNone(proposal)
+        self.assertIsNotNone(reason)
+        self.assertIn("test, workflow, documentation, or config changes only", reason)
+
+    def test_candidate_issue_body_embedded_proof(self):
+        """Bug-to-lint candidate issue bodies must embed anti-pattern code and proof text."""
+        proposal = BugLintProposal(
+            bug_number=5370,
+            bug_title="trade_engine BEGIN-prefix hook never commits",
+            fix_pr_number=5385,
+            rule_type="regex",
+            target_pattern=r'_TRADE_GUC_PREFIX\s*=\s*\([^)]*BEGIN;',
+            anti_pattern_code='_TRADE_GUC_PREFIX = ("BEGIN; ", ...)',
+            fixed_code='_TRADE_GUC_PREFIX = ("SET LOCAL...", ...)',
+            proof_text="Proven: regex matches pre-fix and rejects post-fix",
+            target_file="backend/app/database.py",
+        )
+        report = GardenerReport(
+            repo_root="/test",
+            timestamp="2026-09-27T00:00:00Z",
+            min_confidence=80,
+            frontend_findings=[],
+            backend_findings=[],
+            workaround_findings=[],
+            summary={},
+        )
+        candidates = generate_gardener_issue_candidates(report, [proposal], repo_name="Bavariance/polysimulator")
+        self.assertEqual(len(candidates), 1)
+        body = candidates[0].body
+        self.assertIn("### Concrete Anti-Pattern (Removed Buggy Code)", body)
+        self.assertIn('_TRADE_GUC_PREFIX = ("BEGIN; ", ...)', body)
+        self.assertIn("### Fixed Code (Post-Fix Invariant)", body)
+        self.assertIn("### Proof of Mechanical Verification", body)
+        self.assertIn("Proven: regex matches pre-fix and rejects post-fix", body)
 
 if __name__ == "__main__":
     unittest.main()

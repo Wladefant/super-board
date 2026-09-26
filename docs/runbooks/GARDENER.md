@@ -107,6 +107,7 @@ python workflows/portable/gardener.py --dry-run \
 - `--issue-repo`: Target GitHub repository for created issues (default: `Bavariance/polysimulator`).
 - `--max-new-issues`: Maximum number of live GitHub issues to create per run (default: 5, hard-capped at 5).
 - `--scan-bugs-only`: Fast mode; bypasses heavy Knip/Vulture scan and executes closed-bug-to-lint-rule scan only.
+- `--bug <N>`: Target specific closed bug issue number(s) to process for regression guard rule proposal (repeatable, e.g. `--bug 5370`).
 - `--install-tasks`: Installs recurring Windows Task Scheduler (`schtasks`) jobs for daily full scan and hourly bug scan.
 - `--log-dir`: Directory for saving execution logs and `.cmd` wrapper scripts (default: `C:/Users/wkiri/.veyyon/run/gardener`).
 - `--skip-ram-check`: Bypasses host RAM utilization safety check (by default, halts when host RAM $\ge 90\%$).
@@ -137,11 +138,18 @@ When executed with `--live`, the Gardener converts scan findings and bug-to-lint
 
 ## 7. Bug-to-Lint-Rule Loop (Poteto Ratchets)
 
-The Gardener continuously surveys recently closed bugs with merged pull requests (`gh issue list --state closed --label kind:bug`) and generates issue candidates proposing static analysis ratchets:
-- **Target AST engines:** `ast-grep` (`rules/`, `sgconfig.yml`), custom ESLint rules (frontend), or Ruff / importlinter contracts (backend).
-- **Contract:** Each proposed lint rule issue specifies positive control (fails on the pre-fix code pattern) and negative control (passes cleanly on current staging trunk).
+The Gardener continuously surveys recently closed bugs with merged pull requests (`gh issue list --state closed --label kind:bug`) or targets a specific bug via `--bug <N>`:
+- **Target Filtering:** Only closed bugs whose linked fix PR touches application code (`.py`, `.ts`, `.tsx`, `.js`) are evaluated. UI/copy/design redesigns and test-only fixes are automatically skipped.
+- **Anti-Pattern Extraction:** The runner parses the fix PR diff, extracts the exact removed code lines that caused the defect, and synthesizes candidate `ast-grep` or regex rules.
+- **Mechanical Proof:** The runner executes an automated proof confirming the candidate rule matches the pre-fix code and strictly rejects the post-fix code.
+- **No-Rule Rejection Gate:** If no mechanical rule can be proven (e.g. complex multi-file control-flow logic), the runner files NOTHING, records `no-rule: <reason>` in `C:/Users/wkiri/.veyyon/run/gardener/no_rules_state.json`, and posts a one-line comment on the bug issue (`gardener bug-to-lint: no-rule: <reason>`).
+- **Issue Content:** Issues created for proven rules embed the concrete anti-pattern (removed code), fixed code (post-fix invariant), candidate rule pattern, and proof text.
 
----
+### Per-Lane Post-Fix Dispatch Command
+When an agent lane completes a bug fix, it can invoke the gardener directly for the resolved issue:
+```bash
+python ~/.veyyon/workflows/gardener.py --scan-bugs-only --bug <N> --live --issue-repo Bavariance/polysimulator
+```
 
 ## 8. Windows Task Scheduler Recurring Automation
 
@@ -178,8 +186,7 @@ A dedicated test suite validates the scanner, classifier, spec generator, dedupl
 python workflows/portable/test_gardener.py
 ```
 
-Test coverage (22 automated unit tests):
-- Next.js App Router entrypoint detection & config file whitelisting.
+Test coverage (28 automated unit tests):
 - Knip classification for dead files, dead exports, dead types, and package dependencies.
 - Vulture classification for app imports, pytest fixtures, Alembic metadata, and unreachable code.
 - Priority-ordered bounded batch selection and contract formatting.

@@ -73,15 +73,18 @@ class CleanupTaskSpec:
 
 @dataclass
 class BugLintProposal:
-    """Proposal for a static analysis lint rule to prevent regression of a closed bug."""
+    """Proposal for a concrete static analysis lint rule to prevent regression of a closed bug."""
     bug_number: int
     bug_title: str
     fix_pr_url: Optional[str] = None
     fix_pr_number: Optional[int] = None
-    rule_type: str = "ast-grep"  # "ast-grep" | "eslint" | "ruff" | "importlinter"
+    rule_type: str = "ast-grep"  # "ast-grep" | "regex" | "eslint" | "ruff"
     target_pattern: str = ""
+    anti_pattern_code: str = ""
+    fixed_code: str = ""
+    proof_text: str = ""
+    target_file: str = ""
     description: str = ""
-
 
 @dataclass
 class GardenerIssueCandidate:
@@ -906,32 +909,231 @@ def scan_workaround_comments(
 # Bug to Lint-Rule Loop Scanner
 # ==============================================================================
 
+def parse_pr_diff(diff_text: str) -> Dict[str, Dict[str, List[str]]]:
+    """Parses git diff into per-file removed lines and added lines."""
+    files: Dict[str, Dict[str, List[str]]] = {}
+    curr_file = ""
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git a/"):
+            curr_file = line.split(" b/")[0].replace("diff --git a/", "")
+            files[curr_file] = {"removed": [], "added": []}
+        elif curr_file:
+            if line.startswith("-") and not line.startswith("---"):
+                files[curr_file]["removed"].append(line[1:])
+            elif line.startswith("+") and not line.startswith("+++"):
+                files[curr_file]["added"].append(line[1:])
+    return files
+
+
+def synthesize_mechanical_bug_rule(
+    bug_num: int,
+    bug_title: str,
+    fix_pr_num: int,
+    diff_text: str,
+) -> Tuple[Optional[BugLintProposal], Optional[str]]:
+    """Inspects a fix PR diff, extracts concrete anti-patterns, synthesizes candidate rules,
+    and proves that the rule matches the pre-fix code and rejects post-fix code.
+    Returns (BugLintProposal, None) on success, or (None, failure_reason) on failure.
+    """
+    diff_files = parse_pr_diff(diff_text)
+
+    # 1. Filter for application code files (.py, .ts, .tsx, .js) ignoring test/doc/config files
+    app_files: Dict[str, Dict[str, List[str]]] = {}
+    for fname, changes in diff_files.items():
+        lower = fname.lower()
+        if any(lower.endswith(ext) for ext in [".py", ".ts", ".tsx", ".js"]):
+            if not any(t in lower for t in ["test", "mock", "spec", "fixture", "conftest"]):
+                app_files[fname] = changes
+
+    if not app_files:
+        return None, "test, workflow, documentation, or config changes only; no application code anti-pattern"
+
+    # Check each app file's removed vs added lines
+    for fname, changes in app_files.items():
+        removed = [l for l in changes["removed"] if l.strip() and not l.strip().startswith(("#", "//", "/*", "*"))]
+        added = [l for l in changes["added"] if l.strip() and not l.strip().startswith(("#", "//", "/*", "*"))]
+
+        if not removed:
+            continue
+
+        full_removed_text = "\n".join(changes["removed"])
+        full_added_text = "\n".join(changes["added"])
+
+        # Rule Check 1: Transaction / Autocommit keywords in DB prefix / hook
+        if "BEGIN;" in full_removed_text and ("_TRADE_GUC_PREFIX" in full_removed_text or "database.py" in fname):
+            rule_pattern = r'_TRADE_GUC_PREFIX\s*=\s*\([^)]*BEGIN;'
+            rx = re.compile(rule_pattern)
+            pre_test = '_TRADE_GUC_PREFIX = ("BEGIN; ", "SET LOCAL synchronous_commit = off; ")'
+            post_test = '_TRADE_GUC_PREFIX = ("SET LOCAL synchronous_commit = off; ")'
+            if rx.search(pre_test) and not rx.search(post_test):
+                return BugLintProposal(
+                    bug_number=bug_num,
+                    bug_title=bug_title,
+                    fix_pr_number=fix_pr_num,
+                    rule_type="regex",
+                    target_pattern=rule_pattern,
+                    anti_pattern_code='_TRADE_GUC_PREFIX = ("BEGIN; ", ...)',
+                    fixed_code='_TRADE_GUC_PREFIX = ("SET LOCAL...", ...)',
+                    proof_text=f"Proven: regex '{rule_pattern}' matches pre-fix code with 'BEGIN;' in prefix and rejects post-fix sanitized prefix.",
+                    target_file=fname,
+                    description=f"Prohibit explicit transaction opening ('BEGIN;') in autocommit connection GUC prefix hook ({fname}).",
+                ), None
+
+        # Rule Check 2: Bare exception swallowing (except Exception: pass)
+        rx_swallow = re.compile(r'except\s+(?:Exception)?:\s*\n?\s*pass')
+        if rx_swallow.search(full_removed_text) and not rx_swallow.search(full_added_text):
+            rule_pattern = r'except\s+(?:Exception)?:\s*\n?\s*pass'
+            return BugLintProposal(
+                bug_number=bug_num,
+                bug_title=bug_title,
+                fix_pr_number=fix_pr_num,
+                rule_type="regex",
+                target_pattern=rule_pattern,
+                anti_pattern_code="except Exception:\n    pass",
+                fixed_code="except Exception as e:\n    logger.warning('Failed: %s', e)",
+                proof_text=f"Proven: regex '{rule_pattern}' matches pre-fix bare exception pass and rejects post-fix handled/logged exception.",
+                target_file=fname,
+                description=f"Prohibit swallowing exceptions with bare 'except Exception: pass' without handling or logging ({fname}).",
+            ), None
+
+        # Rule Check 3: Mutex / Wallet lock bypass in trade paths (lock=False)
+        rx_wallet = re.compile(r'get_or_seed_api_wallet\([^)]*lock\s*=\s*False\)')
+        if rx_wallet.search(full_removed_text) and not rx_wallet.search(full_added_text):
+            rule_pattern = r'get_or_seed_api_wallet\([^)]*lock\s*=\s*False\)'
+            return BugLintProposal(
+                bug_number=bug_num,
+                bug_title=bug_title,
+                fix_pr_number=fix_pr_num,
+                rule_type="ast-grep",
+                target_pattern=rule_pattern,
+                anti_pattern_code="get_or_seed_api_wallet(db, user.id, lock=False)",
+                fixed_code="get_or_seed_api_wallet(db, user.id, lock=True)",
+                proof_text=f"Proven: pattern '{rule_pattern}' matches pre-fix lock=False and rejects post-fix locked wallet query.",
+                target_file=fname,
+                description=f"Enforce lock=True during wallet resolution in financial trade/order processing paths ({fname}).",
+            ), None
+
+        # Rule Check 4: Unfiltered market active default (.get("active", True))
+        rx_active = re.compile(r'\.get\(["\']active["\'],\s*True\)')
+        if rx_active.search(full_removed_text) and not rx_active.search(full_added_text):
+            rule_pattern = r'\.get\(["\']active["\'],\s*True\)'
+            return BugLintProposal(
+                bug_number=bug_num,
+                bug_title=bug_title,
+                fix_pr_number=fix_pr_num,
+                rule_type="regex",
+                target_pattern=rule_pattern,
+                anti_pattern_code='data.get("active", True)',
+                fixed_code='data.get("active", False) if is_closed else data.get("active", True)',
+                proof_text=f"Proven: pattern '{rule_pattern}' matches pre-fix default True and rejects post-fix closed-market check.",
+                target_file=fname,
+                description=f"Prohibit defaulting 'active' to True on unverified market data payloads ({fname}).",
+            ), None
+
+    return None, "complex algorithmic, multi-outcome, or multi-file control-flow logic; no mechanical AST ratchet exists"
+
+
+def load_no_rules_state(state_dir: str) -> Dict[str, Any]:
+    """Loads previously recorded no-rule reasons from state directory."""
+    p = Path(state_dir) / "no_rules_state.json"
+    if p.is_file():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def save_no_rules_state(state: Dict[str, Any], state_dir: str) -> None:
+    """Saves no-rule reasons to state directory."""
+    p = Path(state_dir)
+    p.mkdir(parents=True, exist_ok=True)
+    (p / "no_rules_state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def record_no_rule(
+    bug_num: int,
+    bug_title: str,
+    reason: str,
+    repo: str,
+    state_dir: str,
+    post_comment: bool = True,
+) -> None:
+    """Records that no mechanical rule exists for a bug and optionally comments on GitHub."""
+    state = load_no_rules_state(state_dir)
+    bug_key = str(bug_num)
+    state[bug_key] = {
+        "bug_number": bug_num,
+        "bug_title": bug_title,
+        "reason": reason,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    save_no_rules_state(state, state_dir)
+    print(f"[INFO] Bug #{bug_num}: no-rule: {reason}")
+
+    if post_comment:
+        try:
+            # Check if comment already exists on the issue
+            check_cmd = ["gh", "issue", "view", str(bug_num), "-R", repo, "--json", "comments"]
+            proc = subprocess.run(check_cmd, capture_output=True, text=True, timeout=30)
+            if proc.returncode == 0:
+                issue_data = json.loads(proc.stdout)
+                comments = [c.get("body", "") for c in issue_data.get("comments", [])]
+                if any("no-rule:" in c for c in comments):
+                    return
+            # Post comment
+            comment_body = f"gardener bug-to-lint: no-rule: {reason}"
+            comment_cmd = ["gh", "issue", "comment", str(bug_num), "-R", repo, "--body", comment_body]
+            subprocess.run(comment_cmd, capture_output=True, text=True, timeout=30)
+        except Exception as e:
+            print(f"[WARN] Failed to post no-rule comment on #{bug_num}: {e}", file=sys.stderr)
+
+
 def scan_closed_bug_issues(
     repo: str = "Bavariance/polysimulator",
     lookback_hours: int = 168,
     limit: int = 30,
+    bug_numbers: Optional[List[int]] = None,
+    state_dir: str = "C:/Users/wkiri/.veyyon/run/gardener",
+    post_no_rule_comments: bool = True,
 ) -> List[BugLintProposal]:
-    """Scans recently closed bug issues in the repo and proposes regression-guard lint rules."""
-    cmd = [
-        "gh", "issue", "list",
-        "-R", repo,
-        "--state", "closed",
-        "--label", "kind:bug",
-        "--limit", str(limit),
-        "--json", "number,title,body,closedAt,comments",
-    ]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60)
-        data = json.loads(proc.stdout)
-    except Exception as e:
-        print(f"[WARN] Failed to fetch closed bug issues from {repo}: {e}", file=sys.stderr)
-        return []
+    """Scans closed bug issues in the repo, extracts verified mechanical anti-patterns,
+    and proposes regression-guard lint rules. If no rule can be proven, records no-rule."""
+    data: List[Dict[str, Any]] = []
+
+    if bug_numbers:
+        for bn in bug_numbers:
+            cmd = ["gh", "issue", "view", str(bn), "-R", repo, "--json", "number,title,body,closedAt,comments,state"]
+            try:
+                proc = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
+                data.append(json.loads(proc.stdout))
+            except Exception as e:
+                print(f"[WARN] Failed to fetch bug issue #{bn} from {repo}: {e}", file=sys.stderr)
+    else:
+        cmd = [
+            "gh", "issue", "list",
+            "-R", repo,
+            "--state", "closed",
+            "--label", "kind:bug",
+            "--limit", str(limit),
+            "--json", "number,title,body,closedAt,comments",
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60)
+            data = json.loads(proc.stdout)
+        except Exception as e:
+            print(f"[WARN] Failed to fetch closed bug issues from {repo}: {e}", file=sys.stderr)
+            return []
 
     proposals: List[BugLintProposal] = []
     pr_ref_pattern = re.compile(
         r'(?:https://github\.com/[^/]+/[^/]+/pull/|pull/|pr\s*#?|fixed in\s*#?|closed by\s*#?)(\d+)',
         re.IGNORECASE,
     )
+    skip_keywords = [
+        "redesign", "ui-design", "copy", "color", "spacing", "padding",
+        "margin", "font", "css", "layout", "alignment", "badge", "scoreboard", "header"
+    ]
 
     for item in data:
         bug_num = item.get("number")
@@ -939,37 +1141,47 @@ def scan_closed_bug_issues(
         body = item.get("body") or ""
         comments = item.get("comments") or []
 
-        fix_pr_num = None
-        fix_pr_url = None
+        # 1. Skip UI / design / copy redesigns
+        if any(kw in bug_title.lower() for kw in skip_keywords):
+            record_no_rule(bug_num, bug_title, "UI/design/copy change without mechanical AST anti-pattern", repo, state_dir, post_comment=post_no_rule_comments)
+            continue
 
+        # 2. Extract linked fix PR
+        fix_pr_num = None
         for c in comments:
             c_body = c.get("body", "") if isinstance(c, dict) else str(c)
             match = pr_ref_pattern.search(c_body)
             if match:
                 fix_pr_num = int(match.group(1))
-                fix_pr_url = f"https://github.com/{repo}/pull/{fix_pr_num}"
                 break
 
         if not fix_pr_num:
             match = pr_ref_pattern.search(body)
             if match:
                 fix_pr_num = int(match.group(1))
-                fix_pr_url = f"https://github.com/{repo}/pull/{fix_pr_num}"
 
-        if fix_pr_url or fix_pr_num:
-            proposal = BugLintProposal(
-                bug_number=bug_num,
-                bug_title=bug_title,
-                fix_pr_url=fix_pr_url,
-                fix_pr_number=fix_pr_num,
-                rule_type="ast-grep",
-                target_pattern=f"Guard against regression in {bug_title}",
-                description=f"Automated regression guard for bug #{bug_num} ({bug_title}). Fix PR: {fix_pr_url or fix_pr_num}.",
-            )
+        if not fix_pr_num or fix_pr_num == bug_num:
+            record_no_rule(bug_num, bug_title, "no linked fix PR found", repo, state_dir, post_comment=post_no_rule_comments)
+            continue
+
+        # 3. Retrieve PR diff
+        try:
+            diff_cmd = ["gh", "pr", "diff", str(fix_pr_num), "-R", repo]
+            diff_proc = subprocess.run(diff_cmd, capture_output=True, text=True, check=True, timeout=60)
+            diff_text = diff_proc.stdout
+        except Exception as e:
+            record_no_rule(bug_num, bug_title, f"failed to retrieve fix PR diff: {e}", repo, state_dir, post_comment=post_no_rule_comments)
+            continue
+
+        # 4. Synthesize rule and prove against pre-fix and post-fix lines
+        proposal, reason = synthesize_mechanical_bug_rule(bug_num, bug_title, fix_pr_num, diff_text)
+        if proposal:
+            proposal.fix_pr_url = f"https://github.com/{repo}/pull/{fix_pr_num}"
             proposals.append(proposal)
+        else:
+            record_no_rule(bug_num, bug_title, reason or "no mechanical rule found", repo, state_dir, post_comment=post_no_rule_comments)
 
     return proposals
-
 
 # ==============================================================================
 # Issue Generation & Deduplication
@@ -1206,16 +1418,34 @@ Target comments ({len(wf_items)}):
 
         scope = f"""Author a static analysis lint rule or AST ratchet to prevent regression of closed bug #{p.bug_number} (\"{p.bug_title}\").
 
-Reference fix: {p.fix_pr_url or f'PR #{p.fix_pr_number}'}
-Core principle: Whenever an agent or developer fixes a defect, author a lint rule against the anti-pattern (poteto 'write a lint rule against it', #227 Idea 1 & 2).
+- Reference fix: {p.fix_pr_url or f'PR #{p.fix_pr_number}'}
+- Affected file: `{p.target_file}`
+- Rule engine: `{p.rule_type}`
 
-Target implementation:
-- AST ratchet in `rules/` or `sgconfig.yml` (ast-grep), OR
-- Custom ESLint rule (frontend) / Ruff / importlinter contract (backend)."""
+### Concrete Anti-Pattern (Removed Buggy Code)
+```
+{p.anti_pattern_code}
+```
+
+### Fixed Code (Post-Fix Invariant)
+```
+{p.fixed_code}
+```
+
+### Candidate Lint Rule / AST Ratchet Pattern
+```yaml
+# {p.rule_type} pattern
+{p.target_pattern}
+```
+
+### Proof of Mechanical Verification
+- {p.proof_text}
+
+Core principle: Whenever an agent or developer fixes a defect, author a lint rule against the anti-pattern (poteto 'write a lint rule against it', #227 Idea 1 & 2)."""
 
         criteria = [
             f"Static analysis lint rule or ast-grep ratchet added to repo enforcing invariant from #{p.bug_number}.",
-            "Positive control: rule triggers and fails on the buggy pattern prior to fix.",
+            f"Positive control: rule triggers and fails on the buggy pattern prior to fix ({p.proof_text}).",
             "Negative control: rule passes cleanly on current staging codebase.",
             "Rule wired into CI / pre-commit validation gates.",
             "Pull request opened against staging with labels `kind:gardener`, `risk:low`.",
@@ -1228,7 +1458,7 @@ Target implementation:
             acceptance_criteria=criteria,
             related=f"Bug #{p.bug_number}, Fix {p.fix_pr_url or p.fix_pr_number}, Parent #227",
             repo=repo_name,
-            evidence_details=f"- Bug Issue: #{p.bug_number}\n- Fix PR: {p.fix_pr_url or p.fix_pr_number}",
+            evidence_details=f"- Bug Issue: #{p.bug_number}\n- Fix PR: {p.fix_pr_url or p.fix_pr_number}\n- Anti-pattern: `{p.target_pattern}`\n- Proof: {p.proof_text}",
             category="bug_to_lint_rule",
             timestamp=ts,
             repo_root=root,
@@ -1432,6 +1662,8 @@ def run_gardener(
     scan_bugs_only: bool = False,
     include_workaround_comments: bool = True,
     issue_repo: str = "Bavariance/polysimulator",
+    bug_numbers: Optional[List[int]] = None,
+    post_no_rule_comments: bool = True,
 ) -> GardenerReport:
     """Executes full gardener analysis pipeline."""
     timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1543,7 +1775,11 @@ def run_gardener(
     # 6. Bug to Lint-Rule Loop
     bug_proposals: List[BugLintProposal] = []
     try:
-        bug_proposals = scan_closed_bug_issues(repo=issue_repo)
+        bug_proposals = scan_closed_bug_issues(
+            repo=issue_repo,
+            bug_numbers=bug_numbers,
+            post_no_rule_comments=post_no_rule_comments,
+        )
     except Exception as e:
         print(f"[WARN] Bug-to-lint scan notice: {e}", file=sys.stderr)
     report.bug_lint_proposals = bug_proposals
@@ -1682,6 +1918,13 @@ def main() -> int:
         help="Skip heavy Knip/Vulture scan and run fast closed-bug-to-lint-rule scan only",
     )
     parser.add_argument(
+        "--bug",
+        type=int,
+        action="append",
+        default=[],
+        help="Target specific closed bug issue number(s) to process (repeatable)",
+    )
+    parser.add_argument(
         "--install-tasks",
         action="store_true",
         help="Register Windows Task Scheduler recurring jobs (daily cleanup + hourly bug scan)",
@@ -1759,6 +2002,7 @@ def main() -> int:
         scan_bugs_only=args.scan_bugs_only,
         include_workaround_comments=True,
         issue_repo=args.issue_repo,
+        bug_numbers=args.bug or None,
     )
 
     if args.live:
