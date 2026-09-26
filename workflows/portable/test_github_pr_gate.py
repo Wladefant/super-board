@@ -1404,8 +1404,8 @@ class TestGitHubPRGate(unittest.TestCase):
         """Negative controls: no marker, and fewer than two rendered images, each stay BLOCKED."""
         cases = [
             (self.qa_receipt_comment(marker=None), "no PR comment carries a 'QA-RECEIPT: PASS' marker"),
-            (self.qa_receipt_comment(images=0), "0 github.com/user-attachments image(s), 2 required"),
-            (self.qa_receipt_comment(images=1), "1 github.com/user-attachments image(s), 2 required"),
+            (self.qa_receipt_comment(images=0), "0 GitHub-hosted evidence image(s), 2 required"),
+            (self.qa_receipt_comment(images=1), "1 GitHub-hosted evidence image(s), 2 required"),
         ]
         for comment, expected in cases:
             with self.subTest(expected=expected):
@@ -1420,8 +1420,35 @@ class TestGitHubPRGate(unittest.TestCase):
             policy=self.staging_policy(),
         )
         self.assertEqual(result.qa_receipt_verdict, "REQUIRED")
-        self.assertIn("0 github.com/user-attachments image(s)", result.verdict_reason)
+        self.assertIn("0 GitHub-hosted evidence image(s)", result.verdict_reason)
         print("  [PASS] Negative controls: marker, image count and image host all enforced")
+        # Release assets and commit-pinned raw URLs are the other two forms policy allows, so a
+        # receipt built the way live lanes build them (#5630) is evidence, not a blocked merge.
+        hosted = "\n".join([
+            "**QA-RECEIPT: PASS**",
+            f"- **Head SHA**: `{self.head_sha}`",
+            "![desktop](https://github.com/Bavariance/polysimulator/releases/download/qa-evidence-tag/a.png)",
+            f"![mobile](https://github.com/Bavariance/polysimulator/raw/{self.head_sha}/docs/qa/mobile.png)",
+        ])
+        for body in (hosted,):
+            with self.subTest(hosts="release-asset + commit-pinned"):
+                receipt = {"body": body, "html_url": self.QA_RECEIPT_URL}
+                result = evaluate_pr_gate(self.staging_ui_pr(comments=[receipt]), policy=self.staging_policy())
+                self.assertEqual(result.qa_receipt_verdict, "PASSED")
+        # An unpinned raw path and a relative path stay unrecognised.
+        unpinned = "\n".join([
+            "**QA-RECEIPT: PASS**",
+            f"- **Head SHA**: `{self.head_sha}`",
+            "![a](https://github.com/o/r/raw/main/docs/qa/a.png)",
+            "![b](docs/qa/b.png)",
+        ])
+        result = evaluate_pr_gate(
+            self.staging_ui_pr(comments=[{"body": unpinned, "html_url": self.QA_RECEIPT_URL}]),
+            policy=self.staging_policy(),
+        )
+        self.assertEqual(result.qa_receipt_verdict, "REQUIRED")
+        self.assertIn("0 GitHub-hosted evidence image(s)", result.verdict_reason)
+        print("  [PASS] Evidence hosts: attachments, release assets and commit-pinned raw accepted; others not")
 
     def test_qa_receipt_for_another_revision_is_blocked(self):
         """Negative control: a receipt written before a further edit never binds the new head."""
@@ -1465,6 +1492,40 @@ class TestGitHubPRGate(unittest.TestCase):
             evaluate_pr_gate(failed, policy=self.staging_policy()).qa_receipt_verdict, "REQUIRED"
         )
         print("  [PASS] Negative control: receipt served from another revision is BLOCKED")
+
+    def test_qa_receipt_in_the_shape_lanes_actually_post(self):
+        """Positive control: the bold marker and `Head SHA` field real PRs carry do bind the receipt."""
+        head_field = f"- **Head SHA**: `{self.head_sha}`"
+        for marker in ("**QA-RECEIPT: PASS**", "> QA-RECEIPT: PASS", "- QA-RECEIPT: PASS"):
+            with self.subTest(marker=marker):
+                body = "\n".join([
+                    "## Pre-Merge Browser QA Receipt — PASS",
+                    "",
+                    marker,
+                    "",
+                    head_field,
+                    "- **Viewports Tested**: Desktop (1440x900), Mobile (390x844)",
+                    "![desktop](https://github.com/user-attachments/assets/11111111-2222-3333-4444-555555555555)",
+                    "![mobile](https://github.com/user-attachments/assets/66666666-7777-8888-9999-aaaaaaaaaaaa)",
+                ])
+                receipt = {"body": body, "html_url": self.QA_RECEIPT_URL}
+                result = evaluate_pr_gate(self.staging_ui_pr(comments=[receipt]), policy=self.staging_policy())
+                self.assertEqual(result.qa_receipt_verdict, "PASSED")
+                self.assertEqual(result.qa_receipt_url, self.QA_RECEIPT_URL)
+        # The same receipt declaring FAIL is never a pass, decoration or not.
+        failed = "\n".join([
+            "# QA-RECEIPT: FAIL",
+            head_field,
+            "![desktop](https://github.com/user-attachments/assets/11111111-2222-3333-4444-555555555555)",
+            "![mobile](https://github.com/user-attachments/assets/66666666-7777-8888-9999-aaaaaaaaaaaa)",
+        ])
+        result = evaluate_pr_gate(
+            self.staging_ui_pr(comments=[{"body": failed, "html_url": self.QA_RECEIPT_URL}]),
+            policy=self.staging_policy(),
+        )
+        self.assertEqual(result.qa_receipt_verdict, "REQUIRED")
+        self.assertEqual(result.gate_verdict, "BLOCKED")
+        print("  [PASS] Bold, quoted and list-item receipt markers bind; a FAIL marker never does")
 
     def test_qa_receipt_accepts_content_identity_and_review_bodies(self):
         """A receipt may name the patch-id (survives a sync merge) and may live in a review body."""

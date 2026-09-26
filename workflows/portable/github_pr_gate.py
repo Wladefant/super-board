@@ -373,12 +373,21 @@ def evaluate_review_requirement(pr_data: Dict[str, Any]) -> Tuple[bool, str]:
 # surface a user touches: every `frontend/` file (the UI) and the backend
 # order/trading paths the UI drives. Verdicts: EXEMPT (not a staging UI/trading
 # PR), PASSED, REQUIRED (no receipt, or one that does not bind this diff).
-QA_RECEIPT_MARKER_RE = re.compile(r"(?im)^\s*QA-RECEIPT:\s*PASS\b")
+# Lanes post the marker as a plain line, a bold line (`**QA-RECEIPT: PASS**`) and inside
+# list items, so leading markdown decoration is tolerated; the identity requirement is
+# what actually gates, and a decorated line cannot satisfy it on its own.
+QA_RECEIPT_MARKER_RE = re.compile(r"^[ \t>*_`#|\-]*QA-RECEIPT:\s*PASS\b", re.IGNORECASE | re.MULTILINE)
 QA_RECEIPT_MIN_IMAGES = 2
 SHA_TOKEN_RE = re.compile(r"\b[0-9a-fA-F]{40}\b")
-USER_ATTACHMENT_RE = re.compile(
+# Evidence images that render on a PR without a session cookie, exactly the forms
+# AGENTS.md §11 allows: uploaded attachments, release assets, and commit-pinned raw
+# URLs (the last only when pinned to a full commit SHA). raw.githubusercontent.com
+# and relative paths stay unrecognised.
+EVIDENCE_IMAGE_RE = re.compile(
     r"https://github\.com/user-attachments/assets/"
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+    r"|https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/releases/download/[^\s)\"'>]+"
+    r"|https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/raw/[0-9a-fA-F]{40}/[^\s)\"'>]+"
 )
 UI_PATH_RE = re.compile(r"^frontend/", re.IGNORECASE)
 ORDER_TRADING_PATH_RE = re.compile(
@@ -499,7 +508,7 @@ def evaluate_qa_receipt(
         }
         candidates = marker_tokens or {token.lower() for token in SHA_TOKEN_RE.findall(body)}
         found = {token for token in candidates if token in accepted}
-        attachments = len(USER_ATTACHMENT_RE.findall(body))
+        attachments = len(EVIDENCE_IMAGE_RE.findall(body))
         if found and attachments >= QA_RECEIPT_MIN_IMAGES:
             return (
                 "PASSED",
@@ -529,7 +538,7 @@ def evaluate_qa_receipt(
     return (
         "REQUIRED",
         f"QA receipt required ({requirement_reason}): the receipt carries {images} "
-        f"github.com/user-attachments image(s), {QA_RECEIPT_MIN_IMAGES} required.",
+        f"GitHub-hosted evidence image(s), {QA_RECEIPT_MIN_IMAGES} required.",
         None,
     )
 
