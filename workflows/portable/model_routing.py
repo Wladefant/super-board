@@ -18,6 +18,10 @@ based on the read-only subscription snapshot from balance_loader:
   4. Token-saving review protocol:
      - Generates compact EvidencePacket (< 1.5 KB) referencing exact head/diff, contracts,
        reproduction commands, and test outputs so strong reviewers expand only needed files.
+  5. Linear subscription pacing & operator overrides (operator 2026-09-26):
+     - Linear weekly/monthly pacing: elapsed = 1 - time_remaining, allowed = elapsed + burst_margin.
+     - Operator override: ~/.veyyon/run/pacing-override.json ({provider, account?, until, reason})
+       lifts pace caps when active. Waste-minimizing order spends soonest-resetting windows first.
 """
 
 import argparse
@@ -28,9 +32,11 @@ import re
 import socket
 import sqlite3
 import sys
+import time
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 # Ensure balance_loader is importable from sibling module
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -45,7 +51,12 @@ from balance_loader import (
     load_snapshot,
     parse_usage_json,
 )
-from quota_snapshot import load_snapshot as load_quota_snapshot
+from quota_snapshot import (
+    apply_quota_error,
+    load_snapshot as load_quota_snapshot,
+    QuotaReset,
+    SNAPSHOT_PATH,
+)
 
 
 class TaskType(str, Enum):
@@ -297,6 +308,7 @@ def detect_credentialed_providers(auth_store_paths: Optional[List[str]] = None) 
 # model would silently run that model instead. Operator applies these to the profile
 # (see policies/default/AGENTS.md "Worker role pins"); the router never edits config.
 ROLE_MODEL_PINS: Dict[str, str] = {
+    "reviewer": "anthropic/claude-opus-5-5:high",
     "ds-pro": MODEL_DEEPSEEK_PRO,
     "zai-task": MODEL_ZAI_GLM,
     "zai-flash": MODEL_ZAI_GLM_FLASH,
@@ -361,10 +373,84 @@ CODEX_PROVIDER = "openai-codex"
 PACE_THROTTLE_RATIO = 0.90
 PACE_THROTTLE_USED_FLOOR = 0.50
 PACE_PREFER_DELTA = 0.05
-# Floor for the remaining-time fraction: a window about to reset still has a finite pace
-# ratio (remaining allowance over this floor), which is what marks it as expiring.
 PACE_MIN_TIME_FRACTION = 0.01
 
+# Linear weekly/monthly subscription pacing & burst margins (operator ruling 2026-09-26):
+# Weekly/monthly subscription windows are paced linearly:
+#   elapsed = 1.0 - time_remaining
+#   allowed = min(1.0, elapsed + BURST_MARGIN)
+# When used > allowed, the window is throttled unless an operator override is active.
+WEEKLY_BURST_MARGIN: float = 1.0 / 7.0  # 1/7 (~14.2857%): one full day's advance budget
+MONTHLY_BURST_MARGIN: float = 1.0 / 30.0  # 1/30 (~3.3333%): one day's advance budget
+BURST_MARGIN_DEFAULT: float = 0.05  # 5 percentage points
+DEFAULT_PACING_OVERRIDE_PATH: Path = Path(
+    os.environ.get("VEYYON_PACING_OVERRIDE", os.path.expanduser("~/.veyyon/run/pacing-override.json"))
+)
+
+
+@dataclass(frozen=True)
+class PacingOverride:
+    """Explicit operator override lifting pace caps for a provider/account until a timestamp."""
+    provider: str
+    until: Optional[datetime.datetime] = None
+    account: Optional[str] = None
+    reason: Optional[str] = None
+
+    def is_active(self, provider: str, account: Optional[str] = None, now: Optional[datetime.datetime] = None) -> bool:
+        if self.provider != "*" and self.provider != provider:
+            return False
+        if self.account and self.account != "*" and account and self.account != account:
+            return False
+        if self.until is not None:
+            now_dt = now or datetime.datetime.now(datetime.timezone.utc)
+            if now_dt.tzinfo is None:
+                now_dt = now_dt.replace(tzinfo=datetime.timezone.utc)
+            if now_dt > self.until:
+                return False
+        return True
+
+
+def load_pacing_overrides(
+    path: Optional[Union[Path, str]] = None,
+    now: Optional[datetime.datetime] = None,
+) -> List[PacingOverride]:
+    """Load operator pacing overrides from ~/.veyyon/run/pacing-override.json or VEYYON_PACING_OVERRIDE."""
+    target_path = Path(path) if path is not None else DEFAULT_PACING_OVERRIDE_PATH
+    if not target_path.exists():
+        return []
+    try:
+        content = json.loads(target_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    items: List[Dict[str, Any]] = []
+    if isinstance(content, list):
+        items = [x for x in content if isinstance(x, dict)]
+    elif isinstance(content, dict):
+        if "overrides" in content and isinstance(content["overrides"], list):
+            items = [x for x in content["overrides"] if isinstance(x, dict)]
+        else:
+            items = [content]
+    overrides: List[PacingOverride] = []
+    for item in items:
+        p = item.get("provider")
+        if not p:
+            continue
+        until_val = item.get("until")
+        until_dt = None
+        if until_val:
+            try:
+                until_dt = datetime.datetime.fromisoformat(str(until_val).replace("Z", "+00:00"))
+            except Exception:
+                pass
+        ov = PacingOverride(
+            provider=str(p),
+            until=until_dt,
+            account=item.get("account"),
+            reason=item.get("reason"),
+        )
+        if ov.is_active(str(p), item.get("account"), now=now):
+            overrides.append(ov)
+    return overrides
 # Catalog-verified model context windows (models.db authoritative, no fabricated context sizes)
 VERIFIED_CONTEXT_WINDOWS: Dict[str, int] = {
     MODEL_GEMINI_FLASH: 1048576,
@@ -585,24 +671,59 @@ class WindowPace:
     ahead_of_pace: bool
     throttled: bool
     expiring: bool
+    account: str = "default"
+    elapsed_fraction: float = 0.0
+    allowed_fraction: float = 1.0
+    is_weekly_or_monthly: bool = False
+    pace_cap_lifted: bool = False
 
 
-def window_pace(provider: str, window_id: str, duration_hours: float, hours_to_reset: float,
-                remaining_fraction: float, used_fraction: Optional[float] = None) -> WindowPace:
-    """Pace one window: `pace_ratio` = remaining allowance / remaining time (1.0 = linear).
-
-    < 1.0 is ahead of pace (it would run out before its reset), so once the window is at
-    least PACE_THROTTLE_USED_FLOOR consumed it is `throttled` and its rungs are dropped.
-    > 1.0 is behind pace: the allowance would expire unused, so `prefer_furthest_behind_pace`
-    spends it first.  At or above SURPLUS_PACE_HEADROOM within SURPLUS_WINDOW_HOURS of the
-    reset it is `expiring`, which outranks plain pace so nothing is left on the table.
-    `used_fraction` is derived from `remaining_fraction` unless the report carries its own.
-    """
+def window_pace(
+    provider: str,
+    window_id: str,
+    duration_hours: float,
+    hours_to_reset: float,
+    remaining_fraction: float,
+    used_fraction: Optional[float] = None,
+    account: str = "default",
+    overrides: Optional[List[PacingOverride]] = None,
+    now: Optional[datetime.datetime] = None,
+) -> WindowPace:
+    """Pace one window: linear pacing for weekly/monthly, ratio pacing for rolling/short windows."""
     duration = duration_hours if duration_hours and duration_hours > 0 else 24.0
-    time_remaining = min(1.0, max(PACE_MIN_TIME_FRACTION, hours_to_reset / duration))
+    time_remaining = min(1.0, max(0.0, hours_to_reset / duration))
+    effective_time_remaining = max(PACE_MIN_TIME_FRACTION, time_remaining)
     remaining = min(1.0, max(0.0, remaining_fraction))
     used = min(1.0, max(0.0, 1.0 - remaining if used_fraction is None else used_fraction))
-    ratio = remaining / time_remaining
+    ratio = remaining / effective_time_remaining
+
+    is_weekly_or_monthly = (
+        duration >= 120.0
+        or any(k in window_id.lower() for k in ("weekly", "7d", "monthly", "30d"))
+    )
+    elapsed = max(0.0, min(1.0, 1.0 - time_remaining))
+    if duration >= 500.0 or "monthly" in window_id.lower() or "30d" in window_id.lower():
+        burst_margin = MONTHLY_BURST_MARGIN
+    elif is_weekly_or_monthly:
+        burst_margin = WEEKLY_BURST_MARGIN
+    else:
+        burst_margin = BURST_MARGIN_DEFAULT
+    allowed = min(1.0, elapsed + burst_margin)
+
+    pace_cap_lifted = False
+    if overrides:
+        pace_cap_lifted = any(ov.is_active(provider, account, now=now) for ov in overrides)
+
+    if is_weekly_or_monthly:
+        throttled = False if pace_cap_lifted else (used > allowed)
+    else:
+        throttled = False if pace_cap_lifted else (ratio < PACE_THROTTLE_RATIO and used >= PACE_THROTTLE_USED_FLOOR)
+    if provider.startswith(ANTIGRAVITY_PROVIDER) or "antigravity" in provider.lower():
+        # Antigravity reserve floor: keep at least AG_FAMILY_MIN_REMAINING (10%)
+        # in reserve for every Antigravity window.
+        if remaining <= AG_FAMILY_MIN_REMAINING:
+            throttled = True
+
     return WindowPace(
         provider=provider,
         window_id=window_id,
@@ -614,22 +735,34 @@ def window_pace(provider: str, window_id: str, duration_hours: float, hours_to_r
         pace_ratio=ratio,
         behind_pace=ratio >= 1.0 + PACE_PREFER_DELTA,
         ahead_of_pace=ratio <= 1.0 - PACE_PREFER_DELTA,
-        throttled=ratio < PACE_THROTTLE_RATIO and used >= PACE_THROTTLE_USED_FLOOR,
+        throttled=throttled,
         expiring=(ratio >= SURPLUS_PACE_HEADROOM
                   and 0.0 < hours_to_reset <= SURPLUS_WINDOW_HOURS
                   and remaining > 0.0),
+        account=account,
+        elapsed_fraction=elapsed,
+        allowed_fraction=allowed,
+        is_weekly_or_monthly=is_weekly_or_monthly,
+        pace_cap_lifted=pace_cap_lifted,
     )
 
 
 def prefer_furthest_behind_pace(paces: List[WindowPace]) -> Optional[WindowPace]:
-    """The window to spend next: an expiring one first, then the furthest behind pace.
-
-    Callers pass only the windows of models that are already capable of the task, so this is
-    "the provider furthest behind pace among capable models" and never a capability decision.
-    """
+    """The window to spend next: an expiring one first, then soonest-resetting, then furthest behind pace."""
     if not paces:
         return None
-    return max(paces, key=lambda pace: (pace.expiring, pace.pace_ratio, -pace.hours_to_reset))
+    return max(paces, key=lambda pace: (pace.expiring, -pace.hours_to_reset if pace.hours_to_reset > 0 else -9999.0, pace.pace_ratio))
+
+def record_provider_429(
+    provider: str,
+    body: str,
+    window_id: str = "weekly",
+    account: str = "default",
+    now: Optional[datetime.datetime] = None,
+) -> Optional[QuotaReset]:
+    """Record a 429 / quota error for a provider in the local quota snapshot."""
+    return apply_quota_error(provider, window_id, body, account=account, now=now)
+
 
 
 def balance_provider_for(model: str) -> str:
@@ -709,10 +842,14 @@ def _apply_pace_rules(rungs: List[_Rung], pace_of_model, blocked_for_model=None)
             pace = pace_of_model(rung.model)
             ranked.append((_pace_gate_rung(rung, pace, blocked_for_model(rung.model)), pace, position))
         ranked.sort(key=lambda entry: (
+            # Available rungs outrank unavailable/throttled rungs
+            0 if entry[0].available else 1,
             # A promoted rung outranks everything else in its group: the account-level window
             # would otherwise expire unused, which no cheaper tier can compensate for.
             0 if entry[0].promotion else 1,
             0 if (entry[1] is not None and entry[1].expiring) else 1,
+            # Waste minimization: spend the window that resets soonest first
+            entry[1].hours_to_reset if (entry[1] is not None and entry[1].hours_to_reset > 0) else 9999.0,
             -(entry[1].pace_ratio if entry[1] is not None else 1.0),
             entry[2],
         ))
@@ -774,7 +911,9 @@ class ResetAwareModelSelector:
     """
 
     def __init__(self, snapshot: Optional[Any] = None, credentialed_providers: Optional[Set[str]] = None,
-                 quota_snapshot: Optional[Any] = None, chatgpt_web_bridge: Optional[bool] = None):
+                 quota_snapshot: Optional[Any] = None, chatgpt_web_bridge: Optional[bool] = None,
+                 overrides: Optional[List[PacingOverride]] = None,
+                 quota_snapshot_path: Optional[Union[Path, str]] = None):
         if snapshot is not None and isinstance(snapshot, BalanceAdapter):
             self.snapshot = snapshot.fetch_snapshot()
         elif snapshot is not None and hasattr(snapshot, "to_normalized"):
@@ -790,14 +929,71 @@ class ResetAwareModelSelector:
         # (operator 2026-09-25), so eligibility is read from a local snapshot that a 429 or a
         # periodic usage read refreshes. Tests inject their own snapshot here.
         self._quota_snapshot = quota_snapshot
+        self._quota_snapshot_path = Path(quota_snapshot_path) if quota_snapshot_path else getattr(quota_snapshot, "path", None)
         # chatgpt-web readiness is a port probe, cached for the selector's lifetime; callers
         # (tests, dry runs) may pin it either way.
         self._chatgpt_web_bridge = chatgpt_web_bridge
+        self._overrides = overrides
+
+    def current_datetime(self) -> datetime.datetime:
+        """Effective current timestamp of this selector (from snapshot metadata or system clock)."""
+        gen = getattr(self.snapshot, "generated_at_utc", None)
+        if gen:
+            try:
+                dt = datetime.datetime.fromisoformat(str(gen).replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=datetime.timezone.utc)
+                return dt
+            except Exception:
+                pass
+        return datetime.datetime.now(datetime.timezone.utc)
+
+    def pacing_overrides(self) -> List[PacingOverride]:
+        if self._overrides is not None:
+            return self._overrides
+        return load_pacing_overrides(now=self.current_datetime())
+
+    def set_pacing_overrides(self, overrides: Optional[List[PacingOverride]]):
+        self._overrides = overrides
+
+    def record_429(
+        self,
+        provider: str,
+        body: str,
+        window_id: str = "weekly",
+        account: str = "default",
+        now: Optional[datetime.datetime] = None,
+        path: Optional[Union[str, Path]] = None,
+    ) -> Optional[QuotaReset]:
+        """Record a 429 / quota error for a provider, marking it unavailable until retry-after."""
+        target_path = path or self._quota_snapshot_path or getattr(self._quota_snapshot, "path", None)
+        effective_now = now or self.current_datetime()
+        reset = apply_quota_error(provider, window_id, body, account=account, now=effective_now, path=target_path or SNAPSHOT_PATH)
+        if (reset is None or not getattr(reset, "retry_after_seconds", None)) and ("usage_limit_reached" in body.lower() or "usage limit" in body.lower()):
+            win_sec = None
+            if self.snapshot and hasattr(self.snapshot, "providers"):
+                p_info = getattr(self.snapshot, "providers", {}).get(provider)
+                if p_info and getattr(p_info, "windows", None):
+                    for w in p_info.windows:
+                        if (w.id == window_id or not win_sec) and getattr(w, "seconds_to_reset", 0) > 0:
+                            win_sec = float(w.seconds_to_reset)
+            if win_sec and win_sec > 0:
+                until_dt = effective_now + datetime.timedelta(seconds=win_sec)
+                from quota_snapshot import mark_exhausted, _format_iso_utc
+                mark_exhausted(provider, window_id, _format_iso_utc(until_dt), account=account, now=effective_now, path=target_path or SNAPSHOT_PATH, source="429")
+                reset = QuotaReset(exhausted_until=_format_iso_utc(until_dt), retry_after_seconds=win_sec, raw=body)
+        if target_path:
+            self._quota_snapshot = load_quota_snapshot(target_path)
+            self._quota_snapshot_path = target_path
+        else:
+            self._quota_snapshot = load_quota_snapshot()
+        return reset
 
     def quota_snapshot(self):
         """The exhaustion cache, loaded once per selector. A missing file yields an empty one."""
         if self._quota_snapshot is None:
-            self._quota_snapshot = load_quota_snapshot()
+            target_path = self._quota_snapshot_path or SNAPSHOT_PATH
+            self._quota_snapshot = load_quota_snapshot(target_path)
         return self._quota_snapshot
 
     def chatgpt_web_bridge_up(self) -> bool:
@@ -817,10 +1013,11 @@ class ResetAwareModelSelector:
         snapshot = self.quota_snapshot()
         if snapshot is None:
             return None
+        now = self.current_datetime()
         provider = balance_provider_for(model)
-        if snapshot.is_eligible(provider):
+        if snapshot.is_eligible(provider, now=now):
             return None
-        until = snapshot.provider_exhausted_until(provider)
+        until = snapshot.provider_exhausted_until(provider, now=now)
         return (f"{provider} is exhausted until {until.isoformat()}" if until is not None
                 else f"{provider} is exhausted")
 
@@ -832,27 +1029,52 @@ class ResetAwareModelSelector:
         else:
             self.snapshot = snapshot
     def pace_by_provider(self) -> Dict[str, WindowPace]:
-        """Governing pace per provider: its most constrained window (lowest pace ratio)."""
+        """Governing pace per provider: accounts prioritized by available headroom."""
         paces: Dict[str, WindowPace] = {}
+        overrides = self.pacing_overrides()
+        now = self.current_datetime()
         for name, provider in (getattr(self.snapshot, "providers", {}) or {}).items():
             windows = [
-                window_pace(name, window.id, window.duration_seconds / 3600.0,
-                            window.seconds_to_reset / 3600.0, window.remaining_fraction,
-                            window.used_fraction)
+                window_pace(
+                    name, window.id, window.duration_seconds / 3600.0,
+                    window.seconds_to_reset / 3600.0, window.remaining_fraction,
+                    window.used_fraction,
+                    account=getattr(window, "account", "default"),
+                    overrides=overrides,
+                    now=now,
+                )
                 for window in provider.windows
                 if window.duration_seconds and window.duration_seconds > 0
                 and not window.is_cooldown and window.status != "exhausted"
             ]
             if not windows:
                 windows = [
-                    window_pace(name, window.id, window.duration_seconds / 3600.0,
-                                window.seconds_to_reset / 3600.0, window.remaining_fraction,
-                                window.used_fraction)
+                    window_pace(
+                        name, window.id, window.duration_seconds / 3600.0,
+                        window.seconds_to_reset / 3600.0, window.remaining_fraction,
+                        window.used_fraction,
+                        account=getattr(window, "account", "default"),
+                        overrides=overrides,
+                        now=now,
+                    )
                     for window in provider.windows
                     if window.duration_seconds and window.duration_seconds > 0
                 ]
             if windows:
-                paces[name] = min(windows, key=lambda pace: (pace.pace_ratio, pace.hours_to_reset))
+                # Antigravity partner pools are tracked per account (packages/ai/src/usage/google-antigravity.ts:434-441, 180-192, 74-79):
+                # - brandy.sengco: short daily window (<24h reset, ~47% used), healthy partner pool for ag-opus
+                # - brendmark: weekly cap (~6d reset, 80.9% used), shared by Claude and GPT partner models; preserved
+                # Route ag-opus to the healthy account: prioritize unthrottled accounts with remaining headroom.
+                if name.startswith(ANTIGRAVITY_PROVIDER) or "antigravity" in name.lower():
+                    unthrottled = [w for w in windows if not w.throttled]
+                    if unthrottled:
+                        paces[name] = max(unthrottled, key=lambda p: (p.remaining_fraction, -p.hours_to_reset))
+                    else:
+                        paces[name] = max(windows, key=lambda p: (p.remaining_fraction, -p.hours_to_reset))
+                elif name == CODEX_PROVIDER:
+                    paces[name] = min(windows, key=lambda pace: (not pace.throttled, pace.pace_ratio, pace.hours_to_reset))
+                else:
+                    paces[name] = min(windows, key=lambda pace: (not pace.throttled, pace.pace_ratio, pace.hours_to_reset))
         return paces
 
     def pace_of_provider(self, provider: str) -> Optional[WindowPace]:
@@ -1059,16 +1281,20 @@ class ResetAwareModelSelector:
         # window, so glm-5.3 keeps its $15 cap for high-value review instead of leading every
         # ladder.  space-bunny-free is free and uncapped, so it only needs the credential.
         go_credentialed = OPENCODE_GO_PROVIDER in credentialed
-        go_available = go_credentialed and go_meta["is_available"]
-        go_bunny_ok = go_credentialed
-        go_lanes = {model: self.go_lanes_remaining(model) for model in GO_MONTHLY_CAP_USD}
         go_pace = self.pace_of_provider(OPENCODE_GO_PROVIDER)
+        go_available = go_credentialed and go_meta["is_available"] and not (go_pace and go_pace.throttled)
+        go_bunny_ok = go_available
+        go_lanes = {model: self.go_lanes_remaining(model) for model in GO_MONTHLY_CAP_USD}
         go_headroom = go_pace.pace_ratio if go_pace else 1.0
         go_behind_pace = bool(go_pace and go_pace.behind_pace)
 
         def go_ok(model: str) -> bool:
-            """Credentialed, provider healthy, and a whole lane of it left this week."""
-            return go_available and go_lanes.get(model, 0.0) >= 1.0
+            """Credentialed, provider healthy, and a whole lane left this week AND in the 5h window."""
+            return (
+                go_available
+                and go_lanes.get(model, 0.0) >= 1.0
+                and self._go_lanes_in(model, "rolling-5h") >= 1.0
+            )
 
 
         quota_metrics = {
@@ -1087,6 +1313,9 @@ class ResetAwareModelSelector:
             "codex_pro_headroom": codex_pro_headroom,
             "codex_pro_throttled": codex_throttled,
             "codex_lane_remaining": codex_meta["remaining_fraction"],
+            "go_weekly_throttled": bool(go_pace and go_pace.throttled),
+            "go_weekly_allowed": go_pace.allowed_fraction if go_pace else 1.0,
+            "go_weekly_elapsed": go_pace.elapsed_fraction if go_pace else 0.0,
             "codex_lane_reset_hrs": codex_meta["hours_to_reset"],
             "zai_available": zai_ok,
             "minimax_available": minimax_ok,
@@ -1132,9 +1361,11 @@ class ResetAwareModelSelector:
             cooldown=True, pace_group=PACE_GROUP_STRONG,
         )
         codex_fast_promo = codex_promoted(MODEL_CODEX_FAST, "Codex Fast", PACE_GROUP_EXEC)
+        ag_opus_account = ag_anthropic_meta.get("account") or self.pace_by_provider().get(AG_ANTHROPIC_PROVIDER, WindowPace(AG_ANTHROPIC_PROVIDER, "", 0, 0, 0, 0, 0, 0, False, False, False, False)).account
+        ag_account_suffix = f" on account {ag_opus_account}" if ag_opus_account and ag_opus_account != "default" else ""
         ag_opus = _Rung(
             MODEL_AG_CLAUDE_OPUS, ag_claude_ok,
-            f"Antigravity Claude Opus 4.6 (free daily window, expires before any weekly window). {ag_claude_note}.",
+            f"Antigravity Claude Opus 4.6{ag_account_suffix} (healthy partner pool, daily window, expires before weekly cap). {ag_claude_note}.",
             pace_group=PACE_GROUP_STRONG,
         )
         glm = _Rung(MODEL_ZAI_GLM, zai_ok, "Z.AI GLM-5.3 (credentialed Coding Plan).")
@@ -1359,20 +1590,20 @@ class ResetAwareModelSelector:
             final_fallbacks = [MODEL_DEEPSEEK_FLASH]
 
         else:
-            # CASE G: ROUTINE EXECUTION (low/medium implementation, mapping, routine QA). The
-            # free Go model first, then the primary abundant Antigravity lane, then the paid Go
-            # workers and Z.AI overflow. Codex follows them: on pace it is the last subscription
-            # lane, and with its window about to expire the promoted rung leads the band instead
-            # of letting the allowance go to waste.
+            # CASE G: ROUTINE EXECUTION (low/medium implementation, mapping, routine QA).
+            # The free and paid Go models lead on pace, followed by chatgpt-web while its bridge
+            # is up, then the abundant Antigravity Gemini Flash lane. When Go is over pace,
+            # chatgpt-web is preferred first, then Flash.
             label = "Routine execution"
             rungs = [
                 go_bunny,
+                go_glm53_flash,
+                go_gpt6_luna,
+                chatgpt_web,
                 _Rung(MODEL_GEMINI_FLASH, google_ok,
                       "primary abundant execution lane: Gemini 3.8 Flash (Ultra daily allowance).",
                       as_fallback=False, pace_group=PACE_GROUP_EXEC),
                 codex_fast_promo,
-                go_glm53_flash,
-                go_gpt6_luna,
                 _Rung(MODEL_ZAI_GLM, zai_ok, "overflow to Z.AI GLM-5.3 (credentialed).", cooldown=True),
                 _Rung(MODEL_CODEX_FAST, codex_usable,
                       "Google Antigravity in cooldown; Codex Fast (subscription headroom).", cooldown=True, as_fallback=False),
@@ -1504,7 +1735,304 @@ class ResetAwareModelSelector:
             evidence_packet=evidence_dict,
         )
 
+@dataclass
+class WindowBurnPace:
+    """Per-window burn rate and projected utilization against its reset time."""
+    provider: str
+    account: str
+    window_id: str
+    duration_hours: float
+    hours_to_reset: float
+    used_fraction: float
+    remaining_fraction: float
+    burn_per_hour: float
+    projected_at_reset: float
+    action: str  # "ok", "throttle", "spend-more"
+    reasoning: str
+    is_weekly_or_monthly: bool = False
+    throttled: bool = False
+    reserve_held: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "provider": self.provider,
+            "account": self.account,
+            "window_id": self.window_id,
+            "duration_hours": round(self.duration_hours, 1),
+            "hours_to_reset": round(self.hours_to_reset, 1),
+            "used_percent": round(self.used_fraction * 100.0, 1),
+            "remaining_percent": round(self.remaining_fraction * 100.0, 1),
+            "burn_per_hour": round(self.burn_per_hour, 4),
+            "projected_at_reset": round(self.projected_at_reset, 3),
+            "action": self.action,
+            "reasoning": self.reasoning,
+        }
+
+
+def record_usage_sample(snapshot: Any, samples_file: Optional[Path] = None):
+    """Record current window usages to jsonl for rolling burn-rate tracking."""
+    if samples_file is None:
+        run_dir = Path.home() / ".veyyon" / "run"
+        if not run_dir.exists():
+            return
+        samples_file = run_dir / "usage-samples.jsonl"
+    try:
+        now_ts = time.time()
+        entry = {
+            "timestamp": now_ts,
+            "windows": {
+                f"{p_name}:{getattr(w, 'account', 'default')}:{w.id}": {
+                    "used_fraction": w.used_fraction,
+                    "hours_to_reset": w.seconds_to_reset / 3600.0,
+                    "duration_hours": w.duration_seconds / 3600.0,
+                }
+                for p_name, prov in (getattr(snapshot, "providers", {}) or {}).items()
+                for w in prov.windows
+                if w.duration_seconds and w.duration_seconds > 0
+            }
+        }
+        with open(samples_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
+def compute_window_burn_paces(
+    snapshot: Any,
+    samples_file: Optional[Path] = None,
+    now: Optional[datetime.datetime] = None,
+) -> List[WindowBurnPace]:
+    """Compute per-window burn rates against reset times and determine pacing action.
+
+    Antigravity partner pools are tracked per account (packages/ai/src/usage/google-antigravity.ts:434-441, 180-192, 74-79):
+    - brandy.sengco: short daily window (<24h reset, ~47% used), healthy partner pool for ag-opus
+    - brendmark: weekly cap (~6d reset, 80.9% used), shared by Claude and GPT partner models; preserved
+    """
+    burn_paces: List[WindowBurnPace] = []
+    if snapshot is None or not hasattr(snapshot, "providers"):
+        return burn_paces
+
+    # Load recent usage sample history if available to calculate delta burn rate
+    sample_history: List[Dict[str, Any]] = []
+    if samples_file is None:
+        candidate = Path.home() / ".veyyon" / "run" / "usage-samples.jsonl"
+        if candidate.exists():
+            samples_file = candidate
+    if samples_file and samples_file.exists():
+        try:
+            with open(samples_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        sample_history.append(json.loads(line))
+        except Exception:
+            pass
+
+    current_ts = now.timestamp() if now else time.time()
+
+    for prov_name, prov_data in snapshot.providers.items():
+        for window in prov_data.windows:
+            if not window.duration_seconds or window.duration_seconds <= 0:
+                continue
+
+            duration_h = window.duration_seconds / 3600.0
+            reset_h = max(0.0, window.seconds_to_reset / 3600.0)
+            used_frac = min(1.0, max(0.0, window.used_fraction))
+            rem_frac = min(1.0, max(0.0, window.remaining_fraction))
+            account = getattr(window, "account", "default")
+            window_key = f"{prov_name}:{account}:{window.id}"
+
+            # Calculate burn rate per hour from samples over the last 1-2 hours if available
+            burn_rate = 0.0
+            calculated_from_samples = False
+            if sample_history:
+                recent_samples = [
+                    s for s in sample_history
+                    if 0.05 <= (current_ts - s.get("timestamp", 0.0)) / 3600.0 <= 2.5
+                ]
+                if recent_samples:
+                    earliest = recent_samples[0]
+                    delta_h = (current_ts - earliest.get("timestamp", 0.0)) / 3600.0
+                    earlier_win = earliest.get("windows", {}).get(window_key)
+                    if earlier_win and delta_h > 0.01:
+                        delta_used = used_frac - float(earlier_win.get("used_fraction", used_frac))
+                        if delta_used >= 0.0:
+                            burn_rate = delta_used / delta_h
+                            calculated_from_samples = True
+
+            # Fallback to window-average burn rate over elapsed time
+            if not calculated_from_samples:
+                elapsed_h = max(0.1, duration_h - reset_h)
+                burn_rate = max(0.0, used_frac / elapsed_h)
+
+            projected_at_reset = used_frac + (burn_rate * reset_h)
+            is_weekly_monthly = (
+                duration_h >= 120.0
+                or any(k in window.id.lower() for k in ("weekly", "7d", "monthly", "30d"))
+            )
+
+            # Determine pacing action: "ok", "throttle", or "spend-more"
+            action = "ok"
+            reasoning = ""
+
+            # 1. Antigravity windows
+            if prov_name.startswith(ANTIGRAVITY_PROVIDER) or "antigravity" in prov_name.lower():
+                if rem_frac <= AG_FAMILY_MIN_REMAINING:
+                    action = "throttle"
+                    reasoning = (
+                        f"Antigravity reserve floor reached ({rem_frac*100:.1f}% remaining <= "
+                        f"{AG_FAMILY_MIN_REMAINING*100:.0f}% floor); held back to preserve emergency capacity."
+                    )
+                elif "brendmark" in account.lower() and is_weekly_monthly:
+                    action = "throttle"
+                    reasoning = (
+                        f"Weekly partner pool cap shared by Claude and GPT models is {used_frac*100:.1f}% used "
+                        f"with {reset_h:.1f}h left (projected {projected_at_reset*100:.1f}% at reset); throttled to preserve reserve."
+                    )
+                elif "brandy" in account.lower() and not is_weekly_monthly:
+                    action = "ok"
+                    reasoning = (
+                        f"Healthy daily partner pool with {rem_frac*100:.1f}% remaining "
+                        f"(resets in {reset_h:.1f}h); ag-opus routed here."
+                    )
+                elif projected_at_reset > 1.02:
+                    action = "throttle"
+                    reasoning = f"Projected to exhaust before reset ({projected_at_reset*100:.1f}% > 100%)."
+                else:
+                    action = "ok"
+                    reasoning = f"Spend on pace ({projected_at_reset*100:.1f}% projected at reset in {reset_h:.1f}h)."
+
+            # 2. Anthropic weekly window
+            elif prov_name == "anthropic":
+                if reset_h <= 72.0 and rem_frac > 0.05:
+                    if projected_at_reset < 0.92:
+                        action = "spend-more"
+                        reasoning = (
+                            f"Anthropic window resets in {reset_h:.1f}h with {rem_frac*100:.1f}% remaining; "
+                            f"projected {projected_at_reset*100:.1f}% at reset allows spending more on high-value tasks."
+                        )
+                    elif projected_at_reset > 1.02:
+                        action = "throttle"
+                        reasoning = f"Anthropic window projected to exhaust before reset ({projected_at_reset*100:.1f}% > 100%); throttle routine tasks."
+                    else:
+                        action = "ok"
+                        reasoning = f"Anthropic spend is on pace to land near 100% at reset ({projected_at_reset*100:.1f}% projected)."
+                elif projected_at_reset > 1.02:
+                    action = "throttle"
+                    reasoning = f"Anthropic projected to exhaust before reset ({projected_at_reset*100:.1f}% > 100%)."
+                else:
+                    action = "ok"
+                    reasoning = f"Anthropic spend is on pace ({projected_at_reset*100:.1f}% projected at reset)."
+
+            # 3. Other windows (Codex, OpenCode Go, DeepSeek)
+            else:
+                if projected_at_reset > 1.02 and used_frac >= 0.50:
+                    action = "throttle"
+                    reasoning = f"Projected to exceed window allowance at reset ({projected_at_reset*100:.1f}% > 100%); throttling."
+                elif reset_h <= 48.0 and rem_frac > 0.20 and projected_at_reset < 0.75 and is_weekly_monthly:
+                    action = "spend-more"
+                    reasoning = f"Window resets in {reset_h:.1f}h with {rem_frac*100:.1f}% remaining; allowance would expire unused."
+                else:
+                    action = "ok"
+                    reasoning = f"Spend is on pace ({projected_at_reset*100:.1f}% projected at reset in {reset_h:.1f}h)."
+
+            burn_paces.append(
+                WindowBurnPace(
+                    provider=prov_name,
+                    account=account,
+                    window_id=window.id,
+                    duration_hours=duration_h,
+                    hours_to_reset=reset_h,
+                    used_fraction=used_frac,
+                    remaining_fraction=rem_frac,
+                    burn_per_hour=burn_rate,
+                    projected_at_reset=projected_at_reset,
+                    action=action,
+                    reasoning=reasoning,
+                    is_weekly_or_monthly=is_weekly_monthly,
+                    throttled=action == "throttle",
+                    reserve_held=rem_frac <= AG_FAMILY_MIN_REMAINING if "antigravity" in prov_name.lower() else False,
+                )
+            )
+
+    return burn_paces
+
+
+def get_recommended_lanes(selector: ResetAwareModelSelector) -> Dict[str, str]:
+    """Map each standard role to its recommended model and account annotation."""
+    ag_pace = selector.pace_by_provider().get(AG_ANTHROPIC_PROVIDER)
+    ag_account = ag_pace.account if ag_pace else "brandy.sengco"
+    ag_opus_str = f"{MODEL_AG_CLAUDE_OPUS} (account: {ag_account})"
+
+    anthropic_pace = selector.pace_by_provider().get("anthropic")
+    reviewer_str = "anthropic/claude-opus-5-5:high"
+    if anthropic_pace and anthropic_pace.throttled and ag_pace and not ag_pace.throttled:
+        reviewer_str = f"{MODEL_AG_CLAUDE_OPUS} (fallback from throttled Anthropic; account: {ag_account})"
+
+    return {
+        "reviewer": reviewer_str,
+        "ag-opus": ag_opus_str,
+        "task": MODEL_GEMINI_FLASH,
+        "ds-pro": MODEL_DEEPSEEK_PRO,
+        "ds-task": MODEL_DEEPSEEK_FLASH,
+        "go-task": MODEL_GO_BUNNY,
+        "go-deep": MODEL_GO_GLM53_FLASH,
+        "go-review": MODEL_GO_GLM53,
+        "web-task": MODEL_CHATGPT_WEB,
+        "web-thinker": MODEL_CHATGPT_WEB,
+        "codex-worker": MODEL_CODEX_ASTRA,
+        "codex-reviewer": MODEL_CODEX_ASTRA,
+    }
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "pace":
+        pace_parser = argparse.ArgumentParser(description="Veyyon Burn-Rate Pacer CLI")
+        pace_parser.add_argument("subcommand", choices=["pace"])
+        pace_parser.add_argument("--json", action="store_true", help="Output pacing as JSON")
+        pace_parser.add_argument("--adapter", choices=["veyyon", "file", "direct"], default="veyyon")
+        pace_parser.add_argument("--balance-file", default=None)
+        pace_parser.add_argument("--balance-cmd", default=None)
+        pace_args = pace_parser.parse_args()
+
+        adapter = get_balance_adapter(
+            adapter_type="file" if pace_args.balance_file else pace_args.adapter,
+            file_path=pace_args.balance_file,
+            cmd=pace_args.balance_cmd,
+        )
+        selector = ResetAwareModelSelector(adapter)
+        snapshot = selector.snapshot
+        record_usage_sample(snapshot)
+        burn_paces = compute_window_burn_paces(snapshot)
+        lanes = get_recommended_lanes(selector)
+
+        if pace_args.json:
+            result = {
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "windows": [p.to_dict() for p in burn_paces],
+                "recommended_lanes": lanes,
+            }
+            print(json.dumps(result, indent=2))
+        else:
+            print("=" * 80)
+            print("VEYYON BURN-RATE PACER STATUS")
+            print("=" * 80)
+            print(f"{'Provider / Account':<35} {'Used%':>7} {'Burn/h':>8} {'Proj@Reset':>11} {'Action':>12}")
+            print("-" * 80)
+            for p in burn_paces:
+                name_str = f"{p.provider} ({p.account})"
+                used_str = f"{p.used_fraction*100:.1f}%"
+                burn_str = f"{p.burn_per_hour*100:.2f}%"
+                proj_str = f"{p.projected_at_reset*100:.1f}%"
+                print(f"{name_str:<35} {used_str:>7} {burn_str:>8} {proj_str:>11} {p.action:>12}")
+            print("=" * 80)
+            print("RECOMMENDED LANES PER ROLE")
+            print("-" * 80)
+            for role, model_desc in lanes.items():
+                print(f"{role:<16}: {model_desc}")
+            print("=" * 80)
+        return
+
     parser = argparse.ArgumentParser(description="Veyyon Reset-Aware Model Selector CLI")
     parser.add_argument("--task-type", choices=[t.value for t in TaskType], default=TaskType.ROUTINE_EXECUTION.value)
     parser.add_argument("--risk-level", choices=[r.value for r in RiskLevel], default=RiskLevel.LOW.value)

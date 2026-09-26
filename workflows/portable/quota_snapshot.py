@@ -244,6 +244,7 @@ class QuotaSnapshot:
     updated_at: str = ""
     entries: Dict[str, QuotaWindowEntry] = field(default_factory=dict)  # key f"{provider}|{account}|{window_id}"
     load_error: Optional[str] = None
+    path: Optional[Path] = field(default=None, repr=False)
 
     def entry(
         self,
@@ -395,7 +396,7 @@ def load_snapshot(
     """
     resolved = _resolve_snapshot_path(path)
     if not resolved.is_file():
-        return QuotaSnapshot()
+        return QuotaSnapshot(path=resolved)
 
     content: Optional[str] = None
     read_err: Optional[Exception] = None
@@ -412,20 +413,22 @@ def load_snapshot(
     if read_err is not None:
         if raise_on_error:
             raise QuotaSnapshotLockError(f"Failed to read snapshot file {resolved}: {read_err}") from read_err
-        return QuotaSnapshot(load_error=f"locked: {read_err}")
+        return QuotaSnapshot(load_error=f"locked: {read_err}", path=resolved)
 
     if not content or not content.strip():
-        return QuotaSnapshot()
+        return QuotaSnapshot(path=resolved)
 
     try:
         payload = json.loads(content)
         if not isinstance(payload, dict):
             raise ValueError(f"Snapshot payload is not a JSON object: {type(payload)}")
-        return QuotaSnapshot.from_dict(payload)
+        snap = QuotaSnapshot.from_dict(payload)
+        snap.path = resolved
+        return snap
     except Exception as e:
         if raise_on_error:
             raise QuotaSnapshotCorruptError(f"Snapshot file {resolved} is corrupt: {e}") from e
-        return QuotaSnapshot(load_error=f"corrupt: {e}")
+        return QuotaSnapshot(load_error=f"corrupt: {e}", path=resolved)
 
 
 def save_snapshot(snapshot: QuotaSnapshot, path: Union[Path, str] = SNAPSHOT_PATH) -> Path:
@@ -570,6 +573,13 @@ def parse_quota_error(body: str, now: Optional[datetime] = None) -> Optional[Quo
         "retryafter",
         "retry_delay_seconds",
     }
+    rel_ms_keys = {
+        "retry_after_ms",
+        "retry-after-ms",
+        "retryafterms",
+        "quotaresetdelayms",
+        "quota_reset_delay_ms",
+    }
 
     # 1. Absolute reset timestamp from json
     def _extract_abs_ts_from_json(obj: Any) -> Optional[datetime]:
@@ -631,6 +641,11 @@ def parse_quota_error(body: str, now: Optional[datetime] = None) -> Optional[Quo
                 if dur is not None:
                     return dur
             for k, v in obj.items():
+                if k.lower() in rel_ms_keys and isinstance(v, (int, float, str)):
+                    try:
+                        return float(v) / 1000.0
+                    except (ValueError, TypeError):
+                        pass
                 if k.lower() in rel_keys:
                     dur = _parse_duration_seconds(v)
                     if dur is not None:
@@ -648,6 +663,17 @@ def parse_quota_error(body: str, now: Optional[datetime] = None) -> Optional[Quo
 
     delay_sec = _extract_rel_delay_from_json(parsed_json) if parsed_json is not None else None
     if delay_sec is None:
+        m_ms = re.search(
+            r"retry[_-]?after[_-]?ms[\"':\s=]+([0-9]+(?:\.[0-9]+)?)",
+            body,
+            re.IGNORECASE,
+        )
+        if m_ms:
+            try:
+                delay_sec = float(m_ms.group(1)) / 1000.0
+            except (ValueError, TypeError):
+                pass
+    if delay_sec is None:
         m_rel = re.search(
             r"(?:quota[_-]?reset[_-]?delay|retry[_-]?delay(?:[_-]seconds)?|retry[_-]?after)[\"':\s=]+([0-9]+(?:\.[0-9]+)?(?:\s*(?:d|h|m|s|ms|millis|hours?|mins?|secs?))?(?:\s*[0-9]+(?:\.[0-9]+)?\s*(?:d|h|m|s|ms|millis|hours?|mins?|secs?))*)",
             body,
@@ -656,6 +682,8 @@ def parse_quota_error(body: str, now: Optional[datetime] = None) -> Optional[Quo
         if m_rel:
             delay_sec = _parse_duration_seconds(m_rel.group(1))
 
+    if delay_sec is None and ("usage_limit_reached" in body.lower() or "usage limit" in body.lower()):
+        delay_sec = 18000.0
     if delay_sec is not None and delay_sec >= 0.0:
         exhausted_dt = now_dt + timedelta(seconds=delay_sec)
         return QuotaReset(

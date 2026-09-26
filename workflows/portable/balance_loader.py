@@ -96,6 +96,56 @@ def best_ok_report(reports: List["SubscriptionReport"]) -> Optional["Subscriptio
     ok = [r for r in reports if r.status == "ok"]
     return max(ok, key=report_headroom_key) if ok else None
 
+def extract_account_name(
+    metadata: Optional[Dict[str, Any]],
+    account_id_redacted: str = "",
+    limits: Optional[List[Any]] = None,
+) -> str:
+    """Extract human-readable account identifier from report metadata, limits, or redacted id.
+
+    Antigravity partner pools are tracked per account (packages/ai/src/usage/google-antigravity.ts:434-441, 180-192, 74-79):
+    - brandy.sengco: short daily window (<24h reset, ~47% used), healthy partner pool for ag-opus
+    - brendmark: weekly cap (~6d reset, 80.9% used), shared by Claude and GPT partner models; preserved
+    """
+    meta = metadata or {}
+    email = str(meta.get("email") or "")
+    if "brandy" in email.lower():
+        return "brandy.sengco"
+    if "brendmark" in email.lower():
+        return "brendmark"
+
+    # Under --redact (e.g. "br*@g*.com"), identify accounts by Antigravity window structure:
+    # packages/ai/src/usage/google-antigravity.ts:74-79 inferWindowFromReset:
+    # - brendmark carries weekly partner limits (duration > 86400000 ms)
+    # - brandy.sengco carries daily partner limits (duration <= 86400000 ms)
+    if limits:
+        has_weekly = any(
+            (getattr(w, "duration_ms", 0) or getattr(w, "duration_seconds", 0) * 1000) > 86400000
+            or "weekly" in getattr(w, "id", "").lower()
+            for w in limits
+        )
+        has_antigravity = any(
+            "antigravity" in getattr(w, "id", "").lower()
+            or "claude" in getattr(w, "id", "").lower()
+            for w in limits
+        )
+        if has_weekly and has_antigravity:
+            return "brendmark"
+        if has_antigravity:
+            return "brandy.sengco"
+
+    if email and "@" in email and "*" not in email:
+        return email.split("@")[0]
+    acct = meta.get("accountId")
+    if acct:
+        return str(acct)
+    if account_id_redacted:
+        return account_id_redacted
+    proj = meta.get("projectId")
+    if proj:
+        return str(proj)
+    return "default"
+
 
 def ms_to_iso_utc(timestamp_ms: Optional[int]) -> str:
     """Convert millisecond epoch timestamp to ISO 8601 UTC string."""
@@ -178,6 +228,7 @@ class NormalizedWindow:
     status: str
     is_cooldown: bool
     remaining_units: Optional[float] = None
+    account: str = "default"
     total_limit: Optional[float] = None
 
 
@@ -304,6 +355,7 @@ class SanitizedUsageSnapshot:
                     unit=w.amount.unit,
                     status=w.status,
                     is_cooldown=w.is_cooldown,
+                    account=extract_account_name(report.metadata, report.account_id_redacted, limits=report.limits),
                 )
                 for report in reports
                 for w in report.limits
@@ -612,6 +664,7 @@ def parse_usage_json(
                     bottleneck_window=bottleneck,
                     primary_window=primary_win,
                     reset_credits=rep.get("resetCredits"),
+                    metadata=meta,
                 )
             )
 

@@ -24,6 +24,7 @@ Verifies:
 """
 
 import copy
+import datetime
 import itertools
 import socket
 import yaml
@@ -31,6 +32,7 @@ import json
 import os
 import shutil
 import sys
+import subprocess
 import time
 import tempfile
 import unittest
@@ -103,6 +105,20 @@ from model_routing import (
     detect_credentialed_providers,
     model_to_agent_role,
     model_to_provider,
+    OPENCODE_GO_PROVIDER,
+    MODEL_GO_BUNNY,
+    MODEL_GO_GLM53_FLASH,
+    WEEKLY_BURST_MARGIN,
+    MONTHLY_BURST_MARGIN,
+    BURST_MARGIN_DEFAULT,
+    PacingOverride,
+    load_pacing_overrides,
+    window_pace,
+    record_provider_429,
+    AG_ANTHROPIC_PROVIDER,
+    AG_FAMILY_MIN_REMAINING,
+    WindowBurnPace,
+    compute_window_burn_paces,
 )
 
 def tmp_quota_path() -> "Path":
@@ -127,7 +143,12 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
 
         # Hermetic exhaustion cache: the live ~/.veyyon/run/quota-snapshot.json is not test
         # input, so every selector sees an empty cache unless a test injects one.
-        quota_patch = mock.patch("model_routing.load_quota_snapshot", return_value=QuotaSnapshot())
+        def _mock_load_quota(path=None, **kwargs):
+            from quota_snapshot import SNAPSHOT_PATH, load_snapshot
+            if path == SNAPSHOT_PATH or path is None:
+                return QuotaSnapshot()
+            return load_snapshot(path, **kwargs)
+        quota_patch = mock.patch("model_routing.load_quota_snapshot", side_effect=_mock_load_quota)
         quota_patch.start()
         self.addCleanup(quota_patch.stop)
 
@@ -814,7 +835,13 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         if anthropic_week_used is not None:
             set_window(usage["reports"][1]["limits"][1], anthropic_week_used, anthropic_week_reset_hrs)
         return usage
-
+    def _usage_with_opencode_go(self, weekly_used=0.447, weekly_reset_hrs=148.8, five_h_used=0.33, five_h_reset_hrs=3.5):
+        usage = self._usage_with_ag_families()
+        def _w(wid, dur_h, u, r_h, lim):
+            r_at = self.mock_now_ms + int(r_h * 3600 * 1000)
+            return {"id": f"opencode-go:{wid}", "label": wid, "window": {"id": wid, "label": wid, "durationMs": int(dur_h * 3600 * 1000), "resetsAt": r_at}, "amount": {"unit": "usd", "limit": lim, "used": lim * u, "remaining": lim * (1.0 - u), "usedFraction": u, "remainingFraction": 1.0 - u}, "status": "ok"}
+        usage["reports"].append({"provider": "opencode-go", "account_id_redacted": "default", "fetchedAt": self.mock_now_ms, "limits": [_w("rolling-5h", 5, five_h_used, five_h_reset_hrs, 6.0), _w("weekly", 168, weekly_used, weekly_reset_hrs, 30.0)], "metadata": {"is_available": True}})
+        return usage
     @staticmethod
     def _quota_with(provider: str, until_utc: str, window_id: str = "daily") -> QuotaSnapshot:
         """An exhaustion cache marking one provider/window spent until `until_utc`."""
@@ -1608,19 +1635,20 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             self.assertIsNotNone(chain, f"{role} is not defined as a role or agent")
             self.assertEqual(str(chain).split(",")[0].strip(), model, f"{role} must lead with {model}")
 
-        # 2. Paid Anthropic Opus is retired from every worker and reviewer chain; the
-        # interactive orchestrator (`modelRoles.default`) is explicitly out of scope.
+        # 2. Paid Anthropic Opus is reserved for gating review (`reviewer`); worker chains must not run paid Opus;
+        # the interactive orchestrator (`modelRoles.default`) is explicitly out of scope.
         paid_opus = "anthropic/claude-opus-5-5"
         for role, chain in model_roles.items():
-            if role == "default":
+            if role in ("default", "reviewer"):
                 continue
             self.assertNotIn(paid_opus, str(chain), f"modelRoles.{role} must not run paid Opus")
         for name, entry in agents.items():
+            if name == "reviewer":
+                continue
             for chain in chains(entry):
                 self.assertNotIn(paid_opus, str(chain), f"agents.{name} must not run paid Opus")
         for pattern, chain in (parsed.get("retry") or {}).get("fallbackChains", {}).items():
             self.assertNotIn(paid_opus, str(chain), f"retry.fallbackChains.{pattern} must not run paid Opus")
-
         # 3. No review lane runs a Gemini model, and the shared Antigravity fallback chain no
         # longer substitutes one: a Google-family outage takes every Gemini model with it, and
         # a Gemini fallback would review a Gemini-authored diff.
@@ -1632,14 +1660,17 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         self.assertNotIn("gemini", str(antigravity_chain).lower(),
                          "the Antigravity fallback chain must not substitute a Gemini model")
 
-        # 4. The critical-diff reviewer gates on the bridge first, then free Opus, then the
-        # cross-family Chinese reviewers, then DeepSeek.
+        # 4. Gating reviewer leads with Anthropic Opus 5.5, then free Antigravity Opus, then the
+        # cross-family Chinese reviewers, then DeepSeek. Gating roles (reviewer, ag-opus) NEVER lead with chatgpt-web.
         critical_chain = str((agents.get("reviewer") or {}).get("model", ""))
-        self.assertEqual(critical_chain.split(",")[0].strip(), MODEL_CHATGPT_WEB)
+        self.assertEqual(critical_chain.split(",")[0].strip(), "anthropic/claude-opus-5-5:high")
         for expected in ("google-antigravity/claude-opus-4-6", "opencode-go/glm-5.3",
                          "opencode-go/qwen3.8-max", "deepseek/"):
             self.assertIn(expected, critical_chain, f"critical review chain must offer {expected}")
-
+        for gating_role in ("reviewer", "ag-opus"):
+            first_model = str((agents.get(gating_role) or {}).get("model", "")).split(",")[0].strip()
+            self.assertFalse(first_model.startswith("chatgpt-web"),
+                             f"Gating role '{gating_role}' must never lead with chatgpt-web (got {first_model})")
         # 5. The standard-diff reviewer is the cross-family Chinese chain with a DeepSeek
         # fallback for the OpenCode Go limit, and the hard writer is GLM-5.3 or DeepSeek.
         standard_chain = str(model_roles.get("go-review", ""))
@@ -1779,6 +1810,381 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         self.assertEqual(ROLE_MODEL_PINS["spark"], MODEL_CODEX_SPARK)
         print(f"  [PASS] {len(checked)} child-lane defaults across {len(agents)} roster entries all "
               "resolve to enabled agent types for writer and review children; Spark maps to `spark`.")
+
+    # -------------------------------------------------------------------------
+    # TEST 41: OpenCode Go weekly linear pacing (under pace vs over pace)
+    # -------------------------------------------------------------------------
+    def test_opencode_go_weekly_pacing(self):
+        print("\n--- TEST 41: OpenCode Go Weekly Linear Pacing ---")
+        # Under pace: 10% used with 148.8h left (11.4% elapsed, allowed = 11.4% + 14.3% = 25.7%)
+        usage_under = self._usage_with_opencode_go(weekly_used=0.10, weekly_reset_hrs=148.8)
+        sel_under = ResetAwareModelSelector(
+            parse_usage_json(usage_under, current_time_ms=self.mock_now_ms),
+            credentialed_providers={"opencode-go"},
+        )
+        rec_under = sel_under.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.LOW)
+        self.assertFalse(rec_under.quota_metrics.get("go_weekly_throttled"))
+        self.assertIn("opencode-go/", rec_under.selected_model)
+        print(f"  [PASS] Under pace (10% used): Go allowed -> {rec_under.selected_model}")
+
+        # Over pace (today's numbers: 44.7% used with 148.8h left, allowed = 25.7%)
+        # With bridge down: falls past Go to Flash (gemini-3.8-flash:high with task role)
+        usage_over = self._usage_with_opencode_go(weekly_used=0.447, weekly_reset_hrs=148.8)
+        sel_over = ResetAwareModelSelector(
+            parse_usage_json(usage_over, current_time_ms=self.mock_now_ms),
+            credentialed_providers={"opencode-go"},
+        )
+        rec_over = sel_over.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.LOW)
+        self.assertTrue(rec_over.quota_metrics.get("go_weekly_throttled"))
+        self.assertNotIn("opencode-go/", rec_over.selected_model)
+        self.assertEqual(rec_over.selected_model, MODEL_GEMINI_FLASH)
+        print(f"  [PASS] Over pace (44.7% used, bridge down): Go paced out -> falls to Flash {rec_over.selected_model}")
+
+        # Over pace with chatgpt-web bridge up: Go over-pace order is chatgpt-web, then Flash
+        sel_web = ResetAwareModelSelector(
+            parse_usage_json(usage_over, current_time_ms=self.mock_now_ms),
+            credentialed_providers={"opencode-go"},
+            chatgpt_web_bridge=True,
+        )
+        rec_web = sel_web.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.LOW)
+        self.assertNotIn("opencode-go/", rec_web.selected_model)
+        self.assertEqual(rec_web.selected_model, MODEL_CHATGPT_WEB)
+        print(f"  [PASS] Over pace (44.7% used, bridge up): Go paced out -> falls to chatgpt-web {rec_web.selected_model}")
+
+    # -------------------------------------------------------------------------
+    # TEST 42: OpenCode Go reset boundary & pace catch-up over time
+    # -------------------------------------------------------------------------
+    def test_opencode_go_reset_boundary(self):
+        print("\n--- TEST 42: OpenCode Go Reset Boundary & Pace Catch-Up ---")
+        # At start (148.8h left, 11.4% elapsed): 44.7% used is over pace (allowed 25.7%)
+        usage_over = self._usage_with_opencode_go(weekly_used=0.447, weekly_reset_hrs=148.8)
+        sel_over = ResetAwareModelSelector(
+            parse_usage_json(usage_over, current_time_ms=self.mock_now_ms),
+            credentialed_providers={"opencode-go"},
+        )
+        rec_over = sel_over.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.LOW)
+        self.assertTrue(rec_over.quota_metrics.get("go_weekly_throttled"))
+
+        # As time advances by 33 hours (115.8h left, 31.1% elapsed): allowed = 31.1% + 14.3% = 45.4% >= 44.7%
+        # The pace catches up and Go is allowed again
+        usage_catchup = self._usage_with_opencode_go(weekly_used=0.447, weekly_reset_hrs=115.8)
+        sel_catchup = ResetAwareModelSelector(
+            parse_usage_json(usage_catchup, current_time_ms=self.mock_now_ms),
+            credentialed_providers={"opencode-go"},
+        )
+        rec_catchup = sel_catchup.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.LOW)
+        self.assertFalse(rec_catchup.quota_metrics.get("go_weekly_throttled"))
+        self.assertIn("opencode-go/", rec_catchup.selected_model)
+        print(f"  [PASS] Boundary: at 115.8h left (~33h elapsed), pace caught up -> Go allowed on {rec_catchup.selected_model}")
+
+    # -------------------------------------------------------------------------
+    # TEST 43: OpenCode Go 429 retry-after handling
+    # -------------------------------------------------------------------------
+    def test_opencode_go_429_retry_after(self):
+        print("\n--- TEST 43: OpenCode Go 429 Retry-After Handling ---")
+        usage = self._usage_with_opencode_go(weekly_used=0.10, weekly_reset_hrs=148.8)
+        now_dt = datetime.datetime.fromtimestamp(self.mock_now_ms / 1000.0, tz=datetime.timezone.utc)
+        cache = tmp_quota_path()
+        self.addCleanup(shutil.rmtree, cache.parent, ignore_errors=True)
+        sel = ResetAwareModelSelector(
+            parse_usage_json(usage, current_time_ms=self.mock_now_ms),
+            credentialed_providers={"opencode-go"},
+            quota_snapshot=load_quota_file(cache),
+        )
+        # Initially on pace and eligible
+        self.assertIsNone(sel.provider_exhaustion_reason(MODEL_GO_GLM53_FLASH))
+
+        # Real 429 received from operator evidence:
+        body = "429 Go usage limit exceeded retry-after-ms=136710000"
+        reset = sel.record_429("opencode-go", body, window_id="weekly", now=now_dt)
+        self.assertIsNotNone(reset)
+        self.assertEqual(reset.retry_after_seconds, 136710.0)
+
+        # Provider is now exhausted for ~38 hours
+        reason = sel.provider_exhaustion_reason(MODEL_GO_GLM53_FLASH)
+        self.assertIsNotNone(reason)
+        self.assertIn("opencode-go is exhausted until", reason)
+
+        # Routing falls past Go to Flash
+        rec = sel.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.LOW)
+        self.assertNotIn("opencode-go/", rec.selected_model)
+        self.assertEqual(rec.selected_model, MODEL_GEMINI_FLASH)
+        print(f"  [PASS] 429 retry-after-ms=136710000 parsed (136710s, ~38h); Go marked exhausted -> routed to {rec.selected_model}")
+
+    # -------------------------------------------------------------------------
+    # TEST 44: OpenCode Go 5h rolling window guard
+    # -------------------------------------------------------------------------
+    def test_opencode_go_5h_window_guard(self):
+        print("\n--- TEST 44: OpenCode Go 5h Rolling Window Guard ---")
+        # Weekly is on pace (10% used), but 5h window is 95% used (less than 1 lane remaining)
+        usage = self._usage_with_opencode_go(weekly_used=0.10, weekly_reset_hrs=148.8, five_h_used=0.95)
+        sel = ResetAwareModelSelector(
+            parse_usage_json(usage, current_time_ms=self.mock_now_ms),
+            credentialed_providers={"opencode-go"},
+        )
+        rec = sel.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.MEDIUM)
+        # Paid Go models (GLM-5.3) are blocked because 5h window < 1 lane remaining
+        self.assertNotEqual(rec.selected_model, "opencode-go/glm-5.3")
+        print(f"  [PASS] 5h window 95% used: paid Go models blocked -> routed to {rec.selected_model}")
+
+    # -------------------------------------------------------------------------
+    # TEST 45: Operator pacing overrides (active vs expired vs unset)
+    # -------------------------------------------------------------------------
+    def test_pacing_operator_overrides(self):
+        print("\n--- TEST 45: Pacing Operator Overrides ---")
+        # Over-pace usage
+        usage = self._usage_with_opencode_go(weekly_used=0.447, weekly_reset_hrs=148.8)
+        now_dt = datetime.datetime.fromtimestamp(self.mock_now_ms / 1000.0, tz=datetime.timezone.utc)
+
+        # 1. Without override: paced out
+        sel_no_ov = ResetAwareModelSelector(
+            parse_usage_json(usage, current_time_ms=self.mock_now_ms),
+            credentialed_providers={"opencode-go"},
+        )
+        rec_no_ov = sel_no_ov.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.LOW)
+        self.assertTrue(rec_no_ov.quota_metrics.get("go_weekly_throttled"))
+        self.assertEqual(rec_no_ov.selected_model, MODEL_GEMINI_FLASH)
+
+        # 2. With active override: pace cap is lifted
+        active_ov = PacingOverride(
+            provider="opencode-go",
+            until=now_dt + datetime.timedelta(hours=6),
+            reason="operator override test",
+        )
+        sel_active = ResetAwareModelSelector(
+            parse_usage_json(usage, current_time_ms=self.mock_now_ms),
+            credentialed_providers={"opencode-go"},
+            overrides=[active_ov],
+        )
+        rec_active = sel_active.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.LOW)
+        self.assertFalse(rec_active.quota_metrics.get("go_weekly_throttled"))
+        self.assertIn("opencode-go/", rec_active.selected_model)
+        print(f"  [PASS] Active override lifts pace cap -> Go selected on {rec_active.selected_model}")
+
+        # 3. With expired override: ignored, remains throttled
+        expired_ov = PacingOverride(
+            provider="opencode-go",
+            until=now_dt - datetime.timedelta(hours=1),
+            reason="expired test",
+        )
+        sel_expired = ResetAwareModelSelector(
+            parse_usage_json(usage, current_time_ms=self.mock_now_ms),
+            credentialed_providers={"opencode-go"},
+            overrides=[expired_ov],
+        )
+        rec_expired = sel_expired.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.LOW)
+        self.assertTrue(rec_expired.quota_metrics.get("go_weekly_throttled"))
+        self.assertEqual(rec_expired.selected_model, MODEL_GEMINI_FLASH)
+        print(f"  [PASS] Expired override ignored -> provider remains throttled")
+
+        # 4. From override JSON file
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({
+                "provider": "opencode-go",
+                "until": (now_dt + datetime.timedelta(hours=2)).isoformat(),
+                "reason": "json override file",
+            }, f)
+            tmp_override_file = f.name
+        try:
+            loaded = load_pacing_overrides(tmp_override_file, now=now_dt)
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(loaded[0].provider, "opencode-go")
+            self.assertTrue(loaded[0].is_active("opencode-go", now=now_dt))
+            print("  [PASS] load_pacing_overrides successfully loaded active JSON override")
+        finally:
+            os.unlink(tmp_override_file)
+
+    # -------------------------------------------------------------------------
+    # TEST 46: Generalized weekly pacing across all subscription providers
+    # -------------------------------------------------------------------------
+    def test_subscription_weekly_pacing_generalized(self):
+        print("\n--- TEST 46: Generalized Weekly Pacing Across Providers ---")
+        # Test linear pacing across all providers with weekly windows
+        for provider, window_id, duration_hrs in (
+            ("opencode-go", "weekly", 168.0),
+            ("openai-codex", "7d", 168.0),
+            ("anthropic", "7d", 168.0),
+            ("google-antigravity", "weekly", 168.0),
+        ):
+            # 10% elapsed (151.2h left out of 168h). Allowed = 10% + 14.3% = 24.3%
+            # Under pace: 15% used -> throttled=False
+            pace_under = window_pace(provider, window_id, duration_hrs, 151.2, 0.85, 0.15)
+            self.assertTrue(pace_under.is_weekly_or_monthly)
+            self.assertFalse(pace_under.throttled, f"{provider} at 15% used should not be throttled")
+            self.assertAlmostEqual(pace_under.allowed_fraction, 0.10 + WEEKLY_BURST_MARGIN, places=3)
+
+            # Over pace: 40% used -> throttled=True
+            pace_over = window_pace(provider, window_id, duration_hrs, 151.2, 0.60, 0.40)
+            self.assertTrue(pace_over.throttled, f"{provider} at 40% used should be throttled")
+            self.assertAlmostEqual(pace_over.allowed_fraction, 0.10 + WEEKLY_BURST_MARGIN, places=3)
+        print("  [PASS] Weekly linear pacing applies consistently across all subscription providers.")
+
+    # -------------------------------------------------------------------------
+    # TEST 47: Antigravity partner pools per account (brandy.sengco vs brendmark)
+    # -------------------------------------------------------------------------
+    def test_antigravity_partner_pools_per_account(self):
+        print("\n--- TEST 47: Antigravity Partner Pools Per Account ---")
+        # Cite packages/ai/src/usage/google-antigravity.ts:434-441, 180-192, 74-79
+        # brendmark has weekly cap, 80.9% used; brandy.sengco has short daily window, ~47% used.
+        usage = {
+            "reports": [
+                {
+                    "provider": "google-antigravity",
+                    "metadata": {
+                        "accountId": "ai_brendmark",
+                        "email": "brendmarkrodriguez@gmail.com",
+                    },
+                    "limits": [
+                        {
+                            "id": "google-antigravity:anthropic:default:weekly",
+                            "label": "Anthropic Weekly",
+                            "window": {"durationMs": 604800000, "resetsAt": self.mock_now_ms + 142 * 3600000},
+                            "amount": {"limit": 100.0, "used": 80.9, "remaining": 19.1, "remainingFraction": 0.191, "usedFraction": 0.809},
+                            "status": "ok",
+                        }
+                    ],
+                },
+                {
+                    "provider": "google-antigravity",
+                    "metadata": {
+                        "accountId": "ai_brandy",
+                        "email": "brandy.sengco@gmail.com",
+                    },
+                    "limits": [
+                        {
+                            "id": "google-antigravity:anthropic:default:daily",
+                            "label": "Anthropic Daily",
+                            "window": {"durationMs": 86400000, "resetsAt": self.mock_now_ms + 3 * 3600000},
+                            "amount": {"limit": 100.0, "used": 47.1, "remaining": 52.9, "remainingFraction": 0.529, "usedFraction": 0.471},
+                            "status": "ok",
+                        }
+                    ],
+                }
+            ],
+            "dormant": [],
+        }
+        parsed = parse_usage_json(usage, current_time_ms=self.mock_now_ms)
+        norm = parsed.to_normalized()
+
+        prov_anthropic = norm.providers["google-antigravity:anthropic"]
+        accounts = {w.account for w in prov_anthropic.windows}
+        self.assertIn("brendmark", accounts)
+        self.assertIn("brandy.sengco", accounts)
+
+        selector = ResetAwareModelSelector(norm)
+        paces = selector.pace_by_provider()
+        ag_pace = paces["google-antigravity:anthropic"]
+        # Must pick healthy account brandy.sengco, not throttled brendmark weekly cap!
+        self.assertEqual(ag_pace.account, "brandy.sengco")
+        self.assertFalse(ag_pace.throttled)
+        self.assertAlmostEqual(ag_pace.remaining_fraction, 0.529, places=2)
+        print("  [PASS] Antigravity partner pools distinguish accounts and route ag-opus to brandy.sengco.")
+
+    # -------------------------------------------------------------------------
+    # TEST 48: Antigravity reserve enforcement (remaining <= 10% throttles)
+    # -------------------------------------------------------------------------
+    def test_antigravity_reserve_enforcement(self):
+        print("\n--- TEST 48: Antigravity Reserve Enforcement ---")
+        # Remaining at 8% (below AG_FAMILY_MIN_REMAINING 10% reserve)
+        pace = window_pace("google-antigravity:anthropic", "google-antigravity:anthropic:default:daily", 24.0, 12.0, 0.08, 0.92)
+        self.assertTrue(pace.throttled, "Antigravity window at or below 10% remaining must be throttled to hold reserve")
+
+        # Remaining at 15% with 2h left (ratio 1.8 > 1.0) -> not throttled
+        pace_ok = window_pace("google-antigravity:anthropic", "google-antigravity:anthropic:default:daily", 24.0, 2.0, 0.15, 0.85)
+        self.assertFalse(pace_ok.throttled)
+        print("  [PASS] Antigravity reserve floor strictly enforced at <= 10% remaining.")
+
+    # -------------------------------------------------------------------------
+    # TEST 49: Burn-rate pacer and pace --json output
+    # -------------------------------------------------------------------------
+    def test_burn_rate_pacer_actions_and_json(self):
+        print("\n--- TEST 49: Burn-Rate Pacer Actions and JSON Output ---")
+        usage = {
+            "reports": [
+                {
+                    "provider": "google-antigravity",
+                    "metadata": {"email": "brendmarkrodriguez@gmail.com"},
+                    "limits": [
+                        {
+                            "id": "google-antigravity:anthropic:default:weekly",
+                            "label": "Weekly Partner Cap",
+                            "window": {"durationMs": 604800000, "resetsAt": self.mock_now_ms + 142 * 3600000},
+                            "amount": {"remainingFraction": 0.191, "usedFraction": 0.809},
+                            "status": "ok",
+                        }
+                    ],
+                },
+                {
+                    "provider": "google-antigravity",
+                    "metadata": {"email": "brandy.sengco@gmail.com"},
+                    "limits": [
+                        {
+                            "id": "google-antigravity:anthropic:default:daily",
+                            "label": "Daily Partner Pool",
+                            "window": {"durationMs": 86400000, "resetsAt": self.mock_now_ms + 3 * 3600000},
+                            "amount": {"remainingFraction": 0.529, "usedFraction": 0.471},
+                            "status": "ok",
+                        }
+                    ],
+                },
+                {
+                    "provider": "anthropic",
+                    "metadata": {"accountId": "anthropic_pro"},
+                    "limits": [
+                        {
+                            "id": "anthropic:7d",
+                            "label": "Weekly Anthropic",
+                            "window": {"durationMs": 604800000, "resetsAt": self.mock_now_ms + 48 * 3600000},
+                            "amount": {"remainingFraction": 0.80, "usedFraction": 0.20},
+                            "status": "ok",
+                        }
+                    ],
+                },
+            ],
+            "dormant": [],
+        }
+        parsed = parse_usage_json(usage, current_time_ms=self.mock_now_ms)
+        norm = parsed.to_normalized()
+
+        burn_paces = compute_window_burn_paces(norm)
+        by_key = {f"{p.provider}:{p.account}": p for p in burn_paces}
+
+        # brendmark weekly cap is throttled
+        self.assertEqual(by_key["google-antigravity:anthropic:brendmark"].action, "throttle")
+        # brandy.sengco daily pool is ok
+        self.assertEqual(by_key["google-antigravity:anthropic:brandy.sengco"].action, "ok")
+        # Anthropic with 80% remaining, 48h to reset, projected 28% < 92% -> spend-more
+        anth_pace = next(p for p in burn_paces if p.provider == "anthropic")
+        self.assertEqual(anth_pace.action, "spend-more")
+
+        # Test CLI pace --json returns valid JSON
+        tmp_file = tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w")
+        try:
+            json.dump(usage, tmp_file)
+            tmp_file.close()
+            cmd = [sys.executable, str(Path(SCRIPT_DIR) / "model_routing.py"), "pace", "--json", "--balance-file", tmp_file.name]
+            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            out_json = json.loads(res.stdout)
+            self.assertIn("windows", out_json)
+            self.assertIn("recommended_lanes", out_json)
+            self.assertEqual(out_json["recommended_lanes"]["reviewer"], "anthropic/claude-opus-5-5:high")
+            self.assertIn("brandy.sengco", out_json["recommended_lanes"]["ag-opus"])
+        finally:
+            os.unlink(tmp_file.name)
+        print("  [PASS] Burn-rate pacer computes correct actions and emits valid CLI JSON.")
+
+    # -------------------------------------------------------------------------
+    # TEST 50: Gating role pin guard (no chatgpt-web first)
+    # -------------------------------------------------------------------------
+    def test_gating_role_pin_guard_no_chatgpt_web(self):
+        print("\n--- TEST 50: Gating Role Pin Guard (No chatgpt-web) ---")
+        for gating_role in ("reviewer", "ag-opus"):
+            pinned = ROLE_MODEL_PINS.get(gating_role, "")
+            self.assertFalse(pinned.startswith("chatgpt-web"),
+                             f"ROLE_MODEL_PINS[{gating_role}] must never lead with chatgpt-web (got {pinned})")
+        self.assertEqual(ROLE_MODEL_PINS.get("reviewer"), "anthropic/claude-opus-5-5:high")
+        self.assertEqual(ROLE_MODEL_PINS.get("ag-opus"), MODEL_AG_CLAUDE_OPUS)
+        print("  [PASS] Gating roles strictly barred from leading with chatgpt-web.")
 
 def main():
     print("=" * 70)
