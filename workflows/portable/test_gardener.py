@@ -25,17 +25,24 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 from gardener import (
+    BugLintProposal,
     CleanupTaskSpec,
+    GardenerIssueCandidate,
     GardenerReport,
     ToolFinding,
+    check_host_ram_safe,
     classify_knip_issue,
     classify_vulture_line,
+    create_live_gardener_issues,
+    format_contract_issue_body,
     format_summary_markdown,
     format_summary_text,
     generate_cleanup_task_spec,
+    generate_gardener_issue_candidates,
     is_frontend_entrypoint,
     is_test_file,
     run_gardener,
+    scan_workaround_comments,
 )
 
 
@@ -409,6 +416,196 @@ class TestGardenerTaskSpecAndReporting(unittest.TestCase):
             self.assertEqual(captured["kwargs"]["shell"], os.name == "nt")
             self.assertEqual(findings, [])
 
+
+class TestGardenerIssueCreationAndAutomation(unittest.TestCase):
+    """Tests for issue generation, Superboard issue contract, deduplication, and automation."""
+
+    def test_format_contract_issue_body(self):
+        """Issue body must strictly contain all 9 Superboard contract sections and metadata."""
+        body = format_contract_issue_body(
+            fingerprint="gardener:test:123",
+            title="chore(gardener): prune test",
+            scope="Safely prune test items.",
+            acceptance_criteria=["npx tsc passes", "Targeted tests pass"],
+            related="Issue #227",
+            repo="Bavariance/polysimulator",
+            evidence_details="- Test finding 1",
+            category="dead_code_pruning",
+            timestamp="2026-09-26T23:00:00Z",
+            repo_root="/test/repo",
+        )
+
+        # Fingerprint comment
+        self.assertIn("<!-- fingerprint: gardener:test:123 -->", body)
+        self.assertIn("Fingerprint: `gardener:test:123`", body)
+
+        # 9 Required Superboard Contract Sections
+        self.assertIn("## Scope", body)
+        self.assertIn("## Acceptance Criteria", body)
+        self.assertIn("## Dependencies & Parent", body)
+        self.assertIn("## Owner", body)
+        self.assertIn("Wladefant", body)
+        self.assertIn("## State & Blockers", body)
+        self.assertIn("## Branch/PR/Exact Head", body)
+        self.assertIn("## Evidence", body)
+        self.assertIn("## Next Action", body)
+        self.assertIn("## Authorization", body)
+
+    def test_generate_candidates_with_task_spec_and_bugs(self):
+        """Candidates must generate deterministic fingerprints and adhere to taxonomy."""
+        report = GardenerReport(
+            repo_root="/dummy/root",
+            timestamp="2026-09-26T23:00:00Z",
+            min_confidence=80,
+            workaround_findings=[
+                ToolFinding(
+                    tool="comment_linter",
+                    file="backend/app/keys.py",
+                    line=10,
+                    symbol="workaround",
+                    kind="workaround",
+                    confidence=100,
+                    category="untracked_workaround_comment",
+                    safe_to_prune=False,
+                    reason="workaround without issue",
+                )
+            ],
+        )
+        report.task_spec = CleanupTaskSpec(
+            title="chore(gardener): prune items",
+            pr_title="chore(gardener): prune items",
+            pr_labels=["kind:gardener", "risk:low"],
+            target_lane="spark",
+            max_items=5,
+            context_text="",
+            task_text="",
+            target_items=[
+                {
+                    "tool": "knip",
+                    "file": "frontend/components/Old.tsx",
+                    "kind": "unused_file",
+                    "symbol": "Old.tsx",
+                    "category": "verified_dead_file",
+                }
+            ],
+        )
+
+        bug_proposals = [
+            BugLintProposal(
+                bug_number=5500,
+                bug_title="Fix market crash on null outcome",
+                fix_pr_url="https://github.com/Bavariance/polysimulator/pull/5501",
+                fix_pr_number=5501,
+                rule_type="ast-grep",
+                target_pattern="Guard against null outcome",
+                description="Lint rule for #5500",
+            )
+        ]
+
+        candidates = generate_gardener_issue_candidates(report, bug_proposals)
+        self.assertEqual(len(candidates), 3)
+
+        # 1. Dead code prune
+        c_dead = [c for c in candidates if c.category == "dead_code_prune"][0]
+        self.assertTrue(c_dead.fingerprint.startswith("gardener:prune:dead_code_batch:"))
+        self.assertIn("kind:gardener", c_dead.labels)
+        self.assertEqual(c_dead.risk, "low")
+
+        # 2. Workaround comment
+        c_work = [c for c in candidates if c.category == "workaround_comment"][0]
+        self.assertTrue(c_work.fingerprint.startswith("gardener:workaround:batch:"))
+        self.assertIn("kind:gardener", c_work.labels)
+
+        # 3. Bug lint guard
+        c_bug = [c for c in candidates if c.category == "bug_to_lint"][0]
+        self.assertEqual(c_bug.fingerprint, "gardener:bug_lint_guard:5500")
+        self.assertIn("guard for #5500", c_bug.title)
+        self.assertIn("kind:gardener", c_bug.labels)
+
+    def test_create_live_gardener_issues_deduplication_and_capping(self):
+        """Issue creator must skip seen fingerprints and never create more than 5 issues."""
+        candidates = []
+        for i in range(10):
+            candidates.append(
+                GardenerIssueCandidate(
+                    fingerprint=f"gardener:test:fp_{i}",
+                    title=f"chore(gardener): test issue {i}",
+                    labels=["kind:gardener", "area:codebase", "risk:low"],
+                    area="codebase",
+                    risk="low",
+                    body="body",
+                    category="dead_code_prune",
+                )
+            )
+
+        # seen_fingerprints already contains fp_0 and fp_1
+        seen = {"gardener:test:fp_0", "gardener:test:fp_1"}
+
+        # Run in dry_run mode with max_issues=3
+        results_3 = create_live_gardener_issues(
+            candidates=candidates,
+            repo="test/repo",
+            seen_fingerprints=seen.copy(),
+            max_issues=3,
+            dry_run=True,
+        )
+        self.assertEqual(len(results_3), 3)
+        self.assertEqual(results_3[0]["fingerprint"], "gardener:test:fp_2")
+        self.assertEqual(results_3[1]["fingerprint"], "gardener:test:fp_3")
+        self.assertEqual(results_3[2]["fingerprint"], "gardener:test:fp_4")
+
+        # Run with max_issues=10 (should be capped at hard limit 5)
+        results_cap = create_live_gardener_issues(
+            candidates=candidates,
+            repo="test/repo",
+            seen_fingerprints=seen.copy(),
+            max_issues=10,
+            dry_run=True,
+        )
+        self.assertEqual(len(results_cap), 5)
+
+    def test_scan_workaround_comments(self):
+        """Comments with workaround/hack keywords lacking issue reference must be detected."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            fe = root / "frontend"
+            fe.mkdir()
+            be = root / "backend"
+            be.mkdir()
+
+            # Untracked workaround
+            (fe / "widget.tsx").write_text("// Workaround: temporary fix for hydration\nconst x = 1;\n", encoding="utf-8")
+            # Tracked workaround with issue ref #5548
+            (be / "api.py").write_text("# Hack: workaround for #5548 rate limit\npass\n", encoding="utf-8")
+            # Normal code
+            (be / "clean.py").write_text("def run():\n    return 42\n", encoding="utf-8")
+
+            findings = scan_workaround_comments(root)
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0].file, "frontend/widget.tsx")
+            self.assertEqual(findings[0].line, 1)
+            self.assertEqual(findings[0].category, "untracked_workaround_comment")
+            self.assertEqual(findings[0].confidence, 100)
+
+    def test_check_host_ram_safe_mock(self):
+        """Host RAM check must return False when RAM usage >= threshold."""
+        import unittest.mock as _mock
+
+        with _mock.patch("gardener.subprocess.run") as mock_run:
+            # Simulate 95% RAM
+            mock_run.return_value.returncode = 0
+            mock_run.return_value.stdout = json.dumps({"ram": {"percent": 95.2}})
+            is_safe, pct, msg = check_host_ram_safe(max_ram_pct=90.0)
+            self.assertFalse(is_safe)
+            self.assertAlmostEqual(pct, 95.2)
+            self.assertIn(">= threshold", msg)
+
+            # Simulate 65% RAM
+            mock_run.return_value.stdout = json.dumps({"ram": {"percent": 65.0}})
+            is_safe, pct, msg = check_host_ram_safe(max_ram_pct=90.0)
+            self.assertTrue(is_safe)
+            self.assertAlmostEqual(pct, 65.0)
+            self.assertIn("< threshold", msg)
 
 if __name__ == "__main__":
     unittest.main()
