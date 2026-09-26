@@ -958,7 +958,6 @@ def synthesize_mechanical_bug_rule(
 
         full_removed_text = "\n".join(changes["removed"])
         full_added_text = "\n".join(changes["added"])
-
         # Rule Check 1: Transaction / Autocommit keywords in DB prefix / hook
         if "BEGIN;" in full_removed_text and ("_TRADE_GUC_PREFIX" in full_removed_text or "database.py" in fname):
             rule_pattern = r'_TRADE_GUC_PREFIX\s*=\s*\([^)]*BEGIN;'
@@ -966,14 +965,16 @@ def synthesize_mechanical_bug_rule(
             pre_test = '_TRADE_GUC_PREFIX = ("BEGIN; ", "SET LOCAL synchronous_commit = off; ")'
             post_test = '_TRADE_GUC_PREFIX = ("SET LOCAL synchronous_commit = off; ")'
             if rx.search(pre_test) and not rx.search(post_test):
+                real_removed = "\n".join([l for l in changes["removed"] if "BEGIN;" in l or l.strip().startswith('"')]) or changes["removed"][0]
+                real_added = "\n".join(changes["added"][:3]) if changes["added"] else "(statement removed)"
                 return BugLintProposal(
                     bug_number=bug_num,
                     bug_title=bug_title,
                     fix_pr_number=fix_pr_num,
                     rule_type="regex",
                     target_pattern=rule_pattern,
-                    anti_pattern_code='_TRADE_GUC_PREFIX = ("BEGIN; ", ...)',
-                    fixed_code='_TRADE_GUC_PREFIX = ("SET LOCAL...", ...)',
+                    anti_pattern_code=real_removed,
+                    fixed_code=real_added,
                     proof_text=f"Proven: regex '{rule_pattern}' matches pre-fix code with 'BEGIN;' in prefix and rejects post-fix sanitized prefix.",
                     target_file=fname,
                     description=f"Prohibit explicit transaction opening ('BEGIN;') in autocommit connection GUC prefix hook ({fname}).",
@@ -983,14 +984,16 @@ def synthesize_mechanical_bug_rule(
         rx_swallow = re.compile(r'except\s+(?:Exception)?:\s*\n?\s*pass')
         if rx_swallow.search(full_removed_text) and not rx_swallow.search(full_added_text):
             rule_pattern = r'except\s+(?:Exception)?:\s*\n?\s*pass'
+            real_removed = "\n".join([l for l in changes["removed"] if "except" in l or "pass" in l]) or "\n".join(changes["removed"][:3])
+            real_added = "\n".join(changes["added"][:3]) if changes["added"] else "(statement removed)"
             return BugLintProposal(
                 bug_number=bug_num,
                 bug_title=bug_title,
                 fix_pr_number=fix_pr_num,
                 rule_type="regex",
                 target_pattern=rule_pattern,
-                anti_pattern_code="except Exception:\n    pass",
-                fixed_code="except Exception as e:\n    logger.warning('Failed: %s', e)",
+                anti_pattern_code=real_removed,
+                fixed_code=real_added,
                 proof_text=f"Proven: regex '{rule_pattern}' matches pre-fix bare exception pass and rejects post-fix handled/logged exception.",
                 target_file=fname,
                 description=f"Prohibit swallowing exceptions with bare 'except Exception: pass' without handling or logging ({fname}).",
@@ -1000,14 +1003,16 @@ def synthesize_mechanical_bug_rule(
         rx_wallet = re.compile(r'get_or_seed_api_wallet\([^)]*lock\s*=\s*False\)')
         if rx_wallet.search(full_removed_text) and not rx_wallet.search(full_added_text):
             rule_pattern = r'get_or_seed_api_wallet\([^)]*lock\s*=\s*False\)'
+            real_removed = "\n".join([l for l in changes["removed"] if "lock=False" in l or "get_or_seed_api_wallet" in l]) or changes["removed"][0]
+            real_added = "\n".join([l for l in changes["added"] if "get_or_seed_api_wallet" in l or "lock" in l]) or (changes["added"][0] if changes["added"] else "(statement removed)")
             return BugLintProposal(
                 bug_number=bug_num,
                 bug_title=bug_title,
                 fix_pr_number=fix_pr_num,
                 rule_type="ast-grep",
                 target_pattern=rule_pattern,
-                anti_pattern_code="get_or_seed_api_wallet(db, user.id, lock=False)",
-                fixed_code="get_or_seed_api_wallet(db, user.id, lock=True)",
+                anti_pattern_code=real_removed,
+                fixed_code=real_added,
                 proof_text=f"Proven: pattern '{rule_pattern}' matches pre-fix lock=False and rejects post-fix locked wallet query.",
                 target_file=fname,
                 description=f"Enforce lock=True during wallet resolution in financial trade/order processing paths ({fname}).",
@@ -1017,14 +1022,16 @@ def synthesize_mechanical_bug_rule(
         rx_active = re.compile(r'\.get\(["\']active["\'],\s*True\)')
         if rx_active.search(full_removed_text) and not rx_active.search(full_added_text):
             rule_pattern = r'\.get\(["\']active["\'],\s*True\)'
+            real_removed = "\n".join([l for l in changes["removed"] if "active" in l]) or changes["removed"][0]
+            real_added = "\n".join([l for l in changes["added"] if "active" in l]) or (changes["added"][0] if changes["added"] else "(statement removed)")
             return BugLintProposal(
                 bug_number=bug_num,
                 bug_title=bug_title,
                 fix_pr_number=fix_pr_num,
                 rule_type="regex",
                 target_pattern=rule_pattern,
-                anti_pattern_code='data.get("active", True)',
-                fixed_code='data.get("active", False) if is_closed else data.get("active", True)',
+                anti_pattern_code=real_removed,
+                fixed_code=real_added,
                 proof_text=f"Proven: pattern '{rule_pattern}' matches pre-fix default True and rejects post-fix closed-market check.",
                 target_file=fname,
                 description=f"Prohibit defaulting 'active' to True on unverified market data payloads ({fname}).",
