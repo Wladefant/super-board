@@ -682,8 +682,6 @@ def parse_quota_error(body: str, now: Optional[datetime] = None) -> Optional[Quo
         if m_rel:
             delay_sec = _parse_duration_seconds(m_rel.group(1))
 
-    if delay_sec is None and ("usage_limit_reached" in body.lower() or "usage limit" in body.lower()):
-        delay_sec = 18000.0
     if delay_sec is not None and delay_sec >= 0.0:
         exhausted_dt = now_dt + timedelta(seconds=delay_sec)
         return QuotaReset(

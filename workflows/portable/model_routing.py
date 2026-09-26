@@ -210,7 +210,7 @@ GO_MONTHLY_CAP_USD: Dict[str, float] = {
     MODEL_GO_GLM53: 15.0,
     MODEL_GO_QWEN38_MAX: 15.0,
 }
-GO_WINDOW_FRACTION: Dict[str, float] = {"rolling-5h": 0.20, "weekly": 0.50, "monthly": 1.00}
+GO_WINDOW_FRACTION: Dict[str, float] = {"rolling-5h": 0.40, "weekly": 0.50, "monthly": 1.00}
 GO_LANE_COST_USD: Dict[str, float] = {
     MODEL_GO_GLM53_FLASH: 0.4157,
     MODEL_GO_QWEN38_FLASH: 0.2850,
@@ -309,6 +309,7 @@ def detect_credentialed_providers(auth_store_paths: Optional[List[str]] = None) 
 # (see policies/default/AGENTS.md "Worker role pins"); the router never edits config.
 ROLE_MODEL_PINS: Dict[str, str] = {
     "reviewer": "anthropic/claude-opus-5-5:high",
+    "advisor": MODEL_CLAUDE_FABLE,
     "ds-pro": MODEL_DEEPSEEK_PRO,
     "zai-task": MODEL_ZAI_GLM,
     "zai-flash": MODEL_ZAI_GLM_FLASH,
@@ -551,6 +552,8 @@ def model_to_agent_role(model_id: str, task_type: TaskType, risk_level: RiskLeve
         return "compactor"
     if "flash" in model_id:
         return "qa-verifier" if task_type == TaskType.STRONG_REVIEW and risk_level == RiskLevel.LOW else "task"
+    if model_id == MODEL_CLAUDE_FABLE:
+        return "advisor"
     if model_id.startswith("anthropic/"):
         return "reviewer"
     return "task"
@@ -975,8 +978,19 @@ class ResetAwareModelSelector:
                 p_info = getattr(self.snapshot, "providers", {}).get(provider)
                 if p_info and getattr(p_info, "windows", None):
                     for w in p_info.windows:
-                        if (w.id == window_id or not win_sec) and getattr(w, "seconds_to_reset", 0) > 0:
+                        w_id_norm = getattr(w, "id", "").lower()
+                        target_norm = window_id.lower()
+                        is_match = (
+                            w_id_norm == target_norm
+                            or w_id_norm.endswith(":" + target_norm)
+                            or (target_norm in ("weekly", "7d") and any(k in w_id_norm for k in ("weekly", "7d", "168h")))
+                            or (target_norm in ("daily", "5h", "rolling-5h") and any(k in w_id_norm for k in ("daily", "5h", "24h")))
+                        )
+                        if is_match and getattr(w, "seconds_to_reset", 0) > 0:
                             win_sec = float(w.seconds_to_reset)
+                            break
+            if win_sec is None or win_sec <= 0:
+                win_sec = 18000.0  # 5h fallback if window reset is unknown
             if win_sec and win_sec > 0:
                 until_dt = effective_now + datetime.timedelta(seconds=win_sec)
                 from quota_snapshot import mark_exhausted, _format_iso_utc
@@ -1061,9 +1075,7 @@ class ResetAwareModelSelector:
                     if window.duration_seconds and window.duration_seconds > 0
                 ]
             if windows:
-                # Antigravity partner pools are tracked per account (packages/ai/src/usage/google-antigravity.ts:434-441, 180-192, 74-79):
-                # - brandy.sengco: short daily window (<24h reset, ~47% used), healthy partner pool for ag-opus
-                # - brendmark: weekly cap (~6d reset, 80.9% used), shared by Claude and GPT partner models; preserved
+                # Antigravity partner pools are tracked per account.
                 # Route ag-opus to the healthy account: prioritize unthrottled accounts with remaining headroom.
                 if name.startswith(ANTIGRAVITY_PROVIDER) or "antigravity" in name.lower():
                     unthrottled = [w for w in windows if not w.throttled]
@@ -1103,11 +1115,17 @@ class ResetAwareModelSelector:
         if cap is None or not cost:
             return float("inf")
         provider = (getattr(self.snapshot, "providers", {}) or {}).get(OPENCODE_GO_PROVIDER)
-        window = next((w for w in getattr(provider, "windows", []) if w.id == window_id), None)
-        spent = 0.0
-        if window is not None and window.total_limit is not None and window.remaining_units is not None:
-            spent = max(0.0, window.total_limit - window.remaining_units)
-        return max(0.0, (cap * GO_WINDOW_FRACTION[window_id] - spent) / cost)
+        window = next((w for w in getattr(provider, "windows", []) if w.id == window_id or getattr(w, "id", "").endswith(":" + window_id)), None)
+        if window is None:
+            return float("inf")
+        rem = getattr(window, "remaining_units", None)
+        if rem is None and getattr(window, "total_limit", None) is not None and getattr(window, "used_fraction", None) is not None:
+            rem = window.total_limit * (1.0 - window.used_fraction)
+        if rem is None:
+            return float("inf")
+        window_cap = cap * GO_WINDOW_FRACTION.get(window_id, 1.0)
+        avail = min(rem, window_cap)
+        return max(0.0, avail / cost)
 
     def evaluate_provider(self, provider: str) -> Dict[str, Any]:
         """Extract quota metrics and health for a given provider."""
@@ -1383,7 +1401,7 @@ class ResetAwareModelSelector:
         # workhorse ($60 cap, ~144 lanes/month); glm-5.3 is the rare precision reviewer ($15
         # cap, ~4 lanes/month, and one median lane already consumes most of a 5h window, so it
         # can serve at most one lane per 5h); GPT-6 Luna is the cheap bulk filler ($15 cap).
-        # space-bunny-free is free and unlimited and leads wherever it is good enough.
+        # space-bunny-free is free, uncapped and leads wherever free tier is sufficient (gated only by credential and provider availability).
         go_bunny = _Rung(
             MODEL_GO_BUNNY, go_bunny_ok,
             "OpenCode Go space-bunny-free (free, uncapped, 1M ctx, multimodal).",
@@ -1772,10 +1790,18 @@ class WindowBurnPace:
 def record_usage_sample(snapshot: Any, samples_file: Optional[Path] = None):
     """Record current window usages to jsonl for rolling burn-rate tracking."""
     if samples_file is None:
-        run_dir = Path.home() / ".veyyon" / "run"
-        if not run_dir.exists():
-            return
-        samples_file = run_dir / "usage-samples.jsonl"
+        if "VEYYON_USAGE_SAMPLES_FILE" in os.environ:
+            samples_file = Path(os.environ["VEYYON_USAGE_SAMPLES_FILE"])
+        else:
+            run_dir = Path.home() / ".veyyon" / "run"
+            if not run_dir.exists():
+                return
+            samples_file = run_dir / "usage-samples.jsonl"
+    if samples_file:
+        try:
+            samples_file.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
     try:
         now_ts = time.time()
         entry = {
@@ -1804,9 +1830,7 @@ def compute_window_burn_paces(
 ) -> List[WindowBurnPace]:
     """Compute per-window burn rates against reset times and determine pacing action.
 
-    Antigravity partner pools are tracked per account (packages/ai/src/usage/google-antigravity.ts:434-441, 180-192, 74-79):
-    - brandy.sengco: short daily window (<24h reset, ~47% used), healthy partner pool for ag-opus
-    - brendmark: weekly cap (~6d reset, 80.9% used), shared by Claude and GPT partner models; preserved
+    Antigravity partner pools are tracked per account.
     """
     burn_paces: List[WindowBurnPace] = []
     if snapshot is None or not hasattr(snapshot, "providers"):
@@ -1815,9 +1839,14 @@ def compute_window_burn_paces(
     # Load recent usage sample history if available to calculate delta burn rate
     sample_history: List[Dict[str, Any]] = []
     if samples_file is None:
-        candidate = Path.home() / ".veyyon" / "run" / "usage-samples.jsonl"
-        if candidate.exists():
-            samples_file = candidate
+        if "VEYYON_USAGE_SAMPLES_FILE" in os.environ:
+            candidate = Path(os.environ["VEYYON_USAGE_SAMPLES_FILE"])
+            if candidate.exists():
+                samples_file = candidate
+        else:
+            candidate = Path.home() / ".veyyon" / "run" / "usage-samples.jsonl"
+            if candidate.exists():
+                samples_file = candidate
     if samples_file and samples_file.exists():
         try:
             with open(samples_file, "r", encoding="utf-8") as f:
@@ -1883,21 +1912,12 @@ def compute_window_burn_paces(
                         f"Antigravity reserve floor reached ({rem_frac*100:.1f}% remaining <= "
                         f"{AG_FAMILY_MIN_REMAINING*100:.0f}% floor); held back to preserve emergency capacity."
                     )
-                elif "brendmark" in account.lower() and is_weekly_monthly:
-                    action = "throttle"
-                    reasoning = (
-                        f"Weekly partner pool cap shared by Claude and GPT models is {used_frac*100:.1f}% used "
-                        f"with {reset_h:.1f}h left (projected {projected_at_reset*100:.1f}% at reset); throttled to preserve reserve."
-                    )
-                elif "brandy" in account.lower() and not is_weekly_monthly:
-                    action = "ok"
-                    reasoning = (
-                        f"Healthy daily partner pool with {rem_frac*100:.1f}% remaining "
-                        f"(resets in {reset_h:.1f}h); ag-opus routed here."
-                    )
                 elif projected_at_reset > 1.02:
                     action = "throttle"
-                    reasoning = f"Projected to exhaust before reset ({projected_at_reset*100:.1f}% > 100%)."
+                    reasoning = (
+                        f"Projected to exhaust before reset ({projected_at_reset*100:.1f}% > 100%, "
+                        f"{used_frac*100:.1f}% used with {reset_h:.1f}h left); throttled to preserve reserve."
+                    )
                 else:
                     action = "ok"
                     reasoning = f"Spend on pace ({projected_at_reset*100:.1f}% projected at reset in {reset_h:.1f}h)."
@@ -1961,7 +1981,7 @@ def compute_window_burn_paces(
 def get_recommended_lanes(selector: ResetAwareModelSelector) -> Dict[str, str]:
     """Map each standard role to its recommended model and account annotation."""
     ag_pace = selector.pace_by_provider().get(AG_ANTHROPIC_PROVIDER)
-    ag_account = ag_pace.account if ag_pace else "brandy.sengco"
+    ag_account = ag_pace.account if ag_pace else "default"
     ag_opus_str = f"{MODEL_AG_CLAUDE_OPUS} (account: {ag_account})"
 
     anthropic_pace = selector.pace_by_provider().get("anthropic")
@@ -1993,6 +2013,7 @@ def main():
         pace_parser.add_argument("--adapter", choices=["veyyon", "file", "direct"], default="veyyon")
         pace_parser.add_argument("--balance-file", default=None)
         pace_parser.add_argument("--balance-cmd", default=None)
+        pace_parser.add_argument("--samples-file", default=None, help="Custom samples file path (or env VEYYON_USAGE_SAMPLES_FILE)")
         pace_args = pace_parser.parse_args()
 
         adapter = get_balance_adapter(
@@ -2002,8 +2023,11 @@ def main():
         )
         selector = ResetAwareModelSelector(adapter)
         snapshot = selector.snapshot
-        record_usage_sample(snapshot)
-        burn_paces = compute_window_burn_paces(snapshot)
+        samples_path = Path(pace_args.samples_file) if pace_args.samples_file else (
+            Path(os.environ["VEYYON_USAGE_SAMPLES_FILE"]) if "VEYYON_USAGE_SAMPLES_FILE" in os.environ else None
+        )
+        record_usage_sample(snapshot, samples_file=samples_path)
+        burn_paces = compute_window_burn_paces(snapshot, samples_file=samples_path)
         lanes = get_recommended_lanes(selector)
 
         if pace_args.json:

@@ -101,39 +101,9 @@ def extract_account_name(
     account_id_redacted: str = "",
     limits: Optional[List[Any]] = None,
 ) -> str:
-    """Extract human-readable account identifier from report metadata, limits, or redacted id.
-
-    Antigravity partner pools are tracked per account (packages/ai/src/usage/google-antigravity.ts:434-441, 180-192, 74-79):
-    - brandy.sengco: short daily window (<24h reset, ~47% used), healthy partner pool for ag-opus
-    - brendmark: weekly cap (~6d reset, 80.9% used), shared by Claude and GPT partner models; preserved
-    """
+    """Extract human-readable account identifier from report metadata or redacted id."""
     meta = metadata or {}
     email = str(meta.get("email") or "")
-    if "brandy" in email.lower():
-        return "brandy.sengco"
-    if "brendmark" in email.lower():
-        return "brendmark"
-
-    # Under --redact (e.g. "br*@g*.com"), identify accounts by Antigravity window structure:
-    # packages/ai/src/usage/google-antigravity.ts:74-79 inferWindowFromReset:
-    # - brendmark carries weekly partner limits (duration > 86400000 ms)
-    # - brandy.sengco carries daily partner limits (duration <= 86400000 ms)
-    if limits:
-        has_weekly = any(
-            (getattr(w, "duration_ms", 0) or getattr(w, "duration_seconds", 0) * 1000) > 86400000
-            or "weekly" in getattr(w, "id", "").lower()
-            for w in limits
-        )
-        has_antigravity = any(
-            "antigravity" in getattr(w, "id", "").lower()
-            or "claude" in getattr(w, "id", "").lower()
-            for w in limits
-        )
-        if has_weekly and has_antigravity:
-            return "brendmark"
-        if has_antigravity:
-            return "brandy.sengco"
-
     if email and "@" in email and "*" not in email:
         return email.split("@")[0]
     acct = meta.get("accountId")

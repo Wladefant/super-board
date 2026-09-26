@@ -588,7 +588,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         self.assertIsInstance(packet, HarnessDispatchPacket)
         self.assertEqual(packet.schema_version, "1.0")
         self.assertEqual(packet.recommendation["model"], MODEL_CLAUDE_FABLE)
-        self.assertEqual(packet.recommendation["agent_role"], "reviewer")
+        self.assertEqual(packet.recommendation["agent_role"], "advisor")
         self.assertEqual(packet.recommendation["provider"], "anthropic")
         self.assertIsNotNone(packet.evidence_packet)
         self.assertEqual(packet.evidence_packet["head_sha"], "1122334455667788")
@@ -597,7 +597,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         json_str = packet.to_json()
         parsed = json.loads(json_str)
         self.assertEqual(parsed["task"]["task_type"], "strong_review")
-        self.assertEqual(parsed["recommendation"]["agent_role"], "reviewer")
+        self.assertEqual(parsed["recommendation"]["agent_role"], "advisor")
         print("  [PASS] HarnessDispatchPacket emitted valid JSON with agent role and evidence.")
 
     # -------------------------------------------------------------------------
@@ -1916,7 +1916,16 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
     # -------------------------------------------------------------------------
     def test_opencode_go_5h_window_guard(self):
         print("\n--- TEST 44: OpenCode Go 5h Rolling Window Guard ---")
-        # Weekly is on pace (10% used), but 5h window is 95% used (less than 1 lane remaining)
+        # 1. With 5h headroom (0% 5h used, 10% weekly used), GLM-5.3 is selected for STRONG_REVIEW
+        usage_ok = self._usage_with_opencode_go(weekly_used=0.10, weekly_reset_hrs=148.8, five_h_used=0.0)
+        sel_ok = ResetAwareModelSelector(
+            parse_usage_json(usage_ok, current_time_ms=self.mock_now_ms),
+            credentialed_providers={"opencode-go"},
+        )
+        rec_ok = sel_ok.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.MEDIUM)
+        self.assertEqual(rec_ok.selected_model, "opencode-go/glm-5.3")
+
+        # 2. Weekly is on pace (10% used), but 5h window is 95% used (less than 1 lane remaining)
         usage = self._usage_with_opencode_go(weekly_used=0.10, weekly_reset_hrs=148.8, five_h_used=0.95)
         sel = ResetAwareModelSelector(
             parse_usage_json(usage, current_time_ms=self.mock_now_ms),
@@ -1925,8 +1934,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         rec = sel.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.MEDIUM)
         # Paid Go models (GLM-5.3) are blocked because 5h window < 1 lane remaining
         self.assertNotEqual(rec.selected_model, "opencode-go/glm-5.3")
-        print(f"  [PASS] 5h window 95% used: paid Go models blocked -> routed to {rec.selected_model}")
-
+        print(f"  [PASS] 5h window: headroom selects GLM-5.3, 95% used blocks paid Go models -> routed to {rec.selected_model}")
     # -------------------------------------------------------------------------
     # TEST 45: Operator pacing overrides (active vs expired vs unset)
     # -------------------------------------------------------------------------
@@ -2020,19 +2028,19 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         print("  [PASS] Weekly linear pacing applies consistently across all subscription providers.")
 
     # -------------------------------------------------------------------------
-    # TEST 47: Antigravity partner pools per account (brandy.sengco vs brendmark)
+    # TEST 47: Antigravity partner pools per account (partner-b vs partner-a)
     # -------------------------------------------------------------------------
     def test_antigravity_partner_pools_per_account(self):
         print("\n--- TEST 47: Antigravity Partner Pools Per Account ---")
         # Cite packages/ai/src/usage/google-antigravity.ts:434-441, 180-192, 74-79
-        # brendmark has weekly cap, 80.9% used; brandy.sengco has short daily window, ~47% used.
+        # partner-a has weekly cap, 80.9% used; partner-b has short daily window, ~47% used.
         usage = {
             "reports": [
                 {
                     "provider": "google-antigravity",
                     "metadata": {
-                        "accountId": "ai_brendmark",
-                        "email": "brendmarkrodriguez@gmail.com",
+                        "accountId": "ai_partner_a",
+                        "email": "partner-a@example.com",
                     },
                     "limits": [
                         {
@@ -2047,8 +2055,8 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
                 {
                     "provider": "google-antigravity",
                     "metadata": {
-                        "accountId": "ai_brandy",
-                        "email": "brandy.sengco@gmail.com",
+                        "accountId": "ai_partner_b",
+                        "email": "partner-b@example.com",
                     },
                     "limits": [
                         {
@@ -2068,17 +2076,17 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
 
         prov_anthropic = norm.providers["google-antigravity:anthropic"]
         accounts = {w.account for w in prov_anthropic.windows}
-        self.assertIn("brendmark", accounts)
-        self.assertIn("brandy.sengco", accounts)
+        self.assertIn("partner-a", accounts)
+        self.assertIn("partner-b", accounts)
 
         selector = ResetAwareModelSelector(norm)
         paces = selector.pace_by_provider()
         ag_pace = paces["google-antigravity:anthropic"]
-        # Must pick healthy account brandy.sengco, not throttled brendmark weekly cap!
-        self.assertEqual(ag_pace.account, "brandy.sengco")
+        # Must pick healthy account partner-b, not throttled partner-a weekly cap!
+        self.assertEqual(ag_pace.account, "partner-b")
         self.assertFalse(ag_pace.throttled)
         self.assertAlmostEqual(ag_pace.remaining_fraction, 0.529, places=2)
-        print("  [PASS] Antigravity partner pools distinguish accounts and route ag-opus to brandy.sengco.")
+        print("  [PASS] Antigravity partner pools distinguish accounts and route ag-opus to partner-b.")
 
     # -------------------------------------------------------------------------
     # TEST 48: Antigravity reserve enforcement (remaining <= 10% throttles)
@@ -2103,7 +2111,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             "reports": [
                 {
                     "provider": "google-antigravity",
-                    "metadata": {"email": "brendmarkrodriguez@gmail.com"},
+                    "metadata": {"email": "partner-a@example.com"},
                     "limits": [
                         {
                             "id": "google-antigravity:anthropic:default:weekly",
@@ -2116,7 +2124,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
                 },
                 {
                     "provider": "google-antigravity",
-                    "metadata": {"email": "brandy.sengco@gmail.com"},
+                    "metadata": {"email": "partner-b@example.com"},
                     "limits": [
                         {
                             "id": "google-antigravity:anthropic:default:daily",
@@ -2146,31 +2154,55 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         parsed = parse_usage_json(usage, current_time_ms=self.mock_now_ms)
         norm = parsed.to_normalized()
 
-        burn_paces = compute_window_burn_paces(norm)
+        # Use temporary file for hermetic burn-rate samples
+        tmp_samples = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False, mode="w")
+        tmp_samples.close()
+        try:
+            burn_paces = compute_window_burn_paces(norm, samples_file=Path(tmp_samples.name))
+        finally:
+            if os.path.exists(tmp_samples.name):
+                os.unlink(tmp_samples.name)
         by_key = {f"{p.provider}:{p.account}": p for p in burn_paces}
 
         # brendmark weekly cap is throttled
-        self.assertEqual(by_key["google-antigravity:anthropic:brendmark"].action, "throttle")
-        # brandy.sengco daily pool is ok
-        self.assertEqual(by_key["google-antigravity:anthropic:brandy.sengco"].action, "ok")
+        # partner-a weekly cap is throttled
+        self.assertEqual(by_key["google-antigravity:anthropic:partner-a"].action, "throttle")
+        # partner-b daily pool is ok
+        self.assertEqual(by_key["google-antigravity:anthropic:partner-b"].action, "ok")
         # Anthropic with 80% remaining, 48h to reset, projected 28% < 92% -> spend-more
         anth_pace = next(p for p in burn_paces if p.provider == "anthropic")
         self.assertEqual(anth_pace.action, "spend-more")
 
-        # Test CLI pace --json returns valid JSON
+        # Test CLI pace --json returns valid JSON hermetically
         tmp_file = tempfile.NamedTemporaryFile(suffix=".json", delete=False, mode="w")
+        tmp_samples_cli = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False, mode="w")
+        tmp_samples_cli.close()
         try:
             json.dump(usage, tmp_file)
             tmp_file.close()
-            cmd = [sys.executable, str(Path(SCRIPT_DIR) / "model_routing.py"), "pace", "--json", "--balance-file", tmp_file.name]
-            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            cmd = [
+                sys.executable,
+                str(Path(SCRIPT_DIR) / "model_routing.py"),
+                "pace",
+                "--json",
+                "--balance-file",
+                tmp_file.name,
+                "--samples-file",
+                tmp_samples_cli.name,
+            ]
+            env = os.environ.copy()
+            env["VEYYON_USAGE_SAMPLES_FILE"] = tmp_samples_cli.name
+            res = subprocess.run(cmd, capture_output=True, text=True, check=True, env=env)
             out_json = json.loads(res.stdout)
             self.assertIn("windows", out_json)
             self.assertIn("recommended_lanes", out_json)
             self.assertEqual(out_json["recommended_lanes"]["reviewer"], "anthropic/claude-opus-5-5:high")
-            self.assertIn("brandy.sengco", out_json["recommended_lanes"]["ag-opus"])
+            self.assertIn("partner-b", out_json["recommended_lanes"]["ag-opus"])
         finally:
-            os.unlink(tmp_file.name)
+            if os.path.exists(tmp_file.name):
+                os.unlink(tmp_file.name)
+            if os.path.exists(tmp_samples_cli.name):
+                os.unlink(tmp_samples_cli.name)
         print("  [PASS] Burn-rate pacer computes correct actions and emits valid CLI JSON.")
 
     # -------------------------------------------------------------------------
@@ -2186,6 +2218,28 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         self.assertEqual(ROLE_MODEL_PINS.get("ag-opus"), MODEL_AG_CLAUDE_OPUS)
         print("  [PASS] Gating roles strictly barred from leading with chatgpt-web.")
 
+    # -------------------------------------------------------------------------
+    # TEST 51: record_429 usage_limit_reached window reset calculation (Finding 1)
+    # -------------------------------------------------------------------------
+    def test_record_429_usage_limit_reached_window_reset(self):
+        print("\n--- TEST 51: record_429 usage_limit_reached Window Reset ---")
+        now = datetime.datetime(2026, 9, 5, 12, 0, 0, tzinfo=datetime.timezone.utc)
+        p = NormalizedProviderBalance(
+            provider="openai-codex", status="ok", is_active=True, effective_remaining_fraction=0.01,
+            cycle_seconds_to_reset=259200, cycle_hours_to_reset=72, bottleneck_window_id="openai-codex:7d",
+            windows=[
+                NormalizedWindow(id="openai-codex:5h", label="5h", duration_seconds=18000, resets_at_utc="", seconds_to_reset=7200, remaining_fraction=0.5, used_fraction=0.5, unit="units", status="ok", is_cooldown=False),
+                NormalizedWindow(id="openai-codex:7d", label="7d", duration_seconds=604800, resets_at_utc="", seconds_to_reset=259200, remaining_fraction=0.01, used_fraction=0.99, unit="units", status="ok", is_cooldown=False),
+            ]
+        )
+        snap = NormalizedBalanceSnapshot(providers={"openai-codex": p})
+        sel = ResetAwareModelSelector(snap)
+        body = '{"error":{"type":"usage_limit_reached","message":"You have exceeded your current quota."}}'
+        res = sel.record_429("openai-codex", body, window_id="weekly", now=now)
+        self.assertIsNotNone(res)
+        self.assertEqual(res.retry_after_seconds, 259200.0)
+        self.assertEqual(res.exhausted_until, "2026-09-08T12:00:00Z")
+        print("  [PASS] record_429 calculates exhaustion until actual weekly window reset (72h).")
 def main():
     print("=" * 70)
     print("RUNNING VEYYON BALANCE LOADER & MODEL ROUTING SMOKE TEST SUITE")
