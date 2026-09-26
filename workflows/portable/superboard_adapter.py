@@ -1473,11 +1473,15 @@ class SuperboardExecutionAdapter:
         routing = packet.routing
         task_type = self._resolve_task_type(routing, stage)
         risk_level = self._resolve_risk_level(routing, req)
+        # The coordinator's committed selection (same evaluate_step call) is reused
+        # directly, so the dispatch cannot drift from the routing authority mid-step.
+        committed_rec = getattr(routing, "committed_rec", None) if routing else None
         dispatch_packet = selector.dispatch(
             task_type=task_type,
             risk_level=risk_level,
             context_tokens=4000,
             head_sha=getattr(req, "head", None) or (req.get("head") if isinstance(req, dict) else None),
+            precomputed=committed_rec,
         )
 
         # The coordinator's model choice wins over a re-selection, so a divergence can never
