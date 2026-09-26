@@ -106,6 +106,12 @@ Never close an issue as a substitute for a merge. The runtime already forbids
 that path; a closing keyword is the remaining way a partial PR can still
 retire a card.
 
+### Adopt-or-Reject and sub-issue closure invariant
+
+Per repository policy (AGENTS.md §5):
+1. **Never close a parent issue while sub-issues are open.** A parent issue is an anchor; it stays open until all its sub-issues are closed with evidence. `workflows/portable/adoption_audit.py` enforces this and automatically reopens prematurely closed parents.
+2. **Every closed sub-issue must record adoption or rejection:** The closing comment or issue body must carry an explicit `adopted-at: <file:line or skill>` (proving the deliverable was shipped and wired into default use) or `rejected: <rule link>` (citing the recorded rule that ruled it out). An unannotated closure is flagged by `adoption_audit.py`.
+
 ## Running lanes
 
 Nested spawning is disabled in this harness (depth 0). A subagent that tries

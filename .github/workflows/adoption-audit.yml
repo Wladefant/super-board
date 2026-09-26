@@ -1,0 +1,85 @@
+name: Adoption Audit & Parent-Issue Protection
+
+on:
+  schedule:
+    # Run every 6 hours to audit repo adoption & sub-issue integrity
+    - cron: '0 */6 * * *'
+  issues:
+    types:
+      - closed
+      - reopened
+      - edited
+      - labeled
+      - unlabeled
+  workflow_dispatch:
+    inputs:
+      auto_reopen:
+        description: 'Auto-reopen closed parent issues with open sub-issues'
+        type: boolean
+        default: true
+      issue_number:
+        description: 'Single issue number to audit (optional, leave blank for full repo)'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: adoption-audit-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  adoption-audit:
+    name: Audit Adoption & Protect Parent Issues
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run Adoption Audit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+
+          AUTO_REOPEN="--auto-reopen"
+          if [ "${{ github.event.inputs.auto_reopen }}" = "false" ]; then
+            AUTO_REOPEN=""
+          fi
+
+          # If triggered by a specific issue event or manual input, audit that issue first
+          TARGET_ISSUE="${{ github.event.inputs.issue_number }}"
+          if [ -z "$TARGET_ISSUE" ] && [ "${{ github.event_name }}" = "issues" ]; then
+            TARGET_ISSUE="${{ github.event.issue.number }}"
+          fi
+
+          if [ -n "$TARGET_ISSUE" ]; then
+            echo "::notice::Auditing targeted issue #${TARGET_ISSUE}..."
+            python workflows/portable/adoption_audit.py \
+              --repo "${{ github.repository }}" \
+              --issue "$TARGET_ISSUE" \
+              $AUTO_REOPEN \
+              --markdown
+            ISSUE_EC=$?
+            echo "Targeted issue audit finished with exit code: $ISSUE_EC"
+          fi
+
+          echo "::notice::Running full repository adoption audit..."
+          python workflows/portable/adoption_audit.py \
+            --repo "${{ github.repository }}" \
+            $AUTO_REOPEN \
+            --markdown
+          AUDIT_EC=$?
+
+          echo "Adoption audit completed with exit code: $AUDIT_EC"
+          exit $AUDIT_EC

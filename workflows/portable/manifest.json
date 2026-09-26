@@ -294,6 +294,17 @@
         "GardenerReport (JSON, Markdown, or terminal summary)",
         "CleanupTaskSpec (bounded Spark/Flash subagent task specification)"
       ]
+    },
+    "adoption_audit.py": {
+      "role": "Enforce adopt-or-reject policy and prevent premature closure of parent issues with open sub-issues",
+      "owner": "AdoptionAuditRole",
+      "cli_command": "python adoption_audit.py [--repo <owner/repo>] [--issue <number>] [--auto-reopen] [--dry-run] [--json] [--markdown]",
+      "inputs": [
+        "GitHub Issues (kind:research, kind:governance, sub-issues API)"
+      ],
+      "outputs": [
+        "AuditResult (JSON or Markdown summary, non-zero exit on findings)"
+      ]
     }
   },
   "adapters": {
@@ -364,9 +375,11 @@
       "diagnostics.py",
       "session_crash_monitor.py",
       "quota_snapshot.py",
-      "gardener.py"
+      "gardener.py",
+      "adoption_audit.py"
     ],
     "optional_files": [
+      "test_adoption_audit.py",
       "test_gardener.py",
       "test_quota_snapshot.py",
       "usage_snapshot_cache.json",

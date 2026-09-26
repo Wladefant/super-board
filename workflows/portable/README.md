@@ -19,6 +19,7 @@ python ledger.py list
 python continuation_driver.py --help
 python worker_backend.py --list-backends
 python gardener.py --dry-run
+python adoption_audit.py --json
 ```
 
 For state progression, use the canonical native protocol with an explicitly authorized request, repository and state directory. Merge authorization does not waive current-head QA, independent review or applicable CI.
@@ -29,3 +30,4 @@ Preserve `ledger.json`, `decisions.json`, `continuation_journal.json`, `worker_r
 
 The maintained source-bound ledger regression command is `python test_ledger_gates.py`; the repository CI lists the remaining portable contract suites. The older workstation `smoke_test.py` was preserved as an existing local file, not used as current acceptance evidence. Its historical transition fixtures do not satisfy the hardened evidence gates.
 The Gardener dead code and unused export regression command is `python test_gardener.py`.
+The Adoption Audit regression command is `python test_adoption_audit.py`.

@@ -195,3 +195,6 @@ jobs:
 
       - name: telegram notifier
         run: python -B workflows/portable/test_telegram_notifier.py
+
+      - name: adoption audit
+        run: python -B workflows/portable/test_adoption_audit.py
