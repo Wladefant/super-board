@@ -77,8 +77,12 @@ MODEL_CLAUDE_FABLE = "anthropic/claude-fable-5-1"
 # quota is exhausted; operator ruling 2026-09-26 ~13:25Z: "I mean only hard, super hard work, right?
 # Don't move everything in there"). Never used for routine implementation, sync, merge, triage or small reviews.
 MODEL_CLAUDE_OPUS_55 = "anthropic/claude-opus-5-5:high"
+MODEL_ANTHROPIC_OPUS = MODEL_CLAUDE_OPUS_55
 
 MODEL_CODEX_FAST = "openai-codex/gpt-5.3-codex"
+# The operator's Codex worker/review tier is Sol high (profile `codex-worker` and
+# `codex-reviewer` pins). Astra is unsupported on ChatGPT accounts.
+MODEL_CODEX_SOL = "openai-codex/gpt-5.6-sol:high"
 MODEL_CODEX_ASTRA = "openai-codex/gpt-6-astra:medium"
 MODEL_CODEX_SPARK = "openai-codex/gpt-5.3-codex-spark:medium"
 # Manual account-availability switch (2026-09-26, operator ruling):
@@ -338,8 +342,10 @@ ROLE_MODEL_PINS: Dict[str, str] = {
     "zai-flash": MODEL_ZAI_GLM_FLASH,
     "minimax-task": MODEL_MINIMAX_M3,
     "gemini-pro": MODEL_GEMINI_PRO,
-    "codex-worker": MODEL_CODEX_ASTRA,
-    "codex-reviewer": MODEL_CODEX_ASTRA,
+    "codex-worker": MODEL_CODEX_SOL,
+    "codex-reviewer": MODEL_CODEX_SOL,
+    "thinker": MODEL_CODEX_SOL,
+    "reviewer": MODEL_ANTHROPIC_OPUS,
     "ag-opus": MODEL_AG_CLAUDE_OPUS,
     # The astra-ux role was repointed to google-antigravity/claude-opus-4-6 (ag-opus Opus 4.6 route)
     # because gpt-6-astra is unsupported on Codex with ChatGPT accounts and Codex is disabled
@@ -512,7 +518,11 @@ def model_to_agent_role(model_id: str, task_type: TaskType, risk_level: RiskLeve
             # The free Spark allowance has its own enabled roster entry (`spark`); the
             # codex-worker/codex-reviewer pair is pinned for the Astral tiers and disabled here.
             return "spark"
-        return "codex-reviewer" if task_type == TaskType.STRONG_REVIEW else "codex-worker"
+        if task_type == TaskType.STRONG_REVIEW:
+            return "codex-reviewer"
+        if task_type == TaskType.DEEP_REASONING:
+            return "thinker"
+        return "codex-worker"
     if model_id.endswith(":free"):
         return "extra-review"
     if model_id == MODEL_DEEPSEEK_PRO:

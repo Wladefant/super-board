@@ -72,9 +72,11 @@ from model_routing import (
     ResetAwareModelSelector,
     RiskLevel,
     TaskType,
+    MODEL_ANTHROPIC_OPUS,
     MODEL_CLAUDE_FABLE,
     MODEL_CLAUDE_OPUS_55,
     MODEL_CODEX_FAST,
+    MODEL_CODEX_SOL,
     MODEL_CODEX_ASTRA,
     MODEL_CODEX_SPARK,
     MODEL_GEMINI_FLASH,
@@ -722,6 +724,9 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         # 1. Verify model_to_agent_role assigns actual Codex agent roles from roster
         self.assertEqual(model_to_agent_role(MODEL_CODEX_ASTRA, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "codex-reviewer")
         self.assertEqual(model_to_agent_role(MODEL_CODEX_ASTRA, TaskType.ROUTINE_EXECUTION, RiskLevel.HIGH), "codex-worker")
+        self.assertEqual(model_to_agent_role(MODEL_CODEX_SOL, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "codex-reviewer")
+        self.assertEqual(model_to_agent_role(MODEL_CODEX_SOL, TaskType.ROUTINE_EXECUTION, RiskLevel.HIGH), "codex-worker")
+        self.assertEqual(model_to_agent_role(MODEL_CODEX_SOL, TaskType.DEEP_REASONING, RiskLevel.HIGH), "thinker")
         self.assertEqual(model_to_agent_role(MODEL_CODEX_FAST, TaskType.ROUTINE_EXECUTION, RiskLevel.LOW), "codex-worker")
 
         # 2. Verify dispatch packet with promoted Codex assigns actual Codex agent role
@@ -1313,12 +1318,18 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         # Every role this router emits for a pinned model resolves back to that role, so a
         # dispatched role never silently runs a different model. The review roles are
         # resolved as reviews, because that is the only way the router emits them.
-        review_pins = {"codex-reviewer", "web-thinker"}
+        review_pins = {"codex-reviewer", "web-thinker", "reviewer"}
+        reasoning_pins = {"thinker"}
         for role, model in ROLE_MODEL_PINS.items():
             if role == "astra-ux":
                 # Specialized UX role; router emits ag-opus for MODEL_AG_CLAUDE_OPUS
                 continue
-            task_type = TaskType.STRONG_REVIEW if role in review_pins else TaskType.ROUTINE_EXECUTION
+            if role in review_pins:
+                task_type = TaskType.STRONG_REVIEW
+            elif role in reasoning_pins:
+                task_type = TaskType.DEEP_REASONING
+            else:
+                task_type = TaskType.ROUTINE_EXECUTION
             self.assertEqual(model_to_agent_role(model, task_type, RiskLevel.HIGH), role, f"{role} pin {model}")
         print("  [PASS] All role and provider mappings correct (ag-sonnet, ag-gpt, ds-pro, zai-task, zai-flash, minimax-task).")
 
@@ -1671,7 +1682,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             self.assertNotIn(paid_opus, str(chain), f"modelRoles.{role} must not run paid Opus")
         for name, entry in agents.items():
             if name in ("reviewer", "astra-ux"):
-                continue
+                continue  # Opus 5.5 permitted for reviewer per operator ruling 2026-09-26
             for chain in chains(entry):
                 self.assertNotIn(paid_opus, str(chain), f"agents.{name} must not run paid Opus")
         for pattern, chain in (parsed.get("retry") or {}).get("fallbackChains", {}).items():
@@ -1930,6 +1941,15 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             self.assertEqual(model_to_agent_role(MODEL_CODEX_ASTRA, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "reviewer")
             self.assertEqual(model_to_agent_role(MODEL_CODEX_ASTRA, TaskType.ROUTINE_EXECUTION, RiskLevel.HIGH), "task")
             self.assertEqual(model_to_agent_role(MODEL_CODEX_FAST, TaskType.ROUTINE_EXECUTION, RiskLevel.LOW), "task")
+            self.assertEqual(model_to_agent_role(MODEL_CODEX_SOL, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "reviewer")
+            self.assertEqual(model_to_agent_role(MODEL_CODEX_SOL, TaskType.ROUTINE_EXECUTION, RiskLevel.HIGH), "task")
+            self.assertEqual(model_to_agent_role(MODEL_CODEX_SOL, TaskType.DEEP_REASONING, RiskLevel.HIGH), "task")
+            self.assertIsNone(resolve_role_model("codex-worker"))
+            self.assertIsNone(resolve_role_model("codex-reviewer"))
+            self.assertIsNone(resolve_role_model("thinker"))
+            self.assertFalse(is_agent_role_available("codex-worker"))
+            self.assertFalse(is_agent_role_available("codex-reviewer"))
+            self.assertFalse(is_agent_role_available("thinker"))
             # Default unconfigured selector uses live codex_available() -> False
             default_sel = ResetAwareModelSelector(snapshot)
             self.assertFalse(default_sel.codex_account_available())
@@ -1977,6 +1997,12 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             self.assertEqual(model_to_agent_role(MODEL_CODEX_ASTRA, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "codex-reviewer")
             self.assertEqual(model_to_agent_role(MODEL_CODEX_ASTRA, TaskType.ROUTINE_EXECUTION, RiskLevel.HIGH), "codex-worker")
             # Agent roles available when Codex enabled
+            self.assertEqual(model_to_agent_role(MODEL_CODEX_SOL, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "codex-reviewer")
+            self.assertEqual(model_to_agent_role(MODEL_CODEX_SOL, TaskType.ROUTINE_EXECUTION, RiskLevel.HIGH), "codex-worker")
+            self.assertEqual(model_to_agent_role(MODEL_CODEX_SOL, TaskType.DEEP_REASONING, RiskLevel.HIGH), "thinker")
+            self.assertEqual(resolve_role_model("codex-worker"), MODEL_CODEX_SOL)
+            self.assertEqual(resolve_role_model("codex-reviewer"), MODEL_CODEX_SOL)
+            self.assertEqual(resolve_role_model("thinker"), MODEL_CODEX_SOL)
             self.assertTrue(is_agent_role_available("codex-worker"))
             self.assertTrue(is_agent_role_available("codex-reviewer"))
             self.assertTrue(is_agent_role_available("thinker"))
@@ -2038,6 +2064,19 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             with mock.patch.dict(os.environ, {"VEYYON_CODEX_ENABLED": "no"}):
                 self.assertFalse(codex_available(), "VEYYON_CODEX_ENABLED=no must force disabled even if CODEX_ENABLED=True")
 
+        # Positive control on environment override switch: VEYYON_CODEX_ENABLED=1 enables Codex while CODEX_ENABLED=False
+        with mock.patch("model_routing.CODEX_ENABLED", False):
+            with mock.patch.dict(os.environ, {"VEYYON_CODEX_ENABLED": "1"}):
+                self.assertTrue(codex_available(), "VEYYON_CODEX_ENABLED=1 must enable codex_available() when CODEX_ENABLED=False")
+                self.assertEqual(resolve_role_model("codex-worker"), MODEL_CODEX_SOL)
+                self.assertEqual(resolve_role_model("codex-reviewer"), MODEL_CODEX_SOL)
+                self.assertEqual(resolve_role_model("thinker"), MODEL_CODEX_SOL)
+                self.assertTrue(is_agent_role_available("codex-worker"))
+                self.assertTrue(is_agent_role_available("codex-reviewer"))
+                self.assertTrue(is_agent_role_available("thinker"))
+                self.assertEqual(model_to_agent_role(MODEL_CODEX_SOL, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "codex-reviewer")
+                self.assertEqual(model_to_agent_role(MODEL_CODEX_SOL, TaskType.ROUTINE_EXECUTION, RiskLevel.HIGH), "codex-worker")
+                self.assertEqual(model_to_agent_role(MODEL_CODEX_SOL, TaskType.DEEP_REASONING, RiskLevel.HIGH), "thinker")
         # Negative control: no automatic re-enable by date (manual switch only)
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertFalse(codex_available(), "codex_available() must be False regardless of time when CODEX_ENABLED=False")
