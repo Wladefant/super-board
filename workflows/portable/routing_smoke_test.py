@@ -1569,67 +1569,45 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         print(f"  [PASS] Every cheap tier out: {rec_last.selected_model} on slack; reserve kept -> {rec_reserve.selected_model}.")
 
     # -------------------------------------------------------------------------
-    # TEST 36: ChatGPT Web is gated on bridge health, never on a guessed allowance
+    # TEST 36: ChatGPT Web Bridge Ban & Default-Off Invariant (2026-09-26)
     # -------------------------------------------------------------------------
     def test_chatgpt_web_bridge_precondition_and_ladder_placement(self):
-        print("\n--- TEST 36: ChatGPT Web Bridge Gating & Ladder Placement ---")
-        # The probe itself: a live loopback listener reads as up, a dead port as down. A dead
-        # bridge fails through the same OSError path, so a missing daemon can never hang a
-        # selector or be mistaken for available capacity.
+        print("\n--- TEST 36: ChatGPT Web Bridge Ban & Default-Off Invariant ---")
+        # 1. Off by default: an open port alone does NOT make the bridge available.
+        # It requires explicit operator action (VEYYON_CHATGPT_WEB_ENABLED=1).
         listener = socket.socket()
         self.addCleanup(listener.close)
         listener.bind(("127.0.0.1", 0))
-        listener.listen(1)
-        self.assertTrue(chatgpt_web_bridge_available(port=listener.getsockname()[1], timeout=1.0))
+        listener.listen(10)
+        self.assertFalse(chatgpt_web_bridge_available(port=listener.getsockname()[1], timeout=1.0))
         self.assertFalse(chatgpt_web_bridge_available(port=1, timeout=0.25))
 
+        # Explicit probe override or env enables the port check:
+        self.assertTrue(chatgpt_web_bridge_available(port=listener.getsockname()[1], timeout=1.0, force_probe=True))
+        with mock.patch.dict(os.environ, {"VEYYON_CHATGPT_WEB_ENABLED": "1"}):
+            self.assertTrue(chatgpt_web_bridge_available(port=listener.getsockname()[1], timeout=1.0))
+
+        # 2. Stripped from all ladders: even if chatgpt_web_bridge=True or False,
+        # no ladder selects or falls back to chatgpt-web.
         usage = self._usage_with_ag_families(anthropic_used=0.0)
         up = ResetAwareModelSelector(parse_usage_json(usage, current_time_ms=self.mock_now_ms),
                                      chatgpt_web_bridge=True)
         down = ResetAwareModelSelector(parse_usage_json(usage, current_time_ms=self.mock_now_ms),
                                        chatgpt_web_bridge=False)
 
-        # Bridge up, free Antigravity Opus window fully available: the bridge still gates the
-        # critical diff, because it is cross-family to both writer families.
-        critical = up.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
-        self.assertEqual(critical.selected_model, MODEL_CHATGPT_WEB)
-        self.assertTrue(critical.quota_metrics["chatgpt_web_bridge_up"])
-        self.assertEqual(critical.provider_statuses[CHATGPT_WEB_PROVIDER], "ok")
-        self.assertEqual(model_to_agent_role(critical.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH),
-                         "web-thinker")
-        self.assertNotEqual(model_to_provider(critical.selected_model), model_to_provider(critical.fallback_model))
+        for selector in (up, down):
+            for task_type in TaskType:
+                for risk in RiskLevel:
+                    rec = selector.select_model(task_type=task_type, risk_level=risk)
+                    self.assertNotIn(MODEL_CHATGPT_WEB, (rec.selected_model, rec.fallback_model),
+                                     f"{task_type}/{risk} must not select or fall back to chatgpt-web")
 
-        # Hard reasoning and the high-risk implementation first pass also lead with it.
-        self.assertEqual(up.select_model(TaskType.DEEP_REASONING, RiskLevel.MEDIUM).selected_model,
-                         MODEL_CHATGPT_WEB)
-        self.assertEqual(up.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.HIGH,
-                                         domain_tags=["money"]).selected_model, MODEL_CHATGPT_WEB)
+        # Critical diffs fall through cleanly to ag-opus, codex, or deepseek
+        critical = down.select_model(TaskType.STRONG_REVIEW, RiskLevel.HIGH)
+        self.assertIn(critical.selected_model, (MODEL_AG_CLAUDE_OPUS, MODEL_CLAUDE_OPUS_55, MODEL_CODEX_ASTRA))
 
-        # Standard-diff overflow: with every OpenCode Go rung out, a medium-risk review
-        # overflows to the bridge rather than to a Gemini model.
-        self.assertEqual(up.select_model(TaskType.STRONG_REVIEW, RiskLevel.MEDIUM).selected_model,
-                         MODEL_CHATGPT_WEB)
-
-        # Bridge down: the same ladders fall through to the next tier, and no chatgpt-web rung
-        # is ever selected or offered as a fallback anywhere.
-        self.assertEqual(down.select_model(TaskType.STRONG_REVIEW, RiskLevel.HIGH).selected_model,
-                         MODEL_AG_CLAUDE_OPUS)
-        for task_type in TaskType:
-            for risk in RiskLevel:
-                rec = down.select_model(task_type=task_type, risk_level=risk)
-                self.assertNotIn(MODEL_CHATGPT_WEB, (rec.selected_model, rec.fallback_model),
-                                 f"{task_type}/{risk} must fall through while the bridge is down")
-                self.assertFalse(rec.quota_metrics["chatgpt_web_bridge_up"])
-                self.assertEqual(rec.provider_statuses[CHATGPT_WEB_PROVIDER], "down")
-
-        # Its catalog window is respected: above it the rung is dropped, never dispatched blind.
-        self.assertEqual(VERIFIED_CONTEXT_WINDOWS[MODEL_CHATGPT_WEB], 111193)
-        wide = up.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH,
-                               context_tokens=VERIFIED_CONTEXT_WINDOWS[MODEL_CHATGPT_WEB] + 1)
-        self.assertNotEqual(wide.selected_model, MODEL_CHATGPT_WEB)
-        self.assertNotEqual(wide.fallback_model, MODEL_CHATGPT_WEB)
-        print("  [PASS] Bridge gates critical review, hard reasoning/implementation and standard "
-              "overflow; a dead bridge falls through on every ladder.")
+        print("  [PASS] Bridge is off by default, requires explicit operator action, and is "
+              "stripped from all ladders; critical reviews and workers fall through cleanly.")
 
     # -------------------------------------------------------------------------
     # TEST 37: Gemini never reviews — not as a pick, not as a fallback, at any risk or context
