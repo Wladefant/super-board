@@ -947,3 +947,54 @@ python recurrence_guard.py --state-dir <dir> resolve --signature <sig> \
   --head-sha <40-char-sha> --actor <lane> \
   --evidence "command, exit code and what was observed"
 ```
+
+---
+
+## 10. `outer_loop_intake.py` — outer-loop intake and event-driven queue consumption
+
+`outer_loop_intake.py` implements the outer-loop intake pattern from the @poteto
+high-trust agent architecture (Issue #227 Technique 6 / Task 5; delivered in #246).
+
+### What it does
+
+Turns incoming GitHub issues (`opened`, `edited`, `labeled`, `reopened`) and
+operator comments (`issue_comment.created`, `issue_comment.edited`) into fully
+triaged Superboard Project 5 cards:
+
+1. **Canonical Taxonomy Enforcement:**
+   - Exactly one `kind:` label (`kind:bug`, `kind:feature`, `kind:task`, `kind:research`, `kind:docs`, `kind:governance`, `kind:incident`), upgrading legacy labels or inferring from text.
+   - At least one `area:` and `risk:` label.
+2. **Milestone Assignment:**
+   - Preserves existing open capability milestones, or infers from domain keywords (e.g. `GitHub System Integration`, `Phase 2 - Tooling + quota`).
+3. **Superboard Project 5 Enrollment:**
+   - Enrolls new issues into Project 5 (`https://github.com/users/Wladefant/projects/5`).
+4. **Lifecycle State Derivation:**
+   - Parses operator directives (`Wladefant` comments: `/ready`, `approved`, `/blocked`, `/done`, `/building`, `/qa`, `/review`).
+   - Maps closed issues to `Done`.
+   - Checks blockers (`state:blocked`, `state:needs-decision`) -> `Blocked`.
+   - Maps ready issues with scope and acceptance criteria -> `Ready`.
+   - Updates Project 5 status via GraphQL mutation.
+5. **Idempotence & Dry-Run:**
+   - Subsequent sweeps or unchanged cards perform guaranteed 0 writes (`is_idempotent_noop: true`).
+   - `--dry-run` calculates the full triage plan without writing to GitHub.
+
+### Non-polling queue consumption by Main
+
+Main stops running periodic issue-discovery polling sweeps:
+
+1. **Zero-Discovery Invariant:** Issues in the Project 5 `Ready` column are already verified: valid taxonomy, open milestone, scope, acceptance criteria, and zero blockers. Main never wastes tokens re-classifying them.
+2. **Demand-Driven Consumption:** Main pulls from `Ready` only when an active background lane completes and host RAM allows (<85% RAM).
+3. **Event-Driven Signals:** Operator approvals and new intake trigger GitHub Actions workflow runs (`.github/workflows/outer-loop-intake.yml`). Delivery signals wake Main only when actionable work exists.
+
+### CLI reference
+
+```bash
+# Dry-run preview of issue triage
+python outer_loop_intake.py --repo Wladefant/super-board --issue 246 --dry-run
+
+# Live execution from GitHub Actions event payload
+python outer_loop_intake.py --event-path "$GITHUB_EVENT_PATH"
+
+# Run targeted regression test suite
+python test_outer_loop_intake.py
+```
