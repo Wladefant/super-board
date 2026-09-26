@@ -75,13 +75,13 @@ class TestStagingOuterLoopAllowlist(unittest.TestCase):
 
 
 class TestStagingOuterLoopDedupe(unittest.TestCase):
-    """Deduplication: same key twice creates exactly one issue, then comments on second run."""
+    """Deduplication and throttling: deploy failures alert once and never re-alert/comment, container down throttles hourly."""
 
     @patch("staging_outer_loop.send_telegram_alert")
     @patch("staging_outer_loop.add_github_comment")
     @patch("staging_outer_loop.create_github_issue")
     @patch("staging_outer_loop.find_open_issue_by_key")
-    def test_same_key_twice_creates_one_issue_then_comments(
+    def test_deploy_failure_alerts_once_and_never_recreates_or_comments(
         self,
         mock_find_issue,
         mock_create_issue,
@@ -127,7 +127,7 @@ class TestStagingOuterLoopDedupe(unittest.TestCase):
             )
             mock_add_comment.assert_not_called()
 
-            # Verify state was persisted
+            # Verify state was persisted with seen deployment ID
             state_data = json.loads(state_file.read_text(encoding="utf-8"))
             self.assertIn("dep-fixture-001", state_data["last_seen_deployment_ids"])
 
@@ -136,13 +136,12 @@ class TestStagingOuterLoopDedupe(unittest.TestCase):
             mock_send_tg.reset_mock()
             mock_add_comment.reset_mock()
 
-            # --- RUN 2: Issue now exists ---
+            # --- RUN 2: Issue still open ---
             mock_find_issue.return_value = {
                 "number": 9001,
                 "url": "https://github.com/Bavariance/polysimulator/issues/9001",
                 "body": "outer-loop-key: deploy:dep-fixture-001\n\nIncident details...",
             }
-            mock_add_comment.return_value = True
 
             rc2 = run_outer_loop(
                 state_path=state_file,
@@ -152,14 +151,151 @@ class TestStagingOuterLoopDedupe(unittest.TestCase):
             self.assertEqual(rc2, 0)
             # Must NOT create a second issue
             mock_create_issue.assert_not_called()
-            # Must NOT send Telegram on comments
+            # Must NOT send Telegram
             mock_send_tg.assert_not_called()
-            # Must add comment to existing issue
+            # Must NOT comment on deploy failures (deployments are static)
+            mock_add_comment.assert_not_called()
+
+            # Reset mocks for RUN 3
+            mock_create_issue.reset_mock()
+            mock_send_tg.reset_mock()
+            mock_add_comment.reset_mock()
+
+            # --- RUN 3: Issue has been closed (find_open_issue_by_key returns None) ---
+            mock_find_issue.return_value = None
+
+            rc3 = run_outer_loop(
+                state_path=state_file,
+                inject_fixture=fixture_json,
+                now_utc=now + timedelta(minutes=10),
+            )
+            self.assertEqual(rc3, 0)
+            # Must NOT recreate issue or alert because dep-fixture-001 is already in last_seen_deployment_ids
+            mock_create_issue.assert_not_called()
+            mock_send_tg.assert_not_called()
+            mock_add_comment.assert_not_called()
+
+    @patch("staging_outer_loop.send_telegram_alert")
+    @patch("staging_outer_loop.add_github_comment")
+    @patch("staging_outer_loop.create_github_issue")
+    @patch("staging_outer_loop.find_open_issue_by_key")
+    def test_first_run_seeds_deployment_ids_without_alerting(
+        self,
+        mock_find_issue,
+        mock_create_issue,
+        mock_add_comment,
+        mock_send_tg,
+    ):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "state.json"
+            now = datetime(2026, 9, 26, 22, 0, 0, tzinfo=timezone.utc)
+            fixture_dep = {
+                "deployments": [
+                    {
+                        "deploymentId": "dep-historical-001",
+                        "status": "error",
+                        "title": "Historical deploy error",
+                        "description": "Commit: 1111",
+                        "errorMessage": "Old build failure",
+                        "createdAt": "2026-09-26T21:00:00.000Z",
+                    },
+                    {
+                        "deploymentId": "dep-historical-002",
+                        "status": "done",
+                        "title": "Historical deploy success",
+                        "description": "Commit: 2222",
+                        "createdAt": "2026-09-26T21:30:00.000Z",
+                    },
+                ],
+                "containers": [],
+            }
+            mock_find_issue.return_value = None
+
+            # Run 1: with seed_first_run=True, must seed without alerting
+            rc1 = run_outer_loop(
+                state_path=state_file,
+                inject_fixture=json.dumps(fixture_dep),
+                now_utc=now,
+                seed_first_run=True,
+            )
+            self.assertEqual(rc1, 0)
+            mock_create_issue.assert_not_called()
+            mock_send_tg.assert_not_called()
+
+            # Verify state was seeded
+            state_data = json.loads(state_file.read_text(encoding="utf-8"))
+            self.assertTrue(state_data.get("initialized"))
+            self.assertIn("dep-historical-001", state_data["last_seen_deployment_ids"])
+            self.assertIn("dep-historical-002", state_data["last_seen_deployment_ids"])
+
+            # Run 2: a NEW deployment failure arrives
+            fixture_dep["deployments"].append({
+                "deploymentId": "dep-new-003",
+                "status": "error",
+                "title": "New deploy error",
+                "description": "Commit: 3333",
+                "errorMessage": "Fresh build failure",
+                "createdAt": "2026-09-26T22:05:00.000Z",
+            })
+            mock_create_issue.return_value = "https://github.com/Bavariance/polysimulator/issues/9002"
+            mock_send_tg.return_value = True
+
+            rc2 = run_outer_loop(
+                state_path=state_file,
+                inject_fixture=json.dumps(fixture_dep),
+                now_utc=now + timedelta(minutes=5),
+                seed_first_run=True,
+            )
+            self.assertEqual(rc2, 0)
+            mock_create_issue.assert_called_once()
+            mock_send_tg.assert_called_once()
+            state_data2 = json.loads(state_file.read_text(encoding="utf-8"))
+            self.assertIn("dep-new-003", state_data2["last_seen_deployment_ids"])
+
+    @patch("staging_outer_loop.add_github_comment")
+    @patch("staging_outer_loop.create_github_issue")
+    @patch("staging_outer_loop.find_open_issue_by_key")
+    def test_container_down_comments_at_most_once_per_hour(
+        self,
+        mock_find_issue,
+        mock_create_issue,
+        mock_add_comment,
+    ):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_file = Path(tmpdir) / "state.json"
+            now = datetime(2026, 9, 26, 22, 0, 0, tzinfo=timezone.utc)
+            fixture_down = json.dumps({
+                "deployments": [],
+                "containers": [
+                    {
+                        "name": "polysimulator-staging-iad-v09j4g-backend-1",
+                        "state": "exited",
+                        "status": "Exited (1) 5 minutes ago",
+                    }
+                ],
+            })
+            mock_find_issue.return_value = {
+                "number": 7777,
+                "url": "https://github.com/Bavariance/polysimulator/issues/7777",
+                "body": "outer-loop-key: container:polysimulator-staging-iad-v09j4g-backend-1\n\nExisting container down...",
+            }
+            mock_add_comment.return_value = True
+
+            # Run 1 at 22:05 -> should comment
+            t1 = now + timedelta(minutes=5)
+            run_outer_loop(state_path=state_file, inject_fixture=fixture_down, now_utc=t1)
             mock_add_comment.assert_called_once()
-            call_args = mock_add_comment.call_args[0]
-            self.assertEqual(call_args[0], "Bavariance/polysimulator")
-            self.assertEqual(call_args[1], 9001)
-            self.assertIn("deploy:dep-fixture-001", call_args[2])
+
+            # Run 2 at 22:20 (15 min later) -> should skip comment (within 1 hour)
+            mock_add_comment.reset_mock()
+            t2 = now + timedelta(minutes=20)
+            run_outer_loop(state_path=state_file, inject_fixture=fixture_down, now_utc=t2)
+            mock_add_comment.assert_not_called()
+
+            # Run 3 at 23:10 (65 min later) -> should comment again
+            t3 = now + timedelta(minutes=70)
+            run_outer_loop(state_path=state_file, inject_fixture=fixture_down, now_utc=t3)
+            mock_add_comment.assert_called_once()
 
 
 class TestStagingOuterLoopSpikeThresholds(unittest.TestCase):
@@ -450,6 +586,21 @@ class TestStagingOuterLoopSpikeRateLimiting(unittest.TestCase):
             t3 = now + timedelta(minutes=30)
             run_outer_loop(state_path=state_file, inject_fixture=make_fixture(t3), now_utc=t3)
             mock_add_comment.assert_called_once()
+
+class TestStagingOuterLoopErrorLineClassification(unittest.TestCase):
+    """Case-sensitivity and structured level checks in is_error_log_line."""
+
+    def test_is_error_log_line_ignores_lowercase_and_stats(self):
+        from staging_outer_loop import is_error_log_line
+        # Lowercase error in info or stats should NOT trigger
+        self.assertFalse(is_error_log_line('{"timestamp": "2026-09-26T22:00:00Z", "level": "INFO", "message": "error_rate: 0.0"}'))
+        self.assertFalse(is_error_log_line("2026-09-26 INFO app: handling error callback with 0 failures"))
+        self.assertFalse(is_error_log_line('{"logger": "api.stats", "request_count": 100, "error_count": 0}'))
+        # Uppercase ERROR should trigger
+        self.assertTrue(is_error_log_line("2026-09-26 ERROR [app.database] connection refused"))
+        self.assertTrue(is_error_log_line('{"level": "ERROR", "message": "Failed to connect to database"}'))
+        self.assertTrue(is_error_log_line('{"logger": "app", "level": "error", "message": "Failed"}'))
+
 
 if __name__ == "__main__":
     unittest.main()

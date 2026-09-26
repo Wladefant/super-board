@@ -245,7 +245,8 @@ def is_error_log_line(line: str) -> bool:
                 return True
         except Exception:
             pass
-    if re.search(r"\bERROR\b", line, re.IGNORECASE):
+    # Exact uppercase token ERROR (not case-insensitive, so 'error_rate' or lowercase 'error' in info lines does not match)
+    if re.search(r"\bERROR\b", line):
         if not re.search(r"error_count[\"':\s]+0\b", line, re.IGNORECASE):
             return True
     return False
@@ -274,8 +275,12 @@ def check_deploy_failures(
     deployments: List[Dict[str, Any]],
     client_or_fixture: Any,
     tail_lines: int = 60,
+    seen_deployment_ids: Optional[Set[str]] = None,
 ) -> List[Incident]:
-    """Detect deployments with status == 'error', sorted by parsed createdAt descending."""
+    """
+    Detect deployments with status == 'error', sorted by parsed createdAt descending.
+    Ignores deployments whose IDs have already been seen/recorded in seen_deployment_ids.
+    """
     def sort_key(d: Dict[str, Any]) -> float:
         dt = parse_datetime(d.get("createdAt"))
         return dt.timestamp() if dt else 0.0
@@ -286,6 +291,9 @@ def check_deploy_failures(
     for dep in sorted_deps:
         if dep.get("status") == "error":
             dep_id = dep.get("deploymentId") or "unknown"
+            if seen_deployment_ids is not None and dep_id in seen_deployment_ids:
+                continue
+
             key = f"deploy:{dep_id}"
             title_text = redact_log_content(dep.get("title") or "Deployment Error")
             desc = dep.get("description") or ""
@@ -614,7 +622,7 @@ def load_state(state_path: Path) -> Dict[str, Any]:
             return json.loads(state_path.read_text(encoding="utf-8"))
         except Exception:
             pass
-    return {"last_seen_deployment_ids": [], "commented_keys": {}}
+    return {"last_seen_deployment_ids": [], "commented_keys": {}, "initialized": False}
 
 
 def save_state(state_path: Path, state: Dict[str, Any]) -> None:
@@ -641,6 +649,7 @@ def run_outer_loop(
     inject_fixture: Optional[str] = None,
     base_url: str = DEFAULT_BASE_URL,
     now_utc: Optional[datetime] = None,
+    seed_first_run: Optional[bool] = None,
 ) -> int:
     """Execute one outer-loop polling iteration."""
     # Strict allowlist check: fails closed with exit code 2
@@ -648,6 +657,10 @@ def run_outer_loop(
 
     if now_utc is None:
         now_utc = datetime.now(timezone.utc)
+
+    # By default, seed on first run for live polling; do not seed for synthetic test fixtures unless explicitly requested
+    if seed_first_run is None:
+        seed_first_run = (inject_fixture is None)
 
     # Initialize client (either fixture or live Dokploy)
     if inject_fixture:
@@ -670,16 +683,32 @@ def run_outer_loop(
         )
 
     # Load state
+    state_existed = state_path.exists()
     state = load_state(state_path)
     last_seen_deps = set(state.get("last_seen_deployment_ids", []))
     commented_keys = state.get("commented_keys", {})
+    initialized = state.get("initialized", state_existed)
 
     # Collect signals
     deployments = client.get_deployments()
     containers = client.get_containers(app_name)
 
+    all_current_dep_ids = {d.get("deploymentId") for d in deployments if d.get("deploymentId")}
+
+    # On first run (uninitialized state) when seed_first_run is active:
+    # Seed existing deployment IDs into state without alerting for historical/pre-existing errors
+    if not initialized and seed_first_run:
+        print(f"First run detected: seeding {len(all_current_dep_ids)} deployment IDs without alerting.")
+        last_seen_deps = all_current_dep_ids
+        state["last_seen_deployment_ids"] = list(last_seen_deps)
+        state["initialized"] = True
+        state["commented_keys"] = commented_keys
+        state["last_run_utc"] = now_utc.isoformat()
+        if not dry_run:
+            save_state(state_path, state)
+
     incidents: List[Incident] = []
-    incidents.extend(check_deploy_failures(deployments, client))
+    incidents.extend(check_deploy_failures(deployments, client, seen_deployment_ids=last_seen_deps))
     incidents.extend(check_runtime_error_spikes(containers, client, now_utc=now_utc))
     incidents.extend(check_container_down(containers, now_utc=now_utc))
 
@@ -697,15 +726,20 @@ def run_outer_loop(
             issue_num = existing.get("number")
             issue_url = existing.get("url") or f"https://github.com/{repo}/issues/{issue_num}"
 
-            # If it's a spike, at most one comment per hour
-            if inc.signal == "error_spike":
-                last_commented_iso = commented_keys.get(inc.key)
-                if last_commented_iso:
-                    last_dt = parse_datetime(last_commented_iso)
-                    if last_dt and (now_utc - last_dt) < timedelta(hours=1):
-                        print(f"Dedupe: Skipping comment for {inc.key} on issue #{issue_num} (commented within 1 hour).")
-                        skipped_count += 1
-                        continue
+            # Deploy failures are static; never comment on existing issues
+            if inc.signal == "deploy_failed":
+                print(f"Dedupe: Skipping comment for deploy failure {inc.key} on issue #{issue_num} (deployments are static).")
+                skipped_count += 1
+                continue
+
+            # For recurring signals (container_down, error_spike), throttle to at most one comment per hour
+            last_commented_iso = commented_keys.get(inc.key)
+            if last_commented_iso:
+                last_dt = parse_datetime(last_commented_iso)
+                if last_dt and (now_utc - last_dt) < timedelta(hours=1):
+                    print(f"Dedupe: Skipping comment for {inc.key} on issue #{issue_num} (commented within 1 hour).")
+                    skipped_count += 1
+                    continue
 
             comment_body = (
                 f"### Incident Update: {inc.title}\n\n"
@@ -741,6 +775,7 @@ def run_outer_loop(
     if not dry_run:
         all_dep_ids = [d.get("deploymentId") for d in deployments if d.get("deploymentId")]
         state["last_seen_deployment_ids"] = list(set(last_seen_deps).union(all_dep_ids))
+        state["initialized"] = True
         state["commented_keys"] = commented_keys
         state["last_run_utc"] = now_utc.isoformat()
         save_state(state_path, state)
@@ -759,6 +794,8 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="Print plan without mutating GitHub or sending Telegram")
     parser.add_argument("--inject-fixture", type=str, default=None, help="JSON string or file path containing synthetic fixture data")
     parser.add_argument("--dokploy-base-url", default=DEFAULT_BASE_URL, help="Dokploy API base URL")
+    parser.add_argument("--seed-first-run", dest="seed_first_run", action="store_true", default=None, help="Force seeding of existing deployment IDs on first run without alerting")
+    parser.add_argument("--no-seed-first-run", dest="seed_first_run", action="store_false", help="Disable seeding on first run")
 
     args = parser.parse_args()
     rc = run_outer_loop(
@@ -770,6 +807,7 @@ def main() -> None:
         dry_run=args.dry_run,
         inject_fixture=args.inject_fixture,
         base_url=args.dokploy_base_url,
+        seed_first_run=args.seed_first_run,
     )
     sys.exit(rc)
 
