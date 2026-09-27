@@ -78,7 +78,6 @@ const { getRequiredConfiguration } = req("next/dist/lib/typescript/writeConfigur
 """
 
 
-
 def git(args: list[str], cwd: Path) -> str | None:
     r = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=120)
     return r.stdout.strip() if r.returncode == 0 else None
@@ -110,7 +109,6 @@ def commit_distance(clone: Path, a: str | None, b: str | None) -> int | None:
         return None
     left, right = out.split()
     return int(left) + int(right)
-
 
 
 def pack_worktrees(webpack: Path) -> set[str]:
@@ -215,7 +213,6 @@ def typecheck(worktree: Path) -> dict:
     }
     (cache_dir(worktree) / WARM_MARKER).write_text(json.dumps(marker, indent=2) + "\n", encoding="utf-8")
     return result
-
 
 
 def emit(args: argparse.Namespace, result: dict, lines: list[str], code: int) -> int:
