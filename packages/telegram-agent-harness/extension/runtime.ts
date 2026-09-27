@@ -526,8 +526,8 @@ export class TelegramRuntime {
           const sent = await this.poller.sendTelegramMessage(chatId, html);
           if (!sent?.ok) throw new Error("Telegram delivery failed");
         },
-        photo: (file, caption) => this.poller?.sendTelegramPhoto(chatId, file, caption) ?? Promise.resolve(),
-        mediaGroup: (files, caption) => this.poller?.sendMediaGroup(chatId, files, caption) ?? Promise.resolve(),
+        photo: (file, caption) => this.poller?.sendTelegramPhoto(chatId, file, caption, undefined, this.cwd ? resolveGithubRepo(this.cwd) : undefined) ?? Promise.resolve(),
+        mediaGroup: (files, caption) => this.poller?.sendMediaGroup(chatId, files, caption, this.cwd ? resolveGithubRepo(this.cwd) : undefined) ?? Promise.resolve(),
         latestPng: async id => {
           if (id !== currentSessionId()) return null;
           const sessionFile = ctx.sessionManager.getSessionFile();
