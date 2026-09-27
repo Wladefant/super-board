@@ -1766,11 +1766,18 @@ def install_task_scheduler_jobs(
     daily_cmd = Path(log_dir) / "gardener_daily.cmd"
     hourly_cmd = Path(log_dir) / "gardener_hourly.cmd"
 
+    # Scan the current staging tip, never whatever the checkout last held: a scan root nobody
+    # refreshed filed proposals against a day-old tree (Bavariance/polysimulator#5645/#5646).
+    # A refresh that fails ends the run, so a stale tree never produces issues.
+    refresh = (
+        f'git -C "{rp_path}" fetch --quiet origin staging || exit /b 1\n'
+        f'git -C "{rp_path}" checkout --quiet --detach origin/staging || exit /b 1\n'
+    )
     with open(daily_cmd, "w", encoding="utf-8") as f:
-        f.write(f'@echo off\n"{py_path}" "{sc_path}" --live --repo-root "{rp_path}" --issue-repo "{issue_repo}" --log-dir "{lg_path}"\n')
+        f.write(f'@echo off\n{refresh}"{py_path}" "{sc_path}" --live --repo-root "{rp_path}" --issue-repo "{issue_repo}" --log-dir "{lg_path}"\n')
 
     with open(hourly_cmd, "w", encoding="utf-8") as f:
-        f.write(f'@echo off\n"{py_path}" "{sc_path}" --live --scan-bugs-only --repo-root "{rp_path}" --issue-repo "{issue_repo}" --log-dir "{lg_path}"\n')
+        f.write(f'@echo off\n{refresh}"{py_path}" "{sc_path}" --live --scan-bugs-only --repo-root "{rp_path}" --issue-repo "{issue_repo}" --log-dir "{lg_path}"\n')
 
     # 1. Daily Job (Full scan: dead code + workarounds + bugs)
     daily_tn = "SuperboardGardenerDaily"

@@ -198,6 +198,9 @@ jobs:
       - name: github pr gate
         run: python -B workflows/portable/test_github_pr_gate.py
 
+      - name: lane-brief merge guard
+        run: python -B workflows/portable/test_merge_guard.py
+
       - name: verification cli and gate
         run: python -B workflows/portable/test_verify.py
 

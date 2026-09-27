@@ -7,7 +7,7 @@ import tempfile
 import json
 import unittest
 from pathlib import Path
-from install_github_native import POLICY, RUNTIME_FILES, policy_state_path, synchronize
+from install_github_native import POLICY, PROFILE_EXTENSIONS, RUNTIME_FILES, policy_state_path, synchronize
 
 
 class Installation(unittest.TestCase):
@@ -16,7 +16,9 @@ class Installation(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name)
         self.source, self.runtime, self.profile = root / "source", root / "runtime", root / "profile/AGENTS.md"
-        for path in [POLICY] + [Path("workflows/portable") / name for name in RUNTIME_FILES]:
+        for path in [POLICY] + [Path("workflows/portable") / name for name in RUNTIME_FILES] + [
+                    Path("workflows/portable/extensions") / name for name in PROFILE_EXTENSIONS
+                ]:
             target = self.source / path
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(("Reviewable source: " + str(path) + "\r\n").encode())
@@ -90,6 +92,20 @@ class Installation(unittest.TestCase):
                 self.assertIn(f"DRIFT: {name}", report.getvalue())
                 self.assertEqual(installed.read_bytes(), b"stale router")
                 self.assertTrue(synchronize(self.source, self.profile, self.runtime))
+
+    def test_profile_extensions_land_beside_the_profile_and_are_drift_checked(self):
+        self.assertTrue(synchronize(self.source, self.profile, self.runtime))
+        for name in PROFILE_EXTENSIONS:
+            with self.subTest(name=name):
+                installed = self.profile.parent / "extensions" / name
+                source = self.source / "workflows/portable/extensions" / name
+                self.assertEqual(installed.read_bytes(), source.read_bytes())
+                self.assertFalse((self.runtime / name).exists())
+                installed.write_bytes(b"stale hook")
+                report = io.StringIO()
+                with contextlib.redirect_stdout(report):
+                    self.assertFalse(synchronize(self.source, self.profile, self.runtime, check=True))
+                self.assertIn(f"DRIFT: {name}", report.getvalue())
 
     def test_router_import_closure_is_installed(self):
         # A routing module the installed router imports but the installer skips leaves the
