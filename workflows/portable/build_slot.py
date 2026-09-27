@@ -179,19 +179,52 @@ def _parse_timestamp(val: Any) -> Optional[float]:
     return None
 
 
+def _read_queue_lock_info(queue_lock_dir: str) -> Optional[Dict[str, Any]]:
+    """Reads info.json from queue lock directory if present."""
+    info_file = os.path.join(queue_lock_dir, INFO_FILE_NAME)
+    if not os.path.isfile(info_file):
+        return None
+    try:
+        with open(info_file, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
 @contextmanager
-def _queue_atomic_lock(run_dir: str, timeout: float = 10.0, retry_interval: float = 0.05):
+def _queue_atomic_lock(
+    run_dir: str,
+    timeout: float = 10.0,
+    retry_interval: float = 0.05,
+    stale_after: float = 15.0,
+    is_pid_alive_fn=None,
+):
     """
     Short-lived atomic directory lock protecting reads/writes to build-slot.queue.json.
     Uses atomic os.mkdir on Windows and Linux (no fcntl).
+    Reclaims stale queue locks if the holding PID is dead or age exceeds stale_after.
     """
     queue_lock_dir = os.path.join(run_dir, QUEUE_LOCK_NAME)
     start_time = time.time()
     acquired = False
+    pid_checker = is_pid_alive_fn or is_pid_alive
 
     while True:
         try:
             os.mkdir(queue_lock_dir)
+            # Write queue lock metadata (PID + timestamp) for stale reclamation
+            try:
+                info_path = os.path.join(queue_lock_dir, INFO_FILE_NAME)
+                tmp_path = info_path + f".{os.getpid()}.tmp"
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump({
+                        "pid": os.getpid(),
+                        "acquired_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                        "acquired_at_epoch": time.time(),
+                    }, f)
+                os.replace(tmp_path, info_path)
+            except Exception:
+                pass
             acquired = True
             break
         except PermissionError:
@@ -203,10 +236,29 @@ def _queue_atomic_lock(run_dir: str, timeout: float = 10.0, retry_interval: floa
                 raise TimeoutError(f"Timed out waiting for queue file lock: {queue_lock_dir}")
             time.sleep(retry_interval)
         except FileExistsError:
-            # Check if queue lock is stale (older than 15s indicates abandoned lock)
+            # Check if queue lock is stale:
+            # 1. Owner PID is dead (immediate reclaim)
+            # 2. Or lock age exceeds stale_after seconds
+            # 3. Or corrupt lock directory older than grace period
             try:
-                mtime = os.path.getmtime(queue_lock_dir)
-                if time.time() - mtime > 15.0:
+                is_stale = False
+                now = time.time()
+                info = _read_queue_lock_info(queue_lock_dir)
+                if info and info.get("pid"):
+                    lock_pid = int(info["pid"])
+                    if lock_pid > 0 and not pid_checker(lock_pid):
+                        is_stale = True
+                    else:
+                        acq_time = info.get("acquired_at_epoch")
+                        if acq_time and (now - float(acq_time)) >= stale_after:
+                            is_stale = True
+                else:
+                    # No info file or mid-creation: fallback to directory mtime
+                    mtime = os.path.getmtime(queue_lock_dir)
+                    if (now - mtime) >= stale_after:
+                        is_stale = True
+
+                if is_stale:
                     shutil.rmtree(queue_lock_dir, ignore_errors=True)
                     continue
             except Exception:
@@ -221,10 +273,22 @@ def _queue_atomic_lock(run_dir: str, timeout: float = 10.0, retry_interval: floa
     finally:
         if acquired:
             try:
+                info_path = os.path.join(queue_lock_dir, INFO_FILE_NAME)
+                if os.path.isfile(info_path):
+                    os.unlink(info_path)
+            except Exception:
+                pass
+            try:
                 os.rmdir(queue_lock_dir)
             except Exception:
                 try:
-                    shutil.rmtree(queue_lock_dir, ignore_errors=True)
+                    # Narrow fallback: call shutil.rmtree on the queue lock dir only
+                    # if the dir is still ours (it was just created by us and is empty
+                    # apart from our own files); otherwise leave it.
+                    if os.path.isdir(queue_lock_dir):
+                        entries = [e for e in os.listdir(queue_lock_dir) if e != INFO_FILE_NAME]
+                        if not entries:
+                            shutil.rmtree(queue_lock_dir, ignore_errors=True)
                 except Exception:
                     pass
 
@@ -420,7 +484,7 @@ class BuildSlotManager:
         hb_limit = stale_heartbeat_after if stale_heartbeat_after is not None else self.queue_stale_heartbeat_after
         fb_limit = stale_fallback_after if stale_fallback_after is not None else self.queue_stale_fallback_after
 
-        with _queue_atomic_lock(self.run_dir):
+        with _queue_atomic_lock(self.run_dir, is_pid_alive_fn=self.is_pid_alive):
             queue = self._read_queue()
             new_queue, changed = self._clean_queue_locked(queue, time.time(), hb_limit, fb_limit)
             if changed:
@@ -439,7 +503,7 @@ class BuildSlotManager:
         Returns the 0-indexed position in queue.
         """
         hb_limit = stale_heartbeat_after if stale_heartbeat_after is not None else self.queue_stale_heartbeat_after
-        with _queue_atomic_lock(self.run_dir):
+        with _queue_atomic_lock(self.run_dir, is_pid_alive_fn=self.is_pid_alive):
             queue = self._read_queue()
             now = time.time()
             valid_queue, changed = self._clean_queue_locked(
@@ -500,7 +564,7 @@ class BuildSlotManager:
         token: Optional[str] = None,
     ) -> None:
         """Removes entry matching token, or (name, pid) if token is not provided."""
-        with _queue_atomic_lock(self.run_dir):
+        with _queue_atomic_lock(self.run_dir, is_pid_alive_fn=self.is_pid_alive):
             queue = self._read_queue()
             new_queue = []
             for item in queue:
@@ -532,7 +596,7 @@ class BuildSlotManager:
         if token is None and name is None:
             return False
 
-        with _queue_atomic_lock(self.run_dir):
+        with _queue_atomic_lock(self.run_dir, is_pid_alive_fn=self.is_pid_alive):
             queue = self._read_queue()
             now = time.time()
             now_iso = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat()
@@ -682,23 +746,39 @@ class BuildSlotManager:
                 # Update heartbeat first if due (every <= 15s)
                 now = time.time()
                 if now - last_heartbeat >= heartbeat_interval:
-                    hb_ok = self.heartbeat(token=token, name=name, pid=pid)
-                    last_heartbeat = now
-                    if not hb_ok:
-                        notice = (
-                            f"[NOTICE] Queue entry for '{name}' (PID {pid}, token {token}) "
-                            f"was missing during heartbeat; re-enqueuing."
-                        )
-                        print(notice, file=sys.stderr)
-                        logger.warning(notice)
-                        self.enqueue(
-                            name, pid, token=token, stale_heartbeat_after=effective_heartbeat_threshold
-                        )
+                    try:
+                        hb_ok = self.heartbeat(token=token, name=name, pid=pid)
+                        last_heartbeat = now
+                        if not hb_ok:
+                            notice = (
+                                f"[NOTICE] Queue entry for '{name}' (PID {pid}, token {token}) "
+                                f"was missing during heartbeat; re-enqueuing."
+                            )
+                            print(notice, file=sys.stderr)
+                            logger.warning(notice)
+                            self.enqueue(
+                                name, pid, token=token, stale_heartbeat_after=effective_heartbeat_threshold
+                            )
+                    except TimeoutError as e:
+                        logger.warning("Queue lock timeout during heartbeat for '%s': %s (will retry next tick)", name, e)
                 # Check and reclaim any stale lock
                 self.check_stale_and_reclaim(stale_after=stale_after)
 
                 # Clean dead PIDs / stale heartbeats from queue
-                queue = self.clean_queue(stale_heartbeat_after=effective_heartbeat_threshold)
+                try:
+                    queue = self.clean_queue(stale_heartbeat_after=effective_heartbeat_threshold)
+                except TimeoutError as e:
+                    logger.warning("Queue lock timeout during clean_queue for '%s': %s (will retry next tick)", name, e)
+                    # Check overall timeout before sleeping
+                    if timeout is not None:
+                        elapsed = time.time() - start_time
+                        if elapsed >= timeout:
+                            msg = f"Timed out after {timeout:.1f}s waiting for build slot lock (lane '{name}', PID {pid})"
+                            print(msg, file=sys.stderr)
+                            logger.error(msg)
+                            return False
+                    time.sleep(min(poll_interval, heartbeat_interval))
+                    continue
 
                 # Check if current caller is at the head of the FIFO queue
                 is_head_of_queue = False
@@ -717,7 +797,10 @@ class BuildSlotManager:
                             # Atomic creation succeeded! We own the lock.
                             self._write_lock_info(owner=name, pid=pid, token=token)
                             acquired = True
-                            self.dequeue(name, pid, token=token)
+                            try:
+                                self.dequeue(name, pid, token=token)
+                            except TimeoutError as e:
+                                logger.warning("Queue lock timeout during dequeue after acquisition for '%s': %s", name, e)
                             msg = f"Acquired build slot lock for '{name}' (PID {pid})"
                             print(msg)
                             logger.info(msg)
