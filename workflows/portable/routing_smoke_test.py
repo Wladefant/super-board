@@ -602,7 +602,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         self.assertIsInstance(packet, HarnessDispatchPacket)
         self.assertEqual(packet.schema_version, "1.0")
         self.assertEqual(packet.recommendation["model"], MODEL_CLAUDE_FABLE)
-        self.assertEqual(packet.recommendation["agent_role"], "advisor")
+        self.assertEqual(packet.recommendation["agent_role"], "reviewer")
         self.assertEqual(packet.recommendation["provider"], "anthropic")
         self.assertIsNotNone(packet.evidence_packet)
         self.assertEqual(packet.evidence_packet["head_sha"], "1122334455667788")
@@ -611,7 +611,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         json_str = packet.to_json()
         parsed = json.loads(json_str)
         self.assertEqual(parsed["task"]["task_type"], "strong_review")
-        self.assertEqual(parsed["recommendation"]["agent_role"], "advisor")
+        self.assertEqual(parsed["recommendation"]["agent_role"], "reviewer")
         print("  [PASS] HarnessDispatchPacket emitted valid JSON with agent role and evidence.")
 
     # -------------------------------------------------------------------------

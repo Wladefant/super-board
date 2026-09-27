@@ -638,8 +638,6 @@ def model_to_agent_role(model_id: str, task_type: TaskType, risk_level: RiskLeve
         return "compactor"
     if "flash" in model_id:
         return "qa-verifier" if task_type == TaskType.STRONG_REVIEW and risk_level == RiskLevel.LOW else "task"
-    if model_id == MODEL_CLAUDE_FABLE:
-        return "advisor"
     if model_id.startswith("anthropic/"):
         return "reviewer"
     return "task"
