@@ -1117,6 +1117,17 @@ class TestBuildSlot(unittest.TestCase):
         ok_low, _ = manager.check_ram(threshold=0.0)
         self.assertFalse(ok_low)
 
+    def test_help_exits_zero(self):
+        """Negative control for argparse format strings like '90%' causing ValueError."""
+        script = os.path.join(SCRIPT_DIR, "build_slot.py")
+        proc = subprocess.run(
+            [sys.executable, script, "--help"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0, f"--help failed with stderr: {proc.stderr}")
+        self.assertIn("Check system RAM percentage against threshold", proc.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -40,6 +40,8 @@ RUNTIME_FILES = (
     "verify.py", "test_verify.py",
     # Lane-brief merge guard (Wladefant/super-board#227).
     "merge_guard.py", "test_merge_guard.py",
+    # Session crash monitor and test suite.
+    "session_crash_monitor.py", "test_session_crash_monitor.py",
 )
 # Veyyon extensions, installed into the profile's own `extensions/` dir beside AGENTS.md,
 # where Veyyon loads them for every session of that profile.
