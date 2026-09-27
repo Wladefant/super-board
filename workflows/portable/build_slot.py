@@ -723,6 +723,10 @@ class BuildSlotManager:
             try:
                 os.rename(tombstone, slot_dir)
             except OSError as e:
+                if not os.path.isdir(tombstone):
+                    # Carried off by another reclaimer after the read above, as in the
+                    # `moved is None` case: nothing is left here to put back.
+                    return False
                 msg = f"[ERROR] Moved a live build slot lock aside and could not restore it (slot {slot_idx}, {tombstone}): {e}"
                 print(msg, file=sys.stderr)
                 logger.error(msg)

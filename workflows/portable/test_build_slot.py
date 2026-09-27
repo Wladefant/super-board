@@ -1592,6 +1592,31 @@ class TestBuildSlot(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(other_tombstone, "info.json")))
         shutil.rmtree(other_tombstone)
 
+    def test_reclaim_restore_after_tombstone_carried_off_stays_quiet(self):
+        """
+        #315 review B2 (delta): the carry-off can also land after the tombstone read shows a
+        different lock and before the restore rename. The restore then finds no tombstone;
+        that is not a stranded live lock and must not log [ERROR].
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        self._seed_stale_lock(manager)
+        other_tombstone = manager.lock_dir + ".tombstone-other"
+        real_read = build_slot._read_lock_dir_info
+
+        def read_then_lose_it(lock_dir, slot_idx):
+            info = real_read(lock_dir, slot_idx)
+            if ".tombstone-" in lock_dir and lock_dir != other_tombstone:
+                os.rename(lock_dir, other_tombstone)
+                return dict(info, token="next-holder")
+            return info
+
+        err = io.StringIO()
+        with redirect_stderr(err), mock.patch.object(build_slot, "_read_lock_dir_info", side_effect=read_then_lose_it):
+            self.assertFalse(manager.check_stale_and_reclaim())
+        self.assertNotIn("[ERROR]", err.getvalue())
+        self.assertTrue(os.path.isfile(os.path.join(other_tombstone, "info.json")))
+        shutil.rmtree(other_tombstone)
+
     def test_stale_lock_reclaimed_once_without_tombstone_leftovers(self):
         """#315: the tombstone reclaim still frees a dead lock, and only one reclaimer reports it."""
         first = BuildSlotManager(run_dir=self.run_dir)
