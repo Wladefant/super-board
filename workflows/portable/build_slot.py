@@ -194,6 +194,14 @@ def _queue_atomic_lock(run_dir: str, timeout: float = 10.0, retry_interval: floa
             os.mkdir(queue_lock_dir)
             acquired = True
             break
+        except PermissionError:
+            # On Windows, a directory another process is removing sits in
+            # delete-pending state, and os.mkdir raises PermissionError (WinError 5).
+            # Treat like contention: honour timeout, sleep retry_interval, and retry.
+            # Do NOT run stale-rmtree branch (the dir is already being deleted).
+            if time.time() - start_time >= timeout:
+                raise TimeoutError(f"Timed out waiting for queue file lock: {queue_lock_dir}")
+            time.sleep(retry_interval)
         except FileExistsError:
             # Check if queue lock is stale (older than 15s indicates abandoned lock)
             try:
@@ -215,7 +223,10 @@ def _queue_atomic_lock(run_dir: str, timeout: float = 10.0, retry_interval: floa
             try:
                 os.rmdir(queue_lock_dir)
             except Exception:
-                pass
+                try:
+                    shutil.rmtree(queue_lock_dir, ignore_errors=True)
+                except Exception:
+                    pass
 
 
 class BuildSlotManager:
@@ -711,8 +722,8 @@ class BuildSlotManager:
                             print(msg)
                             logger.info(msg)
                             return True
-                        except FileExistsError:
-                            # Lost race to another lane
+                        except (FileExistsError, PermissionError):
+                            # Lost race to another lane, or directory is delete-pending on Windows
                             pass
                         except OSError as e:
                             logger.warning("os.mkdir failed: %s", e)
