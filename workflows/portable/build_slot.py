@@ -724,15 +724,19 @@ class BuildSlotManager:
         hb_limit = stale_heartbeat_after if stale_heartbeat_after is not None else self.queue_stale_heartbeat_after
         fb_limit = stale_fallback_after if stale_fallback_after is not None else self.queue_stale_fallback_after
 
-        with _queue_atomic_lock(self.run_dir, is_pid_alive_fn=self.is_pid_alive):
-            queue = self._read_queue()
-            new_queue, changed = self._clean_queue_locked(queue, time.time(), hb_limit, fb_limit)
-            if changed:
-                try:
-                    self._write_queue(new_queue)
-                except Exception as e:
-                    logger.warning("Failed to write queue in clean_queue: %s (will retry next tick)", e)
-            return new_queue
+        try:
+            with _queue_atomic_lock(self.run_dir, is_pid_alive_fn=self.is_pid_alive):
+                queue = self._read_queue()
+                new_queue, changed = self._clean_queue_locked(queue, time.time(), hb_limit, fb_limit)
+                if changed:
+                    try:
+                        self._write_queue(new_queue)
+                    except Exception as e:
+                        logger.warning("Failed to write queue in clean_queue: %s (will retry next tick)", e)
+                return new_queue
+        except (TimeoutError, PermissionError, OSError) as e:
+            logger.warning("Queue lock acquisition failed in clean_queue: %s; falling back to read-only queue", e)
+            return self._read_queue()
 
     def enqueue(
         self,
@@ -1468,7 +1472,11 @@ class BuildSlotManager:
             primary_lock_status = slots_status[0]
 
         # 3. Clean queue and read
-        queue = self.clean_queue()
+        try:
+            queue = self.clean_queue()
+        except Exception as e:
+            logger.warning("clean_queue failed in status: %s; reading queue directly", e)
+            queue = self._read_queue()
         queue_status = []
         for item in queue:
             enqueued_epoch = item.get("enqueued_at", now)
