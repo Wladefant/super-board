@@ -66,12 +66,12 @@ class TestFeatureMap(unittest.TestCase):
         cls.live_map_path = cls.repo_root / "FEATURE_MAP.json"
 
     def test_01_load_valid_feature_map(self):
-        """Feature map loads cleanly and parses all 5 seeded workflow features."""
+        """Feature map loads cleanly and parses all 6 seeded workflow features."""
         fmap = load_feature_map(path=self.live_map_path, repo_root=self.repo_root)
         self.assertIsInstance(fmap, FeatureMap)
         self.assertEqual(fmap.version, "1.0.0")
         self.assertEqual(fmap.repository, "Wladefant/super-board")
-        self.assertEqual(len(fmap.features), 5)
+        self.assertEqual(len(fmap.features), 6)
         self.assertIn("routing", fmap.features)
         self.assertIn("gate", fmap.features)
         self.assertIn("ledger", fmap.features)
@@ -84,8 +84,8 @@ class TestFeatureMap(unittest.TestCase):
         result = validate_feature_map(fmap, self.repo_root)
         self.assertTrue(result.valid, f"Validation errors: {result.errors}")
         self.assertEqual(len(result.errors), 0)
-        self.assertEqual(result.feature_count, 5)
-        self.assertEqual(result.file_count, 23)
+        self.assertEqual(result.feature_count, 6)
+        self.assertEqual(result.file_count, 26)
 
     def test_03_validate_fails_when_entry_file_missing(self):
         """Validator MUST fail when a mapped entry_file does not exist on disk."""
@@ -279,7 +279,7 @@ class TestFeatureMap(unittest.TestCase):
         self.assertIn("BuildSlotManager", p_show.stdout)
 
     def test_20_cli_list_json(self):
-        """CLI list --json produces valid JSON dictionary with all 5 features."""
+        """CLI list --json produces valid JSON dictionary with all 6 features."""
         script = str(Path(SCRIPT_DIR) / "feature_map.py")
         proc = subprocess.run(
             [sys.executable, script, "list", "--json", "--repo-root", str(self.repo_root)],
@@ -288,7 +288,7 @@ class TestFeatureMap(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0)
         data = json.loads(proc.stdout)
-        self.assertEqual(len(data), 5)
+        self.assertEqual(len(data), 6)
         self.assertIn("routing", data)
         self.assertIn("build_slot", data)
 

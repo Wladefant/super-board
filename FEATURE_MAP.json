@@ -113,6 +113,26 @@
         "StaleLockReclaimer"
       ],
       "cli_command": "python -B workflows/portable/test_build_slot.py"
+    },
+    "polysim_next_cache": {
+      "name": "PolySimulator Next Build Cache",
+      "description": "Per-worktree .next/cache for PolySimulator QA builds: replaces shared-cache junctions, drops webpack packs keyed to other worktrees, seeds and warms .tsbuildinfo from the nearest prepared worktree, and sweeps idle worktrees.",
+      "entry_files": [
+        "workflows/portable/polysim_next_cache.py",
+        "workflows/portable/wt_remove.py"
+      ],
+      "tests": [
+        "workflows/portable/test_polysim_next_cache.py"
+      ],
+      "owning_issue": "https://github.com/Wladefant/super-board/issues/321",
+      "risk": "medium",
+      "components": [
+        "prepare",
+        "sweep",
+        "seed_tsbuildinfo",
+        "rank_sources"
+      ],
+      "cli_command": "python -B workflows/portable/test_polysim_next_cache.py"
     }
   }
 }
