@@ -49,8 +49,7 @@ class TestBuildSlot(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix="test-build-slot-")
         self.run_dir = self.tmp.name
         self.orig_ram = os.environ.get("BUILD_SLOT_RAM_PERCENT")
-        os.environ["BUILD_SLOT_RAM_PERCENT"] = "70.0"
-
+        os.environ["BUILD_SLOT_RAM_PERCENT"] = "80.0"
     def tearDown(self):
         if self.orig_ram is not None:
             os.environ["BUILD_SLOT_RAM_PERCENT"] = self.orig_ram
@@ -246,8 +245,7 @@ class TestBuildSlot(unittest.TestCase):
     def test_cli_subprocesses(self):
         script = os.path.abspath(build_slot.__file__)
         env = dict(os.environ)
-        env["BUILD_SLOT_RAM_PERCENT"] = "70.0"
-
+        env["BUILD_SLOT_RAM_PERCENT"] = "80.0"
         # 1. Status: FREE
         p_stat = subprocess.run(
             [sys.executable, script, "--run-dir", self.run_dir, "status"],
@@ -348,8 +346,7 @@ class TestBuildSlot(unittest.TestCase):
         script = os.path.abspath(build_slot.__file__)
         record_file = os.path.join(self.run_dir, "acquisition_order.txt")
         env = dict(os.environ)
-        env["BUILD_SLOT_RAM_PERCENT"] = "70.0"
-
+        env["BUILD_SLOT_RAM_PERCENT"] = "80.0"
         worker_code = (
             "import os, sys, time, subprocess\n"
             "name = sys.argv[1]\n"
@@ -1128,6 +1125,235 @@ class TestBuildSlot(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, f"--help failed with stderr: {proc.stderr}")
         self.assertIn("Check system RAM percentage against threshold", proc.stdout)
 
+
+    def test_write_queue_retries_on_permission_error_and_succeeds(self):
+        """
+        _write_queue must retry when os.replace raises PermissionError (WinError 5 or 32)
+        and succeed when the file handle is released.
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        real_replace = os.replace
+        replace_attempts = 0
+
+        def flaky_replace(src, dst):
+            nonlocal replace_attempts
+            replace_attempts += 1
+            if replace_attempts <= 2:
+                err = PermissionError(13, "Access is denied")
+                err.winerror = 5
+                raise err
+            return real_replace(src, dst)
+
+        with mock.patch("os.replace", side_effect=flaky_replace):
+            manager._write_queue([{"name": "lane-1", "pid": 1234}])
+
+        self.assertGreaterEqual(replace_attempts, 3)
+        read_back = manager._read_queue()
+        self.assertEqual(len(read_back), 1)
+        self.assertEqual(read_back[0]["name"], "lane-1")
+
+    def test_write_queue_cleans_up_temp_file_on_complete_failure(self):
+        """
+        _write_queue must clean up the temporary file when all retries fail.
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir)
+
+        def failing_replace(src, dst):
+            err = PermissionError(13, "Sharing violation")
+            err.winerror = 32
+            raise err
+
+        with mock.patch("time.sleep", return_value=None):
+            with mock.patch("os.replace", side_effect=failing_replace):
+                with self.assertRaises(PermissionError):
+                    manager._write_queue([{"name": "lane-fail", "pid": 1234}])
+
+        # Verify no temporary files remain in run_dir
+        tmp_files = [f for f in os.listdir(self.run_dir) if f.startswith("queue-") and f.endswith(".tmp")]
+        self.assertEqual(tmp_files, [])
+
+    def test_heartbeat_survives_queue_write_error(self):
+        """
+        A failed write during heartbeat must log a warning and return False,
+        never raising an unhandled exception.
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        manager.enqueue("lane-hb-write", 5555)
+
+        with mock.patch.object(manager, "_write_queue", side_effect=PermissionError(13, "Access is denied")):
+            ok = manager.heartbeat(name="lane-hb-write", pid=5555)
+            self.assertFalse(ok)
+
+    def test_clean_queue_survives_queue_write_error(self):
+        """
+        clean_queue must log a warning and return the cleaned queue if _write_queue fails,
+        without raising out.
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        manager.enqueue("lane-stale", 999999, stale_heartbeat_after=0.01)
+        time.sleep(0.02)
+
+        with mock.patch.object(manager, "_write_queue", side_effect=PermissionError(13, "Access is denied")):
+            cleaned = manager.clean_queue(stale_heartbeat_after=0.01)
+            self.assertIsInstance(cleaned, list)
+
+    def test_check_stale_and_reclaim_dead_child_pid(self):
+        """
+        check_stale_and_reclaim must reclaim the lock immediately if the wrapped
+        child process PID is dead, even if the owner process was veyyon host.
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        # Create lock directory and info with dead child PID
+        os.mkdir(manager.lock_dir)
+        info = {
+            "owner": "test-lane",
+            "pid": os.getpid(),  # Live runner PID
+            "child_pid": 99999999,  # Dead child PID
+            "acquired_at": "2026-09-27T00:00:00Z",
+            "acquired_at_epoch": time.time() - 10.0,
+            "heartbeat_at": "2026-09-27T00:00:00Z",
+            "heartbeat_at_epoch": time.time() - 5.0,
+        }
+        with open(manager.info_file, "w", encoding="utf-8") as f:
+            json.dump(info, f)
+
+        # Mock is_pid_alive so 99999999 is dead, os.getpid() is alive
+        def fake_is_alive(pid):
+            return pid == os.getpid()
+
+        manager.is_pid_alive = fake_is_alive
+        reclaimed = manager.check_stale_and_reclaim()
+        self.assertTrue(reclaimed)
+        self.assertFalse(os.path.isdir(manager.lock_dir))
+
+    def test_run_command_records_child_pid_and_token(self):
+        """
+        run_command executes child under lock, records child_pid and run_token,
+        and releases the lock on completion.
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        ret = manager.run_command(
+            "child-test-lane",
+            [sys.executable, "-c", "import sys, time; time.sleep(0.05); sys.exit(0)"],
+        )
+        self.assertEqual(ret, 0)
+        stat = manager.status()
+        self.assertFalse(stat["lock"]["locked"])
+
+    def test_bounded_concurrency_two_slots_when_ram_under_75_percent(self):
+        """When host RAM is < 75%, 2 concurrent slots can be acquired by distinct lanes."""
+        os.environ["BUILD_SLOT_RAM_PERCENT"] = "70.0"
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        self.assertEqual(manager.get_max_slots(70.0), 2)
+
+        # 1. Lane A acquires
+        self.assertTrue(manager.acquire("lane-a", timeout=1.0))
+        self.assertTrue(manager.is_held_by("lane-a"))
+
+        # 2. Lane B acquires concurrently
+        self.assertTrue(manager.acquire("lane-b", timeout=1.0))
+        self.assertTrue(manager.is_held_by("lane-b"))
+
+        # 3. Third lane C is blocked because both slots are held
+        res_c = manager.acquire("lane-c", timeout=0.05, poll_interval=0.02)
+        self.assertFalse(res_c)
+
+        # Verify status exposes both holders
+        st = manager.status()
+        self.assertEqual(st["max_slots"], 2)
+        self.assertEqual(st["active_slots"], 2)
+        self.assertIn("lane-a", st["holders"])
+        self.assertIn("lane-b", st["holders"])
+
+        # 4. Release lane A, then lane C can acquire
+        self.assertTrue(manager.release("lane-a"))
+        self.assertFalse(manager.is_held_by("lane-a"))
+        self.assertTrue(manager.is_held_by("lane-b"))
+
+        self.assertTrue(manager.acquire("lane-c", timeout=1.0))
+        self.assertTrue(manager.is_held_by("lane-c"))
+
+        self.assertTrue(manager.release("lane-b"))
+        self.assertTrue(manager.release("lane-c"))
+        st_end = manager.status()
+        self.assertEqual(st_end["active_slots"], 0)
+
+    def test_bounded_concurrency_one_slot_when_ram_at_or_above_75_percent(self):
+        """When host RAM is >= 75%, concurrency is bounded to 1 slot."""
+        os.environ["BUILD_SLOT_RAM_PERCENT"] = "80.0"
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        self.assertEqual(manager.get_max_slots(80.0), 1)
+
+        # 1. Lane 1 acquires
+        self.assertTrue(manager.acquire("lane-1", timeout=1.0))
+        self.assertTrue(manager.is_held_by("lane-1"))
+
+        # 2. Lane 2 is blocked because capacity is 1
+        res_2 = manager.acquire("lane-2", timeout=0.05, poll_interval=0.02)
+        self.assertFalse(res_2)
+
+        # Release lane 1, then lane 2 can acquire
+        self.assertTrue(manager.release("lane-1"))
+        self.assertTrue(manager.acquire("lane-2", timeout=1.0))
+        self.assertTrue(manager.release("lane-2"))
+
+    def test_status_shows_both_holders_and_capacity(self):
+        """status() and format_status_human() format and report all slots."""
+        os.environ["BUILD_SLOT_RAM_PERCENT"] = "65.0"
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        self.assertTrue(manager.acquire("slot-holder-0", timeout=1.0))
+        self.assertTrue(manager.acquire("slot-holder-1", timeout=1.0))
+
+        st = manager.status()
+        self.assertEqual(st["max_slots"], 2)
+        self.assertEqual(st["active_slots"], 2)
+        self.assertEqual(set(st["holders"]), {"slot-holder-0", "slot-holder-1"})
+
+        human = build_slot.format_status_human(st)
+        self.assertIn("Capacity:    2 slot(s) allowed", human)
+        self.assertIn("LOCKED (2/2 in use)", human)
+        self.assertIn("slot-holder-0", human)
+        self.assertIn("slot-holder-1", human)
+
+        manager.release("slot-holder-0")
+        manager.release("slot-holder-1")
+
+    def test_queue_deduplication_by_name_and_pid(self):
+        """Duplicate queue entries with the same (name, pid) are deduplicated."""
+        manager = BuildSlotManager(run_dir=self.run_dir, is_pid_alive_fn=lambda p: True)
+        test_pid = 44556
+
+        # Enqueue same lane and pid twice with different tokens
+        manager.enqueue("ProfileLowerFlash", pid=test_pid, token="tok-1")
+        manager.enqueue("ProfileLowerFlash", pid=test_pid, token="tok-2")
+        # Enqueue another lane with same pid
+        manager.enqueue("OtherLane", pid=test_pid, token="tok-3")
+        # Enqueue same lane with different pid
+        manager.enqueue("ProfileLowerFlash", pid=99999, token="tok-4")
+
+        q = manager.clean_queue()
+        plf_entries = [item for item in q if item.get("name") == "ProfileLowerFlash" and item.get("pid") == test_pid]
+        self.assertEqual(len(plf_entries), 1, "Duplicate (name, pid) must be deduplicated to 1 entry")
+        self.assertEqual(plf_entries[0]["token"], "tok-2", "Latest enqueue updates/binds token")
+
+        other_entries = [item for item in q if item.get("name") == "OtherLane"]
+        self.assertEqual(len(other_entries), 1)
+        diff_pid_entries = [item for item in q if item.get("name") == "ProfileLowerFlash" and item.get("pid") == 99999]
+        self.assertEqual(len(diff_pid_entries), 1)
+
+    def test_get_max_slots_thresholds_and_override(self):
+        """get_max_slots correctly resolves tiers and respects overrides."""
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        self.assertEqual(manager.get_max_slots(50.0), 2)
+        self.assertEqual(manager.get_max_slots(74.9), 2)
+        self.assertEqual(manager.get_max_slots(75.0), 1)
+        self.assertEqual(manager.get_max_slots(84.0), 1)
+
+        override_mgr = BuildSlotManager(run_dir=self.run_dir, max_slots=1)
+        self.assertEqual(override_mgr.get_max_slots(50.0), 1)
+
+        override_mgr_2 = BuildSlotManager(run_dir=self.run_dir, max_slots=2)
+        self.assertEqual(override_mgr_2.get_max_slots(80.0), 2)
 
 if __name__ == "__main__":
     unittest.main()
