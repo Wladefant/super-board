@@ -1109,6 +1109,63 @@ class TestBuildSlot(unittest.TestCase):
         self.assertEqual([x["name"] for x in queue], ["prio-1", "prio-2", "prio-3", "normal-2", "normal-1"])
         self.assertTrue(queue[3].get("priority"))
 
+    def test_enqueue_priority_three_fifo(self):
+        """Three priority enqueues A, B, C one after another -> queue order A, B, C (FIFO)."""
+        manager = BuildSlotManager(run_dir=self.run_dir, is_pid_alive_fn=lambda p: True)
+        idx_a = manager.enqueue("A", 1001, token="tok-a", priority=True)
+        idx_b = manager.enqueue("B", 1002, token="tok-b", priority=True)
+        idx_c = manager.enqueue("C", 1003, token="tok-c", priority=True)
+        self.assertEqual(idx_a, 0)
+        self.assertEqual(idx_b, 1)
+        self.assertEqual(idx_c, 2)
+        queue = manager._read_queue()
+        self.assertEqual([x["name"] for x in queue], ["A", "B", "C"])
+
+    def test_enqueue_normal_then_priority_fifo(self):
+        """Normal N, then priority P1, P2 -> order P1, P2, N."""
+        manager = BuildSlotManager(run_dir=self.run_dir, is_pid_alive_fn=lambda p: True)
+        idx_n = manager.enqueue("N", 1000, token="tok-n", priority=False)
+        self.assertEqual(idx_n, 0)
+        idx_p1 = manager.enqueue("P1", 1001, token="tok-p1", priority=True)
+        self.assertEqual(idx_p1, 0)
+        idx_p2 = manager.enqueue("P2", 1002, token="tok-p2", priority=True)
+        self.assertEqual(idx_p2, 1)
+        queue = manager._read_queue()
+        self.assertEqual([x["name"] for x in queue], ["P1", "P2", "N"])
+
+    def test_enqueue_already_priority_re_enqueue_keeps_position(self):
+        """Re-enqueue of the already-priority entry A (same name/pid) keeps its position."""
+        manager = BuildSlotManager(run_dir=self.run_dir, is_pid_alive_fn=lambda p: True)
+        manager.enqueue("P1", 1001, token="tok-p1", priority=True)
+        manager.enqueue("P2", 1002, token="tok-p2", priority=True)
+        manager.enqueue("N", 1003, token="tok-n", priority=False)
+        queue = manager._read_queue()
+        self.assertEqual([x["name"] for x in queue], ["P1", "P2", "N"])
+
+        # Re-enqueue P1 with priority=True -> keeps index 0
+        idx_p1 = manager.enqueue("P1", 1001, token="tok-p1-new", priority=True)
+        self.assertEqual(idx_p1, 0)
+        # Re-enqueue P2 with priority=True -> keeps index 1
+        idx_p2 = manager.enqueue("P2", 1002, token="tok-p2-new", priority=True)
+        self.assertEqual(idx_p2, 1)
+        queue2 = manager._read_queue()
+        self.assertEqual([x["name"] for x in queue2], ["P1", "P2", "N"])
+
+    def test_enqueue_normal_promoted_to_priority_behind_existing_priority(self):
+        """Normal entry N1 re-enqueued with priority while P1 exists -> order P1, N1, ..."""
+        manager = BuildSlotManager(run_dir=self.run_dir, is_pid_alive_fn=lambda p: True)
+        manager.enqueue("P1", 1001, token="tok-p1", priority=True)
+        manager.enqueue("N1", 1002, token="tok-n1", priority=False)
+        manager.enqueue("N2", 1003, token="tok-n2", priority=False)
+        queue = manager._read_queue()
+        self.assertEqual([x["name"] for x in queue], ["P1", "N1", "N2"])
+
+        # N1 re-enqueued with priority=True -> moves behind P1, ahead of N2
+        idx_n1 = manager.enqueue("N1", 1002, token="tok-n1", priority=True)
+        self.assertEqual(idx_n1, 1)
+        queue2 = manager._read_queue()
+        self.assertEqual([x["name"] for x in queue2], ["P1", "N1", "N2"])
+
     def _write_timed_queue(self, manager, entries):
         now = time.time()
         manager._write_queue(
