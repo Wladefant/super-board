@@ -38,7 +38,7 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
 import build_slot
-from build_slot import BuildSlotManager, is_pid_alive
+from build_slot import BuildSlotManager, is_pid_alive, _queue_atomic_lock
 
 
 class TestBuildSlot(unittest.TestCase):
@@ -721,6 +721,75 @@ class TestBuildSlot(unittest.TestCase):
 
         # Both acquired and released; Waiter A acquired FIRST!
         self.assertEqual(events, ["waiter-a", "waiter-b"], "Waiter A must acquire before later arrival Waiter B")
+
+    def test_queue_atomic_lock_permission_error_retry_success(self):
+        """
+        On Windows, a directory in delete-pending state raises PermissionError [WinError 5]
+        on os.mkdir. The retry loop must treat PermissionError like contention,
+        sleep retry_interval, retry, and successfully acquire the lock.
+        """
+        real_mkdir = os.mkdir
+        call_count = 0
+
+        def fake_mkdir(path, *args, **kwargs):
+            nonlocal call_count
+            if os.path.basename(path) == build_slot.QUEUE_LOCK_NAME:
+                call_count += 1
+                if call_count <= 2:
+                    raise PermissionError(13, "Access is denied (delete-pending simulation)")
+            return real_mkdir(path, *args, **kwargs)
+
+        with mock.patch("os.mkdir", side_effect=fake_mkdir):
+            acquired = False
+            with _queue_atomic_lock(self.run_dir, timeout=2.0, retry_interval=0.01):
+                acquired = True
+                queue_lock_dir = os.path.join(self.run_dir, build_slot.QUEUE_LOCK_NAME)
+                self.assertTrue(os.path.isdir(queue_lock_dir))
+
+            self.assertTrue(acquired)
+            self.assertGreaterEqual(call_count, 3)
+
+    def test_queue_atomic_lock_permission_error_timeout_not_permission_error(self):
+        """
+        When os.mkdir always raises PermissionError, _queue_atomic_lock must
+        honour the timeout and raise TimeoutError, NOT PermissionError.
+        """
+        real_mkdir = os.mkdir
+
+        def fake_mkdir(path, *args, **kwargs):
+            if os.path.basename(path) == build_slot.QUEUE_LOCK_NAME:
+                raise PermissionError(13, "Access is denied (delete-pending simulation)")
+            return real_mkdir(path, *args, **kwargs)
+
+        with mock.patch("os.mkdir", side_effect=fake_mkdir):
+            with self.assertRaises(TimeoutError) as ctx:
+                with _queue_atomic_lock(self.run_dir, timeout=0.1, retry_interval=0.01):
+                    pass
+            self.assertIn("Timed out waiting for queue file lock", str(ctx.exception))
+
+    def test_build_slot_acquire_permission_error_retry_success(self):
+        """
+        Main build-slot.lock mkdir retry loop: PermissionError on os.mkdir of
+        build-slot.lock must be treated like contention and retried until acquired.
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        real_mkdir = os.mkdir
+        call_count = 0
+
+        def fake_mkdir(path, *args, **kwargs):
+            nonlocal call_count
+            if os.path.basename(path) == build_slot.LOCK_DIR_NAME:
+                call_count += 1
+                if call_count <= 2:
+                    raise PermissionError(13, "Access is denied (delete-pending simulation)")
+            return real_mkdir(path, *args, **kwargs)
+
+        with mock.patch("os.mkdir", side_effect=fake_mkdir):
+            ok = manager.acquire("perm-lane", timeout=2.0, poll_interval=0.01)
+            self.assertTrue(ok)
+            self.assertTrue(manager.is_held_by("perm-lane"))
+            self.assertGreaterEqual(call_count, 3)
+            manager.release("perm-lane")
 
 
 if __name__ == "__main__":
