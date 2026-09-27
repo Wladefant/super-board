@@ -33,12 +33,13 @@ Invariants:
       Other locks (`acquire` mode has no process left to heartbeat): only when the owner PID
       is dead past the grace period.
     - A reclaim renames the lock dir to a unique tombstone and deletes it only if the
-      tombstone still holds the lock that was judged stale; otherwise it is put back. Two
-      waiters judging the same lock can never delete the lock of the lane that took the slot next.
+      tombstone still holds the lock that was judged stale; otherwise it is put back. A
+      reclaim never deletes a lock other than the one it judged stale.
     - The acquire-mode owner PID is the nearest veyyon session host (not its
       `__veyyon_worker*` helpers); the ancestor climb stops at a parent created after its
       child, since Windows reuses a dead parent's PID.
-    - RAM guard: acquire refuses when host system RAM >= 85% unless --force is passed.
+    - RAM guard: when host system RAM >= 85%, acquire stays in the FIFO queue and waits until
+      RAM drops below the limit (or --timeout expires); --force bypasses the wait.
     - Pure standard library + Windows-safe ctypes (zero fcntl imports).
 """
 
@@ -73,7 +74,6 @@ DEFAULT_POLL_INTERVAL_SECONDS = 5.0
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 10.0  # update queue entry heartbeat every <=15s
 DEFAULT_QUEUE_STALE_HEARTBEAT_SECONDS = 60.0  # reclaim if heartbeat older than 60s
 DEFAULT_QUEUE_STALE_FALLBACK_SECONDS = 30 * 60  # 30 minutes fallback for legacy entries without heartbeat
-RAM_GUARD_THRESHOLD_PERCENT = 85.0
 RAM_TWO_SLOT_THRESHOLD_PERCENT = 75.0
 DEFAULT_RAM_GUARD_THRESHOLD_PERCENT = 85.0
 DEFAULT_RAM_TWO_SLOT_THRESHOLD_PERCENT = 75.0
@@ -695,9 +695,11 @@ class BuildSlotManager:
         Removes the stale lock judged from `judged`, and only that lock (#315). Two waiters
         can judge the same lock stale: the first removes it, a lane acquires the free slot,
         and a plain rmtree by the second would delete that lane's live lock. So the lock is
-        re-read, renamed to a unique tombstone (atomic; only one reclaimer's rename can
-        succeed) and deleted only if the tombstone still holds the judged lock. Returns True
-        if this call reclaimed it.
+        re-read, renamed to a unique tombstone and deleted only if the tombstone still holds
+        the judged lock. The rename does not make the reclaimer the lock's only owner: on
+        Windows two reclaimers' renames of the same dir can both report success, the later
+        one carrying the dir out of the earlier one's tombstone. What holds is that nothing
+        but the judged lock is ever deleted. Returns True if this call deleted it.
         """
         slot_dir = self.slot_dirs[slot_idx]
         want = _lock_identity(judged)
@@ -711,7 +713,12 @@ class BuildSlotManager:
             # while a reader has info.json open; the next poll judges the slot again.
             return False
         # A rename keeps the dir's mtime, so even a corrupt lock's identity survives the move.
-        if _lock_identity(_read_lock_dir_info(tombstone, slot_idx)) != want:
+        moved = _read_lock_dir_info(tombstone, slot_idx)
+        if moved is None:
+            # Another reclaimer's rename carried the dir out of this tombstone; that reclaimer
+            # checks it against its own judgment. Nothing was moved aside here to put back.
+            return False
+        if _lock_identity(moved) != want:
             # The lock changed hands between the re-read and the rename: put it back.
             try:
                 os.rename(tombstone, slot_dir)
@@ -1291,25 +1298,24 @@ class BuildSlotManager:
                 f"poll_interval ({poll_interval}s) must be less than "
                 f"queue_stale_heartbeat_after ({effective_heartbeat_threshold}s)"
             )
-        # 1. RAM Guard Check
+        # 1. RAM Guard notice. High RAM never refuses here: the caller is enqueued below and
+        #    step 3 of the queue loop waits until RAM drops (or the timeout expires).
         ram_pct = get_system_ram_percent()
-        if ram_pct is not None and ram_pct >= RAM_GUARD_THRESHOLD_PERCENT:
-            if not force:
-                msg = (
-                    f"RAM guard: acquisition refused for '{name}' because system RAM is at "
-                    f"{ram_pct:.1f}% (>= {RAM_GUARD_THRESHOLD_PERCENT:.1f}% limit). "
-                    f"Use --force to override."
-                )
-                print(msg, file=sys.stderr)
-                logger.error(msg)
-                return False
-            else:
+        if ram_pct is not None and ram_pct >= self.ram_guard_threshold:
+            if force:
                 notice = (
                     f"[NOTICE] RAM guard overridden with --force: system RAM is at {ram_pct:.1f}% "
-                    f"(>= {RAM_GUARD_THRESHOLD_PERCENT:.1f}% limit)."
+                    f"(>= {self.ram_guard_threshold:.1f}% limit)."
                 )
                 print(notice, file=sys.stderr)
                 logger.warning(notice)
+            else:
+                msg = (
+                    f"RAM guard: RAM at {ram_pct:.1f}% (>= {self.ram_guard_threshold:.1f}%), "
+                    f"'{name}' stays queued and waits"
+                )
+                print(msg, file=sys.stderr)
+                logger.warning(msg)
 
         start_time = time.time()
         last_heartbeat = start_time
@@ -1966,25 +1972,23 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             f"--poll-interval ({args.poll_interval}s) must be less than "
             f"queue_stale_heartbeat_after ({DEFAULT_QUEUE_STALE_HEARTBEAT_SECONDS}s)"
         )
-    if args.command == "run" and "--" in args.cmd and args.cmd[0].startswith("-") and args.cmd[0] != "--":
-        # REMAINDER captures everything after <name>, so options in the documented spot
-        # (`run <name> --timeout 60 -- <cmd>`) arrived inside the command (#315). Parse the
-        # options ahead of `--` into args; values given before <name> stay unless repeated.
-        split = args.cmd.index("--")
-        run_options = argparse.ArgumentParser(prog="build_slot.py run <name>", add_help=False)
-        _add_run_options(run_options)
-        run_options.parse_args(args.cmd[:split], namespace=args)
-        args.cmd = args.cmd[split + 1:]
+    if args.command == "run" and args.cmd and args.cmd[0].startswith("-") and args.cmd[0] != "--" and "--" in args.cmd:
+        # REMAINDER swallows run options written after <name> (`run <name> --timeout 60 -- <cmd>`);
+        # parse the tokens before the `--` separator as run options.
+        sep = args.cmd.index("--")
+        tail_parser = argparse.ArgumentParser(prog="build_slot.py run <name>")
+        _add_run_options(tail_parser)
+        tail_parser.parse_args(args.cmd[:sep], namespace=args)
+        args.cmd = args.cmd[sep:]
     return args
 
 
-def _add_run_options(p: argparse.ArgumentParser) -> None:
-    """Options of `run`, accepted before or after <name> (anywhere ahead of `--`)."""
-    p.add_argument("--timeout", type=float, default=None, help="Maximum seconds to wait to acquire slot")
-    p.add_argument("--priority", action="store_true", help="Enqueue with priority at front of queue")
-    p.add_argument("--force", action="store_true", help="Bypass RAM guard during acquisition")
-    p.add_argument("--cwd", default=None, help="Working directory to execute command in (default: current directory)")
-    p.add_argument(
+def _add_run_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--timeout", type=float, default=None, help="Maximum seconds to wait to acquire slot")
+    parser.add_argument("--priority", action="store_true", help="Enqueue with priority at front of queue")
+    parser.add_argument("--force", action="store_true", help="Bypass RAM guard during acquisition")
+    parser.add_argument("--cwd", default=None, help="Working directory to execute command in (default: current directory)")
+    parser.add_argument(
         "--heartbeat-stale-after",
         type=float,
         default=DEFAULT_LOCK_HEARTBEAT_STALE_SECONDS,
