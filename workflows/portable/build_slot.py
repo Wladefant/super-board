@@ -58,6 +58,7 @@ DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 10.0  # update queue entry heartbeat every 
 DEFAULT_QUEUE_STALE_HEARTBEAT_SECONDS = 60.0  # reclaim if heartbeat older than 60s
 DEFAULT_QUEUE_STALE_FALLBACK_SECONDS = 30 * 60  # 30 minutes fallback for legacy entries without heartbeat
 RAM_GUARD_THRESHOLD_PERCENT = 85.0
+DEFAULT_PID_DEAD_GRACE_PERIOD_SECONDS = 60.0  # never reclaim a dead-PID lock younger than 60s
 
 def get_system_ram_percent() -> Optional[float]:
     """
@@ -177,6 +178,68 @@ def _parse_timestamp(val: Any) -> Optional[float]:
         except Exception:
             pass
     return None
+def find_long_lived_owner_pid() -> int:
+    """
+    Finds the long-lived owner PID for lock attribution.
+    Prefers the ancestor veyyon process if running under veyyon,
+    falling back to os.getppid() or os.getpid().
+    """
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class PROCESSENTRY32(ctypes.Structure):
+                _fields_ = [
+                    ("dwSize", wintypes.DWORD),
+                    ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", wintypes.LONG),
+                    ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", ctypes.c_char * 260),
+                ]
+
+            k32 = ctypes.windll.kernel32
+            TH32CS_SNAPPROCESS = 0x00000002
+            h = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+            if h and h != -1:
+                pe = PROCESSENTRY32()
+                pe.dwSize = ctypes.sizeof(PROCESSENTRY32)
+                parents = {}
+                names = {}
+                if k32.Process32First(h, ctypes.byref(pe)):
+                    while True:
+                        pid = pe.th32ProcessID
+                        ppid = pe.th32ParentProcessID
+                        exe = pe.szExeFile.decode("latin-1", "ignore").lower()
+                        parents[pid] = ppid
+                        names[pid] = exe
+                        if not k32.Process32Next(h, ctypes.byref(pe)):
+                            break
+                k32.CloseHandle(h)
+
+                cur = os.getpid()
+                visited = set()
+                while cur in parents and cur not in visited and cur != 0:
+                    visited.add(cur)
+                    exe_name = names.get(cur, "")
+                    if "veyyon" in exe_name:
+                        return cur
+                    cur = parents[cur]
+        except Exception as e:
+            logger.debug("Failed to detect ancestor veyyon PID: %s", e)
+
+    try:
+        ppid = os.getppid()
+        if ppid > 0:
+            return ppid
+    except Exception:
+        pass
+    return os.getpid()
 
 
 def _read_queue_lock_info(queue_lock_dir: str) -> Optional[Dict[str, Any]]:
@@ -305,6 +368,7 @@ class BuildSlotManager:
         is_pid_alive_fn=None,
         queue_stale_heartbeat_after: float = DEFAULT_QUEUE_STALE_HEARTBEAT_SECONDS,
         queue_stale_fallback_after: float = DEFAULT_QUEUE_STALE_FALLBACK_SECONDS,
+        pid_dead_grace_period: float = DEFAULT_PID_DEAD_GRACE_PERIOD_SECONDS,
     ):
         self.run_dir = os.path.abspath(run_dir or DEFAULT_RUN_DIR)
         self.lock_dir = os.path.join(self.run_dir, LOCK_DIR_NAME)
@@ -313,6 +377,11 @@ class BuildSlotManager:
         self.is_pid_alive = is_pid_alive_fn or is_pid_alive
         self.queue_stale_heartbeat_after = queue_stale_heartbeat_after
         self.queue_stale_fallback_after = queue_stale_fallback_after
+        self.pid_dead_grace_period = (
+            float(pid_dead_grace_period)
+            if pid_dead_grace_period is not None
+            else DEFAULT_PID_DEAD_GRACE_PERIOD_SECONDS
+        )
         os.makedirs(self.run_dir, exist_ok=True)
 
     def _read_lock_info(self) -> Optional[Dict[str, Any]]:
@@ -623,12 +692,37 @@ class BuildSlotManager:
                 self._write_queue(queue)
             return updated
 
-    def check_stale_and_reclaim(self, stale_after: float = DEFAULT_STALE_AFTER_SECONDS) -> bool:
+    def heartbeat_lock(self, name: str, token: Optional[str] = None) -> bool:
+        """
+        Updates the heartbeat timestamp in info.json of the currently held lock
+        if the caller is the current owner.
+        """
+        info = self._read_lock_info()
+        if not info or info.get("owner") != name:
+            return False
+        if token and info.get("token") and info.get("token") != token:
+            return False
+        now = time.time()
+        now_iso = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat()
+        info["heartbeat_at"] = now_iso
+        info["heartbeat_at_epoch"] = now
+        try:
+            with open(self.info_file, "w", encoding="utf-8") as f:
+                json.dump(info, f, indent=2)
+            return True
+        except Exception:
+            return False
+
+    def check_stale_and_reclaim(
+        self,
+        stale_after: float = DEFAULT_STALE_AFTER_SECONDS,
+        pid_dead_grace_period: Optional[float] = None,
+    ) -> bool:
         """
         Checks if the currently held lock is stale.
         Reclaims it if:
-          1. Owner PID is dead.
-          2. Lock age exceeds stale_after seconds.
+          1. Owner PID is dead AND lock age exceeds grace period (and heartbeat not fresh).
+          2. Lock age exceeds stale_after seconds (and heartbeat not fresh).
           3. Corrupt lock directory older than 10s grace period.
         Returns True if a stale lock was reclaimed, False otherwise.
         """
@@ -639,6 +733,11 @@ class BuildSlotManager:
         now = time.time()
         is_stale = False
         reason = ""
+        effective_grace = (
+            pid_dead_grace_period
+            if pid_dead_grace_period is not None
+            else self.pid_dead_grace_period
+        )
 
         if info is None or info.get("corrupt"):
             mtime = os.path.getmtime(self.lock_dir) if os.path.exists(self.lock_dir) else now
@@ -659,13 +758,39 @@ class BuildSlotManager:
 
             age = max(0.0, now - acquired_epoch)
 
-            if pid > 0 and not self.is_pid_alive(pid):
-                is_stale = True
-                reason = f"owner PID {pid} is dead (owner='{owner}', age={age:.1f}s)"
-            elif age >= stale_after:
-                is_stale = True
-                reason = f"exceeded stale-after threshold ({age:.1f}s >= {stale_after:.1f}s, owner='{owner}', PID={pid})"
+            # Check heartbeat recency if available
+            hb_epoch = info.get("heartbeat_at_epoch")
+            if hb_epoch is None and info.get("heartbeat_at"):
+                try:
+                    hb_epoch = datetime.datetime.fromisoformat(info["heartbeat_at"]).timestamp()
+                except Exception:
+                    hb_epoch = None
+            hb_age = (now - hb_epoch) if hb_epoch is not None else None
+            is_hb_fresh = (hb_age is not None and hb_age < effective_grace)
 
+            if pid > 0 and not self.is_pid_alive(pid):
+                # Never reclaim a lock younger than the grace period (e.g. 60s),
+                # or whose heartbeat is fresh (< 60s).
+                # The recorded PID may be a short-lived helper or wrapper process
+                # that exited immediately after acquiring, while the actual lane is still running.
+                if age < effective_grace or is_hb_fresh:
+                    logger.debug(
+                        "Owner PID %d is dead for owner '%s' but lock is protected by grace period "
+                        "(age=%.1fs < %.1fs, hb_fresh=%s); not reclaiming",
+                        pid, owner, age, effective_grace, is_hb_fresh,
+                    )
+                else:
+                    is_stale = True
+                    reason = (
+                        f"owner PID {pid} is dead and lock age exceeds grace period "
+                        f"({age:.1f}s >= {effective_grace:.1f}s, owner='{owner}')"
+                    )
+            elif age >= stale_after:
+                if is_hb_fresh and hb_age is not None and hb_age < effective_grace:
+                    pass
+                else:
+                    is_stale = True
+                    reason = f"exceeded stale-after threshold ({age:.1f}s >= {stale_after:.1f}s, owner='{owner}', PID={pid})"
         if is_stale:
             notice = f"[NOTICE] Reclaiming stale build slot lock: {reason}"
             print(notice, file=sys.stderr)
@@ -1073,11 +1198,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "acquire":
         caller_pid = args.pid
         if caller_pid is None:
-            try:
-                ppid = os.getppid()
-                caller_pid = ppid if ppid > 0 else os.getpid()
-            except Exception:
-                caller_pid = os.getpid()
+            caller_pid = find_long_lived_owner_pid()
         success = manager.acquire(
             name=args.name,
             timeout=args.timeout,

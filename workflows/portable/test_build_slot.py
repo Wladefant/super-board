@@ -120,12 +120,12 @@ class TestBuildSlot(unittest.TestCase):
         # Simulate a lock acquired by a dead process (PID 999999)
         os.makedirs(manager.lock_dir, exist_ok=True)
         dead_pid = 999999
-        now = time.time()
+        past_epoch = time.time() - 120.0
         info = {
             "owner": "dead-lane",
             "pid": dead_pid,
-            "acquired_at": datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat(),
-            "acquired_at_epoch": now,
+            "acquired_at": datetime.datetime.fromtimestamp(past_epoch, datetime.timezone.utc).isoformat(),
+            "acquired_at_epoch": past_epoch,
         }
         with open(manager.info_file, "w", encoding="utf-8") as f:
             json.dump(info, f)
@@ -968,6 +968,77 @@ class TestBuildSlot(unittest.TestCase):
 
         self.assertEqual(errors, [])
         self.assertEqual(counter, 4 * 3)
+
+    def test_stale_lock_dead_pid_within_grace_period_not_reclaimed(self):
+        """
+        When a lock was acquired recently (e.g. 0.5s ago) and the recorded PID dies
+        (e.g. short-lived CLI wrapper or subshell), check_stale_and_reclaim must NOT
+        reclaim the lock while it is within the 60s dead-PID grace period.
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        os.makedirs(manager.lock_dir, exist_ok=True)
+        dead_pid = 999999
+        self.assertFalse(is_pid_alive(dead_pid))
+        recent_epoch = time.time() - 0.5
+        info = {
+            "owner": "short-lived-cli-lane",
+            "pid": dead_pid,
+            "acquired_at": datetime.datetime.fromtimestamp(recent_epoch, datetime.timezone.utc).isoformat(),
+            "acquired_at_epoch": recent_epoch,
+        }
+        with open(manager.info_file, "w", encoding="utf-8") as f:
+            json.dump(info, f)
+
+        # check_stale_and_reclaim must NOT reclaim this lock
+        reclaimed = manager.check_stale_and_reclaim()
+        self.assertFalse(reclaimed)
+        self.assertTrue(os.path.isdir(manager.lock_dir))
+
+    def test_stale_lock_fresh_heartbeat_not_reclaimed(self):
+        """
+        If the owner PID is dead and lock age exceeds grace period, but the lock has
+        a fresh heartbeat (<60s), check_stale_and_reclaim must NOT reclaim it.
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        os.makedirs(manager.lock_dir, exist_ok=True)
+        dead_pid = 999999
+        self.assertFalse(is_pid_alive(dead_pid))
+        old_epoch = time.time() - 300.0
+        now = time.time()
+        info = {
+            "owner": "heartbeating-lane",
+            "pid": dead_pid,
+            "acquired_at": datetime.datetime.fromtimestamp(old_epoch, datetime.timezone.utc).isoformat(),
+            "acquired_at_epoch": old_epoch,
+            "heartbeat_at": datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat(),
+            "heartbeat_at_epoch": now,
+        }
+        with open(manager.info_file, "w", encoding="utf-8") as f:
+            json.dump(info, f)
+
+        reclaimed = manager.check_stale_and_reclaim()
+        self.assertFalse(reclaimed)
+        self.assertTrue(os.path.isdir(manager.lock_dir))
+
+        # But once heartbeat is older than 60s, it IS reclaimed
+        info["heartbeat_at_epoch"] = now - 120.0
+        with open(manager.info_file, "w", encoding="utf-8") as f:
+            json.dump(info, f)
+
+        reclaimed = manager.check_stale_and_reclaim()
+        self.assertTrue(reclaimed)
+        self.assertFalse(os.path.exists(manager.lock_dir))
+
+    def test_find_long_lived_owner_pid_returns_valid_pid(self):
+        """
+        find_long_lived_owner_pid must return a valid positive PID
+        (either veyyon process or parent process).
+        """
+        pid = build_slot.find_long_lived_owner_pid()
+        self.assertIsInstance(pid, int)
+        self.assertGreater(pid, 0)
+        self.assertTrue(is_pid_alive(pid))
+
 
 if __name__ == "__main__":
     unittest.main()
