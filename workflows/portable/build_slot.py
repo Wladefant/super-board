@@ -1408,7 +1408,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p_uncache.add_argument("worktree", help="Path to worktree root directory")
 
     # check-ram [--threshold PERCENT]
-    p_ram = subparsers.add_parser("check-ram", help="Check system RAM percentage against threshold (default: 90%)")
+    p_ram = subparsers.add_parser("check-ram", help="Check system RAM percentage against threshold (default: 90%%)")
     p_ram.add_argument("--threshold", type=float, default=90.0, help="RAM percentage threshold (default: 90.0)")
     p_ram.add_argument("--json", action="store_true", help="Output RAM status as JSON")
 
