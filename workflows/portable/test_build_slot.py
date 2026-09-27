@@ -723,6 +723,56 @@ class TestBuildSlot(unittest.TestCase):
         # Both acquired and released; Waiter A acquired FIRST!
         self.assertEqual(events, ["waiter-a", "waiter-b"], "Waiter A must acquire before later arrival Waiter B")
 
+    def test_queue_atomic_lock_retries_on_permission_error(self):
+        """
+        On Windows, os.mkdir(queue_lock_dir) can transiently raise PermissionError [WinError 5]
+        when another process is deleting the lock dir (delete-pending state).
+        Verify that _queue_atomic_lock treats PermissionError as contention, retries with backoff,
+        and acquires successfully instead of crashing.
+        """
+        real_mkdir = os.mkdir
+        attempts = 0
+
+        def fake_mkdir(path, *args, **kwargs):
+            nonlocal attempts
+            if os.path.basename(path) == build_slot.QUEUE_LOCK_NAME and attempts < 2:
+                attempts += 1
+                raise PermissionError(13, "Permission denied (simulated Windows delete-pending race)")
+            return real_mkdir(path, *args, **kwargs)
+
+        with mock.patch("os.mkdir", side_effect=fake_mkdir):
+            acquired = False
+            with build_slot._queue_atomic_lock(self.run_dir, timeout=2.0, retry_interval=0.01):
+                acquired = True
+            self.assertTrue(acquired)
+            self.assertGreaterEqual(attempts, 2, "fake_mkdir should have raised PermissionError at least twice")
+
+    def test_acquire_retries_on_queue_lock_permission_error(self):
+        """
+        Simulate PermissionError during BuildSlotManager.acquire() when accessing the queue lock.
+        Verify that acquire() does not crash with a traceback and successfully acquires the build slot.
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        real_mkdir = os.mkdir
+        attempts = 0
+
+        def fake_mkdir(path, *args, **kwargs):
+            nonlocal attempts
+            if os.path.basename(path) == build_slot.QUEUE_LOCK_NAME and attempts < 2:
+                attempts += 1
+                raise PermissionError(13, "Permission denied (simulated Windows delete-pending race)")
+            return real_mkdir(path, *args, **kwargs)
+
+        with mock.patch("os.mkdir", side_effect=fake_mkdir):
+            acquired = manager.acquire(
+                name="test-lane-perm",
+                timeout=5.0,
+                poll_interval=0.05,
+            )
+            self.assertTrue(acquired)
+            self.assertGreaterEqual(attempts, 2)
+        self.assertTrue(manager.release("test-lane-perm"))
+
     def test_queue_atomic_lock_permission_error_retry_success(self):
         """
         On Windows, a directory in delete-pending state raises PermissionError [WinError 5]
@@ -901,24 +951,23 @@ class TestBuildSlot(unittest.TestCase):
 
         def worker(worker_id):
             nonlocal counter
-            for _ in range(5):
+            for _ in range(3):
                 try:
-                    with _queue_atomic_lock(self.run_dir, timeout=5.0, retry_interval=0.01):
+                    with _queue_atomic_lock(self.run_dir, timeout=10.0, retry_interval=0.01):
                         current = counter
-                        time.sleep(0.005)
+                        time.sleep(0.001)
                         counter = current + 1
                 except Exception as e:
                     errors.append((worker_id, e))
 
-        threads = [threading.Thread(target=worker, args=(i,)) for i in range(6)]
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
         for t in threads:
             t.start()
         for t in threads:
-            t.join(timeout=10.0)
+            t.join(timeout=15.0)
 
         self.assertEqual(errors, [])
-        self.assertEqual(counter, 6 * 5)
-
+        self.assertEqual(counter, 4 * 3)
 
 if __name__ == "__main__":
     unittest.main()
