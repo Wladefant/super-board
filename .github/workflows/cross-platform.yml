@@ -215,6 +215,8 @@ jobs:
 
       - name: build slot arbiter
         run: python -B workflows/portable/test_build_slot.py
+      - name: worktree removal
+        run: python -B workflows/portable/test_wt_remove.py
       - name: outer loop intake
         run: python -B workflows/portable/test_outer_loop_intake.py
       - name: host status monitor
