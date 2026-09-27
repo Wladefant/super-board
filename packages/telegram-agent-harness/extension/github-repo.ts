@@ -5,6 +5,7 @@
  * super-board session's "#224" does not point at PolySimulator. The repository is read
  * from the working directory's `origin` remote.
  */
+import * as path from "node:path";
 
 /**
  * Resolves `owner/repo` from a GitHub remote URL (https, ssh or scp-like form).
@@ -18,16 +19,31 @@ export function parseGithubRepo(remoteUrl: string): string | null {
 const repoByDir = new Map<string, string | undefined>();
 
 /** `owner/repo` of `dir`'s origin remote, cached per directory; undefined outside a GitHub checkout. */
-export function resolveGithubRepo(dir: string): string | undefined {
+export function resolveGithubRepo(dir?: string): string | undefined {
+  if (!dir) return undefined;
+  const normalized = path.resolve(dir).replace(/\\/g, "/");
+  if (repoByDir.has(normalized)) return repoByDir.get(normalized);
   if (repoByDir.has(dir)) return repoByDir.get(dir);
   let repo: string | undefined;
   try {
-    const result = Bun.spawnSync(["git", "-C", dir, "remote", "get-url", "origin"], { stdout: "pipe", stderr: "ignore" });
-    if (result.exitCode === 0) repo = parseGithubRepo(result.stdout.toString()) ?? undefined;
+    let stdoutText = "";
+    if (typeof Bun !== "undefined" && Bun.spawnSync) {
+      const result = Bun.spawnSync(["git", "-C", dir, "remote", "get-url", "origin"], { stdout: "pipe", stderr: "ignore" });
+      if (result.exitCode === 0) stdoutText = result.stdout.toString();
+    } else {
+      // Fallback for Node.js test or execution environments
+      const { spawnSync } = require("node:child_process");
+      const res = spawnSync("git", ["-C", dir, "remote", "get-url", "origin"], { encoding: "utf8" });
+      if (res.status === 0 && res.stdout) stdoutText = res.stdout;
+    }
+    if (stdoutText) {
+      repo = parseGithubRepo(stdoutText) ?? undefined;
+    }
   } catch {
     // No git binary or an unreadable directory: the session has no repository, so a bare
     // `#N` in its prose stays unlinked rather than pointing at an unrelated project.
   }
+  repoByDir.set(normalized, repo);
   repoByDir.set(dir, repo);
   return repo;
 }
