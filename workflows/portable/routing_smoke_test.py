@@ -105,6 +105,7 @@ from model_routing import (
     CREDENTIAL_ENV_BY_PROVIDER,
     MINIMAX_PROVIDER,
     ROLE_MODEL_PINS,
+    get_recommended_lanes,
     VERIFIED_CONTEXT_WINDOWS,
     ZAI_PROVIDER,
     detect_credentialed_providers,
@@ -876,7 +877,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         usage = self._usage_with_ag_families(anthropic_used=0.0)
         plain = self._selector(usage)
         self.assertEqual(plain.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH).selected_model,
-                         MODEL_AG_CLAUDE_OPUS)
+                         MODEL_CLAUDE_FABLE)
 
         # Three lanes died on a 429 within 3 s after being dispatched onto the exhausted
         # Antigravity Opus window, so a cache entry with a future reset must remove it.
@@ -905,7 +906,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         )
         self.assertIsNone(rearmed.provider_exhaustion_reason(MODEL_AG_CLAUDE_OPUS))
         self.assertEqual(rearmed.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH).selected_model,
-                         MODEL_AG_CLAUDE_OPUS)
+                         MODEL_CLAUDE_FABLE)
 
         # An unrelated provider's window is untouched by the entry.
         self.assertTrue(exhausted.quota_snapshot().is_eligible("openai-codex"))
@@ -935,27 +936,34 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         print(f"  [PASS] 429 body wrote {reset.exhausted_until}; review lane routed to {rec.selected_model}.")
 
     # -------------------------------------------------------------------------
-    # TEST: Review routing: routine reviews (>250 lines) default to ag-opus,
-    # migration/money first-pass escalates to reviewer (Opus 5.5), and ag-opus
-    # exhaustion falls back to reviewer (never Flash).
-    # (Operator ruling 2026-09-26 ~13:25Z: "I mean only hard, super hard work, right?
-    # Don't move everything in there").
+    # TEST: Review routing: routine and delta reviews route to ds-task,
+    # high-risk reviews (money/auth/migration/concurrency) route to reviewer (Opus 5.5),
+    # and high-risk reviews never fall back to Flash.
+    # (Operator ruling 2026-09-27 ~15:00Z).
     # -------------------------------------------------------------------------
-    def test_review_routing_ag_opus_default_and_super_hard_escalation(self):
-        print("\n--- TEST: Review Routing ag-opus Default and Super-Hard Escalation ---")
+    def test_review_routing_routine_ds_task_and_high_risk_reviewer(self):
+        print("\n--- TEST: Review Routing Routine ds-task and High-Risk Reviewer ---")
         usage = self._usage_with_ag_families(anthropic_used=0.0)
         selector = self._selector(usage)
 
-        # 1. Routine review above 250 lines resolves to ag-opus (Opus 4.6 on free daily window)
+        # 1. Routine review above 250 lines resolves to ds-task (DeepSeek Flash)
         rec_routine = selector.select_model(
             task_type=TaskType.STRONG_REVIEW,
             risk_level=RiskLevel.HIGH,
             diff_lines=300,
         )
-        self.assertEqual(rec_routine.selected_model, MODEL_AG_CLAUDE_OPUS)
-        self.assertEqual(model_to_agent_role(rec_routine.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "ag-opus")
+        self.assertEqual(rec_routine.selected_model, MODEL_DEEPSEEK_FLASH)
+        self.assertEqual(model_to_agent_role(rec_routine.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "ds-task")
 
-        # 2. Migration first-pass review resolves to reviewer (Claude Opus 5.5)
+        # 2. Delta review (rework_count >= 1) resolves to ds-task (DeepSeek Flash)
+        rec_delta = selector.select_model(
+            task_type=TaskType.STRONG_REVIEW,
+            rework_count=1,
+        )
+        self.assertEqual(rec_delta.selected_model, MODEL_DEEPSEEK_FLASH)
+        self.assertEqual(model_to_agent_role(rec_delta.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "ds-task")
+
+        # 3. Migration first-pass review resolves to reviewer (Claude Opus 5.5)
         rec_migration = selector.select_model(
             task_type=TaskType.STRONG_REVIEW,
             risk_level=RiskLevel.HIGH,
@@ -965,7 +973,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         self.assertEqual(rec_migration.selected_model, MODEL_CLAUDE_OPUS_55)
         self.assertEqual(model_to_agent_role(rec_migration.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "reviewer")
 
-        # 3. Money first-pass review resolves to reviewer (Claude Opus 5.5)
+        # 4. Money first-pass review resolves to reviewer (Claude Opus 5.5)
         rec_money = selector.select_model(
             task_type=TaskType.STRONG_REVIEW,
             risk_level=RiskLevel.HIGH,
@@ -975,21 +983,39 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         self.assertEqual(rec_money.selected_model, MODEL_CLAUDE_OPUS_55)
         self.assertEqual(model_to_agent_role(rec_money.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "reviewer")
 
-        # 4. ag-opus exhaustion falls back to reviewer (Opus 5.5) and never to Flash
-        exhausted = ResetAwareModelSelector(
-            parse_usage_json(usage, current_time_ms=self.mock_now_ms),
-            quota_snapshot=self._quota_with("google-antigravity:anthropic", "2099-01-01T00:00:00Z"),
-        )
-        rec_exhausted = exhausted.select_model(
+        # 5. Auth first-pass review resolves to reviewer (Claude Opus 5.5)
+        rec_auth = selector.select_model(
             task_type=TaskType.STRONG_REVIEW,
             risk_level=RiskLevel.HIGH,
-            diff_lines=300,
+            domain_tags=["auth"],
+            rework_count=0,
         )
-        self.assertEqual(rec_exhausted.selected_model, MODEL_CLAUDE_OPUS_55)
-        self.assertEqual(model_to_agent_role(rec_exhausted.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "reviewer")
+        self.assertEqual(rec_auth.selected_model, MODEL_CLAUDE_OPUS_55)
+        self.assertEqual(model_to_agent_role(rec_auth.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "reviewer")
+
+        # 6. Concurrency first-pass review resolves to reviewer (Claude Opus 5.5)
+        rec_conc = selector.select_model(
+            task_type=TaskType.STRONG_REVIEW,
+            risk_level=RiskLevel.HIGH,
+            domain_tags=["concurrency"],
+            rework_count=0,
+        )
+        self.assertEqual(rec_conc.selected_model, MODEL_CLAUDE_OPUS_55)
+        self.assertEqual(model_to_agent_role(rec_conc.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "reviewer")
+
+        # 7. High-risk review with Anthropic exhausted never falls back to Flash
+        usage_exhausted = copy.deepcopy(usage)
+        self._block_anthropic(usage_exhausted)
+        sel_exhausted = self._selector(usage_exhausted)
+        rec_exhausted = sel_exhausted.select_model(
+            task_type=TaskType.STRONG_REVIEW,
+            risk_level=RiskLevel.HIGH,
+            domain_tags=["migration"],
+        )
+        self.assertIn(rec_exhausted.selected_model, (MODEL_DEEPSEEK_PRO, MODEL_CODEX_ASTRA))
         self.assertNotIn("flash", rec_exhausted.selected_model.lower())
         self.assertNotIn("flash", rec_exhausted.fallback_model.lower())
-        print("  [PASS] Routine review (>250 lines) -> ag-opus; migration/money -> reviewer; ag-opus exhaustion -> reviewer (never Flash).")
+        print("  [PASS] Routine review (>250 lines) -> ds-task; delta review -> ds-task; migration/money/auth/concurrency -> reviewer (never Flash).")
     def _selector(self, usage):
         return ResetAwareModelSelector(parse_usage_json(usage, current_time_ms=self.mock_now_ms))
 
@@ -1009,10 +1035,9 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         usage = self._usage_with_ag_families(codex_used=0.92, codex_reset_hrs=145)
         self._block_anthropic(usage)
         selector = self._selector(usage)
-        # High-risk review climbs to Antigravity Opus; the high-risk worker ladder (GLM ->
-        # Astra -> DeepSeek V4 Pro -> ag-opus -> Fable) lands on DeepSeek V4 Pro.
+        # High-risk review with Anthropic blocked lands on DeepSeek V4 Pro; the high-risk worker ladder lands on DeepSeek V4 Pro.
         expected = {
-            TaskType.STRONG_REVIEW: MODEL_AG_CLAUDE_OPUS,
+            TaskType.STRONG_REVIEW: MODEL_DEEPSEEK_PRO,
             TaskType.DEEP_REASONING: MODEL_DEEPSEEK_PRO,
             TaskType.ROUTINE_EXECUTION: MODEL_DEEPSEEK_PRO,
         }
@@ -1029,7 +1054,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
                 lim["status"] = "rate_limited"
         rec_routine = self._selector(usage).select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.LOW)
         self.assertNotIn("openai-codex/", rec_routine.selected_model)
-        print("  [PASS] 92% used with 145h left: Codex held back; high-risk review on ag-opus, workers on DeepSeek V4 Pro.")
+        print("  [PASS] 92% used with 145h left: Codex held back; high-risk review and workers on DeepSeek V4 Pro.")
 
         # The same 92% with 6h left is behind pace: the last 8% would expire unused, so it
         # is promoted ahead of every other strong lane, including Antigravity Claude.
@@ -1101,27 +1126,27 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         print(f"  [PASS] Stale Anthropic snapshot kept in reserve; routed to {rec_stale.selected_model}.")
 
     # -------------------------------------------------------------------------
-    # TEST 23: Antigravity Claude daily window is spent before paid Anthropic
+    # TEST 23: High-risk review routes to reviewer (Opus 5.5)
     # -------------------------------------------------------------------------
     def test_antigravity_claude_chosen(self):
-        print("\n--- TEST 23: Antigravity Claude Chosen Before Paid Anthropic ---")
+        print("\n--- TEST 23: High-Risk Review Routes to Reviewer (Opus 5.5) ---")
         selector = self._selector(self._usage_with_ag_families(anthropic_used=0.0))
-        # High-risk review spends Antigravity Claude Opus
-        rec_review = selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
-        self.assertEqual(rec_review.selected_model, MODEL_AG_CLAUDE_OPUS)
-        # Medium-risk review is restricted to worker tiers and does NOT spend ag-opus
+        # High-risk review spends Claude Opus 5.5 (reviewer)
+        rec_review = selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH, domain_tags=["money"])
+        self.assertEqual(rec_review.selected_model, MODEL_CLAUDE_OPUS_55)
+        # Medium-risk review is restricted to worker tiers and does NOT spend Opus 5.5
         rec_med_review = selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.MEDIUM)
-        self.assertNotEqual(rec_med_review.selected_model, MODEL_AG_CLAUDE_OPUS)
+        self.assertNotEqual(rec_med_review.selected_model, MODEL_CLAUDE_OPUS_55)
         # Operator DEEP_REASONING ladder policy (#214): LOW and MEDIUM lead with OpenCode Go
         # GLM-5.3, then DeepSeek V4 Pro, then Gemini 3.8 Flash. Opus is minimized and reserved
         # for orchestrator and high-risk reviews only, so medium-risk deep reasoning does NOT
-        # spend ag-opus; HIGH risk worker routes via CASE B2 ladder.
+        # spend Opus 5.5; HIGH risk worker routes via CASE B2 ladder.
         rec_reason = selector.select_model(task_type=TaskType.DEEP_REASONING, risk_level=RiskLevel.MEDIUM)
         self.assertEqual(rec_reason.selected_model, MODEL_DEEPSEEK_PRO)
         packet = selector.dispatch(task_type=TaskType.DEEP_REASONING, risk_level=RiskLevel.MEDIUM)
         self.assertEqual(packet.recommendation["model"], MODEL_DEEPSEEK_PRO)
         self.assertEqual(packet.recommendation["agent_role"], "ds-pro")
-        print(f"  [PASS] High review on {rec_review.selected_model} (ag-opus); medium review avoids Opus; medium reasoning on {rec_reason.selected_model} (ds-pro).")
+        print(f"  [PASS] High review on {rec_review.selected_model} (reviewer); medium review avoids Opus; medium reasoning on {rec_reason.selected_model} (ds-pro).")
 
         # An almost spent Antigravity Claude window (95% used) is left alone.
         spent = self._selector(self._usage_with_ag_families(anthropic_used=0.95))
@@ -1250,9 +1275,9 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         self.assertAlmostEqual(rec.quota_metrics["codex_remaining"], 0.08, places=6)
         self.assertLess(rec.quota_metrics["codex_pro_headroom"], CODEX_PACE_MIN_HEADROOM)
         self.assertAlmostEqual(rec.burn_headroom, rec.quota_metrics["codex_pro_headroom"])
-        # Throttled pro Codex is not handed high-risk review while ag-opus has headroom.
+        # Throttled pro Codex is not handed high-risk review while reviewer has headroom.
         rec_review = selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
-        self.assertEqual(rec_review.selected_model, MODEL_AG_CLAUDE_OPUS)
+        self.assertEqual(rec_review.selected_model, MODEL_CLAUDE_FABLE)
         print(f"  [PASS] Two-account Codex: metrics from pro window (remaining "
               f"{rec.quota_metrics['codex_remaining']:.2f}, throttled={rec.quota_metrics['codex_pro_throttled']}), "
               f"lane remaining {rec.quota_metrics['codex_lane_remaining']:.2f}; review on {rec_review.selected_model}")
@@ -1327,8 +1352,8 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         self.assertEqual(model_to_agent_role(MODEL_AG_CLAUDE_SONNET, TaskType.ROUTINE_EXECUTION, RiskLevel.LOW), "ag-sonnet")
         # AG GPT → ag-gpt (not ag-opus)
         self.assertEqual(model_to_agent_role(MODEL_AG_GPT_OSS, TaskType.ROUTINE_EXECUTION, RiskLevel.LOW), "ag-gpt")
-        # AG Opus → ag-opus
-        self.assertEqual(model_to_agent_role(MODEL_AG_CLAUDE_OPUS, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "ag-opus")
+        # AG Opus → reviewer (not ag-opus, ag-opus no longer exists)
+        self.assertEqual(model_to_agent_role(MODEL_AG_CLAUDE_OPUS, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "reviewer")
         # DeepSeek V4 Pro → ds-pro (ds-task is pinned to DeepSeek Flash)
         self.assertEqual(model_to_agent_role(MODEL_DEEPSEEK_PRO, TaskType.ROUTINE_EXECUTION, RiskLevel.HIGH), "ds-pro")
         self.assertEqual(model_to_agent_role(MODEL_DEEPSEEK_FLASH, TaskType.ROUTINE_EXECUTION, RiskLevel.LOW), "ds-task")
@@ -1349,7 +1374,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         reasoning_pins = {"thinker"}
         for role, model in ROLE_MODEL_PINS.items():
             if role in ("astra-ux", "advisor"):
-                # Specialized UX/advisor roles; router emits standard agent roles (task / ag-opus)
+                # Specialized UX/advisor roles; router emits standard agent roles (task / reviewer)
                 continue
             if role in review_pins:
                 task_type = TaskType.STRONG_REVIEW
@@ -1640,10 +1665,9 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
                     self.assertNotIn(MODEL_CHATGPT_WEB, (rec.selected_model, rec.fallback_model),
                                      f"{task_type}/{risk} must not select or fall back to chatgpt-web")
 
-        # Critical diffs fall through cleanly to ag-opus, codex, or deepseek
+        # Critical diffs fall through cleanly to reviewer, codex, or deepseek
         critical = down.select_model(TaskType.STRONG_REVIEW, RiskLevel.HIGH)
-        self.assertIn(critical.selected_model, (MODEL_AG_CLAUDE_OPUS, MODEL_CLAUDE_OPUS_55, MODEL_CODEX_ASTRA))
-
+        self.assertIn(critical.selected_model, (MODEL_CLAUDE_OPUS_55, MODEL_CODEX_ASTRA, MODEL_DEEPSEEK_PRO, MODEL_CLAUDE_FABLE))
         print("  [PASS] Bridge is off by default, requires explicit operator action, and is "
               "stripped from all ladders; critical reviews and workers fall through cleanly.")
 
@@ -1717,7 +1741,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         # 3. No review lane runs a Gemini model, and the shared Antigravity fallback chain no
         # longer substitutes one: a Google-family outage takes every Gemini model with it, and
         # a Gemini fallback would review a Gemini-authored diff.
-        for role in ("reviewer", "ag-opus", "go-review", "web-thinker", "codex-reviewer",
+        for role in ("reviewer", "go-review", "web-thinker", "codex-reviewer",
                      "extra-review", "or-review"):
             chain = (agents.get(role) or {}).get("model") or model_roles.get(role) or ""
             self.assertNotIn("gemini", str(chain).lower(), f"review lane {role} must not run Gemini")
@@ -1729,10 +1753,10 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         # cross-family Chinese reviewers, then DeepSeek. Gating roles (reviewer, ag-opus) NEVER lead with chatgpt-web.
         critical_chain = str((agents.get("reviewer") or {}).get("model", ""))
         self.assertEqual(critical_chain.split(",")[0].strip(), "anthropic/claude-opus-5-5:high")
-        for expected in ("google-antigravity/claude-opus-4-6", "opencode-go/glm-5.3",
+        for expected in ("opencode-go/glm-5.3",
                          "opencode-go/qwen3.8-max", "deepseek/"):
             self.assertIn(expected, critical_chain, f"critical review chain must offer {expected}")
-        for gating_role in ("reviewer", "ag-opus"):
+        for gating_role in ("reviewer",):
             first_model = str((agents.get(gating_role) or {}).get("model", "")).split(",")[0].strip()
             self.assertFalse(first_model.startswith("chatgpt-web"),
                              f"Gating role '{gating_role}' must never lead with chatgpt-web (got {first_model})")
@@ -1799,7 +1823,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         # working serially.
         for role, child_model in (
             ("task", True), ("qa-verifier", True), ("spark", False), ("reviewer", True),
-            ("ag-opus", True), ("ds-task", True), ("go-task", True), ("go-review", True),
+            ("ds-task", True), ("go-task", True), ("go-review", True),
             ("go-deep", True), ("go-bulk", True),
         ):
             record = agents.get(role)
@@ -1818,7 +1842,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         # never paid Opus and never a paid Anthropic model anywhere in a child chain.
         cheap_prefixes = ("google-antigravity/gemini-3.8-flash", "deepseek/", "openai-codex/gpt-5.3-codex-spark",
                           "opencode-go/", "openrouter/deepseek/")
-        for role in ("task", "qa-verifier", "reviewer", "ag-opus", "ds-task", "go-task",
+        for role in ("task", "qa-verifier", "reviewer", "ds-task", "go-task",
                      "go-review", "go-deep", "go-bulk"):
             child_chain = str(agents[role]["agents"].get("model", ""))
             self.assertNotIn("anthropic/", child_chain, f"{role} children must not run paid Anthropic")
@@ -2263,7 +2287,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             self.assertIn("windows", out_json)
             self.assertIn("recommended_lanes", out_json)
             self.assertEqual(out_json["recommended_lanes"]["reviewer"], "anthropic/claude-opus-5-5:high")
-            self.assertIn("partner-b", out_json["recommended_lanes"]["ag-opus"])
+            self.assertNotIn("ag-opus", out_json["recommended_lanes"])
         finally:
             if os.path.exists(tmp_file.name):
                 os.unlink(tmp_file.name)
@@ -2276,12 +2300,12 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
     # -------------------------------------------------------------------------
     def test_gating_role_pin_guard_no_chatgpt_web(self):
         print("\n--- TEST 50: Gating Role Pin Guard (No chatgpt-web) ---")
-        for gating_role in ("reviewer", "ag-opus"):
+        for gating_role in ("reviewer",):
             pinned = ROLE_MODEL_PINS.get(gating_role, "")
             self.assertFalse(pinned.startswith("chatgpt-web"),
                              f"ROLE_MODEL_PINS[{gating_role}] must never lead with chatgpt-web (got {pinned})")
         self.assertEqual(ROLE_MODEL_PINS.get("reviewer"), "anthropic/claude-opus-5-5:high")
-        self.assertEqual(ROLE_MODEL_PINS.get("ag-opus"), MODEL_AG_CLAUDE_OPUS)
+        self.assertNotIn("ag-opus", ROLE_MODEL_PINS)
         print("  [PASS] Gating roles strictly barred from leading with chatgpt-web.")
 
     # -------------------------------------------------------------------------
@@ -2322,7 +2346,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         self.assertFalse(selector_off.codex_account_available())
 
         # Strong review (high-risk or routine) must NEVER select openai-codex or Flash;
-        # falls through to ag-opus or reviewer (Opus 5.5).
+        # falls through to reviewer (Opus 5.5).
         rec_review = selector_off.select_model(
             task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH, allow_codex_promotion=True
         )
@@ -2331,16 +2355,16 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         self.assertFalse(rec_review.fallback_model.startswith("openai-codex/"))
         self.assertNotIn("flash", rec_review.selected_model.lower())
         self.assertNotIn("flash", rec_review.fallback_model.lower())
-        self.assertIn(rec_review.selected_model, (MODEL_AG_CLAUDE_OPUS, MODEL_CLAUDE_OPUS_55, MODEL_CLAUDE_FABLE))
+        self.assertIn(rec_review.selected_model, (MODEL_CLAUDE_OPUS_55, MODEL_CLAUDE_FABLE))
         self.assertIn(model_to_agent_role(rec_review.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH),
-                      ("ag-opus", "reviewer", "advisor"))
+                      ("reviewer", "advisor"))
 
-        # With Antigravity Claude available in snapshot: falls through to ag-opus
+        # With Antigravity Claude available in snapshot: falls through to reviewer (Opus 5.5)
         snap_ag = parse_usage_json(self._usage_with_ag_families(), current_time_ms=self.mock_now_ms)
         sel_ag_off = ResetAwareModelSelector(snap_ag, codex_account=False)
         rec_ag_rev = sel_ag_off.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
-        self.assertEqual(rec_ag_rev.selected_model, MODEL_AG_CLAUDE_OPUS)
-        self.assertEqual(model_to_agent_role(rec_ag_rev.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "ag-opus")
+        self.assertIn(rec_ag_rev.selected_model, (MODEL_CLAUDE_OPUS_55, MODEL_CLAUDE_FABLE))
+        self.assertIn(model_to_agent_role(rec_ag_rev.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH), ("reviewer", "advisor"))
         # Routine execution / implementation falls through to task (Gemini Flash).
         rec_exec = selector_off.select_model(
             task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.MEDIUM, allow_codex_promotion=True
@@ -2361,7 +2385,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         )
         self.assertFalse(packet_review.recommendation["model"].startswith("openai-codex/"))
         self.assertFalse(packet_review.recommendation["fallback_model"].startswith("openai-codex/"))
-        self.assertIn(packet_review.recommendation["agent_role"], ("ag-opus", "reviewer", "advisor"))
+        self.assertIn(packet_review.recommendation["agent_role"], ("reviewer", "advisor"))
         self.assertNotIn("flash", packet_review.recommendation["model"].lower())
 
         packet_worker = selector_off.dispatch(
@@ -2409,7 +2433,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             self.assertFalse(default_sel.codex_account_available())
             disp_rev = default_sel.dispatch(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
             self.assertFalse(disp_rev.recommendation["model"].startswith("openai-codex/"))
-            self.assertIn(disp_rev.recommendation["agent_role"], ("ag-opus", "reviewer", "advisor"))
+            self.assertIn(disp_rev.recommendation["agent_role"], ("reviewer", "advisor"))
             disp_work = default_sel.dispatch(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.MEDIUM)
             self.assertFalse(disp_work.recommendation["model"].startswith("openai-codex/"))
             self.assertEqual(disp_work.recommendation["agent_role"], "task")
@@ -2482,7 +2506,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             self.assertFalse(neg_rev.selected_model.startswith("openai-codex/"))
             self.assertFalse(neg_rev.promotion_applied, "Promotion must not be applied to Codex when disabled")
             self.assertNotIn("flash", neg_rev.selected_model.lower(), "High-risk review must never fall back to Flash")
-            self.assertIn(neg_rev.selected_model, (MODEL_AG_CLAUDE_OPUS, MODEL_CLAUDE_OPUS_55, MODEL_CLAUDE_FABLE))
+            self.assertIn(neg_rev.selected_model, (MODEL_CLAUDE_OPUS_55, MODEL_CLAUDE_FABLE))
             self.assertNotEqual(neg_rev.selected_model, MODEL_CODEX_ASTRA)
 
             # In State 2 routine execution returned MODEL_CODEX_FAST with promotion_applied=True.
@@ -2505,7 +2529,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             self.assertFalse(is_agent_role_available("sol"))
             self.assertTrue(is_agent_role_available("task"))
             self.assertTrue(is_agent_role_available("reviewer"))
-            self.assertTrue(is_agent_role_available("ag-opus"))
+            self.assertFalse(is_agent_role_available("ag-opus"))
             self.assertTrue(is_agent_role_available("ds-task"))
             self.assertTrue(is_agent_role_available("go-task"))
 
@@ -2631,6 +2655,89 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         self.assertNotEqual(model_to_agent_role(MODEL_CLAUDE_FABLE, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "advisor")
         self.assertNotEqual(model_to_agent_role(MODEL_CLAUDE_FABLE, TaskType.ROUTINE_EXECUTION, RiskLevel.LOW), "advisor")
         print(f"  [PASS] advisor pinned to {MODEL_GEMINI_FLASH}; Fable never maps to advisor.")
+    # -------------------------------------------------------------------------
+    # TEST 52: No route resolves to ag-opus (Operator ruling 2026-09-27 ~15:00Z)
+    # -------------------------------------------------------------------------
+    def test_no_route_resolves_to_ag_opus(self):
+        print("\n--- TEST 52: No Route Resolves To ag-opus ---")
+        self.assertNotIn("ag-opus", ROLE_MODEL_PINS)
+        self.assertIsNone(resolve_role_model("ag-opus"))
+        self.assertFalse(is_agent_role_available("ag-opus"))
+
+        # Sweep all task types, risk levels, rework counts, diff line sizes, and domain tags
+        usage = self._usage_with_ag_families(anthropic_used=0.0)
+        selector = self._selector(usage)
+        self.assertNotIn("ag-opus", get_recommended_lanes(selector))
+
+        domain_tag_cases = [
+            None,
+            [],
+            ["money"],
+            ["auth"],
+            ["migration"],
+            ["concurrency"],
+            ["architecture"],
+            ["state_machine"],
+            ["schema"],
+            ["invariants"],
+            ["delta"],
+            ["frontend"],
+            ["docs"],
+        ]
+
+        for task_type in TaskType:
+            for risk in RiskLevel:
+                for rework in (0, 1, 2):
+                    for diff in (None, 50, 200, 300, 1000):
+                        for tags in domain_tag_cases:
+                            rec = selector.select_model(
+                                task_type=task_type,
+                                risk_level=risk,
+                                rework_count=rework,
+                                diff_lines=diff,
+                                domain_tags=tags,
+                            )
+                            # Model ID must never be MODEL_AG_CLAUDE_OPUS on any review or execution route
+                            self.assertNotEqual(
+                                rec.selected_model,
+                                MODEL_AG_CLAUDE_OPUS,
+                                f"selected_model was {rec.selected_model} for {task_type}/{risk}/rework={rework}/diff={diff}/tags={tags}",
+                            )
+                            self.assertNotEqual(
+                                rec.fallback_model,
+                                MODEL_AG_CLAUDE_OPUS,
+                                f"fallback_model was {rec.fallback_model} for {task_type}/{risk}/rework={rework}/diff={diff}/tags={tags}",
+                            )
+                            # Agent role mapping must never resolve to ag-opus
+                            role_selected = model_to_agent_role(rec.selected_model, task_type, risk)
+                            self.assertNotEqual(
+                                role_selected,
+                                "ag-opus",
+                                f"selected model role was ag-opus for {rec.selected_model} in {task_type}/{risk}",
+                            )
+                            if rec.fallback_model:
+                                role_fallback = model_to_agent_role(rec.fallback_model, task_type, risk)
+                                self.assertNotEqual(
+                                    role_fallback,
+                                    "ag-opus",
+                                    f"fallback model role was ag-opus for {rec.fallback_model} in {task_type}/{risk}",
+                                )
+                            # Dispatch packet agent_role must never be ag-opus
+                            pkt = selector.dispatch(
+                                task_type=task_type,
+                                risk_level=risk,
+                                rework_count=rework,
+                            )
+                            self.assertNotEqual(
+                                pkt.recommendation["agent_role"],
+                                "ag-opus",
+                                f"dispatch role was ag-opus for {task_type}/{risk}",
+                            )
+                            self.assertNotEqual(
+                                pkt.recommendation["model"],
+                                MODEL_AG_CLAUDE_OPUS,
+                            )
+        print("  [PASS] Zero routes resolve to ag-opus across all task types, risk levels, rework counts, diff sizes and domain tags.")
 
 def main():
     print("=" * 70)
