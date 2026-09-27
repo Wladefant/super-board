@@ -175,7 +175,7 @@ MODEL_OR_FREE_ADVISORY = "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
 # priced at the documented per-1M rates.  Whole lanes per window follow.
 #
 #   model                monthly cap   $/lane   lanes/month   lanes/week   lanes/5h
-#   space-bunny-free     unlimited     0        unlimited     unlimited    unlimited
+#   space-bunny-free     $0 (no cap)   0        Go limit      Go limit     Go limit
 #   glm-5.3-flash        $60           0.4157   ~144          ~72          ~28
 #   qwen3.8-flash        $30           0.2850   ~105          ~52          ~21
 #   gpt-6-luna           $15           0.1920   ~78           ~39          ~15
@@ -185,15 +185,18 @@ MODEL_OR_FREE_ADVISORY = "openrouter/nvidia/nemotron-3-ultra-550b-a55b:free"
 #
 # The Go WORKHORSE is therefore glm-5.3-flash ($60 cap), NOT glm-5.3: the flagship-tier
 # model carries the SMALLEST monthly cap ($15, ~4 lanes a month) and is reserved for the
-# highest-value high-risk review.  space-bunny-free is free and unlimited for a limited
-# time and goes first wherever it can serve.
+# highest-value high-risk review.  space-bunny-free costs nothing, but it is NOT unlimited:
+# the OpenCode Go account usage limit still applies to it and answers with
+# `429 Go usage limit exceeded retry-after-ms=<n>` (GoUsageLimitError; 2026-09-27 a lane died
+# on retry-after-ms=14417000, ~4h).  Record that 429 with `record_429("opencode-go", body,
+# window_id="rolling-5h")` so the rung closes until the reset instead of taking new lanes.
 #
 # Tool-call smoke test (2026-09-25): space-bunny-free ok 4s, glm-5.3 ok 8s,
 # glm-5.3-flash ok 52s, qwen3.8-flash ok 9s, qwen3.8-max ok 11s, gpt-6-luna ok 4s,
 # mimo-v2.6-pro ok 9s.  FAILED, so NOT routed: deepseek-v4.1-flash
 # (`requiresReasoningContentForToolCalls`, but this provider does not replay reasoning;
 # the direct `deepseek` provider works) and muse-spark-1.3-contributor (timeout).
-MODEL_GO_BUNNY = "opencode-go/space-bunny-free"       # free + unlimited, 1M ctx, multimodal
+MODEL_GO_BUNNY = "opencode-go/space-bunny-free"       # $0, Go account usage limit applies, 1M ctx, multimodal
 MODEL_GO_GLM53_FLASH = "opencode-go/glm-5.3-flash"    # $60 cap, .15/.50/.03  <- workhorse
 MODEL_GO_QWEN38_FLASH = "opencode-go/qwen3.8-flash"   # $30 cap, .15/.47/.016
 MODEL_GO_GPT6_LUNA = "opencode-go/gpt-6-luna"         # $15 cap, .10/.50/.01
@@ -263,8 +266,9 @@ GO_LANE_COST_USD: Dict[str, float] = {
 # schedules against, with the 5h and month windows as its inner and outer bounds.
 GO_PACE_WINDOW = "weekly"
 # Rungs in one pace group are interchangeable for the task, so pacing orders them: the free
-# uncapped Go model never competes for allowance and stands alone, and every capped Go model
-# shares one group so they are ranked by pace rather than by declared order.
+# Go model has no dollar allowance to compete for and stands alone (it still closes on a
+# recorded Go usage 429), and every capped Go model shares one group so they are ranked by
+# pace rather than by declared order.
 PACE_GROUP_GO_FREE = "go-free"
 PACE_GROUP_GO_PAID = "go-paid"
 # Strong rungs (review and high-risk worker) and execution rungs are pacing groups too, so a
@@ -413,6 +417,65 @@ def is_agent_role_available(role: str) -> bool:
     if model and model.startswith("openai-codex/") and not codex_available():
         return False
     return True
+
+
+# Agent lanes (profile `agent.agents.<role>`, not `modelRoles`) whose spawns must lead with
+# this model at EVERY nesting depth. veyyon resolves a spawn's model from the SPAWNED agent's
+# own lane chain `[row, row.agents, row.agents.agents, ...]` at index `task_depth - 1`, walking
+# up to the nearest level that names a model (task/agent-settings.ts `laneForSpawn` and
+# `laneModelLayer`). So `task.agents.model` is the model of every `task` spawned by a depth-1
+# lane of ANY type, never "the model a task's children default to". A Go-first chain there sent
+# every grandchild `task` to opencode-go/space-bunny-free, which died on the Go usage 429
+# while Gemini Flash was idle (2026-09-27, ArchiveResume.ArchiveResumeChecks).
+LANE_MODEL_PINS: Dict[str, str] = {
+    "task": MODEL_GEMINI_FLASH,
+    "qa-verifier": MODEL_GEMINI_FLASH,
+}
+
+
+_THINKING_LEVELS = frozenset({"off", "minimal", "low", "medium", "high", "xhigh"})
+
+
+def _model_base(pattern: str) -> str:
+    """A model pattern without its `:level` thinking suffix (`:free` is part of the id)."""
+    base, _, suffix = pattern.strip().rpartition(":")
+    return base if base and suffix in _THINKING_LEVELS else pattern.strip()
+
+
+def lane_model_at_depth(agents_cfg: Dict[str, Any], role: str, task_depth: int) -> Optional[List[str]]:
+    """Model chain veyyon runs for a `role` spawn at `task_depth`, or None when no lane names one.
+
+    Mirror of veyyon's `laneModelLayer`: the lane chain is the role's own row and each nested
+    `agents` mapping under it; the governing level is `task_depth - 1`, and a level naming no
+    model inherits the nearest level above it.
+    """
+    chain: List[Dict[str, Any]] = []
+    node: Any = (agents_cfg or {}).get(role)
+    while isinstance(node, dict):
+        chain.append(node)
+        node = node.get("agents")
+    if not chain:
+        return None
+    for level in range(min(max(0, task_depth - 1), len(chain) - 1), -1, -1):
+        value = chain[level].get("model")
+        models = value if isinstance(value, list) else str(value or "").split(",")
+        models = [m.strip() for m in models if isinstance(m, str) and m.strip()]
+        if models:
+            return models
+    return None
+
+
+def lane_pin_drift(agents_cfg: Dict[str, Any], max_nested_depth: int) -> List[str]:
+    """Every (lane, depth) whose resolved chain does not lead with its LANE_MODEL_PINS model."""
+    drift: List[str] = []
+    for role, pin in LANE_MODEL_PINS.items():
+        for depth in range(1, max(1, max_nested_depth) + 1):
+            models = lane_model_at_depth(agents_cfg, role, depth)
+            head = models[0] if models else None
+            if head is None or _model_base(head) != _model_base(pin):
+                drift.append(f"{role} at depth {depth} runs {head or 'the default role'}, expected {pin}")
+    return drift
+
 
 # Weekly subscription windows are paced, not capped (operator 2026-09-25): each must
 # last the whole week AND be spent fully by its reset. Pace headroom is remaining
@@ -1204,7 +1267,8 @@ class ResetAwareModelSelector:
 
         The cap is the model's own monthly cap scaled to the window (5h 20%, week 50%,
         month 100%); the spend is the provider-level USD veyyon observed, charged in full to
-        this model, which makes the result a lower bound. space-bunny-free is uncapped.
+        this model, which makes the result a lower bound. space-bunny-free has no dollar cap
+        (so no lane count) but is still closed by a recorded Go usage-limit 429.
         """
         return self._go_lanes_in(model, window_id)
 
@@ -1409,7 +1473,9 @@ class ResetAwareModelSelector:
         # through 5h/week/month windows (GO_MONTHLY_CAP_USD / GO_WINDOW_FRACTION).  A paid Go
         # model is offered only while a whole lane of ITS measured cost still fits the pacing
         # window, so glm-5.3 keeps its $15 cap for high-value review instead of leading every
-        # ladder.  space-bunny-free is free and uncapped, so it only needs the credential.
+        # ladder.  space-bunny-free has no dollar cap, so it needs the credential and a healthy
+        # provider: a recorded Go usage-limit 429 (record_429) marks opencode-go exhausted and
+        # closes it with every other Go rung until the retry-after reset.
         go_credentialed = OPENCODE_GO_PROVIDER in credentialed
         go_pace = self.pace_of_provider(OPENCODE_GO_PROVIDER)
         go_available = go_credentialed and go_meta["is_available"] and not (go_pace and go_pace.throttled)
@@ -1538,10 +1604,11 @@ class ResetAwareModelSelector:
         # workhorse ($60 cap, ~144 lanes/month); glm-5.3 is the rare precision reviewer ($15
         # cap, ~4 lanes/month, and one median lane already consumes most of a 5h window, so it
         # can serve at most one lane per 5h); GPT-6 Luna is the cheap bulk filler ($15 cap).
-        # space-bunny-free is free, uncapped and leads wherever free tier is sufficient (gated only by credential and provider availability).
+        # space-bunny-free costs nothing and leads wherever the free tier is sufficient; it is gated by
+        # the credential and provider availability, which a recorded Go usage-limit 429 closes.
         go_bunny = _Rung(
             MODEL_GO_BUNNY, go_bunny_ok,
-            "OpenCode Go space-bunny-free (free, uncapped, 1M ctx, multimodal).",
+            "OpenCode Go space-bunny-free ($0; Go account usage limit applies; 1M ctx, multimodal).",
             pace_group=PACE_GROUP_GO_FREE,
         )
         go_glm53_flash = _Rung(
