@@ -769,7 +769,9 @@ class BuildSlotManager:
     ) -> int:
         """
         Adds (name, pid, token) to the queue if not already present.
-        If priority=True, puts entry at index 0 (or moves existing to index 0).
+        Priority entries sit ahead of normal ones and are FIFO among themselves.
+        If priority=True, inserts after the last existing priority entry (or moves
+        a non-priority entry to that position). If already priority, keeps its position.
         Returns the 0-indexed position in queue.
         """
         hb_limit = stale_heartbeat_after if stale_heartbeat_after is not None else self.queue_stale_heartbeat_after
@@ -800,12 +802,16 @@ class BuildSlotManager:
                     now, datetime.timezone.utc
                 ).isoformat()
                 if priority:
-                    valid_queue[existing_idx]["priority"] = True
-                    if existing_idx > 0:
+                    if not valid_queue[existing_idx].get("priority"):
                         item = valid_queue.pop(existing_idx)
-                        valid_queue.insert(0, item)
+                        item["priority"] = True
+                        target_idx = next(
+                            (i for i, x in enumerate(valid_queue) if not x.get("priority")),
+                            len(valid_queue),
+                        )
+                        valid_queue.insert(target_idx, item)
                         self._write_queue(valid_queue)
-                        return 0
+                        return target_idx
                 self._write_queue(valid_queue)
                 return existing_idx
 
@@ -821,9 +827,13 @@ class BuildSlotManager:
             }
             if priority:
                 entry["priority"] = True
-                valid_queue.insert(0, entry)
+                target_idx = next(
+                    (i for i, x in enumerate(valid_queue) if not x.get("priority")),
+                    len(valid_queue),
+                )
+                valid_queue.insert(target_idx, entry)
                 self._write_queue(valid_queue)
-                return 0
+                return target_idx
             else:
                 valid_queue.append(entry)
                 self._write_queue(valid_queue)
