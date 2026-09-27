@@ -10,6 +10,7 @@ Windows-safe (no fcntl), crash-resilient lock file.
 
 Commands:
     acquire <name> [--timeout SEC] [--heartbeat-stale-after SEC] [--poll-interval SEC] [--force]
+    run <name> [--timeout SEC] [--priority] [--force] [--cwd DIR] [--heartbeat-stale-after SEC] -- <cmd...>
     release <name>
     status [--json]
 
@@ -31,6 +32,12 @@ Invariants:
       only once its heartbeat is older than --heartbeat-stale-after [default 5m] (hung).
       Other locks (`acquire` mode has no process left to heartbeat): only when the owner PID
       is dead past the grace period.
+    - A reclaim renames the lock dir to a unique tombstone and deletes it only if the
+      tombstone still holds the lock that was judged stale; otherwise it is put back. Two
+      waiters judging the same lock can never delete the lock of the lane that took the slot next.
+    - The acquire-mode owner PID is the nearest veyyon session host (not its
+      `__veyyon_worker*` helpers); the ancestor climb stops at a parent created after its
+      child, since Windows reuses a dead parent's PID.
     - RAM guard: acquire refuses when host system RAM >= 85% unless --force is passed.
     - Pure standard library + Windows-safe ctypes (zero fcntl imports).
 """
@@ -41,6 +48,7 @@ import datetime
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -229,22 +237,108 @@ def _parse_timestamp(val: Any) -> Optional[float]:
         except Exception:
             pass
     return None
-def _owner_pid_from_process_table(cur_pid: int, parents: Dict[int, int], names: Dict[int, str]) -> int:
+
+
+# veyyon.exe re-runs itself as helper processes (`__veyyon_worker_daemon_broker` behind
+# `launch`, `__veyyon_worker_js_eval_process` behind JS eval). They live and die on their
+# own schedule, so recording one as the owner freed acquire-mode slots mid-build (#315).
+_VEYYON_HELPER_MARK = "__veyyon_worker"
+# A veyyon entrypoint on a JS runtime's command line (`bun .../veyyon/.../cli.ts`); a path
+# under the `.veyyon` config dir (MCP wrappers, the sidecar) is not one.
+_VEYYON_ENTRY_RE = re.compile(r"(?<![.\w])veyyon(?![\w-])")
+_JS_RUNTIME_EXES = ("node.exe", "bun.exe", "deno.exe", "node", "bun", "deno")
+
+
+def _is_veyyon_host(pid: int, names: Dict[int, str], cmdlines: Dict[int, Optional[str]]) -> bool:
+    """True when pid is a veyyon session host, not a helper worker or an unrelated tool."""
+    exe = names.get(pid, "")
+    cmdline = (cmdlines.get(pid) or "").lower()
+    if _VEYYON_HELPER_MARK in cmdline:
+        return False
+    if "veyyon" in exe:
+        return True
+    return exe in _JS_RUNTIME_EXES and bool(_VEYYON_ENTRY_RE.search(cmdline))
+
+
+def _owner_pid_from_process_table(
+    cur_pid: int,
+    parents: Dict[int, int],
+    names: Dict[int, str],
+    cmdlines: Optional[Dict[int, Optional[str]]] = None,
+    created: Optional[Dict[int, int]] = None,
+) -> int:
     """
     Climbs cur_pid's ancestors in a (pid -> parent pid, pid -> lowercase exe name) table.
-    A veyyon host ends the climb and is the owner; without one, the farthest ancestor
-    still in the table stands in.
+    The nearest veyyon host (see _is_veyyon_host) ends the climb and is the owner; without
+    one, the farthest ancestor reached stands in.
+    Windows keeps a dead process's PID in its children's parent field and hands that PID to
+    new processes, so a parent created after its child is an impostor: the climb stops there
+    instead of wandering into an unrelated, often short-lived process (#315).
     """
+    cmdlines = cmdlines or {}
+    created = created or {}
     cur = cur_pid
     candidate = cur_pid
     visited = set()
     while cur in parents and cur not in visited and cur != 0:
         visited.add(cur)
         candidate = cur
-        if "veyyon" in names.get(cur, ""):
+        if _is_veyyon_host(cur, names, cmdlines):
             break
-        cur = parents[cur]
+        parent = parents[cur]
+        parent_created, child_created = created.get(parent), created.get(cur)
+        if parent_created is not None and child_created is not None and parent_created > child_created:
+            break
+        cur = parent
     return candidate
+
+
+def _win_process_details(pids: List[int]) -> Tuple[Dict[int, Optional[str]], Dict[int, int]]:
+    """Command line and creation time (FILETIME ticks) for each pid that can be opened."""
+    from ctypes import wintypes
+
+    class UNICODE_STRING(ctypes.Structure):
+        _fields_ = [("Length", wintypes.USHORT), ("MaximumLength", wintypes.USHORT), ("Buffer", ctypes.c_void_p)]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    k32.GetProcessTimes.argtypes = (wintypes.HANDLE,) + (ctypes.POINTER(wintypes.FILETIME),) * 4
+    ntdll = ctypes.WinDLL("ntdll")
+    ntdll.NtQueryInformationProcess.restype = ctypes.c_long
+    ntdll.NtQueryInformationProcess.argtypes = (
+        wintypes.HANDLE, wintypes.ULONG, ctypes.c_void_p, wintypes.ULONG, ctypes.POINTER(wintypes.ULONG),
+    )
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    PROCESS_COMMAND_LINE_INFORMATION = 60
+
+    cmdlines: Dict[int, Optional[str]] = {}
+    created: Dict[int, int] = {}
+    for pid in pids:
+        handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            continue
+        try:
+            times = [wintypes.FILETIME() for _ in range(4)]
+            if k32.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
+                created[pid] = (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+            size = wintypes.ULONG(0)
+            ntdll.NtQueryInformationProcess(handle, PROCESS_COMMAND_LINE_INFORMATION, None, 0, ctypes.byref(size))
+            if size.value:
+                buf = ctypes.create_string_buffer(size.value)
+                status = ntdll.NtQueryInformationProcess(
+                    handle, PROCESS_COMMAND_LINE_INFORMATION, buf, size, ctypes.byref(size)
+                )
+                if status >= 0:
+                    us = UNICODE_STRING.from_buffer(buf)
+                    cmdlines[pid] = ctypes.wstring_at(us.Buffer, us.Length // 2) if us.Buffer else ""
+        finally:
+            k32.CloseHandle(handle)
+    return cmdlines, created
+
+
+_MAX_ANCESTOR_DEPTH = 64
 
 
 def find_long_lived_owner_pid() -> int:
@@ -253,7 +347,7 @@ def find_long_lived_owner_pid() -> int:
     The acquire CLI exits as soon as it holds the slot, so its own PID must not be
     recorded: that PID is dead within seconds and the dead-PID rule would free the slot
     60s into the build. Under veyyon the lane lives inside the veyyon host process, so
-    the host PID is recorded; outside veyyon the farthest ancestor stands in.
+    the host PID is recorded; outside veyyon the farthest trustworthy ancestor stands in.
     """
     cur_pid = os.getpid()
     if sys.platform == "win32":
@@ -294,7 +388,14 @@ def find_long_lived_owner_pid() -> int:
                             break
                 k32.CloseHandle(h)
 
-                return _owner_pid_from_process_table(cur_pid, parents, names)
+                chain, cur = [], cur_pid
+                while cur in parents and cur not in chain and len(chain) < _MAX_ANCESTOR_DEPTH:
+                    chain.append(cur)
+                    cur = parents[cur]
+                if cur in parents:
+                    chain.append(cur)
+                cmdlines, created = _win_process_details(chain)
+                return _owner_pid_from_process_table(cur_pid, parents, names, cmdlines, created)
         except Exception as e:
             logger.debug("Failed in find_long_lived_owner_pid: %s", e)
 
@@ -305,6 +406,62 @@ def find_long_lived_owner_pid() -> int:
     except Exception:
         pass
     return cur_pid
+
+
+def _corrupt_lock_info(lock_dir: str, slot_idx: int) -> Dict[str, Any]:
+    try:
+        mtime = os.path.getmtime(lock_dir)
+    except Exception:
+        mtime = time.time()
+    return {
+        "owner": "unknown",
+        "pid": 0,
+        "slot": slot_idx,
+        "acquired_at": datetime.datetime.fromtimestamp(mtime, datetime.timezone.utc).isoformat(),
+        "acquired_at_epoch": mtime,
+        "corrupt": True,
+    }
+
+
+def _read_lock_dir_info(lock_dir: str, slot_idx: int) -> Optional[Dict[str, Any]]:
+    """Reads the info.json of a slot lock dir (or its tombstone); None if the dir is gone."""
+    if not os.path.isdir(lock_dir):
+        return None
+    info_path = os.path.join(lock_dir, INFO_FILE_NAME)
+    if not os.path.isfile(info_path):
+        return _corrupt_lock_info(lock_dir, slot_idx)
+
+    # Retry briefly: a holder still running an older copy rewrites info.json in place,
+    # and Windows can refuse a read mid-replace. Only a persistent failure is corrupt.
+    last_err: Optional[Exception] = None
+    for attempt in range(_INFO_READ_ATTEMPTS):
+        try:
+            with open(info_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                data.setdefault("slot", slot_idx)
+            return data
+        except Exception as e:
+            last_err = e
+            if attempt < _INFO_READ_ATTEMPTS - 1:
+                time.sleep(_INFO_READ_RETRY_DELAY)
+    logger.warning("Failed to read lock info for slot %d: %s", slot_idx, last_err)
+    return _corrupt_lock_info(lock_dir, slot_idx)
+
+
+def _lock_identity(info: Optional[Dict[str, Any]]) -> Optional[Tuple[Any, ...]]:
+    """
+    What tells one holding of a slot from the next: the per-acquisition token (acquire
+    always sets one), else owner, PID and acquisition time for locks written without one.
+    A corrupt lock is known only by its dir's mtime, which a new holder's dir never shares.
+    """
+    if not info:
+        return None
+    if info.get("corrupt"):
+        return ("corrupt", info.get("acquired_at_epoch"))
+    if info.get("token"):
+        return ("token", info["token"])
+    return ("legacy", info.get("owner"), info.get("pid"), info.get("acquired_at_epoch") or info.get("acquired_at"))
 
 
 def _read_queue_lock_info(queue_lock_dir: str) -> Optional[Dict[str, Any]]:
@@ -531,52 +688,41 @@ class BuildSlotManager:
         """Reads lock info metadata for slot_idx if its lock dir exists."""
         if slot_idx >= len(self.slot_dirs):
             return None
+        return _read_lock_dir_info(self.slot_dirs[slot_idx], slot_idx)
+
+    def _tombstone_stale_slot(self, slot_idx: int, judged: Dict[str, Any], reason: str) -> bool:
+        """
+        Removes the stale lock judged from `judged`, and only that lock (#315). Two waiters
+        can judge the same lock stale: the first removes it, a lane acquires the free slot,
+        and a plain rmtree by the second would delete that lane's live lock. So the lock is
+        re-read, renamed to a unique tombstone (atomic; only one reclaimer's rename can
+        succeed) and deleted only if the tombstone still holds the judged lock. Returns True
+        if this call reclaimed it.
+        """
         slot_dir = self.slot_dirs[slot_idx]
-        if not os.path.isdir(slot_dir):
-            return None
-
-        info_path = os.path.join(slot_dir, INFO_FILE_NAME)
-        if not os.path.isfile(info_path):
-            try:
-                mtime = os.path.getmtime(slot_dir)
-            except Exception:
-                mtime = time.time()
-            return {
-                "owner": "unknown",
-                "pid": 0,
-                "slot": slot_idx,
-                "acquired_at": datetime.datetime.fromtimestamp(mtime, datetime.timezone.utc).isoformat(),
-                "acquired_at_epoch": mtime,
-                "corrupt": True,
-            }
-
-        # Retry briefly: a holder still running an older copy rewrites info.json in place,
-        # and Windows can refuse a read mid-replace. Only a persistent failure is corrupt.
-        last_err: Optional[Exception] = None
-        for attempt in range(_INFO_READ_ATTEMPTS):
-            try:
-                with open(info_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    data.setdefault("slot", slot_idx)
-                return data
-            except Exception as e:
-                last_err = e
-                if attempt < _INFO_READ_ATTEMPTS - 1:
-                    time.sleep(_INFO_READ_RETRY_DELAY)
-        logger.warning("Failed to read lock info for slot %d: %s", slot_idx, last_err)
+        want = _lock_identity(judged)
+        if want is None or _lock_identity(self._read_slot_info(slot_idx)) != want:
+            return False
+        tombstone = f"{slot_dir}.tombstone-{os.getpid()}-{uuid.uuid4().hex}"
         try:
-            mtime = os.path.getmtime(slot_dir)
-        except Exception:
-            mtime = time.time()
-        return {
-            "owner": "unknown",
-            "pid": 0,
-            "slot": slot_idx,
-            "acquired_at": datetime.datetime.fromtimestamp(mtime, datetime.timezone.utc).isoformat(),
-            "acquired_at_epoch": mtime,
-            "corrupt": True,
-        }
+            os.rename(slot_dir, tombstone)
+        except OSError:
+            # Another reclaimer or the holder moved it first, or Windows refused the rename
+            # while a reader has info.json open; the next poll judges the slot again.
+            return False
+        # A rename keeps the dir's mtime, so even a corrupt lock's identity survives the move.
+        if _lock_identity(_read_lock_dir_info(tombstone, slot_idx)) != want:
+            # The lock changed hands between the re-read and the rename: put it back.
+            try:
+                os.rename(tombstone, slot_dir)
+            except OSError as e:
+                msg = f"[ERROR] Moved a live build slot lock aside and could not restore it (slot {slot_idx}, {tombstone}): {e}"
+                print(msg, file=sys.stderr)
+                logger.error(msg)
+            return False
+        print(f"[NOTICE] Reclaiming stale build slot lock: {reason}", file=sys.stderr)
+        shutil.rmtree(tombstone, ignore_errors=True)
+        return True
 
     def _read_lock_info(self) -> Optional[Dict[str, Any]]:
         """Reads lock info metadata if primary lock dir exists (backwards compatibility)."""
@@ -964,12 +1110,7 @@ class BuildSlotManager:
                 info["run_token"] = token
             info["heartbeat_at"] = now_iso
             info["heartbeat_at_epoch"] = now
-            info_path = os.path.join(slot_dir, INFO_FILE_NAME)
-            try:
-                _write_json_atomic(info_path, info)
-                return True
-            except Exception:
-                return False
+            return self._write_heartbeat(name, slot_idx, slot_dir, info)
         return False
 
     def heartbeat_lock(self, name: str, token: Optional[str] = None) -> bool:
@@ -988,13 +1129,23 @@ class BuildSlotManager:
             now_iso = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat()
             info["heartbeat_at"] = now_iso
             info["heartbeat_at_epoch"] = now
-            info_path = os.path.join(slot_dir, INFO_FILE_NAME)
-            try:
-                _write_json_atomic(info_path, info)
-                return True
-            except Exception:
-                return False
+            return self._write_heartbeat(name, slot_idx, slot_dir, info)
         return False
+
+    def _write_heartbeat(self, name: str, slot_idx: int, slot_dir: str, info: Dict[str, Any]) -> bool:
+        """
+        Writes heartbeat-bearing lock info. A failure gets its own line: a holder whose
+        heartbeat writes keep failing is reclaimed as hung after heartbeat_stale_after, and
+        this line is how that reclaim gets traced back to its cause (#315).
+        """
+        try:
+            _write_json_atomic(os.path.join(slot_dir, INFO_FILE_NAME), info)
+            return True
+        except Exception as e:
+            msg = f"[HEARTBEAT] Failed to write heartbeat for '{name}' (slot {slot_idx}): {e}"
+            print(msg, file=sys.stderr)
+            logger.warning(msg)
+            return False
 
     def check_stale_and_reclaim(
         self,
@@ -1037,14 +1188,12 @@ class BuildSlotManager:
                 reason = ""
 
                 if info.get("corrupt"):
-                    try:
-                        mtime = os.path.getmtime(slot_dir)
-                        age = now - mtime
-                        if age > 10.0:  # grace period for mid-creation
-                            is_stale = True
-                            reason = f"corrupt or incomplete lock directory (age={age:.1f}s, slot {slot_idx})"
-                    except (FileNotFoundError, OSError):
-                        pass
+                    # The read's dir mtime, not a second stat: the verdict must describe the
+                    # same lock _tombstone_stale_slot checks its tombstone against.
+                    age = now - info.get("acquired_at_epoch", now)
+                    if age > 10.0:  # grace period for mid-creation
+                        is_stale = True
+                        reason = f"corrupt or incomplete lock directory (age={age:.1f}s, slot {slot_idx})"
                 else:
                     pid = info.get("pid", 0)
                     wrapper_pid = info.get("wrapper_pid")
@@ -1100,19 +1249,7 @@ class BuildSlotManager:
                                 f"({age:.1f}s >= {effective_grace:.1f}s, owner='{owner}', slot {slot_idx})"
                             )
 
-                if is_stale:
-                    notice = f"[NOTICE] Reclaiming stale build slot lock: {reason}"
-                    print(notice, file=sys.stderr)
-                    info_path = os.path.join(slot_dir, INFO_FILE_NAME)
-                    try:
-                        if os.path.isfile(info_path):
-                            os.unlink(info_path)
-                    except Exception:
-                        pass
-                    try:
-                        shutil.rmtree(slot_dir, ignore_errors=True)
-                    except Exception:
-                        pass
+                if is_stale and self._tombstone_stale_slot(slot_idx, info, reason):
                     reclaimed_any = True
             except (FileNotFoundError, OSError):
                 pass
@@ -1797,16 +1934,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p_ram.add_argument("--threshold", type=float, default=90.0, help="RAM percentage threshold (default: 90.0)")
     p_ram.add_argument("--json", action="store_true", help="Output RAM status as JSON")
 
-    # run <name> [--timeout SEC] [--priority] [--force] [--cwd DIR] -- <cmd...>
+    # run <name> [--timeout SEC] [--priority] [--force] [--cwd DIR] [--heartbeat-stale-after SEC] -- <cmd...>
     p_run = subparsers.add_parser(
         "run",
         help="Run a build command under the build slot lock, automatically releasing on exit",
     )
     p_run.add_argument("name", help="Lane or worker identifier requesting the slot")
-    p_run.add_argument("--timeout", type=float, default=None, help="Maximum seconds to wait to acquire slot")
-    p_run.add_argument("--priority", action="store_true", help="Enqueue with priority at front of queue")
-    p_run.add_argument("--force", action="store_true", help="Bypass RAM guard during acquisition")
-    p_run.add_argument("--cwd", default=None, help="Working directory to execute command in (default: current directory)")
+    _add_run_options(p_run)
     p_run.add_argument("cmd", nargs=argparse.REMAINDER, help="Command and arguments to execute under the lock (use -- before command)")
 
     # release <name>
@@ -1832,7 +1966,33 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             f"--poll-interval ({args.poll_interval}s) must be less than "
             f"queue_stale_heartbeat_after ({DEFAULT_QUEUE_STALE_HEARTBEAT_SECONDS}s)"
         )
+    if args.command == "run" and "--" in args.cmd and args.cmd[0].startswith("-") and args.cmd[0] != "--":
+        # REMAINDER captures everything after <name>, so options in the documented spot
+        # (`run <name> --timeout 60 -- <cmd>`) arrived inside the command (#315). Parse the
+        # options ahead of `--` into args; values given before <name> stay unless repeated.
+        split = args.cmd.index("--")
+        run_options = argparse.ArgumentParser(prog="build_slot.py run <name>", add_help=False)
+        _add_run_options(run_options)
+        run_options.parse_args(args.cmd[:split], namespace=args)
+        args.cmd = args.cmd[split + 1:]
     return args
+
+
+def _add_run_options(p: argparse.ArgumentParser) -> None:
+    """Options of `run`, accepted before or after <name> (anywhere ahead of `--`)."""
+    p.add_argument("--timeout", type=float, default=None, help="Maximum seconds to wait to acquire slot")
+    p.add_argument("--priority", action="store_true", help="Enqueue with priority at front of queue")
+    p.add_argument("--force", action="store_true", help="Bypass RAM guard during acquisition")
+    p.add_argument("--cwd", default=None, help="Working directory to execute command in (default: current directory)")
+    p.add_argument(
+        "--heartbeat-stale-after",
+        type=float,
+        default=DEFAULT_LOCK_HEARTBEAT_STALE_SECONDS,
+        help=(
+            "Seconds without a heartbeat after which a live `run` holder counts as hung and is "
+            f"reclaimed while this run waits (default: {DEFAULT_LOCK_HEARTBEAT_STALE_SECONDS}s / 5m)"
+        ),
+    )
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -1911,8 +2071,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             priority=args.priority,
             force=args.force,
             cwd=args.cwd,
+            heartbeat_stale_after=args.heartbeat_stale_after,
         )
-        return 0 if success else 1
 
     elif args.command == "release":
         success = manager.release(name=args.name)
