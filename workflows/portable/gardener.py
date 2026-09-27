@@ -53,7 +53,7 @@ class ToolFinding:
     symbol: str = ""
     kind: str = ""                     # "file" | "export" | "type" | "import" | "variable" | "function" | "class" | "unreachable" | "dependency"
     confidence: int = 100              # 0 - 100
-    category: str = "other"            # "verified_dead_file" | "verified_dead_export" | "verified_dead_type" | "unused_import" | "unreachable_code" | "unused_variable" | "test_fixture_or_dummy" | "framework_entrypoint" | "test_file" | "alembic_config" | "unused_dependency" | "other"
+    category: str = "other"            # "verified_dead_file" | "verified_dead_export" | "verified_dead_type" | "unused_import" | "unreachable_code" | "unused_variable" | "test_fixture_or_dummy" | "framework_entrypoint" | "cli_script" | "test_file" | "alembic_config" | "unused_dependency" | "other"
     safe_to_prune: bool = False
     reason: str = ""
 
@@ -183,6 +183,20 @@ def is_frontend_entrypoint(rel_path: str) -> bool:
     return False
 
 
+CLI_SCRIPT_SUFFIXES = (".mjs", ".cjs", ".js", ".ts")
+
+
+def is_cli_script(rel_path: str) -> bool:
+    """A standalone tool under `scripts/`, run as `node scripts/<name>` rather than imported.
+
+    Knip only follows imports from its entry points, so every such script reads as an
+    unused file even when a runbook or a person runs it by hand (render-og.mjs,
+    verify-og-ssrf.mjs, book-liveness-stub-backend.mjs on PolySimulator staging).
+    """
+    p = rel_path.replace("\\", "/").lower()
+    return (p.startswith("scripts/") or "/scripts/" in p) and p.endswith(CLI_SCRIPT_SUFFIXES)
+
+
 def is_test_file(rel_path: str) -> bool:
     """Checks if a file is a unit/integration test."""
     p = rel_path.replace("\\", "/").lower()
@@ -253,6 +267,18 @@ def classify_knip_issue(
                         category="test_file",
                         safe_to_prune=False,
                         reason="Test file; test runner may execute it via glob pattern rather than direct import",
+                    )
+                )
+            elif is_cli_script(file_raw):
+                findings.append(
+                    ToolFinding(
+                        tool="knip",
+                        file=norm_file,
+                        kind="file",
+                        symbol=file_raw,
+                        category="cli_script",
+                        safe_to_prune=False,
+                        reason="Standalone script run with `node scripts/...`; no import reaches it by design",
                     )
                 )
             else:
@@ -882,6 +908,26 @@ ISSUE_REF_PATTERNS = re.compile(
 )
 
 
+def _comment_block(lines: List[str], index: int) -> str:
+    """The contiguous run of comment lines around `lines[index]`, joined.
+
+    A tracking reference often sits a few lines above the word that trips the
+    pattern, inside the same comment (keys.py cites `PR #5146` at the top of a block
+    whose continuation line starts with "workaround"), so the block is the unit.
+    """
+
+    def is_comment(text: str) -> bool:
+        return text.lstrip().startswith(("#", "//", "*", "/*"))
+
+    start = index
+    while start > 0 and is_comment(lines[start - 1]):
+        start -= 1
+    end = index
+    while end + 1 < len(lines) and is_comment(lines[end + 1]):
+        end += 1
+    return "".join(lines[start : end + 1])
+
+
 def scan_workaround_comments(
     repo_root: Path,
     frontend_subpath: str = "frontend",
@@ -906,25 +952,27 @@ def scan_workaround_comments(
                 rel_path = p.relative_to(repo_root).as_posix()
                 try:
                     with open(p, "r", encoding="utf-8", errors="ignore") as f:
-                        for idx, line in enumerate(f, 1):
-                            if WORKAROUND_COMMENT_PATTERNS.search(line):
-                                has_issue = bool(ISSUE_REF_PATTERNS.search(line))
-                                if not has_issue:
-                                    findings.append(
-                                        ToolFinding(
-                                            tool="comment_linter",
-                                            file=rel_path,
-                                            line=idx,
-                                            symbol="workaround_comment",
-                                            kind="workaround",
-                                            confidence=100,
-                                            category="untracked_workaround_comment",
-                                            safe_to_prune=False,
-                                            reason=f"Workaround/hack comment without tracking issue: {line.strip()[:100]}",
-                                        )
-                                    )
-                except Exception:
-                    pass
+                        lines = f.readlines()
+                except OSError:
+                    continue
+                for idx, line in enumerate(lines, 1):
+                    if not WORKAROUND_COMMENT_PATTERNS.search(line):
+                        continue
+                    if ISSUE_REF_PATTERNS.search(_comment_block(lines, idx - 1)):
+                        continue
+                    findings.append(
+                        ToolFinding(
+                            tool="comment_linter",
+                            file=rel_path,
+                            line=idx,
+                            symbol="workaround_comment",
+                            kind="workaround",
+                            confidence=100,
+                            category="untracked_workaround_comment",
+                            safe_to_prune=False,
+                            reason=f"Workaround/hack comment without tracking issue: {line.strip()[:100]}",
+                        )
+                    )
     return findings
 
 
@@ -1718,11 +1766,18 @@ def install_task_scheduler_jobs(
     daily_cmd = Path(log_dir) / "gardener_daily.cmd"
     hourly_cmd = Path(log_dir) / "gardener_hourly.cmd"
 
+    # Scan the current staging tip, never whatever the checkout last held: a scan root nobody
+    # refreshed filed proposals against a day-old tree (Bavariance/polysimulator#5645/#5646).
+    # A refresh that fails ends the run, so a stale tree never produces issues.
+    refresh = (
+        f'git -C "{rp_path}" fetch --quiet origin staging || exit /b 1\n'
+        f'git -C "{rp_path}" checkout --quiet --detach origin/staging || exit /b 1\n'
+    )
     with open(daily_cmd, "w", encoding="utf-8") as f:
-        f.write(f'@echo off\n"{py_path}" "{sc_path}" --live --repo-root "{rp_path}" --issue-repo "{issue_repo}" --log-dir "{lg_path}"\n')
+        f.write(f'@echo off\n{refresh}"{py_path}" "{sc_path}" --live --repo-root "{rp_path}" --issue-repo "{issue_repo}" --log-dir "{lg_path}"\n')
 
     with open(hourly_cmd, "w", encoding="utf-8") as f:
-        f.write(f'@echo off\n"{py_path}" "{sc_path}" --live --scan-bugs-only --repo-root "{rp_path}" --issue-repo "{issue_repo}" --log-dir "{lg_path}"\n')
+        f.write(f'@echo off\n{refresh}"{py_path}" "{sc_path}" --live --scan-bugs-only --repo-root "{rp_path}" --issue-repo "{issue_repo}" --log-dir "{lg_path}"\n')
 
     # 1. Daily Job (Full scan: dead code + workarounds + bugs)
     daily_tn = "SuperboardGardenerDaily"

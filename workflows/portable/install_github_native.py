@@ -38,7 +38,12 @@ RUNTIME_FILES = (
     "build_slot.py", "test_build_slot.py",
     # Verification CLI and smoke test gate.
     "verify.py", "test_verify.py",
+    # Lane-brief merge guard (Wladefant/super-board#227).
+    "merge_guard.py", "test_merge_guard.py",
 )
+# Veyyon extensions, installed into the profile's own `extensions/` dir beside AGENTS.md,
+# where Veyyon loads them for every session of that profile.
+PROFILE_EXTENSIONS = ("superboard-merge-guard.ts",)
 POLICY = Path("policies/default/AGENTS.md")
 # Hash of the policy the last install wrote, recorded beside the profile it wrote to.
 POLICY_STATE_SUFFIX = ".installed.sha256"
@@ -74,8 +79,11 @@ def synchronize(
     source_root: Path, profile: Path, runtime: Path, check: bool = False, force_policy: bool = False
 ) -> bool:
     pairs = [(source_root / POLICY, profile)] + [
-        (source_root / "workflows/portable" / name, runtime / name) for name in RUNTIME_FILES
-    ]
+            (source_root / "workflows/portable" / name, runtime / name) for name in RUNTIME_FILES
+        ] + [
+            (source_root / "workflows/portable/extensions" / name, profile.parent / "extensions" / name)
+            for name in PROFILE_EXTENSIONS
+        ]
     # Read every source before any mutation; an incomplete checkout changes nothing.
     payloads = [(target, source.read_bytes()) for source, target in pairs]
     source_policy = payloads[0][1]

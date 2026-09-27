@@ -677,6 +677,25 @@ class CrashMonitorStateLedger:
             self._save_locked(data)
             return True
 
+    def claim_session_relaunch(self, session_id: str, claim: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Take the one relaunch a session gets. Returns the earlier claim when it is spent.
+
+        `claim_termination` dedupes one death; this caps the session. A resumed Main
+        runs under a new pid, so a supervisor that later binds to it and sees it die
+        again would otherwise claim that second death and relaunch a second time.
+        """
+        lock = FileLock(str(self.lock_path))
+        with lock:
+            data = self._load_locked()
+            if data.get("corrupt"):
+                return {"reason": "crash monitor state file is corrupt"}
+            relaunches = data.setdefault("session_relaunches", {})
+            if session_id in relaunches:
+                return relaunches[session_id]
+            relaunches[session_id] = claim
+            self._save_locked(data)
+            return None
+
     def is_corrupt(self) -> bool:
         """Check if the durable state file exists and is corrupt/unparseable."""
         if not self.state_file.exists():
@@ -1491,16 +1510,31 @@ class SessionCrashMonitor:
                     if self.dry_run:
                         result["reason"] = "dry_run: relaunch not executed"
                     else:
-                        launched, detail = self.herdr.run_in_pane(
-                            self.target_pane_id, result["command"]
+                        spent = self.state_ledger.claim_session_relaunch(
+                            self.session_id,
+                            {
+                                "claimed_at_utc": utc_now_iso(),
+                                "dead_pid": target.pid,
+                                "pane_id": self.target_pane_id,
+                                "supervisor_pid": os.getpid(),
+                            },
                         )
-                        result["launched"] = launched
-                        result["launched_at_utc"] = utc_now_iso() if launched else None
-                        result["reason"] = (
-                            f"relaunched in herdr pane {self.target_pane_id}"
-                            if launched
-                            else f"pane relaunch failed: {detail}"
-                        )
+                        if spent is not None:
+                            result["reason"] = (
+                                f"session {self.session_id} already used its one relaunch "
+                                f"({spent.get('claimed_at_utc') or spent.get('reason')}); not resuming again"
+                            )
+                        else:
+                            launched, detail = self.herdr.run_in_pane(
+                                self.target_pane_id, result["command"]
+                            )
+                            result["launched"] = launched
+                            result["launched_at_utc"] = utc_now_iso() if launched else None
+                            result["reason"] = (
+                                f"relaunched in herdr pane {self.target_pane_id}"
+                                if launched
+                                else f"pane relaunch failed: {detail}"
+                            )
 
         manifest = self.build_manifest(
             target, exit_code, observed_reason, result if self.auto_resume else None
@@ -1912,30 +1946,54 @@ class _RecordingNotifier:
         )
 
 
+def _sacrificial_owner_image(workdir: Path) -> Optional[Path]:
+    """A throwaway executable whose image name is `veyyon.exe`, for the owner check.
+
+    The live-owner refusal only counts processes whose image is Veyyon, so a real
+    process has to carry that name. A copy of the system `ping.exe` needs no extra
+    DLLs, idles for as long as it is told to, and is never a real Veyyon session.
+    """
+    if sys.platform != "win32":
+        return None
+    source = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "PING.EXE"
+    if not source.exists():
+        return None
+    image = workdir / "owner" / "veyyon.exe"
+    image.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, image)
+    return image
+
+
 def run_resume_relaunch_test(
     herdr_bin: str = "herdr",
     state_file: Optional[Path] = None,
 ) -> Dict[str, Any]:
-    """Exercises the relaunch path end to end on a throwaway herdr pane.
+    """Exercises the relaunch path end to end on a throwaway session in a scratch pane.
 
-    A scratch pane is split off an agentless pane, a disposable process is started
-    inside it, and the real auto-resume path runs against that process: pane resolution
-    by process ancestry, the live-owner refusal, the single-claim dedup, the herdr
-    delivery, and the interrupted-lane manifest write.
+    Everything runs against a dummy session id and processes this test starts itself,
+    in a scratch herdr pane split off an agentless pane. Three dummy incarnations of
+    the session are killed in turn:
 
-    The resume command is a sentinel writer rather than a real `veyyon --resume`, so no
-    Veyyon session is created, contacted, or resumed. What is proven is that the monitor
-    resolves the pane that actually hosts the target, delivers the command it built into
-    that pane exactly once, and writes a manifest.
+    1. owner_refusal: a sacrificial process named `veyyon.exe` is registered as the
+       live owner of the dummy session. The first incarnation is killed and the monitor
+       must decline to relaunch, leaving the pane untouched.
+    2. relaunch: the sacrificial owner is stopped, the second incarnation is killed,
+       and the monitor must type the resume command into the pane exactly once.
+    3. no_second_relaunch: a third incarnation (standing in for the resumed Main) is
+       killed. The session already used its one relaunch, so nothing runs in the pane.
+
+    A restarted supervisor replaying the second death must also stop at the ledger.
+    The resume command is a sentinel writer carrying `--resume <dummy id>`, not a
+    real `veyyon --resume`, so no Veyyon session is created, contacted, or resumed.
+    The only processes killed are the ones started here, each checked by command line
+    (or held by handle) before the kill.
     """
     workdir = Path(tempfile.mkdtemp(prefix="veyyon-resume-relaunch-"))
-    sentinel = workdir / "pane-ran-resume.txt"
-    pid_file = workdir / "target.pid"
-    go_file = workdir / "let-the-target-die"
     registry_dir = workdir / "terminals"
     log_dir = workdir / "logs"
     registry_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
+    ledger_path = state_file or (workdir / "state.json")
 
     # Everything handed to a shell below is one token per argument, with no nested
     # quoting, because it has to survive being typed into a pane.
@@ -1943,18 +2001,15 @@ def run_resume_relaunch_test(
     target_script.write_text(
         "import os, pathlib, sys, time\n"
         "pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n"
-        "go = pathlib.Path(sys.argv[2])\n"
-        "deadline = time.time() + 180\n"
-        "while not go.exists() and time.time() < deadline:\n"
-        "    time.sleep(0.2)\n"
-        "time.sleep(0.5)\n"
-        "sys.exit(88)\n",
+        "time.sleep(180)\n",
         encoding="utf-8",
     )
+    sentinel_log = workdir / "pane-ran-resume.log"
     sentinel_script = workdir / "resume_sentinel.py"
     sentinel_script.write_text(
-        "import pathlib\n"
-        f"pathlib.Path(r'{sentinel}').write_text('resumed-in-herdr-pane')\n",
+        "import pathlib, sys\n"
+        f"with open(r'{sentinel_log}', 'a', encoding='utf-8') as f:\n"
+        "    f.write(' '.join(sys.argv[1:]) + '\\n')\n",
         encoding="utf-8",
     )
 
@@ -1966,14 +2021,126 @@ def run_resume_relaunch_test(
         "herdr_bin": herdr_bin,
         "steps": {},
     }
+    steps = report["steps"]
     herdr = HerdrPanes(herdr_bin=herdr_bin)
     pane_id: Optional[str] = None
+    owner_proc: Optional[subprocess.Popen] = None
     notifier = _RecordingNotifier()
+
+    def sentinel_runs() -> List[str]:
+        if not sentinel_log.exists():
+            return []
+        return [line for line in sentinel_log.read_text(encoding="utf-8").splitlines() if line]
+
+    def build_monitor(target_pid: int) -> SessionCrashMonitor:
+        return SessionCrashMonitor(
+            session_id=test_session_id,
+            pid=target_pid,
+            state_file=ledger_path,
+            poll_interval=0.2,
+            # Real relaunch, captured alert: the delivery surface is proven
+            # separately by --test-disposable-crash.
+            dry_run=False,
+            notifier_adapter=notifier,
+            auto_resume=True,
+            resume_argv=[sys.executable, str(sentinel_script), "--resume", test_session_id],
+            herdr=herdr,
+            registry=SessionRegistry(registry_dir),
+            log_dir=log_dir,
+            inflight_dir=log_dir / "inflight",
+            manifest_dir=workdir / "manifests",
+        )
+
+    def start_incarnation(tag: str) -> int:
+        pid_file = workdir / f"{tag}.pid"
+        command = " ".join(
+            [
+                _quote_for_shell(sys.executable),
+                _quote_for_shell(str(target_script)),
+                _quote_for_shell(str(pid_file)),
+                f"--resume={test_session_id}",
+            ]
+        )
+        launched, detail = herdr.run_in_pane(pane_id, command)
+        if not launched:
+            raise RuntimeError(f"could not start dummy incarnation {tag} in {pane_id}: {detail}")
+        deadline = time.time() + 30
+        while time.time() < deadline and not pid_file.exists():
+            time.sleep(0.2)
+        if not pid_file.exists():
+            raise RuntimeError(f"dummy incarnation {tag} never reported its pid")
+        return int(pid_file.read_text(encoding="utf-8").strip())
+
+    def kill_incarnation(monitor: SessionCrashMonitor, target_pid: int) -> Dict[str, Any]:
+        # Kill only a process proven to be this test's dummy: same pid and creation
+        # time as the bound target, and a command line naming the dummy script.
+        info = monitor.probe.get_process_info(target_pid)
+        command_line = monitor.probe.get_command_line(target_pid) or ""
+        if (
+            not info
+            or not info.is_alive
+            or info.creation_time_utc != monitor.bound_target.creation_time_utc
+            or str(target_script) not in command_line
+        ):
+            raise RuntimeError(f"refusing to kill pid {target_pid}: not the bound dummy target")
+        res = subprocess.run(
+            ["taskkill", "/PID", str(target_pid), "/F"],
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=30,
+        )
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            after = monitor.probe.get_process_info(target_pid)
+            if not after or not after.is_alive:
+                break
+            time.sleep(0.2)
+        after = monitor.probe.get_process_info(target_pid)
+        return {"taskkill_rc": res.returncode, "dead": not (after and after.is_alive)}
+
+    def die_and_step(tag: str) -> Dict[str, Any]:
+        target_pid = start_incarnation(tag)
+        monitor = build_monitor(target_pid)
+        ok, message = monitor.bind_target()
+        entry: Dict[str, Any] = {
+            "target_pid": target_pid,
+            "bind": {"ok": ok, "message": message},
+            "resolved_pane_id": monitor.target_pane_id,
+        }
+        if not ok:
+            raise RuntimeError(f"{tag}: bind failed: {message}")
+        if monitor.target_pane_id != pane_id:
+            raise RuntimeError(
+                f"{tag}: pane resolution picked {monitor.target_pane_id}, "
+                f"not the pane hosting the target ({pane_id})"
+            )
+        runs_before = len(sentinel_runs())
+        entry["kill"] = kill_incarnation(monitor, target_pid)
+        result = monitor.step()
+        resume = result.get("auto_resume") or {}
+        entry["step_status"] = result.get("status")
+        entry["step_classification"] = result.get("classification")
+        entry["auto_resume"] = {
+            key: resume.get(key)
+            for key in ("launched", "reason", "live_owner_pid", "command", "manifest_path")
+        }
+        # The pane types the command asynchronously; give a relaunch time to land and
+        # a refusal the same window to prove nothing did.
+        deadline = time.time() + 10
+        while time.time() < deadline and len(sentinel_runs()) == runs_before:
+            time.sleep(0.2)
+        if len(sentinel_runs()) == runs_before:
+            time.sleep(1.0)
+        entry["pane_runs_added"] = len(sentinel_runs()) - runs_before
+        entry["monitor"] = monitor
+        return entry
+
     try:
         host_pane = herdr.scratch_host_pane()
-        report["steps"]["scratch_host_pane"] = host_pane
+        steps["scratch_host_pane"] = host_pane
         pane_id = herdr.split_pane(from_pane=host_pane, cwd=str(workdir))
-        report["steps"]["scratch_pane_id"] = pane_id
+        steps["scratch_pane_id"] = pane_id
         if not pane_id:
             report["error"] = "herdr did not report a new scratch pane"
             return report
@@ -1982,130 +2149,88 @@ def run_resume_relaunch_test(
         ready_deadline = time.time() + 20
         while time.time() < ready_deadline and herdr.pane_shell_pid(pane_id) is None:
             time.sleep(0.2)
-        report["steps"]["scratch_pane_shell_pid"] = herdr.pane_shell_pid(pane_id)
+        steps["scratch_pane_shell_pid"] = herdr.pane_shell_pid(pane_id)
 
-        target_command = " ".join(
-            [
-                _quote_for_shell(sys.executable),
-                _quote_for_shell(str(target_script)),
-                _quote_for_shell(str(pid_file)),
-                _quote_for_shell(str(go_file)),
-                f"--resume={test_session_id}",
-            ]
+        # 1. A live owner exists: the death must not be relaunched.
+        owner_image = _sacrificial_owner_image(workdir)
+        if owner_image is None:
+            report["error"] = "no sacrificial veyyon.exe owner image could be prepared"
+            return report
+        owner_proc = subprocess.Popen(
+            [str(owner_image), "-n", "600", "127.0.0.1"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-        launched, detail = herdr.run_in_pane(pane_id, target_command)
-        report["steps"]["target_launch"] = detail
-        if not launched:
-            report["error"] = f"could not start the disposable target in {pane_id}"
-            return report
-
-        pid_deadline = time.time() + 30
-        while time.time() < pid_deadline and not pid_file.exists():
-            time.sleep(0.2)
-        if not pid_file.exists():
-            report["error"] = "the disposable target never reported its pid"
-            return report
-        target_pid = int(pid_file.read_text(encoding="utf-8").strip())
-        report["steps"]["target_pid"] = target_pid
-
-        def build_monitor(**overrides) -> SessionCrashMonitor:
-            kwargs: Dict[str, Any] = {
-                "session_id": test_session_id,
-                "pid": target_pid,
-                "state_file": state_file or (workdir / "state.json"),
-                "poll_interval": 0.2,
-                # Real relaunch, captured alert: the delivery surface is proven
-                # separately by --test-disposable-crash.
-                "dry_run": False,
-                "notifier_adapter": notifier,
-                "auto_resume": True,
-                "resume_argv": [sys.executable, str(sentinel_script)],
-                "herdr": herdr,
-                "registry": SessionRegistry(registry_dir),
-                "log_dir": log_dir,
-                "inflight_dir": log_dir / "inflight",
-                "manifest_dir": workdir / "manifests",
-            }
-            kwargs.update(overrides)
-            return SessionCrashMonitor(**kwargs)
-
-        monitor = build_monitor()
-        ok, message = monitor.bind_target()
-        report["steps"]["bind"] = {"ok": ok, "message": message}
-        report["steps"]["resolved_pane_id"] = monitor.target_pane_id
-        if not ok:
-            report["error"] = f"bind failed: {message}"
-            return report
-        if monitor.target_pane_id != pane_id:
-            report["error"] = (
-                f"pane resolution picked {monitor.target_pane_id}, "
-                f"not the pane hosting the target ({pane_id})"
-            )
-            return report
-
-        # Let the disposable target die, then run exactly one monitoring cycle.
-        go_file.write_text("go", encoding="utf-8")
-        exit_deadline = time.time() + 30
-        while time.time() < exit_deadline:
-            info = monitor.probe.get_process_info(target_pid)
-            if not info or not info.is_alive:
-                break
-            time.sleep(0.2)
-        info_after = monitor.probe.get_process_info(target_pid)
-        report["steps"]["target_alive_after_wait"] = bool(info_after and info_after.is_alive)
-
-        step_result = monitor.step()
-        report["steps"]["step_status"] = step_result.get("status")
-        report["steps"]["step_classification"] = step_result.get("classification")
-        resume = step_result.get("auto_resume") or {}
-        report["steps"]["auto_resume"] = resume
-        report["steps"]["alerts_captured"] = len(notifier.events)
-
-        sentinel_deadline = time.time() + 15
-        while time.time() < sentinel_deadline and not sentinel.exists():
-            time.sleep(0.2)
-        pane_ran = sentinel.exists()
-        report["steps"]["pane_ran_resume_command"] = pane_ran
-        if pane_ran:
-            report["steps"]["sentinel_text"] = sentinel.read_text(encoding="utf-8")
-
-        # One death, one relaunch: the same termination must not be claimable twice.
-        second_claim = monitor.state_ledger.claim_termination(
-            test_session_id,
-            target_pid,
-            monitor.bound_target.creation_time_utc,
-            {"claimed_at_utc": utc_now_iso(), "supervisor_pid": -1},
+        time.sleep(0.5)
+        (registry_dir / f"{owner_proc.pid}-owner.json").write_text(
+            json.dumps({"sessionId": test_session_id, "pid": owner_proc.pid, "cwd": str(workdir)}),
+            encoding="utf-8",
         )
-        report["steps"]["second_claim_refused"] = not second_claim
+        refusal = die_and_step("owner_refusal")
+        refusal["owner_pid"] = owner_proc.pid
+        refusal_monitor = refusal.pop("monitor")
+        refusal["owner_seen_by_registry"] = bool(
+            SessionRegistry(registry_dir).live_owner(test_session_id, refusal_monitor.probe)
+        )
+        steps["owner_refusal"] = refusal
 
-        manifest_path = resume.get("manifest_path")
-        report["steps"]["manifest_path"] = manifest_path
+        # 2. The owner is gone: exactly one relaunch into the pane.
+        owner_proc.kill()
+        owner_proc.wait(timeout=30)
+        steps["owner_stopped_rc"] = owner_proc.returncode
+        relaunch = die_and_step("relaunch")
+        relaunch_monitor = relaunch.pop("monitor")
+        steps["relaunch"] = relaunch
+        manifest_path = relaunch["auto_resume"].get("manifest_path")
         if manifest_path and Path(manifest_path).exists():
-            report["steps"]["manifest"] = json.loads(
-                Path(manifest_path).read_text(encoding="utf-8")
-            )
+            manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+            relaunch["manifest_schema"] = manifest.get("schema")
 
-        # A restarted supervisor replaying the same binding must stop at the ledger
-        # rather than relaunching a second time.
-        restarted = build_monitor()
-        restarted.target_pid = target_pid
-        restarted.bound_target = monitor.bound_target
-        report["steps"]["restarted_status"] = restarted.step().get("status")
+        # A restarted supervisor replaying that same death must stop at the ledger.
+        restarted = build_monitor(relaunch["target_pid"])
+        restarted.target_pid = relaunch["target_pid"]
+        restarted.bound_target = relaunch_monitor.bound_target
+        steps["restarted_supervisor_status"] = restarted.step().get("status")
+
+        # 3. The resumed incarnation dies too: the session has spent its relaunch.
+        second = die_and_step("no_second_relaunch")
+        second.pop("monitor")
+        steps["no_second_relaunch"] = second
+
+        runs = sentinel_runs()
+        steps["pane_resume_commands_total"] = len(runs)
+        steps["pane_resume_commands"] = runs
 
         report["ok"] = bool(
-            resume.get("launched")
-            and pane_ran
-            and report["steps"]["second_claim_refused"]
-            and report["steps"]["restarted_status"] == "already_processed"
+            refusal["owner_seen_by_registry"]
+            and refusal["kill"]["dead"]
+            and not refusal["auto_resume"]["launched"]
+            and refusal["auto_resume"]["live_owner_pid"] == owner_proc.pid
+            and refusal["pane_runs_added"] == 0
+            and relaunch["kill"]["dead"]
+            and relaunch["auto_resume"]["launched"]
+            and relaunch["pane_runs_added"] == 1
+            and steps["restarted_supervisor_status"] == "already_processed"
+            and second["kill"]["dead"]
+            and not second["auto_resume"]["launched"]
+            and "already used its one relaunch" in (second["auto_resume"]["reason"] or "")
+            and second["pane_runs_added"] == 0
+            and len(runs) == 1
+            and f"--resume {test_session_id}" in runs[0]
         )
         return report
     except Exception as exc:
         report["error"] = f"{type(exc).__name__}: {exc}"
         return report
     finally:
+        if owner_proc is not None and owner_proc.poll() is None:
+            owner_proc.kill()
+            owner_proc.wait(timeout=30)
         if pane_id:
             _closed, close_detail = herdr.close_pane(pane_id)
-            report["steps"]["scratch_pane_closed"] = close_detail
+            steps["scratch_pane_closed"] = close_detail
         shutil.rmtree(workdir, ignore_errors=True)
 
 
