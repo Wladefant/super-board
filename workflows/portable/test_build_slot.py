@@ -71,7 +71,6 @@ class TestBuildSlot(unittest.TestCase):
         acquired = manager.acquire(
             name="test-lane-1",
             timeout=2.0,
-            stale_after=60.0,
             poll_interval=0.05,
         )
         self.assertTrue(acquired)
@@ -149,31 +148,30 @@ class TestBuildSlot(unittest.TestCase):
         self.assertTrue(manager.acquire("new-lane", timeout=2.0, poll_interval=0.05))
         self.assertTrue(manager.release("new-lane"))
 
-    def test_stale_reclaim_age_exceeded(self):
+    def test_live_acquire_owner_never_reclaimed_on_age(self):
+        """
+        #315: an `acquire` lock whose owner is alive keeps the slot however old it is. The old
+        30-minute age rule freed slots under builds that were still running.
+        """
         manager = BuildSlotManager(run_dir=self.run_dir)
-
-        # Create lock with current PID but timestamp 3600 seconds in the past
         os.makedirs(manager.lock_dir, exist_ok=True)
         past_epoch = time.time() - 3600.0
         info = {
-            "owner": "ancient-lane",
+            "owner": "long-build-lane",
             "pid": os.getpid(),
             "acquired_at": datetime.datetime.fromtimestamp(past_epoch, datetime.timezone.utc).isoformat(),
             "acquired_at_epoch": past_epoch,
+            "heartbeat_at_epoch": past_epoch,
         }
         with open(manager.info_file, "w", encoding="utf-8") as f:
             json.dump(info, f)
 
-        # Check reclaim with stale_after = 60s
         stderr_buf = io.StringIO()
         with redirect_stderr(stderr_buf):
-            reclaimed = manager.check_stale_and_reclaim(stale_after=60.0)
-        self.assertTrue(reclaimed)
-        self.assertFalse(os.path.exists(manager.lock_dir))
-
-        captured = stderr_buf.getvalue()
-        self.assertIn("[NOTICE] Reclaiming stale build slot lock", captured)
-        self.assertIn("exceeded stale-after threshold", captured)
+            reclaimed = manager.check_stale_and_reclaim()
+        self.assertFalse(reclaimed, stderr_buf.getvalue())
+        self.assertTrue(os.path.isdir(manager.lock_dir))
+        self.assertEqual(manager.status()["lock"]["owner"], "long-build-lane")
 
     def test_ram_guard_refusal_and_force(self):
         manager = BuildSlotManager(run_dir=self.run_dir)
@@ -1236,7 +1234,7 @@ class TestBuildSlot(unittest.TestCase):
         """
         manager = BuildSlotManager(run_dir=self.run_dir)
         wrapper = self._live_process()
-        self._write_run_lock(manager, wrapper.pid, self._exited_pid(), age=600.0, hb_age=300.0)
+        self._write_run_lock(manager, wrapper.pid, self._exited_pid(), age=600.0, hb_age=240.0)
 
         stderr = io.StringIO()
         with redirect_stderr(stderr):
@@ -1244,16 +1242,32 @@ class TestBuildSlot(unittest.TestCase):
         self.assertFalse(reclaimed, stderr.getvalue())
         self.assertTrue(os.path.isdir(manager.lock_dir))
 
-    def test_live_run_wrapper_without_heartbeat_past_stale_after_reclaimed(self):
-        """A live but hung wrapper (no heartbeat for longer than stale_after) is still reclaimed."""
+    def test_live_run_wrapper_past_30_min_with_fresh_heartbeat_not_reclaimed(self):
+        """
+        #315: QA5748 ran 30m30s under `run`, and by release time its slot belonged to another
+        lane. A live wrapper that still heartbeats keeps the slot however long the build takes.
+        """
         manager = BuildSlotManager(run_dir=self.run_dir)
         wrapper = self._live_process()
-        self._write_run_lock(manager, wrapper.pid, wrapper.pid, age=2000.0, hb_age=1900.0)
+        self._write_run_lock(manager, wrapper.pid, wrapper.pid, age=31 * 60.0, hb_age=5.0)
 
         stderr = io.StringIO()
         with redirect_stderr(stderr):
-            self.assertTrue(manager.check_stale_and_reclaim(stale_after=1800.0))
-        self.assertIn(f"run wrapper PID {wrapper.pid} is alive", stderr.getvalue())
+            self.assertFalse(manager.check_stale_and_reclaim(), stderr.getvalue())
+            self.assertFalse(manager.check_stale_and_reclaim(pid_dead_grace_period=1.0), stderr.getvalue())
+        self.assertTrue(os.path.isdir(manager.lock_dir))
+
+    def test_live_run_wrapper_with_stale_heartbeat_reclaimed(self):
+        """A live wrapper whose heartbeat is older than 5 minutes has hung and is reclaimed."""
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        wrapper = self._live_process()
+        self._write_run_lock(manager, wrapper.pid, wrapper.pid, age=600.0, hb_age=301.0)
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            self.assertTrue(manager.check_stale_and_reclaim())
+        self.assertFalse(os.path.isdir(manager.lock_dir))
+        self.assertIn(f"run wrapper PID {wrapper.pid} is alive but its heartbeat is stale", stderr.getvalue())
 
     def test_dead_run_wrapper_reclaimed_only_after_grace_period(self):
         """

@@ -9,7 +9,7 @@ Replaces orchestrator IRC messages ('BUILD SLOT TAKEN/FREE') with a local,
 Windows-safe (no fcntl), crash-resilient lock file.
 
 Commands:
-    acquire <name> [--timeout SEC] [--stale-after SEC] [--poll-interval SEC] [--force]
+    acquire <name> [--timeout SEC] [--heartbeat-stale-after SEC] [--poll-interval SEC] [--force]
     release <name>
     status [--json]
 
@@ -24,11 +24,13 @@ Invariants:
     - Acquire wait loops write heartbeats before queue cleaning, re-enqueue if pruned,
       and clean up queue entries via try/finally on timeout, exit, or exception.
     - Release by non-owner is strictly refused.
-    - Stale locks are reclaimed with a logged notice. A `run` lock lives exactly as long as
-      its wrapper process (the `build_slot.py run` PID, which waits for the command and
-      releases in `finally`): a dead wrapper is reclaimed after the 60s grace period, and
-      a live one only past --stale-after [default 30m] with no fresh heartbeat. Other locks:
-      owner PID dead past the grace period, or older than --stale-after.
+    - Stale locks are reclaimed with a logged notice. A live holder is never reclaimed on
+      age alone. A `run` lock lives exactly as long as its wrapper process (the
+      `build_slot.py run` PID, which heartbeats every 5s, waits for the command and releases
+      in `finally`): a dead wrapper is reclaimed after the 60s grace period, and a live one
+      only once its heartbeat is older than --heartbeat-stale-after [default 5m] (hung).
+      Other locks (`acquire` mode has no process left to heartbeat): only when the owner PID
+      is dead past the grace period.
     - RAM guard: acquire refuses when host system RAM >= 85% unless --force is passed.
     - Pure standard library + Windows-safe ctypes (zero fcntl imports).
 """
@@ -58,7 +60,7 @@ QUEUE_FILE_NAME = "build-slot.queue.json"
 QUEUE_LOCK_NAME = "build-slot-queue.lock"
 INFO_FILE_NAME = "info.json"
 
-DEFAULT_STALE_AFTER_SECONDS = 30 * 60  # 30 minutes
+DEFAULT_LOCK_HEARTBEAT_STALE_SECONDS = 5 * 60  # a live `run` holder silent this long is hung
 DEFAULT_POLL_INTERVAL_SECONDS = 5.0
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 10.0  # update queue entry heartbeat every <=15s
 DEFAULT_QUEUE_STALE_HEARTBEAT_SECONDS = 60.0  # reclaim if heartbeat older than 60s
@@ -996,21 +998,22 @@ class BuildSlotManager:
 
     def check_stale_and_reclaim(
         self,
-        stale_after: float = DEFAULT_STALE_AFTER_SECONDS,
+        heartbeat_stale_after: float = DEFAULT_LOCK_HEARTBEAT_STALE_SECONDS,
         pid_dead_grace_period: Optional[float] = None,
     ) -> bool:
         """
-        Checks if the currently held lock is stale.
+        Checks if the currently held lock is stale. A live holder is never reclaimed on age
+        alone: a build that runs past any fixed age must keep its slot.
         A heartbeat counts as fresh when younger than the grace period (default 60s).
         Reclaims it if:
           1. `run` lock (has wrapper_pid): the wrapper is dead, the lock is older than the
-             grace period and the heartbeat is not fresh. While the wrapper is alive only
-             rule 3 applies: the wrapper waits for its command and releases in `finally`,
-             so neither a dead wrapped command (a shim or launcher) nor a heartbeat
-             stalled by host memory pressure means the build is gone.
-          2. Other locks: owner PID is dead AND lock age exceeds grace period (and heartbeat not fresh).
-          3. Lock age exceeds stale_after seconds (and heartbeat not fresh).
-          4. Corrupt lock directory older than 10s grace period.
+             grace period and the heartbeat is not fresh; or the wrapper is alive but its
+             heartbeat (written every 5s) is older than heartbeat_stale_after, so it hung.
+             A dead wrapped command (a shim or launcher) never frees the slot: the wrapper
+             waits for its command and releases in `finally`.
+          2. Other locks (`acquire` mode, which has no process left to heartbeat): owner
+             PID is dead AND lock age exceeds grace period (and heartbeat not fresh).
+          3. Corrupt lock directory older than 10s grace period.
         Returns True if a stale lock was reclaimed, False otherwise.
         """
         effective_grace = (
@@ -1067,11 +1070,12 @@ class BuildSlotManager:
                     is_hb_fresh = (hb_age is not None and hb_age < effective_grace)
                     if wrapper_pid:
                         if self.is_pid_alive(wrapper_pid):
-                            if age >= stale_after and not is_hb_fresh:
+                            silence = hb_age if hb_age is not None else age
+                            if silence >= heartbeat_stale_after:
                                 is_stale = True
                                 reason = (
-                                    f"run wrapper PID {wrapper_pid} is alive but has not heartbeated "
-                                    f"within the stale-after threshold ({age:.1f}s >= {stale_after:.1f}s, "
+                                    f"run wrapper PID {wrapper_pid} is alive but its heartbeat is stale "
+                                    f"({silence:.1f}s >= {heartbeat_stale_after:.1f}s, "
                                     f"owner='{owner}', slot {slot_idx})"
                                 )
                         elif age >= effective_grace and not is_hb_fresh:
@@ -1095,9 +1099,6 @@ class BuildSlotManager:
                                 f"owner PID {pid} is dead and lock age exceeds grace period "
                                 f"({age:.1f}s >= {effective_grace:.1f}s, owner='{owner}', slot {slot_idx})"
                             )
-                    elif age >= stale_after and not is_hb_fresh:
-                        is_stale = True
-                        reason = f"exceeded stale-after threshold ({age:.1f}s >= {stale_after:.1f}s, owner='{owner}', PID={pid}, slot {slot_idx})"
 
                 if is_stale:
                     notice = f"[NOTICE] Reclaiming stale build slot lock: {reason}"
@@ -1124,7 +1125,7 @@ class BuildSlotManager:
         self,
         name: str,
         timeout: Optional[float] = None,
-        stale_after: float = DEFAULT_STALE_AFTER_SECONDS,
+        heartbeat_stale_after: float = DEFAULT_LOCK_HEARTBEAT_STALE_SECONDS,
         poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
         force: bool = False,
         pid: Optional[int] = None,
@@ -1218,7 +1219,7 @@ class BuildSlotManager:
 
                 # Check and reclaim any stale lock
                 try:
-                    self.check_stale_and_reclaim(stale_after=stale_after)
+                    self.check_stale_and_reclaim(heartbeat_stale_after=heartbeat_stale_after)
                 except Exception as e:
                     logger.debug("Transient error checking stale lock for '%s': %s", name, e)
 
@@ -1433,14 +1434,14 @@ class BuildSlotManager:
         print(msg, file=sys.stderr)
         logger.error(msg)
         return False
-    def status(self, stale_after: float = DEFAULT_STALE_AFTER_SECONDS) -> Dict[str, Any]:
+    def status(self, heartbeat_stale_after: float = DEFAULT_LOCK_HEARTBEAT_STALE_SECONDS) -> Dict[str, Any]:
         """
         Returns full status dictionary and prints summary.
         Reclaims stale locks with a logged notice.
         Shows all slot holders (up to 2 slots).
         """
         # 1. Reclaim stale lock if present across all slots
-        reclaimed = self.check_stale_and_reclaim(stale_after=stale_after)
+        reclaimed = self.check_stale_and_reclaim(heartbeat_stale_after=heartbeat_stale_after)
 
         # 2. Read lock info for all slots
         now = time.time()
@@ -1603,7 +1604,7 @@ class BuildSlotManager:
         priority: bool = False,
         force: bool = False,
         cwd: Optional[str] = None,
-        stale_after: float = DEFAULT_STALE_AFTER_SECONDS,
+        heartbeat_stale_after: float = DEFAULT_LOCK_HEARTBEAT_STALE_SECONDS,
         poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
     ) -> int:
         """
@@ -1613,7 +1614,7 @@ class BuildSlotManager:
         Records the wrapper PID (this process, the lock's liveness source), the wrapped
         child's PID, a per-run token, and maintains a heartbeat. The lock is reclaimed
         by others only once this wrapper is dead (after the grace period), or when it
-        stops heartbeating for longer than stale_after.
+        stops heartbeating for longer than heartbeat_stale_after.
         Returns the command exit code, or 1 if lock could not be acquired.
         """
         run_token = str(uuid.uuid4())
@@ -1623,7 +1624,7 @@ class BuildSlotManager:
             acquired = self.acquire(
                 name=name,
                 timeout=timeout,
-                stale_after=stale_after,
+                heartbeat_stale_after=heartbeat_stale_after,
                 poll_interval=poll_interval,
                 force=force,
                 pid=runner_pid,
@@ -1741,16 +1742,19 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    # acquire <name> [--timeout SEC] [--stale-after SEC] [--poll-interval SEC] [--force]
+    # acquire <name> [--timeout SEC] [--heartbeat-stale-after SEC] [--poll-interval SEC] [--force]
     p_acq = subparsers.add_parser("acquire", help="Acquire build slot lock (blocks until available)")
     p_acq.add_argument("name", help="Lane or worker identifier requesting the slot")
     p_acq.add_argument("--pid", type=int, default=None, help="Explicit PID to associate with the lock (default: parent process PID)")
     p_acq.add_argument("--timeout", type=float, default=None, help="Maximum seconds to wait (default: block indefinitely)")
     p_acq.add_argument(
-        "--stale-after",
+        "--heartbeat-stale-after",
         type=float,
-        default=DEFAULT_STALE_AFTER_SECONDS,
-        help=f"Seconds after which an inactive/dead lock is reclaimed (default: {DEFAULT_STALE_AFTER_SECONDS}s / 30m)",
+        default=DEFAULT_LOCK_HEARTBEAT_STALE_SECONDS,
+        help=(
+            "Seconds without a heartbeat after which a live `run` holder counts as hung and is "
+            f"reclaimed (default: {DEFAULT_LOCK_HEARTBEAT_STALE_SECONDS}s / 5m); live holders are never reclaimed on age"
+        ),
     )
     p_acq.add_argument(
         "--poll-interval",
@@ -1812,10 +1816,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     # status [--json]
     p_stat = subparsers.add_parser("status", help="Print current lock owner, age, and FIFO queue")
     p_stat.add_argument(
-        "--stale-after",
+        "--heartbeat-stale-after",
         type=float,
-        default=DEFAULT_STALE_AFTER_SECONDS,
-        help=f"Seconds after which an inactive/dead lock is reclaimed during status check (default: {DEFAULT_STALE_AFTER_SECONDS}s / 30m)",
+        default=DEFAULT_LOCK_HEARTBEAT_STALE_SECONDS,
+        help=(
+            "Seconds without a heartbeat after which a live `run` holder is reclaimed during "
+            f"the status check (default: {DEFAULT_LOCK_HEARTBEAT_STALE_SECONDS}s / 5m)"
+        ),
     )
     p_stat.add_argument("--json", action="store_true", help="Output status as structured JSON")
 
@@ -1839,7 +1846,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         success = manager.acquire(
             name=args.name,
             timeout=args.timeout,
-            stale_after=args.stale_after,
+            heartbeat_stale_after=args.heartbeat_stale_after,
             poll_interval=args.poll_interval,
             force=args.force,
             pid=caller_pid,
@@ -1912,7 +1919,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0 if success else 1
 
     elif args.command == "status":
-        stat = manager.status(stale_after=args.stale_after)
+        stat = manager.status(heartbeat_stale_after=args.heartbeat_stale_after)
         if args.json:
             print(json.dumps(stat, indent=2))
         else:
