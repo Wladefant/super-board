@@ -104,7 +104,10 @@ from model_routing import (
     ANTHROPIC_BOTTLENECK_MAX_USED,
     CREDENTIAL_ENV_BY_PROVIDER,
     MINIMAX_PROVIDER,
+    LANE_MODEL_PINS,
     ROLE_MODEL_PINS,
+    lane_model_at_depth,
+    lane_pin_drift,
     get_recommended_lanes,
     VERIFIED_CONTEXT_WINDOWS,
     ZAI_PROVIDER,
@@ -1821,11 +1824,8 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         # Every lane the router routes Chinese/cheap work to is spawnable AND may spawn its own
         # children with `agents: enabled: true`, so a lead lane can fan sub-slices out instead of
         # working serially.
-        for role, child_model in (
-            ("task", True), ("qa-verifier", True), ("spark", False), ("reviewer", True),
-            ("ds-task", True), ("go-task", True), ("go-review", True),
-            ("go-deep", True), ("go-bulk", True),
-        ):
+        for role in ("task", "qa-verifier", "spark", "reviewer", "ds-task", "go-task",
+                     "go-review", "go-deep", "go-bulk"):
             record = agents.get(role)
             self.assertIsNotNone(record, f"{role} must exist as a spawnable agent")
             self.assertTrue(record.get("enabled", True), f"{role} must be enabled in the roster")
@@ -1834,12 +1834,16 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             self.assertIsNot(level1.get("enabled"), False, f"{role} must permit child lanes")
             self.assertGreaterEqual(lane_depth(record, session_depth), 1,
                                     f"{role} must be able to spawn at least one nested level")
-            if child_model:
-                self.assertTrue(str(level1.get("model", "")).strip(),
-                                f"{role} must name the model chain its children default to")
 
-        # Children run the cheapest adequate lane: one of the free/Flash/DeepSeek-Flash rungs,
-        # never paid Opus and never a paid Anthropic model anywhere in a child chain.
+        # A nested `agents.model` is NOT the model of this lane's children: veyyon reads the
+        # SPAWNED agent's own chain at index depth-1, so `task.agents.model` is what every `task`
+        # at depth 2 runs, whoever spawned it. The Flash lanes must therefore lead with Flash at
+        # every depth; a Go-first nested level sent grandchild lanes into a Go usage 429.
+        self.assertEqual(lane_pin_drift(agents, session_depth), [],
+                         "task/qa-verifier must lead with Gemini Flash at every spawn depth")
+
+        # A nested level that does name a model stays on a cheap adequate lane: one of the
+        # free/Flash/DeepSeek-Flash rungs, never paid Opus and never a paid Anthropic model.
         cheap_prefixes = ("google-antigravity/gemini-3.8-flash", "deepseek/", "openai-codex/gpt-5.3-codex-spark",
                           "opencode-go/", "openrouter/deepseek/")
         for role in ("task", "qa-verifier", "reviewer", "ds-task", "go-task",
@@ -1862,6 +1866,46 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
               f"parent-only lanes: {sorted(parent_only)}.")
 
     # -------------------------------------------------------------------------
+    # TEST 39b: Flash lanes lead with Flash at every spawn depth (veyyon laneModelLayer)
+    # -------------------------------------------------------------------------
+    def test_flash_lane_pin_holds_at_every_depth(self):
+        print("\n--- TEST 39b: Flash Lanes Stay On Flash At Every Spawn Depth ---")
+        flash = "google-antigravity/gemini-3.8-flash:high"
+        self.assertEqual(LANE_MODEL_PINS, {"task": MODEL_GEMINI_FLASH, "qa-verifier": MODEL_GEMINI_FLASH})
+
+        # The shape that failed on 2026-09-27: a Go-first nested level under the Flash row. A
+        # depth-1 `task` runs Flash, but every depth-2 `task` (spawned by ANY depth-1 lane, e.g.
+        # an Opus reviewer) resolves to space-bunny-free.
+        go_first = {
+            role: {"model": flash, "agents": {
+                "enabled": True,
+                "model": f"{MODEL_GO_BUNNY},{MODEL_GO_GLM53_FLASH},deepseek/deepseek-flash:high",
+                "agents": {"enabled": True}}}
+            for role in ("task", "qa-verifier")
+        }
+        self.assertEqual(lane_model_at_depth(go_first, "task", 1)[0], flash)
+        self.assertEqual(lane_model_at_depth(go_first, "task", 2)[0], MODEL_GO_BUNNY)
+        # Depth 3 names no model and inherits the nearest level above it (depth 2), as veyyon does.
+        self.assertEqual(lane_model_at_depth(go_first, "task", 3)[0], MODEL_GO_BUNNY)
+        drift = lane_pin_drift(go_first, 3)
+        self.assertIn(f"task at depth 2 runs {MODEL_GO_BUNNY}, expected {MODEL_GEMINI_FLASH}", drift)
+        self.assertIn(f"qa-verifier at depth 3 runs {MODEL_GO_BUNNY}, expected {MODEL_GEMINI_FLASH}", drift)
+        self.assertNotIn(f"task at depth 1 runs {flash}, expected {MODEL_GEMINI_FLASH}", drift)
+
+        # The fix: nested levels name no model, so every depth inherits the Flash row.
+        inherited = {role: {"model": flash, "agents": {"enabled": True, "agents": {"enabled": True}}}
+                     for role in ("task", "qa-verifier")}
+        self.assertEqual(lane_pin_drift(inherited, 3), [])
+        # A nested level that names Flash again (other thinking level) is also clean.
+        explicit = copy.deepcopy(inherited)
+        explicit["task"]["agents"]["model"] = "google-antigravity/gemini-3.8-flash:medium," + MODEL_DEEPSEEK_FLASH
+        self.assertEqual(lane_pin_drift(explicit, 3), [])
+        # A missing row falls back to the default role, which is drift too.
+        self.assertEqual(lane_pin_drift({"task": inherited["task"]}, 1),
+                         [f"qa-verifier at depth 1 runs the default role, expected {MODEL_GEMINI_FLASH}"])
+        print("  [PASS] Go-first nested level flagged at depths 2-3; inherited/explicit Flash chains clean.")
+
+    # -------------------------------------------------------------------------
     # TEST 40: Every child-lane default maps to an enabled, spawnable roster entry
     # -------------------------------------------------------------------------
     def test_child_lane_defaults_resolve_to_enabled_roles(self):
@@ -1871,9 +1915,9 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             self.skipTest(f"profile config not installed at {config_path}")
         agents = ((yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}).get("agent") or {}).get("agents") or {}
 
-        # The nested Agents chain names the model a child lane runs by default. If that model
-        # maps to a role that is not in the roster, or is disabled in it, the parent's fan-out
-        # fails at spawn time — the drift this test exists to catch.
+        # A nested Agents level names the model this same lane type runs when spawned one level
+        # deeper (veyyon laneModelLayer). If that model maps to a role that is not in the roster,
+        # or is disabled in it, a nested spawn fails at spawn time — the drift this test catches.
         checked = set()
         for role, record in agents.items():
             level1 = (record or {}).get("agents")
@@ -2000,6 +2044,44 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         self.assertNotIn("opencode-go/", rec.selected_model)
         self.assertEqual(rec.selected_model, MODEL_GEMINI_FLASH)
         print(f"  [PASS] 429 retry-after-ms=136710000 parsed (136710s, ~38h); Go marked exhausted -> routed to {rec.selected_model}")
+
+    # -------------------------------------------------------------------------
+    # TEST 43b: space-bunny-free is closed by a recorded Go usage 429, not "uncapped"
+    # -------------------------------------------------------------------------
+    def test_go_bunny_closed_by_go_usage_429(self):
+        print("\n--- TEST 43b: space-bunny-free Closed By Go Usage 429 Until Retry-After ---")
+        usage = self._usage_with_opencode_go(weekly_used=0.10, weekly_reset_hrs=148.8)
+        now_dt = datetime.datetime.fromtimestamp(self.mock_now_ms / 1000.0, tz=datetime.timezone.utc)
+        cache = tmp_quota_path()
+        self.addCleanup(shutil.rmtree, cache.parent, ignore_errors=True)
+
+        def selector(at_ms):
+            return ResetAwareModelSelector(parse_usage_json(usage, current_time_ms=at_ms),
+                                           credentialed_providers={"opencode-go"},
+                                           quota_snapshot=load_quota_file(cache))
+
+        # Before any 429 the $0 Go model leads routine work.
+        before = selector(self.mock_now_ms).select_model(
+            task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.LOW)
+        self.assertEqual(before.selected_model, MODEL_GO_BUNNY)
+
+        # The body the 2026-09-27 grandchild lane died on (ArchiveResume.ArchiveResumeChecks, 19:59Z).
+        sel = selector(self.mock_now_ms)
+        reset = sel.record_429("opencode-go", "429 Go usage limit exceeded retry-after-ms=14417000",
+                               window_id="rolling-5h", now=now_dt)
+        self.assertEqual(reset.retry_after_seconds, 14417.0)
+        self.assertIn("opencode-go is exhausted until", sel.provider_exhaustion_reason(MODEL_GO_BUNNY))
+        during = selector(self.mock_now_ms).select_model(
+            task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.LOW)
+        self.assertEqual(during.selected_model, MODEL_GEMINI_FLASH,
+                         "a recorded Go usage 429 must close space-bunny-free, not leave it 'uncapped'")
+
+        # Past the retry-after the Go provider is eligible again with no further bookkeeping.
+        snapshot = load_quota_file(cache)
+        self.assertFalse(snapshot.is_eligible("opencode-go", now=now_dt + datetime.timedelta(seconds=14417 - 60)))
+        self.assertTrue(snapshot.is_eligible("opencode-go", now=now_dt + datetime.timedelta(seconds=14417 + 60)))
+        print(f"  [PASS] bunny leads -> 429 retry-after-ms=14417000 -> {during.selected_model}; "
+              "Go eligible again after the retry-after.")
 
     # -------------------------------------------------------------------------
     # TEST 44: OpenCode Go 5h rolling window guard
