@@ -126,6 +126,18 @@ class TestGardenerClassification(unittest.TestCase):
         self.assertEqual(f.category, "test_file")
         self.assertFalse(f.safe_to_prune)
 
+    def test_classify_knip_cli_script_is_preserved(self):
+        """Standalone `node scripts/*.mjs` tools are not dead files (#5645 false positive)."""
+        for script in ("scripts/verify-og-ssrf.mjs", "scripts/render-og.mjs", "scripts/og-ts-loader.mjs"):
+            issue = {"file": script, "files": [{"name": script}], "exports": [], "types": []}
+            findings = classify_knip_issue(issue, frontend_rel="frontend")
+            self.assertEqual(len(findings), 1, script)
+            self.assertEqual(findings[0].category, "cli_script", script)
+            self.assertFalse(findings[0].safe_to_prune, script)
+        # A component whose name merely contains "scripts" is still judged normally.
+        issue = {"file": "components/TranscriptsPanel.tsx", "files": [{"name": "x"}], "exports": [], "types": []}
+        self.assertEqual(classify_knip_issue(issue, frontend_rel="frontend")[0].category, "verified_dead_file")
+
     def test_classify_knip_dead_exports_and_types(self):
         """Knip dead exports and types must be classified as safe to prune."""
         issue = {
@@ -603,6 +615,31 @@ class TestGardenerIssueCreationAndAutomation(unittest.TestCase):
             self.assertEqual(findings[0].line, 1)
             self.assertEqual(findings[0].category, "untracked_workaround_comment")
             self.assertEqual(findings[0].confidence, 100)
+
+    def test_workaround_comment_block_citing_an_issue_is_tracked(self):
+        """A reference anywhere in the same comment block tracks it (#5646 false positive)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "frontend").mkdir()
+            be = root / "backend"
+            be.mkdir()
+            # Shape of backend/app/api_v1/keys.py:1344-1354 on staging c9f8afe6.
+            (be / "keys.py").write_text(
+                "detail = {\n"
+                "    # DELIBERATELY no lower-tier hint here (Codex P1 on PR #5146).\n"
+                "    # Advising a Pro user to add a free key would hand them two keys,\n"
+                "    # i.e. the documented\n"
+                "    # workaround would quietly defeat the very cap that\n"
+                "    # produced this error.\n"
+                "}\n"
+                "\n"
+                "# unrelated block\n"
+                "# workaround for the flaky cache, no issue yet\n",
+                encoding="utf-8",
+            )
+            findings = scan_workaround_comments(root)
+            self.assertEqual([f.line for f in findings], [10])
+            self.assertEqual(findings[0].file, "backend/keys.py")
 
     def test_check_host_ram_safe_mock(self):
         """Host RAM check must return False when RAM usage >= threshold."""

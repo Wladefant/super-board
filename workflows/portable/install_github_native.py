@@ -38,6 +38,8 @@ RUNTIME_FILES = (
     "build_slot.py", "test_build_slot.py",
     # Verification CLI and smoke test gate.
     "verify.py", "test_verify.py",
+    # Lane-brief merge guard (Wladefant/super-board#227).
+    "merge_guard.py", "test_merge_guard.py",
 )
 POLICY = Path("policies/default/AGENTS.md")
 # Hash of the policy the last install wrote, recorded beside the profile it wrote to.

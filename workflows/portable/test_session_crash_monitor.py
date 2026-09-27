@@ -745,6 +745,34 @@ class TestSessionCrashAutoResume(unittest.TestCase):
         self.assertEqual(restarted.step()["status"], "already_processed")
         self.assertEqual(len(herdr.runs), 1)
 
+    def test_a_resumed_session_that_dies_again_is_not_relaunched_a_second_time(self):
+        probe = RegistryAwareProbe()
+        self.set_target(probe, is_alive=True)
+        herdr = FakeHerdr(pane_id="w9:pZ")
+        notifier = MockTelegramAdapter()
+
+        first = self.build_monitor(probe, herdr, notifier)
+        self.assertTrue(first.bind_target()[0])
+        self.set_target(probe, is_alive=False, exit_code=1)
+        self.assertTrue(first.step()["auto_resume"]["launched"])
+        self.assertEqual(len(herdr.runs), 1)
+
+        # The resumed Main is a new process: new pid, new creation time, so the
+        # per-death claim key differs. The per-session cap must still hold.
+        resumed_pid = self.pid + 1
+        self.creation_time = "2026-09-26T11:45:00+00:00"
+        self.set_target(probe, is_alive=True, pid=resumed_pid)
+        second = self.build_monitor(probe, herdr, notifier, pid=resumed_pid)
+        self.assertTrue(second.bind_target()[0])
+        self.set_target(probe, is_alive=False, exit_code=1, pid=resumed_pid)
+        result = second.step()
+
+        self.assertEqual(result["status"], "terminated")
+        resume = result["auto_resume"]
+        self.assertFalse(resume["launched"])
+        self.assertIn("already used its one relaunch", resume["reason"])
+        self.assertEqual(len(herdr.runs), 1)
+
     def test_refuses_to_relaunch_while_the_registry_names_a_live_owner(self):
         live_pid = 987654
         (self.registry_dir / f"{live_pid}-aaaa.json").write_text(
