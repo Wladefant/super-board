@@ -24,6 +24,7 @@ import datetime
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1197,48 +1198,136 @@ class TestBuildSlot(unittest.TestCase):
             cleaned = manager.clean_queue(stale_heartbeat_after=0.01)
             self.assertIsInstance(cleaned, list)
 
-    def test_check_stale_and_reclaim_dead_child_pid(self):
-        """
-        check_stale_and_reclaim must reclaim the lock immediately if the wrapped
-        child process PID is dead, even if the owner process was veyyon host.
-        """
-        manager = BuildSlotManager(run_dir=self.run_dir)
-        # Create lock directory and info with dead child PID
+    def _exited_pid(self) -> int:
+        """PID of a real process that has already exited (faithful 'dead' for is_pid_alive)."""
+        p = subprocess.Popen([sys.executable, "-c", "pass"])
+        p.wait()
+        self.assertFalse(is_pid_alive(p.pid))
+        return p.pid
+
+    def _live_process(self) -> subprocess.Popen:
+        """A real process that stays alive for the test; killed on cleanup."""
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+        self.addCleanup(p.wait)
+        self.addCleanup(p.kill)
+        self.assertTrue(is_pid_alive(p.pid))
+        return p
+
+    def _write_run_lock(self, manager, wrapper_pid, child_pid, age, hb_age):
+        now = time.time()
         os.mkdir(manager.lock_dir)
         info = {
-            "owner": "test-lane",
-            "pid": os.getpid(),  # Live runner PID
-            "child_pid": 99999999,  # Dead child PID
-            "acquired_at": "2026-09-27T00:00:00Z",
-            "acquired_at_epoch": time.time() - 10.0,
-            "heartbeat_at": "2026-09-27T00:00:00Z",
-            "heartbeat_at_epoch": time.time() - 5.0,
+            "owner": "qa-lane-run",
+            "pid": wrapper_pid,
+            "wrapper_pid": wrapper_pid,
+            "child_pid": child_pid,
+            "token": "run-tok",
+            "acquired_at_epoch": now - age,
+            "heartbeat_at_epoch": now - hb_age,
         }
         with open(manager.info_file, "w", encoding="utf-8") as f:
             json.dump(info, f)
 
-        # Mock is_pid_alive so 99999999 is dead, os.getpid() is alive
-        def fake_is_alive(pid):
-            return pid == os.getpid()
-
-        manager.is_pid_alive = fake_is_alive
-        reclaimed = manager.check_stale_and_reclaim()
-        self.assertTrue(reclaimed)
-        self.assertFalse(os.path.isdir(manager.lock_dir))
-
-    def test_run_command_records_child_pid_and_token(self):
+    def test_live_run_wrapper_with_dead_child_and_stalled_heartbeat_not_reclaimed(self):
         """
-        run_command executes child under lock, records child_pid and run_token,
-        and releases the lock on completion.
+        #315: the `run` wrapper waits for its command and releases in `finally`, so while
+        it is alive the build is alive. A dead wrapped command (cmd.exe or launcher shim)
+        and a heartbeat stalled past 90s by host memory pressure must not free the slot.
         """
         manager = BuildSlotManager(run_dir=self.run_dir)
+        wrapper = self._live_process()
+        self._write_run_lock(manager, wrapper.pid, self._exited_pid(), age=600.0, hb_age=300.0)
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            reclaimed = manager.check_stale_and_reclaim()
+        self.assertFalse(reclaimed, stderr.getvalue())
+        self.assertTrue(os.path.isdir(manager.lock_dir))
+
+    def test_live_run_wrapper_without_heartbeat_past_stale_after_reclaimed(self):
+        """A live but hung wrapper (no heartbeat for longer than stale_after) is still reclaimed."""
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        wrapper = self._live_process()
+        self._write_run_lock(manager, wrapper.pid, wrapper.pid, age=2000.0, hb_age=1900.0)
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            self.assertTrue(manager.check_stale_and_reclaim(stale_after=1800.0))
+        self.assertIn(f"run wrapper PID {wrapper.pid} is alive", stderr.getvalue())
+
+    def test_dead_run_wrapper_reclaimed_only_after_grace_period(self):
+        """
+        A dead wrapper frees the slot once the lock is older than the 60s grace period and
+        its heartbeat has lapsed, even if the wrapped command it left behind is still alive.
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        dead_wrapper = self._exited_pid()
+        orphan_child = self._live_process()
+
+        self._write_run_lock(manager, dead_wrapper, orphan_child.pid, age=30.0, hb_age=30.0)
+        self.assertFalse(manager.check_stale_and_reclaim())
+        self.assertTrue(os.path.isdir(manager.lock_dir))
+        shutil.rmtree(manager.lock_dir)
+
+        self._write_run_lock(manager, dead_wrapper, orphan_child.pid, age=120.0, hb_age=90.0)
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            self.assertTrue(manager.check_stale_and_reclaim())
+        self.assertFalse(os.path.isdir(manager.lock_dir))
+        self.assertIn(f"run wrapper PID {dead_wrapper} is dead", stderr.getvalue())
+
+    def test_run_command_records_wrapper_as_lock_pid(self):
+        """
+        While the command runs, the lock names the wrapper (this process) as pid and
+        wrapper_pid, keeps the command's PID only as child_pid, and is released after.
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        snapshot = os.path.join(self.run_dir, "info-snapshot.json")
+        # A script file, not `-c`: run_command uses shell=True on Windows, where cmd.exe
+        # cuts a multi-line argument at the first newline.
+        reader = os.path.join(self.run_dir, "snapshot_lock_info.py")
+        with open(reader, "w", encoding="utf-8") as f:
+            f.write(
+                "import json, sys, time\n"
+                "src, dst = sys.argv[1], sys.argv[2]\n"
+                "for _ in range(100):\n"
+                "    try:\n"
+                "        info = json.load(open(src, encoding='utf-8'))\n"
+                "    except Exception:\n"
+                "        info = {}\n"
+                "    if info.get('child_pid'):\n"
+                "        break\n"
+                "    time.sleep(0.05)\n"
+                "json.dump(info, open(dst, 'w', encoding='utf-8'))\n"
+            )
         ret = manager.run_command(
             "child-test-lane",
-            [sys.executable, "-c", "import sys, time; time.sleep(0.05); sys.exit(0)"],
+            [sys.executable, reader, manager.info_file, snapshot],
         )
         self.assertEqual(ret, 0)
-        stat = manager.status()
-        self.assertFalse(stat["lock"]["locked"])
+        with open(snapshot, encoding="utf-8") as f:
+            info = json.load(f)
+        self.assertEqual(info["pid"], os.getpid())
+        self.assertEqual(info["wrapper_pid"], os.getpid())
+        self.assertNotEqual(info["child_pid"], os.getpid())
+        self.assertEqual(info["token"], info["run_token"])
+        self.assertFalse(manager.status()["lock"]["locked"])
+
+    def test_acquire_owner_pid_outlives_the_acquire_process(self):
+        """
+        #315: `acquire` exits once it holds the slot. The owner PID it records must be a
+        process that outlives it, or the dead-PID rule frees the slot 60s into the build.
+        """
+        probe = subprocess.run(
+            [sys.executable, "-c",
+             "import os, sys; sys.path.insert(0, sys.argv[1]); import build_slot; "
+             "print(os.getpid(), build_slot.find_long_lived_owner_pid())",
+             SCRIPT_DIR],
+            capture_output=True, text=True, check=True,
+        )
+        probe_pid, owner_pid = (int(x) for x in probe.stdout.split())
+        self.assertNotEqual(owner_pid, probe_pid)
+        self.assertTrue(is_pid_alive(owner_pid))
 
     def test_bounded_concurrency_two_slots_when_ram_under_75_percent(self):
         """When host RAM is < 75%, 2 concurrent slots can be acquired by distinct lanes."""

@@ -24,8 +24,11 @@ Invariants:
     - Acquire wait loops write heartbeats before queue cleaning, re-enqueue if pruned,
       and clean up queue entries via try/finally on timeout, exit, or exception.
     - Release by non-owner is strictly refused.
-    - Stale locks (owner PID dead, or older than --stale-after [default 30m]) are reclaimed
-      with a logged notice.
+    - Stale locks are reclaimed with a logged notice. A `run` lock lives exactly as long as
+      its wrapper process (the `build_slot.py run` PID, which waits for the command and
+      releases in `finally`): a dead wrapper is reclaimed after the 60s grace period, and
+      a live one only past --stale-after [default 30m] with no fresh heartbeat. Other locks:
+      owner PID dead past the grace period, or older than --stale-after.
     - RAM guard: acquire refuses when host system RAM >= 85% unless --force is passed.
     - Pure standard library + Windows-safe ctypes (zero fcntl imports).
 """
@@ -65,7 +68,6 @@ RAM_TWO_SLOT_THRESHOLD_PERCENT = 75.0
 DEFAULT_RAM_GUARD_THRESHOLD_PERCENT = 85.0
 DEFAULT_RAM_TWO_SLOT_THRESHOLD_PERCENT = 75.0
 DEFAULT_PID_DEAD_GRACE_PERIOD_SECONDS = 60.0  # never reclaim a dead-PID lock younger than 60s
-DEFAULT_LOCK_STALE_HEARTBEAT_SECONDS = 90.0  # reclaim lock if heartbeat older than 90s
 
 def get_system_ram_percent() -> Optional[float]:
     """
@@ -187,10 +189,11 @@ def _parse_timestamp(val: Any) -> Optional[float]:
     return None
 def find_long_lived_owner_pid() -> int:
     """
-    Finds the owner PID for lock attribution.
-    Prefers the runner/caller process, explicitly excluding the perpetual
-    veyyon host orchestrator PID so that dead-PID reclamation can detect
-    when a lane process has exited or timed out.
+    Finds the owner PID for `acquire`-mode lock attribution.
+    The acquire CLI exits as soon as it holds the slot, so its own PID must not be
+    recorded: that PID is dead within seconds and the dead-PID rule would free the slot
+    60s into the build. Under veyyon the lane lives inside the veyyon host process, so
+    the host PID is recorded; outside veyyon the farthest ancestor stands in.
     """
     cur_pid = os.getpid()
     if sys.platform == "win32":
@@ -231,16 +234,15 @@ def find_long_lived_owner_pid() -> int:
                             break
                 k32.CloseHandle(h)
 
-                # Climb up ancestors, but stop BEFORE veyyon host
+                # Climb ancestors; a veyyon host ends the climb and is the owner.
                 cur = cur_pid
                 candidate = cur_pid
                 visited = set()
                 while cur in parents and cur not in visited and cur != 0:
                     visited.add(cur)
-                    exe_name = names.get(cur, "")
-                    if "veyyon" in exe_name:
-                        break
                     candidate = cur
+                    if "veyyon" in names.get(cur, ""):
+                        break
                     cur = parents[cur]
                 return candidate
         except Exception as e:
@@ -434,7 +436,6 @@ class BuildSlotManager:
         queue_stale_heartbeat_after: float = DEFAULT_QUEUE_STALE_HEARTBEAT_SECONDS,
         queue_stale_fallback_after: float = DEFAULT_QUEUE_STALE_FALLBACK_SECONDS,
         pid_dead_grace_period: Optional[float] = None,
-        lock_stale_heartbeat_after: float = DEFAULT_LOCK_STALE_HEARTBEAT_SECONDS,
         max_slots: Optional[int] = None,
         ram_two_slot_threshold: float = DEFAULT_RAM_TWO_SLOT_THRESHOLD_PERCENT,
         ram_guard_threshold: float = DEFAULT_RAM_GUARD_THRESHOLD_PERCENT,
@@ -451,11 +452,6 @@ class BuildSlotManager:
             float(pid_dead_grace_period)
             if pid_dead_grace_period is not None
             else DEFAULT_PID_DEAD_GRACE_PERIOD_SECONDS
-        )
-        self.lock_stale_heartbeat_after = (
-            float(lock_stale_heartbeat_after)
-            if lock_stale_heartbeat_after is not None
-            else DEFAULT_LOCK_STALE_HEARTBEAT_SECONDS
         )
         self.max_slots_override = max_slots
         env_slots = os.environ.get("BUILD_SLOT_MAX_SLOTS")
@@ -918,11 +914,12 @@ class BuildSlotManager:
             logger.warning("Queue heartbeat failed for '%s': %s (will retry next tick)", name, e)
             return False
 
-    def _update_lock_child(self, name: str, child_pid: int, token: Optional[str] = None) -> bool:
+    def _record_run_child(self, name: str, wrapper_pid: int, child_pid: int, token: Optional[str] = None) -> bool:
         """
-        Updates the lock info file with the wrapped child PID and current heartbeat.
-        Enables dead-PID reclamation when the child process exits or times out.
-        Checks all slots to find the one held by 'name'.
+        Records the `run` wrapper PID (the lock's liveness source) and the wrapped
+        command's PID (diagnostics only) on the slot held by 'name', and refreshes the
+        heartbeat. 'pid' stays the wrapper: the command may be a cmd.exe or launcher
+        shim whose own lifetime says nothing about the build.
         """
         for slot_idx, slot_dir in enumerate(self.slot_dirs):
             if not os.path.isdir(slot_dir):
@@ -934,8 +931,9 @@ class BuildSlotManager:
                 continue
             now = time.time()
             now_iso = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat()
+            info["pid"] = wrapper_pid
+            info["wrapper_pid"] = wrapper_pid
             info["child_pid"] = child_pid
-            info["pid"] = child_pid
             if token:
                 info["token"] = token
                 info["run_token"] = token
@@ -979,27 +977,25 @@ class BuildSlotManager:
         self,
         stale_after: float = DEFAULT_STALE_AFTER_SECONDS,
         pid_dead_grace_period: Optional[float] = None,
-        stale_heartbeat_after: Optional[float] = None,
     ) -> bool:
         """
         Checks if the currently held lock is stale.
+        A heartbeat counts as fresh when younger than the grace period (default 60s).
         Reclaims it if:
-          1. Wrapped child PID is dead (immediate reclaim for orphaned run commands).
-          2. Lock heartbeat goes stale (>=90s without heartbeat update).
-          3. Owner PID is dead AND lock age exceeds grace period (and heartbeat not fresh).
-          4. Lock age exceeds stale_after seconds (and heartbeat not fresh).
-          5. Corrupt lock directory older than 10s grace period.
+          1. `run` lock (has wrapper_pid): the wrapper is dead, the lock is older than the
+             grace period and the heartbeat is not fresh. While the wrapper is alive only
+             rule 3 applies: the wrapper waits for its command and releases in `finally`,
+             so neither a dead wrapped command (a shim or launcher) nor a heartbeat
+             stalled by host memory pressure means the build is gone.
+          2. Other locks: owner PID is dead AND lock age exceeds grace period (and heartbeat not fresh).
+          3. Lock age exceeds stale_after seconds (and heartbeat not fresh).
+          4. Corrupt lock directory older than 10s grace period.
         Returns True if a stale lock was reclaimed, False otherwise.
         """
         effective_grace = (
             pid_dead_grace_period
             if pid_dead_grace_period is not None
             else self.pid_dead_grace_period
-        )
-        effective_hb_stale = (
-            stale_heartbeat_after
-            if stale_heartbeat_after is not None
-            else self.lock_stale_heartbeat_after
         )
         reclaimed_any = False
 
@@ -1027,7 +1023,7 @@ class BuildSlotManager:
                         pass
                 else:
                     pid = info.get("pid", 0)
-                    child_pid = info.get("child_pid")
+                    wrapper_pid = info.get("wrapper_pid")
                     owner = info.get("owner", "unknown")
                     acquired_epoch = info.get("acquired_at_epoch")
                     if acquired_epoch is None:
@@ -1048,14 +1044,21 @@ class BuildSlotManager:
                             hb_epoch = None
                     hb_age = (now - hb_epoch) if hb_epoch is not None else None
                     is_hb_fresh = (hb_age is not None and hb_age < effective_grace)
-                    if child_pid is not None and child_pid > 0 and not self.is_pid_alive(child_pid):
-                        # Wrapped child process is dead! Immediate reclaim for orphaned run commands.
-                        is_stale = True
-                        reason = f"wrapped child PID {child_pid} is dead (owner='{owner}', slot {slot_idx})"
-                    elif hb_age is not None and hb_age >= effective_hb_stale:
-                        # Heartbeat went stale (default 90s)
-                        is_stale = True
-                        reason = f"lock heartbeat went stale ({hb_age:.1f}s >= {effective_hb_stale:.1f}s, owner='{owner}', PID={pid}, slot {slot_idx})"
+                    if wrapper_pid:
+                        if self.is_pid_alive(wrapper_pid):
+                            if age >= stale_after and not is_hb_fresh:
+                                is_stale = True
+                                reason = (
+                                    f"run wrapper PID {wrapper_pid} is alive but has not heartbeated "
+                                    f"within the stale-after threshold ({age:.1f}s >= {stale_after:.1f}s, "
+                                    f"owner='{owner}', slot {slot_idx})"
+                                )
+                        elif age >= effective_grace and not is_hb_fresh:
+                            is_stale = True
+                            reason = (
+                                f"run wrapper PID {wrapper_pid} is dead and lock age exceeds grace period "
+                                f"({age:.1f}s >= {effective_grace:.1f}s, owner='{owner}', slot {slot_idx})"
+                            )
                     elif pid > 0 and not self.is_pid_alive(pid):
                         # Never reclaim a lock younger than the grace period (e.g. 60s),
                         # or whose heartbeat is fresh (< 60s).
@@ -1071,12 +1074,9 @@ class BuildSlotManager:
                                 f"owner PID {pid} is dead and lock age exceeds grace period "
                                 f"({age:.1f}s >= {effective_grace:.1f}s, owner='{owner}', slot {slot_idx})"
                             )
-                    elif age >= stale_after:
-                        if is_hb_fresh and hb_age is not None and hb_age < effective_grace:
-                            pass
-                        else:
-                            is_stale = True
-                            reason = f"exceeded stale-after threshold ({age:.1f}s >= {stale_after:.1f}s, owner='{owner}', PID={pid}, slot {slot_idx})"
+                    elif age >= stale_after and not is_hb_fresh:
+                        is_stale = True
+                        reason = f"exceeded stale-after threshold ({age:.1f}s >= {stale_after:.1f}s, owner='{owner}', PID={pid}, slot {slot_idx})"
 
                 if is_stale:
                     notice = f"[NOTICE] Reclaiming stale build slot lock: {reason}"
@@ -1589,8 +1589,10 @@ class BuildSlotManager:
         Executes a command under the exclusive build slot lock.
         Holds the lock ONLY for the duration of the command, and guarantees
         release upon command completion or failure.
-        Stores the wrapped child's PID, a per-run token, and maintains a heartbeat.
-        Reclaims the lock when the heartbeat goes stale (>=90s) or when child PID is dead.
+        Records the wrapper PID (this process, the lock's liveness source), the wrapped
+        child's PID, a per-run token, and maintains a heartbeat. The lock is reclaimed
+        by others only once this wrapper is dead (after the grace period), or when it
+        stops heartbeating for longer than stale_after.
         Returns the command exit code, or 1 if lock could not be acquired.
         """
         run_token = str(uuid.uuid4())
@@ -1625,8 +1627,8 @@ class BuildSlotManager:
             proc = subprocess.Popen(cmd, cwd=cwd, shell=(sys.platform == "win32"))
             child_pid = proc.pid
 
-            # Store the wrapped child PID and initial heartbeat in lock info
-            self._update_lock_child(name=name, child_pid=child_pid, token=run_token)
+            # Record wrapper and child PIDs and the initial heartbeat in lock info
+            self._record_run_child(name=name, wrapper_pid=runner_pid, child_pid=child_pid, token=run_token)
 
             # Start background heartbeat while child runs
             def _heartbeat_worker():
