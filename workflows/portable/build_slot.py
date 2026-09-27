@@ -38,7 +38,7 @@ Invariants:
     - The acquire-mode owner PID is the nearest veyyon session host (not its
       `__veyyon_worker*` helpers); the ancestor climb stops at a parent created after its
       child, since Windows reuses a dead parent's PID.
-    - RAM guard: when host system RAM >= 85%, acquire stays in the FIFO queue and waits until
+    - RAM guard: when host system RAM >= 95%, acquire stays in the FIFO queue and waits until
       RAM drops below the limit (or --timeout expires); --force bypasses the wait.
     - Pure standard library + Windows-safe ctypes (zero fcntl imports).
 """
@@ -64,7 +64,17 @@ logger = logging.getLogger("build_slot")
 
 DEFAULT_RUN_DIR = os.path.expanduser("~/.veyyon/run")
 LOCK_DIR_NAME = "build-slot.lock"
-SLOT_LOCK_DIR_NAMES = ["build-slot.lock", "build-slot-1.lock"]
+DEFAULT_MAX_SLOTS = 8
+SLOT_LOCK_DIR_NAMES = [
+    "build-slot.lock",
+    "build-slot-1.lock",
+    "build-slot-2.lock",
+    "build-slot-3.lock",
+    "build-slot-4.lock",
+    "build-slot-5.lock",
+    "build-slot-6.lock",
+    "build-slot-7.lock",
+]
 QUEUE_FILE_NAME = "build-slot.queue.json"
 QUEUE_LOCK_NAME = "build-slot-queue.lock"
 INFO_FILE_NAME = "info.json"
@@ -74,9 +84,9 @@ DEFAULT_POLL_INTERVAL_SECONDS = 5.0
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 10.0  # update queue entry heartbeat every <=15s
 DEFAULT_QUEUE_STALE_HEARTBEAT_SECONDS = 60.0  # reclaim if heartbeat older than 60s
 DEFAULT_QUEUE_STALE_FALLBACK_SECONDS = 30 * 60  # 30 minutes fallback for legacy entries without heartbeat
-RAM_TWO_SLOT_THRESHOLD_PERCENT = 75.0
-DEFAULT_RAM_GUARD_THRESHOLD_PERCENT = 85.0
-DEFAULT_RAM_TWO_SLOT_THRESHOLD_PERCENT = 75.0
+DEFAULT_RAM_GUARD_THRESHOLD_PERCENT = 95.0
+DEFAULT_ACQUISITION_STAGGER_SECONDS = 45.0
+LAST_ACQUIRED_FILE_NAME = "last-acquired-at.json"
 DEFAULT_PID_DEAD_GRACE_PERIOD_SECONDS = 60.0  # never reclaim a dead-PID lock younger than 60s
 
 def get_system_ram_percent() -> Optional[float]:
@@ -649,8 +659,8 @@ class BuildSlotManager:
         queue_stale_fallback_after: float = DEFAULT_QUEUE_STALE_FALLBACK_SECONDS,
         pid_dead_grace_period: Optional[float] = None,
         max_slots: Optional[int] = None,
-        ram_two_slot_threshold: float = DEFAULT_RAM_TWO_SLOT_THRESHOLD_PERCENT,
         ram_guard_threshold: float = DEFAULT_RAM_GUARD_THRESHOLD_PERCENT,
+        acquisition_stagger: Optional[float] = None,
     ):
         self.run_dir = os.path.abspath(run_dir or DEFAULT_RUN_DIR)
         self.slot_dirs = [os.path.join(self.run_dir, name) for name in SLOT_LOCK_DIR_NAMES]
@@ -672,22 +682,67 @@ class BuildSlotManager:
                 self.max_slots_override = int(env_slots)
             except ValueError:
                 pass
-        self.ram_two_slot_threshold = float(ram_two_slot_threshold)
         self.ram_guard_threshold = float(ram_guard_threshold)
+        if acquisition_stagger is not None:
+            self.acquisition_stagger = float(acquisition_stagger)
+        else:
+            self.acquisition_stagger = float(DEFAULT_ACQUISITION_STAGGER_SECONDS)
+            env_stagger = os.environ.get("BUILD_SLOT_STAGGER_SECONDS")
+            if env_stagger is not None:
+                try:
+                    self.acquisition_stagger = float(env_stagger)
+                except ValueError:
+                    pass
+        self.last_acquired_file = os.path.join(self.run_dir, LAST_ACQUIRED_FILE_NAME)
         os.makedirs(self.run_dir, exist_ok=True)
 
     def get_max_slots(self, ram_pct: Optional[float] = None) -> int:
         """
-        Returns the maximum number of concurrent build slots allowed:
-        2 slots when system RAM is under 75% at acquisition, 1 slot otherwise.
+        Returns the maximum number of concurrent build slots allowed (default: 8).
+        Can be overridden via max_slots parameter or BUILD_SLOT_MAX_SLOTS env var.
         """
         if self.max_slots_override is not None:
             return self.max_slots_override
-        if ram_pct is None:
-            ram_pct = get_system_ram_percent()
-        if ram_pct is not None and ram_pct >= self.ram_two_slot_threshold:
-            return 1
-        return 2
+        env_slots = os.environ.get("BUILD_SLOT_MAX_SLOTS")
+        if env_slots is not None:
+            try:
+                return int(env_slots)
+            except ValueError:
+                pass
+        return len(self.slot_dirs)
+    def _read_last_acquired_at(self) -> Optional[float]:
+        """Reads epoch timestamp of most recent slot acquisition from run_dir, if present."""
+        if not os.path.exists(self.last_acquired_file):
+            return None
+        try:
+            with open(self.last_acquired_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return float(data.get("acquired_at_epoch", 0.0))
+        except Exception:
+            return None
+
+    def _record_last_acquired_at(self, name: str, pid: int, slot_idx: int) -> None:
+        """Atomically records the timestamp of a new slot acquisition."""
+        tmp_path = f"{self.last_acquired_file}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
+        now = time.time()
+        payload = {
+            "acquired_at_epoch": now,
+            "acquired_at_iso": datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat(),
+            "owner": name,
+            "pid": pid,
+            "slot": slot_idx,
+        }
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+            os.replace(tmp_path, self.last_acquired_file)
+        except Exception as e:
+            logger.warning("Failed to record last-acquired-at: %s", e)
+            try:
+                if os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            except Exception:
+                pass
 
     def _read_slot_info(self, slot_idx: int = 0) -> Optional[Dict[str, Any]]:
         """Reads lock info metadata for slot_idx if its lock dir exists."""
@@ -1402,7 +1457,7 @@ class BuildSlotManager:
                 # 3. Dynamic RAM evaluation at acquisition
                 curr_ram = get_system_ram_percent()
                 if curr_ram is not None and curr_ram >= self.ram_guard_threshold and not force:
-                    # System RAM is >= 85%, refuse acquisition until it drops
+                    # System RAM is >= 95%, refuse acquisition until it drops
                     if timeout is not None:
                         elapsed = time.time() - start_time
                         if elapsed >= timeout:
@@ -1417,6 +1472,25 @@ class BuildSlotManager:
                     continue
 
                 max_slots = self.get_max_slots(curr_ram)
+                # 4. Acquisition stagger: at most one new acquisition per 45s across all waiters
+                if self.acquisition_stagger > 0 and not force:
+                    last_acq = self._read_last_acquired_at()
+                    if last_acq is not None:
+                        elapsed_since_acq = now - last_acq
+                        if elapsed_since_acq < self.acquisition_stagger:
+                            if timeout is not None:
+                                elapsed = time.time() - start_time
+                                if elapsed >= timeout:
+                                    msg = (
+                                        f"Timed out after {timeout:.1f}s waiting for build slot lock: "
+                                        f"stagger delay active ({elapsed_since_acq:.1f}s < {self.acquisition_stagger:.1f}s since last acquisition)"
+                                    )
+                                    print(msg, file=sys.stderr)
+                                    logger.error(msg)
+                                    return False
+                            sleep_for = min(poll_interval, heartbeat_interval, max(0.01, self.acquisition_stagger - elapsed_since_acq))
+                            time.sleep(sleep_for)
+                            continue
                 # Check currently held slots
                 held_slot_indices = [
                     idx for idx, s_dir in enumerate(self.slot_dirs)
@@ -1465,6 +1539,8 @@ class BuildSlotManager:
                             caller_idx = i
                             break
 
+                    # A free slot goes to the first N eligible waiters in priority/FIFO order,
+                    # where N is the number of available slots.
                     is_eligible = (caller_idx is not None and caller_idx < available_slots_count) or (not queue)
 
                     if is_eligible:
@@ -1476,6 +1552,7 @@ class BuildSlotManager:
                                     os.mkdir(slot_dir)
                                     # Atomic creation succeeded! We own slot_idx.
                                     self._write_slot_info(slot_idx, owner=name, pid=pid, token=token)
+                                    self._record_last_acquired_at(name, pid, slot_idx)
                                     acquired = True
                                     try:
                                         self.dequeue(name, pid, token=token)
@@ -1595,7 +1672,7 @@ class BuildSlotManager:
         """
         Returns full status dictionary and prints summary.
         Reclaims stale locks with a logged notice.
-        Shows all slot holders (up to 2 slots).
+        Shows all slot holders (up to 8 slots).
         """
         # 1. Reclaim stale lock if present across all slots
         reclaimed = self.check_stale_and_reclaim(heartbeat_stale_after=heartbeat_stale_after)
@@ -1676,6 +1753,8 @@ class BuildSlotManager:
 
         # 4. System RAM and dynamic capacity
         ram_pct = get_system_ram_percent()
+        last_acq = self._read_last_acquired_at()
+        last_acq_age = round(now - last_acq, 1) if last_acq is not None else None
         max_slots = self.get_max_slots(ram_pct)
         active_slots = sum(1 for s in slots_status if s["locked"])
         holders = [s["owner"] for s in slots_status if s["locked"] and s.get("owner")]
@@ -1689,8 +1768,10 @@ class BuildSlotManager:
             "queue": queue_status,
             "queue_depth": len(queue_status),
             "ram_percent": ram_pct,
-            "ram_two_slot_threshold": self.ram_two_slot_threshold,
             "ram_guard_threshold": self.ram_guard_threshold,
+            "acquisition_stagger": self.acquisition_stagger,
+            "last_acquired_at": last_acq,
+            "last_acquired_age_seconds": last_acq_age,
             "stale_reclaimed_in_status": reclaimed,
             "run_dir": self.run_dir,
             "lock_dir": self.lock_dir,
@@ -1843,9 +1924,9 @@ def format_status_human(stat: Dict[str, Any]) -> str:
     if not slots and stat.get("lock"):
         slots = [stat["lock"]]
 
-    max_slots = stat.get("max_slots", 1)
-    two_slot_thresh = stat.get("ram_two_slot_threshold", 75.0)
-    lines.append(f"Capacity:    {max_slots} slot(s) allowed (2 if RAM < {two_slot_thresh:.0f}%, 1 otherwise)")
+    max_slots = stat.get("max_slots", len(SLOT_LOCK_DIR_NAMES))
+    guard_thresh = stat.get("ram_guard_threshold", DEFAULT_RAM_GUARD_THRESHOLD_PERCENT)
+    lines.append(f"Capacity:    {max_slots} slot(s) allowed (RAM guard: {guard_thresh:.0f}%)")
 
     holders = [s for s in slots if s.get("locked")]
     if holders:
@@ -1872,8 +1953,18 @@ def format_status_human(stat: Dict[str, Any]) -> str:
             lines.append(f"  Slot {idx}:   FREE (unlocked)")
 
     ram = stat.get("ram_percent")
+    stagger = stat.get("acquisition_stagger", DEFAULT_ACQUISITION_STAGGER_SECONDS)
+    last_acq_age = stat.get("last_acquired_age_seconds")
+    if stagger and stagger > 0:
+        if last_acq_age is not None and last_acq_age < stagger:
+            lines.append(f"Stagger:     WAIT ({last_acq_age:.1f}s since last acquisition, spacing: {stagger:.0f}s)")
+        elif last_acq_age is not None:
+            lines.append(f"Stagger:     READY ({last_acq_age:.1f}s since last acquisition, spacing: {stagger:.0f}s)")
+        else:
+            lines.append(f"Stagger:     READY (no prior acquisition, spacing: {stagger:.0f}s)")
+
     ram_str = f"{ram:.1f}%" if ram is not None else "unavailable"
-    guard_thresh = stat.get("ram_guard_threshold", 85.0)
+    guard_thresh = stat.get("ram_guard_threshold", DEFAULT_RAM_GUARD_THRESHOLD_PERCENT)
     ram_status = f" (ELEVATED >= {guard_thresh:.0f}%)" if (ram is not None and ram >= guard_thresh) else " (OK)"
     lines.append(f"System RAM:  {ram_str}{ram_status}")
 
@@ -1927,7 +2018,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p_acq.add_argument(
         "--force",
         action="store_true",
-        help="Bypass the RAM guard (proceed even if system RAM >= 85%%)",
+        help="Bypass the RAM guard (proceed even if system RAM >= 95%%)",
     )
     p_acq.add_argument(
         "--priority",
