@@ -926,7 +926,11 @@ class BuildSlotManager:
     ) -> int:
         """
         Adds (name, pid, token) to the queue if not already present.
-        If priority=True, puts entry at index 0 (or moves existing to index 0).
+        A new priority entry goes after the last queued priority entry, so
+        priority waiters are served first-come first-served ahead of normal
+        ones; a new normal entry goes to the back. An entry that is already
+        queued only has its heartbeat refreshed and never changes position,
+        so re-enqueueing can't jump anyone who was waiting longer.
         Returns the 0-indexed position in queue.
         """
         hb_limit = stale_heartbeat_after if stale_heartbeat_after is not None else self.queue_stale_heartbeat_after
@@ -956,13 +960,6 @@ class BuildSlotManager:
                 valid_queue[existing_idx]["heartbeat_at_iso"] = datetime.datetime.fromtimestamp(
                     now, datetime.timezone.utc
                 ).isoformat()
-                if priority:
-                    valid_queue[existing_idx]["priority"] = True
-                    if existing_idx > 0:
-                        item = valid_queue.pop(existing_idx)
-                        valid_queue.insert(0, item)
-                        self._write_queue(valid_queue)
-                        return 0
                 self._write_queue(valid_queue)
                 return existing_idx
 
@@ -978,9 +975,13 @@ class BuildSlotManager:
             }
             if priority:
                 entry["priority"] = True
-                valid_queue.insert(0, entry)
+                insert_at = next(
+                    (i + 1 for i in range(len(valid_queue) - 1, -1, -1) if valid_queue[i].get("priority")),
+                    0,
+                )
+                valid_queue.insert(insert_at, entry)
                 self._write_queue(valid_queue)
-                return 0
+                return insert_at
             else:
                 valid_queue.append(entry)
                 self._write_queue(valid_queue)
@@ -1922,7 +1923,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p_acq.add_argument(
         "--priority",
         action="store_true",
-        help="Enqueue at front of queue (or bump to front if already queued)",
+        help="Queue ahead of non-priority waiters, after earlier priority waiters (FIFO among priority)",
     )
 
     # bump <name> [--token TOKEN]
@@ -1989,7 +1990,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def _add_run_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--timeout", type=float, default=None, help="Maximum seconds to wait to acquire slot")
-    parser.add_argument("--priority", action="store_true", help="Enqueue with priority at front of queue")
+    parser.add_argument(
+        "--priority",
+        action="store_true",
+        help="Queue ahead of non-priority waiters, after earlier priority waiters (FIFO among priority)",
+    )
     parser.add_argument("--force", action="store_true", help="Bypass RAM guard during acquisition")
     parser.add_argument("--cwd", default=None, help="Working directory to execute command in (default: current directory)")
     parser.add_argument(

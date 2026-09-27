@@ -1081,24 +1081,28 @@ class TestBuildSlot(unittest.TestCase):
         self.assertGreater(pid, 0)
         self.assertTrue(is_pid_alive(pid))
 
-    def test_enqueue_priority_inserts_at_front(self):
+    def test_enqueue_priority_is_first_come_first_served(self):
         manager = BuildSlotManager(run_dir=self.run_dir, is_pid_alive_fn=lambda p: True)
-        manager.enqueue("waiter-1", 1001, token="tok-1")
-        manager.enqueue("waiter-2", 1002, token="tok-2")
-        manager.enqueue("waiter-3", 1003, token="tok-3")
+        manager.enqueue("normal-1", 1001, token="tok-n1")
 
-        # waiter-4 is enqueued with priority=True -> must land at index 0
-        idx = manager.enqueue("waiter-4", 1004, token="tok-4", priority=True)
-        self.assertEqual(idx, 0)
+        # A priority entry passes normal waiters but queues behind earlier
+        # priority entries: every lane passes --priority, so newest-first
+        # would starve the oldest waiter.
+        self.assertEqual(manager.enqueue("prio-1", 1011, token="tok-p1", priority=True), 0)
+        self.assertEqual(manager.enqueue("prio-2", 1012, token="tok-p2", priority=True), 1)
+        self.assertEqual(manager.enqueue("prio-3", 1013, token="tok-p3", priority=True), 2)
+        self.assertEqual(manager.enqueue("normal-2", 1002, token="tok-n2"), 4)
+        order = ["prio-1", "prio-2", "prio-3", "normal-1", "normal-2"]
+        self.assertEqual([x["name"] for x in manager._read_queue()], order)
+
+        # Re-enqueueing an entry that is already queued (the wait loop does
+        # this when a heartbeat misses) refreshes it in place: it never moves
+        # ahead of anyone and a normal entry doesn't become priority.
+        self.assertEqual(manager.enqueue("prio-3", 1013, token="tok-p3", priority=True), 2)
+        self.assertEqual(manager.enqueue("normal-2", 1002, token="tok-n2", priority=True), 4)
         queue = manager._read_queue()
-        self.assertEqual([x["name"] for x in queue], ["waiter-4", "waiter-1", "waiter-2", "waiter-3"])
-        self.assertTrue(queue[0].get("priority"))
-
-        # waiter-2 is re-enqueued with priority=True -> promoted to index 0
-        idx2 = manager.enqueue("waiter-2", 1002, token="tok-2", priority=True)
-        self.assertEqual(idx2, 0)
-        queue2 = manager._read_queue()
-        self.assertEqual([x["name"] for x in queue2], ["waiter-2", "waiter-4", "waiter-1", "waiter-3"])
+        self.assertEqual([x["name"] for x in queue], order)
+        self.assertFalse(queue[4].get("priority"))
 
     def test_bump_moves_to_front(self):
         manager = BuildSlotManager(run_dir=self.run_dir, is_pid_alive_fn=lambda p: True)
