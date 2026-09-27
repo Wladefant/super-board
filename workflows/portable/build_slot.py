@@ -630,6 +630,11 @@ def _remove_dir_link(link_path: str) -> bool:
             return False
 
 
+def _queue_order_key(item: Dict[str, Any]) -> Tuple[int, float]:
+    """FIFO queue order: priority entries first, each group by original enqueue time."""
+    return (0 if item.get("priority") else 1, _parse_timestamp(item.get("enqueued_at")) or 0.0)
+
+
 class BuildSlotManager:
     """
     Manages the exclusive build slot with atomic directory locking,
@@ -887,7 +892,11 @@ class BuildSlotManager:
                 continue
             seen_keys.add(key)
             new_queue.append(item)
-        return new_queue, changed
+        # FIFO order: priority entries first, then by original enqueue time (stable).
+        ordered = sorted(new_queue, key=_queue_order_key)
+        if ordered != new_queue:
+            changed = True
+        return ordered, changed
 
     def clean_queue(
         self,
@@ -926,11 +935,12 @@ class BuildSlotManager:
     ) -> int:
         """
         Adds (name, pid, token) to the queue if not already present.
-        A new priority entry goes after the last queued priority entry, so
-        priority waiters are served first-come first-served ahead of normal
-        ones; a new normal entry goes to the back. An entry that is already
-        queued only has its heartbeat refreshed and never changes position,
-        so re-enqueueing can't jump anyone who was waiting longer.
+        The queue is kept in _queue_order_key order: priority entries first,
+        each group first-come first-served by original enqueue time. A new
+        entry lands behind every earlier entry of its group. An entry that is
+        already queued only has its heartbeat refreshed; it moves only when
+        re-enqueued with priority while still normal, and then joins the
+        priority group at its own enqueue time.
         Returns the 0-indexed position in queue.
         """
         hb_limit = stale_heartbeat_after if stale_heartbeat_after is not None else self.queue_stale_heartbeat_after
@@ -954,14 +964,17 @@ class BuildSlotManager:
                 )
 
             if existing_idx is not None:
+                item = valid_queue[existing_idx]
                 if token is not None:
-                    valid_queue[existing_idx]["token"] = token
-                valid_queue[existing_idx]["heartbeat_at"] = now
-                valid_queue[existing_idx]["heartbeat_at_iso"] = datetime.datetime.fromtimestamp(
-                    now, datetime.timezone.utc
-                ).isoformat()
+                    item["token"] = token
+                item["heartbeat_at"] = now
+                item["heartbeat_at_iso"] = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat()
+                if priority and not item.get("priority"):
+                    # Upgrade: joins the priority group at its own enqueue time.
+                    item["priority"] = True
+                    valid_queue.sort(key=_queue_order_key)
                 self._write_queue(valid_queue)
-                return existing_idx
+                return valid_queue.index(item)
 
             now_iso = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat()
             entry = {
@@ -975,23 +988,18 @@ class BuildSlotManager:
             }
             if priority:
                 entry["priority"] = True
-                insert_at = next(
-                    (i + 1 for i in range(len(valid_queue) - 1, -1, -1) if valid_queue[i].get("priority")),
-                    0,
-                )
-                valid_queue.insert(insert_at, entry)
-                self._write_queue(valid_queue)
-                return insert_at
-            else:
-                valid_queue.append(entry)
-                self._write_queue(valid_queue)
-                return len(valid_queue) - 1
+            valid_queue.append(entry)
+            # Newest enqueue time: lands behind every earlier entry of its group.
+            valid_queue.sort(key=_queue_order_key)
+            self._write_queue(valid_queue)
+            return valid_queue.index(entry)
 
     def bump(self, name: str, token: Optional[str] = None) -> bool:
         """
-        Moves the entry for 'name' (and optional token) to the front of the queue
-        under the atomic queue lock.
-        Returns True if found and moved, False otherwise.
+        Marks the entry for 'name' (and optional token) as priority under the
+        atomic queue lock. It joins the priority group at its own enqueue time,
+        so it passes normal waiters but never an earlier priority waiter.
+        Returns True if found, False otherwise.
         """
         with _queue_atomic_lock(self.run_dir, is_pid_alive_fn=self.is_pid_alive):
             queue = self._read_queue()
@@ -1007,12 +1015,13 @@ class BuildSlotManager:
             if target_idx is None:
                 return False
 
-            item = queue.pop(target_idx)
+            item = queue[target_idx]
             item["priority"] = True
             now = time.time()
             item["heartbeat_at"] = now
             item["heartbeat_at_iso"] = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat()
-            queue.insert(0, item)
+            # Upgrade to priority but keep FIFO among priority entries (no queue jumping).
+            queue.sort(key=_queue_order_key)
             self._write_queue(queue)
             return True
 
@@ -1927,8 +1936,10 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
 
     # bump <name> [--token TOKEN]
-    p_bump = subparsers.add_parser("bump", help="Move a queued lane to the front of the FIFO queue")
-    p_bump.add_argument("name", help="Lane or worker identifier to move to the front of the queue")
+    p_bump = subparsers.add_parser(
+        "bump", help="Mark a queued lane as priority (FIFO among priority waiters, ahead of normal ones)"
+    )
+    p_bump.add_argument("name", help="Lane or worker identifier to mark as priority")
     p_bump.add_argument("--token", default=None, help="Optional token matching the queued entry")
 
     # prep-cache <worktree> [--cache-dir DIR]
@@ -2031,7 +2042,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     elif args.command == "bump":
         success = manager.bump(name=args.name, token=args.token)
         if success:
-            print(f"[BUMP] Successfully moved '{args.name}' to front of build slot queue.", file=sys.stderr)
+            print(f"[BUMP] Marked '{args.name}' as priority in the build slot queue.", file=sys.stderr)
             return 0
         else:
             print(f"[BUMP] Entry '{args.name}' not found in build slot queue.", file=sys.stderr)

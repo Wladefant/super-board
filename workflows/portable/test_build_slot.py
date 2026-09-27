@@ -492,7 +492,8 @@ class TestBuildSlot(unittest.TestCase):
         # Legacy fresh (<= 30m) preserved
         self.assertIn("legacy-fresh-lane", names)
 
-        self.assertEqual(names, ["fresh-hb-lane", "legacy-fresh-lane"])
+        # Survivors in FIFO order by original enqueue time
+        self.assertEqual(names, ["legacy-fresh-lane", "fresh-hb-lane"])
 
     def test_acquire_timeout_leaves_no_entry_behind(self):
         manager = BuildSlotManager(run_dir=self.run_dir)
@@ -1096,26 +1097,51 @@ class TestBuildSlot(unittest.TestCase):
         self.assertEqual([x["name"] for x in manager._read_queue()], order)
 
         # Re-enqueueing an entry that is already queued (the wait loop does
-        # this when a heartbeat misses) refreshes it in place: it never moves
-        # ahead of anyone and a normal entry doesn't become priority.
+        # this when a heartbeat misses) refreshes it in place.
         self.assertEqual(manager.enqueue("prio-3", 1013, token="tok-p3", priority=True), 2)
-        self.assertEqual(manager.enqueue("normal-2", 1002, token="tok-n2", priority=True), 4)
-        queue = manager._read_queue()
-        self.assertEqual([x["name"] for x in queue], order)
-        self.assertFalse(queue[4].get("priority"))
+        self.assertEqual(manager.enqueue("normal-2", 1002, token="tok-n2"), 4)
+        self.assertEqual([x["name"] for x in manager._read_queue()], order)
 
-    def test_bump_moves_to_front(self):
+        # Upgrading a normal entry joins the priority group at its own
+        # enqueue time: behind every priority entry that queued earlier.
+        self.assertEqual(manager.enqueue("normal-2", 1002, token="tok-n2", priority=True), 3)
+        queue = manager._read_queue()
+        self.assertEqual([x["name"] for x in queue], ["prio-1", "prio-2", "prio-3", "normal-2", "normal-1"])
+        self.assertTrue(queue[3].get("priority"))
+
+    def _write_timed_queue(self, manager, entries):
+        now = time.time()
+        manager._write_queue(
+            [
+                {"name": name, "pid": 3000 + i, "token": f"tok-{name}", "enqueued_at": enqueued_at,
+                 "heartbeat_at": now, "priority": prio}
+                for i, (name, enqueued_at, prio) in enumerate(entries)
+            ]
+        )
+
+    def test_clean_queue_restores_fifo_order(self):
         manager = BuildSlotManager(run_dir=self.run_dir, is_pid_alive_fn=lambda p: True)
-        manager.enqueue("lane-A", 2001, token="tok-A")
-        manager.enqueue("lane-B", 2002, token="tok-B")
-        manager.enqueue("lane-C", 2003, token="tok-C")
+        # A file written newest-first by an older build_slot.py; E's enqueue
+        # time is unreadable, which must not break the sort for everyone.
+        self._write_timed_queue(
+            manager,
+            [("D", 4.0, True), ("C", 3.0, False), ("E", "not-a-time", False), ("B", 2.0, True), ("A", 1.0, True)],
+        )
+        manager.clean_queue()
+        self.assertEqual([x["name"] for x in manager._read_queue()], ["A", "B", "D", "E", "C"])
 
-        # bump lane-C to front
-        ok = manager.bump("lane-C")
-        self.assertTrue(ok)
+    def test_bump_keeps_fifo_among_priority(self):
+        manager = BuildSlotManager(run_dir=self.run_dir, is_pid_alive_fn=lambda p: True)
+        self._write_timed_queue(
+            manager, [("A", 1.0, True), ("B", 2.0, True), ("D", 4.0, True), ("C", 3.0, False)]
+        )
+        self.assertEqual(manager.enqueue("D", 3003, token="tok-D", priority=True), 2)
+
+        # bump marks C priority; it passes no priority entry that queued before it
+        self.assertTrue(manager.bump("C"))
         queue = manager._read_queue()
-        self.assertEqual([x["name"] for x in queue], ["lane-C", "lane-A", "lane-B"])
-        self.assertTrue(queue[0].get("priority"))
+        self.assertEqual([x["name"] for x in queue], ["A", "B", "C", "D"])
+        self.assertTrue(queue[2].get("priority"))
 
         # bump non-existent lane returns False
         self.assertFalse(manager.bump("lane-non-existent"))
