@@ -83,10 +83,10 @@ MODEL_GEMINI_PRO = "google-antigravity/gemini-3.1-pro"
 # 2026-09-25). In worker ladders Fable is the very last rung, and only on slack behind
 # pace (ANTHROPIC_WORKER_MIN_HEADROOM), never on the orchestrator's reserve.
 MODEL_CLAUDE_FABLE = "anthropic/claude-fable-5-1"
-# Paid direct Anthropic Opus 5.5: reserved strictly for super-hard work (money, billing,
-# ledger, migration first-pass reviews, cross-cutting architectural changes, or when ag-opus
-# quota is exhausted; operator ruling 2026-09-26 ~13:25Z: "I mean only hard, super hard work, right?
-# Don't move everything in there"). Never used for routine implementation, sync, merge, triage or small reviews.
+# Paid direct Anthropic Opus 5.5: reserved for high-risk reviews (money, billing,
+# ledger, migration first-pass reviews, cross-cutting architectural changes;
+# operator ruling 2026-09-26 ~13:25Z, updated 2026-09-27 ~15:00Z).
+# Never used for routine implementation, sync, merge, triage or small reviews.
 MODEL_CLAUDE_OPUS_55 = "anthropic/claude-opus-5-5:high"
 MODEL_ANTHROPIC_OPUS = MODEL_CLAUDE_OPUS_55
 
@@ -133,7 +133,7 @@ MODEL_GROK_DORMANT = "xai-oauth/grok-4.6:high"
 # Antigravity serves Claude and GPT families on their own daily windows, separate from
 # Gemini's (live-tested 2026-09-25). They reset daily, so unused headroom expires sooner
 # than any Anthropic/Codex weekly window. They are a permitted cheap worker tier (operator
-# ruling): `ag-opus` may take worker work while its window is above AG_FAMILY_MIN_REMAINING.
+# ruling): Antigravity models may take worker work while their window is above AG_FAMILY_MIN_REMAINING.
 # Opus worker and review roles default to medium effort (Issue #228, operator 2026-09-26).
 MODEL_AG_CLAUDE_OPUS = "google-antigravity/claude-opus-4-6"
 MODEL_AG_CLAUDE_SONNET = "google-antigravity/claude-sonnet-4-6"
@@ -359,8 +359,7 @@ ROLE_MODEL_PINS: Dict[str, str] = {
     "codex-reviewer": MODEL_CODEX_SOL,
     "thinker": MODEL_CODEX_SOL,
     "reviewer": MODEL_ANTHROPIC_OPUS,
-    "ag-opus": MODEL_AG_CLAUDE_OPUS,
-    # The astra-ux role was repointed to google-antigravity/claude-opus-4-6 (ag-opus Opus 4.6 route)
+    # The astra-ux role was repointed to google-antigravity/claude-opus-4-6
     # because gpt-6-astra is unsupported on Codex with ChatGPT accounts and Codex is disabled
     # while CODEX_ENABLED=False (super-board#279).
     "astra-ux": MODEL_AG_CLAUDE_OPUS,
@@ -404,6 +403,10 @@ def is_agent_role_available(role: str) -> bool:
     Codex agent roles (codex-worker, codex-reviewer, thinker, sol) and any role
     pinned to an openai-codex/ model are refused when codex_available() is False.
     """
+    if role not in ROLE_MODEL_PINS and role not in (
+        "task", "qa-verifier", "ds-task", "go-task", "go-deep", "go-review", "go-bulk", "spark", "web-task", "web-thinker", "compactor", "sol"
+    ):
+        return False
     if role in ("codex-worker", "codex-reviewer", "thinker", "sol"):
         return codex_available()
     model = ROLE_MODEL_PINS.get(role)
@@ -546,6 +549,7 @@ VERIFIED_CONTEXT_WINDOWS: Dict[str, int] = {
     MODEL_ZAI_GLM: 131072,
     MODEL_ZAI_GLM_FLASH: 131072,
     MODEL_MINIMAX_M3: 1000000,
+    MODEL_OR_DEEPSEEK_FLASH: 163840,
     # OpenCode Go models (catalog-verified 2026-09-25)
     MODEL_GO_BUNNY: 1048576,
     MODEL_GO_GLM53: 1000000,
@@ -601,8 +605,8 @@ def model_to_agent_role(model_id: str, task_type: TaskType, risk_level: RiskLeve
         return "web-thinker" if task_type == TaskType.STRONG_REVIEW else "web-task"
     if model_id.startswith("openai-codex/"):
         if not codex_available():
-            # Codex account withdrawn (2026-09-26): reviews fall through to reviewer (Opus 5.5 /
-            # ag-opus, never Flash), implementation falls through to task (Flash).
+            # Codex account withdrawn (2026-09-26): reviews fall through to reviewer (Opus 5.5,
+            # never Flash), implementation falls through to task (Flash).
             return "reviewer" if task_type == TaskType.STRONG_REVIEW else "task"
         if "codex-spark" in model_id:
             # The free Spark allowance has its own enabled roster entry (`spark`); the
@@ -629,7 +633,7 @@ def model_to_agent_role(model_id: str, task_type: TaskType, risk_level: RiskLeve
         return "gemini-pro"
     if model_id.startswith("google-antigravity/"):
         if "claude-opus" in model_id:
-            return "ag-opus"
+            return "reviewer"
         if "claude-sonnet" in model_id:
             return "ag-sonnet"
         if "gpt-oss" in model_id:
@@ -1171,7 +1175,7 @@ class ResetAwareModelSelector:
                 ]
             if windows:
                 # Antigravity partner pools are tracked per account.
-                # Route ag-opus to the healthy account: prioritize unthrottled accounts with remaining headroom.
+                # Route Antigravity to the healthy account: prioritize unthrottled accounts with remaining headroom.
                 if name.startswith(ANTIGRAVITY_PROVIDER) or "antigravity" in name.lower():
                     unthrottled = [w for w in windows if not w.throttled]
                     if unthrottled:
@@ -1387,6 +1391,11 @@ class ResetAwareModelSelector:
             and anthropic_headroom >= ANTHROPIC_WORKER_MIN_HEADROOM
             and anthropic_bottleneck_used < ANTHROPIC_BOTTLENECK_MAX_USED
         )
+        anthropic_cycle_hrs = anthropic_meta.get("cycle_hours_to_reset", anthropic_meta.get("hours_to_reset", 999.0))
+        anthropic_near_reset_surplus = (
+            anthropic_worker_ok
+            and anthropic_cycle_hrs <= SURPLUS_WINDOW_HOURS
+        )
 
         # 4. Credential-gated and pay-per-token tiers. A credentialed provider still yields
         # to a cooldown or rate limit the snapshot reports for it.
@@ -1451,30 +1460,35 @@ class ResetAwareModelSelector:
             "codex_account_up": codex_account_up,
         }
 
-        # 5. Rework-aware routing: force a strong first pass for critical domains, large diffs (>250 lines) or after rework.
-        HIGH_RISK_DOMAINS = {"state_machine", "auth", "money", "concurrency", "migration", "schema", "invariants"}
+        # 5. Rework-aware and review routing: force a strong first pass for critical domains, large diffs (>250 lines) or after rework.
+        HIGH_RISK_DOMAINS = {
+            "state_machine", "auth", "money", "concurrency", "migration", "schema",
+            "invariants", "billing", "wallet", "ledger", "payment", "stripe",
+            "alembic", "architecture", "architectural", "cross-cutting",
+        }
+        has_high_risk_domain = bool(domain_tags and any(
+            t.lower() in HIGH_RISK_DOMAINS or any(hr in t.lower() for hr in HIGH_RISK_DOMAINS)
+            for t in domain_tags
+        ))
         is_rework_critical = (
             risk_level == RiskLevel.HIGH
             or rework_count >= 1
-            or (domain_tags is not None and any(t in HIGH_RISK_DOMAINS for t in domain_tags))
+            or has_high_risk_domain
             or (diff_lines is not None and diff_lines > 250)
         )
         is_first_pass = (rework_count <= 0)
-        has_arch_tag = bool(domain_tags and any(t.lower() in {"architecture", "architectural", "cross-cutting"} for t in domain_tags))
-        has_money_or_migration = bool(domain_tags and any(
-            t.lower() in {"money", "billing", "wallet", "ledger", "payment", "stripe", "migration", "migrations", "alembic"}
-            for t in domain_tags
-        ))
-        is_super_hard_review = (
-            task_type == TaskType.STRONG_REVIEW
-            and (
-                has_arch_tag
-                or (has_money_or_migration and is_first_pass)
-            )
+        is_delta_review = (
+            rework_count >= 1
+            or bool(domain_tags and any(t.lower() in {"delta", "delta-review", "delta_review"} for t in domain_tags))
         )
-        is_ag_opus_exhausted = (
-            self.provider_exhaustion_reason(MODEL_AG_CLAUDE_OPUS) is not None
-            or (ag_anthropic_meta["status"] == "ok" and not ag_claude_ok)
+        is_routine_review = (
+            (diff_lines is not None and diff_lines > 250 and not has_high_risk_domain)
+            or (risk_level in (RiskLevel.LOW, RiskLevel.MEDIUM) and not has_high_risk_domain)
+        )
+        is_high_risk_review = (
+            task_type == TaskType.STRONG_REVIEW
+            and has_high_risk_domain
+            and is_first_pass
         )
         evidence_packet_required = risk_level in (RiskLevel.MEDIUM, RiskLevel.HIGH) or task_type == TaskType.STRONG_REVIEW
 
@@ -1501,19 +1515,13 @@ class ResetAwareModelSelector:
             cooldown=True, pace_group=PACE_GROUP_STRONG,
         )
         codex_fast_promo = codex_promoted(MODEL_CODEX_FAST, "Codex Fast", PACE_GROUP_EXEC)
-        ag_opus_account = ag_anthropic_meta.get("account") or self.pace_by_provider().get(AG_ANTHROPIC_PROVIDER, WindowPace(AG_ANTHROPIC_PROVIDER, "", 0, 0, 0, 0, 0, 0, False, False, False, False)).account
-        ag_account_suffix = f" on account {ag_opus_account}" if ag_opus_account and ag_opus_account != "default" else ""
-        ag_opus = _Rung(
-            MODEL_AG_CLAUDE_OPUS, ag_claude_ok,
-            f"Antigravity Claude Opus 4.6{ag_account_suffix} (healthy partner pool, daily window, expires before weekly cap). {ag_claude_note}.",
-            pace_group=PACE_GROUP_STRONG,
-        )
         opus_55_available = anthropic_meta["is_available"] and (self.provider_exhaustion_reason(MODEL_CLAUDE_OPUS_55) is None)
+        opus_55_worker_ok = opus_55_available and (anthropic_worker_ok or has_high_risk_domain)
         opus_55 = _Rung(
-            MODEL_CLAUDE_OPUS_55, opus_55_available,
-            "Claude Opus 5.5 (anthropic/claude-opus-5-5:high): reserved strictly for super-hard work "
-            "(money/billing/ledger/migration first-pass reviews, cross-cutting architectural changes, or ag-opus exhaustion; "
-            'operator ruling 2026-09-26 ~13:25Z: "I mean only hard, super hard work, right? Don\'t move everything in there").',
+            MODEL_CLAUDE_OPUS_55, opus_55_worker_ok,
+            "Claude Opus 5.5 (anthropic/claude-opus-5-5:high): reserved for high-risk reviews "
+            "(money/billing/ledger/migration first-pass reviews, cross-cutting architectural changes; "
+            'operator ruling 2026-09-26 ~13:25Z, updated 2026-09-27 ~15:00Z).',
         )
         glm = _Rung(MODEL_ZAI_GLM, zai_ok, "Z.AI GLM-5.3 (credentialed Coding Plan).")
         deepseek_pro = _Rung(MODEL_DEEPSEEK_PRO, deepseek_ok, "DeepSeek V4 Pro (pay-per-token, 1M context).")
@@ -1588,7 +1596,6 @@ class ResetAwareModelSelector:
                                       or (task_type == TaskType.DEEP_CONTEXT and not is_rework_critical)),
                       "MiniMax-M3 (1M-token window, credentialed; low-risk deep-context/bulk overflow).", cooldown=True),
                 glm,
-                ag_opus,
                 codex_promo,
                 astra_on_pace,
                 _Rung(MODEL_CODEX_FAST, codex_usable, "1M-context tiers unavailable; Codex Fast (400k window, on pace).",
@@ -1606,22 +1613,21 @@ class ResetAwareModelSelector:
             # the escape slot has to hold the contexts this ladder reaches, so the 131k Z.AI
             # windows and the 250k Antigravity window cannot take it. Go GLM-5.3 (1M, the rare
             # precision lane) replaces Codex Fast's dead 400k slot.
-            final_fallbacks = ([MODEL_DEEPSEEK_PRO, MODEL_GO_GLM53] if is_rework_critical
-                               else [MODEL_OR_DEEPSEEK_FLASH])
+            final_fallbacks = [MODEL_DEEPSEEK_PRO, MODEL_GO_GLM53]
 
         elif task_type == TaskType.STRONG_REVIEW and is_rework_critical:
-            # CASE B1: HIGH-RISK REVIEW.
-            # Operator ruling (2026-09-26 ~13:25Z): "I mean only hard, super hard work, right?
-            # Don't move everything in there". Opus 5.5 (the `reviewer` lane, anthropic/claude-opus-5-5:high)
-            # is reserved strictly for super-hard work: money, billing, ledger, migration first-pass reviews,
-            # cross-cutting architectural changes, or when ag-opus quota is exhausted.
-            # Routine gating reviews default to ag-opus (Opus 4.6 on free Antigravity daily window).
-            if is_super_hard_review:
-                label = "Super-hard review (Opus 5.5)"
+            # CASE B1: REVIEW ROUTING.
+            # Operator ruling (2026-09-27 ~15:00Z): Antigravity Opus no longer exists.
+            # Never route to it, not even as a fallback.
+            # - routine and delta reviews → ds-task
+            # - high-risk reviews (money/auth/migration/concurrency) → reviewer (Opus 5.5)
+            # - never Flash for high-risk
+            if is_high_risk_review:
+                # High-risk review (money/auth/migration/concurrency/state_machine/schema/invariants/architecture)
+                label = "High-risk review (reviewer)"
                 rungs = [
-                    opus_55,
-                    ag_opus,
                     codex_promo,
+                    opus_55,
                     go_glm53,
                     _Rung(MODEL_CLAUDE_FABLE, anthropic_worker_ok,
                           f"Claude Fable: the Anthropic weekly window runs {anthropic_headroom:.2f}x behind pace, "
@@ -1630,34 +1636,29 @@ class ResetAwareModelSelector:
                     _Rung(MODEL_CLAUDE_FABLE, anthropic_meta["is_available"],
                           "no review allowance left elsewhere; drawing on the Anthropic orchestrator reserve.",
                           cooldown=True, as_fallback=False),
-                    astra_emergency,
                     _Rung(MODEL_DEEPSEEK_PRO, deepseek_ok, "all strong reviewers unavailable; emergency DeepSeek V4 Pro.", cooldown=True),
-                ]
-                last_resort = _Rung(MODEL_DEEPSEEK_PRO, True, "all strong models unavailable or in cooldown; pay-per-token DeepSeek V4 Pro.", cooldown=True)
-                final_fallbacks = [MODEL_CLAUDE_OPUS_55, MODEL_AG_CLAUDE_OPUS, MODEL_DEEPSEEK_PRO]
-            elif is_ag_opus_exhausted:
-                # ag-opus exhaustion fallback for routine review: escalates to reviewer (Opus 5.5) on slack,
-                # then astra_on_pace, then drawing on the orchestrator reserve (never Flash).
-                label = "High-risk review (ag-opus exhausted fallback)"
-                rungs = [
-                    codex_promo,
-                    _Rung(MODEL_CLAUDE_OPUS_55, opus_55_available and anthropic_worker_ok,
-                          "Claude Opus 5.5: ag-opus exhausted; drawing on Anthropic slack for high-risk review."),
-                    go_glm53,
-                    astra_on_pace,
-                    _Rung(MODEL_CLAUDE_FABLE, anthropic_meta["is_available"],
-                          "no review allowance left elsewhere; drawing on the Anthropic orchestrator reserve.",
-                          cooldown=True, as_fallback=False),
                     astra_emergency,
-                    _Rung(MODEL_DEEPSEEK_PRO, deepseek_ok, "all strong reviewers unavailable; emergency DeepSeek V4 Pro.", cooldown=True),
                 ]
                 last_resort = _Rung(MODEL_DEEPSEEK_PRO, True, "all strong models unavailable or in cooldown; pay-per-token DeepSeek V4 Pro.", cooldown=True)
                 final_fallbacks = [MODEL_CLAUDE_OPUS_55, MODEL_DEEPSEEK_PRO]
+            elif is_routine_review or is_delta_review:
+                label = "Routine / delta review (ds-task)"
+                rungs = [
+                    _Rung(MODEL_DEEPSEEK_FLASH, deepseek_ok,
+                          "routine/delta review on DeepSeek Flash (ds-task).",
+                          pace_group=PACE_GROUP_STRONG),
+                    _Rung(MODEL_GO_GLM53, go_ok(MODEL_GO_GLM53),
+                          "OpenCode Go GLM-5.3 cross-provider fallback for routine/delta review.",
+                          cooldown=True),
+                ]
+                last_resort = _Rung(MODEL_GO_GLM53, True, "all review tiers unavailable; OpenCode Go GLM-5.3.", cooldown=True)
+                final_fallbacks = [MODEL_GO_GLM53, MODEL_DEEPSEEK_PRO]
             else:
-                label = "High-risk review"
+                label = "Strong review"
                 rungs = [
                     codex_promo,
-                    ag_opus,
+                    _Rung(MODEL_CLAUDE_OPUS_55, opus_55_available and anthropic_near_reset_surplus,
+                          "Claude Opus 5.5: Anthropic surplus near reset; spent on high-risk review."),
                     go_glm53,
                     _Rung(MODEL_CLAUDE_FABLE, anthropic_worker_ok,
                           f"Claude Fable: the Anthropic weekly window runs {anthropic_headroom:.2f}x behind pace, "
@@ -1666,12 +1667,10 @@ class ResetAwareModelSelector:
                     _Rung(MODEL_CLAUDE_FABLE, anthropic_meta["is_available"],
                           "no review allowance left elsewhere; drawing on the Anthropic orchestrator reserve.",
                           cooldown=True, as_fallback=False),
-                    astra_emergency,
                     _Rung(MODEL_DEEPSEEK_PRO, deepseek_ok, "all strong reviewers unavailable; emergency DeepSeek V4 Pro.", cooldown=True),
+                    astra_emergency,
                 ]
                 last_resort = _Rung(MODEL_DEEPSEEK_PRO, True, "all strong models unavailable or in cooldown; pay-per-token DeepSeek V4 Pro.", cooldown=True)
-                # Codex Astra's escape slot belongs to the reviewer (Opus 5.5) while Codex is
-                # unroutable, so high-risk review work lands on reviewer or ag-opus.
                 final_fallbacks = [MODEL_CLAUDE_OPUS_55, MODEL_DEEPSEEK_PRO]
         elif is_rework_critical and task_type in (TaskType.ROUTINE_EXECUTION, TaskType.DEEP_REASONING):
             # CASE B2: HIGH-RISK WORKER (implementation first pass, deep reasoning): the Go
@@ -1694,17 +1693,15 @@ class ResetAwareModelSelector:
                 fable_last_resort,
             ]
             last_resort = _Rung(MODEL_DEEPSEEK_PRO, True, "all worker tiers unavailable; pay-per-token DeepSeek V4 Pro.", cooldown=True)
-            # The escape has to be non-Flash, non-free, off the paid Anthropic reserve, and
-            # cross-provider to every rung above it: ag-opus while its free daily window holds,
-            # then the Go precision lane, then pay-per-token DeepSeek V4 Pro. Listing only
-            # ag-opus dead-ends the ladder the moment that one window is exhausted.
-            final_fallbacks = [MODEL_AG_CLAUDE_OPUS, MODEL_GO_GLM53, MODEL_DEEPSEEK_PRO]
+            # cross-provider to every rung above it: the Go precision lane,
+            # then pay-per-token DeepSeek V4 Pro.
+            final_fallbacks = [MODEL_GO_GLM53, MODEL_DEEPSEEK_PRO]
 
         elif task_type == TaskType.STRONG_REVIEW and risk_level == RiskLevel.MEDIUM:
             # CASE C: MEDIUM-RISK REVIEW — standard diffs are reviewed by the cross-family
             # Chinese models (the go-review chain: GLM-5.3, else Qwen3.8 Max, else
             # GLM-5.3-Flash), with ChatGPT web as the overflow while Go is limited. Never
-            # paid Anthropic or Antigravity Opus, and never Gemini, which would review a
+            # paid Anthropic, and never Gemini, which would review a
             # Gemini-authored diff. Codex, Z.AI and DeepSeek follow.
             label = "Medium-risk review"
             rungs = [
@@ -2144,18 +2141,13 @@ def compute_window_burn_paces(
 
 def get_recommended_lanes(selector: ResetAwareModelSelector) -> Dict[str, str]:
     """Map each standard role to its recommended model and account annotation."""
-    ag_pace = selector.pace_by_provider().get(AG_ANTHROPIC_PROVIDER)
-    ag_account = ag_pace.account if ag_pace else "default"
-    ag_opus_str = f"{MODEL_AG_CLAUDE_OPUS} (account: {ag_account})"
-
     anthropic_pace = selector.pace_by_provider().get("anthropic")
     reviewer_str = "anthropic/claude-opus-5-5:high"
-    if anthropic_pace and anthropic_pace.throttled and ag_pace and not ag_pace.throttled:
-        reviewer_str = f"{MODEL_AG_CLAUDE_OPUS} (fallback from throttled Anthropic; account: {ag_account})"
+    if anthropic_pace and anthropic_pace.throttled:
+        reviewer_str = f"{MODEL_DEEPSEEK_PRO} (fallback from throttled Anthropic)"
 
     return {
         "reviewer": reviewer_str,
-        "ag-opus": ag_opus_str,
         "task": MODEL_GEMINI_FLASH,
         "ds-pro": MODEL_DEEPSEEK_PRO,
         "ds-task": MODEL_DEEPSEEK_FLASH,
