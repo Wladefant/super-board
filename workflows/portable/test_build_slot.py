@@ -1639,11 +1639,13 @@ class TestBuildSlot(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             self.assertTrue(manager.acquire("hb-lane", timeout=2.0, poll_interval=0.05, token="hb-token"))
         err = io.StringIO()
-        with redirect_stderr(err), mock.patch.object(build_slot, "_write_json_atomic", side_effect=OSError("disk full")):
+        with redirect_stderr(err), self.assertLogs("build_slot", "WARNING") as logs, \
+                mock.patch.object(build_slot, "_write_json_atomic", side_effect=OSError("disk full")):
             self.assertFalse(manager.heartbeat_lock("hb-lane", token="hb-token"))
             self.assertFalse(manager._record_run_child("hb-lane", os.getpid(), os.getpid(), token="hb-token"))
         line = "[HEARTBEAT] Failed to write heartbeat for 'hb-lane' (slot 0): disk full"
         self.assertEqual(err.getvalue().count(line), 2)
+        self.assertEqual(sum(line in m for m in logs.output), 2)
         with redirect_stdout(io.StringIO()):
             self.assertTrue(manager.release("hb-lane", token="hb-token"))
 
