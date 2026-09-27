@@ -12,7 +12,7 @@ Tests:
   2. Non-owner release refusal.
   3. Stale lock reclamation for dead PIDs.
   4. Stale lock reclamation for age threshold expiration.
-  5. RAM guard refusal (>=85%) and force override.
+  5. RAM guard queued wait (>=85%), timeout, and force override.
   6. FIFO queue ordering and clean queue logic.
   7. Concurrent subprocess FIFO serialization.
   8. CLI subprocess status, JSON, acquire, and release.
@@ -173,18 +173,19 @@ class TestBuildSlot(unittest.TestCase):
         self.assertTrue(os.path.isdir(manager.lock_dir))
         self.assertEqual(manager.status()["lock"]["owner"], "long-build-lane")
 
-    def test_ram_guard_refusal_and_force(self):
+    def test_ram_guard_waits_and_force(self):
         manager = BuildSlotManager(run_dir=self.run_dir)
         os.environ["BUILD_SLOT_RAM_PERCENT"] = "90.0"
 
-        # Attempt acquire without force should fail
+        # Without force, high RAM keeps the lane queued until the timeout, then fails
         stderr_buf = io.StringIO()
         with redirect_stderr(stderr_buf):
             acquired = manager.acquire("high-ram-lane", timeout=0.5, poll_interval=0.05)
 
         self.assertFalse(acquired)
-        self.assertIn("RAM guard: acquisition refused", stderr_buf.getvalue())
+        self.assertIn("'high-ram-lane' stays queued and waits", stderr_buf.getvalue())
         self.assertIn("90.0%", stderr_buf.getvalue())
+        self.assertIn("system RAM remains at 90.0%", stderr_buf.getvalue())
 
         # Attempt acquire with force=True should succeed
         with redirect_stderr(stderr_buf):
@@ -192,8 +193,53 @@ class TestBuildSlot(unittest.TestCase):
                 "force-lane", timeout=0.5, poll_interval=0.05, force=True
             )
         self.assertTrue(acquired_force)
+        self.assertIn("[NOTICE] RAM guard overridden with --force", stderr_buf.getvalue())
         self.assertEqual(manager.status()["lock"]["owner"], "force-lane")
         self.assertTrue(manager.release("force-lane"))
+
+    def test_ram_guard_waits_in_queue_until_ram_drops(self):
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        ram_values = iter([90.0, 90.0, 90.0])
+        queued_names_while_waiting = []
+
+        def fake_ram():
+            value = next(ram_values, 50.0)
+            if value >= 85.0:
+                queued_names_while_waiting.append(
+                    [item["name"] for item in manager._read_queue()]
+                )
+            return value
+
+        stderr_buf = io.StringIO()
+        with mock.patch.object(build_slot, "get_system_ram_percent", side_effect=fake_ram):
+            with redirect_stderr(stderr_buf), redirect_stdout(io.StringIO()):
+                acquired = manager.acquire("waiting-lane", timeout=5.0, poll_interval=0.02)
+
+        self.assertTrue(acquired)
+        self.assertIn("'waiting-lane' stays queued and waits", stderr_buf.getvalue())
+        # The initial guard check happens before enqueue; every later high-RAM poll
+        # inside the queue loop must see the lane holding its queue place.
+        self.assertEqual(queued_names_while_waiting[0], [])
+        self.assertEqual(queued_names_while_waiting[1:], [["waiting-lane"], ["waiting-lane"]])
+        self.assertEqual(manager.status()["lock"]["owner"], "waiting-lane")
+        self.assertEqual(manager.clean_queue(), [])
+        self.assertTrue(manager.release("waiting-lane"))
+
+    def test_ram_guard_times_out_after_waiting_and_cleans_queue(self):
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        timeout = 0.4
+        stderr_buf = io.StringIO()
+        with mock.patch.object(build_slot, "get_system_ram_percent", return_value=90.0):
+            with redirect_stderr(stderr_buf):
+                started = time.monotonic()
+                acquired = manager.acquire("stuck-lane", timeout=timeout, poll_interval=0.02)
+                elapsed = time.monotonic() - started
+
+        self.assertFalse(acquired)
+        self.assertGreaterEqual(elapsed, timeout)
+        self.assertIn("system RAM remains at 90.0%", stderr_buf.getvalue())
+        self.assertEqual(manager.clean_queue(), [])
+        self.assertFalse(manager.status()["lock"]["locked"])
 
     def test_fifo_queue_order(self):
         active_pids = {1001: True, 1002: True, 1003: True, 1004: True}
@@ -1105,6 +1151,41 @@ class TestBuildSlot(unittest.TestCase):
         # Lock must be released after command exits
         stat = manager.status()
         self.assertFalse(stat["lock"]["locked"])
+
+    def test_run_options_after_name_are_honored(self):
+        args = build_slot.parse_args(
+            ["run", "--priority", "lane", "--timeout", "1.5", "--cwd", "D:/wt", "--", "npx", "next", "build"]
+        )
+        self.assertEqual(args.timeout, 1.5)
+        self.assertEqual(args.cwd, "D:/wt")
+        self.assertTrue(args.priority)
+        self.assertFalse(args.force)
+        self.assertEqual(args.cmd, ["--", "npx", "next", "build"])
+
+        # A command without leading options keeps its own `--` arguments untouched
+        args_plain = build_slot.parse_args(["run", "lane", "npm", "run", "build", "--", "--prod"])
+        self.assertIsNone(args_plain.timeout)
+        self.assertEqual(args_plain.cmd, ["npm", "run", "build", "--", "--prod"])
+
+    def test_cli_run_waits_under_high_ram_until_timeout(self):
+        script = os.path.abspath(build_slot.__file__)
+        env = dict(os.environ)
+        env["BUILD_SLOT_RAM_PERCENT"] = "90.0"
+        started = time.monotonic()
+        proc = subprocess.run(
+            [sys.executable, script, "--run-dir", self.run_dir, "run", "cli-ram-lane", "--timeout", "0.5",
+             "--", sys.executable, "-c", "pass"],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(proc.returncode, 1)
+        self.assertGreaterEqual(elapsed, 0.5)
+        self.assertIn("'cli-ram-lane' stays queued and waits", proc.stderr)
+        self.assertIn("Timed out after 0.5s", proc.stderr)
+        self.assertEqual(BuildSlotManager(run_dir=self.run_dir).clean_queue(), [])
 
     def test_check_ram(self):
         manager = BuildSlotManager(run_dir=self.run_dir)
