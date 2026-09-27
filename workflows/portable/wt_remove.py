@@ -12,9 +12,12 @@ This tool removes a worktree in the only safe order:
 1. refuse the main worktree and any path that is not a linked worktree root;
 2. refuse when another worktree's junction points *into* this one (removing it
    would break those lanes), unless ``--orphan-dependents`` is given;
-3. delete every junction/symlink inside the worktree as a link (``RemoveDirectoryW``
+3. refuse, before touching anything, a worktree git would not remove: a locked one,
+   or without ``--force`` one with modified or untracked files (the links this tool
+   unlinks aside) or with a tracked link, which unlinking would itself turn into a change;
+4. delete every junction/symlink inside the worktree as a link (``RemoveDirectoryW``
    on the link, never recursing into it), then verify none is left;
-4. only then run ``git worktree remove`` from the main worktree.
+5. only then run ``git worktree remove`` from the main worktree.
 
 Usage:
     python wt_remove.py <worktree> [--force] [--dry-run] [--orphan-dependents] [--json]
@@ -277,6 +280,46 @@ def worktree_facts(path: str) -> tuple[str, str, str]:
     return top, gdir, common
 
 
+def is_locked(top: str) -> bool:
+    """True when ``git worktree lock`` holds the worktree rooted at ``top``."""
+    r = git(["worktree", "list", "--porcelain"], cwd=top)
+    if r.returncode != 0:
+        raise RuntimeError(f"git worktree list failed: {r.stderr.strip()}")
+    for block in r.stdout.split("\n\n"):
+        lines = block.splitlines()
+        if lines and lines[0].startswith("worktree ") and norm(lines[0][len("worktree "):]) == top:
+            return any(line == "locked" or line.startswith("locked ") for line in lines[1:])
+    return False
+
+
+def dirty_paths(top: str, links: list[str]) -> list[str]:
+    """What makes ``git worktree remove`` refuse without --force, once ``links`` are unlinked:
+    modified or untracked paths other than those links, plus any link git tracks (unlinking a
+    tracked link deletes a tracked file)."""
+    rel = {os.path.normcase(os.path.relpath(link, top)): link for link in links}
+    r = git(["status", "--porcelain=v1", "-z"], cwd=top)
+    if r.returncode != 0:
+        raise RuntimeError(f"git status failed: {r.stderr.strip()}")
+    entries = r.stdout.split("\0")
+    dirty, i = [], 0
+    while i < len(entries):
+        entry = entries[i]
+        i += 1
+        if len(entry) < 4:
+            continue
+        if entry[0] in "RC":  # a rename/copy carries its source path as the next entry
+            i += 1
+        path = entry[3:]
+        if os.path.normcase(os.path.normpath(path.rstrip("/"))) not in rel:
+            dirty.append(path)
+    if rel:
+        tracked = git(["ls-files", "-z", "--", *(os.path.relpath(link, top) for link in links)], cwd=top)
+        if tracked.returncode != 0:
+            raise RuntimeError(f"git ls-files failed: {tracked.stderr.strip()}")
+        dirty += [f"{p} (tracked link)" for p in tracked.stdout.split("\0") if p]
+    return dirty
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -313,6 +356,14 @@ def remove_worktree(
         return report
 
     links = list(iter_links(path))
+    if is_locked(top):
+        report.update(refused=True, error="the worktree is locked (git worktree unlock it first)")
+        return report
+    if not force:
+        report["dirty"] = dirty_paths(top, links)
+        if report["dirty"]:
+            report.update(refused=True, error="the worktree has changes git would refuse to drop; commit or discard them, or pass --force")
+            return report
     for link in links:
         report["unlinked"].append({"link": link, "target": link_target(link)})
         if not dry_run:
@@ -363,6 +414,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{verb}: {item['link']} -> {item['target']}")
         for dep in report.get("dependents", []):
             print(f"dependent: {dep['link']} -> {dep['target']}")
+        for item in report.get("dirty", []):
+            print(f"dirty: {item}")
         for proc in report.get("busy", []):
             print(f"busy: pid {proc['pid']} {proc['name']} cwd={proc['cwd']}")
         if report.get("git"):
