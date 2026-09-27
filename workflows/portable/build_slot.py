@@ -187,6 +187,24 @@ def _parse_timestamp(val: Any) -> Optional[float]:
         except Exception:
             pass
     return None
+def _owner_pid_from_process_table(cur_pid: int, parents: Dict[int, int], names: Dict[int, str]) -> int:
+    """
+    Climbs cur_pid's ancestors in a (pid -> parent pid, pid -> lowercase exe name) table.
+    A veyyon host ends the climb and is the owner; without one, the farthest ancestor
+    still in the table stands in.
+    """
+    cur = cur_pid
+    candidate = cur_pid
+    visited = set()
+    while cur in parents and cur not in visited and cur != 0:
+        visited.add(cur)
+        candidate = cur
+        if "veyyon" in names.get(cur, ""):
+            break
+        cur = parents[cur]
+    return candidate
+
+
 def find_long_lived_owner_pid() -> int:
     """
     Finds the owner PID for `acquire`-mode lock attribution.
@@ -234,17 +252,7 @@ def find_long_lived_owner_pid() -> int:
                             break
                 k32.CloseHandle(h)
 
-                # Climb ancestors; a veyyon host ends the climb and is the owner.
-                cur = cur_pid
-                candidate = cur_pid
-                visited = set()
-                while cur in parents and cur not in visited and cur != 0:
-                    visited.add(cur)
-                    candidate = cur
-                    if "veyyon" in names.get(cur, ""):
-                        break
-                    cur = parents[cur]
-                return candidate
+                return _owner_pid_from_process_table(cur_pid, parents, names)
         except Exception as e:
             logger.debug("Failed in find_long_lived_owner_pid: %s", e)
 

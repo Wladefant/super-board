@@ -1329,6 +1329,23 @@ class TestBuildSlot(unittest.TestCase):
         self.assertNotEqual(owner_pid, probe_pid)
         self.assertTrue(is_pid_alive(owner_pid))
 
+    def test_acquire_owner_is_veyyon_host_not_per_command_shell(self):
+        """
+        #315: under veyyon each bash-tool call runs in a shell that exits with the command.
+        Recording that shell (the child just below the host) let the dead-PID rule free an
+        acquire-mode slot 60s into the build; the host itself is the owner.
+        """
+        parents = {100: 4, 4: 0, 200: 100, 300: 200, 400: 300}
+        names = {100: "veyyon.exe", 4: "explorer.exe", 200: "bash.exe", 300: "sh.exe", 400: "python.exe"}
+        self.assertEqual(build_slot._owner_pid_from_process_table(400, parents, names), 100)
+
+    def test_acquire_owner_without_veyyon_is_farthest_ancestor(self):
+        """Outside veyyon the farthest ancestor in the table owns it; a parent-PID cycle ends the climb."""
+        parents = {10: 999, 20: 10, 30: 20}
+        names = {10: "code.exe", 20: "pwsh.exe", 30: "python.exe"}
+        self.assertEqual(build_slot._owner_pid_from_process_table(30, parents, names), 10)
+        self.assertEqual(build_slot._owner_pid_from_process_table(5, {5: 6, 6: 5}, {}), 6)
+
     def test_bounded_concurrency_two_slots_when_ram_under_75_percent(self):
         """When host RAM is < 75%, 2 concurrent slots can be acquired by distinct lanes."""
         os.environ["BUILD_SLOT_RAM_PERCENT"] = "70.0"
