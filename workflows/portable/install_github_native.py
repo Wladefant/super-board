@@ -36,8 +36,10 @@ RUNTIME_FILES = (
     # Feature map navigation and build slot arbiters.
     "feature_map.py", "feature_map.schema.json", "test_feature_map.py",
     "build_slot.py", "test_build_slot.py",
+    # Safe worktree removal; polysim_frontend_deps.py imports it (Wladefant/super-board#321).
+    "wt_remove.py", "test_wt_remove.py",
     # PolySimulator per-worktree Next cache (Wladefant/super-board#321).
-    "polysim_next_cache.py", "test_polysim_next_cache.py", "wt_remove.py",
+    "polysim_next_cache.py", "test_polysim_next_cache.py",
     # Verification CLI and smoke test gate.
     "verify.py", "test_verify.py",
     # Lane-brief merge guard (Wladefant/super-board#227).

@@ -215,6 +215,8 @@ jobs:
 
       - name: build slot arbiter
         run: python -B workflows/portable/test_build_slot.py
+      - name: worktree removal
+        run: python -B workflows/portable/test_wt_remove.py
       - name: polysim next cache
         run: python -B workflows/portable/test_polysim_next_cache.py
       - name: outer loop intake
