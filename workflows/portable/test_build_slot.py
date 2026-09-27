@@ -492,7 +492,8 @@ class TestBuildSlot(unittest.TestCase):
         # Legacy fresh (<= 30m) preserved
         self.assertIn("legacy-fresh-lane", names)
 
-        self.assertEqual(names, ["fresh-hb-lane", "legacy-fresh-lane"])
+        # Survivors in FIFO order by original enqueue time
+        self.assertEqual(names, ["legacy-fresh-lane", "fresh-hb-lane"])
 
     def test_acquire_timeout_leaves_no_entry_behind(self):
         manager = BuildSlotManager(run_dir=self.run_dir)
@@ -1081,24 +1082,32 @@ class TestBuildSlot(unittest.TestCase):
         self.assertGreater(pid, 0)
         self.assertTrue(is_pid_alive(pid))
 
-    def test_enqueue_priority_inserts_at_front(self):
+    def test_enqueue_priority_is_first_come_first_served(self):
         manager = BuildSlotManager(run_dir=self.run_dir, is_pid_alive_fn=lambda p: True)
-        manager.enqueue("waiter-1", 1001, token="tok-1")
-        manager.enqueue("waiter-2", 1002, token="tok-2")
-        manager.enqueue("waiter-3", 1003, token="tok-3")
+        manager.enqueue("normal-1", 1001, token="tok-n1")
 
-        # waiter-4 is enqueued with priority=True -> must land at index 0 (ahead of all normal entries)
-        idx = manager.enqueue("waiter-4", 1004, token="tok-4", priority=True)
-        self.assertEqual(idx, 0)
+        # A priority entry passes normal waiters but queues behind earlier
+        # priority entries: every lane passes --priority, so newest-first
+        # would starve the oldest waiter.
+        self.assertEqual(manager.enqueue("prio-1", 1011, token="tok-p1", priority=True), 0)
+        self.assertEqual(manager.enqueue("prio-2", 1012, token="tok-p2", priority=True), 1)
+        self.assertEqual(manager.enqueue("prio-3", 1013, token="tok-p3", priority=True), 2)
+        self.assertEqual(manager.enqueue("normal-2", 1002, token="tok-n2"), 4)
+        order = ["prio-1", "prio-2", "prio-3", "normal-1", "normal-2"]
+        self.assertEqual([x["name"] for x in manager._read_queue()], order)
+
+        # Re-enqueueing an entry that is already queued (the wait loop does
+        # this when a heartbeat misses) refreshes it in place.
+        self.assertEqual(manager.enqueue("prio-3", 1013, token="tok-p3", priority=True), 2)
+        self.assertEqual(manager.enqueue("normal-2", 1002, token="tok-n2"), 4)
+        self.assertEqual([x["name"] for x in manager._read_queue()], order)
+
+        # Upgrading a normal entry joins the priority group at its own
+        # enqueue time: behind every priority entry that queued earlier.
+        self.assertEqual(manager.enqueue("normal-2", 1002, token="tok-n2", priority=True), 3)
         queue = manager._read_queue()
-        self.assertEqual([x["name"] for x in queue], ["waiter-4", "waiter-1", "waiter-2", "waiter-3"])
-        self.assertTrue(queue[0].get("priority"))
-
-        # waiter-2 is re-enqueued with priority=True -> promoted behind existing priority waiter-4 (index 1)
-        idx2 = manager.enqueue("waiter-2", 1002, token="tok-2", priority=True)
-        self.assertEqual(idx2, 1)
-        queue2 = manager._read_queue()
-        self.assertEqual([x["name"] for x in queue2], ["waiter-4", "waiter-2", "waiter-1", "waiter-3"])
+        self.assertEqual([x["name"] for x in queue], ["prio-1", "prio-2", "prio-3", "normal-2", "normal-1"])
+        self.assertTrue(queue[3].get("priority"))
 
     def test_enqueue_priority_three_fifo(self):
         """Three priority enqueues A, B, C one after another -> queue order A, B, C (FIFO)."""
@@ -1157,66 +1166,39 @@ class TestBuildSlot(unittest.TestCase):
         queue2 = manager._read_queue()
         self.assertEqual([x["name"] for x in queue2], ["P1", "N1", "N2"])
 
-    def test_enqueue_priority_against_live_queue_snapshot(self):
-        """
-        Check that enqueuing with priority against a copy of the live queue
-        places the new priority entry after the last existing priority entry,
-        keeps the order of all existing entries unchanged, loses no entries,
-        and preserves the exact JSON shape.
-        """
-        live_queue_path = os.path.expanduser("~/.veyyon/run/build-slot.queue.json")
-        if os.path.exists(live_queue_path):
-            with open(live_queue_path, "r", encoding="utf-8") as f:
-                original_data = json.load(f)
-        else:
-            now = time.time()
-            original_data = [
-                {"name": "P1", "pid": 11111, "token": "tok-p1", "enqueued_at": now - 300, "enqueued_at_iso": "...", "heartbeat_at": now, "heartbeat_at_iso": "...", "priority": True},
-                {"name": "P2", "pid": 22222, "token": "tok-p2", "enqueued_at": now - 200, "enqueued_at_iso": "...", "heartbeat_at": now, "heartbeat_at_iso": "...", "priority": True},
-                {"name": "N1", "pid": 33333, "token": "tok-n1", "enqueued_at": now - 100, "enqueued_at_iso": "...", "heartbeat_at": now, "heartbeat_at_iso": "..."},
+    def _write_timed_queue(self, manager, entries):
+        now = time.time()
+        manager._write_queue(
+            [
+                {"name": name, "pid": 3000 + i, "token": f"tok-{name}", "enqueued_at": enqueued_at,
+                 "heartbeat_at": now, "priority": prio}
+                for i, (name, enqueued_at, prio) in enumerate(entries)
             ]
+        )
 
-        dest_queue_file = os.path.join(self.run_dir, "build-slot.queue.json")
-        with open(dest_queue_file, "w", encoding="utf-8") as f:
-            json.dump(original_data, f)
-
-        orig_names = [x["name"] for x in original_data]
-        prio_count = sum(1 for x in original_data if x.get("priority"))
-
+    def test_clean_queue_restores_fifo_order(self):
         manager = BuildSlotManager(run_dir=self.run_dir, is_pid_alive_fn=lambda p: True)
+        # A file written newest-first by an older build_slot.py; E's enqueue
+        # time is unreadable, which must not break the sort for everyone.
+        self._write_timed_queue(
+            manager,
+            [("D", 4.0, True), ("C", 3.0, False), ("E", "not-a-time", False), ("B", 2.0, True), ("A", 1.0, True)],
+        )
+        manager.clean_queue()
+        self.assertEqual([x["name"] for x in manager._read_queue()], ["A", "B", "D", "E", "C"])
 
-        idx = manager.enqueue("TestPrioLane", 99999, token="tok-test-prio", priority=True)
-        self.assertEqual(idx, prio_count)
-
-        new_queue = manager._read_queue()
-        self.assertEqual(len(new_queue), len(original_data) + 1)
-        self.assertEqual(new_queue[idx]["name"], "TestPrioLane")
-        self.assertTrue(new_queue[idx].get("priority"))
-
-        remaining_names = [x["name"] for x in new_queue if x["name"] != "TestPrioLane"]
-        self.assertEqual(remaining_names, orig_names)
-
-        for item in new_queue:
-            self.assertIn("name", item)
-            self.assertIn("pid", item)
-            self.assertIn("enqueued_at", item)
-            self.assertIn("enqueued_at_iso", item)
-            self.assertIn("heartbeat_at", item)
-            self.assertIn("heartbeat_at_iso", item)
-            allowed_keys = {"name", "pid", "token", "enqueued_at", "enqueued_at_iso", "heartbeat_at", "heartbeat_at_iso", "priority"}
-            self.assertTrue(set(item.keys()).issubset(allowed_keys))
-    def test_bump_moves_to_front(self):
+    def test_bump_keeps_fifo_among_priority(self):
         manager = BuildSlotManager(run_dir=self.run_dir, is_pid_alive_fn=lambda p: True)
-        manager.enqueue("lane-A", 2001, token="tok-A")
-        manager.enqueue("lane-B", 2002, token="tok-B")
-        manager.enqueue("lane-C", 2003, token="tok-C")
+        self._write_timed_queue(
+            manager, [("A", 1.0, True), ("B", 2.0, True), ("D", 4.0, True), ("C", 3.0, False)]
+        )
+        self.assertEqual(manager.enqueue("D", 3003, token="tok-D", priority=True), 2)
 
-        # bump lane-C to front
-        ok = manager.bump("lane-C")
-        self.assertTrue(ok)
+        # bump marks C priority; it passes no priority entry that queued before it
+        self.assertTrue(manager.bump("C"))
         queue = manager._read_queue()
-        self.assertEqual([x["name"] for x in queue], ["lane-C", "lane-A", "lane-B"])
-        self.assertTrue(queue[0].get("priority"))
+        self.assertEqual([x["name"] for x in queue], ["A", "B", "C", "D"])
+        self.assertTrue(queue[2].get("priority"))
 
         # bump non-existent lane returns False
         self.assertFalse(manager.bump("lane-non-existent"))
@@ -1545,6 +1527,224 @@ class TestBuildSlot(unittest.TestCase):
         names = {10: "code.exe", 20: "pwsh.exe", 30: "python.exe"}
         self.assertEqual(build_slot._owner_pid_from_process_table(30, parents, names), 10)
         self.assertEqual(build_slot._owner_pid_from_process_table(5, {5: 6, 6: 5}, {}), 6)
+
+    def test_acquire_owner_skips_veyyon_helper_workers(self):
+        """
+        #315: `launch` runs commands under `veyyon.exe __veyyon_worker_daemon_broker` and JS
+        eval under `__veyyon_worker_js_eval_process`. Those helpers are veyyon.exe too, but
+        their lifetime is not the lane's; the session host above them owns the slot.
+        """
+        parents = {100: 4, 200: 100, 300: 200}
+        names = {100: "veyyon.exe", 4: "powershell.exe", 200: "veyyon.exe", 300: "python.exe"}
+        exe = r"C:\Users\u\AppData\Local\veyyon\veyyon.exe"
+        for helper in ("__veyyon_worker_daemon_broker", "__veyyon_worker_js_eval_process"):
+            cmdlines = {100: f'"{exe}"', 200: f"{exe} {helper}", 300: "python build_slot.py acquire x"}
+            with self.subTest(helper=helper):
+                self.assertEqual(build_slot._owner_pid_from_process_table(300, parents, names, cmdlines), 100)
+
+    def test_acquire_owner_is_veyyon_host_on_node_runtime(self):
+        """
+        #315: a veyyon host running on node.exe/bun.exe has no "veyyon" in its exe name; its
+        entrypoint on the command line identifies it. A node MCP wrapper under the `.veyyon`
+        config dir is not a host.
+        """
+        parents = {4: 1, 10: 4, 20: 10, 30: 20, 40: 30}
+        names = {4: "explorer.exe", 10: "pwsh.exe", 20: "node.exe", 30: "bash.exe", 40: "python.exe"}
+        host = {20: r'"C:\Program Files\nodejs\node.exe" C:\src\veyyon\packages\coding-agent\dist\cli.js'}
+        self.assertEqual(build_slot._owner_pid_from_process_table(40, parents, names, host), 20)
+        wrapper = {20: r'node.exe C:/Users/u/.veyyon/profiles/default/agent/github-mcp-wrapper.js'}
+        self.assertEqual(build_slot._owner_pid_from_process_table(40, parents, names, wrapper), 4)
+
+    def test_acquire_owner_climb_stops_at_reused_parent_pid(self):
+        """
+        #315: the lane's parent died and Windows gave its PID to a newer, unrelated process.
+        Climbing into that impostor recorded a PID that died seconds later, and the dead-PID
+        rule reclaimed the live build. A parent created after its child ends the climb.
+        """
+        # 400 python <- 300 sh <- 200 (dead bash's PID, now reused by a later cmd.exe) <- 7 conhost
+        parents = {400: 300, 300: 200, 200: 7, 7: 4, 4: 1}
+        names = {400: "python.exe", 300: "sh.exe", 200: "cmd.exe", 7: "conhost.exe", 4: "explorer.exe"}
+        created = {4: 10, 7: 20, 300: 50, 400: 60, 200: 90}
+        self.assertEqual(build_slot._owner_pid_from_process_table(400, parents, names, {}, created), 300)
+        # Without the reuse (parent older than child) the climb goes on as before.
+        created[200] = 40
+        self.assertEqual(build_slot._owner_pid_from_process_table(400, parents, names, {}, created), 4)
+
+    def _seed_stale_lock(self, manager, token="stale-token"):
+        os.makedirs(manager.lock_dir, exist_ok=True)
+        past_epoch = time.time() - 300.0
+        with open(manager.info_file, "w", encoding="utf-8") as f:
+            json.dump({
+                "owner": "dead-lane",
+                "pid": 999999,
+                "token": token,
+                "acquired_at": datetime.datetime.fromtimestamp(past_epoch, datetime.timezone.utc).isoformat(),
+                "acquired_at_epoch": past_epoch,
+            }, f)
+        self.assertFalse(is_pid_alive(999999))
+
+    def test_second_reclaimer_never_removes_the_next_holders_lock(self):
+        """
+        #315: waiters A and B both judge the same dead lock stale. A reclaims it and lane C
+        acquires the free slot before B acts. B must not delete C's live lock on the strength
+        of its old read; C's build would run with the slot open to a second build.
+        """
+        reclaimer_a = BuildSlotManager(run_dir=self.run_dir)
+        reclaimer_b = BuildSlotManager(run_dir=self.run_dir)
+        lane_c = BuildSlotManager(run_dir=self.run_dir)
+        self._seed_stale_lock(reclaimer_a)
+        stale_snapshot = reclaimer_b._read_slot_info(0)
+        real_read = reclaimer_b._read_slot_info
+        reads = []
+
+        def read_then_lose_the_race(slot_idx=0):
+            reads.append(slot_idx)
+            if len(reads) == 1:
+                self.assertTrue(reclaimer_a.check_stale_and_reclaim())
+                self.assertTrue(lane_c.acquire("lane-c", timeout=2.0, poll_interval=0.05))
+                return stale_snapshot
+            return real_read(slot_idx)
+
+        err = io.StringIO()
+        with redirect_stderr(err), redirect_stdout(io.StringIO()), \
+                mock.patch.object(reclaimer_b, "_read_slot_info", side_effect=read_then_lose_the_race):
+            self.assertFalse(reclaimer_b.check_stale_and_reclaim())
+
+        held = lane_c._read_slot_info(0)
+        self.assertIsNotNone(held, "B deleted lane C's live lock")
+        self.assertEqual(held["owner"], "lane-c")
+        self.assertEqual(err.getvalue().count("[NOTICE] Reclaiming stale build slot lock"), 1)
+        self.assertEqual([n for n in os.listdir(self.run_dir) if ".tombstone-" in n], [])
+        self.assertTrue(lane_c.release("lane-c"))
+
+    def test_reclaimer_restores_a_lock_that_changed_hands_before_its_rename(self):
+        """
+        #315: the handover can land after B's last re-read and before its rename, so B
+        renames lane C's lock. B must see the new lock in its tombstone and put it back, both
+        for a token lock and for a corrupt one whose successor is still being created.
+        """
+        for corrupt in (False, True):
+            with self.subTest(corrupt=corrupt):
+                reclaimer_a = BuildSlotManager(run_dir=self.run_dir)
+                reclaimer_b = BuildSlotManager(run_dir=self.run_dir)
+                self._seed_stale_lock(reclaimer_a)
+                if corrupt:
+                    os.remove(reclaimer_a.info_file)
+                    old = time.time() - 300
+                    os.utime(reclaimer_a.lock_dir, (old, old))
+                stale_snapshot = reclaimer_b._read_slot_info(0)
+                handed_over = []
+
+                def stale_view(slot_idx=0):
+                    if not handed_over:
+                        handed_over.append(True)
+                        self.assertTrue(reclaimer_a.check_stale_and_reclaim())
+                        if corrupt:
+                            os.makedirs(reclaimer_a.lock_dir)  # C mid-creation: no info.json yet
+                        else:
+                            self.assertTrue(reclaimer_a.acquire("lane-c", timeout=2.0, poll_interval=0.05))
+                    return stale_snapshot
+
+                with redirect_stderr(io.StringIO()), redirect_stdout(io.StringIO()), \
+                        mock.patch.object(reclaimer_b, "_read_slot_info", side_effect=stale_view):
+                    self.assertFalse(reclaimer_b.check_stale_and_reclaim())
+
+                self.assertTrue(os.path.isdir(reclaimer_a.lock_dir), "B deleted lane C's lock")
+                if not corrupt:
+                    self.assertEqual(reclaimer_a._read_slot_info(0)["owner"], "lane-c")
+                self.assertEqual([n for n in os.listdir(self.run_dir) if ".tombstone-" in n], [])
+                shutil.rmtree(reclaimer_a.lock_dir)
+
+    def test_reclaim_whose_tombstone_was_carried_off_stays_quiet(self):
+        """
+        #315 review B2: on Windows two reclaimers' renames of one lock dir can both succeed,
+        the later carrying the dir out of the earlier's tombstone. The earlier one then finds
+        its tombstone gone. That is not a live lock lost; it must not log [ERROR] or delete.
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        self._seed_stale_lock(manager)
+        other_tombstone = manager.lock_dir + ".tombstone-other"
+        real_rename = os.rename
+
+        def rename_then_lose_it(src, dst):
+            real_rename(src, dst)
+            if src == manager.lock_dir:
+                real_rename(dst, other_tombstone)
+
+        err = io.StringIO()
+        with redirect_stderr(err), mock.patch.object(build_slot.os, "rename", side_effect=rename_then_lose_it):
+            self.assertFalse(manager.check_stale_and_reclaim())
+        self.assertNotIn("[ERROR]", err.getvalue())
+        self.assertNotIn("[NOTICE] Reclaiming", err.getvalue())
+        self.assertTrue(os.path.isfile(os.path.join(other_tombstone, "info.json")))
+        shutil.rmtree(other_tombstone)
+
+    def test_reclaim_restore_after_tombstone_carried_off_stays_quiet(self):
+        """
+        #315 review B2 (delta): the carry-off can also land after the tombstone read shows a
+        different lock and before the restore rename. The restore then finds no tombstone;
+        that is not a stranded live lock and must not log [ERROR].
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        self._seed_stale_lock(manager)
+        other_tombstone = manager.lock_dir + ".tombstone-other"
+        real_read = build_slot._read_lock_dir_info
+
+        def read_then_lose_it(lock_dir, slot_idx):
+            info = real_read(lock_dir, slot_idx)
+            if ".tombstone-" in lock_dir and lock_dir != other_tombstone:
+                os.rename(lock_dir, other_tombstone)
+                return dict(info, token="next-holder")
+            return info
+
+        err = io.StringIO()
+        with redirect_stderr(err), mock.patch.object(build_slot, "_read_lock_dir_info", side_effect=read_then_lose_it):
+            self.assertFalse(manager.check_stale_and_reclaim())
+        self.assertNotIn("[ERROR]", err.getvalue())
+        self.assertTrue(os.path.isfile(os.path.join(other_tombstone, "info.json")))
+        shutil.rmtree(other_tombstone)
+
+    def test_stale_lock_reclaimed_once_without_tombstone_leftovers(self):
+        """#315: the tombstone reclaim still frees a dead lock, and only one reclaimer reports it."""
+        first = BuildSlotManager(run_dir=self.run_dir)
+        second = BuildSlotManager(run_dir=self.run_dir)
+        self._seed_stale_lock(first)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertTrue(first.check_stale_and_reclaim())
+            self.assertFalse(second.check_stale_and_reclaim())
+        self.assertFalse(os.path.exists(first.lock_dir))
+        self.assertEqual([n for n in os.listdir(self.run_dir) if ".tombstone-" in n], [])
+        self.assertEqual(err.getvalue().count("[NOTICE] Reclaiming stale build slot lock"), 1)
+
+    def test_heartbeat_write_failure_logs_distinct_line(self):
+        """
+        #315: a failed heartbeat write was swallowed; after heartbeat_stale_after the holder is
+        reclaimed as hung with nothing saying why. The failure gets its own line.
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(manager.acquire("hb-lane", timeout=2.0, poll_interval=0.05, token="hb-token"))
+        err = io.StringIO()
+        with redirect_stderr(err), self.assertLogs("build_slot", "WARNING") as logs, \
+                mock.patch.object(build_slot, "_write_json_atomic", side_effect=OSError("disk full")):
+            self.assertFalse(manager.heartbeat_lock("hb-lane", token="hb-token"))
+            self.assertFalse(manager._record_run_child("hb-lane", os.getpid(), os.getpid(), token="hb-token"))
+        line = "[HEARTBEAT] Failed to write heartbeat for 'hb-lane' (slot 0): disk full"
+        self.assertEqual(err.getvalue().count(line), 2)
+        self.assertEqual(sum(line in m for m in logs.output), 2)
+        with redirect_stdout(io.StringIO()):
+            self.assertTrue(manager.release("hb-lane", token="hb-token"))
+
+    def test_run_cli_accepts_heartbeat_stale_after(self):
+        """#315: `run` waits for the slot like `acquire`, so it takes the same hung-holder threshold."""
+        with mock.patch.object(BuildSlotManager, "run_command", return_value=0) as run_command:
+            ret = build_slot.main(
+                ["--run-dir", self.run_dir, "run", "cli-lane", "--heartbeat-stale-after", "42", "--", "echo", "x"]
+            )
+        self.assertEqual(ret, 0)
+        self.assertEqual(run_command.call_args.kwargs["heartbeat_stale_after"], 42.0)
+        self.assertEqual(run_command.call_args.kwargs["cmd"], ["echo", "x"])
 
     def test_heartbeat_rewrite_never_reads_as_corrupt(self):
         """
