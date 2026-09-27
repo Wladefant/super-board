@@ -120,12 +120,12 @@ class TestBuildSlot(unittest.TestCase):
         # Simulate a lock acquired by a dead process (PID 999999)
         os.makedirs(manager.lock_dir, exist_ok=True)
         dead_pid = 999999
-        now = time.time()
+        past_epoch = time.time() - 120.0
         info = {
             "owner": "dead-lane",
             "pid": dead_pid,
-            "acquired_at": datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat(),
-            "acquired_at_epoch": now,
+            "acquired_at": datetime.datetime.fromtimestamp(past_epoch, datetime.timezone.utc).isoformat(),
+            "acquired_at_epoch": past_epoch,
         }
         with open(manager.info_file, "w", encoding="utf-8") as f:
             json.dump(info, f)
@@ -968,6 +968,155 @@ class TestBuildSlot(unittest.TestCase):
 
         self.assertEqual(errors, [])
         self.assertEqual(counter, 4 * 3)
+
+    def test_stale_lock_dead_pid_within_grace_period_not_reclaimed(self):
+        """
+        When a lock was acquired recently (e.g. 0.5s ago) and the recorded PID dies
+        (e.g. short-lived CLI wrapper or subshell), check_stale_and_reclaim must NOT
+        reclaim the lock while it is within the 60s dead-PID grace period.
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        os.makedirs(manager.lock_dir, exist_ok=True)
+        dead_pid = 999999
+        self.assertFalse(is_pid_alive(dead_pid))
+        recent_epoch = time.time() - 0.5
+        info = {
+            "owner": "short-lived-cli-lane",
+            "pid": dead_pid,
+            "acquired_at": datetime.datetime.fromtimestamp(recent_epoch, datetime.timezone.utc).isoformat(),
+            "acquired_at_epoch": recent_epoch,
+        }
+        with open(manager.info_file, "w", encoding="utf-8") as f:
+            json.dump(info, f)
+
+        # check_stale_and_reclaim must NOT reclaim this lock
+        reclaimed = manager.check_stale_and_reclaim()
+        self.assertFalse(reclaimed)
+        self.assertTrue(os.path.isdir(manager.lock_dir))
+
+    def test_stale_lock_fresh_heartbeat_not_reclaimed(self):
+        """
+        If the owner PID is dead and lock age exceeds grace period, but the lock has
+        a fresh heartbeat (<60s), check_stale_and_reclaim must NOT reclaim it.
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        os.makedirs(manager.lock_dir, exist_ok=True)
+        dead_pid = 999999
+        self.assertFalse(is_pid_alive(dead_pid))
+        old_epoch = time.time() - 300.0
+        now = time.time()
+        info = {
+            "owner": "heartbeating-lane",
+            "pid": dead_pid,
+            "acquired_at": datetime.datetime.fromtimestamp(old_epoch, datetime.timezone.utc).isoformat(),
+            "acquired_at_epoch": old_epoch,
+            "heartbeat_at": datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat(),
+            "heartbeat_at_epoch": now,
+        }
+        with open(manager.info_file, "w", encoding="utf-8") as f:
+            json.dump(info, f)
+
+        reclaimed = manager.check_stale_and_reclaim()
+        self.assertFalse(reclaimed)
+        self.assertTrue(os.path.isdir(manager.lock_dir))
+
+        # But once heartbeat is older than 60s, it IS reclaimed
+        info["heartbeat_at_epoch"] = now - 120.0
+        with open(manager.info_file, "w", encoding="utf-8") as f:
+            json.dump(info, f)
+
+        reclaimed = manager.check_stale_and_reclaim()
+        self.assertTrue(reclaimed)
+        self.assertFalse(os.path.exists(manager.lock_dir))
+
+    def test_find_long_lived_owner_pid_returns_valid_pid(self):
+        """
+        find_long_lived_owner_pid must return a valid positive PID
+        (either veyyon process or parent process).
+        """
+        pid = build_slot.find_long_lived_owner_pid()
+        self.assertIsInstance(pid, int)
+        self.assertGreater(pid, 0)
+        self.assertTrue(is_pid_alive(pid))
+
+    def test_enqueue_priority_inserts_at_front(self):
+        manager = BuildSlotManager(run_dir=self.run_dir, is_pid_alive_fn=lambda p: True)
+        manager.enqueue("waiter-1", 1001, token="tok-1")
+        manager.enqueue("waiter-2", 1002, token="tok-2")
+        manager.enqueue("waiter-3", 1003, token="tok-3")
+
+        # waiter-4 is enqueued with priority=True -> must land at index 0
+        idx = manager.enqueue("waiter-4", 1004, token="tok-4", priority=True)
+        self.assertEqual(idx, 0)
+        queue = manager._read_queue()
+        self.assertEqual([x["name"] for x in queue], ["waiter-4", "waiter-1", "waiter-2", "waiter-3"])
+        self.assertTrue(queue[0].get("priority"))
+
+        # waiter-2 is re-enqueued with priority=True -> promoted to index 0
+        idx2 = manager.enqueue("waiter-2", 1002, token="tok-2", priority=True)
+        self.assertEqual(idx2, 0)
+        queue2 = manager._read_queue()
+        self.assertEqual([x["name"] for x in queue2], ["waiter-2", "waiter-4", "waiter-1", "waiter-3"])
+
+    def test_bump_moves_to_front(self):
+        manager = BuildSlotManager(run_dir=self.run_dir, is_pid_alive_fn=lambda p: True)
+        manager.enqueue("lane-A", 2001, token="tok-A")
+        manager.enqueue("lane-B", 2002, token="tok-B")
+        manager.enqueue("lane-C", 2003, token="tok-C")
+
+        # bump lane-C to front
+        ok = manager.bump("lane-C")
+        self.assertTrue(ok)
+        queue = manager._read_queue()
+        self.assertEqual([x["name"] for x in queue], ["lane-C", "lane-A", "lane-B"])
+        self.assertTrue(queue[0].get("priority"))
+
+        # bump non-existent lane returns False
+        self.assertFalse(manager.bump("lane-non-existent"))
+
+    def test_prep_cache_and_unprep_cache(self):
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        fake_worktree = os.path.join(self.run_dir, "fake-worktree")
+        os.makedirs(os.path.join(fake_worktree, "frontend", ".next"), exist_ok=True)
+
+        link_path = manager.prep_cache(fake_worktree)
+        self.assertTrue(os.path.exists(link_path))
+
+        # Write a dummy test file through the link
+        test_file = os.path.join(link_path, "test_cache_entry.txt")
+        with open(test_file, "w", encoding="utf-8") as f:
+            f.write("cached compilation artifact")
+
+        # Verify file exists in shared cache
+        shared_cache = os.path.join(self.run_dir, "next-cache")
+        shared_file = os.path.join(shared_cache, "test_cache_entry.txt")
+        self.assertTrue(os.path.isfile(shared_file))
+
+        # Unprep cache: removes junction without deleting shared cache contents
+        removed = manager.unprep_cache(fake_worktree)
+        self.assertTrue(removed)
+        self.assertFalse(os.path.exists(link_path))
+        # The file in shared cache MUST still exist!
+        self.assertTrue(os.path.isfile(shared_file))
+
+    def test_run_command_releases_lock(self):
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        ret = manager.run_command(
+            "run-lane",
+            [sys.executable, "-c", "import sys; sys.exit(0)"],
+        )
+        self.assertEqual(ret, 0)
+        # Lock must be released after command exits
+        stat = manager.status()
+        self.assertFalse(stat["lock"]["locked"])
+
+    def test_check_ram(self):
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        ok_high, _ = manager.check_ram(threshold=100.0)
+        self.assertTrue(ok_high)
+        ok_low, _ = manager.check_ram(threshold=0.0)
+        self.assertFalse(ok_low)
+
 
 if __name__ == "__main__":
     unittest.main()

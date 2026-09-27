@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -58,6 +59,7 @@ DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 10.0  # update queue entry heartbeat every 
 DEFAULT_QUEUE_STALE_HEARTBEAT_SECONDS = 60.0  # reclaim if heartbeat older than 60s
 DEFAULT_QUEUE_STALE_FALLBACK_SECONDS = 30 * 60  # 30 minutes fallback for legacy entries without heartbeat
 RAM_GUARD_THRESHOLD_PERCENT = 85.0
+DEFAULT_PID_DEAD_GRACE_PERIOD_SECONDS = 60.0  # never reclaim a dead-PID lock younger than 60s
 
 def get_system_ram_percent() -> Optional[float]:
     """
@@ -177,6 +179,68 @@ def _parse_timestamp(val: Any) -> Optional[float]:
         except Exception:
             pass
     return None
+def find_long_lived_owner_pid() -> int:
+    """
+    Finds the long-lived owner PID for lock attribution.
+    Prefers the ancestor veyyon process if running under veyyon,
+    falling back to os.getppid() or os.getpid().
+    """
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class PROCESSENTRY32(ctypes.Structure):
+                _fields_ = [
+                    ("dwSize", wintypes.DWORD),
+                    ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", wintypes.LONG),
+                    ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", ctypes.c_char * 260),
+                ]
+
+            k32 = ctypes.windll.kernel32
+            TH32CS_SNAPPROCESS = 0x00000002
+            h = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+            if h and h != -1:
+                pe = PROCESSENTRY32()
+                pe.dwSize = ctypes.sizeof(PROCESSENTRY32)
+                parents = {}
+                names = {}
+                if k32.Process32First(h, ctypes.byref(pe)):
+                    while True:
+                        pid = pe.th32ProcessID
+                        ppid = pe.th32ParentProcessID
+                        exe = pe.szExeFile.decode("latin-1", "ignore").lower()
+                        parents[pid] = ppid
+                        names[pid] = exe
+                        if not k32.Process32Next(h, ctypes.byref(pe)):
+                            break
+                k32.CloseHandle(h)
+
+                cur = os.getpid()
+                visited = set()
+                while cur in parents and cur not in visited and cur != 0:
+                    visited.add(cur)
+                    exe_name = names.get(cur, "")
+                    if "veyyon" in exe_name:
+                        return cur
+                    cur = parents[cur]
+        except Exception as e:
+            logger.debug("Failed to detect ancestor veyyon PID: %s", e)
+
+    try:
+        ppid = os.getppid()
+        if ppid > 0:
+            return ppid
+    except Exception:
+        pass
+    return os.getpid()
 
 
 def _read_queue_lock_info(queue_lock_dir: str) -> Optional[Dict[str, Any]]:
@@ -293,6 +357,58 @@ def _queue_atomic_lock(
                     pass
 
 
+def _create_dir_link(target: str, link_path: str) -> None:
+    """
+    Creates a directory link (junction on Windows, symlink on Unix).
+    On Windows, mklink /J creates an NTFS junction which does NOT require
+    administrator privileges or developer mode.
+    """
+    target = os.path.abspath(target)
+    link_path = os.path.abspath(link_path)
+    if sys.platform == "win32":
+        try:
+            cmd = ["cmd.exe", "/c", "mklink", "/J", link_path, target]
+            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            return
+        except Exception as e:
+            logger.debug("cmd.exe mklink /J failed: %s; trying os.symlink", e)
+        os.symlink(target, link_path, target_is_directory=True)
+    else:
+        os.symlink(target, link_path, target_is_directory=True)
+
+
+def _remove_dir_link(link_path: str) -> bool:
+    """
+    Safely removes a directory junction or symlink without deleting target contents.
+    On Windows, uses os.rmdir() or cmd /c rmdir without /s.
+    """
+    if not os.path.exists(link_path) and not os.path.islink(link_path):
+        return False
+    if sys.platform == "win32":
+        try:
+            os.rmdir(link_path)
+            return True
+        except Exception:
+            try:
+                cmd = ["cmd.exe", "/c", "rmdir", os.path.abspath(link_path)]
+                res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                return True
+            except Exception as e:
+                logger.warning("Failed to remove junction '%s': %s", link_path, e)
+                return False
+    else:
+        try:
+            if os.path.islink(link_path):
+                os.unlink(link_path)
+                return True
+            else:
+                os.rmdir(link_path)
+                return True
+        except Exception as e:
+            logger.warning("Failed to remove link '%s': %s", link_path, e)
+            return False
+
+
 class BuildSlotManager:
     """
     Manages the exclusive build slot with atomic directory locking,
@@ -305,6 +421,7 @@ class BuildSlotManager:
         is_pid_alive_fn=None,
         queue_stale_heartbeat_after: float = DEFAULT_QUEUE_STALE_HEARTBEAT_SECONDS,
         queue_stale_fallback_after: float = DEFAULT_QUEUE_STALE_FALLBACK_SECONDS,
+        pid_dead_grace_period: float = DEFAULT_PID_DEAD_GRACE_PERIOD_SECONDS,
     ):
         self.run_dir = os.path.abspath(run_dir or DEFAULT_RUN_DIR)
         self.lock_dir = os.path.join(self.run_dir, LOCK_DIR_NAME)
@@ -313,6 +430,11 @@ class BuildSlotManager:
         self.is_pid_alive = is_pid_alive_fn or is_pid_alive
         self.queue_stale_heartbeat_after = queue_stale_heartbeat_after
         self.queue_stale_fallback_after = queue_stale_fallback_after
+        self.pid_dead_grace_period = (
+            float(pid_dead_grace_period)
+            if pid_dead_grace_period is not None
+            else DEFAULT_PID_DEAD_GRACE_PERIOD_SECONDS
+        )
         os.makedirs(self.run_dir, exist_ok=True)
 
     def _read_lock_info(self) -> Optional[Dict[str, Any]]:
@@ -497,9 +619,11 @@ class BuildSlotManager:
         pid: int,
         token: Optional[str] = None,
         stale_heartbeat_after: Optional[float] = None,
+        priority: bool = False,
     ) -> int:
         """
         Adds (name, pid, token) to the queue if not already present.
+        If priority=True, puts entry at index 0 (or moves existing to index 0).
         Returns the 0-indexed position in queue.
         """
         hb_limit = stale_heartbeat_after if stale_heartbeat_after is not None else self.queue_stale_heartbeat_after
@@ -530,6 +654,13 @@ class BuildSlotManager:
                         valid_queue[legacy_idx]["heartbeat_at_iso"] = datetime.datetime.fromtimestamp(
                             now, datetime.timezone.utc
                         ).isoformat()
+                        if priority:
+                            valid_queue[legacy_idx]["priority"] = True
+                            if legacy_idx > 0:
+                                item = valid_queue.pop(legacy_idx)
+                                valid_queue.insert(0, item)
+                                self._write_queue(valid_queue)
+                                return 0
                         self._write_queue(valid_queue)
                         return legacy_idx
             else:
@@ -539,6 +670,13 @@ class BuildSlotManager:
                 )
 
             if existing_idx is not None:
+                if priority:
+                    valid_queue[existing_idx]["priority"] = True
+                    if existing_idx > 0:
+                        item = valid_queue.pop(existing_idx)
+                        valid_queue.insert(0, item)
+                        self._write_queue(valid_queue)
+                        return 0
                 if changed or len(valid_queue) != len(queue):
                     self._write_queue(valid_queue)
                 return existing_idx
@@ -553,9 +691,44 @@ class BuildSlotManager:
                 "heartbeat_at": now,
                 "heartbeat_at_iso": now_iso,
             }
-            valid_queue.append(entry)
-            self._write_queue(valid_queue)
-            return len(valid_queue) - 1
+            if priority:
+                entry["priority"] = True
+                valid_queue.insert(0, entry)
+                self._write_queue(valid_queue)
+                return 0
+            else:
+                valid_queue.append(entry)
+                self._write_queue(valid_queue)
+                return len(valid_queue) - 1
+
+    def bump(self, name: str, token: Optional[str] = None) -> bool:
+        """
+        Moves the entry for 'name' (and optional token) to the front of the queue
+        under the atomic queue lock.
+        Returns True if found and moved, False otherwise.
+        """
+        with _queue_atomic_lock(self.run_dir, is_pid_alive_fn=self.is_pid_alive):
+            queue = self._read_queue()
+            target_idx = None
+            for i, item in enumerate(queue):
+                if token is not None and item.get("token") == token:
+                    target_idx = i
+                    break
+                elif token is None and item.get("name") == name:
+                    target_idx = i
+                    break
+
+            if target_idx is None:
+                return False
+
+            item = queue.pop(target_idx)
+            item["priority"] = True
+            now = time.time()
+            item["heartbeat_at"] = now
+            item["heartbeat_at_iso"] = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat()
+            queue.insert(0, item)
+            self._write_queue(queue)
+            return True
 
     def dequeue(
         self,
@@ -623,64 +796,133 @@ class BuildSlotManager:
                 self._write_queue(queue)
             return updated
 
-    def check_stale_and_reclaim(self, stale_after: float = DEFAULT_STALE_AFTER_SECONDS) -> bool:
+    def heartbeat_lock(self, name: str, token: Optional[str] = None) -> bool:
+        """
+        Updates the heartbeat timestamp in info.json of the currently held lock
+        if the caller is the current owner.
+        """
+        info = self._read_lock_info()
+        if not info or info.get("owner") != name:
+            return False
+        if token and info.get("token") and info.get("token") != token:
+            return False
+        now = time.time()
+        now_iso = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat()
+        info["heartbeat_at"] = now_iso
+        info["heartbeat_at_epoch"] = now
+        try:
+            with open(self.info_file, "w", encoding="utf-8") as f:
+                json.dump(info, f, indent=2)
+            return True
+        except Exception:
+            return False
+
+    def check_stale_and_reclaim(
+        self,
+        stale_after: float = DEFAULT_STALE_AFTER_SECONDS,
+        pid_dead_grace_period: Optional[float] = None,
+    ) -> bool:
         """
         Checks if the currently held lock is stale.
         Reclaims it if:
-          1. Owner PID is dead.
-          2. Lock age exceeds stale_after seconds.
+          1. Owner PID is dead AND lock age exceeds grace period (and heartbeat not fresh).
+          2. Lock age exceeds stale_after seconds (and heartbeat not fresh).
           3. Corrupt lock directory older than 10s grace period.
         Returns True if a stale lock was reclaimed, False otherwise.
         """
-        if not os.path.isdir(self.lock_dir):
-            return False
+        try:
+            if not os.path.isdir(self.lock_dir):
+                return False
 
-        info = self._read_lock_info()
-        now = time.time()
-        is_stale = False
-        reason = ""
+            info = self._read_lock_info()
+            if info is None:
+                return False
 
-        if info is None or info.get("corrupt"):
-            mtime = os.path.getmtime(self.lock_dir) if os.path.exists(self.lock_dir) else now
-            age = now - mtime
-            if age > 10.0:  # grace period for mid-creation
-                is_stale = True
-                reason = f"corrupt or incomplete lock directory (age={age:.1f}s)"
-        else:
-            pid = info.get("pid", 0)
-            owner = info.get("owner", "unknown")
-            acquired_epoch = info.get("acquired_at_epoch")
-            if acquired_epoch is None:
+            now = time.time()
+            is_stale = False
+            reason = ""
+            effective_grace = (
+                pid_dead_grace_period
+                if pid_dead_grace_period is not None
+                else self.pid_dead_grace_period
+            )
+
+            if info.get("corrupt"):
                 try:
-                    iso_str = info.get("acquired_at", "")
-                    acquired_epoch = datetime.datetime.fromisoformat(iso_str).timestamp()
+                    mtime = os.path.getmtime(self.lock_dir)
+                except (FileNotFoundError, OSError):
+                    return False
+                age = now - mtime
+                if age > 10.0:  # grace period for mid-creation
+                    is_stale = True
+                    reason = f"corrupt or incomplete lock directory (age={age:.1f}s)"
+            else:
+                pid = info.get("pid", 0)
+                owner = info.get("owner", "unknown")
+                acquired_epoch = info.get("acquired_at_epoch")
+                if acquired_epoch is None:
+                    try:
+                        iso_str = info.get("acquired_at", "")
+                        acquired_epoch = datetime.datetime.fromisoformat(iso_str).timestamp()
+                    except Exception:
+                        acquired_epoch = now
+
+                age = max(0.0, now - acquired_epoch)
+
+                # Check heartbeat recency if available
+                hb_epoch = info.get("heartbeat_at_epoch")
+                if hb_epoch is None and info.get("heartbeat_at"):
+                    try:
+                        hb_epoch = datetime.datetime.fromisoformat(info["heartbeat_at"]).timestamp()
+                    except Exception:
+                        hb_epoch = None
+                hb_age = (now - hb_epoch) if hb_epoch is not None else None
+                is_hb_fresh = (hb_age is not None and hb_age < effective_grace)
+
+                if pid > 0 and not self.is_pid_alive(pid):
+                    # Never reclaim a lock younger than the grace period (e.g. 60s),
+                    # or whose heartbeat is fresh (< 60s).
+                    # The recorded PID may be a short-lived helper or wrapper process
+                    # that exited immediately after acquiring, while the actual lane is still running.
+                    if age < effective_grace or is_hb_fresh:
+                        logger.debug(
+                            "Owner PID %d is dead for owner '%s' but lock is protected by grace period "
+                            "(age=%.1fs < %.1fs, hb_fresh=%s); not reclaiming",
+                            pid, owner, age, effective_grace, is_hb_fresh,
+                        )
+                    else:
+                        is_stale = True
+                        reason = (
+                            f"owner PID {pid} is dead and lock age exceeds grace period "
+                            f"({age:.1f}s >= {effective_grace:.1f}s, owner='{owner}')"
+                        )
+                elif age >= stale_after:
+                    if is_hb_fresh and hb_age is not None and hb_age < effective_grace:
+                        pass
+                    else:
+                        is_stale = True
+                        reason = f"exceeded stale-after threshold ({age:.1f}s >= {stale_after:.1f}s, owner='{owner}', PID={pid})"
+
+            if is_stale:
+                notice = f"[NOTICE] Reclaiming stale build slot lock: {reason}"
+                print(notice, file=sys.stderr)
+                try:
+                    if os.path.isfile(self.info_file):
+                        os.unlink(self.info_file)
                 except Exception:
-                    acquired_epoch = now
+                    pass
+                try:
+                    shutil.rmtree(self.lock_dir, ignore_errors=True)
+                except Exception:
+                    pass
+                return True
 
-            age = max(0.0, now - acquired_epoch)
-
-            if pid > 0 and not self.is_pid_alive(pid):
-                is_stale = True
-                reason = f"owner PID {pid} is dead (owner='{owner}', age={age:.1f}s)"
-            elif age >= stale_after:
-                is_stale = True
-                reason = f"exceeded stale-after threshold ({age:.1f}s >= {stale_after:.1f}s, owner='{owner}', PID={pid})"
-
-        if is_stale:
-            notice = f"[NOTICE] Reclaiming stale build slot lock: {reason}"
-            print(notice, file=sys.stderr)
-            try:
-                if os.path.isfile(self.info_file):
-                    os.unlink(self.info_file)
-            except Exception:
-                pass
-            try:
-                shutil.rmtree(self.lock_dir, ignore_errors=True)
-            except Exception:
-                pass
-            return True
-
-        return False
+            return False
+        except (FileNotFoundError, OSError):
+            return False
+        except Exception as e:
+            logger.warning("Error checking stale lock: %s", e)
+            return False
 
     def acquire(
         self,
@@ -693,6 +935,7 @@ class BuildSlotManager:
         token: Optional[str] = None,
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
         queue_stale_heartbeat_after: Optional[float] = None,
+        priority: bool = False,
     ) -> bool:
         """
         Acquires the build slot lock for 'name'.
@@ -740,7 +983,7 @@ class BuildSlotManager:
 
         try:
             # 2. Register in FIFO Queue inside try so finally always cleans up
-            self.enqueue(name, pid, token=token, stale_heartbeat_after=effective_heartbeat_threshold)
+            self.enqueue(name, pid, token=token, stale_heartbeat_after=effective_heartbeat_threshold, priority=priority)
 
             while True:
                 # Update heartbeat first if due (every <= 15s)
@@ -757,12 +1000,15 @@ class BuildSlotManager:
                             print(notice, file=sys.stderr)
                             logger.warning(notice)
                             self.enqueue(
-                                name, pid, token=token, stale_heartbeat_after=effective_heartbeat_threshold
+                                name, pid, token=token, stale_heartbeat_after=effective_heartbeat_threshold, priority=priority
                             )
                     except TimeoutError as e:
                         logger.warning("Queue lock timeout during heartbeat for '%s': %s (will retry next tick)", name, e)
                 # Check and reclaim any stale lock
-                self.check_stale_and_reclaim(stale_after=stale_after)
+                try:
+                    self.check_stale_and_reclaim(stale_after=stale_after)
+                except Exception as e:
+                    logger.debug("Transient error checking stale lock for '%s': %s", name, e)
 
                 # Clean dead PIDs / stale heartbeats from queue
                 try:
@@ -952,6 +1198,7 @@ class BuildSlotManager:
                 "name": item.get("name"),
                 "pid": item.get("pid"),
                 "token": item.get("token"),
+                "priority": bool(item.get("priority", False)),
                 "enqueued_at": item.get("enqueued_at_iso"),
                 "wait_seconds": round(wait_time, 1),
                 "heartbeat_at": item.get("heartbeat_at_iso"),
@@ -972,6 +1219,103 @@ class BuildSlotManager:
             "lock_dir": self.lock_dir,
         }
         return result
+    def prep_cache(self, worktree: str, cache_dir: Optional[str] = None) -> str:
+        """
+        Links <worktree>/frontend/.next/cache to shared next-cache directory.
+        Returns the resolved link path.
+        """
+        worktree_abs = os.path.abspath(worktree)
+        shared_cache = os.path.abspath(cache_dir or os.path.join(self.run_dir, "next-cache"))
+        os.makedirs(shared_cache, exist_ok=True)
+
+        frontend_next = os.path.join(worktree_abs, "frontend", ".next")
+        os.makedirs(frontend_next, exist_ok=True)
+
+        link_path = os.path.join(frontend_next, "cache")
+        if os.path.exists(link_path) or os.path.islink(link_path):
+            try:
+                if os.path.samefile(link_path, shared_cache):
+                    logger.debug("Cache link already exists and points to shared cache: %s", link_path)
+                    return link_path
+            except Exception:
+                pass
+            _remove_dir_link(link_path)
+            if os.path.isdir(link_path) and not os.path.islink(link_path):
+                try:
+                    for item in os.listdir(link_path):
+                        s = os.path.join(link_path, item)
+                        d = os.path.join(shared_cache, item)
+                        if os.path.isdir(s):
+                            shutil.copytree(s, d, dirs_exist_ok=True)
+                        else:
+                            shutil.copy2(s, d)
+                except Exception as e:
+                    logger.debug("Error merging existing cache into shared cache: %s", e)
+                shutil.rmtree(link_path, ignore_errors=True)
+
+        _create_dir_link(shared_cache, link_path)
+        logger.info("Linked %s -> %s", link_path, shared_cache)
+        return link_path
+
+    def unprep_cache(self, worktree: str) -> bool:
+        """
+        Removes the frontend/.next/cache junction/link safely without deleting
+        the shared cache contents.
+        """
+        worktree_abs = os.path.abspath(worktree)
+        link_path = os.path.join(worktree_abs, "frontend", ".next", "cache")
+        return _remove_dir_link(link_path)
+
+    def check_ram(self, threshold: float = 90.0) -> Tuple[bool, Optional[float]]:
+        """
+        Checks if system RAM is below the threshold percentage.
+        Returns (is_under_threshold, current_ram_percent).
+        """
+        ram_pct = get_system_ram_percent()
+        if ram_pct is None:
+            return True, None
+        return (ram_pct < threshold), ram_pct
+
+    def run_command(
+        self,
+        name: str,
+        cmd: List[str],
+        timeout: Optional[float] = None,
+        priority: bool = False,
+        force: bool = False,
+        cwd: Optional[str] = None,
+        stale_after: float = DEFAULT_STALE_AFTER_SECONDS,
+        poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
+    ) -> int:
+        """
+        Executes a command under the exclusive build slot lock.
+        Holds the lock ONLY for the duration of the command, and guarantees
+        release upon command completion or failure.
+        Returns the command exit code, or 1 if lock could not be acquired.
+        """
+        caller_pid = find_long_lived_owner_pid()
+        acquired = self.acquire(
+            name=name,
+            timeout=timeout,
+            stale_after=stale_after,
+            poll_interval=poll_interval,
+            force=force,
+            pid=caller_pid,
+            priority=priority,
+        )
+        if not acquired:
+            print(f"[RUN] Failed to acquire build slot lock for '{name}'.", file=sys.stderr)
+            return 1
+
+        cmd_display = " ".join(cmd)
+        print(f"[RUN] Acquired build slot lock for '{name}'. Executing command: {cmd_display}", file=sys.stderr)
+        try:
+            res = subprocess.run(cmd, cwd=cwd, shell=(sys.platform == "win32"))
+            return res.returncode
+        finally:
+            print(f"[RUN] Releasing build slot lock for '{name}'...", file=sys.stderr)
+            self.release(name=name)
+
 
 
 def format_status_human(stat: Dict[str, Any]) -> str:
@@ -999,7 +1343,8 @@ def format_status_human(stat: Dict[str, Any]) -> str:
     for i, q in enumerate(queue):
         hb_age = q.get("heartbeat_age_seconds")
         hb_str = f", hb: {hb_age:.1f}s ago" if hb_age is not None else ""
-        lines.append(f"  [{i + 1}] {q.get('name')} (PID {q.get('pid')}, waiting {q.get('wait_seconds', 0):.1f}s{hb_str})")
+        prio_str = " [PRIORITY]" if q.get("priority") else ""
+        lines.append(f"  [{i + 1}] {q.get('name')} (PID {q.get('pid')}, waiting {q.get('wait_seconds', 0):.1f}s{hb_str}){prio_str}")
     return "\n".join(lines)
 
 
@@ -1042,6 +1387,42 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Bypass the RAM guard (proceed even if system RAM >= 85%%)",
     )
+    p_acq.add_argument(
+        "--priority",
+        action="store_true",
+        help="Enqueue at front of queue (or bump to front if already queued)",
+    )
+
+    # bump <name> [--token TOKEN]
+    p_bump = subparsers.add_parser("bump", help="Move a queued lane to the front of the FIFO queue")
+    p_bump.add_argument("name", help="Lane or worker identifier to move to the front of the queue")
+    p_bump.add_argument("--token", default=None, help="Optional token matching the queued entry")
+
+    # prep-cache <worktree> [--cache-dir DIR]
+    p_cache = subparsers.add_parser("prep-cache", help="Link worktree frontend/.next/cache to shared next-cache directory")
+    p_cache.add_argument("worktree", help="Path to worktree root directory")
+    p_cache.add_argument("--cache-dir", default=None, help="Path to shared cache directory (default: <run-dir>/next-cache)")
+
+    # unprep-cache <worktree>
+    p_uncache = subparsers.add_parser("unprep-cache", help="Remove frontend/.next/cache junction without deleting shared cache contents")
+    p_uncache.add_argument("worktree", help="Path to worktree root directory")
+
+    # check-ram [--threshold PERCENT]
+    p_ram = subparsers.add_parser("check-ram", help="Check system RAM percentage against threshold (default: 90%)")
+    p_ram.add_argument("--threshold", type=float, default=90.0, help="RAM percentage threshold (default: 90.0)")
+    p_ram.add_argument("--json", action="store_true", help="Output RAM status as JSON")
+
+    # run <name> [--timeout SEC] [--priority] [--force] [--cwd DIR] -- <cmd...>
+    p_run = subparsers.add_parser(
+        "run",
+        help="Run a build command under the build slot lock, automatically releasing on exit",
+    )
+    p_run.add_argument("name", help="Lane or worker identifier requesting the slot")
+    p_run.add_argument("--timeout", type=float, default=None, help="Maximum seconds to wait to acquire slot")
+    p_run.add_argument("--priority", action="store_true", help="Enqueue with priority at front of queue")
+    p_run.add_argument("--force", action="store_true", help="Bypass RAM guard during acquisition")
+    p_run.add_argument("--cwd", default=None, help="Working directory to execute command in (default: current directory)")
+    p_run.add_argument("cmd", nargs=argparse.REMAINDER, help="Command and arguments to execute under the lock (use -- before command)")
 
     # release <name>
     p_rel = subparsers.add_parser("release", help="Release build slot lock (refused if not owner)")
@@ -1073,11 +1454,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "acquire":
         caller_pid = args.pid
         if caller_pid is None:
-            try:
-                ppid = os.getppid()
-                caller_pid = ppid if ppid > 0 else os.getpid()
-            except Exception:
-                caller_pid = os.getpid()
+            caller_pid = find_long_lived_owner_pid()
         success = manager.acquire(
             name=args.name,
             timeout=args.timeout,
@@ -1086,6 +1463,66 @@ def main(argv: Optional[List[str]] = None) -> int:
             force=args.force,
             pid=caller_pid,
             token=args.token,
+            priority=args.priority,
+        )
+        return 0 if success else 1
+
+    elif args.command == "bump":
+        success = manager.bump(name=args.name, token=args.token)
+        if success:
+            print(f"[BUMP] Successfully moved '{args.name}' to front of build slot queue.", file=sys.stderr)
+            return 0
+        else:
+            print(f"[BUMP] Entry '{args.name}' not found in build slot queue.", file=sys.stderr)
+            return 1
+
+    elif args.command == "prep-cache":
+        try:
+            link = manager.prep_cache(worktree=args.worktree, cache_dir=args.cache_dir)
+            print(f"[PREP-CACHE] Linked {link} -> shared next-cache")
+            return 0
+        except Exception as e:
+            print(f"[ERROR] Failed to prep-cache for '{args.worktree}': {e}", file=sys.stderr)
+            return 1
+
+    elif args.command == "unprep-cache":
+        try:
+            ok = manager.unprep_cache(worktree=args.worktree)
+            if ok:
+                print(f"[UNPREP-CACHE] Removed cache junction for '{args.worktree}'")
+            else:
+                print(f"[UNPREP-CACHE] No cache junction found for '{args.worktree}'")
+            return 0
+        except Exception as e:
+            print(f"[ERROR] Failed to unprep-cache for '{args.worktree}': {e}", file=sys.stderr)
+            return 1
+
+    elif args.command == "check-ram":
+        ok, ram_pct = manager.check_ram(threshold=args.threshold)
+        ram_str = f"{ram_pct:.1f}%" if ram_pct is not None else "unavailable"
+        if args.json:
+            print(json.dumps({"ok": ok, "ram_percent": ram_pct, "threshold": args.threshold}, indent=2))
+        else:
+            if ok:
+                print(f"[OK] System RAM is {ram_str} (under {args.threshold:.1f}% limit). Safe to proceed.")
+            else:
+                print(f"[WARNING] System RAM is {ram_str} (>= {args.threshold:.1f}% limit). Hold parallel startup.", file=sys.stderr)
+        return 0 if ok else 1
+
+    elif args.command == "run":
+        cmd = args.cmd
+        if cmd and cmd[0] == "--":
+            cmd = cmd[1:]
+        if not cmd:
+            print("[ERROR] No command specified to run under build slot lock. Usage: build_slot.py run <name> -- <cmd...>", file=sys.stderr)
+            return 1
+        return manager.run_command(
+            name=args.name,
+            cmd=cmd,
+            timeout=args.timeout,
+            priority=args.priority,
+            force=args.force,
+            cwd=args.cwd,
         )
         return 0 if success else 1
 
