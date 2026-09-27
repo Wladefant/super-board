@@ -1129,5 +1129,119 @@ class TestBuildSlot(unittest.TestCase):
         self.assertIn("Check system RAM percentage against threshold", proc.stdout)
 
 
+    def test_write_queue_retries_on_permission_error_and_succeeds(self):
+        """
+        _write_queue must retry when os.replace raises PermissionError (WinError 5 or 32)
+        and succeed when the file handle is released.
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        real_replace = os.replace
+        replace_attempts = 0
+
+        def flaky_replace(src, dst):
+            nonlocal replace_attempts
+            replace_attempts += 1
+            if replace_attempts <= 2:
+                err = PermissionError(13, "Access is denied")
+                err.winerror = 5
+                raise err
+            return real_replace(src, dst)
+
+        with mock.patch("os.replace", side_effect=flaky_replace):
+            manager._write_queue([{"name": "lane-1", "pid": 1234}])
+
+        self.assertGreaterEqual(replace_attempts, 3)
+        read_back = manager._read_queue()
+        self.assertEqual(len(read_back), 1)
+        self.assertEqual(read_back[0]["name"], "lane-1")
+
+    def test_write_queue_cleans_up_temp_file_on_complete_failure(self):
+        """
+        _write_queue must clean up the temporary file when all retries fail.
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir)
+
+        def failing_replace(src, dst):
+            err = PermissionError(13, "Sharing violation")
+            err.winerror = 32
+            raise err
+
+        with mock.patch("time.sleep", return_value=None):
+            with mock.patch("os.replace", side_effect=failing_replace):
+                with self.assertRaises(PermissionError):
+                    manager._write_queue([{"name": "lane-fail", "pid": 1234}])
+
+        # Verify no temporary files remain in run_dir
+        tmp_files = [f for f in os.listdir(self.run_dir) if f.startswith("queue-") and f.endswith(".tmp")]
+        self.assertEqual(tmp_files, [])
+
+    def test_heartbeat_survives_queue_write_error(self):
+        """
+        A failed write during heartbeat must log a warning and return False,
+        never raising an unhandled exception.
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        manager.enqueue("lane-hb-write", 5555)
+
+        with mock.patch.object(manager, "_write_queue", side_effect=PermissionError(13, "Access is denied")):
+            ok = manager.heartbeat(name="lane-hb-write", pid=5555)
+            self.assertFalse(ok)
+
+    def test_clean_queue_survives_queue_write_error(self):
+        """
+        clean_queue must log a warning and return the cleaned queue if _write_queue fails,
+        without raising out.
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        manager.enqueue("lane-stale", 999999, stale_heartbeat_after=0.01)
+        time.sleep(0.02)
+
+        with mock.patch.object(manager, "_write_queue", side_effect=PermissionError(13, "Access is denied")):
+            cleaned = manager.clean_queue(stale_heartbeat_after=0.01)
+            self.assertIsInstance(cleaned, list)
+
+    def test_check_stale_and_reclaim_dead_child_pid(self):
+        """
+        check_stale_and_reclaim must reclaim the lock immediately if the wrapped
+        child process PID is dead, even if the owner process was veyyon host.
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        # Create lock directory and info with dead child PID
+        os.mkdir(manager.lock_dir)
+        info = {
+            "owner": "test-lane",
+            "pid": os.getpid(),  # Live runner PID
+            "child_pid": 99999999,  # Dead child PID
+            "acquired_at": "2026-09-27T00:00:00Z",
+            "acquired_at_epoch": time.time() - 10.0,
+            "heartbeat_at": "2026-09-27T00:00:00Z",
+            "heartbeat_at_epoch": time.time() - 5.0,
+        }
+        with open(manager.info_file, "w", encoding="utf-8") as f:
+            json.dump(info, f)
+
+        # Mock is_pid_alive so 99999999 is dead, os.getpid() is alive
+        def fake_is_alive(pid):
+            return pid == os.getpid()
+
+        manager.is_pid_alive = fake_is_alive
+        reclaimed = manager.check_stale_and_reclaim()
+        self.assertTrue(reclaimed)
+        self.assertFalse(os.path.isdir(manager.lock_dir))
+
+    def test_run_command_records_child_pid_and_token(self):
+        """
+        run_command executes child under lock, records child_pid and run_token,
+        and releases the lock on completion.
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        ret = manager.run_command(
+            "child-test-lane",
+            [sys.executable, "-c", "import sys, time; time.sleep(0.05); sys.exit(0)"],
+        )
+        self.assertEqual(ret, 0)
+        stat = manager.status()
+        self.assertFalse(stat["lock"]["locked"])
+
 if __name__ == "__main__":
     unittest.main()

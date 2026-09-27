@@ -40,6 +40,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
@@ -60,6 +61,7 @@ DEFAULT_QUEUE_STALE_HEARTBEAT_SECONDS = 60.0  # reclaim if heartbeat older than 
 DEFAULT_QUEUE_STALE_FALLBACK_SECONDS = 30 * 60  # 30 minutes fallback for legacy entries without heartbeat
 RAM_GUARD_THRESHOLD_PERCENT = 85.0
 DEFAULT_PID_DEAD_GRACE_PERIOD_SECONDS = 60.0  # never reclaim a dead-PID lock younger than 60s
+DEFAULT_LOCK_STALE_HEARTBEAT_SECONDS = 90.0  # reclaim lock if heartbeat older than 90s
 
 def get_system_ram_percent() -> Optional[float]:
     """
@@ -181,10 +183,12 @@ def _parse_timestamp(val: Any) -> Optional[float]:
     return None
 def find_long_lived_owner_pid() -> int:
     """
-    Finds the long-lived owner PID for lock attribution.
-    Prefers the ancestor veyyon process if running under veyyon,
-    falling back to os.getppid() or os.getpid().
+    Finds the owner PID for lock attribution.
+    Prefers the runner/caller process, explicitly excluding the perpetual
+    veyyon host orchestrator PID so that dead-PID reclamation can detect
+    when a lane process has exited or timed out.
     """
+    cur_pid = os.getpid()
     if sys.platform == "win32":
         try:
             import ctypes
@@ -223,16 +227,20 @@ def find_long_lived_owner_pid() -> int:
                             break
                 k32.CloseHandle(h)
 
-                cur = os.getpid()
+                # Climb up ancestors, but stop BEFORE veyyon host
+                cur = cur_pid
+                candidate = cur_pid
                 visited = set()
                 while cur in parents and cur not in visited and cur != 0:
                     visited.add(cur)
                     exe_name = names.get(cur, "")
                     if "veyyon" in exe_name:
-                        return cur
+                        break
+                    candidate = cur
                     cur = parents[cur]
+                return candidate
         except Exception as e:
-            logger.debug("Failed to detect ancestor veyyon PID: %s", e)
+            logger.debug("Failed in find_long_lived_owner_pid: %s", e)
 
     try:
         ppid = os.getppid()
@@ -240,7 +248,7 @@ def find_long_lived_owner_pid() -> int:
             return ppid
     except Exception:
         pass
-    return os.getpid()
+    return cur_pid
 
 
 def _read_queue_lock_info(queue_lock_dir: str) -> Optional[Dict[str, Any]]:
@@ -422,6 +430,7 @@ class BuildSlotManager:
         queue_stale_heartbeat_after: float = DEFAULT_QUEUE_STALE_HEARTBEAT_SECONDS,
         queue_stale_fallback_after: float = DEFAULT_QUEUE_STALE_FALLBACK_SECONDS,
         pid_dead_grace_period: float = DEFAULT_PID_DEAD_GRACE_PERIOD_SECONDS,
+        lock_stale_heartbeat_after: float = DEFAULT_LOCK_STALE_HEARTBEAT_SECONDS,
     ):
         self.run_dir = os.path.abspath(run_dir or DEFAULT_RUN_DIR)
         self.lock_dir = os.path.join(self.run_dir, LOCK_DIR_NAME)
@@ -434,6 +443,11 @@ class BuildSlotManager:
             float(pid_dead_grace_period)
             if pid_dead_grace_period is not None
             else DEFAULT_PID_DEAD_GRACE_PERIOD_SECONDS
+        )
+        self.lock_stale_heartbeat_after = (
+            float(lock_stale_heartbeat_after)
+            if lock_stale_heartbeat_after is not None
+            else DEFAULT_LOCK_STALE_HEARTBEAT_SECONDS
         )
         os.makedirs(self.run_dir, exist_ok=True)
 
@@ -489,16 +503,34 @@ class BuildSlotManager:
             json.dump(info, f, indent=2)
 
     def _read_queue(self) -> List[Dict[str, Any]]:
-        """Reads queue list safely without lock."""
+        """Reads queue list safely with retries for transient Windows locks."""
         if not os.path.isfile(self.queue_file):
             return []
-        try:
-            with open(self.queue_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                return data
-        except Exception:
-            pass
+        delays = [0.02, 0.05, 0.1, 0.15, 0.2]
+        for attempt in range(len(delays)):
+            try:
+                with open(self.queue_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    return data
+                return []
+            except (PermissionError, OSError) as e:
+                winerror = getattr(e, "winerror", None)
+                if isinstance(e, PermissionError) or winerror in (5, 32):
+                    if attempt < len(delays) - 1:
+                        time.sleep(delays[attempt])
+                        continue
+                logger.warning("Failed to read queue file '%s': %s", self.queue_file, e)
+                return []
+            except json.JSONDecodeError:
+                if attempt < len(delays) - 1:
+                    time.sleep(delays[attempt])
+                    continue
+                logger.warning("Corrupt JSON in queue file '%s'", self.queue_file)
+                return []
+            except Exception as e:
+                logger.warning("Unexpected error reading queue file '%s': %s", self.queue_file, e)
+                return []
         return []
 
     def _write_queue(self, queue: List[Dict[str, Any]]) -> None:
@@ -509,24 +541,32 @@ class BuildSlotManager:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(queue, f, indent=2)
             # On Windows, os.replace can transiently raise PermissionError if another handle is open
+            # (WinError 5: Access is denied, or WinError 32: Sharing violation).
+            # Retry with bounded backoff (10 tries over ~2.0s).
+            delays = [0.05, 0.1, 0.15, 0.2, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25]
+            max_retries = len(delays)
             last_err = None
-            for _ in range(10):
+            for attempt in range(max_retries):
                 try:
                     os.replace(temp_path, self.queue_file)
                     last_err = None
                     break
                 except (PermissionError, OSError) as e:
-                    last_err = e
-                    time.sleep(0.01)
+                    winerror = getattr(e, "winerror", None)
+                    if isinstance(e, PermissionError) or winerror in (5, 32):
+                        last_err = e
+                        if attempt < max_retries - 1:
+                            time.sleep(delays[attempt])
+                        continue
+                    raise
             if last_err is not None:
                 raise last_err
-        except Exception:
+        finally:
             if os.path.exists(temp_path):
                 try:
                     os.unlink(temp_path)
                 except Exception:
                     pass
-            raise
 
     def _is_entry_stale(
         self,
@@ -540,9 +580,14 @@ class BuildSlotManager:
         Rule: removed when its PID is dead OR heartbeat_at is older than 60s
         (entries without heartbeat_at from older versions: fall back to enqueued_at age > 30 min).
         """
+        hb_val = item.get("heartbeat_at")
+        hb_epoch = _parse_timestamp(hb_val) if hb_val is not None else None
+        is_hb_fresh = (hb_epoch is not None and (now - hb_epoch) < stale_heartbeat_after)
+
         pid = item.get("pid", 0)
         if pid > 0 and not self.is_pid_alive(pid):
-            return True, f"PID {pid} is dead"
+            if not is_hb_fresh:
+                return True, f"PID {pid} is dead"
 
         hb_val = item.get("heartbeat_at")
         if hb_val is not None:
@@ -610,7 +655,10 @@ class BuildSlotManager:
             queue = self._read_queue()
             new_queue, changed = self._clean_queue_locked(queue, time.time(), hb_limit, fb_limit)
             if changed:
-                self._write_queue(new_queue)
+                try:
+                    self._write_queue(new_queue)
+                except Exception as e:
+                    logger.warning("Failed to write queue in clean_queue: %s (will retry next tick)", e)
             return new_queue
 
     def enqueue(
@@ -765,36 +813,77 @@ class BuildSlotManager:
         Updates the heartbeat_at timestamp for the queue entry identified by token
         (or name + pid if token is not provided/matched).
         Returns True if an entry was found and updated, False otherwise.
+        Never raises out on queue lock timeout or write error.
         """
         if token is None and name is None:
             return False
 
-        with _queue_atomic_lock(self.run_dir, is_pid_alive_fn=self.is_pid_alive):
-            queue = self._read_queue()
-            now = time.time()
-            now_iso = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat()
-            updated = False
-            for item in queue:
-                matched = False
-                if token is not None and item.get("token") == token:
-                    matched = True
-                elif token is not None and not item.get("token") and name is not None and item.get("name") == name:
-                    if pid is None or item.get("pid") == pid:
+        try:
+            with _queue_atomic_lock(self.run_dir, is_pid_alive_fn=self.is_pid_alive):
+                queue = self._read_queue()
+                now = time.time()
+                now_iso = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat()
+                updated = False
+                for item in queue:
+                    matched = False
+                    if token is not None and item.get("token") == token:
                         matched = True
-                        item["token"] = token
-                elif token is None and name is not None and item.get("name") == name:
-                    if pid is None or item.get("pid") == pid:
-                        matched = True
+                    elif token is not None and not item.get("token") and name is not None and item.get("name") == name:
+                        if pid is None or item.get("pid") == pid:
+                            matched = True
+                            item["token"] = token
+                    elif token is None and name is not None and item.get("name") == name:
+                        if pid is None or item.get("pid") == pid:
+                            matched = True
 
-                if matched:
-                    item["heartbeat_at"] = now
-                    item["heartbeat_at_iso"] = now_iso
-                    updated = True
-                    break
+                    if matched:
+                        item["heartbeat_at"] = now
+                        item["heartbeat_at_iso"] = now_iso
+                        updated = True
+                        break
 
-            if updated:
-                self._write_queue(queue)
-            return updated
+                if updated:
+                    try:
+                        self._write_queue(queue)
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to write queue during heartbeat for '%s' (token=%s, PID=%s): %s (will retry next tick)",
+                            name, token, pid, e,
+                        )
+                        return False
+                return updated
+        except TimeoutError as e:
+            logger.warning("Queue lock timeout during heartbeat for '%s': %s (will retry next tick)", name, e)
+            return False
+        except Exception as e:
+            logger.warning("Queue heartbeat failed for '%s': %s (will retry next tick)", name, e)
+            return False
+
+    def _update_lock_child(self, name: str, child_pid: int, token: Optional[str] = None) -> bool:
+        """
+        Updates the lock info file with the wrapped child PID and current heartbeat.
+        Enables dead-PID reclamation when the child process exits or times out.
+        """
+        info = self._read_lock_info()
+        if not info or info.get("owner") != name:
+            return False
+        if token and info.get("token") and info.get("token") != token:
+            return False
+        now = time.time()
+        now_iso = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat()
+        info["child_pid"] = child_pid
+        info["pid"] = child_pid
+        if token:
+            info["token"] = token
+            info["run_token"] = token
+        info["heartbeat_at"] = now_iso
+        info["heartbeat_at_epoch"] = now
+        try:
+            with open(self.info_file, "w", encoding="utf-8") as f:
+                json.dump(info, f, indent=2)
+            return True
+        except Exception:
+            return False
 
     def heartbeat_lock(self, name: str, token: Optional[str] = None) -> bool:
         """
@@ -821,13 +910,16 @@ class BuildSlotManager:
         self,
         stale_after: float = DEFAULT_STALE_AFTER_SECONDS,
         pid_dead_grace_period: Optional[float] = None,
+        stale_heartbeat_after: Optional[float] = None,
     ) -> bool:
         """
         Checks if the currently held lock is stale.
         Reclaims it if:
-          1. Owner PID is dead AND lock age exceeds grace period (and heartbeat not fresh).
-          2. Lock age exceeds stale_after seconds (and heartbeat not fresh).
-          3. Corrupt lock directory older than 10s grace period.
+          1. Wrapped child PID is dead (immediate reclaim for orphaned run commands).
+          2. Lock heartbeat goes stale (>=90s without heartbeat update).
+          3. Owner PID is dead AND lock age exceeds grace period (and heartbeat not fresh).
+          4. Lock age exceeds stale_after seconds (and heartbeat not fresh).
+          5. Corrupt lock directory older than 10s grace period.
         Returns True if a stale lock was reclaimed, False otherwise.
         """
         try:
@@ -846,6 +938,11 @@ class BuildSlotManager:
                 if pid_dead_grace_period is not None
                 else self.pid_dead_grace_period
             )
+            effective_hb_stale = (
+                stale_heartbeat_after
+                if stale_heartbeat_after is not None
+                else self.lock_stale_heartbeat_after
+            )
 
             if info.get("corrupt"):
                 try:
@@ -858,6 +955,7 @@ class BuildSlotManager:
                     reason = f"corrupt or incomplete lock directory (age={age:.1f}s)"
             else:
                 pid = info.get("pid", 0)
+                child_pid = info.get("child_pid")
                 owner = info.get("owner", "unknown")
                 acquired_epoch = info.get("acquired_at_epoch")
                 if acquired_epoch is None:
@@ -878,12 +976,17 @@ class BuildSlotManager:
                         hb_epoch = None
                 hb_age = (now - hb_epoch) if hb_epoch is not None else None
                 is_hb_fresh = (hb_age is not None and hb_age < effective_grace)
-
-                if pid > 0 and not self.is_pid_alive(pid):
+                if child_pid is not None and child_pid > 0 and not self.is_pid_alive(child_pid):
+                    # Wrapped child process is dead! Immediate reclaim for orphaned run commands.
+                    is_stale = True
+                    reason = f"wrapped child PID {child_pid} is dead (owner='{owner}')"
+                elif hb_age is not None and hb_age >= effective_hb_stale:
+                    # Heartbeat went stale (default 90s)
+                    is_stale = True
+                    reason = f"lock heartbeat went stale ({hb_age:.1f}s >= {effective_hb_stale:.1f}s, owner='{owner}', PID={pid})"
+                elif pid > 0 and not self.is_pid_alive(pid):
                     # Never reclaim a lock younger than the grace period (e.g. 60s),
                     # or whose heartbeat is fresh (< 60s).
-                    # The recorded PID may be a short-lived helper or wrapper process
-                    # that exited immediately after acquiring, while the actual lane is still running.
                     if age < effective_grace or is_hb_fresh:
                         logger.debug(
                             "Owner PID %d is dead for owner '%s' but lock is protected by grace period "
@@ -902,7 +1005,6 @@ class BuildSlotManager:
                     else:
                         is_stale = True
                         reason = f"exceeded stale-after threshold ({age:.1f}s >= {stale_after:.1f}s, owner='{owner}', PID={pid})"
-
             if is_stale:
                 notice = f"[NOTICE] Reclaiming stale build slot lock: {reason}"
                 print(notice, file=sys.stderr)
@@ -991,19 +1093,35 @@ class BuildSlotManager:
                 if now - last_heartbeat >= heartbeat_interval:
                     try:
                         hb_ok = self.heartbeat(token=token, name=name, pid=pid)
-                        last_heartbeat = now
-                        if not hb_ok:
-                            notice = (
-                                f"[NOTICE] Queue entry for '{name}' (PID {pid}, token {token}) "
-                                f"was missing during heartbeat; re-enqueuing."
+                        if hb_ok:
+                            last_heartbeat = now
+                        else:
+                            # Verify if the entry is ACTUALLY missing from the queue before logging and re-enqueuing
+                            queue_snapshot = self._read_queue()
+                            is_in_queue = any(
+                                (token and item.get("token") == token)
+                                or (not token and item.get("name") == name and (pid is None or item.get("pid") == pid))
+                                for item in queue_snapshot
                             )
-                            print(notice, file=sys.stderr)
-                            logger.warning(notice)
-                            self.enqueue(
-                                name, pid, token=token, stale_heartbeat_after=effective_heartbeat_threshold, priority=priority
-                            )
-                    except TimeoutError as e:
-                        logger.warning("Queue lock timeout during heartbeat for '%s': %s (will retry next tick)", name, e)
+                            if not is_in_queue:
+                                notice = (
+                                    f"[NOTICE] Queue entry for '{name}' (PID {pid}, token {token}) "
+                                    f"was missing during heartbeat; re-enqueuing."
+                                )
+                                print(notice, file=sys.stderr)
+                                logger.warning(notice)
+                                self.enqueue(
+                                    name, pid, token=token, stale_heartbeat_after=effective_heartbeat_threshold, priority=priority
+                                )
+                                last_heartbeat = now
+                            else:
+                                logger.warning(
+                                    "Heartbeat write not persisted for '%s', but entry is still present; will retry next tick",
+                                    name,
+                                )
+                    except Exception as e:
+                        logger.warning("Queue heartbeat error for '%s': %s (will retry next tick)", name, e)
+
                 # Check and reclaim any stale lock
                 try:
                     self.check_stale_and_reclaim(stale_after=stale_after)
@@ -1013,9 +1131,8 @@ class BuildSlotManager:
                 # Clean dead PIDs / stale heartbeats from queue
                 try:
                     queue = self.clean_queue(stale_heartbeat_after=effective_heartbeat_threshold)
-                except TimeoutError as e:
-                    logger.warning("Queue lock timeout during clean_queue for '%s': %s (will retry next tick)", name, e)
-                    # Check overall timeout before sleeping
+                except (TimeoutError, PermissionError, OSError) as e:
+                    logger.warning("Queue error during clean_queue for '%s': %s (will retry next tick)", name, e)
                     if timeout is not None:
                         elapsed = time.time() - start_time
                         if elapsed >= timeout:
@@ -1023,6 +1140,10 @@ class BuildSlotManager:
                             print(msg, file=sys.stderr)
                             logger.error(msg)
                             return False
+                    time.sleep(min(poll_interval, heartbeat_interval))
+                    continue
+                except Exception as e:
+                    logger.warning("Unexpected error during clean_queue for '%s': %s (will retry next tick)", name, e)
                     time.sleep(min(poll_interval, heartbeat_interval))
                     continue
 
@@ -1099,7 +1220,7 @@ class BuildSlotManager:
             return False
         return True
 
-    def release(self, name: str) -> bool:
+    def release(self, name: str, token: Optional[str] = None) -> bool:
         """
         Releases the build slot lock.
         Refuses if the lock is held by a different owner.
@@ -1107,7 +1228,7 @@ class BuildSlotManager:
         """
         if not os.path.isdir(self.lock_dir):
             # Already free; remove name from queue if lingering
-            self.dequeue(name)
+            self.dequeue(name, token=token)
             msg = f"Build slot lock is already free (release called for '{name}')"
             print(msg)
             return True
@@ -1120,6 +1241,15 @@ class BuildSlotManager:
             msg = (
                 f"ERROR: Refusing to release build slot lock: currently held by "
                 f"'{current_owner}' (PID {current_pid}), not '{name}'."
+            )
+            print(msg, file=sys.stderr)
+            logger.error(msg)
+            return False
+
+        if token is not None and info and info.get("token") and info.get("token") != token:
+            msg = (
+                f"ERROR: Refusing to release build slot lock: token mismatch for "
+                f"'{name}' (held token '{info.get('token')}', release requested for '{token}')."
             )
             print(msg, file=sys.stderr)
             logger.error(msg)
@@ -1138,7 +1268,7 @@ class BuildSlotManager:
             # Fallback in case non-empty
             shutil.rmtree(self.lock_dir, ignore_errors=True)
 
-        self.dequeue(name)
+        self.dequeue(name, token=token)
         msg = f"Released build slot lock for '{name}'"
         print(msg)
         logger.info(msg)
@@ -1291,31 +1421,69 @@ class BuildSlotManager:
         Executes a command under the exclusive build slot lock.
         Holds the lock ONLY for the duration of the command, and guarantees
         release upon command completion or failure.
+        Stores the wrapped child's PID, a per-run token, and maintains a heartbeat.
+        Reclaims the lock when the heartbeat goes stale (>=90s) or when child PID is dead.
         Returns the command exit code, or 1 if lock could not be acquired.
         """
-        caller_pid = find_long_lived_owner_pid()
-        acquired = self.acquire(
-            name=name,
-            timeout=timeout,
-            stale_after=stale_after,
-            poll_interval=poll_interval,
-            force=force,
-            pid=caller_pid,
-            priority=priority,
-        )
+        run_token = str(uuid.uuid4())
+        runner_pid = os.getpid()
+
+        try:
+            acquired = self.acquire(
+                name=name,
+                timeout=timeout,
+                stale_after=stale_after,
+                poll_interval=poll_interval,
+                force=force,
+                pid=runner_pid,
+                token=run_token,
+                priority=priority,
+            )
+        except Exception as e:
+            print(f"[RUN] Failed to acquire build slot lock for '{name}': {e}", file=sys.stderr)
+            logger.error("Failed to acquire build slot lock for '%s': %s", name, e)
+            return 1
+
         if not acquired:
             print(f"[RUN] Failed to acquire build slot lock for '{name}'.", file=sys.stderr)
             return 1
 
         cmd_display = " ".join(cmd)
         print(f"[RUN] Acquired build slot lock for '{name}'. Executing command: {cmd_display}", file=sys.stderr)
-        try:
-            res = subprocess.run(cmd, cwd=cwd, shell=(sys.platform == "win32"))
-            return res.returncode
-        finally:
-            print(f"[RUN] Releasing build slot lock for '{name}'...", file=sys.stderr)
-            self.release(name=name)
 
+        stop_heartbeat = threading.Event()
+        proc = None
+        try:
+            proc = subprocess.Popen(cmd, cwd=cwd, shell=(sys.platform == "win32"))
+            child_pid = proc.pid
+
+            # Store the wrapped child PID and initial heartbeat in lock info
+            self._update_lock_child(name=name, child_pid=child_pid, token=run_token)
+
+            # Start background heartbeat while child runs
+            def _heartbeat_worker():
+                while not stop_heartbeat.wait(5.0):
+                    try:
+                        self.heartbeat_lock(name=name, token=run_token)
+                    except Exception:
+                        pass
+
+            hb_thread = threading.Thread(target=_heartbeat_worker, daemon=True)
+            hb_thread.start()
+
+            ret = proc.wait()
+            return ret
+        except Exception as e:
+            print(f"[RUN] Error running command for '{name}': {e}", file=sys.stderr)
+            logger.error("Error executing command in run_command: %s", e)
+            return 1
+        finally:
+            stop_heartbeat.set()
+            print(f"[RUN] Releasing build slot lock for '{name}'...", file=sys.stderr)
+            try:
+                self.release(name=name, token=run_token)
+            except Exception as e:
+                logger.warning("Error releasing lock for '%s': %s", name, e)
 
 
 def format_status_human(stat: Dict[str, Any]) -> str:
