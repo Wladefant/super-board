@@ -120,12 +120,8 @@ class SeedTests(unittest.TestCase):
         git(self.clone, "worktree", "add", "-q", "--detach", str(target), self.commits[3])
         nc.cache_dir(target).mkdir(parents=True)
 
-        ranked = nc.rank_sources(target, self.clone)
-        usable = [(Path(r["worktree"]).name, r["distance"]) for r in ranked if r["skip"] is None]
-        self.assertEqual(usable, [("near", 1), ("far", 3)])
-        skipped = {Path(r["worktree"]).name: r["skip"] for r in ranked if r["skip"]}
-        self.assertIn("never prepared", skipped["unchecked"])
-        self.assertIn("lockfile differs", skipped["other-lock"])
+        ranked = [(Path(r["worktree"]).name, r["distance"]) for r in nc.rank_sources(target, self.clone)]
+        self.assertEqual(ranked, [("near", 1), ("far", 3)])  # never unchecked or other-lock
 
         result = nc.seed_tsbuildinfo(target, self.clone, None)
         self.assertEqual((result["tsbuildinfo"], result["distance"]), ("seeded", 1))

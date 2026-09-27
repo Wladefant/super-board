@@ -1,44 +1,23 @@
 #!/usr/bin/env python3
 r"""Per-worktree Next.js build cache for PolySimulator lanes (workflows/polysim_next_cache.py).
 
-Why: a QA ``next build`` of a PR head spends most of its time in two phases, measured on
-this workstation (``.next/trace``, Next 14.2.35):
+Why (traces of 20 lane builds, Next 14.2.35): ``verify-typescript-setup`` takes 100-200 s on
+every build because Next writes ``.next/cache/.tsbuildinfo`` with ``program.emit()`` BEFORE it
+asks for diagnostics (``lib/typescript/runTypeCheck.js``), so the buildinfo never records a
+checked file. And ``build_slot.py prep-cache`` junctions every ``.next/cache`` to one shared
+``~/.veyyon/run/next-cache``, whose 3.4 GB of webpack packs are keyed by absolute path to other
+worktrees: they never hit and only fill the build's heap.
 
-* ``verify-typescript-setup`` 100-200 s. Next runs it after the webpack compile, on every
-  build, because it writes ``.next/cache/.tsbuildinfo`` BEFORE it asks for diagnostics
-  (``lib/typescript/runTypeCheck.js``: ``program.emit()`` then ``getPreEmitDiagnostics``).
-  The file it leaves never records a checked file, so its "incremental" check is always a
-  full one (a no-change rebuild: 98 s).
-* ``run-webpack-compiler`` 60-146 s cold, ~30 s when the same worktree path rebuilds.
-  Webpack keys its persistent cache by absolute module path, so a cache that came from
-  another worktree path cannot hit for the app's own modules; it only costs memory.
+``prepare`` gives the worktree its own ``.next/cache`` (a junction is removed as a link, never
+followed), drops a webpack cache holding another worktree's modules, seeds ``.tsbuildinfo``
+from the nearest prepared worktree with the same lockfile, and runs Next's type check with the
+diagnostics queried before emit, so ``next build`` only re-checks what changed. ``sweep`` does
+the cleanup for every idle worktree and empties the shared store once nothing links to it.
+Files are copied, never linked. A worktree a process uses (``wt_remove.busy_processes``) is
+not touched.
 
-``build_slot.py prep-cache`` junctions every worktree's ``.next/cache`` to one shared
-``~/.veyyon/run/next-cache`` and merges each worktree's cache into it. That store grew to
-3.4 GB of webpack packs keyed to five different worktrees, which every linked build loads.
-
-What this does instead:
-
-* ``prepare`` gives the worktree its own ``.next/cache`` directory (a junction is removed
-  as a link, never followed), drops a webpack cache that holds another worktree's modules,
-  seeds ``.tsbuildinfo`` from the nearest prepared worktree (same lockfile) and then runs
-  the type check the way ``next build`` does, but asks for the diagnostics first, so the
-  buildinfo records them. ``next build``'s own check then only re-checks what changed.
-  Type errors fail ``prepare`` (exit 1) before the build slot is spent.
-* ``sweep`` does the same cleanup for every idle worktree of the clone and empties the
-  shared store's webpack packs once no worktree links to it.
-
-Nothing is linked and nothing is shared between two builds: files are copied. A worktree is
-never touched while a process runs inside it or names it (``wt_remove.busy_processes``).
-
-Commands:
-    prepare --worktree W [--source S] [--force] [--json]
-                        run before ``next build`` (outside the build slot is fine):
-                        python polysim_next_cache.py prepare --worktree <wt>
-    sweep [--apply] [--json]
-                        report (default) or apply the cleanup for every idle worktree
-    list --worktree W [--json]
-                        rank the ``.tsbuildinfo`` sources for W
+    python polysim_next_cache.py prepare --worktree <wt> [--source <wt>] [--force] [--json]
+    python polysim_next_cache.py sweep [--apply] [--json]
 
 Exit status: 0 ok; 1 type errors (prepare); 2 bad input; 3 worktree busy.
 """
@@ -99,10 +78,6 @@ const { getRequiredConfiguration } = req("next/dist/lib/typescript/writeConfigur
 """
 
 
-# ---------------------------------------------------------------------------
-# git
-# ---------------------------------------------------------------------------
-
 
 def git(args: list[str], cwd: Path) -> str | None:
     r = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=120)
@@ -136,10 +111,6 @@ def commit_distance(clone: Path, a: str | None, b: str | None) -> int | None:
     left, right = out.split()
     return int(left) + int(right)
 
-
-# ---------------------------------------------------------------------------
-# Cache facts
-# ---------------------------------------------------------------------------
 
 
 def pack_worktrees(webpack: Path) -> set[str]:
@@ -177,26 +148,12 @@ def rank_sources(target: Path, clone: Path, only: Path | None = None) -> list[di
     key, head = lock_key(target), git(["rev-parse", "HEAD"], target)
     rows = []
     for wt in [only] if only else list_worktrees(clone):
-        if wtr.norm(wt) == wtr.norm(target):
-            continue
-        row: dict = {"worktree": str(wt)}
         marker = warm_marker(wt)
-        if not (cache_dir(wt) / TSBUILDINFO).is_file() or marker is None:
-            row["skip"] = "no checked .tsbuildinfo (never prepared)"
-        elif marker.get("lock_key") != key:
-            row["skip"] = f"lockfile differs ({marker.get('lock_key')} != {key})"
-        else:
-            row["skip"] = None
-            row["head"] = marker.get("head")
-            row["distance"] = commit_distance(clone, row["head"], head)
-        rows.append(row)
-    usable = sorted((r for r in rows if r["skip"] is None), key=lambda r: r["distance"] if r["distance"] is not None else 1 << 30)
-    return usable + [r for r in rows if r["skip"] is not None]
-
-
-# ---------------------------------------------------------------------------
-# Steps
-# ---------------------------------------------------------------------------
+        if wtr.norm(wt) == wtr.norm(target) or marker is None or marker.get("lock_key") != key:
+            continue
+        if (cache_dir(wt) / TSBUILDINFO).is_file():
+            rows.append({"worktree": str(wt), "head": marker.get("head"), "distance": commit_distance(clone, marker.get("head"), head)})
+    return sorted(rows, key=lambda r: r["distance"] if r["distance"] is not None else 1 << 30)
 
 
 def own_cache_dir(worktree: Path) -> dict:
@@ -229,7 +186,7 @@ def seed_tsbuildinfo(worktree: Path, clone: Path, source: Path | None) -> dict:
     cache = cache_dir(worktree)
     if warm_marker(worktree) is not None and (cache / TSBUILDINFO).is_file():
         return {"tsbuildinfo": "own"}
-    best = next((r for r in rank_sources(worktree, clone, source) if r["skip"] is None), None)
+    best = next(iter(rank_sources(worktree, clone, source)), None)
     if best is None:
         # A buildinfo `next build` wrote itself holds no diagnostics but still saves parsing.
         return {"tsbuildinfo": "kept unchecked" if (cache / TSBUILDINFO).is_file() else "cold"}
@@ -259,10 +216,6 @@ def typecheck(worktree: Path) -> dict:
     (cache_dir(worktree) / WARM_MARKER).write_text(json.dumps(marker, indent=2) + "\n", encoding="utf-8")
     return result
 
-
-# ---------------------------------------------------------------------------
-# Commands
-# ---------------------------------------------------------------------------
 
 
 def emit(args: argparse.Namespace, result: dict, lines: list[str], code: int) -> int:
@@ -344,14 +297,6 @@ def cmd_sweep(args: argparse.Namespace, clone: Path) -> int:
     return emit(args, result, lines or ["nothing to do"], 0)
 
 
-def cmd_list(args: argparse.Namespace, clone: Path) -> int:
-    ranked = rank_sources(Path(os.path.abspath(args.worktree)), clone)
-    usable = [r for r in ranked if r["skip"] is None]
-    lines = [f"{r['worktree']}  {r['distance']} commits apart" for r in usable]
-    lines.append(f"{len(ranked) - len(usable)} other worktrees are not usable sources (--json lists why)")
-    return emit(args, {"sources": ranked}, lines, 0)
-
-
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--clone", default=str(POLYSIM_CLONE), help="PolySimulator clone whose worktrees are scanned")
@@ -364,9 +309,6 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("sweep", help="unlink shared-cache junctions and drop foreign webpack packs in idle worktrees")
     p.add_argument("--apply", action="store_true")
     p.add_argument("--json", action="store_true")
-    p = sub.add_parser("list", help="rank .tsbuildinfo sources for --worktree")
-    p.add_argument("--worktree", required=True)
-    p.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
     clone = Path(args.clone)
     if args.command == "sweep":
@@ -374,7 +316,7 @@ def main(argv: list[str] | None = None) -> int:
     if not (Path(os.path.abspath(args.worktree)) / "frontend" / "package-lock.json").is_file():
         print(f"error: {args.worktree} has no frontend/package-lock.json", file=sys.stderr)
         return 2
-    return cmd_prepare(args, clone) if args.command == "prepare" else cmd_list(args, clone)
+    return cmd_prepare(args, clone)
 
 
 if __name__ == "__main__":
