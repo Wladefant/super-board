@@ -173,6 +173,46 @@ def is_pid_alive(pid: int) -> bool:
             return False
 
 
+# Bounded backoff for os.replace, which Windows refuses transiently while another process
+# has the target open (WinError 5: Access is denied, WinError 32: sharing violation).
+_REPLACE_RETRY_DELAYS = (0.05, 0.1, 0.15, 0.2, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25)
+# Lock info reads retried before a slot counts as corrupt (~0.1s in total).
+_INFO_READ_ATTEMPTS = 5
+_INFO_READ_RETRY_DELAY = 0.025
+
+
+def _replace_with_retry(src: str, dst: str) -> None:
+    """os.replace(src, dst), retried over ~2s on transient Windows sharing errors."""
+    for attempt, delay in enumerate(_REPLACE_RETRY_DELAYS):
+        try:
+            os.replace(src, dst)
+            return
+        except (PermissionError, OSError) as e:
+            transient = isinstance(e, PermissionError) or getattr(e, "winerror", None) in (5, 32)
+            if not transient or attempt == len(_REPLACE_RETRY_DELAYS) - 1:
+                raise
+            time.sleep(delay)
+
+
+def _write_json_atomic(path: str, data: Any, prefix: str = ".info-") -> None:
+    """
+    Writes JSON so readers see the old or the new document, never a truncated one.
+    Lock info is read by every waiter on every poll; an in-place rewrite let a reader
+    hit the empty file, call the live lock corrupt and reclaim it (#315).
+    """
+    fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path), prefix=prefix, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        _replace_with_retry(tmp_path, path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+
 def _parse_timestamp(val: Any) -> Optional[float]:
     """Parses numeric epoch or ISO timestamp string into epoch seconds."""
     if isinstance(val, (int, float)):
@@ -508,26 +548,33 @@ class BuildSlotManager:
                 "corrupt": True,
             }
 
-        try:
-            with open(info_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                data.setdefault("slot", slot_idx)
-            return data
-        except Exception as e:
-            logger.warning("Failed to read lock info for slot %d: %s", slot_idx, e)
+        # Retry briefly: a holder still running an older copy rewrites info.json in place,
+        # and Windows can refuse a read mid-replace. Only a persistent failure is corrupt.
+        last_err: Optional[Exception] = None
+        for attempt in range(_INFO_READ_ATTEMPTS):
             try:
-                mtime = os.path.getmtime(slot_dir)
-            except Exception:
-                mtime = time.time()
-            return {
-                "owner": "unknown",
-                "pid": 0,
-                "slot": slot_idx,
-                "acquired_at": datetime.datetime.fromtimestamp(mtime, datetime.timezone.utc).isoformat(),
-                "acquired_at_epoch": mtime,
-                "corrupt": True,
-            }
+                with open(info_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    data.setdefault("slot", slot_idx)
+                return data
+            except Exception as e:
+                last_err = e
+                if attempt < _INFO_READ_ATTEMPTS - 1:
+                    time.sleep(_INFO_READ_RETRY_DELAY)
+        logger.warning("Failed to read lock info for slot %d: %s", slot_idx, last_err)
+        try:
+            mtime = os.path.getmtime(slot_dir)
+        except Exception:
+            mtime = time.time()
+        return {
+            "owner": "unknown",
+            "pid": 0,
+            "slot": slot_idx,
+            "acquired_at": datetime.datetime.fromtimestamp(mtime, datetime.timezone.utc).isoformat(),
+            "acquired_at_epoch": mtime,
+            "corrupt": True,
+        }
 
     def _read_lock_info(self) -> Optional[Dict[str, Any]]:
         """Reads lock info metadata if primary lock dir exists (backwards compatibility)."""
@@ -560,8 +607,7 @@ class BuildSlotManager:
         }
         if child_pid is not None:
             info["child_pid"] = child_pid
-        with open(info_path, "w", encoding="utf-8") as f:
-            json.dump(info, f, indent=2)
+        _write_json_atomic(info_path, info)
 
     def _write_lock_info(self, owner: str, pid: int, token: Optional[str] = None) -> None:
         """Writes info.json inside the primary lock directory (backwards compatibility)."""
@@ -600,38 +646,7 @@ class BuildSlotManager:
 
     def _write_queue(self, queue: List[Dict[str, Any]]) -> None:
         """Writes queue list atomically using a temp file and os.replace."""
-        temp_dir = self.run_dir
-        fd, temp_path = tempfile.mkstemp(dir=temp_dir, prefix="queue-", suffix=".tmp")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(queue, f, indent=2)
-            # On Windows, os.replace can transiently raise PermissionError if another handle is open
-            # (WinError 5: Access is denied, or WinError 32: Sharing violation).
-            # Retry with bounded backoff (10 tries over ~2.0s).
-            delays = [0.05, 0.1, 0.15, 0.2, 0.25, 0.25, 0.25, 0.25, 0.25, 0.25]
-            max_retries = len(delays)
-            last_err = None
-            for attempt in range(max_retries):
-                try:
-                    os.replace(temp_path, self.queue_file)
-                    last_err = None
-                    break
-                except (PermissionError, OSError) as e:
-                    winerror = getattr(e, "winerror", None)
-                    if isinstance(e, PermissionError) or winerror in (5, 32):
-                        last_err = e
-                        if attempt < max_retries - 1:
-                            time.sleep(delays[attempt])
-                        continue
-                    raise
-            if last_err is not None:
-                raise last_err
-        finally:
-            if os.path.exists(temp_path):
-                try:
-                    os.unlink(temp_path)
-                except Exception:
-                    pass
+        _write_json_atomic(self.queue_file, queue, prefix="queue-")
 
     def _is_entry_stale(
         self,
@@ -949,8 +964,7 @@ class BuildSlotManager:
             info["heartbeat_at_epoch"] = now
             info_path = os.path.join(slot_dir, INFO_FILE_NAME)
             try:
-                with open(info_path, "w", encoding="utf-8") as f:
-                    json.dump(info, f, indent=2)
+                _write_json_atomic(info_path, info)
                 return True
             except Exception:
                 return False
@@ -974,8 +988,7 @@ class BuildSlotManager:
             info["heartbeat_at_epoch"] = now
             info_path = os.path.join(slot_dir, INFO_FILE_NAME)
             try:
-                with open(info_path, "w", encoding="utf-8") as f:
-                    json.dump(info, f, indent=2)
+                _write_json_atomic(info_path, info)
                 return True
             except Exception:
                 return False

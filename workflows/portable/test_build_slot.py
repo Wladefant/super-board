@@ -1346,6 +1346,38 @@ class TestBuildSlot(unittest.TestCase):
         self.assertEqual(build_slot._owner_pid_from_process_table(30, parents, names), 10)
         self.assertEqual(build_slot._owner_pid_from_process_table(5, {5: 6, 6: 5}, {}), 6)
 
+    def test_heartbeat_rewrite_never_reads_as_corrupt(self):
+        """
+        #315: waiters check the lock while its holder heartbeats. An in-place rewrite of
+        info.json let a waiter read the empty file, call the live lock corrupt and reclaim
+        it (QA5748 lost its slot this way while its driver was running).
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir, max_slots=1)
+        self.assertTrue(manager.acquire("live-holder", timeout=1.0, force=True, token="tok"))
+        # Past the 10s mid-creation grace, as any build that heartbeats is.
+        old = time.time() - 120
+        os.utime(manager.slot_dirs[0], (old, old))
+        stop = threading.Event()
+
+        def heartbeat():
+            while not stop.is_set():
+                manager.heartbeat_lock("live-holder", token="tok")
+
+        holder = threading.Thread(target=heartbeat)
+        holder.start()
+        try:
+            deadline = time.time() + 3.0
+            with redirect_stderr(io.StringIO()):
+                while time.time() < deadline:
+                    self.assertFalse(manager.check_stale_and_reclaim(), "live lock reclaimed as corrupt")
+        finally:
+            stop.set()
+            holder.join()
+        self.assertEqual(manager.status()["lock"]["owner"], "live-holder")
+        self.assertEqual(
+            [n for n in os.listdir(manager.slot_dirs[0]) if n.endswith(".tmp")], [],
+        )
+
     def test_bounded_concurrency_two_slots_when_ram_under_75_percent(self):
         """When host RAM is < 75%, 2 concurrent slots can be acquired by distinct lanes."""
         os.environ["BUILD_SLOT_RAM_PERCENT"] = "70.0"
