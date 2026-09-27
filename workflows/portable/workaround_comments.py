@@ -58,7 +58,7 @@ COMMENT_SYNTAX = {
     for extension in extensions.split()
 }
 
-MARKER = re.compile(r'\b(?:' + '|'.join(MARKER_WORDS) + r')\b', re.IGNORECASE)
+MARKER = re.compile(r'\b(?:' + '|'.join(MARKER_WORDS) + r')\b')
 ISSUE_REFERENCE = re.compile(
     r'https://github\.com/[\w.-]+/[\w.-]+/issues/\d+'  # canonical issue URL
     r'|[\w.-]+/[\w.-]+#\d+'  # owner/repo#N

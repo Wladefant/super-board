@@ -378,6 +378,9 @@ ROLE_MODEL_PINS: Dict[str, str] = {
     # roles pin the same tier; model_to_agent_role splits them by task type.
     "web-task": MODEL_CHATGPT_WEB,
     "web-thinker": MODEL_CHATGPT_WEB,
+    # The advisor role was moved from anthropic/claude-fable-5-1 to google-antigravity/gemini-3.8-flash:high
+    # (operator ruling 2026-09-27) to conserve Anthropic quota; matches live config.yml.
+    "advisor": MODEL_GEMINI_FLASH,
 }
 
 

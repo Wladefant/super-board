@@ -1348,8 +1348,8 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         review_pins = {"codex-reviewer", "web-thinker", "reviewer"}
         reasoning_pins = {"thinker"}
         for role, model in ROLE_MODEL_PINS.items():
-            if role == "astra-ux":
-                # Specialized UX role; router emits ag-opus for MODEL_AG_CLAUDE_OPUS
+            if role in ("astra-ux", "advisor"):
+                # Specialized UX/advisor roles; router emits standard agent roles (task / ag-opus)
                 continue
             if role in review_pins:
                 task_type = TaskType.STRONG_REVIEW
@@ -2618,6 +2618,19 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             self.assertEqual(resolve_role_model("astra-ux"), MODEL_AG_CLAUDE_OPUS)
 
         print("  [PASS] astra-ux resolves to non-Codex model, negative control verified.")
+    # -------------------------------------------------------------------------
+    # TEST 43: Advisor role pinned to Gemini 3.8 Flash (operator ruling 2026-09-27)
+    # -------------------------------------------------------------------------
+    def test_advisor_role_pinned_to_gemini_flash(self):
+        print("\n--- TEST 43: Advisor Role Pinned to Gemini 3.8 Flash ---")
+        self.assertIn("advisor", ROLE_MODEL_PINS)
+        self.assertEqual(ROLE_MODEL_PINS["advisor"], MODEL_GEMINI_FLASH)
+        self.assertEqual(resolve_role_model("advisor"), MODEL_GEMINI_FLASH)
+        self.assertTrue(is_agent_role_available("advisor"))
+        # Fable must never map to advisor (operator ruling: advisor moved to Gemini 3.8 Flash)
+        self.assertNotEqual(model_to_agent_role(MODEL_CLAUDE_FABLE, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "advisor")
+        self.assertNotEqual(model_to_agent_role(MODEL_CLAUDE_FABLE, TaskType.ROUTINE_EXECUTION, RiskLevel.LOW), "advisor")
+        print(f"  [PASS] advisor pinned to {MODEL_GEMINI_FLASH}; Fable never maps to advisor.")
 
 def main():
     print("=" * 70)
