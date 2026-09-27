@@ -106,6 +106,7 @@ from model_routing import (
     MINIMAX_PROVIDER,
     LANE_MODEL_PINS,
     ROLE_MODEL_PINS,
+    ROLE_FALLBACK_LADDERS,
     lane_model_at_depth,
     lane_pin_drift,
     get_recommended_lanes,
@@ -2660,24 +2661,58 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
 
 
     # -------------------------------------------------------------------------
-    # TEST 50: astra-ux role pin — non-Codex UX model while CODEX_ENABLED=False
+    # TEST 50: astra-ux role pin — live Opus 5.5, high-risk fallback, never exhausted ag-opus
     # -------------------------------------------------------------------------
     def test_astra_ux_never_resolves_to_codex_while_disabled(self):
-        print("\n--- TEST 50: astra-ux Role Pin Non-Codex when CODEX_ENABLED=False ---")
-        # Invariant: while CODEX_ENABLED is False (or Codex account unavailable),
+        print("\n--- TEST 50: astra-ux Role Pin & Exhaustion Invariant ---")
+        # Invariant 1: while CODEX_ENABLED is False (or Codex account unavailable),
         # astra-ux must never resolve to an openai-codex/ model (e.g. gpt-6-astra).
         self.assertFalse(CODEX_ENABLED, "CODEX_ENABLED must default to False")
         self.assertIn("astra-ux", ROLE_MODEL_PINS)
         pinned_model = ROLE_MODEL_PINS["astra-ux"]
         self.assertFalse(pinned_model.startswith("openai-codex/"),
                          f"astra-ux pin must not be a Codex model, got {pinned_model}")
-        self.assertEqual(pinned_model, MODEL_AG_CLAUDE_OPUS,
-                         f"astra-ux must pin {MODEL_AG_CLAUDE_OPUS}")
+        self.assertEqual(pinned_model, MODEL_CLAUDE_OPUS_55,
+                         f"astra-ux must pin {MODEL_CLAUDE_OPUS_55}")
 
-        # resolve_role_model must return MODEL_AG_CLAUDE_OPUS
+        # Invariant 2: astra-ux resolves to anthropic/claude-opus-5-5:high first
         resolved = resolve_role_model("astra-ux")
-        self.assertEqual(resolved, MODEL_AG_CLAUDE_OPUS)
+        self.assertEqual(resolved, MODEL_CLAUDE_OPUS_55)
         self.assertFalse(resolved.startswith("openai-codex/"))
+        self.assertNotEqual(resolved, MODEL_AG_CLAUDE_OPUS)
+
+        # Invariant 3: fallback ladder exists, starts with Opus 5.5, has no Flash/free tier
+        self.assertIn("astra-ux", ROLE_FALLBACK_LADDERS)
+        ladder = ROLE_FALLBACK_LADDERS["astra-ux"]
+        self.assertEqual(ladder[0], MODEL_CLAUDE_OPUS_55)
+        for m in ladder:
+            self.assertFalse("flash" in m.lower(), f"astra-ux ladder must not contain Flash: {m}")
+            self.assertFalse("free" in m.lower(), f"astra-ux ladder must not contain free tier: {m}")
+
+        # Invariant 4: astra-ux NEVER resolves to ag-opus when ag-opus is marked exhausted
+        from quota_snapshot import QuotaSnapshot, QuotaWindowEntry
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        mock_snap = QuotaSnapshot(entries={
+            f"{AG_ANTHROPIC_PROVIDER}|default|daily": QuotaWindowEntry(
+                provider=AG_ANTHROPIC_PROVIDER,
+                window_id="daily",
+                exhausted_until=(now_utc + datetime.timedelta(days=5)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                source="429",
+            )
+        })
+        self.assertFalse(mock_snap.is_eligible(AG_ANTHROPIC_PROVIDER))
+        resolved_with_ag_exhausted = resolve_role_model("astra-ux", quota_snapshot=mock_snap)
+        self.assertEqual(resolved_with_ag_exhausted, MODEL_CLAUDE_OPUS_55)
+        self.assertNotEqual(resolved_with_ag_exhausted, MODEL_AG_CLAUDE_OPUS)
+
+        # Negative control: even if ag-opus were the first candidate in the ladder,
+        # resolve_role_model skips exhausted ag-opus and falls back to live model,
+        # proving astra-ux NEVER resolves to ag-opus while it is marked exhausted.
+        with mock.patch.dict(ROLE_FALLBACK_LADDERS, {"astra-ux": [MODEL_AG_CLAUDE_OPUS, MODEL_CLAUDE_OPUS_55]}):
+            neg_resolved = resolve_role_model("astra-ux", quota_snapshot=mock_snap)
+            self.assertEqual(neg_resolved, MODEL_CLAUDE_OPUS_55)
+            self.assertNotEqual(neg_resolved, MODEL_AG_CLAUDE_OPUS,
+                              "Negative control: astra-ux must skip exhausted ag-opus and fall back")
 
         # Check installed profile configuration if present
         config_path = Path(os.path.expanduser("~/.veyyon/profiles/default/agent/config.yml"))
@@ -2692,38 +2727,31 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
                                  f"astra-ux leading model in config.yml must not be Codex: {leading}")
                 self.assertEqual(leading, pinned_model,
                                  f"astra-ux leading model {leading} must match pin {pinned_model}")
+                for m in str(chain).split(","):
+                    m_clean = m.strip().lower()
+                    self.assertFalse("flash" in m_clean, f"config.yml astra-ux chain must not contain Flash: {m}")
+                    self.assertFalse("free" in m_clean, f"config.yml astra-ux chain must not contain free tier: {m}")
                 if "astra-ux" in agents:
                     self.assertTrue(agents["astra-ux"].get("enabled", True), "astra-ux must be enabled")
 
-        # ---------------------------------------------------------------------
-        # NEGATIVE CONTROL:
-        # 1. The old failing configuration (MODEL_CODEX_ASTRA) is an openai-codex/ model.
-        # 2. When CODEX_ENABLED=False (codex_available() is False), resolve_role_model
-        #    MUST refuse to resolve any Codex role (returns None, never openai-codex/*).
-        # 3. If astra-ux were mocked with the old failing Codex pin, resolve_role_model
-        #    blocks it when codex_available() is False.
-        # ---------------------------------------------------------------------
+        # Negative control: Codex unavailable blocks Codex model
         with mock.patch("model_routing.codex_available", return_value=False):
             old_failing_model = MODEL_CODEX_ASTRA  # "openai-codex/gpt-6-astra:medium"
             self.assertTrue(old_failing_model.startswith("openai-codex/"))
             self.assertNotEqual(ROLE_MODEL_PINS["astra-ux"], old_failing_model)
-
-            # Codex roles resolve to None when Codex is disabled
             self.assertIsNone(resolve_role_model("codex-worker"))
             self.assertIsNone(resolve_role_model("codex-reviewer"))
-
-            # Mock astra-ux temporarily pointing to the old failing Codex model:
-            # resolve_role_model MUST NOT resolve to it while Codex is disabled:
-            with mock.patch.dict(ROLE_MODEL_PINS, {"astra-ux": old_failing_model}):
-                neg_resolved = resolve_role_model("astra-ux")
-                self.assertIsNone(neg_resolved,
+            with mock.patch.dict(ROLE_MODEL_PINS, {"astra-ux": old_failing_model}), \
+                 mock.patch.dict(ROLE_FALLBACK_LADDERS, {"astra-ux": [old_failing_model]}):
+                codex_neg = resolve_role_model("astra-ux")
+                self.assertIsNone(codex_neg,
                                   "Negative control: astra-ux with Codex model must resolve to None when CODEX_ENABLED=False")
 
-        # When Codex is enabled, a role pinned to MODEL_AG_CLAUDE_OPUS still resolves to it
+        # Live model resolution remains MODEL_CLAUDE_OPUS_55
         with mock.patch("model_routing.codex_available", return_value=True):
-            self.assertEqual(resolve_role_model("astra-ux"), MODEL_AG_CLAUDE_OPUS)
+            self.assertEqual(resolve_role_model("astra-ux"), MODEL_CLAUDE_OPUS_55)
 
-        print("  [PASS] astra-ux resolves to non-Codex model, negative control verified.")
+        print("  [PASS] astra-ux resolves to live Opus 5.5, skips exhausted ag-opus, negative controls verified.")
     # -------------------------------------------------------------------------
     # TEST 43: Advisor role pinned to Gemini 3.8 Flash (operator ruling 2026-09-27)
     # -------------------------------------------------------------------------

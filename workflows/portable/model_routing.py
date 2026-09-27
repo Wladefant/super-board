@@ -363,10 +363,9 @@ ROLE_MODEL_PINS: Dict[str, str] = {
     "codex-reviewer": MODEL_CODEX_SOL,
     "thinker": MODEL_CODEX_SOL,
     "reviewer": MODEL_ANTHROPIC_OPUS,
-    # The astra-ux role was repointed to google-antigravity/claude-opus-4-6
-    # because gpt-6-astra is unsupported on Codex with ChatGPT accounts and Codex is disabled
-    # while CODEX_ENABLED=False (super-board#279).
-    "astra-ux": MODEL_AG_CLAUDE_OPUS,
+    # The astra-ux role was repointed to anthropic/claude-opus-5-5:high (Opus 5.5 route)
+    # falling back per the existing high-risk ladder, skipping ag-opus while exhausted (super-board#325).
+    "astra-ux": MODEL_CLAUDE_OPUS_55,
     # The free Spark allowance has its own enabled roster entry and its own model, so a lane
     # routed onto Spark must be dispatched as `spark`, never as a Codex Astral role.
     "spark": MODEL_CODEX_SPARK,
@@ -387,17 +386,53 @@ ROLE_MODEL_PINS: Dict[str, str] = {
 }
 
 
-def resolve_role_model(role: str) -> Optional[str]:
-    """Resolve an agent role to its authoritative primary model pin.
+# Fallback ladders for roles with multi-model fallback requirements.
+# astra-ux resolves to anthropic/claude-opus-5-5:high first, falling back per the
+# existing high-risk ladder (skipping ag-opus while exhausted, never Flash or free).
+ROLE_FALLBACK_LADDERS: Dict[str, List[str]] = {
+    "astra-ux": [
+        MODEL_CLAUDE_OPUS_55,
+        MODEL_AG_CLAUDE_OPUS,
+        MODEL_GO_GLM53,
+        MODEL_CLAUDE_FABLE,
+        MODEL_DEEPSEEK_PRO,
+    ],
+}
+
+
+def resolve_role_model(role: str, quota_snapshot: Optional[Any] = None) -> Optional[str]:
+    """Resolve an agent role to its authoritative primary model pin or live fallback.
 
     Returns the model ID pinned in ROLE_MODEL_PINS for the role.
     If the role maps to an openai-codex/ model while Codex is disabled
     (codex_available() is False), returns None to prevent resolving to
     an unavailable Codex model.
+
+    If a role has a fallback ladder in ROLE_FALLBACK_LADDERS (e.g. astra-ux),
+    climbs the ladder and skips any model whose provider is recorded as
+    exhausted in the quota snapshot, ensuring an exhausted model (such as
+    ag-opus) is never selected when marked exhausted.
     """
+    ladder = ROLE_FALLBACK_LADDERS.get(role)
+    if ladder:
+        snapshot = quota_snapshot if quota_snapshot is not None else load_quota_snapshot()
+        for candidate in ladder:
+            if candidate.startswith("openai-codex/") and not codex_available():
+                continue
+            if snapshot is not None:
+                provider = balance_provider_for(candidate)
+                if not snapshot.is_eligible(provider):
+                    continue
+            return candidate
+        return None
+
     model = ROLE_MODEL_PINS.get(role)
     if model and model.startswith("openai-codex/") and not codex_available():
         return None
+    if model and quota_snapshot is not None:
+        provider = balance_provider_for(model)
+        if not quota_snapshot.is_eligible(provider):
+            return None
     return model
 
 
@@ -2292,7 +2327,15 @@ def main():
     parser.add_argument("--balance-cmd", default=None, help="Custom balance CLI command")
     parser.add_argument("--rework-count", type=int, default=0, help="Number of prior failed attempts/invariant reworks")
     parser.add_argument("--domain-tags", default="", help="Comma-separated domain tags (e.g. auth,state_machine,money)")
+    parser.add_argument("--role", default=None, help="Resolve an agent role to its authoritative primary model or live fallback")
     args = parser.parse_args()
+    if args.role:
+        resolved = resolve_role_model(args.role)
+        if args.json:
+            print(json.dumps({"role": args.role, "resolved_model": resolved}))
+        else:
+            print(f"{args.role} -> {resolved}")
+        return
 
     domain_tags = [t.strip() for t in args.domain_tags.split(",") if t.strip()] if args.domain_tags else None
 
