@@ -28,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
 import unittest
 from unittest import mock
 from contextlib import redirect_stderr, redirect_stdout
@@ -790,6 +791,133 @@ class TestBuildSlot(unittest.TestCase):
             self.assertTrue(manager.is_held_by("perm-lane"))
             self.assertGreaterEqual(call_count, 3)
             manager.release("perm-lane")
+
+    def test_queue_atomic_lock_stale_dead_pid_reclaimed(self):
+        """
+        If build-slot-queue.lock exists with an info.json pointing to a dead PID,
+        _queue_atomic_lock must reclaim the stale directory immediately and acquire.
+        """
+        queue_lock_dir = os.path.join(self.run_dir, build_slot.QUEUE_LOCK_NAME)
+        os.makedirs(queue_lock_dir, exist_ok=True)
+        dead_pid = 99999999
+        self.assertFalse(is_pid_alive(dead_pid))
+        info_path = os.path.join(queue_lock_dir, build_slot.INFO_FILE_NAME)
+        with open(info_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "pid": dead_pid,
+                "acquired_at": "2026-09-27T00:00:00Z",
+                "acquired_at_epoch": time.time(),
+            }, f)
+
+        acquired = False
+        with _queue_atomic_lock(self.run_dir, timeout=2.0, retry_interval=0.01):
+            acquired = True
+            info = build_slot._read_queue_lock_info(queue_lock_dir)
+            self.assertIsNotNone(info)
+            self.assertEqual(info["pid"], os.getpid())
+
+        self.assertTrue(acquired)
+        self.assertFalse(os.path.exists(queue_lock_dir))
+
+    def test_queue_atomic_lock_stale_age_reclaimed(self):
+        """
+        If build-slot-queue.lock is older than stale_after, _queue_atomic_lock
+        must reclaim it even if the PID might appear alive.
+        """
+        queue_lock_dir = os.path.join(self.run_dir, build_slot.QUEUE_LOCK_NAME)
+        os.makedirs(queue_lock_dir, exist_ok=True)
+        info_path = os.path.join(queue_lock_dir, build_slot.INFO_FILE_NAME)
+        old_epoch = time.time() - 3600  # 1 hour ago
+        with open(info_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "pid": os.getpid(),
+                "acquired_at": "2026-09-27T00:00:00Z",
+                "acquired_at_epoch": old_epoch,
+            }, f)
+
+        acquired = False
+        with _queue_atomic_lock(self.run_dir, timeout=2.0, retry_interval=0.01, stale_after=5.0):
+            acquired = True
+
+        self.assertTrue(acquired)
+        self.assertFalse(os.path.exists(queue_lock_dir))
+
+    def test_acquire_survives_heartbeat_timeout(self):
+        """
+        In acquire(), a TimeoutError from heartbeat() due to lock contention
+        must log a warning and retry on the next tick, not abort acquisition.
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        manager.acquire("blocker-lane")  # Hold slot so waiter must wait and send heartbeats
+        real_heartbeat = manager.heartbeat
+        hb_calls = 0
+
+        def flaky_heartbeat(*args, **kwargs):
+            nonlocal hb_calls
+            hb_calls += 1
+            if hb_calls <= 2:
+                raise TimeoutError("Queue lock contention during heartbeat")
+            # After 2 flaky attempts, release the blocker so waiter can acquire
+            manager.release("blocker-lane")
+            return real_heartbeat(*args, **kwargs)
+
+        with mock.patch.object(manager, "heartbeat", side_effect=flaky_heartbeat):
+            ok = manager.acquire("hb-flaky-lane", timeout=3.0, poll_interval=0.01, heartbeat_interval=0.01)
+            self.assertTrue(ok)
+            self.assertTrue(manager.is_held_by("hb-flaky-lane"))
+            self.assertGreaterEqual(hb_calls, 2)
+            manager.release("hb-flaky-lane")
+
+    def test_acquire_survives_clean_queue_timeout(self):
+        """
+        In acquire(), a TimeoutError from clean_queue() due to lock contention
+        must log a warning, wait, and retry on the next tick, not abort acquisition.
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        real_clean_queue = manager.clean_queue
+        clean_calls = 0
+
+        def flaky_clean_queue(*args, **kwargs):
+            nonlocal clean_calls
+            clean_calls += 1
+            if clean_calls <= 2:
+                raise TimeoutError("Queue lock contention during clean_queue")
+            return real_clean_queue(*args, **kwargs)
+
+        with mock.patch.object(manager, "clean_queue", side_effect=flaky_clean_queue):
+            ok = manager.acquire("clean-flaky-lane", timeout=2.0, poll_interval=0.01)
+            self.assertTrue(ok)
+            self.assertTrue(manager.is_held_by("clean-flaky-lane"))
+            self.assertGreaterEqual(clean_calls, 3)
+            manager.release("clean-flaky-lane")
+
+    def test_contending_lockers_concurrent_threads(self):
+        """
+        Simulate multiple threads contending for _queue_atomic_lock concurrently.
+        All threads must acquire without data corruption, deadlocks, or unhandled errors.
+        """
+        counter = 0
+        errors = []
+
+        def worker(worker_id):
+            nonlocal counter
+            for _ in range(5):
+                try:
+                    with _queue_atomic_lock(self.run_dir, timeout=5.0, retry_interval=0.01):
+                        current = counter
+                        time.sleep(0.005)
+                        counter = current + 1
+                except Exception as e:
+                    errors.append((worker_id, e))
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10.0)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(counter, 6 * 5)
 
 
 if __name__ == "__main__":
