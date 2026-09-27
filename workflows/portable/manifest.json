@@ -391,7 +391,8 @@
       "session_crash_monitor.py",
       "quota_snapshot.py",
       "gardener.py",
-      "adoption_audit.py"
+      "adoption_audit.py",
+      "wt_remove.py"
     ],
     "optional_files": [
       "test_adoption_audit.py",
