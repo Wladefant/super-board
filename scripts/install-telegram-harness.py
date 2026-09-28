@@ -65,11 +65,13 @@ INSTALLER_OWNED = (
 # Retired executable modules, removed on upgrade rather than left callable on disk.
 RETIRED_TOOL_APPROVAL_FILES = ("guard.ts", "guard-eval.ts", "approvals.ts", "veyyon_telegram_guard.js", "tests/guard.test.ts", "tests/guard-eval.test.ts")
 
-# Import specifiers rewritten when a daemon module is installed. The installed tree
-# flattens the package: extension/*.ts lands at the target root and src/*.ts under
-# harness/, so "../extension/coordinator" and "../src/gui-host-client" resolve to
-# nothing once daemon/*.ts sits at <target>/daemon/. extension/harness/* is only a
-# re-export of src/*, so it collapses onto harness/ as well.
+# Import specifiers rewritten when source directories are flattened into the
+# installed tree. extension/*.ts lands at the target root, daemon/*.ts lands
+# under daemon/, and src/*.ts lands under harness/.
+EXTENSION_IMPORT_REWRITES = (
+    ('from "../daemon/', 'from "./daemon/'),
+)
+
 DAEMON_IMPORT_REWRITES = (
     ('from "../extension/harness/', 'from "../harness/'),
     ('from "../extension/', 'from "../'),
@@ -80,13 +82,12 @@ DAEMON_IMPORT_REWRITES = (
 class SyncItem(NamedTuple):
     source_path: Path
     rel_target: str  # POSIX relative path from target root, e.g. "guard.ts", "harness/index.ts"
-    # Whether DAEMON_IMPORT_REWRITES apply to this file's text on the way in.
-    rewrite_imports: bool = False
+    import_rewrites: Tuple[Tuple[str, str], ...] = ()
 
 
-def rewrite_daemon_imports(text: str) -> str:
-    """Retarget a daemon module's cross-directory imports at the installed layout."""
-    for source_prefix, installed_prefix in DAEMON_IMPORT_REWRITES:
+def rewrite_imports(text: str, rewrites: Tuple[Tuple[str, str], ...]) -> str:
+    """Retarget cross-directory imports at the installed layout."""
+    for source_prefix, installed_prefix in rewrites:
         text = text.replace(source_prefix, installed_prefix)
     return text
 
@@ -94,9 +95,9 @@ def rewrite_daemon_imports(text: str) -> str:
 def expected_bytes(item: SyncItem) -> bytes:
     """The exact bytes `item` must have in the target, which --check compares against."""
     raw = item.source_path.read_bytes()
-    if not item.rewrite_imports:
+    if not item.import_rewrites:
         return raw
-    return rewrite_daemon_imports(raw.decode("utf-8")).encode("utf-8")
+    return rewrite_imports(raw.decode("utf-8"), item.import_rewrites).encode("utf-8")
 
 
 def is_protected_rel_path(rel_path: str) -> bool:
@@ -166,12 +167,17 @@ def plan_sync_items(harness_root: Path, target: Path) -> List[SyncItem]:
     """
     items: List[SyncItem] = []
 
-    # 1. extension/*.ts (top-level only)
+    # 1. extension/*.ts (top-level only). These files move up one directory,
+    # so imports of sibling daemon modules must move from ../daemon to ./daemon.
     ext_dir = harness_root / "extension"
     if ext_dir.is_dir():
         for p in sorted(ext_dir.glob("*.ts")):
             if p.is_file():
-                items.append(SyncItem(source_path=p, rel_target=p.name))
+                items.append(SyncItem(
+                    source_path=p,
+                    rel_target=p.name,
+                    import_rewrites=EXTENSION_IMPORT_REWRITES,
+                ))
 
     # 2. src/*.ts and src/*.py -> target/harness/
     # The Python sidecars are spawned by their TypeScript callers relative to import.meta.dir,
@@ -189,7 +195,11 @@ def plan_sync_items(harness_root: Path, target: Path) -> List[SyncItem]:
     if daemon_dir.is_dir():
         for p in sorted(daemon_dir.glob("*.ts")):
             if p.is_file():
-                items.append(SyncItem(source_path=p, rel_target=f"daemon/{p.name}", rewrite_imports=True))
+                items.append(SyncItem(
+                    source_path=p,
+                    rel_target=f"daemon/{p.name}",
+                    import_rewrites=DAEMON_IMPORT_REWRITES,
+                ))
         launcher = daemon_dir / "veyyon-telegram-daemon.ps1"
         if launcher.is_file():
             items.append(SyncItem(source_path=launcher, rel_target=launcher.name))
