@@ -26,7 +26,8 @@ import { Database } from "bun:sqlite";
 import { getDaemonDbPath } from "../daemon/config";
 import { DaemonStore } from "../daemon/store";
 import { readMessageThreadId } from "./harness/channel-config";
-import { escapeHtml } from "./sanitizer";
+import { escapeHtml, markdownToTelegramHtml } from "./sanitizer";
+import { resolveGithubRepo } from "./github-repo";
 import {
   ACTIVE_LEASE_SYMBOL,
   ACTIVE_ROOT_SYMBOL,
@@ -460,7 +461,7 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
             body: JSON.stringify({
               chat_id: fallbackRoute.chatId,
               message_thread_id: Number(fallbackRoute.topicId),
-              text: `<b>Agent · ${escapeHtml(params.lane_id)}</b>\n${params.text}`,
+              text: `<b>Agent · ${escapeHtml(params.lane_id)}</b>\n${markdownToTelegramHtml(params.text, savedContext?.cwd ? resolveGithubRepo(savedContext.cwd) : undefined)}`,
               parse_mode: "HTML",
             }),
           });
@@ -492,7 +493,7 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
         undefined,
         undefined,
         { laneId: params.lane_id, laneState: params.lane_state },
-        undefined,
+        savedContext?.cwd ? resolveGithubRepo(savedContext.cwd) : undefined,
         threadId,
       );
       if (!sent?.ok) throw new Error("Attributed message was not delivered");

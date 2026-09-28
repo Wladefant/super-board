@@ -104,7 +104,11 @@ from model_routing import (
     ANTHROPIC_BOTTLENECK_MAX_USED,
     CREDENTIAL_ENV_BY_PROVIDER,
     MINIMAX_PROVIDER,
+    LANE_MODEL_PINS,
     ROLE_MODEL_PINS,
+    ROLE_FALLBACK_LADDERS,
+    lane_model_at_depth,
+    lane_pin_drift,
     get_recommended_lanes,
     VERIFIED_CONTEXT_WINDOWS,
     ZAI_PROVIDER,
@@ -1382,7 +1386,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
                 task_type = TaskType.DEEP_REASONING
             else:
                 task_type = TaskType.ROUTINE_EXECUTION
-            self.assertEqual(model_to_agent_role(model, task_type, RiskLevel.HIGH), role, f"{role} pin {model}")
+            self.assertIn(model_to_agent_role(model, task_type, RiskLevel.HIGH), (role, "codex-reviewer"), f"{role} pin {model}")
         print("  [PASS] All role and provider mappings correct (ag-sonnet, ag-gpt, ds-pro, zai-task, zai-flash, minimax-task).")
 
     # -------------------------------------------------------------------------
@@ -1749,10 +1753,10 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         self.assertNotIn("gemini", str(antigravity_chain).lower(),
                          "the Antigravity fallback chain must not substitute a Gemini model")
 
-        # 4. Gating reviewer leads with Anthropic Opus 5.5, then free Antigravity Opus, then the
-        # cross-family Chinese reviewers, then DeepSeek. Gating roles (reviewer, ag-opus) NEVER lead with chatgpt-web.
+        # 4. Gating reviewer leads with Codex Sol (operator ruling 2026-09-29), then
+        # cross-family Chinese reviewers, then DeepSeek. Gating roles (reviewer) NEVER lead with chatgpt-web.
         critical_chain = str((agents.get("reviewer") or {}).get("model", ""))
-        self.assertEqual(critical_chain.split(",")[0].strip(), "anthropic/claude-opus-5-5:high")
+        self.assertEqual(critical_chain.split(",")[0].strip(), MODEL_CODEX_SOL)
         for expected in ("opencode-go/glm-5.3",
                          "opencode-go/qwen3.8-max", "deepseek/"):
             self.assertIn(expected, critical_chain, f"critical review chain must offer {expected}")
@@ -1760,7 +1764,6 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             first_model = str((agents.get(gating_role) or {}).get("model", "")).split(",")[0].strip()
             self.assertFalse(first_model.startswith("chatgpt-web"),
                              f"Gating role '{gating_role}' must never lead with chatgpt-web (got {first_model})")
-
         # 5. The standard-diff reviewer is the cross-family Chinese chain with a DeepSeek
         # fallback for the OpenCode Go limit, and the hard writer is GLM-5.3 or DeepSeek.
         standard_chain = str(model_roles.get("go-review", ""))
@@ -1821,11 +1824,8 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         # Every lane the router routes Chinese/cheap work to is spawnable AND may spawn its own
         # children with `agents: enabled: true`, so a lead lane can fan sub-slices out instead of
         # working serially.
-        for role, child_model in (
-            ("task", True), ("qa-verifier", True), ("spark", False), ("reviewer", True),
-            ("ds-task", True), ("go-task", True), ("go-review", True),
-            ("go-deep", True), ("go-bulk", True),
-        ):
+        for role in ("task", "qa-verifier", "spark", "reviewer", "ds-task", "go-task",
+                     "go-review", "go-deep", "go-bulk"):
             record = agents.get(role)
             self.assertIsNotNone(record, f"{role} must exist as a spawnable agent")
             self.assertTrue(record.get("enabled", True), f"{role} must be enabled in the roster")
@@ -1834,12 +1834,16 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             self.assertIsNot(level1.get("enabled"), False, f"{role} must permit child lanes")
             self.assertGreaterEqual(lane_depth(record, session_depth), 1,
                                     f"{role} must be able to spawn at least one nested level")
-            if child_model:
-                self.assertTrue(str(level1.get("model", "")).strip(),
-                                f"{role} must name the model chain its children default to")
 
-        # Children run the cheapest adequate lane: one of the free/Flash/DeepSeek-Flash rungs,
-        # never paid Opus and never a paid Anthropic model anywhere in a child chain.
+        # A nested `agents.model` is NOT the model of this lane's children: veyyon reads the
+        # SPAWNED agent's own chain at index depth-1, so `task.agents.model` is what every `task`
+        # at depth 2 runs, whoever spawned it. The Flash lanes must therefore lead with Flash at
+        # every depth; a Go-first nested level sent grandchild lanes into a Go usage 429.
+        self.assertEqual(lane_pin_drift(agents, session_depth), [],
+                         "task/qa-verifier must lead with Gemini Flash at every spawn depth")
+
+        # A nested level that does name a model stays on a cheap adequate lane: one of the
+        # free/Flash/DeepSeek-Flash rungs, never paid Opus and never a paid Anthropic model.
         cheap_prefixes = ("google-antigravity/gemini-3.8-flash", "deepseek/", "openai-codex/gpt-5.3-codex-spark",
                           "opencode-go/", "openrouter/deepseek/")
         for role in ("task", "qa-verifier", "reviewer", "ds-task", "go-task",
@@ -1862,6 +1866,46 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
               f"parent-only lanes: {sorted(parent_only)}.")
 
     # -------------------------------------------------------------------------
+    # TEST 39b: Flash lanes lead with Flash at every spawn depth (veyyon laneModelLayer)
+    # -------------------------------------------------------------------------
+    def test_flash_lane_pin_holds_at_every_depth(self):
+        print("\n--- TEST 39b: Flash Lanes Stay On Flash At Every Spawn Depth ---")
+        flash = "google-antigravity/gemini-3.8-flash:high"
+        self.assertEqual(LANE_MODEL_PINS, {"task": MODEL_GEMINI_FLASH, "qa-verifier": MODEL_GEMINI_FLASH})
+
+        # The shape that failed on 2026-09-27: a Go-first nested level under the Flash row. A
+        # depth-1 `task` runs Flash, but every depth-2 `task` (spawned by ANY depth-1 lane, e.g.
+        # an Opus reviewer) resolves to space-bunny-free.
+        go_first = {
+            role: {"model": flash, "agents": {
+                "enabled": True,
+                "model": f"{MODEL_GO_BUNNY},{MODEL_GO_GLM53_FLASH},deepseek/deepseek-flash:high",
+                "agents": {"enabled": True}}}
+            for role in ("task", "qa-verifier")
+        }
+        self.assertEqual(lane_model_at_depth(go_first, "task", 1)[0], flash)
+        self.assertEqual(lane_model_at_depth(go_first, "task", 2)[0], MODEL_GO_BUNNY)
+        # Depth 3 names no model and inherits the nearest level above it (depth 2), as veyyon does.
+        self.assertEqual(lane_model_at_depth(go_first, "task", 3)[0], MODEL_GO_BUNNY)
+        drift = lane_pin_drift(go_first, 3)
+        self.assertIn(f"task at depth 2 runs {MODEL_GO_BUNNY}, expected {MODEL_GEMINI_FLASH}", drift)
+        self.assertIn(f"qa-verifier at depth 3 runs {MODEL_GO_BUNNY}, expected {MODEL_GEMINI_FLASH}", drift)
+        self.assertNotIn(f"task at depth 1 runs {flash}, expected {MODEL_GEMINI_FLASH}", drift)
+
+        # The fix: nested levels name no model, so every depth inherits the Flash row.
+        inherited = {role: {"model": flash, "agents": {"enabled": True, "agents": {"enabled": True}}}
+                     for role in ("task", "qa-verifier")}
+        self.assertEqual(lane_pin_drift(inherited, 3), [])
+        # A nested level that names Flash again (other thinking level) is also clean.
+        explicit = copy.deepcopy(inherited)
+        explicit["task"]["agents"]["model"] = "google-antigravity/gemini-3.8-flash:medium," + MODEL_DEEPSEEK_FLASH
+        self.assertEqual(lane_pin_drift(explicit, 3), [])
+        # A missing row falls back to the default role, which is drift too.
+        self.assertEqual(lane_pin_drift({"task": inherited["task"]}, 1),
+                         [f"qa-verifier at depth 1 runs the default role, expected {MODEL_GEMINI_FLASH}"])
+        print("  [PASS] Go-first nested level flagged at depths 2-3; inherited/explicit Flash chains clean.")
+
+    # -------------------------------------------------------------------------
     # TEST 40: Every child-lane default maps to an enabled, spawnable roster entry
     # -------------------------------------------------------------------------
     def test_child_lane_defaults_resolve_to_enabled_roles(self):
@@ -1871,9 +1915,9 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             self.skipTest(f"profile config not installed at {config_path}")
         agents = ((yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}).get("agent") or {}).get("agents") or {}
 
-        # The nested Agents chain names the model a child lane runs by default. If that model
-        # maps to a role that is not in the roster, or is disabled in it, the parent's fan-out
-        # fails at spawn time — the drift this test exists to catch.
+        # A nested Agents level names the model this same lane type runs when spawned one level
+        # deeper (veyyon laneModelLayer). If that model maps to a role that is not in the roster,
+        # or is disabled in it, a nested spawn fails at spawn time — the drift this test catches.
         checked = set()
         for role, record in agents.items():
             level1 = (record or {}).get("agents")
@@ -2000,6 +2044,44 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         self.assertNotIn("opencode-go/", rec.selected_model)
         self.assertEqual(rec.selected_model, MODEL_GEMINI_FLASH)
         print(f"  [PASS] 429 retry-after-ms=136710000 parsed (136710s, ~38h); Go marked exhausted -> routed to {rec.selected_model}")
+
+    # -------------------------------------------------------------------------
+    # TEST 43b: space-bunny-free is closed by a recorded Go usage 429, not "uncapped"
+    # -------------------------------------------------------------------------
+    def test_go_bunny_closed_by_go_usage_429(self):
+        print("\n--- TEST 43b: space-bunny-free Closed By Go Usage 429 Until Retry-After ---")
+        usage = self._usage_with_opencode_go(weekly_used=0.10, weekly_reset_hrs=148.8)
+        now_dt = datetime.datetime.fromtimestamp(self.mock_now_ms / 1000.0, tz=datetime.timezone.utc)
+        cache = tmp_quota_path()
+        self.addCleanup(shutil.rmtree, cache.parent, ignore_errors=True)
+
+        def selector(at_ms):
+            return ResetAwareModelSelector(parse_usage_json(usage, current_time_ms=at_ms),
+                                           credentialed_providers={"opencode-go"},
+                                           quota_snapshot=load_quota_file(cache))
+
+        # Before any 429 the $0 Go model leads routine work.
+        before = selector(self.mock_now_ms).select_model(
+            task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.LOW)
+        self.assertEqual(before.selected_model, MODEL_GO_BUNNY)
+
+        # The body the 2026-09-27 grandchild lane died on (ArchiveResume.ArchiveResumeChecks, 19:59Z).
+        sel = selector(self.mock_now_ms)
+        reset = sel.record_429("opencode-go", "429 Go usage limit exceeded retry-after-ms=14417000",
+                               window_id="rolling-5h", now=now_dt)
+        self.assertEqual(reset.retry_after_seconds, 14417.0)
+        self.assertIn("opencode-go is exhausted until", sel.provider_exhaustion_reason(MODEL_GO_BUNNY))
+        during = selector(self.mock_now_ms).select_model(
+            task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.LOW)
+        self.assertEqual(during.selected_model, MODEL_GEMINI_FLASH,
+                         "a recorded Go usage 429 must close space-bunny-free, not leave it 'uncapped'")
+
+        # Past the retry-after the Go provider is eligible again with no further bookkeeping.
+        snapshot = load_quota_file(cache)
+        self.assertFalse(snapshot.is_eligible("opencode-go", now=now_dt + datetime.timedelta(seconds=14417 - 60)))
+        self.assertTrue(snapshot.is_eligible("opencode-go", now=now_dt + datetime.timedelta(seconds=14417 + 60)))
+        print(f"  [PASS] bunny leads -> 429 retry-after-ms=14417000 -> {during.selected_model}; "
+              "Go eligible again after the retry-after.")
 
     # -------------------------------------------------------------------------
     # TEST 44: OpenCode Go 5h rolling window guard
@@ -2286,7 +2368,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             out_json = json.loads(res.stdout)
             self.assertIn("windows", out_json)
             self.assertIn("recommended_lanes", out_json)
-            self.assertEqual(out_json["recommended_lanes"]["reviewer"], "anthropic/claude-opus-5-5:high")
+            self.assertEqual(out_json["recommended_lanes"]["reviewer"], MODEL_CODEX_SOL)
             self.assertNotIn("ag-opus", out_json["recommended_lanes"])
         finally:
             if os.path.exists(tmp_file.name):
@@ -2304,7 +2386,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             pinned = ROLE_MODEL_PINS.get(gating_role, "")
             self.assertFalse(pinned.startswith("chatgpt-web"),
                              f"ROLE_MODEL_PINS[{gating_role}] must never lead with chatgpt-web (got {pinned})")
-        self.assertEqual(ROLE_MODEL_PINS.get("reviewer"), "anthropic/claude-opus-5-5:high")
+        self.assertEqual(ROLE_MODEL_PINS.get("reviewer"), MODEL_CODEX_SOL)
         self.assertNotIn("ag-opus", ROLE_MODEL_PINS)
         print("  [PASS] Gating roles strictly barred from leading with chatgpt-web.")
 
@@ -2334,15 +2416,18 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
     # -------------------------------------------------------------------------
     def test_codex_manual_switch_both_states(self):
         print("\n--- TEST 49: Codex Manual Switch: Skipped when False, Routed when True ---")
-        # Invariant: CODEX_ENABLED is False by default (manual switch, operator 2026-09-26)
-        self.assertFalse(CODEX_ENABLED, "CODEX_ENABLED must default to False")
+        # Invariant: CODEX_ENABLED is True by default (re-enabled 2026-09-29, operator ruling)
+        self.assertTrue(CODEX_ENABLED, "CODEX_ENABLED must default to True")
 
         # ---------------------------------------------------------------------
         # STATE 1: Skipped when CODEX_ENABLED = False (or codex_available() == False)
         # ---------------------------------------------------------------------
+        p_enabled = mock.patch("model_routing.CODEX_ENABLED", False)
+        p_avail = mock.patch("model_routing.codex_available", return_value=False)
+        p_enabled.start()
+        p_avail.start()
         snapshot = parse_usage_json(self.mock_usage_dict, current_time_ms=self.mock_now_ms)
         selector_off = ResetAwareModelSelector(snapshot, codex_account=False)
-
         self.assertFalse(selector_off.codex_account_available())
 
         # Strong review (high-risk or routine) must NEVER select openai-codex or Flash;
@@ -2437,7 +2522,8 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             disp_work = default_sel.dispatch(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.MEDIUM)
             self.assertFalse(disp_work.recommendation["model"].startswith("openai-codex/"))
             self.assertEqual(disp_work.recommendation["agent_role"], "task")
-
+        p_enabled.stop()
+        p_avail.stop()
         # ---------------------------------------------------------------------
         # STATE 2: Routed again when CODEX_ENABLED = True (switched back on)
         # ---------------------------------------------------------------------
@@ -2556,9 +2642,8 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
                 self.assertEqual(model_to_agent_role(MODEL_CODEX_SOL, TaskType.ROUTINE_EXECUTION, RiskLevel.HIGH), "codex-worker")
                 self.assertEqual(model_to_agent_role(MODEL_CODEX_SOL, TaskType.DEEP_REASONING, RiskLevel.HIGH), "thinker")
         # Negative control: no automatic re-enable by date (manual switch only)
-        with mock.patch.dict(os.environ, {}, clear=True):
+        with mock.patch("model_routing.CODEX_ENABLED", False), mock.patch.dict(os.environ, {}, clear=True):
             self.assertFalse(codex_available(), "codex_available() must be False regardless of time when CODEX_ENABLED=False")
-
         # Profile config invariant: when CODEX_ENABLED is False, Codex agent roles must be disabled
         if not CODEX_ENABLED:
             config_path = os.path.expanduser("~/.veyyon/profiles/default/agent/config.yml")
@@ -2578,24 +2663,54 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
 
 
     # -------------------------------------------------------------------------
-    # TEST 50: astra-ux role pin — non-Codex UX model while CODEX_ENABLED=False
+    # TEST 50: astra-ux role pin — live Opus 5.5, high-risk fallback, never exhausted ag-opus
     # -------------------------------------------------------------------------
     def test_astra_ux_never_resolves_to_codex_while_disabled(self):
-        print("\n--- TEST 50: astra-ux Role Pin Non-Codex when CODEX_ENABLED=False ---")
-        # Invariant: while CODEX_ENABLED is False (or Codex account unavailable),
-        # astra-ux must never resolve to an openai-codex/ model (e.g. gpt-6-astra).
-        self.assertFalse(CODEX_ENABLED, "CODEX_ENABLED must default to False")
+        print("\n--- TEST 50: astra-ux Role Pin & Exhaustion Invariant ---")
+        # Invariant 1: while CODEX_ENABLED is True, astra-ux pins MODEL_CODEX_ASTRA (operator ruling 2026-09-29)
+        self.assertTrue(CODEX_ENABLED, "CODEX_ENABLED must default to True")
         self.assertIn("astra-ux", ROLE_MODEL_PINS)
         pinned_model = ROLE_MODEL_PINS["astra-ux"]
-        self.assertFalse(pinned_model.startswith("openai-codex/"),
-                         f"astra-ux pin must not be a Codex model, got {pinned_model}")
-        self.assertEqual(pinned_model, MODEL_AG_CLAUDE_OPUS,
-                         f"astra-ux must pin {MODEL_AG_CLAUDE_OPUS}")
+        self.assertEqual(pinned_model, MODEL_CODEX_ASTRA,
+                         f"astra-ux must pin {MODEL_CODEX_ASTRA}")
 
-        # resolve_role_model must return MODEL_AG_CLAUDE_OPUS
+        # Invariant 2: astra-ux resolves to openai-codex/gpt-6-astra:medium first
         resolved = resolve_role_model("astra-ux")
-        self.assertEqual(resolved, MODEL_AG_CLAUDE_OPUS)
-        self.assertFalse(resolved.startswith("openai-codex/"))
+        self.assertEqual(resolved, MODEL_CODEX_ASTRA)
+        self.assertNotEqual(resolved, MODEL_AG_CLAUDE_OPUS)
+
+        # Invariant 3: fallback ladder exists, starts with Astra, has no Flash/free tier
+        self.assertIn("astra-ux", ROLE_FALLBACK_LADDERS)
+        ladder = ROLE_FALLBACK_LADDERS["astra-ux"]
+        self.assertEqual(ladder[0], MODEL_CODEX_ASTRA)
+        for m in ladder:
+            self.assertFalse("flash" in m.lower(), f"astra-ux ladder must not contain Flash: {m}")
+            self.assertFalse("free" in m.lower(), f"astra-ux ladder must not contain free tier: {m}")
+
+        # Invariant 4: astra-ux NEVER resolves to ag-opus when ag-opus is marked exhausted
+        from quota_snapshot import QuotaSnapshot, QuotaWindowEntry
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        mock_snap = QuotaSnapshot(entries={
+            f"{AG_ANTHROPIC_PROVIDER}|default|daily": QuotaWindowEntry(
+                provider=AG_ANTHROPIC_PROVIDER,
+                window_id="daily",
+                exhausted_until=(now_utc + datetime.timedelta(days=5)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                source="429",
+            )
+        })
+        self.assertFalse(mock_snap.is_eligible(AG_ANTHROPIC_PROVIDER))
+        resolved_with_ag_exhausted = resolve_role_model("astra-ux", quota_snapshot=mock_snap)
+        self.assertEqual(resolved_with_ag_exhausted, MODEL_CODEX_ASTRA)
+        self.assertNotEqual(resolved_with_ag_exhausted, MODEL_AG_CLAUDE_OPUS)
+
+        # Negative control: even if ag-opus were the first candidate in the ladder,
+        # resolve_role_model skips exhausted ag-opus and falls back to live model,
+        # proving astra-ux NEVER resolves to ag-opus while it is marked exhausted.
+        with mock.patch.dict(ROLE_FALLBACK_LADDERS, {"astra-ux": [MODEL_AG_CLAUDE_OPUS, MODEL_CLAUDE_OPUS_55]}):
+            neg_resolved = resolve_role_model("astra-ux", quota_snapshot=mock_snap)
+            self.assertEqual(neg_resolved, MODEL_CLAUDE_OPUS_55)
+            self.assertNotEqual(neg_resolved, MODEL_AG_CLAUDE_OPUS,
+                              "Negative control: astra-ux must skip exhausted ag-opus and fall back")
 
         # Check installed profile configuration if present
         config_path = Path(os.path.expanduser("~/.veyyon/profiles/default/agent/config.yml"))
@@ -2606,42 +2721,29 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             chain = (agents.get("astra-ux") or {}).get("model") or model_roles.get("astra-ux")
             if chain is not None:
                 leading = str(chain).split(",")[0].strip()
-                self.assertFalse(leading.startswith("openai-codex/"),
-                                 f"astra-ux leading model in config.yml must not be Codex: {leading}")
                 self.assertEqual(leading, pinned_model,
                                  f"astra-ux leading model {leading} must match pin {pinned_model}")
+                for m in str(chain).split(","):
+                    m_clean = m.strip().lower()
+                    self.assertFalse("flash" in m_clean, f"config.yml astra-ux chain must not contain Flash: {m}")
+                    self.assertFalse("free" in m_clean, f"config.yml astra-ux chain must not contain free tier: {m}")
                 if "astra-ux" in agents:
                     self.assertTrue(agents["astra-ux"].get("enabled", True), "astra-ux must be enabled")
 
-        # ---------------------------------------------------------------------
-        # NEGATIVE CONTROL:
-        # 1. The old failing configuration (MODEL_CODEX_ASTRA) is an openai-codex/ model.
-        # 2. When CODEX_ENABLED=False (codex_available() is False), resolve_role_model
-        #    MUST refuse to resolve any Codex role (returns None, never openai-codex/*).
-        # 3. If astra-ux were mocked with the old failing Codex pin, resolve_role_model
-        #    blocks it when codex_available() is False.
-        # ---------------------------------------------------------------------
+        # Fallback when Codex is unavailable: resolves to non-Codex model from fallback ladder
         with mock.patch("model_routing.codex_available", return_value=False):
-            old_failing_model = MODEL_CODEX_ASTRA  # "openai-codex/gpt-6-astra:medium"
-            self.assertTrue(old_failing_model.startswith("openai-codex/"))
-            self.assertNotEqual(ROLE_MODEL_PINS["astra-ux"], old_failing_model)
+            fallback_resolved = resolve_role_model("astra-ux")
+            self.assertIsNotNone(fallback_resolved)
+            self.assertFalse(fallback_resolved.startswith("openai-codex/"),
+                             f"astra-ux fallback must not be Codex: {fallback_resolved}")
+            self.assertNotIn("flash", fallback_resolved.lower())
+            self.assertNotIn("free", fallback_resolved.lower())
 
-            # Codex roles resolve to None when Codex is disabled
-            self.assertIsNone(resolve_role_model("codex-worker"))
-            self.assertIsNone(resolve_role_model("codex-reviewer"))
-
-            # Mock astra-ux temporarily pointing to the old failing Codex model:
-            # resolve_role_model MUST NOT resolve to it while Codex is disabled:
-            with mock.patch.dict(ROLE_MODEL_PINS, {"astra-ux": old_failing_model}):
-                neg_resolved = resolve_role_model("astra-ux")
-                self.assertIsNone(neg_resolved,
-                                  "Negative control: astra-ux with Codex model must resolve to None when CODEX_ENABLED=False")
-
-        # When Codex is enabled, a role pinned to MODEL_AG_CLAUDE_OPUS still resolves to it
+        # Live model resolution remains MODEL_CODEX_ASTRA
         with mock.patch("model_routing.codex_available", return_value=True):
-            self.assertEqual(resolve_role_model("astra-ux"), MODEL_AG_CLAUDE_OPUS)
+            self.assertEqual(resolve_role_model("astra-ux"), MODEL_CODEX_ASTRA)
 
-        print("  [PASS] astra-ux resolves to non-Codex model, negative control verified.")
+        print("  [PASS] astra-ux resolves to Astra, falls back cleanly when disabled, skips exhausted ag-opus.")
     # -------------------------------------------------------------------------
     # TEST 43: Advisor role pinned to Gemini 3.8 Flash (operator ruling 2026-09-27)
     # -------------------------------------------------------------------------

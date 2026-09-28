@@ -78,6 +78,8 @@ export const PROJECT_SLUG_MAP: Record<string, string> = {
   superboard: "Wladefant/super-board",
   veyyon: "Wladefant/veyyon",
   "codex-chatgpt-web": "Wladefant/codex-chatgpt-web",
+  shipnovo: "Wladefant/shipnovo",
+  bendhltool: "Wladefant/shipnovo",
 };
 
 export function resolveRepoSlug(nameOrSlug?: string): string | null {

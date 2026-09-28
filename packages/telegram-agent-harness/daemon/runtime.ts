@@ -346,7 +346,9 @@ export class TelegramDaemon {
       send: (target, html) => sendTo(target, html, "HTML"),
       // Bare #N in relayed prose links to the bound session's own repository.
       relay: (target, markdown, sessionId) => {
-        const workspace = this.store.getRoute(slot.slotId, target.chatId, target.topicId)?.workspace;
+        const workspace = this.store.getRoute(slot.slotId, target.chatId, target.topicId)?.workspace
+          ?? this.store.routesForSession(sessionId)[0]?.workspace
+          ?? slot.workspace;
         return sendTo(target, markdown, undefined, sessionId, workspace ? resolveGithubRepo(workspace) : undefined);
       },
       log: message => this.log(message),
@@ -467,8 +469,14 @@ export class TelegramDaemon {
             };
           },
           send,
-          photo: (file, caption) => poller.sendTelegramPhoto(chatId, file, caption),
-          mediaGroup: (files, caption) => poller.sendMediaGroup(chatId, files, caption),
+          photo: (file, caption) => {
+            const ws = route?.workspace || slot.workspace;
+            return poller.sendTelegramPhoto(chatId, file, caption, undefined, ws ? resolveGithubRepo(ws) : undefined);
+          },
+          mediaGroup: (files, caption) => {
+            const ws = route?.workspace || slot.workspace;
+            return poller.sendMediaGroup(chatId, files, caption, ws ? resolveGithubRepo(ws) : undefined);
+          },
           latestPng: async () => null,
           inbound: async message => {
             await router.deliver(target, message, "auto");

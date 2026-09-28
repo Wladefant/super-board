@@ -56,6 +56,12 @@ class TestInstallTelegramHarness(unittest.TestCase):
         self.assertTrue((self.target / "harness" / "installed-commands.ts").is_file())
         self.assertTrue((self.target / "harness" / "telegram-router.ts").is_file())
 
+        # Flattened extension modules must still resolve sibling daemon modules.
+        installed_index = (self.target / "index.ts").read_text(encoding="utf-8")
+        self.assertIn('from "./daemon/config"', installed_index)
+        self.assertIn('from "./daemon/store"', installed_index)
+        self.assertNotIn('from "../daemon/', installed_index)
+
         # Assert manifest exists and is valid
         manifest_path = self.target / "install-manifest.json"
         self.assertTrue(manifest_path.is_file())
@@ -398,20 +404,29 @@ class TestInstallTelegramHarness(unittest.TestCase):
                 resolved = self.target / f"{match.group(1)}.ts"
                 self.assertTrue(resolved.is_file(), f"daemon/{name}: '{match.group(1)}' resolves to nothing")
 
-    def test_rewrite_daemon_imports_is_exact(self):
-        """The rewrite maps each source directory onto its installed location."""
-        rewritten = install_module.rewrite_daemon_imports(
+    def test_import_rewrites_are_exact(self):
+        """Each source directory maps onto its installed location."""
+        daemon_source = (
             'import { a } from "../extension/coordinator";\n'
             'import { b } from "../extension/harness/command-runner";\n'
             'import { c } from "../src/gui-host-client";\n'
             'import { d } from "./config";\n'
         )
         self.assertEqual(
-            rewritten,
+            install_module.rewrite_imports(daemon_source, install_module.DAEMON_IMPORT_REWRITES),
             'import { a } from "../coordinator";\n'
             'import { b } from "../harness/command-runner";\n'
             'import { c } from "../harness/gui-host-client";\n'
             'import { d } from "./config";\n',
+        )
+        extension_source = (
+            'import { a } from "../daemon/config";\n'
+            'import { b } from "./runtime";\n'
+        )
+        self.assertEqual(
+            install_module.rewrite_imports(extension_source, install_module.EXTENSION_IMPORT_REWRITES),
+            'import { a } from "./daemon/config";\n'
+            'import { b } from "./runtime";\n',
         )
 
     def test_daemon_runtime_state_is_protected(self):

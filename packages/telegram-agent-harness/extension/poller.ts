@@ -1315,7 +1315,7 @@ export class TelegramPoller {
     file: string,
     caption: string,
     replyMarkup?: Record<string, unknown>,
-    defaultRepo = "Bavariance/polysimulator",
+    defaultRepo?: string,
   ): Promise<void> {
     const sessionId = this.correlation?.getSessionId();
     const slotId = this.correlation?.getSlotId();
@@ -1349,7 +1349,7 @@ export class TelegramPoller {
     chatId: string,
     files: string[],
     caption?: string,
-    defaultRepo = "Bavariance/polysimulator",
+    defaultRepo?: string,
   ): Promise<void> {
     if (!files || files.length === 0) {
       throw new Error("Media group requires at least one file");
