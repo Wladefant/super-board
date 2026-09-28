@@ -96,18 +96,11 @@ MODEL_CODEX_FAST = "openai-codex/gpt-5.3-codex"
 MODEL_CODEX_SOL = "openai-codex/gpt-5.6-sol:high"
 MODEL_CODEX_ASTRA = "openai-codex/gpt-6-astra:medium"
 MODEL_CODEX_SPARK = "openai-codex/gpt-5.3-codex-spark:medium"
-# Manual account-availability switch (2026-09-26, operator ruling):
-# The operator confirmed Codex is off because he has no account, and will buy one again in
-# about a week (~2026-10-03). This is a temporary switch-off, not a removal.
-# Every Codex pin and ladder entry is preserved in place. While CODEX_ENABLED is False (the
-# default), all openai-codex rungs are skipped across all ladders.
-# Codex comes back only when someone flips this switch by hand after the operator confirms
-# the new account works (set CODEX_ENABLED = True, or set VEYYON_CODEX_ENABLED=1).
-CODEX_ENABLED: bool = False
-CODEX_DISABLED_REASON: str = (
-    "Operator has no active Codex account (~2026-10-03 target for new subscription); "
-    "CODEX_ENABLED switch is False."
-)
+# Manual account-availability switch (re-enabled 2026-09-29, operator ruling):
+# The operator confirmed a new Codex account (tricuoc1968@gmail.com, plan prolite, 5x plan).
+# CODEX_ENABLED is True. Can be forced off via VEYYON_CODEX_ENABLED=0.
+CODEX_ENABLED: bool = True
+CODEX_DISABLED_REASON: str = ""
 
 
 def codex_available() -> bool:
@@ -352,20 +345,20 @@ def detect_credentialed_providers(auth_store_paths: Optional[List[str]] = None) 
 # model would silently run that model instead. Operator applies these to the profile
 # (see policies/default/AGENTS.md "Worker role pins"); the router never edits config.
 ROLE_MODEL_PINS: Dict[str, str] = {
-    "reviewer": "anthropic/claude-opus-5-5:high",
-    "advisor": MODEL_CLAUDE_FABLE,
+    # Operator model routing split (2026-09-29):
+    # Opus 5.5 is for orchestrator ONLY (modelRoles.default). No subagent role or reviewer lane default
+    # may land on Opus: reviewer routes to Codex Sol (openai-codex/gpt-5.6-sol:high).
+    "reviewer": MODEL_CODEX_SOL,
+    "codex-worker": MODEL_CODEX_SOL,
+    "codex-reviewer": MODEL_CODEX_SOL,
+    "thinker": MODEL_CODEX_SOL,
+    # Astra (openai-codex/gpt-6-astra) is used sparingly for the hardest items (operator ruling 2026-09-29).
+    "astra-ux": MODEL_CODEX_ASTRA,
     "ds-pro": MODEL_DEEPSEEK_PRO,
     "zai-task": MODEL_ZAI_GLM,
     "zai-flash": MODEL_ZAI_GLM_FLASH,
     "minimax-task": MODEL_MINIMAX_M3,
     "gemini-pro": MODEL_GEMINI_PRO,
-    "codex-worker": MODEL_CODEX_SOL,
-    "codex-reviewer": MODEL_CODEX_SOL,
-    "thinker": MODEL_CODEX_SOL,
-    "reviewer": MODEL_ANTHROPIC_OPUS,
-    # The astra-ux role was repointed to anthropic/claude-opus-5-5:high (Opus 5.5 route)
-    # falling back per the existing high-risk ladder, skipping ag-opus while exhausted (super-board#325).
-    "astra-ux": MODEL_CLAUDE_OPUS_55,
     # The free Spark allowance has its own enabled roster entry and its own model, so a lane
     # routed onto Spark must be dispatched as `spark`, never as a Codex Astral role.
     "spark": MODEL_CODEX_SPARK,
@@ -387,15 +380,23 @@ ROLE_MODEL_PINS: Dict[str, str] = {
 
 
 # Fallback ladders for roles with multi-model fallback requirements.
-# astra-ux resolves to anthropic/claude-opus-5-5:high first, falling back per the
-# existing high-risk ladder (skipping ag-opus while exhausted, never Flash or free).
+# astra-ux resolves to openai-codex/gpt-6-astra:medium first, falling back per the
+# high-risk ladder (skipping ag-opus while exhausted, never Flash or free).
+# reviewer resolves to openai-codex/gpt-5.6-sol:high first (operator ruling 2026-09-29).
 ROLE_FALLBACK_LADDERS: Dict[str, List[str]] = {
     "astra-ux": [
-        MODEL_CLAUDE_OPUS_55,
-        MODEL_AG_CLAUDE_OPUS,
+        MODEL_CODEX_ASTRA,
+        MODEL_CODEX_SOL,
         MODEL_GO_GLM53,
-        MODEL_CLAUDE_FABLE,
+        MODEL_CLAUDE_OPUS_55,
         MODEL_DEEPSEEK_PRO,
+    ],
+    "reviewer": [
+        MODEL_CODEX_SOL,
+        MODEL_GO_GLM53,
+        MODEL_GO_QWEN38_MAX,
+        MODEL_DEEPSEEK_FLASH,
+        MODEL_CLAUDE_OPUS_55,
     ],
 }
 
@@ -440,7 +441,7 @@ def is_agent_role_available(role: str) -> bool:
     """Return True if an agent role is currently available to be dispatched.
 
     Codex agent roles (codex-worker, codex-reviewer, thinker, sol) and any role
-    pinned to an openai-codex/ model are refused when codex_available() is False.
+    pinned to an openai-codex/ model without a fallback ladder are refused when codex_available() is False.
     """
     if role not in ROLE_MODEL_PINS and role not in (
         "task", "qa-verifier", "ds-task", "go-task", "go-deep", "go-review", "go-bulk", "spark", "web-task", "web-thinker", "compactor", "sol"
@@ -448,9 +449,10 @@ def is_agent_role_available(role: str) -> bool:
         return False
     if role in ("codex-worker", "codex-reviewer", "thinker", "sol"):
         return codex_available()
-    model = ROLE_MODEL_PINS.get(role)
-    if model and model.startswith("openai-codex/") and not codex_available():
-        return False
+    if role in ROLE_MODEL_PINS:
+        model = ROLE_MODEL_PINS[role]
+        if model.startswith("openai-codex/") and not codex_available():
+            return resolve_role_model(role) is not None
     return True
 
 
@@ -2244,9 +2246,12 @@ def compute_window_burn_paces(
 def get_recommended_lanes(selector: ResetAwareModelSelector) -> Dict[str, str]:
     """Map each standard role to its recommended model and account annotation."""
     anthropic_pace = selector.pace_by_provider().get("anthropic")
-    reviewer_str = "anthropic/claude-opus-5-5:high"
-    if anthropic_pace and anthropic_pace.throttled:
-        reviewer_str = f"{MODEL_DEEPSEEK_PRO} (fallback from throttled Anthropic)"
+    if codex_available():
+        reviewer_str = MODEL_CODEX_SOL
+    else:
+        reviewer_str = "anthropic/claude-opus-5-5:high"
+        if anthropic_pace and anthropic_pace.throttled:
+            reviewer_str = f"{MODEL_DEEPSEEK_PRO} (fallback from throttled Anthropic)"
 
     return {
         "reviewer": reviewer_str,
@@ -2258,8 +2263,8 @@ def get_recommended_lanes(selector: ResetAwareModelSelector) -> Dict[str, str]:
         "go-review": MODEL_GO_GLM53,
         "web-task": MODEL_CHATGPT_WEB,
         "web-thinker": MODEL_CHATGPT_WEB,
-        "codex-worker": MODEL_CODEX_ASTRA,
-        "codex-reviewer": MODEL_CODEX_ASTRA,
+        "codex-worker": MODEL_CODEX_SOL,
+        "codex-reviewer": MODEL_CODEX_SOL,
     }
 
 

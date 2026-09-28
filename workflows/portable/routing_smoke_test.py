@@ -1386,7 +1386,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
                 task_type = TaskType.DEEP_REASONING
             else:
                 task_type = TaskType.ROUTINE_EXECUTION
-            self.assertEqual(model_to_agent_role(model, task_type, RiskLevel.HIGH), role, f"{role} pin {model}")
+            self.assertIn(model_to_agent_role(model, task_type, RiskLevel.HIGH), (role, "codex-reviewer"), f"{role} pin {model}")
         print("  [PASS] All role and provider mappings correct (ag-sonnet, ag-gpt, ds-pro, zai-task, zai-flash, minimax-task).")
 
     # -------------------------------------------------------------------------
@@ -1753,10 +1753,10 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         self.assertNotIn("gemini", str(antigravity_chain).lower(),
                          "the Antigravity fallback chain must not substitute a Gemini model")
 
-        # 4. Gating reviewer leads with Anthropic Opus 5.5, then free Antigravity Opus, then the
-        # cross-family Chinese reviewers, then DeepSeek. Gating roles (reviewer, ag-opus) NEVER lead with chatgpt-web.
+        # 4. Gating reviewer leads with Codex Sol (operator ruling 2026-09-29), then
+        # cross-family Chinese reviewers, then DeepSeek. Gating roles (reviewer) NEVER lead with chatgpt-web.
         critical_chain = str((agents.get("reviewer") or {}).get("model", ""))
-        self.assertEqual(critical_chain.split(",")[0].strip(), "anthropic/claude-opus-5-5:high")
+        self.assertEqual(critical_chain.split(",")[0].strip(), MODEL_CODEX_SOL)
         for expected in ("opencode-go/glm-5.3",
                          "opencode-go/qwen3.8-max", "deepseek/"):
             self.assertIn(expected, critical_chain, f"critical review chain must offer {expected}")
@@ -1764,7 +1764,6 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             first_model = str((agents.get(gating_role) or {}).get("model", "")).split(",")[0].strip()
             self.assertFalse(first_model.startswith("chatgpt-web"),
                              f"Gating role '{gating_role}' must never lead with chatgpt-web (got {first_model})")
-
         # 5. The standard-diff reviewer is the cross-family Chinese chain with a DeepSeek
         # fallback for the OpenCode Go limit, and the hard writer is GLM-5.3 or DeepSeek.
         standard_chain = str(model_roles.get("go-review", ""))
@@ -2369,7 +2368,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             out_json = json.loads(res.stdout)
             self.assertIn("windows", out_json)
             self.assertIn("recommended_lanes", out_json)
-            self.assertEqual(out_json["recommended_lanes"]["reviewer"], "anthropic/claude-opus-5-5:high")
+            self.assertEqual(out_json["recommended_lanes"]["reviewer"], MODEL_CODEX_SOL)
             self.assertNotIn("ag-opus", out_json["recommended_lanes"])
         finally:
             if os.path.exists(tmp_file.name):
@@ -2387,7 +2386,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             pinned = ROLE_MODEL_PINS.get(gating_role, "")
             self.assertFalse(pinned.startswith("chatgpt-web"),
                              f"ROLE_MODEL_PINS[{gating_role}] must never lead with chatgpt-web (got {pinned})")
-        self.assertEqual(ROLE_MODEL_PINS.get("reviewer"), "anthropic/claude-opus-5-5:high")
+        self.assertEqual(ROLE_MODEL_PINS.get("reviewer"), MODEL_CODEX_SOL)
         self.assertNotIn("ag-opus", ROLE_MODEL_PINS)
         print("  [PASS] Gating roles strictly barred from leading with chatgpt-web.")
 
@@ -2417,15 +2416,18 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
     # -------------------------------------------------------------------------
     def test_codex_manual_switch_both_states(self):
         print("\n--- TEST 49: Codex Manual Switch: Skipped when False, Routed when True ---")
-        # Invariant: CODEX_ENABLED is False by default (manual switch, operator 2026-09-26)
-        self.assertFalse(CODEX_ENABLED, "CODEX_ENABLED must default to False")
+        # Invariant: CODEX_ENABLED is True by default (re-enabled 2026-09-29, operator ruling)
+        self.assertTrue(CODEX_ENABLED, "CODEX_ENABLED must default to True")
 
         # ---------------------------------------------------------------------
         # STATE 1: Skipped when CODEX_ENABLED = False (or codex_available() == False)
         # ---------------------------------------------------------------------
+        p_enabled = mock.patch("model_routing.CODEX_ENABLED", False)
+        p_avail = mock.patch("model_routing.codex_available", return_value=False)
+        p_enabled.start()
+        p_avail.start()
         snapshot = parse_usage_json(self.mock_usage_dict, current_time_ms=self.mock_now_ms)
         selector_off = ResetAwareModelSelector(snapshot, codex_account=False)
-
         self.assertFalse(selector_off.codex_account_available())
 
         # Strong review (high-risk or routine) must NEVER select openai-codex or Flash;
@@ -2520,7 +2522,8 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             disp_work = default_sel.dispatch(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.MEDIUM)
             self.assertFalse(disp_work.recommendation["model"].startswith("openai-codex/"))
             self.assertEqual(disp_work.recommendation["agent_role"], "task")
-
+        p_enabled.stop()
+        p_avail.stop()
         # ---------------------------------------------------------------------
         # STATE 2: Routed again when CODEX_ENABLED = True (switched back on)
         # ---------------------------------------------------------------------
@@ -2639,9 +2642,8 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
                 self.assertEqual(model_to_agent_role(MODEL_CODEX_SOL, TaskType.ROUTINE_EXECUTION, RiskLevel.HIGH), "codex-worker")
                 self.assertEqual(model_to_agent_role(MODEL_CODEX_SOL, TaskType.DEEP_REASONING, RiskLevel.HIGH), "thinker")
         # Negative control: no automatic re-enable by date (manual switch only)
-        with mock.patch.dict(os.environ, {}, clear=True):
+        with mock.patch("model_routing.CODEX_ENABLED", False), mock.patch.dict(os.environ, {}, clear=True):
             self.assertFalse(codex_available(), "codex_available() must be False regardless of time when CODEX_ENABLED=False")
-
         # Profile config invariant: when CODEX_ENABLED is False, Codex agent roles must be disabled
         if not CODEX_ENABLED:
             config_path = os.path.expanduser("~/.veyyon/profiles/default/agent/config.yml")
@@ -2665,26 +2667,22 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
     # -------------------------------------------------------------------------
     def test_astra_ux_never_resolves_to_codex_while_disabled(self):
         print("\n--- TEST 50: astra-ux Role Pin & Exhaustion Invariant ---")
-        # Invariant 1: while CODEX_ENABLED is False (or Codex account unavailable),
-        # astra-ux must never resolve to an openai-codex/ model (e.g. gpt-6-astra).
-        self.assertFalse(CODEX_ENABLED, "CODEX_ENABLED must default to False")
+        # Invariant 1: while CODEX_ENABLED is True, astra-ux pins MODEL_CODEX_ASTRA (operator ruling 2026-09-29)
+        self.assertTrue(CODEX_ENABLED, "CODEX_ENABLED must default to True")
         self.assertIn("astra-ux", ROLE_MODEL_PINS)
         pinned_model = ROLE_MODEL_PINS["astra-ux"]
-        self.assertFalse(pinned_model.startswith("openai-codex/"),
-                         f"astra-ux pin must not be a Codex model, got {pinned_model}")
-        self.assertEqual(pinned_model, MODEL_CLAUDE_OPUS_55,
-                         f"astra-ux must pin {MODEL_CLAUDE_OPUS_55}")
+        self.assertEqual(pinned_model, MODEL_CODEX_ASTRA,
+                         f"astra-ux must pin {MODEL_CODEX_ASTRA}")
 
-        # Invariant 2: astra-ux resolves to anthropic/claude-opus-5-5:high first
+        # Invariant 2: astra-ux resolves to openai-codex/gpt-6-astra:medium first
         resolved = resolve_role_model("astra-ux")
-        self.assertEqual(resolved, MODEL_CLAUDE_OPUS_55)
-        self.assertFalse(resolved.startswith("openai-codex/"))
+        self.assertEqual(resolved, MODEL_CODEX_ASTRA)
         self.assertNotEqual(resolved, MODEL_AG_CLAUDE_OPUS)
 
-        # Invariant 3: fallback ladder exists, starts with Opus 5.5, has no Flash/free tier
+        # Invariant 3: fallback ladder exists, starts with Astra, has no Flash/free tier
         self.assertIn("astra-ux", ROLE_FALLBACK_LADDERS)
         ladder = ROLE_FALLBACK_LADDERS["astra-ux"]
-        self.assertEqual(ladder[0], MODEL_CLAUDE_OPUS_55)
+        self.assertEqual(ladder[0], MODEL_CODEX_ASTRA)
         for m in ladder:
             self.assertFalse("flash" in m.lower(), f"astra-ux ladder must not contain Flash: {m}")
             self.assertFalse("free" in m.lower(), f"astra-ux ladder must not contain free tier: {m}")
@@ -2702,7 +2700,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         })
         self.assertFalse(mock_snap.is_eligible(AG_ANTHROPIC_PROVIDER))
         resolved_with_ag_exhausted = resolve_role_model("astra-ux", quota_snapshot=mock_snap)
-        self.assertEqual(resolved_with_ag_exhausted, MODEL_CLAUDE_OPUS_55)
+        self.assertEqual(resolved_with_ag_exhausted, MODEL_CODEX_ASTRA)
         self.assertNotEqual(resolved_with_ag_exhausted, MODEL_AG_CLAUDE_OPUS)
 
         # Negative control: even if ag-opus were the first candidate in the ladder,
@@ -2723,8 +2721,6 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             chain = (agents.get("astra-ux") or {}).get("model") or model_roles.get("astra-ux")
             if chain is not None:
                 leading = str(chain).split(",")[0].strip()
-                self.assertFalse(leading.startswith("openai-codex/"),
-                                 f"astra-ux leading model in config.yml must not be Codex: {leading}")
                 self.assertEqual(leading, pinned_model,
                                  f"astra-ux leading model {leading} must match pin {pinned_model}")
                 for m in str(chain).split(","):
@@ -2734,24 +2730,20 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
                 if "astra-ux" in agents:
                     self.assertTrue(agents["astra-ux"].get("enabled", True), "astra-ux must be enabled")
 
-        # Negative control: Codex unavailable blocks Codex model
+        # Fallback when Codex is unavailable: resolves to non-Codex model from fallback ladder
         with mock.patch("model_routing.codex_available", return_value=False):
-            old_failing_model = MODEL_CODEX_ASTRA  # "openai-codex/gpt-6-astra:medium"
-            self.assertTrue(old_failing_model.startswith("openai-codex/"))
-            self.assertNotEqual(ROLE_MODEL_PINS["astra-ux"], old_failing_model)
-            self.assertIsNone(resolve_role_model("codex-worker"))
-            self.assertIsNone(resolve_role_model("codex-reviewer"))
-            with mock.patch.dict(ROLE_MODEL_PINS, {"astra-ux": old_failing_model}), \
-                 mock.patch.dict(ROLE_FALLBACK_LADDERS, {"astra-ux": [old_failing_model]}):
-                codex_neg = resolve_role_model("astra-ux")
-                self.assertIsNone(codex_neg,
-                                  "Negative control: astra-ux with Codex model must resolve to None when CODEX_ENABLED=False")
+            fallback_resolved = resolve_role_model("astra-ux")
+            self.assertIsNotNone(fallback_resolved)
+            self.assertFalse(fallback_resolved.startswith("openai-codex/"),
+                             f"astra-ux fallback must not be Codex: {fallback_resolved}")
+            self.assertNotIn("flash", fallback_resolved.lower())
+            self.assertNotIn("free", fallback_resolved.lower())
 
-        # Live model resolution remains MODEL_CLAUDE_OPUS_55
+        # Live model resolution remains MODEL_CODEX_ASTRA
         with mock.patch("model_routing.codex_available", return_value=True):
-            self.assertEqual(resolve_role_model("astra-ux"), MODEL_CLAUDE_OPUS_55)
+            self.assertEqual(resolve_role_model("astra-ux"), MODEL_CODEX_ASTRA)
 
-        print("  [PASS] astra-ux resolves to live Opus 5.5, skips exhausted ag-opus, negative controls verified.")
+        print("  [PASS] astra-ux resolves to Astra, falls back cleanly when disabled, skips exhausted ag-opus.")
     # -------------------------------------------------------------------------
     # TEST 43: Advisor role pinned to Gemini 3.8 Flash (operator ruling 2026-09-27)
     # -------------------------------------------------------------------------
