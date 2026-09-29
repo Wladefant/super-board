@@ -17,7 +17,7 @@ current Telegram route. `kind: "auto"` sends `.jpg`, `.jpeg`, `.png`, and `.webp
 files with `sendPhoto`; PDFs and other files use `sendDocument`. The tool accepts
 an optional caption and filename, keeps the bound `chat_id` and
 `message_thread_id`, and leaves `message_thread_id` unset for direct chats.
-Telegram Bot API uploads are limited here to 20 MiB for photos and 50 MiB for
+Telegram Bot API uploads are limited here to 10 MiB for photos and 50 MiB for
 documents; larger files fail before any network request.
 
 ### Mini App session lifecycle

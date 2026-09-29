@@ -125,7 +125,7 @@ test("missing files and files over each Telegram limit fail before network acces
     chatId: "1",
     filePath: largePhoto,
     kind: "photo",
-  })).rejects.toThrow(/photo limit exceeded.*20\.0 MiB/i);
+  })).rejects.toThrow(/photo limit exceeded.*10\.0 MiB/i);
 
   const largeDocument = path.join(directory, "large.bin");
   fs.writeFileSync(largeDocument, "x");

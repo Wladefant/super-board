@@ -548,7 +548,7 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "telegram_attachment",
     label: "Send Telegram attachment",
-    description: "Send a local image inline or a PDF/other file as a document to the session's exact Telegram chat and forum topic. Telegram Bot API limits apply: 20 MiB for photos and 50 MiB for documents.",
+    description: "Send a local image inline or a PDF/other file as a document to the session's exact Telegram chat and forum topic. Telegram Bot API limits apply: 10 MiB for photos and 50 MiB for documents.",
     parameters: z.object({
       file_path: z.string(),
       kind: z.enum(["auto", "photo", "document"]).default("auto"),

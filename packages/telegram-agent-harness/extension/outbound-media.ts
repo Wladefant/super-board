@@ -6,7 +6,7 @@ import type { TelegramSendMessageResponse } from "./types";
 export type TelegramAttachmentKind = "photo" | "document";
 export type TelegramAttachmentSelection = TelegramAttachmentKind | "auto";
 
-export const TELEGRAM_PHOTO_LIMIT_BYTES = 20 * 1024 * 1024;
+export const TELEGRAM_PHOTO_LIMIT_BYTES = 10 * 1024 * 1024;
 export const TELEGRAM_DOCUMENT_LIMIT_BYTES = 50 * 1024 * 1024;
 
 const PHOTO_EXTENSIONS: Record<string, true> = {
