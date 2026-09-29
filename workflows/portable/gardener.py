@@ -231,10 +231,66 @@ def is_test_or_spec_path(path_str: str) -> bool:
     return False
 
 
+def _get_companion_test_names(stem: str) -> Set[str]:
+    """Generates standard test file prefix variants for a component or module stem."""
+    variants = {
+        stem,
+        stem.lower(),
+        f"{stem[0].lower()}{stem[1:]}" if len(stem) > 1 else stem.lower(),
+    }
+    s1 = re.sub(r'(.)([A-Z][a-z]+)', r'\1_\2', stem)
+    snake = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
+    variants.add(snake)
+    test_prefixes = set()
+    for v in variants:
+        test_prefixes.add(f"{v}.test.")
+        test_prefixes.add(f"{v}.spec.")
+        test_prefixes.add(f"{v}_test.")
+        test_prefixes.add(f"{v}_spec.")
+        test_prefixes.add(f"test_{v}.")
+    return test_prefixes
+
+
+def has_companion_test_file(
+    rel_path: str,
+    repo_root: Optional[Path] = None,
+    frontend_subpath: str = "frontend",
+) -> bool:
+    """Checks whether a candidate file has an accompanying unit or integration test."""
+    p = rel_path.replace("\\", "/")
+    root = repo_root or Path.cwd()
+    candidate_paths = [root / p, root / frontend_subpath / p]
+    target_file = None
+    for cp in candidate_paths:
+        if cp.is_file():
+            target_file = cp
+            break
+    if not target_file:
+        return False
+    parent = target_file.parent
+    stem = target_file.stem
+    companion_prefixes = _get_companion_test_names(stem)
+    for tdir in (parent, parent / "__tests__"):
+        if not tdir.is_dir():
+            continue
+        try:
+            for item in tdir.iterdir():
+                if not item.is_file():
+                    continue
+                ilower = item.name.lower()
+                for cp in companion_prefixes:
+                    if item.name.startswith(cp) or ilower.startswith(cp.lower()):
+                        return True
+        except Exception:
+            pass
+    return False
+
+
 def classify_knip_issue(
     issue: Dict[str, Any],
     frontend_subpath: str = "frontend",
     frontend_rel: Optional[str] = None,
+    repo_root: Optional[Path] = None,
 ) -> List[ToolFinding]:
     """Classifies raw Knip issue entries into structured ToolFinding objects."""
     subpath = frontend_rel or frontend_subpath
@@ -279,6 +335,18 @@ def classify_knip_issue(
                         category="cli_script",
                         safe_to_prune=False,
                         reason="Standalone script run with `node scripts/...`; no import reaches it by design",
+                    )
+                )
+            elif has_companion_test_file(file_raw, repo_root=repo_root, frontend_subpath=subpath):
+                findings.append(
+                    ToolFinding(
+                        tool="knip",
+                        file=norm_file,
+                        kind="file",
+                        symbol=file_raw,
+                        category="test_covered_component",
+                        safe_to_prune=False,
+                        reason="Component has accompanying test file; requires test deprecation before pruning",
                     )
                 )
             else:
@@ -426,7 +494,7 @@ def run_knip(
     issues = data.get("issues", [])
     findings: List[ToolFinding] = []
     for issue in issues:
-        findings.extend(classify_knip_issue(issue, frontend_subpath=frontend_subpath))
+        findings.extend(classify_knip_issue(issue, frontend_subpath=frontend_subpath, repo_root=repo_root))
 
     return findings, None
 
@@ -1187,7 +1255,6 @@ def record_no_rule(
         return False
 
     try:
-        # Check if comment already exists on the issue (fail closed on any error)
         check_cmd = ["gh", "issue", "view", str(bug_num), "-R", repo, "--json", "comments"]
         proc = subprocess.run(check_cmd, capture_output=True, text=True, timeout=30)
         if proc.returncode != 0:
@@ -1348,7 +1415,6 @@ def scan_closed_bug_issues(
 FINGERPRINT_PATTERN = re.compile(r'<!--\s*fingerprint:\s*([^\s>]+)\s*-->')
 INLINE_FINGERPRINT_PATTERN = re.compile(r'Fingerprint:\s*`?([a-zA-Z0-9_:-]+)`?')
 
-
 def fetch_existing_gardener_fingerprints(repo: str = "Bavariance/polysimulator") -> Set[str]:
     """Fetches all existing open and closed kind:gardener issue fingerprints."""
     seen: Set[str] = set()
@@ -1363,7 +1429,14 @@ def fetch_existing_gardener_fingerprints(repo: str = "Bavariance/polysimulator")
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60)
         issues = json.loads(proc.stdout)
+    except Exception as e:
+        print(f"[WARN] Failed to fetch existing gardener issues from {repo}: {e}", file=sys.stderr)
+        issues = []
+
+    if issues and isinstance(issues, list):
         for issue in issues:
+            if not isinstance(issue, dict):
+                continue
             body = issue.get("body") or ""
             title = issue.get("title") or ""
             for m in FINGERPRINT_PATTERN.finditer(body):
@@ -1373,8 +1446,6 @@ def fetch_existing_gardener_fingerprints(repo: str = "Bavariance/polysimulator")
             m_guard = re.search(r'guard for #(\d+)', title, re.IGNORECASE)
             if m_guard:
                 seen.add(f"gardener:bug_lint_guard:{m_guard.group(1)}")
-    except Exception as e:
-        print(f"[WARN] Failed to fetch existing gardener issues from {repo}: {e}", file=sys.stderr)
 
     return seen
 
