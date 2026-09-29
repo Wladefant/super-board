@@ -138,5 +138,67 @@ class SeedTests(unittest.TestCase):
         self.assertEqual(nc.seed_tsbuildinfo(own, self.clone, None), {"tsbuildinfo": "kept unchecked"})
 
 
+class SweepTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.clone = self.tmp / "clone"
+        (self.clone / "frontend").mkdir(parents=True)
+        git(self.clone, "init", "-q")
+        git(self.clone, "config", "user.email", "t@example.com")
+        git(self.clone, "config", "user.name", "t")
+        (self.clone / "frontend" / "f.ts").write_text("export const x = 1;\n", encoding="utf-8")
+        git(self.clone, "add", "-A")
+        git(self.clone, "commit", "-qm", "c0")
+        self.store = self.tmp / "store"
+        (self.store / "webpack").mkdir(parents=True)
+        (self.store / "webpack" / "pack.pack").write_bytes(b"x" * 100)
+
+    def worktree(self, name: str) -> Path:
+        wt = self.tmp / name
+        git(self.clone, "worktree", "add", "-q", "--detach", str(wt), "HEAD")
+        (wt / "frontend" / ".next").mkdir(parents=True, exist_ok=True)
+        return wt
+
+    def test_sweep_refuses_apply_without_confirm(self) -> None:
+        rc = nc.main(["--clone", str(self.clone), "sweep", "--store", str(self.store), "--apply"])
+        self.assertEqual(rc, 2)
+        # Store is untouched
+        self.assertTrue((self.store / "webpack" / "pack.pack").is_file())
+
+    def test_sweep_dry_run_reports_without_modifying(self) -> None:
+        wt = self.worktree("wt-idle")
+        make_dir_link(self.store, nc.cache_dir(wt))
+        rc = nc.main(["--clone", str(self.clone), "sweep", "--store", str(self.store)])
+        self.assertEqual(rc, 0)
+        # Still linked
+        self.assertTrue(nc.wtr.is_link(nc.cache_dir(wt)))
+        self.assertTrue((self.store / "webpack" / "pack.pack").is_file())
+
+    def test_sweep_apply_with_confirm_unlinks_idle_and_deletes_unlinked_store(self) -> None:
+        wt = self.worktree("wt-idle")
+        make_dir_link(self.store, nc.cache_dir(wt))
+        rc = nc.main(["--clone", str(self.clone), "sweep", "--store", str(self.store), "--apply", "--confirm"])
+        self.assertEqual(rc, 0)
+        # Worktree is unlinked
+        self.assertFalse(nc.wtr.is_link(nc.cache_dir(wt)))
+        # Store webpack directory is deleted since no busy worktree linked to it
+        self.assertFalse((self.store / "webpack").exists())
+
+    def test_sweep_unreadable_link_does_not_crash(self) -> None:
+        wt = self.worktree("wt-badlink")
+        make_dir_link(self.store, nc.cache_dir(wt))
+        orig_target = nc.wtr.link_target
+        try:
+            nc.wtr.link_target = lambda p: None
+            rc = nc.main(["--clone", str(self.clone), "sweep", "--store", str(self.store)])
+            self.assertEqual(rc, 0)
+        finally:
+            nc.wtr.link_target = orig_target
+
+    def test_sweep_subcommand_accepts_clone_flag(self) -> None:
+        rc = nc.main(["sweep", "--clone", str(self.clone), "--store", str(self.store)])
+        self.assertEqual(rc, 0)
+
 if __name__ == "__main__":
     unittest.main()

@@ -50,31 +50,38 @@ PACK_WORKTREE = re.compile(rb"[\\/]([^\\/\x00\"'|!]{1,120})[\\/]+frontend[\\/]+"
 # Runs Next's own tsconfig resolution and required options, so the buildinfo matches what
 # `next build` reads, but queries diagnostics before emit so the buildinfo records them.
 TYPECHECK_JS = r"""
-const path = require("path");
-const fe = process.cwd();
-const req = (m) => require(path.join(fe, "node_modules", m));
-const ts = req("typescript");
-const { getTypeScriptConfiguration } = req("next/dist/lib/typescript/getTypeScriptConfiguration");
-const { getRequiredConfiguration } = req("next/dist/lib/typescript/writeConfigurationDefaults");
-(async () => {
-  const cfg = await getTypeScriptConfiguration(ts, path.join(fe, "tsconfig.json"));
-  const options = {
-    ...getRequiredConfiguration(ts), ...cfg.options,
-    declarationMap: false, emitDeclarationOnly: false, noEmit: true,
-    composite: false, incremental: true, tsBuildInfoFile: path.join(fe, ".next", "cache", ".tsbuildinfo"),
-  };
-  const program = ts.createIncrementalProgram({ rootNames: cfg.fileNames, options });
-  const ignored = /[\\/]__(?:tests|mocks)__[\\/]|(?<=[\\/.])(?:spec|test)\.[^\\/]+$/;
-  const errors = ts.getPreEmitDiagnostics(program).filter(
-    (d) => d.category === ts.DiagnosticCategory.Error && !(d.file && ignored.test(d.file.fileName)));
-  program.emit();
-  for (const d of errors.slice(0, 30)) {
-    const at = d.file ? `${path.relative(fe, d.file.fileName)}:${d.file.getLineAndCharacterOfPosition(d.start).line + 1} ` : "";
-    console.error(`${at}TS${d.code}: ${ts.flattenDiagnosticMessageText(d.messageText, "\n")}`);
-  }
-  console.log(JSON.stringify({ files: cfg.fileNames.length, errors: errors.length }));
-  process.exit(errors.length ? 1 : 0);
-})().catch((e) => { console.error(e && e.stack || String(e)); process.exit(2); });
+try {
+  const path = require("path");
+  const fe = process.cwd();
+  const req = (m) => require(path.join(fe, "node_modules", m));
+  const ts = req("typescript");
+  const { getTypeScriptConfiguration } = req("next/dist/lib/typescript/getTypeScriptConfiguration");
+  const { getRequiredConfiguration } = req("next/dist/lib/typescript/writeConfigurationDefaults");
+
+  (async () => {
+    const cfg = await getTypeScriptConfiguration(ts, path.join(fe, "tsconfig.json"));
+    const options = {
+      ...getRequiredConfiguration(ts), ...cfg.options,
+      declarationMap: false, emitDeclarationOnly: false, noEmit: true,
+      composite: false, incremental: true, tsBuildInfoFile: path.join(fe, ".next", "cache", ".tsbuildinfo"),
+    };
+    const program = ts.createIncrementalProgram({ rootNames: cfg.fileNames, options });
+    const errors = ts.getPreEmitDiagnostics(program).filter((d) => d.category === ts.DiagnosticCategory.Error);
+    program.emit();
+    for (const d of errors.slice(0, 30)) {
+      const at = d.file ? `${path.relative(fe, d.file.fileName)}:${d.file.getLineAndCharacterOfPosition(d.start).line + 1} ` : "";
+      console.error(`${at}TS${d.code}: ${ts.flattenDiagnosticMessageText(d.messageText, "\n")}`);
+    }
+    console.log(JSON.stringify({ files: cfg.fileNames.length, errors: errors.length }));
+    process.exit(errors.length ? 1 : 0);
+  })().catch((e) => {
+    console.error(e && e.stack || String(e));
+    process.exit(2);
+  });
+} catch (e) {
+  console.error(e && e.stack || String(e));
+  process.exit(2);
+}
 """
 
 
@@ -201,7 +208,13 @@ def typecheck(worktree: Path) -> dict:
     seconds = round(time.monotonic() - started, 1)
     if r.returncode not in (0, 1):
         raise RuntimeError(f"type check did not run (exit {r.returncode}): {r.stderr.strip()[-2000:]}")
-    summary = json.loads(r.stdout.strip().splitlines()[-1])
+    lines = r.stdout.strip().splitlines()
+    if not lines:
+        raise RuntimeError(f"type check did not output summary (exit {r.returncode}): {r.stderr.strip()[-2000:]}")
+    try:
+        summary = json.loads(lines[-1])
+    except Exception as e:
+        raise RuntimeError(f"type check output could not be parsed: {lines[-1]} (exit {r.returncode}): {r.stderr.strip()[-2000:]}") from e
     result = {"typecheck_s": seconds, "files": summary["files"], "type_errors": summary["errors"]}
     if r.returncode == 1:
         result["type_error_lines"] = r.stderr.strip().splitlines()
@@ -250,6 +263,10 @@ def cmd_prepare(args: argparse.Namespace, clone: Path) -> int:
 
 
 def cmd_sweep(args: argparse.Namespace, clone: Path) -> int:
+    store = Path(getattr(args, "store", None) or SHARED_STORE)
+    if args.apply and not getattr(args, "confirm", False):
+        print("error: 'sweep --apply' modifies worktree caches and deletes store packs. Pass '--confirm' to execute.", file=sys.stderr)
+        return 2
     rows = []
     linked_to_store = []
     procs = wtr.process_paths()
@@ -259,7 +276,10 @@ def cmd_sweep(args: argparse.Namespace, clone: Path) -> int:
         webpack = cache / "webpack"
         if not linked and not webpack.is_dir():
             continue
-        row: dict = {"worktree": str(wt), "linked_to": wtr.link_target(cache) if linked else None}
+        link_target = wtr.link_target(cache) if linked else None
+        if linked and link_target is None:
+            link_target = "<unreadable link>"
+        row: dict = {"worktree": str(wt), "linked_to": link_target}
         if not linked:
             names = pack_worktrees(webpack)
             row["foreign"] = sorted(names - {wt.name.lower()})
@@ -268,7 +288,7 @@ def cmd_sweep(args: argparse.Namespace, clone: Path) -> int:
         holders = wtr.busy_processes(wt, procs)
         if holders:
             row["action"] = "skip: busy (" + ", ".join(f"{name} {pid}" for pid, name, _cwd in holders) + ")"
-            if linked and row["linked_to"] == wtr.norm(SHARED_STORE):
+            if linked and row["linked_to"] == wtr.norm(store):
                 linked_to_store.append(str(wt))
         elif args.apply:
             row.update(own_cache_dir(wt) if linked else drop_foreign_webpack(wt))
@@ -276,38 +296,53 @@ def cmd_sweep(args: argparse.Namespace, clone: Path) -> int:
         else:
             row["action"] = "would unlink" if linked else "would drop foreign webpack"
         rows.append(row)
-    store = {"path": str(SHARED_STORE), "still_linked_by": linked_to_store}
-    store_webpack = SHARED_STORE / "webpack"
+    store_info: dict = {"path": str(store), "still_linked_by": linked_to_store}
+    store_webpack = store / "webpack"
     if store_webpack.is_dir():
-        store["webpack_bytes"] = tree_size(store_webpack)
+        store_info["webpack_bytes"] = tree_size(store_webpack)
         if linked_to_store:
-            store["action"] = "keep: still linked by a busy worktree"
+            store_info["action"] = "keep: still linked by a busy worktree"
         elif args.apply:
             shutil.rmtree(store_webpack)
-            store["action"] = "deleted webpack packs"
+            store_info["action"] = "deleted webpack packs"
         else:
-            store["action"] = "would delete webpack packs"
-    result = {"applied": args.apply, "worktrees": rows, "shared_store": store}
-    lines = [f"{r['action']}: {r['worktree']}" + (f" -> {r['linked_to']}" if r["linked_to"] else f" (modules of {', '.join(r['foreign'])})") for r in rows]
-    if "action" in store:
-        lines.append(f"{store['action']}: {store_webpack} ({store['webpack_bytes'] / 1e9:.2f} GB)")
+            store_info["action"] = "would delete webpack packs"
+    result = {"applied": args.apply, "worktrees": rows, "shared_store": store_info}
+    lines = []
+    for r in rows:
+        if r.get("linked_to"):
+            detail = f" -> {r['linked_to']}"
+        elif "foreign" in r:
+            detail = f" (modules of {', '.join(r.get('foreign', []))})"
+        else:
+            detail = ""
+        lines.append(f"{r['action']}: {r['worktree']}{detail}")
+    if "action" in store_info:
+        lines.append(f"{store_info['action']}: {store_webpack} ({store_info['webpack_bytes'] / 1e9:.2f} GB)")
     return emit(args, result, lines or ["nothing to do"], 0)
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--clone", default=str(POLYSIM_CLONE), help="PolySimulator clone whose worktrees are scanned")
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--clone", default=argparse.SUPPRESS, help="PolySimulator clone whose worktrees are scanned")
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0], parents=[common])
     sub = ap.add_subparsers(dest="command", required=True)
-    p = sub.add_parser("prepare", help="own cache dir, drop foreign webpack packs, warm and run the type check")
+    p = sub.add_parser("prepare", help="own cache dir, drop foreign webpack packs, warm and run the type check", parents=[common])
     p.add_argument("--worktree", required=True)
     p.add_argument("--source", help="seed .tsbuildinfo from this prepared worktree")
     p.add_argument("--force", action="store_true", help="run even when a process uses the worktree")
-    p.add_argument("--json", action="store_true")
-    p = sub.add_parser("sweep", help="unlink shared-cache junctions and drop foreign webpack packs in idle worktrees")
-    p.add_argument("--apply", action="store_true")
-    p.add_argument("--json", action="store_true")
+
+    s = sub.add_parser("sweep", help="unlink shared-cache junctions and drop foreign webpack packs in idle worktrees", parents=[common])
+    s.add_argument("--store", default=str(SHARED_STORE), help="shared cache store path")
+    s.add_argument("--apply", action="store_true", help="apply unlinks and pack deletions")
+    s.add_argument("--confirm", action="store_true", help="required confirmation flag to execute --apply")
+
     args = ap.parse_args(argv)
-    clone = Path(args.clone)
+    clone = Path(getattr(args, "clone", None) or POLYSIM_CLONE)
+    if not hasattr(args, "json"):
+        args.json = False
     if args.command == "sweep":
         return cmd_sweep(args, clone)
     if not (Path(os.path.abspath(args.worktree)) / "frontend" / "package-lock.json").is_file():
