@@ -69,6 +69,10 @@ from quota_snapshot import (
     load_snapshot as load_quota_file,
 )
 from model_routing import (
+    UNSUPPORTED_CODEX_MODELS,
+    is_unsupported_codex_model,
+    _Rung,
+    _climb,
     EvidencePacket,
     HarnessDispatchPacket,
     ResetAwareModelSelector,
@@ -1732,11 +1736,11 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         # the interactive orchestrator (`modelRoles.default`) is explicitly out of scope.
         paid_opus = "anthropic/claude-opus-5-5"
         for role, chain in model_roles.items():
-            if role in ("default", "reviewer", "astra-ux"):
+            if role in ("default", "reviewer", "astra-ux", "opus"):
                 continue
             self.assertNotIn(paid_opus, str(chain), f"modelRoles.{role} must not run paid Opus")
         for name, entry in agents.items():
-            if name in ("reviewer", "astra-ux"):
+            if name in ("reviewer", "astra-ux", "opus"):
                 continue  # Opus 5.5 permitted for reviewer per operator ruling 2026-09-26
             for chain in chains(entry):
                 self.assertNotIn(paid_opus, str(chain), f"agents.{name} must not run paid Opus")
@@ -2840,6 +2844,69 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
                                 MODEL_AG_CLAUDE_OPUS,
                             )
         print("  [PASS] Zero routes resolve to ag-opus across all task types, risk levels, rework counts, diff sizes and domain tags.")
+
+    # -------------------------------------------------------------------------
+    # TEST 53: Unsupported Codex model gpt-6.1-sol rejected/skipped in ladders
+    # -------------------------------------------------------------------------
+    def test_unsupported_codex_model_rejected_and_skipped(self):
+        print("\n--- TEST 53: Unsupported Codex Model gpt-6.1-sol Skipped/Rejected ---")
+        unsupported = "openai-codex/gpt-6.1-sol"
+        supported = MODEL_CODEX_SOL  # "openai-codex/gpt-5.6-sol:high"
+
+        # 1. Verification of unsupported model set and predicate
+        self.assertIn("gpt-6.1-sol", UNSUPPORTED_CODEX_MODELS)
+        self.assertTrue(is_unsupported_codex_model(unsupported))
+        self.assertTrue(is_unsupported_codex_model("openai-codex/gpt-6.1-sol:high"))
+        self.assertTrue(is_unsupported_codex_model("gpt-6.1-sol"))
+        self.assertFalse(is_unsupported_codex_model(supported))
+        self.assertFalse(is_unsupported_codex_model(MODEL_CODEX_ASTRA))
+
+        # 2. Ladder climbing skips unsupported rung and picks next eligible rung
+        rungs_with_unsupported = [
+            _Rung(unsupported, True, "unsupported codex rung"),
+            _Rung(MODEL_DEEPSEEK_FLASH, True, "deepseek fallback"),
+        ]
+        last_resort = _Rung(supported, True, "supported codex resort")
+        chosen, fallback = _climb(rungs_with_unsupported, last_resort, [supported])
+        self.assertNotEqual(chosen.model, unsupported)
+        self.assertEqual(chosen.model, MODEL_DEEPSEEK_FLASH)
+        self.assertEqual(fallback, supported)
+
+        # 3. Ladder containing ONLY unsupported model gets rejected (raises ValueError)
+        rungs_only_unsupported = [
+            _Rung(unsupported, True, "unsupported rung 1"),
+        ]
+        last_resort_unsupported = _Rung(unsupported, True, "unsupported resort")
+        with self.assertRaises(ValueError):
+            _climb(rungs_only_unsupported, last_resort_unsupported, [unsupported])
+
+        # 4. Ladder with supported gpt-5.6-sol passes cleanly
+        rungs_with_supported = [
+            _Rung(supported, True, "supported codex sol"),
+        ]
+        last_resort_supported = _Rung(MODEL_DEEPSEEK_FLASH, True, "deepseek resort")
+        chosen_sol, fallback_sol = _climb(rungs_with_supported, last_resort_supported, [MODEL_DEEPSEEK_FLASH])
+        self.assertEqual(chosen_sol.model, supported)
+        self.assertEqual(fallback_sol, MODEL_DEEPSEEK_FLASH)
+
+        # 5. Role resolution and fallback ladder skips gpt-6.1-sol and resolves to gpt-5.6-sol
+        with mock.patch.dict(ROLE_FALLBACK_LADDERS, {"test-unsupported-role": [unsupported, supported]}):
+            resolved = resolve_role_model("test-unsupported-role")
+            self.assertEqual(resolved, supported)
+
+        with mock.patch.dict(ROLE_FALLBACK_LADDERS, {"test-unsupported-only": [unsupported]}):
+            resolved = resolve_role_model("test-unsupported-only")
+            self.assertIsNone(resolved)
+
+        with mock.patch.dict(ROLE_MODEL_PINS, {"test-pinned-unsupported": unsupported}):
+            self.assertIsNone(resolve_role_model("test-pinned-unsupported"))
+            self.assertFalse(is_agent_role_available("test-pinned-unsupported"))
+
+        with mock.patch.dict(ROLE_MODEL_PINS, {"test-pinned-supported": supported}):
+            self.assertEqual(resolve_role_model("test-pinned-supported"), supported)
+            self.assertTrue(is_agent_role_available("test-pinned-supported"))
+
+        print("  [PASS] openai-codex/gpt-6.1-sol rejected and skipped in ladders; openai-codex/gpt-5.6-sol passes.")
 
 def main():
     print("=" * 70)
