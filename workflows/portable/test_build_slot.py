@@ -1262,15 +1262,53 @@ class TestBuildSlot(unittest.TestCase):
         stat = manager.status()
         self.assertFalse(stat["lock"]["locked"])
 
-    def test_run_options_after_name_rejected_without_mutation(self):
-        """Misplaced CLI options after lane name fail with exit code 2 and no state mutation."""
+    def test_run_options_after_name_are_honored(self):
+        """Documented post-name options with `--` are parsed and honored (discussion_r4136963306)."""
+        args = build_slot.parse_args(
+            ["run", "lane", "--timeout", "1.5", "--cwd", "D:/wt", "--", "npx", "next", "build"]
+        )
+        self.assertEqual(args.timeout, 1.5)
+        self.assertEqual(args.cwd, "D:/wt")
+        self.assertFalse(args.priority)
+        self.assertFalse(args.force)
+        self.assertEqual(args.cmd, ["--", "npx", "next", "build"])
+
+        args_force = build_slot.parse_args(["run", "lane", "--force", "--", "echo", "1"])
+        self.assertTrue(args_force.force)
+        self.assertEqual(args_force.cmd, ["--", "echo", "1"])
+
+        args_hb = build_slot.parse_args(["run", "lane", "--heartbeat-stale-after", "42", "--", "echo", "1"])
+        self.assertEqual(args_hb.heartbeat_stale_after, 42.0)
+
+        args_eq = build_slot.parse_args(["run", "lane", "--timeout=10", "--", "echo", "1"])
+        self.assertEqual(args_eq.timeout, 10.0)
+
+        # Options before and after name both honored
+        args_mixed = build_slot.parse_args(
+            ["run", "--priority", "lane", "--timeout", "1.5", "--cwd", "D:/wt", "--", "npx", "next", "build"]
+        )
+        self.assertEqual(args_mixed.timeout, 1.5)
+        self.assertEqual(args_mixed.cwd, "D:/wt")
+        self.assertTrue(args_mixed.priority)
+        self.assertFalse(args_mixed.force)
+        self.assertEqual(args_mixed.cmd, ["--", "npx", "next", "build"])
+
+        # Main cleanly runs with documented post-name options
+        ret = build_slot.main(
+            ["--run-dir", self.run_dir, "run", "lane", "--timeout", "10", "--", sys.executable, "-c", "import sys; sys.exit(0)"]
+        )
+        self.assertEqual(ret, 0)
+
+    def test_run_options_after_name_without_separator_rejected_without_mutation(self):
+        """Misplaced CLI options after lane name without `--` fail with exit code 2 and no state mutation."""
         misordered_cases = [
-            ["run", "lane", "--timeout", "1.5", "--cwd", "D:/wt", "--", "npx", "next", "build"],
+            ["run", "lane", "--timeout", "1.5", "--cwd", "D:/wt", "npx", "next", "build"],
             ["run", "lane", "--priority", "npx", "next", "build"],
-            ["run", "lane", "--force", "--", "echo", "1"],
-            ["run", "lane", "--cwd", "D:/wt", "--", "echo", "1"],
-            ["run", "lane", "--heartbeat-stale-after", "42", "--", "echo", "1"],
-            ["run", "lane", "--timeout=10", "--", "echo", "1"],
+            ["run", "lane", "--force", "echo", "1"],
+            ["run", "lane", "--cwd", "D:/wt", "echo", "1"],
+            ["run", "lane", "--heartbeat-stale-after", "42", "echo", "1"],
+            ["run", "lane", "--timeout=10", "echo", "1"],
+            ["run", "lane", "--run-dir", "/tmp", "echo", "1"],
         ]
         for cmd_args in misordered_cases:
             with self.subTest(cmd_args=cmd_args):
@@ -1286,14 +1324,64 @@ class TestBuildSlot(unittest.TestCase):
         # Confirm main() exits 2 and creates no queue entry or lock directory
         err = io.StringIO()
         with redirect_stderr(err), self.assertRaises(SystemExit) as cm:
-            build_slot.main(["--run-dir", self.run_dir, "run", "lane", "--priority", "--", "echo", "1"])
+            build_slot.main(["--run-dir", self.run_dir, "run", "lane", "--priority", "echo", "1"])
         self.assertEqual(cm.exception.code, 2)
         self.assertIn("options must precede the lane name", err.getvalue())
         # Assert no lock dir or queue file was created
         if os.path.exists(self.run_dir):
-            entries = os.listdir(self.run_dir)
+            entries = [e for e in os.listdir(self.run_dir) if e not in {"next-cache"}]
             self.assertEqual(entries, [])
 
+    def test_misordered_global_options_rejected_without_mutation(self):
+        """Misordered global options like `--run-dir` fail with exit code 2 and no state mutation."""
+        misordered_global = [
+            ["--run-dir", self.run_dir, "run", "--run-dir", "/tmp", "lane", "--", "echo", "1"],
+            ["--run-dir", self.run_dir, "run", "lane", "--run-dir", "/tmp", "--", "echo", "1"],
+            ["--run-dir", self.run_dir, "run", "lane", "--run-dir", "/tmp", "echo", "1"],
+            ["--run-dir", self.run_dir, "acquire", "lane", "--run-dir", "/tmp"],
+        ]
+        for cmd_args in misordered_global:
+            with self.subTest(cmd_args=cmd_args):
+                err = io.StringIO()
+                with redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                    build_slot.main(cmd_args)
+                self.assertEqual(cm.exception.code, 2)
+                if os.path.exists(self.run_dir):
+                    entries = [e for e in os.listdir(self.run_dir) if e not in {"next-cache"}]
+                    self.assertEqual(entries, [])
+
+    def test_run_dir_named_run_not_mistaken_for_subcommand(self):
+        """Option value equal to 'run' is not mistaken for subcommand (discussion_r4136963314)."""
+        args_acq = build_slot.parse_args(["--run-dir", "run", "acquire", "--timeout", "1", "lane"])
+        self.assertEqual(args_acq.run_dir, "run")
+        self.assertEqual(args_acq.command, "acquire")
+        self.assertEqual(args_acq.timeout, 1.0)
+        self.assertEqual(args_acq.name, "lane")
+
+        args_run_pre = build_slot.parse_args(
+            ["--run-dir", "run", "run", "--timeout", "1", "lane", "--", "echo", "x"]
+        )
+        self.assertEqual(args_run_pre.run_dir, "run")
+        self.assertEqual(args_run_pre.command, "run")
+        self.assertEqual(args_run_pre.timeout, 1.0)
+        self.assertEqual(args_run_pre.name, "lane")
+        self.assertEqual(args_run_pre.cmd, ["echo", "x"])
+
+        args_run_post = build_slot.parse_args(
+            ["--run-dir", "run", "run", "lane", "--timeout", "1", "--", "echo", "x"]
+        )
+        self.assertEqual(args_run_post.run_dir, "run")
+        self.assertEqual(args_run_post.command, "run")
+        self.assertEqual(args_run_post.timeout, 1.0)
+        self.assertEqual(args_run_post.name, "lane")
+        self.assertEqual(args_run_post.cmd, ["--", "echo", "x"])
+
+        args_run_eq = build_slot.parse_args(
+            ["--run-dir=run", "run", "lane", "--timeout", "1", "--", "echo", "x"]
+        )
+        self.assertEqual(args_run_eq.run_dir, "run")
+        self.assertEqual(args_run_eq.command, "run")
+        self.assertEqual(args_run_eq.timeout, 1.0)
     def test_run_options_preceding_lane_name_are_honored(self):
         """Correctly ordered options before lane name parse cleanly."""
         args = build_slot.parse_args(
@@ -1319,7 +1407,7 @@ class TestBuildSlot(unittest.TestCase):
         env["BUILD_SLOT_RAM_PERCENT"] = "96.0"
         started = time.monotonic()
         proc = subprocess.run(
-            [sys.executable, script, "--run-dir", self.run_dir, "run", "--timeout", "0.5", "cli-ram-lane",
+            [sys.executable, script, "--run-dir", self.run_dir, "run", "cli-ram-lane", "--timeout", "0.5",
              "--", sys.executable, "-c", "pass"],
             capture_output=True,
             text=True,
@@ -1799,12 +1887,11 @@ class TestBuildSlot(unittest.TestCase):
         """#315: `run` waits for the slot like `acquire`, so it takes the same hung-holder threshold."""
         with mock.patch.object(BuildSlotManager, "run_command", return_value=0) as run_command:
             ret = build_slot.main(
-                ["--run-dir", self.run_dir, "run", "--heartbeat-stale-after", "42", "cli-lane", "--", "echo", "x"]
+                ["--run-dir", self.run_dir, "run", "cli-lane", "--heartbeat-stale-after", "42", "--", "echo", "x"]
             )
         self.assertEqual(ret, 0)
         self.assertEqual(run_command.call_args.kwargs["heartbeat_stale_after"], 42.0)
         self.assertEqual(run_command.call_args.kwargs["cmd"], ["echo", "x"])
-
     def test_heartbeat_rewrite_never_reads_as_corrupt(self):
         """
         #315: waiters check the lock while its holder heartbeats. An in-place rewrite of

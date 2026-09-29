@@ -2080,56 +2080,62 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             f"--poll-interval ({args.poll_interval}s) must be less than "
             f"queue_stale_heartbeat_after ({DEFAULT_QUEUE_STALE_HEARTBEAT_SECONDS}s)"
         )
-    misordered_opt = _find_misordered_run_option(argv)
-    if misordered_opt is not None:
-        parser.error(
-            "options must precede the lane name: build_slot.py run [--cwd DIR] [--timeout S] [--priority] <name> -- <cmd>"
-        )
+    if args.command == "run":
+        raw_argv = sys.argv[1:] if argv is None else list(argv)
+        sub_idx = _find_subcommand_index(raw_argv)
+        sub_argv = raw_argv[sub_idx + 1:] if sub_idx >= 0 else []
+        i = 0
+        lane_idx = -1
+        while i < len(sub_argv):
+            tok = sub_argv[i]
+            if tok == "--":
+                break
+            opt_name = tok.split("=")[0]
+            if opt_name in {"--priority", "--force"}:
+                i += 1
+            elif opt_name in {"--timeout", "--cwd", "--heartbeat-stale-after"}:
+                if "=" in tok:
+                    i += 1
+                else:
+                    i += 2
+            elif tok.startswith("-"):
+                i += 1
+            else:
+                lane_idx = i
+                break
+        if lane_idx >= 0:
+            rest = sub_argv[lane_idx + 1:]
+            if rest and rest[0].startswith("-") and rest[0] != "--":
+                if "--" in rest:
+                    sep = rest.index("--")
+                    tail_parser = argparse.ArgumentParser(
+                        prog="build_slot.py run <name>",
+                        argument_default=argparse.SUPPRESS,
+                    )
+                    _add_run_options(tail_parser)
+                    tail_parser.parse_args(rest[:sep], namespace=args)
+                    args.cmd = rest[sep:]
+                else:
+                    parser.error(
+                        "options must precede the lane name: build_slot.py run [--cwd DIR] [--timeout S] [--priority] <name> -- <cmd>"
+                    )
     return args
 
 
-KNOWN_RUN_OPTIONS = {
-    "--timeout",
-    "--priority",
-    "--force",
-    "--cwd",
-    "--heartbeat-stale-after",
-}
-
-
-def _find_misordered_run_option(argv: Optional[List[str]]) -> Optional[str]:
-    """
-    Checks if a known run option was placed after the lane name in `argv` (Issue #313).
-    Returns the option flag string if misordered, or None if valid.
-    """
-    if argv is None:
-        argv = sys.argv[1:]
-    if "run" not in argv:
-        return None
-    run_idx = argv.index("run")
-    rest = argv[run_idx + 1:]
+def _find_subcommand_index(argv: List[str]) -> int:
+    """Finds the index of the subcommand in argv, skipping global options and their values."""
     i = 0
-    while i < len(rest):
-        tok = rest[i]
-        if tok == "--":
-            break
-        opt_name = tok.split("=")[0]
-        if opt_name in {"--priority", "--force"}:
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--run-dir":
+            i += 2
+        elif tok.startswith("--run-dir="):
             i += 1
-        elif opt_name in {"--timeout", "--cwd", "--heartbeat-stale-after"}:
-            if "=" in tok:
-                i += 1
-            else:
-                i += 2
         elif tok.startswith("-"):
             i += 1
         else:
-            if i + 1 < len(rest):
-                next_tok = rest[i + 1].split("=")[0]
-                if next_tok in KNOWN_RUN_OPTIONS:
-                    return next_tok
-            break
-    return None
+            return i
+    return -1
 
 
 def _add_run_options(parser: argparse.ArgumentParser) -> None:
