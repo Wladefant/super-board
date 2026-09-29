@@ -39,6 +39,7 @@ from gardener import (
     format_summary_text,
     generate_cleanup_task_spec,
     generate_gardener_issue_candidates,
+    has_companion_test_file,
     is_frontend_entrypoint,
     is_test_file,
     is_test_or_spec_path,
@@ -138,6 +139,47 @@ class TestGardenerClassification(unittest.TestCase):
         issue = {"file": "components/TranscriptsPanel.tsx", "files": [{"name": "x"}], "exports": [], "types": []}
         self.assertEqual(classify_knip_issue(issue, frontend_rel="frontend")[0].category, "verified_dead_file")
 
+    def test_classify_knip_companion_test_is_preserved(self):
+        """Components with companion test files must not be pruned (#5818/#5822 false positives)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            comp_dir = root / "frontend" / "components" / "sports"
+            comp_dir.mkdir(parents=True)
+            comp_file = comp_dir / "SportsFuturesCard.tsx"
+            comp_file.write_text("export const SportsFuturesCard = () => null;", encoding="utf-8")
+            test_file = comp_dir / "SportsFuturesCard.test.tsx"
+            test_file.write_text("describe('SportsFuturesCard', () => {});", encoding="utf-8")
+
+            issue = {
+                "file": "components/sports/SportsFuturesCard.tsx",
+                "files": [{"name": "components/sports/SportsFuturesCard.tsx"}],
+                "exports": [],
+                "types": [],
+            }
+            findings = classify_knip_issue(issue, frontend_rel="frontend", repo_root=root)
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0].category, "test_covered_component")
+            self.assertFalse(findings[0].safe_to_prune)
+            self.assertIn("accompanying test file", findings[0].reason)
+
+    def test_has_companion_test_file_variants(self):
+        """has_companion_test_file must detect adjacent and __tests__ test files with naming variants."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            m_dir = root / "frontend" / "components" / "market"
+            tests_dir = m_dir / "__tests__"
+            tests_dir.mkdir(parents=True)
+
+            comp = m_dir / "UpDownRulesResolution.tsx"
+            comp.write_text("export const UpDownRulesResolution = () => null;", encoding="utf-8")
+
+            t1 = tests_dir / "updownRulesResolution.test.tsx"
+            t1.write_text("test", encoding="utf-8")
+            self.assertTrue(has_companion_test_file("components/market/UpDownRulesResolution.tsx", repo_root=root))
+
+            dead = m_dir / "TrulyDeadComponent.tsx"
+            dead.write_text("export const TrulyDeadComponent = () => null;", encoding="utf-8")
+            self.assertFalse(has_companion_test_file("components/market/TrulyDeadComponent.tsx", repo_root=root))
     def test_classify_knip_dead_exports_and_types(self):
         """Knip dead exports and types must be classified as safe to prune."""
         issue = {
