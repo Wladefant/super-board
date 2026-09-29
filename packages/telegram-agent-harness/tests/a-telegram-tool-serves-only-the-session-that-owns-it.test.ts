@@ -29,7 +29,7 @@ import telegramSessionExtension, {
   registerOperatorTools,
   setActiveRuntime,
 } from "../extension/index";
-import { TelegramRuntime } from "../extension/runtime";
+import { TelegramRuntime, isEligibleRootSession } from "../extension/runtime";
 import { TelegramPoller } from "../extension/poller";
 import { MessageContextStore } from "../src/message-context";
 import { LiveDashboard } from "../src/live-dashboard";
@@ -416,6 +416,33 @@ test("telegram_message reports failure when Telegram does not accept the message
   );
 });
 
+test("telegram_message executes without ReferenceError when called with an eligible root session context", async () => {
+  const host = createHost();
+  registerOperatorTools(host.api);
+  const runtime = new TelegramRuntime(host.api);
+  setActiveRuntime(runtime);
+  const channel = createChannel();
+  (globalThis as unknown as GlobalTelegramState)[ACTIVE_ROOT_SYMBOL] = channel.root(runtime.instanceId);
+
+  const rootCtx = {
+    hasUI: true,
+    isSubagent: false,
+    taskDepth: 0,
+    cwd: "C:/anywhere",
+    sessionManager: { getSessionId: () => "root-session-1" },
+  } as unknown as ExtensionContext;
+
+  const result = (await host.tools.get("telegram_message")!.execute(
+    "call-1",
+    CALLS.telegram_message,
+    undefined,
+    undefined,
+    rootCtx,
+  )) as { content: Array<{ text: string }> };
+
+  expect(result.content[0]!.text).toContain("Delivered message");
+});
+
 test("telegram_dashboard stores the observed snapshot and reconciles each lane's state", async () => {
   const host = createHost();
   registerOperatorTools(host.api);
@@ -453,4 +480,55 @@ test("telegram_dashboard stores the observed snapshot and reconciles each lane's
 
   expect(channel.laneStateOf(active!.result!.message_id)).toBe("active");
   expect(channel.laneStateOf(gone!.result!.message_id)).toBe("exited");
+});
+
+test("a subagent tool context never claims the lifecycle or creates a runtime", async () => {
+  const host = createHost();
+  registerOperatorTools(host.api);
+  setActiveRuntime(null);
+  delete (globalThis as unknown as GlobalTelegramState)[ACTIVE_ROOT_SYMBOL];
+  const channel = createChannel();
+
+  const subagentCtx = {
+    hasUI: true,
+    isSubagent: true,
+    taskDepth: 1,
+    parentTaskPrefix: "sub-1",
+    cwd: "C:/anywhere",
+    sessionManager: { getSessionId: () => "subagent-session" },
+  } as unknown as ExtensionContext;
+
+  for (const [name, params] of Object.entries(CALLS)) {
+    const tool = host.tools.get(name)!;
+    await expect(tool.execute("call-1", params, undefined, undefined, subagentCtx)).rejects.toThrow();
+  }
+  // Nothing reached the foreign channel and no runtime was fabricated for the caller.
+  expect(channel.calls).toEqual([]);
+  expect((globalThis as unknown as GlobalTelegramState)[ACTIVE_ROOT_SYMBOL]).toBeUndefined();
+});
+
+test("isEligibleRootSession admits root sessions even when hasUI is false", () => {
+  const rootPrintSession = {
+    hasUI: false,
+    isSubagent: false,
+    taskDepth: 0,
+    parentTaskPrefix: undefined,
+  } as unknown as ExtensionContext;
+  expect(isEligibleRootSession(rootPrintSession)).toBe(true);
+
+  const subagentSession = {
+    hasUI: false,
+    isSubagent: true,
+    taskDepth: 1,
+    parentTaskPrefix: "sub-1",
+  } as unknown as ExtensionContext;
+  expect(isEligibleRootSession(subagentSession)).toBe(false);
+
+  const nestedSession = {
+    hasUI: true,
+    isSubagent: false,
+    taskDepth: 2,
+    parentTaskPrefix: undefined,
+  } as unknown as ExtensionContext;
+  expect(isEligibleRootSession(nestedSession)).toBe(false);
 });

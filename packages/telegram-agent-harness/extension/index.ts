@@ -90,6 +90,16 @@ let reloadLock: Promise<unknown> = Promise.resolve();
 let operatorReleased = false;
 let lastRebindAttemptAt = 0;
 const REBIND_MIN_INTERVAL_MS = 60_000;
+/**
+ * The extension instance that claimed the host session's root lifecycle, if any.
+ * Module scope (like operatorReleased) so the operator tools — registered with a
+ * concrete host instance — can claim the lifecycle for THAT instance when the
+ * first eligible tool context arrives before any lifecycle hook fired
+ * (headless sessions). Lifecycle handlers and commands gate on instance identity:
+ * a child extension load in the same process must never replace or dispose the
+ * root runtime its parent instance owns.
+ */
+let ownerInstance: ExtensionAPI | null = null;
 
 /**
  * Rebinds the channel when the runtime was disposed while the host session is
@@ -113,6 +123,43 @@ async function ensureChannelBound(reason: string): Promise<void> {
       `[Telegram Loader] Automatic rebind did not attach a channel: ${res.error ?? "lease not acquired"}.`,
     );
   }
+}
+
+/**
+ * Tool-side channel acquisition for the operator tools.
+ *
+ * A tool call arrives with the executing session's context as its fifth argument.
+ * An eligible root session — headless ones included, since they may never fire a
+ * session_start that reaches the loader — claims the root lifecycle here. A
+ * subagent or nested-task context claims nothing: it is served through the root's
+ * channel or rejected. After an explicit `/telegram release` nothing here
+ * re-acquires; only `/tg-reload` or `/telegram reload` re-arms the channel.
+ */
+async function bindToolChannel(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext | undefined,
+  force: boolean,
+): Promise<ActiveRootState | null> {
+  if (ctx && isEligibleRootSession(ctx)) {
+    savedContext = ctx;
+    ownerInstance = pi;
+  }
+  let root = ownedRoot();
+  if (root && !force) return root;
+  const effectiveCtx = ctx && isEligibleRootSession(ctx) ? ctx : savedContext;
+  if (!effectiveCtx || operatorReleased || !currentApi) return root;
+  try {
+    if (!activeRuntime) {
+      const mod = await loadRuntimeModule();
+      activeRuntime = mod.createRuntime(currentApi);
+      activeRuntime.setReloadTrigger(reload);
+    }
+    await activeRuntime.initSession(effectiveCtx, { isReload: true });
+    root = ownedRoot();
+  } catch (err: unknown) {
+    currentApi.logger?.warn(`Telegram tool rebind failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return root;
 }
 
 export function getActiveRuntime(): TelegramRuntime | null {
@@ -171,12 +218,14 @@ function findDaemonRoute(sessionId?: string, workspace?: string): { slotId: stri
             "SELECT slot_id, chat_id, topic_id FROM routes WHERE session_id = ? AND topic_id != '' LIMIT 1"
           ).get(sessionId)
         : null;
-      if (!row && workspace) {
-        const normWs = workspace.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+      if (!row) {
+        // A headless session may have no usable saved context; fall back to the
+        // current workspace so the route lookup still resolves (issue #174).
+        const targetWs = (workspace ?? process.cwd()).replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
         const all = db.query<{ slot_id: string; chat_id: string; topic_id: string; workspace: string }, []>(
           "SELECT slot_id, chat_id, topic_id, workspace FROM routes WHERE topic_id != ''"
         ).all();
-        row = all.find(r => r.workspace && r.workspace.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase() === normWs) ?? null;
+        row = all.find(r => r.workspace && r.workspace.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase() === targetWs) ?? null;
       }
       if (!row) return null;
 
@@ -379,14 +428,8 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
       wait: z.boolean().default(true),
       timeout: z.number().optional(),
     }),
-    async execute(_id, params, signal, onUpdate) {
-      let root = ownedRoot();
-      if (!root && savedContext && activeRuntime) {
-        try {
-          await activeRuntime.initSession(savedContext, { isReload: true });
-          root = ownedRoot();
-        } catch {}
-      }
+    async execute(_id, params, signal, onUpdate, ctx?: ExtensionContext) {
+      let root = await bindToolChannel(pi, ctx, false);
       if (!root || !root.questions) {
         const routeInfo = lastKnownRoute
           ? ` (last bound to chat ${lastKnownRoute.chatId ?? "unknown"}, slot ${lastKnownRoute.slotId ?? "unknown"}, unbound: ${lastKnownRoute.unboundReason ?? "unknown"})`
@@ -442,16 +485,8 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
       lane_state: z.enum(["active", "exited", "unknown"]),
       rebind: z.boolean().optional(),
     }),
-    async execute(_id, params) {
-      let root = ownedRoot();
-      if ((!root || params.rebind) && savedContext && activeRuntime) {
-        try {
-          await activeRuntime.initSession(savedContext, { isReload: true });
-          root = ownedRoot();
-        } catch (err: unknown) {
-          currentApi?.logger?.warn(`Telegram rebind failed: ${err instanceof Error ? err.message : String(err)}`);
-        }
-      }
+    async execute(_id, params, _signal, _onUpdate, ctx?: ExtensionContext) {
+      let root = await bindToolChannel(pi, ctx, params.rebind === true);
       if (!root) {
         const fallbackRoute = findDaemonRoute(savedContext?.sessionId, savedContext?.cwd);
         if (fallbackRoute) {
@@ -512,8 +547,8 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
       blockers: z.array(z.object({ question: z.string(), url: z.string().optional() })),
       mergeQueue: z.array(z.object({ title: z.string(), url: z.string(), state: z.string() })),
     }),
-    async execute(_id, params) {
-      const root = ownedRoot();
+    async execute(_id, params, _signal, _onUpdate, ctx?: ExtensionContext) {
+      const root = await bindToolChannel(pi, ctx, false);
       if (!root || !root.dashboard) throw new Error("No active Telegram dashboard");
       root.dashboard.set({ ...params, observedAt: Date.now() });
       for (const lane of params.lanes) {
@@ -526,7 +561,6 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
 
 export default function telegramSessionExtension(pi: ExtensionAPI): void {
   pi.setLabel("Telegram Alternate Channel");
-  let ownsRootLifecycle = false;
   currentApi ??= pi;
 
   // Guarded for the same reason session_switch is below: a host that does not offer
@@ -541,7 +575,7 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
   }
   pi.on("session_start", async (event: SessionStartEvent, ctx: ExtensionContext) => {
     if (!isEligibleRootSession(ctx)) return;
-    ownsRootLifecycle = true;
+    ownerInstance = pi;
     currentApi = pi;
     savedContext = ctx;
     if (!activeRuntime) {
@@ -555,16 +589,31 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
         );
         return;
       }
-
     }
     await activeRuntime.onSessionStart(event, ctx);
   });
 
   try {
     pi.on("session_switch", async (event: unknown, ctx: ExtensionContext) => {
-      if (!ownsRootLifecycle || !isEligibleRootSession(ctx)) return;
+      if (!isEligibleRootSession(ctx)) return;
+      // Claim on switch, not only on start: a headless session can reach its first
+      // switch before anything claimed the lifecycle for it (print mode, cron).
+      ownerInstance = pi;
+      currentApi = pi;
       savedContext = ctx;
-      await activeRuntime?.onSessionSwitch(event, ctx);
+      if (!activeRuntime) {
+        try {
+          const mod = await loadRuntimeModule();
+          activeRuntime = mod.createRuntime(pi);
+          activeRuntime.setReloadTrigger(reload);
+        } catch (err: unknown) {
+          pi.logger?.error(
+            `[Telegram Loader] Runtime load on session switch failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          return;
+        }
+      }
+      await activeRuntime.onSessionSwitch(event, ctx);
     });
   } catch (err: unknown) {
     pi.logger?.warn(
@@ -573,7 +622,7 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
   }
 
   pi.on("message_start", async (event: { message: { role: string } }) => {
-    if (!ownsRootLifecycle) return;
+    if (ownerInstance !== pi) return;
     if (event.message.role === "user") {
       await ensureChannelBound("message_start");
     }
@@ -581,32 +630,33 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("message_update", async (event: MessageUpdateEvent) => {
-    if (!ownsRootLifecycle) return;
+    if (ownerInstance !== pi) return;
     await activeRuntime?.onMessageUpdate(event);
   });
 
   pi.on("message_end", async (event: MessageEndEvent) => {
-    if (!ownsRootLifecycle) return;
+    if (ownerInstance !== pi) return;
     await activeRuntime?.onMessageEnd(event);
   });
 
   pi.on("turn_end", async () => {
-    if (!ownsRootLifecycle) return;
+    if (ownerInstance !== pi) return;
     await ensureChannelBound("turn_end");
   });
 
   pi.on("session_shutdown", async (event: SessionShutdownEvent) => {
-    if (!ownsRootLifecycle) return;
+    if (ownerInstance !== pi) return;
     if (activeRuntime) {
       await activeRuntime.onSessionShutdown(event);
       activeRuntime = null;
+      ownerInstance = null;
     }
   });
 
   pi.registerCommand("telegram", {
     description: "Inspect, release, or reload Telegram bot lease for this session",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
-      if (!ownsRootLifecycle || !isEligibleRootSession(ctx)) return;
+      if (ownerInstance !== pi || !isEligibleRootSession(ctx)) return;
       const trimmed = args.trim().toLowerCase();
       if (trimmed === "reload") {
         operatorReleased = false;
@@ -649,7 +699,7 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
   pi.registerCommand("tg-reload", {
     description: "Hot reload Telegram harness runtime in-process",
     handler: async (_args: string, ctx: ExtensionCommandContext) => {
-      if (!ownsRootLifecycle || !isEligibleRootSession(ctx)) return;
+      if (ownerInstance !== pi || !isEligibleRootSession(ctx)) return;
       operatorReleased = false;
       ctx.ui.notify("Reloading Telegram harness runtime...", "info");
       const res = await reload({ interactive: true });
