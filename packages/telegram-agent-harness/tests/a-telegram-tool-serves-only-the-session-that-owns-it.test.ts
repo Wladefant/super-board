@@ -454,3 +454,28 @@ test("telegram_dashboard stores the observed snapshot and reconciles each lane's
   expect(channel.laneStateOf(active!.result!.message_id)).toBe("active");
   expect(channel.laneStateOf(gone!.result!.message_id)).toBe("exited");
 });
+
+test("a subagent tool context never claims the lifecycle or creates a runtime", async () => {
+  const host = createHost();
+  registerOperatorTools(host.api);
+  setActiveRuntime(null);
+  delete (globalThis as unknown as GlobalTelegramState)[ACTIVE_ROOT_SYMBOL];
+  const channel = createChannel();
+
+  const subagentCtx = {
+    hasUI: true,
+    isSubagent: true,
+    taskDepth: 1,
+    parentTaskPrefix: "sub-1",
+    cwd: "C:/anywhere",
+    sessionManager: { getSessionId: () => "subagent-session" },
+  } as unknown as ExtensionContext;
+
+  for (const [name, params] of Object.entries(CALLS)) {
+    const tool = host.tools.get(name)!;
+    await expect(tool.execute("call-1", params, undefined, undefined, subagentCtx)).rejects.toThrow();
+  }
+  // Nothing reached the foreign channel and no runtime was fabricated for the caller.
+  expect(channel.calls).toEqual([]);
+  expect((globalThis as unknown as GlobalTelegramState)[ACTIVE_ROOT_SYMBOL]).toBeUndefined();
+});

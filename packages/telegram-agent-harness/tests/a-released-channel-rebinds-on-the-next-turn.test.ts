@@ -258,3 +258,60 @@ test("a channel the operator released stays released, and /tg-reload re-arms it"
   await atClockOffset(244_000, fireTurnEnd);
   expect(getActiveRuntime()?.getPoller()).not.toBeNull();
 });
+
+test("a headless session that never fired session_start claims the channel from its own tool call", async () => {
+  // Strip every state handle so only the tool's context can restore the channel.
+  await disposeRuntimeInPlace();
+  delete (globalThis as unknown as GlobalTelegramState)[ACTIVE_ROOT_SYMBOL];
+  setActiveRuntime(null);
+  setSavedContext(null);
+
+  // A fresh extension load on a host that captures tools as well as lifecycle
+  // hooks. No session_start fires: the print/cron session's context only ever
+  // arrives attached to a tool call.
+  const tools = new Map<string, { execute: (...args: unknown[]) => Promise<unknown> }>();
+  const headlessHost = {
+    setLabel: () => {},
+    on: (event: string, handler: (...args: unknown[]) => Promise<unknown>) => {
+      const list = listeners.get(event) ?? [];
+      list.push(handler);
+      listeners.set(event, list);
+    },
+    registerCommand: (name: string, def: { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }) => {
+      commands.set(name, def);
+    },
+    registerTool: (tool: unknown) => {
+      const named = tool as { name: string; execute: (...args: unknown[]) => Promise<unknown> };
+      tools.set(named.name, named);
+    },
+    zod: inertSchemaModule(),
+    sendUserMessage: () => {},
+    abortActiveTurn: async () => {},
+    logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
+  } as unknown as ExtensionAPI;
+  listeners = new Map();
+  commands = new Map();
+  telegramSessionExtension(headlessHost);
+
+  const headlessCtx = { ...createContext(), hasUI: false } as unknown as ExtensionContext;
+  const callsBefore = telegramCalls.length;
+
+  const sent = (await tools.get("telegram_message")!.execute(
+    "call-1",
+    { text: "Headless lane alive", lane_id: "headless-lane", lane_state: "active" },
+    undefined,
+    undefined,
+    headlessCtx,
+  )) as { content: Array<{ text: string }> };
+
+  expect(getActiveRuntime()?.getPoller()).not.toBeNull();
+  expect(getActiveRuntime()?.getSessionId()).toBe(SESSION_ID);
+  expect(telegramCalls.length).toBeGreaterThan(callsBefore);
+  expect(sent.content[0].text).toContain("Delivered message");
+
+  // The claim arms the automatic hooks too: a disposed channel rebinds on the
+  // next turn without any further tool context.
+  await disposeRuntimeInPlace();
+  await atClockOffset(305_000, () => fireMessageStart("user"));
+  expect(getActiveRuntime()?.getPoller()).not.toBeNull();
+});
