@@ -27,7 +27,10 @@ import copy
 import datetime
 import itertools
 import socket
-import yaml
+try:
+    import yaml
+except ImportError:
+    yaml = None
 import json
 import os
 import shutil
@@ -1706,6 +1709,8 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         config_path = Path(os.path.expanduser("~/.veyyon/profiles/default/agent/config.yml"))
         if not config_path.exists():
             self.skipTest(f"profile config not installed at {config_path}")
+        if yaml is None:
+            self.skipTest(f"PyYAML is not installed; skipping {config_path} verification")
         parsed = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         model_roles = parsed.get("modelRoles") or {}
         agents = (parsed.get("agent") or {}).get("agents") or {}
@@ -1795,6 +1800,8 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         config_path = Path(os.path.expanduser("~/.veyyon/profiles/default/agent/config.yml"))
         if not config_path.exists():
             self.skipTest(f"profile config not installed at {config_path}")
+        if yaml is None:
+            self.skipTest(f"PyYAML is not installed; skipping {config_path} verification")
         parsed = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         settings = parsed.get("agent") or {}
         agents = settings.get("agents") or {}
@@ -1917,6 +1924,8 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         config_path = Path(os.path.expanduser("~/.veyyon/profiles/default/agent/config.yml"))
         if not config_path.exists():
             self.skipTest(f"profile config not installed at {config_path}")
+        if yaml is None:
+            self.skipTest(f"PyYAML is not installed; skipping {config_path} verification")
         agents = ((yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}).get("agent") or {}).get("agents") or {}
 
         # A nested Agents level names the model this same lane type runs when spawned one level
@@ -2651,8 +2660,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         # Profile config invariant: when CODEX_ENABLED is False, Codex agent roles must be disabled
         if not CODEX_ENABLED:
             config_path = os.path.expanduser("~/.veyyon/profiles/default/agent/config.yml")
-            if os.path.exists(config_path):
-                import yaml
+            if os.path.exists(config_path) and yaml is not None:
                 with open(config_path, "r", encoding="utf-8") as f:
                     cfg = yaml.safe_load(f)
                 prof_agents = (cfg.get("agent") or {}).get("agents") or {}
@@ -2718,7 +2726,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
 
         # Check installed profile configuration if present
         config_path = Path(os.path.expanduser("~/.veyyon/profiles/default/agent/config.yml"))
-        if config_path.exists():
+        if config_path.exists() and yaml is not None:
             parsed = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
             agents = (parsed.get("agent") or {}).get("agents") or {}
             model_roles = parsed.get("modelRoles") or {}

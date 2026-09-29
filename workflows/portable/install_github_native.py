@@ -126,10 +126,16 @@ def synchronize(
     required = manifest.setdefault("export", {}).setdefault("required_files", [])
     for name in (
         "github_work_item.py", "review_content.py",
-        "model_routing.py", "balance_loader.py", "routing_smoke_test.py",
+        "model_routing.py", "balance_loader.py",
     ):
         if name not in required:
             required.append(name)
+    if "routing_smoke_test.py" in required:
+        required.remove("routing_smoke_test.py")
+    optional = manifest.setdefault("export", {}).setdefault("optional_files", [])
+    if "routing_smoke_test.py" in source_manifest.get("export", {}).get("optional_files", []):
+        if "routing_smoke_test.py" not in optional:
+            optional.append("routing_smoke_test.py")
     payloads.append((manifest_path, (json.dumps(manifest, indent=2) + "\n").encode()))
     for target, data in payloads:
         if not check:
