@@ -416,6 +416,33 @@ test("telegram_message reports failure when Telegram does not accept the message
   );
 });
 
+test("telegram_message executes without ReferenceError when called with an eligible root session context", async () => {
+  const host = createHost();
+  registerOperatorTools(host.api);
+  const runtime = new TelegramRuntime(host.api);
+  setActiveRuntime(runtime);
+  const channel = createChannel();
+  (globalThis as unknown as GlobalTelegramState)[ACTIVE_ROOT_SYMBOL] = channel.root(runtime.instanceId);
+
+  const rootCtx = {
+    hasUI: true,
+    isSubagent: false,
+    taskDepth: 0,
+    cwd: "C:/anywhere",
+    sessionManager: { getSessionId: () => "root-session-1" },
+  } as unknown as ExtensionContext;
+
+  const result = (await host.tools.get("telegram_message")!.execute(
+    "call-1",
+    CALLS.telegram_message,
+    undefined,
+    undefined,
+    rootCtx,
+  )) as { content: Array<{ text: string }> };
+
+  expect(result.content[0]!.text).toContain("Delivered message");
+});
+
 test("telegram_dashboard stores the observed snapshot and reconciles each lane's state", async () => {
   const host = createHost();
   registerOperatorTools(host.api);
