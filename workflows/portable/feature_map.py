@@ -35,6 +35,21 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # Supported risk levels per Issue #195 & Issue #244 conventions
 ALLOWED_RISK_LEVELS = ("low", "medium", "high")
 
+# Canonical feature fields recognized by schema & model
+CANONICAL_FEATURE_FIELDS: frozenset[str] = frozenset({
+    "name",
+    "description",
+    "entry_files",
+    "tests",
+    "owning_issue",
+    "risk",
+    "components",
+    "cli_command",
+    "docs",
+    "dependencies",
+    "routes",
+})
+
 
 @dataclass
 class FeatureEntry:
@@ -49,6 +64,14 @@ class FeatureEntry:
     cli_command: str = ""
     docs: List[str] = field(default_factory=list)
     dependencies: List[str] = field(default_factory=list)
+    routes: List[str] = field(default_factory=list)
+    extras: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.extras is None:
+            self.extras = {}
+        else:
+            self.extras = {k: v for k, v in self.extras.items() if k not in CANONICAL_FEATURE_FIELDS}
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert entry to dictionary with clean formatting."""
@@ -68,6 +91,11 @@ class FeatureEntry:
             d["docs"] = list(self.docs)
         if self.dependencies:
             d["dependencies"] = list(self.dependencies)
+        if self.routes:
+            d["routes"] = list(self.routes)
+        for k, v in self.extras.items():
+            if k not in CANONICAL_FEATURE_FIELDS:
+                d[k] = v
         return d
 
 
@@ -100,13 +128,14 @@ class FeatureMap:
         description: str = "",
         features: Optional[Dict[str, FeatureEntry]] = None,
         schema: str = "workflows/portable/feature_map.schema.json",
+        extras: Optional[Dict[str, Any]] = None,
     ):
         self.version = version
         self.repository = repository
         self.description = description
         self.features: Dict[str, FeatureEntry] = features or {}
         self.schema = schema
-
+        self.extras: Dict[str, Any] = extras or {}
     def get(self, feature_id: str) -> Optional[FeatureEntry]:
         """Get feature by exact key."""
         return self.features.get(feature_id)
@@ -159,6 +188,15 @@ class FeatureMap:
                     matches.append((fid, entry))
                     break
 
+            # Check routes
+            found_route = False
+            for r in entry.routes:
+                if term in r.lower():
+                    matches.append((fid, entry))
+                    found_route = True
+                    break
+            if found_route:
+                continue
         return matches
 
     def validate(self, repo_root: Path) -> ValidationResult:
@@ -175,6 +213,10 @@ class FeatureMap:
             d["repository"] = self.repository
         if self.description:
             d["description"] = self.description
+        if self.extras:
+            for k, v in self.extras.items():
+                if k not in ("$schema", "version", "repository", "description", "features"):
+                    d[k] = v
         d["features"] = {fid: entry.to_dict() for fid, entry in self.features.items()}
         return d
 
@@ -253,10 +295,16 @@ def load_feature_map(
     if not isinstance(raw_features, dict):
         raise ValueError(f"Feature map 'features' must be a dictionary, got {type(raw_features).__name__}")
 
+    top_extras = {
+        k: v for k, v in data.items()
+        if k not in ("$schema", "version", "repository", "description", "features")
+    }
+
     features: Dict[str, FeatureEntry] = {}
     for fid, fdef in raw_features.items():
         if not isinstance(fdef, dict):
             continue
+        extras = {k: v for k, v in fdef.items() if k not in CANONICAL_FEATURE_FIELDS}
         features[fid] = FeatureEntry(
             name=str(fdef.get("name", "")),
             description=str(fdef.get("description", "")),
@@ -268,6 +316,8 @@ def load_feature_map(
             cli_command=str(fdef.get("cli_command", "")),
             docs=[str(x) for x in fdef.get("docs", [])],
             dependencies=[str(x) for x in fdef.get("dependencies", [])],
+            routes=[str(x) for x in fdef.get("routes", [])] if "routes" in fdef else [],
+            extras=extras,
         )
 
     return FeatureMap(
@@ -276,6 +326,7 @@ def load_feature_map(
         description=description,
         features=features,
         schema=schema,
+        extras=top_extras,
     )
 
 
@@ -367,6 +418,9 @@ def generate_feature_entry(
     components: Optional[Sequence[str]] = None,
     cli_command: str = "",
     docs: Optional[Sequence[str]] = None,
+    dependencies: Optional[Sequence[str]] = None,
+    routes: Optional[Sequence[str]] = None,
+    extras: Optional[Dict[str, Any]] = None,
 ) -> FeatureEntry:
     """Helper to construct a validated FeatureEntry instance."""
     clean_risk = risk.lower().strip()
@@ -383,6 +437,9 @@ def generate_feature_entry(
         components=list(components or []),
         cli_command=cli_command.strip(),
         docs=[f.replace("\\", "/").strip() for f in (docs or []) if f.strip()],
+        dependencies=[str(d).strip() for d in (dependencies or []) if str(d).strip()],
+        routes=[str(r).strip() for r in (routes or []) if str(r).strip()],
+        extras=dict(extras or {}),
     )
 
 
@@ -438,6 +495,11 @@ def format_feature_detail(fid: str, feat: FeatureEntry) -> str:
         for d in feat.docs:
             lines.append(f"  - {d}")
 
+    if feat.routes:
+        lines.append("")
+        lines.append("Routes:")
+        for r in feat.routes:
+            lines.append(f"  - {r}")
     return "\n".join(lines)
 
 
@@ -515,6 +577,7 @@ def build_parser() -> argparse.ArgumentParser:
     gen_parser.add_argument("--components", nargs="*", default=[], help="Key components or classes")
     gen_parser.add_argument("--cli", default="", help="Canonical CLI command")
     gen_parser.add_argument("--docs", nargs="*", default=[], help="Related documentation paths")
+    gen_parser.add_argument("--routes", nargs="*", default=[], help="HTTP or RPC route pattern(s)")
     gen_parser.add_argument("--append", action="store_true", help="Append directly to map file")
 
     return parser
@@ -613,6 +676,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 components=args.components,
                 cli_command=args.cli,
                 docs=args.docs,
+                routes=args.routes,
             )
         except Exception as exc:
             print(f"Error generating feature entry: {exc}", file=sys.stderr)
