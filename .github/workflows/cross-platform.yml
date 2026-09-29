@@ -217,6 +217,8 @@ jobs:
         run: python -B workflows/portable/test_build_slot.py
       - name: worktree removal
         run: python -B workflows/portable/test_wt_remove.py
+      - name: polysim next cache
+        run: python -B workflows/portable/test_polysim_next_cache.py
       - name: outer loop intake
         run: python -B workflows/portable/test_outer_loop_intake.py
       - name: host status monitor
