@@ -76,8 +76,12 @@ export function isSubagent(ctx: ExtensionContext): boolean {
 }
 
 export function isEligibleRootSession(ctx: ExtensionContext): boolean {
+  // Headless root sessions (`veyyon -p`, cron, scheduled runs) legitimately own the
+  // Telegram channel even though they never draw a UI: observed 2026-09-26, every
+  // print-session tool call died with "No active session-bound Telegram channel"
+  // because this check rejected the session at session_start. Subagents and nested
+  // tasks stay excluded — they must never claim the operator channel.
   return Boolean(
-    ctx.hasUI &&
     ctx.isSubagent !== true &&
     (ctx.taskDepth ?? 0) === 0 &&
     !ctx.parentTaskPrefix,
