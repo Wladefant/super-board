@@ -209,7 +209,10 @@ function createChannel(messageThreadId?: number): {
       onLedgerFailure: () => {},
     },
     bridge,
-    { outboundPaceMs: 0 },
+    {
+      outboundPaceMs: 0,
+      ...(messageThreadId === undefined ? {} : { messageThreadId }),
+    },
   );
 
   globalThis.fetch = (async (url, init) => {

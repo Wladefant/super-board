@@ -613,6 +613,7 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
       if (!chat) throw new Error("No authorized Telegram recipient");
       root.messageContext?.setLaneState(root.sessionId, params.lane_id, params.lane_state);
       const threadId = root.poller.getActiveThreadId()
+        ?? root.poller.getMessageThreadId()
         ?? (root.activeSlot?.stateDir ? readMessageThreadId(root.activeSlot.stateDir) : undefined);
       const kind = selectTelegramAttachmentKind(filePath, params.kind);
       const sent = await root.poller.sendTelegramAttachment(
