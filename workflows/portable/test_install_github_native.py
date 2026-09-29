@@ -25,7 +25,10 @@ class Installation(unittest.TestCase):
         self.runtime.mkdir()
         (self.runtime / "state.json").write_bytes(b"operator state")
         self.source_manifest = {"authority": {"shared_system_of_record": "GitHub"}, "modules": {
-            name: {"role": name} for name in ("github_work_item.py", "review_content.py", "install_github_native.py", "ledger.py")
+            name: {"role": name} for name in (
+                "github_work_item.py", "review_content.py", "install_github_native.py", "ledger.py", "verify.py",
+                "model_routing.py", "balance_loader.py", "routing_smoke_test.py",
+            )
         }}
         (self.source / "workflows/portable/manifest.json").write_text(json.dumps(self.source_manifest))
         (self.runtime / "manifest.json").write_text(json.dumps({"unrelated": "preserved", "modules": {"peer.py": {"role": "peer"}}}))
@@ -92,6 +95,18 @@ class Installation(unittest.TestCase):
                 self.assertIn(f"DRIFT: {name}", report.getvalue())
                 self.assertEqual(installed.read_bytes(), b"stale router")
                 self.assertTrue(synchronize(self.source, self.profile, self.runtime))
+
+    def test_router_modules_deploy_through_manifest(self):
+        self.assertTrue(synchronize(self.source, self.profile, self.runtime))
+        manifest = json.loads((self.runtime / "manifest.json").read_text(encoding="utf-8"))
+        for name in ("model_routing.py", "balance_loader.py", "routing_smoke_test.py"):
+            with self.subTest(name=name):
+                self.assertIn(name, manifest.get("modules", {}), f"{name} not deployed in runtime manifest modules")
+                self.assertEqual(manifest["modules"][name], {"role": name})
+        required = manifest.get("export", {}).get("required_files", [])
+        for name in ("model_routing.py", "balance_loader.py", "routing_smoke_test.py"):
+            with self.subTest(required_name=name):
+                self.assertIn(name, required, f"{name} not in runtime manifest required_files")
 
     def test_profile_extensions_land_beside_the_profile_and_are_drift_checked(self):
         self.assertTrue(synchronize(self.source, self.profile, self.runtime))
