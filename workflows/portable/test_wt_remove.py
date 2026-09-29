@@ -54,9 +54,12 @@ class WtRemoveTest(unittest.TestCase):
         run_git("commit", "-q", "-m", "init", cwd=self.main)
         self.wt = self.tmp / "lane"
         run_git("worktree", "add", "-q", "-b", "lane", str(self.wt), cwd=self.main)
+        (self.wt / "feature.txt").write_text("feature-v1", encoding="utf-8")
+        run_git("add", "feature.txt", cwd=self.wt)
+        run_git("commit", "-q", "-m", "feature", cwd=self.wt)
+        run_git("merge", "-q", "lane", cwd=self.main)
         self.link = self.wt / "node_modules"  # deliberately not gitignored: git sees it as untracked
         make_link(self.link, self.shared)
-
     def remove(self, *extra: str) -> int:
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             return wt_remove.main([str(self.wt), "--scan-root", str(self.tmp), *extra])
@@ -117,6 +120,54 @@ class WtRemoveTest(unittest.TestCase):
         make_link(other / "frontend" / "node_modules", self.wt / "frontend" / "node_modules")
         self.assertEqual(self.remove("--force"), 2)
         self.assert_untouched()
+
+    def test_clean_unmerged_worktree_is_refused_untouched(self) -> None:
+        (self.wt / "unmerged.txt").write_text("unmerged", encoding="utf-8")
+        run_git("add", "unmerged.txt", cwd=self.wt)
+        run_git("commit", "-q", "-m", "unmerged feature", cwd=self.wt)
+        self.assertEqual(self.remove(), 2)
+        self.assert_untouched()
+        report = wt_remove.remove_worktree(str(self.wt), False, False, False, (self.tmp,))
+        self.assertTrue(report["refused"])
+        self.assertEqual(report["branch"], "lane")
+        self.assertEqual(report["merged_into"], [])
+        self.assertIn("not reachable", report["error"])
+        self.assert_untouched()
+
+    def test_dirty_unmerged_worktree_with_force_is_refused_untouched(self) -> None:
+        (self.wt / "unmerged.txt").write_text("unmerged", encoding="utf-8")
+        run_git("add", "unmerged.txt", cwd=self.wt)
+        run_git("commit", "-q", "-m", "unmerged feature", cwd=self.wt)
+        (self.wt / "scratch.txt").write_text("dirty content", encoding="utf-8")
+        self.assertEqual(self.remove("--force"), 2)
+        self.assert_untouched()
+        report = wt_remove.remove_worktree(str(self.wt), True, False, False, (self.tmp,))
+        self.assertTrue(report["refused"])
+        self.assertEqual(report["branch"], "lane")
+        self.assertEqual(report["merged_into"], [])
+        self.assertIn("not reachable", report["error"])
+        self.assert_untouched()
+
+    def test_detached_head_reachable_is_removed_and_unmerged_refused(self) -> None:
+        run_git("checkout", "-q", "--detach", cwd=self.wt)
+        report = wt_remove.remove_worktree(str(self.wt), False, True, False, (self.tmp,))
+        self.assertEqual(report["branch"], "(detached)")
+        self.assertIn("main", report["merged_into"])
+        self.assertFalse(report.get("refused", False))
+
+        (self.wt / "detached_unmerged.txt").write_text("unmerged", encoding="utf-8")
+        run_git("add", "detached_unmerged.txt", cwd=self.wt)
+        run_git("commit", "-q", "-m", "detached unmerged", cwd=self.wt)
+        self.assertEqual(self.remove(), 2)
+        self.assert_untouched()
+        self.assertEqual(self.remove("--force"), 2)
+        self.assert_untouched()
+
+    def test_report_includes_branch_full_head_and_merged_into(self) -> None:
+        report = wt_remove.remove_worktree(str(self.wt), False, True, False, (self.tmp,))
+        self.assertEqual(report["branch"], "lane")
+        self.assertEqual(len(report["head"]), 40)
+        self.assertIn("main", report["merged_into"])
 
 
 if __name__ == "__main__":

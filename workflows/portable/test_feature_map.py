@@ -29,6 +29,8 @@ Tests:
   19. CLI query and show subcommands output formatting.
   20. CLI list with --json serialization.
   21. Entry generator helper validation.
+  22. CLI generate --append lossless round-tripping of unknown keys, routes, states, and nested values.
+  23. Extras isolation: extras never overwrite canonical known fields.
 """
 
 from __future__ import annotations
@@ -303,13 +305,15 @@ class TestFeatureMap(unittest.TestCase):
             owning_issue="#123",
             risk="low",
             components=["CustomClass"],
+            routes=["/custom/route"],
         )
         self.assertEqual(entry.name, "Custom Tool")
         self.assertEqual(entry.risk, "low")
+        self.assertEqual(entry.routes, ["/custom/route"])
         d = entry.to_dict()
         self.assertEqual(d["name"], "Custom Tool")
         self.assertEqual(d["components"], ["CustomClass"])
-
+        self.assertEqual(d["routes"], ["/custom/route"])
         # Invalid risk raises ValueError
         with self.assertRaises(ValueError):
             generate_feature_entry(
@@ -322,6 +326,143 @@ class TestFeatureMap(unittest.TestCase):
                 risk="invalid_risk",
             )
 
+
+    def test_22_cli_generate_append_lossless_roundtrip(self):
+        """CLI generate --append preserves unknown keys, routes, states, and nested values."""
+        with tempfile.TemporaryDirectory(prefix="test-fmap-lossless-") as tmp:
+            tmp_root = Path(tmp)
+            initial_map = {
+                "$schema": "workflows/portable/feature_map.schema.json",
+                "version": "1.0.0",
+                "repository": "Wladefant/super-board",
+                "description": "Lossless round-trip test map",
+                "features": {
+                    "existing_tool": {
+                        "name": "Existing Tool",
+                        "description": "Tool with routes, states, and nested extras",
+                        "entry_files": ["existing.py"],
+                        "tests": ["test_existing.py"],
+                        "owning_issue": "https://github.com/Wladefant/super-board/issues/299",
+                        "risk": "medium",
+                        "components": ["ExistingComponent"],
+                        "cli_command": "python existing.py",
+                        "docs": ["docs/existing.md"],
+                        "dependencies": ["dep_tool"],
+                        "routes": ["/api/v1/existing", "/api/v1/legacy"],
+                        "states": ["draft", "active", "archived"],
+                        "custom_config": {
+                            "nested_group": {
+                                "retries": 3,
+                                "timeout_sec": 30.5,
+                                "active": True,
+                            },
+                            "tags": ["core", "high-trust"],
+                        },
+                    }
+                },
+            }
+            map_file = tmp_root / "FEATURE_MAP.json"
+            map_file.write_text(json.dumps(initial_map, indent=2), encoding="utf-8")
+
+            # Run generate --append with --routes for a new feature
+            cmd = [
+                sys.executable,
+                str(Path(SCRIPT_DIR) / "feature_map.py"),
+                "generate",
+                "--id", "new_service",
+                "--name", "New Service",
+                "--description", "New service with routes",
+                "--entry", "new_service.py",
+                "--tests", "test_new_service.py",
+                "--issue", "https://github.com/Wladefant/super-board/issues/300",
+                "--risk", "low",
+                "--routes", "/api/v2/new", "/api/v2/stream",
+                "--append",
+                "--map", str(map_file),
+                "--repo-root", str(tmp_root),
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, f"generate --append failed: {proc.stderr}\nstdout: {proc.stdout}")
+
+            # Load updated JSON and verify lossless preservation
+            updated = json.loads(map_file.read_text(encoding="utf-8"))
+            features = updated.get("features", {})
+            self.assertIn("existing_tool", features)
+            self.assertIn("new_service", features)
+
+            existing = features["existing_tool"]
+            # Assert exact preservation of canonical fields
+            self.assertEqual(existing["name"], "Existing Tool")
+            self.assertEqual(existing["description"], "Tool with routes, states, and nested extras")
+            self.assertEqual(existing["entry_files"], ["existing.py"])
+            self.assertEqual(existing["tests"], ["test_existing.py"])
+            self.assertEqual(existing["owning_issue"], "https://github.com/Wladefant/super-board/issues/299")
+            self.assertEqual(existing["risk"], "medium")
+            self.assertEqual(existing["components"], ["ExistingComponent"])
+            self.assertEqual(existing["cli_command"], "python existing.py")
+            self.assertEqual(existing["docs"], ["docs/existing.md"])
+            self.assertEqual(existing["dependencies"], ["dep_tool"])
+
+            # Assert exact preservation of routes, states, and nested unknown values
+            self.assertEqual(existing["routes"], ["/api/v1/existing", "/api/v1/legacy"])
+            self.assertEqual(existing["states"], ["draft", "active", "archived"])
+            self.assertEqual(
+                existing["custom_config"],
+                {
+                    "nested_group": {
+                        "retries": 3,
+                        "timeout_sec": 30.5,
+                        "active": True,
+                    },
+                    "tags": ["core", "high-trust"],
+                },
+            )
+
+            # Assert new feature entry and its routes
+            new_feat = features["new_service"]
+            self.assertEqual(new_feat["name"], "New Service")
+            self.assertEqual(new_feat["description"], "New service with routes")
+            self.assertEqual(new_feat["entry_files"], ["new_service.py"])
+            self.assertEqual(new_feat["tests"], ["test_new_service.py"])
+            self.assertEqual(new_feat["owning_issue"], "https://github.com/Wladefant/super-board/issues/300")
+            self.assertEqual(new_feat["risk"], "low")
+            self.assertEqual(new_feat["routes"], ["/api/v2/new", "/api/v2/stream"])
+
+    def test_23_extras_never_overwrite_canonical_fields(self):
+        """Extras cannot overwrite canonical known fields at init or serialization."""
+        entry = FeatureEntry(
+            name="Canonical Name",
+            description="Canonical Desc",
+            entry_files=["file1.py"],
+            tests=["test1.py"],
+            owning_issue="#1",
+            risk="low",
+            routes=["/canonical/route"],
+            extras={
+                "name": "Hacked Name",
+                "risk": "high",
+                "routes": ["/hacked/route"],
+                "states": ["valid_extra"],
+                "custom_payload": {"alpha": 1},
+            },
+        )
+        self.assertEqual(entry.name, "Canonical Name")
+        self.assertEqual(entry.risk, "low")
+        self.assertEqual(entry.routes, ["/canonical/route"])
+
+        serialized = entry.to_dict()
+        self.assertEqual(serialized["name"], "Canonical Name")
+        self.assertEqual(serialized["risk"], "low")
+        self.assertEqual(serialized["routes"], ["/canonical/route"])
+        self.assertEqual(serialized["states"], ["valid_extra"])
+        self.assertEqual(serialized["custom_payload"], {"alpha": 1})
+
+        # Even if extras dict is directly mutated with canonical names, to_dict() refuses them
+        entry.extras["name"] = "Direct Mutation"
+        entry.extras["entry_files"] = ["tampered.py"]
+        serialized2 = entry.to_dict()
+        self.assertEqual(serialized2["name"], "Canonical Name")
+        self.assertEqual(serialized2["entry_files"], ["file1.py"])
 
 if __name__ == "__main__":
     unittest.main()

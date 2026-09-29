@@ -50,6 +50,8 @@ DEFAULT_SCAN_ROOTS = (
 )
 # Relative paths inside a worktree where lanes put shared-tree links.
 LINK_SLOTS = ("frontend/node_modules", "node_modules", "frontend/.next/cache")
+# Integration branches checked for reachability before worktree removal (Issue #334)
+INTEGRATION_REFS = ("origin/staging", "origin/main", "staging", "main")
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +294,17 @@ def is_locked(top: str) -> bool:
     return False
 
 
+def check_merged_into(top: str, head: str) -> list[str]:
+    """Return existing integration refs that contain head (from which head is reachable)."""
+    merged: list[str] = []
+    for ref in INTEGRATION_REFS:
+        chk = git(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], cwd=top)
+        if chk.returncode == 0:
+            anc = git(["merge-base", "--is-ancestor", head, ref], cwd=top)
+            if anc.returncode == 0:
+                merged.append(ref)
+    return merged
+
 def dirty_paths(top: str, links: list[str]) -> list[str]:
     """What makes ``git worktree remove`` refuse without --force, once ``links`` are unlinked:
     modified or untracked paths other than those links, plus any link git tracks (unlinking a
@@ -345,6 +358,20 @@ def remove_worktree(
         report.update(refused=True, error="refusing to remove the main worktree")
         return report
 
+    r_head = git(["rev-parse", "HEAD"], cwd=top)
+    if r_head.returncode != 0:
+        report.update(refused=True, error=f"unable to determine HEAD of worktree: {r_head.stderr.strip()}")
+        return report
+    head = r_head.stdout.strip()
+    report["head"] = head
+
+    r_sym = git(["symbolic-ref", "--short", "-q", "HEAD"], cwd=top)
+    branch = r_sym.stdout.strip() if r_sym.returncode == 0 else "(detached)"
+    report["branch"] = branch
+
+    merged_into = check_merged_into(top, head)
+    report["merged_into"] = merged_into
+
     report["dependents"] = [{"link": link, "target": target} for link, target in dependents_of(path, roots)]
     if report["dependents"] and not orphan_dependents:
         report.update(refused=True, error="other worktrees link into this one; relink them first (polysim_frontend_deps.py link) or pass --orphan-dependents")
@@ -355,10 +382,23 @@ def remove_worktree(
         report.update(refused=True, error="processes are running inside this worktree; stop them first")
         return report
 
-    links = list(iter_links(path))
     if is_locked(top):
         report.update(refused=True, error="the worktree is locked (git worktree unlock it first)")
         return report
+
+    if not merged_into:
+        existing_refs = [
+            ref for ref in INTEGRATION_REFS
+            if git(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], cwd=top).returncode == 0
+        ]
+        ref_desc = f"any existing integration ref ({', '.join(existing_refs)})" if existing_refs else f"any integration ref ({', '.join(INTEGRATION_REFS)})"
+        report.update(
+            refused=True,
+            error=f"HEAD {head} ({branch}) is not reachable from {ref_desc}; refusing to remove worktree",
+        )
+        return report
+
+    links = list(iter_links(path))
     if not force:
         report["dirty"] = dirty_paths(top, links)
         if report["dirty"]:
@@ -418,6 +458,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"dirty: {item}")
         for proc in report.get("busy", []):
             print(f"busy: pid {proc['pid']} {proc['name']} cwd={proc['cwd']}")
+        if report.get("branch"):
+            print(f"branch: {report['branch']}")
+        if report.get("head"):
+            print(f"head: {report['head']}")
+        if "merged_into" in report:
+            refs = ", ".join(report["merged_into"]) if report["merged_into"] else "(none)"
+            print(f"merged into: {refs}")
         if report.get("git"):
             print(report["git"]["output"])
         if report.get("error"):
