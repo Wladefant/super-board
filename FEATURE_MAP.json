@@ -133,6 +133,25 @@
         "rank_sources"
       ],
       "cli_command": "python -B workflows/portable/test_polysim_next_cache.py"
+    },
+    "telegram-outbound-media": {
+      "name": "Telegram outbound media",
+      "description": "Agent-facing photos, PDFs, and generic documents routed to the bound Telegram chat and forum topic",
+      "entry_files": [
+        "packages/telegram-agent-harness/extension/index.ts",
+        "packages/telegram-agent-harness/extension/outbound-media.ts",
+        "packages/telegram-agent-harness/extension/poller.ts"
+      ],
+      "tests": [
+        "packages/telegram-agent-harness/tests/outbound-media.test.ts",
+        "packages/telegram-agent-harness/tests/a-telegram-tool-serves-only-the-session-that-owns-it.test.ts"
+      ],
+      "owning_issue": "https://github.com/Wladefant/super-board/issues/344",
+      "risk": "medium",
+      "components": [
+        "telegram_attachment",
+        "TelegramPoller"
+      ]
     }
   }
 }

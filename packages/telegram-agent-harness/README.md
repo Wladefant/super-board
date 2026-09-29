@@ -10,6 +10,16 @@ Universal, mobile-friendly Telegram operations surface for managing multi-agent 
 - **Supergroup Forum Topics Mode (Opt-In)**: Multiplexes multiple concurrent Veyyon sessions into a single Telegram Supergroup using native Telegram Forum Topics (`message_thread_id`).
 - **Superboard Mini App Integration**: In-app Telegram web dashboard for interactive queue and session monitoring.
 
+### Agent outbound attachments
+
+The public `telegram_attachment` tool sends a local file through the session's
+current Telegram route. `kind: "auto"` sends `.jpg`, `.jpeg`, `.png`, and `.webp`
+files with `sendPhoto`; PDFs and other files use `sendDocument`. The tool accepts
+an optional caption and filename, keeps the bound `chat_id` and
+`message_thread_id`, and leaves `message_thread_id` unset for direct chats.
+Telegram Bot API uploads are limited here to 20 MiB for photos and 50 MiB for
+documents; larger files fail before any network request.
+
 ### Mini App session lifecycle
 
 The relay serves the browser modules and forwards authenticated requests to the

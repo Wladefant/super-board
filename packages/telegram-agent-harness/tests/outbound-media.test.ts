@@ -30,7 +30,7 @@ function captureSuccessfulSend(chatId = -1004422647618) {
       ok: true,
       result: { message_id: 731, chat: { id: chatId }, date: 1 },
     });
-  }) as typeof fetch;
+  }) as unknown as typeof fetch;
   return calls;
 }
 
@@ -109,7 +109,7 @@ test("missing files and files over each Telegram limit fail before network acces
   globalThis.fetch = (async () => {
     fetchCalls++;
     throw new Error("network must not be reached");
-  }) as typeof fetch;
+  }) as unknown as typeof fetch;
 
   await expect(sendTelegramAttachment({
     token: "0:test-only",
@@ -146,7 +146,7 @@ test("Telegram API rejection reaches the caller with the method and API diagnost
     ok: false,
     error_code: 400,
     description: "Bad Request: message thread not found",
-  }, { status: 400 })) as typeof fetch;
+  }, { status: 400 })) as unknown as typeof fetch;
 
   await expect(sendTelegramAttachment({
     token: "0:test-only",

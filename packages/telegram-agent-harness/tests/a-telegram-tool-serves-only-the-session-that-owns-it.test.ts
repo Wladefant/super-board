@@ -70,6 +70,14 @@ const CALLS: Record<string, Record<string, unknown>> = {
     wait: false,
   },
   telegram_message: { text: "Lane finished its slice.", lane_id: "worker-auth", lane_state: "active" },
+  telegram_attachment: {
+    file_path: import.meta.path,
+    kind: "document",
+    caption: "Generated ownership fixture",
+    filename: "ownership-fixture.txt",
+    lane_id: "worker-auth",
+    lane_state: "active",
+  },
   telegram_dashboard: { lanes: [], blockers: [], mergeQueue: [] },
 };
 
@@ -141,7 +149,7 @@ function createHost(options: { toolSurface?: boolean } = {}): {
  * lane-provenance services, so a tool that reaches its root produces observable effects
  * (an HTTP send, a stored snapshot, a lane row) rather than a spy call.
  */
-function createChannel(): {
+function createChannel(messageThreadId?: number): {
   root: (instanceId: string) => ActiveRootState;
   calls: Array<{ method: string; body: Record<string, unknown> }>;
   correlations: Map<number, OutboundMessageCorrelation>;
@@ -151,6 +159,9 @@ function createChannel(): {
   failSends: () => void;
 } {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tg-tool-ownership-"));
+  fs.writeFileSync(path.join(dir, "access.json"), JSON.stringify(
+    messageThreadId === undefined ? {} : { message_thread_id: messageThreadId },
+  ));
   const calls: Array<{ method: string; body: Record<string, unknown> }> = [];
   const correlations = new Map<number, OutboundMessageCorrelation>();
   let messageCounter = 700;
@@ -203,7 +214,11 @@ function createChannel(): {
 
   globalThis.fetch = (async (url, init) => {
     const method = String(url).split("/").pop() ?? "";
-    const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
+    const body = init?.body instanceof FormData
+      ? Object.fromEntries((await new Request(url, init).formData()).entries())
+      : init?.body
+        ? (JSON.parse(String(init.body)) as Record<string, unknown>)
+        : {};
     calls.push({ method, body });
     if (sendsFail && method === "sendMessage") {
       return Response.json({ ok: false, description: "Bad Request: chat not found" }, { status: 400 });
@@ -264,7 +279,7 @@ function createChannel(): {
         pi: {} as ExtensionAPI,
         poller,
         coordinator: {} as ActiveRootState["coordinator"],
-        activeSlot: {} as ActiveRootState["activeSlot"],
+        activeSlot: { stateDir: dir } as ActiveRootState["activeSlot"],
         questions,
         messageContext: store,
         dashboard,
@@ -401,6 +416,56 @@ test("telegram_message attributes the lane and records its state on the correlat
   expect(channel.correlations.get(messageId!)?.laneId).toBe("worker-auth");
   expect(channel.laneStateOf(messageId!)).toBe("active");
   expect(result.content[0]!.text).toContain(String(messageId));
+});
+
+test("telegram_attachment sends a document to the owned session topic with lane correlation", async () => {
+  const host = createHost();
+  registerOperatorTools(host.api);
+  const runtime = new TelegramRuntime(host.api);
+  setActiveRuntime(runtime);
+  const channel = createChannel(344);
+  (globalThis as unknown as GlobalTelegramState)[ACTIVE_ROOT_SYMBOL] = channel.root(runtime.instanceId);
+
+  const result = await host.tools.get("telegram_attachment")!.execute(
+    "call-attachment",
+    CALLS.telegram_attachment,
+  );
+
+  const sent = channel.calls.find(call => call.method === "sendDocument");
+  expect(sent?.body.chat_id).toBe("1");
+  expect(sent?.body.message_thread_id).toBe("344");
+  expect((sent?.body.document as File).name).toBe("ownership-fixture.txt");
+  const [messageId] = [...channel.correlations.keys()];
+  expect(channel.correlations.get(messageId!)?.laneId).toBe("worker-auth");
+  expect(channel.laneStateOf(messageId!)).toBe("active");
+  expect(result.content[0]!.text).toContain("topic #344");
+  expect(result.details).toMatchObject({
+    message_id: messageId,
+    chat_id: 1,
+    message_thread_id: 344,
+    kind: "document",
+    filename: "ownership-fixture.txt",
+  });
+});
+
+test("telegram_attachment keeps direct-chat behavior by omitting message_thread_id", async () => {
+  const host = createHost();
+  registerOperatorTools(host.api);
+  const runtime = new TelegramRuntime(host.api);
+  setActiveRuntime(runtime);
+  const channel = createChannel();
+  (globalThis as unknown as GlobalTelegramState)[ACTIVE_ROOT_SYMBOL] = channel.root(runtime.instanceId);
+
+  const result = await host.tools.get("telegram_attachment")!.execute(
+    "call-attachment",
+    CALLS.telegram_attachment,
+  );
+
+  const sent = channel.calls.find(call => call.method === "sendDocument");
+  expect(sent?.body.chat_id).toBe("1");
+  expect(sent?.body.message_thread_id).toBeUndefined();
+  expect(result.content[0]!.text).toContain("direct chat 1");
+  expect(result.details).toMatchObject({ chat_id: 1, message_thread_id: null });
 });
 
 test("telegram_message reports failure when Telegram does not accept the message", async () => {

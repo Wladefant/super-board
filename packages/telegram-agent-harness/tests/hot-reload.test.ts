@@ -590,9 +590,12 @@ describe("Telegram Harness Hot Reload", () => {
     }
     expect(mockApi.userMessages).toEqual([]);
 
-    expect([...mockApi.tools.keys()].sort()).toEqual(["telegram_dashboard", "telegram_message", "telegram_question"]);
+    expect([...mockApi.tools.keys()].sort()).toEqual(["telegram_attachment", "telegram_dashboard", "telegram_message", "telegram_question"]);
     expect(mockApi.tools.get("telegram_question")?.parameterKeys).toContain("options");
     expect(mockApi.tools.get("telegram_message")?.parameterKeys).toEqual(["text", "lane_id", "lane_state", "rebind"]);
+    expect(mockApi.tools.get("telegram_attachment")?.parameterKeys).toEqual([
+      "file_path", "kind", "caption", "filename", "lane_id", "lane_state", "rebind",
+    ]);
     expect(mockApi.tools.get("telegram_dashboard")?.parameterKeys).toEqual(["lanes", "blockers", "mergeQueue"]);
     // Without a session-bound channel every tool must refuse rather than fall back to the terminal.
     expect(mockApi.tools.get("telegram_question")?.description).toContain("never grants approval");
