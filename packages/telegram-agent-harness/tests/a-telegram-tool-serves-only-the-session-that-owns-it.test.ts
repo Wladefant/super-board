@@ -29,7 +29,7 @@ import telegramSessionExtension, {
   registerOperatorTools,
   setActiveRuntime,
 } from "../extension/index";
-import { TelegramRuntime } from "../extension/runtime";
+import { TelegramRuntime, isEligibleRootSession } from "../extension/runtime";
 import { TelegramPoller } from "../extension/poller";
 import { MessageContextStore } from "../src/message-context";
 import { LiveDashboard } from "../src/live-dashboard";
@@ -478,4 +478,30 @@ test("a subagent tool context never claims the lifecycle or creates a runtime", 
   // Nothing reached the foreign channel and no runtime was fabricated for the caller.
   expect(channel.calls).toEqual([]);
   expect((globalThis as unknown as GlobalTelegramState)[ACTIVE_ROOT_SYMBOL]).toBeUndefined();
+});
+
+test("isEligibleRootSession admits root sessions even when hasUI is false", () => {
+  const rootPrintSession = {
+    hasUI: false,
+    isSubagent: false,
+    taskDepth: 0,
+    parentTaskPrefix: undefined,
+  } as unknown as ExtensionContext;
+  expect(isEligibleRootSession(rootPrintSession)).toBe(true);
+
+  const subagentSession = {
+    hasUI: false,
+    isSubagent: true,
+    taskDepth: 1,
+    parentTaskPrefix: "sub-1",
+  } as unknown as ExtensionContext;
+  expect(isEligibleRootSession(subagentSession)).toBe(false);
+
+  const nestedSession = {
+    hasUI: true,
+    isSubagent: false,
+    taskDepth: 2,
+    parentTaskPrefix: undefined,
+  } as unknown as ExtensionContext;
+  expect(isEligibleRootSession(nestedSession)).toBe(false);
 });

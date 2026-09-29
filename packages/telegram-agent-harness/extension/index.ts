@@ -218,12 +218,14 @@ function findDaemonRoute(sessionId?: string, workspace?: string): { slotId: stri
             "SELECT slot_id, chat_id, topic_id FROM routes WHERE session_id = ? AND topic_id != '' LIMIT 1"
           ).get(sessionId)
         : null;
-      if (!row && workspace) {
-        const normWs = workspace.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+      if (!row) {
+        // A headless session may have no usable saved context; fall back to the
+        // current workspace so the route lookup still resolves (issue #174).
+        const targetWs = (workspace ?? process.cwd()).replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
         const all = db.query<{ slot_id: string; chat_id: string; topic_id: string; workspace: string }, []>(
           "SELECT slot_id, chat_id, topic_id, workspace FROM routes WHERE topic_id != ''"
         ).all();
-        row = all.find(r => r.workspace && r.workspace.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase() === normWs) ?? null;
+        row = all.find(r => r.workspace && r.workspace.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase() === targetWs) ?? null;
       }
       if (!row) return null;
 

@@ -107,7 +107,7 @@ function buildPool(root: string): void {
   );
 }
 
-const commandContext = { ui: { notify: () => {} } } as unknown as ExtensionCommandContext;
+const commandContext = { ui: { notify: () => {} }, isSubagent: false, taskDepth: 0 } as unknown as ExtensionCommandContext;
 
 async function fireTurnEnd(): Promise<void> {
   for (const handler of listeners.get("turn_end") ?? []) await handler();
