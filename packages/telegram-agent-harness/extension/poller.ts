@@ -15,6 +15,10 @@ import {
 import { downloadInboundMedia, selectInboundMedia, type InboundMedia } from "./inbound-media";
 import { registerTelegramCommands, renderTelegramHelp } from "./command-registry";
 import { parseTelegramCommand } from "./command-parser";
+import {
+  sendTelegramAttachment as sendAttachmentRequest,
+  type TelegramAttachmentKind,
+} from "./outbound-media";
 import type {
   AccessConfig,
   GroupAccessConfig,
@@ -1310,39 +1314,97 @@ export class TelegramPoller {
     this.db.run("UPDATE update_ledger SET status = 'COMPLETED' WHERE update_id = ?", [row.update_id]);
   }
 
+  public async sendTelegramAttachment(
+    chatId: string | number,
+    file: string,
+    kind: TelegramAttachmentKind,
+    caption = "",
+    filename?: string,
+    correlationMeta?: {
+      sessionId?: string;
+      requestId?: string | null;
+      decisionId?: string | null;
+      projectPath?: string | null;
+      laneId?: string;
+      laneState?: "active" | "exited" | "unknown";
+    },
+    defaultRepo?: string,
+    messageThreadId?: number,
+    replyMarkup?: Record<string, unknown>,
+  ): Promise<TelegramSendMessageResponse> {
+    const sessionId = correlationMeta?.sessionId ?? this.correlation?.getSessionId();
+    const slotId = this.correlation?.getSlotId();
+    const sent = await sendAttachmentRequest({
+      token: this.botToken,
+      chatId,
+      filePath: file,
+      kind,
+      caption,
+      filename,
+      defaultRepo,
+      messageThreadId: messageThreadId ?? this.outboundThreadId,
+      replyMarkup,
+      signal: this.abortController.signal,
+    });
+    const data = sent.response;
+    if (sessionId && slotId && this.correlation) {
+      this.correlation.record({
+        botId: this.botId,
+        chatId: String(data.result?.chat?.id ?? chatId),
+        messageId: data.result!.message_id,
+        slotId,
+        sessionId,
+        requestId: correlationMeta?.requestId ?? null,
+        decisionId: correlationMeta?.decisionId ?? null,
+        projectPath: correlationMeta?.projectPath ?? null,
+        createdAt: Date.now() / 1000,
+        laneId: correlationMeta?.laneId,
+        laneState: correlationMeta?.laneState,
+        senderOrigin: "agent",
+      });
+    }
+    return data;
+  }
+
   public async sendTelegramPhoto(
     chatId: string,
     file: string,
     caption: string,
     replyMarkup?: Record<string, unknown>,
     defaultRepo?: string,
+    messageThreadId?: number,
   ): Promise<void> {
-    const sessionId = this.correlation?.getSessionId();
-    const slotId = this.correlation?.getSlotId();
-    const form = new FormData();
-    form.set("chat_id", chatId);
-    if (this.outboundThreadId !== undefined) form.set("message_thread_id", String(this.outboundThreadId));
-    form.set("photo", Bun.file(file), path.basename(file));
-    const formattedCaption = formatTelegramCaption(redactSecrets(caption), 1024, defaultRepo);
-    if (formattedCaption) {
-      form.set("caption", formattedCaption);
-      form.set("parse_mode", "HTML");
-    }
-    if (replyMarkup) {
-      form.set("reply_markup", JSON.stringify(replyMarkup));
-    }
-    const response = await fetch(`https://api.telegram.org/bot${this.botToken}/sendPhoto`, {
-      method: "POST", body: form, signal: this.abortController.signal,
-    });
-    const data = await response.json() as TelegramSendMessageResponse;
-    if (!response.ok || !data.ok || !data.result) throw new Error("Photo delivery failed");
-    if (sessionId && slotId && this.correlation) {
-      this.correlation.record({
-        botId: this.botId, chatId: String(data.result.chat?.id ?? chatId),
-        messageId: data.result.message_id, slotId, sessionId,
-        requestId: null, decisionId: null, projectPath: null, createdAt: Date.now() / 1000,
-      });
-    }
+    await this.sendTelegramAttachment(
+      chatId,
+      file,
+      "photo",
+      caption,
+      undefined,
+      undefined,
+      defaultRepo,
+      messageThreadId,
+      replyMarkup,
+    );
+  }
+
+  public async sendTelegramDocument(
+    chatId: string,
+    file: string,
+    caption = "",
+    filename?: string,
+    defaultRepo?: string,
+    messageThreadId?: number,
+  ): Promise<void> {
+    await this.sendTelegramAttachment(
+      chatId,
+      file,
+      "document",
+      caption,
+      filename,
+      undefined,
+      defaultRepo,
+      messageThreadId,
+    );
   }
 
   public async sendMediaGroup(

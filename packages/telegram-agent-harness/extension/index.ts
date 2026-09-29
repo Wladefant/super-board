@@ -29,6 +29,10 @@ import { readMessageThreadId } from "./harness/channel-config";
 import { escapeHtml, markdownToTelegramHtml } from "./sanitizer";
 import { resolveGithubRepo } from "./github-repo";
 import {
+  selectTelegramAttachmentKind,
+  sendTelegramAttachment as sendAttachmentRequest,
+} from "./outbound-media";
+import {
   ACTIVE_LEASE_SYMBOL,
   ACTIVE_ROOT_SYMBOL,
   type ActiveRootState,
@@ -535,6 +539,110 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
       activeRuntime?.recordTurnDelivery(params.text);
       recordDaemonAgentMessage(root.sessionId, params.text);
       return { content: [{ type: "text", text: `Delivered message ${sent.result?.message_id}; replies return to Main with lane context.` }] };
+    },
+  });
+
+  pi.registerTool({
+    name: "telegram_attachment",
+    label: "Send Telegram attachment",
+    description: "Send a local image inline or a PDF/other file as a document to the session's exact Telegram chat and forum topic. Telegram Bot API limits apply: 20 MiB for photos and 50 MiB for documents.",
+    parameters: z.object({
+      file_path: z.string(),
+      kind: z.enum(["auto", "photo", "document"]).default("auto"),
+      caption: z.string().optional(),
+      filename: z.string().optional(),
+      lane_id: z.string(),
+      lane_state: z.enum(["active", "exited", "unknown"]),
+      rebind: z.boolean().optional(),
+    }),
+    async execute(_id, params, signal, _onUpdate, ctx?: ExtensionContext) {
+      const root = await bindToolChannel(pi, ctx, params.rebind === true);
+      const workspace = ctx?.cwd ?? savedContext?.cwd;
+      if (!path.isAbsolute(params.file_path) && !workspace) {
+        throw new Error("A relative attachment path requires a session workspace.");
+      }
+      const filePath = path.isAbsolute(params.file_path)
+        ? path.normalize(params.file_path)
+        : path.resolve(workspace!, params.file_path);
+      const defaultRepo = workspace ? resolveGithubRepo(workspace) : undefined;
+
+      if (!root) {
+        const fallbackRoute = findDaemonRoute(savedContext?.sessionId, savedContext?.cwd);
+        if (fallbackRoute) {
+          const sent = await sendAttachmentRequest({
+            token: fallbackRoute.token,
+            chatId: fallbackRoute.chatId,
+            messageThreadId: Number(fallbackRoute.topicId),
+            filePath,
+            kind: params.kind,
+            caption: params.caption,
+            filename: params.filename,
+            defaultRepo,
+            signal,
+          });
+          if (params.caption?.trim()) {
+            activeRuntime?.recordTurnDelivery(params.caption);
+            recordDaemonAgentMessage(savedContext?.sessionId, params.caption);
+          }
+          const details = {
+            message_id: sent.response.result!.message_id,
+            chat_id: sent.response.result!.chat.id,
+            message_thread_id: Number(fallbackRoute.topicId),
+            kind: sent.kind,
+            filename: sent.filename,
+            size_bytes: sent.sizeBytes,
+          };
+          return {
+            content: [{
+              type: "text",
+              text: `Delivered ${sent.kind} ${sent.filename} as message ${details.message_id} to chat ${details.chat_id}, topic #${details.message_thread_id}.`,
+            }],
+            details,
+          };
+        }
+        const routeInfo = lastKnownRoute
+          ? ` (last bound to chat ${lastKnownRoute.chatId ?? "unknown"}, slot ${lastKnownRoute.slotId ?? "unknown"}, unbound: ${lastKnownRoute.unboundReason ?? "unknown"})`
+          : "";
+        throw new Error(`No active session-bound Telegram channel${routeInfo}. Call telegram_attachment with rebind: true to re-acquire the channel.`);
+      }
+
+      const chat = root.poller.getPrimaryChatId();
+      if (!chat) throw new Error("No authorized Telegram recipient");
+      root.messageContext?.setLaneState(root.sessionId, params.lane_id, params.lane_state);
+      const threadId = root.poller.getActiveThreadId()
+        ?? (root.activeSlot?.stateDir ? readMessageThreadId(root.activeSlot.stateDir) : undefined);
+      const kind = selectTelegramAttachmentKind(filePath, params.kind);
+      const sent = await root.poller.sendTelegramAttachment(
+        chat,
+        filePath,
+        kind,
+        params.caption ?? "",
+        params.filename,
+        { laneId: params.lane_id, laneState: params.lane_state },
+        defaultRepo,
+        threadId,
+      );
+      if (params.caption?.trim()) {
+        activeRuntime?.recordTurnDelivery(params.caption);
+        recordDaemonAgentMessage(root.sessionId, params.caption);
+      }
+      const details = {
+        message_id: sent.result!.message_id,
+        chat_id: sent.result!.chat.id,
+        message_thread_id: threadId ?? null,
+        kind,
+        filename: path.basename(params.filename?.trim() || filePath),
+      };
+      const destination = threadId === undefined
+        ? `direct chat ${details.chat_id}`
+        : `chat ${details.chat_id}, topic #${threadId}`;
+      return {
+        content: [{
+          type: "text",
+          text: `Delivered ${kind} ${details.filename} as message ${details.message_id} to ${destination}.`,
+        }],
+        details,
+      };
     },
   });
 
