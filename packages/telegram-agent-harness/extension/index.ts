@@ -147,6 +147,7 @@ async function bindToolChannel(
   if (ctx && isEligibleRootSession(ctx)) {
     savedContext = ctx;
     ownerInstance = pi;
+    currentApi = pi;
   }
   let root = ownedRoot();
   if (root && !force) return root;
@@ -222,10 +223,12 @@ function findDaemonRoute(sessionId?: string, workspace?: string): { slotId: stri
             "SELECT slot_id, chat_id, topic_id FROM routes WHERE session_id = ? AND topic_id != '' LIMIT 1"
           ).get(sessionId)
         : null;
-      if (!row) {
-        // A headless session may have no usable saved context; fall back to the
-        // current workspace so the route lookup still resolves (issue #174).
-        const targetWs = (workspace ?? process.cwd()).replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+      if (!row && workspace) {
+        // Only a workspace the caller actually owns may resolve a route. Never
+        // default to process.cwd(): a context-less caller (a subagent, or a root
+        // that never claimed) would then post into whichever OTHER session shares
+        // this directory (two sessions share super-board on the live daemon.db).
+        const targetWs = workspace.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
         const all = db.query<{ slot_id: string; chat_id: string; topic_id: string; workspace: string }, []>(
           "SELECT slot_id, chat_id, topic_id, workspace FROM routes WHERE topic_id != ''"
         ).all();
