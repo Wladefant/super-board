@@ -17,10 +17,9 @@ This tool removes a worktree in the only safe order:
    unlinks aside) or with a tracked link, which unlinking would itself turn into a change;
 4. delete every junction/symlink inside the worktree as a link (``RemoveDirectoryW``
    on the link, never recursing into it), then verify none is left;
-5. only then run ``git worktree remove`` from the main worktree.
+5. only then run ``git --git-dir=<common> worktree remove <top>``.
 
 Usage:
-    python wt_remove.py <worktree> [--force] [--dry-run] [--orphan-dependents] [--json]
 
 ``--force`` is passed through to ``git worktree remove`` (needed for dirty
 worktrees). Exit codes: 0 removed (or dry run clean), 2 refused, 1 error.
@@ -50,8 +49,6 @@ DEFAULT_SCAN_ROOTS = (
 )
 # Relative paths inside a worktree where lanes put shared-tree links.
 LINK_SLOTS = ("frontend/node_modules", "node_modules", "frontend/.next/cache")
-# Integration branches checked for reachability before worktree removal (Issue #334)
-INTEGRATION_REFS = ("origin/staging", "origin/main", "staging", "main")
 
 
 # ---------------------------------------------------------------------------
@@ -83,13 +80,24 @@ def is_link(path: os.PathLike[str] | str) -> bool:
     return bool(getattr(st, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT)
 
 
+def _verbatim_to_abs(raw: str) -> str:
+    r"""Plain absolute path for a verbatim link target: ``\\?\C:\x`` loses its
+    ``\\?\`` prefix and ``\\?\UNC\server\share`` becomes ``\\server\share``."""
+    if raw.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + raw[8:]
+    if raw.startswith("\\\\?\\"):
+        return raw[4:]
+    return raw
+
+
 def link_target(path: os.PathLike[str] | str) -> str | None:
     """Normalized target of a junction/symlink, or None when it is not readable."""
     try:
         raw = os.readlink(path)
     except (OSError, ValueError):
         return None
-    if not os.path.isabs(raw.replace("\\\\?\\", "")):
+    raw = _verbatim_to_abs(raw)
+    if not os.path.isabs(raw):
         raw = os.path.join(os.path.dirname(os.fspath(path)), raw)
     return norm(raw)
 
@@ -103,8 +111,13 @@ def unlink_link(path: os.PathLike[str] | str) -> None:
         os.unlink(path)
 
 
-def iter_links(root: os.PathLike[str] | str) -> Iterator[str]:
-    """Yield every junction/symlink under ``root`` without descending into any of them."""
+def iter_links(root: os.PathLike[str] | str, errors: list[str] | None = None) -> Iterator[str]:
+    """Yield every junction/symlink under ``root`` without descending into any of them.
+
+    A directory that cannot be scanned (permissions) is reported in ``errors`` when given,
+    instead of being silently skipped: a link hiding there must not make a removal or the
+    leftover check look clean.
+    """
     stack = [os.fspath(root)]
     while stack:
         current = stack.pop()
@@ -119,7 +132,11 @@ def iter_links(root: os.PathLike[str] | str) -> Iterator[str]:
                             stack.append(entry.path)
                     except OSError:
                         continue
-        except (FileNotFoundError, NotADirectoryError, PermissionError):
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as exc:
+            if errors is not None:
+                errors.append(f"{current}: {exc}")
             continue
 
 
@@ -163,9 +180,15 @@ def dependents_of(path: os.PathLike[str] | str, roots: Iterable[Path] = DEFAULT_
 # ---------------------------------------------------------------------------
 
 
-def process_paths() -> list[tuple[int, str, str, str]]:
-    """(pid, exe name, cwd, command line) for every readable process. Windows only."""
+def process_paths(stats: dict | None = None) -> list[tuple[int, int, str, str, str]]:
+    """(pid, parent pid, exe name, cwd, command line) for every readable process. Windows only.
+
+    ``stats``, when given, receives ``platform``, ``total`` and ``read`` so callers can tell
+    a full scan from a partial one (non-Windows, or processes that cannot be opened).
+    """
     if sys.platform != "win32":
+        if stats is not None:
+            stats.update(platform=sys.platform, total=None, read=0)
         return []
     import ctypes
     from ctypes import wintypes
@@ -222,16 +245,20 @@ def process_paths() -> list[tuple[int, str, str, str]]:
         data = read(handle, buf_ptr, length)
         return data.decode("utf-16-le", "replace") if data else ""
 
-    results: list[tuple[int, str, str, str]] = []
+    results: list[tuple[int, int, str, str, str]] = []
+    total = 0
     snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
     if not snap or snap == wintypes.HANDLE(-1).value:
+        if stats is not None:
+            stats.update(platform="win32", total=None, read=0)
         return results
     try:
         entry = PROCESSENTRY32W()
         entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
         ok = kernel32.Process32FirstW(snap, ctypes.byref(entry))
         while ok:
-            pid, name = entry.th32ProcessID, entry.szExeFile
+            total += 1
+            pid, ppid, name = entry.th32ProcessID, entry.th32ParentProcessID, entry.szExeFile
             handle = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid) if pid else None
             if handle:
                 try:
@@ -242,24 +269,56 @@ def process_paths() -> list[tuple[int, str, str, str]]:
                             pp = int.from_bytes(params, "little")
                             cwd = read_unicode_string(handle, pp + 0x38)
                             cmd = read_unicode_string(handle, pp + 0x70)
-                            results.append((pid, name, cwd, cmd))
+                            results.append((pid, ppid, name, cwd, cmd))
                 finally:
                     kernel32.CloseHandle(handle)
             ok = kernel32.Process32NextW(snap, ctypes.byref(entry))
     finally:
         kernel32.CloseHandle(snap)
+    if stats is not None:
+        stats.update(platform="win32", total=total, read=len(results))
     return results
 
 
-def busy_processes(path: os.PathLike[str] | str, procs: list[tuple[int, str, str, str]] | None = None) -> list[tuple[int, str, str]]:
-    """Processes whose cwd lies inside ``path`` or whose command line names it."""
+def _cmd_mentions(cmd: str, target: str) -> bool:
+    """True when ``target`` appears in ``cmd`` at a path boundary. A sibling directory with
+    a shared prefix (``...\\wt-foo-2`` naming vs ``...\\wt-foo``) never matches: the match
+    must end at a separator, quote, ``=`` or whitespace, or the string edge."""
+    cmdn = os.path.normcase(cmd.replace("/", "\\"))
+    start = 0
+    while True:
+        i = cmdn.find(target, start)
+        if i < 0:
+            return False
+        j = i + len(target)
+        before = cmdn[i - 1] if i else ""
+        after = cmdn[j] if j < len(cmdn) else ""
+        if (not before or before in '\\"= \t') and (not after or after in '\\"= \t'):
+            return True
+        start = i + 1
+
+
+def busy_processes(path: os.PathLike[str] | str, procs: list[tuple[int, int, str, str, str]] | None = None) -> list[tuple[int, str, str]]:
+    """Processes whose cwd lies inside ``path`` or whose command line names it.
+
+    The calling process and its whole ancestor chain are skipped: a wrapper such as
+    ``cmd /c python wt_remove.py <wt>`` repeats the path in its own command line, and
+    so do the py launcher and venv redirectors.
+    """
     target = norm(path)
+    rows = list(procs) if procs is not None else process_paths()
+    parents = {pid: ppid for pid, ppid, *_rest in rows if ppid}
     own = os.getpid()
+    ancestors: set[int] = set()
+    cursor = own
+    while cursor in parents and cursor not in ancestors:
+        cursor = parents[cursor]
+        ancestors.add(cursor)
     hits: list[tuple[int, str, str]] = []
-    for pid, name, cwd, cmd in procs if procs is not None else process_paths():
-        if pid == own:
+    for pid, _ppid, name, cwd, cmd in rows:
+        if pid == own or pid in ancestors:
             continue
-        if (cwd and is_within(cwd, target)) or target in os.path.normcase(cmd.replace("/", "\\")):
+        if (cwd and is_within(cwd, target)) or _cmd_mentions(cmd, target):
             hits.append((pid, name, cwd))
     return hits
 
@@ -294,16 +353,25 @@ def is_locked(top: str) -> bool:
     return False
 
 
-def check_merged_into(top: str, head: str) -> list[str]:
-    """Return existing integration refs that contain head (from which head is reachable)."""
-    merged: list[str] = []
-    for ref in INTEGRATION_REFS:
-        chk = git(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], cwd=top)
-        if chk.returncode == 0:
-            anc = git(["merge-base", "--is-ancestor", head, ref], cwd=top)
-            if anc.returncode == 0:
-                merged.append(ref)
-    return merged
+def _holds_only_links(root: str) -> bool:
+    """True when every entry under ``root`` (never descending into links) is itself a link,
+    so unlinking the links leaves nothing git would call dirty. Unreadable -> False."""
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    if is_link(entry.path):
+                        continue
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(entry.path)
+                    else:
+                        return False
+        except OSError:
+            return False
+    return True
+
 
 def dirty_paths(top: str, links: list[str]) -> list[str]:
     """What makes ``git worktree remove`` refuse without --force, once ``links`` are unlinked:
@@ -323,10 +391,13 @@ def dirty_paths(top: str, links: list[str]) -> list[str]:
         if entry[0] in "RC":  # a rename/copy carries its source path as the next entry
             i += 1
         path = entry[3:]
-        if os.path.normcase(os.path.normpath(path.rstrip("/"))) not in rel:
-            dirty.append(path)
+        if os.path.normcase(os.path.normpath(path.rstrip("/"))) in rel:
+            continue
+        if path.endswith("/") and _holds_only_links(os.path.join(top, path.rstrip("/\\"))):
+            continue  # untracked directory whose only content is a link this tool unlinks
+        dirty.append(path)
     if rel:
-        tracked = git(["ls-files", "-z", "--", *(os.path.relpath(link, top) for link in links)], cwd=top)
+        tracked = git(["--literal-pathspecs", "ls-files", "-z", "--", *(os.path.relpath(link, top) for link in links)], cwd=top)
         if tracked.returncode != 0:
             raise RuntimeError(f"git ls-files failed: {tracked.stderr.strip()}")
         dirty += [f"{p} (tracked link)" for p in tracked.stdout.split("\0") if p]
@@ -358,47 +429,33 @@ def remove_worktree(
         report.update(refused=True, error="refusing to remove the main worktree")
         return report
 
-    r_head = git(["rev-parse", "HEAD"], cwd=top)
-    if r_head.returncode != 0:
-        report.update(refused=True, error=f"unable to determine HEAD of worktree: {r_head.stderr.strip()}")
-        return report
-    head = r_head.stdout.strip()
-    report["head"] = head
-
-    r_sym = git(["symbolic-ref", "--short", "-q", "HEAD"], cwd=top)
-    branch = r_sym.stdout.strip() if r_sym.returncode == 0 else "(detached)"
-    report["branch"] = branch
-
-    merged_into = check_merged_into(top, head)
-    report["merged_into"] = merged_into
-
     report["dependents"] = [{"link": link, "target": target} for link, target in dependents_of(path, roots)]
     if report["dependents"] and not orphan_dependents:
         report.update(refused=True, error="other worktrees link into this one; relink them first (polysim_frontend_deps.py link) or pass --orphan-dependents")
         return report
 
-    report["busy"] = [{"pid": pid, "name": name, "cwd": cwd} for pid, name, cwd in busy_processes(path)]
+    scan: dict = {}
+    report["busy"] = [{"pid": pid, "name": name, "cwd": cwd} for pid, name, cwd in busy_processes(path, process_paths(scan))]
+    report["process_scan"] = {
+        "platform": scan.get("platform", sys.platform),
+        "read": scan.get("read", 0),
+        "total": scan.get("total"),
+        "partial": scan.get("total") is None or scan.get("read", 0) < scan.get("total", 0),
+    }
     if report["busy"]:
         report.update(refused=True, error="processes are running inside this worktree; stop them first")
         return report
 
+    scan_errors: list[str] = []
+    links = list(iter_links(path, scan_errors))
+    if scan_errors:
+        report["scan_errors"] = scan_errors
+        if not force:
+            report.update(refused=True, error="some directories could not be scanned for links; resolve the errors or pass --force")
+            return report
     if is_locked(top):
         report.update(refused=True, error="the worktree is locked (git worktree unlock it first)")
         return report
-
-    if not merged_into:
-        existing_refs = [
-            ref for ref in INTEGRATION_REFS
-            if git(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], cwd=top).returncode == 0
-        ]
-        ref_desc = f"any existing integration ref ({', '.join(existing_refs)})" if existing_refs else f"any integration ref ({', '.join(INTEGRATION_REFS)})"
-        report.update(
-            refused=True,
-            error=f"HEAD {head} ({branch}) is not reachable from {ref_desc}; refusing to remove worktree",
-        )
-        return report
-
-    links = list(iter_links(path))
     if not force:
         report["dirty"] = dirty_paths(top, links)
         if report["dirty"]:
@@ -407,18 +464,24 @@ def remove_worktree(
     for link in links:
         report["unlinked"].append({"link": link, "target": link_target(link)})
         if not dry_run:
-            unlink_link(link)
+            try:
+                unlink_link(link)
+            except OSError as exc:
+                report["error"] = f"failed to unlink {link}: {exc}"
+                break
     if dry_run:
         report["dry_run"] = True
         return report
-    leftover = list(iter_links(path))
-    if leftover:
-        report.update(error=f"links still present after unlinking: {leftover[:5]}")
+    leftover = list(iter_links(path, scan_errors))
+    if scan_errors:
+        report["scan_errors"] = scan_errors
+    if leftover or report.get("error"):
+        if leftover and "error" not in report:
+            report["error"] = f"links still present after unlinking: {leftover[:5]}"
         return report
 
-    main_root = os.path.dirname(common)
-    args = ["worktree", "remove"] + (["--force"] if force else []) + [os.fspath(Path(path).resolve())]
-    r = git(args, cwd=main_root, timeout=600)
+    args = ["--git-dir", common, "worktree", "remove"] + (["--force"] if force else []) + [top]
+    r = git(args, cwd=common, timeout=600)
     report["git"] = {"returncode": r.returncode, "output": (r.stdout + r.stderr).strip()[-2000:]}
     report["removed"] = r.returncode == 0 and not os.path.exists(path)
     if not report["removed"]:
@@ -458,13 +521,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"dirty: {item}")
         for proc in report.get("busy", []):
             print(f"busy: pid {proc['pid']} {proc['name']} cwd={proc['cwd']}")
-        if report.get("branch"):
-            print(f"branch: {report['branch']}")
-        if report.get("head"):
-            print(f"head: {report['head']}")
-        if "merged_into" in report:
-            refs = ", ".join(report["merged_into"]) if report["merged_into"] else "(none)"
-            print(f"merged into: {refs}")
+        for err in report.get("scan_errors", []):
+            print(f"scan error: {err}", file=sys.stderr)
+        scan = report.get("process_scan")
+        if scan and scan.get("partial"):
+            total = scan.get("total")
+            print(f"note: process scan was partial (platform={scan['platform']}, read={scan['read']} of {total if total is not None else 'n/a'} processes)", file=sys.stderr)
         if report.get("git"):
             print(report["git"]["output"])
         if report.get("error"):
