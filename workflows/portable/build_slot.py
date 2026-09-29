@@ -61,6 +61,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import uuid
 
 logger = logging.getLogger("build_slot")
+logger.addHandler(logging.NullHandler())
 
 DEFAULT_RUN_DIR = os.path.expanduser("~/.veyyon/run")
 LOCK_DIR_NAME = "build-slot.lock"
@@ -2079,15 +2080,56 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             f"--poll-interval ({args.poll_interval}s) must be less than "
             f"queue_stale_heartbeat_after ({DEFAULT_QUEUE_STALE_HEARTBEAT_SECONDS}s)"
         )
-    if args.command == "run" and args.cmd and args.cmd[0].startswith("-") and args.cmd[0] != "--" and "--" in args.cmd:
-        # REMAINDER swallows run options written after <name> (`run <name> --timeout 60 -- <cmd>`);
-        # parse the tokens before the `--` separator as run options.
-        sep = args.cmd.index("--")
-        tail_parser = argparse.ArgumentParser(prog="build_slot.py run <name>")
-        _add_run_options(tail_parser)
-        tail_parser.parse_args(args.cmd[:sep], namespace=args)
-        args.cmd = args.cmd[sep:]
+    misordered_opt = _find_misordered_run_option(argv)
+    if misordered_opt is not None:
+        parser.error(
+            "options must precede the lane name: build_slot.py run [--cwd DIR] [--timeout S] [--priority] <name> -- <cmd>"
+        )
     return args
+
+
+KNOWN_RUN_OPTIONS = {
+    "--timeout",
+    "--priority",
+    "--force",
+    "--cwd",
+    "--heartbeat-stale-after",
+}
+
+
+def _find_misordered_run_option(argv: Optional[List[str]]) -> Optional[str]:
+    """
+    Checks if a known run option was placed after the lane name in `argv` (Issue #313).
+    Returns the option flag string if misordered, or None if valid.
+    """
+    if argv is None:
+        argv = sys.argv[1:]
+    if "run" not in argv:
+        return None
+    run_idx = argv.index("run")
+    rest = argv[run_idx + 1:]
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok == "--":
+            break
+        opt_name = tok.split("=")[0]
+        if opt_name in {"--priority", "--force"}:
+            i += 1
+        elif opt_name in {"--timeout", "--cwd", "--heartbeat-stale-after"}:
+            if "=" in tok:
+                i += 1
+            else:
+                i += 2
+        elif tok.startswith("-"):
+            i += 1
+        else:
+            if i + 1 < len(rest):
+                next_tok = rest[i + 1].split("=")[0]
+                if next_tok in KNOWN_RUN_OPTIONS:
+                    return next_tok
+            break
+    return None
 
 
 def _add_run_options(parser: argparse.ArgumentParser) -> None:
