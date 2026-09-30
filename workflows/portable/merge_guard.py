@@ -29,6 +29,7 @@ enforce mode and says how to switch the guard off, rather than letting it throug
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import datetime
 import json
 import os
@@ -36,6 +37,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -49,7 +51,9 @@ GUARDED_REPO = "Bavariance/polysimulator"
 GUARDED_BASE = "staging"
 STATE_DIR = Path.home() / ".veyyon" / "run" / "merge-guard"
 MODES = ("enforce", "warn", "off")
-GH_TIMEOUT_SEC = 25
+GH_TIMEOUT_SEC = 40
+BASE_TIMEOUT_SEC = 20
+BASE_CACHE_TTL_SEC = 300  # 5 minutes
 
 # A `feature-map:` line, with the markdown decoration lanes put in front of markers. The
 # note has to sit on the marker line: an empty marker followed by any next line is no note.
@@ -75,15 +79,121 @@ GH_VALUE_FLAGS = {
 }
 
 
-def _run(cmd: List[str], cwd: Optional[str] = None) -> Tuple[int, str, str]:
+def _run(cmd: List[str], cwd: Optional[str] = None, timeout: Optional[float] = None) -> Tuple[int, str, str]:
+    t = timeout if timeout is not None else GH_TIMEOUT_SEC
     try:
         res = subprocess.run(
             cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=GH_TIMEOUT_SEC, cwd=cwd, stdin=subprocess.DEVNULL,
+            timeout=t, cwd=cwd, stdin=subprocess.DEVNULL,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return 1, "", str(exc)
     return res.returncode, res.stdout, res.stderr
+
+
+def _call_runner(
+    runner: Runner, cmd: List[str], cwd: Optional[str] = None, timeout: Optional[float] = None
+) -> Tuple[int, str, str]:
+    try:
+        return runner(cmd, cwd, timeout=timeout)
+    except TypeError:
+        return runner(cmd, cwd)
+
+
+def _load_base_cache(state_dir: Path) -> Dict[str, Any]:
+    cache_path = Path(state_dir) / "base_cache.json"
+    if not cache_path.exists():
+        return {}
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_base_cache(cache: Dict[str, Any], state_dir: Path) -> None:
+    try:
+        p = Path(state_dir)
+        p.mkdir(parents=True, exist_ok=True)
+        (p / "base_cache.json").write_text(json.dumps(cache), encoding="utf-8")
+    except OSError:
+        pass
+
+
+_IN_MEMORY_BASE_CACHE: Dict[Tuple[str, str, int], Tuple[str, float]] = {}
+
+
+def clear_base_cache() -> None:
+    _IN_MEMORY_BASE_CACHE.clear()
+
+
+def get_cached_base(
+    repo: str, pr: int, state_dir: Path = STATE_DIR, ttl_sec: float = BASE_CACHE_TTL_SEC
+) -> Optional[str]:
+    mem_key = (str(Path(state_dir).resolve()), repo, pr)
+    now = time.time()
+    if mem_key in _IN_MEMORY_BASE_CACHE:
+        base, ts = _IN_MEMORY_BASE_CACHE[mem_key]
+        if (now - ts) < ttl_sec:
+            return base
+
+    cache = _load_base_cache(state_dir)
+    key = f"{repo}#{pr}"
+    entry = cache.get(key)
+    if isinstance(entry, dict):
+        ts = entry.get("ts", 0)
+        base = entry.get("base")
+        if isinstance(base, str) and (now - ts) < ttl_sec:
+            _IN_MEMORY_BASE_CACHE[mem_key] = (base, ts)
+            return base
+    return None
+
+
+def set_cached_base(repo: str, pr: int, base: str, state_dir: Path = STATE_DIR) -> None:
+    mem_key = (str(Path(state_dir).resolve()), repo, pr)
+    now = time.time()
+    _IN_MEMORY_BASE_CACHE[mem_key] = (base, now)
+    cache = _load_base_cache(state_dir)
+    key = f"{repo}#{pr}"
+    cache[key] = {"base": base, "ts": now}
+    _save_base_cache(cache, state_dir)
+
+def fetch_pr_base(
+    repo: str,
+    pr: int,
+    runner: Runner = _run,
+    *,
+    timeout: float = BASE_TIMEOUT_SEC,
+    budget: Optional[float] = None,
+    max_retries: int = 1,
+    state_dir: Path = STATE_DIR,
+    ttl_sec: float = BASE_CACHE_TTL_SEC,
+) -> str:
+    cached = get_cached_base(repo, pr, state_dir=state_dir, ttl_sec=ttl_sec)
+    if cached is not None:
+        return cached
+
+    cmd = ["gh", "api", f"repos/{repo}/pulls/{pr}", "--jq", ".base.ref"]
+    total_budget = budget if budget is not None else (timeout * (max_retries + 1))
+    start_time = time.monotonic()
+    last_err = ""
+
+    for attempt in range(max_retries + 1):
+        elapsed = time.monotonic() - start_time
+        remaining = total_budget - elapsed
+        if attempt > 0 and remaining <= 0:
+            break
+        call_timeout = min(timeout, remaining) if remaining > 0 else timeout
+
+        rc, out, err = _call_runner(runner, cmd, timeout=call_timeout)
+        if rc == 0 and out.strip():
+            base = out.strip().splitlines()[0].strip()
+            set_cached_base(repo, pr, base, state_dir=state_dir)
+            return base
+
+        last_err = err.strip() or out.strip() or f"exit code {rc}"
+
+    raise RuntimeError(f"failed to look up base branch for {repo}#{pr}: {last_err or 'timeout'}")
 
 
 def resolve_mode(env: Optional[Dict[str, str]] = None, state_dir: Path = STATE_DIR) -> str:
@@ -221,8 +331,15 @@ def resolve_target(target: Dict[str, Any], cwd: Optional[str], runner: Runner) -
 
 def fetch_pr(repo: str, pr: int, runner: Runner) -> Dict[str, Any]:
     """The PR in the shape `github_pr_gate.evaluate_qa_receipt` reads, plus body and base."""
-    pull = _gh_json(["api", f"repos/{repo}/pulls/{pr}"], runner)
-    files = _gh_pages(f"repos/{repo}/pulls/{pr}/files?per_page=100", runner)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        f_pull = pool.submit(_gh_json, ["api", f"repos/{repo}/pulls/{pr}"], runner)
+        f_files = pool.submit(_gh_pages, f"repos/{repo}/pulls/{pr}/files?per_page=100", runner)
+        f_comments = pool.submit(_gh_pages, f"repos/{repo}/issues/{pr}/comments?per_page=100", runner)
+        f_reviews = pool.submit(_gh_pages, f"repos/{repo}/pulls/{pr}/reviews?per_page=100", runner)
+        pull = f_pull.result()
+        files = f_files.result()
+        comments = f_comments.result()
+        reviews = f_reviews.result()
     return {
         "number": pr,
         "state": str(pull.get("state") or "").upper(),
@@ -231,8 +348,8 @@ def fetch_pr(repo: str, pr: int, runner: Runner) -> Dict[str, Any]:
         "baseRefName": (pull.get("base") or {}).get("ref") or "",
         "body": pull.get("body") or "",
         "files": [{"path": f.get("filename", "")} for f in files],
-        "comments": _gh_pages(f"repos/{repo}/issues/{pr}/comments?per_page=100", runner),
-        "reviews": _gh_pages(f"repos/{repo}/pulls/{pr}/reviews?per_page=100", runner),
+        "comments": comments,
+        "reviews": reviews,
     }
 
 
@@ -266,6 +383,12 @@ def evaluate_feature_map(pr_data: Dict[str, Any]) -> Tuple[str, str]:
 def evaluate_bookends(pr_data: Dict[str, Any], repo: str, cwd: Optional[str] = None) -> Dict[str, Any]:
     base = str(pr_data.get("baseRefName") or "")
     if repo != GUARDED_REPO or base != GUARDED_BASE:
+        if repo == GUARDED_REPO and base == "main":
+            return {
+                "guarded": True,
+                "block": True,
+                "reason": f"merges into {repo}@{base} are blocked: direct merges to main are forbidden (staging-only policy; AGENTS.md §4)",
+            }
         return {"guarded": False, "block": False, "reason": f"{repo}@{base or 'unknown'} is not guarded"}
     qa_verdict, qa_reason, qa_url = evaluate_qa_receipt(
         pr_data, repo=repo, base_ref=base, head_sha=str(pr_data.get("headRefOid") or ""), cwd=cwd
@@ -317,9 +440,24 @@ def check_command(
             if repo != GUARDED_REPO:
                 entry.update(guarded=False, block=False, reason=f"{repo} is not guarded")
             else:
-                pr_data = fetch_pr(repo, pr, runner)
-                entry.update(head=pr_data["headRefOid"], base=pr_data["baseRefName"])
-                entry.update(evaluate_bookends(pr_data, repo, checkout))
+                base = fetch_pr_base(repo, pr, runner, state_dir=state_dir)
+                entry.update(base=base)
+                if base == "main":
+                    entry.update(
+                        guarded=True,
+                        block=True,
+                        reason=f"merges into {repo}@{base} are blocked: direct merges to main are forbidden (staging-only policy; AGENTS.md §4)",
+                    )
+                elif base != GUARDED_BASE:
+                    entry.update(
+                        guarded=False,
+                        block=False,
+                        reason=f"{repo}@{base} is not guarded",
+                    )
+                else:
+                    pr_data = fetch_pr(repo, pr, runner)
+                    entry.update(head=pr_data["headRefOid"])
+                    entry.update(evaluate_bookends(pr_data, repo, checkout))
         except (RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
             entry.update(
                 guarded=True, block=True,
