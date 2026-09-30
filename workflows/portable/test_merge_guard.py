@@ -25,10 +25,14 @@ if SCRIPT_DIR not in sys.path:
 
 from merge_guard import (  # noqa: E402  (sys.path set above)
     check_command,
+    clear_base_cache,
     evaluate_feature_map,
+    fetch_pr_base,
+    get_cached_base,
     main,
     parse_merge_commands,
     resolve_mode,
+    set_cached_base,
 )
 
 REPO = "Bavariance/polysimulator"
@@ -48,7 +52,7 @@ class FakeGitHub:
         self.fail = fail
         self.calls = []
 
-    def __call__(self, cmd, cwd=None):
+    def __call__(self, cmd, cwd=None, timeout=None):
         self.calls.append(cmd)
         if cmd[:2] == ["git", "remote"]:
             return 1, "", "not a PolySimulator checkout"
@@ -60,6 +64,11 @@ class FakeGitHub:
         for (repo, number), pr in self.prs.items():
             prefix = f"repos/{repo}/pulls/{number}"
             if path == prefix:
+                if "--jq" in cmd:
+                    jq_idx = cmd.index("--jq")
+                    expr = cmd[jq_idx + 1] if jq_idx + 1 < len(cmd) else ""
+                    if expr == ".base.ref":
+                        return 0, f"{pr.get('base', 'staging')}\n", ""
                 return 0, json.dumps({
                     "state": "open", "merged": False, "body": pr.get("body", ""),
                     "head": {"sha": HEAD}, "base": {"ref": pr.get("base", "staging")},
@@ -198,7 +207,7 @@ class DecisionTest(unittest.TestCase):
         self.assertEqual(github.fetched(), [])
 
     def test_unguarded_repo_and_base_pass(self):
-        github = FakeGitHub({(REPO, 42): self.ui_pr(base="main")})
+        github = FakeGitHub({(REPO, 42): self.ui_pr(base="feature/untracked")})
         self.assertFalse(self.decide(f"gh pr merge 42 -R {REPO} --merge", github)["block"])
         other = FakeGitHub()
         decision = self.decide("gh pr merge 5 -R Wladefant/super-board --merge", other)
@@ -235,6 +244,119 @@ class DecisionTest(unittest.TestCase):
         self.assertEqual(len(lines), 1)
         self.assertTrue(json.loads(lines[0])["would_block"])
 
+    def test_slow_but_ok(self):
+        def slow_runner(cmd, cwd=None, timeout=None):
+            if cmd == ["gh", "api", f"repos/{REPO}/pulls/42", "--jq", ".base.ref"]:
+                return 0, "staging\n", ""
+            return FakeGitHub({(REPO, 42): self.ui_pr(body=NOTE, comments=[RECEIPT])})(cmd, cwd, timeout)
+
+        decision = check_command(f"gh pr merge 42 -R {REPO} --merge", None, runner=slow_runner, state_dir=self.state)
+        self.assertFalse(decision["block"])
+        self.assertEqual(decision["merges"][0]["base"], "staging")
+
+    def test_slow_lookup_with_retry_succeeds(self):
+        attempts = 0
+        def retry_runner(cmd, cwd=None, timeout=None):
+            nonlocal attempts
+            if cmd == ["gh", "api", f"repos/{REPO}/pulls/42", "--jq", ".base.ref"]:
+                attempts += 1
+                if attempts == 1:
+                    return 1, "", "Command '['gh', ...] timed out after 20 seconds"
+                return 0, "staging\n", ""
+            return FakeGitHub({(REPO, 42): self.ui_pr(body=NOTE, comments=[RECEIPT])})(cmd, cwd, timeout)
+
+        decision = check_command(f"gh pr merge 42 -R {REPO} --merge", None, runner=retry_runner, state_dir=self.state)
+        self.assertFalse(decision["block"])
+        self.assertEqual(attempts, 2)
+        self.assertEqual(decision["merges"][0]["base"], "staging")
+
+    def test_timeout_still_blocks(self):
+        def timing_out_runner(cmd, cwd=None, timeout=None):
+            if cmd == ["gh", "api", f"repos/{REPO}/pulls/42", "--jq", ".base.ref"]:
+                return 1, "", "Command '['gh', 'api', ...] timed out after 20 seconds"
+            return 1, "", "unexpected call"
+
+        decision = check_command(f"gh pr merge 42 -R {REPO} --merge", None, runner=timing_out_runner, state_dir=self.state)
+        self.assertTrue(decision["block"])
+        self.assertIn("could not evaluate this merge", decision["reason"])
+        self.assertIn("fails closed", decision["reason"])
+
+    def test_main_blocks(self):
+        github = FakeGitHub({(REPO, 42): self.ui_pr(base="main")})
+        decision = self.decide(f"gh pr merge 42 -R {REPO} --merge", github)
+        self.assertTrue(decision["block"])
+        self.assertIn("main are forbidden", decision["reason"])
+
+    def test_cache_hit(self):
+        github = FakeGitHub({(REPO, 42): self.ui_pr(body=NOTE, comments=[RECEIPT])})
+        decision1 = self.decide(f"gh pr merge 42 -R {REPO} --merge", github)
+        self.assertFalse(decision1["block"])
+
+        base_calls_1 = [c for c in github.calls if c[:2] == ["gh", "api"] and "--jq" in c]
+        self.assertEqual(len(base_calls_1), 1)
+
+        decision2 = self.decide(f"gh pr merge 42 -R {REPO} --merge", github)
+        self.assertFalse(decision2["block"])
+
+        base_calls_2 = [c for c in github.calls if c[:2] == ["gh", "api"] and "--jq" in c]
+        self.assertEqual(len(base_calls_2), 1)
+
+
+class FetchPrBaseTest(unittest.TestCase):
+    def setUp(self):
+        self.state = Path(tempfile.mkdtemp(prefix="merge-guard-base-test-"))
+
+    def test_fetch_pr_base_success_and_cache(self):
+        calls = []
+        def runner(cmd, cwd=None, timeout=None):
+            calls.append(cmd)
+            return 0, "staging\n", ""
+
+        base = fetch_pr_base("Bavariance/polysimulator", 100, runner=runner, state_dir=self.state)
+        self.assertEqual(base, "staging")
+        self.assertEqual(len(calls), 1)
+
+        base2 = fetch_pr_base("Bavariance/polysimulator", 100, runner=runner, state_dir=self.state)
+        self.assertEqual(base2, "staging")
+        self.assertEqual(len(calls), 1)
+
+    def test_fetch_pr_base_retry_on_first_failure(self):
+        attempts = 0
+        def runner(cmd, cwd=None, timeout=None):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                return 1, "", "transient failure"
+            return 0, "staging\n", ""
+
+        base = fetch_pr_base("Bavariance/polysimulator", 101, runner=runner, state_dir=self.state)
+        self.assertEqual(base, "staging")
+        self.assertEqual(attempts, 2)
+
+    def test_fetch_pr_base_exhaustion_raises(self):
+        def runner(cmd, cwd=None, timeout=None):
+            return 1, "", "hard timeout"
+
+        with self.assertRaises(RuntimeError) as ctx:
+            fetch_pr_base("Bavariance/polysimulator", 102, runner=runner, state_dir=self.state)
+        self.assertIn("failed to look up base branch", str(ctx.exception))
+
+    def test_in_memory_cache_hit_without_disk_reads(self):
+        clear_base_cache()
+        set_cached_base("Bavariance/polysimulator", 200, "staging", state_dir=self.state)
+        cache_file = self.state / "base_cache.json"
+        if cache_file.exists():
+            cache_file.unlink()
+
+        calls = []
+        def runner(cmd, cwd=None, timeout=None):
+            calls.append(cmd)
+            return 0, "should-not-be-called\n", ""
+
+        base = fetch_pr_base("Bavariance/polysimulator", 200, runner=runner, state_dir=self.state)
+        self.assertEqual(base, "staging")
+        self.assertEqual(len(calls), 0)
+        self.assertFalse(cache_file.exists())
 
 class ModeTest(unittest.TestCase):
     def test_env_then_file_then_enforce(self):
