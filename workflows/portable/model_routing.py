@@ -649,7 +649,7 @@ VERIFIED_CONTEXT_WINDOWS: Dict[str, int] = {
     MODEL_ZAI_GLM: 131072,
     MODEL_ZAI_GLM_FLASH: 131072,
     MODEL_MINIMAX_M3: 1000000,
-    MODEL_OR_DEEPSEEK_FLASH: 163840,
+    MODEL_OR_DEEPSEEK_FLASH: 1048576,  # Catalog-verified 1M tokens (models.db openrouter:pseudo-api and OpenRouter live API)
     # OpenCode Go models (catalog-verified 2026-09-25)
     MODEL_GO_BUNNY: 1048576,
     MODEL_GO_GLM53: 1000000,
@@ -1903,7 +1903,10 @@ class ResetAwareModelSelector:
         # tokens) is never picked or offered as a fallback above its window.
         rungs = _apply_pace_rules(rungs, self.pace_of_model, self.provider_exhaustion_reason)
         rungs = [rung for rung in rungs if context_tokens <= VERIFIED_CONTEXT_WINDOWS[rung.model]]
-        is_eligible_fn = lambda m: self.provider_exhaustion_reason(m) is None
+        is_eligible_fn = (
+            lambda m: self.provider_exhaustion_reason(m) is None
+            and context_tokens <= VERIFIED_CONTEXT_WINDOWS.get(m, 0)
+        )
         chosen, fallback_model = _climb(rungs, last_resort, final_fallbacks, is_eligible=is_eligible_fn)
 
         # Free OpenRouter second opinion for reviews: advisory only (1000 req/day free tier),
