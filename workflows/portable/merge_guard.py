@@ -29,6 +29,7 @@ enforce mode and says how to switch the guard off, rather than letting it throug
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import datetime
 import json
 import os
@@ -330,8 +331,15 @@ def resolve_target(target: Dict[str, Any], cwd: Optional[str], runner: Runner) -
 
 def fetch_pr(repo: str, pr: int, runner: Runner) -> Dict[str, Any]:
     """The PR in the shape `github_pr_gate.evaluate_qa_receipt` reads, plus body and base."""
-    pull = _gh_json(["api", f"repos/{repo}/pulls/{pr}"], runner)
-    files = _gh_pages(f"repos/{repo}/pulls/{pr}/files?per_page=100", runner)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        f_pull = pool.submit(_gh_json, ["api", f"repos/{repo}/pulls/{pr}"], runner)
+        f_files = pool.submit(_gh_pages, f"repos/{repo}/pulls/{pr}/files?per_page=100", runner)
+        f_comments = pool.submit(_gh_pages, f"repos/{repo}/issues/{pr}/comments?per_page=100", runner)
+        f_reviews = pool.submit(_gh_pages, f"repos/{repo}/pulls/{pr}/reviews?per_page=100", runner)
+        pull = f_pull.result()
+        files = f_files.result()
+        comments = f_comments.result()
+        reviews = f_reviews.result()
     return {
         "number": pr,
         "state": str(pull.get("state") or "").upper(),
@@ -340,8 +348,8 @@ def fetch_pr(repo: str, pr: int, runner: Runner) -> Dict[str, Any]:
         "baseRefName": (pull.get("base") or {}).get("ref") or "",
         "body": pull.get("body") or "",
         "files": [{"path": f.get("filename", "")} for f in files],
-        "comments": _gh_pages(f"repos/{repo}/issues/{pr}/comments?per_page=100", runner),
-        "reviews": _gh_pages(f"repos/{repo}/pulls/{pr}/reviews?per_page=100", runner),
+        "comments": comments,
+        "reviews": reviews,
     }
 
 
