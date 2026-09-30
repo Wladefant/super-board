@@ -348,7 +348,7 @@ def verify_pr(repo: str, pr_number: int, expected_branch: Optional[str] = None) 
     }
 
 
-def extract_lane_telemetry(session_path: Path) -> Dict[str, Any]:
+def extract_lane_telemetry(session_path: Path, recurse_history: bool = True) -> Dict[str, Any]:
     """Extract operational facts, tool calls, and candidate worktree/PR targets from session JSONL."""
     lines_raw = session_path.read_text(encoding="utf-8", errors="replace").splitlines()
     events = []
@@ -386,6 +386,8 @@ def extract_lane_telemetry(session_path: Path) -> Dict[str, Any]:
 
     explicit_set_cwd: Optional[str] = None
     tool_cwds: List[str] = []
+    pred_cwds: List[str] = []
+    git_call_branches: List[str] = []
     candidate_prs: List[Tuple[str, int]] = []
     has_yield = False
     last_action = None
@@ -415,6 +417,35 @@ def extract_lane_telemetry(session_path: Path) -> Dict[str, Any]:
                                 tool_cwds.append(gc.strip("'\""))
                             for cd_path in re.findall(r'cd\s+["\']?([A-Za-z0-9_./:-]+)["\']?', cmd):
                                 tool_cwds.append(cd_path)
+                            # Check branches in git calls
+                            for m in re.finditer(r'--head\s+([A-Za-z0-9_./-]+)', cmd):
+                                b = m.group(1).strip()
+                                if b not in ("main", "staging", "master"):
+                                    git_call_branches.append(b)
+                            for m in re.finditer(r'git\s+push\s+(?:-u\s+)?(?:origin\s+)?([A-Za-z0-9_./-]+)', cmd):
+                                b = m.group(1).strip()
+                                if not b.startswith("-") and b not in ("main", "staging", "master", "HEAD"):
+                                    git_call_branches.append(b)
+                            for m in re.finditer(r'git\s+checkout\s+(?:-b\s+)?([A-Za-z0-9_./-]+)', cmd):
+                                b = m.group(1).strip()
+                                if not b.startswith("-") and b not in ("main", "staging", "master", "HEAD"):
+                                    git_call_branches.append(b)
+                            for m in re.finditer(r'git\s+-C\s+([A-Za-z0-9_./:-]+)\s+(?:branch\s+--show-current|status)', cmd):
+                                wt_cand = Path(m.group(1).strip("'\""))
+                                if wt_cand.exists() and (wt_cand / ".git").exists():
+                                    try:
+                                        res_b = subprocess.run(
+                                            ["git", "-C", str(wt_cand), "rev-parse", "--abbrev-ref", "HEAD"],
+                                            capture_output=True,
+                                            text=True,
+                                            timeout=5,
+                                            stdin=subprocess.DEVNULL,
+                                        )
+                                        b = res_b.stdout.strip()
+                                        if b and b not in ("main", "staging", "master", "HEAD"):
+                                            git_call_branches.append(b)
+                                    except Exception:
+                                        pass
                             # Check gh pr view
                             for pr_m in re.finditer(r'gh\s+pr\s+view\s+(\d+)(?:.*?-R\s+([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+))?', cmd):
                                 p_num = int(pr_m.group(1))
@@ -427,6 +458,15 @@ def extract_lane_telemetry(session_path: Path) -> Dict[str, Any]:
                                 p_repo = pr_m.group(1) or "Bavariance/polysimulator"
                                 p_num = int(pr_m.group(2))
                                 candidate_prs.append((p_repo, p_num))
+                            if recurse_history:
+                                for hm in re.finditer(r'history://([A-Za-z0-9_.-]+)', p_path):
+                                    pred_name = hm.group(1).split(":")[0]
+                                    pred_file = session_path.parent / f"{pred_name}.jsonl"
+                                    if pred_file.exists():
+                                        pred_t = extract_lane_telemetry(pred_file, recurse_history=False)
+                                        git_call_branches.extend(pred_t.get("git_call_branches", []))
+                                        pred_cwds.extend(pred_t.get("tool_cwds", []))
+                                        candidate_prs.extend(pred_t.get("candidate_prs", []))
                         elif tname == "edit":
                             last_action = f"edit: {args.get('path', '')[:150]}"
                         elif tname == "task":
@@ -434,7 +474,6 @@ def extract_lane_telemetry(session_path: Path) -> Dict[str, Any]:
                             last_action = f"task spawn: {[t.get('name') for t in tasks]}"
                         elif tname == "eval":
                             last_action = f"eval: {args.get('title', '')} {args.get('code', '')[:80]}".strip()
-
     # Prompt hints
     prompt_wts: List[str] = []
     for m in re.finditer(r'(?:Worktree|worktree|directory|repo)[:\s]+([C|c]:[/\\][A-Za-z0-9_./-]+|\.[A-Za-z0-9_./-]+)', user_prompt):
@@ -461,7 +500,9 @@ def extract_lane_telemetry(session_path: Path) -> Dict[str, Any]:
 
     # Reverse order tool_cwds so the latest tool cwd comes first
     unique_tool_cwds = list(dict.fromkeys(reversed(tool_cwds)))
+    unique_pred_cwds = list(dict.fromkeys(reversed(pred_cwds)))
     unique_prs = list(dict.fromkeys(candidate_prs))
+    unique_git_branches = list(dict.fromkeys(git_call_branches))
 
     return {
         "name": name,
@@ -472,6 +513,8 @@ def extract_lane_telemetry(session_path: Path) -> Dict[str, Any]:
         "user_prompt": user_prompt,
         "explicit_set_cwd": explicit_set_cwd,
         "tool_cwds": unique_tool_cwds,
+        "pred_cwds": unique_pred_cwds,
+        "git_call_branches": unique_git_branches,
         "prompt_wts": prompt_wts,
         "prompt_branches": prompt_branches,
         "candidate_prs": unique_prs,
@@ -527,8 +570,39 @@ def audit_lane(session_path: Path, dev_root: str = "C:/Users/wkiri/development")
             elif not wt_failure_reason:
                 wt_failure_reason = res["reason"]
 
-    # Assemble worktree and branch fields
+    is_staging_sequencer = "mergesequencer" in telemetry["name"].lower()
+
+    # Guard: Detect default session root cwd / staging/main on non-sequencer lanes
+    is_default_cwd = False
     if verified_wt:
+        wt_name = Path(verified_wt["path"]).name
+        branch_name = verified_wt["branch"]
+        if (wt_name in SHARED_ROOT_NAMES or branch_name in ("staging", "main", "master")) and not is_staging_sequencer:
+            is_default_cwd = True
+
+    # Assemble worktree and branch fields
+    if is_default_cwd:
+        worktree_field = "UNVERIFIED (default cwd)"
+        # Fall back to branch named in git push/commit calls or predecessor history
+        fallback_branch = None
+        if telemetry.get("git_call_branches"):
+            fallback_branch = telemetry["git_call_branches"][0]
+        elif telemetry.get("prompt_branches"):
+            fallback_branch = telemetry["prompt_branches"][0]
+
+        branch_field = fallback_branch or "UNVERIFIED"
+        head_sha_field = "N/A"
+        repo = "Bavariance/polysimulator"
+
+        # If a worktree matching the fallback branch is found in tool_cwds, extract its head_sha
+        if fallback_branch:
+            for cand in (telemetry["tool_cwds"] + telemetry.get("pred_cwds", [])):
+                cand_res = verify_worktree(cand, base_dir=dev_root)
+                if cand_res["verified"] and cand_res["branch"] == fallback_branch:
+                    head_sha_field = cand_res["short_sha"]
+                    repo = cand_res["repo"]
+                    break
+    elif verified_wt:
         worktree_field = verified_wt["path"]
         branch_field = verified_wt["branch"]
         head_sha_field = verified_wt["short_sha"]
@@ -544,7 +618,6 @@ def audit_lane(session_path: Path, dev_root: str = "C:/Users/wkiri/development")
         branch_field = "UNVERIFIED"
         head_sha_field = "N/A"
         repo = "Bavariance/polysimulator"
-
     # Step 5: Verify candidate PRs
     verified_pr_entry: Optional[str] = None
     pr_unverified_reasons: List[str] = []
