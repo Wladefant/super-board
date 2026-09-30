@@ -26,6 +26,7 @@ import { Database } from "bun:sqlite";
 import { getDaemonDbPath } from "../daemon/config";
 import { DaemonStore } from "../daemon/store";
 import { readMessageThreadId } from "./harness/channel-config";
+import { questionCompactionContext } from "./harness/operator-questions";
 import { escapeHtml, markdownToTelegramHtml } from "./sanitizer";
 import { resolveGithubRepo } from "./github-repo";
 import {
@@ -143,6 +144,7 @@ async function bindToolChannel(
   if (ctx && isEligibleRootSession(ctx)) {
     savedContext = ctx;
     ownerInstance = pi;
+    currentApi = pi;
   }
   let root = ownedRoot();
   if (root && !force) return root;
@@ -218,10 +220,12 @@ function findDaemonRoute(sessionId?: string, workspace?: string): { slotId: stri
             "SELECT slot_id, chat_id, topic_id FROM routes WHERE session_id = ? AND topic_id != '' LIMIT 1"
           ).get(sessionId)
         : null;
-      if (!row) {
-        // A headless session may have no usable saved context; fall back to the
-        // current workspace so the route lookup still resolves (issue #174).
-        const targetWs = (workspace ?? process.cwd()).replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+      if (!row && workspace) {
+        // Only a workspace the caller actually owns may resolve a route. Never
+        // default to process.cwd(): a context-less caller (a subagent, or a root
+        // that never claimed) would then post into whichever OTHER session shares
+        // this directory (two sessions share super-board on the live daemon.db).
+        const targetWs = workspace.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
         const all = db.query<{ slot_id: string; chat_id: string; topic_id: string; workspace: string }, []>(
           "SELECT slot_id, chat_id, topic_id, workspace FROM routes WHERE topic_id != ''"
         ).all();
@@ -573,6 +577,37 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
       `Telegram operator tools not registered on this host: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
+  try {
+    pi.on("session_compacting", async () => {
+      if (ownerInstance !== pi) return undefined;
+      try {
+        const questions = ownedRoot()?.questions ?? activeRuntime?.getQuestions();
+        const sessionId = savedContext?.sessionId;
+        const context = questions
+          ? await questions.compactionContext()
+          : sessionId
+            ? await questionCompactionContext(
+                path.join(os.homedir(), ".veyyon", "workflows", "decisions.json"),
+                {
+                  session_id: sessionId,
+                  ...(lastKnownRoute?.chatId ? { chat_id: lastKnownRoute.chatId } : {}),
+                },
+              )
+            : undefined;
+        return context ? { context: [context] } : undefined;
+      } catch (err: unknown) {
+        pi.logger?.warn(
+          `Telegram question state unavailable during compaction: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return undefined;
+      }
+    });
+  } catch (err: unknown) {
+    pi.logger?.warn(
+      `Telegram session_compacting lifecycle event unavailable on this host: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
   pi.on("session_start", async (event: SessionStartEvent, ctx: ExtensionContext) => {
     if (!isEligibleRootSession(ctx)) return;
     ownerInstance = pi;

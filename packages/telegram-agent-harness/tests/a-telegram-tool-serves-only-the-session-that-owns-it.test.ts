@@ -28,6 +28,7 @@ import telegramSessionExtension, {
   type GlobalTelegramState,
   registerOperatorTools,
   setActiveRuntime,
+  setSavedContext,
 } from "../extension/index";
 import { TelegramRuntime, isEligibleRootSession } from "../extension/runtime";
 import { TelegramPoller } from "../extension/poller";
@@ -505,6 +506,62 @@ test("a subagent tool context never claims the lifecycle or creates a runtime", 
   // Nothing reached the foreign channel and no runtime was fabricated for the caller.
   expect(channel.calls).toEqual([]);
   expect((globalThis as unknown as GlobalTelegramState)[ACTIVE_ROOT_SYMBOL]).toBeUndefined();
+});
+
+test("a context-less caller never posts into another session's route that shares its working directory", async () => {
+  // Live daemon.db holds two sessions in one workspace; a caller that never claimed a
+  // lifecycle (no saved context) must not fall back to process.cwd() and borrow the
+  // other session's topic and bot token.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "tg-route-home-"));
+  const stateDir = path.join(home, "slot-state");
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, ".env"), "TELEGRAM_BOT_TOKEN=999:foreign-token\n");
+  fs.mkdirSync(path.join(home, ".veyyon", "telegram"), { recursive: true });
+  fs.writeFileSync(
+    path.join(home, ".veyyon", "telegram", "manifest.json"),
+    JSON.stringify({ slots: [{ slotId: "slot-x", stateDir }] }),
+  );
+  const db = new Database(path.join(home, ".veyyon", "telegram", "daemon.db"));
+  db.run("CREATE TABLE routes (slot_id TEXT, chat_id TEXT, topic_id TEXT, session_id TEXT, workspace TEXT)");
+  db.run("INSERT INTO routes VALUES ('slot-x', '42', '14', 'other-session', ?)", [process.cwd()]);
+  db.close();
+
+  const previousHome = process.env.USERPROFILE;
+  const previousPosixHome = process.env.HOME;
+  process.env.USERPROFILE = home;
+  process.env.HOME = home;
+  const fetched: string[] = [];
+  globalThis.fetch = (async (url: unknown) => {
+    fetched.push(String(url));
+    return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }));
+  }) as typeof fetch;
+  cleanup.push(() => {
+    if (previousHome === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousHome;
+    if (previousPosixHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousPosixHome;
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  const host = createHost();
+  registerOperatorTools(host.api);
+  setActiveRuntime(null);
+  setSavedContext(null);
+  delete (globalThis as unknown as GlobalTelegramState)[ACTIVE_ROOT_SYMBOL];
+
+  const subagentCtx = {
+    hasUI: true,
+    isSubagent: true,
+    taskDepth: 1,
+    parentTaskPrefix: "sub-1",
+    cwd: process.cwd(),
+    sessionManager: { getSessionId: () => "subagent-session" },
+  } as unknown as ExtensionContext;
+
+  await expect(
+    host.tools.get("telegram_message")!.execute("call-1", CALLS.telegram_message, undefined, undefined, subagentCtx),
+  ).rejects.toThrow(/No active session-bound Telegram channel/);
+  expect(fetched).toEqual([]);
 });
 
 test("isEligibleRootSession admits root sessions even when hasUI is false", () => {
