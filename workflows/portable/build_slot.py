@@ -61,6 +61,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import uuid
 
 logger = logging.getLogger("build_slot")
+logger.addHandler(logging.NullHandler())
 
 DEFAULT_RUN_DIR = os.path.expanduser("~/.veyyon/run")
 LOCK_DIR_NAME = "build-slot.lock"
@@ -2079,15 +2080,62 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             f"--poll-interval ({args.poll_interval}s) must be less than "
             f"queue_stale_heartbeat_after ({DEFAULT_QUEUE_STALE_HEARTBEAT_SECONDS}s)"
         )
-    if args.command == "run" and args.cmd and args.cmd[0].startswith("-") and args.cmd[0] != "--" and "--" in args.cmd:
-        # REMAINDER swallows run options written after <name> (`run <name> --timeout 60 -- <cmd>`);
-        # parse the tokens before the `--` separator as run options.
-        sep = args.cmd.index("--")
-        tail_parser = argparse.ArgumentParser(prog="build_slot.py run <name>")
-        _add_run_options(tail_parser)
-        tail_parser.parse_args(args.cmd[:sep], namespace=args)
-        args.cmd = args.cmd[sep:]
+    if args.command == "run":
+        raw_argv = sys.argv[1:] if argv is None else list(argv)
+        sub_idx = _find_subcommand_index(raw_argv)
+        sub_argv = raw_argv[sub_idx + 1:] if sub_idx >= 0 else []
+        i = 0
+        lane_idx = -1
+        while i < len(sub_argv):
+            tok = sub_argv[i]
+            if tok == "--":
+                break
+            opt_name = tok.split("=")[0]
+            if opt_name in {"--priority", "--force"}:
+                i += 1
+            elif opt_name in {"--timeout", "--cwd", "--heartbeat-stale-after"}:
+                if "=" in tok:
+                    i += 1
+                else:
+                    i += 2
+            elif tok.startswith("-"):
+                i += 1
+            else:
+                lane_idx = i
+                break
+        if lane_idx >= 0:
+            rest = sub_argv[lane_idx + 1:]
+            if rest and rest[0].startswith("-") and rest[0] != "--":
+                if "--" in rest:
+                    sep = rest.index("--")
+                    tail_parser = argparse.ArgumentParser(
+                        prog="build_slot.py run <name>",
+                        argument_default=argparse.SUPPRESS,
+                    )
+                    _add_run_options(tail_parser)
+                    tail_parser.parse_args(rest[:sep], namespace=args)
+                    args.cmd = rest[sep:]
+                else:
+                    parser.error(
+                        "options must precede the lane name: build_slot.py run [--cwd DIR] [--timeout S] [--priority] <name> -- <cmd>"
+                    )
     return args
+
+
+def _find_subcommand_index(argv: List[str]) -> int:
+    """Finds the index of the subcommand in argv, skipping global options and their values."""
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--run-dir":
+            i += 2
+        elif tok.startswith("--run-dir="):
+            i += 1
+        elif tok.startswith("-"):
+            i += 1
+        else:
+            return i
+    return -1
 
 
 def _add_run_options(parser: argparse.ArgumentParser) -> None:
