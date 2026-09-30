@@ -51,7 +51,7 @@ GUARDED_REPO = "Bavariance/polysimulator"
 GUARDED_BASE = "staging"
 STATE_DIR = Path.home() / ".veyyon" / "run" / "merge-guard"
 MODES = ("enforce", "warn", "off")
-GH_TIMEOUT_SEC = 25
+GH_TIMEOUT_SEC = 40
 BASE_TIMEOUT_SEC = 20
 BASE_CACHE_TTL_SEC = 300  # 5 minutes
 
