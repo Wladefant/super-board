@@ -29,11 +29,14 @@ export interface QuestionAnswer {
   origin: "telegram_account";
   actor_id: string;
   authorization: false;
+  answered_at?: string;
 }
 interface Question {
   decision_id: string;
   question: string;
   status: string;
+  reminder_status?: string;
+  created_at?: string;
   answer: QuestionAnswer | null;
   transport: QuestionRoute & { kind: "operator_question"; message_id?: number; selection: string | null };
 }
@@ -44,6 +47,46 @@ interface Result {
   error?: string;
 }
 export interface QuestionRoute { session_id: string; chat_id: string; user_id: string }
+
+type QuestionCompactionRoute = Pick<QuestionRoute, "session_id"> & Partial<QuestionRoute>;
+
+export async function questionCompactionContext(
+  decisionsPath: string,
+  route: QuestionCompactionRoute,
+): Promise<string | undefined> {
+  const data = await Bun.file(decisionsPath).json() as { decisions?: Record<string, Question> };
+  const questions = Object.values(data.decisions ?? {})
+    .filter(question =>
+      (question.status === "pending" || question.status === "answered") &&
+      question.transport?.kind === "operator_question" &&
+      question.transport.session_id === route.session_id &&
+      (route.chat_id === undefined || question.transport.chat_id === route.chat_id) &&
+      (route.user_id === undefined || question.transport.user_id === route.user_id)
+    )
+    .sort((left, right) =>
+      (left.created_at ?? "").localeCompare(right.created_at ?? "") ||
+      left.decision_id.localeCompare(right.decision_id)
+    )
+    .map(question => ({
+      id: question.decision_id,
+      question: question.question,
+      status: question.status,
+      reminder_status: question.reminder_status ?? null,
+      answer: question.answer
+        ? {
+            choice_id: question.answer.choice_id,
+            text: question.answer.text,
+            answered_at: question.answer.answered_at ?? null,
+          }
+        : null,
+    }));
+  if (questions.length === 0) return undefined;
+  return [
+    "The following Telegram question-store snapshot is authoritative at compaction time.",
+    "An answered question MUST NOT remain pending or blocked in the new summary.",
+    JSON.stringify({ questions }),
+  ].join("\n");
+}
 
 /** No independent ledger, Telegram poller, approval grant, or new operator turn. */
 export class OperatorQuestionService {
@@ -93,6 +136,18 @@ export class OperatorQuestionService {
       throw new Error("Question is unavailable on this session and operator route");
     }
     return question;
+  }
+
+  /**
+   * The route-owned question state that a compaction summary must reconcile.
+   *
+   * Answers intentionally do not enter the session as new user turns: they resolve
+   * only the waiting telegram_question call. A later compaction can therefore see an
+   * old "pending" summary after the durable store has moved on. This snapshot makes
+   * the store authoritative without waking the agent or duplicating the answer.
+   */
+  async compactionContext(): Promise<string | undefined> {
+    return questionCompactionContext(this.decisionsPath, this.route());
   }
 
   async wait(

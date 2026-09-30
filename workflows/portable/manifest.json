@@ -114,6 +114,18 @@
         "HarnessDispatchPacket (JSON)"
       ]
     },
+    "routing_smoke_test.py": {
+      "role": "Offline contract validation suite, context-window compliance checks, and non-Anthropic fallback verification",
+      "owner": "ImplementHarnessRouting / ImplementSubscriptionRouter",
+      "cli_command": "python routing_smoke_test.py",
+      "inputs": [
+        "model_routing.py",
+        "balance_loader.py"
+      ],
+      "outputs": [
+        "Smoke test assertions and invariant proofs"
+      ]
+    },
     "github_plan_renderer.py": {
       "role": "GitHub markdown plan, visual architecture, and evidence recap renderer for issue and PR comments",
       "owner": "IntegrateVisualPlanWorkflow",
@@ -398,6 +410,7 @@
       "test_adoption_audit.py",
       "test_gardener.py",
       "test_quota_snapshot.py",
+      "routing_smoke_test.py",
       "usage_snapshot_cache.json",
       "test_github_work_item.py",
       "test_install_github_native.py",
@@ -407,7 +420,6 @@
       "test_github_pr_gate.py",
       "test_telegram_notifier.py",
       "test_telegram_workflow.py",
-      "routing_smoke_test.py",
       "decisions.json",
       "test_worker_backend.py",
       "test_continuation_driver.py",
