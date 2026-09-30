@@ -46,6 +46,8 @@ RUNTIME_FILES = (
     "merge_guard.py", "test_merge_guard.py",
     # Session crash monitor and test suite.
     "session_crash_monitor.py", "test_session_crash_monitor.py",
+    # Mechanically verified lane inventory and crash recovery audit.
+    "lane_inventory.py", "test_lane_inventory.py",
 )
 # Veyyon extensions, installed into the profile's own `extensions/` dir beside AGENTS.md,
 # where Veyyon loads them for every session of that profile.
