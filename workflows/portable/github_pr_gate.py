@@ -582,6 +582,73 @@ def _receipt_line_tokens(body: str, start: int) -> List[str]:
     return [match.group("served").lower()] if match else []
 
 
+# A receipt that presents before/after screenshots must carry the machine captions that
+# `control_polysim.py snapshot --label` writes (`SHOT before served=... expected=...`) and
+# the `SHOT-PAIR` line that `control_polysim.py pair` verified. Alt text like `![before 1440]`
+# is what marks a before/after claim; `initial`/`exercised` receipt shots make no such claim.
+SHOT_CLAIM_RE = re.compile(r"!\[\s*(?:before|after)\b", re.IGNORECASE)
+SHOT_CAPTION_LINE_RE = re.compile(
+    r"^[ \t>*_`|\-]*SHOT (?P<label>before|after)(?P<fields>(?: [a-z0-9]+=\S+)+)[ \t*_`|]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+SHOT_PAIR_LINE_RE = re.compile(
+    r"^[ \t>*_`|\-]*SHOT-PAIR viewport=\S+ phash_dist=(?P<dist>\d+) changed_ratio=(?P<ratio>[0-9.]+)[ \t*_`|]*$",
+    re.MULTILINE,
+)
+SHOT_NEAR_IDENTICAL_BITS = 3
+SHOT_MIN_CHANGED_RATIO = 0.0005
+
+
+def shot_provenance_problems(body: str, binds: Any) -> List[str]:
+    """
+    Why a receipt's before/after screenshots are not provenance-backed evidence.
+
+    Empty when the body claims no before/after pair, or when the pair's machine captions
+    prove: the `after` shot was served by the PR head (`binds` says whether a sha names this
+    diff), the `before` shot was served by a different commit, every caption's served sha
+    equals the sha it was expected to serve, and the pair is neither identical nor near-identical.
+    Mislabelled pairs (a staging build captioned as the PR's "after") are the failure this stops
+    (Bavariance/polysimulator PR #5630 and the audit in its screenshot-provenance issue).
+    """
+    if not SHOT_CLAIM_RE.search(body):
+        return []
+    captions: Dict[str, Dict[str, str]] = {}
+    for match in SHOT_CAPTION_LINE_RE.finditer(body):
+        label = match.group("label").lower()
+        fields = dict(token.partition("=")[::2] for token in match.group("fields").split())
+        captions.setdefault(label, fields)
+    problems: List[str] = []
+    for label in ("before", "after"):
+        if label not in captions:
+            problems.append(f"the receipt shows a '{label}' screenshot but carries no machine 'SHOT {label}' caption")
+    if problems:
+        return problems
+    for label, fields in captions.items():
+        served = str(fields.get("served", "")).lower()
+        expected = str(fields.get("expected", "")).lower()
+        if not (SHA40_RE.fullmatch(served) and SHA40_RE.fullmatch(expected)):
+            problems.append(f"'{label}' caption has no valid 40-hex served/expected sha")
+        elif served != expected:
+            problems.append(f"'{label}' shot served {served[:8]} but was labelled {expected[:8]}")
+    if problems:
+        return problems
+    before_sha = captions["before"]["served"].lower()
+    after_sha = captions["after"]["served"].lower()
+    if not binds(after_sha):
+        problems.append(f"the 'after' shot was served by {after_sha[:8]}, which is not this PR's head")
+    if binds(before_sha) or before_sha == after_sha:
+        problems.append(f"the 'before' shot was served by {before_sha[:8]}, the PR head itself, not origin/staging")
+    pair = SHOT_PAIR_LINE_RE.search(body)
+    if pair is None:
+        problems.append("no 'SHOT-PAIR' line: run `control_polysim.py pair` on the before/after captures")
+    elif int(pair.group("dist")) <= SHOT_NEAR_IDENTICAL_BITS and float(pair.group("ratio")) < SHOT_MIN_CHANGED_RATIO:
+        problems.append(
+            f"before and after are near-identical (phash distance {pair.group('dist')}, "
+            f"{float(pair.group('ratio')):.4%} of pixels changed)"
+        )
+    return problems
+
+
 def evaluate_qa_receipt(
     pr_data: Dict[str, Any],
     *,
@@ -700,6 +767,14 @@ def evaluate_qa_receipt(
                 f"QA receipt required ({requirement_reason}): the receipt carries "
                 f"{declaration['images']} GitHub-hosted evidence image(s), "
                 f"{QA_RECEIPT_MIN_IMAGES} required.",
+                declaration["url"] or None,
+            )
+        shot_problems = shot_provenance_problems(declaration["body"], binds)
+        if shot_problems:
+            return (
+                "REQUIRED",
+                f"QA receipt required ({requirement_reason}): before/after screenshot provenance "
+                f"failed: {'; '.join(shot_problems)}.",
                 declaration["url"] or None,
             )
         return (
