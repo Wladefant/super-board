@@ -203,6 +203,47 @@ class TestLaneInventory(unittest.TestCase):
         self.assertIn("UNVERIFIED", audited["pr"])
         self.assertIn("is MERGED", audited["pr"])
 
+    @patch("lane_inventory.verify_pr")
+    def test_audit_lane_default_cwd_marked_unverified_and_falls_back_to_git_branch(self, mock_verify_pr):
+        """A lane running in session root cwd on staging/main must be tagged UNVERIFIED (default cwd) and fall back to git push/commit branch."""
+        shared_root = Path(self.temp_dir) / ".wt-merge-recovery-20260922-main2"
+        shared_root.mkdir()
+        (shared_root / ".git").mkdir()
+
+        session_file = Path(self.temp_dir) / "RealtimeLane-1.jsonl"
+        lines = [
+            json.dumps({"type": "model_change", "model": "gpt-5.6-sol"}),
+            json.dumps({
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "Worktree .wt-merge-recovery-20260922-main2, PR #5828"}]
+                }
+            }),
+            json.dumps({
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "toolCall",
+                        "name": "bash",
+                        "arguments": {"command": "git push origin feat/2769-user-state-events"}
+                    }]
+                }
+            }),
+            json.dumps({"timestamp": "2026-09-29T21:42:33Z"})
+        ]
+        session_file.write_text("\n".join(lines), encoding="utf-8")
+
+        mock_verify_pr.return_value = {
+            "verified": False,
+            "reason": "PR #5828 is MERGED",
+            "state": "MERGED"
+        }
+
+        audited = audit_lane(session_file, dev_root=self.temp_dir)
+        self.assertEqual(audited["worktree"], "UNVERIFIED (default cwd)")
+        self.assertEqual(audited["branch"], "feat/2769-user-state-events")
+        self.assertIn("UNVERIFIED", audited["pr"])
+
     def test_format_markdown_table(self):
         items = [{
             "name": "Lane-1",
