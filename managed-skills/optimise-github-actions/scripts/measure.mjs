@@ -2,7 +2,7 @@
 // Measure what a repository's GitHub Actions runs cost and how long they take,
 // per workflow and per job.
 //
-// Usage: node measure.mjs OWNER/REPO [--days 14] [--out jobs.json] [--budget 1500] [--cache DIR] [--concurrency 3]
+// Usage: node measure.mjs OWNER/REPO [--days 14] [--out jobs.json] [--budget 1500] [--time-limit 420] [--every K] [--cache DIR] [--concurrency 3]
 // Needs: Node 18+ and the GitHub CLI (`gh auth login`) with read access to Actions.
 // Source: github.com/enesgules/dotfiles (skills/optimise-github-actions) at d1e9b65f4dd4760e0f8b835eaeac510ca0918935,
 // vetted: only `gh api` GET calls via execFile (no shell), writes only --out and the cache dir.
@@ -40,6 +40,10 @@ const cacheDir = option("cache", join(homedir(), ".veyyon", "run", "oga-cache"))
 const concurrency = Number(option("concurrency", 3));
 let calls = 0;
 let overBudget = false;
+// gh calls can take ~5 s each here, so a command with a 600 s ceiling reads only a few hundred runs.
+// --time-limit (seconds, default 420) stops reading jobs in time to print what was read; rerun the
+// same command to continue from the cache until no "Partial data" note remains.
+const deadline = Date.now() + Number(option("time-limit", 420)) * 1000;
 mkdirSync(cacheDir, { recursive: true });
 
 // `gh api --paginate --slurp` is missing from older gh builds, so page by hand: one call per
@@ -82,7 +86,7 @@ async function list(path, key) {
 async function jobsOf(run, attempt) {
   const file = join(cacheDir, `${repo.replace("/", "__")}.${run.id}.${attempt}.json`);
   if (existsSync(file)) return JSON.parse(readFileSync(file, "utf8"));
-  if (calls >= budget) {
+  if (calls >= budget || Date.now() > deadline) {
     overBudget = true;
     return [];
   }
@@ -118,15 +122,15 @@ const runs = (
 console.error(`${runs.length} runs in ${days} days, ${calls} API calls so far.`);
 
 // A busy repo has more runs than the call budget can read jobs for (polysimulator had 10,921 in
-// 14 days). Read jobs for an evenly spaced sample of the runs and say so in the output; run
-// counts, wall-clock times and churn still come from the full run list.
-const sampleSize = Number(option("sample", Math.max(0, Math.floor((budget - calls) * 0.9))));
-const sampled =
-  runs.length <= sampleSize
-    ? runs
-    : Array.from({ length: sampleSize }, (_, i) => runs[Math.floor((i * runs.length) / sampleSize)]);
+// 14 days). Read jobs for every Kth run (run id divisible by K, so the sample stays the same on a
+// rerun and the cache keeps working) and say so in the output; run counts, wall-clock times and
+// churn still come from the full run list. Pass --every K to pin K on a rerun.
+const every = Number(
+  option("every", Math.max(1, Math.ceil(runs.length / Math.max(1, Math.floor((budget - calls) * 0.9))))),
+);
+const sampled = every === 1 ? runs : runs.filter((r) => r.id % every === 0);
 if (sampled.length < runs.length) {
-  console.log(`> **Sampled:** jobs were read for ${sampled.length} of ${runs.length} runs (evenly spaced). Minute totals cover the sample only; multiply by about ${(runs.length / sampled.length).toFixed(1)} for the whole window.\n`);
+  console.log(`> **Sampled:** jobs were read for ${sampled.length} of ${runs.length} runs (run id divisible by ${every}; pass \`--every ${every}\` to repeat it). Minute totals cover the sample only; multiply by about ${(runs.length / sampled.length).toFixed(1)} for the whole window.\n`);
 }
 
 console.log(`## Runs by workflow and event (all ${runs.length} runs, no job reads)\n`);
@@ -172,7 +176,7 @@ const jobs = (
 ).flat();
 console.error(`${calls} API calls used (budget ${budget}).`);
 if (overBudget) {
-  console.log(`> **Partial data:** the ${budget}-call budget ran out before every run's jobs were read. Totals below undercount. Rerun to continue (finished runs are cached in ${cacheDir}) or raise --budget.\n`);
+  console.log(`> **Partial data:** the ${budget}-call budget or the time limit ran out before every run's jobs were read. Totals below undercount. Rerun the same command to continue (finished runs are cached in ${cacheDir}).\n`);
 }
 if (outFile) writeFileSync(outFile, JSON.stringify(jobs));
 
