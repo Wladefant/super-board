@@ -78,33 +78,28 @@ MODEL_GEMINI_FLASH = "google-antigravity/gemini-3.8-flash:high"
 MODEL_GEMINI_LITE = "google-antigravity/gemini-3.1-flash-lite"
 MODEL_GEMINI_PRO = "google-antigravity/gemini-3.1-pro"
 
-# Paid direct Anthropic: the Main orchestrator's budget and the high-risk REVIEW lane.
-# Never a worker primary or worker fallback while any cheap tier has headroom (operator
-# 2026-09-25). In worker ladders Fable is the very last rung, and only on slack behind
-# pace (ANTHROPIC_WORKER_MIN_HEADROOM), never on the orchestrator's reserve.
+# Direct Anthropic roles are task-specific: Opus 5.5 owns UI/design, while
+# Sonnet 5.5 handles broad judgment-heavy non-UI work when its weekly window
+# runs behind pace. Fable remains the interactive orchestrator model only.
 MODEL_CLAUDE_FABLE = "anthropic/claude-fable-5-1"
-# Paid direct Anthropic Opus 5.5: reserved for high-risk reviews (money, billing,
-# ledger, migration first-pass reviews, cross-cutting architectural changes;
-# operator ruling 2026-09-26 ~13:25Z, updated 2026-09-27 ~15:00Z).
-# Never used for routine implementation, sync, merge, triage or small reviews.
 MODEL_CLAUDE_OPUS_55 = "anthropic/claude-opus-5-5:high"
+MODEL_CLAUDE_SONNET_55 = "anthropic/claude-sonnet-5-5:medium"
 MODEL_ANTHROPIC_OPUS = MODEL_CLAUDE_OPUS_55
 
-MODEL_CODEX_FAST = "openai-codex/gpt-5.3-codex"
-# The operator's Codex worker/review tier is Sol high (profile `codex-worker` and
-# `codex-reviewer` pins). Astra is unsupported on ChatGPT accounts.
-MODEL_CODEX_SOL = "openai-codex/gpt-5.6-sol:high"
-MODEL_CODEX_ASTRA = "openai-codex/gpt-6-astra:medium"
+# Codex effort is part of the routing decision. GPT-6.1 Sol medium runs
+# contained implementation, high runs review/reasoning, and GPT-6 Sol is the
+# same-effort fallback. Astra xhigh is reserved for the hardest cross-cutting
+# cases. The local authoritative catalog verified all four IDs on 2026-10-01.
+MODEL_CODEX_FAST = "openai-codex/gpt-6-sol:medium"
+MODEL_CODEX_SOL = "openai-codex/gpt-6.1-sol:high"
+MODEL_CODEX_WORKER = "openai-codex/gpt-6.1-sol:medium"
+MODEL_CODEX_SOL_FALLBACK = "openai-codex/gpt-6-sol:high"
+MODEL_CODEX_ASTRA = "openai-codex/gpt-6-astra:xhigh"
 MODEL_CODEX_SPARK = "openai-codex/gpt-5.3-codex-spark:medium"
 
-# Models that cannot run on the openai-codex (ChatGPT subscription) provider.
-# Verified 2026-09-29: POST chatgpt.com/backend-api/codex/responses with model gpt-6.1-sol
-# -> HTTP 400 "The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."
-# The Codex catalog contains gpt-6-astra, gpt-reserve, gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, codex-auto-review.
-# gpt-6.1-sol exists only as the paid openrouter/openai/gpt-6.1-sol, which is not approved; don't add it anywhere.
-UNSUPPORTED_CODEX_MODELS: FrozenSet[str] = frozenset({
-    "gpt-6.1-sol",
-})
+# Keep the refusal mechanism for a future provider mismatch. Every current
+# Codex route above is present in the openai-codex catalog.
+UNSUPPORTED_CODEX_MODELS: FrozenSet[str] = frozenset()
 # Manual account-availability switch (re-enabled 2026-09-29, operator ruling):
 # The operator confirmed a new Codex account (tricuoc1968@gmail.com, plan prolite, 5x plan).
 # CODEX_ENABLED is True. Can be forced off via VEYYON_CODEX_ENABLED=0.
@@ -349,63 +344,52 @@ def detect_credentialed_providers(auth_store_paths: Optional[List[str]] = None) 
     }
 
 
-# Model each router-emitted role must pin as its FIRST model, for roles this router
-# introduced. The router recommends a role alongside the model; a role pinned to another
-# model would silently run that model instead. Operator applies these to the profile
-# (see policies/default/AGENTS.md "Worker role pins"); the router never edits config.
+# Model each router-emitted role must pin as its FIRST model. The router
+# recommends a role alongside the model; a mismatched first pin silently runs
+# another model and invalidates the decision.
 ROLE_MODEL_PINS: Dict[str, str] = {
-    # Operator model routing split (2026-09-29):
-    # Opus 5.5 is for orchestrator ONLY (modelRoles.default). No subagent role or reviewer lane default
-    # may land on Opus: reviewer routes to Codex Sol (openai-codex/gpt-5.6-sol:high).
     "reviewer": MODEL_CODEX_SOL,
-    "codex-worker": MODEL_CODEX_SOL,
+    "codex-worker": MODEL_CODEX_WORKER,
     "codex-reviewer": MODEL_CODEX_SOL,
     "thinker": MODEL_CODEX_SOL,
-    # Astra (openai-codex/gpt-6-astra) is used sparingly for the hardest items (operator ruling 2026-09-29).
+    "sol": MODEL_CODEX_WORKER,
     "astra-ux": MODEL_CODEX_ASTRA,
+    "sonnet": MODEL_CLAUDE_SONNET_55,
+    "opus": MODEL_CLAUDE_OPUS_55,
     "ds-pro": MODEL_DEEPSEEK_PRO,
     "zai-task": MODEL_ZAI_GLM,
     "zai-flash": MODEL_ZAI_GLM_FLASH,
     "minimax-task": MODEL_MINIMAX_M3,
     "gemini-pro": MODEL_GEMINI_PRO,
-    # The free Spark allowance has its own enabled roster entry and its own model, so a lane
-    # routed onto Spark must be dispatched as `spark`, never as a Codex Astral role.
     "spark": MODEL_CODEX_SPARK,
-    # One role per routed Go model, so a dispatched role can never silently run another
-    # model. opencode-go/qwen3.8-flash, /qwen3.8-max and /mimo-v2.6-pro stay catalog-verified
-    # and unrouted until they have a matching `modelRoles` entry of their own.
     "go-task": MODEL_GO_BUNNY,
     "go-deep": MODEL_GO_GLM53_FLASH,
     "go-review": MODEL_GO_GLM53,
     "go-bulk": MODEL_GO_GPT6_LUNA,
-    # ChatGPT Web serves from a local bridge rather than a metered provider, so both of its
-    # roles pin the same tier; model_to_agent_role splits them by task type.
     "web-task": MODEL_CHATGPT_WEB,
     "web-thinker": MODEL_CHATGPT_WEB,
-    # The advisor role was moved from anthropic/claude-fable-5-1 to google-antigravity/gemini-3.8-flash:high
-    # (operator ruling 2026-09-27) to conserve Anthropic quota; matches live config.yml.
     "advisor": MODEL_GEMINI_FLASH,
 }
 
 
-# Fallback ladders for roles with multi-model fallback requirements.
-# astra-ux resolves to openai-codex/gpt-6-astra:medium first, falling back per the
-# high-risk ladder (skipping ag-opus while exhausted, never Flash or free).
-# reviewer resolves to openai-codex/gpt-5.6-sol:high first (operator ruling 2026-09-29).
+# Fallbacks preserve the task class and effort before crossing providers.
+# Opus is deliberately absent: only explicit UI/design dispatches may use it.
 ROLE_FALLBACK_LADDERS: Dict[str, List[str]] = {
     "astra-ux": [
         MODEL_CODEX_ASTRA,
         MODEL_CODEX_SOL,
+        MODEL_CODEX_SOL_FALLBACK,
+        MODEL_CLAUDE_SONNET_55,
         MODEL_GO_GLM53,
-        MODEL_CLAUDE_OPUS_55,
         MODEL_DEEPSEEK_PRO,
     ],
     "reviewer": [
         MODEL_CODEX_SOL,
+        MODEL_CODEX_SOL_FALLBACK,
+        MODEL_CLAUDE_SONNET_55,
         MODEL_GO_GLM53,
         MODEL_GO_QWEN38_MAX,
-        MODEL_DEEPSEEK_FLASH,
-        MODEL_CLAUDE_OPUS_55,
+        MODEL_DEEPSEEK_PRO,
     ],
 }
 
@@ -666,10 +650,14 @@ VERIFIED_CONTEXT_WINDOWS: Dict[str, int] = {
     MODEL_GEMINI_LITE: 1048576,
     MODEL_GEMINI_PRO: 1048576,
     MODEL_CLAUDE_FABLE: 1000000,
-    MODEL_CODEX_FAST: 400000,
+    MODEL_CLAUDE_SONNET_55: 1000000,
+    MODEL_CODEX_FAST: 272000,
+    MODEL_CODEX_SOL: 272000,
+    MODEL_CODEX_WORKER: 272000,
+    MODEL_CODEX_SOL_FALLBACK: 272000,
     MODEL_CODEX_ASTRA: 272000,
-    MODEL_AG_CLAUDE_OPUS: 250000,
     MODEL_AG_CLAUDE_SONNET: 250000,
+    MODEL_AG_CLAUDE_OPUS: 250000,
     MODEL_AG_GPT_OSS: 131072,
     MODEL_DEEPSEEK_FLASH: 1048576,
     MODEL_DEEPSEEK_PRO: 1000000,
@@ -733,8 +721,8 @@ def model_to_agent_role(model_id: str, task_type: TaskType, risk_level: RiskLeve
         return "web-thinker" if task_type == TaskType.STRONG_REVIEW else "web-task"
     if model_id.startswith("openai-codex/"):
         if not codex_available() or is_unsupported_codex_model(model_id):
-            # Codex account withdrawn (2026-09-26): reviews fall through to reviewer (Opus 5.5,
-            # never Flash), implementation falls through to task (Flash).
+            # An unavailable Codex review falls through to the review role's
+            # cross-provider Sonnet/Go/DeepSeek ladder. Implementation falls to Flash.
             return "reviewer" if task_type == TaskType.STRONG_REVIEW else "task"
         if "codex-spark" in model_id:
             # The free Spark allowance has its own enabled roster entry (`spark`); the
@@ -771,6 +759,11 @@ def model_to_agent_role(model_id: str, task_type: TaskType, risk_level: RiskLeve
     if "flash" in model_id:
         return "qa-verifier" if task_type == TaskType.STRONG_REVIEW and risk_level == RiskLevel.LOW else "task"
     if model_id.startswith("anthropic/"):
+        base = _model_base(model_id)
+        if base == _model_base(MODEL_CLAUDE_OPUS_55):
+            return "opus"
+        if base == _model_base(MODEL_CLAUDE_SONNET_55):
+            return "sonnet"
         return "reviewer"
     return "task"
 
@@ -1610,6 +1603,10 @@ class ResetAwareModelSelector:
             t.lower() in HIGH_RISK_DOMAINS or any(hr in t.lower() for hr in HIGH_RISK_DOMAINS)
             for t in domain_tags
         ))
+        hardest_tags = {"architecture", "architectural", "cross-cutting", "migration", "concurrency"}
+        is_hardest_case = risk_level == RiskLevel.HIGH and bool(
+            domain_tags and any(tag.lower() in hardest_tags for tag in domain_tags)
+        )
         is_rework_critical = (
             risk_level == RiskLevel.HIGH
             or rework_count >= 1
@@ -1641,38 +1638,53 @@ class ResetAwareModelSelector:
                 promotion=True, pace_group=group,
             )
 
-        # A promoted rung leads its pace group, so an expiring Codex window is spent ahead of the
-        # interchangeable cheap tiers that share that group, and every other day loses to them.
-        codex_promo = codex_promoted(MODEL_CODEX_ASTRA, "Codex Astra", PACE_GROUP_STRONG)
+        # Sol is the normal Codex tier. Medium effort writes contained changes;
+        # high effort reviews or reasons about them. Astra xhigh is gated to the
+        # hardest cross-cutting cases instead of acting as a generic Codex rung.
+        sol_review_promo = codex_promoted(MODEL_CODEX_SOL, "GPT-6.1 Sol high", PACE_GROUP_STRONG)
+        sol_worker_promo = codex_promoted(MODEL_CODEX_WORKER, "GPT-6.1 Sol medium", PACE_GROUP_EXEC)
+        sol_review_on_pace = _Rung(
+            MODEL_CODEX_SOL, codex_usable,
+            f"GPT-6.1 Sol high ({codex_pro_headroom:.2f}x pace headroom).",
+            pace_group=PACE_GROUP_STRONG,
+        )
+        sol_worker_on_pace = _Rung(
+            MODEL_CODEX_WORKER, codex_usable,
+            f"GPT-6.1 Sol medium ({codex_pro_headroom:.2f}x pace headroom).",
+            pace_group=PACE_GROUP_EXEC,
+        )
+        astra_promo = _Rung(
+            MODEL_CODEX_ASTRA, codex_near_reset_surplus and is_hardest_case,
+            f"Codex window resets in {codex_pro_hrs:.1f}h; hardest case promoted to Astra xhigh.",
+            promotion=True, pace_group=PACE_GROUP_STRONG,
+        )
         astra_on_pace = _Rung(
-            MODEL_CODEX_ASTRA, codex_usable,
-            f"Codex Astra medium ({codex_pro_headroom:.2f}x pace headroom).",
+            MODEL_CODEX_ASTRA, codex_usable and is_hardest_case,
+            f"Astra xhigh for the hardest cross-cutting case ({codex_pro_headroom:.2f}x pace headroom).",
             pace_group=PACE_GROUP_STRONG,
         )
         astra_emergency = _Rung(
-            MODEL_CODEX_ASTRA, codex_ok,
-            "only Codex ahead of pace remains; spending its emergency reserve.",
+            MODEL_CODEX_ASTRA, codex_ok and is_hardest_case,
+            "hardest case has only the Codex emergency reserve left; using Astra xhigh.",
             cooldown=True, pace_group=PACE_GROUP_STRONG,
         )
-        codex_fast_promo = codex_promoted(MODEL_CODEX_FAST, "Codex Fast", PACE_GROUP_EXEC)
-        opus_55_available = anthropic_meta["is_available"] and (self.provider_exhaustion_reason(MODEL_CLAUDE_OPUS_55) is None)
-        opus_55_worker_ok = opus_55_available and (anthropic_worker_ok or has_high_risk_domain)
-        opus_55 = _Rung(
-            MODEL_CLAUDE_OPUS_55, opus_55_worker_ok,
-            "Claude Opus 5.5 (anthropic/claude-opus-5-5:high): reserved for high-risk reviews "
-            "(money/billing/ledger/migration first-pass reviews, cross-cutting architectural changes; "
-            'operator ruling 2026-09-26 ~13:25Z, updated 2026-09-27 ~15:00Z).',
+        codex_fast_promo = codex_promoted(MODEL_CODEX_FAST, "GPT-6 Sol medium", PACE_GROUP_EXEC)
+        sonnet_available = (
+            anthropic_meta["is_available"]
+            and self.provider_exhaustion_reason(MODEL_CLAUDE_SONNET_55) is None
+        )
+        sonnet_on_pace = _Rung(
+            MODEL_CLAUDE_SONNET_55, sonnet_available and anthropic_worker_ok,
+            f"Sonnet 5.5 medium for judgment-heavy non-UI work ({anthropic_headroom:.2f}x pace headroom).",
+            pace_group=PACE_GROUP_STRONG,
+        )
+        sonnet_surplus = _Rung(
+            MODEL_CLAUDE_SONNET_55, sonnet_available and anthropic_near_reset_surplus,
+            "Anthropic weekly allowance is behind pace near reset; spending it on Sonnet 5.5 medium.",
+            promotion=True, pace_group=PACE_GROUP_STRONG,
         )
         glm = _Rung(MODEL_ZAI_GLM, zai_ok, "Z.AI GLM-5.3 (credentialed Coding Plan).")
         deepseek_pro = _Rung(MODEL_DEEPSEEK_PRO, deepseek_ok, "DeepSeek V4 Pro (pay-per-token, 1M context).")
-        # Worker ladders reach paid Anthropic only when every cheap tier above is out, only
-        # on slack behind pace, and never as a fallback.
-        fable_last_resort = _Rung(
-            MODEL_CLAUDE_FABLE, anthropic_worker_ok,
-            f"every cheap tier is unavailable; last resort on Anthropic slack ({anthropic_headroom:.2f}x behind pace, "
-            "orchestrator reserve untouched).",
-            cooldown=True, as_fallback=False,
-        )
 
         # OpenCode Go rungs, allowance-gated and pace-ordered.  glm-5.3-flash is the Go
         # workhorse ($60 cap, ~144 lanes/month); glm-5.3 is the rare precision reviewer ($15
@@ -1717,138 +1729,103 @@ class ResetAwareModelSelector:
         )
 
         if context_tokens > 180000 or task_type == TaskType.DEEP_CONTEXT:
-            # CASE A: DEEP CONTEXT (> 180k tokens, or a DEEP_CONTEXT task). Every 1M-context
-            # tier in cost order: free first, then the Ultra daily window, then the cheap Go
-            # models, then pay-per-token DeepSeek V4 Pro, then MiniMax-M3 for bulk and
-            # low-risk reads only. Codex and Opus follow those; Fable is reached only when all
-            # of them are out. Implementation, review, reasoning and any rework or high-risk
-            # deep-context read skip MiniMax and climb on.
+            # CASE A: DEEP CONTEXT. Verified 1M-context tiers lead. Sol's 272k
+            # window is eligible only when the request fits it; Sonnet handles
+            # judgment-heavy non-UI context when Anthropic is behind pace.
+            sol_context_promo = (
+                sol_review_promo
+                if task_type in (TaskType.STRONG_REVIEW, TaskType.DEEP_REASONING)
+                else sol_worker_promo
+            )
+            sol_context_on_pace = (
+                sol_review_on_pace
+                if task_type in (TaskType.STRONG_REVIEW, TaskType.DEEP_REASONING)
+                else sol_worker_on_pace
+            )
             label = f"Deep context ({context_tokens} tokens)"
             rungs = [
                 go_bunny,
                 _Rung(MODEL_GEMINI_PRO, google_ok and task_type != TaskType.STRONG_REVIEW,
-                      "Gemini 3.1 Pro (1M-token window; never a reviewer, since Gemini must not "
-                      "review a Gemini-authored diff)."),
+                      "Gemini 3.1 Pro (1M-token window; never a reviewer)."),
                 go_glm53_flash,
                 go_gpt6_luna,
-                _Rung(MODEL_DEEPSEEK_PRO, deepseek_ok, "DeepSeek V4 Pro (pay-per-token, 1M context).", cooldown=True),
+                deepseek_pro,
                 _Rung(MODEL_MINIMAX_M3,
                       minimax_ok and (task_type == TaskType.TINY_TASK
                                       or (task_type == TaskType.DEEP_CONTEXT and not is_rework_critical)),
-                      "MiniMax-M3 (1M-token window, credentialed; low-risk deep-context/bulk overflow).", cooldown=True),
+                      "MiniMax-M3 (1M-token window; low-risk deep-context/bulk overflow).", cooldown=True),
                 glm,
-                codex_promo,
+                astra_promo,
                 astra_on_pace,
-                _Rung(MODEL_CODEX_FAST, codex_usable, "1M-context tiers unavailable; Codex Fast (400k window, on pace).",
-                      cooldown=True),
+                sol_context_promo,
+                sol_context_on_pace,
+                sonnet_surplus,
+                sonnet_on_pace,
                 astra_emergency,
-                _Rung(MODEL_CODEX_FAST, codex_ok,
-                      "only Codex ahead of pace holds this context; spending its emergency reserve.", cooldown=True),
-                _Rung(MODEL_CLAUDE_FABLE, anthropic_worker_ok,
-                      f"every cheap tier whose window holds {context_tokens} tokens is unavailable; last resort on "
-                      f"Anthropic slack ({anthropic_headroom:.2f}x behind pace, orchestrator reserve untouched).",
-                      cooldown=True, as_fallback=False),
             ]
             last_resort = _Rung(MODEL_DEEPSEEK_PRO, True, "every deep-context tier unavailable; pay-per-token DeepSeek V4 Pro.", cooldown=True)
-            # High-risk, rework and money work never falls back to a Flash tier (as in B2), and
-            # the escape slot has to hold the contexts this ladder reaches, so the 131k Z.AI
-            # windows and the 250k Antigravity window cannot take it. Go GLM-5.3 (1M, the rare
-            # precision lane) replaces Codex Fast's dead 400k slot.
             final_fallbacks = [MODEL_DEEPSEEK_PRO, MODEL_GO_GLM53]
 
         elif task_type == TaskType.STRONG_REVIEW and is_rework_critical:
-            # CASE B1: REVIEW ROUTING.
-            # Operator ruling (2026-09-27 ~15:00Z): Antigravity Opus no longer exists.
-            # Never route to it, not even as a fallback.
-            # - routine and delta reviews → ds-task
-            # - high-risk reviews (money/auth/migration/concurrency) → reviewer (Opus 5.5)
-            # - never Flash for high-risk
-            if is_high_risk_review:
-                # High-risk review (money/auth/migration/concurrency/state_machine/schema/invariants/architecture)
-                label = "High-risk review (reviewer)"
+            # Routine/delta reviews stay on cheap review tiers unless a Codex
+            # window is about to expire. First-pass high-risk reviews use Sol
+            # high, Sonnet medium when Anthropic is behind pace, and Astra xhigh
+            # only for the hardest cross-cutting cases. Opus never enters this ladder.
+            if is_routine_review or is_delta_review:
+                label = "Routine / delta review"
                 rungs = [
-                    codex_promo,
-                    opus_55,
-                    go_glm53,
-                    _Rung(MODEL_CLAUDE_FABLE, anthropic_worker_ok,
-                          f"Claude Fable: the Anthropic weekly window runs {anthropic_headroom:.2f}x behind pace, "
-                          "so slack beyond the orchestrator's share is spent on review."),
-                    astra_on_pace,
-                    _Rung(MODEL_CLAUDE_FABLE, anthropic_meta["is_available"],
-                          "no review allowance left elsewhere; drawing on the Anthropic orchestrator reserve.",
-                          cooldown=True, as_fallback=False),
-                    _Rung(MODEL_DEEPSEEK_PRO, deepseek_ok, "all strong reviewers unavailable; emergency DeepSeek V4 Pro.", cooldown=True),
-                    astra_emergency,
-                ]
-                last_resort = _Rung(MODEL_DEEPSEEK_PRO, True, "all strong models unavailable or in cooldown; pay-per-token DeepSeek V4 Pro.", cooldown=True)
-                final_fallbacks = [MODEL_CLAUDE_OPUS_55, MODEL_DEEPSEEK_PRO]
-            elif is_routine_review or is_delta_review:
-                label = "Routine / delta review (ds-task)"
-                rungs = [
+                    sol_review_promo,
                     _Rung(MODEL_DEEPSEEK_FLASH, deepseek_ok,
-                          "routine/delta review on DeepSeek Flash (ds-task).",
-                          pace_group=PACE_GROUP_STRONG),
-                    _Rung(MODEL_GO_GLM53, go_ok(MODEL_GO_GLM53),
-                          "OpenCode Go GLM-5.3 cross-provider fallback for routine/delta review.",
-                          cooldown=True),
+                          "routine/delta review on DeepSeek Flash.", pace_group=PACE_GROUP_STRONG),
+                    go_glm53,
                 ]
                 last_resort = _Rung(MODEL_GO_GLM53, True, "all review tiers unavailable; OpenCode Go GLM-5.3.", cooldown=True)
                 final_fallbacks = [MODEL_GO_GLM53, MODEL_DEEPSEEK_PRO]
             else:
-                label = "Strong review"
+                label = "High-risk review"
                 rungs = [
-                    codex_promo,
-                    _Rung(MODEL_CLAUDE_OPUS_55, opus_55_available and anthropic_near_reset_surplus,
-                          "Claude Opus 5.5: Anthropic surplus near reset; spent on high-risk review."),
-                    go_glm53,
-                    _Rung(MODEL_CLAUDE_FABLE, anthropic_worker_ok,
-                          f"Claude Fable: the Anthropic weekly window runs {anthropic_headroom:.2f}x behind pace, "
-                          "so slack beyond the orchestrator's share is spent on review."),
+                    astra_promo,
                     astra_on_pace,
-                    _Rung(MODEL_CLAUDE_FABLE, anthropic_meta["is_available"],
-                          "no review allowance left elsewhere; drawing on the Anthropic orchestrator reserve.",
-                          cooldown=True, as_fallback=False),
-                    _Rung(MODEL_DEEPSEEK_PRO, deepseek_ok, "all strong reviewers unavailable; emergency DeepSeek V4 Pro.", cooldown=True),
+                    sol_review_promo,
+                    sol_review_on_pace,
+                    sonnet_surplus,
+                    sonnet_on_pace,
+                    go_glm53,
+                    deepseek_pro,
                     astra_emergency,
                 ]
-                last_resort = _Rung(MODEL_DEEPSEEK_PRO, True, "all strong models unavailable or in cooldown; pay-per-token DeepSeek V4 Pro.", cooldown=True)
-                final_fallbacks = [MODEL_CLAUDE_OPUS_55, MODEL_DEEPSEEK_PRO]
+                last_resort = _Rung(MODEL_DEEPSEEK_PRO, True, "all strong review tiers unavailable; pay-per-token DeepSeek V4 Pro.", cooldown=True)
+                final_fallbacks = [MODEL_GO_GLM53, MODEL_DEEPSEEK_PRO]
         elif is_rework_critical and task_type in (TaskType.ROUTINE_EXECUTION, TaskType.DEEP_REASONING):
-            # CASE B2: HIGH-RISK WORKER (implementation first pass, deep reasoning): the Go
-            # workhorse first, then ChatGPT web while its bridge is up — a hard
-            # implementation/reasoning tier ahead of the scarce and paid lanes — then Z.AI
-            # GLM-5.3, the rare Go precision reviewer, and pay-per-token DeepSeek V4 Pro.
-            # Codex follows them and its expiring surplus is promoted once the cheaper tiers
-            # are out; Fable stays the last resort. Writers here are GLM-5.3 or DeepSeek V4
-            # Pro, never Opus, and Gemini Flash is not a high-risk writer either.
+            # CASE B2: HIGH-RISK WORKER. Sol medium and Sonnet medium handle
+            # ordinary hard non-UI work. Astra xhigh appears only when the tags
+            # establish a hardest cross-cutting case.
             label = ("High-risk implementation first pass" if task_type == TaskType.ROUTINE_EXECUTION
                      else "High-risk deep reasoning")
             rungs = [
+                astra_promo,
+                astra_on_pace,
                 go_glm53_flash,
                 glm,
                 go_glm53,
+                sol_worker_promo,
+                sol_worker_on_pace,
+                sonnet_surplus,
+                sonnet_on_pace,
                 deepseek_pro,
-                codex_promo,
-                astra_on_pace,
                 astra_emergency,
-                fable_last_resort,
             ]
             last_resort = _Rung(MODEL_DEEPSEEK_PRO, True, "all worker tiers unavailable; pay-per-token DeepSeek V4 Pro.", cooldown=True)
-            # cross-provider to every rung above it: the Go precision lane,
-            # then pay-per-token DeepSeek V4 Pro.
             final_fallbacks = [MODEL_GO_GLM53, MODEL_DEEPSEEK_PRO]
 
         elif task_type == TaskType.STRONG_REVIEW and risk_level == RiskLevel.MEDIUM:
-            # CASE C: MEDIUM-RISK REVIEW — standard diffs are reviewed by the cross-family
-            # Chinese models (the go-review chain: GLM-5.3, else Qwen3.8 Max, else
-            # GLM-5.3-Flash), with ChatGPT web as the overflow while Go is limited. Never
-            # paid Anthropic, and never Gemini, which would review a
-            # Gemini-authored diff. Codex, Z.AI and DeepSeek follow.
             label = "Medium-risk review"
             rungs = [
+                sol_review_promo,
                 go_glm53,
-                codex_promo,
-                astra_on_pace,
+                sol_review_on_pace,
+                sonnet_surplus,
+                sonnet_on_pace,
                 glm,
                 deepseek_pro,
                 _Rung(MODEL_DEEPSEEK_FLASH, deepseek_ok, "overflow to DeepSeek V4.1 Flash.", cooldown=True),
@@ -1869,29 +1846,24 @@ class ResetAwareModelSelector:
             final_fallbacks = [MODEL_DEEPSEEK_FLASH]
 
         elif task_type == TaskType.DEEP_REASONING:
-            # CASE E: DEEP REASONING (LOW and MEDIUM risk; HIGH risk routes via CASE B2 high-risk worker ladder).
-            # Leads with ChatGPT web while its bridge is up (hard reasoning ahead of the scarce
-            # Go precision model), then opencode-go GLM-5.3, then DeepSeek V4 Pro, or promoted
-            # Codex when its window is expiring.
             label = "Deep reasoning"
             band_group = PACE_GROUP_EXEC if risk_level == RiskLevel.LOW else PACE_GROUP_STRONG
             flash_rung = _Rung(
                 MODEL_GEMINI_FLASH, google_ok,
-                "abundant Gemini 3.8 Flash; direct Anthropic reserved for the orchestrator.",
+                "abundant Gemini 3.8 Flash for bounded reasoning.",
                 pace_group=band_group,
             )
-            codex_rung = codex_promoted(MODEL_CODEX_ASTRA, "Codex Astra", band_group)
-            if codex_rung.promotion:
-                band = [codex_rung, deepseek_pro, flash_rung]
-            else:
-                band = [deepseek_pro, flash_rung]
+            promoted_sol = codex_promoted(MODEL_CODEX_SOL, "GPT-6.1 Sol high", band_group)
+            band = [promoted_sol, deepseek_pro, flash_rung] if promoted_sol.promotion else [deepseek_pro, flash_rung]
             rungs = [
                 go_glm53,
                 *band,
+                sol_review_on_pace,
+                sonnet_surplus,
+                sonnet_on_pace,
                 go_glm53_flash,
                 glm,
-                astra_on_pace,
-                _Rung(MODEL_DEEPSEEK_FLASH, deepseek_ok, "Gemini and Codex unavailable; DeepSeek V4.1 Flash overflow.", cooldown=True),
+                _Rung(MODEL_DEEPSEEK_FLASH, deepseek_ok, "reasoning-tier overflow on DeepSeek Flash.", cooldown=True),
             ]
             last_resort = _Rung(MODEL_OR_DEEPSEEK_FLASH, True, "all reasoning tiers unavailable; OpenRouter DeepSeek Flash.", cooldown=True)
             final_fallbacks = [MODEL_DEEPSEEK_FLASH]
@@ -1926,7 +1898,8 @@ class ResetAwareModelSelector:
                 codex_fast_promo,
                 _Rung(MODEL_ZAI_GLM, zai_ok, "overflow to Z.AI GLM-5.3 (credentialed).", cooldown=True),
                 _Rung(MODEL_CODEX_FAST, codex_usable,
-                      "Google Antigravity in cooldown; Codex Fast (subscription headroom).", cooldown=True, as_fallback=False),
+                      "Google Antigravity in cooldown; GPT-6 Sol medium has subscription headroom.",
+                      cooldown=True, as_fallback=False),
                 _Rung(MODEL_DEEPSEEK_FLASH, deepseek_ok, "overflow to DeepSeek V4.1 Flash.", cooldown=True),
             ]
             last_resort = _Rung(MODEL_OR_DEEPSEEK_FLASH, True, "all execution tiers unavailable; OpenRouter DeepSeek Flash.", cooldown=True)
@@ -2284,18 +2257,19 @@ def compute_window_burn_paces(
 
 
 def get_recommended_lanes(selector: ResetAwareModelSelector) -> Dict[str, str]:
-    """Map each standard role to its recommended model and account annotation."""
-    anthropic_pace = selector.pace_by_provider().get("anthropic")
-    if codex_available():
-        reviewer_str = MODEL_CODEX_SOL
-    else:
-        reviewer_str = "anthropic/claude-opus-5-5:high"
+    """Map each standard role to its task-class-specific model."""
+    reviewer_str = MODEL_CODEX_SOL if codex_available() else MODEL_CLAUDE_SONNET_55
+    if not codex_available():
+        anthropic_pace = selector.pace_by_provider().get("anthropic")
         if anthropic_pace and anthropic_pace.throttled:
             reviewer_str = f"{MODEL_DEEPSEEK_PRO} (fallback from throttled Anthropic)"
 
     return {
         "reviewer": reviewer_str,
         "task": MODEL_GEMINI_FLASH,
+        "sonnet": MODEL_CLAUDE_SONNET_55,
+        "opus": MODEL_CLAUDE_OPUS_55,
+        "astra-ux": MODEL_CODEX_ASTRA,
         "ds-pro": MODEL_DEEPSEEK_PRO,
         "ds-task": MODEL_DEEPSEEK_FLASH,
         "go-task": MODEL_GO_BUNNY,
@@ -2303,7 +2277,7 @@ def get_recommended_lanes(selector: ResetAwareModelSelector) -> Dict[str, str]:
         "go-review": MODEL_GO_GLM53,
         "web-task": MODEL_CHATGPT_WEB,
         "web-thinker": MODEL_CHATGPT_WEB,
-        "codex-worker": MODEL_CODEX_SOL,
+        "codex-worker": MODEL_CODEX_WORKER,
         "codex-reviewer": MODEL_CODEX_SOL,
     }
 
