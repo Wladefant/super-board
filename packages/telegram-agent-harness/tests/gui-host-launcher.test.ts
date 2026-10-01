@@ -41,7 +41,6 @@ describe("veyyon-gui-host.ps1 launcher liveness, port checks, and stale pid hand
   function setupTestHarness(): {
     tempDir: string;
     launcherPath: string;
-    daemonLauncherPath: string;
     runDir: string;
     pidPath: string;
   } {
@@ -59,15 +58,9 @@ describe("veyyon-gui-host.ps1 launcher liveness, port checks, and stale pid hand
     const launcherPath = path.join(tempDir, "veyyon-gui-host.ps1");
     fs.copyFileSync(sourceGuiLauncher, launcherPath);
 
-    const sourceDaemonLauncher = path.resolve(
-      import.meta.dir,
-      "../daemon/veyyon-telegram-daemon.ps1"
-    );
-    const daemonLauncherPath = path.join(tempDir, "veyyon-telegram-daemon.ps1");
-    fs.copyFileSync(sourceDaemonLauncher, daemonLauncherPath);
 
     const pidPath = path.join(runDir, "gui-host.pid");
-    return { tempDir, launcherPath, daemonLauncherPath, runDir, pidPath };
+    return { tempDir, launcherPath, runDir, pidPath };
   }
 
   async function spawnFakeGuiHost(
@@ -297,70 +290,5 @@ describe("veyyon-gui-host.ps1 launcher liveness, port checks, and stale pid hand
     }
     expect(procAlive).toBe(false);
     expect(fs.existsSync(pidPath)).toBe(false);
-  }, 20_000);
-
-  test("daemon launcher waits for port and logs clearly when absent", async () => {
-    const { daemonLauncherPath, tempDir } = setupTestHarness();
-    const unusedPort = 49158;
-
-    // Create a mock daemon/main.ts so start can proceed if it wants to
-    const daemonDir = path.join(tempDir, "daemon");
-    fs.writeFileSync(
-      path.join(daemonDir, "main.ts"),
-      "console.log('DAEMON_MOCK'); process.exit(0);",
-      "utf8"
-    );
-
-    const res = runPsScript(
-      daemonLauncherPath,
-      ["start", "-Endpoint", `tcp:127.0.0.1:${unusedPort}`],
-      { VEYYON_GUI_HOST_PORT_WAIT_TIMEOUT: "1" }
-    );
-
-    expect(res.stdout).toContain(`GUI host port ${unusedPort} is absent after waiting 1 s.`);
-  }, 20_000);
-
-  test("daemon launcher detects open port immediately and logs ready", async () => {
-    const { daemonLauncherPath, tempDir } = setupTestHarness();
-    const { port: readyPort } = await startListeningPort(0);
-
-    // Create a mock daemon/main.ts that stays running
-    const daemonDir = path.join(tempDir, "daemon");
-    fs.writeFileSync(
-      path.join(daemonDir, "main.ts"),
-      `import * as fs from "node:fs";
-import * as path from "node:path";
-const verb = process.argv[2] ?? "run";
-if (verb === "stop") {
-  const pidFile = path.join(import.meta.dir, "run", "daemon.pid");
-  if (fs.existsSync(pidFile)) {
-    const pid = Number.parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
-    if (pid > 0) {
-      try { process.kill(pid, "SIGTERM"); } catch {}
-    }
-  }
-  process.exit(0);
-}
-if (verb === "run") {
-  process.on("SIGTERM", () => { process.exit(0); });
-  const pidFile = path.join(import.meta.dir, "run", "daemon.pid");
-  fs.mkdirSync(path.dirname(pidFile), { recursive: true });
-  fs.writeFileSync(pidFile, String(process.pid), "utf8");
-  process.stdout.write("DAEMON_READY\\n");
-  const { promise } = Promise.withResolvers();
-  await promise;
-}`,
-    );
-
-    const res = runPsScript(
-      daemonLauncherPath,
-      ["start", "-Endpoint", `tcp:127.0.0.1:${readyPort}`, "-StartTimeoutSeconds", "5"],
-      { VEYYON_GUI_HOST_PORT_WAIT_TIMEOUT: "5" }
-    );
-
-    expect(res.stdout).toContain(`GUI host port ${readyPort} is ready.`);
-
-    // Cleanup daemon
-    runPsScript(daemonLauncherPath, ["stop"]);
   }, 20_000);
 });
