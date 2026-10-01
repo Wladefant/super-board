@@ -68,24 +68,32 @@ async function run(): Promise<number> {
   let nextRetryAt = Date.now() + CLAIM_RETRY_MS;
   const { promise, resolve } = Promise.withResolvers<void>();
   const timer = setInterval(() => {
-    const polling = daemon.status().slots.some(slot => slot.polling);
-    if (polling) handedOver = true;
-    if (stopped || (handedOver && !polling && !daemon.hasPendingSlots())) {
-      clearInterval(timer);
-      resolve();
+    // This tick reads bot_pool.db through hasPendingSlots. A SQLite "database is
+    // locked" there used to escape the timer as an uncaught exception and kill the
+    // daemon (and with it every poller). A busy tick is skipped; the next one retries.
+    try {
+      const polling = daemon.status().slots.some(slot => slot.polling);
+      if (polling) handedOver = true;
+      if (stopped || (handedOver && !polling && !daemon.hasPendingSlots())) {
+        clearInterval(timer);
+        resolve();
+        return;
+      }
+      if (!daemon.hasPendingSlots() || retrying || Date.now() < nextRetryAt) return;
+    } catch (error) {
+      daemon.log(`Supervisor tick failed, retrying: ${error instanceof Error ? error.message : String(error)}`);
       return;
     }
-      if (!daemon.hasPendingSlots() || retrying || Date.now() < nextRetryAt) return;
-      retrying = true;
-      void daemon
-        .claimPending()
-        .catch(error => {
-          daemon.log(`Claim retry failed: ${error instanceof Error ? error.message : String(error)}`);
-        })
-        .finally(() => {
-          nextRetryAt = Date.now() + CLAIM_RETRY_MS;
-          retrying = false;
-        });
+    retrying = true;
+    void daemon
+      .claimPending()
+      .catch(error => {
+        daemon.log(`Claim retry failed: ${error instanceof Error ? error.message : String(error)}`);
+      })
+      .finally(() => {
+        nextRetryAt = Date.now() + CLAIM_RETRY_MS;
+        retrying = false;
+      });
   }, 1_000);
   await promise;
   await (stopped ?? daemon.stop());

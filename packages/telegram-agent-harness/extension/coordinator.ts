@@ -556,6 +556,40 @@ export class BotPoolCoordinator {
     }
 
     const now = Date.now() / 1000;
+    const slotsList = Array.from(slotsMap.values());
+
+    // The daemon resolves its slots on a timer and every session resolves them on
+    // attach, so this runs far more often than the manifest changes. An unconditional
+    // upsert made every call one commit per slot: dozens of writers queuing on
+    // bot_pool.db's single write lock for rows that had not changed. Read first (reads
+    // never block in WAL) and write only the rows that differ.
+    const stored = new Map(
+      (
+        this.db
+          .query("SELECT slot_id, state_dir, bot_id, fingerprint, preferred_projects, enabled FROM bot_slots")
+          .all() as Array<{
+          slot_id: string;
+          state_dir: string;
+          bot_id: string;
+          fingerprint: string;
+          preferred_projects: string;
+          enabled: number;
+        }>
+      ).map(row => [row.slot_id, row]),
+    );
+    const changed = slotsList.filter(slot => {
+      const row = stored.get(slot.slotId);
+      return (
+        !row ||
+        row.state_dir !== slot.stateDir ||
+        row.bot_id !== slot.botId ||
+        row.fingerprint !== slot.fingerprint ||
+        row.preferred_projects !== JSON.stringify(slot.preferredProjects) ||
+        row.enabled !== 1
+      );
+    });
+    if (changed.length === 0) return slotsList;
+
     const upsertStmt = this.db.prepare(`
       INSERT INTO bot_slots (slot_id, state_dir, bot_id, fingerprint, preferred_projects, enabled, created_at, updated_at)
       VALUES ($slotId, $stateDir, $botId, $fingerprint, $preferredProjects, 1, $now, $now)
@@ -574,8 +608,7 @@ export class BotPoolCoordinator {
     // its -wal/-shm, and the file stays locked. That is how earlier verifier runs left
     // their temp fixtures behind on Windows.
     try {
-      const slotsList = Array.from(slotsMap.values());
-      for (const slot of slotsList) {
+      for (const slot of changed) {
         upsertStmt.run({
           $slotId: slot.slotId,
           $stateDir: slot.stateDir,
