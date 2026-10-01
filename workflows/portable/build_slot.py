@@ -9,8 +9,8 @@ Replaces orchestrator IRC messages ('BUILD SLOT TAKEN/FREE') with a local,
 Windows-safe (no fcntl), crash-resilient lock file.
 
 Commands:
-    acquire <name> [--timeout SEC] [--heartbeat-stale-after SEC] [--poll-interval SEC] [--force]
-    run <name> [--timeout SEC] [--priority] [--force] [--cwd DIR] [--heartbeat-stale-after SEC] -- <cmd...>
+    acquire <name> [--timeout SEC] [--heartbeat-stale-after SEC] [--poll-interval SEC] [--force] [--next-dir DIR]
+    run <name> [--timeout SEC] [--priority] [--force] [--cwd DIR] [--next-dir DIR] [--heartbeat-stale-after SEC] -- <cmd...>
     release <name>
     status [--json]
 
@@ -51,6 +51,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -609,21 +610,47 @@ def _create_dir_link(target: str, link_path: str) -> None:
         os.symlink(target, link_path, target_is_directory=True)
 
 
+def _is_link_or_junction(path: str) -> bool:
+    """
+    Returns True if path exists and is a symlink or directory junction (Windows reparse point).
+    """
+    try:
+        if os.path.islink(path):
+            return True
+        st = os.stat(path, follow_symlinks=False)
+        reparse_attr = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        file_attrs = getattr(st, "st_file_attributes", 0)
+        if file_attrs & reparse_attr:
+            return True
+    except (OSError, ValueError):
+        pass
+    return False
+
+
 def _remove_dir_link(link_path: str) -> bool:
     """
     Safely removes a directory junction or symlink without deleting target contents.
-    On Windows, uses os.rmdir() or cmd /c rmdir without /s.
+    On Windows, uses os.rmdir(), os.unlink(), or cmd /c rmdir without /s.
+    Never uses shutil.rmtree or deletes target contents.
     """
-    if not os.path.exists(link_path) and not os.path.islink(link_path):
+    if not _is_link_or_junction(link_path) and not os.path.exists(link_path) and not os.path.islink(link_path):
         return False
     if sys.platform == "win32":
         try:
+            if os.path.islink(link_path):
+                os.unlink(link_path)
+                return True
             os.rmdir(link_path)
             return True
         except Exception:
             try:
+                os.unlink(link_path)
+                return True
+            except Exception:
+                pass
+            try:
                 cmd = ["cmd.exe", "/c", "rmdir", os.path.abspath(link_path)]
-                res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                subprocess.run(cmd, capture_output=True, text=True, check=True)
                 return True
             except Exception as e:
                 logger.warning("Failed to remove junction '%s': %s", link_path, e)
@@ -640,6 +667,62 @@ def _remove_dir_link(link_path: str) -> bool:
             logger.warning("Failed to remove link '%s': %s", link_path, e)
             return False
 
+
+def clean_stale_next_junction(
+    next_dir: Optional[str] = None,
+    cwd: Optional[str] = None,
+) -> List[str]:
+    """
+    Safely removes stale junction or symlink at frontend/.next/standalone/node_modules
+    before building, preventing Next.js cleanDistDir from hanging forever on Windows.
+
+    Root cause: Next's cleanDistDir follows the junction into the protected deps store,
+    gets EPERM, and its unlinkPath retry never increments, so it loops forever.
+
+    Auto-detects:
+      - <cwd>/frontend/.next/standalone/node_modules
+      - <cwd>/.next/standalone/node_modules
+    Plus optional next_dir:
+      - <next_dir>/.next/standalone/node_modules
+      - <next_dir>/frontend/.next/standalone/node_modules
+      - <next_dir>/standalone/node_modules
+      - <next_dir> (if named node_modules)
+
+    Only removes if the path is a junction or symlink. Never recursively deletes contents
+    or calls shutil.rmtree. Logs and returns all removed paths.
+    """
+    base_cwd = os.path.abspath(cwd or os.getcwd())
+    raw_candidates: List[str] = []
+
+    if next_dir:
+        nd = os.path.abspath(os.path.join(base_cwd, next_dir)) if not os.path.isabs(next_dir) else os.path.abspath(next_dir)
+        raw_candidates.append(os.path.join(nd, ".next", "standalone", "node_modules"))
+        raw_candidates.append(os.path.join(nd, "frontend", ".next", "standalone", "node_modules"))
+        raw_candidates.append(os.path.join(nd, "standalone", "node_modules"))
+        if os.path.basename(nd).lower() == "node_modules":
+            raw_candidates.append(nd)
+
+    raw_candidates.append(os.path.join(base_cwd, "frontend", ".next", "standalone", "node_modules"))
+    raw_candidates.append(os.path.join(base_cwd, ".next", "standalone", "node_modules"))
+
+    seen = set()
+    cleaned: List[str] = []
+    for cand in raw_candidates:
+        norm = os.path.abspath(cand)
+        if norm in seen:
+            continue
+        seen.add(norm)
+
+        if _is_link_or_junction(norm):
+            if _remove_dir_link(norm):
+                msg = f"[CLEANUP] Removed stale next standalone node_modules junction: {norm}"
+                print(msg, file=sys.stderr)
+                logger.info("Removed stale next standalone node_modules junction: %s", norm)
+                cleaned.append(norm)
+            else:
+                logger.warning("Failed to remove stale next standalone node_modules junction: %s", norm)
+
+    return cleaned
 
 def _queue_order_key(item: Dict[str, Any]) -> Tuple[int, float]:
     """FIFO queue order: priority entries first, each group by original enqueue time."""
@@ -1347,6 +1430,8 @@ class BuildSlotManager:
         heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL_SECONDS,
         queue_stale_heartbeat_after: Optional[float] = None,
         priority: bool = False,
+        next_dir: Optional[str] = None,
+        cwd: Optional[str] = None,
     ) -> bool:
         """
         Acquires the build slot lock for 'name'.
@@ -1511,6 +1596,7 @@ class BuildSlotManager:
                                 self.dequeue(name, pid, token=token)
                                 msg = f"Build slot lock already held by '{name}' (PID {pid})"
                                 print(msg)
+                                clean_stale_next_junction(next_dir=next_dir, cwd=cwd)
                                 return True
                         break
 
@@ -1564,6 +1650,7 @@ class BuildSlotManager:
                                     msg = f"Acquired build slot lock for '{name}' (PID {pid})"
                                     print(msg)
                                     logger.info(msg)
+                                    clean_stale_next_junction(next_dir=next_dir, cwd=cwd)
                                     return True
                                 except (FileExistsError, PermissionError):
                                     # Lost race to another lane on this slot, try next free slot if available
@@ -1845,6 +1932,7 @@ class BuildSlotManager:
         cwd: Optional[str] = None,
         heartbeat_stale_after: float = DEFAULT_LOCK_HEARTBEAT_STALE_SECONDS,
         poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
+        next_dir: Optional[str] = None,
     ) -> int:
         """
         Executes a command under the exclusive build slot lock.
@@ -1869,6 +1957,8 @@ class BuildSlotManager:
                 pid=runner_pid,
                 token=run_token,
                 priority=priority,
+                next_dir=next_dir,
+                cwd=cwd,
             )
         except Exception as e:
             print(f"[RUN] Failed to acquire build slot lock for '{name}': {e}", file=sys.stderr)
@@ -1881,6 +1971,9 @@ class BuildSlotManager:
 
         cmd_display = " ".join(cmd)
         print(f"[RUN] Acquired build slot lock for '{name}'. Executing command: {cmd_display}", file=sys.stderr)
+
+        # Before running the command, clean any stale Next.js standalone node_modules junction
+        clean_stale_next_junction(next_dir=next_dir, cwd=cwd)
 
         stop_heartbeat = threading.Event()
         proc = None
@@ -2026,6 +2119,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true",
         help="Queue ahead of non-priority waiters, after earlier priority waiters (FIFO among priority)",
     )
+    p_acq.add_argument(
+        "--next-dir",
+        default=None,
+        help="Optional path to frontend directory for cleaning stale next standalone junctions",
+    )
 
     # bump <name> [--token TOKEN]
     p_bump = subparsers.add_parser(
@@ -2093,7 +2191,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             opt_name = tok.split("=")[0]
             if opt_name in {"--priority", "--force"}:
                 i += 1
-            elif opt_name in {"--timeout", "--cwd", "--heartbeat-stale-after"}:
+            elif opt_name in {"--timeout", "--cwd", "--next-dir", "--heartbeat-stale-after"}:
                 if "=" in tok:
                     i += 1
                 else:
@@ -2148,6 +2246,11 @@ def _add_run_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--force", action="store_true", help="Bypass RAM guard during acquisition")
     parser.add_argument("--cwd", default=None, help="Working directory to execute command in (default: current directory)")
     parser.add_argument(
+        "--next-dir",
+        default=None,
+        help="Optional path to frontend directory for cleaning stale next standalone junctions",
+    )
+    parser.add_argument(
         "--heartbeat-stale-after",
         type=float,
         default=DEFAULT_LOCK_HEARTBEAT_STALE_SECONDS,
@@ -2175,6 +2278,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             pid=caller_pid,
             token=args.token,
             priority=args.priority,
+            next_dir=getattr(args, "next_dir", None),
         )
         return 0 if success else 1
 
@@ -2235,6 +2339,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             force=args.force,
             cwd=args.cwd,
             heartbeat_stale_after=args.heartbeat_stale_after,
+            next_dir=getattr(args, "next_dir", None),
         )
 
     elif args.command == "release":

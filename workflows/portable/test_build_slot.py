@@ -2128,5 +2128,157 @@ class TestBuildSlot(unittest.TestCase):
         self.assertNotIn("ERROR:build_slot:", err.getvalue())
         mgr.release("holder-lane")
 
+    def test_clean_stale_next_junction_removes_link_preserves_target_sentinel(self):
+        """
+        Removes stale Next.js standalone node_modules junction without deleting target contents.
+        Root cause: Next's cleanDistDir follows the junction into the protected deps store,
+        gets EPERM, and its unlinkPath retry never increments, so it loops forever on Windows.
+        """
+        target_dir = os.path.join(self.run_dir, "protected-node-modules")
+        os.makedirs(target_dir, exist_ok=True)
+        sentinel_path = os.path.join(target_dir, "sentinel.txt")
+        with open(sentinel_path, "w", encoding="utf-8") as f:
+            f.write("sentinel-content-must-survive")
+
+        fake_worktree = os.path.join(self.run_dir, "fake-wt")
+        standalone_dir = os.path.join(fake_worktree, "frontend", ".next", "standalone")
+        os.makedirs(standalone_dir, exist_ok=True)
+        link_path = os.path.join(standalone_dir, "node_modules")
+
+        build_slot._create_dir_link(target_dir, link_path)
+        self.assertTrue(os.path.exists(link_path) or build_slot._is_link_or_junction(link_path))
+        self.assertTrue(build_slot._is_link_or_junction(link_path))
+        self.assertTrue(os.path.isfile(os.path.join(link_path, "sentinel.txt")))
+
+        # Call helper with cwd pointing to worktree
+        cleaned = build_slot.clean_stale_next_junction(cwd=fake_worktree)
+        self.assertIn(os.path.abspath(link_path), [os.path.abspath(p) for p in cleaned])
+        self.assertFalse(build_slot._is_link_or_junction(link_path))
+        self.assertFalse(os.path.exists(link_path))
+
+        # The target directory and sentinel file MUST still exist untouched!
+        self.assertTrue(os.path.isdir(target_dir))
+        self.assertTrue(os.path.isfile(sentinel_path))
+        with open(sentinel_path, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "sentinel-content-must-survive")
+
+    def test_clean_stale_next_junction_auto_detect_frontend_cwd_and_next_dir(self):
+        """Auto-detects <cwd>/.next/standalone/node_modules and handles optional --next-dir."""
+        target_dir = os.path.join(self.run_dir, "shared-deps")
+        os.makedirs(target_dir, exist_ok=True)
+        sentinel = os.path.join(target_dir, "keepme.txt")
+        with open(sentinel, "w", encoding="utf-8") as f:
+            f.write("keepme")
+
+        # Case 1: Running from frontend directory directly (<cwd>/.next/standalone/node_modules)
+        fake_frontend = os.path.join(self.run_dir, "fake-frontend")
+        standalone_1 = os.path.join(fake_frontend, ".next", "standalone")
+        os.makedirs(standalone_1, exist_ok=True)
+        link_1 = os.path.join(standalone_1, "node_modules")
+        build_slot._create_dir_link(target_dir, link_1)
+        self.assertTrue(build_slot._is_link_or_junction(link_1))
+
+        cleaned_1 = build_slot.clean_stale_next_junction(cwd=fake_frontend)
+        self.assertIn(os.path.abspath(link_1), [os.path.abspath(p) for p in cleaned_1])
+        self.assertFalse(build_slot._is_link_or_junction(link_1))
+        self.assertTrue(os.path.isfile(sentinel))
+
+        # Case 2: Using explicit next_dir
+        custom_root = os.path.join(self.run_dir, "custom-project")
+        custom_frontend = os.path.join(custom_root, "web")
+        standalone_2 = os.path.join(custom_frontend, ".next", "standalone")
+        os.makedirs(standalone_2, exist_ok=True)
+        link_2 = os.path.join(standalone_2, "node_modules")
+        build_slot._create_dir_link(target_dir, link_2)
+        self.assertTrue(build_slot._is_link_or_junction(link_2))
+
+        cleaned_2 = build_slot.clean_stale_next_junction(next_dir=custom_frontend, cwd=self.run_dir)
+        self.assertIn(os.path.abspath(link_2), [os.path.abspath(p) for p in cleaned_2])
+        self.assertFalse(build_slot._is_link_or_junction(link_2))
+        self.assertTrue(os.path.isfile(sentinel))
+
+        # Case 3: Regular directory (not a junction or symlink) is never removed
+        normal_dir = os.path.join(fake_frontend, ".next", "standalone", "node_modules")
+        os.makedirs(normal_dir, exist_ok=True)
+        normal_file = os.path.join(normal_dir, "real_package.js")
+        with open(normal_file, "w", encoding="utf-8") as f:
+            f.write("console.log(1)")
+        self.assertFalse(build_slot._is_link_or_junction(normal_dir))
+
+        cleaned_3 = build_slot.clean_stale_next_junction(cwd=fake_frontend)
+        self.assertEqual(cleaned_3, [])
+        self.assertTrue(os.path.isdir(normal_dir))
+        self.assertTrue(os.path.isfile(normal_file))
+
+    def test_acquire_cleans_stale_next_junction(self):
+        """build_slot.py acquire removes stale junction so subsequent next build does not hang."""
+        target_dir = os.path.join(self.run_dir, "target-deps-acq")
+        os.makedirs(target_dir, exist_ok=True)
+        sentinel = os.path.join(target_dir, "sentinel.txt")
+        with open(sentinel, "w", encoding="utf-8") as f:
+            f.write("sentinel-acq")
+
+        fake_wt = os.path.join(self.run_dir, "wt-acq")
+        standalone = os.path.join(fake_wt, "frontend", ".next", "standalone")
+        os.makedirs(standalone, exist_ok=True)
+        link_path = os.path.join(standalone, "node_modules")
+        build_slot._create_dir_link(target_dir, link_path)
+        self.assertTrue(build_slot._is_link_or_junction(link_path))
+
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        ok = manager.acquire("lane-acq", cwd=fake_wt, timeout=2.0)
+        self.assertTrue(ok)
+        manager.release("lane-acq")
+
+        # Junction must be removed, target sentinel must survive
+        self.assertFalse(build_slot._is_link_or_junction(link_path))
+        self.assertFalse(os.path.exists(link_path))
+        self.assertTrue(os.path.isfile(sentinel))
+
+    def test_run_command_cleans_stale_next_junction(self):
+        """build_slot.py run removes stale junction before executing the command."""
+        target_dir = os.path.join(self.run_dir, "target-deps-run")
+        os.makedirs(target_dir, exist_ok=True)
+        sentinel = os.path.join(target_dir, "sentinel.txt")
+        with open(sentinel, "w", encoding="utf-8") as f:
+            f.write("sentinel-run")
+
+        fake_wt = os.path.join(self.run_dir, "wt-run")
+        standalone = os.path.join(fake_wt, "frontend", ".next", "standalone")
+        os.makedirs(standalone, exist_ok=True)
+        link_path = os.path.join(standalone, "node_modules")
+        build_slot._create_dir_link(target_dir, link_path)
+        self.assertTrue(build_slot._is_link_or_junction(link_path))
+
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        ret = manager.run_command(
+            "lane-run-cleanup",
+            [sys.executable, "-c", "import sys; sys.exit(0)"],
+            cwd=fake_wt,
+        )
+        self.assertEqual(ret, 0)
+
+        # Junction must be removed, target sentinel must survive
+        self.assertFalse(build_slot._is_link_or_junction(link_path))
+        self.assertFalse(os.path.exists(link_path))
+        self.assertTrue(os.path.isfile(sentinel))
+
+    def test_cli_next_dir_option_parsed(self):
+        """CLI options for --next-dir are parsed in acquire and run."""
+        args_acq = build_slot.parse_args(["acquire", "lane", "--next-dir", "frontend"])
+        self.assertEqual(args_acq.next_dir, "frontend")
+
+        args_run_pre = build_slot.parse_args(
+            ["run", "lane", "--next-dir", "frontend", "--", "next", "build"]
+        )
+        self.assertEqual(args_run_pre.next_dir, "frontend")
+        self.assertEqual(args_run_pre.cmd, ["--", "next", "build"])
+
+        args_run_with_cwd = build_slot.parse_args(
+            ["run", "lane", "--cwd", "D:/wt", "--next-dir", "frontend", "--", "next", "build"]
+        )
+        self.assertEqual(args_run_with_cwd.cwd, "D:/wt")
+        self.assertEqual(args_run_with_cwd.next_dir, "frontend")
+
 if __name__ == "__main__":
     unittest.main()
