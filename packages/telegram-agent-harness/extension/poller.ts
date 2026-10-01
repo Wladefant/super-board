@@ -741,6 +741,11 @@ export class TelegramPoller {
   }
 
   public ingestUpdates(updates: TelegramUpdate[]): void {
+    // A long poll that times out returns no updates, and that is most polls. Opening
+    // BEGIN IMMEDIATE for nothing takes the ledger's write lock every cycle and, when
+    // another connection holds it, reports "inbound updates are not being recorded"
+    // for a batch that had nothing to record.
+    if (updates.length === 0) return;
     const now = Date.now() / 1000;
     try {
       this.db.run("BEGIN IMMEDIATE;");
