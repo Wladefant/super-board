@@ -28,8 +28,9 @@ import telegramSessionExtension, {
   type GlobalTelegramState,
   registerOperatorTools,
   setActiveRuntime,
+  setSavedContext,
 } from "../extension/index";
-import { TelegramRuntime } from "../extension/runtime";
+import { TelegramRuntime, isEligibleRootSession } from "../extension/runtime";
 import { TelegramPoller } from "../extension/poller";
 import { MessageContextStore } from "../src/message-context";
 import { LiveDashboard } from "../src/live-dashboard";
@@ -416,6 +417,33 @@ test("telegram_message reports failure when Telegram does not accept the message
   );
 });
 
+test("telegram_message executes without ReferenceError when called with an eligible root session context", async () => {
+  const host = createHost();
+  registerOperatorTools(host.api);
+  const runtime = new TelegramRuntime(host.api);
+  setActiveRuntime(runtime);
+  const channel = createChannel();
+  (globalThis as unknown as GlobalTelegramState)[ACTIVE_ROOT_SYMBOL] = channel.root(runtime.instanceId);
+
+  const rootCtx = {
+    hasUI: true,
+    isSubagent: false,
+    taskDepth: 0,
+    cwd: "C:/anywhere",
+    sessionManager: { getSessionId: () => "root-session-1" },
+  } as unknown as ExtensionContext;
+
+  const result = (await host.tools.get("telegram_message")!.execute(
+    "call-1",
+    CALLS.telegram_message,
+    undefined,
+    undefined,
+    rootCtx,
+  )) as { content: Array<{ text: string }> };
+
+  expect(result.content[0]!.text).toContain("Delivered message");
+});
+
 test("telegram_dashboard stores the observed snapshot and reconciles each lane's state", async () => {
   const host = createHost();
   registerOperatorTools(host.api);
@@ -453,4 +481,111 @@ test("telegram_dashboard stores the observed snapshot and reconciles each lane's
 
   expect(channel.laneStateOf(active!.result!.message_id)).toBe("active");
   expect(channel.laneStateOf(gone!.result!.message_id)).toBe("exited");
+});
+
+test("a subagent tool context never claims the lifecycle or creates a runtime", async () => {
+  const host = createHost();
+  registerOperatorTools(host.api);
+  setActiveRuntime(null);
+  delete (globalThis as unknown as GlobalTelegramState)[ACTIVE_ROOT_SYMBOL];
+  const channel = createChannel();
+
+  const subagentCtx = {
+    hasUI: true,
+    isSubagent: true,
+    taskDepth: 1,
+    parentTaskPrefix: "sub-1",
+    cwd: "C:/anywhere",
+    sessionManager: { getSessionId: () => "subagent-session" },
+  } as unknown as ExtensionContext;
+
+  for (const [name, params] of Object.entries(CALLS)) {
+    const tool = host.tools.get(name)!;
+    await expect(tool.execute("call-1", params, undefined, undefined, subagentCtx)).rejects.toThrow();
+  }
+  // Nothing reached the foreign channel and no runtime was fabricated for the caller.
+  expect(channel.calls).toEqual([]);
+  expect((globalThis as unknown as GlobalTelegramState)[ACTIVE_ROOT_SYMBOL]).toBeUndefined();
+});
+
+test("a context-less caller never posts into another session's route that shares its working directory", async () => {
+  // Live daemon.db holds two sessions in one workspace; a caller that never claimed a
+  // lifecycle (no saved context) must not fall back to process.cwd() and borrow the
+  // other session's topic and bot token.
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "tg-route-home-"));
+  const stateDir = path.join(home, "slot-state");
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, ".env"), "TELEGRAM_BOT_TOKEN=999:foreign-token\n");
+  fs.mkdirSync(path.join(home, ".veyyon", "telegram"), { recursive: true });
+  fs.writeFileSync(
+    path.join(home, ".veyyon", "telegram", "manifest.json"),
+    JSON.stringify({ slots: [{ slotId: "slot-x", stateDir }] }),
+  );
+  const db = new Database(path.join(home, ".veyyon", "telegram", "daemon.db"));
+  db.run("CREATE TABLE routes (slot_id TEXT, chat_id TEXT, topic_id TEXT, session_id TEXT, workspace TEXT)");
+  db.run("INSERT INTO routes VALUES ('slot-x', '42', '14', 'other-session', ?)", [process.cwd()]);
+  db.close();
+
+  const previousHome = process.env.USERPROFILE;
+  const previousPosixHome = process.env.HOME;
+  process.env.USERPROFILE = home;
+  process.env.HOME = home;
+  const fetched: string[] = [];
+  globalThis.fetch = (async (url: unknown) => {
+    fetched.push(String(url));
+    return new Response(JSON.stringify({ ok: true, result: { message_id: 1 } }));
+  }) as typeof fetch;
+  cleanup.push(() => {
+    if (previousHome === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousHome;
+    if (previousPosixHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousPosixHome;
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+
+  const host = createHost();
+  registerOperatorTools(host.api);
+  setActiveRuntime(null);
+  setSavedContext(null);
+  delete (globalThis as unknown as GlobalTelegramState)[ACTIVE_ROOT_SYMBOL];
+
+  const subagentCtx = {
+    hasUI: true,
+    isSubagent: true,
+    taskDepth: 1,
+    parentTaskPrefix: "sub-1",
+    cwd: process.cwd(),
+    sessionManager: { getSessionId: () => "subagent-session" },
+  } as unknown as ExtensionContext;
+
+  await expect(
+    host.tools.get("telegram_message")!.execute("call-1", CALLS.telegram_message, undefined, undefined, subagentCtx),
+  ).rejects.toThrow(/No active session-bound Telegram channel/);
+  expect(fetched).toEqual([]);
+});
+
+test("isEligibleRootSession admits root sessions even when hasUI is false", () => {
+  const rootPrintSession = {
+    hasUI: false,
+    isSubagent: false,
+    taskDepth: 0,
+    parentTaskPrefix: undefined,
+  } as unknown as ExtensionContext;
+  expect(isEligibleRootSession(rootPrintSession)).toBe(true);
+
+  const subagentSession = {
+    hasUI: false,
+    isSubagent: true,
+    taskDepth: 1,
+    parentTaskPrefix: "sub-1",
+  } as unknown as ExtensionContext;
+  expect(isEligibleRootSession(subagentSession)).toBe(false);
+
+  const nestedSession = {
+    hasUI: true,
+    isSubagent: false,
+    taskDepth: 2,
+    parentTaskPrefix: undefined,
+  } as unknown as ExtensionContext;
+  expect(isEligibleRootSession(nestedSession)).toBe(false);
 });

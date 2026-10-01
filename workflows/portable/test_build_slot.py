@@ -23,6 +23,7 @@ from __future__ import annotations
 import datetime
 import io
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -1262,20 +1263,144 @@ class TestBuildSlot(unittest.TestCase):
         self.assertFalse(stat["lock"]["locked"])
 
     def test_run_options_after_name_are_honored(self):
+        """Documented post-name options with `--` are parsed and honored (discussion_r4136963306)."""
         args = build_slot.parse_args(
+            ["run", "lane", "--timeout", "1.5", "--cwd", "D:/wt", "--", "npx", "next", "build"]
+        )
+        self.assertEqual(args.timeout, 1.5)
+        self.assertEqual(args.cwd, "D:/wt")
+        self.assertFalse(args.priority)
+        self.assertFalse(args.force)
+        self.assertEqual(args.cmd, ["--", "npx", "next", "build"])
+
+        args_force = build_slot.parse_args(["run", "lane", "--force", "--", "echo", "1"])
+        self.assertTrue(args_force.force)
+        self.assertEqual(args_force.cmd, ["--", "echo", "1"])
+
+        args_hb = build_slot.parse_args(["run", "lane", "--heartbeat-stale-after", "42", "--", "echo", "1"])
+        self.assertEqual(args_hb.heartbeat_stale_after, 42.0)
+
+        args_eq = build_slot.parse_args(["run", "lane", "--timeout=10", "--", "echo", "1"])
+        self.assertEqual(args_eq.timeout, 10.0)
+
+        # Options before and after name both honored
+        args_mixed = build_slot.parse_args(
             ["run", "--priority", "lane", "--timeout", "1.5", "--cwd", "D:/wt", "--", "npx", "next", "build"]
+        )
+        self.assertEqual(args_mixed.timeout, 1.5)
+        self.assertEqual(args_mixed.cwd, "D:/wt")
+        self.assertTrue(args_mixed.priority)
+        self.assertFalse(args_mixed.force)
+        self.assertEqual(args_mixed.cmd, ["--", "npx", "next", "build"])
+
+        # Main cleanly runs with documented post-name options
+        ret = build_slot.main(
+            ["--run-dir", self.run_dir, "run", "lane", "--timeout", "10", "--", sys.executable, "-c", "import sys; sys.exit(0)"]
+        )
+        self.assertEqual(ret, 0)
+
+    def test_run_options_after_name_without_separator_rejected_without_mutation(self):
+        """Misplaced CLI options after lane name without `--` fail with exit code 2 and no state mutation."""
+        misordered_cases = [
+            ["run", "lane", "--timeout", "1.5", "--cwd", "D:/wt", "npx", "next", "build"],
+            ["run", "lane", "--priority", "npx", "next", "build"],
+            ["run", "lane", "--force", "echo", "1"],
+            ["run", "lane", "--cwd", "D:/wt", "echo", "1"],
+            ["run", "lane", "--heartbeat-stale-after", "42", "echo", "1"],
+            ["run", "lane", "--timeout=10", "echo", "1"],
+            ["run", "lane", "--run-dir", "/tmp", "echo", "1"],
+        ]
+        for cmd_args in misordered_cases:
+            with self.subTest(cmd_args=cmd_args):
+                err = io.StringIO()
+                with redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                    build_slot.parse_args(cmd_args)
+                self.assertEqual(cm.exception.code, 2)
+                self.assertIn(
+                    "options must precede the lane name: build_slot.py run [--cwd DIR] [--timeout S] [--priority] <name> -- <cmd>",
+                    err.getvalue(),
+                )
+
+        # Confirm main() exits 2 and creates no queue entry or lock directory
+        err = io.StringIO()
+        with redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            build_slot.main(["--run-dir", self.run_dir, "run", "lane", "--priority", "echo", "1"])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("options must precede the lane name", err.getvalue())
+        # Assert no lock dir or queue file was created
+        if os.path.exists(self.run_dir):
+            entries = [e for e in os.listdir(self.run_dir) if e not in {"next-cache"}]
+            self.assertEqual(entries, [])
+
+    def test_misordered_global_options_rejected_without_mutation(self):
+        """Misordered global options like `--run-dir` fail with exit code 2 and no state mutation."""
+        misordered_global = [
+            ["--run-dir", self.run_dir, "run", "--run-dir", "/tmp", "lane", "--", "echo", "1"],
+            ["--run-dir", self.run_dir, "run", "lane", "--run-dir", "/tmp", "--", "echo", "1"],
+            ["--run-dir", self.run_dir, "run", "lane", "--run-dir", "/tmp", "echo", "1"],
+            ["--run-dir", self.run_dir, "acquire", "lane", "--run-dir", "/tmp"],
+        ]
+        for cmd_args in misordered_global:
+            with self.subTest(cmd_args=cmd_args):
+                err = io.StringIO()
+                with redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                    build_slot.main(cmd_args)
+                self.assertEqual(cm.exception.code, 2)
+                if os.path.exists(self.run_dir):
+                    entries = [e for e in os.listdir(self.run_dir) if e not in {"next-cache"}]
+                    self.assertEqual(entries, [])
+
+    def test_run_dir_named_run_not_mistaken_for_subcommand(self):
+        """Option value equal to 'run' is not mistaken for subcommand (discussion_r4136963314)."""
+        args_acq = build_slot.parse_args(["--run-dir", "run", "acquire", "--timeout", "1", "lane"])
+        self.assertEqual(args_acq.run_dir, "run")
+        self.assertEqual(args_acq.command, "acquire")
+        self.assertEqual(args_acq.timeout, 1.0)
+        self.assertEqual(args_acq.name, "lane")
+
+        args_run_pre = build_slot.parse_args(
+            ["--run-dir", "run", "run", "--timeout", "1", "lane", "--", "echo", "x"]
+        )
+        self.assertEqual(args_run_pre.run_dir, "run")
+        self.assertEqual(args_run_pre.command, "run")
+        self.assertEqual(args_run_pre.timeout, 1.0)
+        self.assertEqual(args_run_pre.name, "lane")
+        self.assertEqual(args_run_pre.cmd, ["echo", "x"])
+
+        args_run_post = build_slot.parse_args(
+            ["--run-dir", "run", "run", "lane", "--timeout", "1", "--", "echo", "x"]
+        )
+        self.assertEqual(args_run_post.run_dir, "run")
+        self.assertEqual(args_run_post.command, "run")
+        self.assertEqual(args_run_post.timeout, 1.0)
+        self.assertEqual(args_run_post.name, "lane")
+        self.assertEqual(args_run_post.cmd, ["--", "echo", "x"])
+
+        args_run_eq = build_slot.parse_args(
+            ["--run-dir=run", "run", "lane", "--timeout", "1", "--", "echo", "x"]
+        )
+        self.assertEqual(args_run_eq.run_dir, "run")
+        self.assertEqual(args_run_eq.command, "run")
+        self.assertEqual(args_run_eq.timeout, 1.0)
+    def test_run_options_preceding_lane_name_are_honored(self):
+        """Correctly ordered options before lane name parse cleanly."""
+        args = build_slot.parse_args(
+            ["run", "--priority", "--timeout", "1.5", "--cwd", "D:/wt", "lane", "--", "npx", "next", "build"]
         )
         self.assertEqual(args.timeout, 1.5)
         self.assertEqual(args.cwd, "D:/wt")
         self.assertTrue(args.priority)
         self.assertFalse(args.force)
-        self.assertEqual(args.cmd, ["--", "npx", "next", "build"])
+        self.assertEqual(args.cmd, ["npx", "next", "build"])
 
         # A command without leading options keeps its own `--` arguments untouched
         args_plain = build_slot.parse_args(["run", "lane", "npm", "run", "build", "--", "--prod"])
         self.assertIsNone(args_plain.timeout)
         self.assertEqual(args_plain.cmd, ["npm", "run", "build", "--", "--prod"])
 
+        # A command where `--` precedes flags passes them as the inner command
+        args_flag = build_slot.parse_args(["run", "lane", "--", "--timeout", "5"])
+        self.assertEqual(args_flag.cmd, ["--timeout", "5"])
     def test_cli_run_waits_under_high_ram_until_timeout(self):
         script = os.path.abspath(build_slot.__file__)
         env = dict(os.environ)
@@ -1767,7 +1892,6 @@ class TestBuildSlot(unittest.TestCase):
         self.assertEqual(ret, 0)
         self.assertEqual(run_command.call_args.kwargs["heartbeat_stale_after"], 42.0)
         self.assertEqual(run_command.call_args.kwargs["cmd"], ["echo", "x"])
-
     def test_heartbeat_rewrite_never_reads_as_corrupt(self):
         """
         #315: waiters check the lock while its holder heartbeats. An in-place rewrite of
@@ -1927,5 +2051,234 @@ class TestBuildSlot(unittest.TestCase):
                 os.environ["BUILD_SLOT_MAX_SLOTS"] = orig_env
             else:
                 os.environ.pop("BUILD_SLOT_MAX_SLOTS", None)
+    def test_cli_diagnostics_emitted_once_on_stderr(self):
+        """#325: CLI diagnostics appear on stderr exactly once (no duplicate lastResort output)."""
+        script = os.path.join(SCRIPT_DIR, "build_slot.py")
+
+        # 1. Timeout notice on acquire
+        mgr = BuildSlotManager(run_dir=self.run_dir, max_slots=1)
+        self.assertTrue(mgr.acquire("holder-lane", timeout=1.0))
+        env = dict(os.environ, BUILD_SLOT_MAX_SLOTS="1")
+
+        proc = subprocess.run(
+            [sys.executable, script, "--run-dir", self.run_dir, "acquire", "waiter-lane", "--timeout", "0.1", "--poll-interval", "0.02"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=env,
+        )
+        self.assertEqual(proc.returncode, 1)
+        timeout_msg = "Timed out after 0.1s waiting for build slot lock (lane 'waiter-lane'"
+        self.assertEqual(proc.stderr.count(timeout_msg), 1)
+        self.assertNotIn("ERROR:build_slot:", proc.stderr)
+
+        # 2. Release refusal notice
+        proc_rel = subprocess.run(
+            [sys.executable, script, "--run-dir", self.run_dir, "release", "non-owner-lane"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(proc_rel.returncode, 1)
+        release_msg = "ERROR: Refusing to release build slot lock:"
+        self.assertEqual(proc_rel.stderr.count(release_msg), 1)
+        self.assertNotIn("ERROR:build_slot:", proc_rel.stderr)
+        mgr.release("holder-lane")
+
+    def test_configured_logging_receives_records(self):
+        """#325: Library callers that configure logging still receive records."""
+        records = []
+
+        class TestHandler(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        handler = TestHandler()
+        target_logger = logging.getLogger("build_slot")
+        target_logger.addHandler(handler)
+        old_level = target_logger.level
+        target_logger.setLevel(logging.DEBUG)
+
+        try:
+            mgr = BuildSlotManager(run_dir=self.run_dir)
+            self.assertTrue(mgr.acquire("log-holder", timeout=1.0))
+            # Trigger release refusal to log an error
+            err_buf = io.StringIO()
+            with redirect_stderr(err_buf):
+                self.assertFalse(mgr.release("wrong-owner"))
+
+            error_records = [r for r in records if r.levelno == logging.ERROR]
+            self.assertTrue(any("Refusing to release build slot lock" in r.getMessage() for r in error_records))
+            mgr.release("log-holder")
+        finally:
+            target_logger.removeHandler(handler)
+            target_logger.setLevel(old_level)
+
+    def test_in_process_unconfigured_stderr_emitted_once(self):
+        """#325: In-process calls without root handler do not duplicate stderr lines."""
+        mgr = BuildSlotManager(run_dir=self.run_dir, max_slots=1)
+        self.assertTrue(mgr.acquire("holder-lane", timeout=1.0))
+
+        err = io.StringIO()
+        with redirect_stderr(err):
+            ok = mgr.acquire("waiter-lane", timeout=0.1, poll_interval=0.02)
+        self.assertFalse(ok)
+        timeout_msg = "Timed out after 0.1s waiting for build slot lock (lane 'waiter-lane'"
+        self.assertEqual(err.getvalue().count(timeout_msg), 1)
+        self.assertNotIn("ERROR:build_slot:", err.getvalue())
+        mgr.release("holder-lane")
+
+    def test_clean_stale_next_junction_removes_link_preserves_target_sentinel(self):
+        """
+        Removes stale Next.js standalone node_modules junction without deleting target contents.
+        Root cause: Next's cleanDistDir follows the junction into the protected deps store,
+        gets EPERM, and its unlinkPath retry never increments, so it loops forever on Windows.
+        """
+        target_dir = os.path.join(self.run_dir, "protected-node-modules")
+        os.makedirs(target_dir, exist_ok=True)
+        sentinel_path = os.path.join(target_dir, "sentinel.txt")
+        with open(sentinel_path, "w", encoding="utf-8") as f:
+            f.write("sentinel-content-must-survive")
+
+        fake_worktree = os.path.join(self.run_dir, "fake-wt")
+        standalone_dir = os.path.join(fake_worktree, "frontend", ".next", "standalone")
+        os.makedirs(standalone_dir, exist_ok=True)
+        link_path = os.path.join(standalone_dir, "node_modules")
+
+        build_slot._create_dir_link(target_dir, link_path)
+        self.assertTrue(os.path.exists(link_path) or build_slot._is_link_or_junction(link_path))
+        self.assertTrue(build_slot._is_link_or_junction(link_path))
+        self.assertTrue(os.path.isfile(os.path.join(link_path, "sentinel.txt")))
+
+        # Call helper with cwd pointing to worktree
+        cleaned = build_slot.clean_stale_next_junction(cwd=fake_worktree)
+        self.assertIn(os.path.abspath(link_path), [os.path.abspath(p) for p in cleaned])
+        self.assertFalse(build_slot._is_link_or_junction(link_path))
+        self.assertFalse(os.path.exists(link_path))
+
+        # The target directory and sentinel file MUST still exist untouched!
+        self.assertTrue(os.path.isdir(target_dir))
+        self.assertTrue(os.path.isfile(sentinel_path))
+        with open(sentinel_path, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "sentinel-content-must-survive")
+
+    def test_clean_stale_next_junction_auto_detect_frontend_cwd_and_next_dir(self):
+        """Auto-detects <cwd>/.next/standalone/node_modules and handles optional --next-dir."""
+        target_dir = os.path.join(self.run_dir, "shared-deps")
+        os.makedirs(target_dir, exist_ok=True)
+        sentinel = os.path.join(target_dir, "keepme.txt")
+        with open(sentinel, "w", encoding="utf-8") as f:
+            f.write("keepme")
+
+        # Case 1: Running from frontend directory directly (<cwd>/.next/standalone/node_modules)
+        fake_frontend = os.path.join(self.run_dir, "fake-frontend")
+        standalone_1 = os.path.join(fake_frontend, ".next", "standalone")
+        os.makedirs(standalone_1, exist_ok=True)
+        link_1 = os.path.join(standalone_1, "node_modules")
+        build_slot._create_dir_link(target_dir, link_1)
+        self.assertTrue(build_slot._is_link_or_junction(link_1))
+
+        cleaned_1 = build_slot.clean_stale_next_junction(cwd=fake_frontend)
+        self.assertIn(os.path.abspath(link_1), [os.path.abspath(p) for p in cleaned_1])
+        self.assertFalse(build_slot._is_link_or_junction(link_1))
+        self.assertTrue(os.path.isfile(sentinel))
+
+        # Case 2: Using explicit next_dir
+        custom_root = os.path.join(self.run_dir, "custom-project")
+        custom_frontend = os.path.join(custom_root, "web")
+        standalone_2 = os.path.join(custom_frontend, ".next", "standalone")
+        os.makedirs(standalone_2, exist_ok=True)
+        link_2 = os.path.join(standalone_2, "node_modules")
+        build_slot._create_dir_link(target_dir, link_2)
+        self.assertTrue(build_slot._is_link_or_junction(link_2))
+
+        cleaned_2 = build_slot.clean_stale_next_junction(next_dir=custom_frontend, cwd=self.run_dir)
+        self.assertIn(os.path.abspath(link_2), [os.path.abspath(p) for p in cleaned_2])
+        self.assertFalse(build_slot._is_link_or_junction(link_2))
+        self.assertTrue(os.path.isfile(sentinel))
+
+        # Case 3: Regular directory (not a junction or symlink) is never removed
+        normal_dir = os.path.join(fake_frontend, ".next", "standalone", "node_modules")
+        os.makedirs(normal_dir, exist_ok=True)
+        normal_file = os.path.join(normal_dir, "real_package.js")
+        with open(normal_file, "w", encoding="utf-8") as f:
+            f.write("console.log(1)")
+        self.assertFalse(build_slot._is_link_or_junction(normal_dir))
+
+        cleaned_3 = build_slot.clean_stale_next_junction(cwd=fake_frontend)
+        self.assertEqual(cleaned_3, [])
+        self.assertTrue(os.path.isdir(normal_dir))
+        self.assertTrue(os.path.isfile(normal_file))
+
+    def test_acquire_cleans_stale_next_junction(self):
+        """build_slot.py acquire removes stale junction so subsequent next build does not hang."""
+        target_dir = os.path.join(self.run_dir, "target-deps-acq")
+        os.makedirs(target_dir, exist_ok=True)
+        sentinel = os.path.join(target_dir, "sentinel.txt")
+        with open(sentinel, "w", encoding="utf-8") as f:
+            f.write("sentinel-acq")
+
+        fake_wt = os.path.join(self.run_dir, "wt-acq")
+        standalone = os.path.join(fake_wt, "frontend", ".next", "standalone")
+        os.makedirs(standalone, exist_ok=True)
+        link_path = os.path.join(standalone, "node_modules")
+        build_slot._create_dir_link(target_dir, link_path)
+        self.assertTrue(build_slot._is_link_or_junction(link_path))
+
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        ok = manager.acquire("lane-acq", cwd=fake_wt, timeout=2.0)
+        self.assertTrue(ok)
+        manager.release("lane-acq")
+
+        # Junction must be removed, target sentinel must survive
+        self.assertFalse(build_slot._is_link_or_junction(link_path))
+        self.assertFalse(os.path.exists(link_path))
+        self.assertTrue(os.path.isfile(sentinel))
+
+    def test_run_command_cleans_stale_next_junction(self):
+        """build_slot.py run removes stale junction before executing the command."""
+        target_dir = os.path.join(self.run_dir, "target-deps-run")
+        os.makedirs(target_dir, exist_ok=True)
+        sentinel = os.path.join(target_dir, "sentinel.txt")
+        with open(sentinel, "w", encoding="utf-8") as f:
+            f.write("sentinel-run")
+
+        fake_wt = os.path.join(self.run_dir, "wt-run")
+        standalone = os.path.join(fake_wt, "frontend", ".next", "standalone")
+        os.makedirs(standalone, exist_ok=True)
+        link_path = os.path.join(standalone, "node_modules")
+        build_slot._create_dir_link(target_dir, link_path)
+        self.assertTrue(build_slot._is_link_or_junction(link_path))
+
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        ret = manager.run_command(
+            "lane-run-cleanup",
+            [sys.executable, "-c", "import sys; sys.exit(0)"],
+            cwd=fake_wt,
+        )
+        self.assertEqual(ret, 0)
+
+        # Junction must be removed, target sentinel must survive
+        self.assertFalse(build_slot._is_link_or_junction(link_path))
+        self.assertFalse(os.path.exists(link_path))
+        self.assertTrue(os.path.isfile(sentinel))
+
+    def test_cli_next_dir_option_parsed(self):
+        """CLI options for --next-dir are parsed in acquire and run."""
+        args_acq = build_slot.parse_args(["acquire", "lane", "--next-dir", "frontend"])
+        self.assertEqual(args_acq.next_dir, "frontend")
+
+        args_run_pre = build_slot.parse_args(
+            ["run", "lane", "--next-dir", "frontend", "--", "next", "build"]
+        )
+        self.assertEqual(args_run_pre.next_dir, "frontend")
+        self.assertEqual(args_run_pre.cmd, ["--", "next", "build"])
+
+        args_run_with_cwd = build_slot.parse_args(
+            ["run", "lane", "--cwd", "D:/wt", "--next-dir", "frontend", "--", "next", "build"]
+        )
+        self.assertEqual(args_run_with_cwd.cwd, "D:/wt")
+        self.assertEqual(args_run_with_cwd.next_dir, "frontend")
+
 if __name__ == "__main__":
     unittest.main()

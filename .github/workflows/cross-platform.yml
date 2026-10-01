@@ -14,6 +14,12 @@ on:
     branches: [main, dev]
   pull_request:
 
+# A newer push to the same PR supersedes the older run, so cancel it. Runs on
+# main and dev are never cancelled: each merge keeps its own result.
+concurrency:
+  group: cross-platform-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -24,6 +30,8 @@ jobs:
   smoke:
     name: smoke (${{ matrix.os }} / py${{ matrix.python }})
     runs-on: ${{ matrix.os }}
+    # Longest observed leg is under 4 min; a hung leg would otherwise hold a runner for 6 h.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -80,6 +88,7 @@ jobs:
   claudex-powershell:
     name: claudex PowerShell fixtures
     runs-on: windows-latest
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v4
@@ -95,6 +104,7 @@ jobs:
   claudex-zero-quota-integration:
     name: claudex zero-quota integration (Claude Code 2.1.218)
     runs-on: windows-latest
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v4
@@ -136,6 +146,7 @@ jobs:
   wave-plan:
     name: wave-plan (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -164,6 +175,7 @@ jobs:
   portable-contracts:
     name: portable-contracts (${{ matrix.os }} / py${{ matrix.python }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:

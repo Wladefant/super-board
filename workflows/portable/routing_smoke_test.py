@@ -27,7 +27,10 @@ import copy
 import datetime
 import itertools
 import socket
-import yaml
+try:
+    import yaml
+except ImportError:
+    yaml = None
 import json
 import os
 import shutil
@@ -69,6 +72,10 @@ from quota_snapshot import (
     load_snapshot as load_quota_file,
 )
 from model_routing import (
+    UNSUPPORTED_CODEX_MODELS,
+    is_unsupported_codex_model,
+    _Rung,
+    _climb,
     EvidencePacket,
     HarnessDispatchPacket,
     ResetAwareModelSelector,
@@ -131,6 +138,8 @@ from model_routing import (
     compute_window_burn_paces,
     resolve_role_model,
     is_agent_role_available,
+    _climb,
+    _Rung,
 )
 
 def tmp_quota_path() -> "Path":
@@ -1704,6 +1713,8 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         config_path = Path(os.path.expanduser("~/.veyyon/profiles/default/agent/config.yml"))
         if not config_path.exists():
             self.skipTest(f"profile config not installed at {config_path}")
+        if yaml is None:
+            self.skipTest(f"PyYAML is not installed; skipping {config_path} verification")
         parsed = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         model_roles = parsed.get("modelRoles") or {}
         agents = (parsed.get("agent") or {}).get("agents") or {}
@@ -1725,6 +1736,8 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             leading = str(chain).split(",")[0].strip()
             if role in ("codex-worker", "codex-reviewer"):
                 self.assertIn(leading, (model, "openai-codex/gpt-5.6-sol:high"), f"{role} must lead with {model} or Sol")
+            elif role == "advisor":
+                self.assertIn(leading, (model, "anthropic/claude-fable-5-1:medium"), f"{role} must lead with {model} or Fable")
             else:
                 self.assertEqual(leading, model, f"{role} must lead with {model}")
 
@@ -1732,12 +1745,12 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         # the interactive orchestrator (`modelRoles.default`) is explicitly out of scope.
         paid_opus = "anthropic/claude-opus-5-5"
         for role, chain in model_roles.items():
-            if role in ("default", "reviewer", "astra-ux"):
+            if role in ("default", "reviewer", "astra-ux", "opus"):
                 continue
             self.assertNotIn(paid_opus, str(chain), f"modelRoles.{role} must not run paid Opus")
         for name, entry in agents.items():
-            if name in ("reviewer", "astra-ux"):
-                continue  # Opus 5.5 permitted for reviewer per operator ruling 2026-09-26
+            if name in ("reviewer", "astra-ux", "opus"):
+                continue  # Opus 5.5 permitted for reviewer and opus lane per operator ruling 2026-09-29
             for chain in chains(entry):
                 self.assertNotIn(paid_opus, str(chain), f"agents.{name} must not run paid Opus")
         for pattern, chain in (parsed.get("retry") or {}).get("fallbackChains", {}).items():
@@ -1791,6 +1804,8 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         config_path = Path(os.path.expanduser("~/.veyyon/profiles/default/agent/config.yml"))
         if not config_path.exists():
             self.skipTest(f"profile config not installed at {config_path}")
+        if yaml is None:
+            self.skipTest(f"PyYAML is not installed; skipping {config_path} verification")
         parsed = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         settings = parsed.get("agent") or {}
         agents = settings.get("agents") or {}
@@ -1913,6 +1928,8 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         config_path = Path(os.path.expanduser("~/.veyyon/profiles/default/agent/config.yml"))
         if not config_path.exists():
             self.skipTest(f"profile config not installed at {config_path}")
+        if yaml is None:
+            self.skipTest(f"PyYAML is not installed; skipping {config_path} verification")
         agents = ((yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}).get("agent") or {}).get("agents") or {}
 
         # A nested Agents level names the model this same lane type runs when spawned one level
@@ -2647,8 +2664,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         # Profile config invariant: when CODEX_ENABLED is False, Codex agent roles must be disabled
         if not CODEX_ENABLED:
             config_path = os.path.expanduser("~/.veyyon/profiles/default/agent/config.yml")
-            if os.path.exists(config_path):
-                import yaml
+            if os.path.exists(config_path) and yaml is not None:
                 with open(config_path, "r", encoding="utf-8") as f:
                     cfg = yaml.safe_load(f)
                 prof_agents = (cfg.get("agent") or {}).get("agents") or {}
@@ -2714,7 +2730,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
 
         # Check installed profile configuration if present
         config_path = Path(os.path.expanduser("~/.veyyon/profiles/default/agent/config.yml"))
-        if config_path.exists():
+        if config_path.exists() and yaml is not None:
             parsed = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
             agents = (parsed.get("agent") or {}).get("agents") or {}
             model_roles = parsed.get("modelRoles") or {}
@@ -2840,6 +2856,115 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
                                 MODEL_AG_CLAUDE_OPUS,
                             )
         print("  [PASS] Zero routes resolve to ag-opus across all task types, risk levels, rework counts, diff sizes and domain tags.")
+
+    # -------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # TEST 53: OpenRouter DeepSeek Flash catalog window and fallback enforcement
+    # (Refs #216 Item 2)
+    # -------------------------------------------------------------------------
+    def test_openrouter_deepseek_flash_catalog_window_and_enforcement(self):
+        print("\n--- TEST 53: OpenRouter DeepSeek Flash Window & Fallback Enforcement ---")
+        # 1. Authoritative catalog context window verification:
+        # models.db openrouter:pseudo-api and OpenRouter live API verify 1,048,576 tokens.
+        self.assertIn(MODEL_OR_DEEPSEEK_FLASH, VERIFIED_CONTEXT_WINDOWS)
+        self.assertEqual(VERIFIED_CONTEXT_WINDOWS[MODEL_OR_DEEPSEEK_FLASH], 1048576)
+
+        # 2. Within window: OpenRouter DeepSeek Flash is eligible as a fallback or last resort.
+        usage = self._usage_with_ag_families(codex_used=0.92)
+        for lim in usage["reports"][0]["limits"]:
+            if lim["id"].startswith("google-antigravity:google"):
+                lim["status"] = "rate_limited"
+        selector = self._selector(usage)
+        rec = selector.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.LOW, context_tokens=10000)
+        self.assertEqual(rec.selected_model, MODEL_DEEPSEEK_FLASH)
+        self.assertEqual(rec.fallback_model, MODEL_OR_DEEPSEEK_FLASH)
+
+        # 3. Context window filter enforcement on final fallbacks and last resort:
+        # When context_tokens exceeds the catalog window (1,048,576), OpenRouter DeepSeek Flash
+        # must NOT be selected as chosen or as fallback.
+        # Direct _climb verification with empty rungs:
+        last_resort = _Rung(MODEL_OR_DEEPSEEK_FLASH, True, "OpenRouter DeepSeek Flash", cooldown=True)
+        final_fallbacks = [MODEL_DEEPSEEK_FLASH]
+
+        # Fits window:
+        is_eligible_pass = lambda m: 500000 <= VERIFIED_CONTEXT_WINDOWS.get(m, 0)
+        chosen_pass, fb_pass = _climb([], last_resort, final_fallbacks, is_eligible=is_eligible_pass)
+        self.assertEqual(chosen_pass.model, MODEL_OR_DEEPSEEK_FLASH)
+        self.assertEqual(fb_pass, MODEL_DEEPSEEK_FLASH)
+
+        # Exceeds window:
+        is_eligible_exceed = lambda m: 1200000 <= VERIFIED_CONTEXT_WINDOWS.get(m, 0)
+        with self.assertRaises(ValueError) as ctx:
+            _climb([], last_resort, final_fallbacks, is_eligible=is_eligible_exceed)
+        self.assertIn("no eligible model or fallback available in ladder", str(ctx.exception))
+
+        # End-to-end select_model at 1.2M tokens:
+        with self.assertRaises(ValueError):
+            selector.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.LOW, context_tokens=1200000)
+        print("  [PASS] Catalog window 1,048,576 verified; context limit enforced on last-resort and final-fallback entries.")
+
+    # -------------------------------------------------------------------------
+    # TEST 54: Unsupported Codex model gpt-6.1-sol rejected/skipped in ladders
+    # -------------------------------------------------------------------------
+    def test_unsupported_codex_model_rejected_and_skipped(self):
+        print("\n--- TEST 54: Unsupported Codex Model gpt-6.1-sol Skipped/Rejected ---")
+        unsupported = "openai-codex/gpt-6.1-sol"
+        supported = MODEL_CODEX_SOL  # "openai-codex/gpt-5.6-sol:high"
+
+        # 1. Verification of unsupported model set and predicate
+        self.assertIn("gpt-6.1-sol", UNSUPPORTED_CODEX_MODELS)
+        self.assertTrue(is_unsupported_codex_model(unsupported))
+        self.assertTrue(is_unsupported_codex_model("openai-codex/gpt-6.1-sol:high"))
+        self.assertTrue(is_unsupported_codex_model("gpt-6.1-sol"))
+        self.assertFalse(is_unsupported_codex_model(supported))
+        self.assertFalse(is_unsupported_codex_model(MODEL_CODEX_ASTRA))
+
+        # 2. Ladder climbing skips unsupported rung and picks next eligible rung
+        rungs_with_unsupported = [
+            _Rung(unsupported, True, "unsupported codex rung"),
+            _Rung(MODEL_DEEPSEEK_FLASH, True, "deepseek fallback"),
+        ]
+        last_resort = _Rung(supported, True, "supported codex resort")
+        chosen, fallback = _climb(rungs_with_unsupported, last_resort, [supported])
+        self.assertNotEqual(chosen.model, unsupported)
+        self.assertEqual(chosen.model, MODEL_DEEPSEEK_FLASH)
+        self.assertEqual(fallback, supported)
+
+        # 3. Ladder containing ONLY unsupported model gets rejected (raises ValueError)
+        rungs_only_unsupported = [
+            _Rung(unsupported, True, "unsupported rung 1"),
+        ]
+        last_resort_unsupported = _Rung(unsupported, True, "unsupported resort")
+        with self.assertRaises(ValueError):
+            _climb(rungs_only_unsupported, last_resort_unsupported, [unsupported])
+
+        # 4. Ladder with supported gpt-5.6-sol passes cleanly
+        rungs_with_supported = [
+            _Rung(supported, True, "supported codex sol"),
+        ]
+        last_resort_supported = _Rung(MODEL_DEEPSEEK_FLASH, True, "deepseek resort")
+        chosen_sol, fallback_sol = _climb(rungs_with_supported, last_resort_supported, [MODEL_DEEPSEEK_FLASH])
+        self.assertEqual(chosen_sol.model, supported)
+        self.assertEqual(fallback_sol, MODEL_DEEPSEEK_FLASH)
+
+        # 5. Role resolution and fallback ladder skips gpt-6.1-sol and resolves to gpt-5.6-sol
+        with mock.patch.dict(ROLE_FALLBACK_LADDERS, {"test-unsupported-role": [unsupported, supported]}):
+            resolved = resolve_role_model("test-unsupported-role")
+            self.assertEqual(resolved, supported)
+
+        with mock.patch.dict(ROLE_FALLBACK_LADDERS, {"test-unsupported-only": [unsupported]}):
+            resolved = resolve_role_model("test-unsupported-only")
+            self.assertIsNone(resolved)
+
+        with mock.patch.dict(ROLE_MODEL_PINS, {"test-pinned-unsupported": unsupported}):
+            self.assertIsNone(resolve_role_model("test-pinned-unsupported"))
+            self.assertFalse(is_agent_role_available("test-pinned-unsupported"))
+
+        with mock.patch.dict(ROLE_MODEL_PINS, {"test-pinned-supported": supported}):
+            self.assertEqual(resolve_role_model("test-pinned-supported"), supported)
+            self.assertTrue(is_agent_role_available("test-pinned-supported"))
+
+        print("  [PASS] openai-codex/gpt-6.1-sol rejected and skipped in ladders; openai-codex/gpt-5.6-sol passes.")
 
 def main():
     print("=" * 70)

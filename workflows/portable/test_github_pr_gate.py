@@ -1743,6 +1743,51 @@ class TestGitHubPRGate(unittest.TestCase):
         self.assertEqual(result.qa_receipt_verdict, "PASSED")
         print("  [PASS] A later FAIL or RETRACTED overrides an earlier PASS, for its own diff only")
 
+    def shot_receipt(self, *, before=None, after=None, before_expected=None, after_expected=None,
+                     dist=20, ratio=0.12, pair=True, captions=True):
+        """A receipt with a before/after table, as `control_polysim.py pair` prints it."""
+        before = before or "e" * 40
+        after = after or self.head_sha
+        lines = [
+            "| Viewport | Before | After |",
+            "| **1440x900** | ![before 1440](https://github.com/user-attachments/assets/00000001-1111-2222-3333-000000000001)"
+            " | ![after 1440](https://github.com/user-attachments/assets/00000002-1111-2222-3333-000000000002) |",
+        ]
+        if captions:
+            lines.append(f"SHOT before served={before} expected={before_expected or before} url=x viewport=1440x900")
+            lines.append(f"SHOT after served={after} expected={after_expected or after} url=x viewport=1440x900")
+        if pair:
+            lines.append(f"SHOT-PAIR viewport=1440x900 phash_dist={dist} changed_ratio={ratio}")
+        receipt = self.qa_receipt_comment(extra="\n".join(lines))
+        return receipt
+
+    def test_before_after_receipt_needs_verified_shot_provenance(self):
+        """Positive control and negative controls for the screenshot provenance gate."""
+        good = self.staging_ui_pr(comments=[self.shot_receipt()])
+        self.assertEqual(evaluate_pr_gate(good, policy=self.staging_policy()).qa_receipt_verdict, "PASSED")
+        cases = {
+            "staging build captioned as the PR's after": dict(after="e" * 40),
+            "after served by the PR head but labelled another sha": dict(after_expected="f" * 40),
+            "before served by the PR head": dict(before=self.head_sha),
+            "identical images": dict(dist=0, ratio=0.0),
+            "near-identical images": dict(dist=2, ratio=0.0001),
+            "no SHOT-PAIR line": dict(pair=False),
+            "hand-written table without captions": dict(captions=False, pair=False),
+        }
+        for name, kwargs in cases.items():
+            with self.subTest(name):
+                pr = self.staging_ui_pr(comments=[self.shot_receipt(**kwargs)])
+                result = evaluate_pr_gate(pr, policy=self.staging_policy())
+                self.assertEqual(result.qa_receipt_verdict, "REQUIRED")
+                self.assertEqual(result.gate_verdict, "BLOCKED")
+                self.assertIn("screenshot provenance failed", result.verdict_reason)
+        print("  [PASS] Mislabelled or duplicate before/after pairs are BLOCKED; a verified pair passes")
+
+    def test_receipt_without_before_after_claim_needs_no_shot_captions(self):
+        """Initial/exercised receipt shots make no before/after claim and keep passing."""
+        pr = self.staging_ui_pr(comments=[self.qa_receipt_comment()])
+        self.assertEqual(evaluate_pr_gate(pr, policy=self.staging_policy()).qa_receipt_verdict, "PASSED")
+
     def test_qa_receipt_served_from_a_pre_sync_head_still_binds(self):
         """A sync-only push moves the head without changing its diff, so its QA stands."""
         from review_content import content_identity
