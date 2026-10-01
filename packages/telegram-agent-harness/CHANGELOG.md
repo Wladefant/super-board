@@ -13,6 +13,7 @@
 - HTTP 409 conflict bounded exponential backoff, diagnostic warning logs, and host session error notifications on Telegram poller exhaustion.
 - `telegram_question` tool asking the operator a labeled-choice question on the session's Telegram route, returning only that question's answer and never an approval.
 - `telegram_message` tool sending lane-attributed updates with durable reply context, so an operator reply routes back to the originating lane.
+- `telegram_attachment` tool sending inline photos, PDFs, and generic documents to the session's exact Telegram chat and forum topic, with captions, caller-selected filenames, direct-chat compatibility, and explicit 10 MiB photo / 50 MiB document preflight errors.
 - `telegram_dashboard` tool refreshing one pinned fleet dashboard from observed lane, blocker and merge-queue state on a 30-second coalesced edit.
 - Telegram free-text replies and callback selections answer the question they reply to instead of starting a new operator turn.
 - Configured message thread id is read from the leased channel so a forum-topic channel receives messages in its own topic.
