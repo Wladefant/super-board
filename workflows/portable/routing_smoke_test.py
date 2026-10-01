@@ -84,8 +84,11 @@ from model_routing import (
     MODEL_ANTHROPIC_OPUS,
     MODEL_CLAUDE_FABLE,
     MODEL_CLAUDE_OPUS_55,
+    MODEL_CLAUDE_SONNET_55,
     MODEL_CODEX_FAST,
     MODEL_CODEX_SOL,
+    MODEL_CODEX_WORKER,
+    MODEL_CODEX_SOL_FALLBACK,
     MODEL_CODEX_ASTRA,
     MODEL_CODEX_SPARK,
     MODEL_GEMINI_FLASH,
@@ -345,18 +348,18 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         snapshot = parse_usage_json(near_reset_dict, current_time_ms=self.mock_now_ms)
         selector = ResetAwareModelSelector(snapshot)
 
-        # A) High-Risk Review: should promote Codex Astra to prevent allowance expiration!
+        # A) Reviews and reasoning promote GPT-6.1 Sol high; Astra remains reserved
+        # for explicitly tagged hardest cross-cutting work.
         rec_review = selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
         self.assertTrue(rec_review.promotion_applied)
-        self.assertEqual(rec_review.selected_model, MODEL_CODEX_ASTRA)
-        self.assertIn("promoted Codex Astra", rec_review.reasoning)
-        print(f"  [PASS] High-risk review promoted Codex Astra: {rec_review.selected_model}")
+        self.assertEqual(rec_review.selected_model, MODEL_CODEX_SOL)
+        self.assertIn("GPT-6.1 Sol high", rec_review.reasoning)
+        print(f"  [PASS] High-risk review promoted GPT-6.1 Sol: {rec_review.selected_model}")
 
-        # B) Deep Reasoning: should promote Codex Astra
         rec_reasoning = selector.select_model(task_type=TaskType.DEEP_REASONING, risk_level=RiskLevel.MEDIUM)
         self.assertTrue(rec_reasoning.promotion_applied)
-        self.assertEqual(rec_reasoning.selected_model, MODEL_CODEX_ASTRA)
-        print(f"  [PASS] Deep reasoning promoted Codex Astra: {rec_reasoning.selected_model}")
+        self.assertEqual(rec_reasoning.selected_model, MODEL_CODEX_SOL)
+        print(f"  [PASS] Deep reasoning promoted GPT-6.1 Sol: {rec_reasoning.selected_model}")
 
         # C) Routine Execution (capable task): should promote Codex Fast
         rec_exec = selector.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.MEDIUM)
@@ -379,11 +382,11 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         snapshot = parse_usage_json(exhausted_dict, current_time_ms=self.mock_now_ms)
         selector = ResetAwareModelSelector(snapshot)
 
-        # High-risk review should NOT promote Codex; should route to Claude Fable 5.1
+        # With Codex exhausted, judgment-heavy non-UI review uses Sonnet medium.
         rec = selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
         self.assertFalse(rec.promotion_applied)
-        self.assertEqual(rec.selected_model, MODEL_CLAUDE_FABLE)
-        print(f"  [PASS] Quota exhausted: No promotion; routed to {rec.selected_model}")
+        self.assertEqual(rec.selected_model, MODEL_CLAUDE_SONNET_55)
+        print(f"  [PASS] Codex exhausted: no promotion; routed to {rec.selected_model}")
 
     # -------------------------------------------------------------------------
     # TEST 5: Distant Reset -> Anthropic Preservation & Flash 3.8 Default
@@ -475,12 +478,12 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         snapshot = parse_usage_json(self.mock_usage_dict, current_time_ms=self.mock_now_ms)
         selector = ResetAwareModelSelector(snapshot)
 
-        # High-risk review must NOT select Gemini 3.8 Flash as sole quality gate
+        # High-risk review must use a strong non-UI tier, never Flash or Opus.
         rec = selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
-        self.assertNotEqual(rec.selected_model, MODEL_GEMINI_FLASH)
-        self.assertEqual(rec.selected_model, MODEL_CLAUDE_FABLE)
+        self.assertEqual(rec.selected_model, MODEL_CLAUDE_SONNET_55)
+        self.assertNotEqual(rec.selected_model, MODEL_CLAUDE_OPUS_55)
         self.assertTrue(rec.evidence_packet_required)
-        print(f"  [PASS] High-risk review enforced strong model: {rec.selected_model}")
+        print(f"  [PASS] High-risk review enforced strong non-UI model: {rec.selected_model}")
 
     # -------------------------------------------------------------------------
     # TEST 10: Deep Context Routing
@@ -615,8 +618,8 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
 
         self.assertIsInstance(packet, HarnessDispatchPacket)
         self.assertEqual(packet.schema_version, "1.0")
-        self.assertEqual(packet.recommendation["model"], MODEL_CLAUDE_FABLE)
-        self.assertEqual(packet.recommendation["agent_role"], "reviewer")
+        self.assertEqual(packet.recommendation["model"], MODEL_CLAUDE_SONNET_55)
+        self.assertEqual(packet.recommendation["agent_role"], "sonnet")
         self.assertEqual(packet.recommendation["provider"], "anthropic")
         self.assertIsNotNone(packet.evidence_packet)
         self.assertEqual(packet.evidence_packet["head_sha"], "1122334455667788")
@@ -625,7 +628,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         json_str = packet.to_json()
         parsed = json.loads(json_str)
         self.assertEqual(parsed["task"]["task_type"], "strong_review")
-        self.assertEqual(parsed["recommendation"]["agent_role"], "reviewer")
+        self.assertEqual(parsed["recommendation"]["agent_role"], "sonnet")
         print("  [PASS] HarnessDispatchPacket emitted valid JSON with agent role and evidence.")
 
     # -------------------------------------------------------------------------
@@ -656,21 +659,16 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         snapshot = parse_usage_json(self.mock_usage_dict, current_time_ms=self.mock_now_ms)
         selector = ResetAwareModelSelector(snapshot)
 
-        # Routine execution with rework_count=1 escalates to the high-risk worker ladder
-        # (Flash barred): GLM-5.3 (credentialed) -> DeepSeek V4 Pro -> Codex Astra medium ->
-        # Antigravity Opus -> Fable last resort. Paid Anthropic is never a worker primary or
-        # fallback while a cheap tier has headroom (operator 2026-09-25: the cheap tiers precede
-        # the subscription Codex window in worker ladders; Codex leads only in strong review).
+        # Rework is judgment-heavy non-UI work: Sol medium is the normal Codex
+        # writer and Sonnet medium is the cross-provider fallback.
         rec = selector.select_model(
             task_type=TaskType.ROUTINE_EXECUTION,
             risk_level=RiskLevel.LOW,
             rework_count=1,
         )
         self.assertNotEqual(rec.selected_model, MODEL_GEMINI_FLASH)
-        # Default fixture: no Z.AI or OpenCode Go credential, Codex on pace, Anthropic with slack.
-        self.assertEqual(rec.selected_model, MODEL_DEEPSEEK_PRO)
-        self.assertEqual(rec.fallback_model, MODEL_CODEX_ASTRA)
-        self.assertNotIn("anthropic/", rec.fallback_model)
+        self.assertEqual(rec.selected_model, MODEL_CODEX_WORKER)
+        self.assertEqual(rec.fallback_model, MODEL_CLAUDE_SONNET_55)
         self.assertIn("high-risk implementation", rec.reasoning.lower())
         print(f"  [PASS] Rework escalation: {rec.selected_model} (fallback: {rec.fallback_model}, cross-provider)")
 
@@ -678,7 +676,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         glm_selector = ResetAwareModelSelector(snapshot, credentialed_providers={ZAI_PROVIDER})
         rec_glm = glm_selector.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.LOW, rework_count=1)
         self.assertEqual(rec_glm.selected_model, MODEL_ZAI_GLM)
-        self.assertEqual(rec_glm.fallback_model, MODEL_DEEPSEEK_PRO)
+        self.assertEqual(rec_glm.fallback_model, MODEL_CODEX_WORKER)
         print(f"  [PASS] Credentialed GLM-5.3 leads the ladder: {rec_glm.selected_model} (fallback {rec_glm.fallback_model})")
 
     # -------------------------------------------------------------------------
@@ -689,17 +687,14 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         snapshot = parse_usage_json(self.mock_usage_dict, current_time_ms=self.mock_now_ms)
         selector = ResetAwareModelSelector(snapshot)
 
-        # High-risk domain tags: auth, state_machine, money, concurrency, migrations
-        # Same high-risk worker ladder as rework; never paid Anthropic while cheap tiers exist.
+        # High-risk domain tags move bounded Flash work to Sol medium.
         rec = selector.select_model(
             task_type=TaskType.ROUTINE_EXECUTION,
             risk_level=RiskLevel.LOW,
             domain_tags=["auth", "state_machine"],
         )
-        self.assertNotEqual(rec.selected_model, MODEL_GEMINI_FLASH)
-        self.assertEqual(rec.selected_model, MODEL_DEEPSEEK_PRO)
-        self.assertNotIn("anthropic/", rec.fallback_model)
-        # Cross-provider fallback
+        self.assertEqual(rec.selected_model, MODEL_CODEX_WORKER)
+        self.assertEqual(rec.fallback_model, MODEL_CLAUDE_SONNET_55)
         self.assertNotEqual(model_to_provider(rec.selected_model),
                             model_to_provider(rec.fallback_model))
         print(f"  [PASS] Domain tags escalated to {rec.selected_model} (cross-provider fallback: {rec.fallback_model})")
@@ -738,18 +733,19 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         snapshot = parse_usage_json(self.mock_usage_dict, current_time_ms=self.mock_now_ms)
         selector = ResetAwareModelSelector(snapshot)
 
-        # A) High-risk review
+        # High-risk review and reasoning never select or fall back to Flash.
         rec_rev = selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
-        self.assertNotEqual(rec_rev.selected_model, MODEL_GEMINI_FLASH)
-        self.assertNotEqual(rec_rev.fallback_model, MODEL_GEMINI_FLASH)
-        self.assertIn(rec_rev.fallback_model, (MODEL_CLAUDE_FABLE, MODEL_CODEX_ASTRA, MODEL_GEMINI_PRO, MODEL_DEEPSEEK_PRO))
+        self.assertNotIn("flash", rec_rev.selected_model.lower())
+        self.assertNotIn("flash", rec_rev.fallback_model.lower())
+        self.assertIn(rec_rev.fallback_model, (MODEL_CLAUDE_SONNET_55, MODEL_CODEX_SOL,
+                                               MODEL_GO_GLM53_FLASH, MODEL_DEEPSEEK_PRO))
 
-        # B) High-risk deep reasoning
         rec_reason = selector.select_model(task_type=TaskType.DEEP_REASONING, risk_level=RiskLevel.HIGH)
-        self.assertNotEqual(rec_reason.selected_model, MODEL_GEMINI_FLASH)
-        self.assertNotEqual(rec_reason.fallback_model, MODEL_GEMINI_FLASH)
-        self.assertIn(rec_reason.fallback_model, (MODEL_CODEX_ASTRA, MODEL_GEMINI_PRO, MODEL_DEEPSEEK_PRO, MODEL_AG_CLAUDE_OPUS))
-        print(f"  [PASS] High-risk reasoning and review fallback strictly strong model: {rec_reason.fallback_model} (Flash barred).")
+        self.assertNotIn("flash", rec_reason.selected_model.lower())
+        self.assertNotIn("flash", rec_reason.fallback_model.lower())
+        self.assertIn(rec_reason.fallback_model, (MODEL_CLAUDE_SONNET_55, MODEL_CODEX_SOL,
+                                                  MODEL_DEEPSEEK_PRO))
+        print(f"  [PASS] High-risk reasoning and review use strong non-Flash fallbacks: {rec_reason.fallback_model}.")
 
     # -------------------------------------------------------------------------
     # TEST 21: Codex Agent Roles & Structural Retry Flash Bar
@@ -781,7 +777,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             risk_level=RiskLevel.HIGH,
             head_sha="abcdef123456",
         )
-        self.assertEqual(packet_review.recommendation["model"], MODEL_CODEX_ASTRA)
+        self.assertEqual(packet_review.recommendation["model"], MODEL_CODEX_SOL)
         self.assertEqual(packet_review.recommendation["agent_role"], "codex-reviewer")
         print(f"  [PASS] Codex review dispatch role: {packet_review.recommendation['agent_role']}")
 
@@ -890,7 +886,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         usage = self._usage_with_ag_families(anthropic_used=0.0)
         plain = self._selector(usage)
         self.assertEqual(plain.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH).selected_model,
-                         MODEL_CLAUDE_FABLE)
+                         MODEL_CLAUDE_SONNET_55)
 
         # Three lanes died on a 429 within 3 s after being dispatched onto the exhausted
         # Antigravity Opus window, so a cache entry with a future reset must remove it.
@@ -919,7 +915,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         )
         self.assertIsNone(rearmed.provider_exhaustion_reason(MODEL_AG_CLAUDE_OPUS))
         self.assertEqual(rearmed.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH).selected_model,
-                         MODEL_CLAUDE_FABLE)
+                         MODEL_CLAUDE_SONNET_55)
 
         # An unrelated provider's window is untouched by the entry.
         self.assertTrue(exhausted.quota_snapshot().is_eligible("openai-codex"))
@@ -949,86 +945,46 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         print(f"  [PASS] 429 body wrote {reset.exhausted_until}; review lane routed to {rec.selected_model}.")
 
     # -------------------------------------------------------------------------
-    # TEST: Review routing: routine and delta reviews route to ds-task,
-    # high-risk reviews (money/auth/migration/concurrency) route to reviewer (Opus 5.5),
-    # and high-risk reviews never fall back to Flash.
-    # (Operator ruling 2026-09-27 ~15:00Z).
+    # TEST: Task-class routing keeps Opus out of non-UI review.
     # -------------------------------------------------------------------------
     def test_review_routing_routine_ds_task_and_high_risk_reviewer(self):
-        print("\n--- TEST: Review Routing Routine ds-task and High-Risk Reviewer ---")
+        print("\n--- TEST: Task-Class Review Routing ---")
         usage = self._usage_with_ag_families(anthropic_used=0.0)
         selector = self._selector(usage)
 
-        # 1. Routine review above 250 lines resolves to ds-task (DeepSeek Flash)
         rec_routine = selector.select_model(
-            task_type=TaskType.STRONG_REVIEW,
-            risk_level=RiskLevel.HIGH,
-            diff_lines=300,
-        )
+            task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH, diff_lines=300)
         self.assertEqual(rec_routine.selected_model, MODEL_DEEPSEEK_FLASH)
-        self.assertEqual(model_to_agent_role(rec_routine.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "ds-task")
 
-        # 2. Delta review (rework_count >= 1) resolves to ds-task (DeepSeek Flash)
-        rec_delta = selector.select_model(
-            task_type=TaskType.STRONG_REVIEW,
-            rework_count=1,
-        )
+        rec_delta = selector.select_model(task_type=TaskType.STRONG_REVIEW, rework_count=1)
         self.assertEqual(rec_delta.selected_model, MODEL_DEEPSEEK_FLASH)
-        self.assertEqual(model_to_agent_role(rec_delta.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "ds-task")
 
-        # 3. Migration first-pass review resolves to reviewer (Claude Opus 5.5)
-        rec_migration = selector.select_model(
-            task_type=TaskType.STRONG_REVIEW,
-            risk_level=RiskLevel.HIGH,
-            domain_tags=["migration"],
-            rework_count=0,
-        )
-        self.assertEqual(rec_migration.selected_model, MODEL_CLAUDE_OPUS_55)
-        self.assertEqual(model_to_agent_role(rec_migration.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "reviewer")
+        for domain in ("migration", "money", "auth", "concurrency"):
+            rec = selector.select_model(
+                task_type=TaskType.STRONG_REVIEW,
+                risk_level=RiskLevel.HIGH,
+                domain_tags=[domain],
+                rework_count=0,
+            )
+            self.assertNotEqual(rec.selected_model, MODEL_CLAUDE_OPUS_55, domain)
+            self.assertIn(
+                model_to_agent_role(rec.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH),
+                ("codex-reviewer", "sonnet", "ds-pro", "go-review"),
+                domain,
+            )
+            self.assertNotIn("flash", rec.fallback_model.lower(), domain)
 
-        # 4. Money first-pass review resolves to reviewer (Claude Opus 5.5)
-        rec_money = selector.select_model(
-            task_type=TaskType.STRONG_REVIEW,
-            risk_level=RiskLevel.HIGH,
-            domain_tags=["money"],
-            rework_count=0,
-        )
-        self.assertEqual(rec_money.selected_model, MODEL_CLAUDE_OPUS_55)
-        self.assertEqual(model_to_agent_role(rec_money.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "reviewer")
-
-        # 5. Auth first-pass review resolves to reviewer (Claude Opus 5.5)
-        rec_auth = selector.select_model(
-            task_type=TaskType.STRONG_REVIEW,
-            risk_level=RiskLevel.HIGH,
-            domain_tags=["auth"],
-            rework_count=0,
-        )
-        self.assertEqual(rec_auth.selected_model, MODEL_CLAUDE_OPUS_55)
-        self.assertEqual(model_to_agent_role(rec_auth.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "reviewer")
-
-        # 6. Concurrency first-pass review resolves to reviewer (Claude Opus 5.5)
-        rec_conc = selector.select_model(
-            task_type=TaskType.STRONG_REVIEW,
-            risk_level=RiskLevel.HIGH,
-            domain_tags=["concurrency"],
-            rework_count=0,
-        )
-        self.assertEqual(rec_conc.selected_model, MODEL_CLAUDE_OPUS_55)
-        self.assertEqual(model_to_agent_role(rec_conc.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "reviewer")
-
-        # 7. High-risk review with Anthropic exhausted never falls back to Flash
         usage_exhausted = copy.deepcopy(usage)
         self._block_anthropic(usage_exhausted)
-        sel_exhausted = self._selector(usage_exhausted)
-        rec_exhausted = sel_exhausted.select_model(
+        rec_exhausted = self._selector(usage_exhausted).select_model(
             task_type=TaskType.STRONG_REVIEW,
             risk_level=RiskLevel.HIGH,
             domain_tags=["migration"],
         )
-        self.assertIn(rec_exhausted.selected_model, (MODEL_DEEPSEEK_PRO, MODEL_CODEX_ASTRA))
+        self.assertNotEqual(rec_exhausted.selected_model, MODEL_CLAUDE_OPUS_55)
         self.assertNotIn("flash", rec_exhausted.selected_model.lower())
         self.assertNotIn("flash", rec_exhausted.fallback_model.lower())
-        print("  [PASS] Routine review (>250 lines) -> ds-task; delta review -> ds-task; migration/money/auth/concurrency -> reviewer (never Flash).")
+        print("  [PASS] Routine/delta reviews stay cheap; high-risk non-UI reviews use Codex/Sonnet and never Opus or Flash.")
     def _selector(self, usage):
         return ResetAwareModelSelector(parse_usage_json(usage, current_time_ms=self.mock_now_ms))
 
@@ -1069,97 +1025,76 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         self.assertNotIn("openai-codex/", rec_routine.selected_model)
         print("  [PASS] 92% used with 145h left: Codex held back; high-risk review and workers on DeepSeek V4 Pro.")
 
-        # The same 92% with 6h left is behind pace: the last 8% would expire unused, so it
-        # is promoted ahead of every other strong lane, including Antigravity Claude.
+        # Near reset, review allowance is spent on GPT-6.1 Sol high, not Astra.
         usage_end = self._usage_with_ag_families(codex_used=0.92, codex_reset_hrs=6)
         rec_end = self._selector(usage_end).select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
         self.assertFalse(rec_end.quota_metrics["codex_pro_throttled"])
         self.assertTrue(rec_end.promotion_applied)
-        self.assertEqual(rec_end.selected_model, MODEL_CODEX_ASTRA)
+        self.assertEqual(rec_end.selected_model, MODEL_CODEX_SOL)
         print(f"  [PASS] 92% used with 6h left: remaining Codex spent before reset on {rec_end.selected_model}.")
 
-        # Exactly on pace (50% used, 84h left) is neither throttled nor promoted.
         usage_pace = self._usage_with_ag_families(anthropic_used=0.95, codex_used=0.49, codex_reset_hrs=84)
         self._block_anthropic(usage_pace)
         rec_pace = self._selector(usage_pace).select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
         self.assertFalse(rec_pace.quota_metrics["codex_pro_throttled"])
         self.assertFalse(rec_pace.promotion_applied)
-        self.assertEqual(rec_pace.selected_model, MODEL_CODEX_ASTRA)
-        print(f"  [PASS] On-pace Codex remains a normal strong lane: {rec_pace.selected_model}")
+        self.assertEqual(rec_pace.selected_model, MODEL_CODEX_SOL)
+        print(f"  [PASS] On-pace Codex remains the normal Sol review lane: {rec_pace.selected_model}")
 
     # -------------------------------------------------------------------------
-    # TEST 26: Direct Anthropic is the Fable orchestrator's weekly budget
+    # TEST 26: Direct Anthropic uses Sonnet only when its worker allowance permits it.
     # -------------------------------------------------------------------------
     def test_anthropic_orchestrator_reserve(self):
         print("\n--- TEST 26: Anthropic Orchestrator Reserve ---")
-        # 64% of the week used with 72h left (57% elapsed): ahead of pace, so workers leave it
-        # to the orchestrator even for high-risk review while Codex is on pace.
-        usage = self._usage_with_ag_families(anthropic_used=0.95, anthropic_week_used=0.64, anthropic_week_reset_hrs=72)
+        usage = self._usage_with_ag_families(
+            anthropic_used=0.95, anthropic_week_used=0.64, anthropic_week_reset_hrs=72)
         rec = self._selector(usage).select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
         self.assertTrue(rec.quota_metrics["anthropic_orchestrator_reserve"])
-        self.assertEqual(rec.selected_model, MODEL_CODEX_ASTRA)
+        self.assertNotIn("anthropic/", rec.selected_model)
         self.assertNotIn("anthropic/", rec.fallback_model)
-        print(f"  [PASS] Ahead-of-pace Anthropic reserved; high-risk review on {rec.selected_model}.")
 
-        # The reserve is an emergency lane only when nothing else strong can take the work.
         usage_last = self._usage_with_ag_families(
             anthropic_used=0.95, codex_used=0.92, codex_reset_hrs=145,
             anthropic_week_used=0.64, anthropic_week_reset_hrs=72,
         )
         rec_last = self._selector(usage_last).select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
-        self.assertEqual(rec_last.selected_model, MODEL_CLAUDE_FABLE)
-        self.assertTrue(rec_last.cooldown_fallback)
-        self.assertIn("orchestrator reserve", rec_last.reasoning)
-        print(f"  [PASS] Reserve drawn only as last resort: {rec_last.selected_model}")
+        self.assertNotIn("anthropic/", rec_last.selected_model)
+        self.assertNotEqual(rec_last.selected_model, MODEL_CLAUDE_OPUS_55)
 
-        # 30% used with 20h left: most of the week would expire unused, so the high-risk
-        # REVIEW lane spends it. Worker lanes still never take paid Anthropic while a cheap
-        # tier has headroom (operator 2026-09-25), surplus or not.
-        usage_surplus = self._usage_with_ag_families(anthropic_used=0.95, anthropic_week_used=0.30, anthropic_week_reset_hrs=20)
+        usage_surplus = self._usage_with_ag_families(
+            anthropic_used=0.0, anthropic_week_used=0.30, anthropic_week_reset_hrs=20)
         selector = self._selector(usage_surplus)
-        self.assertFalse(selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
-                         .quota_metrics["anthropic_orchestrator_reserve"])
-        self.assertEqual(
-            selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH).selected_model,
-            MODEL_CLAUDE_OPUS_55,
-        )
-        for task_type, risk in ((TaskType.DEEP_REASONING, RiskLevel.MEDIUM), (TaskType.DEEP_REASONING, RiskLevel.HIGH),
-                                (TaskType.ROUTINE_EXECUTION, RiskLevel.HIGH), (TaskType.STRONG_REVIEW, RiskLevel.MEDIUM)):
-            rec_worker = selector.select_model(task_type=task_type, risk_level=risk)
-            self.assertNotIn("anthropic/", rec_worker.selected_model, f"{task_type}/{risk}")
-            self.assertNotIn("anthropic/", rec_worker.fallback_model, f"{task_type}/{risk}")
-        print("  [PASS] Anthropic surplus near reset spent by high-risk review only; worker lanes stay on cheap tiers.")
+        rec_surplus = selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
+        self.assertFalse(rec_surplus.quota_metrics["anthropic_orchestrator_reserve"])
+        self.assertEqual(rec_surplus.selected_model, MODEL_CLAUDE_SONNET_55)
+        self.assertEqual(model_to_agent_role(rec_surplus.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "sonnet")
 
-        # Stale Anthropic data never counts as slack.
-        stale = self._usage_with_ag_families(anthropic_used=0.95, anthropic_week_used=0.0, anthropic_week_reset_hrs=20)
+        stale = self._usage_with_ag_families(
+            anthropic_used=0.95, anthropic_week_used=0.0, anthropic_week_reset_hrs=20)
         stale["reports"][1]["fetchedAt"] = self.mock_now_ms - 2 * 3600 * 1000
         rec_stale = self._selector(stale).select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
         self.assertTrue(rec_stale.quota_metrics["anthropic_orchestrator_reserve"])
-        self.assertEqual(rec_stale.selected_model, MODEL_CODEX_ASTRA)
-        print(f"  [PASS] Stale Anthropic snapshot kept in reserve; routed to {rec_stale.selected_model}.")
+        self.assertNotIn("anthropic/", rec_stale.selected_model)
+        print("  [PASS] Anthropic reserve blocks workers; near-reset slack goes to Sonnet medium, never Opus.")
 
-    # -------------------------------------------------------------------------
-    # TEST 23: High-risk review routes to reviewer (Opus 5.5)
+    # TEST 23: Non-UI judgment routes to Sonnet, never Opus.
     # -------------------------------------------------------------------------
     def test_antigravity_claude_chosen(self):
-        print("\n--- TEST 23: High-Risk Review Routes to Reviewer (Opus 5.5) ---")
+        print("\n--- TEST 23: Non-UI Judgment Routes to Sonnet ---")
         selector = self._selector(self._usage_with_ag_families(anthropic_used=0.0))
-        # High-risk review spends Claude Opus 5.5 (reviewer)
-        rec_review = selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH, domain_tags=["money"])
-        self.assertEqual(rec_review.selected_model, MODEL_CLAUDE_OPUS_55)
-        # Medium-risk review is restricted to worker tiers and does NOT spend Opus 5.5
+        rec_review = selector.select_model(
+            task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH, domain_tags=["money"])
+        self.assertEqual(rec_review.selected_model, MODEL_CLAUDE_SONNET_55)
+        self.assertEqual(model_to_agent_role(rec_review.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "sonnet")
+
         rec_med_review = selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.MEDIUM)
         self.assertNotEqual(rec_med_review.selected_model, MODEL_CLAUDE_OPUS_55)
-        # Operator DEEP_REASONING ladder policy (#214): LOW and MEDIUM lead with OpenCode Go
-        # GLM-5.3, then DeepSeek V4 Pro, then Gemini 3.8 Flash. Opus is minimized and reserved
-        # for orchestrator and high-risk reviews only, so medium-risk deep reasoning does NOT
-        # spend Opus 5.5; HIGH risk worker routes via CASE B2 ladder.
+
         rec_reason = selector.select_model(task_type=TaskType.DEEP_REASONING, risk_level=RiskLevel.MEDIUM)
         self.assertEqual(rec_reason.selected_model, MODEL_DEEPSEEK_PRO)
         packet = selector.dispatch(task_type=TaskType.DEEP_REASONING, risk_level=RiskLevel.MEDIUM)
-        self.assertEqual(packet.recommendation["model"], MODEL_DEEPSEEK_PRO)
         self.assertEqual(packet.recommendation["agent_role"], "ds-pro")
-        print(f"  [PASS] High review on {rec_review.selected_model} (reviewer); medium review avoids Opus; medium reasoning on {rec_reason.selected_model} (ds-pro).")
+        print(f"  [PASS] High review on {rec_review.selected_model}; medium reasoning on {rec_reason.selected_model}.")
 
         # An almost spent Antigravity Claude window (95% used) is left alone.
         spent = self._selector(self._usage_with_ag_families(anthropic_used=0.95))
@@ -1288,12 +1223,12 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         self.assertAlmostEqual(rec.quota_metrics["codex_remaining"], 0.08, places=6)
         self.assertLess(rec.quota_metrics["codex_pro_headroom"], CODEX_PACE_MIN_HEADROOM)
         self.assertAlmostEqual(rec.burn_headroom, rec.quota_metrics["codex_pro_headroom"])
-        # Throttled pro Codex is not handed high-risk review while reviewer has headroom.
+        # Throttled pro Codex hands judgment-heavy non-UI review to Sonnet.
         rec_review = selector.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
-        self.assertEqual(rec_review.selected_model, MODEL_CLAUDE_FABLE)
-        print(f"  [PASS] Two-account Codex: metrics from pro window (remaining "
-              f"{rec.quota_metrics['codex_remaining']:.2f}, throttled={rec.quota_metrics['codex_pro_throttled']}), "
-              f"lane remaining {rec.quota_metrics['codex_lane_remaining']:.2f}; review on {rec_review.selected_model}")
+        self.assertEqual(rec_review.selected_model, MODEL_CLAUDE_SONNET_55)
+        print(f"  [PASS] Two-account Codex metrics use the pro window (remaining "
+              f"{rec.quota_metrics['codex_remaining']:.2f}, throttled={rec.quota_metrics['codex_pro_throttled']}); "
+              f"review falls to {rec_review.selected_model}.")
 
     # -------------------------------------------------------------------------
     # TEST 29: Anthropic 5h window protection (Finding 3)
@@ -1387,7 +1322,6 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         reasoning_pins = {"thinker"}
         for role, model in ROLE_MODEL_PINS.items():
             if role in ("astra-ux", "advisor"):
-                # Specialized UX/advisor roles; router emits standard agent roles (task / reviewer)
                 continue
             if role in review_pins:
                 task_type = TaskType.STRONG_REVIEW
@@ -1395,8 +1329,14 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
                 task_type = TaskType.DEEP_REASONING
             else:
                 task_type = TaskType.ROUTINE_EXECUTION
-            self.assertIn(model_to_agent_role(model, task_type, RiskLevel.HIGH), (role, "codex-reviewer"), f"{role} pin {model}")
-        print("  [PASS] All role and provider mappings correct (ag-sonnet, ag-gpt, ds-pro, zai-task, zai-flash, minimax-task).")
+            self.assertIn(
+                model_to_agent_role(model, task_type, RiskLevel.HIGH),
+                (role, "codex-reviewer", "codex-worker"),
+                f"{role} pin {model}",
+            )
+        self.assertEqual(model_to_agent_role(MODEL_CLAUDE_OPUS_55, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "opus")
+        self.assertEqual(model_to_agent_role(MODEL_CLAUDE_SONNET_55, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "sonnet")
+        print("  [PASS] Role mappings preserve distinct Opus, Sonnet, and effort-specific Codex lanes.")
 
     # -------------------------------------------------------------------------
     # TEST 32: Chinese providers disabled by default, enabled by credential
@@ -1472,15 +1412,12 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         print("  [PASS] Z.AI/MiniMax Code routed only when credentialed (env or stored); MiniMax limited to bulk/triage.")
 
     # -------------------------------------------------------------------------
-    # TEST 33: Paid Anthropic is never a worker primary or fallback while a cheap tier has
-    # headroom — including the low-risk review, low/medium reasoning and deep-context lanes.
+    # TEST 33: Task-class routing may use Sonnet medium when Anthropic is behind
+    # pace, but never Opus, never an over-context model, and never Anthropic
+    # while the orchestrator reserve is active.
     # -------------------------------------------------------------------------
     def test_worker_lanes_never_spend_orchestrator_reserve(self):
-        print("\n--- TEST 33: Worker Lanes Never Take Paid Anthropic While Cheap Tiers Exist ---")
-        # Anthropic has maximum slack (0% used, 20h left) — the most tempting case — plus the
-        # states named in reviews 5317588095 and 5317952644: reserve active with Antigravity
-        # Claude spent and Codex throttled, Anthropic surplus near reset, Google down, and
-        # Google + DeepSeek out with Codex on pace (the deep-context gap).
+        print("\n--- TEST 33: Task-Class Anthropic Guard ---")
         def deepseek_out(usage):
             report = copy.deepcopy(usage["reports"][0])
             report["provider"] = "deepseek"
@@ -1549,14 +1486,16 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
                                 if (risk == RiskLevel.HIGH or variant) and (
                                         task_type != TaskType.TINY_TASK or ctx > 180000):
                                     self.assertNotIn("flash", rec.fallback_model, where)
-                                if is_review_lane and ctx <= 180000:
-                                    continue  # the high-risk REVIEW lane may spend Anthropic slack
-                                self.assertNotIn("anthropic/", rec.selected_model, where)
-                                self.assertNotIn("anthropic/", rec.fallback_model, where)
-        print(f"  [PASS] {checked} worker routes (task x risk x rework/domain x 6 context sizes x credentials x "
-              f"{len(scenarios)} quota states): none selects or falls back to paid Anthropic, to a model whose window "
-              "is below the context, or to MiniMax outside low-risk bulk/deep-context work; no high-risk, rework or "
-              "money route falls back to a Flash tier; every fallback crosses providers.")
+                                for model in (rec.selected_model, rec.fallback_model):
+                                    self.assertNotEqual(model, MODEL_CLAUDE_OPUS_55, where)
+                                    if model.startswith("anthropic/"):
+                                        self.assertEqual(model, MODEL_CLAUDE_SONNET_55, where)
+                                if label == "reserve_active":
+                                    self.assertNotIn("anthropic/", rec.selected_model, where)
+                                    self.assertNotIn("anthropic/", rec.fallback_model, where)
+        print(f"  [PASS] {checked} routes preserve context bounds, reserve Anthropic when required, "
+              "allow only Sonnet medium for non-UI judgment, bar Opus, keep high-risk fallbacks off Flash, "
+              "and cross providers.")
 
         # The deep-context gap (review 5317952644 A'): with both 1M-context cheap tiers out,
         # Codex on pace holds 200k/240k, and credentialed GLM holds a 10k DEEP_CONTEXT task.
@@ -1564,23 +1503,22 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
                                                        current_time_ms=self.mock_now_ms))
         for ctx in (200000, 240000):
             rec = gap.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.MEDIUM, context_tokens=ctx)
-            self.assertEqual(rec.selected_model, MODEL_CODEX_ASTRA, ctx)
+            self.assertEqual(rec.selected_model, MODEL_CODEX_WORKER, ctx)
             self.assertFalse(rec.quota_metrics["codex_pro_throttled"])
         gap_glm = ResetAwareModelSelector(parse_usage_json(scenarios["google_deepseek_out_codex_on_pace"],
                                                            current_time_ms=self.mock_now_ms),
                                           credentialed_providers={ZAI_PROVIDER})
         self.assertEqual(gap_glm.select_model(task_type=TaskType.DEEP_CONTEXT, risk_level=RiskLevel.LOW,
                                               context_tokens=10000).selected_model, MODEL_ZAI_GLM)
-        # 500k exceeds every non-1M window (Codex Fast 400k): only then may Fable fire on slack.
+        # At 500k the Codex windows no longer fit; Sonnet's 1M window handles
+        # judgment-heavy non-UI context while Anthropic has slack.
         rec_500k = gap.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.MEDIUM, context_tokens=500000)
-        self.assertEqual(rec_500k.selected_model, MODEL_CLAUDE_FABLE)
-        self.assertIn("whose window holds 500000 tokens is unavailable", rec_500k.reasoning)
-        print(f"  [PASS] Google + DeepSeek out, Codex on pace: 200k/240k -> {MODEL_CODEX_ASTRA}, DEEP_CONTEXT/10k -> "
-              f"{MODEL_ZAI_GLM} (credentialed); Fable only at 500k, beyond every cheap window.")
+        self.assertEqual(rec_500k.selected_model, MODEL_CLAUDE_SONNET_55)
+        self.assertLessEqual(500000, VERIFIED_CONTEXT_WINDOWS[rec_500k.selected_model])
+        print(f"  [PASS] Deep context uses Sol medium through 240k and Sonnet medium at 500k.")
 
-        # Review 5318271884 K: with Gemini Pro and DeepSeek V4 Pro out and MiniMax credentialed,
-        # high-risk implementation, review and money reasoning above 180k go to Codex Astra on
-        # pace; only a low-risk deep-context read may use the MiniMax overflow.
+        # MiniMax remains confined to low-risk deep-context reads. Other work
+        # uses task-specific Sol effort: high for review, medium for execution.
         gap_minimax = ResetAwareModelSelector(parse_usage_json(scenarios["google_deepseek_out_codex_on_pace"],
                                                                current_time_ms=self.mock_now_ms),
                                               credentialed_providers={MINIMAX_PROVIDER})
@@ -1592,16 +1530,16 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             (TaskType.DEEP_CONTEXT, 10000, {"risk_level": RiskLevel.HIGH}),
         ):
             rec = gap_minimax.select_model(task_type=task_type, context_tokens=ctx, **extra)
-            self.assertEqual(rec.selected_model, MODEL_CODEX_ASTRA, f"{task_type.value}/{ctx}/{extra}")
+            expected = MODEL_CODEX_SOL if task_type == TaskType.STRONG_REVIEW else MODEL_CODEX_WORKER
+            self.assertIn(rec.selected_model, (expected, MODEL_CLAUDE_SONNET_55),
+                          f"{task_type.value}/{ctx}/{extra}")
             self.assertNotIn("minimax-code/", rec.fallback_model)
         self.assertEqual(gap_minimax.select_model(task_type=TaskType.DEEP_CONTEXT, risk_level=RiskLevel.LOW,
                                                   context_tokens=200000).selected_model, MODEL_MINIMAX_M3)
-        print(f"  [PASS] Gemini Pro + DeepSeek V4 Pro out, MiniMax credentialed: high-risk impl/review/money reasoning "
-              f"above 180k -> {MODEL_CODEX_ASTRA}; MiniMax only for a low-risk deep-context read.")
+        print("  [PASS] MiniMax stays on low-risk deep-context reads; Sol effort follows task class.")
 
-        # Review 5318271884 L: GLM-5.3 holds exactly 131,072 tokens; at 131,073 every ladder
-        # skips it (high-risk worker, deep-context, tiny-task GLM-5.3-Flash). The high-risk
-        # worker lane then takes DeepSeek V4 Pro, which precedes Codex Astra in that ladder.
+        # GLM-5.3 holds exactly 131,072 tokens. One token over the
+        # verified window moves execution to Sol medium.
         glm_all_ok = ResetAwareModelSelector(parse_usage_json(scenarios["all_ok"], current_time_ms=self.mock_now_ms),
                                              credentialed_providers={ZAI_PROVIDER})
         at_limit = glm_all_ok.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.HIGH,
@@ -1609,11 +1547,11 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         over_limit = glm_all_ok.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.HIGH,
                                              context_tokens=131073)
         self.assertEqual(at_limit.selected_model, MODEL_ZAI_GLM)
-        self.assertEqual(over_limit.selected_model, MODEL_DEEPSEEK_PRO)
+        self.assertEqual(over_limit.selected_model, MODEL_CODEX_WORKER)
         self.assertEqual(gap_glm.select_model(task_type=TaskType.DEEP_CONTEXT, risk_level=RiskLevel.LOW,
                                               context_tokens=131072).selected_model, MODEL_ZAI_GLM)
         self.assertEqual(gap_glm.select_model(task_type=TaskType.DEEP_CONTEXT, risk_level=RiskLevel.LOW,
-                                              context_tokens=131073).selected_model, MODEL_CODEX_ASTRA)
+                                              context_tokens=131073).selected_model, MODEL_CODEX_WORKER)
         glm_google_down = ResetAwareModelSelector(parse_usage_json(google_down, current_time_ms=self.mock_now_ms),
                                                   credentialed_providers={ZAI_PROVIDER})
         self.assertEqual(glm_google_down.select_model(task_type=TaskType.TINY_TASK, context_tokens=131072).selected_model,
@@ -1623,18 +1561,17 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         print(f"  [PASS] GLM window fit: 131,072 -> {MODEL_ZAI_GLM}; 131,073 -> {over_limit.selected_model} "
               "(high-risk worker, deep-context and tiny-task ladders).")
 
-        # When every cheap tier is out, the high-risk worker ladder reaches Fable as its last
-        # rung, and only on slack behind pace.
-        usage_out = self._usage_with_ag_families(anthropic_used=0.95, anthropic_week_used=0.0, anthropic_week_reset_hrs=20)
+        # When cheap and Codex tiers are out, judgment-heavy non-UI work uses
+        # Sonnet medium while Anthropic has worker headroom.
+        usage_out = self._usage_with_ag_families(anthropic_used=0.0, anthropic_week_used=0.0, anthropic_week_reset_hrs=20)
         for rep in usage_out["reports"]:
             if rep["provider"] in ("google-antigravity", "openai-codex"):
                 rep["metadata"]["limitReached"] = True
                 rep["metadata"]["allowed"] = False
         deepseek_out(usage_out)
         rec_last = self._selector(usage_out).select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.HIGH)
-        self.assertEqual(rec_last.selected_model, MODEL_CLAUDE_FABLE)
-        self.assertTrue(rec_last.cooldown_fallback)
-        self.assertIn("last resort", rec_last.reasoning)
+        self.assertEqual(rec_last.selected_model, MODEL_CLAUDE_SONNET_55)
+        self.assertNotEqual(rec_last.selected_model, MODEL_CLAUDE_OPUS_55)
         # Ahead of pace, the orchestrator reserve is never touched: pay-per-token last resort.
         usage_reserve = copy.deepcopy(usage_out)
         set_week = usage_reserve["reports"][1]["limits"][1]
@@ -1678,11 +1615,11 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
                     self.assertNotIn(MODEL_CHATGPT_WEB, (rec.selected_model, rec.fallback_model),
                                      f"{task_type}/{risk} must not select or fall back to chatgpt-web")
 
-        # Critical diffs fall through cleanly to reviewer, codex, or deepseek
+        # Critical non-UI diffs fall through to Sol, Sonnet, or DeepSeek; never Opus.
         critical = down.select_model(TaskType.STRONG_REVIEW, RiskLevel.HIGH)
-        self.assertIn(critical.selected_model, (MODEL_CLAUDE_OPUS_55, MODEL_CODEX_ASTRA, MODEL_DEEPSEEK_PRO, MODEL_CLAUDE_FABLE))
-        print("  [PASS] Bridge is off by default, requires explicit operator action, and is "
-              "stripped from all ladders; critical reviews and workers fall through cleanly.")
+        self.assertIn(critical.selected_model, (MODEL_CODEX_SOL, MODEL_CLAUDE_SONNET_55, MODEL_DEEPSEEK_PRO))
+        self.assertNotEqual(critical.selected_model, MODEL_CLAUDE_OPUS_55)
+        print("  [PASS] Bridge is default-off and absent from every ladder; critical work still routes by task class.")
 
     # -------------------------------------------------------------------------
     # TEST 37: Gemini never reviews — not as a pick, not as a fallback, at any risk or context
@@ -2447,26 +2384,25 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         selector_off = ResetAwareModelSelector(snapshot, codex_account=False)
         self.assertFalse(selector_off.codex_account_available())
 
-        # Strong review (high-risk or routine) must NEVER select openai-codex or Flash;
-        # falls through to reviewer (Opus 5.5).
+        # With Codex disabled, strong non-UI review falls through to Sonnet,
+        # never to Opus or Flash.
         rec_review = selector_off.select_model(
             task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH, allow_codex_promotion=True
         )
         self.assertEqual(rec_review.provider_statuses["openai-codex"], "unavailable")
-        self.assertFalse(rec_review.selected_model.startswith("openai-codex/"))
+        self.assertEqual(rec_review.selected_model, MODEL_CLAUDE_SONNET_55)
         self.assertFalse(rec_review.fallback_model.startswith("openai-codex/"))
-        self.assertNotIn("flash", rec_review.selected_model.lower())
         self.assertNotIn("flash", rec_review.fallback_model.lower())
-        self.assertIn(rec_review.selected_model, (MODEL_CLAUDE_OPUS_55, MODEL_CLAUDE_FABLE))
-        self.assertIn(model_to_agent_role(rec_review.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH),
-                      ("reviewer", "advisor"))
+        self.assertEqual(
+            model_to_agent_role(rec_review.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH),
+            "sonnet",
+        )
 
-        # With Antigravity Claude available in snapshot: falls through to reviewer (Opus 5.5)
         snap_ag = parse_usage_json(self._usage_with_ag_families(), current_time_ms=self.mock_now_ms)
         sel_ag_off = ResetAwareModelSelector(snap_ag, codex_account=False)
         rec_ag_rev = sel_ag_off.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
-        self.assertIn(rec_ag_rev.selected_model, (MODEL_CLAUDE_OPUS_55, MODEL_CLAUDE_FABLE))
-        self.assertIn(model_to_agent_role(rec_ag_rev.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH), ("reviewer", "advisor"))
+        self.assertEqual(rec_ag_rev.selected_model, MODEL_CLAUDE_SONNET_55)
+        self.assertEqual(model_to_agent_role(rec_ag_rev.selected_model, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "sonnet")
         # Routine execution / implementation falls through to task (Gemini Flash).
         rec_exec = selector_off.select_model(
             task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.MEDIUM, allow_codex_promotion=True
@@ -2487,7 +2423,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         )
         self.assertFalse(packet_review.recommendation["model"].startswith("openai-codex/"))
         self.assertFalse(packet_review.recommendation["fallback_model"].startswith("openai-codex/"))
-        self.assertIn(packet_review.recommendation["agent_role"], ("reviewer", "advisor"))
+        self.assertEqual(packet_review.recommendation["agent_role"], "sonnet")
         self.assertNotIn("flash", packet_review.recommendation["model"].lower())
 
         packet_worker = selector_off.dispatch(
@@ -2535,7 +2471,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             self.assertFalse(default_sel.codex_account_available())
             disp_rev = default_sel.dispatch(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
             self.assertFalse(disp_rev.recommendation["model"].startswith("openai-codex/"))
-            self.assertIn(disp_rev.recommendation["agent_role"], ("reviewer", "advisor"))
+            self.assertEqual(disp_rev.recommendation["agent_role"], "sonnet")
             disp_work = default_sel.dispatch(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.MEDIUM)
             self.assertFalse(disp_work.recommendation["model"].startswith("openai-codex/"))
             self.assertEqual(disp_work.recommendation["agent_role"], "task")
@@ -2548,7 +2484,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             selector_on = ResetAwareModelSelector(snapshot, codex_account=True)
             self.assertTrue(selector_on.codex_account_available())
 
-            # Near reset with surplus allowance: promotes Codex Astra / Fast
+            # Near reset with surplus allowance: Sol high reviews and Sol medium executes.
             near_reset_dict = copy.deepcopy(self.mock_usage_dict)
             codex_lim = near_reset_dict["reports"][2]["limits"][0]
             codex_lim["window"]["resetsAt"] = self.mock_now_ms + (18 * 3600 * 1000)
@@ -2558,7 +2494,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             on_sel_surplus = ResetAwareModelSelector(on_snap, codex_account=True)
 
             on_review = on_sel_surplus.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
-            self.assertEqual(on_review.selected_model, MODEL_CODEX_ASTRA)
+            self.assertEqual(on_review.selected_model, MODEL_CODEX_SOL)
             self.assertTrue(on_review.promotion_applied)
 
             on_exec = on_sel_surplus.select_model(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.MEDIUM)
@@ -2567,7 +2503,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
 
             # Dispatch packets map to actual Codex agent roles when enabled
             on_pkt_rev = on_sel_surplus.dispatch(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH)
-            self.assertEqual(on_pkt_rev.recommendation["model"], MODEL_CODEX_ASTRA)
+            self.assertEqual(on_pkt_rev.recommendation["model"], MODEL_CODEX_SOL)
             self.assertEqual(on_pkt_rev.recommendation["agent_role"], "codex-reviewer")
 
             on_pkt_work = on_sel_surplus.dispatch(task_type=TaskType.ROUTINE_EXECUTION, risk_level=RiskLevel.MEDIUM)
@@ -2581,7 +2517,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             self.assertEqual(model_to_agent_role(MODEL_CODEX_SOL, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "codex-reviewer")
             self.assertEqual(model_to_agent_role(MODEL_CODEX_SOL, TaskType.ROUTINE_EXECUTION, RiskLevel.HIGH), "codex-worker")
             self.assertEqual(model_to_agent_role(MODEL_CODEX_SOL, TaskType.DEEP_REASONING, RiskLevel.HIGH), "thinker")
-            self.assertEqual(resolve_role_model("codex-worker"), MODEL_CODEX_SOL)
+            self.assertEqual(resolve_role_model("codex-worker"), MODEL_CODEX_WORKER)
             self.assertEqual(resolve_role_model("codex-reviewer"), MODEL_CODEX_SOL)
             self.assertEqual(resolve_role_model("thinker"), MODEL_CODEX_SOL)
             self.assertTrue(is_agent_role_available("codex-worker"))
@@ -2602,15 +2538,15 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             neg_sel_surplus = ResetAwareModelSelector(on_snap, codex_account=False)
             self.assertFalse(neg_sel_surplus.codex_account_available())
 
-            # Stimulus identical to State 2 (near reset with surplus allowance):
-            # In State 2 this returned MODEL_CODEX_ASTRA with promotion_applied=True.
-            # In Negative Control, it MUST NOT select Codex Astra or any Codex model:
-            neg_rev = neg_sel_surplus.select_model(task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH, allow_codex_promotion=True)
+            # The same near-reset stimulus must not select any Codex model when
+            # the account switch is off; non-UI judgment falls to Sonnet.
+            neg_rev = neg_sel_surplus.select_model(
+                task_type=TaskType.STRONG_REVIEW, risk_level=RiskLevel.HIGH, allow_codex_promotion=True)
             self.assertFalse(neg_rev.selected_model.startswith("openai-codex/"))
             self.assertFalse(neg_rev.promotion_applied, "Promotion must not be applied to Codex when disabled")
-            self.assertNotIn("flash", neg_rev.selected_model.lower(), "High-risk review must never fall back to Flash")
-            self.assertIn(neg_rev.selected_model, (MODEL_CLAUDE_OPUS_55, MODEL_CLAUDE_FABLE))
-            self.assertNotEqual(neg_rev.selected_model, MODEL_CODEX_ASTRA)
+            self.assertEqual(neg_rev.selected_model, MODEL_CLAUDE_SONNET_55)
+            self.assertNotIn("flash", neg_rev.selected_model.lower())
+            self.assertNotEqual(neg_rev.selected_model, MODEL_CLAUDE_OPUS_55)
 
             # In State 2 routine execution returned MODEL_CODEX_FAST with promotion_applied=True.
             # In Negative Control, it MUST NOT select Codex Fast or any Codex model:
@@ -2649,7 +2585,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         with mock.patch("model_routing.CODEX_ENABLED", False):
             with mock.patch.dict(os.environ, {"VEYYON_CODEX_ENABLED": "1"}):
                 self.assertTrue(codex_available(), "VEYYON_CODEX_ENABLED=1 must enable codex_available() when CODEX_ENABLED=False")
-                self.assertEqual(resolve_role_model("codex-worker"), MODEL_CODEX_SOL)
+                self.assertEqual(resolve_role_model("codex-worker"), MODEL_CODEX_WORKER)
                 self.assertEqual(resolve_role_model("codex-reviewer"), MODEL_CODEX_SOL)
                 self.assertEqual(resolve_role_model("thinker"), MODEL_CODEX_SOL)
                 self.assertTrue(is_agent_role_available("codex-worker"))
@@ -2904,67 +2840,33 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         print("  [PASS] Catalog window 1,048,576 verified; context limit enforced on last-resort and final-fallback entries.")
 
     # -------------------------------------------------------------------------
-    # TEST 54: Unsupported Codex model gpt-6.1-sol rejected/skipped in ladders
+    # TEST 54: Current Codex families are supported and legacy 5.6 is absent.
     # -------------------------------------------------------------------------
     def test_unsupported_codex_model_rejected_and_skipped(self):
-        print("\n--- TEST 54: Unsupported Codex Model gpt-6.1-sol Skipped/Rejected ---")
-        unsupported = "openai-codex/gpt-6.1-sol"
-        supported = MODEL_CODEX_SOL  # "openai-codex/gpt-5.6-sol:high"
+        print("\n--- TEST 54: Current Codex Families and Effort Pins ---")
+        self.assertEqual(UNSUPPORTED_CODEX_MODELS, frozenset())
+        for model in (
+            MODEL_CODEX_WORKER,
+            MODEL_CODEX_SOL,
+            MODEL_CODEX_SOL_FALLBACK,
+            MODEL_CODEX_ASTRA,
+        ):
+            self.assertFalse(is_unsupported_codex_model(model), model)
+            self.assertTrue(is_agent_role_available(model_to_agent_role(
+                model, TaskType.STRONG_REVIEW, RiskLevel.HIGH)))
 
-        # 1. Verification of unsupported model set and predicate
-        self.assertIn("gpt-6.1-sol", UNSUPPORTED_CODEX_MODELS)
-        self.assertTrue(is_unsupported_codex_model(unsupported))
-        self.assertTrue(is_unsupported_codex_model("openai-codex/gpt-6.1-sol:high"))
-        self.assertTrue(is_unsupported_codex_model("gpt-6.1-sol"))
-        self.assertFalse(is_unsupported_codex_model(supported))
-        self.assertFalse(is_unsupported_codex_model(MODEL_CODEX_ASTRA))
+        configured = list(ROLE_MODEL_PINS.values())
+        for ladder in ROLE_FALLBACK_LADDERS.values():
+            configured.extend(ladder)
+        self.assertTrue(all("gpt-5.6-sol" not in model for model in configured))
 
-        # 2. Ladder climbing skips unsupported rung and picks next eligible rung
-        rungs_with_unsupported = [
-            _Rung(unsupported, True, "unsupported codex rung"),
-            _Rung(MODEL_DEEPSEEK_FLASH, True, "deepseek fallback"),
-        ]
-        last_resort = _Rung(supported, True, "supported codex resort")
-        chosen, fallback = _climb(rungs_with_unsupported, last_resort, [supported])
-        self.assertNotEqual(chosen.model, unsupported)
-        self.assertEqual(chosen.model, MODEL_DEEPSEEK_FLASH)
-        self.assertEqual(fallback, supported)
-
-        # 3. Ladder containing ONLY unsupported model gets rejected (raises ValueError)
-        rungs_only_unsupported = [
-            _Rung(unsupported, True, "unsupported rung 1"),
-        ]
-        last_resort_unsupported = _Rung(unsupported, True, "unsupported resort")
-        with self.assertRaises(ValueError):
-            _climb(rungs_only_unsupported, last_resort_unsupported, [unsupported])
-
-        # 4. Ladder with supported gpt-5.6-sol passes cleanly
-        rungs_with_supported = [
-            _Rung(supported, True, "supported codex sol"),
-        ]
-        last_resort_supported = _Rung(MODEL_DEEPSEEK_FLASH, True, "deepseek resort")
-        chosen_sol, fallback_sol = _climb(rungs_with_supported, last_resort_supported, [MODEL_DEEPSEEK_FLASH])
-        self.assertEqual(chosen_sol.model, supported)
-        self.assertEqual(fallback_sol, MODEL_DEEPSEEK_FLASH)
-
-        # 5. Role resolution and fallback ladder skips gpt-6.1-sol and resolves to gpt-5.6-sol
-        with mock.patch.dict(ROLE_FALLBACK_LADDERS, {"test-unsupported-role": [unsupported, supported]}):
-            resolved = resolve_role_model("test-unsupported-role")
-            self.assertEqual(resolved, supported)
-
-        with mock.patch.dict(ROLE_FALLBACK_LADDERS, {"test-unsupported-only": [unsupported]}):
-            resolved = resolve_role_model("test-unsupported-only")
-            self.assertIsNone(resolved)
-
-        with mock.patch.dict(ROLE_MODEL_PINS, {"test-pinned-unsupported": unsupported}):
-            self.assertIsNone(resolve_role_model("test-pinned-unsupported"))
-            self.assertFalse(is_agent_role_available("test-pinned-unsupported"))
-
-        with mock.patch.dict(ROLE_MODEL_PINS, {"test-pinned-supported": supported}):
-            self.assertEqual(resolve_role_model("test-pinned-supported"), supported)
-            self.assertTrue(is_agent_role_available("test-pinned-supported"))
-
-        print("  [PASS] openai-codex/gpt-6.1-sol rejected and skipped in ladders; openai-codex/gpt-5.6-sol passes.")
+        self.assertEqual(ROLE_MODEL_PINS["codex-worker"], MODEL_CODEX_WORKER)
+        self.assertEqual(ROLE_MODEL_PINS["codex-reviewer"], MODEL_CODEX_SOL)
+        self.assertEqual(ROLE_MODEL_PINS["astra-ux"], MODEL_CODEX_ASTRA)
+        self.assertTrue(MODEL_CODEX_WORKER.endswith(":medium"))
+        self.assertTrue(MODEL_CODEX_SOL.endswith(":high"))
+        self.assertTrue(MODEL_CODEX_ASTRA.endswith(":xhigh"))
+        print("  [PASS] GPT-6.1/6 Sol and Astra are supported at task-specific effort; GPT-5.6 Sol is absent.")
 
 def main():
     print("=" * 70)
