@@ -54,6 +54,10 @@ class WtRemoveTest(unittest.TestCase):
         run_git("commit", "-q", "-m", "init", cwd=self.main)
         self.wt = self.tmp / "lane"
         run_git("worktree", "add", "-q", "-b", "lane", str(self.wt), cwd=self.main)
+        (self.wt / "feature.txt").write_text("feature-v1", encoding="utf-8")
+        run_git("add", "feature.txt", cwd=self.wt)
+        run_git("commit", "-q", "-m", "feature", cwd=self.wt)
+        run_git("merge", "-q", "lane", cwd=self.main)
         self.link = self.wt / "node_modules"  # deliberately not gitignored: git sees it as untracked
         make_link(self.link, self.shared)
 
@@ -118,6 +122,61 @@ class WtRemoveTest(unittest.TestCase):
         self.assertEqual(self.remove("--force"), 2)
         self.assert_untouched()
 
+    # --- unmerged-work guard (issue #334) ---------------------------------------------
+    def _commit_unmerged(self, name: str = "unmerged.txt") -> None:
+        (self.wt / name).write_text("unmerged", encoding="utf-8")
+        run_git("add", name, cwd=self.wt)
+        run_git("commit", "-q", "-m", "unmerged work", cwd=self.wt)
+
+    def test_clean_unmerged_worktree_is_refused_untouched(self) -> None:
+        self._commit_unmerged()
+        self.assertEqual(self.remove(), 2)
+        self.assert_untouched()
+        report = wt_remove.remove_worktree(str(self.wt), False, False, False, (self.tmp,))
+        self.assertTrue(report["refused"])
+        self.assertEqual(report["branch"], "lane")
+        self.assertEqual(report["merged_into"], [])
+        self.assertIn("not reachable", report["error"])
+        self.assert_untouched()
+
+    def test_dirty_unmerged_worktree_with_force_is_refused_untouched(self) -> None:
+        self._commit_unmerged()
+        (self.wt / "scratch.txt").write_text("dirty content", encoding="utf-8")
+        self.assertEqual(self.remove("--force"), 2)
+        self.assert_untouched()
+        report = wt_remove.remove_worktree(str(self.wt), True, False, False, (self.tmp,))
+        self.assertTrue(report["refused"])
+        self.assertEqual(report["merged_into"], [])
+        self.assertIn("not reachable", report["error"])
+        self.assert_untouched()
+
+    def test_allow_unmerged_overrides_the_guard_and_keeps_the_shared_tree(self) -> None:
+        self._commit_unmerged()
+        self.assertEqual(self.remove("--allow-unmerged", "--dry-run"), 0)
+        self.assert_untouched()
+        self.assertEqual(self.remove("--allow-unmerged"), 0)
+        self.assertFalse(self.wt.exists())
+        self.assertTrue(self.sentinel.is_file(), "the shared tree must survive removal")
+
+    def test_detached_head_reachable_is_removed_and_unmerged_refused(self) -> None:
+        run_git("checkout", "-q", "--detach", cwd=self.wt)
+        report = wt_remove.remove_worktree(str(self.wt), False, True, False, (self.tmp,))
+        self.assertEqual(report["branch"], "(detached)")
+        self.assertIn("main", report["merged_into"])
+        self.assertFalse(report.get("refused", False))
+
+        self._commit_unmerged("detached_unmerged.txt")
+        self.assertEqual(self.remove(), 2)
+        self.assert_untouched()
+        self.assertEqual(self.remove("--force"), 2)
+        self.assert_untouched()
+
+    def test_report_includes_branch_full_head_and_merged_into(self) -> None:
+        report = wt_remove.remove_worktree(str(self.wt), False, True, False, (self.tmp,))
+        self.assertEqual(report["branch"], "lane")
+        self.assertEqual(len(report["head"]), 40)
+        self.assertIn("main", report["merged_into"])
+
     # --- issue #326, item 1: the caller's ancestor chain is not "busy" ---------------
     def test_busy_ignores_caller_ancestor_chain(self) -> None:
         wt = str(self.wt)
@@ -155,9 +214,13 @@ class WtRemoveTest(unittest.TestCase):
     def test_cmd_wrapper_dry_run_on_idle_worktree_exits_zero(self) -> None:
         script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wt_remove.py")
         r = subprocess.run(
-            f'cmd /c "{sys.executable}" "{script}" "{self.wt}" --dry-run',
+            f'cmd /c ""{sys.executable}" "{script}" "{self.wt}" --dry-run"',
             capture_output=True, text=True, timeout=120, cwd=str(self.tmp),
         )
+        self.assertEqual(r.returncode, 0, f"stdout={r.stdout!r} stderr={r.stderr!r}")
+        self.assertIn("dry run: nothing changed", r.stdout)
+        self.assert_untouched()
+
     def test_verbatim_unc_target_keeps_share(self) -> None:
         self.assertEqual(wt_remove._verbatim_to_abs("\\\\?\\UNC\\server\\share\\dir"), "\\\\server\\share\\dir")
         self.assertEqual(wt_remove._verbatim_to_abs("\\\\?\\C:\\dir"), "C:\\dir")
@@ -248,6 +311,7 @@ class WtRemoveTest(unittest.TestCase):
         (self.wt / "a1").write_text("tracked", encoding="utf-8")
         run_git("add", "a1", cwd=self.wt)
         run_git("commit", "-q", "-m", "a1", cwd=self.wt)
+        run_git("merge", "-q", "lane", cwd=self.main)  # keep the lane reachable so the unmerged-work guard stays out of this test
         make_link(self.wt / "a[1]", self.shared)
         self.assertEqual(self.remove(), 0)
         self.assertFalse(self.wt.exists())

@@ -15,11 +15,15 @@ This tool removes a worktree in the only safe order:
 3. refuse, before touching anything, a worktree git would not remove: a locked one,
    or without ``--force`` one with modified or untracked files (the links this tool
    unlinks aside) or with a tracked link, which unlinking would itself turn into a change;
+   also refuse, even with ``--force``, a worktree whose HEAD is not reachable from an
+   integration ref (``origin/staging``, ``origin/main``, ``staging``, ``main``): removing
+   it would orphan unmerged commits. ``--allow-unmerged`` overrides that refusal;
 4. delete every junction/symlink inside the worktree as a link (``RemoveDirectoryW``
    on the link, never recursing into it), then verify none is left;
 5. only then run ``git --git-dir=<common> worktree remove <top>``.
 
 Usage:
+    python wt_remove.py <worktree> [--force] [--dry-run] [--orphan-dependents] [--allow-unmerged] [--json]
 
 ``--force`` is passed through to ``git worktree remove`` (needed for dirty
 worktrees). Exit codes: 0 removed (or dry run clean), 2 refused, 1 error.
@@ -49,6 +53,8 @@ DEFAULT_SCAN_ROOTS = (
 )
 # Relative paths inside a worktree where lanes put shared-tree links.
 LINK_SLOTS = ("frontend/node_modules", "node_modules", "frontend/.next/cache")
+# Integration branches checked for reachability before worktree removal (Issue #334)
+INTEGRATION_REFS = ("origin/staging", "origin/main", "staging", "main")
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +379,18 @@ def _holds_only_links(root: str) -> bool:
     return True
 
 
+def check_merged_into(top: str, head: str) -> list[str]:
+    """Return existing integration refs that contain head (from which head is reachable)."""
+    merged: list[str] = []
+    for ref in INTEGRATION_REFS:
+        chk = git(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], cwd=top)
+        if chk.returncode == 0:
+            anc = git(["merge-base", "--is-ancestor", head, ref], cwd=top)
+            if anc.returncode == 0:
+                merged.append(ref)
+    return merged
+
+
 def dirty_paths(top: str, links: list[str]) -> list[str]:
     """What makes ``git worktree remove`` refuse without --force, once ``links`` are unlinked:
     modified or untracked paths other than those links, plus any link git tracks (unlinking a
@@ -415,6 +433,7 @@ def remove_worktree(
     dry_run: bool,
     orphan_dependents: bool,
     roots: Iterable[Path] = DEFAULT_SCAN_ROOTS,
+    allow_unmerged: bool = False,
 ) -> dict:
     report: dict = {"worktree": norm(path), "unlinked": [], "dependents": [], "busy": [], "removed": False}
     if not os.path.isdir(path):
@@ -428,6 +447,20 @@ def remove_worktree(
     if gdir == common:
         report.update(refused=True, error="refusing to remove the main worktree")
         return report
+
+    r_head = git(["rev-parse", "HEAD"], cwd=top)
+    if r_head.returncode != 0:
+        report.update(refused=True, error=f"unable to determine HEAD of worktree: {r_head.stderr.strip()}")
+        return report
+    head = r_head.stdout.strip()
+    report["head"] = head
+
+    r_sym = git(["symbolic-ref", "--short", "-q", "HEAD"], cwd=top)
+    branch = r_sym.stdout.strip() if r_sym.returncode == 0 else "(detached)"
+    report["branch"] = branch
+
+    merged_into = check_merged_into(top, head)
+    report["merged_into"] = merged_into
 
     report["dependents"] = [{"link": link, "target": target} for link, target in dependents_of(path, roots)]
     if report["dependents"] and not orphan_dependents:
@@ -455,6 +488,17 @@ def remove_worktree(
             return report
     if is_locked(top):
         report.update(refused=True, error="the worktree is locked (git worktree unlock it first)")
+        return report
+    if not merged_into and not allow_unmerged:
+        existing_refs = [
+            ref for ref in INTEGRATION_REFS
+            if git(["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], cwd=top).returncode == 0
+        ]
+        ref_desc = f"any existing integration ref ({', '.join(existing_refs)})" if existing_refs else f"any integration ref ({', '.join(INTEGRATION_REFS)})"
+        report.update(
+            refused=True,
+            error=f"HEAD {head} ({branch}) is not reachable from {ref_desc}; refusing to remove worktree (pass --allow-unmerged to override)",
+        )
         return report
     if not force:
         report["dirty"] = dirty_paths(top, links)
@@ -496,6 +540,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true", help="list what would be unlinked; change nothing")
     ap.add_argument("--orphan-dependents", action="store_true", help="remove even if other worktrees link into this one")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--allow-unmerged", action="store_true", help="remove even when HEAD is not reachable from an integration ref (its commits become unreachable)")
     ap.add_argument(
         "--scan-root",
         action="append",
@@ -506,7 +551,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         roots = tuple(args.scan_root) if args.scan_root else DEFAULT_SCAN_ROOTS
-        report = remove_worktree(os.path.abspath(args.worktree), args.force, args.dry_run, args.orphan_dependents, roots)
+        report = remove_worktree(os.path.abspath(args.worktree), args.force, args.dry_run, args.orphan_dependents, roots, allow_unmerged=args.allow_unmerged)
     except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
         report = {"worktree": args.worktree, "error": str(exc)}
     if args.json:
@@ -521,6 +566,13 @@ def main(argv: list[str] | None = None) -> int:
             print(f"dirty: {item}")
         for proc in report.get("busy", []):
             print(f"busy: pid {proc['pid']} {proc['name']} cwd={proc['cwd']}")
+        if report.get("branch"):
+            print(f"branch: {report['branch']}")
+        if report.get("head"):
+            print(f"head: {report['head']}")
+        if "merged_into" in report:
+            refs = ", ".join(report["merged_into"]) if report["merged_into"] else "(none)"
+            print(f"merged into: {refs}")
         for err in report.get("scan_errors", []):
             print(f"scan error: {err}", file=sys.stderr)
         scan = report.get("process_scan")
