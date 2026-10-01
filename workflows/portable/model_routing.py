@@ -36,7 +36,7 @@ import time
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple, Union
 
 # Ensure balance_loader is importable from sibling module
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -96,6 +96,15 @@ MODEL_CODEX_FAST = "openai-codex/gpt-5.3-codex"
 MODEL_CODEX_SOL = "openai-codex/gpt-5.6-sol:high"
 MODEL_CODEX_ASTRA = "openai-codex/gpt-6-astra:medium"
 MODEL_CODEX_SPARK = "openai-codex/gpt-5.3-codex-spark:medium"
+
+# Models that cannot run on the openai-codex (ChatGPT subscription) provider.
+# Verified 2026-09-29: POST chatgpt.com/backend-api/codex/responses with model gpt-6.1-sol
+# -> HTTP 400 "The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."
+# The Codex catalog contains gpt-6-astra, gpt-reserve, gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, codex-auto-review.
+# gpt-6.1-sol exists only as the paid openrouter/openai/gpt-6.1-sol, which is not approved; don't add it anywhere.
+UNSUPPORTED_CODEX_MODELS: FrozenSet[str] = frozenset({
+    "gpt-6.1-sol",
+})
 # Manual account-availability switch (re-enabled 2026-09-29, operator ruling):
 # The operator confirmed a new Codex account (tricuoc1968@gmail.com, plan prolite, 5x plan).
 # CODEX_ENABLED is True. Can be forced off via VEYYON_CODEX_ENABLED=0.
@@ -420,6 +429,8 @@ def resolve_role_model(role: str, quota_snapshot: Optional[Any] = None) -> Optio
         for candidate in ladder:
             if candidate.startswith("openai-codex/") and not codex_available():
                 continue
+            if is_unsupported_codex_model(candidate):
+                continue
             if snapshot is not None:
                 provider = balance_provider_for(candidate)
                 if not snapshot.is_eligible(provider):
@@ -429,6 +440,8 @@ def resolve_role_model(role: str, quota_snapshot: Optional[Any] = None) -> Optio
 
     model = ROLE_MODEL_PINS.get(role)
     if model and model.startswith("openai-codex/") and not codex_available():
+        return None
+    if model and is_unsupported_codex_model(model):
         return None
     if model and quota_snapshot is not None:
         provider = balance_provider_for(model)
@@ -451,8 +464,9 @@ def is_agent_role_available(role: str) -> bool:
         return codex_available()
     if role in ROLE_MODEL_PINS:
         model = ROLE_MODEL_PINS[role]
-        if model.startswith("openai-codex/") and not codex_available():
-            return resolve_role_model(role) is not None
+        if model.startswith("openai-codex/"):
+            if not codex_available() or is_unsupported_codex_model(model):
+                return resolve_role_model(role) is not None
     return True
 
 
@@ -477,6 +491,20 @@ def _model_base(pattern: str) -> str:
     """A model pattern without its `:level` thinking suffix (`:free` is part of the id)."""
     base, _, suffix = pattern.strip().rpartition(":")
     return base if base and suffix in _THINKING_LEVELS else pattern.strip()
+
+
+def is_unsupported_codex_model(model: str) -> bool:
+    """Return True if model cannot run on the openai-codex (ChatGPT subscription) provider.
+
+    Verified 2026-09-29: POST chatgpt.com/backend-api/codex/responses with model gpt-6.1-sol
+    -> HTTP 400 "The 'gpt-6.1-sol' model is not supported when using Codex with a ChatGPT account."
+    """
+    if not model:
+        return False
+    base = _model_base(model)
+    if base.startswith("openai-codex/"):
+        return base[len("openai-codex/"):] in UNSUPPORTED_CODEX_MODELS
+    return base in UNSUPPORTED_CODEX_MODELS
 
 
 def lane_model_at_depth(agents_cfg: Dict[str, Any], role: str, task_depth: int) -> Optional[List[str]]:
@@ -649,7 +677,7 @@ VERIFIED_CONTEXT_WINDOWS: Dict[str, int] = {
     MODEL_ZAI_GLM: 131072,
     MODEL_ZAI_GLM_FLASH: 131072,
     MODEL_MINIMAX_M3: 1000000,
-    MODEL_OR_DEEPSEEK_FLASH: 163840,
+    MODEL_OR_DEEPSEEK_FLASH: 1048576,  # Catalog-verified 1M tokens (models.db openrouter:pseudo-api and OpenRouter live API)
     # OpenCode Go models (catalog-verified 2026-09-25)
     MODEL_GO_BUNNY: 1048576,
     MODEL_GO_GLM53: 1000000,
@@ -704,7 +732,7 @@ def model_to_agent_role(model_id: str, task_type: TaskType, risk_level: RiskLeve
     if model_id.startswith("chatgpt-web/"):
         return "web-thinker" if task_type == TaskType.STRONG_REVIEW else "web-task"
     if model_id.startswith("openai-codex/"):
-        if not codex_available():
+        if not codex_available() or is_unsupported_codex_model(model_id):
             # Codex account withdrawn (2026-09-26): reviews fall through to reviewer (Opus 5.5,
             # never Flash), implementation falls through to task (Flash).
             return "reviewer" if task_type == TaskType.STRONG_REVIEW else "task"
@@ -988,6 +1016,10 @@ def _pace_gate_rung(rung: _Rung, pace: Optional[WindowPace],
     """
     if not rung.available:
         return rung
+    if is_unsupported_codex_model(rung.model):
+        return replace(rung, available=False, reason=(
+            f"{rung.reason} Blocked: {rung.model} is not supported on openai-codex subscription (HTTP 400)."
+        ))
     if blocked_reason:
         return replace(rung, available=False, reason=f"{rung.reason} Blocked: {blocked_reason}.")
     if pace is None:
@@ -1061,14 +1093,18 @@ def _climb(
     All fallback candidates (including last_resort and final_fallbacks) must pass is_eligible."""
     eligible_check = is_eligible or (lambda _m: True)
 
-    index = next((i for i, rung in enumerate(rungs) if rung.available), None)
+    index = next(
+        (i for i, rung in enumerate(rungs)
+         if rung.available and not is_unsupported_codex_model(rung.model) and eligible_check(rung.model)),
+        None
+    )
     if index is None:
-        if last_resort.available and eligible_check(last_resort.model):
+        if last_resort.available and not is_unsupported_codex_model(last_resort.model) and eligible_check(last_resort.model):
             chosen = last_resort
         else:
             chosen_candidate = None
             for m in final_fallbacks:
-                if eligible_check(m):
+                if not is_unsupported_codex_model(m) and eligible_check(m):
                     chosen_candidate = _Rung(m, True, "final fallback")
                     break
             if chosen_candidate is None:
@@ -1080,14 +1116,13 @@ def _climb(
     provider = model_to_provider(chosen.model)
     below = [] if index is None else rungs[index + 1:]
     for rung in below:
-        if rung.available and rung.as_fallback and model_to_provider(rung.model) != provider:
+        if rung.available and rung.as_fallback and not is_unsupported_codex_model(rung.model) and model_to_provider(rung.model) != provider:
             if eligible_check(rung.model):
                 return chosen, rung.model
 
     for model in (last_resort.model, *final_fallbacks):
-        if model_to_provider(model) != provider and eligible_check(model):
+        if not is_unsupported_codex_model(model) and model_to_provider(model) != provider and eligible_check(model):
             return chosen, model
-
     raise ValueError(f"no eligible cross-provider fallback for {chosen.model}")
 
 
@@ -1223,6 +1258,8 @@ class ResetAwareModelSelector:
         429 within 3 s. Once that reset time passes the same provider is eligible again with
         no further bookkeeping.
         """
+        if is_unsupported_codex_model(model):
+            return f"{model} is not supported on openai-codex subscription (HTTP 400)"
         snapshot = self.quota_snapshot()
         if snapshot is None:
             return None
@@ -1902,8 +1939,11 @@ class ResetAwareModelSelector:
         # drops a rung whose verified window cannot hold the context, so GLM-5.3 (131,072
         # tokens) is never picked or offered as a fallback above its window.
         rungs = _apply_pace_rules(rungs, self.pace_of_model, self.provider_exhaustion_reason)
-        rungs = [rung for rung in rungs if context_tokens <= VERIFIED_CONTEXT_WINDOWS[rung.model]]
-        is_eligible_fn = lambda m: self.provider_exhaustion_reason(m) is None
+        rungs = [rung for rung in rungs if context_tokens <= VERIFIED_CONTEXT_WINDOWS.get(rung.model, 0)]
+        is_eligible_fn = (
+            lambda m: self.provider_exhaustion_reason(m) is None
+            and context_tokens <= VERIFIED_CONTEXT_WINDOWS.get(m, 0)
+        )
         chosen, fallback_model = _climb(rungs, last_resort, final_fallbacks, is_eligible=is_eligible_fn)
 
         # Free OpenRouter second opinion for reviews: advisory only (1000 req/day free tier),

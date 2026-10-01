@@ -26,6 +26,7 @@ import { Database } from "bun:sqlite";
 import { getDaemonDbPath } from "../daemon/config";
 import { DaemonStore } from "../daemon/store";
 import { readMessageThreadId } from "./harness/channel-config";
+import { questionCompactionContext } from "./harness/operator-questions";
 import { escapeHtml, markdownToTelegramHtml } from "./sanitizer";
 import { resolveGithubRepo } from "./github-repo";
 import {
@@ -685,6 +686,37 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
       `Telegram operator tools not registered on this host: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
+  try {
+    pi.on("session_compacting", async () => {
+      if (ownerInstance !== pi) return undefined;
+      try {
+        const questions = ownedRoot()?.questions ?? activeRuntime?.getQuestions();
+        const sessionId = savedContext?.sessionId;
+        const context = questions
+          ? await questions.compactionContext()
+          : sessionId
+            ? await questionCompactionContext(
+                path.join(os.homedir(), ".veyyon", "workflows", "decisions.json"),
+                {
+                  session_id: sessionId,
+                  ...(lastKnownRoute?.chatId ? { chat_id: lastKnownRoute.chatId } : {}),
+                },
+              )
+            : undefined;
+        return context ? { context: [context] } : undefined;
+      } catch (err: unknown) {
+        pi.logger?.warn(
+          `Telegram question state unavailable during compaction: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return undefined;
+      }
+    });
+  } catch (err: unknown) {
+    pi.logger?.warn(
+      `Telegram session_compacting lifecycle event unavailable on this host: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
   pi.on("session_start", async (event: SessionStartEvent, ctx: ExtensionContext) => {
     if (!isEligibleRootSession(ctx)) return;
     ownerInstance = pi;

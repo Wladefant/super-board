@@ -46,6 +46,8 @@ RUNTIME_FILES = (
     "merge_guard.py", "test_merge_guard.py",
     # Session crash monitor and test suite.
     "session_crash_monitor.py", "test_session_crash_monitor.py",
+    # Mechanically verified lane inventory and crash recovery audit.
+    "lane_inventory.py", "test_lane_inventory.py",
 )
 # Veyyon extensions, installed into the profile's own `extensions/` dir beside AGENTS.md,
 # where Veyyon loads them for every session of that profile.
@@ -117,13 +119,25 @@ def synchronize(
     manifest_path = runtime / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
     manifest.setdefault("authority", {}).update(source_manifest["authority"])
-    for name in ("github_work_item.py", "review_content.py", "install_github_native.py", "ledger.py", "verify.py"):
+    for name in (
+        "github_work_item.py", "review_content.py", "install_github_native.py", "ledger.py", "verify.py",
+        "model_routing.py", "balance_loader.py", "routing_smoke_test.py",
+    ):
         if name in source_manifest.get("modules", {}):
             manifest.setdefault("modules", {})[name] = source_manifest["modules"][name]
     required = manifest.setdefault("export", {}).setdefault("required_files", [])
-    for name in ("github_work_item.py", "review_content.py"):
+    for name in (
+        "github_work_item.py", "review_content.py",
+        "model_routing.py", "balance_loader.py",
+    ):
         if name not in required:
             required.append(name)
+    if "routing_smoke_test.py" in required:
+        required.remove("routing_smoke_test.py")
+    optional = manifest.setdefault("export", {}).setdefault("optional_files", [])
+    if "routing_smoke_test.py" in source_manifest.get("export", {}).get("optional_files", []):
+        if "routing_smoke_test.py" not in optional:
+            optional.append("routing_smoke_test.py")
     payloads.append((manifest_path, (json.dumps(manifest, indent=2) + "\n").encode()))
     for target, data in payloads:
         if not check:
