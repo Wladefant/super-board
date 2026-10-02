@@ -1,6 +1,6 @@
 # Managed Skills Catalog
 
-Complete index of all 57 managed agent skills maintained in the Veyyon runtime profile. Each skill is published under `managed-skills/<name>/` after credential and secret scrubbing, with full upstream documentation, recipes, and licenses preserved.
+Complete index of all 58 managed agent skills maintained in the Veyyon runtime profile. Each skill is published under `managed-skills/<name>/` after credential and secret scrubbing, with full upstream documentation, recipes, and licenses preserved.
 
 All blob links are pinned to immutable commit SHA [`6b5172a129305156eff0c44c9b1e29c7dde16a9b`](https://github.com/Wladefant/super-board/blob/6b5172a129305156eff0c44c9b1e29c7dde16a9b/managed-skills/).
 
@@ -9,9 +9,9 @@ All blob links are pinned to immutable commit SHA [`6b5172a129305156eff0c44c9b1e
 - [Design from X threads](#design-from-x-threads) (23 skills)
 - [Ops & infra](#ops--infra) (15 skills)
 - [PolySimulator workflow](#polysimulator-workflow) (14 skills)
-- [Other](#other) (5 skills)
+- [Other](#other) (6 skills)
 
-**Total Skills Published:** 57
+**Total Skills Published:** 58
 
 ## Design from X threads
 
@@ -97,4 +97,5 @@ General architectural patterns, durable task recovery, and prose de-puffing guid
 | [`ing-fast-feedback-release-loop`](./ing-fast-feedback-release-loop/SKILL.md) | Fast feedback release loop for TestING operator bugs with parallel native acceptance and issue closure. | ING TestING release orchestration workflow | Yes (Runtime skill; rapid feedback loop) | [`SKILL.md` (6b5172a)](https://github.com/Wladefant/super-board/blob/6b5172a129305156eff0c44c9b1e29c7dde16a9b/managed-skills/ing-fast-feedback-release-loop/SKILL.md) |
 | [`ing-never-stop-wave`](./ing-never-stop-wave/SKILL.md) | Continuous replenishment, Flash quota fallback, and edge-case testing wave orchestration for ING. | ING multi-agent test wave replenishment workflow | Yes (Runtime skill; continuous test execution) | [`SKILL.md` (6b5172a)](https://github.com/Wladefant/super-board/blob/6b5172a129305156eff0c44c9b1e29c7dde16a9b/managed-skills/ing-never-stop-wave/SKILL.md) |
 | [`unslop-writing`](./unslop-writing/SKILL.md) | Cut AI tells, puffery, hedging, robotic jargon, and filler from human-facing text, commits, and PR descriptions. | Human communication craft standard (prompt & copy de-puffing policy) | Yes (Runtime skill; PR descriptions, docs & messages) | [`SKILL.md` (6b5172a)](https://github.com/Wladefant/super-board/blob/6b5172a129305156eff0c44c9b1e29c7dde16a9b/managed-skills/unslop-writing/SKILL.md) |
+| [`ste-writing`](./ste-writing/SKILL.md) | 80% ASD-STE100 house style for operator-facing text: short sentences, one idea each, active voice, plain words, result first. | Karpathy [post](https://x.com/karpathy/status/2105819303471976479); adapted from [prithivrajmu/asd-ste100](https://github.com/prithivrajmu/asd-ste100) (MIT) and [danyuchn/asd-ste100-skill](https://github.com/danyuchn/asd-ste100-skill) (MIT) | Yes (Runtime skill; final answers, Telegram, PR and issue text) | [`SKILL.md`](https://github.com/Wladefant/super-board/blob/main/managed-skills/ste-writing/SKILL.md) |
 
