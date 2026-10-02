@@ -73,6 +73,7 @@ Live operator instructions in the active session override this file, profile doc
 - **Single Telegram Channel (2026-09-26):** final replies auto-forward as the sole summary, `telegram_message` for urgent mid-turn alerts only, `telegram_question` for decisions. Deduplication and single-channel routing owned by TelegramDedupe (`fix/telegram-dedupe`, `sanitizer.ts`).
 - **Every Mention Is a Link (2026-09-08, updated 2026-09-26):** EVERY issue and PR reference in any Telegram (`<a href="...">owner/repo#N</a>`) or GitHub text (full Markdown URL) MUST be a full clickable link. Auto-linkified by `sanitizer.ts` (`linkifyReferences`) on Telegram, and enforced by policy on GitHub. Visual evidence embeds as images. Write `owner/repo#N` or the full URL.
 - **Operator UI Preferences Are Standing Decisions:** Design-staging comments and live instructions about rejected UI are settled decisions. Do not reintroduce a rejected element; when touching adjacent UI, check the operator's issue/PR comments for such rulings first.
+- **STE Writing for Operator-Facing Text (2026-10-02, Karpathy's "80% of the way to ASD-STE100"):** final answers, Telegram messages, reports, and PR/issue text for the operator follow the managed skill `ste-writing` (short sentences, one idea each, active voice, plain words, state in line 1), together with `unslop-writing`. Facts, links, hedges, and code stay unchanged.
 
 ## 4. Scheduled Execution Hygiene
 
