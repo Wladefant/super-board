@@ -151,6 +151,7 @@ class RoutingStatus:
     task_type: Optional[str] = None
     risk_level: Optional[str] = None
     fallback_model: Optional[str] = None
+    fallback_note: Optional[str] = None
     promotion_applied: bool = False
     cooldown_fallback: bool = False
     rationale: Optional[str] = None
@@ -822,6 +823,7 @@ class Coordinator:
             risk_level=risk_level.value,
             recommended_role=model_to_agent_role(rec.selected_model, task_type, risk_level),
             fallback_model=rec.fallback_model,
+            fallback_note=getattr(rec, "fallback_note", None),
             promotion_applied=rec.promotion_applied,
             cooldown_fallback=rec.cooldown_fallback,
             rationale=rec.reasoning,
@@ -1005,9 +1007,12 @@ def format_packet_summary(packet: CoordinatorPacket) -> str:
 
     rt = packet.routing
     if rt.evaluated:
+        fb_line = f"Fallback Model:  {rt.fallback_model}"
+        if getattr(rt, "fallback_note", None):
+            fb_line += f" (NOTE: {rt.fallback_note})"
         lines.extend([
             f"Selected Model:  {rt.recommended_model} (role: {rt.recommended_role})",
-            f"Fallback Model:  {rt.fallback_model}",
+            fb_line,
             f"Promotion:       {'YES (Codex surplus promoted)' if rt.promotion_applied else 'NO'}",
             f"Routing Reason:  {rt.rationale}",
         ])
