@@ -506,13 +506,16 @@ def remove_worktree(
             report.update(refused=True, error="the worktree has changes git would refuse to drop; commit or discard them, or pass --force")
             return report
     for link in links:
-        report["unlinked"].append({"link": link, "target": link_target(link)})
-        if not dry_run:
-            try:
-                unlink_link(link)
-            except OSError as exc:
-                report["error"] = f"failed to unlink {link}: {exc}"
-                break
+        target = link_target(link)
+        if dry_run:
+            report["unlinked"].append({"link": link, "target": target})
+            continue
+        try:
+            unlink_link(link)
+        except OSError as exc:
+            report["error"] = f"failed to unlink {link}: {exc}"
+            break
+        report["unlinked"].append({"link": link, "target": target})
     if dry_run:
         report["dry_run"] = True
         return report

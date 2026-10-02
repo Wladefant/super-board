@@ -281,8 +281,11 @@ class WtRemoveTest(unittest.TestCase):
             with unittest.mock.patch.object(wt_remove, "unlink_link", side_effect=flaky):
                 report = wt_remove.remove_worktree(str(self.wt), False, False, False, (self.tmp,))
         self.assertIn("simulated unlink failure", report["error"])
-        self.assertEqual(len(report["unlinked"]), 2)
+        self.assertIn(calls[1], report["error"])
+        self.assertEqual(len(report["unlinked"]), 1)
+        self.assertEqual(report["unlinked"][0]["link"], calls[0])
         self.assertFalse(report["removed"])
+        self.assertNotIn("git", report)
         self.assertTrue(self.wt.is_dir())
         self.assertFalse(wt_remove.is_link(self.link), "first link should have been unlinked")
         self.assertTrue(wt_remove.is_link(self.wt / "frontend" / "node_modules"))
