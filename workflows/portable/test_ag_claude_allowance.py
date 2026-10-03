@@ -21,6 +21,8 @@ from model_routing import (
     AG_ANTHROPIC_PROVIDER,
     AG_CLAUDE_MAX_USED_5H,
     AG_CLAUDE_MAX_USED_WEEKLY,
+    ROLE_FALLBACK_LADDERS,
+    ROLE_MODEL_PINS,
     MODEL_AG_CLAUDE_OPUS,
     MODEL_AG_CLAUDE_SONNET,
     ROLE_MODEL_PINS,
@@ -101,8 +103,16 @@ def test_cap_pauses_opus_and_moves_sonnet_off_antigravity_never_to_anthropic(tmp
     sonnet = resolve_role_model("agc-sonnet", snap)
     assert sonnet is not None and sonnet.startswith("openai-codex/")
     monkeypatch.setenv("VEYYON_CODEX_ENABLED", "0")
-    sonnet_no_codex = resolve_role_model("agc-sonnet", snap)
-    assert sonnet_no_codex is not None and not sonnet_no_codex.startswith(("anthropic/", "google-antigravity/"))
+    # Codex off and the cap reached: the slice pauses. It never lands on Anthropic or a paid Chinese tier.
+    assert resolve_role_model("agc-sonnet", snap) is None
+
+
+def test_agc_ladders_exclude_anthropic_and_paid_chinese_tiers():
+    for role in ("agc-opus", "agc-sonnet"):
+        for model in ROLE_FALLBACK_LADDERS[role]:
+            assert not model.startswith(("anthropic/", "opencode-go/", "zai/", "minimax-code/", "deepseek/")), (role, model)
+    assert ROLE_FALLBACK_LADDERS["agc-opus"] == [MODEL_AG_CLAUDE_OPUS]
+    assert ROLE_FALLBACK_LADDERS["agc-sonnet"][0] == MODEL_AG_CLAUDE_SONNET
 
 
 def test_weekly_cap_blocks_even_when_the_5h_window_is_fresh(tmp_path):
