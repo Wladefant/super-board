@@ -35,9 +35,16 @@ if (-not $StateDir) {
 $state = Join-Path $StateDir 'watchdog-state.json'
 $log = Join-Path $StateDir 'watchdog.log'
 $serverLog = Join-Path $StateDir 'herdr-server.log'
+
+# One run at a time per watched session: overlapping runs must not both start a server.
+$mutex = New-Object System.Threading.Mutex($false, ('Global\herdr-watchdog-' + $(if ($Session) { $Session } else { 'default' })))
+$locked = $false
+try { $locked = $mutex.WaitOne(0) } catch [System.Threading.AbandonedMutexException] { $locked = $true }
+if (-not $locked) { Write-Output 'another herdr_watchdog run is active; skipping'; exit 0 }
 function Write-Log([string]$m) {
     $line = '{0} {1}' -f (Get-Date).ToUniversalTime().ToString('o'), $m
-    if ($DryRun) { Write-Output $line } else { Add-Content -Path $log -Value $line }
+    if ($DryRun) { Write-Output $line; return }
+    try { Add-Content -Path $log -Value $line } catch { Write-Error -ErrorAction Continue ("watchdog log write failed: " + $_) }
 }
 
 function Get-RecentVeyyonSession([int]$Minutes = 30) {
@@ -61,8 +68,9 @@ function Get-RecentVeyyonSession([int]$Minutes = 30) {
     return $null
 }
 
-# True when the tail of the server log holds the clean-exit line herdr writes on `server stop`.
-function Test-CleanShutdown([int]$ServerPid) {
+# True when the server log holds the clean-exit line herdr writes on `server stop` for this exact
+# process: same PID and a timestamp at or after the process start (a reused PID cannot match an old line).
+function Test-CleanShutdown([int]$ServerPid, [long]$StartedUnix) {
     if (-not (Test-Path -LiteralPath $serverLog)) { return $false }
     $fs = [System.IO.File]::Open($serverLog, 'Open', 'Read', 'ReadWrite')
     try {
@@ -73,7 +81,14 @@ function Test-CleanShutdown([int]$ServerPid) {
         $read = $fs.Read($buf, 0, $take)
         $text = [System.Text.Encoding]::UTF8.GetString($buf, 0, $read)
     } finally { $fs.Dispose() }
-    return [bool]($text -match ('app\.shutdown" subsystem="server" outcome="completed" pid={0}(\D|$)' -f $ServerPid))
+    $re = '(?m)^(\S+)\s+\S+\s+.*?app\.shutdown" subsystem="server" outcome="completed" pid={0}(\D|$)' -f $ServerPid
+    foreach ($m in [regex]::Matches($text, $re)) {
+        try {
+            $at = [DateTimeOffset]::Parse($m.Groups[1].Value, [Globalization.CultureInfo]::InvariantCulture).ToUnixTimeSeconds()
+            if ($at -ge $StartedUnix - 5) { return $true }
+        } catch { }
+    }
+    return $false
 }
 
 function Test-SessionMatch([string]$cmd) {
@@ -84,11 +99,12 @@ function Test-SessionMatch([string]$cmd) {
 $procs = @(Get-CimInstance Win32_Process -Filter "Name='herdr.exe'")
 $servers = @($procs | Where-Object { Test-SessionMatch $_.CommandLine })
 $clients = @($procs | Where-Object { $_.CommandLine -notmatch '\sserver(\s|$)' -and $_.CommandLine -notmatch '\s(update|status|api|pane|tab|workspace|agent|session|machine|integration|worktree|notification|config|channel)\b' })
-$st = @{ wasUp = $false; stopped = $false; lastPids = @(); starts = @() }
+$blind = @($procs | Where-Object { -not $_.CommandLine }).Count
+$st = @{ wasUp = $false; stopped = $false; lastPids = @(); lastStarted = @(); starts = @() }
 if (Test-Path $state) {
     try {
         $j = Get-Content $state -Raw | ConvertFrom-Json
-        $st = @{ wasUp = [bool]$j.wasUp; stopped = [bool]$j.stopped; lastPids = @($j.lastPids | Where-Object { $null -ne $_ }); starts = @($j.starts | Where-Object { $null -ne $_ }) }
+        $st = @{ wasUp = [bool]$j.wasUp; stopped = [bool]$j.stopped; lastPids = @($j.lastPids | Where-Object { $null -ne $_ }); lastStarted = @($j.lastStarted | Where-Object { $null -ne $_ }); starts = @($j.starts | Where-Object { $null -ne $_ }) }
     } catch { }
 }
 $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
@@ -98,14 +114,20 @@ if ($servers.Count -gt 0) {
     $st.wasUp = $true
     $st.stopped = $false
     $st.lastPids = @($servers | ForEach-Object { [int]$_.ProcessId })
+    $st.lastStarted = @($servers | ForEach-Object { [DateTimeOffset]::new($_.CreationDate).ToUnixTimeSeconds() })
     Write-Log ("ok servers={0} clients={1}" -f $servers.Count, $clients.Count)
+} elseif ($blind -gt 0) {
+    Write-Log ("no-restart: {0} herdr process(es) with unreadable command line, cannot rule out a running server" -f $blind)
 } elseif ($st.stopped) {
     Write-Log "no-restart: server was stopped deliberately and has not been seen since"
 } else {
     $abnormal = $false
     $reason = ''
     if ($st.wasUp) {
-        $unclean = @($st.lastPids | Where-Object { -not (Test-CleanShutdown $_) })
+        $unclean = @()
+        for ($i = 0; $i -lt $st.lastPids.Count; $i++) {
+            if (-not (Test-CleanShutdown $st.lastPids[$i] ([long]$st.lastStarted[$i]))) { $unclean += $st.lastPids[$i] }
+        }
         if ($unclean.Count -gt 0) {
             $abnormal = $true
             $reason = 'server exited without a clean shutdown (pid {0}), clients={1}' -f ($unclean -join ','), $clients.Count
@@ -142,11 +164,18 @@ if ($servers.Count -gt 0) {
             } elseif ($DryRun) {
                 Write-Log ("would start herdr server, start {0} of {1} ({2})" -f ($n + 1), $MaxStarts, $reason)
             } else {
-                $exe = if ($HerdrExe) { $HerdrExe } else { (Get-Command herdr -ErrorAction Stop).Source }
-                $argv = if ($Session) { @('--session', $Session, 'server') } else { @('server') }
-                $p = Start-Process -FilePath $exe -ArgumentList $argv -WindowStyle Hidden -PassThru
-                $st.starts += $now
-                Write-Log ("restarted herdr server pid={0} via {1}, start {2} of {3} ({4})" -f $p.Id, $exe, ($n + 1), $MaxStarts, $reason)
+                $again = @(Get-CimInstance Win32_Process -Filter "Name='herdr.exe'" | Where-Object { Test-SessionMatch $_.CommandLine })
+                if ($again.Count -gt 0) {
+                    Write-Log ("no-restart: server appeared before start (pid {0})" -f (($again | ForEach-Object { $_.ProcessId }) -join ','))
+                } else {
+                    $exe = if ($HerdrExe) { $HerdrExe } else { (Get-Command herdr -ErrorAction Stop).Source }
+                    $argv = if ($Session) { @('--session', $Session, 'server') } else { @('server') }
+                    $p = Start-Process -FilePath $exe -ArgumentList $argv -WindowStyle Hidden -PassThru
+                    $st.starts += $now
+                    # Persist the start before logging, so a log failure cannot bypass backoff and the cap.
+                    $st | ConvertTo-Json | Set-Content $state
+                    Write-Log ("restarted herdr server pid={0} via {1}, start {2} of {3} ({4})" -f $p.Id, $exe, ($n + 1), $MaxStarts, $reason)
+                }
             }
         }
     }

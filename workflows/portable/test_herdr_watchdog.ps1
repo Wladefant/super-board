@@ -96,6 +96,16 @@ if ($s4) {
     Check 'deliberate stop is logged' ([bool](Select-String -Path $wlog -Pattern 'deliberate stop' -Quiet))
 }
 
+# 5. PID reuse: a clean-shutdown line from an OLDER process with the same PID must not hide a crash.
+if ($s4) {
+    $future = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 3600
+    @{ wasUp = $true; stopped = $false; lastPids = @($s4.ProcessId); lastStarted = @($future); starts = @() } |
+        ConvertTo-Json | Set-Content (Join-Path $dir 'watchdog-state.json')
+    Invoke-Watchdog
+    $s5 = Wait-ServerUp
+    Check 'stale shutdown line of a reused PID does not block restart' ($null -ne $s5)
+}
+
 # cleanup: only this session
 foreach ($p in (Get-SessionServers)) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
 & $HerdrExe session delete $Session 2>&1 | Out-Null
