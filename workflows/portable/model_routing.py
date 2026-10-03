@@ -416,17 +416,15 @@ ROLE_FALLBACK_LADDERS: Dict[str, List[str]] = {
         MODEL_GO_QWEN38_MAX,
         MODEL_DEEPSEEK_PRO,
     ],
-    # Antigravity Claude slices: small allowance, never direct Anthropic. Opus (UI/design) has
-    # no other rung, so an over-cap or exhausted window pauses it; Sonnet (judgment) continues
-    # on the non-Anthropic reviewer ladder.
+    # Antigravity Claude slices: small allowance, never direct Anthropic and never the paid
+    # Chinese tiers (GLM, Qwen; operator decision 2026-10-03). Opus (UI/design) has no other rung,
+    # so an over-cap or exhausted window pauses it. Sonnet (judgment) continues on Codex Sol and
+    # then pauses. DeepSeek is left out: ds-task is capped at 2 lanes and never takes judgment slices.
     "agc-opus": [MODEL_AG_CLAUDE_OPUS],
     "agc-sonnet": [
         MODEL_AG_CLAUDE_SONNET,
         MODEL_CODEX_SOL,
         MODEL_CODEX_SOL_FALLBACK,
-        MODEL_GO_GLM53,
-        MODEL_GO_QWEN38_MAX,
-        MODEL_DEEPSEEK_PRO,
     ],
 }
 
