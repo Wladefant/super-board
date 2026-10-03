@@ -45,7 +45,8 @@ ATTACHMENT_URL_RE = re.compile(r"https://github\.com/user-attachments/assets/[0-
 SHA40_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 MARKER = "<!-- pr-demo-video -->"
 MAX_SECONDS = 30
-BROWSER_CHANNELS = (None, "msedge", "chrome")
+MIN_PLAYWRIGHT = (1, 50)  # 1.46 crashes its driver when a recording context closes (TargetClosedError)
+PLAYWRIGHT_BROWSERS = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or Path.home() / "AppData" / "Local" / "ms-playwright")
 
 
 class DemoError(RuntimeError):
@@ -70,6 +71,24 @@ def apply_steps(page: Any, steps: List[Dict[str, Any]]) -> None:
             raise DemoError(f"step {i}: unknown action {action!r}")
 
 
+def find_browser() -> Optional[str]:
+    """PR_DEMO_BROWSER, else the newest installed Playwright chromium build, else None (Playwright default)."""
+    env = os.environ.get("PR_DEMO_BROWSER")
+    if env:
+        return env
+    builds = sorted(PLAYWRIGHT_BROWSERS.glob("chromium-*/chrome-win64/chrome.exe"),
+                    key=lambda p: int(p.parts[-3].split("-")[-1]), reverse=True)
+    return str(builds[0]) if builds else None
+
+
+def check_playwright_version() -> None:
+    from importlib.metadata import version
+    parts = tuple(int(x) for x in version("playwright").split(".")[:2])
+    if parts < MIN_PLAYWRIGHT:
+        raise DemoError(f"playwright {version('playwright')} is too old (need >= {MIN_PLAYWRIGHT[0]}.{MIN_PLAYWRIGHT[1]}; "
+                        "older drivers crash on video close). Use a venv with a newer playwright.")
+
+
 def record(url: str, out_dir: Path, steps: List[Dict[str, Any]], seconds: int, width: int, height: int) -> Path:
     if seconds < 1 or seconds > MAX_SECONDS:
         raise DemoError(f"--seconds must be 1..{MAX_SECONDS}")
@@ -78,16 +97,13 @@ def record(url: str, out_dir: Path, steps: List[Dict[str, Any]], seconds: int, w
     except ImportError as e:
         raise DemoError("python playwright is not installed") from e
     out_dir.mkdir(parents=True, exist_ok=True)
-    last_err: Optional[Exception] = None
+    check_playwright_version()
+    exe = find_browser()
     with sync_playwright() as p:
-        for channel in BROWSER_CHANNELS:
-            try:
-                browser = p.chromium.launch(headless=True, channel=channel) if channel else p.chromium.launch(headless=True)
-                break
-            except Exception as e:  # try the next installed browser
-                last_err = e
-        else:
-            raise DemoError(f"no launchable Chromium (default, msedge, chrome): {last_err}")
+        try:
+            browser = p.chromium.launch(headless=True, executable_path=exe) if exe else p.chromium.launch(headless=True)
+        except Exception as e:
+            raise DemoError(f"cannot launch Chromium ({exe or 'playwright default'}): {e}") from e
         try:
             ctx = browser.new_context(
                 viewport={"width": width, "height": height},
@@ -202,7 +218,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"posted: {comment_url}")
         passed, results = evidence_lint.verify_posted(comment_url)
         for r in results:
-            print(f"{'OK  ' if r['ok'] else 'FAIL'} <{r['tag']}> {r['url']} -> {r['detail']}")
+            print(f"{'OK  ' if r['ok'] else 'FAIL'} <{r['tag']}> {r['url'].split('?')[0]} -> {r['detail']}")
         if not passed:
             raise DemoError("posted comment does not render all media")
         print("verify-posted: PASS")

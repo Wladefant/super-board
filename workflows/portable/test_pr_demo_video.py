@@ -53,6 +53,17 @@ class Stages(unittest.TestCase):
             with self.assertRaises(pdv.DemoError):
                 pdv.record("https://example.com", Path("."), [], s, 800, 600)
 
+    def test_old_playwright_rejected(self):
+        with mock.patch("importlib.metadata.version", return_value="1.46.0"):
+            with self.assertRaises(pdv.DemoError):
+                pdv.check_playwright_version()
+        with mock.patch("importlib.metadata.version", return_value="1.57.0"):
+            pdv.check_playwright_version()
+
+    def test_browser_env_override_wins(self):
+        with mock.patch.dict(os.environ, {"PR_DEMO_BROWSER": "X:/chrome.exe"}):
+            self.assertEqual(pdv.find_browser(), "X:/chrome.exe")
+
     def test_unknown_step_action_rejected(self):
         with self.assertRaises(pdv.DemoError):
             pdv.apply_steps(mock.Mock(), [{"action": "teleport"}])

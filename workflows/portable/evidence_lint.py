@@ -194,7 +194,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     passed, results = verify_posted(args.url, retries=args.retries)
     for r in results:
-        print(f"{'OK  ' if r['ok'] else 'FAIL'} <{r['tag']}> {r['url']} -> {r['detail']}")
+        print(f"{'OK  ' if r['ok'] else 'FAIL'} <{r['tag']}> {r['url'].split('?')[0]} -> {r['detail']}")
     if not results:
         print("verify-posted: no media found in the rendered HTML")
     print(f"verify-posted: {'PASS' if passed else 'FAIL'} ({len(results)} media)")
