@@ -39,10 +39,16 @@ export class SocketGuiHostPort implements GuiHostPort {
   private pending: PendingRequest | null = null;
   private requestTail: Promise<unknown> = Promise.resolve();
 
+  /**
+   * `onEvent` receives every decoded frame, including the ones that arrive with no
+   * request in flight: a host pushes `TranscriptAppended` and `StreamingChanged` as a
+   * turn runs, and a caller that only correlates replies would drop them.
+   */
   constructor(
     private readonly endpoint: string,
     private readonly authToken?: string,
     private readonly timeoutMs = 5_000,
+    private readonly onEvent?: (frame: unknown) => void,
   ) {}
 
   request(action: unknown): Promise<GuiHostResponse> {
@@ -89,7 +95,8 @@ export class SocketGuiHostPort implements GuiHostPort {
       });
       socket.on("data", chunk => { if (this.socket === socket) this.onData(String(chunk)); });
       socket.on("error", error => {
-        if (this.socket === socket) this.fail(new GuiHostRequestError(error.message, "SOCKET_ERROR"));
+        const code = (error as NodeJS.ErrnoException).code || "SOCKET_ERROR";
+        if (this.socket === socket) this.fail(new GuiHostRequestError(error.message, code));
       });
       socket.on("close", () => {
         if (this.socket === socket) this.fail(new GuiHostRequestError("Veyyon GUI host connection closed", "SOCKET_CLOSED"));
@@ -129,6 +136,7 @@ export class SocketGuiHostPort implements GuiHostPort {
   }
 
   private onFrame(frame: unknown): void {
+    this.onEvent?.(frame);
     const record = frame !== null && typeof frame === "object" ? frame as Record<string, unknown> : null;
     const connection = record?.ConnectionChanged as Record<string, unknown> | undefined;
     if (connection && "Connected" in connection && !this.connected) {

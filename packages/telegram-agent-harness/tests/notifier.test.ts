@@ -27,3 +27,10 @@ test.skipIf(!process.env.TG_NOTIFIER_INSTALLED_PATH)("installed notifier HTML an
   if (result.exitCode !== 0) throw new Error(result.stderr.toString());
   expect(result.exitCode).toBe(0);
 }, 60_000);
+
+test("operator question store Python contracts", () => {
+  const pkg = resolve(import.meta.dir, "..");
+  const result = Bun.spawnSync(["python", "-m", "unittest", "discover", "-s", "tests", "-p", "test_operator_questions.py"], { cwd: pkg });
+  if (result.exitCode !== 0) throw new Error(result.stderr.toString());
+  expect(result.exitCode).toBe(0);
+}, 60_000);

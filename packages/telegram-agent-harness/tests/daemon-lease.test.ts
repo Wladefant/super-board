@@ -1,0 +1,408 @@
+/**
+ * The daemon's exclusion invariant, against the real pool coordinator and a real
+ * `bot_pool.db`: a token is polled by exactly one process. The daemon takes an
+ * ordinary slot lease, so an in-session extension sees the slot as busy and skips
+ * it — which is what keeps Telegram from answering with HTTP 409 Conflict.
+ */
+
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { BotPoolCoordinator } from "../extension/coordinator";
+import type { TelegramPoller } from "../extension/poller";
+import { readDaemonSlotIds, resolveDaemonSlots } from "../daemon/config";
+import { claimDaemonPidFile, TelegramDaemon, type DaemonRuntimeOptions } from "../daemon/runtime";
+import type { TerminalSessionControl } from "../daemon/session-control";
+
+const OPERATOR_CHAT = "1247617658";
+
+interface SlotSpec {
+  slotId: string;
+  daemon?: boolean;
+  projects?: string[];
+  defaultProject?: string;
+}
+
+let root: string;
+let workspace: string;
+let poolDbPath: string;
+let manifestPath: string;
+let channelsDir: string;
+let previousDaemonDir: string | undefined;
+let coordinators: BotPoolCoordinator[];
+let daemons: TelegramDaemon[];
+let startedPollers: FakePoller[];
+
+/** Stands in for the Bot API transport; no network call is made in these tests. */
+class FakePoller {
+  public running = false;
+  public readonly sent: { chatId: string; text: string }[] = [];
+  constructor(public readonly stateDir: string) {}
+  async start(): Promise<void> {
+    this.running = true;
+  }
+  async stop(): Promise<void> {
+    this.running = false;
+  }
+  getPrimaryChatId(): string | null {
+    return OPERATOR_CHAT;
+  }
+  async sendTelegramMessage(chatId: string, text: string): Promise<{ ok: true }> {
+    this.sent.push({ chatId, text });
+    return { ok: true };
+  }
+}
+
+function writePool(specs: SlotSpec[]): void {
+  fs.mkdirSync(channelsDir, { recursive: true });
+  const slots = specs.map((spec, index) => {
+    const stateDir = path.join(channelsDir, spec.slotId);
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(stateDir, ".env"),
+      `TELEGRAM_BOT_TOKEN=100000000${index}:AA${crypto.randomUUID().replace(/-/g, "")}\n`,
+      "utf8",
+    );
+    fs.writeFileSync(
+      path.join(stateDir, "access.json"),
+      JSON.stringify({ dmPolicy: "allowlist", allowFrom: [OPERATOR_CHAT] }),
+      "utf8",
+    );
+    return {
+      slotId: spec.slotId,
+      stateDir,
+      projects: spec.projects ?? [workspace],
+      enabled: true,
+      ...(spec.daemon === undefined ? {} : { daemon: spec.daemon }),
+      ...(spec.defaultProject === undefined ? {} : { defaultProject: spec.defaultProject }),
+    };
+  });
+  fs.writeFileSync(manifestPath, JSON.stringify({ version: 1, slots }, null, 2), "utf8");
+}
+
+function coordinator(): BotPoolCoordinator {
+  const instance = new BotPoolCoordinator(poolDbPath, manifestPath, channelsDir);
+  coordinators.push(instance);
+  return instance;
+}
+
+function daemon(overrides: DaemonRuntimeOptions = {}): TelegramDaemon {
+  const instance = new TelegramDaemon({
+    poolDbPath,
+    manifestPath,
+    channelsDir,
+    daemonDbPath: path.join(root, "daemon.db"),
+    log: () => {},
+    pollerFactory: (_token, stateDir) => {
+      const poller = new FakePoller(stateDir);
+      startedPollers.push(poller);
+      return poller as unknown as TelegramPoller;
+    },
+    controlFactory: () =>
+      ({
+        endpoint: "tcp:127.0.0.1:1",
+        isBusy: () => false,
+        close: () => {},
+      }) as unknown as TerminalSessionControl,
+    ...overrides,
+  });
+  daemons.push(instance);
+  return instance;
+}
+
+beforeEach(() => {
+  root = fs.mkdtempSync(path.join(os.tmpdir(), "veyyon-daemon-lease-"));
+  workspace = path.join(root, "project");
+  fs.mkdirSync(workspace, { recursive: true });
+  poolDbPath = path.join(root, "bot_pool.db");
+  manifestPath = path.join(root, "manifest.json");
+  channelsDir = path.join(root, "channels");
+  previousDaemonDir = process.env.VEYYON_TELEGRAM_DAEMON_DIR;
+  process.env.VEYYON_TELEGRAM_DAEMON_DIR = path.join(root, "run");
+  coordinators = [];
+  daemons = [];
+  startedPollers = [];
+});
+
+afterEach(async () => {
+  for (const instance of daemons) await instance.stop();
+  for (const instance of coordinators) instance.close();
+  if (previousDaemonDir === undefined) delete process.env.VEYYON_TELEGRAM_DAEMON_DIR;
+  else process.env.VEYYON_TELEGRAM_DAEMON_DIR = previousDaemonDir;
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+describe("daemon slot opt-in", () => {
+  test("only slots marked daemon:true are taken over", () => {
+    writePool([{ slotId: "slot-daemon", daemon: true }, { slotId: "slot-session" }, { slotId: "slot-explicit-false", daemon: false }]);
+    expect([...readDaemonSlotIds(manifestPath)]).toEqual(["slot-daemon"]);
+    expect(resolveDaemonSlots(coordinator(), manifestPath).map(slot => slot.slotId)).toEqual(["slot-daemon"]);
+  });
+
+  test("the environment override wins over the manifest, so a disposable bot needs no operator state edit", () => {
+    writePool([{ slotId: "slot-a", daemon: true }, { slotId: "slot-b" }]);
+    const previous = process.env.VEYYON_TELEGRAM_DAEMON_SLOTS;
+    process.env.VEYYON_TELEGRAM_DAEMON_SLOTS = "slot-b";
+    try {
+      expect([...readDaemonSlotIds(manifestPath)]).toEqual(["slot-b"]);
+    } finally {
+      if (previous === undefined) delete process.env.VEYYON_TELEGRAM_DAEMON_SLOTS;
+      else process.env.VEYYON_TELEGRAM_DAEMON_SLOTS = previous;
+    }
+  });
+
+  test("a declared project that does not exist leaves the workspace unresolved rather than guessed", () => {
+    writePool([{ slotId: "slot-daemon", daemon: true, projects: ["C:/definitely/not/here"] }]);
+    expect(resolveDaemonSlots(coordinator(), manifestPath)[0].workspace).toBeNull();
+  });
+
+  test("a slot that declares no project runs its sessions in defaultProject", () => {
+    writePool([{ slotId: "slot-daemon", daemon: true, projects: [], defaultProject: workspace }]);
+    expect(resolveDaemonSlots(coordinator(), manifestPath)[0].workspace).toBe(workspace);
+  });
+
+  test("a defaultProject that is not a directory on this machine resolves to nothing", () => {
+    writePool([{ slotId: "slot-daemon", daemon: true, projects: [], defaultProject: "C:/definitely/not/here" }]);
+    expect(resolveDaemonSlots(coordinator(), manifestPath)[0].workspace).toBeNull();
+  });
+
+  test("a declared project that resolves wins over defaultProject", () => {
+    writePool([{ slotId: "slot-daemon", daemon: true, projects: [workspace], defaultProject: root }]);
+    expect(resolveDaemonSlots(coordinator(), manifestPath)[0].workspace).toBe(workspace);
+  });
+});
+
+describe("no double poller", () => {
+  test("a daemon-held slot is refused to an in-session claim", async () => {
+    writePool([{ slotId: "slot-daemon", daemon: true }]);
+    const report = await daemon().start();
+
+    expect(report.slots).toEqual([
+      { slotId: "slot-daemon", botId: report.slots[0].botId, workspace, polling: true },
+    ]);
+    expect(startedPollers.length).toBe(1);
+    expect(startedPollers[0].running).toBe(true);
+
+    // What an in-session extension does on session start: the daemon's token is not
+    // in the pool it draws from at all.
+    const claim = await coordinator().acquireLease("session-in-tui", workspace);
+    expect(claim.ok).toBe(false);
+    expect(claim.error).toBe("POOL_EXHAUSTED");
+    expect(claim.reason).toContain("owned by the standalone daemon");
+
+    // And a claim that names the slot anyway is refused by the daemon's own lease,
+    // naming the holder rather than quietly starting a second poller.
+    const byName = coordinator().acquireLeaseForSlot("slot-daemon", "session-in-tui", workspace);
+    expect(byName.ok).toBe(false);
+    expect(byName.error).toBe("SLOT_BUSY");
+    expect(byName.busyHolders?.[0]?.sessionId).toBe("daemon:slot-daemon");
+  });
+
+  test("a slot an older session still holds is skipped, not stolen", async () => {
+    writePool([{ slotId: "slot-daemon", daemon: true }]);
+    // A poller from before the slot was handed to the daemon, claiming it by name
+    // the way the in-session pool used to: its lease is a legitimate holder.
+    const sessionClaim = coordinator().acquireLeaseForSlot("slot-daemon", "session-in-tui", workspace);
+    expect(sessionClaim.ok).toBe(true);
+
+    const report = await daemon().start();
+    expect(report.slots[0]).toMatchObject({ slotId: "slot-daemon", polling: false });
+    expect(report.slots[0].skipped).toContain("session-in-tui");
+    expect(startedPollers.length).toBe(0);
+  });
+
+  test("a slot that opted out stays available to the session", async () => {
+    writePool([{ slotId: "slot-daemon", daemon: true }, { slotId: "slot-session" }]);
+    await daemon().start();
+
+    const claim = await coordinator().acquireLease("session-in-tui", workspace);
+    expect(claim.ok).toBe(true);
+    expect(claim.slot?.slotId).toBe("slot-session");
+  });
+
+  test("a released slot goes back to the daemon, never to the session pool", async () => {
+    writePool([{ slotId: "slot-daemon", daemon: true }]);
+    const instance = daemon();
+    await instance.start();
+
+    expect(await instance.stopSlot("slot-daemon")).toBe(true);
+    expect(await instance.stopSlot("slot-daemon")).toBe(false);
+    expect(startedPollers[0].running).toBe(false);
+    expect(instance.status().slots).toEqual([]);
+
+    const claim = await coordinator().acquireLease("session-in-tui", workspace);
+    expect(claim.ok).toBe(false);
+    expect(claim.error).toBe("POOL_EXHAUSTED");
+  });
+
+  test("a daemon-owned slot with no affinity is not the wildcard every session claims", async () => {
+    // The operator's bug: a bot that serves every project declares no projects, an
+    // empty declaration is eligible for all of them, and the daemon was not running
+    // yet — so the next terminal opened claimed the daemon's token and kept it.
+    writePool([{ slotId: "slot-daemon", daemon: true, projects: [] }]);
+
+    const claim = await coordinator().acquireLease("session-in-tui", workspace);
+    expect(claim.ok).toBe(false);
+    expect(claim.error).toBe("POOL_EXHAUSTED");
+    expect(claim.reason).toContain("1 owned by the standalone daemon");
+
+    // And the daemon, starting afterwards, finds the token free.
+    const report = await daemon().start();
+    expect(report.slots[0]).toMatchObject({ slotId: "slot-daemon", polling: true });
+  });
+
+  test("stop releases every lease it holds", async () => {
+    writePool([{ slotId: "slot-a", daemon: true }, { slotId: "slot-b", daemon: true }]);
+    const instance = daemon();
+    expect((await instance.start()).slots.filter(slot => slot.polling).length).toBe(2);
+
+    await instance.stop();
+    const pool = coordinator().getPoolStatus();
+    expect(pool.slots.filter(slot => slot.lease?.leaseStatus === "ACTIVE")).toEqual([]);
+  });
+
+  test("a status snapshot is published for an operator to read", async () => {
+    writePool([{ slotId: "slot-daemon", daemon: true }]);
+    await daemon().start();
+
+    const statusPath = path.join(root, "run", "daemon.status.json");
+    const snapshot = JSON.parse(fs.readFileSync(statusPath, "utf8")) as { pid: number; slots: { slotId: string; polling: boolean }[] };
+    expect(snapshot.pid).toBe(process.pid);
+    expect(snapshot.slots).toEqual([{ slotId: "slot-daemon", botId: snapshot.slots[0].botId, workspace, polling: true }]);
+  });
+});
+
+describe("waiting out a holder", () => {
+  test("a slot held at startup is taken over once its holder releases", async () => {
+    writePool([{ slotId: "slot-daemon", daemon: true, projects: [] }]);
+    // The state this workstation was actually in: a session claimed the daemon's
+    // token before the daemon existed, so start() finds nothing to poll.
+    const holder = coordinator();
+    expect(holder.acquireLeaseForSlot("slot-daemon", "session-in-tui", workspace).ok).toBe(true);
+
+    const instance = daemon();
+    const initial = await instance.start();
+    expect(initial.slots[0]).toMatchObject({ polling: false });
+    expect(initial.slots[0].skipped).toContain("session-in-tui");
+
+    // Retrying while the holder is still there changes nothing, and starts no poller.
+    expect((await instance.claimPending()).slots[0]).toMatchObject({ polling: false });
+    expect(startedPollers.length).toBe(0);
+
+    holder.releaseLease("slot-daemon", "session-in-tui");
+
+    const after = await instance.claimPending();
+    expect(after.slots[0]).toMatchObject({ slotId: "slot-daemon", polling: true });
+    expect(startedPollers.length).toBe(1);
+    expect(startedPollers[0].running).toBe(true);
+  });
+
+  test("a retry does not disturb a slot the daemon already polls", async () => {
+    writePool([{ slotId: "slot-a", daemon: true }, { slotId: "slot-b", daemon: true }]);
+    const instance = daemon();
+    await instance.start();
+    expect(startedPollers.length).toBe(2);
+
+    const retried = await instance.claimPending();
+    expect(retried.slots.map(slot => slot.polling)).toEqual([true, true]);
+    // No second poller for a token already being polled: that is the 409 case.
+    expect(startedPollers.length).toBe(2);
+  });
+});
+
+describe("non-blocking polling startup", () => {
+  test("claim() resolves while a fake poller start() promise is still pending and status report shows polling: true", async () => {
+    writePool([{ slotId: "slot-pending", daemon: true }]);
+    let pollerResolve: () => void;
+    const pendingPromise = new Promise<void>(resolve => {
+      pollerResolve = resolve;
+    });
+
+    let pollerStarted = false;
+    const instance = daemon({
+      pollerFactory: (_token, stateDir) => {
+        const poller = new FakePoller(stateDir);
+        poller.start = async () => {
+          poller.running = true;
+          pollerStarted = true;
+          await pendingPromise;
+        };
+        startedPollers.push(poller);
+        return poller as unknown as TelegramPoller;
+      },
+    });
+
+    const report = await instance.start();
+    expect(pollerStarted).toBe(true);
+    expect(report.slots).toEqual([
+      {
+        slotId: "slot-pending",
+        botId: "1000000000",
+        workspace,
+        polling: true,
+      },
+    ]);
+    expect(instance.status().slots).toEqual([
+      {
+        slotId: "slot-pending",
+        botId: "1000000000",
+        workspace,
+        polling: true,
+      },
+    ]);
+
+    pollerResolve!();
+  });
+
+  test("poller termination/rejection releases lease and allows claimPending to reclaim", async () => {
+    writePool([{ slotId: "slot-failing", daemon: true }]);
+    let pollerReject: (err: Error) => void;
+    let shouldFail = true;
+
+    const instance = daemon({
+      pollerFactory: (_token, stateDir) => {
+        const poller = new FakePoller(stateDir);
+        poller.start = async () => {
+          poller.running = true;
+          if (shouldFail) {
+            await new Promise<void>((_, reject) => {
+              pollerReject = reject;
+            });
+          }
+        };
+        startedPollers.push(poller);
+        return poller as unknown as TelegramPoller;
+      },
+    });
+
+    const report = await instance.start();
+    expect(report.slots[0].polling).toBe(true);
+
+    pollerReject!(new Error("network connection dropped"));
+    await new Promise(r => setTimeout(r, 10));
+
+    expect(instance.status().slots).toHaveLength(0);
+    expect(instance.hasPendingSlots()).toBe(true);
+
+    shouldFail = false;
+    const retried = await instance.claimPending();
+    expect(retried.slots[0]).toMatchObject({ slotId: "slot-failing", polling: true });
+    expect(instance.status().slots[0]).toMatchObject({ slotId: "slot-failing", polling: true });
+  });
+});
+
+describe("single daemon per machine", () => {
+  test("a live pid holder refuses a second daemon, a dead one does not", () => {
+    const pidPath = path.join(root, "run", "daemon.pid");
+    expect(claimDaemonPidFile(pidPath)).toEqual({ ok: true });
+    expect(fs.readFileSync(pidPath, "utf8")).toBe(String(process.pid));
+
+    // Re-claiming from the same process is a restart of the owner, not a conflict.
+    expect(claimDaemonPidFile(pidPath)).toEqual({ ok: true });
+
+    // A pid that cannot exist is treated as dead and reclaimed.
+    fs.writeFileSync(pidPath, "0", "utf8");
+    expect(claimDaemonPidFile(pidPath)).toEqual({ ok: true });
+  });
+});

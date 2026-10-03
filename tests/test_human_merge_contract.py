@@ -136,6 +136,11 @@ class InstalledTreeTests(unittest.TestCase):
         detail = "\n".join(f"  {o.path}:{o.line} — {o.mechanism}" for o in report.occurrences)
         self.assertTrue(report.clean, f"active merge paths on an installed tree:\n{detail}")
 
+    def test_the_installed_payload_has_no_active_skipped_status(self) -> None:
+        report = scan_retired_status(self.tree / ".claude")
+        detail = "\n".join(f"  {o.path}:{o.line}" for o in report.occurrences)
+        self.assertTrue(report.clean, f"`Skipped` on an installed tree:\n{detail}")
+
     def test_an_active_merge_mechanism_in_the_installed_tree_is_caught(self) -> None:
         rogue = self.tree / ".claude" / "bin" / "rogue-lane.sh"
         rogue.write_text("#!/usr/bin/env bash\ngh pr merge \"$1\" --rebase\n", encoding="utf-8")
@@ -148,6 +153,28 @@ class InstalledTreeTests(unittest.TestCase):
             )
         finally:
             rogue.unlink()
+    def test_an_active_skipped_status_in_the_installed_tree_is_caught(self) -> None:
+        rogue = self.tree / ".claude" / "bin" / "rogue-lane.py"
+        rogue.write_text('card["status"] = "Skipped"\n', encoding="utf-8")
+        try:
+            report = scan_retired_status(self.tree / ".claude")
+            self.assertFalse(report.clean, "the retired-status gate stopped biting on an installed tree")
+            self.assertEqual(
+                [(o.path, o.line) for o in report.occurrences],
+                [("bin/rogue-lane.py", 1)],
+            )
+        finally:
+            rogue.unlink()
+
+    def test_a_retired_status_declaration_in_the_installed_tree_is_not_caught(self) -> None:
+        decl = self.tree / ".claude" / "bin" / "decl.py"
+        decl.write_text('RETIRED_STATUS = "Skipped"\n', encoding="utf-8")
+        try:
+            report = scan_retired_status(self.tree / ".claude")
+            self.assertTrue(report.clean, "a declaration list is not a use")
+        finally:
+            decl.unlink()
+
 
 
 class SelfExclusionTests(unittest.TestCase):
@@ -245,6 +272,50 @@ class ProhibitionStatementTests(unittest.TestCase):
         self.assertFalse(self._scan("lane.md", body).clean)
 
 
+class RetiredStatusDefinitionVersusUseTests(unittest.TestCase):
+    """A definition that legitimately names a retired status is not a use.
+
+    The retired-status gate hunts resurrection — a status being assigned,
+    transitioned to, or offered as a destination for a card. It must not flag:
+      - the module that defines the lifecycle and declares what is retired;
+      - a registry entry declaring retired statuses;
+      - a test fixture exercising the refusal of the retired value.
+    """
+
+    def test_only_the_real_use_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pkg = root / "bin" / "super_board_runtime"
+            pkg.mkdir(parents=True)
+            (pkg / "lifecycle.py").write_bytes(
+                (_REPO_ROOT / "scripts" / "super_board_runtime" / "lifecycle.py").read_bytes()
+            )
+            (root / "bin" / "board_options.py").write_text(
+                'RETIRED_BOARD_STATUSES = ("Skipped",)\n', encoding="utf-8"
+            )
+            (root / "bin" / "test_refusal.py").write_text(
+                'with pytest.raises(ValueError, match="retired"): canonicalize_status("Skipped")\n',
+                encoding="utf-8",
+            )
+            (root / "bin" / "lane.py").write_text(
+                'card["status"] = "Skipped"\n', encoding="utf-8"
+            )
+
+            report = scan_retired_status(root, allowlist=())
+            self.assertFalse(report.clean)
+            self.assertEqual(
+                [(o.path, o.line) for o in report.occurrences],
+                [("bin/lane.py", 1)],
+            )
+
+    def test_a_declaration_list_is_not_a_use(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "bin").mkdir(parents=True)
+            (root / "bin" / "decl.py").write_text('RETIRED_STATUS = "Skipped"\n', encoding="utf-8")
+            report = scan_retired_status(root, allowlist=())
+            self.assertTrue(report.clean, "a declaration list is not a use")
+
 class ConfigAssignmentTests(unittest.TestCase):
     """Assigning a config value is not a merge invocation.
 
@@ -275,6 +346,91 @@ class ConfigAssignmentTests(unittest.TestCase):
                 self.assertFalse(report.clean, body)
                 self.assertEqual(report.occurrences[0].mechanism, "squash-or-merge-commit")
 
+
+
+class AutoMergeBoundaryAndDoneTransitionTests(unittest.TestCase):
+    """Negative boundary enforcement and read-only status inspections are not merge paths.
+
+    The contract defends the invariant that no auto-merge or rogue Done transition
+    can run outside human merge authorization. It must not flag:
+      - negative boundary assignments (e.g. `auto_merge_allowed = False`);
+      - boundary assertions and key checks;
+      - prohibition assertions in docstrings/comments;
+      - status comparisons (e.g. `== "Done"`), mapping dicts, or read-only snapshots.
+    It MUST catch:
+      - active auto-merge enablement (e.g. `auto_merge = True`, `enable_auto_merge()`);
+      - active status assignments to Done (e.g. `card["status"] = "Done"`, `item.status = "Done"`).
+    """
+
+    def _scan(self, name: str, body: str):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body, encoding="utf-8")
+            return scan_merge_prohibitions(Path(tmp), allowlist=())
+
+    def test_negative_boundaries_and_assertions_are_clean(self) -> None:
+        bodies = (
+            "auto_merge_allowed: bool = False\n",
+            "auto_merge_allowed = False\n",
+            'boundaries["auto_merge_allowed"] = False\n',
+            'res.boundaries.get("auto_merge_allowed", False)\n',
+            '{"auto_merge_allowed": false}\n',
+            "assert_false(packet.boundaries.auto_merge_allowed)\n",
+            'assert_true(bounds["auto_merge_allowed"] is False)\n',
+            'self.assertEqual(res.boundaries["auto_merge_allowed"], False)\n',
+            'for key in ("auto_merge_allowed", "auto_deploy_allowed"):\n    pass\n',
+            'self.assertIn("auto_merge_allowed", outcome.error)\n',
+            'f"  Auto-Merge Allowed: {packet.boundaries.auto_merge_allowed} (prohibited)"\n',
+            '"""If an adapter claims auto-merge is allowed, abort immediately."""\n',
+            '# strict no-auto-merge policy\n',
+        )
+        for body in bodies:
+            with self.subTest(body=body.strip()):
+                report = self._scan("workflows/portable/driver.py", body)
+                self.assertTrue(report.clean, f"expected clean: {body}")
+
+    def test_active_auto_merge_enablement_is_caught(self) -> None:
+        bodies = (
+            "enable_auto_merge()\n",
+            "auto_merge = True\n",
+            'boundaries["auto_merge_allowed"] = True\n',
+            'PAYLOAD = {"auto_merge": True}\n',
+        )
+        for body in bodies:
+            with self.subTest(body=body.strip()):
+                report = self._scan("workflows/portable/driver.py", body)
+                self.assertFalse(report.clean, f"expected violation: {body}")
+                self.assertEqual(report.occurrences[0].mechanism, "auto-merge-enablement")
+
+    def test_status_comparison_and_mock_snapshots_are_clean(self) -> None:
+        bodies = (
+            'if snapshot.get("project_status") == "Done":\n    pass\n',
+            'if canonical_status == "Done":\n    pass\n',
+            'if status == "Done":\n    pass\n',
+            'STATUS_MAP = {"done": "Done"}\n',
+            '{"id": "AC-1", "description": "Done", "status": "verified"}\n',
+            'record["github_snapshot"] = {"state": "CLOSED", "project_status": "Done"}\n',
+        )
+        for body in bodies:
+            with self.subTest(body=body.strip()):
+                report = self._scan("workflows/portable/driver.py", body)
+                self.assertTrue(report.clean, f"expected clean: {body}")
+
+    def test_status_assignment_to_done_is_caught(self) -> None:
+        bodies = (
+            'card["status"] = "Done"\n',
+            'item.status = "Done"\n',
+            'status = "Done"\n',
+            '{"status": "Done"}\n',
+            'status: "Done"\n',
+            'gh project item-edit --status Done\n',
+        )
+        for body in bodies:
+            with self.subTest(body=body.strip()):
+                report = self._scan("workflows/portable/driver.py", body)
+                self.assertFalse(report.clean, f"expected violation: {body}")
+                self.assertEqual(report.occurrences[0].mechanism, "runtime-done-transition")
 
 class AllowlistTests(unittest.TestCase):
     def test_the_allowlist_is_an_explicit_file(self) -> None:

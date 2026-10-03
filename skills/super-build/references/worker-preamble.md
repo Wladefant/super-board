@@ -20,6 +20,10 @@ judgment calls; they do not make the work impossible. Record which ones
 resolved in your session output, then follow the degraded path in §1. What
 *does* halt is a hard human gate (§3) or an unsatisfiable build gate
 ("Failure mode" below).
+### Feature map navigation (operator 2026-09-26, #244)
+
+Before broad repository searching, grep/find sweeps, or guessing file locations, consult `FEATURE_MAP.json` (or execute `python workflows/portable/feature_map.py query <term>`). It maps features directly to entrypoint files, test suites, owning issues, and risk tiers.
+
 
 ## Decision policy (mandatory)
 
@@ -81,7 +85,7 @@ resolved in your session output, then follow the degraded path in §1. What
 6. **After completing all issue work, you MUST:**
    a. Verify all applicable gates green (lint, typecheck, tests for execute issues).
    b. Make a final commit using the correct format for what you delivered:
-      - **Full delivery** → `chore(loop): close #<N> — <one-line summary>` ONLY if EVERY acceptance-criterion checkbox in the issue body is satisfied by code, schema, migration, UI, i18n, and tests committed in this branch. The `close #N` syntax auto-links; the orchestrator will merge + auto-close. Your final assistant message should be a short summary; no special prefix needed.
+      - **Full delivery** → `chore(loop): close #<N> — <one-line summary>` ONLY if EVERY acceptance-criterion checkbox in the issue body is satisfied by code, schema, migration, UI, i18n, and tests committed in this branch. The `close #N` syntax auto-links; the orchestrator merges your branch and then closes the issue itself (step 6c below). The keyword alone closes nothing unless that merge reaches the repository's default branch — never assume it did. Your final assistant message should be a short summary; no special prefix needed.
       - **Intentional partial** → `wip(loop): #<N> partial — <slice-summary>` if you deliberately landed a subset (foundation/scaffolding, single layer of the feature) AND the partial is type-checked, linted, and tested in isolation AND merging it to the base branch is safe (no broken imports, no half-wired routes). Then:
         1. Make your final assistant message **start with the literal first line `WIP-PARTIAL: <one-line reason for stopping>`** — this is the dispatcher's contract for "merge as partial, leave issue open." Without this prefix the orchestrator will treat your branch as a failed run and discard it.
         2. Exit non-zero (the harness will exit on `end_turn` of the final message; that is sufficient).
@@ -90,6 +94,9 @@ resolved in your session output, then follow the degraded path in §1. What
       - **Do not edit the issue body.** Acceptance-criterion checkboxes are the orchestrator's source of truth; rewriting them to "look done" is gaming the contract.
    c. Stop. Do **NOT** run `gh issue close`, do **NOT** remove the `loop:in-progress` label, do **NOT** comment on the issue — the orchestrator handles all of that after merging your branch.
    d. Do **NOT** advance to another issue. The orchestrator handles dispatch.
+   e. **Encode, don't memorize:** if an operator behavioural decision or requirement was clarified or decided during this issue, ensure it is encoded in policy, skill, or code in this cycle before closing. Memory is only a cache.
+   f. **Source-verified reporting (Decision 13):** paste raw command output next to every GitHub object claim (PR number, head SHA, comment URL) and log ID, and never state an ID not directly read from a tool result.
+   g. **Writing style:** write your final assistant message, PR body, and issue comments for the operator in the `ste-writing` house style (about 80% ASD-STE100): state the result in line 1, one idea per sentence, 25 words or fewer, active voice, plain words. Keep every fact, link, SHA, and hedge. Apply `unslop-writing` as well.
 
 ## Failure mode
 
@@ -100,6 +107,11 @@ If you cannot satisfy any gate (test fails, lint won't pass, typecheck error you
 - Exit non-zero.
 
 The orchestrator will halt or route according to the Super Build skill, remove/adjust the `loop:in-progress` label, post a failure comment with the log tail on the issue, and notify the user. Your worktree stays intact for human inspection when needed.
+
+### Repeat-failure limit & learning (operator 2026-09-24)
+- Try a failing command or approach at most 2–3 times; on the 3rd failure, stop that approach immediately and switch to a materially different alternative.
+- Write the failure (command, error, attempt count, alternative chosen) in a comment on the work item's GitHub issue.
+- Save the lesson in the same turn with `learn` or `retain` (for facts) or a managed skill (for procedures); check prior lessons (`recall`) before touching the same tool or area. Never loop failing commands.
 
 ## Working environment
 

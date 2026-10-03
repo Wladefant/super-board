@@ -316,6 +316,21 @@ Four more rules that are not config and are not optional:
   otherwise it is reopened, moved to Blocked, and given a corrective comment. A closed-unmerged
   pull request needs linked abandonment or supersession evidence, else Blocked. Pre-activation
   historical evidence is never rewritten to manufacture acceptance.
+- **Closing keywords are inert off the default branch.** `Closes` / `Fixes` / `Resolves #N`
+  close the linked issue only when the commit reaches the repository's **default** branch.
+  A pull request merged into `staging` — or any other non-default base — creates no closing
+  link and fires no close event, so the issue stays open and its card stays in `Review` with
+  no warning. This is GitHub behaviour, not a runtime bug; it was found on
+  [polysimulator#2430](https://github.com/Bavariance/polysimulator/issues/2430), whose
+  [PR #2431](https://github.com/Bavariance/polysimulator/pull/2431) carried a closing keyword,
+  merged, and left the issue open. A board routed to a non-default base therefore writes
+  `Refs #N` plus the full issue URL and closes each issue explicitly against accepted
+  completion evidence — never on the strength of the keyword. The workaround that automates the
+  explicit close, tracked in [#70](https://github.com/Wladefant/super-board/issues/70), is a
+  **closure normalizer**, not a second completion ledger: it acts only on a merged
+  non-default-base pull request whose linked-issue set is exactly one, it refuses an ambiguous
+  link rather than guessing, and every close it performs is audited by naming the merge commit
+  in the closure comment, so the board's completion trail still reads back to a real merge.
 
 And two habits that keep the board honest under concurrency: **compare before mutate** — reread
 the item by immutable node ID, reread repository state, reread Project values, compare against

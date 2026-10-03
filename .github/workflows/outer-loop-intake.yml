@@ -1,0 +1,45 @@
+name: Outer-Loop Intake
+
+on:
+  issues:
+    types:
+      - opened
+      - edited
+      - labeled
+      - unlabeled
+      - reopened
+  issue_comment:
+    types:
+      - created
+      - edited
+
+permissions:
+  contents: read
+  issues: write
+  repository-projects: write
+
+concurrency:
+  group: outer-loop-intake-${{ github.event.issue.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  triage:
+    name: Outer-Loop Issue & Comment Triage
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Skip pull requests (issue_comment also fires for PR comments in GitHub's data model)
+    if: ${{ !github.event.issue.pull_request }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run Outer-Loop Webhook Intake
+        run: python -B workflows/portable/outer_loop_intake.py --event-path "$GITHUB_EVENT_PATH"
+        env:
+          GITHUB_TOKEN: ${{ secrets.SUPER_BOARD_PROJECT_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.SUPER_BOARD_PROJECT_TOKEN || secrets.GITHUB_TOKEN }}

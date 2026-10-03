@@ -212,6 +212,31 @@ class TestRequestValidation(_Fixture):
 
 class TestNativeDispatch(_Fixture):
 
+    def test_native_ticket_preserves_visible_fallback_note(self):
+        backend = WorkerBackend(state_dir=self.state)
+        request = self._request().to_dict()
+        note = "fallback tier is currently out (deepseek: limit_reached)"
+        request.update(fallback_model="deepseek/deepseek-flash:high",
+                       fallback_agent_role="ds-task", fallback_note=note)
+        ticket = backend.prepare_native(request)
+        self.assertTrue(ticket.ready, ticket.blocked_reason)
+        self.assertEqual(ticket.request["model"], "test-model")
+        self.assertEqual(ticket.request.get("fallback_model"), request["fallback_model"])
+        self.assertEqual(ticket.request.get("fallback_agent_role"), "ds-task")
+        self.assertEqual(ticket.request.get("fallback_note"), note)
+        self.assertIn(request["fallback_model"], ticket.prompt)
+        self.assertIn(note, ticket.prompt)
+        record_path = os.path.join(self.state, "worker_runs", ticket.run_id, "dispatch.json")
+        with open(record_path, encoding="utf-8") as stream:
+            record = json.load(stream)
+        self.assertEqual(record["request"]["fallback_note"], note)
+        self.assertIn(note, record["prompt"])
+        healthy = self._request(request_id="healthy").to_dict()
+        healthy.update(fallback_model=request["fallback_model"], fallback_note=None)
+        healthy_ticket = backend.prepare_native(healthy)
+        self.assertTrue(healthy_ticket.ready)
+        self.assertNotIn("Fallback note:", healthy_ticket.prompt)
+
     def _result(self, ticket, **over):
         result = {
             "stage": ticket.request["stage"],
@@ -869,7 +894,42 @@ class TestCheckExpectationContract(_Fixture):
         self.assertIn("negative_control", prompt)
         self.assertIn("At least one \"verification\" check must have exited 0", prompt)
         self.assertIn("Never adjust one so it looks expected", prompt)
+        self.assertIn("Repeat-failure limit", prompt)
+        self.assertIn("Mandatory failure write-down", prompt)
+        self.assertIn("Standard 3-heading handoff protocol", prompt)
+        self.assertIn("Feature map navigation", prompt)
 
+    def test_static_prompt_prefix_precedes_dynamic_fields(self):
+        """Static prompt prefix must precede variable fields to maximize prompt caching."""
+        schema = agent_result_schema()
+        prompt = worker_backend.build_stage_prompt(self._request(), schema)
+        contract_pos = prompt.index("RESULT CONTRACT")
+        dynamic_pos = prompt.index("# DYNAMIC WORK ITEM PARAMETERS")
+        self.assertLess(contract_pos, dynamic_pos)
+
+    def test_four_stage_feature_loop_briefs_and_effort_calibration(self):
+        """Four-stage feature loop stages (spec, scaffold, build/implement, verify/qa) must have briefs and calibrated effort."""
+        schema = agent_result_schema()
+        for stage, expected_effort in [
+            ("spec", "low"),
+            ("scaffold", "low"),
+            ("build", "medium"),
+            ("implement", "medium"),
+            ("qa", "high"),
+            ("review", "high"),
+            ("verify", "high"),
+        ]:
+            self.assertEqual(worker_backend.get_stage_effort(stage), expected_effort)
+            req = self._request(stage=stage)
+            prompt = worker_backend.build_stage_prompt(req, schema)
+            self.assertIn(worker_backend.STAGE_BRIEFS[stage].split()[2], prompt)
+        # Every effort-mapped stage must carry its own brief; a stage present in
+        # STAGE_EFFORT_MAP but absent from STAGE_BRIEFS silently inherits the
+        # BUILD worker brief, so the mapping must stay in lockstep.
+        self.assertEqual(
+            set(worker_backend.STAGE_EFFORT_MAP), set(worker_backend.STAGE_BRIEFS)
+        )
+        self.assertEqual(worker_backend.get_stage_effort("unknown_stage", default="medium"), "medium")
 
 class TestHeadBinding(_Fixture):
 

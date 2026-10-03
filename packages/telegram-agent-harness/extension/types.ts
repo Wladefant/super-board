@@ -5,8 +5,23 @@
 export interface ManifestSlot {
   slotId: string;
   stateDir: string;
-  preferredProjects: string[];
+  preferredProjects?: string[];
+  projects?: string[];
   enabled: boolean;
+  /**
+   * Opt-in to standalone-daemon ownership of this slot's token. Absent or false
+   * leaves the slot to the in-session extension exactly as before; true hands the
+   * token to the machine-wide daemon: the daemon holds a normal pool lease while it
+   * runs, and the in-session pool never claims the slot at all, so the operator's
+   * bot does not silently fall back to whichever terminal happens to be open.
+   */
+  daemon?: boolean;
+  /**
+   * Absolute directory a daemon-owned slot's sessions run in when `preferredProjects`
+   * declares nothing. A slot that serves every project declares no affinity, which
+   * leaves the daemon without a cwd to create a session in; this names one.
+   */
+  defaultProject?: string;
 }
 
 export interface BotPoolManifest {
@@ -20,7 +35,12 @@ export interface DiscoveredSlot {
   botId: string;
   fingerprint: string;
   preferredProjects: string[];
+  projects?: string[];
   enabled: boolean;
+  /** Manifest opt-in to daemon ownership; see {@link ManifestSlot.daemon}. */
+  daemon?: boolean;
+  /** Manifest fallback workspace; see {@link ManifestSlot.defaultProject}. */
+  defaultProject?: string;
 }
 
 export type LeaseStatus = "ACTIVE" | "RELEASED";
@@ -43,9 +63,36 @@ export interface ProcessIdentity {
   uncertain?: boolean;
 }
 
+/**
+ * Per-group entry of {@link AccessConfig.groups}. An empty object means "this chat is
+ * allowed, use the channel allowlist"; `allowFrom` narrows it to a subset of the
+ * channel allowlist for that one chat. It can only take operators away: a group entry
+ * is a restriction on where an allowlisted account may speak, never a second door
+ * into the channel.
+ */
+export interface GroupAccessConfig {
+  allowFrom?: string[];
+}
+
 export interface AccessConfig {
   dmPolicy: string;
   allowFrom: string[];
+  /**
+   * Group and supergroup chat ids this bot may be driven from, keyed by chat id
+   * (`"-1004422647618"`). A DM is authorized by `allowFrom` alone; a group needs its
+   * chat id here as well, because a Telegram account being allowlisted says nothing
+   * about which rooms that account may speak for. Absent is the same as empty: no
+   * group is authorized.
+   */
+  groups?: Record<string, GroupAccessConfig>;
+}
+
+export interface BusySlotHolder {
+  slotId: string;
+  sessionId?: string;
+  projectPath?: string;
+  ownerPid?: number;
+  reason?: string;
 }
 
 export interface ClaimResult {
@@ -54,6 +101,7 @@ export interface ClaimResult {
   error?: string;
   reason?: string;
   activeOwnerPid?: number;
+  busyHolders?: BusySlotHolder[];
 }
 
 export interface PoolStatusSummary {
@@ -88,6 +136,7 @@ export interface TelegramCallbackQuery {
   };
   message?: {
     message_id: number;
+    message_thread_id?: number;
     chat: {
       id: number;
       type: "private" | "group" | "supergroup" | "channel";
@@ -96,6 +145,7 @@ export interface TelegramCallbackQuery {
     };
     date: number;
     text?: string;
+    caption?: string;
   };
   data?: string;
 }
@@ -104,6 +154,7 @@ export interface TelegramUpdate {
   update_id: number;
   message?: {
     message_id: number;
+    message_thread_id?: number;
     from?: {
       id: number;
       is_bot: boolean;
@@ -137,6 +188,7 @@ export interface TelegramUpdate {
       caption?: string;
       photo?: Array<{ file_id: string; file_unique_id: string }>;
       document?: { file_id: string; file_name?: string; mime_type?: string };
+      forum_topic_created?: { name: string; icon_color?: number; icon_custom_emoji_id?: string };
     };
   };
   callback_query?: TelegramCallbackQuery;
@@ -161,6 +213,7 @@ export interface TelegramSendMessageResponse {
   };
   description?: string;
   error_code?: number;
+  parameters?: { retry_after?: number };
 }
 
 /**
@@ -179,6 +232,9 @@ export interface OutboundMessageCorrelation {
   decisionId: string | null;
   projectPath: string | null;
   createdAt: number;
+  laneId?: string;
+  laneState?: "active" | "exited" | "unknown";
+  senderOrigin?: "agent";
 }
 
 export type ReplyRoutingDecision =

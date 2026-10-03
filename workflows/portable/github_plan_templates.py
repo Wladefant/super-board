@@ -275,7 +275,7 @@ class QaEvidenceGate:
 
 @dataclass
 class GitHubIssuePlan:
-    """Complete GitHub-Native Issue Plan."""
+    """Acceptance plan for one independently actionable deliverable."""
     issue_number: int
     title: str
     brief: str
@@ -310,6 +310,10 @@ class GitHubIssuePlan:
                 f"{synthetic_badge}\n"
                 f"**Target Issue:** #{self.issue_number} | **Superboard:** [Project #1]({self.superboard_project_url})\n"
                 f"**Labels:** {labels_str}\n\n"
+                f"**Scope:** One independently actionable deliverable per issue. "
+                f"Split independent deliverables into dedicated issues and enrol each on the [Project board]({self.superboard_project_url}). "
+                "The board owns cross-issue status, ordering and grouping; an optional master issue is only a checklist of links, never the place work is specified or tracked. "
+                "The durable ledger indexes those issues and preserves unresolved scope across compaction and restarts.\n\n"
                 f"### 🎯 High-Altitude Brief\n{self.brief}\n"
             )
         elif section_id == "preflight" and self.preflight:
@@ -375,7 +379,7 @@ class GitHubIssuePlan:
                 "| Feature Dimension | Hosted Agent-Native Canvas | GitHub-Native Plan (This Workflow) |\n"
                 "| :--- | :--- | :--- |\n"
                 "| **Service & Infrastructure** | External Node/Dokploy service, port bindings, OAuth | Lightweight local Python CLI; no background daemons *(wrappers under active verification)* |\n"
-                "| **Source of Truth** | External DB (`plan.agent-native.com` / SQLite) | GitHub Issue & PR Timeline directly |\n"
+                "| **Source of Truth** | External DB (`plan.agent-native.com` / SQLite) | Dedicated issue per deliverable; Project board for aggregation; ledger for lossless recovery |\n"
                 "| **Visual Diagrams** | Interactive flex cards, canvas drag-and-drop | Native Mermaid diagrams (` ```mermaid `) *(limited canvas support; declarative only)* |\n"
                 "| **Idempotent Updates** | Proprietary REST API | Managed section markers (`<!-- github-plan:... -->`) |\n"
                 "| **Decision Governance** | Markdown comment pins | Typed `DEC-*` contracts integrated with request ledger |\n"

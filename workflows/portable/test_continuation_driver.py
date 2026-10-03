@@ -826,9 +826,22 @@ class TestInstalledDriverCliRepoRoot(_Fixture):
         return config
 
     def _run_cli(self, request_id: str, repo_root: str, config: str):
+        # Isolate GitHub intake/publication, not the CLI or child worker.
+        # Network success/failure and readback have separate contract fixtures.
+        bootstrap = os.path.join(self.tmp, "fixture_cli.py")
+        with open(bootstrap, "w", encoding="utf-8") as fixture:
+            fixture.write(
+                "import sys, runpy\n"
+                f"sys.path.insert(0, {SCRIPT_DIR!r})\n"
+                "from unittest.mock import patch\n"
+                "from ledger import RequestLedger\n"
+                "from superboard_adapter import SuperboardExecutionAdapter\n"
+                "with patch.object(RequestLedger, 'refresh_from_github', RequestLedger.get_request), patch.object(SuperboardExecutionAdapter, 'publish_worker_report', return_value='https://github.com/example/fixture/issues/1#issuecomment-1'):\n"
+                f"    runpy.run_path({os.path.join(SCRIPT_DIR, 'continuation_driver.py')!r}, run_name='__main__')\n"
+            )
         return subprocess.run(
             [
-                sys.executable, os.path.join(SCRIPT_DIR, "continuation_driver.py"),
+                sys.executable, bootstrap,
                 "--request-id", request_id,
                 "--state-dir", self.tmp,
                 "--repo-root", repo_root,
@@ -1021,6 +1034,13 @@ class TestNativeCheckExpectationReconcile(_Fixture):
 
     def setUp(self):
         super().setUp()
+        intake = patch.object(RequestLedger, "refresh_from_github", RequestLedger.get_request)
+        intake.start()
+        self.addCleanup(intake.stop)
+        reports = patch("superboard_adapter.SuperboardExecutionAdapter.publish_worker_report",
+                        return_value="https://github.com/example/fixture/issues/1#issuecomment-1")
+        reports.start()
+        self.addCleanup(reports.stop)
         self.repo = os.path.join(self.tmp, "repo")
         os.makedirs(self.repo)
         self._git("init", "-q", "-b", "main")
@@ -1241,6 +1261,11 @@ class TestContinuationDriverTelegramNotifications(_Fixture):
 
     def setUp(self):
         super().setUp()
+        # These notification fixtures do not authorize reads of real issues.
+        # Actual API intake is covered by test_github_work_item.
+        intake = patch.object(RequestLedger, "refresh_from_github", RequestLedger.get_request)
+        intake.start()
+        self.addCleanup(intake.stop)
         # Zero-quota fixture credentials for dry-run Telegram notification testing
         self._orig_chat_id = os.environ.get("TELEGRAM_NOTIFY_CHAT_ID")
         self._orig_token = os.environ.get("TELEGRAM_BOT_TOKEN")

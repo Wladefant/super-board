@@ -1,0 +1,59 @@
+{
+  "width": 800,
+  "height": 600,
+  "screen": "screen.svg",
+  "after": "screen-after.svg",
+  "steps": [
+    {
+      "name": "Navigation Header",
+      "problem": "Unmodified persistent navigation header baseline",
+      "fix": "Retained consistent header anchor across both layout iterations",
+      "rect": [
+        40,
+        20,
+        720,
+        60
+      ],
+      "afterRect": [
+        40,
+        20,
+        720,
+        60
+      ]
+    },
+    {
+      "name": "Telemetry Overview",
+      "problem": "Main telemetry block was crowded by bottom action proximity",
+      "fix": "Preserved stable monitoring viewport while right-hand controls are restructured",
+      "rect": [
+        40,
+        100,
+        450,
+        360
+      ],
+      "afterRect": [
+        40,
+        100,
+        450,
+        360
+      ]
+    },
+    {
+      "name": "Action Center",
+      "problem": "Emergency deployment actions were positioned beneath passive node telemetry",
+      "fix": "Elevated high-priority deployment controls to the top of the right rail for immediate accessibility",
+      "rect": [
+        510,
+        290,
+        250,
+        170
+      ],
+      "afterRect": [
+        510,
+        100,
+        250,
+        170
+      ]
+    }
+  ]
+}

@@ -11,16 +11,16 @@ test.skipIf(!installed)("installed routing keeps command, authorization and deci
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tg-command-test-"));
   const commands: string[] = [], inbound: string[] = [];
   const poller = new TelegramPoller("0:test-only", dir, { dmPolicy: "allowlist", allowFrom: ["1"] }, {
-    isIdle: () => true, onUserMessage: (text: string) => inbound.push(text), onFollowUp: () => {}, onSteer: () => {}, onAbort: () => {}, onRelease: async () => {}, getStatusText: () => "test", onTelegramTurnStart: () => {}, onLedgerFailure: () => {},
+    isIdle: () => true, onUserMessage: (text: string) => inbound.push(text), onFollowUp: () => {}, onSteer: () => {}, onAbort: () => {}, onRelease: async () => {}, getStatusText: () => "test", onLedgerFailure: () => {},
     onHarnessCommand: async (text: string) => { await Promise.resolve(); if (!/^\/(agents|usage|prompt|shot)(?:\s|$)/.test(text)) return false; commands.push(text); return true; },
   });
   try {
-    for (const text of ["/agents", "/usage", "/prompt veyyon:root hello", "/shot veyyon:root"]) await poller.processLedgerRow({ update_id: 1, text, chat_id: "1", user_id: "1" });
+    for (const text of ["/agents", "/usage", "/prompt veyyon:root hello", "/shot veyyon:root"]) await poller.processLedgerRow({ update_id: 1, text, chat_id: "1", user_id: "1", sender_origin: "telegram_account" });
     expect(commands).toHaveLength(4); expect(inbound).toHaveLength(0);
-    await poller.processLedgerRow({ update_id: 2, text: "/agents", chat_id: "2", user_id: "2" });
+    await poller.processLedgerRow({ update_id: 2, text: "/agents", chat_id: "2", user_id: "2", sender_origin: "telegram_account" });
     expect(commands).toHaveLength(4);
-    await poller.processLedgerRow({ update_id: 3, text: "Please revise option A", chat_id: "1", user_id: "1" });
-    expect(inbound).toEqual(["Please revise option A"]);
+    await poller.processLedgerRow({ update_id: 3, text: "Please revise option A", chat_id: "1", user_id: "1", sender_origin: "telegram_account" });
+    expect(inbound).toEqual(["[Telegram sender: 1; origin: telegram_account]\nPlease revise option A"]);
   } finally { poller.stop(); fs.rmSync(dir, { recursive: true, force: true }); }
 });
 

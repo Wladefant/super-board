@@ -31,6 +31,70 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 
+def fetch_github_sub_issues(repo: str, issue_number: int, timeout_sec: int = 10) -> List[Dict[str, Any]]:
+    """
+    Fetch sub-issues for a parent issue using GitHub REST API.
+    Fails closed: raises RuntimeError on subprocess error, timeout, or parse failure.
+    Returns list of dicts: [{"number": int, "title": str, "state": str}].
+    """
+    if not repo or not issue_number or issue_number <= 0:
+        raise ValueError(f"Invalid repository '{repo}' or issue number '{issue_number}'")
+    cmd = ["gh", "api", "--paginate", "-q", ".[]", f"repos/{repo}/issues/{issue_number}/sub_issues?per_page=100"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=timeout_sec)
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"gh api sub_issues timed out after {timeout_sec}s for {repo}#{issue_number}") from e
+    except Exception as e:
+        raise RuntimeError(f"gh api sub_issues invocation failed for {repo}#{issue_number}: {e}") from e
+
+    if proc.returncode != 0:
+        err_msg = proc.stderr.strip() if proc.stderr else proc.stdout.strip()
+        raise RuntimeError(f"gh api sub_issues failed with exit {proc.returncode}: {err_msg}")
+
+    trimmed = proc.stdout.strip()
+    if not trimmed:
+        return []
+
+    results: List[Dict[str, Any]] = []
+    if trimmed.startswith("["):
+        try:
+            import re
+            matches = re.findall(r"\[.*?\](?=\s*\[|\s*$)", trimmed, flags=re.DOTALL)
+            if matches:
+                for m in matches:
+                    arr = json.loads(m)
+                    if isinstance(arr, list):
+                        results.extend(arr)
+            else:
+                data = json.loads(trimmed)
+                if isinstance(data, list):
+                    results.extend(data)
+                elif isinstance(data, dict):
+                    results.append(data)
+        except Exception as e:
+            raise RuntimeError(f"Failed to parse sub-issues JSON for {repo}#{issue_number}: {e}") from e
+    else:
+        for line in trimmed.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                if isinstance(obj, dict):
+                    results.append(obj)
+            except Exception as e:
+                raise RuntimeError(f"Failed to parse sub-issues NDJSON for {repo}#{issue_number}: {e}") from e
+
+    return [
+        {
+            "number": item.get("number"),
+            "title": item.get("title", ""),
+            "state": item.get("state", "open"),
+        }
+        for item in results
+        if isinstance(item, dict) and item.get("number")
+    ]
+
 # ---------------------------------------------------------------------------
 # Data Models
 # ---------------------------------------------------------------------------
@@ -126,6 +190,7 @@ class ProjectConfig:
         dry_run: bool = False,
         ledger_record: Optional[Dict[str, Any]] = None,
         graphql_runner: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None,
+        sub_issues_checker: Optional[Callable[[str, int], List[Dict[str, Any]]]] = None,
     ) -> "SuperboardLifecycleOutcome":
         """
         Update GitHub Project V2 card status for this project.
@@ -133,7 +198,7 @@ class ProjectConfig:
           .update_lifecycle(request_id, state, head_sha, evidence_url) -> outcome
           exposing attributes: .ok (bool), .blocked_reason (str|None), .board_url (str|None)
         """
-        updater = SuperboardProjectUpdater(self, graphql_runner=graphql_runner)
+        updater = SuperboardProjectUpdater(self, graphql_runner=graphql_runner, sub_issues_checker=sub_issues_checker)
         return updater.update_lifecycle(
             request_id=request_id,
             state=state,
@@ -142,6 +207,7 @@ class ProjectConfig:
             issue_number=issue_number,
             dry_run=dry_run,
             ledger_record=ledger_record,
+            sub_issues_checker=sub_issues_checker,
         )
 
 
@@ -157,7 +223,7 @@ def create_polysimulator_config() -> ProjectConfig:
     return ProjectConfig(
         repo="Bavariance/polysimulator",
         project_name="PolySimulator",
-        project_number=1,
+        project_number=5,
         base_branch="staging",
         staging=StagingEnvironmentConfig(
             dokploy_compose_id="TU7b_dY9l9_nCas6YBNwj",
@@ -180,6 +246,8 @@ def create_polysimulator_config() -> ProjectConfig:
             forbidden_supabase_refs=["zaraprptkegxqpvnsubu"],
         ),
         metadata={
+            "project_owner": "Wladefant",
+            "project_owner_type": "users",
             "description": "PolySimulator staging engineering environment",
             "dokploy_host": "hosting.wladefant.de",
             "staging_domain": "polysim.wladefant.de",
@@ -196,7 +264,7 @@ def create_generic_config(repo: str = "generic/unconfigured") -> ProjectConfig:
     return ProjectConfig(
         repo=repo,
         project_name=name,
-        project_number=1,
+        project_number=5 if repo in ("Wladefant/super-board", "Wladefant/veyyon") else 1,
         base_branch="main",
         staging=StagingEnvironmentConfig(
             dokploy_compose_id=None,
@@ -213,7 +281,11 @@ def create_generic_config(repo: str = "generic/unconfigured") -> ProjectConfig:
             forbidden_compose_ids=[],
             forbidden_supabase_refs=[],
         ),
-        metadata={"description": f"Generic adapter for {repo}"},
+        metadata={
+            "description": f"Generic adapter for {repo}",
+            **({"project_owner": "Wladefant", "project_owner_type": "users"}
+               if repo in ("Wladefant/super-board", "Wladefant/veyyon") else {}),
+        },
     )
 
 
@@ -677,7 +749,7 @@ def default_graphql_runner(query: str, variables: Dict[str, Any]) -> Dict[str, A
     cmd.extend(["-f", f"query={query}"])
 
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=30)
     except Exception as e:
         raise RuntimeError(f"Failed to execute gh api graphql subprocess: {e}")
 
@@ -709,10 +781,11 @@ class SuperboardProjectUpdater:
         config: Optional[ProjectConfig] = None,
         *,
         graphql_runner: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None,
+        sub_issues_checker: Optional[Callable[[str, int], List[Dict[str, Any]]]] = None,
     ):
         self.config = config or get_current_project_config()
         self.graphql_runner = graphql_runner or default_graphql_runner
-
+        self.sub_issues_checker = sub_issues_checker
     def _parse_repo(self) -> Tuple[bool, str, str, Optional[str]]:
         """Validate and parse repo into (owner, repo_name). Returns (ok, owner, repo, err)."""
         repo = (self.config.repo or "").strip()
@@ -793,9 +866,12 @@ class SuperboardProjectUpdater:
             raise RuntimeError(err_msg)
 
         items = (issue.get("projectItems") or {}).get("nodes") or []
+        project_owner = self.config.metadata.get("project_owner", owner)
         for it in items:
             proj = it.get("project") or {}
-            if proj.get("number") == project_number:
+            if proj.get("number") == project_number and (
+                (proj.get("owner") or {}).get("login", owner) == project_owner
+            ):
                 status_val = it.get("fieldValueByName") or {}
                 return {
                     "item_id": it.get("id"),
@@ -806,7 +882,7 @@ class SuperboardProjectUpdater:
                     "option_id": status_val.get("optionId"),
                 }
 
-        raise RuntimeError(f"Issue #{issue_number} is not linked to project #{project_number} on {owner}")
+        raise RuntimeError(f"Issue #{issue_number} is not linked to project #{project_number} on {project_owner}")
 
     def update_lifecycle(
         self,
@@ -818,6 +894,7 @@ class SuperboardProjectUpdater:
         issue_number: Optional[int] = None,
         dry_run: bool = False,
         ledger_record: Optional[Dict[str, Any]] = None,
+        sub_issues_checker: Optional[Callable[[str, int], List[Dict[str, Any]]]] = None,
     ) -> SuperboardLifecycleOutcome:
         """
         Public duck-typed lifecycle update method conforming to the frozen contract:
@@ -835,7 +912,9 @@ class SuperboardProjectUpdater:
             )
 
         project_number = int(self.config.project_number or 1)
-        board_url = f"https://github.com/orgs/{owner}/projects/{project_number}"
+        project_owner = self.config.metadata.get("project_owner", owner)
+        owner_type = self.config.metadata.get("project_owner_type", "orgs")
+        board_url = f"https://github.com/{owner_type}/{project_owner}/projects/{project_number}"
 
         # 2. Resolve issue number
         target_issue = self._resolve_issue_number(request_id, issue_number)
@@ -896,9 +975,43 @@ class SuperboardProjectUpdater:
                     github_writes=0,
                 )
 
+            # 4b. Inviolable Parent-Close Gate: Refuse to transition parent issues to Done if they have open sub-issues
+            effective_checker = sub_issues_checker or self.sub_issues_checker
+            open_subs: List[Dict[str, Any]] = []
+            try:
+                if effective_checker is not None:
+                    subs = effective_checker(f"{owner}/{repo_name}", target_issue)
+                else:
+                    subs = fetch_github_sub_issues(f"{owner}/{repo_name}", target_issue)
+                if not isinstance(subs, list):
+                    raise ValueError(f"Sub-issues check returned invalid type: {type(subs)}")
+                open_subs = [s for s in subs if str(s.get("state", "")).lower() == "open"]
+            except Exception as e:
+                return SuperboardLifecycleOutcome(
+                    ok=False,
+                    blocked_reason=(
+                        f"Cannot transition parent issue #{target_issue} to 'Done': "
+                        f"Failed to verify sub-issues ({e}). Inviolable parent-close guard fails closed."
+                    ),
+                    board_url=board_url,
+                    dry_run=dry_run,
+                    github_writes=0,
+                )
+            if open_subs:
+                sub_desc = [f"#{s['number']}: {s.get('title', '')} ({s.get('state', 'open')})" for s in open_subs]
+                return SuperboardLifecycleOutcome(
+                    ok=False,
+                    blocked_reason=(
+                        f"Cannot transition parent issue #{target_issue} to 'Done': "
+                        f"Issue has {len(open_subs)} open sub-issue(s): " + "; ".join(sub_desc)
+                    ),
+                    board_url=board_url,
+                    dry_run=dry_run,
+                    github_writes=0,
+                )
         # 5. Dynamic schema discovery
         try:
-            schema = self.get_board_schema(owner, project_number)
+            schema = self.get_board_schema(project_owner, project_number)
         except Exception as e:
             return SuperboardLifecycleOutcome(
                 ok=False,
@@ -1054,6 +1167,7 @@ def update_project_lifecycle(
     dry_run: bool = False,
     ledger_record: Optional[Dict[str, Any]] = None,
     graphql_runner: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None,
+    sub_issues_checker: Optional[Callable[[str, int], List[Dict[str, Any]]]] = None,
 ) -> SuperboardLifecycleOutcome:
     """Convenience functional wrapper around SuperboardProjectUpdater."""
     cfg = config or get_current_project_config()
@@ -1066,6 +1180,7 @@ def update_project_lifecycle(
         dry_run=dry_run,
         ledger_record=ledger_record,
         graphql_runner=graphql_runner,
+        sub_issues_checker=sub_issues_checker,
     )
 
 

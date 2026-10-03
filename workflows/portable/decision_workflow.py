@@ -1137,7 +1137,14 @@ class DecisionManager:
                 f.write("\n")
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp_path, self.decisions_path)
+            for attempt in range(10):
+                try:
+                    os.replace(tmp_path, self.decisions_path)
+                    break
+                except PermissionError:
+                    if attempt == 9:
+                        raise
+                    time.sleep(0.05)
         except Exception:
             if os.path.exists(tmp_path):
                 try:

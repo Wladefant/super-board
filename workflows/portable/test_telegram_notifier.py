@@ -22,6 +22,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -32,6 +33,7 @@ from telegram_notifier import (
     DEFAULT_COOLDOWN_SECONDS,
     DEFAULT_DEDUP_WINDOW_SECONDS,
     DEFAULT_GLOBAL_MIN_INTERVAL,
+    DEFAULT_HARD_DEADLINE_SECONDS,
     MESSAGE_CORRELATIONS_DDL,
     VALID_EVENT_TYPES,
     DeduplicationLedger,
@@ -42,6 +44,9 @@ from telegram_notifier import (
     SecretSanitizer,
     TelegramNotificationAdapter,
     DecisionCallbackStore,
+    ProcessDeadlineWatchdog,
+    QuestionReminderManager,
+    _safe_urlopen,
     build_decision_inline_keyboard,
     format_decision_presentation,
     resolve_pool_db_path,
@@ -71,6 +76,12 @@ class TestSecretSanitizer(unittest.TestCase):
         cleaned = SecretSanitizer.sanitize(text)
         self.assertNotIn(r"Users\wkiri", cleaned)
         self.assertIn(r"C:\Users\<user>\development", cleaned)
+
+    def test_veyyon_extension_path_preserved(self):
+        text = r"Recovery: veyyon.exe --extension C:\Users\wkiri\.veyyon\telegram\index.ts --resume 01a0496f"
+        cleaned = SecretSanitizer.sanitize(text)
+        self.assertIn(r"C:\Users\wkiri\.veyyon\telegram\index.ts", cleaned)
+        self.assertNotIn("<user>", cleaned)
 
 
 class TestNotificationEvent(unittest.TestCase):
@@ -195,7 +206,7 @@ class TestMessageFormatting(unittest.TestCase):
     def test_mentions_are_clickable_references(self):
         event = NotificationEvent(
             event_type="status", project="Wladefant/super-board", request_id="links",
-            summary="Issue #83, PR #84 and other/repo#12: https://github.com/other/repo/blob/main/doc.md",
+            summary="super-board #83, super-board PR #84 and other/repo#12: https://github.com/other/repo/blob/main/doc.md",
             canonical_link="https://github.com/Wladefant/super-board/issues/83",
         )
         message = TelegramNotificationAdapter.format_message(event)
@@ -203,6 +214,86 @@ class TestMessageFormatting(unittest.TestCase):
         self.assertIn('<a href="https://github.com/Wladefant/super-board/pull/84">#84</a>', message)
         self.assertIn('<a href="https://github.com/other/repo/issues/12">other/repo#12</a>', message)
         self.assertIn('<a href="https://github.com/other/repo/blob/main/doc.md">', message)
+
+    def test_reproduction_veyyon_url_and_polysimulator_pr_not_linked_to_veyyon(self):
+        # Reproduction test: message containing a veyyon URL plus #5157 (polysimulator)
+        # must NOT produce Wladefant/veyyon/issues/5157, and MUST produce Bavariance/polysimulator.
+        event = NotificationEvent(
+            event_type="status",
+            project="polysimulator",
+            request_id="reproduce-cross-repo",
+            summary="Header in veyyon, referencing #5157 (polysimulator) and polysimulator PR #5071",
+            canonical_link="https://github.com/Wladefant/veyyon/issues/19#issuecomment-5687476338",
+        )
+        message = TelegramNotificationAdapter.format_message(event)
+        self.assertNotIn("Wladefant/veyyon/issues/5157", message)
+        self.assertNotIn("Wladefant/veyyon/pull/5157", message)
+        self.assertNotIn("Wladefant/veyyon/issues/5071", message)
+        self.assertNotIn("Wladefant/veyyon/pull/5071", message)
+        self.assertIn('<a href="https://github.com/Bavariance/polysimulator/issues/5157">#5157</a>', message)
+        self.assertIn('<a href="https://github.com/Bavariance/polysimulator/pull/5071">#5071</a>', message)
+
+    def test_multi_repo_message_bare_numbers_stay_plain_text(self):
+        # When a message mentions more than one repo and #N has no explicit qualifier,
+        # leave it as plain text - never guess.
+        event = NotificationEvent(
+            event_type="status",
+            project="polysimulator",
+            request_id="multi-repo-bare",
+            summary="Landed PRs #5157, #5071, #5072, #5018, #5015 after review",
+            canonical_link="https://github.com/Wladefant/veyyon/issues/19#issuecomment-5687476338",
+        )
+        message = TelegramNotificationAdapter.format_message(event)
+        # Header link is veyyon
+        self.assertIn('<a href="https://github.com/Wladefant/veyyon/issues/19#issuecomment-5687476338">', message)
+        # Bare issue numbers in multi-repo context MUST NOT be linkified to veyyon or polysimulator
+        self.assertNotIn("Wladefant/veyyon/issues/5157", message)
+        self.assertNotIn("Bavariance/polysimulator/issues/5157", message)
+        self.assertNotIn("Wladefant/veyyon/pull/5157", message)
+        self.assertNotIn("Bavariance/polysimulator/pull/5157", message)
+        # The numbers should remain plain text
+        self.assertIn("#5157", message)
+        self.assertIn("#5071", message)
+
+    def test_single_repo_context_bare_numbers_link_to_project(self):
+        # Single configured project repo and no other repo appears: bare numbers linkify.
+        event = NotificationEvent(
+            event_type="status",
+            project="Wladefant/super-board",
+            request_id="single-repo-bare",
+            summary="Closed Issue #83 and merged PR #84 cleanly",
+            canonical_link="https://github.com/Wladefant/super-board/issues/83",
+        )
+        message = TelegramNotificationAdapter.format_message(event)
+        self.assertIn('<a href="https://github.com/Wladefant/super-board/issues/83">#83</a>', message)
+        self.assertIn('<a href="https://github.com/Wladefant/super-board/pull/84">#84</a>', message)
+
+    def test_cross_repo_same_line_super_board_issue_121(self):
+        # Issue 136 scenario: in polysimulator session, super-board #121 must link to super-board
+        event = NotificationEvent(
+            event_type="status",
+            project="Bavariance/polysimulator",
+            request_id="issue-136",
+            summary="Working on super-board #121 and super-board PR #122",
+            canonical_link="https://github.com/Bavariance/polysimulator/issues/4500",
+        )
+        message = TelegramNotificationAdapter.format_message(event)
+        self.assertNotIn("Bavariance/polysimulator/issues/121", message)
+        self.assertNotIn("Bavariance/polysimulator/pull/121", message)
+        self.assertIn('<a href="https://github.com/Wladefant/super-board/issues/121">#121</a>', message)
+        self.assertIn('<a href="https://github.com/Wladefant/super-board/pull/122">#122</a>', message)
+
+    def test_explicit_qualifiers_owner_slash_and_short_names(self):
+        event = NotificationEvent(
+            event_type="status",
+            project="Wladefant/super-board",
+            request_id="explicit-qualifiers",
+            summary="Checked Bavariance/polysimulator#5157 and super-board#121",
+            canonical_link="https://github.com/Wladefant/super-board/issues/83",
+        )
+        message = TelegramNotificationAdapter.format_message(event)
+        self.assertIn('<a href="https://github.com/Bavariance/polysimulator/issues/5157">Bavariance/polysimulator#5157</a>', message)
+        self.assertIn('<a href="https://github.com/Wladefant/super-board/issues/121">super-board#121</a>', message)
 
     def test_commit_branch_run_and_document_links(self):
         sha = "a" * 40
@@ -1284,7 +1375,7 @@ class TestDecisionInteractiveCallback(unittest.TestCase):
             encoding="utf-8",
         )
         self.resolver = ProjectSlotResolver(manifest_path=manifest_file, channels_dir=self.channels_dir)
-
+        self.ledger = DeduplicationLedger(Path(self.tmp) / "state.json")
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
@@ -1352,7 +1443,8 @@ class TestDecisionInteractiveCallback(unittest.TestCase):
         )
         self.assertIsNotNone(kb)
         self.assertIn("inline_keyboard", kb)
-        buttons = kb["inline_keyboard"][0]
+        self.assertTrue(all(len(row) == 1 for row in kb["inline_keyboard"]))
+        buttons = [button for row in kb["inline_keyboard"] for button in row]
         self.assertEqual(len(buttons), 2)
         self.assertEqual(buttons[0]["text"], "A: Approved access path")
         self.assertTrue(buttons[0]["callback_data"].startswith("cb:d_"))
@@ -1361,7 +1453,7 @@ class TestDecisionInteractiveCallback(unittest.TestCase):
 
     def test_send_notification_dry_run_includes_buttons(self):
         store = DecisionCallbackStore(self.pool_db)
-        adapter = TelegramNotificationAdapter(resolver=self.resolver, callback_store=store)
+        adapter = TelegramNotificationAdapter(resolver=self.resolver, callback_store=store, ledger=self.ledger)
         ev = NotificationEvent(
             event_type="decision",
             project="Bavariance/polysimulator",
@@ -1378,14 +1470,14 @@ class TestDecisionInteractiveCallback(unittest.TestCase):
         self.assertTrue(receipt.delivered)
         self.assertIsNotNone(receipt.reply_markup)
         self.assertIn("inline_keyboard", receipt.reply_markup)
-        buttons = receipt.reply_markup["inline_keyboard"][0]
+        buttons = [button for row in receipt.reply_markup["inline_keyboard"] for button in row if "callback_data" in button]
         self.assertEqual(len(buttons), 2)
         self.assertEqual(buttons[0]["text"], "A: Access remedy")
         self.assertTrue(buttons[0]["callback_data"].startswith("cb:d_"))
 
     def test_question_buttons_bind_choices_to_origin(self):
         store = DecisionCallbackStore(self.pool_db)
-        adapter = TelegramNotificationAdapter(resolver=self.resolver, callback_store=store)
+        adapter = TelegramNotificationAdapter(resolver=self.resolver, callback_store=store, ledger=self.ledger)
         event = NotificationEvent(
             event_type="question", project="Bavariance/polysimulator",
             request_id="question-example", summary="Proceed with the harmless check?",
@@ -1396,13 +1488,132 @@ class TestDecisionInteractiveCallback(unittest.TestCase):
             ]},
         )
         receipt = adapter.notify(event, dry_run=True)
-        buttons = receipt.reply_markup["inline_keyboard"][0]
+        buttons = [button for row in receipt.reply_markup["inline_keyboard"] for button in row if "callback_data" in button]
         self.assertEqual([button["text"] for button in buttons], ["A: Run check", "B: Wait"])
         for button, choice in zip(buttons, ["A", "B"]):
             record = store.lookup(button["callback_data"])
             self.assertEqual(record["choice_id"], choice)
             self.assertEqual(record["decision_id"], "decision-example")
             self.assertEqual(record["session_id"], "session-owner")
+
+
+class TestTelegramNotifierHardening(unittest.TestCase):
+    """Targeted regression tests for Issue #92 and #93 hardening:
+    - Bounded network execution via _safe_urlopen
+    - Guaranteed JSON failure receipt on deadline watchdog
+    - --force bypasses cadence in QuestionReminderManager
+    - Structured delivery receipts on transport timeout
+    - Raw HTML message and reply-to message ID support
+    """
+
+    def test_safe_urlopen_timeout_enforced(self):
+        import urllib.request
+        # Using a dummy unreachable/blackhole IP to verify quick timeout without hanging
+        req = urllib.request.Request("http://10.255.255.1:81/")
+        start_t = time.time()
+        with self.assertRaises((TimeoutError, OSError)):
+            _safe_urlopen(req, timeout=0.2, deadline=0.2)
+        elapsed = time.time() - start_t
+        self.assertLess(elapsed, 2.0, "Timeout should be enforced well within 2 seconds")
+
+    def test_watchdog_process_deadline_emits_json_receipt(self):
+        # Run a subprocess script that initializes watchdog with 0.3s deadline and hangs
+        code = (
+            "import sys, time; "
+            "from telegram_notifier import ProcessDeadlineWatchdog; "
+            "wd = ProcessDeadlineWatchdog(timeout=0.3, json_output=True, slot_id='test-slot'); "
+            "wd.start(); "
+            "time.sleep(15.0)"
+        )
+        start_t = time.time()
+        proc = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            cwd=str(Path(__file__).parent),
+        )
+        elapsed = time.time() - start_t
+        self.assertNotEqual(proc.returncode, 0, "Subprocess must exit non-zero when deadline exceeded")
+        self.assertLess(elapsed, 10.0, "Watchdog must terminate process promptly")
+        # Verify JSON receipt was emitted to stdout
+        data = json.loads(proc.stdout)
+        self.assertFalse(data.get("delivered"))
+        self.assertEqual(data.get("status"), "failed")
+        self.assertIn("Execution deadline exceeded", data.get("reason", ""))
+        self.assertEqual(data.get("slot_id"), "test-slot")
+
+    def test_question_reminder_force_bypasses_cadence(self):
+        with tempfile.TemporaryDirectory() as td:
+            dp = Path(td) / "decisions.json"
+            sp = Path(td) / "telegram_notify_state.json"
+            lp = Path(td) / "empty_ledger.json"
+            lp.write_text(json.dumps({"version": 1, "requests": {}}), encoding="utf-8")
+            now = time.time()
+            dp.write_text(json.dumps({
+                "version": 1,
+                "decisions": {
+                    "dec-123": {
+                        "decision_id": "dec-123",
+                        "status": "pending",
+                        "question": "Choose an option?",
+                        "last_notified_at": now - 10.0,  # Only 10s ago (cadence 900s)
+                        "next_reminder_at": now + 890.0,
+                    }
+                }
+            }), encoding="utf-8")
+            mgr = QuestionReminderManager(decisions_path=dp, ledger_path=lp, state_file=sp)
+            # Normal check: not due
+            unresolved_normal = mgr.get_unresolved_questions(now=now, force=False)
+            self.assertEqual(len(unresolved_normal), 1)
+            self.assertFalse(unresolved_normal[0].is_due)
+
+            # Forced check: due immediately!
+            unresolved_forced = mgr.get_unresolved_questions(now=now, force=True)
+            self.assertEqual(len(unresolved_forced), 1)
+            self.assertTrue(unresolved_forced[0].is_due)
+            self.assertEqual(unresolved_forced[0].seconds_remaining, 0)
+
+    def test_adapter_network_timeout_receipt_contract(self):
+        with tempfile.TemporaryDirectory() as td:
+            state_dir = Path(td) / "test-slot"
+            state_dir.mkdir(parents=True)
+            (state_dir / ".env").write_text("TELEGRAM_BOT_TOKEN=dummy:token\n", encoding="utf-8")
+            (state_dir / "access.json").write_text(json.dumps({"allowFrom": ["123456"]}), encoding="utf-8")
+            manifest = {
+                "version": 1,
+                "slots": [{"slotId": "test-slot", "stateDir": str(state_dir), "preferredProjects": ["test"], "enabled": True}],
+            }
+            manifest_path = Path(td) / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            resolver = ProjectSlotResolver(manifest_path=manifest_path)
+            adapter = TelegramNotificationAdapter(resolver=resolver, state_dir_override=Path(td))
+            event = NotificationEvent(
+                event_type="milestone",
+                project="test",
+                request_id="req-1",
+                summary="Build succeeded",
+                canonical_link="https://example.com",
+            )
+            with patch("telegram_notifier._safe_urlopen", side_effect=TimeoutError("HTTP request timed out after 10.0s")):
+                receipt = adapter.notify(event, dry_run=False)
+                self.assertFalse(receipt.delivered)
+                self.assertEqual(receipt.status, "failed")
+                self.assertIn("timed out", receipt.reason)
+                self.assertEqual(receipt.chat_id, "[REDACTED_DESTINATION]")
+    def test_raw_message_and_reply_to_payload(self):
+        raw_html = "<b>Bold title</b>\n<code>Code block</code>"
+        event = NotificationEvent(
+            event_type="status",
+            project="test",
+            request_id="req-2",
+            summary="",
+            canonical_link="",
+            metadata={"raw_message": raw_html, "reply_to_message_id": 9988},
+        )
+        event.validate()
+        rendered = TelegramNotificationAdapter.format_message(event)
+        self.assertEqual(rendered, raw_html)
 
 
 if __name__ == "__main__":

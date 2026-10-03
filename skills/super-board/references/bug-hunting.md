@@ -289,8 +289,8 @@ incident is
 the issue is unmet.
 
 **Why.** Templates default to a closing keyword. Agents copy
-`Resolves #<N>`. GitHub fires the close on merge regardless of how
-much of the issue landed.
+`Resolves #<N>`. When the base is the repository's default branch, GitHub
+fires the close on merge regardless of how much of the issue landed.
 
 **Consequence.** Live work disappears from the board. A half-fixed
 card is `Done`. Two PRs on 2026-08-26 would have silently closed
@@ -303,6 +303,13 @@ the full issue URL (e.g.
 before merge. Process contract:
 [`github-ops.md`](https://github.com/Wladefant/super-board/blob/main/skills/super-board/references/github-ops.md)
 § Closing an issue.
+
+**Mirror image, same class.** Where the base is *not* the default
+branch, the keyword is inert: the merge closes nothing, the issue
+stays open and the card stays in `Review` with no warning
+([super-board#70](https://github.com/Wladefant/super-board/issues/70)).
+The decisive check is the same read of the issue state after the
+merge — never infer closure from a keyword in either direction.
 
 **Example.** The closing-keyword trap recorded in
 [`github-ops.md`](https://github.com/Wladefant/super-board/blob/main/skills/super-board/references/github-ops.md)

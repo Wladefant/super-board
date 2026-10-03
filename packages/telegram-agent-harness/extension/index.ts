@@ -1,13 +1,16 @@
 /**
- * index.ts — Veyyon Telegram Session Extension.
+ * index.ts — Veyyon Telegram Session Extension (Thin Loader).
  *
  * Attaches Telegram as an alternate bidirectional I/O channel to the CURRENT
- * active Veyyon interactive root session (sharing the exact conversation, turn state,
- * and tools) using atomic bot leases from the shared bot pool.
+ * active Veyyon interactive root session.
+ *
+ * Acts as a stable loader that forwards all extension lifecycle hooks to a
+ * dynamically imported runtime module (runtime.ts). Supports in-process hot reload
+ * via Telegram `/reload` and Veyyon slash command `/tg-reload` without restarting
+ * the host session.
  */
 
 import type {
-  AssistantMessage,
   ExtensionAPI,
   ExtensionCommandContext,
   ExtensionContext,
@@ -15,512 +18,807 @@ import type {
   MessageUpdateEvent,
   SessionShutdownEvent,
   SessionStartEvent,
-  ToolCallEvent,
 } from "@veyyon/coding-agent";
-import { BotPoolCoordinator } from "./coordinator";
-import { DangerousToolGuard } from "./guard";
-import { TelegramPoller } from "./poller";
-import { chunkMessage, escapeHtml } from "./sanitizer";
-import type { DiscoveredSlot, MessageCorrelationBridge } from "./types";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { handleInstalledCommand } from "./harness/installed-commands";
-import { BunCommandRunner } from "./harness/command-runner";
-import { latestSessionPng } from "./harness/session-artifacts";
+import { Database } from "bun:sqlite";
+import { getDaemonDbPath } from "../daemon/config";
+import { DaemonStore } from "../daemon/store";
+import { readMessageThreadId } from "./harness/channel-config";
+import { questionCompactionContext } from "./harness/operator-questions";
+import { escapeHtml, markdownToTelegramHtml } from "./sanitizer";
+import { resolveGithubRepo } from "./github-repo";
+import {
+  selectTelegramAttachmentKind,
+  sendTelegramAttachment as sendAttachmentRequest,
+} from "./outbound-media";
+import {
+  ACTIVE_LEASE_SYMBOL,
+  ACTIVE_ROOT_SYMBOL,
+  type ActiveRootState,
+  type GlobalTelegramState,
+  isEligibleRootSession,
+  isSubagent,
+  TelegramRuntime,
+  type TelegramRuntimeOptions,
+} from "./runtime";
 
-export const ACTIVE_ROOT_SYMBOL = Symbol.for("veyyon.telegram.active_root");
-export const ACTIVE_LEASE_SYMBOL = Symbol.for("veyyon.telegram.active_lease");
+export {
+  ACTIVE_LEASE_SYMBOL,
+  ACTIVE_ROOT_SYMBOL,
+  type ActiveRootState,
+  type GlobalTelegramState,
+  isEligibleRootSession,
+  isSubagent,
+};
 
-export interface ActiveRootState {
-  instanceId: string;
-  sessionId: string;
-  slotId: string;
-  pi: ExtensionAPI;
-  poller: TelegramPoller;
-  guard: DangerousToolGuard;
-  coordinator: BotPoolCoordinator;
-  activeSlot: DiscoveredSlot;
+export interface ReloadOptions {
+  chatId?: string;
+  interactive?: boolean;
+  manifestPath?: string;
+  runtimeSpecifier?: string;
+  runtimeOptions?: TelegramRuntimeOptions;
 }
 
-export interface GlobalTelegramState {
-  [ACTIVE_ROOT_SYMBOL]?: ActiveRootState;
-  [ACTIVE_LEASE_SYMBOL]?: {
-    slotId: string;
-    sessionId: string;
+export interface ReloadResult {
+  success: boolean;
+  sha?: string;
+  error?: string;
+}
+
+export function getInstalledSourceSha(manifestPath?: string): string {
+  const manifestFile =
+    manifestPath ??
+    path.join(os.homedir(), ".veyyon", "telegram", "install-manifest.json");
+  try {
+    if (fs.existsSync(manifestFile)) {
+      const parsed = JSON.parse(fs.readFileSync(manifestFile, "utf-8")) as Record<string, unknown>;
+      const candidate =
+        parsed.source_sha ??
+        parsed.sourceSha ??
+        parsed.sha ??
+        parsed.git_commit ??
+        parsed.commit;
+      if (typeof candidate === "string" && candidate.length > 0) {
+        return candidate;
+      }
+    }
+  } catch {}
+  return "unknown";
+}
+
+let activeRuntime: TelegramRuntime | null = null;
+let savedContext: ExtensionContext | null = null;
+let currentApi: ExtensionAPI | null = null;
+let reloadLock: Promise<unknown> = Promise.resolve();
+let operatorReleased = false;
+let lastRebindAttemptAt = 0;
+const REBIND_MIN_INTERVAL_MS = 60_000;
+/**
+ * The extension instance that claimed the host session's root lifecycle, if any.
+ * Module scope (like operatorReleased) so the operator tools — registered with a
+ * concrete host instance — can claim the lifecycle for THAT instance when the
+ * first eligible tool context arrives before any lifecycle hook fired
+ * (headless sessions). Lifecycle handlers and commands gate on instance identity:
+ * a child extension load in the same process must never replace or dispose the
+ * root runtime its parent instance owns.
+ */
+let ownerInstance: ExtensionAPI | null = null;
+
+/**
+ * Rebinds the channel when the runtime was disposed while the host session is
+ * still alive (observed 2026-09-20: lease RELEASED mid-session, every
+ * telegram_* tool failing with "No active session-bound Telegram channel" and
+ * inbound silently dropped until an operator typed /tg-reload). Skipped after an
+ * explicit `/telegram release`; a failed claim (pool busy) retries on a later turn.
+ */
+async function ensureChannelBound(reason: string): Promise<void> {
+  if (operatorReleased || !savedContext || !currentApi) return;
+  if (activeRuntime?.getPoller()) return;
+  const now = Date.now();
+  if (now - lastRebindAttemptAt < REBIND_MIN_INTERVAL_MS) return;
+  lastRebindAttemptAt = now;
+  currentApi.logger?.warn(`[Telegram Loader] Channel unbound at ${reason}; attempting automatic rebind.`);
+  const res = await reload({ interactive: false });
+  if (res.success && activeRuntime?.getPoller()) {
+    currentApi.logger?.info?.(`[Telegram Loader] Channel rebound automatically (SHA: ${res.sha ?? "unknown"}).`);
+  } else {
+    currentApi.logger?.warn(
+      `[Telegram Loader] Automatic rebind did not attach a channel: ${res.error ?? "lease not acquired"}.`,
+    );
+  }
+}
+
+/**
+ * Tool-side channel acquisition for the operator tools.
+ *
+ * A tool call arrives with the executing session's context as its fifth argument.
+ * An eligible root session — headless ones included, since they may never fire a
+ * session_start that reaches the loader — claims the root lifecycle here. A
+ * subagent or nested-task context claims nothing: it is served through the root's
+ * channel or rejected. After an explicit `/telegram release` nothing here
+ * re-acquires; only `/tg-reload` or `/telegram reload` re-arms the channel.
+ */
+async function bindToolChannel(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext | undefined,
+  force: boolean,
+): Promise<ActiveRootState | null> {
+  if (ctx && isEligibleRootSession(ctx)) {
+    savedContext = ctx;
+    ownerInstance = pi;
+    currentApi = pi;
+  }
+  let root = ownedRoot();
+  if (root && !force) return root;
+  const effectiveCtx = ctx && isEligibleRootSession(ctx) ? ctx : savedContext;
+  if (!effectiveCtx || operatorReleased || !currentApi) return root;
+  try {
+    if (!activeRuntime) {
+      const mod = await loadRuntimeModule();
+      activeRuntime = mod.createRuntime(currentApi);
+      activeRuntime.setReloadTrigger(reload);
+    }
+    await activeRuntime.initSession(effectiveCtx, { isReload: true });
+    root = ownedRoot();
+  } catch (err: unknown) {
+    currentApi.logger?.warn(`Telegram tool rebind failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  return root;
+}
+
+export function getActiveRuntime(): TelegramRuntime | null {
+  return activeRuntime;
+}
+
+export function setActiveRuntime(runtime: TelegramRuntime | null): void {
+  activeRuntime = runtime;
+}
+
+export function setSavedContext(ctx: ExtensionContext | null): void {
+  savedContext = ctx;
+}
+
+/**
+ * The active root this loader's CURRENT runtime owns, or null.
+ *
+ * Tools are registered once per extension load and outlive every hot reload, while
+ * the runtime holding the channel is replaced on each one. So ownership cannot be
+ * a captured instance id: it is re-derived from whichever runtime is loaded now.
+ * A retained handler belonging to an extension that is no longer active — its
+ * runtime disposed, or another instance's runtime holding the process-global root —
+ * therefore resolves null instead of borrowing that root's question service,
+ * message route or dashboard.
+ */
+export interface LastKnownRoute {
+  chatId?: string;
+  slotId?: string;
+  sessionId?: string;
+  unboundAt?: number;
+  unboundReason?: string;
+}
+
+export let lastKnownRoute: LastKnownRoute | null = null;
+
+export function recordLastKnownRoute(route: Partial<LastKnownRoute>): void {
+  lastKnownRoute = { ...lastKnownRoute, ...route };
+}
+
+export function recordRouteUnbound(reason: string): void {
+  if (lastKnownRoute) {
+    lastKnownRoute.unboundReason = reason;
+    lastKnownRoute.unboundAt = Date.now();
+  } else {
+    lastKnownRoute = { unboundReason: reason, unboundAt: Date.now() };
+  }
+}
+function findDaemonRoute(sessionId?: string, workspace?: string): { slotId: string; chatId: string; topicId: string; token: string } | null {
+  try {
+    const dbPath = path.join(os.homedir(), ".veyyon", "telegram", "daemon.db");
+    if (!fs.existsSync(dbPath)) return null;
+    const db = new Database(dbPath, { readonly: true });
+    try {
+      let row = sessionId
+        ? db.query<{ slot_id: string; chat_id: string; topic_id: string }, [string]>(
+            "SELECT slot_id, chat_id, topic_id FROM routes WHERE session_id = ? AND topic_id != '' LIMIT 1"
+          ).get(sessionId)
+        : null;
+      if (!row && workspace) {
+        // Only a workspace the caller actually owns may resolve a route. Never
+        // default to process.cwd(): a context-less caller (a subagent, or a root
+        // that never claimed) would then post into whichever OTHER session shares
+        // this directory (two sessions share super-board on the live daemon.db).
+        const targetWs = workspace.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+        const all = db.query<{ slot_id: string; chat_id: string; topic_id: string; workspace: string }, []>(
+          "SELECT slot_id, chat_id, topic_id, workspace FROM routes WHERE topic_id != ''"
+        ).all();
+        row = all.find(r => r.workspace && r.workspace.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase() === targetWs) ?? null;
+      }
+      if (!row) return null;
+
+      const manifestPath = path.join(os.homedir(), ".veyyon", "telegram", "manifest.json");
+      if (!fs.existsSync(manifestPath)) return null;
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as { slots?: Array<{ slotId: string; stateDir: string }> };
+      const slot = manifest.slots?.find(s => s.slotId === row!.slot_id);
+      if (!slot) return null;
+      const envPath = path.join(slot.stateDir, ".env");
+      if (!fs.existsSync(envPath)) return null;
+      const envContent = fs.readFileSync(envPath, "utf8");
+      const match = /TELEGRAM_BOT_TOKEN=["']?([^"'\r\n]+)/.exec(envContent);
+      if (!match) return null;
+
+      return {
+        slotId: row.slot_id,
+        chatId: row.chat_id,
+        topicId: row.topic_id,
+        token: match[1].trim(),
+      };
+    } finally {
+      db.close();
+    }
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Records a telegram_message text in the daemon ledger when the daemon relays this
+ * session, so its relay holds back a final reply that repeats it.
+ */
+function recordDaemonAgentMessage(sessionId: string | undefined, text: string): void {
+  if (!sessionId || !fs.existsSync(getDaemonDbPath())) return;
+  try {
+    const store = new DaemonStore();
+    try {
+      if (store.routesForSession(sessionId).length > 0) store.recordAgentMessage(sessionId, text);
+    } finally {
+      store.close();
+    }
+  } catch (err: unknown) {
+    currentApi?.logger?.warn(`Telegram dedupe record failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+
+export function ownedRoot(): ActiveRootState | null {
+  const runtime = activeRuntime;
+  if (!runtime) return null;
+  const root = (globalThis as unknown as GlobalTelegramState)[ACTIVE_ROOT_SYMBOL];
+  if (root && root.instanceId === runtime.instanceId) {
+    recordLastKnownRoute({
+      chatId: root.poller.getPrimaryChatId() ?? undefined,
+      slotId: root.activeSlot.slotId,
+      sessionId: root.sessionId,
+      unboundReason: undefined,
+    });
+    return root;
+  }
+  return null;
+}
+
+export async function loadRuntimeModule(
+  specifier?: string,
+): Promise<{ createRuntime: (pi: ExtensionAPI, options?: TelegramRuntimeOptions) => TelegramRuntime }> {
+  const importUrl = specifier ?? `./runtime.ts?v=${Date.now()}`;
+  // Dynamic import with cache-busting timestamp is REQUIRED for in-process hot reload
+  // so the runtime engine invalidates its module cache on reload.
+  const mod = (await import(importUrl)) as {
+    createRuntime?: (pi: ExtensionAPI, options?: TelegramRuntimeOptions) => TelegramRuntime;
   };
+  if (!mod || typeof mod.createRuntime !== "function") {
+    throw new Error(`Module from "${importUrl}" does not export createRuntime`);
+  }
+  return { createRuntime: mod.createRuntime };
 }
 
-export function isSubagent(ctx: ExtensionContext): boolean {
-  return Boolean(
-    ctx.isSubagent === true ||
-    (ctx.taskDepth ?? 0) > 0 ||
-    Boolean(ctx.parentTaskPrefix),
-  );
+export async function reload(opts?: ReloadOptions): Promise<ReloadResult> {
+  const prevLock = reloadLock;
+  let releaseLock: () => void = () => {};
+  reloadLock = new Promise<void>(resolve => {
+    releaseLock = resolve;
+  });
+
+  try {
+    await prevLock;
+    return await executeReload(opts);
+  } finally {
+    releaseLock();
+  }
 }
 
-export function isEligibleRootSession(ctx: ExtensionContext): boolean {
-  return Boolean(
-    ctx.hasUI &&
-    ctx.isSubagent !== true &&
-    (ctx.taskDepth ?? 0) === 0 &&
-    !ctx.parentTaskPrefix,
-  );
+async function executeReload(opts?: ReloadOptions): Promise<ReloadResult> {
+  if (opts?.chatId && activeRuntime) {
+    const allowFrom = activeRuntime.getAllowFrom();
+    if (allowFrom.length > 0 && !allowFrom.includes(opts.chatId)) {
+      currentApi?.logger?.warn(
+        `Telegram /reload rejected from non-allowlisted chat ${opts.chatId}`,
+      );
+      return { success: false, error: "Unauthorized chat" };
+    }
+  }
+
+  let newModule: { createRuntime: (pi: ExtensionAPI, options?: TelegramRuntimeOptions) => TelegramRuntime };
+  try {
+    newModule = await loadRuntimeModule(opts?.runtimeSpecifier);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    currentApi?.logger?.error(`[Telegram Hot Reload] Dynamic import failed: ${message}`);
+    if (opts?.chatId && activeRuntime) {
+      try {
+        await activeRuntime.notifyOperator(
+          opts.chatId,
+          `<b>Hot reload failed:</b> ${message}. Previous runtime retained.`,
+        );
+      } catch {}
+    }
+    return { success: false, error: message };
+  }
+
+  const oldRuntime = activeRuntime;
+  const operatorChatId = opts?.chatId || oldRuntime?.getPrimaryChatId();
+
+  if (oldRuntime) {
+    try {
+      await oldRuntime.dispose();
+    } catch (err: unknown) {
+      currentApi?.logger?.warn(
+        `[Telegram Hot Reload] Error disposing previous runtime: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  if (!currentApi) {
+    return { success: false, error: "ExtensionAPI not initialized" };
+  }
+
+  const newRuntime = newModule.createRuntime(currentApi, opts?.runtimeOptions);
+  newRuntime.setReloadTrigger(reload);
+  activeRuntime = newRuntime;
+
+  if (savedContext) {
+    try {
+      const initialized = await newRuntime.initSession(savedContext, { isReload: true });
+      if (!initialized) {
+        const errorMsg = "Failed to re-initialize Telegram session after reload: bot lease not acquired or session not eligible.";
+        currentApi?.logger?.error(`[Telegram Hot Reload] ${errorMsg}`);
+        recordRouteUnbound(errorMsg);
+        return { success: false, error: errorMsg };
+      }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      currentApi?.logger?.error(`[Telegram Hot Reload] Failed to re-initialize session: ${message}`);
+      recordRouteUnbound(`Reload failed: ${message}`);
+      return { success: false, error: message };
+    }
+  }
+
+  const sha = getInstalledSourceSha(opts?.manifestPath);
+  const targetChat = operatorChatId || newRuntime.getPrimaryChatId();
+  if (targetChat) {
+    try {
+      await newRuntime.notifyOperator(
+        targetChat,
+        `<b>Telegram harness reloaded.</b> Source SHA: <code>${sha}</code>`,
+      );
+    } catch (notifyErr: unknown) {
+      currentApi?.logger?.warn(
+        `[Telegram Hot Reload] Failed to notify operator chat: ${notifyErr instanceof Error ? notifyErr.message : String(notifyErr)}`,
+      );
+    }
+  }
+
+  return { success: true, sha };
 }
 
-function getStatusSummary(ctx: ExtensionContext, slot: DiscoveredSlot | null, sessionId: string): string {
-  const modelName = ctx.model?.id ?? "default";
-  const idleState = ctx.isIdle() ? "Idle" : "Running / Streaming";
-  const slotName = slot?.slotId ?? "None";
-  const botId = slot?.botId ?? "Unknown";
+/**
+ * Registers the operator-facing tools on the host.
+ *
+ * They live on the loader, not the runtime: a hot reload replaces the runtime but
+ * must not re-register a tool name the host already holds. Each handler resolves
+ * its channel through `ownedRoot()` on every call instead of capturing one.
+ */
+export function registerOperatorTools(pi: ExtensionAPI): void {
+  const z = pi.zod;
+  pi.registerTool({
+    name: "telegram_question",
+    label: "Ask operator on Telegram",
+    description: "Ask a clear question on the session's Telegram route, with labeled options, recommendation and prose replies. Returns only that question's answer; never grants approval. Use get/wait with its id after an interruption.",
+    parameters: z.object({
+      action: z.enum(["ask", "get", "wait"]).default("ask"),
+      id: z.string().optional(),
+      question: z.string().optional(),
+      problem: z.string().optional(),
+      impact: z.string().optional(),
+      recommendation: z.string().optional(),
+      options: z.array(z.object({ id: z.string(), label: z.string(), description: z.string().optional() })).optional(),
+      details_url: z.string().optional(),
+      wait: z.boolean().default(true),
+      timeout: z.number().optional(),
+    }),
+    async execute(_id, params, signal, onUpdate, ctx?: ExtensionContext) {
+      let root = await bindToolChannel(pi, ctx, false);
+      if (!root || !root.questions) {
+        const routeInfo = lastKnownRoute
+          ? ` (last bound to chat ${lastKnownRoute.chatId ?? "unknown"}, slot ${lastKnownRoute.slotId ?? "unknown"}, unbound: ${lastKnownRoute.unboundReason ?? "unknown"})`
+          : "";
+        currentApi?.logger?.warn(`Telegram question receiver unavailable${routeInfo}`);
+        throw new Error(`No active session-bound Telegram question receiver${routeInfo}. Call telegram_message with rebind: true to re-acquire the channel. Do not substitute a terminal question.`);
+      }
+      const service = root.questions;
+      let question;
+      if (params.action === "ask") {
+        if (!params.question || !params.options || !params.recommendation) {
+          throw new Error("Provide question, options with readable labels, and a recommended option id.");
+        }
+        question = await service.ask({
+          ...params,
+          question: params.question,
+          options: params.options,
+          recommendation: params.recommendation,
+        });
+      } else {
+        if (!params.id) throw new Error("Question id is required for get/wait");
+        question = await service.get(params.id);
+      }
+      onUpdate?.({ content: [{ type: "text", text: `Telegram question ${question.decision_id} is ${question.status}. Silence leaves it pending.` }] });
+      const timeoutMs = (params.timeout ? Math.max(1, Math.min(300, params.timeout)) : 60) * 1000;
+      let lastProgressSec = 0;
+      const result = params.action === "get" || !params.wait
+        ? question
+        : await service.wait(
+            question.decision_id,
+            signal,
+            200,
+            timeoutMs,
+            elapsedMs => {
+              const elapsedSec = Math.floor(elapsedMs / 1000);
+              if (elapsedSec > 0 && elapsedSec - lastProgressSec >= 5) {
+                lastProgressSec = elapsedSec;
+                onUpdate?.({ content: [{ type: "text", text: `Waiting for Telegram answer (${question.decision_id}), ${elapsedSec}s elapsed...` }] });
+              }
+            },
+          );
+      return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
+    },
+  });
 
-  return [
-    "📊 <b>Veyyon Session Status</b>",
-    `Session ID: <code>${sessionId}</code>`,
-    `Model: <code>${modelName}</code>`,
-    `State: <b>${idleState}</b>`,
-    `Bot Slot: <code>${slotName}</code> (Bot ID: ${botId})`,
-    `Directory: <code>${escapeHtml(ctx.cwd)}</code>`,
-  ].join("\n");
+  pi.registerTool({
+    name: "telegram_message",
+    label: "Send attributed Telegram message",
+    description: "Send a lane update to the session's Telegram route with durable reply context. For a decision use telegram_question; do not send a question without its real labeled choices. Mark exited lanes explicitly.",
+    parameters: z.object({
+      text: z.string(),
+      lane_id: z.string(),
+      lane_state: z.enum(["active", "exited", "unknown"]),
+      rebind: z.boolean().optional(),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx?: ExtensionContext) {
+      let root = await bindToolChannel(pi, ctx, params.rebind === true);
+      if (!root) {
+        const fallbackRoute = findDaemonRoute(savedContext?.sessionId, savedContext?.cwd);
+        if (fallbackRoute) {
+          const res = await fetch(`https://api.telegram.org/bot${fallbackRoute.token}/sendMessage`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              chat_id: fallbackRoute.chatId,
+              message_thread_id: Number(fallbackRoute.topicId),
+              text: `<b>Agent · ${escapeHtml(params.lane_id)}</b>\n${markdownToTelegramHtml(params.text, savedContext?.cwd ? resolveGithubRepo(savedContext.cwd) : undefined)}`,
+              parse_mode: "HTML",
+            }),
+          });
+          const data = (await res.json()) as { ok?: boolean; result?: { message_id: number } };
+          if (data.ok && data.result) {
+            activeRuntime?.recordTurnDelivery(params.text);
+            recordDaemonAgentMessage(savedContext?.sessionId, params.text);
+            return {
+              content: [{
+                type: "text",
+                text: `Delivered message ${data.result.message_id} to topic #${fallbackRoute.topicId}; replies return with lane context.`,
+              }],
+            };
+          }
+        }
+        const routeInfo = lastKnownRoute
+          ? ` (last bound to chat ${lastKnownRoute.chatId ?? "unknown"}, slot ${lastKnownRoute.slotId ?? "unknown"}, unbound: ${lastKnownRoute.unboundReason ?? "unknown"})`
+          : "";
+        currentApi?.logger?.warn(`Telegram route unavailable${routeInfo}`);
+        throw new Error(`No active session-bound Telegram channel${routeInfo}. Call telegram_message with rebind: true to re-acquire the channel. Do not substitute a terminal question.`);
+      }
+      const chat = root.poller.getPrimaryChatId();
+      if (!chat) throw new Error("No authorized Telegram recipient");
+      root.messageContext?.setLaneState(root.sessionId, params.lane_id, params.lane_state);
+      const threadId = root.poller.getActiveThreadId() ?? (root.activeSlot?.stateDir ? readMessageThreadId(root.activeSlot.stateDir) : undefined);
+      const sent = await root.poller.sendTelegramMessage(
+        chat,
+        `<b>Agent · ${escapeHtml(params.lane_id)}</b>\n${params.text}`,
+        undefined,
+        undefined,
+        { laneId: params.lane_id, laneState: params.lane_state },
+        savedContext?.cwd ? resolveGithubRepo(savedContext.cwd) : undefined,
+        threadId,
+      );
+      if (!sent?.ok) throw new Error("Attributed message was not delivered");
+      activeRuntime?.recordTurnDelivery(params.text);
+      recordDaemonAgentMessage(root.sessionId, params.text);
+      return { content: [{ type: "text", text: `Delivered message ${sent.result?.message_id}; replies return to Main with lane context.` }] };
+    },
+  });
+
+  pi.registerTool({
+    name: "telegram_attachment",
+    label: "Send Telegram attachment",
+    description: "Send a local image inline or a PDF/other file as a document to the session's exact Telegram chat and forum topic. Telegram Bot API limits apply: 10 MiB for photos and 50 MiB for documents.",
+    parameters: z.object({
+      file_path: z.string(),
+      kind: z.enum(["auto", "photo", "document"]).default("auto"),
+      caption: z.string().optional(),
+      filename: z.string().optional(),
+      lane_id: z.string(),
+      lane_state: z.enum(["active", "exited", "unknown"]),
+      rebind: z.boolean().optional(),
+    }),
+    async execute(_id, params, signal, _onUpdate, ctx?: ExtensionContext) {
+      const root = await bindToolChannel(pi, ctx, params.rebind === true);
+      const workspace = ctx?.cwd ?? savedContext?.cwd;
+      if (!path.isAbsolute(params.file_path) && !workspace) {
+        throw new Error("A relative attachment path requires a session workspace.");
+      }
+      const filePath = path.isAbsolute(params.file_path)
+        ? path.normalize(params.file_path)
+        : path.resolve(workspace!, params.file_path);
+      const defaultRepo = workspace ? resolveGithubRepo(workspace) : undefined;
+
+      if (!root) {
+        const fallbackRoute = findDaemonRoute(savedContext?.sessionId, savedContext?.cwd);
+        if (fallbackRoute) {
+          const sent = await sendAttachmentRequest({
+            token: fallbackRoute.token,
+            chatId: fallbackRoute.chatId,
+            messageThreadId: Number(fallbackRoute.topicId),
+            filePath,
+            kind: params.kind,
+            caption: params.caption,
+            filename: params.filename,
+            defaultRepo,
+            signal,
+          });
+          if (params.caption?.trim()) {
+            activeRuntime?.recordTurnDelivery(params.caption);
+            recordDaemonAgentMessage(savedContext?.sessionId, params.caption);
+          }
+          const details = {
+            message_id: sent.response.result!.message_id,
+            chat_id: sent.response.result!.chat.id,
+            message_thread_id: Number(fallbackRoute.topicId),
+            kind: sent.kind,
+            filename: sent.filename,
+            size_bytes: sent.sizeBytes,
+          };
+          return {
+            content: [{
+              type: "text",
+              text: `Delivered ${sent.kind} ${sent.filename} as message ${details.message_id} to chat ${details.chat_id}, topic #${details.message_thread_id}.`,
+            }],
+            details,
+          };
+        }
+        const routeInfo = lastKnownRoute
+          ? ` (last bound to chat ${lastKnownRoute.chatId ?? "unknown"}, slot ${lastKnownRoute.slotId ?? "unknown"}, unbound: ${lastKnownRoute.unboundReason ?? "unknown"})`
+          : "";
+        throw new Error(`No active session-bound Telegram channel${routeInfo}. Call telegram_attachment with rebind: true to re-acquire the channel.`);
+      }
+
+      const chat = root.poller.getPrimaryChatId();
+      if (!chat) throw new Error("No authorized Telegram recipient");
+      root.messageContext?.setLaneState(root.sessionId, params.lane_id, params.lane_state);
+      const threadId = root.poller.getActiveThreadId()
+        ?? root.poller.getMessageThreadId()
+        ?? (root.activeSlot?.stateDir ? readMessageThreadId(root.activeSlot.stateDir) : undefined);
+      const kind = selectTelegramAttachmentKind(filePath, params.kind);
+      const sent = await root.poller.sendTelegramAttachment(
+        chat,
+        filePath,
+        kind,
+        params.caption ?? "",
+        params.filename,
+        { laneId: params.lane_id, laneState: params.lane_state },
+        defaultRepo,
+        threadId,
+      );
+      if (params.caption?.trim()) {
+        activeRuntime?.recordTurnDelivery(params.caption);
+        recordDaemonAgentMessage(root.sessionId, params.caption);
+      }
+      const details = {
+        message_id: sent.result!.message_id,
+        chat_id: sent.result!.chat.id,
+        message_thread_id: threadId ?? null,
+        kind,
+        filename: path.basename(params.filename?.trim() || filePath),
+      };
+      const destination = threadId === undefined
+        ? `direct chat ${details.chat_id}`
+        : `chat ${details.chat_id}, topic #${threadId}`;
+      return {
+        content: [{
+          type: "text",
+          text: `Delivered ${kind} ${details.filename} as message ${details.message_id} to ${destination}.`,
+        }],
+        details,
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "telegram_dashboard",
+    label: "Update Telegram fleet dashboard",
+    description: "Refresh the one pinned Telegram dashboard with the actual lane tasks, questions waiting on the operator, and merge queue. Edits coalesce every 30 seconds; no new post per event. Supply observed state, never invent a live registry.",
+    parameters: z.object({
+      lanes: z.array(z.object({ name: z.string(), task: z.string(), state: z.enum(["active", "blocked", "exited"]) })),
+      blockers: z.array(z.object({ question: z.string(), url: z.string().optional() })),
+      mergeQueue: z.array(z.object({ title: z.string(), url: z.string(), state: z.string() })),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx?: ExtensionContext) {
+      const root = await bindToolChannel(pi, ctx, false);
+      if (!root || !root.dashboard) throw new Error("No active Telegram dashboard");
+      root.dashboard.set({ ...params, observedAt: Date.now() });
+      for (const lane of params.lanes) {
+        root.messageContext?.setLaneState(root.sessionId, lane.name, lane.state === "exited" ? "exited" : "active");
+      }
+      return { content: [{ type: "text", text: "Dashboard snapshot saved; the pinned message will update at the next coalesced refresh." }] };
+    },
+  });
 }
 
 export default function telegramSessionExtension(pi: ExtensionAPI): void {
   pi.setLabel("Telegram Alternate Channel");
+  currentApi ??= pi;
 
-  const instanceId = crypto.randomUUID();
-  const globalState = globalThis as unknown as GlobalTelegramState;
-
-  let streamDebounceTimer: Timer | null = null;
-  let sentTelegramMessageIds: number[] = [];
-  let streamedChunks: string[] = [];
-  let accumulatedAssistantText = "";
-
-  let outboundQueue: Promise<void> = Promise.resolve();
-
-  function queueOutbound(task: () => Promise<void>): Promise<void> {
-    const next = outboundQueue.then(task, task);
-    outboundQueue = next;
-    return next;
-  }
-
-
-  async function syncAssistantOutput(targetText: string): Promise<void> {
-    return queueOutbound(async () => {
-      const root = globalState[ACTIVE_ROOT_SYMBOL];
-      if (!root || root.instanceId !== instanceId || !targetText.trim()) return;
-
-      const primaryChat = root.poller.getPrimaryChatId();
-      if (!primaryChat) return;
-
-      const chunks = chunkMessage(targetText, 3800);
-      for (let i = 0; i < chunks.length; i++) {
-        const chunk = chunks[i];
-        if (i < sentTelegramMessageIds.length) {
-          if (chunk !== streamedChunks[i]) {
-            await root.poller.editTelegramMessage(primaryChat, sentTelegramMessageIds[i], escapeHtml(chunk));
-            streamedChunks[i] = chunk;
-          }
-        } else {
-          const res = await root.poller.sendTelegramMessage(primaryChat, escapeHtml(chunk));
-          if (res?.ok && typeof res.result?.message_id === "number") {
-            sentTelegramMessageIds.push(res.result.message_id);
-            streamedChunks.push(chunk);
-          }
-        }
-      }
-    });
-  }
-
-  /**
-   * Re-points this root's lease at `nextSessionId`, or gives the channel up.
-   *
-   * Only a lease this process still holds may carry a new session identity. If the pool
-   * reclaimed it, this root stops polling a bot it no longer owns and stops being the
-   * active root, rather than binding its outbound messages to a session the pool has
-   * already reassigned. Every re-entry path shares this rule: which lifecycle event the
-   * new session id arrived through must not decide whether ownership is rechecked.
-   *
-   * Returns true when the lease still belongs to this process.
-   */
-  function repointLeaseOrRelinquish(
-    root: ActiveRootState,
-    nextSessionId: string,
-    projectCwd: string,
-  ): boolean {
-    const repointed = root.coordinator.updateLeaseSession(
-      root.activeSlot.slotId,
-      nextSessionId,
-      projectCwd,
-      process.pid,
-    );
-
-    if (!repointed) {
-      pi.logger.warn(
-        `Telegram bot lease on slot ${root.activeSlot.slotId} is no longer held by this process; releasing the channel instead of re-pointing it to session ${nextSessionId}.`,
-      );
-      root.poller.stop();
-      root.coordinator.close();
-      delete globalState[ACTIVE_ROOT_SYMBOL];
-      delete globalState[ACTIVE_LEASE_SYMBOL];
-      return false;
-    }
-
-    root.sessionId = nextSessionId;
-    globalState[ACTIVE_LEASE_SYMBOL] = {
-      slotId: root.activeSlot.slotId,
-      sessionId: nextSessionId,
-    };
-    return true;
-  }
-
-  // --------------------------------------------------------------------------
-  // Lifecycle: Session Start (Acquire Lease & Start Poller)
-  // --------------------------------------------------------------------------
-  pi.on("session_start", async (_event: SessionStartEvent, ctx: ExtensionContext) => {
-    if (!isEligibleRootSession(ctx)) {
-      return;
-    }
-
-    const newSessionId = ctx.sessionManager.getSessionId();
-    const existingRoot = globalState[ACTIVE_ROOT_SYMBOL];
-
-    if (existingRoot) {
-      if (existingRoot.instanceId === instanceId || existingRoot.sessionId === newSessionId) {
-        if (existingRoot.activeSlot && existingRoot.sessionId !== newSessionId) {
-          repointLeaseOrRelinquish(existingRoot, newSessionId, ctx.cwd);
-        }
-        return;
-      }
-      return;
-    }
-
-    const coordinator = new BotPoolCoordinator();
-    const claim = await coordinator.acquireLease(newSessionId, ctx.cwd, process.pid);
-
-    if (!claim.ok || !claim.slot) {
-      pi.logger.warn(
-        `Telegram bot lease not acquired for session ${newSessionId}: ${claim.reason || "Pool busy"}`,
-      );
-      coordinator.close();
-      return;
-    }
-
-    const activeSlot = claim.slot;
-    const token = coordinator.readRawTokenForSlot(activeSlot.stateDir);
-
-    if (!token) {
-      coordinator.releaseLease(activeSlot.slotId, newSessionId, process.pid);
-      coordinator.close();
-      pi.logger.warn(`Telegram bot token missing for slot ${activeSlot.slotId}. Released lease.`);
-      return;
-    }
-
-    const guard = new DangerousToolGuard(activeSlot.stateDir);
-    const accessConfig = coordinator.readAccessConfig(activeSlot.stateDir);
-
-    // The session that owns this channel can change while the lease is held (an
-    // in-TUI session switch), so the correlation surface resolves it on every call
-    // instead of capturing the session id from session_start.
-    const currentSessionId = (): string => {
-      const root = globalState[ACTIVE_ROOT_SYMBOL];
-      return root && root.instanceId === instanceId ? root.sessionId : newSessionId;
-    };
-
-    const correlationBridge: MessageCorrelationBridge = {
-      getSessionId: currentSessionId,
-      getSlotId: () => activeSlot.slotId,
-      record: correlation => {
-        coordinator.recordOutboundMessage(correlation);
-      },
-      resolveReply: (botId, chatId, replyToMessageId) =>
-        coordinator.resolveReplyRouting(botId, chatId, replyToMessageId, currentSessionId()),
-      resolveCallback: (callbackToken, userId, chatId) =>
-        coordinator.validateDecisionCallback(callbackToken, userId, chatId, currentSessionId()),
-      consumeCallback: callbackToken =>
-        coordinator.consumeDecisionCallback(callbackToken),
-    };
-
-    try {
-      const poller = new TelegramPoller(
-        token,
-        activeSlot.stateDir,
-        accessConfig,
-        {
-          isIdle: () => ctx.isIdle(),
-          getSessionFile: () => ctx.sessionManager.getSessionFile(),
-          onUserMessage: text => {
-            if (guard) guard.startTelegramTurn();
-            pi.sendUserMessage(text);
-          },
-          onFollowUp: text => {
-            if (guard) guard.startTelegramTurn();
-            pi.sendUserMessage(text, { deliverAs: "followUp" });
-          },
-          onSteer: text => {
-            if (guard) guard.startTelegramTurn();
-            pi.sendUserMessage(text, { deliverAs: "steer" });
-          },
-          onAbort: () => {
-            ctx.abort();
-          },
-          onRelease: async () => {
-            const root = globalState[ACTIVE_ROOT_SYMBOL];
-            if (root && root.instanceId === instanceId) {
-              root.poller.stop();
-              root.coordinator.releaseLease(root.activeSlot.slotId, root.sessionId, process.pid);
-              root.coordinator.close();
-              delete globalState[ACTIVE_ROOT_SYMBOL];
-              delete globalState[ACTIVE_LEASE_SYMBOL];
-            }
-          },
-          getStatusText: () => getStatusSummary(ctx, activeSlot, currentSessionId()),
-          onHarnessCommand: (text, chatId) => handleInstalledCommand(text, {
-            session: () => ({ id: currentSessionId(), cwd: ctx.cwd, idle: ctx.isIdle() }),
-            send: async html => {
-              const sent = await poller.sendTelegramMessage(chatId, html);
-              if (!sent?.ok) throw new Error("Telegram delivery failed");
-            },
-            photo: (file, caption) => poller.sendTelegramPhoto(chatId, file, caption),
-            latestPng: async id => {
-              if (id !== currentSessionId()) return null;
-              const sessionFile = ctx.sessionManager.getSessionFile();
-              return sessionFile ? latestSessionPng(sessionFile) : null;
-            },
-            inbound: async (message, idle) => {
-              guard.startTelegramTurn();
-              if (idle) pi.sendUserMessage(message);
-              else pi.sendUserMessage(message, { deliverAs: "steer" });
-            },
-          }, new BunCommandRunner()),
-          onTelegramTurnStart: () => {
-            if (guard) guard.startTelegramTurn();
-          },
-          onDecisionCallback: async (decisionId, choiceId, context) => {
-            if (guard) guard.startTelegramTurn();
-            try {
-              const workflowScript = path.join(os.homedir(), ".veyyon", "workflows", "decision_workflow.py");
-              if (fs.existsSync(workflowScript)) {
-                const proc = Bun.spawn([
-                  "python",
-                  workflowScript,
-                  "resolve-callback",
-                  "--id",
-                  decisionId,
-                  "--choice",
-                  choiceId,
-                  "--token",
-                  `telegram-session-${currentSessionId()}`,
-                  "--session",
-                  currentSessionId(),
-                  "--json",
-                ]);
-                await proc.exited;
-              }
-            } catch (err: unknown) {
-              pi.logger.warn(`Could not trigger canonical decision resolution: ${String(err)}`);
-            }
-
-            const promptText = [
-              `[Telegram Decision Received] Operator selected Option ${choiceId} for decision '${decisionId}'.`,
-              context ? `Context: ${context}` : "",
-              `Decision blocker has been cleared in request ledger. Resuming authorized work.`,
-            ].filter(Boolean).join("\n");
-
-            pi.sendUserMessage(promptText, { deliverAs: "followUp" });
-          },
-          onLedgerFailure: message => {
-            pi.logger.warn(
-              `Telegram inbound ledger failure on slot ${activeSlot.slotId}: ${message}. Inbound updates are not being recorded; delivery is stalled until this clears.`,
-            );
-          },
-        },
-        correlationBridge,
-      );
-
-      globalState[ACTIVE_ROOT_SYMBOL] = {
-        instanceId,
-        sessionId: newSessionId,
-        slotId: activeSlot.slotId,
-        pi,
-        poller,
-        guard,
-        coordinator,
-        activeSlot,
-      };
-
-      globalState[ACTIVE_LEASE_SYMBOL] = {
-        slotId: activeSlot.slotId,
-        sessionId: newSessionId,
-      };
-
-      void poller.start();
-
-      const primaryChatId = poller.getPrimaryChatId();
-      if (primaryChatId) {
-        const greeting = [
-          "🟢 <b>Veyyon Session Connected</b>",
-          `Session: <code>${newSessionId}</code>`,
-          `Model: <code>${ctx.model?.id ?? "default"}</code>`,
-          `Slot: <code>${activeSlot.slotId}</code>`,
-          `Project: <code>${escapeHtml(ctx.cwd)}</code>`,
-        ].join("\n");
-        await poller.sendTelegramMessage(primaryChatId, greeting);
-      }
-    } catch {
-      coordinator.releaseLease(activeSlot.slotId, newSessionId, process.pid);
-      coordinator.close();
-      delete globalState[ACTIVE_ROOT_SYMBOL];
-      delete globalState[ACTIVE_LEASE_SYMBOL];
-    }
-  });
-
-  // --------------------------------------------------------------------------
-  // Lifecycle: In-TUI Session Switch (Re-point Lease & Correlation Identity)
-  // --------------------------------------------------------------------------
-  // Registration is guarded because a host that predates this lifecycle event must
-  // still load the extension; the lease then stays pinned until session_shutdown.
+  // Guarded for the same reason session_switch is below: a host that does not offer
+  // the tool-registration surface must still load the channel rather than fail to
+  // attach. Absence is logged, never silent.
   try {
-    pi.on("session_switch", async (_event: unknown, ctx: ExtensionContext) => {
-      const root = globalState[ACTIVE_ROOT_SYMBOL];
-      if (!root || root.instanceId !== instanceId) return;
-
-      const switchedSessionId = ctx.sessionManager.getSessionId();
-      if (!switchedSessionId || switchedSessionId === root.sessionId) return;
-
-      repointLeaseOrRelinquish(root, switchedSessionId, ctx.cwd);
+    registerOperatorTools(pi);
+  } catch (err: unknown) {
+    pi.logger?.warn(
+      `Telegram operator tools not registered on this host: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  try {
+    pi.on("session_compacting", async () => {
+      if (ownerInstance !== pi) return undefined;
+      try {
+        const questions = ownedRoot()?.questions ?? activeRuntime?.getQuestions();
+        const sessionId = savedContext?.sessionId;
+        const context = questions
+          ? await questions.compactionContext()
+          : sessionId
+            ? await questionCompactionContext(
+                path.join(os.homedir(), ".veyyon", "workflows", "decisions.json"),
+                {
+                  session_id: sessionId,
+                  ...(lastKnownRoute?.chatId ? { chat_id: lastKnownRoute.chatId } : {}),
+                },
+              )
+            : undefined;
+        return context ? { context: [context] } : undefined;
+      } catch (err: unknown) {
+        pi.logger?.warn(
+          `Telegram question state unavailable during compaction: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return undefined;
+      }
     });
   } catch (err: unknown) {
-    pi.logger.warn(
+    pi.logger?.warn(
+      `Telegram session_compacting lifecycle event unavailable on this host: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  pi.on("session_start", async (event: SessionStartEvent, ctx: ExtensionContext) => {
+    if (!isEligibleRootSession(ctx)) return;
+    ownerInstance = pi;
+    currentApi = pi;
+    savedContext = ctx;
+    if (!activeRuntime) {
+      try {
+        const mod = await loadRuntimeModule();
+        activeRuntime = mod.createRuntime(pi);
+        activeRuntime.setReloadTrigger(reload);
+      } catch (err: unknown) {
+        pi.logger?.error(
+          `[Telegram Loader] Initial runtime load failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return;
+      }
+    }
+    await activeRuntime.onSessionStart(event, ctx);
+  });
+
+  try {
+    pi.on("session_switch", async (event: unknown, ctx: ExtensionContext) => {
+      if (!isEligibleRootSession(ctx)) return;
+      // Claim on switch, not only on start: a headless session can reach its first
+      // switch before anything claimed the lifecycle for it (print mode, cron).
+      ownerInstance = pi;
+      currentApi = pi;
+      savedContext = ctx;
+      if (!activeRuntime) {
+        try {
+          const mod = await loadRuntimeModule();
+          activeRuntime = mod.createRuntime(pi);
+          activeRuntime.setReloadTrigger(reload);
+        } catch (err: unknown) {
+          pi.logger?.error(
+            `[Telegram Loader] Runtime load on session switch failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          return;
+        }
+      }
+      await activeRuntime.onSessionSwitch(event, ctx);
+    });
+  } catch (err: unknown) {
+    pi.logger?.warn(
       `Telegram session_switch lifecycle event unavailable on this host: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
 
-  // --------------------------------------------------------------------------
-  // Outbound Assistant Message Streaming & Mirroring (Multi-Chunk Safe)
-  // --------------------------------------------------------------------------
-  pi.on("message_start", async event => {
-    const root = globalState[ACTIVE_ROOT_SYMBOL];
-    if (!root || root.instanceId !== instanceId) return;
-    if (event.message.role === "assistant") {
-      accumulatedAssistantText = "";
-      sentTelegramMessageIds = [];
-      streamedChunks = [];
+  pi.on("message_start", async (event: { message: { role: string } }) => {
+    if (ownerInstance !== pi) return;
+    if (event.message.role === "user") {
+      await ensureChannelBound("message_start");
     }
+    await activeRuntime?.onMessageStart(event);
   });
 
   pi.on("message_update", async (event: MessageUpdateEvent) => {
-    const root = globalState[ACTIVE_ROOT_SYMBOL];
-    if (!root || root.instanceId !== instanceId || event.message.role !== "assistant") return;
-    const streamEvent = event.assistantMessageEvent;
-
-    if (streamEvent.type === "text_delta" && streamEvent.delta) {
-      accumulatedAssistantText += streamEvent.delta;
-
-      if (!streamDebounceTimer) {
-        streamDebounceTimer = setTimeout(async () => {
-          streamDebounceTimer = null;
-          await syncAssistantOutput(accumulatedAssistantText);
-        }, 1500);
-
-        if (typeof streamDebounceTimer.unref === "function") {
-          streamDebounceTimer.unref();
-        }
-      }
-    }
+    if (ownerInstance !== pi) return;
+    await activeRuntime?.onMessageUpdate(event);
   });
 
   pi.on("message_end", async (event: MessageEndEvent) => {
-    const root = globalState[ACTIVE_ROOT_SYMBOL];
-    if (!root || root.instanceId !== instanceId || event.message.role !== "assistant") return;
-
-    if (streamDebounceTimer) {
-      clearTimeout(streamDebounceTimer);
-      streamDebounceTimer = null;
-    }
-
-    const assistantMsg = event.message as AssistantMessage;
-    const fullText = assistantMsg.content
-      .filter((c): c is { type: "text"; text: string } => c.type === "text")
-      .map(c => c.text)
-      .join("\n");
-
-    if (fullText.trim()) {
-      await syncAssistantOutput(fullText);
-    }
-
-    sentTelegramMessageIds = [];
-    streamedChunks = [];
-    accumulatedAssistantText = "";
-  });
-
-  // Assistant replies carry actionable explanations; raw tool lifecycle events stay local.
-
-  pi.on("tool_call", async (event: ToolCallEvent) => {
-    const root = globalState[ACTIVE_ROOT_SYMBOL];
-    if (!root || root.instanceId !== instanceId || !root.guard) return;
-
-    const evaluation = root.guard.evaluateToolCall(
-      event.toolName,
-      event.input as Record<string, unknown>,
-    );
-
-    if (!evaluation.allowed) {
-      return {
-        block: true,
-        reason: evaluation.reason ?? "Production-sensitive operation blocked for remote turn.",
-      };
-    }
-  });
-
-
-  pi.on("agent_end", async () => {
-    const root = globalState[ACTIVE_ROOT_SYMBOL];
-    if (!root || root.instanceId !== instanceId) return;
-    root.guard.endTurn();
+    if (ownerInstance !== pi) return;
+    await activeRuntime?.onMessageEnd(event);
   });
 
   pi.on("turn_end", async () => {
-    const root = globalState[ACTIVE_ROOT_SYMBOL];
-    if (!root || root.instanceId !== instanceId) return;
-    root.guard.endTurn();
+    if (ownerInstance !== pi) return;
+    await ensureChannelBound("turn_end");
   });
 
-  // --------------------------------------------------------------------------
-  // Teardown: Session Shutdown (Within 2s budget)
-  // --------------------------------------------------------------------------
-  pi.on("session_shutdown", async (_event: SessionShutdownEvent) => {
-    const root = globalState[ACTIVE_ROOT_SYMBOL];
-    if (!root || root.instanceId !== instanceId) return;
-
-    if (streamDebounceTimer) {
-      clearTimeout(streamDebounceTimer);
-      streamDebounceTimer = null;
+  pi.on("session_shutdown", async (event: SessionShutdownEvent) => {
+    if (ownerInstance !== pi) return;
+    if (activeRuntime) {
+      await activeRuntime.onSessionShutdown(event);
+      activeRuntime = null;
+      ownerInstance = null;
     }
-
-    root.poller.stop();
-    root.coordinator.releaseLease(root.activeSlot.slotId, root.sessionId, process.pid);
-    root.coordinator.close();
-
-    delete globalState[ACTIVE_ROOT_SYMBOL];
-    delete globalState[ACTIVE_LEASE_SYMBOL];
   });
 
-  // --------------------------------------------------------------------------
-  // CLI / TUI Commands
-  // --------------------------------------------------------------------------
   pi.registerCommand("telegram", {
-    description: "Inspect or release Telegram bot lease for this session",
+    description: "Inspect, release, or reload Telegram bot lease for this session",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
+      if (ownerInstance !== pi || !isEligibleRootSession(ctx)) return;
       const trimmed = args.trim().toLowerCase();
-      const root = globalState[ACTIVE_ROOT_SYMBOL];
+      if (trimmed === "reload") {
+        operatorReleased = false;
+        ctx.ui.notify("Reloading Telegram harness runtime...", "info");
+        const res = await reload({ interactive: true });
+        if (res.success) {
+          ctx.ui.notify(`Telegram harness reloaded (SHA: ${res.sha ?? "unknown"}).`, "info");
+        } else {
+          ctx.ui.notify(`Telegram harness reload failed: ${res.error ?? "unknown error"}`, "error");
+        }
+        return;
+      }
 
       if (trimmed === "release") {
-        if (root && root.instanceId === instanceId) {
-          root.poller.stop();
-          root.coordinator.releaseLease(root.activeSlot.slotId, root.sessionId, process.pid);
-          root.coordinator.close();
-          delete globalState[ACTIVE_ROOT_SYMBOL];
-          delete globalState[ACTIVE_LEASE_SYMBOL];
+        operatorReleased = true;
+        if (activeRuntime) {
+          await activeRuntime.dispose();
+          activeRuntime = null;
           ctx.ui.notify("Telegram bot lease released.", "info");
         } else {
           ctx.ui.notify("No active Telegram bot lease.", "warning");
@@ -528,16 +826,31 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
         return;
       }
 
-      // Default: status
-      const coordinator = new BotPoolCoordinator();
-      try {
+      const coordinator = activeRuntime?.getCoordinator();
+      if (coordinator) {
         const poolStatus = coordinator.getPoolStatus();
+        const slot = activeRuntime?.getActiveSlot();
         ctx.ui.notify(
-          `Telegram Status: ${root ? `Claimed [${root.slotId}]` : "Unclaimed"} (Total: ${poolStatus.totalSlots}, Free: ${poolStatus.freeSlots})`,
+          `Telegram Status: ${slot ? `Claimed [${slot.slotId}]` : "Unclaimed"} (Total: ${poolStatus.totalSlots}, Free: ${poolStatus.freeSlots})`,
           "info",
         );
-      } finally {
-        coordinator.close();
+      } else {
+        ctx.ui.notify("Telegram Status: Unclaimed", "info");
+      }
+    },
+  });
+
+  pi.registerCommand("tg-reload", {
+    description: "Hot reload Telegram harness runtime in-process",
+    handler: async (_args: string, ctx: ExtensionCommandContext) => {
+      if (ownerInstance !== pi || !isEligibleRootSession(ctx)) return;
+      operatorReleased = false;
+      ctx.ui.notify("Reloading Telegram harness runtime...", "info");
+      const res = await reload({ interactive: true });
+      if (res.success) {
+        ctx.ui.notify(`Telegram harness reloaded (SHA: ${res.sha ?? "unknown"}).`, "info");
+      } else {
+        ctx.ui.notify(`Telegram harness reload failed: ${res.error ?? "unknown error"}`, "error");
       }
     },
   });

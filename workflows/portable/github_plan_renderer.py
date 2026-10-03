@@ -17,9 +17,7 @@ import argparse
 import json
 import os
 import re
-import subprocess
 import sys
-import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -168,14 +166,6 @@ def load_recap_from_dict(data: Dict[str, Any]) -> GitHubPrRecap:
     )
 
 
-def gh_cli_run(args: List[str]) -> Tuple[int, str, str]:
-    """Execute gh command safely and return (exit_code, stdout, stderr)."""
-    cmd = ["gh"] + args
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
-    except Exception as e:
-        return 1, "", str(e)
 
 
 def main():
@@ -259,24 +249,16 @@ def main():
         with open(args.file, "r", encoding="utf-8") as f:
             body = f.read()
         
-        if args.comment_id:
-            # Update existing comment
-            cmd = ["api", f"repos/{args.repo}/issues/comments/{args.comment_id}", "-X", "PATCH", "-f", f"body={body}"]
-            code, out, err = gh_cli_run(cmd)
-            if code == 0:
-                print(f"Successfully updated comment {args.comment_id}")
-            else:
-                print(f"Error updating comment: {err}", file=sys.stderr)
-                sys.exit(code)
-        else:
-            # Post new comment
-            cmd = ["issue", "comment", str(args.issue), "-R", args.repo, "--body", body]
-            code, out, err = gh_cli_run(cmd)
-            if code == 0:
-                print(f"Successfully posted comment on #{args.issue}: {out}")
-            else:
-                print(f"Error posting comment: {err}", file=sys.stderr)
-                sys.exit(code)
+        from github_work_item import publish_report
+        try:
+            url = publish_report(
+                f"https://github.com/{args.repo}/issues/{args.issue}", body,
+                comment_id=args.comment_id,
+            )
+        except ValueError as exc:
+            print(f"GitHub report not verified: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Successfully {'updated' if args.comment_id else 'posted'} and recovered: {url}")
 
 
 if __name__ == "__main__":

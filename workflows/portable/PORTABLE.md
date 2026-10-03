@@ -7,10 +7,18 @@ A harness-agnostic, pure Python standard library multi-agent coordination core l
 ## 1. Architectural Authority & Inviolable Principles
 
 1. **Shared System of Record (Canonical):**
-   * **GitHub Issues** and **Superboard (Project #1)** for `Bavariance/polysimulator` are the authoritative shared sources of truth for requirements, task status, human decisions, and verified closure.
+   * **GitHub Issues** and [Wladefant Project 5](https://github.com/users/Wladefant/projects/5) are the authoritative shared sources of truth for requirements, task status, human decisions, and verified closure.
+   * **One independently actionable deliverable per issue and Project card.** Before dispatch, split a multi-deliverable request, reuse an existing matching issue or create a dedicated one for each deliverable, and enrol each issue on the repository's configured Project board. Keep its acceptance criteria, owner, dependencies, decisions, PR, evidence and next action on that issue. A program or phase is not one work item.
+   * **Project 5 is the aggregation layer.** Group deliverables through native parent/sub-issues, canonical kind/area/risk labels, assignees and bounded capability milestones. Standalone issues explicitly explain why no parent applies. No Discussions; release tags remain an open question, not a gate.
    * Remote status always supersedes local caches on conflict.
 2. **Local Recovery Cache:**
    * `ledger.json` and `decisions.json` act as machine-local, crash-resilient, atomic restart recovery caches.
+   * The ledger is a lossless cross-topic index linking dedicated issues, never their replacement. Retain original prompts, criteria, authorization, owners, dependencies, blockers, evidence and next actions across compaction and restarts, including unpublished intake. Migrate old umbrella items by linking dedicated issues without deleting history, silently closing unresolved work or dropping scope; only the operator may cancel scope.
+   * Intake and enrollment remain caller responsibilities. `refresh_from_github` reads issue body, the complete paginated discussion (with author, timestamp and comment URL), milestone, parent, labels, assignees, dependencies and Project 5 Status through the authenticated API before scheduling. Missing/partial data, missing structure or checkpoint disagreement blocks; cached claims never substitute. Implicit intake is bounded to 20 registered candidates; select an issue explicitly to address a larger cache. This does not discover or authorize new backlog work.
+   * `github_plan_renderer.py render-plan` renders the acceptance steps of one deliverable, not a program backlog. Render and publish separately for each dedicated issue. `post-issue-comment --issue` takes that issue explicitly; managed-section updates do not decompose work or enrol it on the board.
+   * **No local reports:** reports, summaries, audits, findings and evidence must be readable GitHub markdown with returned URLs, never `local://` documents. Worker publication and `post-issue-comment` (including updates) share one publisher. Success requires recovering the exact comment ID, URL and body through the same intake reader used on restart; an empty transport or a comment visible only through a separate node lookup cannot produce success. A failed publication blocks advancement. Discussion is attributed input, not automatic authorization.
+   * The memoryless-agent issue contract is defined in [the versioned profile policy](../../policies/default/AGENTS.md): original request/scope, acceptance criteria, native parent/dependencies, assignee/lane, state/blocker, branch/PR/full head, evidence, next action and authorization/constraints.
+   * PolySimulator closing keywords do not fire for PRs merging into `staging` because its default is `main`; verified explicit closure is required. Native merge queues are unavailable for these account/repository plans.
    * They eliminate reliance on fictitious native schedulers or polling GitHub APIs continuously.
    * Multi-agent concurrency is protected via advisory file locking (`msvcrt` on Windows, `fcntl` on POSIX) and atomic filesystem replaces (`tempfile.mkstemp` + `os.replace`).
 3. **No Auto-Merge & No Auto-Deploy:**
@@ -22,7 +30,7 @@ A harness-agnostic, pure Python standard library multi-agent coordination core l
 5. **No Credential Exposure:**
    * Quota, balance, and probe utilities sanitize and redact all account identifiers, emails, project refs, and tokens.
 6. **Head-Bound Evidence Invalidation:**
-   * Git HEAD changes invalidate all head-bound acceptance criteria, QA proof URLs, and review signoffs, automatically resetting state to `implementation`.
+   * Execution-checkpoint proofs remain head-bound. The installed `github_pr_gate.py` and `review_content.py` retain stable patch-id **and** whitespace-sensitive stripped-diff sha256, valid ancestor delta chains, the COMMENT-review approval waiver on named single-author branches (`Bavariance/polysimulator@staging`, `Wladefant/super-board@main`, and `Wladefant/veyyon@main`) and anti-self-approval. Native review timestamps additionally bind fresh CI/security invalidation: unchanged content never permits a newly broken or newly vulnerable candidate through the gate. Legacy local review metadata cannot grant approval.
 
 ---
 
@@ -31,17 +39,19 @@ A harness-agnostic, pure Python standard library multi-agent coordination core l
 | Module | Owning Agent Lane | Architectural Role | CLI Interface | Primary Inputs | Primary Outputs |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **`coordinator.py`** | `PortableWorkflowCoordinator` | Single bounded coordinator combining state, decision sync, preflight gating, normalized usage, and model selection. | `python coordinator.py [--state-dir <dir>] [--json] [--summary] [--no-sync-decisions] [--usage-adapter auto\|file\|veyyon\|direct] [--balance-file <file>]` | `ledger.json`, `decisions.json`, `preflight_evidence/`, `usage_fixture.json` | `CoordinatorPacket` (JSON or terminal summary) |
-| **`ledger.py`** | `ImplementRequestLedger` / `FixLedgerInvariants` | Machine-local durable request ledger, transition graph validator, per-criterion evidence verification, and restart recovery. | `python ledger.py [add \| update \| check \| next \| list \| show \| recover] [--ledger <path>]` | `ledger.json` | State transitions, invariant reports, recovery queues |
+| **`ledger.py`** | `ImplementRequestLedger` / `IngrainPolicy` | Execution checkpoint cache, transition guards and mandatory API refresh before scheduling; no local work authority. | `python ledger.py [add \| update \| check \| next \| list \| show \| recover] [--ledger <path>]` | Checkpoint cache and authenticated GitHub API | API-backed execution view; cached inspection commands are not dispatch authorization |
 | **`decision_workflow.py`** | `IntegrateDecisionWorkflow` / `HardenDecisionProvenance` | Asynchronous human decision workflow with strict responder authorization, authored-comment exclusion, and bounded sync. A refused reply (stale, agent-authored, unauthorized, unsafe) is an audited *input* outcome recorded in `rejected_inputs`, never the question's own status, so an unanswered question stays `pending`/`clarification_requested` and stays inside the sync window; replaying an unchanged refused comment is idempotent. `answer.comment_created_at` carries the comment's API-verified creation time and is the only proof of when a decision was answered; `answer.answered_at` is ingest audit only. A resolved decision is terminal: only the exact authenticated comment replays, and no later or edited comment re-answers it or rewrites its timestamps. `status: rejected` exists only as a legacy value, reopened fail-closed by `recover` against a proven open ledger binding. | `python decision_workflow.py [ask \| ingest \| reply \| sync \| show \| list \| recover] [--decisions <path>] [--ledger <path>]` | `decisions.json`, GitHub issue comments via `gh` | Verified human decisions, unblocked ledger requests, clarification prompts, refused-input audit, reopened legacy questions |
 | **`preflight.py`** | `ImplementIntegrationPreflight` | Manifest-driven staging integration preflight gates (Dokploy staging compose, Supabase staging ref, Stripe test mode). | `python preflight.py [check \| probe \| record-evidence \| inventory] [--evidence-dir <dir>] [--json]` | Task manifests, service probe evidence | `PreflightResult` (passed, blocked, not_applicable), probe inventory |
 | **`balance_loader.py`** | `ImplementSubscriptionRouter` / `ReviewHarnessStrongModel` | Read-only sanitized subscription usage snapshot loader, multi-window constraint analyzer, and provider quota tracker. | `python balance_loader.py [--normalized] [--adapter veyyon\|file\|direct] [--balance-file <file>] [--json]` | `usage_snapshot_cache.json`, `usage_fixture.json`, or live CLI | `NormalizedBalanceSnapshot` (JSON) |
-| **`model_routing.py`** | `ImplementHarnessRouting` / `ImplementSubscriptionRouter` | Capability-first, reset-aware model selection, near-reset Codex promotion, and compact EvidencePacket generation (< 1.5 KB). | `python model_routing.py [--task-type <type>] [--risk-level <level>] [--emit-dispatch] [--adapter veyyon\|file\|direct] [--balance-file <file>]` | `NormalizedBalanceSnapshot` | `HarnessDispatchPacket` (JSON) |
+| **`model_routing.py`** | `ImplementHarnessRouting` / `ImplementSubscriptionRouter` | Capability-first, reset-aware model selection, near-reset Codex promotion, per-window burn-rate pacing (`pace [--json]`), and Antigravity partner pool account routing. | `python model_routing.py [pace [--json]] [--task-type <type>] [--risk-level <level>] [--emit-dispatch] [--adapter veyyon|file|direct] [--balance-file <file>]` | `NormalizedBalanceSnapshot` | `HarnessDispatchPacket` or `WindowBurnPace` (JSON) |
+| **`routing_smoke_test.py`** | `ImplementHarnessRouting` / `ImplementSubscriptionRouter` | Offline contract validation suite, context-window compliance checks, and non-Anthropic fallback verification. | `python routing_smoke_test.py` | `model_routing.py`, `balance_loader.py` | Smoke test assertions and invariant proofs |
 | **`github_plan_renderer.py`** | `IntegrateVisualPlanWorkflow` | Visual plan and evidence recap markdown renderer with badges, timelines, and progress metrics for GitHub issue/PR comments. | `python github_plan_renderer.py [--spec <file>] [--type plan\|recap]` | Plan or recap JSON specification | Formatted GitHub Markdown comment text |
 | **`telegram_notifier.py`** | `IntegrateTelegramStatus` | Portable Telegram workflow status notification adapter with strict deduplication, cooldowns, single-sentence formatting, and multi-repo destination resolution. | `python telegram_notifier.py [--packet <file>] [--event-type milestone\|blocker\|decision\|completion] [--project <name>] [--send] [--dry-run] [--test-connection] [--json]` | `CoordinatorPacket` JSON, CLI event arguments, manifest/channel config | `DeliveryReceipt` (JSON or terminal summary), deduplicated Telegram messages |
 | **`superboard_adapter.py`** | `PackagePortableCoordinator` | Execution adapter bridging portable coordinator with existing Superboard loop tooling (`super-qa-dispatch.sh`, `super-board-run.sh`, `super_board_runtime`). | `python superboard_adapter.py [--config <file>] [--state-dir <dir>] [--fake-executor] [--real-worker] [--notify-telegram] [--json] [--summary]` | `ledger.json`, `preflight_evidence/`, Superboard project config, `HarnessDispatchPacket` | `AdapterExecutionResult`, exact-SHA QA evidence, Telegram status events |
 | **`github_pr_gate.py`** | `FinalizeExecutableRouting` | Deterministic GitHub PR status and review gate verifying CI, GitHub approvals, or source-backed independent automated review artifacts on named non-production branches. | `python github_pr_gate.py --pr <pr_url_or_number> [--head-sha <sha>] [--review-record <artifact.json>] [--policy-config <policy.json>] [--json]` | Live GitHub PR via `gh`, native required-check contexts, optional `portable-review/v1` artifact | `PRGateEvaluation` (`PASSED`, `BLOCKED`, `PENDING`) with detailed gate breakdown |
 | **`diagnostics.py`** | `PackagePortableCoordinator` | Unified aggregate system, service, provider, request and host resource diagnostics. Exposes where problems lie, what is missing, distinguishes access from health and stale from failed, and asks user only when true authorization/preference/credential needed with deduplicatable question IDs. | `python diagnostics.py [--state-dir <dir>] [--strict] [--json] [--summary]` (or `python coordinator.py --diagnostics`) | `ledger.json`, `decisions.json`, `preflight_evidence/`, usage snapshots | `DiagnosticReport` (JSON or terminal summary), `human_inputs`, `agent_actions` |
 | **`recurrence_guard.py`** | `ImplementRecurrenceGuard` | Durable failure recurrence persistence and corrective-action gates. Stable `project+environment+operation+error_class` signatures with unique observation ids, so duplicate ingestion is not recurrence and an intended negative control is retained without counting. First occurrence keeps diagnosis/owner/next action; second refuses unchanged blind retry until a systemic corrective action is recorded; third escalates once per epoch through the existing deduplicated notification contract. Records only — executes nothing and satisfies no authorization or head-bound QA/review gate. | `python recurrence_guard.py [--state-dir <dir>] [--summary] [observe \| check-retry \| record-corrective-action \| supersede-observation \| resolve \| list \| show \| escalations]` | `recurrence.json`, `ledger.json`, observed failure text from a native worker outcome, the continuation driver, CI, a deployment or a tool | `IntakeResult`, `RetryDecision` (CLI exit 3 when a retry is refused), `NotificationEvent` payloads with their dedup signatures, ledger evidence/blocker/next_action |
+| **`verify.py`** | `VerificationGate` | Verification CLI and smoke test gate classifying modified surfaces (`docs`, `backend`, `frontend`, `workflow`), executing scenario checks, and emitting head-bound `verify-receipt/v1` JSON artifacts. | `python verify.py [--pr <number|url>] [--files <path...>] [--head-sha <sha>] [--receipt-out <path>] [--json]` | Changed files, unified diffs, PR metadata, scenario QA receipts | `VerificationReceipt` (`verify-receipt/v1`), `ScenarioCheckResult`, gate evaluation |
 
 ### Automated review artifact contract
 
@@ -49,10 +59,11 @@ A harness-agnostic, pure Python standard library multi-agent coordination core l
 must bind the repository, PR number, full head SHA, full base SHA, and live PR author. The
 reviewer must be a distinct automation actor, and `source` must name that same actor through
 an `agent://` or `history://` transcript URI with a SHA-256 digest. Outcomes are exactly
-`approved` or `changes_requested`; the latter always blocks. A valid artifact can replace
-the GitHub Approve button only where the resolved named policy sets
-`require_github_approval` to false. Production-protected bases retain mandatory independent
-GitHub `APPROVED` review.
+approved or `changes_requested`; the latter always blocks. A valid artifact or automated
+COMMENT review verdict can replace the GitHub Approve button only where the resolved named
+policy sets `require_github_approval` to false (`Bavariance/polysimulator@staging`,
+`Wladefant/super-board@main`, and `Wladefant/veyyon@main`). Production-protected bases retain
+mandatory independent GitHub `APPROVED` review.
 
 This local gate treats the artifact as advisory trusted-workflow evidence. Schema,
 provenance shape, actor separation, and exact-head/base bindings are validated, but this is
@@ -60,6 +71,19 @@ not a cryptographic identity guarantee; the supplying workflow must authenticate
 the referenced transcript. An author `COMMENTED` review is never represented as GitHub
 approval.
 
+
+### Verification receipt contract (`verify-receipt/v1`)
+
+`--verify-receipt` in `github_pr_gate.py` reads a head-bound `verify-receipt/v1` JSON artifact
+emitted by `verify.py`. The receipt classifies all changed files across four primary surfaces:
+- `docs`: Markdown syntax linting and UTF-8 encoding validation.
+- `backend`: Python syntax compilation, test receipt ingestion, or targeted test execution.
+- `frontend`: Mandates head-bound dual-viewport (desktop 1440px/1920px & mobile 320px/390px) browser QA receipts.
+- `workflow`: Python syntax compilation and targeted workflow verification.
+
+A valid receipt must bind the exact 40-character head SHA and report `status: "PASSED"`.
+When `require_verify_receipt` is enabled in the gate approval policy (or `--require-verify-receipt`
+flag is passed), missing or failing receipts block the gate.
 ---
 
 ## 3. Single Bounded Coordinator Command
@@ -95,7 +119,7 @@ python coordinator.py \
   * `direct`: In-memory direct structure.
 * `--balance-file <file>`: Path to custom usage JSON fixture.
 * `--repo <repo>`: Target GitHub repository (default: `Bavariance/polysimulator`).
-* `--no-sync-decisions`: Skip remote GitHub decision synchronization (useful in offline or test environments).
+* `--no-sync-decisions`: Skip decision synchronization only. It does **not** disable mandatory GitHub work intake; offline dispatch is refused.
 * `--request-id <id>`: Target specific request ID instead of highest-priority eligible request.
 * `--json`: Emit machine-readable JSON packet.
 * `--summary`: Emit formatted terminal summary.
@@ -165,7 +189,7 @@ python coordinator.py \
     "auto_deploy_allowed": false,
     "self_spawn_loop": false,
     "execution_dispatched": false,
-    "shared_authority": "GitHub Issues & Superboard (Project #1)",
+    "shared_authority": "GitHub Issues & https://github.com/users/Wladefant/projects/5",
     "local_recovery_cache": "ledger.json"
   }
 }
@@ -309,7 +333,7 @@ python telegram_notifier.py \
   --project "Bavariance/polysimulator" \
   --request-id "req-001" \
   --summary "Request transitioned to QA on commit 693de377." \
-  --link "https://github.com/Bavariance/polysimulator/issues/4543" \
+  --link "https://github.com/<owner>/<repo>/issues/<dedicated-issue-number>" \
   --dry-run \
   --json
 
@@ -319,6 +343,23 @@ python telegram_notifier.py --packet coordinator_output.json --send
 ---
 
 ## 6. Export Procedure & Verification
+
+### GitHub-native profile/runtime installation
+
+Commit `policies/default/AGENTS.md` and the workflow changes in an open PR before installation. From that same pinned source checkout:
+
+```text
+python workflows/portable/install_github_native.py --source-root <checkout>
+python workflows/portable/install_github_native.py --source-root <checkout> --check
+```
+
+The installer replaces only enumerated policy/code files atomically and verifies exact bytes. `--check` is read-only and returns nonzero on drift. Preserve the PR/commit URL in the migration issue comment, use that checkout to check parity, and change source through another PR before reinstalling. No session restart, process operation, state deletion or unrelated configuration replacement occurs.
+
+The enumeration (`RUNTIME_FILES`) includes the model router (`model_routing.py`, its `balance_loader.py` dependency and `routing_smoke_test.py`). `coordinator.py` and `superboard_adapter.py` import the router at runtime, so `--check` also reports router drift. The profile `config.yml` is never installed; its role pins remain a manual step.
+
+The installed manifest is updated only for GitHub authority and the owned module/export entries, preserving other integrations. The parity check validates those fields without replacing unrelated metadata.
+
+Migration evidence: [GitHub-native enforcement issue](https://github.com/Wladefant/super-board/issues/114).
 
 To export the portable workflow package to an isolated directory using the canonical standard library export recipe:
 

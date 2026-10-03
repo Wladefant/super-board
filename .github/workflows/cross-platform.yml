@@ -14,6 +14,12 @@ on:
     branches: [main, dev]
   pull_request:
 
+# A newer push to the same PR supersedes the older run, so cancel it. Runs on
+# main and dev are never cancelled: each merge keeps its own result.
+concurrency:
+  group: cross-platform-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
@@ -24,6 +30,8 @@ jobs:
   smoke:
     name: smoke (${{ matrix.os }} / py${{ matrix.python }})
     runs-on: ${{ matrix.os }}
+    # Longest observed leg is under 4 min; a hung leg would otherwise hold a runner for 6 h.
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -66,6 +74,11 @@ jobs:
       - name: status — parser fixture tests
         run: python -B tests/test_status_parse.py
 
+      - name: host status monitor tests
+        run: python -B tests/test_host_status.py
+      - name: host status monitor live execution
+        run: python -B workflows/portable/host_status.py --json
+
       - name: claudex — compile zero-quota helpers
         run: python -c "from pathlib import Path; paths=[Path('skills/claudex-optimized/scripts/preflight.py'),Path('skills/claudex-optimized/scripts/probe-routing.py')]; [compile(p.read_text(encoding='utf-8'), str(p), 'exec') for p in paths]"
 
@@ -75,6 +88,7 @@ jobs:
   claudex-powershell:
     name: claudex PowerShell fixtures
     runs-on: windows-latest
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v4
@@ -90,6 +104,7 @@ jobs:
   claudex-zero-quota-integration:
     name: claudex zero-quota integration (Claude Code 2.1.218)
     runs-on: windows-latest
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v4
@@ -131,6 +146,7 @@ jobs:
   wave-plan:
     name: wave-plan (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -159,6 +175,7 @@ jobs:
   portable-contracts:
     name: portable-contracts (${{ matrix.os }} / py${{ matrix.python }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -193,5 +210,30 @@ jobs:
       - name: github pr gate
         run: python -B workflows/portable/test_github_pr_gate.py
 
+      - name: lane-brief merge guard
+        run: python -B workflows/portable/test_merge_guard.py
+
+      - name: verification cli and gate
+        run: python -B workflows/portable/test_verify.py
+
       - name: telegram notifier
         run: python -B workflows/portable/test_telegram_notifier.py
+
+      - name: feature map validator
+        run: python -B workflows/portable/test_feature_map.py
+
+      - name: feature map live validation
+        run: python -B workflows/portable/feature_map.py validate
+
+      - name: build slot arbiter
+        run: python -B workflows/portable/test_build_slot.py
+      - name: worktree removal
+        run: python -B workflows/portable/test_wt_remove.py
+      - name: polysim next cache
+        run: python -B workflows/portable/test_polysim_next_cache.py
+      - name: outer loop intake
+        run: python -B workflows/portable/test_outer_loop_intake.py
+      - name: host status monitor
+        run: python -B tests/test_host_status.py
+      - name: host status monitor live execution
+        run: python -B workflows/portable/host_status.py --json

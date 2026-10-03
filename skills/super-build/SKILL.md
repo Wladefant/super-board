@@ -133,8 +133,8 @@ Poll BashOutput on each in-flight shell. As each finishes:
 
 **On dispatcher exit 0 (success):**
 - `cd <repo-root>`
-- `git merge --no-ff loop/issue-N -m "merge: loop/issue-N (closes #N)"`
-- `gh issue close N --comment "Closed by /super-build in $(git rev-parse --short HEAD)"`
+- `git merge --no-ff loop/issue-N -m "merge: loop/issue-N (closes #N)"` (for parent issues with open sub-issues, use `refs #N` instead; closing keywords are rejected)
+- `gh issue close N --comment "Closed by /super-build in $(git rev-parse --short HEAD)"` (only for leaf issues or parents whose sub-issues are all closed; parent close with open sub-issues is refused)
 - `gh issue edit N --remove-label loop:in-progress`
 - `git worktree remove .worktrees/issue-N`
 - `git branch -D loop/issue-N`
@@ -238,7 +238,7 @@ When invoked by super-board (env `SUPER_BOARD_RUN=1` set by the runner, or invoc
 - Respect the worktree path super-board hands you (typically `.worktrees/issue-<N>-build/`). Don't create your own.
 - Respect the single branch super-board hands you (`issue-<N>-<slug>`). Don't create alternate branches.
 - Nested spawning is disabled: do not `task` / `spawn_subagent`. Announce file ownership over IRC before editing a shared file. Push early — a cancelled lane loses finished-but-unrecorded work.
-- Closing keywords (`Closes` / `Fixes` / `Resolves #N`) only when the diff satisfies every AC. Otherwise `Part of` plus the full issue URL.
+- Closing keywords (`Closes` / `Fixes` / `Resolves #N`) only when the diff satisfies every AC. Otherwise `Part of` plus the full issue URL. A keyword also fires only when the commit reaches the repository's default branch — when `config.base_branch` is not the default, it closes nothing, so close the issue explicitly against evidence rather than assuming the merge did it.
 - After a fix: name the bug class and hunt siblings before moving on. See `references/bug-hunting.md`. Attack the fix's NEW shape, not only the old hole.
 
 ### Lifecycle (Builder, first pass)
@@ -272,5 +272,5 @@ Hash inputs (joined with `|`): lane (`build`) | error class | first 3 unique nor
 ### Never merge
 Builder NEVER squash-merges. Reviewer owns merge.
 
-### Block/Skip exits use the §4 mandatory template
-When moving a card to Blocked or Skipped, populate the full template from `.claude/skills/super-board/references/block-template.md`. A 1-line "needs creds" comment is a contract violation.
+### Blocked exits use the §4 mandatory template
+When moving a card to Blocked, populate the full template from `.claude/skills/super-board/references/block-template.md`. A 1-line "needs creds" comment is a contract violation.
