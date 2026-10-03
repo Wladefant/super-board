@@ -1,6 +1,6 @@
 ---
 name: super-board
-description: GitHub-Project-driven autonomous pipeline. Five verbs — onboard, lint, status, run, stop — that take a Project board from empty to drained across Build → QA → Review → Done lanes, with graceful shutdown / resume. Use when the user says "super-board", "/super-board", "drain my GitHub project", "set up the autonomous loop", "kick off the headless build/QA pipeline", or "stop super-board".
+description: GitHub-Project-driven autonomous pipeline. Six verbs — idea, onboard, lint, status, run, stop — take a Project board from intake to completion.
 ---
 
 # super-board — autonomous GitHub Project pipeline
@@ -28,10 +28,11 @@ Consequences, in order of how likely they are to bite you:
 Background:
 [missing upstream dependencies](https://github.com/Wladefant/super-board/blob/main/docs/reference/MISSING-UPSTREAM-DEPENDENCIES.md).
 
-## Five verbs
+## Six verbs
 
 | Verb | Where | What it does |
 |---|---|---|
+| `super-board idea "<sentence>"` | native host | drafts, independently judges, and rewrites candidates through the existing intake linter before filing. Read `references/idea.md`. Dry-run by default. |
 | `super-board onboard` | interactive | one-time setup wizard; writes `.claude/super-board/configs/<slug>.json` |
 | `super-board lint` | interactive | walks active-pipeline issues, flags vague ACs, runs pre-flight readiness |
 | `super-board status` | interactive (read-only) | snapshot of active config, column counts, in-flight workers |
