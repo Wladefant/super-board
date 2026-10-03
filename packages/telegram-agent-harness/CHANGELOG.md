@@ -22,6 +22,7 @@
 - `daemon/main.ts run` waits out a slot that is held instead of exiting 75. A token claimed by an interactive session frees itself when that session exits or its operator runs `/telegram release`, and a detached daemon that gave up at startup is not there to notice; it now retries every 10s (`VEYYON_TELEGRAM_CLAIM_RETRY_MS`) and logs a skip only when the reason changes. Exiting on release is unchanged once a slot has actually been polled, so `/release` still stops the daemon.
 
 ### Fixed
+- The daemon no longer counts a stale terminal owner file as live when the OS has given its PID to another process, which failed delivery with "No unique live terminal owner for this session". `discoverOwners` now compares the owner file's recorded `startedAtMs` (or, for legacy files, its mtime) with the process's real creation time, and ignores files published before the current holder of the PID started. Two genuine owners of one session still count as ambiguous.
 - Compaction now receives the current route-owned `telegram_question` records, including durable answer and reminder state, so an answer saved outside the transcript cannot survive in the handoff summary as a pending operator decision.
 - Operator tools execute cleanly without `ReferenceError` when called with an eligible root session context (Refs Wladefant/veyyon#201).
 - Mini App sessions support persistent per-session revocation and unique signed identities; expired clients clear credentials without replaying mutations, and the relay evicts least-recently-used rate-limit buckets.

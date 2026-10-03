@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
@@ -35,7 +36,12 @@ interface Owner {
   sessionFile: string;
   endpoint: string;
   token: string;
+  /** Optional process start time (epoch ms) recorded by the owner when it published the file. */
+  startedAtMs?: number;
 }
+
+// Clock skew / timestamp granularity allowance when comparing file times to process start times.
+const START_TIME_TOLERANCE_MS = 2000;
 export class SessionControlUnavailableError extends Error {}
 
 export function isProcessAlive(pid: number): boolean {
@@ -43,6 +49,45 @@ export function isProcessAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true; } catch (error) {
     return (error as NodeJS.ErrnoException).code !== "ESRCH";
   }
+}
+
+/** Actual process creation times (epoch ms) for the given PIDs; PIDs that cannot be read are omitted. */
+export function readProcessStartTimes(pids: number[]): Map<number, number> {
+  const times = new Map<number, number>();
+  const unique = [...new Set(pids.filter(pid => Number.isSafeInteger(pid) && pid > 0))];
+  if (unique.length === 0) return times;
+  const run = (command: string, args: string[]): string => {
+    const result = spawnSync(command, args, { encoding: "utf8", timeout: 15_000, stdio: ["ignore", "pipe", "ignore"], windowsHide: true, env: { ...process.env, LC_ALL: "C" } });
+    return result.status === 0 ? result.stdout : "";
+  };
+  if (process.platform === "win32") {
+    const script = `Get-CimInstance Win32_Process -Filter '${unique.map(pid => `ProcessId=${pid}`).join(" OR ")}' | ForEach-Object { "$($_.ProcessId) $(([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds())" }`;
+    for (const line of run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script]).split(/\r?\n/)) {
+      const match = /^(\d+) (\d+)$/.exec(line.trim());
+      if (match) times.set(Number(match[1]), Number(match[2]));
+    }
+  } else {
+    for (const line of run("ps", ["-o", "pid=,lstart=", "-p", unique.join(",")]).split("\n")) {
+      const match = /^\s*(\d+)\s+(.+?)\s*$/.exec(line);
+      const started = match ? Date.parse(match[2]!) : Number.NaN;
+      if (match && Number.isFinite(started)) times.set(Number(match[1]), started);
+    }
+  }
+  return times;
+}
+
+/**
+ * A PID existing is not proof the owner is alive: the OS reuses PIDs. The owner file must have been
+ * published by the process that now holds the PID. Genuine owners write the file after they start, so a
+ * file last written before the process started (or whose recorded start time differs) belongs to a dead
+ * predecessor. When the OS will not report a start time, fall back to PID existence alone.
+ */
+export function ownerIdentityMatches(owner: { startedAtMs?: unknown }, fileMtimeMs: number, actualStartMs: number | undefined): boolean {
+  if (actualStartMs === undefined) return true;
+  if (typeof owner.startedAtMs === "number" && Number.isFinite(owner.startedAtMs)) {
+    return Math.abs(owner.startedAtMs - actualStartMs) <= START_TIME_TOLERANCE_MS;
+  }
+  return fileMtimeMs + START_TIME_TOLERANCE_MS >= actualStartMs;
 }
 
 export function discoverConfigRoots(configRoot?: string): string[] {
@@ -107,24 +152,29 @@ export function getProjectKeyFromSessionPath(sessionPath?: string | null): strin
 
 export function discoverOwners(configRoot?: string): Owner[] {
   const roots = discoverConfigRoots(configRoot);
-  const owners: Owner[] = [];
+  const candidates: { owner: Owner; mtimeMs: number }[] = [];
   for (const profileRoot of roots) {
     const directory = path.join(profileRoot, "run", "terminals");
     if (!fs.existsSync(directory)) continue;
     for (const name of fs.readdirSync(directory)) {
       if (!name.endsWith(".json")) continue;
       try {
-        const owner = JSON.parse(fs.readFileSync(path.join(directory, name), "utf8"));
+        const file = path.join(directory, name);
+        const owner = JSON.parse(fs.readFileSync(file, "utf8"));
         if (owner.version !== 1 || typeof owner.sessionId !== "string" || typeof owner.cwd !== "string" ||
             typeof owner.sessionFile !== "string" || typeof owner.endpoint !== "string" ||
             typeof owner.token !== "string" || !/^[a-f0-9]{64}$/.test(owner.token) || !isProcessAlive(owner.pid)) continue;
         // Never accept a TCP discovery endpoint. This is same-user local IPC, not a remote host.
         if (process.platform === "win32" ? !owner.endpoint.startsWith("\\\\.\\pipe\\veyyon-terminal-") : !path.isAbsolute(owner.endpoint)) continue;
-        owners.push(owner);
+        candidates.push({ owner, mtimeMs: fs.statSync(file).mtimeMs });
       } catch { /* A terminal can exit or atomically republish while discovery runs. */ }
     }
   }
-  return owners;
+  // A live PID is not enough: Windows and Unix reuse PIDs, leaving stale owner files that point at strangers.
+  const startTimes = readProcessStartTimes(candidates.map(candidate => candidate.owner.pid));
+  return candidates
+    .filter(candidate => ownerIdentityMatches(candidate.owner, candidate.mtimeMs, startTimes.get(candidate.owner.pid)))
+    .map(candidate => candidate.owner);
 }
 
 class TerminalConnection {
