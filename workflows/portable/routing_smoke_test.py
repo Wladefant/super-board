@@ -1342,12 +1342,12 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
     # -------------------------------------------------------------------------
     def test_agent_role_mappings(self):
         print("\n--- TEST 31: Agent Role Mappings ---")
-        # AG Sonnet → ag-sonnet (not ag-opus)
-        self.assertEqual(model_to_agent_role(MODEL_AG_CLAUDE_SONNET, TaskType.ROUTINE_EXECUTION, RiskLevel.LOW), "ag-sonnet")
+        # AG Sonnet 5.5 → agc-sonnet (small capped Antigravity Claude allowance)
+        self.assertEqual(model_to_agent_role(MODEL_AG_CLAUDE_SONNET, TaskType.ROUTINE_EXECUTION, RiskLevel.LOW), "agc-sonnet")
         # AG GPT → ag-gpt (not ag-opus)
         self.assertEqual(model_to_agent_role(MODEL_AG_GPT_OSS, TaskType.ROUTINE_EXECUTION, RiskLevel.LOW), "ag-gpt")
-        # AG Opus → reviewer (not ag-opus, ag-opus no longer exists)
-        self.assertEqual(model_to_agent_role(MODEL_AG_CLAUDE_OPUS, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "reviewer")
+        # AG Opus 5.5 → agc-opus (the old ag-opus role stays gone)
+        self.assertEqual(model_to_agent_role(MODEL_AG_CLAUDE_OPUS, TaskType.STRONG_REVIEW, RiskLevel.HIGH), "agc-opus")
         # DeepSeek V4 Pro → ds-pro (ds-task is pinned to DeepSeek Flash)
         self.assertEqual(model_to_agent_role(MODEL_DEEPSEEK_PRO, TaskType.ROUTINE_EXECUTION, RiskLevel.HIGH), "ds-pro")
         self.assertEqual(model_to_agent_role(MODEL_DEEPSEEK_FLASH, TaskType.ROUTINE_EXECUTION, RiskLevel.LOW), "ds-task")
