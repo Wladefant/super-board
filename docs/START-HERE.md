@@ -80,6 +80,7 @@ Two honest limits on this result:
   (Builder.io free credits, or your own provider keys); **"Skip to editor"** bypasses it and
   creates a blank design, which is the path used here. **No AI provider is configured on this
   deployment**, so prompt-driven generation — the app's headline feature — remains untested.
+  **Decision 2026-10-03 ([#42](https://github.com/Wladefant/super-board/issues/42)):** paid models stay off. No free provider key exists in the Dokploy environment of any Agent Native app, so generation stays unavailable. Sessions use the offline HTML path (see `design-prototyping`, "When no AI provider is connected"). To change this, the operator names a provider and adds its key in Dokploy environment configuration, never in the repository.
 - **The probe account and its design still exist** on the deployment. Delete them when convenient.
 
 #### Email verification is NOT required here — definitively
