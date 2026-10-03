@@ -366,6 +366,10 @@ Authenticate/Reconnect the Design connector, or
 reinstall to fix auth. Never hand-roll MCP calls with curl. If it still fails, take the
 offline fallback and say so.
 
+### When no AI provider is connected
+
+Decision 2026-10-03 (https://github.com/Wladefant/super-board/issues/42): paid models stay off, and no free provider is configured on the hosted Design app. "New Design" opens the Connect AI dialog; use **Skip to editor**. The hosted app is then a manual editor, board and handoff surface. `present-design-variants` cannot generate. Do not connect a key without the operator's go. Generate variants on the offline path below and say so in the summary.
+
 ---
 
 ## FALLBACK PATH — standalone HTML prototype (offline / no host)
