@@ -88,6 +88,7 @@ INSTALLED_BIN_SCRIPTS: tuple[str, ...] = (
     "super-board-project.py",
     "super-board-publish.py",
     "super-board-normalize.py",
+    "super-board-idea.py",
     "super-board-codex-review.py",
     "super-board-install-verify.py",
     "super-qa-dispatch.sh",
