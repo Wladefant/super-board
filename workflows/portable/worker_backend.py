@@ -477,6 +477,9 @@ class WorkerRequest:
     criteria: List[str] = field(default_factory=list)
     task_type: Optional[str] = None
     backend: Optional[str] = None
+    fallback_model: Optional[str] = None
+    fallback_agent_role: Optional[str] = None
+    fallback_note: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -1225,6 +1228,12 @@ def build_stage_prompt(req: Any, schema: Dict[str, Any]) -> str:
         f"Repository root: {repo_root}",
         f"Expected head commit: {head_sha}",
     ]
+    fallback_model = _field(req, "fallback_model")
+    if fallback_model:
+        lines.append(f"Fallback model: {fallback_model}")
+    fallback_note = _field(req, "fallback_note")
+    if fallback_note:
+        lines.append(f"Fallback note: {fallback_note}")
     if task:
         lines += ["", "TASK", task]
     if criteria:
@@ -1443,6 +1452,9 @@ class WorkerBackend:
             criteria=list(_field(request, "criteria", []) or []),
             task_type=_field(request, "task_type") or None,
             backend=NATIVE_BACKEND_NAME,
+            fallback_model=_field(request, "fallback_model") or None,
+            fallback_agent_role=_field(request, "fallback_agent_role") or None,
+            fallback_note=_field(request, "fallback_note") or None,
         )
 
     def _native_run_dir(self, run_id: str) -> str:

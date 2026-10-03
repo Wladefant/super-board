@@ -288,6 +288,26 @@ class TestOutTierFallbackNote(unittest.TestCase):
         self.assertIn("exhausted until", note)
         self.assertIn("gemini-3.1-pro", note)
 
+    def test_precomputed_note_tracks_dispatch_snapshot(self):
+        for before, after, expects_note in (
+            (self.exhausted_usage_dict, self.healthy_usage_dict, False),
+            (self.healthy_usage_dict, self.exhausted_usage_dict, True),
+        ):
+            with self.subTest(expects_note=expects_note):
+                selector = ResetAwareModelSelector(
+                    parse_usage_json(before, current_time_ms=self.mock_now_ms),
+                    quota_snapshot=QuotaSnapshot(),
+                )
+                rec = selector.select_model()
+                selector.set_snapshot(parse_usage_json(after, current_time_ms=self.mock_now_ms))
+                packet = selector.dispatch(precomputed=rec)
+                self.assertEqual(packet.recommendation["model"], rec.selected_model)
+                self.assertEqual(packet.recommendation["fallback_model"], rec.fallback_model)
+                if expects_note:
+                    self.assertIn("limit_reached", packet.recommendation["fallback_note"])
+                else:
+                    self.assertIsNone(packet.recommendation["fallback_note"])
+
     def test_selection_preserved_identically(self):
         """Verify that fallback_note does not change model or fallback selection."""
         snapshot_exhausted = parse_usage_json(self.exhausted_usage_dict, current_time_ms=self.mock_now_ms)

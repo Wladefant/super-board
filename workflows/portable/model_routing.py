@@ -2056,11 +2056,7 @@ class ResetAwareModelSelector:
 
         now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        fallback_note = (
-            rec.fallback_note
-            if getattr(rec, "fallback_note", None)
-            else self.resolve_fallback_note(rec.fallback_model, rec.provider_statuses)
-        )
+        fallback_note = self.resolve_fallback_note(rec.fallback_model)
 
         return HarnessDispatchPacket(
             schema_version="1.0",
