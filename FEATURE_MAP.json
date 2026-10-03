@@ -4,6 +4,16 @@
   "repository": "Wladefant/super-board",
   "description": "Machine-readable feature map for agent navigation in super-board",
   "features": {
+    "idea-intake": {
+      "name": "Single-sentence Idea Intake",
+      "description": "Draft, independently judge, lint and rewrite issues before explicit filing.",
+      "entry_files": ["scripts/super-board-idea.py", "scripts/super_board_runtime/idea.py"],
+      "tests": ["tests/test_idea_intake.py", "tests/test_intake_normalizer.py"],
+      "owning_issue": "https://github.com/Wladefant/super-board/issues/2",
+      "risk": "low",
+      "cli_command": "python scripts/super-board-idea.py --help",
+      "docs": ["skills/super-board/references/idea.md"]
+    },
     "routing": {
       "name": "Model Routing & Usage Telemetry",
       "description": "Calibrated model routing ladders, role-to-model pins, provider pacing, allowance tracking, and fallback policies for agent lanes.",
