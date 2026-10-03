@@ -1,0 +1,40 @@
+{
+  "width": 800,
+  "height": 600,
+  "screen": "screen.svg",
+  "steps": [
+    {
+      "name": "Navigation Header",
+      "what": "Persistent top header displaying service identity and global cluster health indicator",
+      "why": "Establishes immediate operational context and system status at a single glance",
+      "rect": [
+        40,
+        20,
+        720,
+        60
+      ]
+    },
+    {
+      "name": "Telemetry Overview",
+      "what": "Primary metrics card showing real-time throughput and latency sparklines",
+      "why": "Surfaces mission-critical operational telemetry without requiring navigation drilldown",
+      "rect": [
+        40,
+        100,
+        450,
+        360
+      ]
+    },
+    {
+      "name": "Action Center",
+      "what": "Dedicated action panel containing one-click deployment and traffic draining controls",
+      "why": "Groups high-frequency incident mitigation actions into an explicit operational zone",
+      "rect": [
+        510,
+        290,
+        250,
+        170
+      ]
+    }
+  ]
+}
