@@ -67,9 +67,14 @@ RETIRED_TOOL_APPROVAL_FILES = ("guard.ts", "guard-eval.ts", "approvals.ts", "vey
 
 # Import specifiers rewritten when source directories are flattened into the
 # installed tree. extension/*.ts lands at the target root, daemon/*.ts lands
-# under daemon/, and src/*.ts lands under harness/.
+# under daemon/, and src/*.ts lands under harness/ (its extension imports move up to ../).
 EXTENSION_IMPORT_REWRITES = (
     ('from "../daemon/', 'from "./daemon/'),
+)
+
+SRC_IMPORT_REWRITES = (
+    ('from "../extension/harness/', 'from "./'),
+    ('from "../extension/', 'from "../'),
 )
 
 DAEMON_IMPORT_REWRITES = (
@@ -186,7 +191,11 @@ def plan_sync_items(harness_root: Path, target: Path) -> List[SyncItem]:
     if src_dir.is_dir():
         for p in sorted([*src_dir.glob("*.ts"), *src_dir.glob("*.py")]):
             if p.is_file():
-                items.append(SyncItem(source_path=p, rel_target=f"harness/{p.name}"))
+                items.append(SyncItem(
+                    source_path=p,
+                    rel_target=f"harness/{p.name}",
+                    import_rewrites=SRC_IMPORT_REWRITES if p.suffix == ".ts" else (),
+                ))
 
     # 3. daemon/*.ts -> target/daemon/, and the launcher to the target root. The
     #    daemon is what keeps the bot answering with no session open, so it is part
