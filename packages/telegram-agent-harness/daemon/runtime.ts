@@ -15,7 +15,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
 import { randomUUID } from "node:crypto";
-import { OperatorQuestionService, questionOperator } from "../src/operator-questions";
+import { isClosed, OperatorQuestionService, QuestionStore, questionOperator, readQuestions, type QuestionRoute } from "../src/operator-questions";
 import {
   BotPoolCoordinator,
   getDefaultManifestPath,
@@ -44,7 +44,8 @@ import {
 } from "./session-control";
 import { DaemonStore } from "./store";
 import { connectMiniApp, miniAppUrl, buildMiniAppUrl } from "./miniapp";
-import { ForumManager, type ForumApiClient, type AutoAttachResult } from "./forum";
+import { DefaultTelegramForumClient, ForumManager, workspaceFolder, type ForumApiClient, type AutoAttachResult } from "./forum";
+import { QuestionsTopic } from "./questions-topic";
 
 export interface DaemonSlotReport {
   slotId: string;
@@ -90,6 +91,7 @@ interface ActiveSlot {
   poller: TelegramPoller;
   router: SlotRouter;
   forumManager?: ForumManager;
+  questionsTopic?: QuestionsTopic;
   leaseSessionId: string;
   stopMiniApp: () => void;
   autoAttachTimer?: NodeJS.Timeout;
@@ -237,6 +239,7 @@ export class TelegramDaemon {
     const index = this.active.findIndex(entry => entry.slot.slotId === slotId);
     if (index < 0) return;
     const [ended] = this.active.splice(index, 1);
+    ended.questionsTopic?.stop();
     if (ended.autoAttachTimer) {
       clearInterval(ended.autoAttachTimer);
     }
@@ -311,6 +314,15 @@ export class TelegramDaemon {
     // Assigned after construction: the poller and the router each need the other,
     // and the poller is what knows which chat a callback is currently serving.
     let poller: TelegramPoller;
+    let questionsTopic: QuestionsTopic | undefined;
+    const decisionsPath = path.join(os.homedir(), ".veyyon", "workflows", "decisions.json");
+    const poolPath = this.options.poolDbPath ?? process.env.VEYYON_POOL_DB ?? path.join(os.homedir(), ".veyyon", "telegram", "bot_pool.db");
+    // Questions are answered from the Questions topic too, where no session is bound. There the
+    // expected owner is the one the outbound copy or the button was issued for.
+    const inQuestionsTopic = (): boolean => {
+      const thread = questionsTopic?.threadId();
+      return thread !== null && thread !== undefined && poller.getActiveThreadId() === thread;
+    };
 
     const forumManager = forumChatId
       ? new ForumManager({
@@ -362,10 +374,22 @@ export class TelegramDaemon {
       record: correlationRow => {
         this.coordinator.recordOutboundMessage(correlationRow);
       },
-      resolveReply: (botId, chatId, replyToMessageId) =>
-        this.coordinator.resolveReplyRouting(botId, chatId, replyToMessageId, sessionIdForChat()),
-      resolveCallback: (callbackToken, userId, chatId) =>
-        this.coordinator.validateDecisionCallback(callbackToken, userId, chatId, sessionIdForChat()),
+      resolveReply: (botId, chatId, replyToMessageId) => {
+        const resolved = this.coordinator.resolveReplyRouting(botId, chatId, replyToMessageId, sessionIdForChat());
+        const owner = resolved.correlation;
+        if (resolved.decision === "reject_foreign_session" && owner?.decisionId?.startsWith("tq:") && inQuestionsTopic()) {
+          return this.coordinator.resolveReplyRouting(botId, chatId, replyToMessageId, owner.sessionId);
+        }
+        return resolved;
+      },
+      resolveCallback: (callbackToken, userId, chatId) => {
+        const resolved = this.coordinator.validateDecisionCallback(callbackToken, userId, chatId, sessionIdForChat());
+        const issued = resolved.record;
+        if (resolved.decision === "reject_foreign_session" && issued?.decisionId.startsWith("tq:") && inQuestionsTopic()) {
+          return this.coordinator.validateDecisionCallback(callbackToken, userId, chatId, issued.sessionId);
+        }
+        return resolved;
+      },
       consumeCallback: callbackToken => this.coordinator.consumeDecisionCallback(callbackToken),
     };
 
@@ -496,16 +520,17 @@ export class TelegramDaemon {
       },
       onQuestionAnswer: async (decisionId: string, eventId: string, answer: { choice?: string; text?: string }) => {
         const target = currentTarget();
-        const sessionId = router.boundSession(target);
+        const sessionId = inQuestionsTopic()
+          ? (await readQuestions(decisionsPath)).find(question => question.decision_id === decisionId)?.transport.session_id
+          : router.boundSession(target);
         if (!sessionId) throw new Error("Question receiver unavailable: this topic has no session owner.");
-        const questions = new OperatorQuestionService(
-          poller,
-          () => ({ session_id: sessionId, chat_id: target.chatId, user_id: questionOperator(this.coordinator.readAccessConfig(slot.stateDir), target.chatId) }),
-          path.join(os.homedir(), ".veyyon", "workflows", "decisions.json"),
-          this.options.poolDbPath ?? process.env.VEYYON_POOL_DB ?? path.join(os.homedir(), ".veyyon", "telegram", "bot_pool.db"),
-          message => this.log(message),
-        );
-        await questions.answer(decisionId, eventId, answer);
+        const questions = this.questionService(poller, {
+          session_id: sessionId, chat_id: target.chatId,
+          user_id: questionOperator(this.coordinator.readAccessConfig(slot.stateDir), target.chatId),
+        }, decisionsPath, poolPath);
+        const updated = await questions.answer(decisionId, eventId, answer);
+        if (isClosed(updated)) questionsTopic?.request(0);
+        else await questionsTopic?.refresh(decisionId);
       },
       onDecisionCallback: async (decisionId: string, choiceId: string, context?: string) => {
         if (decisionId.startsWith("attach:")) {
@@ -531,6 +556,8 @@ export class TelegramDaemon {
     const pollerOptions = {
       commands: getDaemonCommands(),
       isDaemon: true,
+      // A timed-out send may still have been delivered; the Questions topic must not post a card twice.
+      sendTimeoutMs: 20_000,
       slotId: slot.slotId,
       ...(forumChatId ? { forumChatId } : {}),
     };
@@ -598,6 +625,10 @@ export class TelegramDaemon {
       if (!response.ok || !result.ok) this.log(`Slot ${slot.slotId}: Mini App menu registration rejected`);
     }).catch(() => this.log(`Slot ${slot.slotId}: Mini App menu registration unavailable`));
     let autoAttachTimer: NodeJS.Timeout | undefined;
+    if (forumChatId) {
+      questionsTopic = this.createQuestionsTopic(slot, token, forumChatId, poller, decisionsPath, poolPath);
+      questionsTopic.start(decisionsPath);
+    }
     if (forumManager && slot.autoAttach !== false) {
       const intervalMs = slot.autoAttachIntervalMs ?? 10_000;
       autoAttachTimer = setInterval(() => {
@@ -607,7 +638,56 @@ export class TelegramDaemon {
         });
       }, intervalMs);
     }
-    return { slot, poller, router, forumManager, leaseSessionId, stopMiniApp, autoAttachTimer };
+    return { slot, poller, router, forumManager, questionsTopic, leaseSessionId, stopMiniApp, autoAttachTimer };
+  }
+
+  private questionService(poller: TelegramPoller, route: QuestionRoute, decisionsPath: string, poolPath: string): OperatorQuestionService {
+    return new OperatorQuestionService(poller, () => route, decisionsPath, poolPath, message => this.log(message));
+  }
+
+  /** The slot's Questions topic: one list of every open operator question, kept in step with the decision store. */
+  public createQuestionsTopic(
+    slot: DaemonSlot, token: string, forumChatId: string, poller: TelegramPoller,
+    decisionsPath: string, poolPath: string,
+  ): QuestionsTopic {
+    const client = this.options.forumClientFactory?.(token, forumChatId) ?? new DefaultTelegramForumClient(token);
+    const ledger = new QuestionStore(decisionsPath, poolPath);
+    let live = new Set<string>();
+    return new QuestionsTopic({
+      chatId: forumChatId,
+      slotId: slot.slotId,
+      store: this.store,
+      ledger,
+      prepare: async () => {
+        live = new Set((await this.control.listSessions().catch(() => [])).map(session => session.id));
+      },
+      session: sessionId => {
+        const workspace = this.store.routesForSession(sessionId)[0]?.workspace ?? "";
+        return { name: workspace ? workspaceFolder(workspace) : sessionId.slice(0, 8), ended: !live.has(sessionId) };
+      },
+      transport: {
+        createTopic: async name => (await client.createForumTopic(forumChatId, name)).message_thread_id,
+        send: async (threadId, text, markup, owner) => {
+          const sent = await poller.sendTelegramMessage(forumChatId, text, "HTML", markup,
+            owner ? { sessionId: owner.sessionId, decisionId: owner.decisionId } : undefined, undefined, threadId);
+          if (sent?.ok && sent.result?.message_id) return { messageId: sent.result.message_id };
+          if (/thread not found/i.test(sent?.description ?? "")) return "gone";
+          this.log(`Slot ${slot.slotId}: Questions topic send failed: ${sent?.description ?? "no response"}`);
+          return "error";
+        },
+        edit: async (messageId, text, markup) => {
+          const edited = await poller.editTelegramMessage(forumChatId, messageId, text, "HTML", undefined, markup);
+          if (edited?.ok || /not modified/i.test(edited?.description ?? "")) return "ok";
+          return /not found/i.test(edited?.description ?? "") ? "gone" : "error";
+        },
+        remove: messageId => poller.deleteTelegramMessage(forumChatId, messageId),
+        pin: async messageId => { await poller.pinTelegramMessage(forumChatId, messageId); },
+      },
+      finalize: async question => {
+        await this.questionService(poller, question.transport, decisionsPath, poolPath).finalize(question);
+      },
+      log: message => this.log(message),
+    });
   }
 
   /**
@@ -656,6 +736,7 @@ export class TelegramDaemon {
     const index = this.active.findIndex(entry => entry.slot.slotId === slotId);
     if (index < 0) return false;
     const [entry] = this.active.splice(index, 1);
+    entry.questionsTopic?.stop();
     if (entry.autoAttachTimer) {
       clearInterval(entry.autoAttachTimer);
       entry.autoAttachTimer = undefined;

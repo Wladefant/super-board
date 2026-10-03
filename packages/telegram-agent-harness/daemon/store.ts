@@ -79,6 +79,20 @@ export class DaemonStore {
       session_id TEXT NOT NULL, text TEXT NOT NULL, sent_at INTEGER NOT NULL
     )`);
     this.db.run("CREATE INDEX IF NOT EXISTS agent_messages_session ON agent_messages (session_id, sent_at)");
+    // Small daemon facts that are not routes: the Questions topic id, its index message, its digest.
+    this.db.run("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  }
+
+  public getKv(key: string): string | null {
+    return this.db.query<{ value: string }, [string]>("SELECT value FROM kv WHERE key = ?").get(key)?.value ?? null;
+  }
+
+  public setKv(key: string, value: string): void {
+    this.db.run("INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", [key, value]);
+  }
+
+  public deleteKv(key: string): void {
+    this.db.run("DELETE FROM kv WHERE key = ?", [key]);
   }
 
   public putSessionListing(slotId: string, chatId: string, topicId: string, ids: string[]): void {

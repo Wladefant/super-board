@@ -423,10 +423,13 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "telegram_question",
     label: "Ask operator on Telegram",
-    description: "Ask a clear question on the session's Telegram route, with labeled options, recommendation and prose replies. Returns only that question's answer; never grants approval. Use get/wait with its id after an interruption.",
+    description: "Ask a clear question on the session's Telegram route, with labeled options, recommendation and prose replies. Returns only that question's answer; never grants approval. Use get/wait with its id after an interruption. All open questions of all sessions are listed in the Questions topic; if the operator answered one somewhere else (terminal, prose to you), close it with resolve (id plus answer text or option id), and close one that no longer matters with drop (id plus reason), so it leaves that list.",
     parameters: z.object({
-      action: z.enum(["ask", "get", "wait"]).default("ask"),
+      action: z.enum(["ask", "get", "wait", "resolve", "drop"]).default("ask"),
       id: z.string().optional(),
+      answer: z.string().optional(),
+      choice: z.string().optional(),
+      reason: z.string().optional(),
       question: z.string().optional(),
       problem: z.string().optional(),
       impact: z.string().optional(),
@@ -457,6 +460,12 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
           options: params.options,
           recommendation: params.recommendation,
         });
+      } else if (params.action === "resolve") {
+        if (!params.id) throw new Error("Question id is required for resolve");
+        question = await service.resolve(params.id, { choice: params.choice, text: params.answer });
+      } else if (params.action === "drop") {
+        if (!params.id || !params.reason) throw new Error("Question id and a reason are required for drop");
+        question = await service.drop(params.id, params.reason);
       } else {
         if (!params.id) throw new Error("Question id is required for get/wait");
         question = await service.get(params.id);
@@ -464,7 +473,7 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
       onUpdate?.({ content: [{ type: "text", text: `Telegram question ${question.decision_id} is ${question.status}. Silence leaves it pending.` }] });
       const timeoutMs = (params.timeout ? Math.max(1, Math.min(300, params.timeout)) : 60) * 1000;
       let lastProgressSec = 0;
-      const result = params.action === "get" || !params.wait
+      const result = (params.action !== "ask" && params.action !== "wait") || !params.wait
         ? question
         : await service.wait(
             question.decision_id,

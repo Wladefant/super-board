@@ -81,7 +81,6 @@ function questionRecord(
 		decision_id: id,
 		question: `Question ${id}?`,
 		status,
-		reminder_status: status === "pending" ? "active" : status,
 		created_at: "2026-09-29T13:38:34Z",
 		answer: answer
 			? {
@@ -164,7 +163,8 @@ test("compaction receives current route-owned Telegram question state", async ()
 	expect(result?.context).toHaveLength(1);
 	expect(result?.context?.[0]).toContain("authoritative");
 	expect(result?.context?.[0]).toContain('"id":"tq:pending"');
-	expect(result?.context?.[0]).toContain('"reminder_status":"active"');
+	expect(result?.context?.[0]).toContain('"status":"pending"');
+	expect(result?.context?.[0]).not.toContain("reminder");
 	expect(result?.context?.[0]).toContain('"id":"tq:answered"');
 	expect(result?.context?.[0]).toContain(
 		'"text":"Yes, split it into three issues"',

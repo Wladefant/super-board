@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { escapeHtml } from "../extension/sanitizer";
 import type { TelegramPoller } from "../extension/poller";
 import type { AccessConfig } from "../extension/types";
 
@@ -26,30 +27,98 @@ export interface QuestionAnswer {
   question_id: string;
   choice_id: string | null;
   text: string;
-  origin: "telegram_account";
+  origin: "telegram_account" | "agent_recorded";
   actor_id: string;
   authorization: false;
   answered_at?: string;
 }
-interface Question {
+export interface Question {
   decision_id: string;
   question: string;
-  status: string;
-  reminder_status?: string;
+  status: "pending" | "answered" | "dropped" | string;
   created_at?: string;
+  options: Array<{ id: string; label: string; description?: string }>;
   answer: QuestionAnswer | null;
-  transport: QuestionRoute & { kind: "operator_question"; message_id?: number; selection: string | null };
+  drop?: { reason: string; dropped_at?: string };
+  transport: QuestionRoute & {
+    kind: "operator_question";
+    selection: string | null;
+    created_ts?: number;
+    /** The copy in the session's own topic. */
+    message_id?: number | null;
+    /** The copy in the Questions topic. Cache only. */
+    topic_message_id?: number | null;
+    topic_card_at?: number | null;
+    session_finalized?: boolean;
+  };
 }
 interface Result {
   question?: Question;
   questions?: Question[];
   card?: { id: string; text: string; reply_markup?: Record<string, unknown> };
+  status?: string;
   error?: string;
 }
 export interface QuestionRoute { session_id: string; chat_id: string; user_id: string }
 
-type QuestionCompactionRoute = Pick<QuestionRoute, "session_id"> & Partial<QuestionRoute>;
+/** What the operator sees on a question once it is closed anywhere. */
+export function closedQuestionText(question: Question): string {
+  const labelOf = (id: string | null) => question.options.find(option => option.id === id)?.label ?? id;
+  let verdict: string;
+  if (question.status === "dropped") {
+    verdict = `🚫 <b>Dropped:</b> ${escapeHtml(question.drop?.reason ?? "no longer needed")}`;
+  } else {
+    const answer = question.answer;
+    const parts = [labelOf(answer?.choice_id ?? null), answer?.text?.slice(0, 300)].filter(Boolean) as string[];
+    verdict = `✅ <b>Answered:</b> ${escapeHtml(parts.join(" — ") || "answer saved")}`;
+  }
+  return `${verdict}\n<i>${escapeHtml(question.question)}</i>`;
+}
 
+/** True when a question no longer waits for an answer. */
+export const isClosed = (question: Question): boolean => question.status === "answered" || question.status === "dropped";
+
+async function spawnQuestionStore(request: object): Promise<Result> {
+  const proc = Bun.spawn(["python", path.join(import.meta.dir, "operator_questions.py")],
+    { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+  proc.stdin.write(JSON.stringify(request));
+  proc.stdin.end();
+  const timeout = setTimeout(() => proc.kill(), 15_000);
+  try {
+    const [output, , exit] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+    const result = JSON.parse(output) as Result;
+    if (exit !== 0 || result.error) throw new Error(result.error || "Question store unavailable; no answer recorded");
+    return result;
+  } finally { clearTimeout(timeout); }
+}
+
+/** Every question of every session, read straight from the decision store. */
+export async function readQuestions(decisionsPath: string): Promise<Question[]> {
+  let data: { decisions?: Record<string, Question> };
+  try { data = await Bun.file(decisionsPath).json(); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+  return Object.values(data.decisions ?? {}).filter(question => question.transport?.kind === "operator_question");
+}
+
+/** Daemon-owned operations on any question. They cache Telegram ids and mint cards; they never answer. */
+export class QuestionStore {
+  constructor(readonly decisionsPath: string, private readonly poolPath: string) {}
+  list(): Promise<Question[]> { return readQuestions(this.decisionsPath); }
+  async cache(id: string, fields: { topic_message_id?: number | null; topic_card_at?: number | null; session_finalized?: boolean }): Promise<void> {
+    await spawnQuestionStore({ operation: "cache", payload: { id, ...fields },
+      decisions_path: this.decisionsPath, pool_path: this.poolPath });
+  }
+  async cardFor(id: string): Promise<{ question: Question; card: NonNullable<Result["card"]> }> {
+    const result = await spawnQuestionStore({ operation: "card_for", payload: { id },
+      decisions_path: this.decisionsPath, pool_path: this.poolPath });
+    return { question: result.question!, card: result.card! };
+  }
+}
+
+type QuestionCompactionRoute = Pick<QuestionRoute, "session_id"> & Partial<QuestionRoute>;
 export async function questionCompactionContext(
   decisionsPath: string,
   route: QuestionCompactionRoute,
@@ -57,7 +126,7 @@ export async function questionCompactionContext(
   const data = await Bun.file(decisionsPath).json() as { decisions?: Record<string, Question> };
   const questions = Object.values(data.decisions ?? {})
     .filter(question =>
-      (question.status === "pending" || question.status === "answered") &&
+      (question.status === "pending" || isClosed(question)) &&
       question.transport?.kind === "operator_question" &&
       question.transport.session_id === route.session_id &&
       (route.chat_id === undefined || question.transport.chat_id === route.chat_id) &&
@@ -71,7 +140,6 @@ export async function questionCompactionContext(
       id: question.decision_id,
       question: question.question,
       status: question.status,
-      reminder_status: question.reminder_status ?? null,
       answer: question.answer
         ? {
             choice_id: question.answer.choice_id,
@@ -90,8 +158,6 @@ export async function questionCompactionContext(
 
 /** No independent ledger, Telegram poller, approval grant, or new operator turn. */
 export class OperatorQuestionService {
-  private timer: Timer | undefined;
-  private running: Promise<void> | undefined;
   constructor(private readonly poller: TelegramPoller, private readonly route: () => QuestionRoute,
     private readonly decisionsPath: string, private readonly poolPath: string,
     private readonly report: (message: string) => void,
@@ -100,22 +166,13 @@ export class OperatorQuestionService {
 
   private async python(operation: string, payload: object, card: boolean): Promise<Result> {
     const boundRoute = this.route();
-    const proc = Bun.spawn(["python", path.join(import.meta.dir, "operator_questions.py")],
-      { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
-    proc.stdin.write(JSON.stringify({ operation, payload, card, route: boundRoute,
-      decisions_path: this.decisionsPath, pool_path: this.poolPath }));
-    proc.stdin.end();
-    const timeout = setTimeout(() => proc.kill(), 15_000);
-    try {
-      const [output, , exit] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
-      const result = JSON.parse(output) as Result;
-      if (exit !== 0 || result.error) throw new Error(result.error || "Question store unavailable; no answer recorded");
-      const current = this.route();
-      if (current.session_id !== boundRoute.session_id || current.chat_id !== boundRoute.chat_id || current.user_id !== boundRoute.user_id) {
-        throw new Error("Session route changed; the original question remains bound to its original session");
-      }
-      return result;
-    } finally { clearTimeout(timeout); }
+    const result = await spawnQuestionStore({ operation, payload, card, route: boundRoute,
+      decisions_path: this.decisionsPath, pool_path: this.poolPath });
+    const current = this.route();
+    if (current.session_id !== boundRoute.session_id || current.chat_id !== boundRoute.chat_id || current.user_id !== boundRoute.user_id) {
+      throw new Error("Session route changed; the original question remains bound to its original session");
+    }
+    return result;
   }
 
   async ask(input: OperatorQuestionInput): Promise<Question> {
@@ -161,7 +218,7 @@ export class OperatorQuestionService {
     for (;;) {
       signal?.throwIfAborted();
       const question = await this.get(id);
-      if (question.answer) return question.answer;
+      if (question.answer || question.status === "dropped") return question.answer ?? question;
 
       const elapsed = Date.now() - startTime;
       if (elapsed >= timeoutMs) {
@@ -182,18 +239,41 @@ export class OperatorQuestionService {
     }
   }
 
-  async answer(id: string, eventId: string, input: { choice?: string; text?: string }): Promise<void> {
+  /** Records an operator answer that arrived by button or reply, then closes the session copy. */
+  async answer(id: string, eventId: string, input: { choice?: string; text?: string }): Promise<Question> {
     const result = await this.invoke("answer", { id, event_id: eventId, ...input }, true);
-    if (result.question?.answer) {
-      const messageId = result.question.transport.message_id;
-      if (messageId) await this.poller.clearCallbackButtons(this.route().chat_id, messageId);
-      const sent = await this.poller.sendTelegramMessage(this.route().chat_id,
-        "<b>Answer saved for this question.</b> Returned to its waiting task, not sent as a new instruction.",
-        undefined, undefined, { decisionId: id });
-      if (!sent?.ok) this.report("Answer saved, but Telegram receipt delivery failed");
-    } else {
-      await this.publish(result, true);
+    if (isClosed(result.question!)) await this.finalize(result.question!);
+    else await this.publish(result, true);
+    return result.question!;
+  }
+
+  /** The operator answered somewhere else (terminal, prose the agent heard). */
+  async resolve(id: string, input: { choice?: string; text?: string }): Promise<Question> {
+    const result = await this.invoke("resolve", { id, ...input }, false);
+    await this.finalize(result.question!);
+    return result.question!;
+  }
+
+  /** The question no longer matters. */
+  async drop(id: string, reason: string): Promise<Question> {
+    const result = await this.invoke("drop", { id, reason }, false);
+    await this.finalize(result.question!);
+    return result.question!;
+  }
+
+  /**
+   * Rewrites the copy in the session's topic to its verdict. Safe to repeat: the daemon calls it again
+   * for any closed question whose copy was not finalized, and a missing or unchanged message counts as done.
+   */
+  async finalize(question: Question): Promise<void> {
+    const messageId = question.transport.message_id;
+    if (messageId && !question.transport.session_finalized) {
+      const edited = await this.poller.editTelegramMessage(question.transport.chat_id, messageId,
+        closedQuestionText(question), "HTML");
+      const done = edited?.ok || /not modified|not found/i.test(edited?.description ?? "");
+      if (!done) { this.report(`Question ${question.decision_id} is closed, but its Telegram copy was not updated`); return; }
     }
+    await this.invoke("cache", { id: question.decision_id, session_finalized: true }, false);
   }
 
   private async publish(result: Result, edit = false): Promise<void> {
@@ -208,26 +288,12 @@ export class OperatorQuestionService {
       throw new Error("Selection saved. Reply to the original question to add context and submit your answer.");
     }
     // The card text is finished HTML, exactly as the edit above treats it.
+    // An edit without a session copy has nothing to redraw; a fresh card here would land in the
+    // Questions topic and break its one-message-per-question rule.
+    if (!sent && edit) return;
     if (!sent) sent = await this.poller.sendTelegramMessage(chat_id, result.card.text,
       "HTML", result.card.reply_markup, { decisionId: result.card.id });
-    if (!sent?.ok || !sent.result?.message_id) throw new Error("Question persists, but Telegram delivery failed; it remains pending");
+    if (!sent?.ok || !sent.result?.message_id) throw new Error(`Question persists, but Telegram delivery failed${sent?.description ? ` (${sent.description})` : ""}; it remains pending`);
     await this.invoke("sent", { id: result.card.id, message_id: sent.result.message_id }, false);
-  }
-
-  start(): void {
-    if (this.timer) return;
-    this.timer = setInterval(() => {
-      this.running ??= this.remind().catch(error => this.report(String(error))).finally(() => { this.running = undefined; });
-    }, 30_000);
-    this.timer.unref?.();
-  }
-
-  stop(): void { clearInterval(this.timer); this.timer = undefined; }
-
-  private async remind(): Promise<void> {
-    const result = await this.invoke("due", {}, false);
-    // One reminder per cadence tick, with cadence persisted by the existing decision workflow.
-    const question = result.questions?.[0];
-    if (question) await this.publish(await this.invoke("get", { id: question.decision_id }, true));
   }
 }

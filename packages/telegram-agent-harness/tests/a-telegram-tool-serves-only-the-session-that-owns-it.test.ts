@@ -264,7 +264,6 @@ function createChannel(messageThreadId?: number): {
 
   cleanup.push(() => {
     poller.stop();
-    questions.stop();
     dashboard.stop();
     rows.close();
     store.close();
