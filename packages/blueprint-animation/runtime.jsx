@@ -35,4 +35,4 @@ function InputPiece(){
  </svg>;
 }
 export function mountInput(){const s=window.BLUEPRINT;createRoot(document.getElementById('root')).render(<CompositionStage width={s.width+160} height={s.height+270}><InputPiece/></CompositionStage>);}
-export function mountUpstream(){createRoot(document.getElementById('root')).render(<window.NorthwindBlueprintApp/>);}
+export function mountUpstream(){document.documentElement.style.setProperty('--amp-gray-1','#fafafa');createRoot(document.getElementById('root')).render(<window.NorthwindBlueprintApp/>);}
