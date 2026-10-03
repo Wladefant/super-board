@@ -288,6 +288,9 @@ export class OperatorQuestionService {
       throw new Error("Selection saved. Reply to the original question to add context and submit your answer.");
     }
     // The card text is finished HTML, exactly as the edit above treats it.
+    // An edit without a session copy has nothing to redraw; a fresh card here would land in the
+    // Questions topic and break its one-message-per-question rule.
+    if (!sent && edit) return;
     if (!sent) sent = await this.poller.sendTelegramMessage(chat_id, result.card.text,
       "HTML", result.card.reply_markup, { decisionId: result.card.id });
     if (!sent?.ok || !sent.result?.message_id) throw new Error(`Question persists, but Telegram delivery failed${sent?.description ? ` (${sent.description})` : ""}; it remains pending`);

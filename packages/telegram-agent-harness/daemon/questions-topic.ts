@@ -156,6 +156,7 @@ export class QuestionsTopic {
     const { ledger, transport } = this.options;
     await this.options.prepare?.();
     if (probe) await this.probeCopies((await ledger.list()).filter(q => q.status === "pending"));
+    await this.baselineLegacy();
     const all = await ledger.list();
     const open = all.filter(q => q.status === "pending").sort(order);
     const thread = await this.ensureThread();
@@ -209,9 +210,23 @@ export class QuestionsTopic {
     await this.digest(thread, current);
   }
 
+  /**
+   * Questions closed before the Questions topic existed keep their session copy as it is: rewriting
+   * hundreds of old messages on the first start would stall the outbound queue ahead of the open ones.
+   */
+  private async baselineLegacy(): Promise<void> {
+    const { store, ledger } = this.options;
+    const key = this.key("baseline");
+    if (store.getKv(key) !== null) return;
+    for (const question of (await ledger.list()).filter(isClosed)) {
+      if (!question.transport.session_finalized) await ledger.cache(question.decision_id, { session_finalized: true });
+    }
+    store.setKv(key, "1");
+  }
+
   private retry(reason: string): void {
     this.log(`${reason}; will retry`);
-    this.request(10_000, true);
+    this.request(10_000, false);
   }
 
   /** The topic was deleted by hand: forget every cached id and rebuild from the store. */

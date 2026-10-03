@@ -610,7 +610,7 @@ export class TelegramPoller {
       const data = (await response.json()) as TelegramSendMessageResponse;
       this.observeRateLimit(data);
       if (data.ok) return "ok";
-      return /not found|can't be deleted|to delete not found|not modified/i.test(data.description ?? "") ? "gone" : "error";
+      return /not found|to delete not found|not modified/i.test(data.description ?? "") ? "gone" : "error";
     } catch {
       return "error";
     }

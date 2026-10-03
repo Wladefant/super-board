@@ -185,4 +185,33 @@ describe("Questions topic", () => {
     expect(others().filter(text => text.includes("🔔"))).toHaveLength(1);
     expect(others().find(text => text.includes("🔔"))).toContain("3 open questions");
   });
+  test("questions closed before the topic existed are baselined without any Telegram edit", async () => {
+    for (let n = 1; n <= 5; n++) {
+      const legacy = open(`old${n}`, "s1", n);
+      legacy.status = "answered";
+      questions.set(legacy.decision_id, legacy);
+    }
+    questions.set("q1", open("q1", "s1", 50));
+    await make().reconcile();
+    expect(finalized).toEqual([]);
+    expect(cards()).toEqual(["q1"]);
+    questions.get("q1")!.status = "answered";
+    await make().reconcile();
+    expect(finalized).toEqual(["q1"]);
+  });
+
+  test("a copy Telegram refuses to delete stays cached and is retried, never forgotten", async () => {
+    questions.set("q1", open("q1", "s1", 10));
+    let refuse = true;
+    const stubborn: QuestionsTransport = { ...transport, remove: async id => refuse ? "error" : transport.remove(id) };
+    const topic = make({ transport: stubborn });
+    await topic.reconcile();
+    questions.get("q1")!.status = "answered";
+    await topic.reconcile();
+    expect(cards()).toEqual(["q1"]);
+    expect(questions.get("q1")!.transport.topic_message_id).not.toBeNull();
+    refuse = false;
+    await topic.reconcile();
+    expect(cards()).toEqual([]);
+  });
 });
