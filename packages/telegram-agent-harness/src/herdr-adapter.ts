@@ -207,7 +207,7 @@ export class HerdrAdapter implements AgentHarnessAdapter {
       const result = await this.runner.run([this.binary, "agent", "lifecycle", sessionId, ...action]);
       if (result.exitCode !== 0) {
         try {
-          const failure = JSON.parse(result.stdout) as { error?: { code?: unknown } };
+          const failure = JSON.parse(result.stderr || result.stdout) as { error?: { code?: unknown } };
           if (failure.error?.code === "partial_delivery") return { status: "unknown", generation: "", delivered: false, partial: true };
         } catch { /* not a structured error */ }
         return null;
