@@ -164,6 +164,13 @@ export class HerdrAdapter implements AgentHarnessAdapter {
     const prompt = text.trim();
     if (!prompt) return { ok: false, disposition: "rejected", detail: "Prompt text is empty." };
     const result = await this.lifecycle(sessionId, ["submit", prompt]);
+    if (result?.partial) {
+      return {
+        ok: false,
+        disposition: "rejected",
+        detail: "Herdr typed the prompt but did not press Enter because the agent changed state. The text may still sit unsent in the agent's input box. No retry was attempted.",
+      };
+    }
     if (!result?.delivered || result.status !== "working") {
       return {
         ok: false,
@@ -193,11 +200,18 @@ export class HerdrAdapter implements AgentHarnessAdapter {
     status: string;
     generation: string;
     delivered: boolean;
+    partial?: boolean;
   } | null> {
     if (!sessionId || sessionId === "unavailable") return null;
     try {
       const result = await this.runner.run([this.binary, "agent", "lifecycle", sessionId, ...action]);
-      if (result.exitCode !== 0) return null;
+      if (result.exitCode !== 0) {
+        try {
+          const failure = JSON.parse(result.stdout) as { error?: { code?: unknown } };
+          if (failure.error?.code === "partial_delivery") return { status: "unknown", generation: "", delivered: false, partial: true };
+        } catch { /* not a structured error */ }
+        return null;
+      }
       const native = parseEnvelope(result.stdout);
       if (native.type !== "agent_lifecycle"
         || !["idle", "working", "blocked", "unknown"].includes(String(native.status))

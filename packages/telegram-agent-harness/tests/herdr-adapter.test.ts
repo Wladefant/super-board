@@ -128,6 +128,17 @@ describe("HerdrAdapter", () => {
     ]);
   });
 
+  test("native partial_delivery is surfaced as unsent typed text and never retried", async () => {
+    const runner = new FakeRunner([
+      { exitCode: 1, stdout: JSON.stringify({ id: "cli:agent:lifecycle", error: { code: "partial_delivery", message: "x" } }), stderr: "" },
+    ]);
+    const adapter = new HerdrAdapter(runner);
+    const result = await adapter.prompt("builder", "typed but not entered");
+    expect(result.ok).toBe(false);
+    expect(result.detail).toContain("unsent");
+    expect(runner.calls).toHaveLength(1);
+  });
+
   test("malformed and empty success envelopes rejected", async () => {
     for (const malformed of [
       {},
