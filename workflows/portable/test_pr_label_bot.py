@@ -97,6 +97,16 @@ class Sweep(unittest.TestCase):
         rep = bot.run_sweep("o/r", True, 5, runner=self.fake([pr(1, [f("a.py", 400)])], ["size:XL"], log))
         self.assertEqual(rep["readback_failed"], [1])  # fake readback returns size:M, not XL
 
+    def test_negative_or_zero_cap_writes_and_creates_nothing(self):
+        for cap in (0, -1):
+            log = []
+            bot.run_sweep("o/r", True, cap, runner=self.fake([pr(1, [f("a.py", 40)]), pr(2, [f("a.py", 400)])], [], log))
+            self.assertFalse(any(c[:3] in (["gh", "pr", "edit"], ["gh", "label", "create"]) for c in log), cap)
+
+    def test_capped_file_list_gets_conservative_risk_high(self):
+        files = [f(f"f{i}.py", 1, 0) for i in range(100)]
+        self.assertEqual(bot.risk_labels(pr(9, files)), ["risk:high"])
+
     def test_missing_size_label_is_created_live_only(self):
         log = []
         bot.run_sweep("o/r", True, 5, runner=self.fake([pr(1, [f("a.py", 40)])], [], log))

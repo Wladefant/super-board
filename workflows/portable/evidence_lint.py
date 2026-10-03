@@ -61,11 +61,20 @@ def _strip_code(text: str) -> str:
     return INLINE_CODE_RE.sub("", FENCE_RE.sub("", text))
 
 
+BANNED_HOSTS = frozenset({"raw.githubusercontent.com", "gist.githubusercontent.com", "i.ibb.co", "ibb.co", "imgur.com",
+                          "i.imgur.com", "0x0.st", "files.catbox.moe", "postimg.cc", "i.postimg.cc"})
+
+
+def _host(url: str) -> str:
+    m = re.match(r"^https?://([^/:?#]+)", url.strip(), re.IGNORECASE)
+    return m.group(1).lower() if m else ""
+
+
 def classify_target(target: str) -> Optional[Violation]:
     """Return a Violation if `target` is not an approved media link, else None."""
     t = target.strip()
     low = t.lower()
-    if low.startswith("https://raw.githubusercontent.com") or "raw.githubusercontent.com" in low:
+    if _host(t) == "raw.githubusercontent.com":
         return Violation("raw-githubusercontent", t, "raw.githubusercontent.com 404s on private repos")
     if low.startswith("file:") or re.match(r"^[a-zA-Z]:[\\/]", t) or t.startswith(("\\\\", "/", "~")):
         return Violation("local-path", t, "local filesystem path")
@@ -100,9 +109,7 @@ def lint_text(text: str) -> List[Violation]:
         url = m.group(0).rstrip(".,;")
         if url in md_targets:
             continue
-        if "raw.githubusercontent.com" in url.lower():
-            add(classify_target(url))
-        elif MEDIA_EXT_RE.search(url) or "/user-attachments/" in url:
+        if _host(url) in BANNED_HOSTS or MEDIA_EXT_RE.search(url) or "/user-attachments/" in url:
             add(classify_target(url))
     return found
 

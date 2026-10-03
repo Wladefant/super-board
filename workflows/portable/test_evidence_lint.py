@@ -56,6 +56,13 @@ class LintForms(unittest.TestCase):
         text = "Do not use `![x](C:\\a.png)`.\n```\n<img src=x>\nhttps://raw.githubusercontent.com/a/b\n```\n"
         self.assertEqual(el.lint_text(text), [])
 
+    def test_approved_pinned_url_containing_banned_host_text_passes(self):
+        self.assertEqual(el.lint_text(f"![x](https://github.com/o/r/raw/{SHA}/notes-on-raw.githubusercontent.com.png)"), [])
+
+    def test_extensionless_banned_host_in_reference_style_is_rejected(self):
+        text = "![x][ref]\n\n[ref]: https://i.ibb.co/Xy/shot\n"
+        self.assertEqual(forms(text), ["foreign-host"])
+
     def test_plain_links_are_not_media(self):
         self.assertEqual(el.lint_text("See https://github.com/o/r/issues/1 and https://example.com/page"), [])
 

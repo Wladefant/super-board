@@ -14,8 +14,8 @@ import project_drift as pd
 REPO = "o/r"
 
 
-def it(n, state="open", is_pr=False, labels=(), milestone="M1", merged=False):
-    return {"number": n, "node_id": f"N{n}", "state": state, "is_pr": is_pr, "merged": merged,
+def it(n, state="open", is_pr=False, labels=(), milestone="M1", state_reason=None):
+    return {"number": n, "node_id": f"N{n}", "state": state, "is_pr": is_pr, "state_reason": state_reason,
             "labels": list(labels), "milestone": milestone}
 
 
@@ -44,11 +44,17 @@ class Detect(unittest.TestCase):
 
     def test_closed_issue_not_done_repaired_but_merged_pr_is_report_only(self):
         board = {(REPO, 4): entry(4, "Building"), (REPO, 5): entry(5, "QA")}
-        f = pd.detect(REPO, [it(4, state="closed", labels=["kind:task"]), it(5, state="closed", is_pr=True, merged=True)], board)
-        self.assertEqual(codes(f), [("closed-not-done", 4), ("field-unset", 4), ("merged-not-done", 5)])
+        f = pd.detect(REPO, [it(4, state="closed", labels=["kind:task"]), it(5, state="closed", is_pr=True)], board)
+        self.assertEqual(codes(f), [("closed-not-done", 4), ("field-unset", 4), ("pr-closed-not-done", 5)])
         by = {x["number"]: x for x in f if x["code"] != "field-unset"}
         self.assertEqual(by[4]["repair"], [("Status", "Done")])
         self.assertIsNone(by[5]["repair"])  # policy: merges never auto-Done
+
+    def test_not_planned_closure_is_report_only(self):
+        board = {(REPO, 20): entry(20, "Backlog", kind="Task")}
+        f = pd.detect(REPO, [it(20, state="closed", labels=["kind:task"], state_reason="not_planned")], board)
+        self.assertEqual(codes(f), [("closed-unplanned-not-done", 20)])
+        self.assertIsNone(f[0]["repair"])
 
     def test_open_but_done_and_status_unset(self):
         board = {(REPO, 6): entry(6, "Done"), (REPO, 7): entry(7, None)}
@@ -126,6 +132,27 @@ class Apply(unittest.TestCase):
         self.assertEqual(res["deferred_items"], 1)
         self.assertLessEqual(res["writes"], 9)
 
+    def test_cap_counts_attempts_that_raise(self):
+        items = [it(n, labels=["kind:bug"]) for n in (1, 2, 3)]
+        findings = pd.detect(REPO, items, {})
+
+        def boom(query, variables):
+            raise RuntimeError("transport error after server applied it")
+
+        res = pd.apply_repairs(findings, {(REPO, i["number"]): i for i in items}, {}, SCHEMA, boom, 3)
+        self.assertEqual(res["writes"], 1)  # the attempt that raised still counts
+        self.assertEqual(len(res["failed"]), 1)
+        self.assertEqual(res["deferred_items"], 2)  # 1 spent + 3 planned > cap 3
+
+    def test_recheck_skips_items_whose_state_changed(self):
+        board = {(REPO, 4): entry(4, "Building", kind="Task")}
+        items = [it(4, state="closed", labels=["kind:task"])]
+        findings = pd.detect(REPO, items, board)
+        g = FakeGql()
+        res = pd.apply_repairs(findings, {(REPO, 4): items[0]}, board, SCHEMA, g, 10, recheck=lambda r, n: "open")
+        self.assertEqual(res["skipped_state_changed"], [f"{REPO}#4"])
+        self.assertEqual(g.mutations(), 0)
+
     def test_readback_mismatch_is_reported_failed(self):
         items = [it(1, labels=["kind:bug"])]
         findings = pd.detect(REPO, items, {})
@@ -165,6 +192,13 @@ class Sweep(unittest.TestCase):
         self.assertEqual(rep["by_repo"]["x/y"]["missing-from-project"], 1)
 
     def test_quota_near_reserve_halts(self):
+        with self.assertRaises(pd.QuotaError):
+            pd.run_sweep([REPO], [REPO], "own", 5, True, 10, gql=fake_gql_factory([]), lister=lambda r: [], quota=lambda: 1100)
+
+    def test_write_cap_is_derived_from_remaining_quota(self):
+        rep = pd.run_sweep([REPO], [REPO], "own", 5, True, 100000, gql=fake_gql_factory([]),
+                           lister=lambda r: [], quota=lambda: 1400, recheck=None)
+        self.assertEqual(rep["effective_max_writes"], 150)  # (1400-1000-100)//2
         with self.assertRaises(pd.QuotaError):
             pd.run_sweep([REPO], [REPO], "own", 5, True, 10, gql=fake_gql_factory([]), lister=lambda r: [], quota=lambda: 1100)
 

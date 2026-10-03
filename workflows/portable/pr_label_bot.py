@@ -85,6 +85,8 @@ def size_label(lines: int) -> str:
 
 def risk_labels(pr: Dict[str, Any]) -> List[str]:
     found = set()
+    if len(pr.get("files") or []) >= FILE_LIST_CAP:
+        found.add("risk:high")  # capped list may hide a risky path; same conservative rule as the review gate
     for f in pr.get("files") or []:
         path = (f.get("path") or "").replace("\\", "/")
         if MONEY_PATH_RE.search(path):
@@ -130,13 +132,15 @@ def run_sweep(repo: str, live: bool, max_writes: int, only_pr: Optional[int] = N
         prs = [p for p in prs if p["number"] == only_pr]
     plans = [p for p in (plan_pr(pr) for pr in prs) if p["add"] or p["remove"]]
     existing = {l["name"] for l in json.loads(runner(["gh", "label", "list", "-R", repo, "-L", "300", "--json", "name"], 60))}
-    needed = sorted({a for p in plans for a in p["add"]})
+    max_writes = max(0, max_writes)
+    batch = plans[:max_writes]
+    needed = sorted({a for p in batch for a in p["add"]})
     created = ensure_labels(repo, needed, existing, live, runner)
 
     applied, failed = [], []
     skipped = max(0, len(plans) - max_writes)
     if live:
-        for plan in plans[:max_writes]:
+        for plan in batch:
             cmd = ["gh", "pr", "edit", str(plan["number"]), "-R", repo]
             for a in plan["add"]:
                 cmd += ["--add-label", a]

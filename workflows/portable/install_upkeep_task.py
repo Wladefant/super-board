@@ -37,10 +37,11 @@ def build_cmd(worktree: str) -> str:
         f'git -C "{worktree}" fetch --quiet origin main || exit /b 1',
         f'git -C "{worktree}" checkout --quiet --detach origin/main || exit /b 1',
         f'echo === %DATE% %TIME% pr_label_bot >> "{log}"',
-        f'"{PYTHON}" "{portable}\\pr_label_bot.py" --repo {SB_REPO} --live --max-writes 20 >> "{log}" 2>&1',
+        "set RC=0",
+        f'"{PYTHON}" "{portable}\\pr_label_bot.py" --repo {SB_REPO} --live --max-writes 20 >> "{log}" 2>&1 || set RC=1',
         f'echo === %DATE% %TIME% project_drift >> "{log}"',
-        f'"{PYTHON}" "{portable}\\project_drift.py" --repo {SB_REPO} --repo {POLY_REPO} --repair-repo {SB_REPO} --live --max-writes 60 >> "{log}" 2>&1',
-        "exit /b 0",
+        f'"{PYTHON}" "{portable}\\project_drift.py" --repo {SB_REPO} --repo {POLY_REPO} --repair-repo {SB_REPO} --live --max-writes 60 >> "{log}" 2>&1 || set RC=1',
+        "exit /b %RC%",
         "",
     ])
 

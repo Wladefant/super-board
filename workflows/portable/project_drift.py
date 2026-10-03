@@ -134,7 +134,7 @@ def graphql_remaining() -> int:
 
 def list_repo_items(repo: str) -> List[Dict[str, Any]]:
     """All issues and PRs of a repo via REST (one list, PRs carry a pull_request key)."""
-    jq = ('.[] | {number, node_id, state, is_pr: (.pull_request != null), merged: (.pull_request.merged_at != null), '
+    jq = ('.[] | {number, node_id, state, state_reason, is_pr: (.pull_request != null), '
           'labels: [.labels[].name], milestone: (.milestone.title // null)}')
     proc = subprocess.run(["gh", "api", "--paginate", f"repos/{repo}/issues?state=all&per_page=100", "-q", jq],
                           capture_output=True, text=True, timeout=180)
@@ -222,9 +222,12 @@ def detect(repo: str, items: List[Dict[str, Any]], board: Dict[Tuple[str, int], 
             if not entry["Status"]:
                 add("status-unset", it, [("Status", expected_status(it))])
             elif not is_open and not it["is_pr"] and entry["Status"] != "Done":
-                add("closed-not-done", it, [("Status", "Done")], f"was {entry['Status']}")
+                if it.get("state_reason") in (None, "completed"):
+                    add("closed-not-done", it, [("Status", "Done")], f"was {entry['Status']}")
+                else:  # not_planned / duplicate: a person decides what the board should say
+                    add("closed-unplanned-not-done", it, None, f"{it['state_reason']}, was {entry['Status']}")
             elif not is_open and it["is_pr"] and entry["Status"] != "Done":
-                add("merged-not-done" if it["merged"] else "closed-pr-not-done", it, None, f"was {entry['Status']}")
+                add("pr-closed-not-done", it, None, f"was {entry['Status']}")  # policy: merges never auto-Done
             elif is_open and entry["Status"] == "Done":
                 add("open-but-done", it, [("Status", expected_status(it))])
             for fld, vals in sorted(want.items()):
@@ -248,13 +251,22 @@ def count_by_code(findings: List[Dict[str, Any]]) -> Dict[str, int]:
     return dict(sorted(out.items()))
 
 
+def current_state(repo: str, number: int) -> str:
+    proc = subprocess.run(["gh", "api", f"repos/{repo}/issues/{number}", "-q", ".state"],
+                          capture_output=True, text=True, timeout=30)
+    if proc.returncode != 0:
+        raise RuntimeError(f"state recheck failed for {repo}#{number}: {proc.stderr.strip()[:200]}")
+    return proc.stdout.strip()
+
+
 def apply_repairs(findings: List[Dict[str, Any]], items_by_key: Dict[Tuple[str, int], Dict[str, Any]],
                   board: Dict[Tuple[str, int], Dict[str, Any]], schema: Dict[str, Any], gql: GQL,
-                  max_writes: int) -> Dict[str, Any]:
+                  max_writes: int, recheck: Optional[Callable[[str, int], str]] = None) -> Dict[str, Any]:
     """Group repairs per item (an add and its field sets are one unit). Count board mutations against the cap."""
     writes = 0
     done: List[str] = []
     failed: List[str] = []
+    skipped_changed: List[str] = []
     deferred = 0
     grouped: Dict[Tuple[str, int], Dict[str, Any]] = {}
     for f in findings:
@@ -273,33 +285,44 @@ def apply_repairs(findings: List[Dict[str, Any]], items_by_key: Dict[Tuple[str, 
             continue
         label = f"{key[0]}#{key[1]}"
         try:
+            if recheck is not None and "Status" in g["sets"]:
+                if recheck(key[0], key[1]) != items_by_key[key]["state"]:
+                    skipped_changed.append(label)
+                    continue
+            # Count each attempt BEFORE the call: a mutation that reaches the server and then raises still spent budget.
             if g["add"]:
+                writes += 1
                 node_id = items_by_key[key]["node_id"]
                 res = gql(ADD_MUTATION, {"project": schema["project_id"], "content": node_id})
                 item_id = res["data"]["addProjectV2ItemById"]["item"]["id"]
             else:
                 item_id = board[key]["item_id"]
-            writes += 1 if g["add"] else 0
             for fld, val in g["sets"].items():
                 opt = schema["fields"][fld]["options"].get(val)
                 if not opt:
                     raise RuntimeError(f"no option {val!r} on field {fld}")
-                gql(SET_MUTATION, {"project": schema["project_id"], "item": item_id, "field": schema["fields"][fld]["id"], "option": opt})
                 writes += 1
+                gql(SET_MUTATION, {"project": schema["project_id"], "item": item_id, "field": schema["fields"][fld]["id"], "option": opt})
             back = (gql(READBACK_QUERY, {"item": item_id}).get("data") or {}).get("node") or {}
             ok = all(((back.get(f.lower()) or {}).get("name")) == v for f, v in g["sets"].items())
             (done if ok else failed).append(label)
         except Exception as e:
             failed.append(f"{label}: {e}")
-    return {"writes": writes, "repaired": done, "failed": failed, "deferred_items": deferred}
+    return {"writes": writes, "repaired": done, "failed": failed, "skipped_state_changed": skipped_changed,
+            "deferred_items": deferred}
 
 
 def run_sweep(repos: List[str], repair_repos: List[str], owner: str, project: int, live: bool, max_writes: int,
               gql: GQL = default_graphql_runner, lister: RestLister = list_repo_items,
-              quota: Callable[[], int] = graphql_remaining) -> Dict[str, Any]:
+              quota: Callable[[], int] = graphql_remaining,
+              recheck: Optional[Callable[[str, int], str]] = current_state) -> Dict[str, Any]:
     remaining = quota()
-    if remaining - 150 < GQL_RESERVE:
+    max_writes = max(0, max_writes)
+    # Reading the board and schema costs about 100 points of headroom; every write may be followed by a readback (x2).
+    affordable = (remaining - GQL_RESERVE - 100) // 2
+    if affordable < 1:
         raise QuotaError(f"GraphQL remaining {remaining} would breach the {GQL_RESERVE}-point reserve")
+    max_writes = min(max_writes, affordable)
     schema = fetch_schema(gql, owner, project)
     board = fetch_board(gql, owner, project)
     all_findings: List[Dict[str, Any]] = []
@@ -322,7 +345,8 @@ def run_sweep(repos: List[str], repair_repos: List[str], owner: str, project: in
         "graphql_remaining_at_start": remaining,
     }
     if live:
-        report["applied"] = apply_repairs(repairable, items_by_key, board, schema, gql, max_writes)
+        report["applied"] = apply_repairs(repairable, items_by_key, board, schema, gql, max_writes, recheck=recheck)
+        report["effective_max_writes"] = max_writes
     else:
         report["applied"] = {"writes": 0}
     report["sample"] = [f"{f['repo']}#{f['number']} {f['code']} {f['detail']}".strip() for f in all_findings if f["repair"] is None][:25]
