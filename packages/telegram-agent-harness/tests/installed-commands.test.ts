@@ -24,6 +24,18 @@ function fixture(idle = true) {
   const runner: CommandRunner = { run: async argv => {
     await Promise.resolve(); (calls as string[][]).push([...argv]);
     if (argv[0] === "veyyon") return { exitCode: 0, stderr: "", stdout: JSON.stringify({ reports: [{ provider: "Codex Spark", limits: [{ label: "5-hour", status: "ok", amount: { remaining: 85, unit: "percent" }, window: { resetsAt: Date.now() + 3600000 } }] }] }) };
+    if (argv[2] === "lifecycle") {
+      const action = argv[4];
+      if (action === "snapshot") {
+        return { exitCode: 0, stderr: "", stdout: JSON.stringify({ result: { type: "agent_lifecycle", status: "idle", generation: "gen-h1", delivered: false } }) };
+      }
+      if (action === "submit") {
+        return { exitCode: 0, stderr: "", stdout: JSON.stringify({ result: { type: "agent_lifecycle", status: "working", generation: "gen-h1", delivered: true } }) };
+      }
+      if (action === "abort") {
+        return { exitCode: 0, stderr: "", stdout: JSON.stringify({ result: { type: "agent_lifecycle", status: "idle", generation: argv[5] ?? "gen-h1", delivered: true } }) };
+      }
+    }
     return { exitCode: 0, stderr: "", stdout: JSON.stringify({ result: argv[2] === "list" ? { agents: [{ pane_id: "h1", name: "Herdr <worker>", agent_status: "idle" }] } : { agent: { pane_id: "h1", name: "Worker", agent_status: "idle" } } }) };
   } };
   return { port, runner, sent, photos, inbound, calls, state };
@@ -32,7 +44,10 @@ function fixture(idle = true) {
 test("agents lists actual adapter and bound root, escapes labels, admits missing worker registry", async () => {
   const f = fixture();
   expect(await handleInstalledCommand("/agents", f.port, f.runner)).toBe(true);
-  expect(f.calls).toEqual([["herdr", "agent", "list"]]);
+  expect(f.calls).toEqual([
+    ["herdr", "agent", "list"],
+    ["herdr", "agent", "lifecycle", "Herdr <worker>", "snapshot"],
+  ]);
   expect(f.sent[0]).toContain("herdr:Herdr &lt;worker&gt;"); expect(f.sent[0]).toContain("veyyon:root");
   expect(f.sent[0]).toContain("&lt;worker&gt;"); expect(f.sent[0]).toContain("registry is not exposed");
 });
@@ -58,9 +73,9 @@ test("prompt never redirects a worker or switched session to Main", async () => 
   await handleInstalledCommand("/prompt veyyon:root hello", f.port, f.runner);
   expect(f.inbound).toHaveLength(0);
 });
-test("Herdr prompt uses get-state then actual CLI prompt argv", async () => {
+test("Herdr prompt uses native lifecycle submit with no legacy fallback", async () => {
   const f = fixture(); await handleInstalledCommand("/prompt herdr:h1 hello world", f.port, f.runner);
-  expect(f.calls).toEqual([["herdr", "agent", "get", "h1"], ["herdr", "agent", "prompt", "h1", "hello world"]]);
+  expect(f.calls).toEqual([["herdr", "agent", "lifecycle", "h1", "submit", "hello world"]]);
   expect(f.inbound).toHaveLength(0);
 });
 test("shot sends latest PNG as native photo with session caption", async () => {

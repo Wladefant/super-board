@@ -47,25 +47,105 @@ test("successful handshake clears its deadline while a later request is active",
 });
 
 for (const scenario of ["idle-to-prompt", "active-to-idle-abort", "active-to-subsequent-abort"] as const) {
-  test(`Herdr race reproduction: ${scenario}`, async () => {
+  test(`Herdr race regression: ${scenario}`, async () => {
     let state = scenario === "idle-to-prompt" ? "idle" : "working";
     let turn = 1;
-    const deliveries: { state: string; turn: number; command: string }[] = [];
+    const calls: string[][] = [];
     const runner: CommandRunner = { async run(argv) {
-      if (argv[2] === "get") {
-        const snapshot = { agent: { name: "builder", agent_status: state } };
-        // The native lifecycle changes after the snapshot, before the next CLI request.
+      calls.push([...argv]);
+      if (scenario === "idle-to-prompt") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            result: { type: "agent_lifecycle", status: "working", generation: "gen-1", delivered: false },
+          }),
+          stderr: "",
+        };
+      }
+      if (argv[4] === "snapshot") {
+        const snapshot = { type: "agent_lifecycle", status: state, generation: `gen-${turn}`, delivered: false };
         state = scenario === "active-to-idle-abort" ? "idle" : "working";
         if (scenario === "active-to-subsequent-abort") turn++;
         return { exitCode: 0, stdout: JSON.stringify({ result: snapshot }), stderr: "" };
       }
-      deliveries.push({ state, turn, command: argv[2] });
-      return { exitCode: 0, stdout: JSON.stringify({ result: {} }), stderr: "" };
+      const generation = scenario === "active-to-subsequent-abort" ? `gen-${turn}` : argv[5];
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          result: { type: "agent_lifecycle", status: state, generation, delivered: false },
+        }),
+        stderr: "",
+      };
     } };
     const adapter = new HerdrAdapter(runner);
     const result = scenario === "idle-to-prompt" ? await adapter.prompt("builder", "hello") : await adapter.abort("builder");
-    // These assertions characterize the confirmed upstream defect, not closure.
-    expect(result.ok).toBe(true);
-    expect(deliveries).toEqual([{ state, turn, command: scenario === "idle-to-prompt" ? "prompt" : "send-keys" }]);
+    expect(result.ok).toBe(false);
+    if (scenario === "idle-to-prompt") {
+      expect(result).toMatchObject({ disposition: "rejected" });
+      expect(calls).toEqual([["herdr", "agent", "lifecycle", "builder", "submit", "hello"]]);
+    } else {
+      expect(calls).toEqual([
+        ["herdr", "agent", "lifecycle", "builder", "snapshot"],
+        ["herdr", "agent", "lifecycle", "builder", "abort", "gen-1"],
+      ]);
+    }
   });
 }
+
+test("Herdr abort: matching delivered:true ack with the same token succeeds", async () => {
+  const calls: string[][] = [];
+  const runner: CommandRunner = {
+    async run(argv) {
+      calls.push([...argv]);
+      if (argv[4] === "snapshot") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({ result: { type: "agent_lifecycle", status: "working", generation: "gen-token-abc", delivered: false } }),
+          stderr: "",
+        };
+      }
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({ result: { type: "agent_lifecycle", status: "idle", generation: "gen-token-abc", delivered: true } }),
+        stderr: "",
+      };
+    },
+  };
+  const adapter = new HerdrAdapter(runner);
+  const result = await adapter.abort("builder");
+  expect(result.ok).toBe(true);
+  expect(result.detail).toBe("Herdr confirmed the interrupt reached the observed generation.");
+  expect(calls).toEqual([
+    ["herdr", "agent", "lifecycle", "builder", "snapshot"],
+    ["herdr", "agent", "lifecycle", "builder", "abort", "gen-token-abc"],
+  ]);
+});
+
+test("Herdr abort: mismatched generation token on ack fails without raw fallback", async () => {
+  const calls: string[][] = [];
+  const runner: CommandRunner = {
+    async run(argv) {
+      calls.push([...argv]);
+      if (argv[4] === "snapshot") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({ result: { type: "agent_lifecycle", status: "working", generation: "gen-token-abc", delivered: false } }),
+          stderr: "",
+        };
+      }
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({ result: { type: "agent_lifecycle", status: "idle", generation: "gen-token-diff", delivered: true } }),
+        stderr: "",
+      };
+    },
+  };
+  const adapter = new HerdrAdapter(runner);
+  const result = await adapter.abort("builder");
+  expect(result.ok).toBe(false);
+  expect(result.detail).toBe("Herdr did not confirm that abort. No raw interrupt or retry was sent.");
+  expect(calls).toEqual([
+    ["herdr", "agent", "lifecycle", "builder", "snapshot"],
+    ["herdr", "agent", "lifecycle", "builder", "abort", "gen-token-abc"],
+  ]);
+});

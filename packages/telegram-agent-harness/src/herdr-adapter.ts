@@ -73,7 +73,7 @@ function toSession(value: unknown, observedAt: number): AgentSession {
     project: stringValue(agent.foreground_cwd) ?? stringValue(agent.cwd),
     observedAt,
     detail: state === "unknown" ? "Herdr cannot classify this agent yet." : kind,
-    canPrompt: state === "idle",
+    canPrompt: false,
   };
 }
 
@@ -106,7 +106,7 @@ export class HerdrAdapter implements AgentHarnessAdapter {
       }];
     }
     try {
-      return parseHerdrAgentList(result.stdout, observedAt);
+      return await Promise.all(parseHerdrAgentList(result.stdout, observedAt).map(session => this.withLifecycle(session)));
     } catch {
       return [{
         backend: this.backend,
@@ -146,7 +146,7 @@ export class HerdrAdapter implements AgentHarnessAdapter {
     }
     try {
       const envelope = parseEnvelope(result.stdout);
-      return toSession(envelope.agent, Date.now());
+      return await this.withLifecycle(toSession(envelope.agent, Date.now()));
     } catch {
       return {
         backend: this.backend,
@@ -163,21 +163,15 @@ export class HerdrAdapter implements AgentHarnessAdapter {
   async prompt(sessionId: string, text: string, _mode: PromptMode = "auto"): Promise<PromptResult> {
     const prompt = text.trim();
     if (!prompt) return { ok: false, disposition: "rejected", detail: "Prompt text is empty." };
-    const state = await this.getState(sessionId);
-    if (state.state !== "idle") {
+    const result = await this.lifecycle(sessionId, ["submit", prompt]);
+    if (!result?.delivered || result.status !== "working") {
       return {
         ok: false,
         disposition: "rejected",
-        detail: state.state === "working"
-          ? "Herdr cannot safely queue or steer this busy agent. Nothing was sent."
-          : `Agent is ${state.state}; nothing was sent.`,
+        detail: "Native idle-only delivery was not confirmed. No fallback or retry was attempted.",
       };
     }
-    const result = await this.runner.run([this.binary, "agent", "prompt", sessionId, prompt]);
-    if (result.exitCode !== 0) {
-      return { ok: false, disposition: "rejected", detail: "Herdr rejected the prompt; nothing was retried." };
-    }
-    return { ok: true, disposition: "started", detail: "Prompt delivered to the idle Herdr agent." };
+    return { ok: true, disposition: "started", detail: "Herdr confirmed delivery to the reserved idle generation." };
   }
 
   async answer(_sessionId: string, _interactionId: string, _answer: DecisionAnswer): Promise<ActionResult> {
@@ -185,14 +179,40 @@ export class HerdrAdapter implements AgentHarnessAdapter {
   }
 
   async abort(sessionId: string): Promise<ActionResult> {
-    const state = await this.getState(sessionId);
-    if (state.state !== "working" && state.state !== "blocked") {
-      return { ok: false, detail: `Agent is ${state.state}; there is no observed active turn to abort.` };
+    const observed = await this.lifecycle(sessionId, ["snapshot"]);
+    if (!observed || observed.delivered || !["working", "blocked"].includes(observed.status)) {
+      return { ok: false, detail: "Herdr did not expose an active native generation to abort." };
     }
-    const result = await this.runner.run([this.binary, "agent", "send-keys", sessionId, "ctrl+c"]);
-    return result.exitCode === 0
-      ? { ok: true, detail: "Abort signal sent to the selected Herdr agent." }
-      : { ok: false, detail: "Herdr could not abort the selected agent." };
+    const result = await this.lifecycle(sessionId, ["abort", observed.generation]);
+    return result?.delivered && result.generation === observed.generation
+      ? { ok: true, detail: "Herdr confirmed the interrupt reached the observed generation." }
+      : { ok: false, detail: "Herdr did not confirm that abort. No raw interrupt or retry was sent." };
+  }
+
+  private async lifecycle(sessionId: string, action: string[]): Promise<{
+    status: string;
+    generation: string;
+    delivered: boolean;
+  } | null> {
+    if (!sessionId || sessionId === "unavailable") return null;
+    try {
+      const result = await this.runner.run([this.binary, "agent", "lifecycle", sessionId, ...action]);
+      if (result.exitCode !== 0) return null;
+      const native = parseEnvelope(result.stdout);
+      if (native.type !== "agent_lifecycle"
+        || !["idle", "working", "blocked", "unknown"].includes(String(native.status))
+        || typeof native.generation !== "string" || !native.generation
+        || typeof native.delivered !== "boolean") return null;
+      return { status: native.status as string, generation: native.generation, delivered: native.delivered };
+    } catch {
+      return null;
+    }
+  }
+
+  private async withLifecycle(session: AgentSession): Promise<AgentSession> {
+    const native = await this.lifecycle(session.id, ["snapshot"]);
+    if (!native || native.delivered) return session;
+    return { ...session, state: mapHerdrState(native.status), canPrompt: native.status === "idle" };
   }
 
   async artifacts(_sessionId: string): Promise<ArtifactResult> {
