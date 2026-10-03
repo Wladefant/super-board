@@ -12,7 +12,7 @@ Mobbin references, no production edit before approval. This file owns the
 method here.
 
 Surface routing is the [Agent Native operating guide](https://github.com/Wladefant/super-board/blob/main/docs/architecture/AGENT-NATIVE-OPERATING-GUIDE.md).
-Work lives on the board: PolySimulator https://github.com/users/Wladefant/projects/10 -- the board is owned by the Wladefant user while `Bavariance/polysimulator` is an org repo, so GitHub refuses the repo link; add issues to the board by node ID. IDs in [BOARD-IDS](https://github.com/Wladefant/super-board/blob/main/docs/reference/BOARD-IDS.md).
+Work lives on the board: PolySimulator https://github.com/orgs/Bavariance/projects/1 -- the organization board linked to `Bavariance/polysimulator`. IDs in [BOARD-IDS](https://github.com/Wladefant/super-board/blob/main/docs/reference/BOARD-IDS.md).
 
 ## Where the truth lives
 
@@ -30,8 +30,8 @@ than designing against stale values.
 
 ## Design tokens
 
-<!-- TOKENS:BEGIN -- harvested 2026-07-28 from frontend/app/globals.css @ 3c82c13 -->
-Harvested from [`frontend/app/globals.css`](https://github.com/Bavariance/polysimulator/blob/main/frontend/app/globals.css).
+<!-- TOKENS:BEGIN -- harvested 2026-07-28 from frontend/app/globals.css @ 3c82c13; reconciled 2026-10-03 against staging globals.css + tailwind.config.ts -->
+Harvested from [`frontend/app/globals.css`](https://github.com/Bavariance/polysimulator/blob/main/frontend/app/globals.css). Extra Tailwind-level tokens, the light-theme proposal and formatting conventions are in [`references/polysim-tokens.md`](references/polysim-tokens.md).
 
 **Colour**
 
@@ -56,11 +56,10 @@ referenced by name from the CSS comments: `accent.green #2dd6a0`,
 `accent.amber #f5c769`, `accent.blue #4f8dff`. Read that file too before using
 them; the CSS is not their source.
 
-**Type** — `DM Sans` via `--font-sans`, then system stack. Sizes `--font-size-xs`
+**Type** — `DM Sans` via `--font-sans`, self-hosted (`@font-face` in `globals.css`), then system stack. `--font-display` is `Clash Display` and `--font-mono` is `Geist Mono`, both wired into Tailwind `fontFamily.display|mono` with fallbacks. Sizes `--font-size-xs`
 `0.7rem` · `sm` `0.85rem` · `base` `0.95rem` · `md` `1.05rem` · `lg` `1.25rem` ·
-`xl` `2rem` · `2xl` `3rem` (drops to `2.4rem` under 860px). Line heights
-`--line-height-tight` `1.1`, `--line-height-base` `1.4`. `font-synthesis: none`
-on the weight utilities; `font-variant-numeric: tabular-nums` on `body`.
+`xl` `2rem` · `2xl` `3rem`. Line heights
+`--line-height-tight` `1.1`, `--line-height-base` `1.4`. Default text colour is `#f4f7ff` on `#050912`.
 
 **Spacing** — `--space-1..8` = `4 8 12 16 24 32 48 64` px.
 
