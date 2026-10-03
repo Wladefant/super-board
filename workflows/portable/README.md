@@ -35,3 +35,4 @@ The Gardener dead code and unused export regression command is `python test_gard
 The Verification CLI and smoke test gate regression command is `python test_verify.py`.
 The Adoption Audit regression command is `python test_adoption_audit.py`.
 The Outer-Loop webhook intake regression command is `python test_outer_loop_intake.py`.
+The Theo/T3 workflow tools (issue #208) each have a regression command: `python test_evidence_lint.py` (evidence link lint and posted-media check), `python test_pr_demo_video.py` (PR demo video step), `python test_pr_label_bot.py` (size and risk labels), `python test_project_drift.py` (Project 5 drift sweep). `install_upkeep_task.py` registers the bounded hourly sweep `SuperboardUpkeepHourly` (label bot plus drift repair, super-board only; PolySimulator is report-only).

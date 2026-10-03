@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""
+evidence_lint.py - one supported path for PR/issue evidence media.
+
+Supported media link forms (profile AGENTS.md section 8):
+  1. GitHub user attachments: https://github.com/user-attachments/assets/<uuid>
+  2. Commit-pinned raw: https://github.com/<owner>/<repo>/raw/<40-hex>/<path>
+
+Everything else is rejected before posting: raw.githubusercontent.com, relative
+or local paths, file:// URLs, third-party hosts, branch-named raw/blob refs,
+release-asset URLs (404 through GitHub's image proxy on private repos), and
+HTML <img>/<video> tags (broken in issue views, sanitized in comments).
+
+Subcommands:
+  lint <file|->                     lint Markdown text, exit 1 on any violation
+  verify-posted <github-url> [--retries N]
+                                    fetch the rendered HTML of a posted PR/issue
+                                    body or comment and require every media URL
+                                    to load (HTTP 200, image/* or video/*)
+
+Pure standard library; shells out to `gh` only for verify-posted.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from html.parser import HTMLParser
+from typing import List, Optional, Tuple
+
+UUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+ATTACHMENT_RE = re.compile(rf"^https://github\.com/user-attachments/(assets/{UUID}|files/\d+/[^\s]+)$")
+PINNED_RAW_RE = re.compile(r"^https://github\.com/[\w.-]+/[\w.-]+/raw/[0-9a-fA-F]{40}/[^\s]+$")
+
+FENCE_RE = re.compile(r"^\s*(```|~~~).*?^\s*\1\s*$", re.MULTILINE | re.DOTALL)
+INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(\s*<?([^)\s>]+)>?(?:\s+\"[^\"]*\")?\s*\)")
+HTML_MEDIA_TAG_RE = re.compile(r"<\s*(img|video|source)\b", re.IGNORECASE)
+URL_RE = re.compile(r"https?://[^\s<>)\]\"']+")
+MEDIA_EXT_RE = re.compile(r"\.(png|jpe?g|gif|webp|mp4|webm|mov)(\?|$)", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class Violation:
+    form: str
+    target: str
+    message: str
+
+    def __str__(self) -> str:
+        return f"[{self.form}] {self.message}: {self.target}"
+
+
+def _strip_code(text: str) -> str:
+    return INLINE_CODE_RE.sub("", FENCE_RE.sub("", text))
+
+
+def classify_target(target: str) -> Optional[Violation]:
+    """Return a Violation if `target` is not an approved media link, else None."""
+    t = target.strip()
+    low = t.lower()
+    if low.startswith("https://raw.githubusercontent.com") or "raw.githubusercontent.com" in low:
+        return Violation("raw-githubusercontent", t, "raw.githubusercontent.com 404s on private repos")
+    if low.startswith("file:") or re.match(r"^[a-zA-Z]:[\\/]", t) or t.startswith(("\\\\", "/", "~")):
+        return Violation("local-path", t, "local filesystem path")
+    if not re.match(r"^https?://", low):
+        return Violation("relative-path", t, "relative path does not render")
+    if ATTACHMENT_RE.match(t) or PINNED_RAW_RE.match(t):
+        return None
+    if re.search(r"^https://github\.com/[\w.-]+/[\w.-]+/(raw|blob)/", t):
+        return Violation("unpinned-ref", t, "raw/blob ref must be a full 40-hex commit SHA")
+    if "/releases/download/" in low:
+        return Violation("release-asset", t, "release-asset URLs 404 through the image proxy on private repos")
+    return Violation("foreign-host", t, "not a GitHub user-attachment or commit-pinned raw URL")
+
+
+def lint_text(text: str) -> List[Violation]:
+    body = _strip_code(text)
+    found: List[Violation] = []
+    seen = set()
+
+    def add(v: Optional[Violation]) -> None:
+        if v and (v.form, v.target) not in seen:
+            seen.add((v.form, v.target))
+            found.append(v)
+
+    for m in HTML_MEDIA_TAG_RE.finditer(body):
+        add(Violation("html-media-tag", f"<{m.group(1)}>", "use Markdown image syntax or a bare user-attachments URL"))
+    md_targets = set()
+    for m in MD_IMAGE_RE.finditer(body):
+        md_targets.add(m.group(1))
+        add(classify_target(m.group(1)))
+    for m in URL_RE.finditer(body):
+        url = m.group(0).rstrip(".,;")
+        if url in md_targets:
+            continue
+        if "raw.githubusercontent.com" in url.lower():
+            add(classify_target(url))
+        elif MEDIA_EXT_RE.search(url) or "/user-attachments/" in url:
+            add(classify_target(url))
+    return found
+
+
+# ------------------------------------------------------------ verify-posted
+class _MediaCollector(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.urls: List[Tuple[str, str]] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("img", "video", "source"):
+            d = dict(attrs)
+            src = d.get("src")
+            if src and src.startswith("http"):
+                self.urls.append((tag, src))
+
+
+def extract_media_urls(html: str) -> List[Tuple[str, str]]:
+    p = _MediaCollector()
+    p.feed(html)
+    return p.urls
+
+
+COMMENT_RE = re.compile(r"https://github\.com/([\w.-]+)/([\w.-]+)/(?:issues|pull)/(\d+)(?:#issuecomment-(\d+))?")
+
+
+def fetch_rendered_html(url: str, timeout: int = 60) -> str:
+    m = COMMENT_RE.match(url.strip())
+    if not m:
+        raise ValueError(f"not a GitHub issue/PR/comment URL: {url}")
+    owner, repo, num, cid = m.groups()
+    path = f"repos/{owner}/{repo}/issues/comments/{cid}" if cid else f"repos/{owner}/{repo}/issues/{num}"
+    proc = subprocess.run(
+        ["gh", "api", "-H", "Accept: application/vnd.github.html+json", path],
+        capture_output=True, text=True, timeout=timeout,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"gh api failed: {proc.stderr.strip()[:300]}")
+    return json.loads(proc.stdout).get("body_html") or ""
+
+
+def check_media_url(url: str, timeout: int = 30) -> Tuple[bool, str]:
+    req = urllib.request.Request(url, headers={"User-Agent": "super-board-evidence-lint", "Range": "bytes=0-1023"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            ok = resp.status in (200, 206) and (ctype.startswith("image/") or ctype.startswith("video/"))
+            return ok, f"HTTP {resp.status} {ctype}"
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}"
+    except Exception as e:  # network failure is a verification failure, never a pass
+        return False, f"error {type(e).__name__}: {e}"
+
+
+def verify_posted(url: str, retries: int = 3, delay: float = 3.0) -> Tuple[bool, List[dict]]:
+    html = ""
+    for attempt in range(retries):
+        html = fetch_rendered_html(url)
+        if extract_media_urls(html):
+            break
+        time.sleep(delay)
+    media = extract_media_urls(html)
+    results = []
+    for tag, src in media:
+        ok, detail = check_media_url(src)
+        results.append({"tag": tag, "url": src, "ok": ok, "detail": detail})
+    passed = bool(results) and all(r["ok"] for r in results)
+    return passed, results
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    lp = sub.add_parser("lint")
+    lp.add_argument("file", help="Markdown file, or - for stdin")
+    vp = sub.add_parser("verify-posted")
+    vp.add_argument("url")
+    vp.add_argument("--retries", type=int, default=3)
+    args = ap.parse_args(argv)
+
+    if args.cmd == "lint":
+        text = sys.stdin.read() if args.file == "-" else open(args.file, encoding="utf8").read()
+        violations = lint_text(text)
+        for v in violations:
+            print(v)
+        print(f"evidence-lint: {len(violations)} violation(s)")
+        return 1 if violations else 0
+
+    passed, results = verify_posted(args.url, retries=args.retries)
+    for r in results:
+        print(f"{'OK  ' if r['ok'] else 'FAIL'} <{r['tag']}> {r['url']} -> {r['detail']}")
+    if not results:
+        print("verify-posted: no media found in the rendered HTML")
+    print(f"verify-posted: {'PASS' if passed else 'FAIL'} ({len(results)} media)")
+    return 0 if passed else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
