@@ -67,15 +67,22 @@ def identify_opencode_go_window(
     if "month" in key or "30d" in key or duration_ms > 1209600000:
         return "monthly", 60.0
     return "default", 12.0
+# Antigravity now reports Claude and GPT as ONE shared pool (`claude-gpt`, 5h + weekly
+# windows, measured 2026-10-03). Claude models draw from it, so it maps to the provider
+# key the router uses for Claude (`google-antigravity:anthropic`).
+ANTIGRAVITY_FAMILY_ALIASES: Dict[str, str] = {"claude-gpt": "anthropic"}
+
+
 def antigravity_family_provider(limit_id: str) -> str:
     """Map an Antigravity limit id (`google-antigravity:<family>:<tier>:<window>`) to its provider key.
 
     The Gemini family keeps the bare `google-antigravity` key; every other family
-    (anthropic, openai) becomes `google-antigravity:<family>`.
+    (anthropic, openai, the shared claude-gpt pool) becomes `google-antigravity:<family>`.
     """
     parts = limit_id.split(":")
     if len(parts) >= 3 and parts[0] == ANTIGRAVITY_PROVIDER and parts[1] and parts[1] != "google":
-        return f"{ANTIGRAVITY_PROVIDER}:{parts[1]}"
+        family = ANTIGRAVITY_FAMILY_ALIASES.get(parts[1], parts[1])
+        return f"{ANTIGRAVITY_PROVIDER}:{family}"
     return ANTIGRAVITY_PROVIDER
 
 
