@@ -746,6 +746,9 @@ class SuperboardExecutionAdapter:
             "head_sha": expected_sha,
             "model": recommendation.get("model"),
             "agent_role": recommendation.get("agent_role"),
+            "fallback_model": recommendation.get("fallback_model"),
+            "fallback_agent_role": recommendation.get("fallback_agent_role"),
+            "fallback_note": recommendation.get("fallback_note"),
             "routing_task_type": dispatch.task.get("task_type"),
             "risk_level": dispatch.task.get("risk_level"),
             "repo_root": self.repo_root,
@@ -1649,10 +1652,21 @@ def format_adapter_summary(res: AdapterExecutionResult) -> str:
     ]
     if res.dispatch_packet:
         dp = res.dispatch_packet
+        rec_data = dp.get("recommendation") if isinstance(dp.get("recommendation"), dict) else {}
+        model = dp.get("recommended_model") or rec_data.get("model")
+        role = dp.get("recommended_role") or rec_data.get("agent_role")
+        ctx = dp.get("context_window") or (dp.get("task", {}).get("context_tokens") if isinstance(dp.get("task"), dict) else None)
         lines.extend([
-            f"Assigned Model:  {dp.get('recommended_model')} (role: {dp.get('recommended_role')})",
-            f"Context Window:  {dp.get('context_window')} tokens",
+            f"Assigned Model:  {model} (role: {role})",
+            f"Context Window:  {ctx} tokens",
         ])
+        fallback_model = rec_data.get("fallback_model") or dp.get("fallback_model")
+        if fallback_model:
+            fallback_note = rec_data.get("fallback_note") or dp.get("fallback_note")
+            fb_line = f"Fallback Model:  {fallback_model}"
+            if fallback_note:
+                fb_line += f" (NOTE: {fallback_note})"
+            lines.append(fb_line)
     if res.worker_result:
         wr = res.worker_result
         lines.extend([

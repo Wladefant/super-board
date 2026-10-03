@@ -212,6 +212,31 @@ class TestRequestValidation(_Fixture):
 
 class TestNativeDispatch(_Fixture):
 
+    def test_native_ticket_preserves_visible_fallback_note(self):
+        backend = WorkerBackend(state_dir=self.state)
+        request = self._request().to_dict()
+        note = "fallback tier is currently out (deepseek: limit_reached)"
+        request.update(fallback_model="deepseek/deepseek-flash:high",
+                       fallback_agent_role="ds-task", fallback_note=note)
+        ticket = backend.prepare_native(request)
+        self.assertTrue(ticket.ready, ticket.blocked_reason)
+        self.assertEqual(ticket.request["model"], "test-model")
+        self.assertEqual(ticket.request.get("fallback_model"), request["fallback_model"])
+        self.assertEqual(ticket.request.get("fallback_agent_role"), "ds-task")
+        self.assertEqual(ticket.request.get("fallback_note"), note)
+        self.assertIn(request["fallback_model"], ticket.prompt)
+        self.assertIn(note, ticket.prompt)
+        record_path = os.path.join(self.state, "worker_runs", ticket.run_id, "dispatch.json")
+        with open(record_path, encoding="utf-8") as stream:
+            record = json.load(stream)
+        self.assertEqual(record["request"]["fallback_note"], note)
+        self.assertIn(note, record["prompt"])
+        healthy = self._request(request_id="healthy").to_dict()
+        healthy.update(fallback_model=request["fallback_model"], fallback_note=None)
+        healthy_ticket = backend.prepare_native(healthy)
+        self.assertTrue(healthy_ticket.ready)
+        self.assertNotIn("Fallback note:", healthy_ticket.prompt)
+
     def _result(self, ticket, **over):
         result = {
             "stage": ticket.request["stage"],

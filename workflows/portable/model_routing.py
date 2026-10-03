@@ -72,6 +72,27 @@ class RiskLevel(str, Enum):
     MEDIUM = "medium"    # Internal workflows, multiple file refactors
     HIGH = "high"        # Shared contracts, security, invariants, financial/data safety
 
+HIGH_RISK_DOMAINS = frozenset({
+    "state_machine", "auth", "money", "concurrency", "migration", "schema",
+    "invariants", "billing", "wallet", "ledger", "payment", "stripe",
+    "alembic", "architecture", "architectural", "cross-cutting",
+})
+
+
+def has_critical_domain(domain_tags: Optional[List[str]]) -> bool:
+    return bool(domain_tags and any(
+        any(domain in tag.lower() for domain in HIGH_RISK_DOMAINS)
+        for tag in domain_tags
+    ))
+
+
+def reject_critical_tiny(task_type: TaskType, critical: bool) -> None:
+    if task_type == TaskType.TINY_TASK and critical:
+        raise ValueError(
+            "TINY_TASK must not carry high-risk domains, rework, or large diffs; "
+            "classify the work as implementation, reasoning, or review."
+        )
+
 
 # Verified Model Identifiers (strictly verified catalog IDs, NO fictitious names)
 MODEL_GEMINI_FLASH = "google-antigravity/gemini-3.8-flash:high"
@@ -812,6 +833,7 @@ class RoutingRecommendation:
     evidence_packet_required: bool
     # Non-blocking second opinion; never a merge gate or approval.
     advisory_model: Optional[str] = None
+    fallback_note: Optional[str] = None
 
 
 @dataclass
@@ -1264,6 +1286,37 @@ class ResetAwareModelSelector:
         return (f"{provider} is exhausted until {until.isoformat()}" if until is not None
                 else f"{provider} is exhausted")
 
+    def resolve_fallback_note(
+        self,
+        fallback_model: str,
+        provider_statuses: Optional[Dict[str, str]] = None,
+    ) -> Optional[str]:
+        """Produce a human-readable dispatch-time note if the fallback model's tier or provider
+        is out or unavailable (e.g. limitReached / exhausted / cooldown). Preserves model
+        selection while providing visibility into dead or degraded fallbacks."""
+        if not fallback_model:
+            return None
+        # 1. Exhaustion reason from quota snapshot (if recorded)
+        reason = self.provider_exhaustion_reason(fallback_model)
+        if reason:
+            return f"fallback model '{fallback_model}' tier is currently out ({reason})"
+
+        # 2. Provider statuses from usage/balance evaluation
+        fb_provider = balance_provider_for(fallback_model)
+        statuses = provider_statuses or {}
+        status = statuses.get(fb_provider)
+        if not status and hasattr(self, "evaluate_provider"):
+            prov_eval = self.evaluate_provider(fb_provider)
+            status = prov_eval.get("status")
+            if not prov_eval.get("is_available", True) and not status:
+                status = "unavailable"
+
+        out_statuses = ("limit_reached", "cooldown", "rate_limited", "not_allowed", "dormant", "down", "unavailable", "exhausted")
+        if status and str(status).lower() in out_statuses:
+            return f"fallback model '{fallback_model}' tier is currently out ({fb_provider}: {status})"
+
+        return None
+
     def set_snapshot(self, snapshot: Any):
         if snapshot is not None and isinstance(snapshot, BalanceAdapter):
             self.snapshot = snapshot.fetch_snapshot()
@@ -1594,15 +1647,7 @@ class ResetAwareModelSelector:
         }
 
         # 5. Rework-aware and review routing: force a strong first pass for critical domains, large diffs (>250 lines) or after rework.
-        HIGH_RISK_DOMAINS = {
-            "state_machine", "auth", "money", "concurrency", "migration", "schema",
-            "invariants", "billing", "wallet", "ledger", "payment", "stripe",
-            "alembic", "architecture", "architectural", "cross-cutting",
-        }
-        has_high_risk_domain = bool(domain_tags and any(
-            t.lower() in HIGH_RISK_DOMAINS or any(hr in t.lower() for hr in HIGH_RISK_DOMAINS)
-            for t in domain_tags
-        ))
+        has_high_risk_domain = has_critical_domain(domain_tags)
         hardest_tags = {"architecture", "architectural", "cross-cutting", "migration", "concurrency"}
         is_hardest_case = risk_level == RiskLevel.HIGH and bool(
             domain_tags and any(tag.lower() in hardest_tags for tag in domain_tags)
@@ -1613,6 +1658,7 @@ class ResetAwareModelSelector:
             or has_high_risk_domain
             or (diff_lines is not None and diff_lines > 250)
         )
+        reject_critical_tiny(task_type, is_rework_critical)
         is_first_pass = (rework_count <= 0)
         is_delta_review = (
             rework_count >= 1
@@ -1922,6 +1968,8 @@ class ResetAwareModelSelector:
         # Free OpenRouter second opinion for reviews: advisory only (1000 req/day free tier),
         # never a merge gate, never an approval, never a replacement for the review above.
         advisory_model = MODEL_OR_FREE_ADVISORY if task_type == TaskType.STRONG_REVIEW else None
+        fallback_note = self.resolve_fallback_note(fallback_model, provider_statuses)
+
 
         return RoutingRecommendation(
             task_type=task_type.value,
@@ -1937,6 +1985,7 @@ class ResetAwareModelSelector:
             quota_metrics=quota_metrics,
             evidence_packet_required=evidence_packet_required,
             advisory_model=advisory_model,
+            fallback_note=fallback_note,
         )
 
     def dispatch(
@@ -1978,6 +2027,13 @@ class ResetAwareModelSelector:
                 domain_tags=domain_tags,
             )
         )
+        # A precomputed recommendation must not bypass the tiny-task prohibition.
+        reject_critical_tiny(TaskType(rec.task_type), (
+            rec.risk_level == RiskLevel.HIGH.value
+            or risk_level == RiskLevel.HIGH
+            or rework_count >= 1
+            or has_critical_domain(domain_tags)
+        ))
 
         agent_role = model_to_agent_role(rec.selected_model, task_type, risk_level)
         fallback_role = model_to_agent_role(rec.fallback_model, task_type, risk_level)
@@ -2000,6 +2056,8 @@ class ResetAwareModelSelector:
 
         now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+        fallback_note = self.resolve_fallback_note(rec.fallback_model)
+
         return HarnessDispatchPacket(
             schema_version="1.0",
             generated_at_utc=now_utc,
@@ -2018,6 +2076,7 @@ class ResetAwareModelSelector:
                 "fallback_model": rec.fallback_model,
                 "fallback_provider": fallback_provider,
                 "fallback_agent_role": fallback_role,
+                "fallback_note": fallback_note,
                 "promotion_applied": rec.promotion_applied,
                 "cooldown_fallback": rec.cooldown_fallback,
                 "rationale": rec.reasoning,
@@ -2395,7 +2454,10 @@ def main():
         print(f"Risk Level:      {rec.risk_level}")
         print(f"Context Tokens:  {rec.context_tokens}")
         print(f"Selected Model:  {rec.selected_model}")
-        print(f"Fallback Model:  {rec.fallback_model}")
+        fb_line = f"Fallback Model:  {rec.fallback_model}"
+        if getattr(rec, "fallback_note", None):
+            fb_line += f" (NOTE: {rec.fallback_note})"
+        print(fb_line)
         print(f"Promotion:       {'YES (Codex surplus promoted)' if rec.promotion_applied else 'NO'}")
         print(f"Cooldown Fallbk: {'YES' if rec.cooldown_fallback else 'NO'}")
         print(f"Evidence Packet: {'REQUIRED' if rec.evidence_packet_required else 'OPTIONAL'}")

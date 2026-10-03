@@ -151,6 +151,40 @@ def tmp_quota_path() -> "Path":
 
 class TestBalanceLoaderAndRouting(unittest.TestCase):
 
+    def test_tiny_task_rejects_critical_work(self):
+        selector = ResetAwareModelSelector(
+            parse_usage_json(self.mock_usage_dict, current_time_ms=self.mock_now_ms),
+            quota_snapshot=QuotaSnapshot(),
+        )
+        cases = [
+            {"risk_level": RiskLevel.HIGH},
+            {"rework_count": 1},
+            {"domain_tags": ["money"]},
+            {"domain_tags": ["AUTH"]},
+            {"domain_tags": ["wallet-ledger"]},
+            {"domain_tags": ["concurrency"]},
+            {"diff_lines": 251},
+        ]
+        for context_tokens in (10000, 180000, 180001, 1000000):
+            for case in cases:
+                with self.subTest(context_tokens=context_tokens, case=case):
+                    with self.assertRaisesRegex(ValueError, "TINY_TASK must not carry"):
+                        selector.select_model(
+                            task_type=TaskType.TINY_TASK,
+                            context_tokens=context_tokens,
+                            **case,
+                        )
+        with self.assertRaisesRegex(ValueError, "TINY_TASK must not carry"):
+            selector.dispatch(task_type=TaskType.TINY_TASK, domain_tags=["money"])
+        safe = selector.dispatch(task_type=TaskType.TINY_TASK)
+        self.assertEqual(safe.task["task_type"], TaskType.TINY_TASK.value)
+        safe_rec = selector.select_model(task_type=TaskType.TINY_TASK)
+        for case in ({"risk_level": RiskLevel.HIGH}, {"rework_count": 1},
+                     {"domain_tags": ["money"]}):
+            with self.subTest(precomputed=case):
+                with self.assertRaisesRegex(ValueError, "TINY_TASK must not carry"):
+                    selector.dispatch(precomputed=safe_rec, **case)
+
     def setUp(self):
         # Hermetic credentials: no Z.AI/MiniMax key from the caller's environment and no
         # veyyon auth store on disk, so every selector below sees zero credential-gated
@@ -645,6 +679,10 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         selector = ResetAwareModelSelector(snapshot)
         for tt in TaskType:
             for rl in RiskLevel:
+                if tt == TaskType.TINY_TASK and rl == RiskLevel.HIGH:
+                    with self.assertRaisesRegex(ValueError, "TINY_TASK must not carry"):
+                        selector.dispatch(task_type=tt, risk_level=rl)
+                    continue
                 selector.dispatch(task_type=tt, risk_level=rl)
 
         mtime_after = os.path.getmtime(config_path) if os.path.exists(config_path) else 0
@@ -1160,6 +1198,10 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             selector = self._selector(usage)
             for task_type in TaskType:
                 for risk in RiskLevel:
+                    if task_type == TaskType.TINY_TASK and risk == RiskLevel.HIGH:
+                        with self.assertRaisesRegex(ValueError, "TINY_TASK must not carry"):
+                            selector.select_model(task_type=task_type, risk_level=risk)
+                        continue
                     rec = selector.select_model(task_type=task_type, risk_level=risk)
                     sel_prov = model_to_provider(rec.selected_model)
                     fb_prov = model_to_provider(rec.fallback_model)
@@ -1177,6 +1219,10 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         selector_blocked = self._selector(usage_blocked)
         for task_type in TaskType:
             for risk in RiskLevel:
+                if task_type == TaskType.TINY_TASK and risk == RiskLevel.HIGH:
+                    with self.assertRaisesRegex(ValueError, "TINY_TASK must not carry"):
+                        selector_blocked.select_model(task_type=task_type, risk_level=risk)
+                    continue
                 rec = selector_blocked.select_model(task_type=task_type, risk_level=risk)
                 if rec.selected_model != rec.fallback_model:
                     sel_prov = model_to_provider(rec.selected_model)
@@ -1382,6 +1428,10 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         selector = self._selector(self._usage_with_ag_families())
         for task_type in TaskType:
             for risk in RiskLevel:
+                if task_type == TaskType.TINY_TASK and risk == RiskLevel.HIGH:
+                    with self.assertRaisesRegex(ValueError, "TINY_TASK must not carry"):
+                        selector.select_model(task_type=task_type, risk_level=risk)
+                    continue
                 rec = selector.select_model(task_type=task_type, risk_level=risk)
                 for model in (rec.selected_model, rec.fallback_model):
                     self.assertNotIn("zai/", model)
@@ -1464,6 +1514,11 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
                             is_review_lane = task_type == TaskType.STRONG_REVIEW and (
                                 risk == RiskLevel.HIGH or variant)
                             for ctx in (10000, 131072, 131073, 200000, 220000, 240000):
+                                if task_type == TaskType.TINY_TASK and (risk == RiskLevel.HIGH or variant):
+                                    with self.assertRaisesRegex(ValueError, "TINY_TASK must not carry"):
+                                        selector.select_model(
+                                            task_type=task_type, risk_level=risk, context_tokens=ctx, **variant)
+                                    continue
                                 rec = selector.select_model(
                                     task_type=task_type, risk_level=risk, context_tokens=ctx, **variant)
                                 where = f"[{label}/{sorted(creds)}] {task_type.value}/{risk.value}/{variant}/{ctx}"
@@ -1611,6 +1666,10 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         for selector in (up, down):
             for task_type in TaskType:
                 for risk in RiskLevel:
+                    if task_type == TaskType.TINY_TASK and risk == RiskLevel.HIGH:
+                        with self.assertRaisesRegex(ValueError, "TINY_TASK must not carry"):
+                            selector.select_model(task_type=task_type, risk_level=risk)
+                        continue
                     rec = selector.select_model(task_type=task_type, risk_level=risk)
                     self.assertNotIn(MODEL_CHATGPT_WEB, (rec.selected_model, rec.fallback_model),
                                      f"{task_type}/{risk} must not select or fall back to chatgpt-web")
@@ -2442,6 +2501,10 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
         # Across ALL task types and risk levels, openai-codex is never selected
         for task_type in TaskType:
             for risk in RiskLevel:
+                if task_type == TaskType.TINY_TASK and risk == RiskLevel.HIGH:
+                    with self.assertRaisesRegex(ValueError, "TINY_TASK must not carry"):
+                        selector_off.select_model(task_type=task_type, risk_level=risk, allow_codex_promotion=True)
+                    continue
                 rec = selector_off.select_model(task_type=task_type, risk_level=risk, allow_codex_promotion=True)
                 self.assertFalse(
                     rec.selected_model.startswith("openai-codex/"),
@@ -2738,12 +2801,37 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             ["frontend"],
             ["docs"],
         ]
-
+        high_risk_domains = {
+            "state_machine", "auth", "money", "concurrency", "migration", "schema",
+            "invariants", "billing", "wallet", "ledger", "payment", "stripe",
+            "alembic", "architecture", "architectural", "cross-cutting",
+        }
         for task_type in TaskType:
             for risk in RiskLevel:
                 for rework in (0, 1, 2):
                     for diff in (None, 50, 200, 300, 1000):
                         for tags in domain_tag_cases:
+                            if task_type == TaskType.TINY_TASK:
+                                has_high_risk = bool(tags and any(
+                                    t.lower() in high_risk_domains or any(hr in t.lower() for hr in high_risk_domains)
+                                    for t in tags
+                                ))
+                                is_crit = (
+                                    risk == RiskLevel.HIGH
+                                    or rework >= 1
+                                    or has_high_risk
+                                    or (diff is not None and diff > 250)
+                                )
+                                if is_crit:
+                                    with self.assertRaisesRegex(ValueError, "TINY_TASK must not carry"):
+                                        selector.select_model(
+                                            task_type=task_type,
+                                            risk_level=risk,
+                                            rework_count=rework,
+                                            diff_lines=diff,
+                                            domain_tags=tags,
+                                        )
+                                    continue
                             rec = selector.select_model(
                                 task_type=task_type,
                                 risk_level=risk,
