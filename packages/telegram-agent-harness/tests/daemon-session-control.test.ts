@@ -4,7 +4,8 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { TerminalSessionControl, type SessionEvent } from "../daemon/session-control";
+import { spawn } from "node:child_process";
+import { discoverOwners, ownerIdentityMatches, TerminalSessionControl, type SessionEvent } from "../daemon/session-control";
 
 const cleanup: (() => void)[] = [];
 afterEach(() => { for (const close of cleanup.splice(0).reverse()) close(); });
@@ -85,4 +86,60 @@ test("incorrect discovery credentials cannot deliver to an owner", async () => {
   fs.writeFileSync(first.recordPath, JSON.stringify({ ...first.record, token: "f".repeat(64) }));
   await expect(control.deliver("protected", "nonce")).rejects.toThrow();
   expect(first.received).toEqual([]);
+});
+
+function publish(root: string, name: string, pid: number, extra: Record<string, unknown> = {}) {
+  const directory = path.join(root, "run", "terminals");
+  fs.mkdirSync(directory, { recursive: true });
+  const nonce = crypto.randomUUID();
+  const endpoint = process.platform === "win32" ? `\\\\.\\pipe\\veyyon-terminal-${nonce}` : path.join(root, `${nonce}.sock`);
+  const token = (crypto.randomUUID() + crypto.randomUUID()).replaceAll("-", "");
+  const file = path.join(directory, `${name}.json`);
+  fs.writeFileSync(file, JSON.stringify({ version: 1, sessionId: name, pid, cwd: root, sessionFile: path.join(root, `${name}.jsonl`), endpoint, token, ...extra }));
+  return file;
+}
+
+function idleChild() {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore", windowsHide: true });
+  cleanup.push(() => { child.kill(); });
+  return child;
+}
+
+test("a stale owner file whose PID was recycled by another live process is not an owner", async () => {
+  const { root } = context();
+  const stranger = idleChild();
+  const file = publish(root, "recycled", stranger.pid!);
+  const hourAgo = new Date(Date.now() - 3_600_000);
+  fs.utimesSync(file, hourAgo, hourAgo);
+  expect(discoverOwners(root)).toEqual([]);
+  // Same stale PID with a recorded start time that differs from the real process is also rejected.
+  publish(root, "recorded", stranger.pid!, { startedAtMs: Date.now() - 3_600_000 });
+  expect(discoverOwners(root)).toEqual([]);
+});
+
+test("a genuine single owner is discovered, with or without a recorded start time", () => {
+  const { root } = context();
+  publish(root, "legacy", process.pid);
+  expect(discoverOwners(root).map(o => o.sessionId)).toEqual(["legacy"]);
+  publish(root, "legacy", process.pid, { startedAtMs: Math.round(performance.timeOrigin) });
+  expect(discoverOwners(root).map(o => o.sessionId)).toEqual(["legacy"]);
+});
+
+test("two genuine owners for one session stay ambiguous while a recycled file beside them is ignored", async () => {
+  const { root, control } = context();
+  const first = await owner(root, "shared");
+  fs.writeFileSync(path.join(path.dirname(first.recordPath), "second.json"), JSON.stringify(first.record));
+  const stranger = idleChild();
+  const stale = publish(root, "stale-shared", stranger.pid!, { sessionId: "shared" });
+  const hourAgo = new Date(Date.now() - 3_600_000);
+  fs.utimesSync(stale, hourAgo, hourAgo);
+  expect(discoverOwners(root).length).toBe(2);
+  await expect(control.deliver("shared", "nonce")).rejects.toThrow();
+  expect(first.received).toEqual([]);
+});
+
+test("owner identity falls back to PID existence only when the OS reports no start time", () => {
+  expect(ownerIdentityMatches({}, 0, undefined)).toBe(true);
+  expect(ownerIdentityMatches({}, 1_000, 10_000)).toBe(false);
+  expect(ownerIdentityMatches({}, 10_000, 10_000)).toBe(true);
 });
