@@ -95,6 +95,11 @@ export interface PollerOptions {
    * topic — must stay unset when this is given.
    */
   forumChatId?: string;
+  /**
+   * How long a sendMessage may take before the poller gives up. A send that times out may still have
+   * been delivered, so a caller that cannot tolerate a duplicate wants this generous. Defaults to 3000 ms.
+   */
+  sendTimeoutMs?: number;
   botUsername?: string;
   slotId?: string;
 }
@@ -497,7 +502,7 @@ export class TelegramPoller {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
-          signal: AbortSignal.any([this.abortController.signal, AbortSignal.timeout(3000)]),
+          signal: AbortSignal.any([this.abortController.signal, AbortSignal.timeout(this.options.sendTimeoutMs ?? 3000)]),
         },
       );
 
@@ -563,7 +568,7 @@ export class TelegramPoller {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
-          signal: AbortSignal.any([this.abortController.signal, AbortSignal.timeout(3000)]),
+          signal: AbortSignal.any([this.abortController.signal, AbortSignal.timeout(this.options.sendTimeoutMs ?? 3000)]),
         },
       );
 
@@ -590,6 +595,34 @@ export class TelegramPoller {
     } catch {
       return false;
     }
+  }
+
+  /** Bot API call whose answer the caller classifies: `gone` is a message or topic that no longer exists. */
+  private async classifiedCall(method: string, body: Record<string, unknown>): Promise<"ok" | "gone" | "error"> {
+    try {
+      await this.paceOutbound();
+      const response = await fetch(`https://api.telegram.org/bot${this.botToken}/${method}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.any([this.abortController.signal, AbortSignal.timeout(5000)]),
+      });
+      const data = (await response.json()) as TelegramSendMessageResponse;
+      this.observeRateLimit(data);
+      if (data.ok) return "ok";
+      return /not found|can't be deleted|to delete not found|not modified/i.test(data.description ?? "") ? "gone" : "error";
+    } catch {
+      return "error";
+    }
+  }
+
+  /** Deletes one message. A message that is already gone counts as deleted. */
+  public deleteTelegramMessage(chatId: string | number, messageId: number): Promise<"ok" | "gone" | "error"> {
+    return this.classifiedCall("deleteMessage", { chat_id: chatId, message_id: messageId });
+  }
+
+  public pinTelegramMessage(chatId: string | number, messageId: number): Promise<"ok" | "gone" | "error"> {
+    return this.classifiedCall("pinChatMessage", { chat_id: chatId, message_id: messageId, disable_notification: true });
   }
   public async answerCallbackQuery(
     callbackQueryId: string,

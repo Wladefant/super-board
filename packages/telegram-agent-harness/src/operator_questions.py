@@ -52,24 +52,21 @@ class OperatorQuestions:
                     "recommendation": payload["recommendation"], "blocking_dependencies": [],
                     "authorized_responders": [route["user_id"]], "session_id": route["session_id"],
                     "status": "pending", "answer": None, "created_at": get_iso_timestamp(),
-                    "reminder_status": "active", "cadence_seconds": max(900, float(payload.get("cadence_seconds", 900))),
-                    "next_reminder_at": now, "reminder_count": 0,
                     "transport": {**route, "kind": "operator_question", "selection": None,
                                   "events": [], "problem": payload.get("problem", ""),
-                                  "impact": payload.get("impact", ""), "details_url": payload.get("details_url")},
+                                  "impact": payload.get("impact", ""), "details_url": payload.get("details_url"),
+                                  "created_ts": now, "message_id": None, "topic_message_id": None,
+                                  "topic_card_at": None, "session_finalized": False},
                 }
                 questions[identifier] = record
-            elif operation == "due":
-                return {"questions": [q for q in questions.values() if self._owns(q, route)
-                        and q.get("status") != "answered" and q.get("next_reminder_at", 0) <= now]}
             else:
                 identifier = payload.get("id")
                 record = questions.get(identifier)
                 if not record or not self._owns(record, route):
                     raise ValueError("Question is unavailable on this session and operator route")
                 if operation == "wait":
-                    if record.get("status") == "answered" and record.get("answer"):
-                        return {"question": record, "status": "answered", "answer": record["answer"]}
+                    if record.get("status") in ("answered", "dropped"):
+                        return self._closed_result(record)
                     timeout = max(0.05, float(payload.get("timeout", 60.0)))
                     poll_interval = max(0.02, float(payload.get("poll_interval", 0.05)))
                     return self._wait_for_answer(identifier, route, timeout, poll_interval)
@@ -77,6 +74,8 @@ class OperatorQuestions:
                     event_id = str(payload["event_id"])
                     events = record["transport"]["events"]
                     if not any(event["id"] == event_id for event in events):
+                        if record["status"] == "dropped":
+                            raise ValueError("Question was dropped; it takes no more answers")
                         if record["status"] == "answered":
                             raise ValueError("Answer already sent; reopen the question to change it")
                         choice = payload.get("choice")
@@ -93,18 +92,54 @@ class OperatorQuestions:
                                                 "text": text, "origin": "telegram_account", "actor_id": route["user_id"],
                                                 "authorization": False, "answered_at": get_iso_timestamp()}
                             record["status"] = "answered"
-                            record["reminder_status"] = "answered"
                         events.append({"id": event_id, "choice": choice, "text": payload.get("text"), "at": now})
+                elif operation == "resolve":
+                    # The operator answered somewhere else: the terminal, or in prose the agent heard.
+                    if record["status"] == "pending":
+                        text = str(payload.get("text", "")).strip()
+                        choice = payload.get("choice")
+                        if choice is not None and choice not in [o["id"] for o in record["options"]]:
+                            raise ValueError("That option does not belong to this question")
+                        if not text and not choice:
+                            raise ValueError("Give the answer text or the chosen option")
+                        record["answer"] = {"question_id": identifier, "choice_id": choice, "text": text,
+                                            "origin": "agent_recorded", "actor_id": route["user_id"],
+                                            "authorization": False, "answered_at": get_iso_timestamp()}
+                        record["status"] = "answered"
+                elif operation == "drop":
+                    if record["status"] == "pending":
+                        reason = str(payload.get("reason", "")).strip()
+                        if not reason:
+                            raise ValueError("Give the reason the question is dropped")
+                        record["status"] = "dropped"
+                        record["drop"] = {"reason": reason, "dropped_at": get_iso_timestamp()}
                 elif operation == "sent":
-                    record["last_notified_at"] = now
-                    record["next_reminder_at"] = now + record["cadence_seconds"]
-                    record["reminder_count"] += 1
                     record["transport"]["message_id"] = payload["message_id"]
                 elif operation != "get":
                     raise ValueError("Unknown question operation")
             if operation != "get":
                 self.manager._save_data_unlocked(data)
         return {"question": record}
+
+    def cache(self, payload: dict) -> dict:
+        """Daemon-owned Telegram message ids. Cache only: the question state never depends on them."""
+        allowed = ("topic_message_id", "topic_card_at", "session_finalized")
+        with FileLock(self.manager.lock_path):
+            data = self.manager._load_data_unlocked()
+            record = data["decisions"].get(payload.get("id"))
+            if not record or record.get("transport", {}).get("kind") != "operator_question":
+                raise ValueError("Unknown question")
+            for key in allowed:
+                if key in payload:
+                    record["transport"][key] = payload[key]
+            self.manager._save_data_unlocked(data)
+        return {"question": record}
+
+    @staticmethod
+    def _closed_result(record: dict) -> dict:
+        if record.get("status") == "dropped":
+            return {"question": record, "status": "dropped", "drop": record.get("drop")}
+        return {"question": record, "status": "answered", "answer": record["answer"]}
 
     @staticmethod
     def _owns(record: dict, route: dict) -> bool:
@@ -121,8 +156,8 @@ class OperatorQuestions:
                 record = data["decisions"].get(identifier)
                 if not record or not self._owns(record, route):
                     raise ValueError("Question is unavailable on this session and operator route")
-                if record.get("status") == "answered" and record.get("answer"):
-                    return {"question": record, "status": "answered", "answer": record["answer"]}
+                if record.get("status") in ("answered", "dropped"):
+                    return self._closed_result(record)
         with FileLock(self.manager.lock_path):
             data = self.manager._load_data_unlocked()
             record = data["decisions"].get(identifier)
@@ -146,13 +181,28 @@ class OperatorQuestions:
                }))
         return {"text": text, "reply_markup": markup, "id": record["decision_id"]}
 
+    def card_for(self, identifier: str) -> dict:
+        """A fresh card for a pending question; the daemon posts it in the Questions topic."""
+        with FileLock(self.manager.lock_path):
+            record = self.manager._load_data_unlocked()["decisions"].get(identifier)
+        if not record or record.get("transport", {}).get("kind") != "operator_question" or record["status"] != "pending":
+            raise ValueError("Question is not open")
+        return {"question": record, "card": self.card(record)}
+
 
 def main():
     request = json.load(sys.stdin)
     service = OperatorQuestions(request["decisions_path"], request["pool_path"])
-    result = service.run(request["operation"], request.get("payload", {}), request["route"])
-    if request.get("card") and "question" in result and result["question"]["status"] != "answered":
-        result["card"] = service.card(result["question"])
+    operation = request["operation"]
+    # Daemon-owned operations act on any question; they never answer or change one.
+    if operation == "cache":
+        result = service.cache(request.get("payload", {}))
+    elif operation == "card_for":
+        result = service.card_for(request["payload"]["id"])
+    else:
+        result = service.run(operation, request.get("payload", {}), request["route"])
+        if request.get("card") and "question" in result and result["question"]["status"] == "pending":
+            result["card"] = service.card(result["question"])
     print(json.dumps(result, ensure_ascii=False))
 
 

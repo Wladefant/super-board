@@ -44,15 +44,47 @@ class OperatorQuestionTests(unittest.TestCase):
             self.assertEqual(answer["choice_id"], choice)
             self.assertEqual(answer["text"], "Use larger targets but keep both search bars.")
 
-    def test_restart_keeps_unanswered_question_and_bounded_cadence(self):
+    def test_restart_keeps_unanswered_question(self):
         record = self.ask()
         self.service.run("sent", {"id": record["decision_id"], "message_id": 17}, self.route)
         restarted = module.OperatorQuestions(self.decisions, self.pool)
         persisted = restarted.run("get", {"id": record["decision_id"]}, self.route)["question"]
         self.assertEqual(persisted["status"], "pending")
         self.assertIsNone(persisted["answer"])
-        self.assertGreaterEqual(persisted["next_reminder_at"] - persisted["last_notified_at"], 900)
-        self.assertEqual(restarted.run("due", {}, self.route)["questions"], [])
+        self.assertNotIn("next_reminder_at", persisted)
+
+    def test_resolve_closes_a_question_answered_elsewhere_once(self):
+        record = self.ask()
+        closed = self.service.run("resolve", {"id": record["decision_id"], "choice": "b"}, self.route)["question"]
+        self.assertEqual((closed["status"], closed["answer"]["choice_id"], closed["answer"]["origin"]), ("answered", "b", "agent_recorded"))
+        again = self.service.run("resolve", {"id": record["decision_id"], "text": "later"}, self.route)["question"]
+        self.assertEqual(again["answer"], closed["answer"])
+        with self.assertRaisesRegex(ValueError, "answer text or the chosen option"):
+            self.service.run("resolve", {"id": self.ask("Another?")["decision_id"]}, self.route)
+        with self.assertRaisesRegex(ValueError, "does not belong"):
+            self.service.run("resolve", {"id": self.ask("Third?")["decision_id"], "choice": "zzz"}, self.route)
+
+    def test_drop_needs_a_reason_and_ends_waiting(self):
+        record = self.ask()
+        with self.assertRaisesRegex(ValueError, "reason"):
+            self.service.run("drop", {"id": record["decision_id"]}, self.route)
+        dropped = self.service.run("drop", {"id": record["decision_id"], "reason": "obsolete"}, self.route)["question"]
+        self.assertEqual((dropped["status"], dropped["drop"]["reason"]), ("dropped", "obsolete"))
+        self.assertEqual(self.service.run("wait", {"id": record["decision_id"], "timeout": 0.3}, self.route)["status"], "dropped")
+        with self.assertRaisesRegex(ValueError, "dropped"):
+            self.service.run("answer", {"id": record["decision_id"], "event_id": "e", "text": "x"}, self.route)
+
+    def test_daemon_cache_and_card_for_serve_open_questions_only(self):
+        record = self.ask()
+        cached = self.service.cache({"id": record["decision_id"], "topic_message_id": 99, "topic_card_at": 5.0, "message_id": 7})
+        self.assertEqual(cached["question"]["transport"]["topic_message_id"], 99)
+        self.assertNotEqual(cached["question"]["transport"].get("message_id"), 7)  # only cache fields are writable
+        card = self.service.card_for(record["decision_id"])
+        self.assertEqual(card["question"]["decision_id"], record["decision_id"])
+        self.assertTrue(card["card"]["reply_markup"]["inline_keyboard"])
+        self.service.run("resolve", {"id": record["decision_id"], "choice": "b"}, self.route)
+        with self.assertRaisesRegex(ValueError, "not open"):
+            self.service.card_for(record["decision_id"])
 
     def test_context_labels_and_opaque_tokens_use_existing_store(self):
         record = self.ask()
@@ -89,7 +121,7 @@ class OperatorQuestionTests(unittest.TestCase):
         adapter = Mock()
         self.assertEqual(reminders.dispatch_reminders(adapter, force=True)["due_count"], 0)
         adapter.notify.assert_not_called()
-        self.assertEqual(self.service.run("due", {}, self.route)["questions"][0]["decision_id"], record["decision_id"])
+
     def test_wait_times_out_and_returns_pending(self):
         record = self.ask()
         result = self.service.run("wait", {"id": record["decision_id"], "timeout": 0.3}, self.route)

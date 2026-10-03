@@ -237,7 +237,7 @@ test("free-text reply to question card is intercepted, answered, and never trigg
   expect(answered.answer?.text).toBe("Use compact mode for now");
 }, 20_000);
 
-test("free-text answer clears callback buttons and sends confirmation receipt to Telegram", async () => {
+test("free-text answer rewrites the session copy to its verdict, with no buttons and no extra message", async () => {
   const f = fixture();
   const pending = await f.service.ask({
     question: "Approve deployment to staging?",
@@ -250,18 +250,13 @@ test("free-text answer clears callback buttons and sends confirmation receipt to
   f.poller.ingestUpdates([f.reply(questionMsgId, "Approved via text")]);
   await f.poller.redrivePendingUpdates();
 
-  // Buttons cleared
-  const clearCall = f.calls.find(c => c.method === "editMessageReplyMarkup");
-  expect(clearCall).toBeDefined();
-  expect(clearCall?.body.message_id).toBe(questionMsgId);
-  expect(clearCall?.body.reply_markup).toEqual({ inline_keyboard: [] });
-
-  // Confirmation receipt sent
-  const receiptCall = f.calls.find(c =>
-    String(c.body.text).includes("Answer saved for this question"),
-  );
-  expect(receiptCall).toBeDefined();
-  expect(receiptCall?.body.text).toContain("Returned to its waiting task, not sent as a new instruction");
+  // The copy itself becomes the verdict; nothing else is posted.
+  const editCall = f.calls.find(c => c.method === "editMessageText" && c.body.message_id === questionMsgId);
+  expect(editCall).toBeDefined();
+  expect(String(editCall?.body.text)).toContain("Answered:");
+  expect(String(editCall?.body.text)).toContain("Approved via text");
+  expect(editCall?.body.reply_markup).toEqual({ inline_keyboard: [] });
+  expect(f.calls.filter(c => c.method === "sendMessage")).toHaveLength(1);
 }, 20_000);
 
 test("parallel service.wait resolves promptly when free-text answer arrives", async () => {

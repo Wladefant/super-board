@@ -342,7 +342,6 @@ export class TelegramRuntime {
       this.pi.logger?.warn(
         `Telegram bot lease on slot ${root.activeSlot.slotId} is no longer held by this process; releasing the channel instead of re-pointing it to session ${nextSessionId}.`,
       );
-      root.questions?.stop();
       root.dashboard?.stop();
       root.messageContext?.close();
       void root.poller.stop();
@@ -639,7 +638,6 @@ export class TelegramRuntime {
     const dashboard = new LiveDashboard(poller, runner, currentSessionId, message => this.pi.logger?.warn(message));
     this.dashboard = dashboard;
 
-    questions.start();
     dashboard.start();
     globalState[ACTIVE_ROOT_SYMBOL] = {
       instanceId: this.instanceId,
@@ -781,7 +779,6 @@ export class TelegramRuntime {
 
       // Stop the timer-driven services before the poller they write through, so a
       // coalesced refresh cannot fire against a stopped channel.
-      this.questions?.stop();
       this.questions = null;
       this.dashboard?.stop();
       this.dashboard = null;

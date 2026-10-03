@@ -66,13 +66,13 @@ service = new OperatorQuestionService(poller, () => ({ session_id: session, chat
   decisions, poolPath, text => evidence("ERROR", text));
 let timer: Timer | undefined;
 const stop = () => {
-  clearInterval(timer); service.stop(); poller.stop(); contextStore.close();
+  clearInterval(timer); poller.stop(); contextStore.close();
   coordinator.releaseLease(selected.slotId, session, process.pid); coordinator.close();
   evidence("STOPPED_AND_LEASE_RELEASED", { pid: process.pid });
   process.exit(0);
 };
 process.on("SIGINT", stop); process.on("SIGTERM", stop);
-void poller.start(); service.start();
+void poller.start();
 const idsFile = path.join(work, "question-ids.json");
 let ids: string[];
 if (fs.existsSync(idsFile)) {
