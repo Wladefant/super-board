@@ -53,6 +53,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import io
 from contextlib import closing
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -61,6 +62,10 @@ try:
     from ledger import FileLock
 except ImportError:
     from workflows.ledger import FileLock
+try:
+    import telegram_budget
+except ImportError:
+    from workflows.portable import telegram_budget
 
 # Supported event classes
 VALID_EVENT_TYPES = {"milestone", "blocker", "decision", "completion", "question", "status"}
@@ -204,6 +209,68 @@ def _safe_urlopen(
                 raise TimeoutError(f"HTTP request timed out after {effective_timeout:.1f}s")
     finally:
         socket.setdefaulttimeout(old_timeout)
+
+
+# A 429 longer than this is never slept through; the caller gets the failure.
+MAX_RETRY_AFTER_SECONDS = 60.0
+
+
+def _retry_after_seconds(body: bytes, header: Optional[str]) -> float:
+    try:
+        value = json.loads(body.decode("utf-8")).get("parameters", {}).get("retry_after")
+        if isinstance(value, (int, float)):
+            return max(1.0, float(value))
+    except (ValueError, AttributeError, UnicodeDecodeError):
+        pass
+    try:
+        return max(1.0, float(header)) if header is not None else 30.0
+    except ValueError:
+        return 30.0
+
+
+def _governed_urlopen(
+    req: urllib.request.Request,
+    token: str,
+    chat_id: str,
+    timeout: float = DEFAULT_HTTP_TIMEOUT,
+    deadline: float = DEFAULT_HARD_DEADLINE_SECONDS,
+    budget: Any = None,
+    now_ms: Any = None,
+    sleep: Any = None,
+) -> bytes:
+    """``_safe_urlopen`` for a send into ``chat_id``, inside the per-bot budget shared with the daemon.
+
+    Waits for the shared per-chat budget (1 send/s, groups 20/min with 12 kept for panels), books the send,
+    and after a 429 records ``retry_after`` in the shared file and retries once. A wait that would not fit
+    in ``deadline`` is never slept through: the send is not made and BudgetBlocked (or the 429 as
+    HTTPError) is raised.
+    """
+    if budget is None:
+        budget = telegram_budget.budget_for(token.split(":", 1)[0])
+    now_ms = now_ms or (lambda: time.time() * 1000)
+    sleep = sleep or time.sleep
+    started = now_ms()
+
+    def remaining_ms() -> float:
+        return deadline * 1000 - (now_ms() - started)
+
+    for attempt in range(2):
+        telegram_budget.acquire(budget, chat_id, "message", max_wait_ms=remaining_ms(), now_ms=now_ms, sleep=sleep)
+        try:
+            return _safe_urlopen(req, timeout=timeout, deadline=max(1.0, remaining_ms() / 1000))
+        except urllib.error.HTTPError as err:
+            if err.code != 429:
+                raise
+            body = err.read()
+            wait_s = _retry_after_seconds(body, err.headers.get("Retry-After") if err.headers else None)
+            if budget is not None:
+                until = now_ms() + wait_s * 1000
+                budget.update(lambda state: telegram_budget.record_rate_limit(state, chat_id, until), now_ms())
+            if attempt == 1 or wait_s > MAX_RETRY_AFTER_SECONDS or wait_s * 1000 > remaining_ms():
+                raise urllib.error.HTTPError(err.url, err.code, err.reason, err.headers, io.BytesIO(body)) from None
+            if budget is None:
+                sleep(wait_s)
+    raise AssertionError("unreachable")
 
 
 class ProcessDeadlineWatchdog:
@@ -1519,7 +1586,7 @@ class TelegramNotificationAdapter:
                 },
                 method="POST",
             )
-            resp_bytes = _safe_urlopen(req, timeout=DEFAULT_HTTP_TIMEOUT, deadline=effective_deadline)
+            resp_bytes = _governed_urlopen(req, token, str(target_chat), timeout=DEFAULT_HTTP_TIMEOUT, deadline=effective_deadline)
             resp_data = json.loads(resp_bytes.decode("utf-8"))
             if resp_data.get("ok"):
                 result = resp_data.get("result", {})
@@ -1533,7 +1600,7 @@ class TelegramNotificationAdapter:
                                              "reply_markup": reply_markup, "parse_mode": "HTML", **thread_fields}).encode("utf-8"),
                             headers={"Content-Type": "application/json"}, method="POST",
                         )
-                        keyboard_bytes = _safe_urlopen(keyboard_request, timeout=DEFAULT_HTTP_TIMEOUT, deadline=effective_deadline)
+                        keyboard_bytes = _governed_urlopen(keyboard_request, token, str(target_chat), timeout=DEFAULT_HTTP_TIMEOUT, deadline=effective_deadline)
                         keyboard_result = json.loads(keyboard_bytes.decode("utf-8"))
                         if not keyboard_result.get("ok"):
                             raise ValueError("Album delivered but action message failed")
