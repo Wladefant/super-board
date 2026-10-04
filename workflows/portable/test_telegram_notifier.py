@@ -1778,6 +1778,7 @@ class TestSharedSendBudget(unittest.TestCase):
             t.start()
         for t in threads:
             t.join()
+        self.assertEqual(len(results), 8, results)
         self.assertEqual(results.count(0), 1, results)
         self.assertTrue(all(r == 1000 for r in results if r), results)
 
@@ -1789,13 +1790,55 @@ class TestSharedSendBudget(unittest.TestCase):
         self.send(telegram, budget, "7")
         self.assertEqual(telegram.statuses, [200])
 
-    def test_stale_lock_from_a_dead_process_is_swept(self):
+    def _hold(self, budget, pid, age=0.0):
+        budget.lock.write_text(json.dumps({"pid": pid, "token": "other", "at": time.time() * 1000}), encoding="utf-8")
+        if age:
+            old = time.time() - age
+            os.utime(budget.lock, (old, old))
+
+    def test_lock_left_by_a_dead_process_is_swept_at_once(self):
+        import subprocess
+        import sys
+
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
         budget = telegram_budget.SharedBudget("1", self.dir)
-        budget.lock.mkdir()
-        old = time.time() - telegram_budget.STALE_LOCK_SECONDS - 5
-        os.utime(budget.lock, (old, old))
+        self._hold(budget, child.pid)
         self.assertEqual(budget.update(lambda s: telegram_budget.reserve(s, "7", "message", 5000).wait_ms), 0)
         self.assertFalse(budget.lock.exists())
+
+    def test_live_holder_is_never_evicted_and_the_deadline_holds(self):
+        budget = telegram_budget.SharedBudget("1", self.dir)
+        self._hold(budget, os.getpid(), age=11.5)
+        before = budget.lock.read_text(encoding="utf-8")
+        ran = []
+        started = time.monotonic()
+        with patch.object(telegram_budget, "LOCK_TIMEOUT_SECONDS", 0.3):
+            self.assertIsNone(budget.update(lambda s: ran.append(1)))
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertEqual(ran, [])
+        self.assertEqual(budget.lock.read_text(encoding="utf-8"), before)
+
+    def test_one_deadline_covers_every_lock_shape(self):
+        budget = telegram_budget.SharedBudget("1", self.dir)
+        budget.lock.write_text("", encoding="utf-8")  # a regular file with no holder
+        started = time.monotonic()
+        with patch.object(telegram_budget, "LOCK_TIMEOUT_SECONDS", 0.3):
+            self.assertIsNone(budget.update(lambda s: 1))
+        self.assertLess(time.monotonic() - started, 1.5)
+        old = time.time() - telegram_budget.UNNAMED_LOCK_SECONDS - 0.5
+        os.utime(budget.lock, (old, old))
+        self.assertEqual(budget.update(lambda s: 1), 1)
+
+    def test_earlier_mkdir_lock_is_kept_while_recent_and_swept_when_old(self):
+        budget = telegram_budget.SharedBudget("1", self.dir)
+        budget.lock.mkdir()
+        with patch.object(telegram_budget, "LOCK_TIMEOUT_SECONDS", 0.2):
+            self.assertIsNone(budget.update(lambda s: 1))
+        self.assertTrue(budget.lock.exists())
+        old = time.time() - 60
+        os.utime(budget.lock, (old, old))
+        self.assertEqual(budget.update(lambda s: 1), 1)
 
     def test_budget_off_switch_sends_without_a_file(self):
         telegram = _FakeTelegram(self.clock)

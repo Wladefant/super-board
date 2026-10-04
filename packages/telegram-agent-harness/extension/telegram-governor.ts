@@ -279,7 +279,7 @@ export class TelegramGovernor {
       }
       if (readyAt <= now) {
         // The local budget allows it; the file also counts the other processes' sends to this chat.
-        const claim = this.shared?.update((ledger) => reserve(ledger, chat, entry.kind, now, this.config()), now);
+        const claim = await this.shared?.update((ledger) => reserve(ledger, chat, entry.kind, now, this.config()), now);
         if (claim && claim.blockedMs > this.maxRetryWaitMs) throw new TelegramRateLimitedError(claim.blockedMs);
         if (claim && claim.waitMs > 0) {
           entry.log?.(`telegram governor: chat ${chat} ${entry.kind} waits ${claim.waitMs} ms (${claim.reason}, shared with other processes)`);
@@ -301,7 +301,7 @@ export class TelegramGovernor {
     if (entry.kind === "inbound") return;
     for (;;) {
       const now = this.now();
-      const wait = Math.max(this.blockedUntil - now, this.shared?.botBlockedMs(now) ?? 0);
+      const wait = Math.max(this.blockedUntil - now, (await this.shared?.botBlockedMs(now)) ?? 0);
       if (wait <= 0) return;
       if (wait > this.maxRetryWaitMs) throw new TelegramRateLimitedError(wait);
       entry.log?.(`telegram governor: ${entry.kind} call waits ${wait} ms (retry_after)`);
@@ -336,7 +336,7 @@ export class TelegramGovernor {
       const scope = state ? `chat ${chat}` : "bot";
       if (state) state.blockedUntil = Math.max(state.blockedUntil, until);
       else this.blockedUntil = Math.max(this.blockedUntil, until);
-      this.shared?.update((ledger) => recordRateLimit(ledger, state ? chat : undefined, until), this.now());
+      await this.shared?.update((ledger) => recordRateLimit(ledger, state ? chat : undefined, until), this.now());
       const retry = attempt === 0 && entry.kind !== "inbound" && retryAfterSeconds * 1000 <= this.maxRetryWaitMs;
       entry.log?.(`telegram governor: 429, ${scope} blocked for ${retryAfterSeconds} s${retry ? ", one retry after the wait" : ", not retried"}`);
       if (!retry) return response;

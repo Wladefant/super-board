@@ -1,16 +1,20 @@
+// The lock tests below use the real clock on purpose: the lock deadline and the event-loop check measure real
+// waiting on a file lock, which a fake clock cannot drive.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import {
-  emptyState, recordRateLimit, reserve, SharedBudget, STALE_LOCK_MS, type BudgetConfig,
+  emptyState, recordRateLimit, reserve, SharedBudget, UNNAMED_LOCK_MS, type BudgetConfig,
 } from "../extension/telegram-budget";
 import { governedTelegramFetch, TelegramGovernor, type GovernedRequest } from "../extension/telegram-governor";
 
 const CFG: BudgetConfig = { chatIntervalMs: 1000, groupLimit: 20, windowMs: 60_000, panelReserve: 12 };
 
+/** Lets every pending promise chain run, including the shared budget's awaited file work. */
 async function flush(): Promise<void> {
-  for (let i = 0; i < 50; i++) await Promise.resolve();
+  for (let i = 0; i < 20; i++) await Promise.resolve();
+  await new Promise<void>((resolve) => setImmediate(resolve));
 }
 
 /** One clock for every simulated process; sleep parks until the driver jumps to the wake time. */
@@ -180,20 +184,75 @@ describe("shared budget file", () => {
     expect(res.status).toBe(200);
   });
 
-  test("a lock left by a dead process is swept after it goes stale", () => {
+  const lockFile = () => path.join(dir, "1.lock");
+  const heldBy = (pid: number) => fs.writeFileSync(lockFile(), JSON.stringify({ pid, token: "other", at: Date.now() }));
+  const age = (target: string, ms: number) => {
+    const old = new Date(Date.now() - ms);
+    fs.utimesSync(target, old, old);
+  };
+
+  test("a lock left by a dead process is swept at once", async () => {
+    const dead = Bun.spawnSync([process.execPath, "-e", "0"]).pid;
+    heldBy(dead);
     const budget = new SharedBudget("1", dir);
-    const lock = path.join(dir, "1.lock");
-    fs.mkdirSync(lock);
-    const old = new Date(Date.now() - STALE_LOCK_MS - 1000);
-    fs.utimesSync(lock, old, old);
-    expect(budget.update((state) => reserve(state, "7", "message", Date.now(), CFG).waitMs)).toBe(0);
-    expect(fs.existsSync(lock)).toBe(false);
+    expect(await budget.update((state) => reserve(state, "7", "message", Date.now(), CFG).waitMs)).toBe(0);
+    expect(fs.existsSync(lockFile())).toBe(false);
   });
 
-  test("a corrupt file starts from an empty budget", () => {
+  test("a live holder is never evicted, however long it holds; the caller gives up at the deadline", async () => {
+    heldBy(process.pid);
+    age(lockFile(), 11_500);
+    const before = fs.readFileSync(lockFile(), "utf8");
+    const budget = new SharedBudget("1", dir, 300);
+    let ran = false;
+    const started = Date.now();
+    expect(await budget.update(() => { ran = true; return 1; })).toBeUndefined();
+    expect(ran).toBe(false);
+    expect(Date.now() - started).toBeLessThan(1500);
+    expect(fs.readFileSync(lockFile(), "utf8")).toBe(before);
+  });
+
+  test("one deadline covers a lock of any shape, including a regular file with no holder", async () => {
+    fs.writeFileSync(lockFile(), "");
+    const budget = new SharedBudget("1", dir, 300);
+    const started = Date.now();
+    expect(await budget.update(() => 1)).toBeUndefined();
+    expect(Date.now() - started).toBeLessThan(1500);
+    // Once it is old enough to be a crashed writer, it is swept.
+    age(lockFile(), UNNAMED_LOCK_MS + 500);
+    expect(await budget.update(() => 1)).toBe(1);
+  });
+
+  test("the earlier mkdir lock: kept while recent, swept when old", async () => {
+    fs.mkdirSync(lockFile());
+    const budget = new SharedBudget("1", dir, 200);
+    expect(await budget.update(() => 1)).toBeUndefined();
+    expect(fs.existsSync(lockFile())).toBe(true);
+    age(lockFile(), 60_000);
+    expect(await budget.update(() => 1)).toBe(1);
+  });
+
+  test("waiting for the lock never blocks the event loop", async () => {
+    heldBy(process.pid);
+    const budget = new SharedBudget("1", dir, 300);
+    let ticks = 0;
+    const timer = setInterval(() => { ticks++; }, 10);
+    await budget.update(() => 1);
+    clearInterval(timer);
+    expect(ticks).toBeGreaterThanOrEqual(10);
+  });
+
+  test("concurrent read-modify-write cycles lose no update", async () => {
+    const budget = new SharedBudget("1", dir);
+    const results = await Promise.all(Array.from({ length: 25 }, () => budget.update((state) => ++state.botBlockedUntil)));
+    expect(results.every((r) => r !== undefined)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(path.join(dir, "1.json"), "utf8")).botBlockedUntil).toBe(25);
+  });
+
+  test("a corrupt file starts from an empty budget", async () => {
     fs.writeFileSync(path.join(dir, "1.json"), "{not json");
     const budget = new SharedBudget("1", dir);
-    expect(budget.update((state) => reserve(state, "7", "message", 5000, CFG).waitMs)).toBe(0);
+    expect(await budget.update((state) => reserve(state, "7", "message", 5000, CFG).waitMs)).toBe(0);
     expect(JSON.parse(fs.readFileSync(path.join(dir, "1.json"), "utf8")).chats["7"].sends).toEqual([[5000, "message"]]);
   });
 });

@@ -5,14 +5,14 @@ Telegram counts sends per bot token, so the daemon, the session extensions and
 telegram_notifier.py must see each other's sends. They do through one small JSON
 file per bot under ``~/.veyyon/run/telegram-budget/`` (override with
 ``VEYYON_TELEGRAM_BUDGET_DIR``; the value ``off`` disables sharing), guarded by an
-atomic ``mkdir`` lock directory.
+O_EXCL lock file that names its holder (pid and a random token).
 
 This is the same file format and the same ``reserve`` arithmetic as
 packages/telegram-agent-harness/extension/telegram-budget.ts. Keep the two in step.
 Times are epoch milliseconds.
 
-The lock is held for one read-compute-write. A holder that died leaves a lock that
-is ignored after STALE_LOCK_SECONDS. If the lock cannot be taken in
+The lock is held for one read-compute-write, never across a Telegram call. A holder
+that died is recognised by its pid being gone; a live holder is never evicted. If the lock cannot be taken in
 LOCK_TIMEOUT_SECONDS or the file system fails, the caller sends anyway: a late
 message beats a lost one.
 """
@@ -21,13 +21,18 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 LOCK_TIMEOUT_SECONDS = 2.0
-STALE_LOCK_SECONDS = 10.0
+# A lock whose holder cannot be named (it died mid-write) is abandoned after this long.
+UNNAMED_LOCK_SECONDS = 1.0
+# Holds last microseconds. A named holder older than this is a dead process whose pid was reused.
+MAX_LOCK_AGE_SECONDS = 300.0
 
 CHAT_INTERVAL_MS = 1000
 GROUP_LIMIT = 20
@@ -45,6 +50,30 @@ class Reservation:
 def default_budget_dir() -> Path:
     override = os.environ.get("VEYYON_TELEGRAM_BUDGET_DIR")
     return Path(override) if override else Path.home() / ".veyyon" / "run" / "telegram-budget"
+
+
+def pid_alive(pid: int) -> bool:
+    """True while a process with this pid exists. Never signals it (os.kill(pid, 0) would kill on Windows)."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return kernel32.GetLastError() == 5  # access denied: exists
+        code = ctypes.c_ulong()
+        ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+        kernel32.CloseHandle(handle)
+        return bool(ok) and code.value == 259  # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
 
 
 def is_group_chat(chat_id: str) -> bool:
@@ -110,7 +139,8 @@ class SharedBudget:
         """Runs ``fn`` on the state under the lock and saves it. Returns None when the file is unusable."""
         try:
             self.file.parent.mkdir(parents=True, exist_ok=True)
-            if not self._acquire():
+            token = self._acquire()
+            if token is None:
                 return None
             try:
                 state = self._read()
@@ -118,32 +148,72 @@ class SharedBudget:
                 self._write(state, time.time() * 1000 if now_ms is None else now_ms)
                 return result
             finally:
-                try:
-                    os.rmdir(self.lock)
-                except OSError:
-                    pass
+                self._release(token)
         except Exception:
             return None
 
-    def _acquire(self) -> bool:
+    def _acquire(self) -> Optional[str]:
+        """Creates the lock file (O_EXCL) naming this process. None when the deadline passes.
+
+        Every pass of the loop checks the deadline, whatever shape the lock path is in.
+        """
         deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
+        token = f"{os.getpid()}.{uuid.uuid4()}"
         while True:
             try:
-                os.mkdir(self.lock)
-                return True
-            except FileExistsError:
+                fd = os.open(self.lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                try:
+                    os.write(fd, json.dumps({"pid": os.getpid(), "token": token, "at": time.time() * 1000}).encode())
+                finally:
+                    os.close(fd)
+                return token
+            except (FileExistsError, PermissionError):
                 pass
             except OSError:
-                return False
-            try:
-                if time.time() - os.stat(self.lock).st_mtime > STALE_LOCK_SECONDS:
-                    os.rmdir(self.lock)
-                    continue
-            except OSError:
-                continue
+                return None
+            self._sweep_if_abandoned()
             if time.monotonic() >= deadline:
-                return False
-            time.sleep(0.002)
+                return None
+            time.sleep(0.002 + random.random() * 0.003)
+
+    def _sweep_if_abandoned(self) -> None:
+        """Removes the lock when its holder is gone. A live holder is never removed. Never raises."""
+        try:
+            st = os.stat(self.lock)
+            age = time.time() - st.st_mtime
+            if os.path.isdir(self.lock):
+                # Left by the earlier mkdir-based lock, which carried no holder name.
+                if age > UNNAMED_LOCK_SECONDS * 10:
+                    os.rmdir(self.lock)
+                return
+            raw = Path(self.lock).read_text(encoding="utf-8")
+            pid = None
+            try:
+                pid = json.loads(raw).get("pid")
+            except (ValueError, AttributeError):
+                pass  # The holder died between creating the file and writing its name.
+            if isinstance(pid, int):
+                abandoned = not pid_alive(pid) or age > MAX_LOCK_AGE_SECONDS
+            else:
+                abandoned = age > UNNAMED_LOCK_SECONDS
+            # Look again right before removing, so a lock another process just took is left alone.
+            if abandoned and Path(self.lock).read_text(encoding="utf-8") == raw:
+                os.unlink(self.lock)
+        except Exception:
+            pass
+
+    def _release(self, token: str) -> None:
+        # On Windows a waiter reading the lock holds it open, and unlink then fails with PermissionError, so retry.
+        for _ in range(400):
+            try:
+                if json.loads(Path(self.lock).read_text(encoding="utf-8")).get("token") != token:
+                    return  # Already swept as abandoned; nothing of ours is left to remove.
+                os.unlink(self.lock)
+                return
+            except FileNotFoundError:
+                return
+            except (OSError, ValueError):
+                time.sleep(0.005)
 
     def _read(self) -> Dict[str, Any]:
         try:
