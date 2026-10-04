@@ -18,6 +18,11 @@ Violations flagged:
       (`closed_subissue_without_adoption_or_rejection`).
   (c) A research recommendation with no sub-issue
       (`research_recommendation_without_subissue`).
+  (d) An open issue with more than MAX_TOPIC_COMMENTS long comments
+      (>= LONG_COMMENT_CHARS characters each) and no native sub-issues
+      (`topic_comment_dump_without_subissues`). Per-topic results belong in
+      one native sub-issue each, never in comments on the parent
+      (https://github.com/Wladefant/super-board/issues/419).
 
 Options:
   --repo <owner/repo>   Target repository (default: Wladefant/super-board or GITHUB_REPOSITORY).
@@ -45,6 +50,10 @@ import sys
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 DEFAULT_REPO = "Wladefant/super-board"
+
+# Check (d): more long comments than this on an issue with no sub-issues is a dump.
+MAX_TOPIC_COMMENTS = 5
+LONG_COMMENT_CHARS = 1500
 
 # Regex for adoption & rejection annotations
 ADOPTED_AT_RE = re.compile(r"(?i)\badopted-at:\s*(\S+)")
@@ -90,6 +99,7 @@ class AuditSummary:
     closed_parents_with_open_subissues: int = 0
     closed_subissues_without_adoption_or_rejection: int = 0
     research_recommendations_without_subissues: int = 0
+    topic_comment_dumps_without_subissues: int = 0
 
 
 @dataclass
@@ -364,6 +374,7 @@ def run_adoption_audit(
     closed_parent_count = 0
     closed_subissue_count = 0
     research_rec_count = 0
+    topic_dump_count = 0
 
     if issue_number is not None:
         single = client.get_single_issue(repo, issue_number)
@@ -433,6 +444,31 @@ def run_adoption_audit(
                 )
                 findings.append(finding)
                 closed_parent_count += 1
+
+        # -------------------------------------------------------------
+        # Check (d): Topic dump - many long comments, no native sub-issues
+        # -------------------------------------------------------------
+        comment_total = issue.get("comments") or 0
+        if state == "open" and not has_subissues and comment_total > MAX_TOPIC_COMMENTS:
+            long_comments = [
+                c for c in client.get_issue_comments(repo, num)
+                if len(c.get("body") or "") >= LONG_COMMENT_CHARS
+            ]
+            if len(long_comments) > MAX_TOPIC_COMMENTS:
+                findings.append(
+                    Finding(
+                        category="topic_comment_dump_without_subissues",
+                        issue_number=num,
+                        title=title,
+                        url=url,
+                        details={
+                            "long_comments_count": len(long_comments),
+                            "threshold": MAX_TOPIC_COMMENTS,
+                            "min_chars": LONG_COMMENT_CHARS,
+                        },
+                    )
+                )
+                topic_dump_count += 1
 
         # -------------------------------------------------------------
         # Check (c): Research recommendation with no sub-issue
@@ -507,6 +543,7 @@ def run_adoption_audit(
         closed_parents_with_open_subissues=closed_parent_count,
         closed_subissues_without_adoption_or_rejection=closed_subissue_count,
         research_recommendations_without_subissues=research_rec_count,
+        topic_comment_dumps_without_subissues=topic_dump_count,
     )
 
     return AuditResult(
@@ -533,6 +570,7 @@ def format_markdown_report(result: AuditResult) -> str:
         f"- **(a) Closed parents with open sub-issues:** {result.summary.closed_parents_with_open_subissues}",
         f"- **(b) Closed sub-issues without adoption or rejection proof:** {result.summary.closed_subissues_without_adoption_or_rejection}",
         f"- **(c) Research recommendations with no sub-issue:** {result.summary.research_recommendations_without_subissues}",
+        f"- **(d) Topic dumps in comments without sub-issues:** {result.summary.topic_comment_dumps_without_subissues}",
         "",
     ]
 
@@ -547,6 +585,7 @@ def format_markdown_report(result: AuditResult) -> str:
     a_findings = [f for f in result.findings if f.category == "closed_parent_with_open_subissues"]
     b_findings = [f for f in result.findings if f.category == "closed_subissue_without_adoption_or_rejection"]
     c_findings = [f for f in result.findings if f.category == "research_recommendation_without_subissue"]
+    d_findings = [f for f in result.findings if f.category == "topic_comment_dump_without_subissues"]
 
     if a_findings:
         lines.append("### (a) Closed Parents with Open Sub-Issues")
@@ -576,6 +615,13 @@ def format_markdown_report(result: AuditResult) -> str:
             rec = f.details.get("recommendation", "")
             lines.append(f"- **Parent Issue #{f.issue_number}:** [{f.title}]({f.url})")
             lines.append(f"  - 🚩 Unlinked recommendation: `{rec}`")
+        lines.append("")
+    if d_findings:
+        lines.append("### (d) Topic Dumps in Comments (create one native sub-issue per topic)")
+        lines.append("")
+        for f in d_findings:
+            n = f.details.get("long_comments_count")
+            lines.append(f"- **Issue #{f.issue_number}:** [{f.title}]({f.url}) has {n} long comments and no sub-issues")
         lines.append("")
 
     return "\n".join(lines)

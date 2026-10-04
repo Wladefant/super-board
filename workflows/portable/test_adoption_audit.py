@@ -516,6 +516,60 @@ Details.
         self.assertEqual(result.status, "pass")
         self.assertEqual(len(result.findings), 0)
 
+    @staticmethod
+    def _comments(n_long: int, n_short: int = 0) -> List[Dict[str, Any]]:
+        return [{"body": "competitor finding " * 120} for _ in range(n_long)] + [
+            {"body": "ok"} for _ in range(n_short)
+        ]
+
+    def _dump_issue(self, number: int, comments: int, subs_total: int = 0, state: str = "open") -> Dict[str, Any]:
+        return {
+            "number": number,
+            "title": "Competitor analysis",
+            "state": state,
+            "body": "Parent",
+            "labels": [{"name": "kind:research"}],
+            "comments": comments,
+            "sub_issues_summary": {"total": subs_total, "completed": 0, "percent_completed": 0},
+        }
+
+    def test_topic_dump_of_long_comments_without_subissues_is_flagged(self):
+        client = MockGitHubClient(
+            issues=[self._dump_issue(133, 21)],
+            comments_map={133: self._comments(20, 1)},
+        )
+        result = run_adoption_audit(repo="Wladefant/shipnovo", client=client)
+        dumps = [f for f in result.findings if f.category == "topic_comment_dump_without_subissues"]
+        self.assertEqual(len(dumps), 1)
+        self.assertEqual(dumps[0].issue_number, 133)
+        self.assertEqual(dumps[0].details["long_comments_count"], 20)
+        self.assertEqual(result.summary.topic_comment_dumps_without_subissues, 1)
+        self.assertEqual(result.status, "fail")
+        self.assertIn("(d) Topic Dumps in Comments", format_markdown_report(result))
+
+    def test_topic_dump_negative_controls_pass(self):
+        # Same comment volume, but the issue has native sub-issues.
+        with_subs = self._dump_issue(1, 21, subs_total=3)
+        # Many comments, but short (discussion, not result dumps).
+        short_talk = self._dump_issue(2, 30)
+        # Exactly at the threshold: 5 long comments is allowed.
+        at_limit = self._dump_issue(3, 5)
+        # Closed issues are not flagged.
+        closed = self._dump_issue(4, 21, state="closed")
+        client = MockGitHubClient(
+            issues=[with_subs, short_talk, at_limit, closed],
+            sub_issues_map={1: [{"number": 11, "title": "Sub", "state": "open"}]},
+            comments_map={
+                1: self._comments(20),
+                2: self._comments(2, 28),
+                3: self._comments(5),
+                4: self._comments(20),
+            },
+        )
+        result = run_adoption_audit(repo="Wladefant/shipnovo", client=client)
+        dumps = [f for f in result.findings if f.category == "topic_comment_dump_without_subissues"]
+        self.assertEqual(dumps, [])
+
     def test_format_markdown_report_clean(self):
         result = AuditResult(
             repo="Wladefant/super-board",
