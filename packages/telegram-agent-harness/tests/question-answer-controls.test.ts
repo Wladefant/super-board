@@ -7,6 +7,8 @@ import { DaemonStore } from "../daemon/store";
 import { getDaemonSecret, computeTokenHmac } from "../daemon/lane-panel";
 import { QuestionsTopic, type QuestionsTransport } from "../daemon/questions-topic";
 import type { Question } from "../src/operator-questions";
+import { OperatorQuestionService } from "../src/operator-questions";
+import type { TelegramPoller } from "../extension/poller";
 
 const cleanup: Array<() => void> = [];
 afterEach(() => {
@@ -552,3 +554,36 @@ test("when signing is enabled, unsigned question tokens are rejected as forged w
   expect(attachRes.decision).toBe("deliver");
   expect(attachRes.record?.choiceId).toBe("sess-target-42");
 });
+
+test("real Python question ask publishes canonical signed choices and submits the answer", async () => {
+  const { dir, poolDbPath, coordinator, secret } = setupTestEnvironment();
+  type Keyboard = { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
+  const decisionsPath = path.join(dir, "real-decisions.json");
+  let markup: Keyboard = { inline_keyboard: [] };
+  const transport = {
+    sendTelegramMessage: async (_chat: string, _text: string, _mode: string, keyboard: Keyboard) => {
+      markup = keyboard;
+      return { ok: true, result: { message_id: 71 } };
+    },
+    editTelegramMessage: async (_chat: string, _id: number, _text: string, _mode: string, _unused: unknown, keyboard: Keyboard) => {
+      markup = keyboard;
+      return { ok: true, result: { message_id: 71 } };
+    },
+  };
+  const route = { session_id: "real-question-session", chat_id: "-100123", user_id: "4242" };
+  // This faithful transport implements only the methods the service exercises.
+  const service = new OperatorQuestionService(transport as unknown as TelegramPoller, () => route, decisionsPath, poolDbPath,
+    () => {}, undefined, coordinator, secret);
+  const question = await service.ask({ question: "Use the test choice?", options: [{ id: "yes", label: "Yes" }, { id: "no", label: "No" }], recommendation: "yes" });
+  const yesToken = markup.inline_keyboard.flat().find(button => button.text.includes("Yes"))!.callback_data;
+  const yes = coordinator.validateDecisionCallback(yesToken, route.user_id, route.chat_id, route.session_id, decisionsPath);
+  expect(yes.decision).toBe("deliver");
+  expect(yes.record?.choiceId).toBe("yes");
+  await service.answer(question.decision_id, "real-select", { choice: yes.record!.choiceId });
+  const sendButton = markup.inline_keyboard.flat().find(button => coordinator.lookupDecisionCallback(button.callback_data)?.choiceId === "__send");
+  expect(sendButton).toBeDefined();
+  const send = coordinator.validateDecisionCallback(sendButton!.callback_data, route.user_id, route.chat_id, route.session_id, decisionsPath);
+  const answered = await service.answer(question.decision_id, "real-submit", { choice: send.record!.choiceId });
+  expect(answered.status).toBe("answered");
+  expect(answered.answer?.choice_id).toBe("yes");
+}, 60000);

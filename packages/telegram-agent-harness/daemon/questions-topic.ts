@@ -159,7 +159,9 @@ export class QuestionsTopic {
     const now = this.now() / 1000;
     const signedRows = markup.inline_keyboard.map(row => row.map(btn => {
       if (!btn.callback_data) return btn;
-      const choiceId = btn.callback_data;
+      if (btn.callback_data.startsWith("ans:")) return btn;
+      const original = this.options.coordinator!.lookupDecisionCallback(btn.callback_data);
+      const choiceId = original?.choiceId ?? btn.callback_data;
       const record = this.options.coordinator!.issueDecisionCallback({
         decisionId: question.decision_id,
         choiceId,

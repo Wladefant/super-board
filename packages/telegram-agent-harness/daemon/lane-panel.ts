@@ -149,33 +149,36 @@ export function deriveDaemonStateDir(store?: unknown): string {
 }
 
 export function getSlotSecretFilePath(stateDir: string, slotId: string): string {
-  const sanitizedSlot = (slotId || "daemon").replace(/[^a-zA-Z0-9._-]/g, "_");
-  return path.join(stateDir, "secrets", `${sanitizedSlot}.secret`);
+  const identity = createHash("sha256").update(slotId).digest("hex");
+  return path.join(stateDir, "secrets", `${identity}.secret`);
 }
 
-function getWindowsCurrentUser(): string {
-  if (process.env.USERNAME && process.env.USERNAME.trim()) {
-    return process.env.USERNAME.trim();
-  }
-  const res = spawnSync("whoami.exe", [], { windowsHide: true, encoding: "utf8" });
-  if (res.status === 0 && res.stdout.trim()) {
-    return res.stdout.trim();
-  }
-  throw new Error("Unable to determine current Windows user for secret ACL restriction");
+
+function enforceWindowsOwnerAcl(target: string, directory: boolean): void {
+  const script = `
+    $ErrorActionPreference = 'Stop'
+    $target = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(target).toString("base64")}'))
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $item = Get-Item -LiteralPath $target
+    $acl = $item.GetAccessControl([Security.AccessControl.AccessControlSections]::Access)
+    foreach ($old in @($acl.GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]))) { [void]$acl.RemoveAccessRuleSpecific($old) }
+    $acl.SetAccessRuleProtection($true, $false)
+    $rule = New-Object Security.AccessControl.FileSystemAccessRule($sid, 'FullControl', '${directory ? "ContainerInherit, ObjectInherit" : "None"}', 'None', 'Allow')
+    $acl.AddAccessRule($rule)
+    $item.SetAccessControl($acl)
+    $actual = Get-Acl -LiteralPath $target
+    if (!$actual.AreAccessRulesProtected) { throw 'Unprotected secret ACL' }
+    $rules = @($actual.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+    if ($rules.Count -ne 1 -or $rules[0].IdentityReference -ne $sid -or $rules[0].AccessControlType -ne 'Allow' -or $rules[0].FileSystemRights -ne 'FullControl') { throw 'Unexpected secret ACL' }
+  `;
+  const result = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")],
+    { windowsHide: true, encoding: "utf8", timeout: 15_000 });
+  if (result.error || result.status !== 0) throw new Error("Cannot enforce owner-only daemon secret ACL");
 }
 
 function protectSecretsDirectory(secretsDir: string): void {
   if (process.platform === "win32") {
-    const user = getWindowsCurrentUser();
-    const res = spawnSync(
-      "icacls.exe",
-       [secretsDir, "/inheritance:r", "/grant:r", `${user}:(OI)(CI)(F)`],
-      { windowsHide: true, encoding: "utf8" },
-    );
-    const hasFailures = /Failed processing [1-9]\d* files/i.test(res.stdout);
-    if (res.status !== 0 || (res.stderr && res.stderr.trim().length > 0) || !res.stdout.includes("Successfully processed") || hasFailures) {
-      throw new Error(`Failed to enforce Windows ACL on secrets directory ${secretsDir}: ${res.stderr || res.stdout || `exit ${res.status}`}`);
-    }
+    enforceWindowsOwnerAcl(secretsDir, true);
   } else {
     try {
       fs.chmodSync(secretsDir, 0o700);
@@ -188,16 +191,7 @@ function protectSecretsDirectory(secretsDir: string): void {
 
 function protectSecretFile(filePath: string, fd?: number): void {
   if (process.platform === "win32") {
-    const user = getWindowsCurrentUser();
-    const res = spawnSync(
-      "icacls.exe",
-      [filePath, "/inheritance:r", "/grant:r", `${user}:(F)`],
-      { windowsHide: true, encoding: "utf8" },
-    );
-    const hasFailures = /Failed processing [1-9]\d* files/i.test(res.stdout);
-    if (res.status !== 0 || (res.stderr && res.stderr.trim().length > 0) || !res.stdout.includes("Successfully processed") || hasFailures) {
-      throw new Error(`Failed to enforce Windows ACL on secret file ${filePath}: ${res.stderr || res.stdout || `exit ${res.status}`}`);
-    }
+    enforceWindowsOwnerAcl(filePath, false);
   } else {
     try {
       if (typeof fd === "number") {
@@ -213,14 +207,11 @@ function protectSecretFile(filePath: string, fd?: number): void {
 }
 
 function parseSecretBuffer(buf: Buffer): Buffer {
-  const str = buf.toString("utf8").trim();
-  if (/^[0-9a-fA-F]{64}$/.test(str)) {
-    return Buffer.from(str, "hex");
-  }
-  if (buf.length === 32) {
-    return buf;
-  }
-  return Buffer.from(str, "hex");
+  const str = buf.toString("utf8");
+  if (!/^[0-9a-fA-F]{64}$/.test(str)) throw new Error("Invalid daemon signing secret encoding");
+  const secret = Buffer.from(str, "hex");
+  if (secret.length !== 32) throw new Error("Invalid daemon signing secret length");
+  return secret;
 }
 
 function readSecretFileWithRetry(filePath: string): Buffer {
@@ -228,13 +219,14 @@ function readSecretFileWithRetry(filePath: string): Buffer {
   while (Date.now() - start < 3000) {
     try {
       if (fs.existsSync(filePath)) {
+        protectSecretFile(filePath);
         const data = fs.readFileSync(filePath);
         if (data.length >= 32) {
           return parseSecretBuffer(data);
         }
       }
     } catch (e: unknown) {
-      if (e && typeof e === "object" && "code" in e && e.code !== "ENOENT") throw e;
+      if (!(e && typeof e === "object" && "code" in e && e.code === "ENOENT")) throw e;
     }
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
   }
@@ -253,19 +245,12 @@ export function getDaemonSecret(
   const secretPath = getSlotSecretFilePath(stateDir, slotId);
   const secretsDir = path.dirname(secretPath);
 
-  if (fs.existsSync(secretPath)) {
-    try {
-      const existing = fs.readFileSync(secretPath);
-      if (existing.length >= 32) {
-        return parseSecretBuffer(existing);
-      }
-    } catch (err: unknown) {
-      if (err && typeof err === "object" && "code" in err && err.code !== "ENOENT") throw err;
-    }
-  }
-
   fs.mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
   protectSecretsDirectory(secretsDir);
+  if (fs.existsSync(secretPath)) {
+    protectSecretFile(secretPath);
+    return readSecretFileWithRetry(secretPath);
+  }
 
   let fd: number | null = null;
   try {
@@ -503,8 +488,9 @@ export class LanePanels {
     }
   }
 
+  private signingSecret?: Buffer;
   private getSecret(): Buffer {
-    return getDaemonSecret(this.options.store, this.options.slotId);
+    return this.signingSecret ??= getDaemonSecret(this.options.store, this.options.slotId);
   }
 
   private createTokenRecord(

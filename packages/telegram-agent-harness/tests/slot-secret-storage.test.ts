@@ -134,3 +134,33 @@ test("fails closed if permission enforcement or directory protection fails, leav
   const secretFile = path.join(secretsDirAsFile, "slot-blocked.secret");
   expect(fs.existsSync(secretFile)).toBe(false);
 });
+
+test("existing malformed keys fail closed and slot identities cannot alias", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "slot-invalid-key-"));
+  cleanup.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = getSlotSecretFilePath(dir, "a/b");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, "z".repeat(64));
+  expect(() => getDaemonSecret({ stateDir: dir }, "a/b")).toThrow("Invalid daemon signing secret");
+  expect(fs.readFileSync(file, "utf8")).toBe("z".repeat(64));
+  expect(getSlotSecretFilePath(dir, "a_b")).not.toBe(file);
+});
+
+test("existing valid keys lose broad explicit grants before read", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "slot-existing-acl-"));
+  cleanup.push(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = getSlotSecretFilePath(dir, "existing");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, "ab".repeat(32), { mode: 0o666 });
+  if (process.platform === "win32") {
+    const grant = spawnSync("icacls.exe", [file, "/grant", "*S-1-1-0:(R)"], { encoding: "utf8", timeout: 15000 });
+    expect(grant.status).toBe(0);
+  } else fs.chmodSync(file, 0o666);
+  expect(getDaemonSecret({ stateDir: dir }, "existing")).toEqual(Buffer.from("ab".repeat(32), "hex"));
+  if (process.platform === "win32") {
+    const acl = spawnSync("icacls.exe", [file], { encoding: "utf8", timeout: 15000 });
+    expect(acl.status).toBe(0);
+    expect(acl.stdout).not.toContain("Everyone");
+    expect(acl.stdout).not.toContain("(I)");
+  } else expect(fs.statSync(file).mode & 0o777).toBe(0o600);
+});

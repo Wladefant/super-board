@@ -151,9 +151,12 @@ export class QuestionStore {
       const now = Date.now() / 1000;
       const signedRows = card.reply_markup.inline_keyboard.map(row => row.map(btn => {
         if (!btn.callback_data) return btn;
+        if (btn.callback_data.startsWith("ans:")) return btn;
+        const original = this.coordinator!.lookupDecisionCallback(btn.callback_data);
+        if (!original || original.decisionId !== question.decision_id) throw new Error("Question button has no canonical choice");
         const record = this.coordinator!.issueDecisionCallback({
           decisionId: question.decision_id,
-          choiceId: btn.callback_data,
+          choiceId: original.choiceId,
           sessionId: question.transport.session_id,
           chatId: question.transport.chat_id,
           userId: question.transport.user_id,
@@ -349,9 +352,12 @@ export class OperatorQuestionService {
     const now = Date.now() / 1000;
     const signedRows = markup.inline_keyboard.map(row => row.map(btn => {
       if (!btn.callback_data) return btn;
+      if (btn.callback_data.startsWith("ans:")) return btn;
+      const original = this.coordinator!.lookupDecisionCallback(btn.callback_data);
+      if (!original || original.decisionId !== question.decision_id) throw new Error("Question button has no canonical choice");
       const record = this.coordinator!.issueDecisionCallback({
         decisionId: question.decision_id,
-        choiceId: btn.callback_data,
+        choiceId: original.choiceId,
         sessionId: question.transport.session_id,
         chatId: question.transport.chat_id,
         userId: question.transport.user_id,
