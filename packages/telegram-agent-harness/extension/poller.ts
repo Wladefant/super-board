@@ -660,18 +660,10 @@ export class TelegramPoller {
         body.text = redactSecrets(text);
       }
 
-      const response = await fetch(
-        `https://api.telegram.org/bot${this.botToken}/answerCallbackQuery`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-          signal: AbortSignal.any([this.abortController.signal, AbortSignal.timeout(3000)]),
-        },
-      );
-      const data: unknown = await response.json();
+      const data: unknown = await this.botCall("answerCallbackQuery", body);
       return Boolean(data && typeof data === "object" && "ok" in data && data.ok === true);
-    } catch {
+    } catch (err) {
+      this.logTransportError("answerCallbackQuery", err);
       return false;
     }
   }
