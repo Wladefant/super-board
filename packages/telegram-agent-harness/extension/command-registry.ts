@@ -1,4 +1,4 @@
-import { telegramFetch } from "./telegram-fetch";
+import { governedTelegramFetch } from "./telegram-governor";
 import { escapeHtml } from "./sanitizer";
 
 /** The menu and help are projections of the same supported command surface. */
@@ -91,12 +91,12 @@ export async function registerTelegramCommands(
   if (forumChatId) chats.push(forumChatId);
   for (const chatId of chats) {
     try {
-      const response = await telegramFetch(`https://api.telegram.org/bot${botToken}/setMyCommands`, {
+      const response = await governedTelegramFetch(`https://api.telegram.org/bot${botToken}/setMyCommands`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ commands, scope: { type: "chat", chat_id: chatId }, language_code: "" }),
         signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(5000)]) : AbortSignal.timeout(5000),
-      });
+      }, { kind: "other" });
       const result = await response.json() as { ok?: boolean };
       if (!response.ok || result.ok !== true) throw new Error("Registration refused");
     } catch {
@@ -106,12 +106,12 @@ export async function registerTelegramCommands(
   }
   if (forumChatId) {
     try {
-      await telegramFetch(`https://api.telegram.org/bot${botToken}/setMyCommands`, {
+      await governedTelegramFetch(`https://api.telegram.org/bot${botToken}/setMyCommands`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ commands, scope: { type: "all_group_chats" }, language_code: "" }),
         signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(5000)]) : AbortSignal.timeout(5000),
-      });
+      }, { kind: "other" });
     } catch {
       // Best-effort scope fallback; chat-specific scope is primary
     }

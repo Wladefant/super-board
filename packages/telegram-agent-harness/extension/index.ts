@@ -10,7 +10,7 @@
  * the host session.
  */
 
-import { telegramFetch } from "./telegram-fetch";
+import { governedTelegramFetch } from "./telegram-governor";
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
@@ -508,7 +508,7 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
       if (!root) {
         const fallbackRoute = findDaemonRoute(savedContext?.sessionId, savedContext?.cwd);
         if (fallbackRoute) {
-          const res = await telegramFetch(`https://api.telegram.org/bot${fallbackRoute.token}/sendMessage`, {
+          const res = await governedTelegramFetch(`https://api.telegram.org/bot${fallbackRoute.token}/sendMessage`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
@@ -517,7 +517,7 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
               text: `<b>Agent · ${escapeHtml(params.lane_id)}</b>\n${markdownToTelegramHtml(params.text, savedContext?.cwd ? resolveGithubRepo(savedContext.cwd) : undefined)}`,
               parse_mode: "HTML",
             }),
-          });
+          }, { chatId: fallbackRoute.chatId });
           const data = (await res.json()) as { ok?: boolean; result?: { message_id: number } };
           if (data.ok && data.result) {
             activeRuntime?.recordTurnDelivery(params.text);
