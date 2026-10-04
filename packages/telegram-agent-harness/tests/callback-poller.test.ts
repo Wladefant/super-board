@@ -25,7 +25,7 @@ function fixture(decision: CallbackValidationDecision = "deliver", consume = tru
     isIdle: () => true, onUserMessage: () => {}, onFollowUp: () => {}, onSteer: () => {}, onAbort: () => {}, onRelease: async () => {}, getStatusText: () => "test", onLedgerFailure: () => {},
     onDecisionCallback: async (id, choice, context) => { delivered.push(`${id}:${choice}:${context}`); },
   };
-  const poller = new TelegramPoller("0:test-only", dir, { dmPolicy: "allowlist", allowFrom: ["1"] }, callbacks, bridge);
+  const poller = new TelegramPoller("0:test-only", dir, { dmPolicy: "allowlist", allowFrom: ["1"] }, callbacks, bridge, { sendTimeoutMs: 1000 });
   globalThis.fetch = (async (input, init) => {
     calls.push({ method: String(input).split("/").pop()!, body: JSON.parse(String(init?.body ?? "{}")) });
     return Response.json({ ok: true });

@@ -67,6 +67,23 @@ function attributeSender(fromId: string, text: string): string {
   return `[Telegram sender: ${fromId}; origin: telegram_account]\n${text}`;
 }
 
+/**
+ * Time one Bot API call may take. api.telegram.org's IPv6 route intermittently stalls a connect for
+ * ~21 s before the client falls back to IPv4, so any shorter budget turns that stall into a lost message.
+ */
+export const DEFAULT_SEND_TIMEOUT_MS = 25_000;
+
+/** Error codes raised before any byte of the request left this machine, so a retry cannot duplicate it. */
+const PRE_SEND_ERROR_CODES = new Set([
+  "ConnectionRefused", "FailedToOpenSocket", "ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "ENETUNREACH", "EHOSTUNREACH",
+]);
+
+/** True only for connect and DNS failures. A timeout or a read error may have delivered the message. */
+export function failedBeforeRequestSent(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null)?.code;
+  return typeof code === "string" && PRE_SEND_ERROR_CODES.has(code);
+}
+
 export interface PollerOptions {
   maxConflictRetries?: number;
   initialConflictBackoffMs?: number;
@@ -97,9 +114,12 @@ export interface PollerOptions {
   forumChatId?: string;
   /**
    * How long a sendMessage may take before the poller gives up. A send that times out may still have
-   * been delivered, so a caller that cannot tolerate a duplicate wants this generous. Defaults to 3000 ms.
+   * been delivered, so a caller that cannot tolerate a duplicate wants this generous. Defaults to
+   * {@link DEFAULT_SEND_TIMEOUT_MS}.
    */
   sendTimeoutMs?: number;
+  /** Receives one line for every outbound call that failed at the transport level. Never carries the token. */
+  log?: (message: string) => void;
   botUsername?: string;
   slotId?: string;
 }
@@ -366,6 +386,40 @@ export class TelegramPoller {
     this.db.run("INSERT INTO bridge_meta(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [key, value]);
   }
 
+  /**
+   * One Bot API POST. A connect or DNS failure is retried once, since nothing was sent; a timeout
+   * or any later failure is thrown as is, because the message may already have been delivered.
+   */
+  private async botCall(method: string, body: Record<string, unknown>): Promise<TelegramSendMessageResponse> {
+    const url = `https://api.telegram.org/bot${this.botToken}/${method}`;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          signal: AbortSignal.any([
+            this.abortController.signal,
+            AbortSignal.timeout(this.options.sendTimeoutMs ?? DEFAULT_SEND_TIMEOUT_MS),
+          ]),
+        });
+        return (await response.json()) as TelegramSendMessageResponse;
+      } catch (err) {
+        if (attempt > 0 || this.abortController.signal.aborted || !failedBeforeRequestSent(err)) throw err;
+        this.logTransportError(method, err, "retrying once");
+      }
+    }
+  }
+
+  private logTransportError(method: string, err: unknown, note = ""): void {
+    const name = err instanceof Error ? err.name : typeof err;
+    const code = (err as { code?: unknown } | null)?.code;
+    const message = (err instanceof Error ? err.message : String(err)).split(this.botToken).join("<token>");
+    this.options.log?.(redactSecrets(
+      `Telegram ${method} failed: ${name}${typeof code === "string" ? ` (${code})` : ""}: ${message}${note ? ` — ${note}` : ""}`,
+    ));
+  }
+
   private paceOutbound(): Promise<void> {
     const reserve = this.outboundReservation.then(async () => {
       const delay = Math.max(0, this.nextOutboundAt - Date.now());
@@ -427,11 +481,7 @@ export class TelegramPoller {
 
   private async dashboardApi(method: string, body: Record<string, unknown>): Promise<void> {
     await this.paceOutbound();
-    const response = await fetch(`https://api.telegram.org/bot${this.botToken}/${method}`, {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
-      signal: AbortSignal.any([this.abortController.signal, AbortSignal.timeout(3000)]),
-    });
-    const data = await response.json();
+    const data = await this.botCall(method, body);
     this.observeRateLimit(data);
     if (!data.ok) throw new Error(`Dashboard ${method} unavailable; check pin permission and Telegram retry window`);
   }
@@ -496,17 +546,7 @@ export class TelegramPoller {
       const boundSessionId = correlationMeta?.sessionId ?? this.correlation?.getSessionId() ?? null;
 
       await this.paceOutbound();
-      const response = await fetch(
-        `https://api.telegram.org/bot${this.botToken}/sendMessage`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-          signal: AbortSignal.any([this.abortController.signal, AbortSignal.timeout(this.options.sendTimeoutMs ?? 3000)]),
-        },
-      );
-
-      const data = (await response.json()) as TelegramSendMessageResponse;
+      const data = await this.botCall("sendMessage", body);
       this.observeRateLimit(data);
       if (
         data?.ok &&
@@ -533,7 +573,8 @@ export class TelegramPoller {
         });
       }
       return data;
-    } catch {
+    } catch (err) {
+      this.logTransportError("sendMessage", err);
       return null;
     }
   }
@@ -562,20 +603,11 @@ export class TelegramPoller {
       };
 
       await this.paceOutbound();
-      const response = await fetch(
-        `https://api.telegram.org/bot${this.botToken}/editMessageText`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-          signal: AbortSignal.any([this.abortController.signal, AbortSignal.timeout(this.options.sendTimeoutMs ?? 3000)]),
-        },
-      );
-
-      const data = (await response.json()) as TelegramSendMessageResponse;
+      const data = await this.botCall("editMessageText", body);
       this.observeRateLimit(data);
       return data;
-    } catch {
+    } catch (err) {
+      this.logTransportError("editMessageText", err);
       return null;
     }
   }
@@ -584,15 +616,10 @@ export class TelegramPoller {
       const reply_markup = replacementText
         ? { inline_keyboard: [[{ text: replacementText, callback_data: "noop" }]] }
         : { inline_keyboard: [] };
-      const response = await fetch(`https://api.telegram.org/bot${this.botToken}/editMessageReplyMarkup`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ chat_id: chatId, message_id: messageId, reply_markup }),
-        signal: AbortSignal.any([this.abortController.signal, AbortSignal.timeout(3000)]),
-      });
-      const data: unknown = await response.json();
+      const data: unknown = await this.botCall("editMessageReplyMarkup", { chat_id: chatId, message_id: messageId, reply_markup });
       return Boolean(data && typeof data === "object" && "ok" in data && data.ok === true);
-    } catch {
+    } catch (err) {
+      this.logTransportError("editMessageReplyMarkup", err);
       return false;
     }
   }
@@ -601,17 +628,12 @@ export class TelegramPoller {
   private async classifiedCall(method: string, body: Record<string, unknown>): Promise<"ok" | "gone" | "error"> {
     try {
       await this.paceOutbound();
-      const response = await fetch(`https://api.telegram.org/bot${this.botToken}/${method}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-        signal: AbortSignal.any([this.abortController.signal, AbortSignal.timeout(5000)]),
-      });
-      const data = (await response.json()) as TelegramSendMessageResponse;
+      const data = await this.botCall(method, body);
       this.observeRateLimit(data);
       if (data.ok) return "ok";
       return /not found|to delete not found|not modified/i.test(data.description ?? "") ? "gone" : "error";
-    } catch {
+    } catch (err) {
+      this.logTransportError(method, err);
       return "error";
     }
   }
