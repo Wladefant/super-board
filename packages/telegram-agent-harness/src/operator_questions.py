@@ -5,8 +5,10 @@ JSON stdin/stdout keeps prose and credentials out of shell argument parsing.
 """
 from __future__ import annotations
 
+from datetime import datetime
 import json
 import os
+import re
 from pathlib import Path
 import sys
 import time
@@ -16,6 +18,56 @@ SOURCE_WORKFLOWS = Path(__file__).resolve().parents[3] / "workflows" / "portable
 sys.path.insert(0, str(SOURCE_WORKFLOWS if SOURCE_WORKFLOWS.is_dir() else Path.home() / ".veyyon" / "workflows"))
 from decision_workflow import DecisionManager, FileLock, get_iso_timestamp
 from telegram_notifier import DecisionCallbackStore, NotificationEvent, build_decision_inline_keyboard, render_card
+
+
+_STOPWORDS = frozenset(
+    "this that with from have will your what when which should would could there their about into then than "
+    "also just more some only been were they them does need want like make made over under each very".split())
+
+
+def _terms(*texts: str) -> set:
+    words = set()
+    for text in texts:
+        for word in re.findall(r"[a-z0-9][a-z0-9_\-]{3,}", str(text).lower()):
+            if word not in _STOPWORDS:
+                words.add(word)
+    return words
+
+
+def _epoch(value) -> float:
+    if isinstance(value, (int, float)):
+        return float(value)
+    return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+
+
+def possible_answers(questions: list, messages: list, min_shared: int = 2) -> list:
+    """Pending questions that a later operator message may already answer. Read-only.
+
+    A match is a suggestion, never an answer: the caller reads the message, then calls `resolve`
+    (and states which question it closed and how it read the reply) or asks the question anyway.
+    A message qualifies when it arrived after the question and shares at least `min_shared`
+    distinctive words with the question text, its problem and its option labels.
+    """
+    found = []
+    for question in questions:
+        if question.get("status") != "pending":
+            continue
+        transport = question.get("transport", {})
+        created = transport.get("created_ts") or _epoch(question["created_at"])
+        wanted = _terms(question.get("question", ""), transport.get("problem", ""),
+                        *[option.get("label", "") for option in question.get("options", [])])
+        hits = []
+        for message in messages:
+            if _epoch(message["at"]) < created:
+                continue
+            shared = sorted(wanted & _terms(message.get("text", "")))
+            if len(shared) >= min_shared:
+                hits.append({"message_id": message.get("id"), "shared": shared, "text": message.get("text", "")})
+        if hits:
+            hits.sort(key=lambda hit: -len(hit["shared"]))
+            found.append({"decision_id": question["decision_id"], "question": question["question"],
+                          "possibly_answered_by": hits})
+    return found
 
 
 class OperatorQuestions:
@@ -199,6 +251,11 @@ def main():
         result = service.cache(request.get("payload", {}))
     elif operation == "card_for":
         result = service.card_for(request["payload"]["id"])
+    elif operation == "possible_answers":
+        payload = request["payload"]
+        pending = [q for q in service.manager._load_data_unlocked()["decisions"].values()
+                   if q.get("transport", {}).get("kind") == "operator_question"]
+        result = {"matches": possible_answers(pending, payload["messages"], int(payload.get("min_shared", 2)))}
     else:
         result = service.run(operation, request.get("payload", {}), request["route"])
         if request.get("card") and "question" in result and result["question"]["status"] == "pending":
