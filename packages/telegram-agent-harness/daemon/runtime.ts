@@ -22,7 +22,7 @@ import {
   getProcessIdentity,
 } from "../extension/coordinator";
 import { TelegramPoller } from "../extension/poller";
-import { telegramFetch } from "../extension/telegram-fetch";
+import { governedTelegramFetch } from "../extension/telegram-governor";
 import { resolveGithubRepo } from "../extension/github-repo";
 import { chunkMessage, escapeHtml } from "../extension/sanitizer";
 import type { AccessConfig, MessageCorrelationBridge } from "../extension/types";
@@ -617,10 +617,10 @@ export class TelegramDaemon {
       },
     });
     const url = miniAppUrl(slot.stateDir);
-    if (url) for (const chatId of access.allowFrom) void telegramFetch(`https://api.telegram.org/bot${token}/setChatMenuButton`, {
+    if (url) for (const chatId of access.allowFrom) void governedTelegramFetch(`https://api.telegram.org/bot${token}/setChatMenuButton`, {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ chat_id: chatId, menu_button: { type: "web_app", text: "Superboard", web_app: { url } } }),
-    }).then(async response => {
+    }, { kind: "other" }).then(async response => {
       const result = await response.json();
       if (!response.ok || !result.ok) this.log(`Slot ${slot.slotId}: Mini App menu registration rejected`);
     }).catch(() => this.log(`Slot ${slot.slotId}: Mini App menu registration unavailable`));

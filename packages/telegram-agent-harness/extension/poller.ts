@@ -2,7 +2,8 @@
  * poller.ts — Long-polling Telegram Bot API transport & message dispatcher.
  */
 
-import { telegramFetch, type ResolvedAddress } from "./telegram-fetch";
+import { type ResolvedAddress } from "./telegram-fetch";
+import { governedTelegramFetch, type TelegramGovernor } from "./telegram-governor";
 import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -123,6 +124,8 @@ export interface PollerOptions {
   log?: (message: string) => void;
   /** Overrides DNS resolution for Bot API calls. Tests use it to pin the address families. */
   resolveHost?: (host: string) => Promise<ResolvedAddress[]>;
+  /** Governor for this bot's outbound calls. Defaults to the process-wide one; tests inject a fake clock. */
+  governor?: TelegramGovernor;
   botUsername?: string;
   slotId?: string;
 }
@@ -393,19 +396,28 @@ export class TelegramPoller {
    * One Bot API POST. A connect or DNS failure is retried once, since nothing was sent; a timeout
    * or any later failure is thrown as is, because the message may already have been delivered.
    */
-  private async botCall(method: string, body: Record<string, unknown>): Promise<TelegramSendMessageResponse> {
+  private async botCall(
+    method: string,
+    body: Record<string, unknown>,
+    kind: "message" | "panel" = "message",
+  ): Promise<TelegramSendMessageResponse> {
     const url = `https://api.telegram.org/bot${this.botToken}/${method}`;
+    const chatId = typeof body.chat_id === "string" || typeof body.chat_id === "number" ? body.chat_id : undefined;
+    const coalesceKey = method === "editMessageText" && chatId !== undefined ? `edit:${chatId}:${String(body.message_id)}` : undefined;
     for (let attempt = 0; ; attempt++) {
       try {
-        const response = await telegramFetch(url, {
+        const response = await governedTelegramFetch(url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
-          signal: AbortSignal.any([
-            this.abortController.signal,
-            AbortSignal.timeout(this.options.sendTimeoutMs ?? DEFAULT_SEND_TIMEOUT_MS),
-          ]),
-        }, { resolve: this.options.resolveHost });
+          signal: this.abortController.signal,
+        }, {
+          chatId,
+          kind,
+          coalesceKey,
+          timeoutMs: this.options.sendTimeoutMs ?? DEFAULT_SEND_TIMEOUT_MS,
+          log: (line) => this.options.log?.(line),
+        }, { resolve: this.options.resolveHost, governor: this.options.governor });
         return (await response.json()) as TelegramSendMessageResponse;
       } catch (err) {
         if (attempt > 0 || this.abortController.signal.aborted || !failedBeforeRequestSent(err)) throw err;
@@ -461,7 +473,7 @@ export class TelegramPoller {
     if (Date.now() - last < 30_000) return;
     let messageId = Number(this.getMeta(key) ?? 0);
     if (messageId) {
-      const edited = await this.editTelegramMessage(chatId, messageId, html);
+      const edited = await this.editTelegramMessage(chatId, messageId, html, undefined, undefined, undefined, "panel");
       if (!edited?.ok && !edited?.description?.includes("message is not modified")) {
         if (edited?.error_code === 400 && edited.description?.includes("message to edit not found")) {
           messageId = 0;
@@ -484,7 +496,7 @@ export class TelegramPoller {
 
   private async dashboardApi(method: string, body: Record<string, unknown>): Promise<void> {
     await this.paceOutbound();
-    const data = await this.botCall(method, body);
+    const data = await this.botCall(method, body, "panel");
     this.observeRateLimit(data);
     if (!data.ok) throw new Error(`Dashboard ${method} unavailable; check pin permission and Telegram retry window`);
   }
@@ -590,6 +602,8 @@ export class TelegramPoller {
     /** Session repository for bare `#N`. Omit it and the reference stays unlinked. */
     defaultRepo?: string,
     replyMarkup?: Record<string, unknown>,
+    /** `panel` draws on the group budget reserved for dashboards. */
+    kind: "message" | "panel" = "message",
   ): Promise<TelegramSendMessageResponse | null> {
     // "HTML" is finished markup, exactly as in sendTelegramMessage; anything else is Markdown.
     const sanitized = redactSecrets(text);
@@ -606,7 +620,7 @@ export class TelegramPoller {
       };
 
       await this.paceOutbound();
-      const data = await this.botCall("editMessageText", body);
+      const data = await this.botCall("editMessageText", body, kind);
       this.observeRateLimit(data);
       return data;
     } catch (err) {
@@ -715,7 +729,7 @@ export class TelegramPoller {
       try {
         const allowedUpdates = encodeURIComponent(JSON.stringify(["message", "callback_query"]));
         const url = `https://api.telegram.org/bot${this.botToken}/getUpdates?offset=${offset}&timeout=20&allowed_updates=${allowedUpdates}`;
-        const res = await telegramFetch(url, { signal: this.abortController.signal });
+        const res = await governedTelegramFetch(url, { signal: this.abortController.signal }, { kind: "inbound", log: (line) => this.options.log?.(line) }, { resolve: this.options.resolveHost, governor: this.options.governor });
 
         if (!res.ok) {
           if (res.status === 409) {
@@ -1231,9 +1245,9 @@ export class TelegramPoller {
     if (!row.media_json && rawText.startsWith("/")) {
       if (rawText.includes("@") && !this.botUsername) {
         try {
-          const meRes = await telegramFetch(`https://api.telegram.org/bot${this.botToken}/getMe`, {
-            signal: AbortSignal.timeout(3000),
-          });
+          const meRes = await governedTelegramFetch(`https://api.telegram.org/bot${this.botToken}/getMe`, {}, {
+            kind: "inbound", timeoutMs: 3000, log: (line) => this.options.log?.(line),
+          }, { resolve: this.options.resolveHost, governor: this.options.governor });
           const me = (await meRes.json()) as { ok?: boolean; result?: { username?: string } };
           if (me.ok && me.result?.username) {
             this.botUsername = me.result.username.toLowerCase();
@@ -1501,11 +1515,11 @@ export class TelegramPoller {
 
     form.set("media", JSON.stringify(mediaList));
 
-    const response = await telegramFetch(`https://api.telegram.org/bot${this.botToken}/sendMediaGroup`, {
+    const response = await governedTelegramFetch(`https://api.telegram.org/bot${this.botToken}/sendMediaGroup`, {
       method: "POST",
       body: form,
       signal: this.abortController.signal,
-    });
+    }, { chatId, log: (line) => this.options.log?.(line) }, { resolve: this.options.resolveHost, governor: this.options.governor });
     const data = (await response.json()) as {
       ok: boolean;
       result?: Array<{ message_id: number; chat?: { id: number } }>;

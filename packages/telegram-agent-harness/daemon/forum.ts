@@ -21,6 +21,7 @@
 
 import * as path from "node:path";
 import { escapeHtml } from "../extension/sanitizer";
+import { governedTelegramFetch, governorFor } from "../extension/telegram-governor";
 import type { DaemonSlot } from "./config";
 import {
   findSessionFile,
@@ -63,9 +64,9 @@ export interface ForumApiClient {
 export class DefaultTelegramForumClient implements ForumApiClient {
   private readonly token: string;
   private readonly apiBaseUrl: string;
-  private readonly customFetch: typeof fetch;
+  private readonly customFetch: typeof fetch | undefined;
 
-  constructor(token: string, apiBaseUrl = "https://api.telegram.org", customFetch: typeof fetch = fetch) {
+  constructor(token: string, apiBaseUrl = "https://api.telegram.org", customFetch?: typeof fetch) {
     this.token = token;
     this.apiBaseUrl = apiBaseUrl.replace(/\/+$/, "");
     this.customFetch = customFetch;
@@ -73,11 +74,17 @@ export class DefaultTelegramForumClient implements ForumApiClient {
 
   private async call<T>(method: string, body: Record<string, unknown>): Promise<T> {
     const url = `${this.apiBaseUrl}/bot${this.token}/${method}`;
-    const response = await this.customFetch(url, {
+    const init: RequestInit = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-    });
+    };
+    const chatId = typeof body.chat_id === "string" || typeof body.chat_id === "number" ? body.chat_id : undefined;
+    const request = { chatId, kind: "message" as const };
+    const customFetch = this.customFetch;
+    const response = customFetch
+      ? await governorFor(this.token.split(":")[0]).schedule(request, (signal) => customFetch(url, { ...init, signal }))
+      : await governedTelegramFetch(url, init, request);
     if (!response.ok) {
       let errDetail = `HTTP ${response.status} ${response.statusText}`;
       try {

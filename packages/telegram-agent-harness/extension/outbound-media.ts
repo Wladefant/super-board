@@ -1,5 +1,5 @@
 import { stat } from "node:fs/promises";
-import { telegramFetch } from "./telegram-fetch";
+import { governedTelegramFetch } from "./telegram-governor";
 import * as path from "node:path";
 import { formatTelegramCaption, redactSecrets } from "./sanitizer";
 import type { TelegramSendMessageResponse } from "./types";
@@ -98,14 +98,12 @@ export async function sendTelegramAttachment(
     form.set("reply_markup", JSON.stringify(request.replyMarkup));
   }
 
-  const timeout = AbortSignal.timeout(120_000);
-  const signal = request.signal ? AbortSignal.any([request.signal, timeout]) : timeout;
   const method = kind === "photo" ? "sendPhoto" : "sendDocument";
-  const response = await telegramFetch(`https://api.telegram.org/bot${request.token}/${method}`, {
+  const response = await governedTelegramFetch(`https://api.telegram.org/bot${request.token}/${method}`, {
     method: "POST",
     body: form,
-    signal,
-  });
+    signal: request.signal,
+  }, { chatId: request.chatId, timeoutMs: 120_000 });
   let data: TelegramSendMessageResponse;
   try {
     data = (await response.json()) as TelegramSendMessageResponse;
