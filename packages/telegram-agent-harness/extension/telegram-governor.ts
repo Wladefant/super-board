@@ -21,7 +21,10 @@
  *
  * Calls go out through {@link telegramFetch}, so they keep IPv4-first connects.
  */
+import { type BudgetConfig, isGroupChat, recordRateLimit, reserve, sharedBudgetFor, type SharedBudget } from "./telegram-budget";
 import { telegramFetch, type TelegramFetchDeps } from "./telegram-fetch";
+
+export { isGroupChat };
 
 export type GovernorKind = "message" | "panel" | "other" | "inbound";
 
@@ -47,6 +50,8 @@ export interface GovernorOptions {
   /** Queued, not-yet-sent calls one chat may hold per lane. More are refused so a stuck chat cannot grow memory. */
   maxQueuedPerChat?: number;
   now?: () => number;
+  /** Budget file shared with the other processes of this bot. Omit for a process-local budget. */
+  shared?: SharedBudget;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 }
 
@@ -108,11 +113,6 @@ const defaultSleep = (ms: number, signal?: AbortSignal): Promise<void> => {
   return promise;
 };
 
-/** Groups, supergroups and channels have negative ids; a private chat id is positive. */
-export function isGroupChat(chatId: string): boolean {
-  return chatId.startsWith("-");
-}
-
 function parseRetryAfter(body: unknown, header: string | null): number | undefined {
   if (body && typeof body === "object" && "parameters" in body) {
     const parameters = body.parameters;
@@ -151,6 +151,7 @@ export class TelegramGovernor {
   private readonly maxQueuedPerChat: number;
   private readonly now: () => number;
   private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
+  private readonly shared: SharedBudget | undefined;
   /** Set by a 429 on a call that is not bound to a chat. */
   private blockedUntil = 0;
   private readonly chats = new Map<string, ChatState>();
@@ -164,6 +165,7 @@ export class TelegramGovernor {
     this.maxQueuedPerChat = options.maxQueuedPerChat ?? 200;
     this.now = options.now ?? Date.now;
     this.sleep = options.sleep ?? defaultSleep;
+    this.shared = options.shared;
   }
 
   public snapshot(): GovernorSnapshot {
@@ -276,6 +278,14 @@ export class TelegramGovernor {
         }
       }
       if (readyAt <= now) {
+        // The local budget allows it; the file also counts the other processes' sends to this chat.
+        const claim = this.shared?.update((ledger) => reserve(ledger, chat, entry.kind, now, this.config()), now);
+        if (claim && claim.blockedMs > this.maxRetryWaitMs) throw new TelegramRateLimitedError(claim.blockedMs);
+        if (claim && claim.waitMs > 0) {
+          entry.log?.(`telegram governor: chat ${chat} ${entry.kind} waits ${claim.waitMs} ms (${claim.reason}, shared with other processes)`);
+          await this.sleep(claim.waitMs, entry.signal);
+          continue;
+        }
         state.sends.push({ at: now, kind: entry.kind });
         state.lastAt = now;
         return;
@@ -290,12 +300,18 @@ export class TelegramGovernor {
   private async waitUnblocked(entry: Entry): Promise<void> {
     if (entry.kind === "inbound") return;
     for (;;) {
-      const wait = this.blockedUntil - this.now();
+      const now = this.now();
+      const wait = Math.max(this.blockedUntil - now, this.shared?.botBlockedMs(now) ?? 0);
       if (wait <= 0) return;
       if (wait > this.maxRetryWaitMs) throw new TelegramRateLimitedError(wait);
       entry.log?.(`telegram governor: ${entry.kind} call waits ${wait} ms (retry_after)`);
       await this.sleep(wait, entry.signal);
     }
+  }
+
+  /** The numbers the shared budget file is computed with. */
+  private config(): BudgetConfig {
+    return { chatIntervalMs: this.chatIntervalMs, groupLimit: this.groupLimit, windowMs: this.windowMs, panelReserve: this.panelReserve };
   }
 
   private attempt(entry: Entry): Promise<Response> {
@@ -320,6 +336,7 @@ export class TelegramGovernor {
       const scope = state ? `chat ${chat}` : "bot";
       if (state) state.blockedUntil = Math.max(state.blockedUntil, until);
       else this.blockedUntil = Math.max(this.blockedUntil, until);
+      this.shared?.update((ledger) => recordRateLimit(ledger, state ? chat : undefined, until), this.now());
       const retry = attempt === 0 && entry.kind !== "inbound" && retryAfterSeconds * 1000 <= this.maxRetryWaitMs;
       entry.log?.(`telegram governor: 429, ${scope} blocked for ${retryAfterSeconds} s${retry ? ", one retry after the wait" : ", not retried"}`);
       if (!retry) return response;
@@ -333,7 +350,7 @@ const governors = new Map<string, TelegramGovernor>();
 export function governorFor(botId: string): TelegramGovernor {
   let governor = governors.get(botId);
   if (!governor) {
-    governor = new TelegramGovernor();
+    governor = new TelegramGovernor({ shared: sharedBudgetFor(botId) });
     governors.set(botId, governor);
   }
   return governor;

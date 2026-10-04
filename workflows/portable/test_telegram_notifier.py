@@ -25,10 +25,18 @@ import subprocess
 import sys
 import tempfile
 import time
+import io
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock, patch
 
+# Tests that send through a patched transport must not draw on, or write to, the operator's live shared budget.
+os.environ.setdefault("VEYYON_TELEGRAM_BUDGET_DIR", "off")
+
+import telegram_budget
 from telegram_notifier import (
     DEFAULT_COOLDOWN_SECONDS,
     DEFAULT_DEDUP_WINDOW_SECONDS,
@@ -46,6 +54,7 @@ from telegram_notifier import (
     DecisionCallbackStore,
     ProcessDeadlineWatchdog,
     QuestionReminderManager,
+    _governed_urlopen,
     _safe_urlopen,
     build_decision_inline_keyboard,
     format_decision_presentation,
@@ -1614,6 +1623,186 @@ class TestTelegramNotifierHardening(unittest.TestCase):
         event.validate()
         rendered = TelegramNotificationAdapter.format_message(event)
         self.assertEqual(rendered, raw_html)
+
+
+class _FakeClock:
+    """One clock for every simulated process; sleep moves it."""
+
+    def __init__(self) -> None:
+        self.t = 1_000_000.0
+
+    def now_ms(self) -> float:
+        return self.t
+
+    def sleep(self, seconds: float) -> None:
+        self.t += seconds * 1000
+
+
+class _FakeTelegram:
+    """Answers 429 when a chat gets under 1 s apart or a group a 21st message in a minute."""
+
+    def __init__(self, clock: _FakeClock, retry_after_on_call: Optional[Dict[int, int]] = None) -> None:
+        self.clock = clock
+        self.sent: List[Dict[str, Any]] = []
+        self.statuses: List[int] = []
+        self.calls = 0
+        self.retry_after_on_call = retry_after_on_call or {}
+
+    def urlopen(self, req, timeout=0, deadline=0):
+        self.calls += 1
+        chat = str(json.loads(req.data)["chat_id"])
+        now = self.clock.now_ms()
+        history = [s for s in self.sent if s["chat"] == chat]
+        too_fast = bool(history) and now - history[-1]["at"] < 1000
+        group_full = chat.startswith("-") and len([s for s in history if now - s["at"] < 60_000]) >= 20
+        scripted = self.retry_after_on_call.get(self.calls)
+        if scripted is not None or too_fast or group_full:
+            self.statuses.append(429)
+            body = json.dumps({"ok": False, "parameters": {"retry_after": scripted or 5}}).encode()
+            raise urllib.error.HTTPError(req.full_url, 429, "Too Many Requests", {}, io.BytesIO(body))
+        self.statuses.append(200)
+        self.sent.append({"at": now, "chat": chat})
+        return json.dumps({"ok": True, "result": {"message_id": len(self.sent)}}).encode()
+
+
+class TestSharedSendBudget(unittest.TestCase):
+    """The notifier and the TypeScript governor draw on one per-bot budget kept in a shared file."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="tg-budget-"))
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.clock = _FakeClock()
+
+    def send(self, telegram: _FakeTelegram, budget, chat: str, deadline: float = 15.0):
+        req = urllib.request.Request("https://api.telegram.org/bot1:T/sendMessage", data=json.dumps({"chat_id": chat}).encode())
+        with patch("telegram_notifier._safe_urlopen", side_effect=telegram.urlopen):
+            return _governed_urlopen(req, "1:T", chat, deadline=deadline, budget=budget,
+                                     now_ms=self.clock.now_ms, sleep=self.clock.sleep)
+
+    def other_process(self, chat: str, count: int, kind: str = "message"):
+        """What the daemon's governor writes to the same file: `count` sends into `chat` now."""
+        budget = telegram_budget.SharedBudget("1", self.dir)
+        for _ in range(count):
+            claim = budget.update(lambda s: telegram_budget.reserve(s, chat, kind, self.clock.now_ms()), self.clock.now_ms())
+            self.assertEqual(claim.wait_ms, 0)
+            self.clock.t += 1000
+
+    def test_notifier_and_daemon_together_keep_one_send_per_second_per_chat(self):
+        telegram = _FakeTelegram(self.clock)
+        budget = telegram_budget.SharedBudget("1", self.dir)
+        daemon = telegram_budget.SharedBudget("1", self.dir)
+        for _ in range(3):
+            self.send(telegram, budget, "7")
+            # The daemon sends into the same chat in between, without going through this process.
+            telegram_budget.acquire(daemon, "7", "message", max_wait_ms=60_000, now_ms=self.clock.now_ms, sleep=self.clock.sleep)
+            telegram.sent.append({"at": self.clock.now_ms(), "chat": "7"})
+        gaps = [b["at"] - a["at"] for a, b in zip(telegram.sent, telegram.sent[1:])]
+        self.assertTrue(all(g >= 1000 for g in gaps), gaps)
+        self.assertEqual(telegram.statuses, [200, 200, 200])
+
+    def test_group_message_share_is_counted_across_processes(self):
+        telegram = _FakeTelegram(self.clock)
+        budget = telegram_budget.SharedBudget("1", self.dir)
+        start = self.clock.now_ms()
+        self.other_process("-100", 6)  # the daemon already used 6 of the 8 ordinary messages per minute
+        for _ in range(4):
+            self.send(telegram, budget, "-100", deadline=300.0)
+        self.assertEqual(telegram.statuses, [200] * 4)
+        # Only 2 of the 4 fit in the first minute: the third waits for the daemon's first send to leave the window.
+        self.assertLess(telegram.sent[1]["at"] - start, 60_000)
+        self.assertGreaterEqual(telegram.sent[2]["at"] - start, 60_000)
+
+    def test_retry_after_recorded_by_one_process_holds_back_the_other(self):
+        budget = telegram_budget.SharedBudget("1", self.dir)
+        daemon = telegram_budget.SharedBudget("1", self.dir)
+        start = self.clock.now_ms()
+        daemon.update(lambda s: telegram_budget.record_rate_limit(s, "7", start + 9000), start)
+        telegram = _FakeTelegram(self.clock)
+        self.send(telegram, budget, "7")
+        self.assertEqual(telegram.sent[0]["at"], start + 9000)
+        self.send(telegram, budget, "8")
+        self.assertEqual(telegram.sent[1]["at"], start + 9000)  # another chat was never blocked
+
+    def test_429_is_recorded_and_retried_once_after_retry_after(self):
+        telegram = _FakeTelegram(self.clock, {1: 7})
+        budget = telegram_budget.SharedBudget("1", self.dir)
+        start = self.clock.now_ms()
+        self.send(telegram, budget, "7")
+        self.assertEqual(telegram.statuses, [429, 200])
+        self.assertEqual(telegram.sent[0]["at"], start + 7000)
+        state = budget._read()
+        self.assertEqual(state["chats"]["7"]["blockedUntil"], start + 7000)
+
+    def test_a_second_429_is_raised_not_looped(self):
+        telegram = _FakeTelegram(self.clock, {1: 2, 2: 2})
+        budget = telegram_budget.SharedBudget("1", self.dir)
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.send(telegram, budget, "7")
+        self.assertEqual(caught.exception.code, 429)
+        self.assertEqual(json.loads(caught.exception.read())["parameters"]["retry_after"], 2)
+        self.assertEqual(telegram.calls, 2)
+
+    def test_retry_after_beyond_the_inline_limit_is_not_slept_through(self):
+        telegram = _FakeTelegram(self.clock, {1: 3600})
+        budget = telegram_budget.SharedBudget("1", self.dir)
+        start = self.clock.now_ms()
+        with self.assertRaises(urllib.error.HTTPError):
+            self.send(telegram, budget, "7")
+        self.assertEqual(self.clock.now_ms(), start)
+        self.assertEqual(telegram.calls, 1)
+
+    def test_a_wait_longer_than_the_deadline_sends_nothing(self):
+        budget = telegram_budget.SharedBudget("1", self.dir)
+        start = self.clock.now_ms()
+        budget.update(lambda s: telegram_budget.record_rate_limit(s, "7", start + 30_000), start)
+        telegram = _FakeTelegram(self.clock)
+        with self.assertRaises(telegram_budget.BudgetBlocked):
+            self.send(telegram, budget, "7", deadline=15.0)
+        self.assertEqual(telegram.calls, 0)
+        self.assertEqual(self.clock.now_ms(), start)
+
+    def test_concurrent_reservations_book_exactly_one_send_per_instant(self):
+        import threading
+        now = self.clock.now_ms()
+        results: List[int] = []
+        guard = threading.Lock()
+
+        def reserve_once():
+            claim = telegram_budget.SharedBudget("1", self.dir).update(
+                lambda s: telegram_budget.reserve(s, "7", "message", now), now)
+            with guard:
+                results.append(claim.wait_ms)
+
+        threads = [threading.Thread(target=reserve_once) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(results.count(0), 1, results)
+        self.assertTrue(all(r == 1000 for r in results if r), results)
+
+    def test_unusable_budget_directory_does_not_block_sending(self):
+        blocker = self.dir / "file"
+        blocker.write_text("x")
+        telegram = _FakeTelegram(self.clock)
+        budget = telegram_budget.SharedBudget("1", blocker / "sub")
+        self.send(telegram, budget, "7")
+        self.assertEqual(telegram.statuses, [200])
+
+    def test_stale_lock_from_a_dead_process_is_swept(self):
+        budget = telegram_budget.SharedBudget("1", self.dir)
+        budget.lock.mkdir()
+        old = time.time() - telegram_budget.STALE_LOCK_SECONDS - 5
+        os.utime(budget.lock, (old, old))
+        self.assertEqual(budget.update(lambda s: telegram_budget.reserve(s, "7", "message", 5000).wait_ms), 0)
+        self.assertFalse(budget.lock.exists())
+
+    def test_budget_off_switch_sends_without_a_file(self):
+        telegram = _FakeTelegram(self.clock)
+        with patch.dict(os.environ, {"VEYYON_TELEGRAM_BUDGET_DIR": "off"}):
+            self.assertIsNone(telegram_budget.budget_for("1"))
+            self.send(telegram, None, "7")
+        self.assertEqual(telegram.statuses, [200])
 
 
 if __name__ == "__main__":

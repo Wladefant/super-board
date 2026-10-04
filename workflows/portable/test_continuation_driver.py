@@ -24,6 +24,9 @@ import subprocess
 import tempfile
 import unittest
 
+# Sends through a patched transport must not touch the operator's live shared Telegram budget.
+os.environ.setdefault("VEYYON_TELEGRAM_BUDGET_DIR", "off")
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)

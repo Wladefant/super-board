@@ -176,6 +176,20 @@
         "DeliveryReceipt (JSON or terminal summary), deduplicated Telegram messages"
       ]
     },
+    "telegram_budget.py": {
+      "role": "Per-bot Bot API send budget (1 send/s per chat, 20/min per group with 12 kept for panels, retry_after blocks) kept in one file under ~/.veyyon/run/telegram-budget so the notifier and the TypeScript governor in the daemon and session extensions draw on the same limit",
+      "owner": "TelegramCrossProcessBudget",
+      "inputs": [
+        "Bot id, chat id, send kind"
+      ],
+      "outputs": [
+        "Booked send or the wait before the next try; recorded 429 blocks"
+      ],
+      "boundaries": [
+        "Same file format and arithmetic as packages/telegram-agent-harness/extension/telegram-budget.ts",
+        "Fails open: an unusable budget file never blocks a send"
+      ]
+    },
     "telegram_workflow.py": {
       "role": "Transport-free, fail-closed Telegram read facade over canonical Veyyon agent/session snapshots, Superboard ledger tasks, coordinator status, and authentic DecisionManager approvals",
       "owner": "TelegramWorkflow",
@@ -391,6 +405,7 @@
       "superboard_adapter.py",
       "github_pr_gate.py",
       "telegram_notifier.py",
+      "telegram_budget.py",
       "telegram_workflow.py",
       "cross_repo_smoke_test.py",
       "fixtures/alternate_repo_config.json",
