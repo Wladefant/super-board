@@ -177,7 +177,22 @@ class SharedBudget:
             time.sleep(0.002 + random.random() * 0.003)
 
     def _sweep_if_abandoned(self) -> None:
-        """Removes the lock when its holder is gone. A live holder is never removed. Never raises."""
+        """Removes the lock when its holder is gone. A live holder is never removed. Never raises.
+
+        Sweepers take a second O_EXCL file first, so only one of them can read-then-remove at a time. The
+        holder is dead, so nobody else can change the lock meanwhile.
+        """
+        sweeping = Path(f"{self.lock}.sweep")
+        try:
+            os.close(os.open(sweeping, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+        except OSError:
+            # Another sweeper is at work. Its own file is abandoned only if it crashed mid-sweep.
+            try:
+                if time.time() - os.stat(sweeping).st_mtime > UNNAMED_LOCK_SECONDS:
+                    os.unlink(sweeping)
+            except OSError:
+                pass
+            return
         try:
             st = os.stat(self.lock)
             age = time.time() - st.st_mtime
@@ -196,11 +211,15 @@ class SharedBudget:
                 abandoned = not pid_alive(pid) or age > MAX_LOCK_AGE_SECONDS
             else:
                 abandoned = age > UNNAMED_LOCK_SECONDS
-            # Look again right before removing, so a lock another process just took is left alone.
-            if abandoned and Path(self.lock).read_text(encoding="utf-8") == raw:
+            if abandoned:
                 os.unlink(self.lock)
         except Exception:
             pass
+        finally:
+            try:
+                os.unlink(sweeping)
+            except OSError:
+                pass
 
     def _release(self, token: str) -> None:
         # On Windows a waiter reading the lock holds it open, and unlink then fails with PermissionError, so retry.

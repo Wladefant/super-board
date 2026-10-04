@@ -184,18 +184,37 @@ export class SharedBudget {
 
   /** Retries with a timer, so the event loop stays free. Every pass checks the deadline, whatever shape the lock path is in. */
   private async waitForLock(token: string): Promise<"held" | "failed"> {
-    const deadline = Date.now() + this.lockTimeoutMs;
+    // Monotonic: a wall clock that jumps back must not stretch the deadline.
+    const deadline = performance.now() + this.lockTimeoutMs;
     for (;;) {
       this.sweepIfAbandoned();
-      if (Date.now() >= deadline) return "failed";
+      if (performance.now() >= deadline) return "failed";
       await new Promise<void>((resolve) => setTimeout(resolve, 2 + Math.random() * 3));
       const got = this.tryLock(token);
       if (got !== "busy") return got === "held" ? "held" : "failed";
     }
   }
 
-  /** Removes the lock when its holder is gone. Never throws. */
+  /**
+   * Removes the lock when its holder is gone. Never throws. Sweepers take a second O_EXCL file first, so only one
+   * of them can read-then-remove at a time. The holder is dead, so nobody else can change the lock meanwhile,
+   * and a lock another process took over after the sweep before ours is never the one removed.
+   */
   private sweepIfAbandoned(): void {
+    const sweeping = `${this.lock}.sweep`;
+    let fd: number;
+    try {
+      fd = fs.openSync(sweeping, "wx");
+    } catch {
+      // Another sweeper is at work. Its own file is itself abandoned only if it crashed mid-sweep.
+      try {
+        if (Date.now() - fs.statSync(sweeping).mtimeMs > UNNAMED_LOCK_MS) fs.unlinkSync(sweeping);
+      } catch {
+        // Gone already.
+      }
+      return;
+    }
+    fs.closeSync(fd);
     try {
       const stat = fs.statSync(this.lock);
       if (stat.isDirectory()) {
@@ -212,10 +231,15 @@ export class SharedBudget {
         // The holder died between creating the file and writing its name.
       }
       const abandoned = typeof pid === "number" ? !pidAlive(pid) || age > MAX_LOCK_AGE_MS : age > UNNAMED_LOCK_MS;
-      // Look again right before removing, so a lock a faster process just took over is left alone.
-      if (abandoned && fs.readFileSync(this.lock, "utf8") === raw) fs.unlinkSync(this.lock);
+      if (abandoned) fs.unlinkSync(this.lock);
     } catch {
       // Gone already, or not removable: the deadline decides.
+    } finally {
+      try {
+        fs.unlinkSync(sweeping);
+      } catch {
+        // Already removed as stale by another sweeper.
+      }
     }
   }
 
