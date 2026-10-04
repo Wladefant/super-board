@@ -57,7 +57,14 @@ interface Result {
   questions?: Question[];
   card?: { id: string; text: string; reply_markup?: Record<string, unknown> };
   status?: string;
+  matches?: PossibleAnswer[];
   error?: string;
+}
+/** A pending question that a later operator message may already answer. A suggestion, never an answer. */
+export interface PossibleAnswer {
+  decision_id: string;
+  question: string;
+  possibly_answered_by: Array<{ message_id: string | number | null; shared: string[]; text: string }>;
 }
 export interface QuestionRoute { session_id: string; chat_id: string; user_id: string }
 
@@ -115,6 +122,12 @@ export class QuestionStore {
     const result = await spawnQuestionStore({ operation: "card_for", payload: { id },
       decisions_path: this.decisionsPath, pool_path: this.poolPath });
     return { question: result.question!, card: result.card! };
+  }
+  /** Pending questions that recent operator messages (`at` = epoch seconds or ISO) may already answer. Read-only. */
+  async possibleAnswers(messages: Array<{ id: string | number; text: string; at: number | string }>, minShared = 2): Promise<PossibleAnswer[]> {
+    const result = await spawnQuestionStore({ operation: "possible_answers", payload: { messages, min_shared: minShared },
+      decisions_path: this.decisionsPath, pool_path: this.poolPath });
+    return result.matches ?? [];
   }
 }
 

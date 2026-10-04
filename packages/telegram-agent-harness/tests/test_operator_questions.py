@@ -129,6 +129,41 @@ class OperatorQuestionTests(unittest.TestCase):
         self.assertTrue(result.get("timed_out"))
         self.assertEqual(result["question"]["decision_id"], record["decision_id"])
 
+    def referral_question(self):
+        return self.service.run("register", {"question": "Referral reward: how large should partner payouts be?",
+            "problem": "Partners need an agreed payout percentage", "options": [
+                {"id": "low", "label": "Low percentage", "description": "Small payout"},
+                {"id": "high", "label": "High percentage", "description": "Large payout"}],
+            "recommendation": "low"}, self.route)["question"]
+
+    def test_free_text_reply_after_the_question_is_suggested_as_its_answer(self):
+        record = self.referral_question()
+        created = record["transport"]["created_ts"]
+        found = module.possible_answers([record], [
+            {"id": 11, "text": "Yes more or less, partners get a payout percentage, 20% or whatever", "at": created + 60}])
+        self.assertEqual([m["decision_id"] for m in found], [record["decision_id"]])
+        hit = found[0]["possibly_answered_by"][0]
+        self.assertEqual(hit["message_id"], 11)
+        self.assertIn("partners", hit["shared"])
+        self.assertIn("payout", hit["shared"])
+
+    def test_reply_older_than_the_question_or_unrelated_is_not_a_match(self):
+        record = self.referral_question()
+        created = record["transport"]["created_ts"]
+        self.assertEqual(module.possible_answers([record], [
+            {"id": 1, "text": "partners get a payout percentage", "at": created - 5},
+            {"id": 2, "text": "please merge the herdr change", "at": created + 5},
+            {"id": 3, "text": "one shared word: partners", "at": created + 5}]), [])
+
+    def test_answered_questions_are_never_suggested_and_suggestion_closes_nothing(self):
+        record = self.referral_question()
+        message = [{"id": 5, "text": "partners payout percentage twenty", "at": record["transport"]["created_ts"] + 1}]
+        self.assertEqual(len(module.possible_answers([record], message)), 1)
+        self.assertEqual(self.service.run("get", {"id": record["decision_id"]}, self.route)["question"]["status"], "pending")
+        self.service.run("resolve", {"id": record["decision_id"], "text": "20 percent"}, self.route)
+        closed = self.service.run("get", {"id": record["decision_id"]}, self.route)["question"]
+        self.assertEqual(module.possible_answers([closed], message), [])
+
 
 if __name__ == "__main__":
     unittest.main()
