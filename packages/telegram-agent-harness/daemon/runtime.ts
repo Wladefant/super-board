@@ -691,7 +691,7 @@ export class TelegramDaemon {
       log: message => this.log(`Slot ${slot.slotId}: ${message}`),
       transport: {
         send: async (target, text, markup, sessionId) => {
-          const sent = await poller.sendTelegramMessage(target.chatId, text, "HTML", markup, { sessionId }, undefined, Number(target.topicId));
+          const sent = await poller.sendTelegramMessage(target.chatId, text, "HTML", markup, { sessionId }, undefined, Number(target.topicId), "panel");
           if (sent?.ok && sent.result?.message_id) return { messageId: sent.result.message_id };
           return /thread not found/i.test(sent?.description ?? "") ? "gone" : "error";
         },

@@ -5,9 +5,10 @@ import * as path from "node:path";
 import { LANE_PANEL_CALLBACK_PREFIX, TelegramPoller, type PollerCallbacks } from "../extension/poller";
 import type { MessageCorrelationBridge, TelegramUpdate } from "../extension/types";
 import type { FleetLane, FleetSnapshot } from "../daemon/fleet-state";
-import { LanePanels, PANEL_EXPIRED_ANSWER, renderLanePanel, type PanelOutcome } from "../daemon/lane-panel";
+import { LanePanels, PANEL_ALREADY_STOPPING_ANSWER, PANEL_EXPIRED_ANSWER, renderLanePanel, type PanelOutcome } from "../daemon/lane-panel";
 import type { RouteTarget } from "../daemon/router";
 import { DaemonStore } from "../daemon/store";
+import { TelegramGovernor } from "../extension/telegram-governor";
 
 const originalFetch = globalThis.fetch;
 const cleanup: Array<() => void> = [];
@@ -52,11 +53,14 @@ function fixture(options: { miniAppLink?: string } = {}) {
     editOutcome: "ok" as PanelOutcome,
     nextMessageId: 500,
     stops: [] as RouteTarget[],
+    /** When set, a panel post runs it first: a test holds the pass in flight there. */
+    sendGate: null as (() => Promise<void>) | null,
+    snapshots: 0,
   };
   const calls: Call[] = [];
   const panels = new LanePanels({
     slotId: "slot", chatId: CHAT, store,
-    snapshot: async () => state.snapshot,
+    snapshot: async () => { state.snapshots++; return state.snapshot; },
     boundSession: target => store.getRoute("slot", target.chatId, target.topicId)?.sessionId ?? null,
     isBusy: () => state.busy,
     stop: async target => { state.stops.push(target); return true; },
@@ -66,6 +70,7 @@ function fixture(options: { miniAppLink?: string } = {}) {
     formatClock: () => "14:05",
     transport: {
       send: async (_target, text, markup) => {
+        if (state.sendGate) await state.sendGate();
         const messageId = state.nextMessageId++;
         calls.push({ op: "send", messageId, text, markup });
         return { messageId };
@@ -209,6 +214,131 @@ test("Stop uses the abort path; Steer and Follow-up arm the topic's next message
   await f.panels.run(buttons["➕ Follow-up"]!);
   f.state.now += 5 * MIN;
   expect(f.panels.takeArmed(TOPIC)).toBeNull();
+});
+
+test("a double-tapped Stop stops the turn once; a later turn can be stopped again", async () => {
+  const f = fixture();
+  await f.panels.tick();
+  const stop = f.buttons()["⏹ Stop"]!;
+
+  // Both taps are answered at receipt before the ledger runs either.
+  expect(f.panels.peek(stop)).toBe("⏹ Stopping the current turn.");
+  expect(f.panels.peek(stop)).toBe(PANEL_ALREADY_STOPPING_ANSWER);
+  await Promise.all([f.panels.run(stop), f.panels.run(stop)]);
+  expect(f.state.stops).toEqual([TOPIC]);
+
+  // A tap after the Stop went out, while the turn winds down, sends nothing either.
+  f.state.now += 10_000;
+  expect(f.panels.peek(stop)).toBe(PANEL_ALREADY_STOPPING_ANSWER);
+  await f.panels.run(stop);
+  expect(f.state.stops).toEqual([TOPIC]);
+
+  // The turn ended; the next turn's Stop works again.
+  f.state.busy = false;
+  expect(f.panels.peek(stop)).toBe("Nothing to stop: the session is idle.");
+  await f.panels.run(stop);
+  expect(f.state.stops).toEqual([TOPIC]);
+  f.state.busy = true;
+  expect(f.panels.peek(stop)).toBe("⏹ Stopping the current turn.");
+  await f.panels.run(stop);
+  expect(f.state.stops).toEqual([TOPIC, TOPIC]);
+
+  // A Stop the turn ignored lapses after the settle window, so the operator can press it again.
+  f.state.now += 31_000;
+  expect(f.panels.peek(stop)).toBe("⏹ Stopping the current turn.");
+  await f.panels.run(stop);
+  expect(f.state.stops).toEqual([TOPIC, TOPIC, TOPIC]);
+});
+
+test("after stop() nothing is posted, pinned or edited, not even by the pass in flight", async () => {
+  const f = fixture();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  f.state.sendGate = async () => { entered.resolve(); await release.promise; };
+  const inFlight = f.panels.tick();
+  await entered.promise;
+  const stopped = f.panels.stop();
+  release.resolve();
+  await stopped;
+  await inFlight;
+  // The post already under way lands; its pin does not follow.
+  expect(f.calls.map(call => call.op)).toEqual(["send"]);
+  const snapshots = f.state.snapshots;
+
+  f.state.sendGate = null;
+  f.state.now += 10 * MIN;
+  f.state.snapshot = snapshotOf([lane({ lastAction: "edit: something new" })]);
+  await f.panels.tick();
+  f.panels.start();
+  await f.panels.stop();
+  expect(f.calls.map(call => call.op)).toEqual(["send"]);
+  // Not even a fleet snapshot is read once stopped.
+  expect(f.state.snapshots).toBe(snapshots);
+
+  // Stopped before its pass began: that pass posts nothing at all.
+  const g = fixture();
+  const pass = g.panels.tick();
+  await g.panels.stop();
+  await pass;
+  expect(g.calls).toEqual([]);
+});
+
+test("panel state, tokens and arms go when the lane ends, the tokens expire or the topic loses its route", async () => {
+  const f = fixture();
+  await f.panels.tick();
+  await f.panels.run(f.buttons()["🧭 Steer"]!);
+  expect(f.panels.memory()).toEqual({ states: 1, tokens: 3, armed: 1 });
+
+  // The lane ends: its buttons and its armed Steer are dropped with it.
+  f.state.snapshot = snapshotOf([]);
+  f.state.now += 2 * MIN;
+  await f.panels.tick();
+  expect(f.panels.memory()).toEqual({ states: 1, tokens: 0, armed: 0 });
+  expect(f.panels.takeArmed(TOPIC)).toBeNull();
+
+  // The topic loses its route: nothing about it is kept.
+  f.store.deleteRoute("slot", CHAT, TOPIC.topicId);
+  await f.panels.tick();
+  expect(f.panels.memory()).toEqual({ states: 0, tokens: 0, armed: 0 });
+
+  // Edits keep failing, so no fresh keyboard replaces the tokens: they and the arm are dropped once expired.
+  const g = fixture();
+  await g.panels.tick();
+  await g.panels.run(g.buttons()["➕ Follow-up"]!);
+  g.state.editOutcome = "error";
+  for (let step = 1; step <= 31; step++) {
+    g.state.now += 2 * MIN;
+    g.state.snapshot = snapshotOf([lane({ lastAction: `step ${step}` })]);
+    await g.panels.tick();
+  }
+  expect(g.panels.stats.failures).toBe(31);
+  expect(g.panels.memory()).toEqual({ states: 1, tokens: 0, armed: 0 });
+});
+
+test("the panel post and its edits draw on the governor's panel queue; other sends stay messages", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "lane-panel-kind-"));
+  const kinds: Array<string | undefined> = [];
+  class RecordingGovernor extends TelegramGovernor {
+    override schedule(...args: Parameters<TelegramGovernor["schedule"]>): Promise<Response> {
+      kinds.push(args[0].kind);
+      return super.schedule(...args);
+    }
+  }
+  const callbacks: PollerCallbacks = {
+    isIdle: () => true, onUserMessage: () => {}, onFollowUp: () => {}, onSteer: () => {}, onAbort: () => {}, onRelease: async () => {},
+    getStatusText: () => "test", onLedgerFailure: () => {},
+  };
+  const poller = new TelegramPoller("0:test-only", dir, { dmPolicy: "allowlist", allowFrom: ["1"] }, callbacks, undefined, {
+    sendTimeoutMs: 1000, outboundPaceMs: 0, governor: new RecordingGovernor({ chatIntervalMs: 0 }),
+  });
+  cleanup.push(() => { poller.stop(); fs.rmSync(dir, { recursive: true, force: true }); });
+  globalThis.fetch = (async () => Response.json({ ok: true, result: { message_id: 9, chat: { id: Number(CHAT) } } })) as typeof fetch;
+
+  await poller.sendTelegramMessage(CHAT, "<b>panel</b>", "HTML", { inline_keyboard: [] }, { sessionId: "s1" }, undefined, 42, "panel");
+  await poller.editTelegramMessage(CHAT, 9, "<b>panel</b>", "HTML", undefined, undefined, "panel");
+  await poller.pinTelegramMessage(CHAT, 9, "panel");
+  await poller.sendTelegramMessage(CHAT, "a reply", "HTML", undefined, undefined, undefined, 42);
+  expect(kinds).toEqual(["panel", "panel", "panel", "message"]);
 });
 
 test("stale buttons answer expired and do nothing: TTL, a newer keyboard, a rebound topic", async () => {

@@ -24,6 +24,7 @@ export type PanelOutcome = "ok" | "gone" | "error";
 type Markup = { inline_keyboard: Array<Array<Record<string, string>>> };
 
 export const PANEL_EXPIRED_ANSWER = "⌛ Expired. Use the buttons on the current panel.";
+export const PANEL_ALREADY_STOPPING_ANSWER = "⏹ Already stopping.";
 
 export interface PanelTransport {
   /** Posts a new panel into the topic. `gone` means the topic no longer exists. */
@@ -58,6 +59,8 @@ export interface LanePanelOptions {
   tokenTtlMs?: number;
   /** How long a Steer or Follow-up click waits for the operator's next message. */
   armTtlMs?: number;
+  /** How long a sent Stop makes further Stop taps answer "already stopping" while the turn winds down. */
+  stopSettleMs?: number;
 }
 
 interface Keyboard {
@@ -81,6 +84,11 @@ interface PanelState {
   running: boolean;
   /** The keyboard on the message in Telegram. */
   keyboard: Keyboard | null;
+  /**
+   * The topic's Stop in progress. A tap claims it at receipt (`peek`), the ledger sends it once (`run`).
+   * Further taps while it is set answer "already stopping" and send nothing.
+   */
+  stop: { phase: "claimed" | "sent"; at: number } | null;
 }
 
 export interface PanelStats {
@@ -173,11 +181,14 @@ export class LanePanels {
   private readonly idleIntervalMs: number;
   private readonly tokenTtlMs: number;
   private readonly armTtlMs: number;
+  private readonly stopSettleMs: number;
   private readonly states = new Map<string, PanelState>();
   private readonly tokens = new Map<string, TokenRecord>();
   private readonly armed = new Map<string, { mode: "steer" | "followUp"; until: number }>();
   private chain: Promise<void> = Promise.resolve();
   private timer: Timer | undefined;
+  /** Set by {@link stop}: nothing is scheduled, sent or edited afterwards. */
+  private stopped = false;
   public readonly stats: PanelStats = { sends: 0, edits: 0, unchanged: 0, failures: 0 };
 
   constructor(private readonly options: LanePanelOptions) {
@@ -186,6 +197,7 @@ export class LanePanels {
     this.idleIntervalMs = options.idleIntervalMs ?? 120_000;
     this.tokenTtlMs = options.tokenTtlMs ?? 60 * 60_000;
     this.armTtlMs = options.armTtlMs ?? 5 * 60_000;
+    this.stopSettleMs = options.stopSettleMs ?? 30_000;
   }
 
   private log(message: string): void {
@@ -198,14 +210,18 @@ export class LanePanels {
 
   /** Checks every `tickMs` which panels are due. A pass never overlaps the previous one. */
   start(tickMs = 10_000): void {
-    if (this.timer) return;
+    if (this.timer || this.stopped) return;
     void this.tick();
     this.timer = setInterval(() => void this.tick(), tickMs);
     this.timer.unref?.();
   }
 
-  /** Stops the timer. Resolves once the pass in flight is done, so the caller may close the store. */
+  /**
+   * Stops for good: no further pass, send or edit, even from a pass already in flight.
+   * Resolves once that pass is done, so the caller may close the store.
+   */
   stop(): Promise<void> {
+    this.stopped = true;
     clearInterval(this.timer);
     this.timer = undefined;
     return this.chain;
@@ -213,9 +229,15 @@ export class LanePanels {
 
   /** One pass over the due panels. Serialized, and it never rejects. */
   tick(): Promise<void> {
+    if (this.stopped) return this.chain;
     const run = this.chain.then(() => this.pass()).catch(error => this.log(`pass failed: ${String(error)}`));
     this.chain = run;
     return run;
+  }
+
+  /** Entries held in memory, for diagnostics and tests. Bounded by the topics that still have a route. */
+  memory(): { states: number; tokens: number; armed: number } {
+    return { states: this.states.size, tokens: this.tokens.size, armed: this.armed.size };
   }
 
   private routes(): Array<{ target: RouteTarget; sessionId: string }> {
@@ -226,13 +248,32 @@ export class LanePanels {
 
   private async pass(): Promise<void> {
     const now = this.now();
-    const due = this.routes().filter(({ target }) => {
+    const routes = this.routes();
+    this.prune(new Set(routes.map(({ target }) => this.kvKey(target, ""))), now);
+    const due = routes.filter(({ target }) => {
       const state = this.states.get(this.kvKey(target, ""));
       return !state || now - state.lastAttemptAt >= (state.running ? this.activeIntervalMs : this.idleIntervalMs);
     });
     if (!due.length) return;
     const snapshot = await this.options.snapshot();
-    for (const route of due) await this.update(route.target, route.sessionId, snapshot);
+    for (const route of due) {
+      if (this.stopped) return;
+      await this.update(route.target, route.sessionId, snapshot);
+    }
+  }
+
+  /**
+   * Drops what can no longer be used: expired tokens and arms, and everything held for a topic whose
+   * route is gone. The daemon runs for weeks, so nothing here may outlive its topic.
+   */
+  private prune(liveKeys: Set<string>, now: number): void {
+    for (const [token, record] of this.tokens) if (now >= record.expiresAt) this.tokens.delete(token);
+    for (const [key, armed] of this.armed) if (armed.until <= now || !liveKeys.has(key)) this.armed.delete(key);
+    for (const [key, state] of this.states) {
+      if (liveKeys.has(key)) continue;
+      this.revoke(state);
+      this.states.delete(key);
+    }
   }
 
   private keyboardFor(state: PanelState, sessionId: string, now: number): Keyboard {
@@ -277,10 +318,18 @@ export class LanePanels {
     const now = this.now();
     const key = this.kvKey(target, "");
     let state = this.states.get(key);
-    if (!state) this.states.set(key, state = { lastAttemptAt: now, running: false, keyboard: null });
+    if (!state) this.states.set(key, state = { lastAttemptAt: now, running: false, keyboard: null, stop: null });
     const lane = snapshot.lanes.find(entry => entry.id === sessionId && entry.kind === "interactive") ?? null;
     state.lastAttemptAt = now;
     state.running = lane?.status === "running";
+    // A Stop is settled once the turn is over.
+    if (!state.running) state.stop = null;
+    if (!lane) {
+      // The session ended: its buttons are dead now, even if the edit that removes them fails.
+      this.revoke(state);
+      state.keyboard = null;
+      this.armed.delete(key);
+    }
 
     const storedId = Number(store.getKv(this.kvKey(target, "id")) ?? 0);
     // A topic whose session is not running gets no new panel; an existing one shows that it ended.
@@ -331,6 +380,7 @@ export class LanePanels {
     store.setKv(this.kvKey(target, "id"), String(sent.messageId));
     store.setKv(this.kvKey(target, "hash"), hash);
     this.commit(key, state, target, keyboard);
+    if (this.stopped) return;
     await transport.pin(target, sent.messageId).catch(error => this.log(`topic ${target.topicId}: pin failed: ${String(error)}`));
   }
 
@@ -352,19 +402,37 @@ export class LanePanels {
     return record;
   }
 
-  /** The answer shown on the click itself, at receipt. Never acts. */
+  /**
+   * The answer shown on the click itself, at receipt. Steer and Follow-up only answer; the first Stop tap
+   * claims the topic's Stop, so {@link run} sends it once and every further tap answers "already stopping".
+   */
   peek(data: string): string {
     const record = this.resolve(data);
     if (!record) return PANEL_EXPIRED_ANSWER;
     if (record.action === "stop") {
-      return this.options.isBusy(record.target) ? "⏹ Stopping the current turn." : "Nothing to stop: the session is idle.";
+      const state = this.states.get(record.key);
+      if (!state) return PANEL_EXPIRED_ANSWER;
+      const now = this.now();
+      if (!this.options.isBusy(record.target)) {
+        state.stop = null;
+        return "Nothing to stop: the session is idle.";
+      }
+      // A claim whose run never came, or a sent Stop the turn ignored, lapses after the settle window.
+      if (state.stop && now - state.stop.at < this.stopSettleMs) {
+        return PANEL_ALREADY_STOPPING_ANSWER;
+      }
+      state.stop = { phase: "claimed", at: now };
+      return "⏹ Stopping the current turn.";
     }
     return record.action === "steer"
       ? "🧭 Send your steer as the next message in this topic."
       : "➕ Send your follow-up as the next message in this topic. It runs after the current turn.";
   }
 
-  /** Acts on a click from the inbound ledger. A stale token does nothing; it was answered as expired. */
+  /**
+   * Acts on a click from the inbound ledger. A stale token does nothing; it was answered as expired.
+   * A Stop runs only for the tap that claimed it in {@link peek}, and only once.
+   */
   async run(data: string): Promise<void> {
     const record = this.resolve(data);
     if (!record) {
@@ -375,10 +443,19 @@ export class LanePanels {
       this.armed.set(record.key, { mode: record.action, until: this.now() + this.armTtlMs });
       return;
     }
+    const state = this.states.get(record.key);
+    if (state?.stop?.phase !== "claimed") {
+      this.log(`topic ${record.target.topicId}: stop already sent or not claimed; ignored`);
+      return;
+    }
+    // Claimed and sent in one synchronous step, so a second run of the same tap cannot slip in.
+    state.stop = { phase: "sent", at: this.now() };
     try {
       const stopped = await this.options.stop(record.target);
       this.log(`topic ${record.target.topicId}: stop ${stopped ? "sent" : "found no active turn"}`);
+      if (!stopped) state.stop = null;
     } catch (error) {
+      state.stop = null;
       this.log(`topic ${record.target.topicId}: stop failed: ${String(error)}`);
     }
   }

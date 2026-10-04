@@ -49,8 +49,8 @@ export interface PollerCallbacks {
   onQuestionAnswer?: (decisionId: string, eventId: string, answer: { choice?: string; text?: string }) => Promise<void>;
   /**
    * Lane panel buttons (callback data starting with {@link LANE_PANEL_CALLBACK_PREFIX}). `peek` gives the answer
-   * shown on the click at receipt, "expired" for a stale token, and must not act; `run` acts on the click from
-   * the inbound ledger.
+   * shown on the click at receipt, "expired" for a stale token, and sends nothing (it may claim a Stop, so a
+   * second tap is told it is already stopping); `run` acts on the click from the inbound ledger.
    */
   lanePanel?: {
     peek: (data: string) => string;
@@ -544,6 +544,8 @@ export class TelegramPoller {
      * falls back to {@link outboundThreadId}.
      */
     messageThreadId?: number,
+    /** `panel` draws on the group budget reserved for dashboards. */
+    kind: "message" | "panel" = "message",
   ): Promise<TelegramSendMessageResponse | null> {
     const sanitized = redactSecrets(text);
     const formatted = replyMarkupOrParseMode === "HTML" ? sanitized : markdownToTelegramHtml(sanitized, defaultRepo);
@@ -573,7 +575,7 @@ export class TelegramPoller {
       const boundSessionId = correlationMeta?.sessionId ?? this.correlation?.getSessionId() ?? null;
 
       await this.paceOutbound();
-      const data = await this.botCall("sendMessage", body);
+      const data = await this.botCall("sendMessage", body, kind);
       this.observeRateLimit(data);
       if (
         data?.ok &&
