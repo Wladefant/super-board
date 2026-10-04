@@ -9,6 +9,7 @@ import { readMessageThreadId } from "../src/channel-config";
 import { renderDashboard } from "../src/live-dashboard";
 import { OperatorQuestionService } from "../src/operator-questions";
 import type { MessageCorrelationBridge, OutboundMessageCorrelation, TelegramUpdate } from "../extension/types";
+import { instantTransport } from "./instant-transport";
 
 const originalFetch = globalThis.fetch;
 const cleanup: Array<() => void> = [];
@@ -37,7 +38,7 @@ function fixture(thread?: number) {
     onAbort: () => turns.push("ABORT"), onRelease: async () => { turns.push("RELEASE"); },
     getStatusText: () => "test", onLedgerFailure: () => {},
     onQuestionAnswer: async (id, event, answer) => { answers.push({ id, event, answer }); },
-  }, bridge, { messageThreadId: thread });
+  }, bridge, instantTransport({ messageThreadId: thread }));
   globalThis.fetch = (async (url, init) => {
     const method = String(url).split("/").pop()!;
     const body = JSON.parse(String(init?.body));
