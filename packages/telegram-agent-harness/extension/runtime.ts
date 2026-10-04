@@ -303,15 +303,36 @@ export class TelegramRuntime {
         for (let i = 0; i < chunks.length; i++) {
           const chunk = chunks[i];
           if (i < this.sentTelegramMessageIds.length) {
-            if (chunk !== this.streamedChunks[i]) {
-              await this.poller.editTelegramMessage(primaryChat, this.sentTelegramMessageIds[i], chunk, "HTML");
-              this.streamedChunks[i] = chunk;
+            if (chunk === this.streamedChunks[i]) continue;
+            // Only a confirmed edit advances the sent marker. A null or refused edit leaves the
+            // chunk pending, so the next flush retries it.
+            let edited = await this.poller.editTelegramMessage(primaryChat, this.sentTelegramMessageIds[i], chunk, "HTML");
+            if (final && edited?.ok !== true) {
+              edited = await this.poller.editTelegramMessage(primaryChat, this.sentTelegramMessageIds[i], chunk, "HTML");
             }
+            if (edited?.ok === true) {
+              this.streamedChunks[i] = chunk;
+              continue;
+            }
+            if (!final) break;
+            // The final edit keeps failing: deliver the full chunk as a new message.
+            const resent = await this.poller.sendTelegramMessage(primaryChat, chunk, "HTML");
+            if (resent?.ok && typeof resent.result?.message_id === "number") {
+              this.sentTelegramMessageIds[i] = resent.result.message_id;
+              this.streamedChunks[i] = chunk;
+              continue;
+            }
+            this.pi.logger?.warn?.(`[Telegram] Final reply chunk ${i + 1}/${chunks.length} was not delivered.`);
+            break;
           } else {
             const res = await this.poller.sendTelegramMessage(primaryChat, chunk, "HTML");
             if (res?.ok && typeof res.result?.message_id === "number") {
               this.sentTelegramMessageIds.push(res.result.message_id);
               this.streamedChunks.push(chunk);
+            } else {
+              // Later chunks must not jump ahead of a missing one.
+              if (final) this.pi.logger?.warn?.(`[Telegram] Final reply chunk ${i + 1}/${chunks.length} was not delivered.`);
+              break;
             }
           }
         }
