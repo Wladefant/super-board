@@ -10,7 +10,10 @@ import { dlopen, FFIType, ptr } from "bun:ffi";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { getTokenFingerprint } from "./sanitizer";
+import { computeTokenHmac } from "../daemon/lane-panel";
+import type { DaemonStore } from "../daemon/store";
 import type {
   AccessConfig,
   BotLeaseRecord,
@@ -299,7 +302,8 @@ export class BotPoolCoordinator {
   private manifestPath: string;
   private channelsDir: string;
   private activeHeartbeatTimers = new Map<string, Timer>();
-
+  private auditStore?: Pick<DaemonStore, "auditControl">;
+  private daemonSecret?: Buffer;
   constructor(
     dbPath: string = getDefaultPoolDbPath(),
     manifestPath: string = getDefaultManifestPath(),
@@ -1185,8 +1189,63 @@ export class BotPoolCoordinator {
       return null;
     }
   }
+  public setAuditStore(auditStore?: Pick<DaemonStore, "auditControl">): void {
+    this.auditStore = auditStore;
+  }
 
-  public consumeDecisionCallback(callbackToken: string, now?: number): boolean {
+  public setDaemonSecret(secret?: Buffer): void {
+    this.daemonSecret = secret;
+  }
+
+  public issueDecisionCallback(input: {
+    decisionId: string;
+    choiceId: string;
+    sessionId: string;
+    chatId: string;
+    userId: string;
+    secret?: Buffer;
+    topicId?: string;
+    questionHash?: string;
+    expiresAt?: number;
+    ttlSeconds?: number;
+    now?: number;
+  }): DecisionCallbackRecord {
+    const sec = input.secret ?? this.daemonSecret;
+    if (!sec) {
+      throw new Error("Cannot issue signed decision callback: daemon secret is required");
+    }
+    const now = input.now ?? Date.now() / 1000;
+    const expiresAt = input.expiresAt ?? (now + (input.ttlSeconds ?? 86400));
+    const nonce = randomBytes(9).toString("base64url");
+    const topicId = input.topicId ?? "";
+    const sig = computeTokenHmac(
+      sec,
+      input.sessionId,
+      input.chatId,
+      topicId,
+      input.userId,
+      Math.floor(expiresAt),
+      input.choiceId,
+      nonce,
+    );
+    const callbackToken = `ans:${nonce}:${sig}`;
+    const record: DecisionCallbackRecord = {
+      callbackToken,
+      decisionId: input.decisionId,
+      choiceId: input.choiceId,
+      sessionId: input.sessionId,
+      chatId: input.chatId,
+      userId: input.userId,
+      questionHash: input.questionHash ?? "",
+      expiresAt,
+      consumedAt: null,
+      createdAt: now,
+    };
+    this.recordDecisionCallback(record);
+    return record;
+  }
+
+  public consumeDecisionCallback(callbackToken: string, now?: number, eventId?: string): boolean {
     this.ensureDbOpen();
     try {
       const nowTs = now ?? Date.now() / 1000;
@@ -1194,6 +1253,20 @@ export class BotPoolCoordinator {
         "UPDATE decision_callbacks SET consumed_at = ? WHERE callback_token = ? AND consumed_at IS NULL",
         [nowTs, callbackToken],
       );
+      if (res.changes > 0 && this.auditStore) {
+        const record = this.lookupDecisionCallback(callbackToken);
+        if (record) {
+          const evId = eventId ?? `evt-ans-${record.decisionId}-${Math.floor(nowTs * 1000)}`;
+          this.auditStore.auditControl({
+            eventId: evId,
+            userId: record.userId,
+            action: "answer",
+            sessionId: record.sessionId,
+            result: "ok",
+            at: Math.floor(nowTs * 1000),
+          });
+        }
+      }
       return res.changes > 0;
     } catch {
       return false;
@@ -1206,16 +1279,74 @@ export class BotPoolCoordinator {
     chatId: string,
     expectedSessionId: string,
     decisionsPath?: string,
+    options?: {
+      secret?: Buffer;
+      auditStore?: Pick<DaemonStore, "auditControl">;
+      eventId?: string;
+      now?: number;
+      skipAudit?: boolean;
+      topicId?: string;
+    },
   ): DecisionCallbackResolution {
+    const auditStore = options?.auditStore ?? this.auditStore;
+    const sec = options?.secret ?? this.daemonSecret;
+    const now = options?.now ?? Date.now() / 1000;
+    const nowMs = Math.floor(now * 1000);
+    const eventId = options?.eventId ?? `evt-val-${randomBytes(6).toString("hex")}`;
+
+    const audit = (action: string, result: string, sessId: string, uId: string) => {
+      if (!options?.skipAudit && auditStore) {
+        auditStore.auditControl({
+          eventId,
+          userId: uId,
+          action,
+          sessionId: sessId,
+          result,
+          at: nowMs,
+        });
+      }
+    };
+
     const record = this.lookupDecisionCallback(callbackToken);
     if (!record) {
+      const isForgedShape = callbackToken.includes(":");
+      audit("answer", isForgedShape ? "forged" : "unknown", expectedSessionId || "unknown", String(userId));
       return {
         decision: "reject_unknown",
         detail: "Callback token not recognized or forged.",
       };
     }
 
+    if (sec && record.callbackToken.includes(":")) {
+      const colonIdx = record.callbackToken.lastIndexOf(":");
+      const sig = record.callbackToken.slice(colonIdx + 1);
+      const rest = record.callbackToken.slice(0, colonIdx);
+      const nonce = rest.includes(":") ? rest.slice(rest.lastIndexOf(":") + 1) : rest;
+      const topicId = options?.topicId ?? "";
+      const expectedSig = computeTokenHmac(
+        sec,
+        record.sessionId,
+        record.chatId,
+        topicId,
+        record.userId,
+        Math.floor(record.expiresAt),
+        record.choiceId,
+        nonce,
+      );
+      const sigBuf = Buffer.from(sig);
+      const expBuf = Buffer.from(expectedSig);
+      if (sigBuf.length !== expBuf.length || !timingSafeEqual(sigBuf, expBuf)) {
+        audit("answer", "forged", record.sessionId, String(userId));
+        return {
+          decision: "reject_unknown",
+          record,
+          detail: "Callback token signature verification failed; forged token.",
+        };
+      }
+    }
+
     if (record.userId !== String(userId) || record.chatId !== String(chatId)) {
+      audit("answer", "unauthorized", record.sessionId, String(userId));
       return {
         decision: "reject_unauthorized",
         record,
@@ -1224,6 +1355,7 @@ export class BotPoolCoordinator {
     }
 
     if (record.sessionId !== expectedSessionId) {
+      audit("answer", "reject_foreign_session", record.sessionId, String(userId));
       return {
         decision: "reject_foreign_session",
         record,
@@ -1231,8 +1363,8 @@ export class BotPoolCoordinator {
       };
     }
 
-    const now = Date.now() / 1000;
     if (now > record.expiresAt) {
+      audit("answer", "expired", record.sessionId, String(userId));
       return {
         decision: "reject_expired",
         record,
@@ -1241,6 +1373,7 @@ export class BotPoolCoordinator {
     }
 
     if (record.consumedAt !== null) {
+      audit("answer", "replay", record.sessionId, String(userId));
       return {
         decision: "reject_already_consumed",
         record,
@@ -1248,7 +1381,6 @@ export class BotPoolCoordinator {
       };
     }
 
-    // Check canonical decisions file if available
     const decFile = decisionsPath || path.join(os.homedir(), ".veyyon", "workflows", "decisions.json");
     if (fs.existsSync(decFile)) {
       try {
@@ -1256,6 +1388,7 @@ export class BotPoolCoordinator {
         const data = JSON.parse(content);
         const dec = data?.decisions?.[record.decisionId];
         if (dec && (dec.status === "answered" || dec.answer != null)) {
+          audit("answer", "already_answered", record.sessionId, String(userId));
           return {
             decision: "reject_already_answered",
             record,

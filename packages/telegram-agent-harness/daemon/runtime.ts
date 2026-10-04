@@ -25,7 +25,7 @@ import { TelegramPoller } from "../extension/poller";
 import { governedTelegramFetch } from "../extension/telegram-governor";
 import { resolveGithubRepo } from "../extension/github-repo";
 import { chunkMessage, escapeHtml } from "../extension/sanitizer";
-import type { AccessConfig, MessageCorrelationBridge } from "../extension/types";
+import type { AccessConfig, MessageCorrelationBridge, PanelCallbackContext, TelegramSendMessageResponse } from "../extension/types";
 import { BunCommandRunner } from "../extension/harness/command-runner";
 import { handleInstalledCommand } from "../src/installed-commands";
 import {
@@ -48,7 +48,7 @@ import { connectMiniApp, miniAppUrl, buildMiniAppUrl } from "./miniapp";
 import { DefaultTelegramForumClient, ForumManager, workspaceFolder, type ForumApiClient, type AutoAttachResult } from "./forum";
 import { QuestionsTopic } from "./questions-topic";
 import { defaultFleetSources, FleetState, type FleetQuestion, type FleetSources } from "./fleet-state";
-import { LanePanels, PANEL_EXPIRED_ANSWER } from "./lane-panel";
+import { LanePanels, PANEL_EXPIRED_ANSWER, getDaemonSecret } from "./lane-panel";
 
 export interface DaemonSlotReport {
   slotId: string;
@@ -122,6 +122,7 @@ export class TelegramDaemon {
     this.options = options;
     this.coordinator = new BotPoolCoordinator(options.poolDbPath, options.manifestPath, options.channelsDir);
     this.store = new DaemonStore(options.daemonDbPath);
+    this.coordinator.setAuditStore(this.store);
     this.control = options.controlFactory
       ? options.controlFactory(event => this.fanOut(event), message => this.log(message))
       : new TerminalSessionControl({
@@ -317,6 +318,8 @@ export class TelegramDaemon {
     if (forumChatId && this.coordinator.allowGroupChat(slot.stateDir, forumChatId)) {
       this.log(`Slot ${slot.slotId}: authorized forum chat ${forumChatId} in access.json`);
     }
+    const slotSecret = getDaemonSecret(this.store, slot.slotId);
+    this.coordinator.setDaemonSecret(slotSecret);
     const access = this.coordinator.readAccessConfig(slot.stateDir);
     // Assigned after construction: the poller and the router each need the other,
     // and the poller is what knows which chat a callback is currently serving.
@@ -391,15 +394,16 @@ export class TelegramDaemon {
         }
         return resolved;
       },
-      resolveCallback: (callbackToken, userId, chatId) => {
-        const resolved = this.coordinator.validateDecisionCallback(callbackToken, userId, chatId, sessionIdForChat());
-        const issued = resolved.record;
-        if (resolved.decision === "reject_foreign_session" && issued?.decisionId.startsWith("tq:") && inQuestionsTopic()) {
-          return this.coordinator.validateDecisionCallback(callbackToken, userId, chatId, issued.sessionId);
-        }
-        return resolved;
+      resolveCallback: (callbackToken, userId, chatId, eventId) => {
+        const issued = this.coordinator.lookupDecisionCallback(callbackToken);
+        const expectedSession = (issued?.decisionId.startsWith("tq:") && inQuestionsTopic())
+          ? issued.sessionId
+          : sessionIdForChat();
+        return this.coordinator.validateDecisionCallback(callbackToken, userId, chatId, expectedSession, decisionsPath, {
+          eventId,
+        });
       },
-      consumeCallback: callbackToken => this.coordinator.consumeDecisionCallback(callbackToken),
+      consumeCallback: (callbackToken, eventId) => this.coordinator.consumeDecisionCallback(callbackToken, undefined, eventId),
     };
 
     const runner = new BunCommandRunner();
@@ -415,7 +419,10 @@ export class TelegramDaemon {
       onUserMessage: (text: string) => {
         // A Steer or Follow-up button on the topic's panel decides how its next message is delivered.
         const target = currentTarget();
-        void this.acknowledge(router, target, text, lanePanels?.takeArmed(target) ?? "auto");
+        const activeUser = poller.getActiveUserId();
+        const replyToMessageId = poller.getActiveReplyToMessageId();
+        const armed = lanePanels?.takeArmed(target, activeUser, replyToMessageId) ?? "auto";
+        void this.acknowledge(router, target, text, armed);
       },
       onSteer: (text: string) => {
         void this.acknowledge(router, currentTarget(), text, "steer");
@@ -564,8 +571,8 @@ export class TelegramDaemon {
       },
       // Buttons of a panel this daemon no longer serves (feature off, restarted) answer as expired.
       lanePanel: {
-        peek: (data: string) => lanePanels?.peek(data) ?? PANEL_EXPIRED_ANSWER,
-        run: async (data: string) => { await lanePanels?.run(data); },
+        peek: (data: string, context?: PanelCallbackContext) => lanePanels?.peek(data, context) ?? PANEL_EXPIRED_ANSWER,
+        run: async (data: string, context?: PanelCallbackContext) => { await lanePanels?.run(data, context); },
       },
     };
 
@@ -644,7 +651,7 @@ export class TelegramDaemon {
       questionsTopic = this.createQuestionsTopic(slot, token, forumChatId, poller, decisionsPath, poolPath);
       questionsTopic.start(decisionsPath);
     }
-    if (forumChatId && slot.lanePanel) lanePanels = this.createLanePanels(slot, forumChatId, poller, router, decisionsPath, () => questionsTopic?.threadId());
+    if (forumChatId && slot.lanePanel) lanePanels = this.createLanePanels(slot, token, forumChatId, poller, router, decisionsPath, () => questionsTopic?.threadId());
     if (forumManager && slot.autoAttach !== false) {
       const intervalMs = slot.autoAttachIntervalMs ?? 10_000;
       autoAttachTimer = setInterval(() => {
@@ -663,7 +670,7 @@ export class TelegramDaemon {
 
   /** The slot's live topic panels: one pinned, edited-in-place status message per session topic. */
   private createLanePanels(
-    slot: DaemonSlot, forumChatId: string, poller: TelegramPoller, router: SlotRouter, decisionsPath: string,
+    slot: DaemonSlot, token: string, forumChatId: string, poller: TelegramPoller, router: SlotRouter, decisionsPath: string,
     questionsThread: () => number | null | undefined,
   ): LanePanels {
     let openQuestions: FleetQuestion[] = [];
@@ -673,9 +680,12 @@ export class TelegramDaemon {
       runUsage: () => Promise.reject(new Error("the lane panel reads no usage")),
       questions: () => openQuestions,
     }, { usageCacheMs: Number.POSITIVE_INFINITY });
+    const access = this.coordinator.readAccessConfig(slot.stateDir);
+    const operatorId = questionOperator(access, forumChatId);
     const panels = new LanePanels({
       slotId: slot.slotId,
       chatId: forumChatId,
+      operatorId,
       store: this.store,
       snapshot: async () => {
         const questions = await readQuestions(decisionsPath).catch(() => []);
@@ -701,6 +711,106 @@ export class TelegramDaemon {
           return /message to edit not found/i.test(edited?.description ?? "") ? "gone" : "error";
         },
         pin: async (target, messageId) => { await poller.pinTelegramMessage(target.chatId, messageId, "panel"); },
+        confirm: async (target, text, markup, userId) => {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 25_000);
+          try {
+            const body: Record<string, unknown> = {
+              chat_id: target.chatId,
+              text,
+              parse_mode: "HTML",
+              reply_markup: markup,
+              ephemeral_message_parameters: {
+                receiver_user_id: Number(userId),
+              },
+            };
+            if (target.topicId) {
+              body.message_thread_id = Number(target.topicId);
+            }
+            const response = await governedTelegramFetch(
+              `https://api.telegram.org/bot${token}/sendMessage`,
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+                signal: controller.signal,
+              },
+              {
+                chatId: target.chatId,
+                kind: "panel",
+                timeoutMs: 25_000,
+              },
+            );
+            const data = (await response.json()) as { ok: boolean; result?: { ephemeral_message_id?: number } };
+            if (data.ok && typeof data.result?.ephemeral_message_id === "number") {
+              return { ephemeralMessageId: data.result.ephemeral_message_id };
+            }
+            return "error";
+          } catch {
+            return "error";
+          } finally {
+            clearTimeout(timer);
+          }
+        },
+        editConfirm: async (target, id, text, markup, userId) => {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 25_000);
+          try {
+            const body: Record<string, unknown> = {
+              chat_id: target.chatId,
+              ephemeral_message_id: id,
+              text,
+              parse_mode: "HTML",
+              reply_markup: markup,
+              receiver_user_id: Number(userId),
+            };
+            if (target.topicId) {
+              body.message_thread_id = Number(target.topicId);
+            }
+            const response = await governedTelegramFetch(
+              `https://api.telegram.org/bot${token}/editEphemeralMessageText`,
+              {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+                signal: controller.signal,
+              },
+              {
+                chatId: target.chatId,
+                kind: "panel",
+                timeoutMs: 25_000,
+              },
+            );
+            const data = (await response.json()) as { ok: boolean; description?: string };
+            if (data.ok || /not modified/i.test(data.description ?? "")) {
+              return "ok";
+            }
+            if (/message to edit not found/i.test(data.description ?? "") || /message.*not found/i.test(data.description ?? "")) {
+              return "gone";
+            }
+            return "error";
+          } catch {
+            return "error";
+          } finally {
+            clearTimeout(timer);
+          }
+        },
+        prompt: async (target, text, sessionId) => {
+          const sent = await poller.sendTelegramMessage(
+            target.chatId,
+            text,
+            "HTML",
+            { force_reply: true, selective: true },
+            { sessionId },
+            undefined,
+            target.topicId ? Number(target.topicId) : undefined,
+            "panel",
+          );
+          if (sent?.ok && typeof sent.result?.message_id === "number") {
+            return { messageId: sent.result.message_id };
+          }
+          return "error";
+        },
       },
     });
     panels.start();
@@ -720,6 +830,7 @@ export class TelegramDaemon {
       slotId: slot.slotId,
       store: this.store,
       ledger,
+      coordinator: this.coordinator,
       prepare: async () => {
         live = new Set((await this.control.listSessions().catch(() => [])).map(session => session.id));
       },

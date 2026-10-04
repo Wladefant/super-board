@@ -81,6 +81,14 @@ export class DaemonStore {
     this.db.run("CREATE INDEX IF NOT EXISTS agent_messages_session ON agent_messages (session_id, sent_at)");
     // Small daemon facts that are not routes: the Questions topic id, its index message, its digest.
     this.db.run("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+    this.db.run(`CREATE TABLE IF NOT EXISTS control_audits (
+      event_id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      action TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      result TEXT NOT NULL,
+      at INTEGER NOT NULL
+    )`);
   }
 
   public getKv(key: string): string | null {
@@ -93,6 +101,76 @@ export class DaemonStore {
 
   public deleteKv(key: string): void {
     this.db.run("DELETE FROM kv WHERE key = ?", [key]);
+  }
+
+  public auditControl(input: {
+    eventId: string;
+    userId: string;
+    action: string;
+    sessionId: string;
+    result: string;
+    at: number;
+  }): void {
+    this.db.run(
+      `INSERT INTO control_audits (event_id, user_id, action, session_id, result, at)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(event_id) DO NOTHING`,
+      [input.eventId, input.userId, input.action, input.sessionId, input.result, input.at],
+    );
+  }
+
+  public getControlAudit(eventId: string): {
+    eventId: string;
+    userId: string;
+    action: string;
+    sessionId: string;
+    result: string;
+    at: number;
+  } | null {
+    const row = this.db
+      .query<{ event_id: string; user_id: string; action: string; session_id: string; result: string; at: number }, [string]>(
+        "SELECT * FROM control_audits WHERE event_id = ?",
+      )
+      .get(eventId);
+    return row
+      ? {
+          eventId: row.event_id,
+          userId: row.user_id,
+          action: row.action,
+          sessionId: row.session_id,
+          result: row.result,
+          at: row.at,
+        }
+      : null;
+  }
+
+  public listControlAudits(sessionId?: string): Array<{
+    eventId: string;
+    userId: string;
+    action: string;
+    sessionId: string;
+    result: string;
+    at: number;
+  }> {
+    const rows = sessionId
+      ? this.db
+          .query<{ event_id: string; user_id: string; action: string; session_id: string; result: string; at: number }, [string]>(
+            "SELECT * FROM control_audits WHERE session_id = ? ORDER BY at ASC",
+          )
+          .all(sessionId)
+      : this.db
+          .query<{ event_id: string; user_id: string; action: string; session_id: string; result: string; at: number }, []>(
+            "SELECT * FROM control_audits ORDER BY at ASC",
+          )
+          .all();
+    return rows.map(row => ({
+      eventId: row.event_id,
+      userId: row.user_id,
+      action: row.action,
+      sessionId: row.session_id,
+      result: row.result,
+      at: row.at,
+    }));
   }
 
   public putSessionListing(slotId: string, chatId: string, topicId: string, ids: string[]): void {

@@ -12,14 +12,22 @@
  * makes an older token answer {@link PANEL_EXPIRED_ANSWER} and do nothing.
  */
 
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { LANE_PANEL_CALLBACK_PREFIX } from "../extension/poller";
 import { escapeHtml } from "../extension/sanitizer";
 import type { FleetLane, FleetSnapshot } from "./fleet-state";
 import type { RouteTarget } from "./router";
 import type { DaemonStore } from "./store";
 
-export type PanelAction = "stop" | "steer" | "followUp";
+export interface PanelCallbackContext {
+  userId: string;
+  chatId: string;
+  topicId: string;
+  eventId: string;
+  messageId?: number;
+}
+
+export type PanelAction = "stop" | "steer" | "followUp" | "confirm" | "cancel";
 export type PanelOutcome = "ok" | "gone" | "error";
 type Markup = { inline_keyboard: Array<Array<Record<string, string>>> };
 
@@ -32,13 +40,17 @@ export interface PanelTransport {
   /** Edits the panel. `gone` means the message was deleted; `error` covers a refused or dropped edit. */
   edit(target: RouteTarget, messageId: number, text: string, markup: Markup): Promise<PanelOutcome>;
   pin(target: RouteTarget, messageId: number): Promise<void>;
+  confirm(target: RouteTarget, text: string, markup: Markup, userId: string): Promise<{ ephemeralMessageId: number } | "error">;
+  editConfirm(target: RouteTarget, id: number, text: string, markup: Markup, userId: string): Promise<PanelOutcome>;
+  prompt(target: RouteTarget, text: string, sessionId: string): Promise<{ messageId: number } | "error">;
 }
 
 export interface LanePanelOptions {
   slotId: string;
   /** The forum supergroup whose topics carry panels. */
   chatId: string;
-  store: Pick<DaemonStore, "getKv" | "setKv" | "deleteKv" | "listRoutes">;
+  operatorId: string;
+  store: Pick<DaemonStore, "getKv" | "setKv" | "deleteKv" | "listRoutes" | "auditControl">;
   transport: PanelTransport;
   snapshot(): Promise<FleetSnapshot>;
   /** Session bound to the topic right now. A token issued for another session is stale. */
@@ -67,16 +79,54 @@ interface Keyboard {
   id: string;
   sessionId: string;
   issuedAt: number;
-  tokens: Record<PanelAction, string>;
+  tokens: Record<"stop" | "steer" | "followUp", string>;
+  records?: Record<"stop" | "steer" | "followUp", TokenRecord>;
 }
 
 interface TokenRecord {
   key: string;
-  keyboardId: string;
+  keyboardId?: string;
   target: RouteTarget;
   sessionId: string;
   action: PanelAction;
   expiresAt: number;
+  nonce: string;
+  token: string;
+  consumed: boolean;
+  pairedToken?: string;
+  ephemeralMessageId?: number;
+}
+
+interface ArmedRecord {
+  mode: "steer" | "followUp";
+  messageId: number;
+  userId: string;
+  sessionId: string;
+  expiresAt: number;
+}
+
+export function computeTokenHmac(
+  secret: Buffer,
+  sessionId: string,
+  chatId: string,
+  topicId: string,
+  operatorId: string,
+  expiresAt: number,
+  action: PanelAction | string,
+  nonce: string,
+): string {
+  const payload = `${sessionId}:${chatId}:${topicId}:${operatorId}:${expiresAt}:${action}:${nonce}`;
+  return createHmac("sha256", secret).update(payload).digest("base64url");
+}
+
+export function getDaemonSecret(store: Pick<DaemonStore, "getKv" | "setKv">, slotId = "slot"): Buffer {
+  const key = `lanepanel:${slotId}:secret`;
+  let hex = store.getKv(key);
+  if (!hex) {
+    hex = randomBytes(32).toString("hex");
+    store.setKv(key, hex);
+  }
+  return Buffer.from(hex, "hex");
 }
 
 interface PanelState {
@@ -99,7 +149,7 @@ export interface PanelStats {
   failures: number;
 }
 
-const ACTION_LABELS: Record<PanelAction, string> = { stop: "⏹ Stop", steer: "🧭 Steer", followUp: "➕ Follow-up" };
+const ACTION_LABELS: Record<"stop" | "steer" | "followUp", string> = { stop: "⏹ Stop", steer: "🧭 Steer", followUp: "➕ Follow-up" };
 const MAX_CHILD_LINES = 6;
 
 function truncate(text: string, max: number): string {
@@ -147,7 +197,7 @@ export function renderLanePanel(
   }
   const lines: string[] = [];
   lines.push(lane.status === "running"
-    ? `🟢 <b>Running</b>${lane.elapsedMs === null ? "" : ` · ${formatElapsed(lane.elapsedMs)}`}`
+    ? `🟢 <b>Running</b>${lane.elapsedMs === null ? "" : ` · ${escapeHtml(formatElapsed(lane.elapsedMs))}`}`
     : `⚪ <b>Idle</b>${lane.lastActivityMs > 0 ? ` · since ${clock(lane.lastActivityMs)}` : ""}`);
   lines.push(`<b>${escapeHtml(truncate(lane.name, 60))}</b>`);
   // `anthropic/claude-opus-5-5:high` reads as `claude-opus-5-5:high` on a phone.
@@ -160,7 +210,7 @@ export function renderLanePanel(
     lines.push("", `<b>Lanes</b> · ${running} running · ${children.length - running} idle`);
     for (const { lane: child, depth } of children.slice(0, MAX_CHILD_LINES)) {
       const dot = child.status === "running" ? "🟢" : "⚪";
-      const elapsed = child.status === "running" && child.elapsedMs !== null ? ` · ${formatElapsed(child.elapsedMs)}` : "";
+      const elapsed = child.status === "running" && child.elapsedMs !== null ? ` · ${escapeHtml(formatElapsed(child.elapsedMs))}` : "";
       const action = child.status === "running" && child.lastAction ? ` — ${escapeHtml(truncate(child.lastAction, 48))}` : "";
       lines.push(`${"  ".repeat(depth)}${depth ? "↳ " : ""}${dot} ${escapeHtml(truncate(child.name, 28))}${elapsed}${action}`);
     }
@@ -184,7 +234,8 @@ export class LanePanels {
   private readonly stopSettleMs: number;
   private readonly states = new Map<string, PanelState>();
   private readonly tokens = new Map<string, TokenRecord>();
-  private readonly armed = new Map<string, { mode: "steer" | "followUp"; until: number }>();
+  private readonly tokensByNonce = new Map<string, TokenRecord>();
+  private readonly armed = new Map<string, ArmedRecord>();
   private chain: Promise<void> = Promise.resolve();
   private timer: Timer | undefined;
   /** Set by {@link stop}: nothing is scheduled, sent or edited afterwards. */
@@ -237,7 +288,7 @@ export class LanePanels {
 
   /** Entries held in memory, for diagnostics and tests. Bounded by the topics that still have a route. */
   memory(): { states: number; tokens: number; armed: number } {
-    return { states: this.states.size, tokens: this.tokens.size, armed: this.armed.size };
+    return { states: this.states.size, tokens: this.tokensByNonce.size, armed: this.armed.size };
   }
 
   private routes(): Array<{ target: RouteTarget; sessionId: string }> {
@@ -267,8 +318,17 @@ export class LanePanels {
    * route is gone. The daemon runs for weeks, so nothing here may outlive its topic.
    */
   private prune(liveKeys: Set<string>, now: number): void {
-    for (const [token, record] of this.tokens) if (now >= record.expiresAt) this.tokens.delete(token);
-    for (const [key, armed] of this.armed) if (armed.until <= now || !liveKeys.has(key)) this.armed.delete(key);
+    for (const [nonce, record] of this.tokensByNonce) {
+      if (now >= record.expiresAt || !liveKeys.has(record.key)) {
+        this.tokensByNonce.delete(nonce);
+        this.tokens.delete(record.token);
+      }
+    }
+    for (const [key, armed] of this.armed) {
+      if (armed.expiresAt <= now || !liveKeys.has(key)) {
+        this.armed.delete(key);
+      }
+    }
     for (const [key, state] of this.states) {
       if (liveKeys.has(key)) continue;
       this.revoke(state);
@@ -276,17 +336,81 @@ export class LanePanels {
     }
   }
 
-  private keyboardFor(state: PanelState, sessionId: string, now: number): Keyboard {
+  private getSecret(): Buffer {
+    return getDaemonSecret(this.options.store, this.options.slotId);
+  }
+
+  private createTokenRecord(
+    key: string,
+    target: RouteTarget,
+    sessionId: string,
+    action: PanelAction,
+    expiresAt: number,
+    keyboardId?: string,
+    register = true,
+  ): TokenRecord {
+    const nonce = randomBytes(9).toString("base64url");
+    const sig = computeTokenHmac(
+      this.getSecret(),
+      sessionId,
+      target.chatId,
+      target.topicId,
+      this.options.operatorId,
+      expiresAt,
+      action,
+      nonce,
+    );
+    const token = `${LANE_PANEL_CALLBACK_PREFIX}${nonce}:${sig}`;
+    const record: TokenRecord = {
+      key,
+      keyboardId,
+      target,
+      sessionId,
+      action,
+      expiresAt,
+      nonce,
+      token,
+      consumed: false,
+    };
+    if (register) {
+      this.tokens.set(token, record);
+      this.tokensByNonce.set(nonce, record);
+    }
+    return record;
+  }
+
+  private keyboardFor(state: PanelState, key: string, target: RouteTarget, sessionId: string, now: number): Keyboard {
     const current = state.keyboard;
     if (current && current.sessionId === sessionId && now - current.issuedAt < this.tokenTtlMs / 2) return current;
-    const token = (): string => `${LANE_PANEL_CALLBACK_PREFIX}${randomBytes(9).toString("base64url")}`;
-    return { id: randomBytes(6).toString("hex"), sessionId, issuedAt: now, tokens: { stop: token(), steer: token(), followUp: token() } };
+    const keyboardId = randomBytes(6).toString("hex");
+    const expiresAt = now + this.tokenTtlMs;
+    const stopRec = this.createTokenRecord(key, target, sessionId, "stop", expiresAt, keyboardId, false);
+    const steerRec = this.createTokenRecord(key, target, sessionId, "steer", expiresAt, keyboardId, false);
+    const followUpRec = this.createTokenRecord(key, target, sessionId, "followUp", expiresAt, keyboardId, false);
+    return {
+      id: keyboardId,
+      sessionId,
+      issuedAt: now,
+      tokens: {
+        stop: stopRec.token,
+        steer: steerRec.token,
+        followUp: followUpRec.token,
+      },
+      records: {
+        stop: stopRec,
+        steer: steerRec,
+        followUp: followUpRec,
+      },
+    };
   }
 
   private markup(target: RouteTarget, keyboard: Keyboard | null): Markup {
     const rows: Markup["inline_keyboard"] = [];
     if (keyboard) {
-      rows.push((Object.keys(ACTION_LABELS) as PanelAction[]).map(action => ({ text: ACTION_LABELS[action], callback_data: keyboard.tokens[action] })));
+      rows.push((["stop", "steer", "followUp"] as const).map(action => ({
+        text: ACTION_LABELS[action],
+        callback_data: keyboard.tokens[action],
+      })));
     }
     const link = this.options.miniAppLink;
     if (keyboard && link) {
@@ -300,17 +424,23 @@ export class LanePanels {
     if (state.keyboard === keyboard) return;
     this.revoke(state);
     state.keyboard = keyboard;
-    if (!keyboard) return;
-    for (const action of Object.keys(keyboard.tokens) as PanelAction[]) {
-      this.tokens.set(keyboard.tokens[action], {
-        key, keyboardId: keyboard.id, target, sessionId: keyboard.sessionId, action,
-        expiresAt: keyboard.issuedAt + this.tokenTtlMs,
-      });
+    if (!keyboard?.records) return;
+    for (const record of Object.values(keyboard.records)) {
+      this.tokens.set(record.token, record);
+      this.tokensByNonce.set(record.nonce, record);
     }
   }
 
   private revoke(state: PanelState): void {
-    if (state.keyboard) for (const token of Object.values(state.keyboard.tokens)) this.tokens.delete(token);
+    if (state.keyboard) {
+      for (const token of Object.values(state.keyboard.tokens)) {
+        const record = this.tokens.get(token);
+        if (record) {
+          this.tokensByNonce.delete(record.nonce);
+        }
+        this.tokens.delete(token);
+      }
+    }
   }
 
   private async update(target: RouteTarget, sessionId: string, snapshot: FleetSnapshot): Promise<void> {
@@ -335,7 +465,7 @@ export class LanePanels {
     // A topic whose session is not running gets no new panel; an existing one shows that it ended.
     if (!lane && !storedId) return;
     if (lane) store.setKv(this.kvKey(target, "title"), lane.name);
-    const keyboard = lane ? this.keyboardFor(state, sessionId, now) : null;
+    const keyboard = lane ? this.keyboardFor(state, key, target, sessionId, now) : null;
     const text = renderLanePanel(lane, snapshot, { title: store.getKv(this.kvKey(target, "title")), formatClock: this.options.formatClock });
     const markup = this.markup(target, keyboard);
     const hash = createHash("sha256").update(text).update(JSON.stringify(markup)).digest("hex");
@@ -390,25 +520,86 @@ export class LanePanels {
     return value === null ? null : Number(value);
   }
 
-  private resolve(data: string): TokenRecord | null {
-    const record = this.tokens.get(data);
-    if (!record) return null;
-    const state = this.states.get(record.key);
-    if (this.now() >= record.expiresAt || state?.keyboard?.id !== record.keyboardId
-        || this.options.boundSession(record.target) !== record.sessionId) {
-      this.tokens.delete(data);
-      return null;
+  private resolve(
+    data: string,
+    context?: PanelCallbackContext,
+  ): {
+    record?: TokenRecord;
+    action: PanelAction | "unknown";
+    sessionId: string;
+    error?: "forged" | "unauthorized" | "expired" | "replay" | "stale" | "unknown";
+  } {
+    if (!data.startsWith(LANE_PANEL_CALLBACK_PREFIX)) {
+      return { action: "unknown", sessionId: "", error: "unknown" };
     }
-    return record;
+    const rest = data.slice(LANE_PANEL_CALLBACK_PREFIX.length);
+    const colonIdx = rest.indexOf(":");
+    if (colonIdx === -1) {
+      return { action: "unknown", sessionId: "", error: "forged" };
+    }
+    const nonce = rest.slice(0, colonIdx);
+    const sig = rest.slice(colonIdx + 1);
+
+    const record = this.tokensByNonce.get(nonce) ?? this.tokens.get(data);
+    if (!record) {
+      return { action: "unknown", sessionId: "", error: "forged" };
+    }
+
+    const expectedSig = computeTokenHmac(
+      this.getSecret(),
+      record.sessionId,
+      record.target.chatId,
+      record.target.topicId,
+      this.options.operatorId,
+      record.expiresAt,
+      record.action,
+      record.nonce,
+    );
+    const sigBuf = Buffer.from(sig);
+    const expBuf = Buffer.from(expectedSig);
+    if (sigBuf.length !== expBuf.length || !timingSafeEqual(sigBuf, expBuf)) {
+      return { record, action: record.action, sessionId: record.sessionId, error: "forged" };
+    }
+
+    if (!context || !context.userId || !context.chatId || !context.topicId) {
+      return { record, action: record.action, sessionId: record.sessionId, error: "unauthorized" };
+    }
+    if (context.userId !== this.options.operatorId) {
+      return { record, action: record.action, sessionId: record.sessionId, error: "unauthorized" };
+    }
+    if (context.chatId !== record.target.chatId || context.topicId !== record.target.topicId) {
+      return { record, action: record.action, sessionId: record.sessionId, error: "unauthorized" };
+    }
+
+    if (this.now() >= record.expiresAt) {
+      return { record, action: record.action, sessionId: record.sessionId, error: "expired" };
+    }
+
+    if (record.consumed) {
+      return { record, action: record.action, sessionId: record.sessionId, error: "replay" };
+    }
+
+    if (this.options.boundSession(record.target) !== record.sessionId) {
+      return { record, action: record.action, sessionId: record.sessionId, error: "stale" };
+    }
+
+    if (record.keyboardId) {
+      const state = this.states.get(record.key);
+      if (state?.keyboard?.id !== record.keyboardId) {
+        return { record, action: record.action, sessionId: record.sessionId, error: "stale" };
+      }
+    }
+
+    return { record, action: record.action, sessionId: record.sessionId };
   }
 
   /**
-   * The answer shown on the click itself, at receipt. Steer and Follow-up only answer; the first Stop tap
-   * claims the topic's Stop, so {@link run} sends it once and every further tap answers "already stopping".
+   * The answer shown on the click itself, at receipt.
    */
-  peek(data: string): string {
-    const record = this.resolve(data);
-    if (!record) return PANEL_EXPIRED_ANSWER;
+  peek(data: string, context?: PanelCallbackContext): string {
+    const res = this.resolve(data, context);
+    if (res.error || !res.record) return PANEL_EXPIRED_ANSWER;
+    const record = res.record;
     if (record.action === "stop") {
       const state = this.states.get(record.key);
       if (!state) return PANEL_EXPIRED_ANSWER;
@@ -417,54 +608,255 @@ export class LanePanels {
         state.stop = null;
         return "Nothing to stop: the session is idle.";
       }
-      // A claim whose run never came, or a sent Stop the turn ignored, lapses after the settle window.
       if (state.stop && now - state.stop.at < this.stopSettleMs) {
         return PANEL_ALREADY_STOPPING_ANSWER;
       }
       state.stop = { phase: "claimed", at: now };
+      return "Confirm stopping the current turn.";
+    }
+    if (record.action === "confirm") {
       return "⏹ Stopping the current turn.";
     }
+    if (record.action === "cancel") {
+      return "Stop cancelled.";
+    }
     return record.action === "steer"
-      ? "🧭 Send your steer as the next message in this topic."
-      : "➕ Send your follow-up as the next message in this topic. It runs after the current turn.";
+      ? "🧭 Send your steer as a reply to the prompt."
+      : "➕ Send your follow-up as a reply to the prompt. It runs after the current turn.";
   }
 
   /**
-   * Acts on a click from the inbound ledger. A stale token does nothing; it was answered as expired.
-   * A Stop runs only for the tap that claimed it in {@link peek}, and only once.
+   * Acts on a click from the inbound ledger. Validates and audits once per event.
    */
-  async run(data: string): Promise<void> {
-    const record = this.resolve(data);
-    if (!record) {
-      this.log("stale panel button ignored");
+  async run(data: string, context?: PanelCallbackContext): Promise<void> {
+    const now = this.now();
+    const eventId = context?.eventId ?? randomBytes(8).toString("hex");
+    const userId = context?.userId ?? "unknown";
+
+    const res = this.resolve(data, context);
+    if (res.error || !res.record) {
+      this.options.store.auditControl({
+        eventId,
+        userId,
+        action: res.action,
+        sessionId: res.sessionId,
+        result: res.error ?? "unknown",
+        at: now,
+      });
+      this.log(`panel button rejected (${res.error ?? "unknown"})`);
       return;
     }
-    if (record.action !== "stop") {
-      this.armed.set(record.key, { mode: record.action, until: this.now() + this.armTtlMs });
+
+    const record = res.record;
+
+    if (record.action === "stop") {
+      const state = this.states.get(record.key);
+      if (state?.stop?.phase !== "claimed") {
+        this.options.store.auditControl({
+          eventId,
+          userId,
+          action: "stop",
+          sessionId: record.sessionId,
+          result: "stale",
+          at: now,
+        });
+        this.log(`topic ${record.target.topicId}: stop already sent or not claimed; ignored`);
+        return;
+      }
+
+      // Stop first click opens ephemeral confirm/cancel keyboard, 30-second expiry.
+      const confirmExpiresAt = now + 30_000;
+      const confirmTokenRec = this.createTokenRecord(
+        record.key,
+        record.target,
+        record.sessionId,
+        "confirm",
+        confirmExpiresAt,
+      );
+      const cancelTokenRec = this.createTokenRecord(
+        record.key,
+        record.target,
+        record.sessionId,
+        "cancel",
+        confirmExpiresAt,
+      );
+      confirmTokenRec.pairedToken = cancelTokenRec.nonce;
+      cancelTokenRec.pairedToken = confirmTokenRec.nonce;
+
+      const markup: Markup = {
+        inline_keyboard: [[
+          { text: "Confirm Stop", callback_data: confirmTokenRec.token },
+          { text: "Cancel", callback_data: cancelTokenRec.token },
+        ]],
+      };
+
+      const confirmRes = await this.options.transport.confirm(
+        record.target,
+        "Stop the current turn?",
+        markup,
+        userId,
+      );
+
+      if (confirmRes === "error" || !confirmRes?.ephemeralMessageId) {
+        state.stop = null;
+        this.options.store.auditControl({
+          eventId,
+          userId,
+          action: "stop",
+          sessionId: record.sessionId,
+          result: "error",
+          at: now,
+        });
+        this.log(`topic ${record.target.topicId}: confirm prompt failed`);
+        return;
+      }
+
+      confirmTokenRec.ephemeralMessageId = confirmRes.ephemeralMessageId;
+      cancelTokenRec.ephemeralMessageId = confirmRes.ephemeralMessageId;
+
+      this.options.store.auditControl({
+        eventId,
+        userId,
+        action: "stop",
+        sessionId: record.sessionId,
+        result: "confirm_prompted",
+        at: now,
+      });
       return;
     }
-    const state = this.states.get(record.key);
-    if (state?.stop?.phase !== "claimed") {
-      this.log(`topic ${record.target.topicId}: stop already sent or not claimed; ignored`);
+
+    if (record.action === "cancel") {
+      // Cancel consumes paired confirm.
+      record.consumed = true;
+      if (record.pairedToken) {
+        const paired = this.tokensByNonce.get(record.pairedToken);
+        if (paired) paired.consumed = true;
+      }
+      const state = this.states.get(record.key);
+      if (state) state.stop = null;
+
+      if (record.ephemeralMessageId) {
+        await this.options.transport.editConfirm(
+          record.target,
+          record.ephemeralMessageId,
+          "Stop cancelled.",
+          { inline_keyboard: [] },
+          userId,
+        ).catch(() => {});
+      }
+
+      this.options.store.auditControl({
+        eventId,
+        userId,
+        action: "cancel",
+        sessionId: record.sessionId,
+        result: "cancelled",
+        at: now,
+      });
       return;
     }
-    // Claimed and sent in one synchronous step, so a second run of the same tap cannot slip in.
-    state.stop = { phase: "sent", at: this.now() };
-    try {
-      const stopped = await this.options.stop(record.target);
-      this.log(`topic ${record.target.topicId}: stop ${stopped ? "sent" : "found no active turn"}`);
-      if (!stopped) state.stop = null;
-    } catch (error) {
-      state.stop = null;
-      this.log(`topic ${record.target.topicId}: stop failed: ${String(error)}`);
+
+    if (record.action === "confirm") {
+      // Stop only executes confirmed single-use token, consumed synchronously before await.
+      record.consumed = true;
+      if (record.pairedToken) {
+        const paired = this.tokensByNonce.get(record.pairedToken);
+        if (paired) paired.consumed = true;
+      }
+      const state = this.states.get(record.key);
+      if (state) state.stop = { phase: "sent", at: now };
+
+      let stopped = false;
+      let stopError: unknown = null;
+      try {
+        stopped = await this.options.stop(record.target);
+        this.log(`topic ${record.target.topicId}: stop ${stopped ? "sent" : "found no active turn"}`);
+        if (!stopped && state) state.stop = null;
+      } catch (err) {
+        stopError = err;
+        if (state) state.stop = null;
+        this.log(`topic ${record.target.topicId}: stop failed`);
+      }
+
+      if (record.ephemeralMessageId) {
+        await this.options.transport.editConfirm(
+          record.target,
+          record.ephemeralMessageId,
+          stopped ? "Turn stopped." : "Nothing to stop.",
+          { inline_keyboard: [] },
+          userId,
+        ).catch(() => {});
+      }
+
+      this.options.store.auditControl({
+        eventId,
+        userId,
+        action: "confirm",
+        sessionId: record.sessionId,
+        result: stopError ? "error" : stopped ? "ok" : "idle",
+        at: now,
+      });
+      return;
+    }
+
+    if (record.action === "steer" || record.action === "followUp") {
+      const promptText = record.action === "steer"
+        ? "🧭 Reply to this message with your steer for the lane."
+        : "➕ Reply to this message with your follow-up for the lane.";
+
+      const promptRes = await this.options.transport.prompt(record.target, promptText, record.sessionId);
+      if (promptRes === "error" || !promptRes?.messageId) {
+        this.options.store.auditControl({
+          eventId,
+          userId,
+          action: record.action,
+          sessionId: record.sessionId,
+          result: "error",
+          at: now,
+        });
+        this.log(`topic ${record.target.topicId}: prompt failed`);
+        return;
+      }
+
+      this.armed.set(record.key, {
+        mode: record.action,
+        messageId: promptRes.messageId,
+        userId,
+        sessionId: record.sessionId,
+        expiresAt: now + this.armTtlMs,
+      });
+
+      this.options.store.auditControl({
+        eventId,
+        userId,
+        action: record.action,
+        sessionId: record.sessionId,
+        result: "ok",
+        at: now,
+      });
+      return;
     }
   }
 
   /** The delivery mode a Steer or Follow-up click armed for this topic's next message; consumed once. */
-  takeArmed(target: RouteTarget): "steer" | "followUp" | null {
+  takeArmed(target: RouteTarget, userId?: string, replyToMessageId?: number): "steer" | "followUp" | null {
     const key = this.kvKey(target, "");
     const armed = this.armed.get(key);
+    if (!armed) return null;
+    const now = this.now();
+    if (now >= armed.expiresAt) {
+      this.armed.delete(key);
+      return null;
+    }
+    const currentSession = this.options.boundSession(target);
+    if (!currentSession || currentSession !== armed.sessionId) {
+      this.armed.delete(key);
+      return null;
+    }
+    if (replyToMessageId !== armed.messageId || userId !== armed.userId) {
+      return null;
+    }
     this.armed.delete(key);
-    return armed && armed.until > this.now() ? armed.mode : null;
+    return armed.mode;
   }
 }

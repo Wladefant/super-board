@@ -288,6 +288,21 @@ export interface MessageCorrelationBridge {
   getSlotId: () => string;
   record: (correlation: OutboundMessageCorrelation) => void;
   resolveReply: (botId: string, chatId: string, replyToMessageId: number) => ReplyRoutingResolution;
-  resolveCallback?: (callbackToken: string, userId: string, chatId: string) => DecisionCallbackResolution;
-  consumeCallback?: (callbackToken: string) => boolean;
+  resolveCallback?: (callbackToken: string, userId: string, chatId: string, eventId?: string) => DecisionCallbackResolution;
+  consumeCallback?: (callbackToken: string, eventId?: string) => boolean;
+}
+
+export interface PanelCallbackContext {
+  userId: string;
+  chatId: string;
+  topicId: string;
+  eventId: string;
+  messageId?: number;
+}
+
+export interface ActiveDeliveryContext {
+  userId: string;
+  chatId: string;
+  replyToMessageId?: number;
+  threadId?: number;
 }

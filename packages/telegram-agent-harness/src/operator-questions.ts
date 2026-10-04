@@ -2,7 +2,23 @@ import * as path from "node:path";
 import { escapeHtml } from "../extension/sanitizer";
 import type { TelegramPoller } from "../extension/poller";
 import type { AccessConfig } from "../extension/types";
+import type { BotPoolCoordinator } from "../extension/coordinator";
 
+interface InlineKeyboardButton {
+  text: string;
+  callback_data?: string;
+}
+
+interface InlineKeyboardMarkup {
+  inline_keyboard: InlineKeyboardButton[][];
+}
+
+function isInlineKeyboardMarkup(value: unknown): value is InlineKeyboardMarkup {
+  if (!value || typeof value !== "object" || !("inline_keyboard" in value)) {
+    return false;
+  }
+  return Array.isArray(value.inline_keyboard);
+}
 /** A forum chat is not an operator account; callback ownership must name a user. */
 export function questionOperator(access: AccessConfig, chatId: string): string {
   if (!chatId.startsWith("-") && access.allowFrom.includes(chatId)) return chatId;
@@ -112,7 +128,12 @@ export async function readQuestions(decisionsPath: string): Promise<Question[]> 
 
 /** Daemon-owned operations on any question. They cache Telegram ids and mint cards; they never answer. */
 export class QuestionStore {
-  constructor(readonly decisionsPath: string, private readonly poolPath: string) {}
+  constructor(
+    readonly decisionsPath: string,
+    private readonly poolPath: string,
+    private readonly coordinator?: BotPoolCoordinator,
+    private readonly secret?: Buffer,
+  ) {}
   list(): Promise<Question[]> { return readQuestions(this.decisionsPath); }
   async cache(id: string, fields: { topic_message_id?: number | null; topic_card_at?: number | null; session_finalized?: boolean }): Promise<void> {
     await spawnQuestionStore({ operation: "cache", payload: { id, ...fields },
@@ -121,7 +142,28 @@ export class QuestionStore {
   async cardFor(id: string): Promise<{ question: Question; card: NonNullable<Result["card"]> }> {
     const result = await spawnQuestionStore({ operation: "card_for", payload: { id },
       decisions_path: this.decisionsPath, pool_path: this.poolPath });
-    return { question: result.question!, card: result.card! };
+    const question = result.question!;
+    let card = result.card!;
+    if (this.coordinator && this.secret && isInlineKeyboardMarkup(card.reply_markup)) {
+      const ttlSeconds = 86400;
+      const now = Date.now() / 1000;
+      const signedRows = card.reply_markup.inline_keyboard.map(row => row.map(btn => {
+        if (!btn.callback_data) return btn;
+        const record = this.coordinator!.issueDecisionCallback({
+          decisionId: question.decision_id,
+          choiceId: btn.callback_data,
+          sessionId: question.transport.session_id,
+          chatId: question.transport.chat_id,
+          userId: question.transport.user_id,
+          secret: this.secret!,
+          ttlSeconds,
+          now,
+        });
+        return { ...btn, callback_data: record.callbackToken };
+      }));
+      card = { ...card, reply_markup: { ...card.reply_markup, inline_keyboard: signedRows } };
+    }
+    return { question, card };
   }
   /** Pending questions that recent operator messages (`at` = epoch seconds or ISO) may already answer. Read-only. */
   async possibleAnswers(messages: Array<{ id: string | number; text: string; at: number | string }>, minShared = 2): Promise<PossibleAnswer[]> {
@@ -171,11 +213,17 @@ export async function questionCompactionContext(
 
 /** No independent ledger, Telegram poller, approval grant, or new operator turn. */
 export class OperatorQuestionService {
-  constructor(private readonly poller: TelegramPoller, private readonly route: () => QuestionRoute,
-    private readonly decisionsPath: string, private readonly poolPath: string,
+  constructor(
+    private readonly poller: TelegramPoller,
+    private readonly route: () => QuestionRoute,
+    private readonly decisionsPath: string,
+    private readonly poolPath: string,
     private readonly report: (message: string) => void,
     private readonly invoke: (operation: string, payload: object, card: boolean) => Promise<Result> =
-      (operation, payload, card) => this.python(operation, payload, card)) {}
+      (operation, payload, card) => this.python(operation, payload, card),
+    private readonly coordinator?: BotPoolCoordinator,
+    private readonly secret?: Buffer,
+  ) {}
 
   private async python(operation: string, payload: object, card: boolean): Promise<Result> {
     const boundRoute = this.route();
@@ -289,12 +337,36 @@ export class OperatorQuestionService {
     await this.invoke("cache", { id: question.decision_id, session_finalized: true }, false);
   }
 
+  private signMarkup(question: Question, markup?: Record<string, unknown>): Record<string, unknown> | undefined {
+    if (!this.coordinator || !this.secret || !isInlineKeyboardMarkup(markup)) {
+      return markup;
+    }
+    const ttlSeconds = 86400;
+    const now = Date.now() / 1000;
+    const signedRows = markup.inline_keyboard.map(row => row.map(btn => {
+      if (!btn.callback_data) return btn;
+      const record = this.coordinator!.issueDecisionCallback({
+        decisionId: question.decision_id,
+        choiceId: btn.callback_data,
+        sessionId: question.transport.session_id,
+        chatId: question.transport.chat_id,
+        userId: question.transport.user_id,
+        secret: this.secret!,
+        ttlSeconds,
+        now,
+      });
+      return { ...btn, callback_data: record.callbackToken };
+    }));
+    return { ...markup, inline_keyboard: signedRows };
+  }
+
   private async publish(result: Result, edit = false): Promise<void> {
     if (!result.card || !result.question) return;
     const { chat_id } = this.route();
+    const markup = this.signMarkup(result.question, result.card.reply_markup);
     let sent = edit && result.question.transport.message_id
       ? await this.poller.editTelegramMessage(chat_id, result.question.transport.message_id,
-          result.card.text, "HTML", undefined, result.card.reply_markup)
+          result.card.text, "HTML", undefined, markup)
       : null;
     // A lost message may be recreated; a transient edit failure must not duplicate it.
     if (edit && result.question.transport.message_id && !sent?.ok) {
@@ -305,7 +377,7 @@ export class OperatorQuestionService {
     // Questions topic and break its one-message-per-question rule.
     if (!sent && edit) return;
     if (!sent) sent = await this.poller.sendTelegramMessage(chat_id, result.card.text,
-      "HTML", result.card.reply_markup, { decisionId: result.card.id });
+      "HTML", markup, { decisionId: result.card.id });
     if (!sent?.ok || !sent.result?.message_id) throw new Error(`Question persists, but Telegram delivery failed${sent?.description ? ` (${sent.description})` : ""}; it remains pending`);
     await this.invoke("sent", { id: result.card.id, message_id: sent.result.message_id }, false);
   }
