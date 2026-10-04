@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import * as path from "node:path";
-import { governedTelegramFetch, TelegramGovernor, type GovernedRequest } from "../extension/telegram-governor";
+import {
+  governedTelegramFetch, TelegramGovernor, TelegramQueueFullError, TelegramRateLimitedError, type GovernedRequest,
+  type GovernorOptions,
+} from "../extension/telegram-governor";
 
 /** Lets every already-resolved promise chain run; no wall-clock time passes. */
 async function flush(): Promise<void> {
@@ -66,9 +69,9 @@ function fakeTelegram(clock: { now: () => number }, script: { retryAfterOnCall?:
   return { sent, statuses, fetch, calls: () => calls };
 }
 
-function setup(script?: { retryAfterOnCall?: Map<number, number> }) {
+function setup(script?: { retryAfterOnCall?: Map<number, number> }, options: GovernorOptions = {}) {
   const clock = fakeClock();
-  const governor = new TelegramGovernor({ now: clock.now, sleep: clock.sleep });
+  const governor = new TelegramGovernor({ now: clock.now, sleep: clock.sleep, ...options });
   const telegram = fakeTelegram(clock, script);
   const call = (chat: string | number, request: GovernedRequest, text = "x", method = "sendMessage") =>
     governedTelegramFetch(
@@ -140,17 +143,28 @@ describe("TelegramGovernor budget", () => {
 });
 
 describe("TelegramGovernor retry_after", () => {
-  test("waits out retry_after, retries once, and blocks every chat meanwhile", async () => {
+  test("waits out retry_after and retries once, without blocking other chats", async () => {
     const { clock, telegram, call } = setup({ retryAfterOnCall: new Map([[1, 7]]) });
     const start = clock.now();
     const first = call(7, {}, "first");
-    await flush();
     const other = call(8, {}, "other chat");
     const [res] = await clock.drive(Promise.all([first, other]));
     expect((await res.json()).ok).toBe(true);
     expect(telegram.statuses[0]).toBe(429);
-    expect(telegram.sent.every((s) => s.at - start >= 7000)).toBe(true);
+    const byChat = (chat: string) => telegram.sent.find((s) => s.chat === chat);
+    expect(byChat("7")?.at).toBe(start + 7000);
+    expect(byChat("8")?.at).toBeLessThan(start + 7000);
     expect(telegram.calls()).toBe(3);
+  });
+
+  test("a 429 on a call bound to no chat blocks the whole bot", async () => {
+    const { clock, telegram, call } = setup({ retryAfterOnCall: new Map([[1, 4]]) });
+    const start = clock.now();
+    const menu = call(7, { kind: "other", chatId: undefined }, "menu", "setMyCommands");
+    await flush();
+    const send = call(8, {}, "after");
+    await clock.drive(Promise.all([menu, send]));
+    expect(telegram.sent.find((s) => s.chat === "8")?.at).toBeGreaterThanOrEqual(start + 4000);
   });
 
   test("a second 429 is returned to the caller and not retried in a loop", async () => {
@@ -165,7 +179,15 @@ describe("TelegramGovernor retry_after", () => {
     const res = await clock.drive(call(7, {}));
     expect(res.status).toBe(429);
     expect(telegram.calls()).toBe(1);
-    expect(governor.snapshot().blockedForMs).toBe(3600_000);
+    expect(governor.snapshot().chats[0].blockedForMs).toBe(3600_000);
+  });
+
+  test("a call queued behind a long retry_after fails fast instead of sleeping inline", async () => {
+    const { clock, telegram, call } = setup({ retryAfterOnCall: new Map([[1, 3600]]) });
+    await clock.drive(call(7, {}));
+    const queued = call(7, {}, "later");
+    await expect(clock.drive(queued)).rejects.toBeInstanceOf(TelegramRateLimitedError);
+    expect(telegram.calls()).toBe(1);
   });
 
   test("logs governor state", async () => {
@@ -175,6 +197,42 @@ describe("TelegramGovernor retry_after", () => {
     expect(lines.some((l) => l.includes("429") && l.includes("2 s"))).toBe(true);
     expect(lines.some((l) => l.includes("retry_after"))).toBe(true);
     expect(lines.join("\n")).not.toContain(":T");
+  });
+});
+
+describe("TelegramGovernor queues", () => {
+  test("a message held by the group window does not hold up a panel", async () => {
+    const { clock, telegram, call } = setup();
+    await clock.drive(Promise.all(Array.from({ length: 8 }, (_, i) => call(-100, { kind: "message" }, `m${i}`))));
+    const before = clock.now();
+    const held = call(-100, { kind: "message" }, "held");
+    const panel = call(-100, { kind: "panel" }, "panel");
+    await clock.drive(panel);
+    expect(telegram.sent.find((s) => s.text === "panel")?.at).toBeLessThanOrEqual(before + 1000);
+    expect(telegram.sent.some((s) => s.text === "held")).toBe(false);
+    await clock.drive(held);
+    expect(telegram.sent.find((s) => s.text === "held")?.at).toBeGreaterThanOrEqual(before + 1000);
+  });
+
+  test("a full queue refuses a new message and logs it", async () => {
+    const { clock, telegram, call } = setup(undefined, { maxQueuedPerChat: 3 });
+    const lines: string[] = [];
+    const accepted = [1, 2, 3].map((i) => call(7, { log: (l) => lines.push(l) }, `m${i}`));
+    const refused = call(7, { log: (l) => lines.push(l) }, "m4");
+    await expect(refused).rejects.toBeInstanceOf(TelegramQueueFullError);
+    await clock.drive(Promise.all(accepted));
+    expect(telegram.sent.map((s) => s.text)).toEqual(["m1", "m2", "m3"]);
+    expect(lines.some((l) => l.includes("queue full"))).toBe(true);
+  });
+
+  test("a full queue drops its oldest panel edit for a newer panel call", async () => {
+    const { clock, telegram, call } = setup(undefined, { maxQueuedPerChat: 2 });
+    const p1 = call(7, { kind: "panel", coalesceKey: "e:1" }, "p1", "editMessageText");
+    const p2 = call(7, { kind: "panel", coalesceKey: "e:2" }, "p2", "editMessageText");
+    const p3 = call(7, { kind: "panel", coalesceKey: "e:3" }, "p3", "editMessageText");
+    await expect(p1).rejects.toBeInstanceOf(TelegramQueueFullError);
+    await clock.drive(Promise.all([p2, p3]));
+    expect(telegram.sent.map((s) => s.text)).toEqual(["p2", "p3"]);
   });
 });
 

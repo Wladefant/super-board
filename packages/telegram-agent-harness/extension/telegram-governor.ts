@@ -9,8 +9,13 @@
  * - Spacing: at least `chatIntervalMs` between two sends into the same chat.
  * - Group window: at most `groupLimit` sends per `windowMs` into a group. `panelReserve` of them can only
  *   be spent by panels, so a chatty session cannot starve the dashboard.
- * - 429: the bot is blocked until `retry_after` has passed. The call is retried once after that wait and
- *   the second answer is returned as is. A `retry_after` above `maxRetryWaitMs` is not waited out inline.
+ * - 429: the chat (or, for a call bound to no chat, the whole bot) is blocked until `retry_after` has passed.
+ *   The call is retried once after that wait and the second answer is returned as is. A block longer than
+ *   `maxRetryWaitMs` is never slept through: the first call gets the 429 back and queued calls fail with
+ *   {@link TelegramRateLimitedError}.
+ * - Queues: panels and ordinary messages queue apart, so a message held by its group share never holds up a
+ *   panel. Each chat queues at most `maxQueuedPerChat`; a full queue drops its oldest panel edit for a newer
+ *   panel call and refuses a new message with {@link TelegramQueueFullError}.
  * - Coalescing: an edit of the same message that is still queued is replaced by the newer edit, and both
  *   callers get the answer to the one request that is sent.
  *
@@ -39,13 +44,15 @@ export interface GovernorOptions {
   windowMs?: number;
   panelReserve?: number;
   maxRetryWaitMs?: number;
+  /** Queued, not-yet-sent calls one chat may hold per lane. More are refused so a stuck chat cannot grow memory. */
+  maxQueuedPerChat?: number;
   now?: () => number;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 }
 
 export interface GovernorSnapshot {
   blockedForMs: number;
-  chats: Array<{ chat: string; sendsInWindow: number; queued: number }>;
+  chats: Array<{ chat: string; sendsInWindow: number; queued: number; blockedForMs: number }>;
 }
 
 type Send = (signal: AbortSignal | undefined) => Promise<Response>;
@@ -59,17 +66,25 @@ interface Entry {
   send: Send;
   signal: AbortSignal | undefined;
   kind: GovernorKind;
+  coalesceKey: string | undefined;
   timeoutMs: number | undefined;
   log: ((message: string) => void) | undefined;
   waiters: Waiter[];
+  /** True once a request has left for Telegram; a started call can no longer absorb a newer edit. */
   started: boolean;
+  /** True once the entry was dropped from a full queue; the chain skips it. */
+  dropped: boolean;
 }
 
 interface ChatState {
-  tail: Promise<void>;
+  /** Panels and ordinary messages queue separately, so a message waiting on its group share never holds up a panel. */
+  tails: Record<"message" | "panel", Promise<void>>;
+  /** Entries queued behind a tail and not yet picked up, oldest first. */
+  waiting: Entry[];
   sends: Array<{ at: number; kind: GovernorKind }>;
   lastAt: number;
-  queued: number;
+  /** A 429 on a chat-bound call limits that chat only. */
+  blockedUntil: number;
   pending: Map<string, Entry>;
 }
 
@@ -87,6 +102,8 @@ const defaultSleep = (ms: number, signal?: AbortSignal): Promise<void> => {
     signal?.removeEventListener("abort", onAbort);
     resolve();
   }, ms);
+  // A pending wait must not keep the process alive.
+  timer.unref();
   signal?.addEventListener("abort", onAbort, { once: true });
   return promise;
 };
@@ -107,14 +124,34 @@ function parseRetryAfter(body: unknown, header: string | null): number | undefin
   return Number.isFinite(fromHeader) ? fromHeader : undefined;
 }
 
+/** Raised instead of sleeping through a rate limit longer than the inline limit. */
+export class TelegramRateLimitedError extends Error {
+  constructor(public readonly retryAfterMs: number) {
+    super(`Telegram rate limit: blocked for another ${Math.ceil(retryAfterMs / 1000)} s; the call was not sent.`);
+    this.name = "TelegramRateLimitedError";
+  }
+}
+
+/** Raised when a chat's queue is full, or when a panel edit is dropped to make room for a newer one. */
+export class TelegramQueueFullError extends Error {
+  constructor(chat: string, dropped: boolean) {
+    super(dropped
+      ? `Telegram outbound queue for chat ${chat} was full; an older panel edit was dropped for a newer one.`
+      : `Telegram outbound queue for chat ${chat} is full; the call was not sent.`);
+    this.name = "TelegramQueueFullError";
+  }
+}
+
 export class TelegramGovernor {
   private readonly chatIntervalMs: number;
   private readonly groupLimit: number;
   private readonly windowMs: number;
   private readonly panelReserve: number;
   private readonly maxRetryWaitMs: number;
+  private readonly maxQueuedPerChat: number;
   private readonly now: () => number;
   private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
+  /** Set by a 429 on a call that is not bound to a chat. */
   private blockedUntil = 0;
   private readonly chats = new Map<string, ChatState>();
 
@@ -124,6 +161,7 @@ export class TelegramGovernor {
     this.windowMs = options.windowMs ?? 60_000;
     this.panelReserve = options.panelReserve ?? 12;
     this.maxRetryWaitMs = options.maxRetryWaitMs ?? 60_000;
+    this.maxQueuedPerChat = options.maxQueuedPerChat ?? 200;
     this.now = options.now ?? Date.now;
     this.sleep = options.sleep ?? defaultSleep;
   }
@@ -135,17 +173,25 @@ export class TelegramGovernor {
       chats: [...this.chats].map(([chat, state]) => ({
         chat,
         sendsInWindow: state.sends.filter((s) => now - s.at < this.windowMs).length,
-        queued: state.queued,
+        queued: state.waiting.length,
+        blockedForMs: Math.max(0, state.blockedUntil - now),
       })),
     };
   }
 
-  /** Runs `send` once the budget allows it. Resolves with the final response, after at most one 429 retry. */
+  /**
+   * Runs `send` once the budget allows it. Resolves with the final response, after at most one 429 retry.
+   * Rejects with {@link TelegramRateLimitedError} when the wait would exceed the inline limit and with
+   * {@link TelegramQueueFullError} when the chat's queue is full.
+   */
   public schedule(request: GovernedRequest, send: Send, signal?: AbortSignal): Promise<Response> {
     const kind = request.kind ?? (request.chatId === undefined ? "other" : "message");
-    if (request.chatId === undefined || kind === "inbound") {
-      return this.run({ send, signal, kind, timeoutMs: request.timeoutMs, log: request.log, waiters: [], started: true }, undefined);
-    }
+    const entry: Entry = {
+      send, signal, kind, coalesceKey: request.coalesceKey, timeoutMs: request.timeoutMs, log: request.log,
+      waiters: [], started: false, dropped: false,
+    };
+    if (request.chatId === undefined || kind === "inbound") return this.run(entry, undefined, undefined);
+
     const chat = String(request.chatId);
     const state = this.chatState(chat);
     if (request.coalesceKey) {
@@ -159,34 +205,50 @@ export class TelegramGovernor {
         return waiter.promise;
       }
     }
-    const entry: Entry = { send, signal, kind, timeoutMs: request.timeoutMs, log: request.log, waiters: [], started: false };
+    if (state.waiting.length >= this.maxQueuedPerChat && !this.makeRoom(state, chat, entry)) {
+      request.log?.(`telegram governor: chat ${chat} queue full (${state.waiting.length}), ${kind} call refused`);
+      return Promise.reject(new TelegramQueueFullError(chat, false));
+    }
     const first = Promise.withResolvers<Response>();
     entry.waiters.push(first);
-    const done = first.promise;
     if (request.coalesceKey) state.pending.set(request.coalesceKey, entry);
-    state.queued++;
-    state.tail = state.tail.then(async () => {
+    state.waiting.push(entry);
+    const lane = kind === "panel" ? "panel" : "message";
+    state.tails[lane] = state.tails[lane].then(async () => {
+      if (entry.dropped) return;
+      state.waiting.splice(state.waiting.indexOf(entry), 1);
       try {
         const response = await this.run(entry, state, chat);
-        this.settle(entry, response);
+        entry.waiters.forEach((waiter, index) => waiter.resolve(index === 0 ? response : response.clone()));
       } catch (error) {
         for (const waiter of entry.waiters) waiter.reject(error);
       } finally {
-        state.queued--;
-        if (request.coalesceKey && state.pending.get(request.coalesceKey) === entry) state.pending.delete(request.coalesceKey);
+        if (entry.coalesceKey && state.pending.get(entry.coalesceKey) === entry) state.pending.delete(entry.coalesceKey);
       }
     });
-    return done;
+    return first.promise;
   }
 
-  private settle(entry: Entry, response: Response): void {
-    entry.waiters.forEach((waiter, index) => waiter.resolve(index === 0 ? response : response.clone()));
+  /** A full queue drops its oldest queued panel edit for a newer panel call. Messages never displace anything. */
+  private makeRoom(state: ChatState, chat: string, incoming: Entry): boolean {
+    if (incoming.kind !== "panel") return false;
+    const victim = state.waiting.find((e) => e.kind === "panel" && !e.started);
+    if (!victim) return false;
+    victim.dropped = true;
+    state.waiting.splice(state.waiting.indexOf(victim), 1);
+    if (victim.coalesceKey && state.pending.get(victim.coalesceKey) === victim) state.pending.delete(victim.coalesceKey);
+    for (const waiter of victim.waiters) waiter.reject(new TelegramQueueFullError(chat, true));
+    incoming.log?.(`telegram governor: chat ${chat} queue full, dropped the oldest queued panel edit`);
+    return true;
   }
 
   private chatState(chat: string): ChatState {
     let state = this.chats.get(chat);
     if (!state) {
-      state = { tail: Promise.resolve(), sends: [], lastAt: Number.NEGATIVE_INFINITY, queued: 0, pending: new Map() };
+      state = {
+        tails: { message: Promise.resolve(), panel: Promise.resolve() },
+        waiting: [], sends: [], lastAt: Number.NEGATIVE_INFINITY, blockedUntil: 0, pending: new Map(),
+      };
       this.chats.set(chat, state);
     }
     return state;
@@ -197,8 +259,11 @@ export class TelegramGovernor {
     for (;;) {
       const now = this.now();
       state.sends = state.sends.filter((s) => now - s.at < this.windowMs);
-      let readyAt = Math.max(this.blockedUntil, state.lastAt + this.chatIntervalMs);
-      let reason = this.blockedUntil > state.lastAt + this.chatIntervalMs ? "retry_after" : "chat interval";
+      const blocked = Math.max(this.blockedUntil, state.blockedUntil);
+      if (blocked - now > this.maxRetryWaitMs) throw new TelegramRateLimitedError(blocked - now);
+      const spaced = state.lastAt + this.chatIntervalMs;
+      let readyAt = Math.max(blocked, spaced);
+      let reason = blocked > spaced ? "retry_after" : "chat interval";
       if (isGroupChat(chat)) {
         const limit = entry.kind === "panel" ? this.groupLimit : this.groupLimit - this.panelReserve;
         const counted = entry.kind === "panel" ? state.sends : state.sends.filter((s) => s.kind !== "panel");
@@ -221,10 +286,13 @@ export class TelegramGovernor {
     }
   }
 
+  /** Chat-less calls only honour a bot-wide block. getUpdates and downloads are not rate limited by send budgets. */
   private async waitUnblocked(entry: Entry): Promise<void> {
+    if (entry.kind === "inbound") return;
     for (;;) {
       const wait = this.blockedUntil - this.now();
       if (wait <= 0) return;
+      if (wait > this.maxRetryWaitMs) throw new TelegramRateLimitedError(wait);
       entry.log?.(`telegram governor: ${entry.kind} call waits ${wait} ms (retry_after)`);
       await this.sleep(wait, entry.signal);
     }
@@ -248,9 +316,12 @@ export class TelegramGovernor {
       if (response.status !== 429) return response;
       const body: unknown = await response.clone().json().catch(() => undefined);
       const retryAfterSeconds = Math.max(1, parseRetryAfter(body, response.headers.get("Retry-After")) ?? 30);
-      this.blockedUntil = Math.max(this.blockedUntil, this.now() + retryAfterSeconds * 1000);
+      const until = this.now() + retryAfterSeconds * 1000;
+      const scope = state ? `chat ${chat}` : "bot";
+      if (state) state.blockedUntil = Math.max(state.blockedUntil, until);
+      else this.blockedUntil = Math.max(this.blockedUntil, until);
       const retry = attempt === 0 && entry.kind !== "inbound" && retryAfterSeconds * 1000 <= this.maxRetryWaitMs;
-      entry.log?.(`telegram governor: 429, bot blocked for ${retryAfterSeconds} s${retry ? ", one retry after the wait" : ", not retried"}`);
+      entry.log?.(`telegram governor: 429, ${scope} blocked for ${retryAfterSeconds} s${retry ? ", one retry after the wait" : ", not retried"}`);
       if (!retry) return response;
     }
   }
