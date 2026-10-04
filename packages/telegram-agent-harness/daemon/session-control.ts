@@ -28,7 +28,7 @@ export interface SessionControlOptions {
   onEvent: (event: SessionEvent) => void;
   onLog: (message: string) => void;
 }
-interface Owner {
+export interface Owner {
   version: 1;
   sessionId: string;
   pid: number;
