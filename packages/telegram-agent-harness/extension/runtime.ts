@@ -610,6 +610,7 @@ export class TelegramRuntime {
     const pollerOptions: PollerOptions | undefined = {
       ...(messageThreadId !== undefined ? { messageThreadId } : {}),
       slotId: activeSlot.slotId,
+      log: (message: string) => this.pi.logger?.warn(message),
     };
 
     const poller = this.options.pollerFactory

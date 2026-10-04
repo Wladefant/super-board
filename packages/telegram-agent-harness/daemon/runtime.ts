@@ -556,8 +556,7 @@ export class TelegramDaemon {
     const pollerOptions = {
       commands: getDaemonCommands(),
       isDaemon: true,
-      // A timed-out send may still have been delivered; the Questions topic must not post a card twice.
-      sendTimeoutMs: 20_000,
+      log: (message: string) => this.log(`Slot ${slot.slotId}: ${message}`),
       slotId: slot.slotId,
       ...(forumChatId ? { forumChatId } : {}),
     };
