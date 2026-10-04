@@ -134,6 +134,8 @@ export function markdownToTelegramHtml(markdown: string, defaultRepo?: string): 
     placeholders.push(val);
     return key;
   }
+  /** Text with placeholders resolved, so a quote's size counts the code inside it. */
+  const measure = (s: string): string => s.replace(/\x01TGPH_(\d+)\x01/g, (_m, i) => placeholders[Number(i)] ?? "");
   const allRepos = extractMentionedRepos(markdown);
   const projectRepo = resolveRepoSlug(defaultRepo);
   if (projectRepo) {
@@ -142,6 +144,15 @@ export function markdownToTelegramHtml(markdown: string, defaultRepo?: string): 
 
   // 1. Normalize line endings
   let text = markdown.replace(/\r\n/g, "\n");
+
+  // 2a. Fenced code inside a quote: every line carries a `>` marker, which must not leak into
+  //     the code. The block becomes one placeholder line that keeps the quote prefix, so the
+  //     quote pass later wraps `<pre>` inside `<blockquote>` (allowed by the Bot API).
+  text = text.replace(/^([ \t]*>[ \t]?)```([a-zA-Z0-9_-]*)[ \t]*\n((?:[ \t]*>.*\n)*?)[ \t]*>[ \t]?```[ \t]*$/gm, (_m, prefix: string, lang: string, body: string) => {
+    const code = body.replace(/\n$/, "").split("\n").map(l => l.replace(/^[ \t]*>[ ]?/, "")).join("\n");
+    const attr = lang ? ` class="language-${escapeHtml(lang)}"` : "";
+    return `${prefix}${addPlaceholder(`<pre><code${attr}>${escapeHtml(code)}</code></pre>`)}`;
+  });
 
   // 2. Code blocks: ```lang\ncode\n```
   text = text.replace(/```([a-zA-Z0-9_-]*)\n([\s\S]*?)```/g, (_m, lang, code) => {
@@ -152,6 +163,10 @@ export function markdownToTelegramHtml(markdown: string, defaultRepo?: string): 
 
   // 2b. Tables: Telegram has no table entity, so render aligned monospace <pre> blocks
   text = convertTablesToPre(text, addPlaceholder);
+
+  // 2c. Backslash escapes: `\*`, `\_`, `\`` ... keep the literal character, drop the backslash.
+  //     Backslash before any other character (Windows paths) is left alone.
+  text = text.replace(/\\([`*_~\[\]#>])/g, (_m, ch: string) => addPlaceholder(escapeHtml(ch)));
 
   // 3. Inline code: `code`
   text = text.replace(/`([^`\n]+)`/g, (_m, code) => {
@@ -169,7 +184,7 @@ export function markdownToTelegramHtml(markdown: string, defaultRepo?: string): 
   text = text.replace(validTagsPattern, (match) => addPlaceholder(match));
 
   // 6. Markdown blockquotes: >> and > (before escapeHtml, with placeholder delimiters)
-  text = convertBlockquotesToHtml(text, addPlaceholder);
+  text = convertBlockquotesToHtml(text, addPlaceholder, measure);
 
   // Generated command/help HTML already escapes its text. Keep valid entities
   // encoded once; restoring them never turns encoded markup into active tags.
@@ -179,9 +194,10 @@ export function markdownToTelegramHtml(markdown: string, defaultRepo?: string): 
   text = escapeHtml(text);
 
   // 9. Headers: # Header -> <b>Header</b>
-  text = text.replace(/^(#{1,6})\s+(.+)$/gm, (_m, _hashes, title) => `<b>${title.trim()}</b>`);
+  text = text.replace(/^(#{1,6})\s+(.+)$/gm, (_m, _hashes, title: string) => `<b>${title.trim().replace(/\*\*([^*\n]+)\*\*/g, "$1")}</b>`);
 
-  // 10. Bullet lists: - item or * item or + item -> • item
+  // 10. Task lists, then bullet lists: - [ ] item -> ☐ item, - item -> • item
+  text = text.replace(/^(\s*)[-*+]\s+\[([ xX])\]\s+(.+)$/gm, (_m, indent: string, mark: string, item: string) => `${indent}${mark === " " ? "☐" : "☑"} ${item}`);
   text = text.replace(/^(\s*)[-*+]\s+(.+)$/gm, "$1• $2");
 
   // 11. Markdown links: [text](url) - protect with placeholder so label and url are not double-linked
@@ -270,11 +286,12 @@ export function markdownToTelegramHtml(markdown: string, defaultRepo?: string): 
   });
 
   // 14. Inline formatting: bold, italic, strikethrough
-  text = text.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
-  text = text.replace(/(^|[\s,.:;!?(])__([^_\n]+)__(?=[\s,.:;!?)]|$)/g, "$1<b>$2</b>");
+  text = text.replace(/\*\*\*(?=\S)([^*\n]+?)(?<=\S)\*\*\*/g, "<b><i>$1</i></b>");
+  text = text.replace(/\*\*(?=\S)(.+?)(?<=\S)\*\*/g, "<b>$1</b>");
+  text = text.replace(/(^|[\s,.:;!?(])__(?=\S)(.+?)(?<=\S)__(?=[\s,.:;!?)]|$)/g, "$1<b>$2</b>");
   text = text.replace(/(^|[^\*])\*([^*\n\s](?:[^*\n]*[^*\n\s])?)\*(?=[^\*]|$)/g, "$1<i>$2</i>");
   text = text.replace(/(^|[\s,.:;!?(])_([^_\n\s](?:[^_\n]*[^_\n\s])?)_(?=[\s,.:;!?)]|$)/g, "$1<i>$2</i>");
-  text = text.replace(/~~([^~\n]+)~~/g, "<s>$1</s>");
+  text = text.replace(/~~(?=\S)([^~\n]+?)(?<=\S)~~/g, "<s>$1</s>");
 
   // 15. Restore placeholders in reverse
   for (let i = placeholders.length - 1; i >= 0; i--) {
@@ -401,7 +418,7 @@ const EXPANDABLE_QUOTE_LINES = 4;
 const EXPANDABLE_QUOTE_CHARS = 400;
 const EXPANDABLE_MARKER = /^\s*>\s*\[(?:expandable|!NOTE|!COLLAPSIBLE|!DETAILS)\]/i;
 
-function convertBlockquotesToHtml(src: string, addPlaceholder: (val: string) => string): string {
+function convertBlockquotesToHtml(src: string, addPlaceholder: (val: string) => string, measure: (s: string) => string = s => s): string {
   // <details><summary>S</summary>body</details> -> expandable quote led by the bold summary
   src = src.replace(/<details\b[^>]*>\s*(?:<summary>([\s\S]*?)<\/summary>)?([\s\S]*?)<\/details>/gi, (_m, summary: string | undefined, body: string) => {
     const title = summary?.trim();
@@ -427,11 +444,13 @@ function convertBlockquotesToHtml(src: string, addPlaceholder: (val: string) => 
     if (/^\s*>/.test(line)) {
       const bqLines: string[] = [];
       while (i < lines.length && /^\s*>/.test(lines[i]) && !/^\s*>>/.test(lines[i])) {
-        bqLines.push(lines[i].replace(/^\s*>\s?/, ""));
+        // `> > x` is one flat quote: Telegram cannot nest blockquotes
+        bqLines.push(lines[i].replace(/^\s*>[ ]?(?:>[ ])*/, ""));
         i++;
       }
       const body = bqLines.join("\n");
-      const expandable = bqLines.length > EXPANDABLE_QUOTE_LINES || body.length > EXPANDABLE_QUOTE_CHARS;
+      const shown = measure(body);
+      const expandable = shown.split("\n").length > EXPANDABLE_QUOTE_LINES || shown.length > EXPANDABLE_QUOTE_CHARS;
       out.push(`${addPlaceholder(expandable ? "<blockquote expandable>" : "<blockquote>")}\n${body}\n${addPlaceholder("</blockquote>")}`);
       continue;
     }

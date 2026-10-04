@@ -363,3 +363,60 @@ describe("Sanitizer & Security Utilities", () => {
     expect(sameLineResult).toContain('<a href="https://github.com/Bavariance/polysimulator/issues/5071">#5071</a>');
   });
 });
+
+describe("Markdown constructs inside and beside quotes", () => {
+  test("a quote keeps inline code, bold and links as entities", () => {
+    expect(markdownToTelegramHtml("> Run `bun test` and **check** [docs](https://x.com/a)\n> second line")).toBe(
+      '<blockquote>\nRun <code>bun test</code> and <b>check</b> <a href="https://x.com/a">docs</a>\nsecond line\n</blockquote>',
+    );
+  });
+
+  test("a fenced block inside a quote becomes <pre> inside the blockquote with no `>` markers", () => {
+    const html = markdownToTelegramHtml("> intro\n> ```ts\n> const a = 1 < 2;\n> if (a) {}\n> ```\n> after");
+    expect(html).toBe(
+      '<blockquote>\nintro\n<pre><code class="language-ts">const a = 1 &lt; 2;\nif (a) {}</code></pre>\nafter\n</blockquote>',
+    );
+    expect(html).not.toContain("&gt;");
+  });
+
+  test("a long quote with code is expandable because the code counts toward its size", () => {
+    const code = Array.from({ length: 6 }, (_, i) => `> line ${i}`).join("\n");
+    expect(markdownToTelegramHtml(`> \`\`\`\n${code}\n> \`\`\``)).toStartWith("<blockquote expandable>");
+  });
+
+  test("nested quote markers flatten into one quote", () => {
+    expect(markdownToTelegramHtml("> > inner")).toBe("<blockquote>\ninner\n</blockquote>");
+  });
+
+  test("lists inside quotes and task lists render", () => {
+    expect(markdownToTelegramHtml("> - item `a`\n>   - nested **b**\n> - [ ] todo\n> - [x] done")).toBe(
+      "<blockquote>\n• item <code>a</code>\n  • nested <b>b</b>\n☐ todo\n☑ done\n</blockquote>",
+    );
+    expect(markdownToTelegramHtml("- [ ] open\n- [X] done")).toBe("☐ open\n☑ done");
+  });
+
+  test("nested emphasis and escapes", () => {
+    expect(markdownToTelegramHtml("***both*** and **a *b* c**")).toBe("<b><i>both</i></b> and <b>a <i>b</i> c</b>");
+    expect(markdownToTelegramHtml("\\*literal\\* \\`tick\\` C:\\Users\\x")).toBe("*literal* `tick` C:\\Users\\x");
+  });
+
+  test("headings never nest bold in bold; links and markup inside code stay literal", () => {
+    expect(markdownToTelegramHtml("# Head **bold**")).toBe("<b>Head bold</b>");
+    expect(markdownToTelegramHtml("`[a](https://x.com)` `**x**`")).toBe("<code>[a](https://x.com)</code> <code>**x**</code>");
+  });
+
+  test("a table renders as <pre> and a quote holding <pre> survives chunking balanced", () => {
+    expect(markdownToTelegramHtml("| a | b |\n|---|---|\n| `x` | **y** |")).toBe("<pre>a | b\n--+--\nx | y</pre>");
+    const long = "> ```\n" + Array.from({ length: 400 }, (_, i) => `> row ${i} ${"x".repeat(20)}`).join("\n") + "\n> ```";
+    const chunks = chunkMessage(markdownToTelegramHtml(long));
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const chunk of chunks) {
+      expect(chunk.length).toBeLessThanOrEqual(4096);
+      for (const tag of ["blockquote", "pre", "code"]) {
+        const open = (chunk.match(new RegExp(`<${tag}[ >]`, "g")) ?? []).length;
+        const close = (chunk.match(new RegExp(`</${tag}>`, "g")) ?? []).length;
+        expect(open).toBe(close);
+      }
+    }
+  });
+});
