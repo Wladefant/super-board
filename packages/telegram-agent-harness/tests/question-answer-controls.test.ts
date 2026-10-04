@@ -408,3 +408,147 @@ test("QuestionsTopic signs question card reply markup with HMAC-signed Answer to
   expect(resolution.decision).toBe("deliver");
   expect(resolution.record?.choiceId).toBe("opt_yes");
 });
+
+test("multi-slot start validates slot A tokens after B starts", () => {
+  const { dir, poolDbPath } = setupTestEnvironment();
+  const manifestPath = path.join(dir, "manifest.json");
+  const channelsDir = path.join(dir, "channels");
+
+  const store = new DaemonStore(path.join(dir, "multi-slot-daemon.db"));
+  const coordinator = new BotPoolCoordinator(poolDbPath, manifestPath, channelsDir);
+  coordinator.setAuditStore(store);
+
+  // Slot A starts: acquires secret and sets per-slot secret in coordinator (no shared global secret)
+  const slotAId = "slot-alpha";
+  const slotASecret = getDaemonSecret(store, slotAId);
+  coordinator.setSlotSecret(slotAId, slotASecret);
+
+  // Issue token for Slot A using per-slot secret
+  const recA = coordinator.issueDecisionCallback({
+    decisionId: "tq:dec-slot-a",
+    choiceId: "opt_slot_a",
+    sessionId: "sess-slot-a",
+    chatId: "-100111",
+    userId: "user-1",
+    slotId: slotAId,
+    ttlSeconds: 3600,
+    now: 1700000000,
+  });
+
+  // Slot B starts: acquires distinct secret and sets per-slot secret in coordinator
+  const slotBId = "slot-beta";
+  const slotBSecret = getDaemonSecret(store, slotBId);
+  coordinator.setSlotSecret(slotBId, slotBSecret);
+
+  // Issue token for Slot B using per-slot secret
+  const recB = coordinator.issueDecisionCallback({
+    decisionId: "tq:dec-slot-b",
+    choiceId: "opt_slot_b",
+    sessionId: "sess-slot-b",
+    chatId: "-100222",
+    userId: "user-2",
+    slotId: slotBId,
+    ttlSeconds: 3600,
+    now: 1700000000,
+  });
+
+  // Verify Slot A token validates successfully after Slot B has started
+  const resA = coordinator.validateDecisionCallback(
+    recA.callbackToken,
+    "user-1",
+    "-100111",
+    "sess-slot-a",
+    undefined,
+    { eventId: "evt-slot-a-val", now: 1700000010 },
+  );
+  expect(resA.decision).toBe("deliver");
+  expect(resA.record?.choiceId).toBe("opt_slot_a");
+
+  // Verify Slot B token also validates successfully
+  const resB = coordinator.validateDecisionCallback(
+    recB.callbackToken,
+    "user-2",
+    "-100222",
+    "sess-slot-b",
+    undefined,
+    { eventId: "evt-slot-b-val", now: 1700000010 },
+  );
+  expect(resB.decision).toBe("deliver");
+  expect(resB.record?.choiceId).toBe("opt_slot_b");
+
+  // Consume Slot A token
+  const consumed = coordinator.consumeDecisionCallback(recA.callbackToken, 1700000015, "evt-slot-a-val");
+  expect(consumed).toBe(true);
+
+  // Re-consume with duplicate eventId is rejected
+  const consumedDup = coordinator.consumeDecisionCallback(recA.callbackToken, 1700000016, "evt-slot-a-val");
+  expect(consumedDup).toBe(false);
+
+  // Duplicate validate after consumption is rejected as already consumed
+  const resADup = coordinator.validateDecisionCallback(
+    recA.callbackToken,
+    "user-1",
+    "-100111",
+    "sess-slot-a",
+    undefined,
+    { eventId: "evt-slot-a-val", now: 1700000020 },
+  );
+  expect(resADup.decision).toBe("reject_already_consumed");
+
+  coordinator.close();
+  store.close();
+});
+
+test("when signing is enabled, unsigned question tokens are rejected as forged while attach legacy callbacks are preserved", () => {
+  const { coordinator, store, secret } = setupTestEnvironment();
+
+  // Register legacy unsigned question token
+  coordinator.recordDecisionCallback({
+    callbackToken: "legacy_unsigned_question_choice",
+    decisionId: "tq:legacy-unsigned-question",
+    choiceId: "opt_legacy_choice",
+    sessionId: "sess-legacy-q",
+    chatId: "-100123456789",
+    userId: "100",
+    questionHash: "",
+    expiresAt: 1700000000 + 3600,
+    createdAt: 1700000000,
+  });
+
+  // Register legacy attach callback (unrelated to questions)
+  coordinator.recordDecisionCallback({
+    callbackToken: "att:legacy_session_attach",
+    decisionId: "attach:topic-42",
+    choiceId: "sess-target-42",
+    sessionId: "sess-target-42",
+    chatId: "-100123456789",
+    userId: "100",
+    questionHash: "",
+    expiresAt: 1700000000 + 3600,
+    createdAt: 1700000000,
+  });
+
+  // Unsigned question token MUST be rejected when signing is enabled
+  const questionRes = coordinator.validateDecisionCallback(
+    "legacy_unsigned_question_choice",
+    "100",
+    "-100123456789",
+    "sess-legacy-q",
+    undefined,
+    { eventId: "evt-legacy-q-reject", now: 1700000010 },
+  );
+  expect(questionRes.decision).toBe("reject_unknown");
+  expect(store.getControlAudit("evt-legacy-q-reject")?.result).toBe("forged");
+
+  // Unrelated attach callback MUST NOT be broken and should validate successfully
+  const attachRes = coordinator.validateDecisionCallback(
+    "att:legacy_session_attach",
+    "100",
+    "-100123456789",
+    "sess-target-42",
+    undefined,
+    { eventId: "evt-attach-ok", now: 1700000010 },
+  );
+  expect(attachRes.decision).toBe("deliver");
+  expect(attachRes.record?.choiceId).toBe("sess-target-42");
+});

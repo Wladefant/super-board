@@ -319,7 +319,7 @@ export class TelegramDaemon {
       this.log(`Slot ${slot.slotId}: authorized forum chat ${forumChatId} in access.json`);
     }
     const slotSecret = getDaemonSecret(this.store, slot.slotId);
-    this.coordinator.setDaemonSecret(slotSecret);
+    this.coordinator.setSlotSecret(slot.slotId, slotSecret);
     const access = this.coordinator.readAccessConfig(slot.stateDir);
     // Assigned after construction: the poller and the router each need the other,
     // and the poller is what knows which chat a callback is currently serving.
@@ -401,6 +401,7 @@ export class TelegramDaemon {
           : sessionIdForChat();
         return this.coordinator.validateDecisionCallback(callbackToken, userId, chatId, expectedSession, decisionsPath, {
           eventId,
+          secret: slotSecret,
         });
       },
       consumeCallback: (callbackToken, eventId) => this.coordinator.consumeDecisionCallback(callbackToken, undefined, eventId),
@@ -545,7 +546,7 @@ export class TelegramDaemon {
         const questions = this.questionService(poller, {
           session_id: sessionId, chat_id: target.chatId,
           user_id: questionOperator(this.coordinator.readAccessConfig(slot.stateDir), target.chatId),
-        }, decisionsPath, poolPath);
+        }, decisionsPath, poolPath, slot.slotId);
         const updated = await questions.answer(decisionId, eventId, answer);
         if (isClosed(updated)) questionsTopic?.request(0);
         else await questionsTopic?.refresh(decisionId);
@@ -569,10 +570,20 @@ export class TelegramDaemon {
       onConflict: (diagnosis: string, attempt: number, maxAttempts: number) => {
         this.log(`Slot ${slot.slotId} HTTP 409 conflict (attempt ${attempt}/${maxAttempts}): ${diagnosis}`);
       },
+      onRejectedControl: (token: string, context: PanelCallbackContext, reason: string) => {
+        if (token.startsWith("lp:")) {
+          lanePanels?.auditRejected(token, context, reason);
+        } else {
+          this.coordinator.auditRejectedDecision(token, context.eventId, context.userId, reason);
+        }
+      },
       // Buttons of a panel this daemon no longer serves (feature off, restarted) answer as expired.
       lanePanel: {
         peek: (data: string, context?: PanelCallbackContext) => lanePanels?.peek(data, context) ?? PANEL_EXPIRED_ANSWER,
         run: async (data: string, context?: PanelCallbackContext) => { await lanePanels?.run(data, context); },
+        auditRejected: (token: string, context?: PanelCallbackContext, reason?: string) => {
+          lanePanels?.auditRejected(token, context, reason);
+        },
       },
     };
 
@@ -664,8 +675,20 @@ export class TelegramDaemon {
     return { slot, poller, router, forumManager, questionsTopic, leaseSessionId, stopMiniApp, autoAttachTimer, lanePanels };
   }
 
-  private questionService(poller: TelegramPoller, route: QuestionRoute, decisionsPath: string, poolPath: string): OperatorQuestionService {
-    return new OperatorQuestionService(poller, () => route, decisionsPath, poolPath, message => this.log(message));
+  private questionService(poller: TelegramPoller, route: QuestionRoute, decisionsPath: string, poolPath: string, slotId?: string): OperatorQuestionService {
+    const slotSecret = slotId
+      ? (this.coordinator.getSlotSecret(slotId) ?? getDaemonSecret(this.store, slotId))
+      : (route.session_id ? this.coordinator.getSlotSecretForSession(route.session_id) : undefined);
+    return new OperatorQuestionService(
+      poller,
+      () => route,
+      decisionsPath,
+      poolPath,
+      message => this.log(message),
+      undefined,
+      this.coordinator,
+      slotSecret,
+    );
   }
 
   /** The slot's live topic panels: one pinned, edited-in-place status message per session topic. */
@@ -823,7 +846,8 @@ export class TelegramDaemon {
     decisionsPath: string, poolPath: string,
   ): QuestionsTopic {
     const client = this.options.forumClientFactory?.(token, forumChatId) ?? new DefaultTelegramForumClient(token);
-    const ledger = new QuestionStore(decisionsPath, poolPath);
+    const slotSecret = getDaemonSecret(this.store, slot.slotId);
+    const ledger = new QuestionStore(decisionsPath, poolPath, this.coordinator, slotSecret);
     let live = new Set<string>();
     return new QuestionsTopic({
       chatId: forumChatId,
@@ -857,7 +881,7 @@ export class TelegramDaemon {
         pin: async messageId => { await poller.pinTelegramMessage(forumChatId, messageId); },
       },
       finalize: async question => {
-        await this.questionService(poller, question.transport, decisionsPath, poolPath).finalize(question);
+        await this.questionService(poller, question.transport, decisionsPath, poolPath, slot.slotId).finalize(question);
       },
       log: message => this.log(message),
     });
@@ -918,7 +942,7 @@ export class TelegramDaemon {
     entry.stopMiniApp();
     await entry.poller.stop();
     this.coordinator.releaseLease(entry.slot.slotId, entry.leaseSessionId);
-    this.log(`Slot ${entry.slot.slotId} stopped and lease released`);
+    this.coordinator.setSlotSecret(entry.slot.slotId, undefined);
     return true;
   }
 

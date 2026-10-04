@@ -9,12 +9,17 @@ import { LanePanels } from "../daemon/lane-panel";
 import { DaemonStore } from "../daemon/store";
 import { questionOperator } from "../src/operator-questions";
 import { governedTelegramFetch } from "../extension/telegram-governor";
+import { BotPoolCoordinator } from "../extension/coordinator";
 
 const originalFetch = globalThis.fetch;
 const cleanup: Array<() => void> = [];
 afterEach(() => {
+  for (const close of cleanup.splice(0)) {
+    try {
+      close();
+    } catch {}
+  }
   globalThis.fetch = originalFetch;
-  for (const close of cleanup.splice(0)) close();
 });
 
 const OPERATOR_ID = "100";
@@ -40,14 +45,17 @@ function setupPollerTest(options: {
   const peekContexts: PanelCallbackContext[] = [];
   const runContexts: PanelCallbackContext[] = [];
   const ranTokens: string[] = [];
+  const rejectedAudits: Array<{ token: string; context: PanelCallbackContext; reason: string }> = [];
 
   const bridge: MessageCorrelationBridge = {
     getSessionId: () => "sess-test",
     getSlotId: () => "slot-test",
     record: () => {},
     resolveReply: () => ({ decision: "reject_unknown", detail: "Unknown" }),
+    auditRejectedCallback: (token, userId, chatId, eventId, reason) => {
+      rejectedAudits.push({ token, context: { userId, chatId, topicId: "", eventId }, reason });
+    },
   };
-
   let capturedActiveUserId: string | undefined;
   let capturedActiveReplyToId: number | undefined;
 
@@ -69,6 +77,12 @@ function setupPollerTest(options: {
         ranTokens.push(data);
         if (context) runContexts.push(context);
       },
+      auditRejected: (data, context, reason) => {
+        if (context) rejectedAudits.push({ token: data, context, reason: reason ?? "unknown" });
+      },
+    },
+    onRejectedControl: (token, context, reason) => {
+      rejectedAudits.push({ token, context, reason });
     },
   };
 
@@ -83,6 +97,7 @@ function setupPollerTest(options: {
     callbacks,
     bridge,
     options.messageThreadId !== undefined ? options.messageThreadId : { sendTimeoutMs: 1000 },
+    { sendTimeoutMs: 1000 },
   );
 
   cleanup.push(() => {
@@ -152,6 +167,7 @@ function setupPollerTest(options: {
     peekContexts,
     runContexts,
     ranTokens,
+    rejectedAudits,
     update,
   };
 }
@@ -195,7 +211,7 @@ test("poller passes complete authenticated PanelCallbackContext to peek at recei
   expect(row.error).toBeNull();
 });
 
-test("unauthorized user outside allowlist answers rejection at receipt and invokes run for audit with context", async () => {
+test("unauthorized user outside allowlist answers rejection at receipt and invokes audit without run", async () => {
   const fixture = setupPollerTest({
     fromId: 9999, // Unauthorized user
     chatId: Number(CHAT_ID),
@@ -209,11 +225,14 @@ test("unauthorized user outside allowlist answers rejection at receipt and invok
   const answer = fixture.calls.find(c => c.method === "answerCallbackQuery");
   expect(answer?.body.text).toBe(PANEL_EXPIRED_ANSWER);
 
-  // Still invoked panel run for audit
-  expect(fixture.ranTokens).toEqual([`${LANE_PANEL_CALLBACK_PREFIX}token-abc`]);
-  expect(fixture.runContexts.length).toBe(1);
-  expect(fixture.runContexts[0].userId).toBe("9999");
-  expect(fixture.runContexts[0].eventId).toBe("update:432");
+  // Does NOT invoke panel run on rejection
+  expect(fixture.ranTokens).toEqual([]);
+  expect(fixture.runContexts.length).toBe(0);
+  expect(fixture.rejectedAudits.length).toBe(1);
+  expect(fixture.rejectedAudits[0].token).toBe(`${LANE_PANEL_CALLBACK_PREFIX}token-abc`);
+  expect(fixture.rejectedAudits[0].context.userId).toBe("9999");
+  expect(fixture.rejectedAudits[0].context.eventId).toBe("update:432");
+  expect(fixture.rejectedAudits[0].reason).toBe("unauthorized");
 
   // Ledger marked REJECTED / UNAUTHORIZED
   const db = new Database(path.join(fixture.dir, "veyyon_bridge_state.db"));
@@ -223,7 +242,7 @@ test("unauthorized user outside allowlist answers rejection at receipt and invok
   expect(row.error).toBe("UNAUTHORIZED");
 });
 
-test("unauthorized group answers rejection at receipt and invokes run for audit with context", async () => {
+test("unauthorized group answers rejection at receipt and invokes audit without run", async () => {
   const fixture = setupPollerTest({
     fromId: Number(OPERATOR_ID),
     chatId: -999888, // Not in accessConfig.groups
@@ -237,11 +256,14 @@ test("unauthorized group answers rejection at receipt and invokes run for audit 
   const answer = fixture.calls.find(c => c.method === "answerCallbackQuery");
   expect(answer?.body.text).toBe(PANEL_EXPIRED_ANSWER);
 
-  // Still invoked panel run for audit
-  expect(fixture.ranTokens).toEqual([`${LANE_PANEL_CALLBACK_PREFIX}token-abc`]);
-  expect(fixture.runContexts.length).toBe(1);
-  expect(fixture.runContexts[0].chatId).toBe("-999888");
-  expect(fixture.runContexts[0].eventId).toBe("update:433");
+  // Does NOT invoke panel run on rejection
+  expect(fixture.ranTokens).toEqual([]);
+  expect(fixture.runContexts.length).toBe(0);
+  expect(fixture.rejectedAudits.length).toBe(1);
+  expect(fixture.rejectedAudits[0].token).toBe(`${LANE_PANEL_CALLBACK_PREFIX}token-abc`);
+  expect(fixture.rejectedAudits[0].context.chatId).toBe("-999888");
+  expect(fixture.rejectedAudits[0].context.eventId).toBe("update:433");
+  expect(fixture.rejectedAudits[0].reason).toBe("unauthorized");
 
   // Ledger marked REJECTED / UNAUTHORIZED
   const db = new Database(path.join(fixture.dir, "veyyon_bridge_state.db"));
@@ -251,7 +273,7 @@ test("unauthorized group answers rejection at receipt and invokes run for audit 
   expect(row.error).toBe("UNAUTHORIZED");
 });
 
-test("bot origin answers rejection at receipt and invokes run for audit", async () => {
+test("bot origin answers rejection at receipt and invokes audit without run", async () => {
   const fixture = setupPollerTest({
     fromId: Number(OPERATOR_ID),
     isBot: true,
@@ -266,10 +288,13 @@ test("bot origin answers rejection at receipt and invokes run for audit", async 
   const answer = fixture.calls.find(c => c.method === "answerCallbackQuery");
   expect(answer?.body.text).toBe(PANEL_EXPIRED_ANSWER);
 
-  // Still invoked panel run for audit
-  expect(fixture.ranTokens).toEqual([`${LANE_PANEL_CALLBACK_PREFIX}token-abc`]);
-  expect(fixture.runContexts.length).toBe(1);
-  expect(fixture.runContexts[0].eventId).toBe("update:434");
+  // Does NOT invoke panel run on rejection
+  expect(fixture.ranTokens).toEqual([]);
+  expect(fixture.runContexts.length).toBe(0);
+  expect(fixture.rejectedAudits.length).toBe(1);
+  expect(fixture.rejectedAudits[0].token).toBe(`${LANE_PANEL_CALLBACK_PREFIX}token-abc`);
+  expect(fixture.rejectedAudits[0].context.eventId).toBe("update:434");
+  expect(fixture.rejectedAudits[0].reason).toBe("non_operator_origin");
 
   // Ledger marked REJECTED / NON_OPERATOR_ORIGIN
   const db = new Database(path.join(fixture.dir, "veyyon_bridge_state.db"));
@@ -279,7 +304,7 @@ test("bot origin answers rejection at receipt and invokes run for audit", async 
   expect(row.error).toBe("NON_OPERATOR_ORIGIN");
 });
 
-test("wrong thread invokes run for audit and marks WRONG_THREAD in ledger", async () => {
+test("wrong thread invokes audit without run and marks WRONG_THREAD in ledger", async () => {
   const fixture = setupPollerTest({
     fromId: Number(OPERATOR_ID),
     chatId: Number(CHAT_ID),
@@ -290,11 +315,14 @@ test("wrong thread invokes run for audit and marks WRONG_THREAD in ledger", asyn
 
   await fixture.poller.start();
 
-  // Invoked panel run for audit
-  expect(fixture.ranTokens).toEqual([`${LANE_PANEL_CALLBACK_PREFIX}token-abc`]);
-  expect(fixture.runContexts.length).toBe(1);
-  expect(fixture.runContexts[0].topicId).toBe("99");
-  expect(fixture.runContexts[0].eventId).toBe("update:435");
+  // Does NOT invoke panel run on rejection
+  expect(fixture.ranTokens).toEqual([]);
+  expect(fixture.runContexts.length).toBe(0);
+  expect(fixture.rejectedAudits.length).toBe(1);
+  expect(fixture.rejectedAudits[0].token).toBe(`${LANE_PANEL_CALLBACK_PREFIX}token-abc`);
+  expect(fixture.rejectedAudits[0].context.topicId).toBe("99");
+  expect(fixture.rejectedAudits[0].context.eventId).toBe("update:435");
+  expect(fixture.rejectedAudits[0].reason).toBe("wrong_thread");
 
   // Ledger marked REJECTED / WRONG_THREAD
   const db = new Database(path.join(fixture.dir, "veyyon_bridge_state.db"));
@@ -302,6 +330,34 @@ test("wrong thread invokes run for audit and marks WRONG_THREAD in ledger", asyn
   db.close();
   expect(row.status).toBe("REJECTED");
   expect(row.error).toBe("WRONG_THREAD");
+});
+
+test("disabled dm policy answers rejection at receipt and invokes audit without invoking run", async () => {
+  const fixture = setupPollerTest({
+    dmPolicy: "disabled",
+    fromId: Number(OPERATOR_ID),
+    chatId: Number(CHAT_ID),
+    threadId: Number(TOPIC_ID),
+    updateId: 436,
+  });
+
+  await fixture.poller.start();
+
+  const answer = fixture.calls.find(c => c.method === "answerCallbackQuery");
+  expect(answer?.body.text).toBe(PANEL_EXPIRED_ANSWER);
+
+  expect(fixture.ranTokens).toEqual([]);
+  expect(fixture.runContexts.length).toBe(0);
+  expect(fixture.rejectedAudits.length).toBe(1);
+  expect(fixture.rejectedAudits[0].token).toBe(`${LANE_PANEL_CALLBACK_PREFIX}token-abc`);
+  expect(fixture.rejectedAudits[0].context.eventId).toBe("update:436");
+  expect(fixture.rejectedAudits[0].reason).toBe("dm_policy_disabled");
+
+  const db = new Database(path.join(fixture.dir, "veyyon_bridge_state.db"));
+  const row = db.query("SELECT status, error FROM update_ledger WHERE update_id = 436").get() as { status: string; error: string };
+  db.close();
+  expect(row.status).toBe("REJECTED");
+  expect(row.error).toBe("DM_POLICY_DISABLED");
 });
 
 test("poller exposes active user and reply-to message ID accessors during row processing", async () => {
@@ -635,4 +691,420 @@ test("prompt transport sends force_reply true and selective true in exact topic 
   expect(sentArgs[0].thread).toBe(Number(TOPIC_ID));
   expect(sentArgs[0].markup).toEqual({ force_reply: true, selective: true });
   expect(sentArgs[0].meta).toEqual({ sessionId: "sess-xyz" });
+});
+
+test("regression: disabled-policy, wrong-thread, bot-origin, and group rejection with actual LanePanels produce zero prompts, confirms, or aborts and record exactly 1 audit", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tg-panel-rejection-test-"));
+  const dbPath = path.join(dir, "daemon.db");
+  const store = new DaemonStore(dbPath);
+  store.putRoute({ slotId: "s1", chatId: CHAT_ID, topicId: TOPIC_ID, sessionId: "sess-1", workspace: "C:/w/test" });
+
+  const transportCalls: Array<{ op: string; text?: string; markup?: unknown }> = [];
+  const abortCalls: unknown[] = [];
+
+  const panels = new LanePanels({
+    slotId: "s1",
+    chatId: CHAT_ID,
+    operatorId: OPERATOR_ID,
+    store,
+    snapshot: async () => ({
+      version: 1,
+      observedAt: 0,
+      lanes: [{
+        id: "sess-1", name: "test-lane", kind: "interactive", parentId: null, childIds: [], cwd: "C:/w/test",
+        model: "model", status: "running", startedAtMs: 0, elapsedMs: 100, lastActivityMs: 0, lastAction: "bash",
+      }],
+      counts: { running: 1, idle: 0, subagents: 0 },
+      usage: { available: false, observedAt: 0, windows: [] },
+      hostMemory: { totalBytes: 1, freeBytes: 1, usedPercent: 0 },
+      questions: [],
+    }),
+    boundSession: () => "sess-1",
+    isBusy: () => true,
+    stop: async t => { abortCalls.push(t); return true; },
+    transport: {
+      send: async (_t, text, markup) => {
+        transportCalls.push({ op: "send", text, markup });
+        return { messageId: 100 };
+      },
+      edit: async (_t, _id, text, markup) => {
+        transportCalls.push({ op: "edit", text, markup });
+        return "ok";
+      },
+      pin: async () => {},
+      confirm: async (_t, text, markup) => {
+        transportCalls.push({ op: "confirm", text, markup });
+        return { ephemeralMessageId: 200 };
+      },
+      editConfirm: async () => "ok",
+      prompt: async (_t, text) => {
+        transportCalls.push({ op: "prompt", text });
+        return { messageId: 300 };
+      },
+    },
+  });
+
+  await panels.tick();
+  const lastSend = transportCalls.find(c => c.markup);
+  const keyboard = typeof lastSend?.markup === "object" && lastSend.markup !== null && "inline_keyboard" in lastSend.markup
+    && Array.isArray(lastSend.markup.inline_keyboard)
+    ? lastSend.markup.inline_keyboard
+    : [];
+  const buttons: Record<string, string> = {};
+  for (const row of keyboard) {
+    if (Array.isArray(row)) {
+      for (const b of row) {
+        if (b && typeof b === "object" && "text" in b && typeof b.text === "string" && "callback_data" in b && typeof b.callback_data === "string") {
+          buttons[b.text] = b.callback_data;
+        }
+      }
+    }
+  }
+
+  const steerToken = buttons["🧭 Steer"];
+  const stopToken = buttons["⏹ Stop"];
+  expect(steerToken).toBeDefined();
+  expect(stopToken).toBeDefined();
+
+  const runScenario = async (options: {
+    dmPolicy?: "allowlist" | "disabled";
+    allowFrom?: string[];
+    groups?: Record<string, { allowFrom?: string[] }>;
+    messageThreadId?: number;
+    fromId?: number;
+    isBot?: boolean;
+    chatId?: number;
+    threadId?: number;
+    updateId: number;
+    token: string;
+    expectedReason: string;
+    expectedError: string;
+  }) => {
+    const pollerDir = fs.mkdtempSync(path.join(os.tmpdir(), "tg-poller-scen-"));
+    const calls: Array<{ method: string; body: Record<string, unknown> }> = [];
+
+    const callbacks: PollerCallbacks = {
+      isIdle: () => true,
+      onUserMessage: () => {},
+      onFollowUp: () => {},
+      onSteer: () => {},
+      onAbort: () => {},
+      onRelease: async () => {},
+      getStatusText: () => "status",
+      onLedgerFailure: () => {},
+      lanePanel: panels,
+    };
+
+    const bridge: MessageCorrelationBridge = {
+      getSessionId: () => "sess-1",
+      getSlotId: () => "s1",
+      record: () => {},
+      resolveReply: () => ({ decision: "reject_unknown", detail: "Unknown" }),
+    };
+
+    const poller = new TelegramPoller(
+      "0:test-token",
+      pollerDir,
+      {
+        dmPolicy: options.dmPolicy ?? "allowlist",
+        allowFrom: options.allowFrom ?? [OPERATOR_ID],
+        groups: options.groups ?? { [CHAT_ID]: {} },
+      },
+      callbacks,
+      bridge,
+      options.messageThreadId !== undefined ? options.messageThreadId : { sendTimeoutMs: 1000 },
+      { sendTimeoutMs: 1000 },
+    );
+
+    const update: TelegramUpdate = {
+      update_id: options.updateId,
+      callback_query: {
+        id: `cq-${options.updateId}`,
+        from: {
+          id: options.fromId ?? Number(OPERATOR_ID),
+          is_bot: options.isBot ?? false,
+          first_name: "TestUser",
+        },
+        message: {
+          message_id: 50,
+          date: 1000,
+          chat: {
+            id: options.chatId ?? Number(CHAT_ID),
+            type: "supergroup",
+          },
+          message_thread_id: options.threadId ?? Number(TOPIC_ID),
+          text: "panel",
+        },
+        data: options.token,
+      },
+    };
+
+    let polls = 0;
+    globalThis.fetch = (async (input, init) => {
+      const url = new URL(String(input));
+      const method = url.pathname.split("/").pop()!;
+      if (method === "getUpdates") {
+        if (++polls === 1) return Response.json({ ok: true, result: [update] });
+        poller.stop();
+        throw new Error("stopped");
+      }
+      const bodyText = typeof init?.body === "string" ? init.body : "{}";
+      calls.push({ method, body: JSON.parse(bodyText) as Record<string, unknown> });
+      return Response.json({ ok: true });
+    }) as typeof fetch;
+
+    const cleanupScenario = () => {
+      poller.stop();
+      try { fs.rmSync(pollerDir, { recursive: true, force: true }); } catch {}
+    };
+    cleanup.push(cleanupScenario);
+
+    try {
+      await poller.start();
+    } catch {}
+    poller.stop();
+    // 1. Receipt answered with PANEL_EXPIRED_ANSWER
+    const answer = calls.find(c => c.method === "answerCallbackQuery");
+    expect(answer?.body.text).toBe(PANEL_EXPIRED_ANSWER);
+
+    // 2. Ledger marked REJECTED with expected error
+    const db = new Database(path.join(pollerDir, "veyyon_bridge_state.db"));
+    const rawData = db.query("SELECT status, error FROM update_ledger WHERE update_id = ?").get(options.updateId);
+    let rowStatus = "";
+    let rowError: string | null = null;
+    if (rawData && typeof rawData === "object" && "status" in rawData && typeof rawData.status === "string") {
+      rowStatus = rawData.status;
+      if ("error" in rawData && typeof rawData.error === "string") {
+        rowError = rawData.error;
+      }
+    }
+    db.close();
+    expect(rowStatus).toBe("REJECTED");
+    expect(rowError).toBe(options.expectedError);
+
+    // 3. Exactly 1 audit record produced with expected reason
+    const audit = store.getControlAudit(`update:${options.updateId}`);
+    expect(audit).toBeDefined();
+    expect(audit?.result).toBe(options.expectedReason);
+
+    cleanupScenario();
+    const idx = cleanup.indexOf(cleanupScenario);
+    if (idx !== -1) cleanup.splice(idx, 1);
+  };
+
+  const initialPrompts = transportCalls.filter(c => c.op === "prompt").length;
+  const initialConfirms = transportCalls.filter(c => c.op === "confirm").length;
+  const initialAborts = abortCalls.length;
+
+  // Scenario 1: Disabled DM Policy
+  await runScenario({
+    dmPolicy: "disabled",
+    updateId: 701,
+    token: steerToken!,
+    expectedReason: "dm_policy_disabled",
+    expectedError: "DM_POLICY_DISABLED",
+  });
+
+  // Scenario 2: Wrong thread
+  await runScenario({
+    messageThreadId: Number(TOPIC_ID),
+    threadId: 999, // Mismatched thread
+    updateId: 702,
+    token: steerToken!,
+    expectedReason: "wrong_thread",
+    expectedError: "WRONG_THREAD",
+  });
+
+  // Scenario 3: Bot origin
+  await runScenario({
+    isBot: true,
+    updateId: 703,
+    token: stopToken!,
+    expectedReason: "non_operator_origin",
+    expectedError: "NON_OPERATOR_ORIGIN",
+  });
+
+  // Scenario 4: Group rejection
+  await runScenario({
+    chatId: -999888, // Not in groups
+    updateId: 704,
+    token: steerToken!,
+    expectedReason: "unauthorized",
+    expectedError: "UNAUTHORIZED",
+  });
+
+  // ZERO prompts, confirms, or aborts across ALL rejection scenarios
+  expect(transportCalls.filter(c => c.op === "prompt").length).toBe(initialPrompts);
+  expect(transportCalls.filter(c => c.op === "confirm").length).toBe(initialConfirms);
+  expect(abortCalls.length).toBe(initialAborts);
+
+  store.close();
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+});
+
+test("regression: unauthorized Answer token produces exactly 1 audit without resolution or delivery", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tg-answer-unauth-"));
+  const dbPath = path.join(dir, "daemon.db");
+  const store = new DaemonStore(dbPath);
+  const secret = Buffer.alloc(32, 7);
+
+  const coordinator = new BotPoolCoordinator(path.join(dir, "pool.db"));
+  coordinator.setAuditStore(store);
+  coordinator.setSlotSecret("s1", secret);
+
+  const issued = coordinator.issueDecisionCallback({
+    decisionId: "tq:quest-1",
+    choiceId: "opt-1",
+    sessionId: "sess-1",
+    chatId: CHAT_ID,
+    userId: OPERATOR_ID,
+    slotId: "s1",
+    secret,
+  });
+  const answerToken = issued.callbackToken;
+
+  const pollerDir = fs.mkdtempSync(path.join(os.tmpdir(), "tg-poller-ans-"));
+  let deliveredAnswers = 0;
+  let resolvedAnswers = 0;
+
+  const callbacks: PollerCallbacks = {
+    isIdle: () => true,
+    onUserMessage: () => {},
+    onFollowUp: () => {},
+    onSteer: () => {},
+    onAbort: () => {},
+    onRelease: async () => {},
+    getStatusText: () => "status",
+    onLedgerFailure: () => {},
+    onQuestionAnswer: () => {
+      deliveredAnswers++;
+    },
+    onDecisionCallback: () => {
+      resolvedAnswers++;
+    },
+  };
+
+  const bridge: MessageCorrelationBridge = {
+    getSessionId: () => "sess-1",
+    getSlotId: () => "s1",
+    record: () => {},
+    resolveReply: () => ({ decision: "reject_unknown", detail: "Unknown" }),
+    resolveCallback: (token, userId, chatId, eventId) => {
+      resolvedAnswers++;
+      return coordinator.validateDecisionCallback(token, userId, chatId, "sess-1", path.join(dir, "decisions.json"), { eventId, secret });
+    },
+    consumeCallback: (token, eventId) => coordinator.consumeDecisionCallback(token, undefined, eventId),
+    auditRejectedCallback: (token, userId, chatId, eventId, reason) => {
+      coordinator.auditRejectedDecision(token, eventId, userId, reason);
+    },
+  };
+
+  const poller = new TelegramPoller(
+    "0:test-token",
+    pollerDir,
+    {
+      dmPolicy: "allowlist",
+      allowFrom: [OPERATOR_ID],
+      groups: { [CHAT_ID]: {} },
+    },
+    callbacks,
+    bridge,
+    { sendTimeoutMs: 1000 },
+  );
+
+  const updateId = 801;
+  const unauthorizedUserId = 9999;
+  const update: TelegramUpdate = {
+    update_id: updateId,
+    callback_query: {
+      id: `cq-${updateId}`,
+      from: {
+        id: unauthorizedUserId,
+        is_bot: false,
+        first_name: "Attacker",
+      },
+      message: {
+        message_id: 60,
+        date: 1000,
+        chat: {
+          id: Number(CHAT_ID),
+          type: "supergroup",
+        },
+        message_thread_id: Number(TOPIC_ID),
+        text: "question",
+      },
+      data: answerToken,
+    },
+  };
+
+  const calls: Array<{ method: string; body: Record<string, unknown> }> = [];
+  let polls = 0;
+  globalThis.fetch = (async (input, init) => {
+    const url = new URL(String(input));
+    const method = url.pathname.split("/").pop()!;
+    if (method === "getUpdates") {
+      if (++polls === 1) return Response.json({ ok: true, result: [update] });
+      poller.stop();
+      throw new Error("stopped");
+    }
+    const bodyText = typeof init?.body === "string" ? init.body : "{}";
+    calls.push({ method, body: JSON.parse(bodyText) as Record<string, unknown> });
+    return Response.json({ ok: true });
+  }) as typeof fetch;
+
+  const cleanupAns = () => {
+    poller.stop();
+    coordinator.close();
+    store.close();
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+    try { fs.rmSync(pollerDir, { recursive: true, force: true }); } catch {}
+  };
+  cleanup.push(cleanupAns);
+
+  try {
+    await poller.start();
+  } catch {}
+  poller.stop();
+
+  // 1. Zero resolution or delivery to callbacks
+  expect(deliveredAnswers).toBe(0);
+  expect(resolvedAnswers).toBe(0);
+
+  // 2. Query answered as unauthorized
+  const answer = calls.find(c => c.method === "answerCallbackQuery" && typeof c.body.text === "string" && Boolean(c.body.text));
+  expect(answer?.body.text).toContain("Unauthorized account");
+  // 3. Ledger marked REJECTED / UNAUTHORIZED
+  const db = new Database(path.join(pollerDir, "veyyon_bridge_state.db"));
+  const rawData = db.query("SELECT status, error FROM update_ledger WHERE update_id = ?").get(updateId);
+  let rowStatus = "";
+  let rowError: string | null = null;
+  if (rawData && typeof rawData === "object" && "status" in rawData && typeof rawData.status === "string") {
+    rowStatus = rawData.status;
+    if ("error" in rawData && typeof rawData.error === "string") {
+      rowError = rawData.error;
+    }
+  }
+  db.close();
+  expect(rowStatus).toBe("REJECTED");
+  expect(rowError).toBe("UNAUTHORIZED");
+
+  // 4. Exactly 1 audit record in daemon store
+  const audit = store.getControlAudit(`update:${updateId}`);
+  expect(audit).toBeDefined();
+  expect(audit?.action).toBe("answer");
+  expect(audit?.result).toBe("unauthorized");
+  expect(audit?.userId).toBe(String(unauthorizedUserId));
+  expect(audit?.sessionId).toBe("sess-1");
+
+  // 5. Duplicate event processing does not duplicate audit or trigger action
+  const auditCountRow = store.db.query("SELECT count(*) as count FROM control_audits WHERE event_id = ?").get(`update:${updateId}`);
+  let countVal = 0;
+  if (auditCountRow && typeof auditCountRow === "object" && "count" in auditCountRow && typeof auditCountRow.count === "number") {
+    countVal = auditCountRow.count;
+  }
+  expect(countVal).toBe(1);
+
+  cleanupAns();
+  const idx = cleanup.indexOf(cleanupAns);
+  if (idx !== -1) cleanup.splice(idx, 1);
 });

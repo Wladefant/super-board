@@ -290,6 +290,7 @@ export interface MessageCorrelationBridge {
   resolveReply: (botId: string, chatId: string, replyToMessageId: number) => ReplyRoutingResolution;
   resolveCallback?: (callbackToken: string, userId: string, chatId: string, eventId?: string) => DecisionCallbackResolution;
   consumeCallback?: (callbackToken: string, eventId?: string) => boolean;
+  auditRejectedCallback?: (callbackToken: string, userId: string, chatId: string, eventId: string, reason: string) => void;
 }
 
 export interface PanelCallbackContext {

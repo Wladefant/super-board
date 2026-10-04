@@ -153,7 +153,8 @@ export class QuestionsTopic {
     if (!this.options.coordinator || !isInlineKeyboardMarkup(markup)) {
       return markup;
     }
-    const secret = getDaemonSecret(this.options.store, this.options.slotId);
+    const secret = this.options.coordinator?.getSlotSecret(this.options.slotId)
+      ?? getDaemonSecret(this.options.store, this.options.slotId);
     const ttlSeconds = (this.options.cardRefreshMs ?? 24 * 3_600_000) / 1000;
     const now = this.now() / 1000;
     const signedRows = markup.inline_keyboard.map(row => row.map(btn => {
@@ -165,6 +166,7 @@ export class QuestionsTopic {
         sessionId: question.transport.session_id,
         chatId: this.options.chatId,
         userId: question.transport.user_id,
+        slotId: this.options.slotId,
         secret,
         ttlSeconds,
         now,

@@ -144,7 +144,9 @@ export class QuestionStore {
       decisions_path: this.decisionsPath, pool_path: this.poolPath });
     const question = result.question!;
     let card = result.card!;
-    if (this.coordinator && this.secret && isInlineKeyboardMarkup(card.reply_markup)) {
+    const sec = this.secret
+      ?? (this.coordinator && question.transport.session_id ? this.coordinator.getSlotSecretForSession(question.transport.session_id) : undefined);
+    if (this.coordinator && sec && isInlineKeyboardMarkup(card.reply_markup)) {
       const ttlSeconds = 86400;
       const now = Date.now() / 1000;
       const signedRows = card.reply_markup.inline_keyboard.map(row => row.map(btn => {
@@ -155,7 +157,7 @@ export class QuestionStore {
           sessionId: question.transport.session_id,
           chatId: question.transport.chat_id,
           userId: question.transport.user_id,
-          secret: this.secret!,
+          secret: sec,
           ttlSeconds,
           now,
         });
@@ -338,7 +340,9 @@ export class OperatorQuestionService {
   }
 
   private signMarkup(question: Question, markup?: Record<string, unknown>): Record<string, unknown> | undefined {
-    if (!this.coordinator || !this.secret || !isInlineKeyboardMarkup(markup)) {
+    const sec = this.secret
+      ?? (this.coordinator && question.transport.session_id ? this.coordinator.getSlotSecretForSession(question.transport.session_id) : undefined);
+    if (!this.coordinator || !sec || !isInlineKeyboardMarkup(markup)) {
       return markup;
     }
     const ttlSeconds = 86400;
@@ -351,7 +355,7 @@ export class OperatorQuestionService {
         sessionId: question.transport.session_id,
         chatId: question.transport.chat_id,
         userId: question.transport.user_id,
-        secret: this.secret!,
+        secret: sec,
         ttlSeconds,
         now,
       });

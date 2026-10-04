@@ -6,7 +6,7 @@ import { randomBytes } from "node:crypto";
 import { LANE_PANEL_CALLBACK_PREFIX, TelegramPoller, type PollerCallbacks } from "../extension/poller";
 import type { MessageCorrelationBridge, TelegramUpdate } from "../extension/types";
 import type { FleetLane, FleetSnapshot } from "../daemon/fleet-state";
-import { LanePanels, PANEL_ALREADY_STOPPING_ANSWER, PANEL_EXPIRED_ANSWER, renderLanePanel, type PanelCallbackContext, type PanelOutcome } from "../daemon/lane-panel";
+import { LanePanels, PANEL_ALREADY_STOPPING_ANSWER, PANEL_EXPIRED_ANSWER, renderLanePanel, type PanelCallbackContext, type PanelOutcome, type PanelTransport, type Markup } from "../daemon/lane-panel";
 import type { RouteTarget } from "../daemon/router";
 import { DaemonStore } from "../daemon/store";
 import { TelegramGovernor } from "../extension/telegram-governor";
@@ -68,6 +68,33 @@ function fixture(options: { miniAppLink?: string; operatorId?: string } = {}) {
     snapshots: 0,
   };
   const calls: Call[] = [];
+  const transport: PanelTransport = {
+    send: async (_target: RouteTarget, text: string, markup: Markup) => {
+      if (state.sendGate) await state.sendGate();
+      const messageId = state.nextMessageId++;
+      calls.push({ op: "send", messageId, text, markup });
+      return { messageId };
+    },
+    edit: async (_target: RouteTarget, messageId: number, text: string, markup: Markup) => {
+      calls.push({ op: "edit", messageId, text, markup });
+      return state.editOutcome;
+    },
+    pin: async (_target: RouteTarget, messageId: number) => { calls.push({ op: "pin", messageId }); },
+    confirm: async (target: RouteTarget, text: string, markup: Markup, userId: string) => {
+      const ephemeralMessageId = state.nextEphemeralId++;
+      calls.push({ op: "confirm", messageId: ephemeralMessageId, text, markup, userId, target });
+      return { ephemeralMessageId };
+    },
+    editConfirm: async (target: RouteTarget, id: number, text: string, markup: Markup, userId: string) => {
+      calls.push({ op: "editConfirm", messageId: id, text, markup, userId, target });
+      return "ok";
+    },
+    prompt: async (target: RouteTarget, text: string, _sessionId: string) => {
+      const messageId = state.nextMessageId++;
+      calls.push({ op: "prompt", messageId, text, target });
+      return { messageId };
+    },
+  };
   const panels = new LanePanels({
     slotId: "slot", chatId: CHAT, operatorId, store,
     snapshot: async () => { state.snapshots++; return state.snapshot; },
@@ -78,33 +105,7 @@ function fixture(options: { miniAppLink?: string; operatorId?: string } = {}) {
     miniAppLink: options.miniAppLink,
     now: () => state.now,
     formatClock: () => "14:05",
-    transport: {
-      send: async (_target, text, markup) => {
-        if (state.sendGate) await state.sendGate();
-        const messageId = state.nextMessageId++;
-        calls.push({ op: "send", messageId, text, markup });
-        return { messageId };
-      },
-      edit: async (_target, messageId, text, markup) => {
-        calls.push({ op: "edit", messageId, text, markup });
-        return state.editOutcome;
-      },
-      pin: async (_target, messageId) => { calls.push({ op: "pin", messageId }); },
-      confirm: async (target, text, markup, userId) => {
-        const ephemeralMessageId = state.nextEphemeralId++;
-        calls.push({ op: "confirm", messageId: ephemeralMessageId, text, markup, userId, target });
-        return { ephemeralMessageId };
-      },
-      editConfirm: async (target, id, text, markup, userId) => {
-        calls.push({ op: "editConfirm", messageId: id, text, markup, userId, target });
-        return "ok";
-      },
-      prompt: async (target, text, _sessionId) => {
-        const messageId = state.nextMessageId++;
-        calls.push({ op: "prompt", messageId, text, target });
-        return { messageId };
-      },
-    },
+    transport,
   });
   const buttons = (): Record<string, string> => {
     const last = calls.filter(call => call.markup && (call.op === "send" || call.op === "edit")).at(-1)!;
@@ -121,7 +122,7 @@ function fixture(options: { miniAppLink?: string; operatorId?: string } = {}) {
     eventId: randomBytes(8).toString("hex"),
     ...overrides,
   });
-  return { store, state, calls, panels, buttons, confirmButtons, ctx, operatorId };
+  return { store, state, calls, panels, buttons, confirmButtons, ctx, operatorId, transport };
 }
 
 test("the panel is compact: state, short model, last action, child lanes and the open question", () => {
@@ -278,28 +279,41 @@ test("a double-tapped Stop stops the turn once; a later turn can be stopped agai
   await f.panels.run(cButtons["Confirm Stop"]!, f.ctx());
   expect(f.state.stops).toEqual([TOPIC]);
 
-  // A tap after the Stop went out, while the turn winds down, sends nothing either.
+  // A tap on the already consumed token answers expired and is rejected as replay.
   f.state.now += 10_000;
-  expect(f.panels.peek(stop, f.ctx())).toBe(PANEL_ALREADY_STOPPING_ANSWER);
+  expect(f.panels.peek(stop, f.ctx())).toBe(PANEL_EXPIRED_ANSWER);
   await f.panels.run(stop, f.ctx());
   expect(f.state.stops).toEqual([TOPIC]);
 
-  // The turn ended; the next turn's Stop works again.
+  // When panel updates on tick, fresh tokens are issued. While turn is settling, peek answers already stopping.
+  await f.panels.tick();
+  let freshStop = f.buttons()["⏹ Stop"]!;
+  expect(f.panels.peek(freshStop, f.ctx())).toBe(PANEL_ALREADY_STOPPING_ANSWER);
+  await f.panels.run(freshStop, f.ctx());
+  expect(f.state.stops).toEqual([TOPIC]);
+
+  // The turn ended; the next turn's Stop works again after panel update.
   f.state.busy = false;
-  expect(f.panels.peek(stop, f.ctx())).toBe("Nothing to stop: the session is idle.");
-  await f.panels.run(stop, f.ctx());
+  await f.panels.tick();
+  freshStop = f.buttons()["⏹ Stop"]!;
+  expect(f.panels.peek(freshStop, f.ctx())).toBe("Nothing to stop: the session is idle.");
+  await f.panels.run(freshStop, f.ctx());
   expect(f.state.stops).toEqual([TOPIC]);
   f.state.busy = true;
-  expect(f.panels.peek(stop, f.ctx())).toBe("Confirm stopping the current turn.");
-  await f.panels.run(stop, f.ctx());
+  await f.panels.tick();
+  freshStop = f.buttons()["⏹ Stop"]!;
+  expect(f.panels.peek(freshStop, f.ctx())).toBe("Confirm stopping the current turn.");
+  await f.panels.run(freshStop, f.ctx());
   const cButtons2 = f.confirmButtons();
   await f.panels.run(cButtons2["Confirm Stop"]!, f.ctx());
   expect(f.state.stops).toEqual([TOPIC, TOPIC]);
 
   // A Stop the turn ignored lapses after the settle window, so the operator can press it again.
   f.state.now += 31_000;
-  expect(f.panels.peek(stop, f.ctx())).toBe("Confirm stopping the current turn.");
-  await f.panels.run(stop, f.ctx());
+  await f.panels.tick();
+  freshStop = f.buttons()["⏹ Stop"]!;
+  expect(f.panels.peek(freshStop, f.ctx())).toBe("Confirm stopping the current turn.");
+  await f.panels.run(freshStop, f.ctx());
   const cButtons3 = f.confirmButtons();
   await f.panels.run(cButtons3["Confirm Stop"]!, f.ctx());
   expect(f.state.stops).toEqual([TOPIC, TOPIC, TOPIC]);
@@ -445,6 +459,7 @@ function pollerFixture(fromId: number) {
   const calls: Array<{ method: string; body: Record<string, unknown> }> = [];
   const ran: string[] = [];
   const decided: string[] = [];
+  const audited: Array<{ data: string; context?: PanelCallbackContext; reason?: string }> = [];
   const bridge: MessageCorrelationBridge = {
     getSessionId: () => "s1", getSlotId: () => "slot", record: () => {},
     resolveReply: () => ({ decision: "reject_unknown", detail: "Unknown message" }),
@@ -455,7 +470,11 @@ function pollerFixture(fromId: number) {
     isIdle: () => true, onUserMessage: () => {}, onFollowUp: () => {}, onSteer: () => {}, onAbort: () => {}, onRelease: async () => {},
     getStatusText: () => "test", onLedgerFailure: () => {},
     onDecisionCallback: async id => { decided.push(id); },
-    lanePanel: { peek: data => `peeked ${data}`, run: async data => { ran.push(data); } },
+    lanePanel: {
+      peek: data => `peeked ${data}`,
+      run: async data => { ran.push(data); },
+      auditRejected: (data, context, reason) => { audited.push({ data, context, reason }); },
+    },
   };
   const poller = new TelegramPoller("0:test-only", dir, { dmPolicy: "allowlist", allowFrom: ["1"], groups: { [CHAT]: {} } }, callbacks, bridge, { sendTimeoutMs: 1000 });
   cleanup.push(() => { poller.stop(); fs.rmSync(dir, { recursive: true, force: true }); });
@@ -474,7 +493,7 @@ function pollerFixture(fromId: number) {
     calls.push({ method: url.pathname.split("/").pop()!, body: JSON.parse(String(init?.body ?? "{}")) });
     return Response.json({ ok: true });
   }) as typeof fetch;
-  return { poller, calls, ran, decided };
+  return { poller, calls, ran, decided, audited };
 }
 
 test("a panel click is answered with its outcome at receipt and acted on once from the ledger", async () => {
@@ -491,7 +510,10 @@ test("a panel click from an account outside the allowlist is answered with rejec
   await f.poller.start();
   expect(f.calls.filter(call => call.method === "answerCallbackQuery").map(call => call.body.text))
     .toEqual([PANEL_EXPIRED_ANSWER]);
-  expect(f.ran).toEqual([`${LANE_PANEL_CALLBACK_PREFIX}tok`]);
+  expect(f.ran).toEqual([]);
+  expect(f.audited.length).toBe(1);
+  expect(f.audited[0].data).toBe(`${LANE_PANEL_CALLBACK_PREFIX}tok`);
+  expect(f.audited[0].reason).toBe("unauthorized");
   expect(f.decided).toEqual([]);
 });
 
@@ -584,9 +606,11 @@ test("ephemeral confirm and cancel lifecycle: cancel consumes paired confirm, si
   expect(f.store.getControlAudit("evt-confirm-replayed")?.result).toBe("replay");
   expect(f.state.stops).toEqual([]);
 
-  // New stop flow
-  expect(f.panels.peek(stopToken, f.ctx())).toBe("Confirm stopping the current turn.");
-  await f.panels.run(stopToken, f.ctx({ eventId: "evt-stop-claim-2" }));
+  // New stop flow regenerates tokens on tick
+  await f.panels.tick();
+  const stopToken2 = f.buttons()["⏹ Stop"]!;
+  expect(f.panels.peek(stopToken2, f.ctx())).toBe("Confirm stopping the current turn.");
+  await f.panels.run(stopToken2, f.ctx({ eventId: "evt-stop-claim-2" }));
   const cButtons2 = f.confirmButtons();
 
   // Confirm executes synchronously before await and stops turn
@@ -607,8 +631,10 @@ test("ephemeral confirm and cancel lifecycle: cancel consumes paired confirm, si
 
   // Third stop flow with expiry (advance past stop settle window)
   f.state.now += 31_000;
-  expect(f.panels.peek(stopToken, f.ctx())).toBe("Confirm stopping the current turn.");
-  await f.panels.run(stopToken, f.ctx({ eventId: "evt-stop-claim-3" }));
+  await f.panels.tick();
+  const stopToken3 = f.buttons()["⏹ Stop"]!;
+  expect(f.panels.peek(stopToken3, f.ctx())).toBe("Confirm stopping the current turn.");
+  await f.panels.run(stopToken3, f.ctx({ eventId: "evt-stop-claim-3" }));
   const cButtons3 = f.confirmButtons();
   f.state.now += 30_001; // exceeds 30-second expiry
   expect(f.panels.peek(cButtons3["Confirm Stop"]!, f.ctx())).toBe(PANEL_EXPIRED_ANSWER);
@@ -700,4 +726,51 @@ test("failures handled without secret or request body logs", async () => {
     expect(line.toLowerCase().includes("secret")).toBe(false);
     expect(line.length).toBeLessThan(150);
   }
+});
+
+test("concurrent run calls delayed prompt/confirm transports and duplicate event IDs deduplicated", async () => {
+  const f = fixture();
+  await f.panels.tick();
+  const stop = f.buttons()["⏹ Stop"]!;
+
+  const confirmDeferred = Promise.withResolvers<{ ephemeralMessageId: number }>();
+  const originalConfirm = f.transport.confirm;
+  f.transport.confirm = async () => confirmDeferred.promise;
+
+  expect(f.panels.peek(stop, f.ctx())).toBe("Confirm stopping the current turn.");
+  const run1 = f.panels.run(stop, f.ctx({ eventId: "evt-conc-stop-1" }));
+  const run2 = f.panels.run(stop, f.ctx({ eventId: "evt-conc-stop-2" }));
+
+  confirmDeferred.resolve({ ephemeralMessageId: 999 });
+  await Promise.all([run1, run2]);
+
+  expect(f.store.getControlAudit("evt-conc-stop-1")?.result).toBe("confirm_prompted");
+  expect(f.store.getControlAudit("evt-conc-stop-2")?.result).toBe("replay");
+
+  f.transport.confirm = originalConfirm;
+
+  const confirmCallsBefore = f.calls.filter(c => c.op === "confirm").length;
+  await f.panels.run(stop, f.ctx({ eventId: "evt-conc-stop-1" }));
+  const confirmCallsAfter = f.calls.filter(c => c.op === "confirm").length;
+  expect(confirmCallsAfter).toBe(confirmCallsBefore);
+
+  await f.panels.tick();
+  const steer = f.buttons()["🧭 Steer"]!;
+
+  const promptDeferred = Promise.withResolvers<{ messageId: number }>();
+  f.transport.prompt = async () => promptDeferred.promise;
+
+  const steerRun1 = f.panels.run(steer, f.ctx({ eventId: "evt-conc-steer-1" }));
+  const steerRun2 = f.panels.run(steer, f.ctx({ eventId: "evt-conc-steer-2" }));
+
+  promptDeferred.resolve({ messageId: 888 });
+  await Promise.all([steerRun1, steerRun2]);
+
+  expect(f.store.getControlAudit("evt-conc-steer-1")?.result).toBe("ok");
+  expect(f.store.getControlAudit("evt-conc-steer-2")?.result).toBe("replay");
+
+  const promptCallsBefore = f.calls.filter(c => c.op === "prompt").length;
+  await f.panels.run(steer, f.ctx({ eventId: "evt-conc-steer-1" }));
+  const promptCallsAfter = f.calls.filter(c => c.op === "prompt").length;
+  expect(promptCallsAfter).toBe(promptCallsBefore);
 });

@@ -13,12 +13,15 @@
  */
 
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { spawnSync } from "node:child_process";
 import { LANE_PANEL_CALLBACK_PREFIX } from "../extension/poller";
 import { escapeHtml } from "../extension/sanitizer";
+import { getDaemonRunDir } from "./config";
 import type { FleetLane, FleetSnapshot } from "./fleet-state";
 import type { RouteTarget } from "./router";
 import type { DaemonStore } from "./store";
-
 export interface PanelCallbackContext {
   userId: string;
   chatId: string;
@@ -50,7 +53,7 @@ export interface LanePanelOptions {
   /** The forum supergroup whose topics carry panels. */
   chatId: string;
   operatorId: string;
-  store: Pick<DaemonStore, "getKv" | "setKv" | "deleteKv" | "listRoutes" | "auditControl">;
+  store: Pick<DaemonStore, "getKv" | "setKv" | "deleteKv" | "listRoutes" | "auditControl"> & Partial<Pick<DaemonStore, "getControlAudit">> & { stateDir?: string; dbPath?: string };
   transport: PanelTransport;
   snapshot(): Promise<FleetSnapshot>;
   /** Session bound to the topic right now. A token issued for another session is stale. */
@@ -119,14 +122,176 @@ export function computeTokenHmac(
   return createHmac("sha256", secret).update(payload).digest("base64url");
 }
 
-export function getDaemonSecret(store: Pick<DaemonStore, "getKv" | "setKv">, slotId = "slot"): Buffer {
-  const key = `lanepanel:${slotId}:secret`;
-  let hex = store.getKv(key);
-  if (!hex) {
-    hex = randomBytes(32).toString("hex");
-    store.setKv(key, hex);
+export interface DaemonStoreLike {
+  stateDir?: string;
+  dbPath?: string;
+  db?: { filename?: string };
+  getKv?: (key: string) => string | null;
+  setKv?: (key: string, value: string) => void;
+}
+
+export function deriveDaemonStateDir(store?: unknown): string {
+  if (store && typeof store === "object") {
+    if ("stateDir" in store && typeof store.stateDir === "string" && store.stateDir.length > 0) {
+      return store.stateDir;
+    }
+    if ("dbPath" in store && typeof store.dbPath === "string" && store.dbPath.length > 0) {
+      return path.dirname(store.dbPath);
+    }
+    if ("db" in store && store.db && typeof store.db === "object" && "filename" in store.db) {
+      const filename = store.db.filename;
+      if (typeof filename === "string" && filename.length > 0 && filename !== ":memory:") {
+        return path.dirname(filename);
+      }
+    }
   }
-  return Buffer.from(hex, "hex");
+  return process.env.VEYYON_TELEGRAM_DAEMON_DIR || getDaemonRunDir();
+}
+
+export function getSlotSecretFilePath(stateDir: string, slotId: string): string {
+  const sanitizedSlot = (slotId || "daemon").replace(/[^a-zA-Z0-9._-]/g, "_");
+  return path.join(stateDir, "secrets", `${sanitizedSlot}.secret`);
+}
+
+function getWindowsCurrentUser(): string {
+  if (process.env.USERNAME && process.env.USERNAME.trim()) {
+    return process.env.USERNAME.trim();
+  }
+  const res = spawnSync("whoami.exe", [], { windowsHide: true, encoding: "utf8" });
+  if (res.status === 0 && res.stdout.trim()) {
+    return res.stdout.trim();
+  }
+  throw new Error("Unable to determine current Windows user for secret ACL restriction");
+}
+
+function protectSecretsDirectory(secretsDir: string): void {
+  if (process.platform === "win32") {
+    const user = getWindowsCurrentUser();
+    const res = spawnSync(
+      "icacls.exe",
+       [secretsDir, "/inheritance:r", "/grant:r", `${user}:(OI)(CI)(F)`],
+      { windowsHide: true, encoding: "utf8" },
+    );
+    const hasFailures = /Failed processing [1-9]\d* files/i.test(res.stdout);
+    if (res.status !== 0 || (res.stderr && res.stderr.trim().length > 0) || !res.stdout.includes("Successfully processed") || hasFailures) {
+      throw new Error(`Failed to enforce Windows ACL on secrets directory ${secretsDir}: ${res.stderr || res.stdout || `exit ${res.status}`}`);
+    }
+  } else {
+    try {
+      fs.chmodSync(secretsDir, 0o700);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(`Failed to enforce 0700 permissions on secrets directory ${secretsDir}: ${message}`);
+    }
+  }
+}
+
+function protectSecretFile(filePath: string, fd?: number): void {
+  if (process.platform === "win32") {
+    const user = getWindowsCurrentUser();
+    const res = spawnSync(
+      "icacls.exe",
+      [filePath, "/inheritance:r", "/grant:r", `${user}:(F)`],
+      { windowsHide: true, encoding: "utf8" },
+    );
+    const hasFailures = /Failed processing [1-9]\d* files/i.test(res.stdout);
+    if (res.status !== 0 || (res.stderr && res.stderr.trim().length > 0) || !res.stdout.includes("Successfully processed") || hasFailures) {
+      throw new Error(`Failed to enforce Windows ACL on secret file ${filePath}: ${res.stderr || res.stdout || `exit ${res.status}`}`);
+    }
+  } else {
+    try {
+      if (typeof fd === "number") {
+        fs.fchmodSync(fd, 0o600);
+      } else {
+        fs.chmodSync(filePath, 0o600);
+      }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      throw new Error(`Failed to enforce 0600 permissions on secret file ${filePath}: ${message}`);
+    }
+  }
+}
+
+function parseSecretBuffer(buf: Buffer): Buffer {
+  const str = buf.toString("utf8").trim();
+  if (/^[0-9a-fA-F]{64}$/.test(str)) {
+    return Buffer.from(str, "hex");
+  }
+  if (buf.length === 32) {
+    return buf;
+  }
+  return Buffer.from(str, "hex");
+}
+
+function readSecretFileWithRetry(filePath: string): Buffer {
+  const start = Date.now();
+  while (Date.now() - start < 3000) {
+    try {
+      if (fs.existsSync(filePath)) {
+        const data = fs.readFileSync(filePath);
+        if (data.length >= 32) {
+          return parseSecretBuffer(data);
+        }
+      }
+    } catch (e: unknown) {
+      if (e && typeof e === "object" && "code" in e && e.code !== "ENOENT") throw e;
+    }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  }
+  const finalData = fs.readFileSync(filePath);
+  if (finalData.length < 32) {
+    throw new Error(`Secret file at ${filePath} is incomplete or empty`);
+  }
+  return parseSecretBuffer(finalData);
+}
+
+export function getDaemonSecret(
+  store?: Pick<DaemonStore, "getKv" | "setKv"> | DaemonStoreLike | unknown,
+  slotId = "daemon",
+): Buffer {
+  const stateDir = deriveDaemonStateDir(store);
+  const secretPath = getSlotSecretFilePath(stateDir, slotId);
+  const secretsDir = path.dirname(secretPath);
+
+  if (fs.existsSync(secretPath)) {
+    try {
+      const existing = fs.readFileSync(secretPath);
+      if (existing.length >= 32) {
+        return parseSecretBuffer(existing);
+      }
+    } catch (err: unknown) {
+      if (err && typeof err === "object" && "code" in err && err.code !== "ENOENT") throw err;
+    }
+  }
+
+  fs.mkdirSync(secretsDir, { recursive: true, mode: 0o700 });
+  protectSecretsDirectory(secretsDir);
+
+  let fd: number | null = null;
+  try {
+    fd = fs.openSync(secretPath, "wx", 0o600);
+  } catch (err: unknown) {
+    if (err && typeof err === "object" && "code" in err && err.code === "EEXIST") {
+      return readSecretFileWithRetry(secretPath);
+    }
+    throw err;
+  }
+
+  try {
+    protectSecretFile(secretPath, fd);
+    const secretHex = randomBytes(32).toString("hex");
+    fs.writeSync(fd, secretHex);
+    fs.closeSync(fd);
+    fd = null;
+    return Buffer.from(secretHex, "hex");
+  } catch (err) {
+    if (fd !== null) {
+      try { fs.closeSync(fd); } catch {}
+      fd = null;
+    }
+    try { fs.unlinkSync(secretPath); } catch {}
+    throw err;
+  }
 }
 
 interface PanelState {
@@ -236,6 +401,7 @@ export class LanePanels {
   private readonly tokens = new Map<string, TokenRecord>();
   private readonly tokensByNonce = new Map<string, TokenRecord>();
   private readonly armed = new Map<string, ArmedRecord>();
+  private readonly processedEvents = new Set<string>();
   private chain: Promise<void> = Promise.resolve();
   private timer: Timer | undefined;
   /** Set by {@link stop}: nothing is scheduled, sent or edited afterwards. */
@@ -303,7 +469,8 @@ export class LanePanels {
     this.prune(new Set(routes.map(({ target }) => this.kvKey(target, ""))), now);
     const due = routes.filter(({ target }) => {
       const state = this.states.get(this.kvKey(target, ""));
-      return !state || now - state.lastAttemptAt >= (state.running ? this.activeIntervalMs : this.idleIntervalMs);
+      const hasConsumed = Boolean(state?.keyboard?.records && Object.values(state.keyboard.records).some(r => r.consumed));
+      return !state || hasConsumed || now - state.lastAttemptAt >= (state.running ? this.activeIntervalMs : this.idleIntervalMs);
     });
     if (!due.length) return;
     const snapshot = await this.options.snapshot();
@@ -381,7 +548,8 @@ export class LanePanels {
 
   private keyboardFor(state: PanelState, key: string, target: RouteTarget, sessionId: string, now: number): Keyboard {
     const current = state.keyboard;
-    if (current && current.sessionId === sessionId && now - current.issuedAt < this.tokenTtlMs / 2) return current;
+    const hasConsumedTokens = current && current.records && Object.values(current.records).some(r => r.consumed);
+    if (current && current.sessionId === sessionId && now - current.issuedAt < this.tokenTtlMs / 2 && !hasConsumedTokens) return current;
     const keyboardId = randomBytes(6).toString("hex");
     const expiresAt = now + this.tokenTtlMs;
     const stopRec = this.createTokenRecord(key, target, sessionId, "stop", expiresAt, keyboardId, false);
@@ -465,10 +633,10 @@ export class LanePanels {
     // A topic whose session is not running gets no new panel; an existing one shows that it ended.
     if (!lane && !storedId) return;
     if (lane) store.setKv(this.kvKey(target, "title"), lane.name);
-    const keyboard = lane ? this.keyboardFor(state, key, target, sessionId, now) : null;
+    let keyboard = lane ? this.keyboardFor(state, key, target, sessionId, now) : null;
     const text = renderLanePanel(lane, snapshot, { title: store.getKv(this.kvKey(target, "title")), formatClock: this.options.formatClock });
-    const markup = this.markup(target, keyboard);
-    const hash = createHash("sha256").update(text).update(JSON.stringify(markup)).digest("hex");
+    let markup = this.markup(target, keyboard);
+    let hash = createHash("sha256").update(text).update(JSON.stringify(markup)).digest("hex");
 
     let messageId = storedId;
     if (messageId) {
@@ -496,6 +664,9 @@ export class LanePanels {
       state.keyboard = null;
       messageId = 0;
       if (!lane) return;
+      keyboard = this.keyboardFor(state, key, target, sessionId, now);
+      markup = this.markup(target, keyboard);
+      hash = createHash("sha256").update(text).update(JSON.stringify(markup)).digest("hex");
     }
 
     const sent = await transport.send(target, text, markup, sessionId);
@@ -633,6 +804,18 @@ export class LanePanels {
     const eventId = context?.eventId ?? randomBytes(8).toString("hex");
     const userId = context?.userId ?? "unknown";
 
+    if (context?.eventId) {
+      if (this.processedEvents.has(context.eventId) || this.options.store.getControlAudit?.(context.eventId)) {
+        this.log(`event ${context.eventId} already processed; skipping duplicate`);
+        return;
+      }
+      this.processedEvents.add(context.eventId);
+      if (this.processedEvents.size > 10_000) {
+        const first = this.processedEvents.values().next().value;
+        if (first) this.processedEvents.delete(first);
+      }
+    }
+
     const res = this.resolve(data, context);
     if (res.error || !res.record) {
       this.options.store.auditControl({
@@ -663,7 +846,8 @@ export class LanePanels {
         this.log(`topic ${record.target.topicId}: stop already sent or not claimed; ignored`);
         return;
       }
-
+      record.consumed = true;
+      if (state) state.lastAttemptAt = 0;
       // Stop first click opens ephemeral confirm/cancel keyboard, 30-second expiry.
       const confirmExpiresAt = now + 30_000;
       const confirmTokenRec = this.createTokenRecord(
@@ -699,6 +883,10 @@ export class LanePanels {
 
       if (confirmRes === "error" || !confirmRes?.ephemeralMessageId) {
         state.stop = null;
+        this.tokens.delete(confirmTokenRec.token);
+        this.tokensByNonce.delete(confirmTokenRec.nonce);
+        this.tokens.delete(cancelTokenRec.token);
+        this.tokensByNonce.delete(cancelTokenRec.nonce);
         this.options.store.auditControl({
           eventId,
           userId,
@@ -733,7 +921,10 @@ export class LanePanels {
         if (paired) paired.consumed = true;
       }
       const state = this.states.get(record.key);
-      if (state) state.stop = null;
+      if (state) {
+        state.stop = null;
+        state.lastAttemptAt = 0;
+      }
 
       if (record.ephemeralMessageId) {
         await this.options.transport.editConfirm(
@@ -764,7 +955,10 @@ export class LanePanels {
         if (paired) paired.consumed = true;
       }
       const state = this.states.get(record.key);
-      if (state) state.stop = { phase: "sent", at: now };
+      if (state) {
+        state.stop = { phase: "sent", at: now };
+        state.lastAttemptAt = 0;
+      }
 
       let stopped = false;
       let stopError: unknown = null;
@@ -800,6 +994,9 @@ export class LanePanels {
     }
 
     if (record.action === "steer" || record.action === "followUp") {
+      record.consumed = true;
+      const state = this.states.get(record.key);
+      if (state) state.lastAttemptAt = 0;
       const promptText = record.action === "steer"
         ? "🧭 Reply to this message with your steer for the lane."
         : "➕ Reply to this message with your follow-up for the lane.";
@@ -836,6 +1033,22 @@ export class LanePanels {
       });
       return;
     }
+  }
+  auditRejected(token: string, context?: PanelCallbackContext, reason = "rejected"): void {
+    const eventId = context?.eventId;
+    if (!eventId) return;
+    const res = this.resolve(token, context);
+    const action = res.action !== "unknown" ? res.action : (token.startsWith(LANE_PANEL_CALLBACK_PREFIX) ? "panel" : "unknown");
+    const sessionId = res.sessionId || res.record?.sessionId || "unknown";
+    const userId = context?.userId ?? this.options.operatorId ?? "unknown";
+    this.options.store.auditControl?.({
+      eventId,
+      userId,
+      action,
+      sessionId,
+      result: reason,
+      at: this.now(),
+    });
   }
 
   /** The delivery mode a Steer or Follow-up click armed for this topic's next message; consumed once. */
