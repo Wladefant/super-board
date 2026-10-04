@@ -581,11 +581,17 @@ class TestProjectAdapterLifecycle(unittest.TestCase):
             return {}
 
         updater_ok = SuperboardProjectUpdater(cfg, graphql_runner=mock_graphql, sub_issues_checker=mock_closed_checker)
+        old_ticked_issue = {
+            "number": 4543,
+            "body": "- [x] done and proven",
+            "created_at": "2020-01-01T00:00:00Z",
+        }
         outcome_ok = updater_ok.update_lifecycle(
             "req-4543",
             "Done",
             head_sha=head,
             ledger_record=verified_closure,
+            issue_fetcher=lambda repo, num: old_ticked_issue,
         )
         self.assertTrue(outcome_ok.ok)
         self.assertEqual(outcome_ok.github_writes, 1)

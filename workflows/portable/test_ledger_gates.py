@@ -952,6 +952,9 @@ sys.exit(0)
         self.assertEqual(self.ledger.get_request("req-dangling-parent-ref")["state"], "review")
 
         # Positive control: the same dangling parent closes once no sub-issue is open
+        self.ledger.issue_fetcher = lambda repo, num: {
+            "number": num, "body": "- [x] proven", "created_at": "2020-01-01T00:00:00Z",
+        }
         res = self.ledger.update_request(
             req_id="req-dangling-parent-ref", state="done", sub_issues_checker=lambda repo, issue_num: []
         )

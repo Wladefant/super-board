@@ -30,6 +30,8 @@ import sys
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+from close_guard import CloseRefused, guard_close
+
 
 def fetch_github_sub_issues(repo: str, issue_number: int, timeout_sec: int = 10) -> List[Dict[str, Any]]:
     """
@@ -191,6 +193,9 @@ class ProjectConfig:
         ledger_record: Optional[Dict[str, Any]] = None,
         graphql_runner: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None,
         sub_issues_checker: Optional[Callable[[str, int], List[Dict[str, Any]]]] = None,
+        force_close_reason: Optional[str] = None,
+        issue_fetcher: Optional[Callable[[str, int], Dict[str, Any]]] = None,
+        close_commenter: Optional[Callable[[str, int, str], None]] = None,
     ) -> "SuperboardLifecycleOutcome":
         """
         Update GitHub Project V2 card status for this project.
@@ -208,6 +213,9 @@ class ProjectConfig:
             dry_run=dry_run,
             ledger_record=ledger_record,
             sub_issues_checker=sub_issues_checker,
+            force_close_reason=force_close_reason,
+            issue_fetcher=issue_fetcher,
+            close_commenter=close_commenter,
         )
 
 
@@ -895,6 +903,9 @@ class SuperboardProjectUpdater:
         dry_run: bool = False,
         ledger_record: Optional[Dict[str, Any]] = None,
         sub_issues_checker: Optional[Callable[[str, int], List[Dict[str, Any]]]] = None,
+        force_close_reason: Optional[str] = None,
+        issue_fetcher: Optional[Callable[[str, int], Dict[str, Any]]] = None,
+        close_commenter: Optional[Callable[[str, int, str], None]] = None,
     ) -> SuperboardLifecycleOutcome:
         """
         Public duck-typed lifecycle update method conforming to the frozen contract:
@@ -1005,6 +1016,25 @@ class SuperboardProjectUpdater:
                         f"Cannot transition parent issue #{target_issue} to 'Done': "
                         f"Issue has {len(open_subs)} open sub-issue(s): " + "; ".join(sub_desc)
                     ),
+                    board_url=board_url,
+                    dry_run=dry_run,
+                    github_writes=0,
+                )
+            # 4c. Close-Only-When-Every-Box-Is-Proven Guard (super-board#440): unchecked boxes or an
+            # issue created this run / under 10 min ago block Done unless --force-close <reason>.
+            try:
+                guard_close(
+                    f"{owner}/{repo_name}",
+                    target_issue,
+                    force_reason=force_close_reason,
+                    actor="project_adapter",
+                    fetcher=issue_fetcher,
+                    commenter=(lambda *_a: None) if dry_run else close_commenter,
+                )
+            except CloseRefused as e:
+                return SuperboardLifecycleOutcome(
+                    ok=False,
+                    blocked_reason=f"Cannot transition issue #{target_issue} to 'Done': {e}",
                     board_url=board_url,
                     dry_run=dry_run,
                     github_writes=0,
@@ -1168,6 +1198,9 @@ def update_project_lifecycle(
     ledger_record: Optional[Dict[str, Any]] = None,
     graphql_runner: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None,
     sub_issues_checker: Optional[Callable[[str, int], List[Dict[str, Any]]]] = None,
+    force_close_reason: Optional[str] = None,
+    issue_fetcher: Optional[Callable[[str, int], Dict[str, Any]]] = None,
+    close_commenter: Optional[Callable[[str, int, str], None]] = None,
 ) -> SuperboardLifecycleOutcome:
     """Convenience functional wrapper around SuperboardProjectUpdater."""
     cfg = config or get_current_project_config()
@@ -1181,6 +1214,9 @@ def update_project_lifecycle(
         ledger_record=ledger_record,
         graphql_runner=graphql_runner,
         sub_issues_checker=sub_issues_checker,
+        force_close_reason=force_close_reason,
+        issue_fetcher=issue_fetcher,
+        close_commenter=close_commenter,
     )
 
 
@@ -1203,6 +1239,7 @@ def main():
     up_p.add_argument("--evidence-url", default=None, help="Evidence URL or proof link")
     up_p.add_argument("--dry-run", action="store_true", help="Dry run mode: do not mutate GitHub")
     up_p.add_argument("--ledger-record", default=None, help="Path to the ledger request JSON required for Done")
+    up_p.add_argument("--force-close", default=None, metavar="REASON", help="Override the Done close guard (unchecked boxes, issue under 10 min old); recorded in an issue comment")
     up_p.add_argument("--json", action="store_true", help="Output outcome as JSON")
 
     # status
@@ -1239,6 +1276,7 @@ def main():
             issue_number=args.issue,
             dry_run=args.dry_run,
             ledger_record=ledger_record,
+            force_close_reason=args.force_close,
         )
         if args.json:
             print(json.dumps(outcome.to_dict(), indent=2))
