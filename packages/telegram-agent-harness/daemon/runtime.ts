@@ -47,6 +47,8 @@ import { DaemonStore } from "./store";
 import { connectMiniApp, miniAppUrl, buildMiniAppUrl } from "./miniapp";
 import { DefaultTelegramForumClient, ForumManager, workspaceFolder, type ForumApiClient, type AutoAttachResult } from "./forum";
 import { QuestionsTopic } from "./questions-topic";
+import { defaultFleetSources, FleetState, type FleetQuestion, type FleetSources } from "./fleet-state";
+import { LanePanels, PANEL_EXPIRED_ANSWER } from "./lane-panel";
 
 export interface DaemonSlotReport {
   slotId: string;
@@ -85,6 +87,8 @@ export interface DaemonRuntimeOptions {
   ) => TerminalSessionControl;
   /** Injected in tests to fake Bot API calls for forum supergroup topics. */
   forumClientFactory?: (token: string, forumChatId: string) => ForumApiClient;
+  /** Injected in tests so the lane panel reads fake sessions instead of the real terminal owners. */
+  fleetSources?: FleetSources;
 }
 
 interface ActiveSlot {
@@ -96,6 +100,7 @@ interface ActiveSlot {
   leaseSessionId: string;
   stopMiniApp: () => void;
   autoAttachTimer?: NodeJS.Timeout;
+  lanePanels?: LanePanels;
 }
 
 export class TelegramDaemon {
@@ -241,6 +246,7 @@ export class TelegramDaemon {
     if (index < 0) return;
     const [ended] = this.active.splice(index, 1);
     ended.questionsTopic?.stop();
+    void ended.lanePanels?.stop();
     if (ended.autoAttachTimer) {
       clearInterval(ended.autoAttachTimer);
     }
@@ -316,6 +322,8 @@ export class TelegramDaemon {
     // and the poller is what knows which chat a callback is currently serving.
     let poller: TelegramPoller;
     let questionsTopic: QuestionsTopic | undefined;
+    // Assigned after the poller exists; the poller's callbacks reach it through this variable.
+    let lanePanels: LanePanels | undefined;
     const decisionsPath = path.join(os.homedir(), ".veyyon", "workflows", "decisions.json");
     const poolPath = this.options.poolDbPath ?? process.env.VEYYON_POOL_DB ?? path.join(os.homedir(), ".veyyon", "telegram", "bot_pool.db");
     // Questions are answered from the Questions topic too, where no session is bound. There the
@@ -405,7 +413,9 @@ export class TelegramDaemon {
         return findSessionFile(sessionId, resolveSessionsRoots(this.control.configRoot)) ?? undefined;
       },
       onUserMessage: (text: string) => {
-        void this.acknowledge(router, currentTarget(), text, "auto");
+        // A Steer or Follow-up button on the topic's panel decides how its next message is delivered.
+        const target = currentTarget();
+        void this.acknowledge(router, target, text, lanePanels?.takeArmed(target) ?? "auto");
       },
       onSteer: (text: string) => {
         void this.acknowledge(router, currentTarget(), text, "steer");
@@ -552,6 +562,11 @@ export class TelegramDaemon {
       onConflict: (diagnosis: string, attempt: number, maxAttempts: number) => {
         this.log(`Slot ${slot.slotId} HTTP 409 conflict (attempt ${attempt}/${maxAttempts}): ${diagnosis}`);
       },
+      // Buttons of a panel this daemon no longer serves (feature off, restarted) answer as expired.
+      lanePanel: {
+        peek: (data: string) => lanePanels?.peek(data) ?? PANEL_EXPIRED_ANSWER,
+        run: async (data: string) => { await lanePanels?.run(data); },
+      },
     };
 
     const pollerOptions = {
@@ -629,6 +644,7 @@ export class TelegramDaemon {
       questionsTopic = this.createQuestionsTopic(slot, token, forumChatId, poller, decisionsPath, poolPath);
       questionsTopic.start(decisionsPath);
     }
+    if (forumChatId && slot.lanePanel) lanePanels = this.createLanePanels(slot, forumChatId, poller, router, decisionsPath, () => questionsTopic?.threadId());
     if (forumManager && slot.autoAttach !== false) {
       const intervalMs = slot.autoAttachIntervalMs ?? 10_000;
       autoAttachTimer = setInterval(() => {
@@ -638,11 +654,57 @@ export class TelegramDaemon {
         });
       }, intervalMs);
     }
-    return { slot, poller, router, forumManager, questionsTopic, leaseSessionId, stopMiniApp, autoAttachTimer };
+    return { slot, poller, router, forumManager, questionsTopic, leaseSessionId, stopMiniApp, autoAttachTimer, lanePanels };
   }
 
   private questionService(poller: TelegramPoller, route: QuestionRoute, decisionsPath: string, poolPath: string): OperatorQuestionService {
     return new OperatorQuestionService(poller, () => route, decisionsPath, poolPath, message => this.log(message));
+  }
+
+  /** The slot's live topic panels: one pinned, edited-in-place status message per session topic. */
+  private createLanePanels(
+    slot: DaemonSlot, forumChatId: string, poller: TelegramPoller, router: SlotRouter, decisionsPath: string,
+    questionsThread: () => number | null | undefined,
+  ): LanePanels {
+    let openQuestions: FleetQuestion[] = [];
+    // The panel shows no usage, so `veyyon usage` is never spawned for it: the failed read is cached for good.
+    const fleet = new FleetState({
+      ...(this.options.fleetSources ?? defaultFleetSources(this.control.configRoot)),
+      runUsage: () => Promise.reject(new Error("the lane panel reads no usage")),
+      questions: () => openQuestions,
+    }, { usageCacheMs: Number.POSITIVE_INFINITY });
+    const panels = new LanePanels({
+      slotId: slot.slotId,
+      chatId: forumChatId,
+      store: this.store,
+      snapshot: async () => {
+        const questions = await readQuestions(decisionsPath).catch(() => []);
+        openQuestions = questions.filter(question => !isClosed(question))
+          .map(question => ({ id: question.decision_id, text: question.question, sessionId: question.transport.session_id }));
+        return fleet.snapshot();
+      },
+      boundSession: target => router.boundSession(target),
+      isBusy: target => router.isBusy(target),
+      stop: target => router.abort(target),
+      excludeTopic: topicId => String(questionsThread() ?? "") === topicId,
+      miniAppLink: slot.lanePanelMiniAppLink,
+      log: message => this.log(`Slot ${slot.slotId}: ${message}`),
+      transport: {
+        send: async (target, text, markup, sessionId) => {
+          const sent = await poller.sendTelegramMessage(target.chatId, text, "HTML", markup, { sessionId }, undefined, Number(target.topicId), "panel");
+          if (sent?.ok && sent.result?.message_id) return { messageId: sent.result.message_id };
+          return /thread not found/i.test(sent?.description ?? "") ? "gone" : "error";
+        },
+        edit: async (target, messageId, text, markup) => {
+          const edited = await poller.editTelegramMessage(target.chatId, messageId, text, "HTML", undefined, markup, "panel");
+          if (edited?.ok || /not modified/i.test(edited?.description ?? "")) return "ok";
+          return /message to edit not found/i.test(edited?.description ?? "") ? "gone" : "error";
+        },
+        pin: async (target, messageId) => { await poller.pinTelegramMessage(target.chatId, messageId, "panel"); },
+      },
+    });
+    panels.start();
+    return panels;
   }
 
   /** The slot's Questions topic: one list of every open operator question, kept in step with the decision store. */
@@ -737,6 +799,7 @@ export class TelegramDaemon {
     if (index < 0) return false;
     const [entry] = this.active.splice(index, 1);
     entry.questionsTopic?.stop();
+    await entry.lanePanels?.stop();
     if (entry.autoAttachTimer) {
       clearInterval(entry.autoAttachTimer);
       entry.autoAttachTimer = undefined;
