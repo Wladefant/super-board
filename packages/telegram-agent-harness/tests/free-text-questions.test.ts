@@ -6,6 +6,7 @@ import { Database } from "bun:sqlite";
 import { TelegramPoller } from "../extension/poller";
 import { OperatorQuestionService, questionOperator, type QuestionRoute } from "../src/operator-questions";
 import type { MessageCorrelationBridge, OutboundMessageCorrelation, TelegramUpdate } from "../extension/types";
+import { instantTransport } from "./instant-transport";
 
 const originalFetch = globalThis.fetch;
 const cleanup: Array<() => void> = [];
@@ -107,7 +108,7 @@ function fixture(options: QuestionFixtureOptions = {}) {
           },
     },
     bridge,
-    { outboundPaceMs: 0 },
+    instantTransport(),
   );
 
   const decisionsPath = path.join(dir, "decisions.json");

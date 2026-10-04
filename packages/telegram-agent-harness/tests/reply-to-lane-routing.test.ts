@@ -6,6 +6,7 @@ import { Database } from "bun:sqlite";
 import { TelegramPoller } from "../extension/poller";
 import { MessageContextStore } from "../src/message-context";
 import type { MessageCorrelationBridge, OutboundMessageCorrelation, TelegramUpdate, ChannelAccessConfig, PollerOptions } from "../extension/types";
+import { instantTransport } from "./instant-transport";
 
 const originalFetch = globalThis.fetch;
 const cleanup: Array<() => void> = [];
@@ -62,7 +63,7 @@ function fixture(
       onLedgerFailure: () => {},
     },
     bridge,
-    { outboundPaceMs: 0, ...optionsOverrides },
+    instantTransport(optionsOverrides),
   );
 
   globalThis.fetch = (async (url, init) => {

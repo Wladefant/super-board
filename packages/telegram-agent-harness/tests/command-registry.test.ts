@@ -6,6 +6,7 @@ import { Database } from "bun:sqlite";
 import { registerTelegramCommands, renderTelegramHelp, TELEGRAM_COMMANDS } from "../extension/command-registry";
 import { TelegramPoller } from "../extension/poller";
 import { getDaemonCommands } from "../daemon/router";
+import { instantTransport } from "./instant-transport";
 
 const originalFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = originalFetch; });
@@ -56,7 +57,7 @@ test("real poller startup registers before polling and still polls after registr
     const calls: string[] = [], failures: string[] = [];
     const poller = new TelegramPoller("1:test", dir, { dmPolicy: "allowlist", allowFrom: ["101"] }, {
       isIdle: () => true, onUserMessage: () => {}, onFollowUp: () => {}, onSteer: () => {}, onAbort: () => {}, onRelease: async () => {}, getStatusText: () => "status", onLedgerFailure: message => failures.push(message),
-    });
+    }, undefined, instantTransport());
     globalThis.fetch = (async (url) => {
       if (String(url).endsWith("setMyCommands")) { calls.push("register"); return Response.json({ ok: registrationOk }); }
       calls.push("poll"); poller.stop(); return Response.json({ ok: false });
@@ -123,7 +124,7 @@ test("command boundaries, native idle/busy delivery and release preserve the dur
     isIdle: () => idle, onUserMessage: text => user.push(text), onFollowUp: () => {}, onSteer: text => steer.push(text), onAbort: () => { aborts++; },
     onRelease: async () => { released = true; poller.stop(); }, getStatusText: () => "status", onLedgerFailure: message => { throw new Error(message); },
     onHarnessCommand: async () => false,
-  });
+  }, undefined, instantTransport());
   globalThis.fetch = (async (_url, init) => { replies.push(JSON.parse(String(init?.body)).text); return Response.json({ ok: true, result: { message_id: replies.length, chat: { id: 101 } } }); }) as typeof fetch;
   async function deliver(text: string) {
     poller.ingestUpdates([{ update_id: ++updateId, message: { message_id: updateId, date: 0, chat: { id: 101, type: "private" }, from: { id: 101, is_bot: false }, text } }]);

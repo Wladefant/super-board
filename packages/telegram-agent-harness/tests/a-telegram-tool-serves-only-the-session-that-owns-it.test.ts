@@ -36,6 +36,7 @@ import { MessageContextStore } from "../src/message-context";
 import { LiveDashboard } from "../src/live-dashboard";
 import { OperatorQuestionService } from "../src/operator-questions";
 import type { MessageCorrelationBridge, OutboundMessageCorrelation } from "../extension/types";
+import { instantTransport } from "./instant-transport";
 
 interface ToolUpdate {
   content: Array<{ type: string; text: string }>;
@@ -210,8 +211,7 @@ function createChannel(messageThreadId?: number): {
     },
     bridge,
     {
-      outboundPaceMs: 0,
-      ...(messageThreadId === undefined ? {} : { messageThreadId }),
+      ...instantTransport(messageThreadId === undefined ? {} : { messageThreadId }),
     },
   );
 
