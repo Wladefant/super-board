@@ -1,0 +1,56 @@
+{
+  "generatedAt": 1791133501003,
+  "reports": [
+    {
+      "provider": "google-antigravity",
+      "fetchedAt": 1,
+      "limits": [
+        {
+          "id": "a",
+          "label": "Claude and GPT models",
+          "scope": {
+            "provider": "google-antigravity",
+            "windowId": "5h"
+          },
+          "window": {
+            "id": "5h",
+            "label": "5-hour limit",
+            "durationMs": 18000000,
+            "resetsAt": 1791143042000
+          },
+          "amount": {
+            "unit": "percent",
+            "remainingFraction": 0,
+            "usedFraction": 1,
+            "remaining": 0,
+            "used": 100,
+            "limit": 100
+          },
+          "status": "exhausted"
+        },
+        {
+          "id": "b",
+          "label": "Claude and GPT models",
+          "scope": {
+            "windowId": "weekly"
+          },
+          "window": {
+            "id": "weekly",
+            "label": "Weekly limit",
+            "resetsAt": 1791500000000
+          },
+          "amount": {
+            "unit": "percent",
+            "remainingFraction": 0.37,
+            "remaining": 37
+          },
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "provider": "broken",
+      "limits": "nope"
+    }
+  ]
+}

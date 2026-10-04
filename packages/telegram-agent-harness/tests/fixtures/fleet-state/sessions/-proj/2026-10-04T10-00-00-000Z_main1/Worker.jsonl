@@ -1,0 +1,4 @@
+{"type":"title","v":1,"title":"","updatedAt":"2026-10-04T10:00:00.000Z","pad":"                                        "}
+{"type":"session","version":3,"id":"sub-worker","timestamp":"2026-10-04T10:00:00.000Z","cwd":"C:\\\\work\\\\proj"}
+{"id":"a1","parentId":null,"timestamp":"2026-10-04T10:00:00.000Z","type":"model_change","model":"google-antigravity/gemini-3.8-flash"}
+{"id":"w1","parentId":"a1","timestamp":"2026-10-04T10:08:00.000Z","type":"custom","customType":"tool_execution_start","data":{"toolCallId":"tw1","toolName":"read","startedAt":"2026-10-04T10:08:00.000Z","intent":"Reading session-control.ts"}}

@@ -48,6 +48,9 @@ const SENSITIVE_PATTERNS: RegExp[] = [
   /\bsk-[A-Za-z0-9_-]{20,}\b/g,
   // Resend keys
   /\bre_[A-Za-z0-9_-]{24,}\b/g,
+  // GitHub tokens (classic ghp_/gho_/ghu_/ghs_/ghr_ and fine-grained github_pat_)
+  /\bgh[pousr]_[A-Za-z0-9]{30,}\b/g,
+  /\bgithub_pat_[A-Za-z0-9_]{30,}\b/g,
   // Generic Bearer tokens
   /Bearer\s+[A-Za-z0-9._~+/-]{20,}/gi,
   // Password / Secret in json / env assignments
