@@ -44,6 +44,8 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
+from close_guard import CloseRefused, guard_close
+
 VALID_STATES = [
     "pending",
     "implementation",
@@ -469,8 +471,12 @@ class RequestLedger:
         ledger_path: Optional[str] = None,
         state_dir: Optional[str] = None,
         sub_issues_checker: Optional[Callable[[str, int], List[Dict[str, Any]]]] = None,
+        issue_fetcher: Optional[Callable[[str, int], Dict[str, Any]]] = None,
+        close_commenter: Optional[Callable[[str, int, str], None]] = None,
     ):
         self.sub_issues_checker = sub_issues_checker
+        self.issue_fetcher = issue_fetcher
+        self.close_commenter = close_commenter
         if ledger_path:
             self.ledger_path = os.path.abspath(ledger_path)
         elif state_dir:
@@ -731,6 +737,7 @@ class RequestLedger:
         parent_req_id: Optional[str] = None,
         sub_requests: Optional[List[str]] = None,
         sub_issues_checker: Optional[Callable[[str, int], List[Dict[str, Any]]]] = None,
+        force_close_reason: Optional[str] = None,
         reason: str = "Update",
     ) -> Dict[str, Any]:
         try:
@@ -1318,6 +1325,21 @@ class RequestLedger:
                                 f"Cannot transition '{req_id}' to 'done': Parent issue #{issue_num} has {len(open_subs)} open sub-issue(s): "
                                 + "; ".join(sub_desc)
                             )
+                        # Close-Only-When-Every-Box-Is-Proven Guard (super-board#440): no unchecked
+                        # boxes, not created this run or under 10 min ago, unless --force-close.
+                        try:
+                            close_result = guard_close(
+                                gh_repo,
+                                int(issue_num),
+                                force_reason=force_close_reason,
+                                actor=effective_actor,
+                                fetcher=self.issue_fetcher,
+                                commenter=self.close_commenter,
+                            )
+                        except CloseRefused as e:
+                            raise ValueError(f"Cannot transition '{req_id}' to 'done': {e}")
+                        if close_result["forced"]:
+                            reason = f"{reason} [force-close: {force_close_reason}]"
                 req["state"] = target_state
                 req["history"].append({
                     "timestamp": now,
@@ -2034,6 +2056,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_upd.add_argument("--blocker", help="Set blocker text")
     p_upd.add_argument("--clear-blocker", action="store_true", help="Clear current blocker")
     p_upd.add_argument("--next-action", help="Update next action description")
+    p_upd.add_argument("--force-close", default=None, metavar="REASON", help="Override the close guard (unchecked boxes, issue under 10 min old); the reason is recorded in a comment on the linked issue")
     p_upd.add_argument("--actor", default=None, help="Actor recording the change (no default operator trust)")
     p_upd.add_argument("--reason", default="Update", help="Reason for change")
     p_upd.add_argument("--parent-req-id", default=None, help="Update parent request ID")
@@ -2288,6 +2311,7 @@ def main():
                 clear_decision_blocker=args.clear_decision_blocker,
                 actor=args.actor,
                 reason=args.reason,
+                force_close_reason=args.force_close,
                 remove_criterion=args.remove_criterion,
                 parent_req_id=args.parent_req_id,
                 sub_requests=[s.strip() for s in args.sub_requests.split(",") if s.strip()] if args.sub_requests is not None else None,

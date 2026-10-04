@@ -404,6 +404,7 @@
       "quota_snapshot.py",
       "gardener.py",
       "adoption_audit.py",
+      "close_guard.py",
       "wt_remove.py",
       "evidence_lint.py",
       "pr_demo_video.py",
@@ -412,6 +413,7 @@
     ],
     "optional_files": [
       "test_adoption_audit.py",
+      "test_close_guard.py",
       "test_evidence_lint.py",
       "test_pr_demo_video.py",
       "test_pr_label_bot.py",

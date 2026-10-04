@@ -47,13 +47,26 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+from close_guard import MIN_AGE_SECONDS, is_plan_issue, issue_labels, parse_github_time, unchecked_boxes
 
 DEFAULT_REPO = "Wladefant/super-board"
 
 # Check (d): more long comments than this on an issue with no sub-issues is a dump.
 MAX_TOPIC_COMMENTS = 5
 LONG_COMMENT_CHARS = 1500
+
+# Check (e): look at issues closed within this many days.
+PREMATURE_CLOSE_DAYS = 7
+
+# Check (e) categories.
+PREMATURE_CLOSE_CATEGORIES = (
+    "closed_with_unchecked_boxes",
+    "closed_within_minutes_of_creation",
+    "plan_closed_without_subissues",
+)
 
 # Regex for adoption & rejection annotations
 ADOPTED_AT_RE = re.compile(r"(?i)\badopted-at:\s*(\S+)")
@@ -100,6 +113,7 @@ class AuditSummary:
     closed_subissues_without_adoption_or_rejection: int = 0
     research_recommendations_without_subissues: int = 0
     topic_comment_dumps_without_subissues: int = 0
+    premature_closes: int = 0
 
 
 @dataclass
@@ -298,6 +312,29 @@ class GitHubClient:
         except json.JSONDecodeError:
             return []
 
+    def get_closed_issues_since(self, repo: str, since_iso: str) -> List[Dict[str, Any]]:
+        """Fetch non-PR issues updated since `since_iso` that are closed (read-only)."""
+        issues: List[Dict[str, Any]] = []
+        page = 1
+        while True:
+            rc, stdout, _ = self._run_gh([
+                "api",
+                f"repos/{repo}/issues?state=closed&since={since_iso.replace('+', '%2B')}&per_page=100&page={page}",
+            ])
+            if rc != 0 or not stdout.strip():
+                break
+            try:
+                batch = json.loads(stdout)
+            except json.JSONDecodeError:
+                break
+            if not isinstance(batch, list) or not batch:
+                break
+            issues.extend([i for i in batch if not i.get("pull_request")])
+            if len(batch) < 100:
+                break
+            page += 1
+        return issues
+
     def get_issue_comments(self, repo: str, issue_number: int) -> List[Dict[str, Any]]:
         """Fetch comments for an issue."""
         rc, stdout, _ = self._run_gh(["api", f"repos/{repo}/issues/{issue_number}/comments?per_page=100"])
@@ -362,6 +399,8 @@ def run_adoption_audit(
     auto_reopen: bool = False,
     dry_run: bool = False,
     client: Optional[GitHubClient] = None,
+    premature_close_repos: Optional[List[str]] = None,
+    premature_close_days: int = PREMATURE_CLOSE_DAYS,
 ) -> AuditResult:
     """Execute adoption audit against target repository or single issue."""
     if client is None:
@@ -536,6 +575,11 @@ def run_adoption_audit(
                 findings.append(finding)
                 closed_subissue_count += 1
 
+    if premature_close_repos:
+        pc_findings, pc_scanned = audit_premature_closes(premature_close_repos, days=premature_close_days, client=client)
+        findings.extend(pc_findings)
+        scanned_count += pc_scanned
+
     status = "fail" if findings else "pass"
     summary = AuditSummary(
         total_issues_scanned=scanned_count,
@@ -544,6 +588,7 @@ def run_adoption_audit(
         closed_subissues_without_adoption_or_rejection=closed_subissue_count,
         research_recommendations_without_subissues=research_rec_count,
         topic_comment_dumps_without_subissues=topic_dump_count,
+        premature_closes=sum(1 for f in findings if f.category in PREMATURE_CLOSE_CATEGORIES),
     )
 
     return AuditResult(
@@ -571,6 +616,7 @@ def format_markdown_report(result: AuditResult) -> str:
         f"- **(b) Closed sub-issues without adoption or rejection proof:** {result.summary.closed_subissues_without_adoption_or_rejection}",
         f"- **(c) Research recommendations with no sub-issue:** {result.summary.research_recommendations_without_subissues}",
         f"- **(d) Topic dumps in comments without sub-issues:** {result.summary.topic_comment_dumps_without_subissues}",
+        f"- **(e) Closed without proof:** {result.summary.premature_closes}",
         "",
     ]
 
@@ -586,6 +632,7 @@ def format_markdown_report(result: AuditResult) -> str:
     b_findings = [f for f in result.findings if f.category == "closed_subissue_without_adoption_or_rejection"]
     c_findings = [f for f in result.findings if f.category == "research_recommendation_without_subissue"]
     d_findings = [f for f in result.findings if f.category == "topic_comment_dump_without_subissues"]
+    e_findings = [f for f in result.findings if f.category in PREMATURE_CLOSE_CATEGORIES]
 
     if a_findings:
         lines.append("### (a) Closed Parents with Open Sub-Issues")
@@ -623,8 +670,79 @@ def format_markdown_report(result: AuditResult) -> str:
             n = f.details.get("long_comments_count")
             lines.append(f"- **Issue #{f.issue_number}:** [{f.title}]({f.url}) has {n} long comments and no sub-issues")
         lines.append("")
+    if e_findings:
+        lines.append("### (e) Closed Without Proof (unchecked boxes, closed within 10 min, or plan with no sub-issue)")
+        lines.append("")
+        for f in e_findings:
+            repo = f.details.get("repo", "")
+            if f.category == "closed_with_unchecked_boxes":
+                why = f"{f.details.get('unchecked_boxes')} unchecked box(es), e.g. `{(f.details.get('first_boxes') or [''])[0]}`"
+            elif f.category == "closed_within_minutes_of_creation":
+                why = f"closed {f.details.get('seconds_open')}s after creation"
+            else:
+                why = "plan/research issue closed with no sub-issue"
+            lines.append(f"- **{repo}#{f.issue_number}:** [{f.title}]({f.url}) - {why}")
+        lines.append("")
 
     return "\n".join(lines)
+
+
+def audit_premature_closes(
+    repos: List[str],
+    days: int = PREMATURE_CLOSE_DAYS,
+    client: Optional[GitHubClient] = None,
+    now: Optional[datetime] = None,
+) -> Tuple[List[Finding], int]:
+    """Check (e): issues closed in the last `days` days that were not proven done.
+
+    Flags a closed issue when it (a) still has a `- [ ]` box in the body, (b) was closed
+    less than MIN_AGE_SECONDS after creation, or (c) is a plan/research issue that was
+    closed with no sub-issue at all (nothing carries the work forward).
+    Read-only. Returns (findings, closed_issues_scanned). Every finding has a URL.
+    """
+    client = client or GitHubClient()
+    now = now or datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=days)
+    findings: List[Finding] = []
+    scanned = 0
+    for repo in repos:
+        for issue in client.get_closed_issues_since(repo, cutoff.isoformat()):
+            closed_at = parse_github_time(issue.get("closed_at"))
+            if issue.get("state") != "closed" or closed_at is None or closed_at < cutoff:
+                continue
+            scanned += 1
+            num = issue.get("number")
+            title = issue.get("title", "")
+            url = issue.get("html_url", f"https://github.com/{repo}/issues/{num}")
+            boxes = unchecked_boxes(issue.get("body"))
+            created = parse_github_time(issue.get("created_at"))
+            lifetime = (closed_at - created).total_seconds() if created else None
+            if boxes:
+                findings.append(Finding(
+                    category="closed_with_unchecked_boxes",
+                    issue_number=num, title=title, url=url,
+                    details={"repo": repo, "unchecked_boxes": len(boxes), "first_boxes": boxes[:3],
+                             "closed_at": issue.get("closed_at")},
+                ))
+            if lifetime is not None and lifetime < MIN_AGE_SECONDS:
+                findings.append(Finding(
+                    category="closed_within_minutes_of_creation",
+                    issue_number=num, title=title, url=url,
+                    details={"repo": repo, "seconds_open": int(lifetime), "min_seconds": MIN_AGE_SECONDS,
+                             "created_at": issue.get("created_at"), "closed_at": issue.get("closed_at")},
+                ))
+            if is_plan_issue(title, issue_labels(issue)):
+                summary = issue.get("sub_issues_summary") or {}
+                total = summary.get("total")
+                if total is None:
+                    total = len(client.get_sub_issues(repo, num))
+                if total == 0:
+                    findings.append(Finding(
+                        category="plan_closed_without_subissues",
+                        issue_number=num, title=title, url=url,
+                        details={"repo": repo, "closed_at": issue.get("closed_at")},
+                    ))
+    return findings, scanned
 
 
 def main() -> None:
@@ -662,15 +780,54 @@ def main() -> None:
         action="store_true",
         help="Emit Markdown report to stdout",
     )
+    parser.add_argument(
+        "--premature-closes",
+        action="store_true",
+        help="Also run check (e): issues closed in the last --close-days days with unchecked boxes, "
+        "closed under 10 min after creation, or plan issues closed with no sub-issue",
+    )
+    parser.add_argument(
+        "--only-premature-closes",
+        action="store_true",
+        help="Run only check (e) (read-only); skips checks (a)-(d)",
+    )
+    parser.add_argument(
+        "--close-repos",
+        default=None,
+        help="Comma-separated owner/repo list for check (e) (default: --repo)",
+    )
+    parser.add_argument(
+        "--close-days",
+        type=int,
+        default=PREMATURE_CLOSE_DAYS,
+        help=f"Look-back window in days for check (e) (default: {PREMATURE_CLOSE_DAYS})",
+    )
 
     args = parser.parse_args()
 
-    result = run_adoption_audit(
-        repo=args.repo,
-        issue_number=args.issue,
-        auto_reopen=args.auto_reopen,
-        dry_run=args.dry_run,
-    )
+    close_repos = [r.strip() for r in args.close_repos.split(",") if r.strip()] if args.close_repos else [args.repo]
+    if args.only_premature_closes:
+        pc_findings, pc_scanned = audit_premature_closes(close_repos, days=args.close_days)
+        result = AuditResult(
+            repo=",".join(close_repos),
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            status="fail" if pc_findings else "pass",
+            summary=AuditSummary(
+                total_issues_scanned=pc_scanned,
+                total_findings=len(pc_findings),
+                premature_closes=len(pc_findings),
+            ),
+            findings=pc_findings,
+        )
+    else:
+        result = run_adoption_audit(
+            repo=args.repo,
+            issue_number=args.issue,
+            auto_reopen=args.auto_reopen,
+            dry_run=args.dry_run,
+            premature_close_repos=close_repos if args.premature_closes else None,
+            premature_close_days=args.close_days,
+        )
 
     if args.json:
         print(json.dumps(result.to_dict(), indent=2))
