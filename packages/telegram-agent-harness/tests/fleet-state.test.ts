@@ -4,7 +4,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { defaultFleetSources, FleetState, parseFleetUsage, readSessionFile, type FleetSources } from "../daemon/fleet-state";
+import { defaultFleetSources, FleetState, parseFleetUsage, readSessionFile, runCommandWithTimeout, type FleetSources } from "../daemon/fleet-state";
 import { discoverOwners, readProcessStartTimes, type Owner } from "../daemon/session-control";
 
 const FIXTURES = path.join(import.meta.dir, "fixtures", "fleet-state");
@@ -161,4 +161,58 @@ test("the usage timeout is passed to the runner", async () => {
 test("parseFleetUsage rejects garbage without throwing", () => {
   expect(parseFleetUsage("not json", 1)).toMatchObject({ available: false, windows: [] });
   expect(parseFleetUsage(JSON.stringify({ reports: [] }), 1).available).toBe(false);
+});
+
+function sessionLines(extra: object[]): string[] {
+  const lines = fs.readFileSync(mainFile, "utf8").split("\n").filter(Boolean).slice(0, 2);
+  return [...lines, ...extra.map(entry => JSON.stringify(entry))];
+}
+
+test("a token straddling the truncation limit does not leak its prefix", () => {
+  const file = path.join(root, "straddle.jsonl");
+  const text = `${"x".repeat(170)} ghp_${"a".repeat(36)} tail`;
+  const entry = { id: "s1", parentId: null, timestamp: "2026-10-04T10:07:00.000Z", type: "message", message: { role: "assistant", content: [{ type: "text", text }] } };
+  fs.writeFileSync(file, sessionLines([entry]).join("\n") + "\n");
+  const action = readSessionFile(file)!.lastAction!;
+  expect(action).not.toContain("ghp_");
+  expect(action.length).toBeLessThanOrEqual(200);
+});
+
+test("a secret in the title is redacted from the lane name", async () => {
+  const file = path.join(root, "titled.jsonl");
+  const lines = sessionLines([]);
+  lines[0] = JSON.stringify({ type: "title", v: 1, title: `Deploy ghp_${"b".repeat(36)}`, updatedAt: "2026-10-04T10:00:00.000Z" });
+  fs.writeFileSync(file, lines.join("\n") + "\n");
+  const snapshot = await new FleetState(sources({ listOwners: () => [owner("titled", file)] })).snapshot();
+  expect(snapshot.lanes[0]!.name).not.toContain("ghp_");
+});
+
+test("a 200 KB session file reports the newest model and action from its tail", () => {
+  const file = path.join(root, "medium.jsonl");
+  const filler = JSON.stringify({ id: "z", parentId: null, timestamp: "2026-10-04T10:01:00.000Z", type: "custom_message", content: "y".repeat(900) });
+  const entries = [
+    { id: "m9", parentId: null, timestamp: "2026-10-04T10:09:00.000Z", type: "model_change", model: "openai-codex/gpt-5.6-sol" },
+    { id: "c9", parentId: "m9", timestamp: "2026-10-04T10:09:10.000Z", type: "custom", customType: "tool_execution_start", data: { toolName: "bash", intent: "Newest action" } },
+  ];
+  fs.writeFileSync(file, [...sessionLines([]), ...Array(220).fill(filler), ...entries.map(entry => JSON.stringify(entry))].join("\n") + "\n");
+  const size = fs.statSync(file).size;
+  expect(size).toBeGreaterThan(190_000);
+  expect(size).toBeLessThan(256 * 1024);
+  const info = readSessionFile(file)!;
+  expect(info.model).toBe("openai-codex/gpt-5.6-sol");
+  expect(info.lastAction).toBe("bash: Newest action");
+});
+
+test("a hanging usage command is killed and bounded by the timeout", async () => {
+  const started = Date.now();
+  const hang = { command: process.execPath, args: ["-e", "setTimeout(() => {}, 60000)"] };
+  await expect(runCommandWithTimeout(hang, 300)).rejects.toThrow("timed out");
+  expect(Date.now() - started).toBeLessThan(5000);
+  const snapshot = await new FleetState({ ...sources(), runUsage: ms => runCommandWithTimeout(hang, ms) }, { usageTimeoutMs: 300 }).snapshot();
+  expect(snapshot.usage).toMatchObject({ available: false });
+});
+
+test("a usage command that exits non-zero is rejected and one that prints JSON is returned", async () => {
+  await expect(runCommandWithTimeout({ command: process.execPath, args: ["-e", "process.exit(3)"] }, 5000)).rejects.toThrow("exited 3");
+  expect(await runCommandWithTimeout({ command: process.execPath, args: ["-e", "console.log('{\"reports\":[]}')"] }, 5000)).toContain("reports");
 });

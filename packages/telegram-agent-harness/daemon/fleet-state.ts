@@ -14,7 +14,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import { redactSecrets } from "../extension/sanitizer";
 import { discoverOwners, type Owner } from "./session-control";
 
@@ -184,7 +184,7 @@ export function readSessionFile(file: string, maxActionChars = DEFAULTS.lastActi
     const stat = fs.fstatSync(fd);
     const head = parseLines(readWindow(fd, 0, Math.min(stat.size, HEAD_BYTES)), false);
     const tailStart = Math.max(0, stat.size - TAIL_BYTES);
-    const tail = tailStart === 0 ? head : parseLines(readWindow(fd, tailStart, stat.size - tailStart), true);
+    const tail = parseLines(readWindow(fd, tailStart, stat.size - tailStart), tailStart > 0);
     const header = head.find(entry => entry.type === "session");
     const id = str(header?.id);
     if (!header || !id) return null;
@@ -209,11 +209,11 @@ export function readSessionFile(file: string, maxActionChars = DEFAULTS.lastActi
     return {
       id,
       cwd: str(header.cwd) ?? "",
-      title,
+      title: title ? redactSecrets(title) : null,
       startedAtMs: Number.isFinite(started) ? started : null,
       mtimeMs: stat.mtimeMs,
       model,
-      lastAction: lastAction ? redactSecrets(truncate(lastAction, maxActionChars)) : null,
+      lastAction: lastAction ? truncate(redactSecrets(lastAction), maxActionChars) : null,
     };
   } catch {
     return null;
@@ -234,20 +234,35 @@ export function listChildSessionFiles(file: string): string[] {
   }
 }
 
-function runVeyyonUsage(timeoutMs: number): Promise<string> {
+export interface UsageCommand { command: string; args: string[] }
+
+/** Run a command, kill it when `timeoutMs` passes, and reject; no shell is involved. */
+export function runCommandWithTimeout(spec: UsageCommand, timeoutMs: number): Promise<string> {
   const { promise, resolve, reject } = Promise.withResolvers<string>();
-  execFile("veyyon", ["usage", "--json"], { timeout: timeoutMs, windowsHide: true, shell: process.platform === "win32", maxBuffer: 4 * 1024 * 1024 },
-    (error, stdout) => error ? reject(error) : resolve(stdout));
+  const child = spawn(spec.command, spec.args, { windowsHide: true, stdio: ["ignore", "pipe", "ignore"] });
+  const chunks: Buffer[] = [];
+  let size = 0;
+  const timer = setTimeout(() => { child.kill("SIGKILL"); reject(new Error("usage command timed out")); }, timeoutMs);
+  child.stdout.on("data", (chunk: Buffer) => {
+    size += chunk.length;
+    if (size > 4 * 1024 * 1024) { child.kill("SIGKILL"); reject(new Error("usage output too large")); return; }
+    chunks.push(chunk);
+  });
+  child.once("error", error => { clearTimeout(timer); reject(error); });
+  child.once("close", code => {
+    clearTimeout(timer);
+    if (code === 0) resolve(Buffer.concat(chunks).toString("utf8")); else reject(new Error(`usage command exited ${code}`));
+  });
   return promise;
 }
 
-export function defaultFleetSources(configRoot?: string): FleetSources {
+export function defaultFleetSources(configRoot?: string, usageCommand: UsageCommand = { command: "veyyon", args: ["usage", "--json"] }): FleetSources {
   return {
     now: () => Date.now(),
     listOwners: () => discoverOwners(configRoot),
     readSession: file => readSessionFile(file),
     listChildFiles: listChildSessionFiles,
-    runUsage: runVeyyonUsage,
+    runUsage: timeoutMs => runCommandWithTimeout(usageCommand, timeoutMs),
     hostMemory: () => ({ totalBytes: os.totalmem(), freeBytes: os.freemem() }),
     questions: () => [],
   };
@@ -301,7 +316,11 @@ export class FleetState {
     if (cached && now - cached.at < this.options.usageCacheMs) return Promise.resolve(cached.value);
     this.usageInflight ??= (async () => {
       try {
-        const value = parseFleetUsage(await this.sources.runUsage(this.options.usageTimeoutMs), now);
+        // execFile's own timeout may not bound a shell-wrapped child on Windows, so the promise is raced too.
+        const timeout = Promise.withResolvers<never>();
+        const timer = setTimeout(() => timeout.reject(new Error("veyyon usage timed out")), this.options.usageTimeoutMs);
+        const raw = await Promise.race([this.sources.runUsage(this.options.usageTimeoutMs), timeout.promise]).finally(() => clearTimeout(timer));
+        const value = parseFleetUsage(raw, now);
         this.usageCache = { at: now, value };
         return value;
       } catch {
