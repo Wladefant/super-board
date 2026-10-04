@@ -1830,23 +1830,21 @@ class TestSharedSendBudget(unittest.TestCase):
         os.utime(budget.lock, (old, old))
         self.assertEqual(budget.update(lambda s: 1), 1)
 
-    def test_only_one_sweeper_removes_an_abandoned_lock_and_a_crashed_sweeper_does_not_wedge_it(self):
+    def test_live_holder_is_not_evicted_however_old_and_sweeping_leaves_no_litter(self):
         import subprocess
         import sys
 
-        child = subprocess.Popen([sys.executable, "-c", "pass"])
-        child.wait()
         budget = telegram_budget.SharedBudget("1", self.dir)
-        self._hold(budget, child.pid)
-        sweeping = Path(f"{budget.lock}.sweep")
-        sweeping.write_text("", encoding="utf-8")
+        self._hold(budget, os.getpid(), age=3 * 3600)
         with patch.object(telegram_budget, "LOCK_TIMEOUT_SECONDS", 0.2):
             self.assertIsNone(budget.update(lambda s: 1))
         self.assertTrue(budget.lock.exists())
-        old = time.time() - telegram_budget.UNNAMED_LOCK_SECONDS - 0.5
-        os.utime(sweeping, (old, old))
+        budget.lock.unlink()
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        self._hold(budget, child.pid)
         self.assertEqual(budget.update(lambda s: 1), 1)
-        self.assertFalse(sweeping.exists())
+        self.assertEqual(sorted(p.name for p in self.dir.iterdir()), ["1.json"])
 
     def test_earlier_mkdir_lock_is_kept_while_recent_and_swept_when_old(self):
         budget = telegram_budget.SharedBudget("1", self.dir)

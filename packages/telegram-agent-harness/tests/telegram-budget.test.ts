@@ -223,19 +223,16 @@ describe("shared budget file", () => {
     expect(await budget.update(() => 1)).toBe(1);
   });
 
-  test("only one sweeper removes an abandoned lock at a time; a crashed sweeper does not wedge it", async () => {
-    const dead = Bun.spawnSync([process.execPath, "-e", "0"]).pid;
-    heldBy(dead);
-    const sweeping = `${lockFile()}.sweep`;
-    fs.writeFileSync(sweeping, "");
+  test("a live holder is not evicted however old its lock is, and sweeping leaves no litter", async () => {
+    heldBy(process.pid);
+    age(lockFile(), 3 * 3600);
     const budget = new SharedBudget("1", dir, 200);
-    // A sweep is in progress: the dead lock is left for that sweeper, and the caller gives up at its deadline.
     expect(await budget.update(() => 1)).toBeUndefined();
     expect(fs.existsSync(lockFile())).toBe(true);
-    // The sweeper crashed: its file ages out, then the dead lock is swept.
-    age(sweeping, UNNAMED_LOCK_MS + 500);
-    expect(await new SharedBudget("1", dir).update(() => 1)).toBe(1);
-    expect(fs.existsSync(sweeping)).toBe(false);
+    fs.unlinkSync(lockFile());
+    heldBy(Bun.spawnSync([process.execPath, "-e", "0"]).pid);
+    expect(await budget.update(() => 1)).toBe(1);
+    expect(fs.readdirSync(dir).sort()).toEqual(["1.json"]);
   });
 
   test("the earlier mkdir lock: kept while recent, swept when old", async () => {

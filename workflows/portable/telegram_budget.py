@@ -5,14 +5,15 @@ Telegram counts sends per bot token, so the daemon, the session extensions and
 telegram_notifier.py must see each other's sends. They do through one small JSON
 file per bot under ``~/.veyyon/run/telegram-budget/`` (override with
 ``VEYYON_TELEGRAM_BUDGET_DIR``; the value ``off`` disables sharing), guarded by an
-O_EXCL lock file that names its holder (pid and a random token).
+lock file that names its holder (pid and a random token).
 
 This is the same file format and the same ``reserve`` arithmetic as
 packages/telegram-agent-harness/extension/telegram-budget.ts. Keep the two in step.
 Times are epoch milliseconds.
 
 The lock is held for one read-compute-write, never across a Telegram call. A holder
-that died is recognised by its pid being gone; a live holder is never evicted. If the lock cannot be taken in
+that died is recognised by its pid being gone; a live holder is never evicted. A pid reused by an unrelated
+process keeps a dead holder's lock alive: callers then fail open after the deadline until the file is deleted. If the lock cannot be taken in
 LOCK_TIMEOUT_SECONDS or the file system fails, the caller sends anyway: a late
 message beats a lost one.
 """
@@ -29,10 +30,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 LOCK_TIMEOUT_SECONDS = 2.0
-# A lock whose holder cannot be named (it died mid-write) is abandoned after this long.
+# A lock that names no holder (not written by this code: empty or garbage) is abandoned after this long.
 UNNAMED_LOCK_SECONDS = 1.0
-# Holds last microseconds. A named holder older than this is a dead process whose pid was reused.
-MAX_LOCK_AGE_SECONDS = 300.0
 
 CHAT_INTERVAL_MS = 1000
 GROUP_LIMIT = 20
@@ -160,39 +159,43 @@ class SharedBudget:
         deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
         token = f"{os.getpid()}.{uuid.uuid4()}"
         while True:
-            try:
-                fd = os.open(self.lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                try:
-                    os.write(fd, json.dumps({"pid": os.getpid(), "token": token, "at": time.time() * 1000}).encode())
-                finally:
-                    os.close(fd)
+            got = self._try_lock(token)
+            if got == "held":
                 return token
-            except (FileExistsError, PermissionError):
-                pass
-            except OSError:
+            if got == "failed":
                 return None
             self._sweep_if_abandoned()
             if time.monotonic() >= deadline:
                 return None
             time.sleep(0.002 + random.random() * 0.003)
 
-    def _sweep_if_abandoned(self) -> None:
-        """Removes the lock when its holder is gone. A live holder is never removed. Never raises.
-
-        Sweepers take a second O_EXCL file first, so only one of them can read-then-remove at a time. The
-        holder is dead, so nobody else can change the lock meanwhile.
-        """
-        sweeping = Path(f"{self.lock}.sweep")
+    def _try_lock(self, token: str) -> str:
+        # The holder's name must be in the file from the moment the lock exists, or a crash between create and
+        # write would leave a lock nobody can attribute. So write a private file and hard-link it into place:
+        # the link is atomic, fails if the lock exists, and the lock is never seen empty.
+        tmp = f"{self.lock}.{token}.tmp"
         try:
-            os.close(os.open(sweeping, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            with open(tmp, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps({"pid": os.getpid(), "token": token, "at": time.time() * 1000}))
+            os.link(tmp, self.lock)
+            return "held"
+        except (FileExistsError, PermissionError):
+            return "busy"
         except OSError:
-            # Another sweeper is at work. Its own file is abandoned only if it crashed mid-sweep.
+            return "failed"
+        finally:
             try:
-                if time.time() - os.stat(sweeping).st_mtime > UNNAMED_LOCK_SECONDS:
-                    os.unlink(sweeping)
+                os.unlink(tmp)
             except OSError:
                 pass
-            return
+
+    def _sweep_if_abandoned(self) -> None:
+        """Removes the lock when its holder's pid is gone. A live holder is never removed, however old its lock.
+
+        The lock is claimed by an atomic rename, so only one sweeper acts on it. If the claimed file turns out
+        not to be the one judged dead (another process swept and took the lock meanwhile), it is linked straight
+        back. Never raises.
+        """
         try:
             st = os.stat(self.lock)
             age = time.time() - st.st_mtime
@@ -206,20 +209,19 @@ class SharedBudget:
             try:
                 pid = json.loads(raw).get("pid")
             except (ValueError, AttributeError):
-                pass  # The holder died between creating the file and writing its name.
-            if isinstance(pid, int):
-                abandoned = not pid_alive(pid) or age > MAX_LOCK_AGE_SECONDS
-            else:
-                abandoned = age > UNNAMED_LOCK_SECONDS
-            if abandoned:
-                os.unlink(self.lock)
+                pass  # Not one of ours (empty or garbage): judged by age alone.
+            abandoned = (not pid_alive(pid)) if isinstance(pid, int) else age > UNNAMED_LOCK_SECONDS
+            if not abandoned:
+                return
+            claimed = f"{self.lock}.{os.getpid()}.{uuid.uuid4()}.dead"
+            os.rename(self.lock, claimed)
+            try:
+                if Path(claimed).read_text(encoding="utf-8") != raw:
+                    os.link(claimed, self.lock)
+            finally:
+                os.unlink(claimed)
         except Exception:
             pass
-        finally:
-            try:
-                os.unlink(sweeping)
-            except OSError:
-                pass
 
     def _release(self, token: str) -> None:
         # On Windows a waiter reading the lock holds it open, and unlink then fails with PermissionError, so retry.

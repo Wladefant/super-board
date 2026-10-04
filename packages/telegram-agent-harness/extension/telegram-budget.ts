@@ -4,7 +4,7 @@
  * The governor in telegram-governor.ts queues sends inside one process. Telegram counts per bot token, so
  * the daemon, each session extension and workflows/portable/telegram_notifier.py must also see each
  * other's sends. They do through one small JSON file per bot under `~/.veyyon/run/telegram-budget/`,
- * guarded by an O_EXCL lock file that names its holder. workflows/portable/telegram_budget.py implements the same
+ * guarded by a lock file that names its holder. workflows/portable/telegram_budget.py implements the same
  * file format and the same {@link reserve} arithmetic; keep the two in step.
  *
  * File format (times are epoch milliseconds):
@@ -12,8 +12,9 @@
  *     "chats": { "<chat id>": { "lastAt": number, "blockedUntil": number, "sends": [[at, "panel"|"message"], ...] } } }
  *
  * The lock is held only for one read-compute-write of that file, never across a Telegram call. A holder that
- * dies is recognised by its pid being gone (see {@link SharedBudget}); a live holder is never evicted, however
- * long it holds. If the lock cannot be taken within {@link LOCK_TIMEOUT_MS}, or the file system fails, the
+ * dies is recognised by its pid being gone; a live holder is never evicted, however long it holds. A pid reused
+ * by an unrelated process keeps a dead holder's lock alive: every caller then fails open after the deadline until
+ * that lock file is deleted by hand. If the lock cannot be taken within {@link LOCK_TIMEOUT_MS}, or the file system fails, the
  * caller sends on its own in-process budget: a late message beats a lost one. Waiting never blocks the event loop.
  */
 import * as fs from "node:fs";
@@ -47,10 +48,8 @@ export interface Reservation {
 }
 
 export const LOCK_TIMEOUT_MS = 2_000;
-/** A lock whose holder cannot be named (it died mid-write) is abandoned after this long. */
+/** A lock that names no holder (not written by this code: empty or garbage) is abandoned after this long. */
 export const UNNAMED_LOCK_MS = 1_000;
-/** Holds last microseconds. A named holder older than this is a dead process whose pid was reused. */
-export const MAX_LOCK_AGE_MS = 5 * 60_000;
 
 export function emptyState(): BudgetState {
   return { botBlockedUntil: 0, chats: {} };
@@ -168,17 +167,23 @@ export class SharedBudget {
    * holder is recognised by its pid being gone, not by how long the lock has existed.
    */
   private tryLock(token: string): "held" | "busy" | "failed" {
+    // The holder's name must be in the file from the moment the lock exists, or a crash between create and write
+    // would leave a lock nobody can attribute. So write a private file and hard-link it into place: the link is
+    // atomic, fails if the lock exists, and the lock is never seen empty.
+    const tmp = `${this.lock}.${token}.tmp`;
     try {
-      const fd = fs.openSync(this.lock, "wx");
-      try {
-        fs.writeSync(fd, JSON.stringify({ pid: process.pid, token, at: Date.now() }));
-      } finally {
-        fs.closeSync(fd);
-      }
+      fs.writeFileSync(tmp, JSON.stringify({ pid: process.pid, token, at: Date.now() }));
+      fs.linkSync(tmp, this.lock);
       return "held";
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       return code === "EEXIST" || code === "EPERM" || code === "EACCES" || code === "EBUSY" ? "busy" : "failed";
+    } finally {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        // Never created.
+      }
     }
   }
 
@@ -196,25 +201,12 @@ export class SharedBudget {
   }
 
   /**
-   * Removes the lock when its holder is gone. Never throws. Sweepers take a second O_EXCL file first, so only one
-   * of them can read-then-remove at a time. The holder is dead, so nobody else can change the lock meanwhile,
-   * and a lock another process took over after the sweep before ours is never the one removed.
+   * Removes the lock when its holder is gone (its pid no longer exists). A live holder is never removed, however
+   * old its lock. The lock is claimed by an atomic rename, so only one sweeper acts on it. If the claimed file
+   * turns out not to be the one that was judged dead (another process swept and took the lock in the meantime),
+   * it is linked straight back. Never throws.
    */
   private sweepIfAbandoned(): void {
-    const sweeping = `${this.lock}.sweep`;
-    let fd: number;
-    try {
-      fd = fs.openSync(sweeping, "wx");
-    } catch {
-      // Another sweeper is at work. Its own file is itself abandoned only if it crashed mid-sweep.
-      try {
-        if (Date.now() - fs.statSync(sweeping).mtimeMs > UNNAMED_LOCK_MS) fs.unlinkSync(sweeping);
-      } catch {
-        // Gone already.
-      }
-      return;
-    }
-    fs.closeSync(fd);
     try {
       const stat = fs.statSync(this.lock);
       if (stat.isDirectory()) {
@@ -223,23 +215,23 @@ export class SharedBudget {
         return;
       }
       const raw = fs.readFileSync(this.lock, "utf8");
-      const age = Date.now() - stat.mtimeMs;
       let pid: unknown;
       try {
         pid = (JSON.parse(raw) as { pid?: unknown }).pid;
       } catch {
-        // The holder died between creating the file and writing its name.
+        // Not one of ours (empty or garbage): judged by age alone.
       }
-      const abandoned = typeof pid === "number" ? !pidAlive(pid) || age > MAX_LOCK_AGE_MS : age > UNNAMED_LOCK_MS;
-      if (abandoned) fs.unlinkSync(this.lock);
+      const abandoned = typeof pid === "number" ? !pidAlive(pid) : Date.now() - stat.mtimeMs > UNNAMED_LOCK_MS;
+      if (!abandoned) return;
+      const claimed = `${this.lock}.${process.pid}.${crypto.randomUUID()}.dead`;
+      fs.renameSync(this.lock, claimed);
+      try {
+        if (fs.readFileSync(claimed, "utf8") !== raw) fs.linkSync(claimed, this.lock);
+      } finally {
+        fs.unlinkSync(claimed);
+      }
     } catch {
       // Gone already, or not removable: the deadline decides.
-    } finally {
-      try {
-        fs.unlinkSync(sweeping);
-      } catch {
-        // Already removed as stale by another sweeper.
-      }
     }
   }
 
