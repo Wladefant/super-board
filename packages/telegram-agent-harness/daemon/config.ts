@@ -104,6 +104,16 @@ export interface DaemonSlot extends DiscoveredSlot {
    * Default: 10_000 (10 seconds).
    */
   autoAttachIntervalMs?: number;
+  /**
+   * Post a live panel at the top of every forum topic bound to a session (daemon/lane-panel.ts).
+   * Off unless set to true.
+   */
+  lanePanel?: boolean;
+  /**
+   * Mini App direct link (`https://t.me/<bot>/<app>`) for the panel's "Open in Mini App" button.
+   * The button is left out while this is unset.
+   */
+  lanePanelMiniAppLink?: string;
 }
 
 /**
@@ -172,6 +182,8 @@ export function resolveDaemonSlots(
     forumChatId?: string;
     autoAttach?: boolean;
     autoAttachIntervalMs?: number;
+    lanePanel?: boolean;
+    lanePanelMiniAppLink?: string;
   }>();
   if (fs.existsSync(manifestPath)) {
     try {
@@ -182,6 +194,8 @@ export function resolveDaemonSlots(
           forumChatId?: string | number;
           autoAttach?: boolean;
           autoAttachIntervalMs?: number;
+          lanePanel?: boolean;
+          lanePanelMiniAppLink?: string;
         }>;
       };
       if (Array.isArray(manifest.slots)) {
@@ -193,6 +207,10 @@ export function resolveDaemonSlots(
               autoAttach: typeof slot.autoAttach === "boolean" ? slot.autoAttach : undefined,
               autoAttachIntervalMs: typeof slot.autoAttachIntervalMs === "number" && slot.autoAttachIntervalMs > 0
                 ? slot.autoAttachIntervalMs
+                : undefined,
+              lanePanel: slot.lanePanel === true,
+              lanePanelMiniAppLink: typeof slot.lanePanelMiniAppLink === "string" && /^https:\/\/t\.me\/\S+$/.test(slot.lanePanelMiniAppLink)
+                ? slot.lanePanelMiniAppLink
                 : undefined,
             });
           }
@@ -211,6 +229,8 @@ export function resolveDaemonSlots(
         forumChatId: extra?.forumChatId,
         autoAttach: extra?.autoAttach ?? (extra?.mode === "forum" ? true : undefined),
         autoAttachIntervalMs: extra?.autoAttachIntervalMs,
+        lanePanel: extra?.lanePanel === true,
+        lanePanelMiniAppLink: extra?.lanePanelMiniAppLink,
         workspace: resolveWorkspace(slot.projects ?? slot.preferredProjects, candidates, slot.defaultProject),
       };
     });

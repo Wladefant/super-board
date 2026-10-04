@@ -89,6 +89,13 @@ In forum mode, the daemon automatically creates and binds Telegram forum topics 
 - **Session listing indicator**: `/sessions` marks sessions that already have an attached forum topic with a `📌` indicator.
 - **Dry run**: Test or inspect actions without contacting Telegram via `bun daemon/main.ts --reconcile-once --dry-run`.
 
+### Live Lane Panel (Opt-In)
+Set `"lanePanel": true` on a forum slot in the daemon manifest to give every topic bound to a session one pinned panel message:
+- **Content**: state (running with elapsed time, or idle since HH:MM), model, last action, child lanes with their state, and the open question that waits on the operator. An ended session leaves the panel saying so, without buttons.
+- **Updates**: the message is edited in place, only when its content changed, at most every 30 s while the session runs and every 120 s while it idles. Edits go through the Telegram governor as `panel` calls, so they use the reserved panel budget and coalesce.
+- **Buttons**: `Stop` ends the current turn (same path as `/stop`); `Steer` and `Follow-up` make the operator's next message in the topic a steer or a queued follow-up (armed for 5 minutes). Button tokens expire after 1 hour, when a newer panel replaces them, when the topic is rebound, or when the daemon restarts; a stale button answers "Expired".
+- **Mini App**: set `"lanePanelMiniAppLink": "https://t.me/<bot>/<app>"` to add an `Open in Mini App` button that opens the Mini App on the topic. Without it the button is left out.
+
 ### Commands in Forum Mode
 - `/topics` — List active topics and bound session status (`idle` / `running`)
 - `/new [workspace]` — Start a new session in workspace and open a dedicated topic

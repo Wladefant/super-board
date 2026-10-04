@@ -14,6 +14,7 @@ import {
 import { TelegramPoller } from "../extension/poller";
 import { FakeForumApiClient } from "./daemon-forum.test";
 import type { MessageCorrelationBridge } from "../extension/types";
+import { DaemonStore } from "../daemon/store";
 
 const OPERATOR_ID = "1247617658";
 const FORUM_CHAT_ID = "-10077889900";
@@ -314,4 +315,63 @@ describe("TelegramDaemon forum auto-attach runtime", () => {
       await daemon.stop();
     }
   });
+
+  for (const enabled of [false, true]) {
+    test(`lanePanel ${enabled ? "true posts and pins one panel" : "unset posts no panel"} in a bound topic`, async () => {
+      createManifest(false);
+      if (enabled) {
+        const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+        manifest.slots[0].lanePanel = true;
+        fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+      }
+      const daemonDbPath = path.join(tempDir, "daemon.db");
+      const seed = new DaemonStore(daemonDbPath);
+      seed.putRoute({ slotId: "slot-runtime-forum", chatId: FORUM_CHAT_ID, topicId: "77", sessionId: "panel-sess", workspace: "C:/dev/proj" });
+      seed.close();
+      const sent: Array<{ chatId: string | number; text: string; markup: unknown; thread?: number }> = [];
+      const pinned: number[] = [];
+      const firstPin = Promise.withResolvers<void>();
+      const fake = fakeControl();
+      const daemon = new TelegramDaemon({
+        manifestPath, poolDbPath: path.join(tempDir, "pool.db"), daemonDbPath,
+        channelsDir: path.join(tempDir, "channels"),
+        controlFactory: () => fake.control, forumClientFactory: () => new FakeForumApiClient(),
+        pollerFactory: () => Object.assign(dummyPoller(), {
+          sendTelegramMessage: async (chatId: string | number, text: string, _mode: unknown, markup: unknown, _meta: unknown, _repo: unknown, thread?: number) => {
+            sent.push({ chatId, text, markup, thread });
+            return { ok: true, result: { message_id: 900 } };
+          },
+          pinTelegramMessage: async (_chatId: string | number, messageId: number) => { pinned.push(messageId); firstPin.resolve(); return "ok"; },
+        }),
+        fleetSources: {
+          now: () => Date.now(),
+          listOwners: () => [{ version: 1, sessionId: "panel-sess", pid: process.pid, cwd: "C:/dev/proj", sessionFile: "panel.jsonl", endpoint: "", token: "" }],
+          readSession: () => ({ id: "panel-sess", cwd: "C:/dev/proj", title: "Panel lane", startedAtMs: Date.now(), mtimeMs: Date.now(), model: "x/model-a", lastAction: "bash: ls" }),
+          listChildFiles: () => [],
+          runUsage: async () => { throw new Error("usage must not run for the panel"); },
+          hostMemory: () => ({ totalBytes: 1, freeBytes: 1 }),
+          questions: () => [],
+        },
+        log: () => {},
+      });
+      await daemon.start();
+      try {
+        // The first pass starts with the slot; a disabled slot has no panel work to wait for.
+        if (enabled) await firstPin.promise;
+        const panels = sent.filter(entry => entry.text.includes("Panel lane"));
+        if (!enabled) {
+          expect(panels).toEqual([]);
+          return;
+        }
+        expect(panels).toHaveLength(1);
+        expect(panels[0]).toMatchObject({ chatId: FORUM_CHAT_ID, thread: 77 });
+        expect(panels[0]!.text).toContain("Model: <code>model-a</code>");
+        expect(JSON.stringify(panels[0]!.markup)).toContain('"callback_data":"lp:');
+        expect(JSON.stringify(panels[0]!.markup)).not.toContain("Mini App");
+        expect(pinned).toEqual([900]);
+      } finally {
+        await daemon.stop();
+      }
+    });
+  }
 });

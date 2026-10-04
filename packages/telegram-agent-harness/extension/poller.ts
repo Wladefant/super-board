@@ -48,6 +48,15 @@ export interface PollerCallbacks {
   ) => void | Promise<void>;
   onQuestionAnswer?: (decisionId: string, eventId: string, answer: { choice?: string; text?: string }) => Promise<void>;
   /**
+   * Lane panel buttons (callback data starting with {@link LANE_PANEL_CALLBACK_PREFIX}). `peek` gives the answer
+   * shown on the click at receipt, "expired" for a stale token, and must not act; `run` acts on the click from
+   * the inbound ledger.
+   */
+  lanePanel?: {
+    peek: (data: string) => string;
+    run: (data: string) => Promise<void>;
+  };
+  /**
    * Reports an HTTP 409 conflict when Telegram getUpdates reports another poller
    * instance is polling with the same bot token.
    */
@@ -59,6 +68,9 @@ export interface PollerCallbacks {
    */
   onLedgerFailure: (message: string) => void;
 }
+
+/** Callback data of lane panel buttons (daemon/lane-panel.ts) starts with this. */
+export const LANE_PANEL_CALLBACK_PREFIX = "lp:";
 
 /**
  * Stamps every inbound turn with the Telegram account it came from. A Telegram account
@@ -642,10 +654,14 @@ export class TelegramPoller {
   }
 
   /** Bot API call whose answer the caller classifies: `gone` is a message or topic that no longer exists. */
-  private async classifiedCall(method: string, body: Record<string, unknown>): Promise<"ok" | "gone" | "error"> {
+  private async classifiedCall(
+    method: string,
+    body: Record<string, unknown>,
+    kind: "message" | "panel" = "message",
+  ): Promise<"ok" | "gone" | "error"> {
     try {
       await this.paceOutbound();
-      const data = await this.botCall(method, body);
+      const data = await this.botCall(method, body, kind);
       this.observeRateLimit(data);
       if (data.ok) return "ok";
       return /not found|to delete not found|not modified/i.test(data.description ?? "") ? "gone" : "error";
@@ -660,8 +676,12 @@ export class TelegramPoller {
     return this.classifiedCall("deleteMessage", { chat_id: chatId, message_id: messageId });
   }
 
-  public pinTelegramMessage(chatId: string | number, messageId: number): Promise<"ok" | "gone" | "error"> {
-    return this.classifiedCall("pinChatMessage", { chat_id: chatId, message_id: messageId, disable_notification: true });
+  public pinTelegramMessage(
+    chatId: string | number,
+    messageId: number,
+    kind: "message" | "panel" = "message",
+  ): Promise<"ok" | "gone" | "error"> {
+    return this.classifiedCall("pinChatMessage", { chat_id: chatId, message_id: messageId, disable_notification: true }, kind);
   }
   public async answerCallbackQuery(
     callbackQueryId: string,
@@ -781,8 +801,9 @@ export class TelegramPoller {
             this.ingestUpdates(data.result);
             // Stop every click's spinner before media downloads or session delivery
             // can hold up the serial ledger queue. This acknowledges receipt only.
+            // A lane panel click is answered with its outcome here, since a query is answered only once.
             await Promise.all(data.result.flatMap(update => update.callback_query
-              ? [this.answerCallbackQuery(update.callback_query.id, "Received; checking selection.")]
+              ? [this.answerCallbackQuery(update.callback_query.id, this.receiptAnswer(update.callback_query))]
               : []));
           } catch (err: unknown) {
             this.callbacks.onLedgerFailure(
@@ -802,6 +823,16 @@ export class TelegramPoller {
         await Bun.sleep(2000);
       }
     }
+  }
+
+  /** The answer to a click at receipt. Only an allowlisted operator learns anything about a panel token. */
+  private receiptAnswer(callback: NonNullable<TelegramUpdate["callback_query"]>): string {
+    const data = callback.data ?? "";
+    if (data.startsWith(LANE_PANEL_CALLBACK_PREFIX) && this.callbacks.lanePanel
+        && this.accessConfig.allowFrom.includes(String(callback.from.id))) {
+      return this.callbacks.lanePanel.peek(data);
+    }
+    return "Received; checking selection.";
   }
 
   public ingestUpdates(updates: TelegramUpdate[]): void {
@@ -1064,6 +1095,13 @@ export class TelegramPoller {
         if (cbQueryId) await this.answerCallbackQuery(cbQueryId, "Telegram tool-call approvals are obsolete. Nothing was authorized or executed.", true);
         if (typeof row.reply_to_message_id === "number") await this.clearCallbackButtons(chatId, row.reply_to_message_id);
         this.db.run("UPDATE update_ledger SET status = 'REJECTED', error = 'OBSOLETE_TOOL_APPROVAL' WHERE update_id = ?", [row.update_id]);
+        return;
+      }
+
+      if (callbackToken.startsWith(LANE_PANEL_CALLBACK_PREFIX)) {
+        // Answered at receipt; a stale token was told it expired there, and `run` ignores it.
+        await this.callbacks.lanePanel?.run(callbackToken);
+        this.db.run("UPDATE update_ledger SET status = 'COMPLETED' WHERE update_id = ?", [row.update_id]);
         return;
       }
 
