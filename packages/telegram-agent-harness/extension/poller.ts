@@ -2,6 +2,7 @@
  * poller.ts — Long-polling Telegram Bot API transport & message dispatcher.
  */
 
+import { telegramFetch, type ResolvedAddress } from "./telegram-fetch";
 import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -120,6 +121,8 @@ export interface PollerOptions {
   sendTimeoutMs?: number;
   /** Receives one line for every outbound call that failed at the transport level. Never carries the token. */
   log?: (message: string) => void;
+  /** Overrides DNS resolution for Bot API calls. Tests use it to pin the address families. */
+  resolveHost?: (host: string) => Promise<ResolvedAddress[]>;
   botUsername?: string;
   slotId?: string;
 }
@@ -394,7 +397,7 @@ export class TelegramPoller {
     const url = `https://api.telegram.org/bot${this.botToken}/${method}`;
     for (let attempt = 0; ; attempt++) {
       try {
-        const response = await fetch(url, {
+        const response = await telegramFetch(url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
@@ -402,7 +405,7 @@ export class TelegramPoller {
             this.abortController.signal,
             AbortSignal.timeout(this.options.sendTimeoutMs ?? DEFAULT_SEND_TIMEOUT_MS),
           ]),
-        });
+        }, { resolve: this.options.resolveHost });
         return (await response.json()) as TelegramSendMessageResponse;
       } catch (err) {
         if (attempt > 0 || this.abortController.signal.aborted || !failedBeforeRequestSent(err)) throw err;
@@ -712,7 +715,7 @@ export class TelegramPoller {
       try {
         const allowedUpdates = encodeURIComponent(JSON.stringify(["message", "callback_query"]));
         const url = `https://api.telegram.org/bot${this.botToken}/getUpdates?offset=${offset}&timeout=20&allowed_updates=${allowedUpdates}`;
-        const res = await fetch(url, { signal: this.abortController.signal });
+        const res = await telegramFetch(url, { signal: this.abortController.signal });
 
         if (!res.ok) {
           if (res.status === 409) {
@@ -1228,7 +1231,7 @@ export class TelegramPoller {
     if (!row.media_json && rawText.startsWith("/")) {
       if (rawText.includes("@") && !this.botUsername) {
         try {
-          const meRes = await fetch(`https://api.telegram.org/bot${this.botToken}/getMe`, {
+          const meRes = await telegramFetch(`https://api.telegram.org/bot${this.botToken}/getMe`, {
             signal: AbortSignal.timeout(3000),
           });
           const me = (await meRes.json()) as { ok?: boolean; result?: { username?: string } };
@@ -1498,7 +1501,7 @@ export class TelegramPoller {
 
     form.set("media", JSON.stringify(mediaList));
 
-    const response = await fetch(`https://api.telegram.org/bot${this.botToken}/sendMediaGroup`, {
+    const response = await telegramFetch(`https://api.telegram.org/bot${this.botToken}/sendMediaGroup`, {
       method: "POST",
       body: form,
       signal: this.abortController.signal,
