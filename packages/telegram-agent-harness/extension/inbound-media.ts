@@ -1,4 +1,5 @@
 import * as fs from "node:fs/promises";
+import { telegramFetch } from "./telegram-fetch";
 import * as path from "node:path";
 import type { TelegramUpdate } from "./types";
 
@@ -22,13 +23,13 @@ export async function downloadInboundMedia(token: string, media: InboundMedia, d
   const boundedSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(60000)]) : AbortSignal.timeout(60000);
   let temporary: string | undefined;
   try {
-    const metadata = await fetch(`https://api.telegram.org/bot${token}/getFile`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ file_id: media.file_id }), signal: boundedSignal });
+    const metadata = await telegramFetch(`https://api.telegram.org/bot${token}/getFile`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ file_id: media.file_id }), signal: boundedSignal });
     const info = await metadata.json() as { ok?: boolean; result?: { file_path?: string; file_size?: number } };
     if (!metadata.ok || !info.ok || !info.result?.file_path) throw new Error();
     if ((info.result.file_size ?? 0) > MAX_MEDIA_BYTES) throw new Error();
     const remotePath = info.result.file_path;
     if (!/^[a-zA-Z0-9_./-]+$/.test(remotePath) || remotePath.split("/").includes("..")) throw new Error();
-    const response = await fetch(`https://api.telegram.org/file/bot${token}/${remotePath}`, { signal: boundedSignal });
+    const response = await telegramFetch(`https://api.telegram.org/file/bot${token}/${remotePath}`, { signal: boundedSignal });
     if (!response.ok || !response.body || Number(response.headers.get("content-length") ?? 0) > MAX_MEDIA_BYTES) throw new Error();
     await fs.mkdir(directory, { recursive: true });
     const destination = path.resolve(directory, `${updateId}.${ext}`);

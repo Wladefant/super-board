@@ -24,7 +24,7 @@ function poller(log: string[], extra: Record<string, unknown> = {}): TelegramPol
       onAbort: () => {}, onRelease: async () => {}, getStatusText: () => "t", onLedgerFailure: () => {},
     },
     undefined,
-    { outboundPaceMs: 0, log: m => log.push(m), ...extra },
+    { outboundPaceMs: 0, log: m => log.push(m), resolveHost: async () => [{ address: "149.154.166.110", family: 4 }], ...extra },
   );
   closers.push(() => { p.stop(); fs.rmSync(dir, { recursive: true, force: true }); });
   return p;

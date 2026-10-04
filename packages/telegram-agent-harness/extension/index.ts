@@ -10,6 +10,7 @@
  * the host session.
  */
 
+import { telegramFetch } from "./telegram-fetch";
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
@@ -507,7 +508,7 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
       if (!root) {
         const fallbackRoute = findDaemonRoute(savedContext?.sessionId, savedContext?.cwd);
         if (fallbackRoute) {
-          const res = await fetch(`https://api.telegram.org/bot${fallbackRoute.token}/sendMessage`, {
+          const res = await telegramFetch(`https://api.telegram.org/bot${fallbackRoute.token}/sendMessage`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({

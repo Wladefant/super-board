@@ -1,3 +1,4 @@
+import { telegramFetch } from "./telegram-fetch";
 import { escapeHtml } from "./sanitizer";
 
 /** The menu and help are projections of the same supported command surface. */
@@ -90,7 +91,7 @@ export async function registerTelegramCommands(
   if (forumChatId) chats.push(forumChatId);
   for (const chatId of chats) {
     try {
-      const response = await fetch(`https://api.telegram.org/bot${botToken}/setMyCommands`, {
+      const response = await telegramFetch(`https://api.telegram.org/bot${botToken}/setMyCommands`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ commands, scope: { type: "chat", chat_id: chatId }, language_code: "" }),
@@ -105,7 +106,7 @@ export async function registerTelegramCommands(
   }
   if (forumChatId) {
     try {
-      await fetch(`https://api.telegram.org/bot${botToken}/setMyCommands`, {
+      await telegramFetch(`https://api.telegram.org/bot${botToken}/setMyCommands`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ commands, scope: { type: "all_group_chats" }, language_code: "" }),
