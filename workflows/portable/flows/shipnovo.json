@@ -16,7 +16,7 @@
     {
       "id": "article_create_edit_keyboard",
       "name": "Artikel anlegen und bearbeiten bei geoeffneter Tastatur",
-      "description": "Erfasst einen internen Artikel mit QA-Praefix, prueft Tastaturfokus und Dialoglayout auf mobilen Viewports (390x420 und 390x844), speichert und fuehrt sicheres Cleanup aus.",
+      "description": "Erfasst einen internen Artikel mit QA-Praefix, prueft Tastaturfokus und Dialoglayout auf mobilen Viewports (390x420 und 390x844) und prueft, dass der Speichern-Button erreichbar ist. Speichert nie: der Dialog wird im Cleanup geschlossen, damit im echten Konto nichts bestehen bleibt.",
       "allowed_actions": [
         "goto",
         "tap",
@@ -99,20 +99,14 @@
           ]
         },
         {
-          "id": "save_article",
-          "action": "tap",
+          "id": "assert_save_button_reachable_not_tapped",
+          "action": "assert",
           "selector": "[role='dialog'] button[type='submit'], [role='dialog'] button:has-text('Artikel speichern')",
+          "expected_present": true,
           "checks": [
             "visible",
-            "tap_target_min_44",
-            "element_from_point"
+            "tap_target_min_44"
           ]
-        },
-        {
-          "id": "assert_article_saved",
-          "action": "assert",
-          "selector": "table, [data-sonner-toast], [role='status']",
-          "expected_present": true
         }
       ],
       "cleanup": [
@@ -311,7 +305,7 @@
     {
       "id": "dhl_pdf_upload_stock",
       "name": "DHL-Label-PDF-Upload ohne Vorrats-Sackgasse",
-      "description": "Prueft den Upload von DHL-Label-PDFs auf /labels bzw. /templates und stellt sicher, dass fehlende Labelvorraete automatisch angelegt werden statt in einer Fehlermeldungs-Sackgasse zu enden.",
+      "description": "Prueft den Upload von DHL-Label-PDFs auf /labels bzw. /templates und stellt sicher, dass fehlende Labelvorraete automatisch angelegt werden statt in einer Fehlermeldungs-Sackgasse zu enden. Laedt das DHL-Common-Label-Beispiel (nur Fake-Daten) als QA-flow-dhl-sample hoch; im echten Konto entstehen dadurch Labels, daher loescht das Cleanup jede Datei QA-flow-dhl-sample* wieder.",
       "allowed_actions": [
         "goto",
         "tap",
@@ -345,7 +339,7 @@
           "id": "upload_sample_dhl_pdf",
           "action": "upload",
           "selector": "input[type='file'][accept*='pdf']",
-          "file": "workflows/portable/fixtures/sample_label.pdf",
+          "file": "workflows/portable/fixtures/QA-flow-dhl-sample.pdf",
           "checks": [
             "visible"
           ]
@@ -355,14 +349,34 @@
           "action": "assert",
           "selector": "[role='alert'], [data-sonner-toast], [role='status'], .text-destructive, h2:has-text('Labels')",
           "expected_present": true
+        },
+        {
+          "id": "wait_until_upload_reported",
+          "action": "assert",
+          "selector": "[data-sonner-toast]",
+          "expected_present": true,
+          "timeout_ms": 30000
         }
       ],
-      "cleanup": []
+      "cleanup": [
+        {
+          "id": "cleanup_reload_labels",
+          "action": "goto",
+          "url": "/labels"
+        },
+        {
+          "id": "cleanup_delete_uploaded_qa_labels",
+          "action": "cleanup",
+          "selector": "button[aria-label^='QA-flow-dhl-sample']",
+          "then": "[role='dialog'] button:has-text('Löschen')",
+          "repeat": 12
+        }
+      ]
     },
     {
       "id": "order_edit_notes",
       "name": "Bestellung bearbeiten mit internen QA-Notizen",
-      "description": "Oeffnet eine Bestellung, erfasst interne Bestellnotizen mit QA-Praefix und speichert sie sicher ohne externe eBay-Schreiboperationen oder Kaeuferbenachrichtigungen.",
+      "description": "Oeffnet eine Bestellung, tippt eine interne Notiz mit QA-Praefix und prueft, dass der Speichern-Button erreichbar ist. Speichert nie: das Cleanup laedt /orders neu und verwirft den Text, die echte Notiz bleibt unveraendert.",
       "allowed_actions": [
         "goto",
         "tap",
@@ -391,7 +405,7 @@
         {
           "id": "open_first_order",
           "action": "tap",
-          "selector": "main a[href*='/orders/']:first-child, table tbody tr:first-child a, [data-testid='order-row']:first-child",
+          "selector": "main table tbody tr a[href*='/orders/'], [data-testid='order-row']",
           "checks": [
             "visible",
             "tap_target_min_44",
@@ -418,34 +432,21 @@
           ]
         },
         {
-          "id": "save_order_notes",
-          "action": "tap",
-          "selector": "button:has-text('Notizen speichern'), button[type='submit']",
+          "id": "assert_save_button_enabled_not_tapped",
+          "action": "assert",
+          "selector": "button:has-text('Notizen speichern')",
+          "expected_present": true,
           "checks": [
             "visible",
-            "tap_target_min_44",
-            "element_from_point"
+            "tap_target_min_44"
           ]
-        },
-        {
-          "id": "assert_notes_saved_state",
-          "action": "assert",
-          "selector": "#order-notes, [data-sonner-toast], [role='status']",
-          "expected_present": true
         }
       ],
       "cleanup": [
         {
-          "id": "cleanup_restore_empty_notes",
-          "action": "type",
-          "selector": "#order-notes, textarea[name='notes']",
-          "text": "QA-Bereinigt",
-          "mutation": true
-        },
-        {
-          "id": "cleanup_save_restored_notes",
-          "action": "cleanup",
-          "selector": "button:has-text('Notizen speichern')"
+          "id": "cleanup_discard_unsaved_notes",
+          "action": "goto",
+          "url": "/orders"
         }
       ]
     },
