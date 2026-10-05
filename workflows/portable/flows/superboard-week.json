@@ -1,7 +1,7 @@
 {
   "schema": "flow-qa/v1",
   "project": "superboard-week",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Flow QA for the Superboard Week view against the fixture preview (bun scripts/week-preview.ts in packages/telegram-agent-harness). Covers week navigation, the detail dialog, prev/next disabled until a week is known, the error and loading states, the busy week, the calendar switcher in a short viewport, and picking a calendar from its listbox (popover on desktop, bottom sheet on a phone). Read-only: the page has no data mutations, and the page has no text input, so no step opens a soft keyboard.",
   "viewports": [
     "390x844",
@@ -34,7 +34,7 @@
         { "id": "assert_close_unobstructed", "action": "assert", "selector": "#detail[open] #detail-close", "checks": ["visible", "element_from_point"] },
         { "id": "close_detail", "action": "cleanup", "selector": "#detail-close" },
         { "id": "assert_detail_closed", "action": "assert", "selector": "#detail:not([open])", "expected_present": true },
-        { "id": "check_calendar_switcher", "action": "assert", "selector": "#board", "expected_present": true, "checks": ["visible", "tap_target_min_44", "element_from_point"] }
+        { "id": "check_calendar_switcher", "action": "assert", "selector": "#board", "expected_present": true, "checks": ["visible", "tap_target_min_44"], "note": "No element_from_point here: an assert does not scroll, and the open_stopped_lane tap scrolled the page to the summary, so the switcher sits above the viewport. week_calendar_picker taps the switcher with element_from_point." }
       ],
       "cleanup": []
     },

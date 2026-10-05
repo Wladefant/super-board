@@ -1,0 +1,35 @@
+{
+  "schema": 1,
+  "project": "super-board",
+  "stage": "greenfield",
+  "dns": { "provider": "cloudflare", "zones": ["wladefant.de"] },
+  "components": [
+    {
+      "name": "super-board-week",
+      "kind": "web",
+      "host": "dokploy-app",
+      "url": "https://week.wladefant.de",
+      "dokploy_app_id": "nL9_otGMouU_P77Fvscdn",
+      "monthly_cost_usd": null
+    },
+    {
+      "name": "super-board-miniapp",
+      "kind": "web",
+      "host": "dokploy-app",
+      "url": null,
+      "dokploy_app_id": "4SKIT_eBv6f8G15bMJ59f",
+      "monthly_cost_usd": null
+    },
+    {
+      "name": "hindsight",
+      "kind": "api",
+      "host": "dokploy-app",
+      "url": "https://hindsight.wladefant.de",
+      "dokploy_app_id": "8e8FsHi2iEHScw2cwyuc5",
+      "monthly_cost_usd": null
+    }
+  ],
+  "supabase": { "in_use": false },
+  "next_migration_step": "Put a cost on each component. Dokploy runs all three; DNS is already on Cloudflare.",
+  "exempt": null
+}
