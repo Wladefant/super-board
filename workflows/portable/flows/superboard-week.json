@@ -1,8 +1,8 @@
 {
   "schema": "flow-qa/v1",
   "project": "superboard-week",
-  "version": "1.1.0",
-  "description": "Flow QA for the Superboard Week view against the fixture preview (bun scripts/week-preview.ts in packages/telegram-agent-harness). Covers week navigation, the detail dialog, prev/next disabled until a week is known, the error and loading states, the busy week, the calendar switcher with the keyboard open, and picking a calendar from its listbox (popover on desktop, bottom sheet on a phone). Read-only: the page has no data mutations.",
+  "version": "1.1.1",
+  "description": "Flow QA for the Superboard Week view against the fixture preview (bun scripts/week-preview.ts in packages/telegram-agent-harness). Covers week navigation, the detail dialog, prev/next disabled until a week is known, the error and loading states, the busy week, the calendar switcher in a short viewport, and picking a calendar from its listbox (popover on desktop, bottom sheet on a phone). Read-only: the page has no data mutations, and the page has no text input, so no step opens a soft keyboard.",
   "viewports": [
     "390x844",
     "390x420",
@@ -17,7 +17,7 @@
       "id": "week_nav_and_detail",
       "name": "Step through weeks and open a lane",
       "description": "Loads a week, taps prev, next and This week without a reload, opens a stopped lane from the summary and closes it again.",
-      "allowed_actions": ["goto", "tap", "assert", "cleanup", "keyboard-open"],
+      "allowed_actions": ["goto", "tap", "assert", "cleanup"],
       "forbidden_actions": ["eval", "prod_access"],
       "steps": [
         { "id": "goto_week", "action": "goto", "url": "/?scenario=normal&week=2026-09-28&board=all" },
@@ -34,7 +34,7 @@
         { "id": "assert_close_unobstructed", "action": "assert", "selector": "#detail[open] #detail-close", "checks": ["visible", "element_from_point"] },
         { "id": "close_detail", "action": "cleanup", "selector": "#detail-close" },
         { "id": "assert_detail_closed", "action": "assert", "selector": "#detail:not([open])", "expected_present": true },
-        { "id": "focus_calendar_switcher", "action": "keyboard-open", "selector": "#board", "checks": ["visible", "tap_target_min_44", "element_from_point", "input_focus_in_viewport"] }
+        { "id": "check_calendar_switcher", "action": "assert", "selector": "#board", "expected_present": true, "checks": ["visible", "tap_target_min_44", "element_from_point"] }
       ],
       "cleanup": []
     },

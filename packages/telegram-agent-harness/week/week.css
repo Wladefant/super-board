@@ -208,7 +208,7 @@ h1 { font-size: 28px; letter-spacing: -0.03em; margin-top: var(--s1); font-varia
 }
 .option::before { content: ''; }
 .option[aria-selected="true"] { background: var(--panel-2); border-color: #405077; font-weight: 600; }
-.option[aria-selected="true"]::before { content: '✓'; color: var(--accent); }
+.option[aria-selected="true"]::before { content: '✓' / ''; color: var(--accent); }
 .option:hover { background: var(--panel-2); }
 .option-label { overflow-wrap: anywhere; }
 .option-count { color: var(--muted); font-size: 13px; font-weight: 400; }

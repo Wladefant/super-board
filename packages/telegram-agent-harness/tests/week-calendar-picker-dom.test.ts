@@ -54,6 +54,11 @@ describe("calendar switcher", () => {
     const selected = options().filter(o => o.getAttribute("aria-selected") === "true");
     expect(selected.map(o => o.getAttribute("data-value"))).toEqual(["all"]);
     expect(doc().activeElement).toBe(selected[0]);
+    // The page behind the modal dialog is inert, so the name must come from inside the dialog.
+    const list = doc().querySelector("#detail [role=listbox]")!;
+    const nameIds = list.getAttribute("aria-labelledby")!.split(" ");
+    expect(nameIds.map(id => doc().getElementById(id)?.closest("#detail")).every(Boolean)).toBe(true);
+    expect(nameIds.map(id => doc().getElementById(id)!.textContent).join(" ")).toBe("Calendar");
   });
 
   test("arrow keys, Home and End move through the options", () => {
@@ -87,6 +92,8 @@ describe("calendar switcher", () => {
     const picked = doc().activeElement!;
     const value = picked.getAttribute("data-value")!;
     const label = picked.querySelector(".option-label")!.textContent!;
+    const lanes = picked.querySelector(".option-count")!.textContent!;
+    const rowsBefore = doc().querySelectorAll("#agenda .row").length;
     expect(value).not.toBe("all");
     key(picked, "Enter");
     await page.quiescent();
@@ -98,6 +105,9 @@ describe("calendar switcher", () => {
     expect(new URL(page.window.location.href).searchParams.get("week")).toBe("2026-09-28");
     expect(page.window.localStorage.getItem("superboard.week.board")).toBe(value);
     expect(control().textContent).toContain(label);
+    // The loaded week is filtered to the picked calendar: the stats and the agenda follow.
+    expect(doc().getElementById("stats")!.textContent).toStartWith(lanes);
+    expect(doc().querySelectorAll("#agenda .row").length).toBeLessThan(rowsBefore);
     // The filter runs on the loaded week: picking a calendar fetches nothing and reloads nothing.
     expect(weekRequests).toBe(before);
   });
@@ -109,5 +119,34 @@ describe("calendar switcher", () => {
     expect(isOpen()).toBe(false);
     expect(boardParam()).toBe("all");
     expect(control().textContent).toContain("All boards");
+  });
+});
+
+describe("calendar switcher with no week loaded", () => {
+  let failed: WeekPage;
+  beforeAll(async () => {
+    failed = await openWeekPage(request => {
+      const path = new URL(request.url).pathname;
+      if (path === "/api/session") return Response.json({ appSession: "test" });
+      return Response.json({ error: "relay not connected" }, { status: 503 });
+    }, "/?week=2026-09-28&board=kind%3Ashipnovo");
+  });
+  afterAll(() => failed.close());
+
+  test("a board that is not in the list still leaves one option to focus and pick", async () => {
+    const d = failed.window.document;
+    d.getElementById("board")!.click();
+    const opts = [...d.querySelectorAll("#detail [role=listbox] [role=option]")];
+    expect(opts.map(o => o.getAttribute("data-value"))).toEqual(["all", "unassigned"]);
+    expect(opts.filter(o => o.getAttribute("aria-selected") === "true")).toEqual([]);
+    expect(opts.map(o => o.getAttribute("tabindex"))).toEqual(["0", "-1"]);
+    expect(d.activeElement).toBe(opts[0]);
+    d.activeElement!.dispatchEvent(new failed.window.KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true }));
+    expect(d.activeElement).toBe(opts[1]);
+    d.activeElement!.dispatchEvent(new failed.window.KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    await failed.quiescent();
+    expect(d.getElementById("detail")!.hasAttribute("open")).toBe(false);
+    expect(new URL(failed.window.location.href).searchParams.get("board")).toBe("unassigned");
+    expect(d.getElementById("board")!.textContent).toContain("Unassigned");
   });
 });

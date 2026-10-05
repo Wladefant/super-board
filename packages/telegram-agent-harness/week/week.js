@@ -439,13 +439,16 @@ function openPicker() {
   const group = (id, label, items) => items.length
     ? el('div', { role: 'group', class: 'option-group', 'aria-labelledby': id }, el('p', { id, class: 'option-group-title' }, label), items.map(option))
     : null;
-  const list = el('div', { role: 'listbox', class: 'options', 'aria-labelledby': 'board-label', onkeydown: pickerKey, onclick: event => {
+  const list = el('div', { role: 'listbox', class: 'options', 'aria-labelledby': 'detail-title', onkeydown: pickerKey, onclick: event => {
     const picked = event.target.closest('[role=option]');
     if (picked) pick(picked.dataset.value);
   } }, option(opts.all), group('opts-kinds', 'Calendars by kind', opts.kinds), group('opts-boards', 'Boards', opts.boards), option(opts.unassigned));
   openDialog($('board'), 'Calendar', [list], true);
   $('board').setAttribute('aria-expanded', 'true');
-  list.querySelector('[aria-selected="true"]')?.focus();
+  // A board from the URL or storage may not be in the list (no week loaded): the first option then takes focus.
+  const current = list.querySelector('[aria-selected="true"]') || list.querySelector('[role=option]');
+  current.tabIndex = 0;
+  current.focus();
 }
 
 /** Arrow keys, Home and End move through the options; Enter or Space picks; Escape closes unchanged. */
