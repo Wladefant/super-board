@@ -9,6 +9,8 @@ export interface MiniAppOptions {
   sessions: () => Promise<unknown>;
   dashboard: (userId: string, sessionId?: string | null) => unknown;
   status: () => unknown;
+  /** `GET /api/week?start=&board=&kind=`; absent = the route answers 404. */
+  week?: (query: { start: string | null; board: string | null; kind: string | null }) => Promise<unknown>;
 }
 export async function miniAppRequest(request: MiniAppRequest, options: MiniAppOptions) {
   let user: string;
@@ -66,6 +68,10 @@ export async function miniAppRequest(request: MiniAppRequest, options: MiniAppOp
         status: options.status(),
         dashboard: options.dashboard(user, session),
       });
+    }
+    if (reqPath === "/api/week" && request.method === "GET" && options.week) {
+      try { return respond(200, await options.week({ start: queryParams?.get("start") ?? null, board: queryParams?.get("board") ?? null, kind: queryParams?.get("kind") ?? null })); }
+      catch { return respond(503, { error: "Week data is unavailable on this PC right now." }); }
     }
     if (reqPath === "/api/approval" && request.method === "POST") {
       return respond(410, { error: "Telegram tool-call approvals have been removed. No operation was authorized or executed." });

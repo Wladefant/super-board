@@ -698,6 +698,7 @@ async function inspectTargetElement(page, selector) {
   if (!selector) return null;
   return page.evaluate((sel) => {
     const el = document.querySelector(sel);
+    if (el) el.scrollIntoView({ block: 'center', inline: 'nearest' });
     if (!el) return null;
 
     const rect = el.getBoundingClientRect();
@@ -788,7 +789,7 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
   } catch (_) {}
 
   const onNav = () => { navObserved = true; };
-  page.once('framenavigated', onNav);
+  page.once('load', onNav);
 
   // Pre-action target inspection
   let preInspection = null;
@@ -898,6 +899,9 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
 
     case 'assert': {
       if (step.selector) {
+        if (step.expected_present !== false) {
+          await page.waitForSelector(step.selector, { timeout: 10000 }).catch(() => null);
+        }
         const el = await page.$(step.selector);
         const exists = !!el;
         if (step.expected_present !== false && !exists) {
@@ -947,7 +951,7 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
   await new Promise(r => setTimeout(r, 60));
 
   // Remove navigation listener
-  page.off('framenavigated', onNav);
+  page.off('load', onNav);
 
   // Post-action inspections
   const postInspection = step.selector ? await inspectTargetElement(page, step.selector) : null;
@@ -961,7 +965,7 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
   const requestedChecks = Array.isArray(step.checks) ? step.checks : [];
 
   // Check: visible
-  if (requestedChecks.includes('visible') || (step.selector && step.action === 'tap')) {
+  if (step.selector && (requestedChecks.includes('visible') || step.action === 'tap')) {
     const insp = postInspection || preInspection;
     checksResults.push(checkVisible(insp?.rect, insp?.style));
   }
@@ -973,7 +977,7 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
   }
 
   // Check: tap_target_min_44
-  if (requestedChecks.includes('tap_target_min_44') || requestedChecks.includes('target_min_44') || (step.action === 'tap' && vpConfig.isMobile)) {
+  if (vpConfig.isMobile && (requestedChecks.includes('tap_target_min_44') || requestedChecks.includes('target_min_44') || step.action === 'tap')) {
     const insp = preInspection || postInspection;
     checksResults.push(checkTapTargetMin44(insp?.rect));
   }

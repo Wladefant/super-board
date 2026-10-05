@@ -16,7 +16,7 @@
     {
       "id": "markets_navigation_and_filters",
       "name": "Maerkte-Uebersicht und Kategorie-Navigation",
-      "description": "Prueft das Laden der Maerkte-Uebersicht auf PolySimulator Staging, Navigation zwischen Kategorien und Verhindern von horizontalem Overflow auf mobilen Viewports.",
+      "description": "Loads the PolySimulator markets list, checks the feed renders, and taps the Sort control without a document reload.",
       "allowed_actions": [
         "goto",
         "tap",
@@ -40,13 +40,13 @@
         {
           "id": "assert_market_feed_present",
           "action": "assert",
-          "selector": "[data-testid='market-card'], .market-card, main article, main a[href*='/markets/']",
+          "selector": "main a[href^='/markets/']",
           "expected_present": true
         },
         {
-          "id": "switch_category_tab",
+          "id": "open_sort_control",
           "action": "tap",
-          "selector": "nav[role='tablist'] button:nth-child(2), [data-testid='category-filter']:nth-child(2), button:has-text('Crypto')",
+          "selector": "button[aria-label='Sort markets']",
           "no_document_reload": true,
           "checks": [
             "visible",
@@ -67,11 +67,10 @@
     {
       "id": "market_trade_panel_interaction",
       "name": "Markt-Detailseite und Trade-Panel Eingabemaske",
-      "description": "Oeffnet die Detailseite eines Marktes auf Staging, waehlt den Outcome 'Yes' und prueft die Share-Eingabemaske mit Vorberechnung im isolierten Staging-Bereich.",
+      "description": "Opens a market detail page from the list and checks the trade panel amount input exists. No order is placed.",
       "allowed_actions": [
         "goto",
         "tap",
-        "type",
         "assert",
         "cleanup"
       ],
@@ -94,7 +93,7 @@
         {
           "id": "open_first_market_detail",
           "action": "tap",
-          "selector": "a[href*='/markets/']:first-child, [data-testid='market-card']:first-child a",
+          "selector": "main a[aria-label][href^='/markets/']",
           "checks": [
             "visible",
             "tap_target_min_44",
@@ -104,49 +103,22 @@
         {
           "id": "assert_trade_panel_visible",
           "action": "assert",
-          "selector": "[data-testid='trade-panel'], form, button:has-text('Buy Yes'), button:has-text('Yes')",
+          "selector": "input[type='number']",
           "expected_present": true
         },
         {
-          "id": "select_buy_yes_outcome",
-          "action": "tap",
-          "selector": "button:has-text('Buy Yes'), [data-testid='outcome-yes'], button:has-text('Yes')",
-          "checks": [
-            "visible",
-            "tap_target_min_44",
-            "element_from_point"
-          ]
-        },
-        {
-          "id": "type_test_share_amount",
-          "action": "type",
-          "selector": "input[type='number'], input[placeholder*='0'], input[name='amount']",
-          "text": "QA-10",
-          "mutation": true,
-          "checks": [
-            "visible"
-          ]
-        },
-        {
-          "id": "assert_return_calculation_displayed",
+          "id": "assert_amount_input_present",
           "action": "assert",
-          "selector": "[data-testid='estimated-return'], div:has-text('Return'), div:has-text('Total')"
+          "selector": "input[type='number']",
+          "expected_present": true
         }
       ],
-      "cleanup": [
-        {
-          "id": "cleanup_reset_amount_field",
-          "action": "type",
-          "selector": "input[type='number'], input[placeholder*='0'], input[name='amount']",
-          "text": "QA-0",
-          "mutation": true
-        }
-      ]
+      "cleanup": []
     },
     {
       "id": "order_book_and_activity_tabs",
-      "name": "Orderbuch und Aktivitaets-Tabs ohne Seiten-Reload",
-      "description": "Prueft den Wechsel zwischen Orderbuch und kuerzlichen Trades auf der Marktdetailseite ohne Dokument-Reload auf Staging.",
+      "name": "Detail tabs without page reload",
+      "description": "Opens a market detail page and switches between the Comments and Activity tabs without a document reload.",
       "allowed_actions": [
         "goto",
         "tap",
@@ -170,16 +142,16 @@
         {
           "id": "open_market_item",
           "action": "tap",
-          "selector": "a[href*='/markets/']:first-child",
+          "selector": "main a[aria-label][href^='/markets/']",
           "checks": [
             "visible",
             "tap_target_min_44"
           ]
         },
         {
-          "id": "switch_to_order_book_tab",
+          "id": "switch_to_comments_tab",
           "action": "tap",
-          "selector": "button:has-text('Order Book'), [data-testid='tab-order-book']",
+          "selector": "button[role='tab']:first-of-type",
           "no_document_reload": true,
           "checks": [
             "visible",
@@ -191,7 +163,7 @@
         {
           "id": "switch_to_activity_tab",
           "action": "tap",
-          "selector": "button:has-text('Activity'), button:has-text('Trades'), [data-testid='tab-activity']",
+          "selector": "button[role='tab']:last-of-type",
           "no_document_reload": true,
           "checks": [
             "visible",

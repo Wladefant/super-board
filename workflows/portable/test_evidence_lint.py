@@ -105,5 +105,55 @@ class HtmlExtraction(unittest.TestCase):
             el.fetch_rendered_html("https://example.com/x")
 
 
+class DoneReport(unittest.TestCase):
+    def kinds(self, body, deleted=None):
+        return sorted(v.form for v in el.lint_done_report(body, deleted))
+
+    def test_body_without_the_lines_fails(self):
+        self.assertEqual(self.kinds("Summary only."), ["missing-deleted", "missing-not-run"])
+
+    def test_body_with_none_lines_passes(self):
+        self.assertEqual(self.kinds("Deleted: none\nNot run: none\n"), [])
+
+    def test_lists_and_markdown_decoration_pass(self):
+        self.assertEqual(self.kinds("- **Deleted:** old.py, docs/old.md\n* Not run: e2e (no browser)\n"), [])
+
+    def test_empty_template_lines_count_as_missing(self):
+        self.assertEqual(self.kinds("Deleted: \nNot run: \n"), ["missing-deleted", "missing-not-run"])
+
+    def test_html_comment_and_code_fence_do_not_count(self):
+        body = "<!-- Deleted: none -->\n```\nNot run: none\n```\n"
+        self.assertEqual(self.kinds(body), ["missing-deleted", "missing-not-run"])
+
+    def test_deleted_none_with_deleted_files_is_flagged(self):
+        self.assertEqual(self.kinds("Deleted: none\nNot run: none", ["a/old.py"]), ["deleted-mismatch"])
+
+    def test_deleted_list_with_deleted_files_passes(self):
+        self.assertEqual(self.kinds("Deleted: a/old.py\nNot run: none", ["a/old.py"]), [])
+
+    def test_deleted_paths_come_from_change_type(self):
+        files = [{"path": "a", "changeType": "DELETED"}, {"path": "b", "changeType": "MODIFIED"}]
+        self.assertEqual(el._deleted_paths(files), ["a"])
+
+    def test_cli_warn_only_exits_zero_and_strict_exits_one(self):
+        import io, contextlib, tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf8") as fh:
+            fh.write("no report here")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(el.main(["done-report", fh.name, "--warn-only"]), 0)
+            self.assertEqual(el.main(["done-report", fh.name]), 1)
+        os.unlink(fh.name)
+        self.assertIn("WARN", buf.getvalue())
+        self.assertIn("FAIL", buf.getvalue())
+
+    def test_recap_template_always_renders_both_lines(self):
+        import github_plan_templates as gpt
+        recap = gpt.GitHubPrRecap(pr_number=1, head_sha="a" * 40, base_branch="main", title="t", summary="s")
+        self.assertEqual(el.lint_done_report(recap.render()), [])
+        recap.deleted = ["x.py"]
+        self.assertIn("Deleted: x.py", recap.render())
+
+
 if __name__ == "__main__":
     unittest.main()
