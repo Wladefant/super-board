@@ -18,8 +18,8 @@ const MIN = 60_000;
 const HOUR = 60 * MIN;
 const T0 = Date.UTC(2026, 9, 5, 8, 0); // Monday 2026-10-05 08:00Z
 const BOARDS: BoardInfo[] = [
-  { id: "Wladefant/5", title: "Superboard", kind: "veyyon-lanes", color: "#22d3ee", repos: ["Wladefant/super-board", "Wladefant/veyyon"] },
-  { id: "Bavariance/1", title: "Polysimulator", kind: "polysimulator", color: "#6366f1", repos: ["Bavariance/polysimulator"] },
+  { id: "Wladefant/5", title: "Superboard", kind: "veyyon-lanes", color: "#22d3ee", repos: ["Wladefant/super-board", "Wladefant/veyyon"], owner: "Wladefant", number: 5, dateField: "Target Date" },
+  { id: "Bavariance/1", title: "Polysimulator", kind: "polysimulator", color: "#6366f1", repos: ["Bavariance/polysimulator"], owner: "Bavariance", number: 1, dateField: "Target Date" },
 ];
 
 function block(over: Partial<WeekBlock> & { startMs: number; endMs: number }): WeekBlock {
@@ -257,12 +257,12 @@ describe("GET /api/week and static files", () => {
   }
 
   test("401 without a valid app session, 200 JSON with one", async () => {
-    const opts = options(async start => ({ version: 1, start }));
+    const opts = options(async query => ({ version: 1, start: query.start, board: query.board, kind: query.kind }));
     const denied = await miniAppRequest({ id: "1", path: "/api/week?start=5", method: "GET", initData: "", appSession: "bad", body: "" }, opts);
     expect(denied.status).toBe(401);
-    const ok = await miniAppRequest({ id: "2", path: "/api/week?start=5", method: "GET", initData: "", appSession: issueAppSession("42", opts.token), body: "" }, opts);
+    const ok = await miniAppRequest({ id: "2", path: "/api/week?start=5&board=Bavariance%2F1&kind=polysimulator", method: "GET", initData: "", appSession: issueAppSession("42", opts.token), body: "" }, opts);
     expect(ok.status).toBe(200);
-    expect(ok.data).toEqual({ version: 1, start: "5" });
+    expect(ok.data).toEqual({ version: 1, start: "5", board: "Bavariance/1", kind: "polysimulator" });
   });
 
   test("static allow-list serves flat web files and the shared client, refuses everything else", () => {

@@ -35,9 +35,27 @@ export interface WeekBlock extends SessionBlock {
   live: boolean;
 }
 
-export interface BoardInfo { id: string; title: string; kind: string; color: string; repos: string[] }
+export interface BoardInfo { id: string; title: string; kind: string; color: string; repos: string[]; owner: string; number: number; dateField: string | null }
 
 export interface WeekPullRequest { repo: string; number: number; title: string; url: string; state: string; mergedAt: string | null; branch: string }
+
+/** One project card placed in the week (issue #482). `derived` = placed by activity, not by a planned date. */
+export interface WeekCard {
+  boardId: string;
+  kind: string;
+  title: string;
+  url: string | null;
+  repo: string | null;
+  number: number | null;
+  type: "issue" | "pr" | "draft";
+  state: "OPEN" | "CLOSED" | "MERGED";
+  /** Placement (ms). For a planned range this is its start. */
+  at: number;
+  /** End of a planned range longer than a day; null otherwise. */
+  endAt: number | null;
+  source: "target" | "start" | "iteration" | "activity";
+  derived: boolean;
+}
 
 export interface WeekData {
   version: 1;
@@ -59,8 +77,11 @@ export interface WeekData {
   noCommitBlocks: string[];
   report: [string, string, string];
   pullRequests: WeekPullRequest[];
+  /** Project cards placed in this week, one entry per (board, card). */
+  cards: WeekCard[];
+  cardTotals: { cards: number; planned: number; derived: number };
   /** For the dropdown: every board with the projects seen this week that belong to it. */
-  boards: (BoardInfo & { projects: string[] })[];
+  boards: (BoardInfo & { projects: string[]; cards: number })[];
 }
 
 // ------------------------------------------------------------------ time zone
@@ -155,6 +176,7 @@ export interface SummaryInput {
   asOf: number;
   boards: BoardInfo[];
   pullRequests?: WeekPullRequest[];
+  cards?: WeekCard[];
   stale?: boolean;
   staleReason?: string | null;
 }
@@ -204,6 +226,7 @@ export function summarizeWeek(input: SummaryInput): WeekData {
   const activeMs = unionMs(clip(all, weekStart, weekEnd));
   const sessionMs = clip(all, weekStart, weekEnd).reduce((sum, [s, e]) => sum + (e - s), 0);
   const prs = input.pullRequests ?? [];
+  const cards = input.cards ?? [];
   const merged = prs.filter(pr => pr.mergedAt).length;
 
   const top = projects[0];
@@ -232,7 +255,9 @@ export function summarizeWeek(input: SummaryInput): WeekData {
     noCommitBlocks: noCommit.map(b => `${b.sessionId}:${b.startMs}`),
     report,
     pullRequests: prs,
-    boards: input.boards.map(b => ({ ...b, projects: [...seen].filter(p => boardsForProject(p, [b]).length > 0).sort() })),
+    cards,
+    cardTotals: { cards: cards.length, planned: cards.length - cards.filter(c => c.derived).length, derived: cards.filter(c => c.derived).length },
+    boards: input.boards.map(b => ({ ...b, projects: [...seen].filter(p => boardsForProject(p, [b]).length > 0).sort(), cards: cards.filter(c => c.boardId === b.id).length })),
   };
 }
 

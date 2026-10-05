@@ -53,34 +53,43 @@ export function parsePullRequests(raw: unknown): WeekPullRequest[] {
 
 export class GithubReader {
   private last: GithubResult | null = null;
-  private inflight: Promise<GithubResult> | null = null;
+  private lastSince = 0;
+  private inflight: { since: number; promise: Promise<GithubResult> } | null = null;
   private checkedAt = 0;
 
   constructor(private readonly deps: GithubReaderDeps, private readonly owners: string[], private readonly cacheMs = GITHUB_CACHE_MS) {}
 
   read(sinceMs: number): Promise<GithubResult> {
-    // One refresh at a time: concurrent requests share it instead of each taking a quota reading.
-    this.inflight ??= this.refresh(sinceMs).finally(() => { this.inflight = null; });
-    return this.inflight;
+    // One refresh per week at a time: concurrent requests for it share one quota reading.
+    if (this.inflight?.since === sinceMs) return this.inflight.promise;
+    const previous = this.inflight?.promise.catch(() => undefined) ?? Promise.resolve();
+    const promise = previous.then(() => this.refresh(sinceMs));
+    const entry = { since: sinceMs, promise };
+    this.inflight = entry;
+    void promise.finally(() => { if (this.inflight === entry) this.inflight = null; }).catch(() => undefined);
+    return promise;
   }
 
   private async refresh(sinceMs: number): Promise<GithubResult> {
     const now = this.deps.now();
-    if (this.last && !this.last.stale && now - this.last.fetchedAt < this.cacheMs) return this.last;
-    if (this.last?.stale && now - this.checkedAt < GITHUB_RETRY_MS) return this.last;
+    if (this.last && this.lastSince === sinceMs && !this.last.stale && now - this.last.fetchedAt < this.cacheMs) return this.last;
+    if (this.last?.stale && this.lastSince === sinceMs && now - this.checkedAt < GITHUB_RETRY_MS) return this.last;
     this.checkedAt = now;
     const code = await this.deps.guard(GITHUB_QUERY_COST * this.owners.length);
-    if (code !== 0) return this.stale(now, code === 75 ? "GitHub quota reserve reached; showing the last snapshot." : "GitHub guard unavailable; showing the last snapshot.");
+    if (code !== 0) return this.stale(now, code === 75 ? "GitHub quota reserve reached; showing the last snapshot." : "GitHub guard unavailable; showing the last snapshot.", sinceMs);
     try {
       const raw = await this.deps.graphql(buildQuery(this.owners, new Date(sinceMs).toISOString()));
       this.last = { pullRequests: parsePullRequests(raw), fetchedAt: now, stale: false, staleReason: null };
+      this.lastSince = sinceMs;
       return this.last;
     } catch {
-      return this.stale(now, "GitHub read failed; showing the last snapshot.");
+      return this.stale(now, "GitHub read failed; showing the last snapshot.", sinceMs);
     }
   }
 
-  private stale(now: number, reason: string): GithubResult {
+  private stale(now: number, reason: string, sinceMs: number): GithubResult {
+    // Only the week we last read may be served stale; another week gets an empty list, never the wrong PRs.
+    if (this.last && this.lastSince !== sinceMs) return { pullRequests: [], fetchedAt: 0, stale: true, staleReason: reason };
     const previous = this.last ?? { pullRequests: [], fetchedAt: 0, stale: true, staleReason: null };
     this.last = { ...previous, stale: true, staleReason: reason };
     return this.last;

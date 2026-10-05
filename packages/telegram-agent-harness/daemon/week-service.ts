@@ -6,7 +6,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { FleetSnapshot } from "./fleet-state";
-import { defaultGithubDeps, GithubReader } from "./week-github";
+import { defaultGithubDeps, GithubReader, type GithubReaderDeps } from "./week-github";
+import { CardsReader, filterWeek, placeCards, type WeekFilter, type WeekQuery } from "./week-boards";
 import { gitCommitCounter, scanSessionRoot, withCommits, type CommitCounter } from "./week-sessions";
 import { WeekStore } from "./week-store";
 import { resolveSessionsRoots } from "./session-control";
@@ -18,6 +19,7 @@ export interface WeekServiceOptions {
   sessionRoots: string[];
   boards: BoardInfo[];
   github?: GithubReader;
+  cards?: CardsReader;
   fleet?: () => Promise<FleetSnapshot | null>;
   countCommits?: CommitCounter;
   zone?: string;
@@ -31,8 +33,12 @@ export function loadBoards(file: string): BoardInfo[] {
   for (const item of list) {
     if (!item || typeof item !== "object") continue;
     const b = Object.fromEntries(Object.entries(item));
-    if (typeof b.id !== "string") continue;
-    out.push({ id: b.id, title: String(b.title ?? b.id), kind: String(b.kind ?? "other"), color: String(b.color ?? "#94a3b8"), repos: Array.isArray(b.repos) ? b.repos.map(String) : [] });
+    if (typeof b.id !== "string" || typeof b.owner !== "string" || typeof b.number !== "number") continue;
+    out.push({
+      id: b.id, title: String(b.title ?? b.id), kind: String(b.kind ?? "other"), color: String(b.color ?? "#94a3b8"),
+      repos: Array.isArray(b.repos) ? b.repos.map(String) : [], owner: b.owner, number: b.number,
+      dateField: typeof b.dateField === "string" ? b.dateField : null,
+    });
   }
   return out;
 }
@@ -60,17 +66,20 @@ export class WeekService {
     const weekStart = weekStartOf(start, this.zone);
     const weekEnd = addDays(weekStart, 7, this.zone);
     const cached = this.options.store.lastSnapshot(weekStart);
-    // A snapshot built after the week ended is final. One built mid-week is rebuilt once the week is over.
-    if (cached && cached.asOf >= weekEnd) return cached;
+    // A snapshot built after the week ended is final unless its GitHub part was stale. One built mid-week is rebuilt once the week is over.
+    if (cached && cached.asOf >= weekEnd && !cached.stale) return cached;
     if (cached && !snapshotStaleness(cached.asOf, now).stale) return cached;
     try {
       for (const root of this.options.sessionRoots) this.options.store.appendBlocks(scanSessionRoot(root, weekStart));
       const fleet = await (this.options.fleet?.() ?? Promise.resolve(null)).catch(() => null);
       const blocks = await withCommits(this.options.store.blocksBetween(weekStart, weekEnd), this.count, fleet);
       const github = this.options.github ? await this.options.github.read(weekStart) : null;
+      const cards = this.options.cards ? await this.options.cards.read() : null;
       const data = summarizeWeek({
         blocks, weekStart, zone: this.zone, asOf: now, boards: this.options.boards,
-        pullRequests: github?.pullRequests, stale: github?.stale ?? false, staleReason: github?.staleReason ?? null,
+        pullRequests: github?.pullRequests, cards: cards ? placeCards(cards.cards, this.options.boards, weekStart, weekEnd) : undefined,
+        stale: (github?.stale ?? false) || (cards?.stale ?? false),
+        staleReason: github?.staleReason ?? cards?.staleReason ?? null,
       });
       this.options.store.saveSnapshot(data);
       return data;
@@ -79,16 +88,23 @@ export class WeekService {
       throw new Error("week data unavailable");
     }
   }
+
+  /** The week for one board and kind filter; the stored snapshot always holds the unfiltered week. */
+  async getFiltered(start: number, filter: WeekFilter): Promise<WeekData> {
+    return filterWeek(await this.get(start), filter, this.zone);
+  }
 }
 
 /** Production wiring for the daemon: one store under the slot state dir, guard-gated GitHub owners from boards.json. */
-export function defaultWeekRoute(stateDir: string, fleet?: () => Promise<FleetSnapshot | null>): (start: string | null) => Promise<WeekData> {
+export function defaultWeekRoute(stateDir: string, fleet?: () => Promise<FleetSnapshot | null>): (query: WeekQuery) => Promise<WeekData> {
   const here = path.dirname(fileURLToPath(import.meta.url));
   const boards = loadBoards(path.join(here, "..", "week", "boards.json"));
   const owners = [...new Set(boards.flatMap(b => b.repos.map(r => r.split("/")[0]!)))].slice(0, 6);
   const repoRoot = process.env.SUPERBOARD_REPO_ROOT ?? path.resolve(here, "..", "..", "..");
   const store = new WeekStore(path.join(stateDir, "week.sqlite"));
-  const github = new GithubReader(defaultGithubDeps(repoRoot), owners);
-  const service = new WeekService({ store, sessionRoots: resolveSessionsRoots(), boards, github, fleet });
-  return start => service.get(parseStart(start, Date.now()));
+  const deps: GithubReaderDeps = defaultGithubDeps(repoRoot);
+  const github = new GithubReader(deps, owners);
+  const cards = new CardsReader(deps, boards);
+  const service = new WeekService({ store, sessionRoots: resolveSessionsRoots(), boards, github, cards, fleet });
+  return query => service.getFiltered(parseStart(query.start, Date.now()), { board: query.board, kind: query.kind });
 }
