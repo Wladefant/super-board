@@ -32,9 +32,8 @@ export const KIND_LABELS = {
   other: 'Other boards',
 };
 
-// Pastel fills: every entry keeps 4.5:1 or more against the dark ink #0b1020 (tested).
-export const PROJECT_PALETTE = ['#8ab4ff', '#7ee0b8', '#f5c06b', '#d9a6ff', '#7fd7e6', '#e6e07a', '#ffb38a', '#b7c4dd', '#a8e6a1', '#f2a7d0'];
-export const INK = '#0b1020';
+// Lane fills are CSS tokens (--lane-0 … --lane-9 in week.css), one set per colour scheme.
+export const LANE_COLOURS = 10;
 
 export const kindLabel = kind => KIND_LABELS[kind] || kind;
 
@@ -143,10 +142,13 @@ export function unionMs(intervals, from = -Infinity, to = Infinity) {
   return total;
 }
 
-/** Stable colour per project, assigned over the whole week so filtering never recolours a block. */
+/**
+ * Stable colour per project, assigned over the whole week so filtering never recolours a block.
+ * The value is a CSS token reference, so a scheme change recolours every lane without a re-render.
+ */
 export function projectColors(data) {
   const names = [...new Set(data.blocks.map(b => b.project))].sort();
-  return new Map(names.map((name, i) => [name, PROJECT_PALETTE[i % PROJECT_PALETTE.length]]));
+  return new Map(names.map((name, i) => [name, `var(--lane-${i % LANE_COLOURS})`]));
 }
 
 export const commitCount = block => (typeof block.commits === 'number' ? block.commits : 0);
@@ -328,4 +330,50 @@ export function contrastRatio(a, b) {
   };
   const [hi, lo] = [lum(a), lum(b)].sort((x, y) => y - x);
   return (hi + 0.05) / (lo + 0.05);
+}
+
+/** `a` moved `t` (0…1) of the way toward `b`, both #rrggbb, mixed in sRGB. */
+export function mixColors(a, b, t) {
+  return `#${[1, 3, 5].map(i => {
+    const from = parseInt(a.slice(i, i + 2), 16);
+    return Math.round(from + (parseInt(b.slice(i, i + 2), 16) - from) * t).toString(16).padStart(2, '0');
+  }).join('')}`;
+}
+
+/** `color` moved toward `toward` in 5% steps until it keeps `min`:1 against every background. */
+function readable(color, toward, backgrounds, min) {
+  for (let step = 0; step < 20; step += 1) {
+    const mixed = mixColors(color, toward, step / 20);
+    if (backgrounds.every(bg => contrastRatio(mixed, bg) >= min)) return mixed;
+  }
+  return toward;
+}
+
+const HEX = /^#[0-9a-f]{6}$/i;
+
+/**
+ * Week view tokens from Telegram's theme (Telegram.WebApp.themeParams), or null when there is none
+ * to use: outside Telegram, or a theme whose text does not reach 4.5:1 on its own surfaces.
+ * Telegram supplies the surfaces and the text. Users pick those colours, so muted and accent text are
+ * pulled toward the text colour until they keep 4.5:1, and control borders until 3:1 (WCAG AA).
+ * Lane fills and status colours stay with the scheme in week.css.
+ */
+export function telegramTokens(params) {
+  const pick = (...keys) => keys.map(key => params?.[key]).find(value => HEX.test(value ?? ''));
+  const panel = pick('section_bg_color', 'bg_color');
+  const text = pick('text_color');
+  if (!panel || !text) return null;
+  const bg = pick('secondary_bg_color', 'bg_color');
+  const accent = pick('accent_text_color', 'link_color') ?? text;
+  const surfaces = [bg, panel, mixColors(panel, text, 0.06)];
+  const buttons = [mixColors(panel, accent, 0.12), mixColors(panel, accent, 0.22)];
+  if (![...surfaces, ...buttons].every(surface => contrastRatio(text, surface) >= 4.5)) return null;
+  return {
+    '--bg': bg, '--panel': panel, '--panel-2': surfaces[2], '--btn': buttons[0], '--btn-hover': buttons[1],
+    '--line': pick('section_separator_color') ?? mixColors(panel, text, 0.14),
+    '--text': text, '--focus': text,
+    '--muted': readable(pick('hint_color', 'subtitle_text_color') ?? mixColors(panel, text, 0.4), text, surfaces, 4.5),
+    '--accent': readable(accent, text, surfaces, 4.5),
+    '--ctl-line': readable(mixColors(panel, text, 0.35), text, surfaces, 3),
+  };
 }

@@ -3,12 +3,41 @@ import {
   ALL, BOARD_PARAM, BOARD_STORAGE_KEY, WEEK_PARAM,
   blockBoards, blockTitle, boardOptions, cardSpans, commitCount, daySegments, firstHour, formatDuration,
   isValidWeek, kindLabel, layoutDay, minutesOfDay, projectColors, resolveSelection,
-  adjacentWeeks, selectBlocks, selectionLabel, summarize, weekRequestStart, zoneIsoDate,
+  adjacentWeeks, selectBlocks, selectionLabel, summarize, telegramTokens, weekRequestStart, zoneIsoDate,
 } from './week-model.js';
 
 const tg = window.Telegram?.WebApp;
 tg?.ready();
 tg?.expand();
+
+const systemLight = window.matchMedia('(prefers-color-scheme: light)');
+let themed = [];
+
+/**
+ * Picks the scheme and colours (Refs #562). In Telegram: Telegram's colorScheme, with its surfaces and text
+ * on top when they read (telegramTokens). Outside Telegram, telegram-web-app.js still loads but sends no theme,
+ * so the page follows prefers-color-scheme. Runs again on Telegram's themeChanged and on a system change.
+ */
+function applyTheme() {
+  const root = document.documentElement;
+  const params = tg?.themeParams;
+  const fromTelegram = Boolean(params?.bg_color) && (tg.colorScheme === 'light' || tg.colorScheme === 'dark');
+  root.dataset.scheme = fromTelegram ? tg.colorScheme : systemLight.matches ? 'light' : 'dark';
+  for (const name of themed) root.style.removeProperty(name);
+  const theme = fromTelegram ? telegramTokens(params) : null;
+  themed = theme ? Object.keys(theme) : [];
+  for (const name of themed) root.style.setProperty(name, theme[name]);
+  const bg = theme?.['--bg'] || window.getComputedStyle(root).getPropertyValue('--bg').trim();
+  if (!bg) return;
+  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', bg);
+  if (fromTelegram && tg.isVersionAtLeast?.('6.9')) {
+    tg.setHeaderColor(bg);
+    tg.setBackgroundColor(bg);
+  }
+}
+applyTheme();
+tg?.onEvent?.('themeChanged', applyTheme);
+systemLight.addEventListener('change', applyTheme);
 
 const $ = id => document.getElementById(id);
 const HOUR_PX = 48;

@@ -14,15 +14,26 @@ export interface WeekPage {
   close(): Promise<void>;
 }
 
-export async function openWeekPage(handler: (request: Request) => Response | Promise<Response>, path = "/"): Promise<WeekPage> {
+export interface WeekPageOptions {
+  /** Stands in for `window.Telegram.WebApp` (telegram-web-app.js); omitted = a plain browser. */
+  telegram?: object;
+  /** The system scheme the page sees through `prefers-color-scheme`. */
+  prefersColorScheme?: "light" | "dark";
+}
+
+export async function openWeekPage(handler: (request: Request) => Response | Promise<Response>, path = "/", options: WeekPageOptions = {}): Promise<WeekPage> {
   const server = Bun.serve({ port: 0, fetch: handler });
   const origin = `http://localhost:${server.port}`;
   const window = new Window({
     url: `${origin}${path}`,
     width: 390,
     height: 844,
-    settings: { disableJavaScriptEvaluation: true, disableJavaScriptFileLoading: true, disableCSSFileLoading: true },
+    settings: {
+      disableJavaScriptEvaluation: true, disableJavaScriptFileLoading: true, disableCSSFileLoading: true,
+      ...(options.prefersColorScheme ? { device: { prefersColorScheme: options.prefersColorScheme } } : {}),
+    },
   });
+  if (options.telegram) Object.assign(window, { Telegram: { WebApp: options.telegram } });
   const g = globalThis as Record<string, unknown>;
   const saved = Object.fromEntries(GLOBALS.map(name => [name, g[name]]));
   const timers: Timer[] = [];
