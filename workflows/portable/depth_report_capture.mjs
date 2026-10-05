@@ -94,7 +94,7 @@ function inspectPage() {
     const r = box.getBBox();
     labels.push({ text: text.textContent, fits: t.x >= r.x && t.y >= r.y && t.x + t.width <= r.x + r.width && t.y + t.height <= r.y + r.height });
   }
-  return { contrast, labels, scrollWidth: document.documentElement.scrollWidth, innerWidth: window.innerWidth };
+  return { contrast, labels, scrollWidth: document.documentElement.scrollWidth };
 }
 
 export async function capture({ baseUrl, expectedSha, outputDir }) {
@@ -136,7 +136,8 @@ export async function capture({ baseUrl, expectedSha, outputDir }) {
         const lowContrast = seen.contrast.filter((c) => c.ratio < c.min);
         const unfit = seen.labels.filter((l) => !l.fits);
         const checks = [
-          checkNoHorizontalOverflow(seen.scrollWidth, seen.innerWidth),
+          // vp.width, not innerWidth: a phone zooms out to fit wide content, so innerWidth grows with it.
+          checkNoHorizontalOverflow(seen.scrollWidth, vp.width),
           { name: 'text_contrast', passed: lowContrast.length === 0, detail: lowContrast.length ? `below AA: ${JSON.stringify(lowContrast)}` : `${seen.contrast.length} text runs, lowest ${Math.min(...seen.contrast.map((c) => c.ratio))}:1` },
           { name: 'svg_labels_fit', passed: unfit.length === 0, detail: unfit.length ? `outside their box: ${unfit.map((l) => l.text).join(', ')}` : `${seen.labels.length} labels inside their boxes` },
           { name: 'offline', passed: blocked.length === 0, detail: blocked.length ? `requests outside ${origin}: ${blocked.join(', ')}` : `no request outside ${origin}` }
