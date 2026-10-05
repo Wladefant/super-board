@@ -3,12 +3,40 @@ import {
   ALL, BOARD_PARAM, BOARD_STORAGE_KEY, WEEK_PARAM,
   blockBoards, blockTitle, boardOptions, cardSpans, commitCount, daySegments, firstHour, formatDuration,
   isValidWeek, kindLabel, layoutDay, minutesOfDay, projectColors, resolveSelection,
-  adjacentWeeks, selectBlocks, selectionLabel, summarize, weekRequestStart, zoneIsoDate,
+  adjacentWeeks, selectBlocks, selectionLabel, summarize, SURFACE_BOUND, telegramTokens, weekRequestStart, zoneIsoDate,
 } from './week-model.js';
 
 const tg = window.Telegram?.WebApp;
 tg?.ready();
 tg?.expand();
+
+let themed = [];
+
+/**
+ * Picks the scheme (weekScheme, from scheme.js before the first paint) and colours (Refs #562). In Telegram,
+ * Telegram's surfaces and text go on top when they read (telegramTokens), and the scheme's status and lane
+ * colours are moved until they keep AA on those surfaces. Runs again on Telegram's themeChanged and on a system change.
+ */
+function applyTheme() {
+  const root = document.documentElement;
+  const fromTelegram = window.weekScheme();
+  for (const name of themed) root.style.removeProperty(name);
+  const css = window.getComputedStyle(root);
+  const own = Object.fromEntries(SURFACE_BOUND.map(name => [name, css.getPropertyValue(name).trim()]));
+  const theme = fromTelegram ? telegramTokens(tg.themeParams, own) : null;
+  themed = theme ? Object.keys(theme) : [];
+  for (const name of themed) root.style.setProperty(name, theme[name]);
+  const bg = theme?.['--bg'] || css.getPropertyValue('--bg').trim();
+  if (!bg) return;
+  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', bg);
+  if (fromTelegram && tg.isVersionAtLeast?.('6.9')) {
+    tg.setHeaderColor(bg);
+    tg.setBackgroundColor(bg);
+  }
+}
+applyTheme();
+tg?.onEvent?.('themeChanged', applyTheme);
+window.matchMedia('(prefers-color-scheme: light)').addEventListener('change', applyTheme);
 
 const $ = id => document.getElementById(id);
 const HOUR_PX = 48;
