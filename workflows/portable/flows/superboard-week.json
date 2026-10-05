@@ -1,8 +1,8 @@
 {
   "schema": "flow-qa/v1",
   "project": "superboard-week",
-  "version": "1.0.0",
-  "description": "Flow QA for the Superboard Week view against the fixture preview (bun scripts/week-preview.ts in packages/telegram-agent-harness). Covers week navigation, the detail dialog, prev/next disabled until a week is known, the error and loading states, the busy week and the calendar select with the keyboard open. Read-only: the page has no data mutations.",
+  "version": "1.1.0",
+  "description": "Flow QA for the Superboard Week view against the fixture preview (bun scripts/week-preview.ts in packages/telegram-agent-harness). Covers week navigation, the detail dialog, prev/next disabled until a week is known, the error and loading states, the busy week, the calendar switcher with the keyboard open, and picking a calendar from its listbox (popover on desktop, bottom sheet on a phone). Read-only: the page has no data mutations.",
   "viewports": [
     "390x844",
     "390x420",
@@ -34,7 +34,7 @@
         { "id": "assert_close_unobstructed", "action": "assert", "selector": "#detail[open] #detail-close", "checks": ["visible", "element_from_point"] },
         { "id": "close_detail", "action": "cleanup", "selector": "#detail-close" },
         { "id": "assert_detail_closed", "action": "assert", "selector": "#detail:not([open])", "expected_present": true },
-        { "id": "focus_calendar_select", "action": "keyboard-open", "selector": "#board", "checks": ["visible", "tap_target_min_44", "element_from_point", "input_focus_in_viewport"] }
+        { "id": "focus_calendar_switcher", "action": "keyboard-open", "selector": "#board", "checks": ["visible", "tap_target_min_44", "element_from_point", "input_focus_in_viewport"] }
       ],
       "cleanup": []
     },
@@ -56,6 +56,31 @@
         { "id": "tap_try_again", "action": "tap", "selector": ".notice-error button", "no_document_reload": true, "checks": ["visible", "tap_target_min_44", "element_from_point", "no_document_reload"] },
         { "id": "assert_still_disabled", "action": "assert", "selector": "#prev[disabled]", "expected_present": true },
         { "id": "tap_this_week_on_error", "action": "tap", "selector": "#today", "no_document_reload": true, "checks": ["visible", "tap_target_min_44", "element_from_point", "no_document_reload"] }
+      ],
+      "cleanup": []
+    },
+    {
+      "id": "week_calendar_picker",
+      "name": "Pick a calendar from the switcher",
+      "description": "Taps the calendar switcher, picks Shipnovo from the listbox, and checks that the sheet closes and the switcher names the new calendar without a reload. Then switches back to All boards.",
+      "allowed_actions": ["goto", "tap", "assert"],
+      "forbidden_actions": ["eval", "prod_access"],
+      "steps": [
+        { "id": "goto_week_picker", "action": "goto", "url": "/?scenario=normal&week=2026-09-28&board=all" },
+        { "id": "wait_week_loaded_picker", "action": "assert", "selector": "#calendar[aria-busy='false']", "expected_present": true },
+        { "id": "assert_switcher_label", "action": "assert", "selector": "#board-value", "expected_text": "All boards" },
+        { "id": "open_picker", "action": "tap", "selector": "#board", "no_document_reload": true, "checks": ["visible", "tap_target_min_44", "element_from_point", "no_document_reload"] },
+        { "id": "assert_listbox_open", "action": "assert", "selector": "#detail[open] [role=listbox]", "expected_present": true },
+        { "id": "assert_switcher_expanded", "action": "assert", "selector": "#board[aria-expanded='true']", "expected_present": true },
+        { "id": "assert_selected_option", "action": "assert", "selector": "#detail [role=option][aria-selected='true']", "expected_text": "All boards" },
+        { "id": "pick_shipnovo", "action": "tap", "selector": "#detail [role=option][data-value='kind:shipnovo']", "no_document_reload": true, "checks": ["visible", "tap_target_min_44", "element_from_point", "no_document_reload"] },
+        { "id": "assert_picker_closed", "action": "assert", "selector": "#detail:not([open])", "expected_present": true },
+        { "id": "assert_switcher_collapsed", "action": "assert", "selector": "#board[aria-expanded='false']", "expected_present": true },
+        { "id": "assert_label_shipnovo", "action": "assert", "selector": "#board-value", "expected_text": "Shipnovo" },
+        { "id": "assert_stats_shipnovo", "action": "assert", "selector": "#stats", "expected_text": "4 lanes" },
+        { "id": "reopen_picker", "action": "tap", "selector": "#board", "no_document_reload": true, "checks": ["visible", "element_from_point", "no_document_reload"] },
+        { "id": "pick_all_boards", "action": "tap", "selector": "#detail [role=option][data-value='all']", "no_document_reload": true, "checks": ["visible", "tap_target_min_44", "element_from_point", "no_document_reload"] },
+        { "id": "assert_label_all", "action": "assert", "selector": "#board-value", "expected_text": "All boards" }
       ],
       "cleanup": []
     },

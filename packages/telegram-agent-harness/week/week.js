@@ -21,6 +21,8 @@ const state = {
   data: null,
   loading: false,
   trigger: null,
+  // The calendar list the picker opens: the loaded week's boards and lane counts (null: no week loaded).
+  picker: { boards: [], count: null },
 };
 
 /** The Monday (YYYY-MM-DD) in the URL, or null for the PC's current week. */
@@ -132,7 +134,7 @@ function showError(error) {
 function clearData() {
   const boards = state.data.boards || [];
   state.data = null;
-  renderBoardSelect(boards, null);
+  renderBoardPicker(boards, null);
   $('stats').replaceChildren();
   $('asof').hidden = true;
   $('total').textContent = '–';
@@ -159,7 +161,7 @@ function render() {
   const colors = projectColors(data);
   $('calendar').setAttribute('aria-busy', 'false');
   $('week-title').textContent = `${f.monthDay.format(data.weekStart)} – ${f.monthDay.format(data.weekEnd - 1)}`;
-  renderBoardSelect(data.boards || [], value => selectBlocks(data, value).length);
+  renderBoardPicker(data.boards || [], value => selectBlocks(data, value).length);
   renderStats(summary);
   renderAsOf(data, f);
   renderGrid(data, summary, colors, f);
@@ -168,17 +170,9 @@ function render() {
 }
 
 /** `count` gives the lanes per option; null leaves the counts out (no week loaded). */
-function renderBoardSelect(boards, count) {
-  const select = $('board');
-  const opts = boardOptions(boards);
-  const option = o => el('option', { value: o.value, selected: o.value === state.board }, count ? `${o.label} · ${plural(count(o.value), 'lane')}` : o.label);
-  select.replaceChildren(
-    option(opts.all),
-    opts.kinds.length ? el('optgroup', { label: 'Calendars by kind' }, opts.kinds.map(option)) : null,
-    opts.boards.length ? el('optgroup', { label: 'Boards' }, opts.boards.map(option)) : null,
-    option(opts.unassigned),
-  );
-  select.value = state.board;
+function renderBoardPicker(boards, count) {
+  state.picker = { boards, count };
+  $('board-value').textContent = selectionLabel(state.board, boards);
 }
 
 function renderStats(summary) {
@@ -356,7 +350,8 @@ function renderSidebar(data, summary, colors, f) {
 }
 
 // ---- detail popover / bottom sheet ----
-function openDialog(trigger, title, body) {
+/** `below` drops the popover under the trigger, like a menu; otherwise it opens beside it. */
+function openDialog(trigger, title, body, below = false) {
   const dialog = $('detail');
   if (dialog.open) dialog.close();
   state.trigger = trigger;
@@ -365,20 +360,20 @@ function openDialog(trigger, title, body) {
   dialog.style.removeProperty('left');
   dialog.style.removeProperty('top');
   dialog.showModal();
-  if (window.matchMedia('(min-width: 900px)').matches && trigger) placeNear(dialog, trigger);
+  if (window.matchMedia('(min-width: 900px)').matches && trigger) placeNear(dialog, trigger, below);
   dialog.scrollTop = 0;
   $('detail-close').focus();
 }
 
-function placeNear(dialog, trigger) {
+function placeNear(dialog, trigger, below) {
   const r = trigger.getBoundingClientRect();
   const w = dialog.offsetWidth;
   const h = dialog.offsetHeight;
   const gap = 8;
-  let left = r.right + gap;
-  if (left + w > innerWidth - gap) left = r.left - gap - w;
+  let left = below ? r.left : r.right + gap;
+  if (!below && left + w > innerWidth - gap) left = r.left - gap - w;
   left = Math.min(Math.max(gap, left), innerWidth - w - gap);
-  const top = Math.min(Math.max(gap, r.top), innerHeight - h - gap);
+  const top = Math.min(Math.max(gap, below ? r.bottom + gap : r.top), innerHeight - h - gap);
   dialog.style.left = `${left}px`;
   dialog.style.top = `${Math.max(gap, top)}px`;
 }
@@ -433,12 +428,50 @@ function openList(trigger, blocks, f, colors) {
   ]);
 }
 
+// ---- calendar picker: a listbox in the same popover (desktop) / bottom sheet (phone) ----
+function openPicker() {
+  const { boards, count } = state.picker;
+  const opts = boardOptions(boards);
+  const option = o => el('button', {
+    type: 'button', role: 'option', class: 'option', 'data-value': o.value,
+    'aria-selected': String(o.value === state.board), tabindex: o.value === state.board ? '0' : '-1',
+  }, el('span', { class: 'option-label' }, o.label), count ? el('span', { class: 'option-count num' }, plural(count(o.value), 'lane')) : null);
+  const group = (id, label, items) => items.length
+    ? el('div', { role: 'group', class: 'option-group', 'aria-labelledby': id }, el('p', { id, class: 'option-group-title' }, label), items.map(option))
+    : null;
+  const list = el('div', { role: 'listbox', class: 'options', 'aria-labelledby': 'board-label', onkeydown: pickerKey, onclick: event => {
+    const picked = event.target.closest('[role=option]');
+    if (picked) pick(picked.dataset.value);
+  } }, option(opts.all), group('opts-kinds', 'Calendars by kind', opts.kinds), group('opts-boards', 'Boards', opts.boards), option(opts.unassigned));
+  openDialog($('board'), 'Calendar', [list], true);
+  $('board').setAttribute('aria-expanded', 'true');
+  list.querySelector('[aria-selected="true"]')?.focus();
+}
+
+/** Arrow keys, Home and End move through the options; Enter or Space picks; Escape closes unchanged. */
+function pickerKey(event) {
+  const items = [...event.currentTarget.querySelectorAll('[role=option]')];
+  const at = items.indexOf(document.activeElement);
+  const to = { ArrowDown: Math.min(at + 1, items.length - 1), ArrowUp: Math.max(at - 1, 0), Home: 0, End: items.length - 1 }[event.key];
+  if (to !== undefined) items[to].focus();
+  else if ((event.key === 'Enter' || event.key === ' ') && at >= 0) pick(items[at].dataset.value);
+  else if (event.key === 'Escape') dialog.close();
+  else return;
+  event.preventDefault();
+}
+
+function pick(value) {
+  dialog.close();
+  if (value !== state.board) setBoard(value);
+}
+
 const dialog = $('detail');
 $('detail-close').addEventListener('click', () => dialog.close());
 dialog.addEventListener('click', event => { if (event.target === dialog) dialog.close(); });
 dialog.addEventListener('close', () => {
   const trigger = state.trigger;
   state.trigger = null;
+  $('board').setAttribute('aria-expanded', 'false');
   if (trigger?.isConnected) trigger.focus({ preventScroll: false });
 });
 
@@ -468,7 +501,9 @@ function setBoard(value) {
   state.board = value;
   try { localStorage.setItem(BOARD_STORAGE_KEY, value); } catch { /* storage blocked: URL still carries it */ }
   writeUrl();
-  render();
+  // With no week loaded, render() draws nothing, so only the switcher's label follows.
+  if (state.data) render();
+  else renderBoardPicker(state.picker.boards, null);
 }
 
 function setWeek(iso) {
@@ -485,7 +520,12 @@ function syncNav() {
   $('next').disabled = !nav;
 }
 
-$('board').addEventListener('change', event => setBoard(event.target.value));
+$('board').addEventListener('click', openPicker);
+$('board').addEventListener('keydown', event => {
+  if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+  event.preventDefault();
+  openPicker();
+});
 $('prev').addEventListener('click', () => setWeek(adjacentWeeks(state.week).prev));
 $('next').addEventListener('click', () => setWeek(adjacentWeeks(state.week).next));
 $('today').addEventListener('click', () => setWeek(null));
