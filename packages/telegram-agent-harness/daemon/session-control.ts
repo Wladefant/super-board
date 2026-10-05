@@ -20,13 +20,19 @@ export interface DaemonSessionSummary {
 export interface TranscriptText { entryId: string; text: string }
 export type SessionEvent =
   | { kind: "history" | "appended"; sessionId: string; entries: TranscriptText[] }
-  | { kind: "streaming"; sessionId: string; active: boolean };
+  | { kind: "streaming"; sessionId: string; active: boolean }
+  /** A delivery the operator was told about failed or was lost after it was accepted. */
+  | { kind: "delivery"; sessionId: string; messageId: string; state: "failed" | "lost"; error: string };
 export type DeliveryMode = "auto" | "steer" | "followUp";
 export type DeliveryOutcome = "started" | "steered" | "queued";
 export interface SessionControlOptions {
   configRoot?: string;
   onEvent: (event: SessionEvent) => void;
   onLog: (message: string) => void;
+  /** Deadline for a session's reply to a delivery (default 15 s). */
+  replyTimeoutMs?: number;
+  /** Deadline for the first reply on a new connection (default 90 s): a busy session may take 40 s. */
+  subscribeTimeoutMs?: number;
 }
 export interface Owner {
   version: 1;
@@ -177,12 +183,22 @@ export function discoverOwners(configRoot?: string): Owner[] {
     .map(candidate => candidate.owner);
 }
 
+/** How long a deliver waits for the session's reply. The session may be blocked on a large write. */
+export const DELIVER_REPLY_TIMEOUT_MS = 15_000;
+export const SUBSCRIBE_REPLY_TIMEOUT_MS = 90_000;
+const PENDING_DELIVERY = Symbol("pending-delivery");
+type ReplyFrame = { ok?: boolean; result?: unknown; error?: unknown };
+/** For a request that outlives its deadline: `reply` gets the late answer, `lost` runs if the connection dies first. */
+export interface LateHandlers { reply: (frame: ReplyFrame) => void; lost: () => void }
+export interface DeliveryEvent { messageId: string; state: string; outcome?: string; error?: string }
+
 class TerminalConnection {
   private socket: net.Socket;
-  private pending = new Map<string, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
+  private pending = new Map<string, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout; late?: LateHandlers }>();
   private ready: Promise<void>;
   public closed = false;
-  constructor(readonly owner: Owner, onEvent: (event: SessionEvent) => void) {
+  public replyTimeoutMs = DELIVER_REPLY_TIMEOUT_MS;
+  constructor(readonly owner: Owner, onEvent: (event: SessionEvent) => void, private readonly onDelivery: (event: DeliveryEvent) => void = () => {}) {
     this.socket = net.createConnection(owner.endpoint);
     const { promise, resolve, reject } = Promise.withResolvers<void>();
     this.ready = promise;
@@ -216,12 +232,14 @@ class TerminalConnection {
             if ((event.kind === "history" || event.kind === "appended") && Array.isArray(event.entries) &&
                 event.entries.every((entry: TranscriptText) => typeof entry.entryId === "string" && typeof entry.text === "string")) onEvent(event);
             else if (event.kind === "streaming" && typeof event.active === "boolean") onEvent(event);
+            else if (event.kind === "delivery" && typeof event.messageId === "string" && typeof event.state === "string") this.onDelivery(event);
             continue;
           }
           const pending = this.pending.get(frame.id);
           if (!pending) continue;
           clearTimeout(pending.timer);
           this.pending.delete(frame.id);
+          if (pending.late) { pending.late.reply(frame); continue; }
           if (frame.ok === true) pending.resolve(frame.result);
           else pending.reject(new SessionControlUnavailableError(String(frame.error)));
         } catch { this.close(); return; }
@@ -230,16 +248,29 @@ class TerminalConnection {
     this.socket.on("error", () => this.close());
     this.socket.on("close", () => this.close());
   }
-  async request(op: string, payload: Record<string, unknown> = {}): Promise<unknown> {
+  /**
+   * With `lateReply`, a session that does not answer in time keeps the request in flight and the socket
+   * open; the promise resolves with PENDING_DELIVERY and a later reply goes to `lateReply`. The message is
+   * never sent twice, because the session may already have accepted it.
+   */
+  async request(op: string, payload: Record<string, unknown> = {}, late?: LateHandlers, timeoutMs = this.replyTimeoutMs): Promise<unknown> {
     await this.ready;
     if (this.closed) throw new SessionControlUnavailableError("Terminal owner disconnected; no GUI fallback is permitted");
     const id = crypto.randomUUID();
     const { promise, resolve, reject } = Promise.withResolvers<unknown>();
     const timer = setTimeout(() => {
+      const entry = this.pending.get(id);
+      if (late && entry) {
+        entry.late = late;
+        entry.timer = setTimeout(() => this.pending.delete(id), 30 * 60_000);
+        entry.timer.unref?.();
+        resolve(PENDING_DELIVERY);
+        return;
+      }
       this.pending.delete(id);
       reject(new SessionControlUnavailableError("Terminal request timed out; acceptance unknown; not retried"));
       this.close();
-    }, 15_000);
+    }, timeoutMs);
     this.pending.set(id, { resolve, reject, timer });
     this.socket.write(JSON.stringify({ version: 1, id, token: this.owner.token, sessionId: this.owner.sessionId, op, ...payload }) + "\n");
     return promise;
@@ -250,6 +281,8 @@ class TerminalConnection {
     this.socket.destroy();
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
+      // The request already resolved as pending: nothing awaits it, so the loss must be reported here.
+      if (pending.late) { pending.late.lost(); continue; }
       pending.reject(new SessionControlUnavailableError("Terminal owner disconnected; delivery is not retried"));
     }
     this.pending.clear();
@@ -298,17 +331,50 @@ export class TerminalSessionControl {
           if (event.active) this.streaming.add(sessionId); else this.streaming.delete(sessionId);
         }
         this.options.onEvent(event);
+      }, delivery => {
+        const label = `delivery ${delivery.messageId} for ${sessionId}`;
+        if (delivery.state === "failed") {
+          const error = delivery.error ?? "unknown error";
+          this.options.onLog(`${label} failed in the terminal: ${error}`);
+          this.options.onEvent({ kind: "delivery", sessionId, messageId: delivery.messageId, state: "failed", error });
+        } else this.options.onLog(`${label} ${delivery.state}${delivery.outcome ? ` (${delivery.outcome})` : ""}`);
       });
-      try { await connection.request("subscribe"); return connection; }
+      if (this.options.replyTimeoutMs) connection.replyTimeoutMs = this.options.replyTimeoutMs;
+      try { await connection.request("subscribe", {}, undefined, this.options.subscribeTimeoutMs ?? SUBSCRIBE_REPLY_TIMEOUT_MS); return connection; }
       catch (error) { connection.close(); throw error; }
     })();
     this.connections.set(sessionId, pending);
     try { return await pending; } catch (error) { this.connections.delete(sessionId); throw error; }
   }
+  /**
+   * The message id lets a session that supports `deliver-ack` accept at once and run the delivery later.
+   * An older session ignores `ack` and answers with the outcome. A reply that misses the deadline leaves
+   * the delivery pending: it is logged as pending, never retried, and confirmed when the reply arrives.
+   */
   async deliver(sessionId: string, text: string, mode: DeliveryMode = "auto"): Promise<DeliveryOutcome> {
-    const result = await (await this.connection(sessionId)).request("deliver", { text, mode });
-    if (result !== "started" && result !== "steered" && result !== "queued") throw new Error("Invalid terminal delivery response");
-    return result;
+    const messageId = crypto.randomUUID();
+    const label = `delivery ${messageId} for ${sessionId}`;
+    const result = await (await this.connection(sessionId)).request("deliver", { text, mode, ack: true, messageId }, {
+      reply: frame => {
+        if (frame.ok === true) { this.options.onLog(`${label} accepted late`); return; }
+        const error = String(frame.error);
+        this.options.onLog(`${label} rejected late: ${error}`);
+        this.options.onEvent({ kind: "delivery", sessionId, messageId, state: "failed", error });
+      },
+      lost: () => {
+        const error = "the connection to the session closed before it confirmed the message";
+        this.options.onLog(`${label} lost: ${error}`);
+        this.options.onEvent({ kind: "delivery", sessionId, messageId, state: "lost", error });
+      },
+    });
+    if (result === PENDING_DELIVERY) {
+      this.options.onLog(`${label} pending: the session has not answered in ${(this.options.replyTimeoutMs ?? DELIVER_REPLY_TIMEOUT_MS) / 1000}s; not retried`);
+      return "queued";
+    }
+    if (result === "started" || result === "steered" || result === "queued") return result;
+    const ack = result as { accepted?: unknown; state?: unknown; outcome?: unknown } | null;
+    if (ack && typeof ack === "object" && ack.accepted === true) return "queued";
+    throw new Error("Invalid terminal delivery response");
   }
   async abort(sessionId: string): Promise<boolean> { return await (await this.connection(sessionId)).request("abort") === true; }
   async loadTranscript(sessionId: string): Promise<void> { await this.connection(sessionId); }
