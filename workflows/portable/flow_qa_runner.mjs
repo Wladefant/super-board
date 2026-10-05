@@ -797,7 +797,7 @@ async function queryAll(page, selector) {
 async function isShown(page, handle) {
   return page.evaluate((el) => {
     const r = el.getBoundingClientRect();
-    return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden';
+    return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden' && !el.closest('[inert],[aria-hidden="true"]');
   }, handle);
 }
 
@@ -819,7 +819,7 @@ async function waitForTarget(page, selector, timeoutMs, { visible = true } = {})
   }
 }
 
-async function firstVisibleHandle(page, selector, timeoutMs) {
+export async function firstVisibleHandle(page, selector, timeoutMs) {
   const handle = await waitForTarget(page, selector, timeoutMs);
   if (!handle) throw new Error(`No visible element for selector "${selector}"`);
   return handle;
@@ -837,12 +837,12 @@ async function currentTarget(page, selector) {
 /**
  * Evaluates in-page geometry and elementFromPoint for named checks.
  */
-async function inspectTargetElement(page, selector) {
+async function inspectTargetElement(page, selector, scroll = true) {
   if (!selector) return null;
   const handle = await currentTarget(page, selector);
   if (!handle) return null;
-  return page.evaluate((el) => {
-    el.scrollIntoView({ block: 'center', inline: 'nearest' });
+  return page.evaluate((el, doScroll) => {
+    if (doScroll) el.scrollIntoView({ block: 'center', inline: 'nearest' });
 
     const rect = el.getBoundingClientRect();
     const style = window.getComputedStyle(el);
@@ -863,13 +863,30 @@ async function inspectTargetElement(page, selector) {
       }
     }
 
+    // Effective hit area: probe outward from the centre while elementFromPoint still lands on the target.
+    // Counts padding and ::before overlays that getBoundingClientRect() does not.
+    const hits = (x, y) => {
+      if (x < 0 || y < 0 || x >= window.innerWidth || y >= window.innerHeight) return false;
+      const a = document.elementFromPoint(x, y);
+      return !!a && (a === el || el.contains(a));
+    };
+    const reach = (dx, dy) => {
+      let n = 0;
+      while (n < 60 && hits(cx + dx * (n + 1), cy + dy * (n + 1))) n++;
+      return n;
+    };
+    const hitRect = isTargetOrDescendant
+      ? { width: reach(-1, 0) + reach(1, 0) + 1, height: reach(0, -1) + reach(0, 1) + 1 }
+      : null;
+
     return {
       rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height, top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right },
+      hitRect,
       style: { display: style.display, visibility: style.visibility, opacity: style.opacity },
       pointElementInfo: { isTargetOrDescendant, coveringElementDescription },
       isConnected: el.isConnected
     };
-  }, handle);
+  }, handle, scroll);
 }
 
 /**
@@ -937,7 +954,7 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
   // Pre-action target inspection
   let preInspection = null;
   if (step.selector) {
-    preInspection = await inspectTargetElement(page, step.selector);
+    preInspection = await inspectTargetElement(page, step.selector, step.action !== 'assert');
   }
 
   // A touch-only step (a swipe, which only phone sheets answer) is skipped with a passing note on a desktop viewport.
@@ -1128,6 +1145,13 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
             detail: `Assert failed: element "${step.selector}" not present`
           });
         }
+        if (step.expected_present === false && exists) {
+          checksResults.push({
+            name: 'assert_absent',
+            passed: false,
+            detail: `Assert failed: element "${step.selector}" is present but should be absent`
+          });
+        }
         if (step.expected_text && exists) {
           const text = await page.evaluate(e => e.textContent, el);
           const textMatches = text && text.includes(step.expected_text);
@@ -1190,7 +1214,7 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
   page.off('load', onNav);
 
   // Post-action inspections
-  const postInspection = step.selector ? await inspectTargetElement(page, step.selector) : null;
+  const postInspection = step.selector ? await inspectTargetElement(page, step.selector, step.action !== 'assert') : null;
   const geom = await inspectPageGeometry(page);
   let docIdAfter = null;
   try {
@@ -1216,7 +1240,7 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
   // Check: tap_target_min_44
   if (vpConfig.isMobile && (requestedChecks.includes('tap_target_min_44') || requestedChecks.includes('target_min_44') || step.action === 'tap')) {
     const insp = preInspection || postInspection;
-    checksResults.push(checkTapTargetMin44(insp?.rect));
+    checksResults.push(checkTapTargetMin44(insp?.hitRect || insp?.rect));
   }
 
   // Check: no_horizontal_overflow
@@ -1233,6 +1257,45 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
   // Check: no_document_reload
   if (requestedChecks.includes('no_document_reload') || step.no_document_reload) {
     checksResults.push(checkNoDocumentReload(docIdBefore, docIdAfter, navObserved));
+  }
+
+  // Check: url_matches (regex on pathname+search after the step; waits for SPA navigation)
+  if (step.expected_url) {
+    const re = String(step.expected_url);
+    const matched = await page
+      .waitForFunction((r) => new RegExp(r).test(location.pathname + location.search), { timeout: step.timeout_ms || 8000 }, re)
+      .then(() => true)
+      .catch(() => false);
+    const now = await page.evaluate(() => location.pathname + location.search);
+    checksResults.push({
+      name: 'url_matches',
+      passed: matched,
+      detail: matched ? `URL "${now}" matches /${re}/` : `URL "${now}" does not match /${re}/`
+    });
+  }
+
+  // Check: clear_of_sticky_header (target top is not under a fixed/sticky header at the top)
+  if (requestedChecks.includes('clear_of_sticky_header') && step.selector) {
+    await new Promise((r) => setTimeout(r, 1200));
+    const res = await page.evaluate((sel) => {
+      const el = document.querySelector(sel);
+      if (!el) return { missing: true };
+      const top = el.getBoundingClientRect().top;
+      let bottom = 0;
+      for (const h of document.querySelectorAll('header, nav, [role="banner"]')) {
+        const cs = getComputedStyle(h);
+        if (cs.position !== 'fixed' && cs.position !== 'sticky') continue;
+        const r = h.getBoundingClientRect();
+        if (r.top <= 1 && r.bottom > 0 && r.width > innerWidth * 0.5) bottom = Math.max(bottom, r.bottom);
+      }
+      return { top, bottom };
+    }, step.selector);
+    const ok = !res.missing && res.top >= res.bottom - 1;
+    checksResults.push({
+      name: 'clear_of_sticky_header',
+      passed: ok,
+      detail: res.missing ? `Target "${step.selector}" not found` : `target top ${Math.round(res.top)}px, sticky header bottom ${Math.round(res.bottom)}px`
+    });
   }
 
   // Check: dismissed (swipe dismissal)
