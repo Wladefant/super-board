@@ -96,7 +96,7 @@ Before broad repository searching, grep/find sweeps, or guessing file locations,
    d. Do **NOT** advance to another issue. The orchestrator handles dispatch.
    e. **Encode, don't memorize:** if an operator behavioural decision or requirement was clarified or decided during this issue, ensure it is encoded in policy, skill, or code in this cycle before closing. Memory is only a cache.
    f. **Source-verified reporting (Decision 13):** paste raw command output next to every GitHub object claim (PR number, head SHA, comment URL) and log ID, and never state an ID not directly read from a tool result.
-   g. **Writing style:** write your final assistant message, PR body, and issue comments for the operator in the `ste-writing` house style (about 80% ASD-STE100): state the result in line 1, one idea per sentence, 25 words or fewer, active voice, plain words. Keep every fact, link, SHA, and hedge. Apply `unslop-writing` as well.
+   g. **Writing style:** write your final assistant message, PR body, and issue comments for the operator in the `ste-writing` house style (about 80% ASD-STE100): state the result in line 1, one idea per sentence, 25 words or fewer, active voice, plain words. Keep every fact, link, SHA, and hedge. Apply `unslop-writing` as well. Before you post, run `python ~/.veyyon/workflows/ste_check.py check <file>` on the text. It warns and never blocks. Fix every error line.
 
 ## Failure mode
 

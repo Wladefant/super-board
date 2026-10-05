@@ -1,4 +1,4 @@
-<!-- Writing style: short sentences (25 words or fewer), one idea each, active voice, plain words, result first. See the `ste-writing` managed skill. Keep every fact, link and hedge. -->
+<!-- Writing style: short sentences (25 words or fewer), one idea each, active voice, plain words, result first. See the `ste-writing` managed skill. Keep every fact, link and hedge. Check the text: `python ~/.veyyon/workflows/ste_check.py check <file>` (warns, never blocks). -->
 ## Linked Issue
 <!-- Mandatory issue reference. For leaf/sub-issues, use a closing keyword, e.g. Fixes #123 or Closes Wladefant/super-board#123.
      IMPORTANT: If linking a parent issue/epic that has open sub-issues, DO NOT use closing keywords (Fixes/Closes/Resolves).

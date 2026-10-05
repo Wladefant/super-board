@@ -29,6 +29,7 @@ import { DaemonStore } from "../daemon/store";
 import { readMessageThreadId } from "./harness/channel-config";
 import { questionCompactionContext } from "./harness/operator-questions";
 import { escapeHtml, markdownToTelegramHtml } from "./sanitizer";
+import { meterOutbound } from "./ste-meter";
 import { resolveGithubRepo } from "./github-repo";
 import {
   selectTelegramAttachmentKind,
@@ -508,6 +509,7 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
       if (!root) {
         const fallbackRoute = findDaemonRoute(savedContext?.sessionId, savedContext?.cwd);
         if (fallbackRoute) {
+          void meterOutbound(params.text, "md", "telegram-fallback");
           const res = await governedTelegramFetch(`https://api.telegram.org/bot${fallbackRoute.token}/sendMessage`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
