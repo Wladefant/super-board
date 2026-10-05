@@ -31,7 +31,7 @@ import { fileURLToPath } from 'node:url';
 function detectRepo() {
   try {
     return execFileSync('gh', ['repo', 'view', '--json', 'nameWithOwner', '-q', '.nameWithOwner'], {
-      encoding: 'utf8',
+      encoding: 'utf8', windowsHide: true,
     }).trim();
   } catch {
     console.error('Cannot determine the repo. Run inside a git repo with `gh`, or pass --repo owner/name.');
@@ -55,7 +55,7 @@ const BODY_LIMIT = has('--full') ? Infinity : 1200;
 
 function gh(path) {
   const out = execFileSync('gh', ['api', path, '--paginate'], {
-    encoding: 'utf8',
+    encoding: 'utf8', windowsHide: true,
     maxBuffer: 64 * 1024 * 1024,
   });
   // --paginate concatenates JSON arrays; stitch them back into one array.
@@ -174,7 +174,7 @@ const sanitizeSweep = (text) => {
     const raw = execFileSync(
       process.env.SUPER_BOARD_PYTHON || 'python3',
       [join(scripts, 'super-board-publish.py'), 'publish', '--input', payload, '--json'],
-      { encoding: 'utf8' },
+      { encoding: 'utf8', windowsHide: true },
     );
     return JSON.parse(raw).text;
   } catch (err) {

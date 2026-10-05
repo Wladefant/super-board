@@ -132,6 +132,7 @@ class GhProbe:
                 text=True,
                 env=env,
                 timeout=30,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except (OSError, subprocess.SubprocessError):
             return None
@@ -170,7 +171,8 @@ class GhProbe:
             ]
         try:
             result = subprocess.run(
-                command, capture_output=True, text=True, env=env, timeout=30
+                command, capture_output=True, text=True, env=env, timeout=30,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except (OSError, subprocess.SubprocessError):
             return False

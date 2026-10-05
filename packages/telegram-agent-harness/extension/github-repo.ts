@@ -28,12 +28,12 @@ export function resolveGithubRepo(dir?: string): string | undefined {
   try {
     let stdoutText = "";
     if (typeof Bun !== "undefined" && Bun.spawnSync) {
-      const result = Bun.spawnSync(["git", "-C", dir, "remote", "get-url", "origin"], { stdout: "pipe", stderr: "ignore" });
+      const result = Bun.spawnSync(["git", "-C", dir, "remote", "get-url", "origin"], { stdout: "pipe", stderr: "ignore", windowsHide: true });
       if (result.exitCode === 0) stdoutText = result.stdout.toString();
     } else {
       // Fallback for Node.js test or execution environments
       const { spawnSync } = require("node:child_process");
-      const res = spawnSync("git", ["-C", dir, "remote", "get-url", "origin"], { encoding: "utf8" });
+      const res = spawnSync("git", ["-C", dir, "remote", "get-url", "origin"], { encoding: "utf8", windowsHide: true });
       if (res.status === 0 && res.stdout) stdoutText = res.stdout;
     }
     if (stdoutText) {

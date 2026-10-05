@@ -601,7 +601,7 @@ def _create_dir_link(target: str, link_path: str) -> None:
     if sys.platform == "win32":
         try:
             cmd = ["cmd.exe", "/c", "mklink", "/J", link_path, target]
-            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            res = subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             return
         except Exception as e:
             logger.debug("cmd.exe mklink /J failed: %s; trying os.symlink", e)
@@ -650,7 +650,7 @@ def _remove_dir_link(link_path: str) -> bool:
                 pass
             try:
                 cmd = ["cmd.exe", "/c", "rmdir", os.path.abspath(link_path)]
-                subprocess.run(cmd, capture_output=True, text=True, check=True)
+                subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                 return True
             except Exception as e:
                 logger.warning("Failed to remove junction '%s': %s", link_path, e)
@@ -1978,7 +1978,7 @@ class BuildSlotManager:
         stop_heartbeat = threading.Event()
         proc = None
         try:
-            proc = subprocess.Popen(cmd, cwd=cwd, shell=(sys.platform == "win32"))
+            proc = subprocess.Popen(cmd, cwd=cwd, shell=(sys.platform == "win32"), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             child_pid = proc.pid
 
             # Record wrapper and child PIDs and the initial heartbeat in lock info

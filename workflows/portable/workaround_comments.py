@@ -179,6 +179,7 @@ def _git_diff(base: str, root: Path) -> str | None:
     result = subprocess.run(
         ['git', '-C', str(root), 'diff', '--no-color', '--unified=0', f'{base}...HEAD'],
         capture_output=True, text=True, encoding='utf-8', errors='replace',
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     if result.returncode != 0:
         print(f'[workaround-comments] git diff failed: {result.stderr.strip()}', file=sys.stderr)

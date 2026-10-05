@@ -362,8 +362,8 @@ def package_json_dependencies_changed(
     path = f.get("path") if isinstance(f, dict) else str(f)
     if base_commit and head_sha and path:
         try:
-            b_out = subprocess.run(["git", "show", f"{base_commit}:{path}"], capture_output=True, text=True, check=True).stdout
-            h_out = subprocess.run(["git", "show", f"{head_sha}:{path}"], capture_output=True, text=True, check=True).stdout
+            b_out = subprocess.run(["git", "show", f"{base_commit}:{path}"], capture_output=True, text=True, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+            h_out = subprocess.run(["git", "show", f"{head_sha}:{path}"], capture_output=True, text=True, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
             b_json = json.loads(b_out)
             h_json = json.loads(h_out)
             for k in DEPENDENCY_FIELDS:
@@ -1132,6 +1132,7 @@ def _run_gh(cmd: List[str], timeout_sec: int) -> subprocess.CompletedProcess:
         text=True,
         timeout=timeout_sec,
         shell=True if sys.platform == "win32" else False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
 
 
@@ -1180,13 +1181,13 @@ def fetch_pr_json(pr_number: int, repo: str = "Bavariance/polysimulator", timeou
     from review_content import json_pages
     data["reviews"] = [review for page in json_pages(reviews.stdout) for review in page]
     data["comments"] = [comment for page in json_pages(comments.stdout) for comment in page]
-    subprocess.run(["git", "fetch", "origin", f"+refs/heads/{data['baseRefName']}:refs/remotes/origin/{data['baseRefName']}"], check=True)
+    subprocess.run(["git", "fetch", "origin", f"+refs/heads/{data['baseRefName']}:refs/remotes/origin/{data['baseRefName']}"], check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     from review_content import target_shas
     for sha in target_shas(data["reviews"], data["headRefOid"]):
-        if subprocess.run(["git", "cat-file", "-e", sha + "^{commit}"], stderr=subprocess.DEVNULL).returncode:
+        if subprocess.run(["git", "cat-file", "-e", sha + "^{commit}"], stderr=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).returncode:
             # A target that stays unreachable fails closed in evaluate(), and only
             # when it is actually needed; an unfetchable one must not abort the gate.
-            subprocess.run(["git", "fetch", "origin", sha], stderr=subprocess.DEVNULL)
+            subprocess.run(["git", "fetch", "origin", sha], stderr=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     return data
 
 def evaluate_pr_gate(

@@ -673,6 +673,7 @@ def fetch_live_usage(redact: bool = True, timeout_sec: int = 25) -> Dict[str, An
             timeout=timeout_sec,
             check=True,
             shell=True if sys.platform == "win32" else False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         return json.loads(res.stdout)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError) as e:
@@ -685,6 +686,7 @@ def fetch_live_usage(redact: bool = True, timeout_sec: int = 25) -> Dict[str, An
                     text=True,
                     timeout=timeout_sec,
                     shell=True,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
                 if res2.returncode == 0 and res2.stdout.strip().startswith("{"):
                     return json.loads(res2.stdout)

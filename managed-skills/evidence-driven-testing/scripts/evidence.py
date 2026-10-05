@@ -161,7 +161,7 @@ def wayland_capture_support() -> tuple[bool, str]:
     for tool in ("wayland-info", "weston-info"):
         if shutil.which(tool):
             try:
-                result = subprocess.run([tool], text=True, capture_output=True, check=False, timeout=5)
+                result = subprocess.run([tool], text=True, capture_output=True, check=False, timeout=5, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             except (OSError, subprocess.TimeoutExpired) as error:
                 return False, f"{tool} failed: {error}"
             if WLR_SCREENCOPY_PROTOCOL in result.stdout:
@@ -551,6 +551,7 @@ def _identity_ps(pid: int) -> dict[str, Any] | None:
         text=True,
         capture_output=True,
         check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     if result.returncode != 0 and not result.stdout.strip():
         return None

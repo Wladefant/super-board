@@ -476,6 +476,7 @@ def run_knip(
             text=True,
             shell=use_shell,
             timeout=180,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except subprocess.TimeoutExpired:
         return [], "Knip scan timed out after 180 seconds"
@@ -696,6 +697,7 @@ def run_vulture(
             capture_output=True,
             text=True,
             timeout=180,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except subprocess.TimeoutExpired:
         return [], "Vulture scan timed out after 180 seconds"
@@ -1256,7 +1258,7 @@ def record_no_rule(
 
     try:
         check_cmd = ["gh", "issue", "view", str(bug_num), "-R", repo, "--json", "comments"]
-        proc = subprocess.run(check_cmd, capture_output=True, text=True, timeout=30)
+        proc = subprocess.run(check_cmd, capture_output=True, text=True, timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         if proc.returncode != 0:
             print(f"[WARN] Failed to view issue #{bug_num} on {repo} (exit {proc.returncode}); skipping comment write to fail closed", file=sys.stderr)
             return False
@@ -1273,7 +1275,7 @@ def record_no_rule(
         # Post comment
         comment_body = f"gardener bug-to-lint: no-rule: {reason}"
         comment_cmd = ["gh", "issue", "comment", str(bug_num), "-R", repo, "--body", comment_body]
-        subprocess.run(comment_cmd, capture_output=True, text=True, check=True, timeout=30)
+        subprocess.run(comment_cmd, capture_output=True, text=True, check=True, timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         print(f"[OK] Posted no-rule comment on #{bug_num}: {comment_body}")
         return True
     except Exception as e:
@@ -1299,7 +1301,7 @@ def scan_closed_bug_issues(
         for bn in bug_numbers:
             cmd = ["gh", "issue", "view", str(bn), "-R", repo, "--json", "number,title,body,closedAt,comments,state,labels"]
             try:
-                proc = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
+                proc = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                 item = json.loads(proc.stdout)
                 state = (item.get("state") or "").upper()
                 labels = [l.get("name", "") if isinstance(l, dict) else str(l) for l in item.get("labels", [])]
@@ -1322,7 +1324,7 @@ def scan_closed_bug_issues(
             "--json", "number,title,body,closedAt,comments,state,labels",
         ]
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60)
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             data = json.loads(proc.stdout)
         except Exception as e:
             print(f"[WARN] Failed to fetch closed bug issues from {repo}: {e}", file=sys.stderr)
@@ -1392,7 +1394,7 @@ def scan_closed_bug_issues(
         # 3. Retrieve PR diff
         try:
             diff_cmd = ["gh", "pr", "diff", str(fix_pr_num), "-R", fix_pr_repo]
-            diff_proc = subprocess.run(diff_cmd, capture_output=True, text=True, check=True, timeout=60)
+            diff_proc = subprocess.run(diff_cmd, capture_output=True, text=True, check=True, timeout=60, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             diff_text = diff_proc.stdout
         except Exception as e:
             _record_no_rule_gated(bug_num, bug_title, f"failed to retrieve fix PR diff: {e}")
@@ -1427,7 +1429,7 @@ def fetch_existing_gardener_fingerprints(repo: str = "Bavariance/polysimulator")
         "--json", "number,title,body,state",
     ]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60)
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         issues = json.loads(proc.stdout)
     except Exception as e:
         print(f"[WARN] Failed to fetch existing gardener issues from {repo}: {e}", file=sys.stderr)
@@ -1458,7 +1460,7 @@ def get_open_milestone(repo: str = "Bavariance/polysimulator") -> Optional[str]:
         "--jq", ".[].title",
     ]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30)
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         titles = [t.strip() for t in proc.stdout.splitlines() if t.strip()]
         if not titles:
             return None
@@ -1755,7 +1757,7 @@ def create_live_gardener_issues(
             cmd.extend(["--milestone", milestone])
 
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             issue_url = proc.stdout.strip()
             print(f"[OK] Created gardener issue: {issue_url}")
 
@@ -1766,6 +1768,7 @@ def create_live_gardener_issues(
                     text=True,
                     check=True,
                     timeout=30,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
                 print(f"[OK] Enrolled in Project {project_number}: {issue_url}")
             except Exception as e:
@@ -1800,6 +1803,7 @@ def check_host_ram_safe(max_ram_pct: float = 90.0) -> Tuple[bool, float, str]:
             capture_output=True,
             text=True,
             timeout=15,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         if proc.returncode == 0 and proc.stdout:
             data = json.loads(proc.stdout)
@@ -1816,6 +1820,14 @@ def check_host_ram_safe(max_ram_pct: float = 90.0) -> Tuple[bool, float, str]:
 # ==============================================================================
 # Task Scheduler Installation
 # ==============================================================================
+
+def _hidden_tr(cmd_path: Path) -> str:
+    """schtasks /tr that runs a .cmd wrapper with no console window (profile AGENTS.md 13.10)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from hidden_window_audit import ensure_launcher, hidden_tr
+    ensure_launcher()
+    return hidden_tr(f'"{cmd_path}"')
+
 
 def install_task_scheduler_jobs(
     python_exe: str,
@@ -1852,7 +1864,7 @@ def install_task_scheduler_jobs(
 
     # 1. Daily Job (Full scan: dead code + workarounds + bugs)
     daily_tn = "SuperboardGardenerDaily"
-    daily_tr = f'"{daily_cmd.resolve()}"'
+    daily_tr = _hidden_tr(daily_cmd.resolve())
     cmd_daily = [
         "schtasks", "/create",
         "/tn", daily_tn,
@@ -1862,14 +1874,14 @@ def install_task_scheduler_jobs(
         "/f",
     ]
     try:
-        proc = subprocess.run(cmd_daily, capture_output=True, text=True, check=True)
+        proc = subprocess.run(cmd_daily, capture_output=True, text=True, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         results[daily_tn] = {"status": "created", "output": proc.stdout.strip(), "cmd_file": str(daily_cmd)}
     except subprocess.CalledProcessError as e:
         results[daily_tn] = {"status": "error", "error": e.stderr.strip() or str(e)}
 
     # 2. Hourly Job (Fast bug-to-lint scan only)
     hourly_tn = "SuperboardGardenerBugLintHourly"
-    hourly_tr = f'"{hourly_cmd.resolve()}"'
+    hourly_tr = _hidden_tr(hourly_cmd.resolve())
     cmd_hourly = [
         "schtasks", "/create",
         "/tn", hourly_tn,
@@ -1878,7 +1890,7 @@ def install_task_scheduler_jobs(
         "/f",
     ]
     try:
-        proc = subprocess.run(cmd_hourly, capture_output=True, text=True, check=True)
+        proc = subprocess.run(cmd_hourly, capture_output=True, text=True, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         results[hourly_tn] = {"status": "created", "output": proc.stdout.strip(), "cmd_file": str(hourly_cmd)}
     except subprocess.CalledProcessError as e:
         results[hourly_tn] = {"status": "error", "error": e.stderr.strip() or str(e)}
@@ -1923,7 +1935,7 @@ def install_depth_survey_task(
     cmd_file = Path(log_dir) / "gardener_survey.cmd"
     cmd_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
     name = "SuperboardGardenerDepthSurvey"
-    cmd = ["schtasks", "/create", "/tn", name, "/tr", f'"{cmd_file.resolve()}"',
+    cmd = ["schtasks", "/create", "/tn", name, "/tr", _hidden_tr(cmd_file.resolve()),
            "/sc", "daily", "/mo", str(every_days), "/st", "04:30", "/f"]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60,

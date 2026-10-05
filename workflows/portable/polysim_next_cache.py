@@ -86,7 +86,7 @@ try {
 
 
 def git(args: list[str], cwd: Path) -> str | None:
-    r = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=120)
+    r = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=120, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     return r.stdout.strip() if r.returncode == 0 else None
 
 
@@ -204,7 +204,7 @@ def seed_tsbuildinfo(worktree: Path, clone: Path, source: Path | None) -> dict:
 def typecheck(worktree: Path) -> dict:
     fe = worktree / "frontend"
     started = time.monotonic()
-    r = subprocess.run(["node", "-e", TYPECHECK_JS], cwd=str(fe), capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    r = subprocess.run(["node", "-e", TYPECHECK_JS], cwd=str(fe), capture_output=True, text=True, stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     seconds = round(time.monotonic() - started, 1)
     if r.returncode not in (0, 1):
         raise RuntimeError(f"type check did not run (exit {r.returncode}): {r.stderr.strip()[-2000:]}")

@@ -16,7 +16,7 @@ ISSUE = "https://github.com/Wladefant/super-board/issues/401"
 def newest_age_hours(host: str, directory: str):
     cmd = f"ls -1t {directory}/komo-*.tar.gz.gpg 2>/dev/null | head -1 | xargs -r stat -c %Y"
     r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", host, cmd],
-                       capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+                       capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if r.returncode != 0:
         return None, f"ssh failed (exit {r.returncode})"
     out = r.stdout.strip()
@@ -41,7 +41,7 @@ def main() -> int:
     cmd = [sys.executable, str(NOTIFIER), "--project", "super-board", "--event-type", "blocker",
            "--request-id", "komo-backup", "--summary", f"Komo backup missed: {reason}",
            "--link", ISSUE, "--dry-run" if a.dry_run else "--send"]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     print("notifier exit", r.returncode, (r.stdout or "")[-300:])
     return 1
 

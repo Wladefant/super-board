@@ -289,7 +289,7 @@ class ProcessProbe:
                     "-Command",
                     f'(Get-CimInstance Win32_Process -Filter "ProcessId={pid}").CommandLine',
                 ]
-                res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=5, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                 if res.returncode == 0:
                     return res.stdout.strip()
             except Exception:
@@ -356,6 +356,7 @@ class ProcessProbe:
                     capture_output=True,
                     text=True,
                     timeout=10,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
             except Exception:
                 return [int(pid)]
@@ -417,7 +418,7 @@ class ProcessProbe:
                     f"Where-Object {{ ($_.Name -like 'veyyon.exe*' -or $_.Name -eq 'veyyon') -and $_.CommandLine -like '*{ps_session_id}*' }} | "
                     "Select-Object -ExpandProperty ProcessId",
                 ]
-                res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+                res = subprocess.run(cmd, capture_output=True, text=True, timeout=5, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                 if res.returncode == 0 and res.stdout.strip():
                     lines = [ln.strip() for ln in res.stdout.strip().splitlines() if ln.strip()]
                     if lines:
@@ -858,7 +859,7 @@ class HerdrPanes:
 
     @staticmethod
     def _subprocess_runner(argv: Sequence[str], timeout: float):
-        res = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        res = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return res.returncode, res.stdout, res.stderr
 
     def _result(self, argv: Sequence[str]) -> Dict[str, Any]:
@@ -1897,7 +1898,8 @@ def run_disposable_crash_test(
     # 1. Spawn a disposable python subprocess that terminates unexpectedly with exit code 88
     test_session_id = f"{session_id}-DISPOSABLE-TEST"
     proc = subprocess.Popen(
-        [sys.executable, "-c", "import sys, time; time.sleep(0.5); sys.exit(88)", f"--resume={test_session_id}"]
+        [sys.executable, "-c", "import sys, time; time.sleep(0.5); sys.exit(88)", f"--resume={test_session_id}"],
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     pid = proc.pid
     monitor = SessionCrashMonitor(
@@ -2089,6 +2091,7 @@ def run_resume_relaunch_test(
             text=True,
             stdin=subprocess.DEVNULL,
             timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         deadline = time.time() + 30
         while time.time() < deadline:

@@ -122,7 +122,7 @@ except ImportError:
                 cmd.extend(["-f", f"{k}={json.dumps(v)}"])
             else:
                 cmd.extend(["-f", f"{k}={v}"])
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return json.loads(res.stdout)
 
 
@@ -342,7 +342,7 @@ class TriageResult:
 def default_cli_runner(args: List[str]) -> str:
     """Run gh command line tool for issue edits."""
     cmd = ["gh"] + args
-    res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    res = subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     return res.stdout
 
 

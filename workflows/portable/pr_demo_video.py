@@ -127,7 +127,7 @@ def record(url: str, out_dir: Path, steps: List[Dict[str, Any]], seconds: int, w
 
 def run(cmd: List[str], timeout: int) -> str:
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except subprocess.TimeoutExpired as e:
         raise DemoError(f"{cmd[0]} timed out after {timeout}s") from e
     except FileNotFoundError as e:

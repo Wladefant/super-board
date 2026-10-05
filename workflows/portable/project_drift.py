@@ -126,7 +126,7 @@ class QuotaError(RuntimeError):
 
 def graphql_remaining() -> int:
     out = subprocess.run(["gh", "api", "rate_limit", "-q", ".resources.graphql.remaining"],
-                         capture_output=True, text=True, timeout=30)
+                         capture_output=True, text=True, timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if out.returncode != 0:
         raise QuotaError(f"cannot read GraphQL quota: {out.stderr.strip()[:200]}")
     return int(out.stdout.strip())
@@ -137,7 +137,7 @@ def list_repo_items(repo: str) -> List[Dict[str, Any]]:
     jq = ('.[] | {number, node_id, state, state_reason, is_pr: (.pull_request != null), '
           'labels: [.labels[].name], milestone: (.milestone.title // null)}')
     proc = subprocess.run(["gh", "api", "--paginate", f"repos/{repo}/issues?state=all&per_page=100", "-q", jq],
-                          capture_output=True, text=True, timeout=180)
+                          capture_output=True, text=True, timeout=180, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if proc.returncode != 0:
         raise RuntimeError(f"listing {repo} failed: {proc.stderr.strip()[:300]}")
     return [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
@@ -253,7 +253,7 @@ def count_by_code(findings: List[Dict[str, Any]]) -> Dict[str, int]:
 
 def current_state(repo: str, number: int) -> str:
     proc = subprocess.run(["gh", "api", f"repos/{repo}/issues/{number}", "-q", ".state"],
-                          capture_output=True, text=True, timeout=30)
+                          capture_output=True, text=True, timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if proc.returncode != 0:
         raise RuntimeError(f"state recheck failed for {repo}#{number}: {proc.stderr.strip()[:200]}")
     return proc.stdout.strip()

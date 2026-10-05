@@ -443,7 +443,7 @@ def _fetch_repo_prs_graphql(
             cmd.extend(["-F", f"cursor={cursor}"])
         cmd.extend(["-F", f"query={gql}"])
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             if res.returncode != 0 or not res.stdout:
                 break
             data = json.loads(res.stdout)
@@ -478,7 +478,7 @@ def _fetch_repo_prs_fallback(
         "--json", "number,title,url,state,mergedAt,createdAt,additions,deletions,reviews"
     ]
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         if res.returncode == 0 and res.stdout:
             data = json.loads(res.stdout)
             for p in data:
@@ -1065,6 +1065,7 @@ def post_to_issue(issue_url: str, body: str) -> bool:
         result = subprocess.run(
             ["gh", "issue", "comment", number, "--repo", repo, "--body", body],
             capture_output=True, text=True, timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         return result.returncode == 0
     except (subprocess.TimeoutExpired, FileNotFoundError):

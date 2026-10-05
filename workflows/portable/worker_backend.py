@@ -860,6 +860,7 @@ def _git_head(repo_root: str) -> Optional[str]:
             text=True,
             timeout=30,
             shell=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -881,6 +882,7 @@ def _git_commit(repo_root: str, commit: str) -> Optional[str]:
             text=True,
             timeout=30,
             shell=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -2058,6 +2060,7 @@ class WorkerBackend:
                 timeout=spec.timeout_seconds,
                 shell=False,
                 env=env,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except subprocess.TimeoutExpired:
             return blocked(

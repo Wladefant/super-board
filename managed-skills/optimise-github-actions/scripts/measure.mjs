@@ -54,7 +54,7 @@ async function get(path) {
   for (let attempt = 1; ; attempt++) {
     calls++;
     try {
-      const { stdout } = await exec("gh", ["api", path], { maxBuffer: 1 << 28, timeout: 120000 });
+      const { stdout } = await exec("gh", ["api", path], { maxBuffer: 1 << 28, timeout: 120000, windowsHide: true });
       return JSON.parse(stdout);
     } catch (err) {
       const transient = /timeout|TLS|EOF|reset|502|503|504/i.test(String(err.stderr ?? err.message));
@@ -75,7 +75,7 @@ async function list(path, key) {
 }
 
 {
-  const { stdout } = await exec("gh", ["api", "rate_limit", "--jq", ".resources.core.remaining"]);
+  const { stdout } = await exec("gh", ["api", "rate_limit", "--jq", ".resources.core.remaining"], { windowsHide: true });
   const remaining = Number(stdout.trim());
   if (remaining < budget + 500) {
     console.error(`Only ${remaining} GitHub API calls left this hour; need ${budget + 500}. Wait for the reset or pass a smaller --budget.`);

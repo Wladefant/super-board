@@ -119,6 +119,7 @@ def _run_gh(args: List[str], timeout_sec: int, input_text: Optional[str] = None)
             timeout=timeout_sec,
             input=input_text,
             check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except Exception as e:  # timeout, missing gh
         return 1, "", str(e)

@@ -2377,7 +2377,7 @@ class TestBalanceLoaderAndRouting(unittest.TestCase):
             ]
             env = os.environ.copy()
             env["VEYYON_USAGE_SAMPLES_FILE"] = tmp_samples_cli.name
-            res = subprocess.run(cmd, capture_output=True, text=True, check=True, env=env)
+            res = subprocess.run(cmd, capture_output=True, text=True, check=True, env=env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             out_json = json.loads(res.stdout)
             self.assertIn("windows", out_json)
             self.assertIn("recommended_lanes", out_json)

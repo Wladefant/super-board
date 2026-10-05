@@ -58,7 +58,7 @@ Runner = Callable[[List[str], int], str]
 
 
 def default_runner(cmd: List[str], timeout: int) -> str:
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if proc.returncode != 0:
         raise RuntimeError(f"{' '.join(cmd[:4])} failed (exit {proc.returncode}): {proc.stderr.strip()[:300]}")
     return proc.stdout

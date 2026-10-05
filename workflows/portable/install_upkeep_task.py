@@ -22,6 +22,8 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
+from hidden_window_audit import ensure_launcher, hidden_tr
+
 TASK_NAME = "SuperboardUpkeepHourly"
 RUN_DIR = Path(os.path.expanduser("~")) / ".veyyon" / "run" / "upkeep"
 PYTHON = r"C:\Users\wkiri\miniconda3\python.exe"
@@ -47,7 +49,7 @@ def build_cmd(worktree: str) -> str:
 
 
 def schtasks_argv(cmd_path: str) -> List[str]:
-    return ["schtasks", "/create", "/f", "/tn", TASK_NAME, "/sc", "hourly", "/mo", "1", "/tr", f'"{cmd_path}"']
+    return ["schtasks", "/create", "/f", "/tn", TASK_NAME, "/sc", "hourly", "/mo", "1", "/tr", hidden_tr(f'"{cmd_path}"')]
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -58,7 +60,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = ap.parse_args(argv)
 
     if args.remove:
-        return subprocess.run(["schtasks", "/delete", "/f", "/tn", TASK_NAME], timeout=30).returncode
+        return subprocess.run(["schtasks", "/delete", "/f", "/tn", TASK_NAME], timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).returncode
     if not args.worktree:
         ap.error("--worktree is required")
     cmd_path = str(RUN_DIR / "upkeep_hourly.cmd")
@@ -67,8 +69,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"# {cmd_path}\n{body}\n# {' '.join(schtasks_argv(cmd_path))}")
         return 0
     RUN_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_launcher()
     Path(cmd_path).write_text(body, encoding="ascii", newline="")
-    rc = subprocess.run(schtasks_argv(cmd_path), timeout=30).returncode
+    rc = subprocess.run(schtasks_argv(cmd_path), timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).returncode
     print(f"registered {TASK_NAME}" if rc == 0 else f"schtasks failed ({rc})")
     return rc
 

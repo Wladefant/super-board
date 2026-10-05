@@ -91,9 +91,9 @@ def _ram_darwin() -> dict[str, Any]:
     import subprocess
 
     try:
-        out = subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip()
+        out = subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).strip()
         total = int(out)
-        vm = subprocess.check_output(["vm_stat"], text=True)
+        vm = subprocess.check_output(["vm_stat"], text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         page_size = 4096
         free_pages = 0
         inactive_pages = 0

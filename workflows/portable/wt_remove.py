@@ -335,7 +335,7 @@ def busy_processes(path: os.PathLike[str] | str, procs: list[tuple[int, int, str
 
 
 def git(args: list[str], cwd: str | None = None, timeout: float = 120) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=timeout)
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
 def worktree_facts(path: str) -> tuple[str, str, str]:

@@ -210,6 +210,7 @@ def fetch_rendered_html(url: str, timeout: int = 60) -> str:
     proc = subprocess.run(
         ["gh", "api", "-H", "Accept: application/vnd.github.html+json", path],
         capture_output=True, text=True, timeout=timeout,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     if proc.returncode != 0:
         raise RuntimeError(f"gh api failed: {proc.stderr.strip()[:300]}")

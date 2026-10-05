@@ -377,7 +377,7 @@ def gh_issue_state_lookup(config: NormalizedConfig) -> StateLookup:
         if config.repo_remote:
             command += ["--repo", config.repo_remote]
         try:
-            result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+            result = subprocess.run(command, capture_output=True, text=True, timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except (OSError, subprocess.SubprocessError):
             return None
         if result.returncode != 0:
