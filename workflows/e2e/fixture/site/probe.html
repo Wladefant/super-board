@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Probe</title></head>
+<body>
+<h1>Probe</h1>
+<div role="status" id="status">pending</div>
+<script>
+// One request to our own host (must pass) and one to a host outside the allow-list (must be aborted).
+// no-cors makes a leaked request resolve, so "leaked" proves the request left the browser.
+const own = fetch('/ok.txt').then(() => true, () => false);
+const other = fetch('https://example.org/', { mode: 'no-cors' }).then(() => true, () => false);
+Promise.all([own, other]).then(([a, b]) => {
+  document.getElementById('status').textContent = (a ? 'allowed-own' : 'own-failed') + ',' + (b ? 'leaked' : 'blocked-other');
+});
+</script>
+</body></html>

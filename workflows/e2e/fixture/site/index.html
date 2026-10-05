@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Spike Shop</title></head>
+<body>
+<h1>Spike Shop</h1>
+<p id="count">0 items in cart</p>
+<ul>
+<li>Red sneaker <button type="button" aria-label="Add Red sneaker to cart">Add to cart</button></li>
+<li>Blue boot <button type="button" aria-label="Add Blue boot to cart">Add to cart</button></li>
+</ul>
+<div role="status" id="status"></div>
+<script>
+let n = 0;
+document.querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
+  n++;
+  document.getElementById('count').textContent = n + (n === 1 ? ' item in cart' : ' items in cart');
+  document.getElementById('status').textContent = 'Added ' + b.getAttribute('aria-label').replace('Add ', '').replace(' to cart', '');
+}));
+</script>
+</body></html>

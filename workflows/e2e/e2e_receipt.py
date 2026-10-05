@@ -18,6 +18,10 @@ PASS only when all of these hold; each failed condition prints a `FLOW-QA-REASON
 Served sha: `--served-sha`, or read from `<--base-url>/api/version` (fields sha, served_sha,
 version, git_sha). It is read from the server, never from the branch.
 
+Replay is the default: a model call or a cache miss gives `FLOW-QA-REASON replay_not_clean`
+(`replay_not_clean` joins the list above). `--allow-model-calls` opts out, for record runs only.
+`--require-replay` is accepted and does nothing.
+
 Usage:
   e2e_receipt.py --report .e2e/report.json --expected-sha <40hex> --base-url http://127.0.0.1:3000
   e2e_receipt.py --report R --expected-sha S --served-sha S --out receipt.txt
@@ -74,7 +78,7 @@ def _is_production(origin: str) -> bool:
 
 def evaluate(
     report: Any, expected_sha: str, served_sha: Optional[str], required_viewports: List[str],
-    require_replay: bool = False,
+    require_replay: bool = True,
 ) -> Dict[str, Any]:
     reasons: List[str] = []
     out: Dict[str, Any] = {
@@ -164,7 +168,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--served-sha")
     ap.add_argument("--base-url")
     ap.add_argument("--allow-host", action="append", default=[], help="extra staging host for the /api/version read; repeatable")
-    ap.add_argument("--require-replay", action="store_true", help="fail when any model call or cache miss happened")
+    ap.add_argument("--allow-model-calls", action="store_true",
+                    help="opt out of the default replay check: accept model calls and cache misses (record runs only)")
+    ap.add_argument("--require-replay", action="store_true", help=argparse.SUPPRESS)  # deprecated: now the default
     ap.add_argument("--viewports", default=",".join(PINS["requiredReceiptViewports"]),
                     help="required viewports (comma list); the gate needs 390x844 and 1440x900")
     ap.add_argument("--out")
@@ -181,7 +187,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     except (OSError, ValueError):
         report = None
     required = [v for v in args.viewports.split(",") if v]
-    ev = evaluate(report, args.expected_sha, served, required, require_replay=args.require_replay)
+    ev = evaluate(report, args.expected_sha, served, required, require_replay=not args.allow_model_calls)
     text = render(ev, served)
     if args.out:
         Path(args.out).write_text(text, encoding="utf-8")

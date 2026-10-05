@@ -383,6 +383,34 @@ class TemplateHostGuardRunsTests(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("forbidden-production-host", proc.stderr)
 
+    def refusal(self, url, staging="'staging.polysimulator.com'"):
+        text = TEMPLATE.read_text(encoding="utf-8")
+        block = re.search(r"// BEGIN host-guard(.*?)// END host-guard", text, re.S).group(1)
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "req.mts"
+            script.write_text(
+                f"const STAGING_HOSTS: string[] = [{staging}];\n" + block
+                + f"\nconsole.log('REFUSAL ' + String(requestHostRefusal({json.dumps(url)})));\n",
+                encoding="utf-8",
+            )
+            env = {"PATH": os.environ["PATH"], "SystemRoot": os.environ.get("SystemRoot", "")}
+            proc = subprocess.run(["node", str(script)], capture_output=True, text=True, timeout=60, env=env, creationflags=NO_WINDOW)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout.strip().split("REFUSAL ")[-1]
+
+    def test_request_level_refusal_for_every_subresource_kind(self):
+        for url in ("https://polysimulator.com/api/x", "wss://app.polysimulator.com/socket",
+                    "https://zaraprptkegxqpvnsubu.supabase.co/rest/v1/", "https://akamai-iad-prod.example.net/"):
+            self.assertEqual(self.refusal(url), "forbidden-production-host", url)
+        for url in ("https://example.org/pixel.png", "http://localhost.evil.test/"):
+            self.assertEqual(self.refusal(url), "not-in-allow-list", url)
+        self.assertEqual(self.refusal("not a url"), "unparseable-url")
+
+    def test_request_level_allows_listed_hosts_and_inline_schemes(self):
+        for url in ("http://127.0.0.1:3000/a", "http://localhost/x", "https://staging.polysimulator.com/api",
+                    "data:image/png;base64,AAAA", "blob:http://127.0.0.1/abc", "about:blank"):
+            self.assertEqual(self.refusal(url), "null", url)
+
 
 class _Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):  # noqa: N802
@@ -454,17 +482,32 @@ class RedirectTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             e2e_receipt.fetch_served_sha("https://polysimulator.com")
 
-    def test_replay_must_be_clean_when_required(self):
+    def test_replay_is_required_by_default(self):
+        vp = ["390x844", "1440x900"]
         dirty = make_report(model_calls=2)
-        ev = e2e_receipt.evaluate(dirty, HEAD, HEAD, ["390x844", "1440x900"], require_replay=True)
-        self.assertIn("replay_not_clean", ev["reasons"])
-        ev = e2e_receipt.evaluate(dirty, HEAD, HEAD, ["390x844", "1440x900"])
-        self.assertEqual(ev["reasons"], [])
+        self.assertIn("replay_not_clean", e2e_receipt.evaluate(dirty, HEAD, HEAD, vp)["reasons"])
         missed = make_report(cache_mode="missed")
-        ev = e2e_receipt.evaluate(missed, HEAD, HEAD, ["390x844", "1440x900"], require_replay=True)
-        self.assertIn("replay_not_clean", ev["reasons"])
-        clean = e2e_receipt.evaluate(make_report(), HEAD, HEAD, ["390x844", "1440x900"], require_replay=True)
-        self.assertEqual(clean["reasons"], [])
+        self.assertIn("replay_not_clean", e2e_receipt.evaluate(missed, HEAD, HEAD, vp)["reasons"])
+        self.assertEqual(e2e_receipt.evaluate(make_report(), HEAD, HEAD, vp)["reasons"], [])
+
+    def test_allow_model_calls_opts_out_of_the_replay_check(self):
+        vp = ["390x844", "1440x900"]
+        ev = e2e_receipt.evaluate(make_report(model_calls=2), HEAD, HEAD, vp, require_replay=False)
+        self.assertEqual(ev["reasons"], [])
+
+    def test_cli_replay_default_and_opt_out(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "report.json"
+            path.write_text(json.dumps(make_report(model_calls=3)), encoding="utf-8")
+            base = ["--report", str(path), "--expected-sha", HEAD, "--served-sha", HEAD]
+            out = io.StringIO()
+            with redirect_stdout(out):
+                self.assertEqual(e2e_receipt.main(base), 1)
+            self.assertIn("FLOW-QA-REASON replay_not_clean", out.getvalue())
+            self.assertRegex(out.getvalue(), r"model_calls=[1-9]")
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(e2e_receipt.main(base + ["--allow-model-calls"]), 0)
+                self.assertEqual(e2e_receipt.main(base + ["--require-replay"]), 1)
 
     def test_timeout_kills_the_whole_tree(self):
         with tempfile.TemporaryDirectory() as tmp:
