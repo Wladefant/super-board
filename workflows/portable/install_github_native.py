@@ -40,6 +40,8 @@ RUNTIME_FILES = (
     "wt_remove.py", "test_wt_remove.py",
     # PolySimulator per-worktree Next cache (Wladefant/super-board#321).
     "polysim_next_cache.py", "test_polysim_next_cache.py",
+    # Per-repo Lessons lifecycle with the 20-line cap (Wladefant/super-board#503).
+    "lessons.py", "test_lessons.py",
     # Verification CLI and smoke test gate.
     "verify.py", "test_verify.py",
     # Lane-brief merge guard (Wladefant/super-board#227).

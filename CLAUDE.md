@@ -66,6 +66,8 @@ Follow `policies/default/AGENTS.md` section 14 on every change:
 
 Newest first. One `When X, do Y` line per operator correction, at most 20. Add with `workflows/portable/lessons.py add`. The same mistake twice means rewrite the line.
 
+- When results arrive per topic (per competitor, carrier or screen), do create one native sub-issue per topic and never post a comment per topic on the parent (operator, 2026-10-04, [Wladefant/shipnovo#133](https://github.com/Wladefant/shipnovo/issues/133)).
+
 ## Installation contract
 
 This repo is consumed by dropping its `.claude/`-shaped tree into a target project. The release zip is laid out so:
