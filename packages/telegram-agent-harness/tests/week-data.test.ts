@@ -178,6 +178,35 @@ describe("store and service", () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  test("a mid-week snapshot is rebuilt once the week is over, and the rebuilt one is final", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "week-final-"));
+    try {
+      const session = [
+        JSON.stringify({ type: "session", id: "s1", timestamp: new Date(T0).toISOString(), cwd: "C:\\dev\\super-board" }),
+        JSON.stringify({ type: "message", timestamp: new Date(T0).toISOString(), message: { role: "user", content: "go" } }),
+      ].join("\n");
+      fs.writeFileSync(path.join(dir, "a.jsonl"), session);
+      const weekEnd = weekStartOf(T0, "UTC") + 7 * 24 * HOUR;
+      let now = T0 + HOUR;
+      let counted = 0;
+      const service = new WeekService({ store: new WeekStore(":memory:"), sessionRoots: [dir], boards: BOARDS, zone: "UTC", now: () => now, countCommits: async () => { counted++; return []; } });
+      const mid = await service.get(T0);
+      expect(mid.asOf).toBe(T0 + HOUR);
+
+      now = weekEnd + 5 * MIN; // week just ended, mid-week snapshot is still within 10 min of nothing: must rebuild
+      const final = await service.get(T0);
+      expect(final.asOf).toBe(now);
+      expect(counted).toBe(2);
+
+      now = weekEnd + 3 * 24 * HOUR;
+      const again = await service.get(T0);
+      expect(again.asOf).toBe(final.asOf);
+      expect(counted).toBe(2);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("github guard", () => {

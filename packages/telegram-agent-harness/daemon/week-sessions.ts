@@ -139,7 +139,7 @@ export function scanSessionRoot(root: string, sinceMs: number): SessionBlock[] {
 export type CommitCounter = (cwd: string, startMs: number, endMs: number) => Promise<string[] | null>;
 
 export const gitCommitCounter: CommitCounter = (cwd, startMs, endMs) => {
-  const { promise, resolve } = Promise.withResolvers<number | null>();
+  const { promise, resolve } = Promise.withResolvers<string[] | null>();
   if (!cwd || !fs.existsSync(cwd)) { resolve(null); return promise; }
   // A commit shortly after the last message still belongs to the block.
   const until = new Date(endMs + 5 * 60_000).toISOString();
