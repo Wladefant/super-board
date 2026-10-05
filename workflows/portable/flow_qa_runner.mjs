@@ -700,13 +700,13 @@ async function stampDocumentIdentity(page) {
  * Returns the first element matching the selector that has a layout box, polling until timeoutMs.
  * A page can render the same control twice (mobile and desktop copies) with one hidden by CSS.
  */
-async function firstVisibleHandle(page, selector, timeoutMs) {
+export async function firstVisibleHandle(page, selector, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     for (const handle of await page.$$(selector)) {
       const shown = await handle.evaluate((el) => {
         const r = el.getBoundingClientRect();
-        return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden';
+        return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden' && !el.closest('[inert],[aria-hidden="true"]');
       });
       if (shown) return handle;
     }
@@ -724,7 +724,7 @@ async function inspectTargetElement(page, selector, scroll = true) {
     const all = Array.from(document.querySelectorAll(sel));
     const el = all.find((c) => {
       const r = c.getBoundingClientRect();
-      return r.width > 0 && r.height > 0 && getComputedStyle(c).visibility !== 'hidden';
+      return r.width > 0 && r.height > 0 && getComputedStyle(c).visibility !== 'hidden' && !c.closest('[inert],[aria-hidden="true"]');
     }) || all[0] || null;
     if (el && doScroll) el.scrollIntoView({ block: 'center', inline: 'nearest' });
     if (!el) return null;
