@@ -52,6 +52,8 @@ RUNTIME_FILES = (
     "lane_inventory.py", "test_lane_inventory.py",
     # STE writing style checker and regression suite (Wladefant/super-board#525).
     "ste_check.py", "test_ste_check.py",
+    # Hosting manifest audit, daily hidden task installer and tests (Wladefant/super-board#571).
+    "hosting_audit.py", "install_hosting_audit_task.py", "test_hosting_audit.py",
 )
 # Veyyon extensions, installed into the profile's own `extensions/` dir beside AGENTS.md,
 # where Veyyon loads them for every session of that profile.
