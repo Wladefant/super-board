@@ -287,38 +287,42 @@ def render_report(sv: Survey, template_path: Path) -> str:
     template = Path(template_path).read_text(encoding="utf-8")
     style = re.search(r"<style>.*?</style>", template, re.S).group(0)
     esc = html.escape
+    repo = esc(Path(sv.repo_root).name)
     cards = []
     for i, c in enumerate(sv.candidates):
         css = {"Strong": "Strong", "Worth exploring": "Worth", "Speculative": "Speculative"}[c.strength]
+        callers = f"{c.callers} caller{'' if c.callers == 1 else 's'}"
         cards.append(f"""    <article class="candidate" id="c{i}">
       <h2>{esc(c.title)}</h2>
-      <div class="badges"><span class="badge {css}">{esc(c.strength)}</span><span class="badge">{c.touches} commits touched it</span></div>
+      <div class="badges"><span class="badge {css}">{esc(c.strength)}</span><span class="badge">{c.touches} commits in {sv.since_days} days</span></div>
       <p class="files">{esc(c.path)}</p>
       <p class="test"><strong>Deletion test: {esc(c.deletion_test)}.</strong> {esc(c.evidence)}</p>
       <div class="pair">
-        <figure><figcaption>Before</figcaption>{_svg_before(c)}</figure>
-        <figure><figcaption>After</figcaption>{_svg_after(c)}</figure>
+        <figure><figcaption>Before</figcaption>{_svg_before(c, i)}</figure>
+        <figure><figcaption>After</figcaption>{_svg_after(c, i)}</figure>
       </div>
       <p><strong>Problem.</strong> {esc(c.problem)}</p>
       <p><strong>Solution.</strong> {esc(c.solution)}</p>
-      <ul class="wins"><li>locality: change and bugs concentrate in one module</li><li>leverage: {c.callers} caller(s) share one interface</li></ul>
+      <ul class="wins"><li>locality: change and bugs concentrate in one module</li><li>leverage: {callers} share one interface</li></ul>
     </article>""")
     top = sv.candidates[0] if sv.candidates else None
     top_html = (f'<p><a href="#c0">{esc(top.title)}</a>: {esc(top.strength)}, deletion test {esc(top.deletion_test)}, '
-                f'{top.touches} recent commits.</p>' if top else "<p>No candidate cleared the bar.</p>")
+                f'{top.touches} commits in {sv.since_days} days.</p>' if top else "<p>No candidate cleared the bar.</p>")
+    when = esc(sv.timestamp[:16].replace("T", " ")) + " UTC"
     return f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Architecture review for {esc(Path(sv.repo_root).name)}</title>
+<title>Architecture review for {repo}</title>
 {style}
 </head>
 <body>
 <main>
   <header>
-    <h1>Architecture review for {esc(Path(sv.repo_root).name)}</h1>
-    <p class="legend">{esc(sv.timestamp)} · commit {esc(sv.sha[:12])} · {sv.hot_files_scanned} hot files from the last {sv.since_days} days · solid box = module · dashed line = seam · red arrow = leakage · thick dark box = deep module</p>
+    <h1>Architecture review for {repo}</h1>
+    <p class="legend">{when} · commit {esc(sv.sha[:12])} · {sv.hot_files_scanned} hot files from the last {sv.since_days} days</p>
+    <p class="legend">solid box = module · bar on a box = its interface · dashed line = seam · red arrow = leakage · thick dark box = deep module</p>
   </header>
   <section id="candidates">
 {chr(10).join(cards)}
@@ -333,24 +337,64 @@ def render_report(sv: Survey, template_path: Path) -> str:
 """
 
 
-def _svg_before(c: Candidate) -> str:
-    n = max(2, min(5, c.callers or 2))
-    boxes = "".join(
-        f'<rect class="mod" x="{10 + i * 60}" y="20" width="52" height="30"/><text x="{14 + i * 60}" y="39">caller</text>'
-        f'<path class="{"leak" if c.deletion_test != "pass-through" else "call"}" d="M{36 + i * 60},50 L160,110"/>'
-        for i in range(n))
-    return ('<svg viewBox="0 0 320 200" role="img" aria-label="before: many callers into a wide interface">'
-            '<defs><marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">'
-            '<path d="M0,0 L8,4 L0,8 z" fill="currentColor"/></marker></defs>'
-            f'{boxes}<rect class="mod" x="100" y="110" width="120" height="50"/><text x="112" y="140">{html.escape(Path(c.path).stem[:14])}</text>'
-            '<line class="seam" x1="10" y1="175" x2="310" y2="175"/></svg>')
+_CALLER_W, _CALLER_GAP, _SEAM_Y = 52, 8, 80
 
 
-def _svg_after(c: Candidate) -> str:
-    label = "delete it" if c.deletion_test == "pass-through" else "deep module"
-    return ('<svg viewBox="0 0 320 200" role="img" aria-label="after: one small interface over the behaviour">'
-            f'<rect class="deepmod" x="60" y="30" width="200" height="110"/><text x="84" y="90">{label}</text>'
-            '<line class="seam" x1="10" y1="175" x2="310" y2="175"/></svg>')
+def _callers_row(c: Candidate) -> Tuple[str, List[float]]:
+    """Up to five caller boxes, centred; the fifth reads `+N` when more files call the module."""
+    n = max(1, min(5, c.callers))
+    x0 = (320 - (n * _CALLER_W + (n - 1) * _CALLER_GAP)) / 2
+    boxes, centres = [], []
+    for i in range(n):
+        x = x0 + i * (_CALLER_W + _CALLER_GAP)
+        label = f"+{c.callers - 4}" if i == 4 and c.callers > 5 else "caller"
+        boxes.append(f'<rect class="mod" x="{x:g}" y="16" width="{_CALLER_W}" height="28"/>'
+                     f'<text x="{x + _CALLER_W / 2:g}" y="34" text-anchor="middle">{label}</text>')
+        centres.append(x + _CALLER_W / 2)
+    return "".join(boxes), centres
+
+
+def _markers(key: str) -> str:
+    """Arrow heads for one SVG. Ids are global to the page, so `key` must be unique per SVG."""
+    head = '<path d="M0,0 L8,4 L0,8 z" class="{cls}"/>'
+    return ("<defs>"
+            f'<marker id="call-{key}" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">{head.format(cls="head-call")}</marker>'
+            f'<marker id="leak-{key}" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">{head.format(cls="head-leak")}</marker>'
+            "</defs>")
+
+
+def _label(text: str, limit: int = 24) -> str:
+    return html.escape(text if len(text) <= limit else text[: limit - 1] + "…")
+
+
+def _svg_before(c: Candidate, i: int) -> str:
+    """The shallow module: its interface bar is as wide as the module, and calls cross the seam to all of it."""
+    row, centres = _callers_row(c)
+    kind = "call" if c.deletion_test == "pass-through" else "leak"
+    span = 200 / max(1, len(centres) - 1)
+    arrows = "".join(f'<path class="{kind}" marker-end="url(#{kind}-{i}-before)" d="M{x:g},44 L{60 + j * span if len(centres) > 1 else 160:g},118"/>'
+                     for j, x in enumerate(centres))
+    return (f'<svg viewBox="0 0 320 200" role="img" aria-label="before: {len(centres)} callers reach across the seam into the whole of {_label(Path(c.path).stem)}">'
+            f'{_markers(f"{i}-before")}{row}<line class="seam" x1="10" y1="{_SEAM_Y}" x2="310" y2="{_SEAM_Y}"/>{arrows}'
+            '<rect class="iface" x="40" y="120" width="240" height="8"/>'
+            f'<rect class="mod" x="40" y="128" width="240" height="44"/><text x="160" y="155" text-anchor="middle">{_label(Path(c.path).stem)}</text>'
+            '</svg>')
+
+
+def _svg_after(c: Candidate, i: int) -> str:
+    """The deep module: callers meet at one narrow interface; a pass-through module is gone."""
+    row, centres = _callers_row(c)
+    gone = c.deletion_test == "pass-through"
+    name = "the real module" if gone else _label(Path(c.path).stem)
+    note = f"{_label(Path(c.path).stem, 18)} deleted" if gone else "one small interface"
+    joins = "".join(f'<path class="call" d="M{x:g},44 L160,66"/>' for x in centres)
+    return (f'<svg viewBox="0 0 320 200" role="img" aria-label="after: callers meet at one small interface of {name}">'
+            f'{_markers(f"{i}-after")}{row}{joins}<path class="call" marker-end="url(#call-{i}-after)" d="M160,66 L160,102"/>'
+            f'<line class="seam" x1="10" y1="{_SEAM_Y}" x2="310" y2="{_SEAM_Y}"/>'
+            '<rect class="iface" x="136" y="104" width="48" height="8"/>'
+            f'<rect class="deepmod" x="60" y="112" width="200" height="72"/>'
+            f'<text x="160" y="143" text-anchor="middle">{name}<tspan class="note" x="160" dy="18">{note}</tspan></text>'
+            '</svg>')
 
 
 def find_template() -> Path:
