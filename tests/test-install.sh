@@ -75,6 +75,8 @@ for required in \
   ".claude/skills/super-build" \
   ".claude/skills/super-qa" \
   ".claude/skills/super-review" \
+  ".claude/skills/codebase-design/SKILL.md" \
+  ".claude/skills/improve-codebase-architecture/SKILL.md" \
   ".claude/bin/super-board-run.sh" \
   ".claude/bin/super-board-stop.sh" \
   ".claude/bin/super-board-gh-guard.sh" \
