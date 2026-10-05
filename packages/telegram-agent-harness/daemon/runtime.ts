@@ -688,6 +688,7 @@ export class TelegramDaemon {
       undefined,
       this.coordinator,
       slotSecret,
+      (sessionId, text) => this.control.deliver(sessionId, text, "auto"),
     );
   }
 
