@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
-  ALL, INK, PROJECT_PALETTE, UNASSIGNED, boardOptions, contrastRatio, daySegments, isValidWeek, layoutDay,
+  ALL, UNASSIGNED, boardOptions, daySegments, projectColors, isValidWeek, layoutDay,
   cardSpans, cardsOnDay, firstHour, resolveSelection, selectBlocks, selectCards, shiftWeek, summarize, unionMs,
   adjacentWeeks, weekRequestStart, zoneIsoDate,
 } from "../week/week-model.js";
@@ -184,7 +184,11 @@ describe("week navigation and colour", () => {
     }
   });
 
-  test("every project colour keeps 4.5:1 contrast with the block text", () => {
-    for (const color of PROJECT_PALETTE) expect(contrastRatio(color, INK)).toBeGreaterThanOrEqual(4.5);
+  test("projects get lane colour tokens by name, cycling after ten, so filtering never recolours a block", () => {
+    const blocks = Array.from({ length: 11 }, (_, i) => ({ project: `p${String(i).padStart(2, "0")}` }));
+    const colors = projectColors({ blocks: [...blocks].reverse() } as never);
+    expect(colors.get("p00")).toBe("var(--lane-0)");
+    expect(colors.get("p09")).toBe("var(--lane-9)");
+    expect(colors.get("p10")).toBe("var(--lane-0)");
   });
 });
