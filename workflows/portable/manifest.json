@@ -424,7 +424,8 @@
       "evidence_lint.py",
       "pr_demo_video.py",
       "pr_label_bot.py",
-      "project_drift.py"
+      "project_drift.py",
+      "supabase_staging_health.py"
     ],
     "optional_files": [
       "test_adoption_audit.py",
@@ -434,6 +435,8 @@
       "test_pr_label_bot.py",
       "test_project_drift.py",
       "install_upkeep_task.py",
+      "install_supabase_health_task.py",
+      "test_supabase_staging_health.py",
       "test_gardener.py",
       "test_quota_snapshot.py",
       "routing_smoke_test.py",
