@@ -1,0 +1,532 @@
+{
+  "schema": "flow-qa/v1",
+  "project": "shipnovo",
+  "version": "1.0.0",
+  "description": "Content-bound real user Flow QA definitions for Shipnovo covering article create/edit keyboard, phone row edit reachability, offer sheet swipe dismissal, return tabs single row, DHL PDF upload no-dead-end, order edit internal notes, and packing mode scan with stop before ship confirmation.",
+  "viewports": [
+    "390x844",
+    "390x420",
+    "1440x900"
+  ],
+  "themes": [
+    "light",
+    "dark"
+  ],
+  "flows": [
+    {
+      "id": "article_create_edit_keyboard",
+      "name": "Artikel anlegen und bearbeiten bei geoeffneter Tastatur",
+      "description": "Erfasst einen internen Artikel mit QA-Praefix, prueft Tastaturfokus und Dialoglayout auf mobilen Viewports (390x420 und 390x844), speichert und fuehrt sicheres Cleanup aus.",
+      "allowed_actions": [
+        "goto",
+        "tap",
+        "type",
+        "keyboard-open",
+        "assert",
+        "cleanup"
+      ],
+      "forbidden_actions": [
+        "eval",
+        "delete_database",
+        "ebay_publish",
+        "purchase_label",
+        "confirm_ship"
+      ],
+      "steps": [
+        {
+          "id": "goto_products_page",
+          "action": "goto",
+          "url": "/products",
+          "checks": [
+            "visible",
+            "no_horizontal_overflow"
+          ]
+        },
+        {
+          "id": "open_article_dialog",
+          "action": "tap",
+          "selector": "button[aria-label='Artikel anlegen'], button:has-text('Artikel anlegen'), [data-testid='btn-create-article']",
+          "checks": [
+            "visible",
+            "element_from_point",
+            "tap_target_min_44"
+          ]
+        },
+        {
+          "id": "assert_dialog_open",
+          "action": "assert",
+          "selector": "[role='dialog']",
+          "expected_present": true
+        },
+        {
+          "id": "open_keyboard_sku_focus",
+          "action": "keyboard-open",
+          "selector": "input[name='sku']",
+          "checks": [
+            "visible",
+            "input_focus_in_viewport",
+            "element_from_point"
+          ]
+        },
+        {
+          "id": "type_sku",
+          "action": "type",
+          "selector": "input[name='sku']",
+          "text": "QA-ART-FLOW-459",
+          "mutation": true,
+          "checks": [
+            "visible"
+          ]
+        },
+        {
+          "id": "type_title",
+          "action": "type",
+          "selector": "input[name='title']",
+          "text": "QA-Flow Testartikel Mobile",
+          "mutation": true,
+          "checks": [
+            "visible"
+          ]
+        },
+        {
+          "id": "type_variant",
+          "action": "type",
+          "selector": "input[name='variant']",
+          "text": "QA-Blau-M",
+          "mutation": true,
+          "checks": [
+            "visible"
+          ]
+        },
+        {
+          "id": "save_article",
+          "action": "tap",
+          "selector": "[role='dialog'] button[type='submit'], [role='dialog'] button:has-text('Artikel speichern')",
+          "checks": [
+            "visible",
+            "tap_target_min_44",
+            "element_from_point"
+          ]
+        },
+        {
+          "id": "assert_article_saved",
+          "action": "assert",
+          "selector": "table, [data-sonner-toast], [role='status']",
+          "expected_present": true
+        }
+      ],
+      "cleanup": [
+        {
+          "id": "cleanup_close_dialog_if_open",
+          "action": "cleanup",
+          "selector": "[role='dialog'] button:has-text('Abbrechen'), [role='dialog'] button[aria-label='Close'], [role='dialog'] button[aria-label='Schließen']"
+        }
+      ]
+    },
+    {
+      "id": "article_row_edit_phone",
+      "name": "Artikel-Zeilenbearbeitung auf dem Smartphone erreichbar",
+      "description": "Prueft, ob in der Artikeltabelle auf dem Smartphone (390x844) eine sichtbare, erreichbare Bearbeiten-Aktion mit Mindest-Touch-Target vorhanden ist, ohne horizontales Scrollen zu erzwingen.",
+      "allowed_actions": [
+        "goto",
+        "tap",
+        "assert",
+        "cleanup"
+      ],
+      "forbidden_actions": [
+        "eval",
+        "delete_database",
+        "drop_table",
+        "ebay_publish"
+      ],
+      "steps": [
+        {
+          "id": "goto_products_page",
+          "action": "goto",
+          "url": "/products",
+          "checks": [
+            "visible",
+            "no_horizontal_overflow"
+          ]
+        },
+        {
+          "id": "tap_row_edit_action",
+          "action": "tap",
+          "selector": "table tbody tr:first-child button[aria-label*='bearbeiten'], table tbody tr:first-child button:has-text('Bearbeiten'), table tbody tr:first-child a[aria-label*='bearbeiten']",
+          "checks": [
+            "visible",
+            "tap_target_min_44",
+            "element_from_point",
+            "no_horizontal_overflow"
+          ]
+        },
+        {
+          "id": "assert_edit_sheet_open",
+          "action": "assert",
+          "selector": "[role='dialog']",
+          "expected_present": true
+        }
+      ],
+      "cleanup": [
+        {
+          "id": "cleanup_close_edit_dialog",
+          "action": "cleanup",
+          "selector": "[role='dialog'] button:has-text('Abbrechen'), [role='dialog'] button[aria-label='Schließen']"
+        }
+      ]
+    },
+    {
+      "id": "offer_sheet_swipe_close",
+      "name": "Angebotsdetail-Sheet per Swipe nach unten schliessen",
+      "description": "Oeffnet ein eBay-Angebot in der mobilen Sheet-Ansicht und prueft, ob das Sheet per Swipe-Geste nach unten geschlossen werden kann.",
+      "allowed_actions": [
+        "goto",
+        "tap",
+        "swipe",
+        "assert",
+        "cleanup"
+      ],
+      "forbidden_actions": [
+        "eval",
+        "delete_database",
+        "ebay_publish",
+        "purchase_label"
+      ],
+      "steps": [
+        {
+          "id": "goto_listings_page",
+          "action": "goto",
+          "url": "/listings",
+          "checks": [
+            "visible",
+            "no_horizontal_overflow"
+          ]
+        },
+        {
+          "id": "open_offer_detail_sheet",
+          "action": "tap",
+          "selector": "main table tbody tr:first-child, [data-testid='listing-row']:first-child, main table tbody tr td:first-child",
+          "checks": [
+            "visible",
+            "tap_target_min_44",
+            "element_from_point"
+          ]
+        },
+        {
+          "id": "assert_sheet_present",
+          "action": "assert",
+          "selector": "[role='dialog']",
+          "expected_present": true
+        },
+        {
+          "id": "swipe_down_to_dismiss_sheet",
+          "action": "swipe",
+          "selector": "[role='dialog']",
+          "direction": "down",
+          "distance": 250,
+          "assert_dismissal": true,
+          "checks": [
+            "dismissed"
+          ]
+        },
+        {
+          "id": "assert_sheet_dismissed_state",
+          "action": "assert",
+          "selector": "[role='dialog']",
+          "expected_present": false
+        }
+      ],
+      "cleanup": [
+        {
+          "id": "cleanup_close_sheet_fallback",
+          "action": "cleanup",
+          "selector": "[role='dialog'] button[aria-label='Close'], [role='dialog'] button[aria-label='Schließen'], [role='dialog'] button:has-text('Schließen')"
+        }
+      ]
+    },
+    {
+      "id": "returns_tabs_same_row",
+      "name": "Retouren-Filtertabs in einer Zeile ohne Reload",
+      "description": "Prueft, dass die Status-Tabs auf /returns mobil in einer einzigen horizontal scrollbaren Zeile liegen (kein Umbruch ueber mehrere Zeilen) und Filterwechsel ohne Dokument-Reload erfolgen.",
+      "allowed_actions": [
+        "goto",
+        "tap",
+        "assert",
+        "cleanup"
+      ],
+      "forbidden_actions": [
+        "eval",
+        "delete_database",
+        "create_external_return"
+      ],
+      "steps": [
+        {
+          "id": "goto_returns_page",
+          "action": "goto",
+          "url": "/returns",
+          "checks": [
+            "visible",
+            "no_horizontal_overflow"
+          ]
+        },
+        {
+          "id": "verify_status_tabs_container",
+          "action": "assert",
+          "selector": "[aria-label='Retouren filtern'], [data-testid='status-tabs']",
+          "expected_present": true
+        },
+        {
+          "id": "tap_tab_offen",
+          "action": "tap",
+          "selector": "[aria-label='Retouren filtern'] button:nth-child(2), button:has-text('Offen')",
+          "no_document_reload": true,
+          "checks": [
+            "visible",
+            "tap_target_min_44",
+            "element_from_point",
+            "no_document_reload"
+          ]
+        },
+        {
+          "id": "tap_tab_wartet",
+          "action": "tap",
+          "selector": "[aria-label='Retouren filtern'] button:nth-child(3), button:has-text('Wartet')",
+          "no_document_reload": true,
+          "checks": [
+            "visible",
+            "tap_target_min_44",
+            "element_from_point",
+            "no_document_reload"
+          ]
+        },
+        {
+          "id": "assert_returns_table_present",
+          "action": "assert",
+          "selector": "[aria-label='Retouren filtern']",
+          "expected_present": true
+        }
+      ],
+      "cleanup": []
+    },
+    {
+      "id": "dhl_pdf_upload_stock",
+      "name": "DHL-Label-PDF-Upload ohne Vorrats-Sackgasse",
+      "description": "Prueft den Upload von DHL-Label-PDFs auf /labels bzw. /templates und stellt sicher, dass fehlende Labelvorraete automatisch angelegt werden statt in einer Fehlermeldungs-Sackgasse zu enden.",
+      "allowed_actions": [
+        "goto",
+        "tap",
+        "upload",
+        "assert",
+        "cleanup"
+      ],
+      "forbidden_actions": [
+        "eval",
+        "delete_database",
+        "purchase_label",
+        "confirm_ship"
+      ],
+      "steps": [
+        {
+          "id": "goto_labels_page",
+          "action": "goto",
+          "url": "/labels",
+          "checks": [
+            "visible",
+            "no_horizontal_overflow"
+          ]
+        },
+        {
+          "id": "verify_upload_control_present",
+          "action": "assert",
+          "selector": "button:has-text('DHL-PDF hochladen'), input[type='file'][accept*='pdf']",
+          "expected_present": true
+        },
+        {
+          "id": "upload_sample_dhl_pdf",
+          "action": "upload",
+          "selector": "input[type='file'][accept*='pdf']",
+          "file": "workflows/portable/fixtures/sample_label.pdf",
+          "checks": [
+            "visible"
+          ]
+        },
+        {
+          "id": "assert_upload_handled_without_dead_end",
+          "action": "assert",
+          "selector": "[role='alert'], [data-sonner-toast], [role='status'], .text-destructive, h2:has-text('Labels')",
+          "expected_present": true
+        }
+      ],
+      "cleanup": []
+    },
+    {
+      "id": "order_edit_notes",
+      "name": "Bestellung bearbeiten mit internen QA-Notizen",
+      "description": "Oeffnet eine Bestellung, erfasst interne Bestellnotizen mit QA-Praefix und speichert sie sicher ohne externe eBay-Schreiboperationen oder Kaeuferbenachrichtigungen.",
+      "allowed_actions": [
+        "goto",
+        "tap",
+        "type",
+        "assert",
+        "cleanup"
+      ],
+      "forbidden_actions": [
+        "eval",
+        "ebay_write",
+        "buy_label",
+        "confirm_ship",
+        "send_message",
+        "delete_order"
+      ],
+      "steps": [
+        {
+          "id": "goto_orders_page",
+          "action": "goto",
+          "url": "/orders",
+          "checks": [
+            "visible",
+            "no_horizontal_overflow"
+          ]
+        },
+        {
+          "id": "open_first_order",
+          "action": "tap",
+          "selector": "main a[href*='/orders/']:first-child, table tbody tr:first-child a, [data-testid='order-row']:first-child",
+          "checks": [
+            "visible",
+            "tap_target_min_44",
+            "element_from_point"
+          ]
+        },
+        {
+          "id": "focus_order_notes_field",
+          "action": "tap",
+          "selector": "#order-notes, textarea[name='notes'], textarea[placeholder*='Notiz']",
+          "checks": [
+            "visible",
+            "element_from_point"
+          ]
+        },
+        {
+          "id": "type_internal_qa_notes",
+          "action": "type",
+          "selector": "#order-notes, textarea[name='notes']",
+          "text": "QA-Flow Testnotiz interne Pruefung",
+          "mutation": true,
+          "checks": [
+            "visible"
+          ]
+        },
+        {
+          "id": "save_order_notes",
+          "action": "tap",
+          "selector": "button:has-text('Notizen speichern'), button[type='submit']",
+          "checks": [
+            "visible",
+            "tap_target_min_44",
+            "element_from_point"
+          ]
+        },
+        {
+          "id": "assert_notes_saved_state",
+          "action": "assert",
+          "selector": "#order-notes, [data-sonner-toast], [role='status']",
+          "expected_present": true
+        }
+      ],
+      "cleanup": [
+        {
+          "id": "cleanup_restore_empty_notes",
+          "action": "type",
+          "selector": "#order-notes, textarea[name='notes']",
+          "text": "QA-Bereinigt",
+          "mutation": true
+        },
+        {
+          "id": "cleanup_save_restored_notes",
+          "action": "cleanup",
+          "selector": "button:has-text('Notizen speichern')"
+        }
+      ]
+    },
+    {
+      "id": "packing_mode_scan",
+      "name": "Packmodus Scannertest mit sicherem Halt vor Versandbestaetigung",
+      "description": "Oeffnet den Packmodus, aktiviert den Scannertest ohne Buchung, fuehrt einen Testscan durch und stoppt strikt vor 'Versand bestaetigen' ohne externe Uebergabe oder eBay-Versandmeldung.",
+      "allowed_actions": [
+        "goto",
+        "tap",
+        "type",
+        "assert",
+        "cleanup"
+      ],
+      "forbidden_actions": [
+        "confirm_ship",
+        "mark_shipped",
+        "buy_label",
+        "ebay_write",
+        "send_message",
+        "eval"
+      ],
+      "steps": [
+        {
+          "id": "goto_shipping_runs_page",
+          "action": "goto",
+          "url": "/shipping-runs",
+          "checks": [
+            "visible",
+            "no_horizontal_overflow"
+          ]
+        },
+        {
+          "id": "open_pack_mode_view",
+          "action": "tap",
+          "selector": "a[href*='/pack']:first-child, a:has-text('Packmodus'):first-child, a:has-text('Weiter packen'):first-child",
+          "checks": [
+            "visible",
+            "tap_target_min_44",
+            "element_from_point"
+          ]
+        },
+        {
+          "id": "assert_scanner_input_present",
+          "action": "assert",
+          "selector": "input[placeholder*='Code scannen'], input[aria-label='Scancode']",
+          "expected_present": true
+        },
+        {
+          "id": "activate_scanner_test_mode",
+          "action": "tap",
+          "selector": "input[type='checkbox']",
+          "checks": [
+            "visible",
+            "tap_target_min_44"
+          ]
+        },
+        {
+          "id": "enter_test_barcode_without_booking",
+          "action": "type",
+          "selector": "input[placeholder*='Code scannen'], input[aria-label='Scancode']",
+          "text": "QA-SCAN-459-TEST",
+          "mutation": true,
+          "checks": [
+            "visible"
+          ]
+        },
+        {
+          "id": "assert_scanner_test_notice",
+          "action": "assert",
+          "selector": "main, [role='status'], p:has-text('Scannertest')",
+          "expected_present": true
+        },
+        {
+          "id": "stop_strictly_before_ship_confirmation",
+          "action": "assert",
+          "selector": "button:has-text('Versand bestätigen'), [data-testid='confirm-ship']",
+          "expected_present": false
+        }
+      ],
+      "cleanup": []
+    }
+  ]
+}

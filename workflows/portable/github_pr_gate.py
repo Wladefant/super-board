@@ -649,6 +649,50 @@ def shot_provenance_problems(body: str, binds: Any) -> List[str]:
     return problems
 
 
+def _content_binder(
+    head_sha: str, base_ref: str, cwd: Optional[str]
+) -> Tuple[Any, List[str], Optional[str]]:
+    """
+    Build `binds(token)` for receipt evaluation: whether a 40-hex token names this diff.
+
+    The head SHA and the head's own identity forms bind directly. Any other token has to be a
+    commit whose content identity matches the head's, which keeps a receipt served from a
+    pre-sync head valid. A token that is not a commit here never binds. The content forms need
+    a real checkout of the head; a checkout that cannot supply them narrows what a receipt may
+    name, it never blocks one that names the head SHA outright.
+    Returns (binds, identity_forms, identity_error).
+    """
+    from review_content import content_identity
+
+    base = "origin/" + base_ref
+    identity_forms = [head_sha]
+    head_identity = set()
+    identity_error = None
+    try:
+        head_identity = {form.lower() for form in content_identity(head_sha, base, cwd) if form}
+        identity_forms.extend(sorted(head_identity))
+    except (ValueError, subprocess.CalledProcessError) as exc:
+        identity_error = str(exc)
+    accepted = {form.lower() for form in identity_forms if form}
+    resolved: Dict[str, bool] = {}
+
+    def binds(token: str) -> bool:
+        if token in accepted:
+            return True
+        if token not in resolved:
+            match = False
+            if head_identity:
+                try:
+                    forms = {form.lower() for form in content_identity(token, base, cwd) if form}
+                    match = bool(forms & head_identity)
+                except (ValueError, subprocess.CalledProcessError):
+                    match = False
+            resolved[token] = match
+        return resolved[token]
+
+    return binds, identity_forms, identity_error
+
+
 def evaluate_qa_receipt(
     pr_data: Dict[str, Any],
     *,
@@ -684,45 +728,7 @@ def evaluate_qa_receipt(
     if not required:
         return "EXEMPT", requirement_reason, None
 
-    from review_content import content_identity
-
-    base = "origin/" + base_ref
-    # The content forms need a real checkout of the head; a checkout that cannot
-    # supply them narrows what a receipt may name, it never blocks one that names
-    # the head SHA outright.
-    identity_forms = [head_sha]
-    head_identity = set()
-    identity_error = None
-    try:
-        head_identity = {form.lower() for form in content_identity(head_sha, base, cwd) if form}
-        identity_forms.extend(sorted(head_identity))
-    except (ValueError, subprocess.CalledProcessError) as exc:
-        identity_error = str(exc)
-    accepted = {form.lower() for form in identity_forms if form}
-    resolved: Dict[str, bool] = {}
-
-    def binds(token: str) -> bool:
-        """
-        Whether a 40-hex token names this diff.
-
-        The head SHA and the head's own identity forms bind directly. Any other
-        token has to be a commit whose content identity matches the head's, which
-        is what keeps a receipt served from a pre-sync head valid. A token that is
-        not a commit here — a patch-id quoted from another revision, or something
-        this checkout cannot resolve — never binds.
-        """
-        if token in accepted:
-            return True
-        if token not in resolved:
-            match = False
-            if head_identity:
-                try:
-                    forms = {form.lower() for form in content_identity(token, base, cwd) if form}
-                    match = bool(forms & head_identity)
-                except (ValueError, subprocess.CalledProcessError):
-                    match = False
-            resolved[token] = match
-        return resolved[token]
+    binds, identity_forms, identity_error = _content_binder(head_sha, base_ref, cwd)
 
     declarations = []
     for source in list(pr_data.get("comments") or []) + list(pr_data.get("reviews") or []):
@@ -802,6 +808,151 @@ def evaluate_qa_receipt(
         "REQUIRED",
         f"QA receipt required ({requirement_reason}): the receipt names no identity for "
         f"this head (accepted identity tokens: {forms}"
+        f"{'; identity lookup failed: ' + identity_error if identity_error else ''}).",
+        None,
+    )
+
+
+# ------------------------------------------------------------------ flow QA
+# `QA-RECEIPT` proves a human-style look at screenshots. `FLOW-QA` proves a user flow ran:
+# the runner (`flow_qa_runner.mjs`) tapped, typed, swiped and switched tabs against the build
+# serving the head, at phone and desktop widths, and counted assertions. Staging UI PRs need
+# both. The marker line names the served revision, exactly like QA-RECEIPT, so a receipt from
+# a stale head cannot bind (negative control: test_github_pr_gate.py).
+FLOW_QA_MARKER_RE = re.compile(
+    r"^[ \t>*_`#|\-]*FLOW-QA:\s*(?P<state>PASS|FAIL|FAILED|RETRACTED|RETRACT)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+FLOW_QA_SERVED_RE = re.compile(
+    r"FLOW-QA:\s*(?:PASS|FAIL|FAILED|RETRACTED|RETRACT)\b[ \t>*_`|:\-–—]*"
+    r"(?P<served>[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\b",
+    re.IGNORECASE,
+)
+FLOW_QA_ASSERTIONS_RE = re.compile(
+    r"^[ \t>*_`|\-]*FLOW-QA-ASSERTIONS pass=(?P<passed>\d+) fail=(?P<failed>\d+)[ \t*_`|]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+FLOW_QA_VIEWPORTS_RE = re.compile(
+    r"^[ \t>*_`|\-]*FLOW-QA-VIEWPORTS (?P<viewports>[0-9x,]+)[ \t*_`|]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+FLOW_QA_REQUIRED_VIEWPORTS = ("390x844", "1440x900")
+
+
+def evaluate_flow_qa_requirement(
+    pr_data: Dict[str, Any], repo: str, base_ref: str
+) -> Tuple[bool, str]:
+    """Whether this PR must carry a FLOW-QA receipt: PolySimulator `staging`, UI paths only."""
+    if repo != "Bavariance/polysimulator" or base_ref != "staging":
+        return False, f"no Flow QA requirement for {repo}@{base_ref or 'unknown'}"
+    files = pr_data.get("files")
+    if files is None:
+        return False, "no file list supplied, Flow QA not required"
+    if len(files) >= 100:
+        return True, f"file list truncated at {len(files)} files, Flow QA required by default"
+    for f in files:
+        path = f.get("path", "") if isinstance(f, dict) else str(f)
+        norm_path = path.replace("\\", "/")
+        if not is_test_path(norm_path) and UI_PATH_RE.match(norm_path):
+            return True, f"UI path {path}"
+    return False, "no UI paths"
+
+
+def evaluate_flow_qa_receipt(
+    pr_data: Dict[str, Any],
+    *,
+    repo: str,
+    base_ref: str,
+    head_sha: str,
+    cwd: Optional[str] = None,
+) -> Tuple[str, str, Optional[str]]:
+    """
+    Verify the FLOW-QA receipt a staging UI change must carry.
+
+    One comment (or review body) must hold a `FLOW-QA: PASS <served-sha>` line whose sha names
+    this diff, a `FLOW-QA-ASSERTIONS pass=N fail=0` line with N > 0, and a
+    `FLOW-QA-VIEWPORTS` line covering 390x844 and 1440x900. The newest receipt that binds
+    this diff decides; a later FAIL or RETRACTED overrides an earlier PASS. Returns
+    (EXEMPT | PASSED | REQUIRED, reason, comment_url).
+    """
+    required, requirement_reason = evaluate_flow_qa_requirement(pr_data, repo, base_ref)
+    if not required:
+        return "EXEMPT", requirement_reason, None
+    prefix = f"Flow QA receipt required ({requirement_reason})"
+    binds, identity_forms, identity_error = _content_binder(head_sha, base_ref, cwd)
+
+    declarations = []
+    for source in list(pr_data.get("comments") or []) + list(pr_data.get("reviews") or []):
+        body = str(source.get("body") or "")
+        for marker in FLOW_QA_MARKER_RE.finditer(body):
+            end = body.find("\n", marker.start())
+            line = body[marker.start() : end if end != -1 else len(body)]
+            served = FLOW_QA_SERVED_RE.search(line)
+            declarations.append(
+                {
+                    "posted": _receipt_timestamp(source),
+                    "state": marker.group("state").upper(),
+                    "tokens": [served.group("served").lower()] if served else [],
+                    "url": str(source.get("html_url") or source.get("url") or ""),
+                    "body": body,
+                }
+            )
+    declarations.sort(key=lambda item: item["posted"], reverse=True)
+
+    saw_pass_marker = False
+    saw_pass_served = False
+    for declaration in declarations:
+        tokens = set(declaration["tokens"])
+        if declaration["state"] in QA_RECEIPT_FAILED_STATES:
+            tokens |= {token.lower() for token in SHA_TOKEN_RE.findall(declaration["body"])}
+        else:
+            saw_pass_marker = True
+            saw_pass_served = saw_pass_served or bool(declaration["tokens"])
+        if not any(binds(token) for token in tokens):
+            continue
+        if declaration["state"] in QA_RECEIPT_FAILED_STATES:
+            return (
+                "REQUIRED",
+                f"{prefix}: the newest receipt binding this diff is {declaration['state']}.",
+                declaration["url"] or None,
+            )
+        counts = FLOW_QA_ASSERTIONS_RE.search(declaration["body"])
+        if counts is None:
+            return "REQUIRED", f"{prefix}: no 'FLOW-QA-ASSERTIONS pass=N fail=M' line.", declaration["url"] or None
+        if int(counts.group("passed")) <= 0 or int(counts.group("failed")) != 0:
+            return (
+                "REQUIRED",
+                f"{prefix}: assertions pass={counts.group('passed')} fail={counts.group('failed')}; "
+                "a PASS needs pass>0 and fail=0.",
+                declaration["url"] or None,
+            )
+        vp = FLOW_QA_VIEWPORTS_RE.search(declaration["body"])
+        covered = set(vp.group("viewports").lower().split(",")) if vp else set()
+        missing = [v for v in FLOW_QA_REQUIRED_VIEWPORTS if v not in covered]
+        if missing:
+            return (
+                "REQUIRED",
+                f"{prefix}: the receipt does not cover viewport(s) {', '.join(missing)}.",
+                declaration["url"] or None,
+            )
+        return (
+            "PASSED",
+            f"Flow QA receipt binds head {head_sha[:8]} ({requirement_reason})",
+            declaration["url"] or None,
+        )
+
+    if not declarations:
+        return "REQUIRED", f"{prefix}: no PR comment carries a 'FLOW-QA: PASS' marker.", None
+    if saw_pass_marker and not saw_pass_served:
+        return (
+            "REQUIRED",
+            f"{prefix}: the marker names no served revision; a 'FLOW-QA: PASS <served-sha>' line is required.",
+            None,
+        )
+    forms = ", ".join(identity_forms) or "none resolved"
+    return (
+        "REQUIRED",
+        f"{prefix}: the receipt names no identity for this head (accepted identity tokens: {forms}"
         f"{'; identity lookup failed: ' + identity_error if identity_error else ''}).",
         None,
     )
@@ -940,6 +1091,9 @@ class PRGateEvaluation:
     qa_receipt_verdict: Optional[str] = None
     qa_receipt_reason: Optional[str] = None
     qa_receipt_url: Optional[str] = None
+    flow_qa_receipt_verdict: Optional[str] = None
+    flow_qa_receipt_reason: Optional[str] = None
+    flow_qa_receipt_url: Optional[str] = None
     released_checks: List[str] = field(default_factory=list)
     local_tests_record: Optional[Dict[str, Any]] = None
 
@@ -966,6 +1120,8 @@ class PRGateEvaluation:
             f"{f' - {self.verify_receipt_reason}' if self.verify_receipt_reason else ''}\n"
             f"- **Browser QA:** `{self.qa_receipt_verdict or 'EXEMPT'}`"
             f"{f' - {self.qa_receipt_reason}' if self.qa_receipt_reason else ''}\n"
+            f"- **Flow QA:** `{self.flow_qa_receipt_verdict or 'EXEMPT'}`"
+            f"{f' - {self.flow_qa_receipt_reason}' if self.flow_qa_receipt_reason else ''}\n"
             f"- **Verdict:** **{self.gate_verdict}** — {self.verdict_reason}\n"
         )
 
@@ -1465,6 +1621,11 @@ def evaluate_pr_gate(
         pr_data, repo=repo, base_ref=base_ref, head_sha=head_sha
     )
     qa_receipt_blocked = qa_receipt_verdict == "REQUIRED"
+    # 4D. Real user-flow QA receipt (FLOW-QA), required for staging UI changes
+    flow_qa_receipt_verdict, flow_qa_receipt_reason, flow_qa_receipt_url = evaluate_flow_qa_receipt(
+        pr_data, repo=repo, base_ref=base_ref, head_sha=head_sha
+    )
+    flow_qa_receipt_blocked = flow_qa_receipt_verdict == "REQUIRED"
     # 5. Final Gate Verdict
     if ci_verdict == "FAILURE":
         gate_verdict = "BLOCKED"
@@ -1487,6 +1648,9 @@ def evaluate_pr_gate(
     elif qa_receipt_blocked:
         gate_verdict = "BLOCKED"
         verdict_reason = f"{qa_receipt_reason}"
+    elif flow_qa_receipt_blocked:
+        gate_verdict = "BLOCKED"
+        verdict_reason = f"{flow_qa_receipt_reason}"
     elif review_required:
         if approval_verdict == "SELF_APPROVED_ONLY":
             gate_verdict = "BLOCKED"
@@ -1551,6 +1715,8 @@ def evaluate_pr_gate(
         verdict_reason += f" Verification receipt: {verify_receipt_verdict}."
     if qa_receipt_verdict and qa_receipt_verdict != "EXEMPT":
         verdict_reason += f" Browser QA receipt: {qa_receipt_verdict}."
+    if flow_qa_receipt_verdict and flow_qa_receipt_verdict != "EXEMPT":
+        verdict_reason += f" Flow QA receipt: {flow_qa_receipt_verdict}."
     if released_critical_checks:
         verdict_reason += f" Deploy-critical checks released: local tests recorded ({', '.join(released_critical_checks)})."
     return PRGateEvaluation(
@@ -1585,6 +1751,9 @@ def evaluate_pr_gate(
         qa_receipt_verdict=qa_receipt_verdict,
         qa_receipt_reason=qa_receipt_reason,
         qa_receipt_url=qa_receipt_url,
+        flow_qa_receipt_verdict=flow_qa_receipt_verdict,
+        flow_qa_receipt_reason=flow_qa_receipt_reason,
+        flow_qa_receipt_url=flow_qa_receipt_url,
         released_checks=released_critical_checks,
         local_tests_record=local_tests_record if is_valid_ltr else None,
     )

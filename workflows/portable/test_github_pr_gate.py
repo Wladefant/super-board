@@ -192,7 +192,8 @@ class TestGitHubPRGate(unittest.TestCase):
         )
 
     def qa_receipt_comment(
-        self, *, named=None, identity=None, images=2, marker="PASS", served=None, extra="", when=None
+        self, *, named=None, identity=None, images=2, marker="PASS", served=None, extra="", when=None,
+        flow=True,
     ):
         """A browser-QA receipt in the shape lanes post on a PR, for `named` (default: the head).
 
@@ -213,12 +214,48 @@ class TestGitHubPRGate(unittest.TestCase):
             f"![shot-{i}](https://github.com/user-attachments/assets/{i:08d}-1111-2222-3333-{i:012d})"
             for i in range(images)
         )
+        if flow:
+            # The flow receipt is a given in fixtures that isolate the browser-QA behaviour.
+            lines.extend(self.flow_qa_lines())
         if extra:
             lines.append(extra)
         comment = {"body": "\n".join(lines), "html_url": self.QA_RECEIPT_URL}
         if when:
             comment["created_at"] = when
         return comment
+
+    def flow_qa_lines(self, *, served=None, passed=12, failed=0, viewports="390x844,1440x900", marker="PASS"):
+        """The lines `flow_qa_runner.mjs` prints: marker bound to the served sha, counts, viewports."""
+        served = served or self.head_sha
+        return [
+            f"FLOW-QA: {marker} {served}",
+            f"FLOW-QA-ASSERTIONS pass={passed} fail={failed}",
+            f"FLOW-QA-VIEWPORTS {viewports}",
+        ]
+
+    def test_flow_qa_receipt_positive_and_negative_controls(self):
+        """UI diff needs a FLOW-QA receipt bound to the head: stale sha, failures, thin coverage are BLOCKED."""
+        stale = "1" * 40
+        cases = [
+            ("no flow lines", dict(flow=False), "no PR comment carries a 'FLOW-QA: PASS' marker"),
+            ("stale sha", dict(flow=False, extra="\n".join(self.flow_qa_lines(served=stale))), None),
+            ("failed assertion", dict(flow=False, extra="\n".join(self.flow_qa_lines(failed=1))), None),
+            ("zero assertions", dict(flow=False, extra="\n".join(self.flow_qa_lines(passed=0))), None),
+            ("phone only", dict(flow=False, extra="\n".join(self.flow_qa_lines(viewports="390x844"))), None),
+            ("fail marker", dict(flow=False, extra="\n".join(self.flow_qa_lines(marker="FAIL"))), None),
+        ]
+        for label, kwargs, expected in cases:
+            with self.subTest(case=label):
+                result = evaluate_pr_gate(
+                    self.staging_ui_pr(comments=[self.qa_receipt_comment(**kwargs)]), policy=self.staging_policy()
+                )
+                self.assertEqual(result.flow_qa_receipt_verdict, "REQUIRED", result.flow_qa_receipt_reason)
+                self.assertEqual(result.gate_verdict, "BLOCKED")
+                if expected:
+                    self.assertIn(expected, result.verdict_reason)
+        good = evaluate_pr_gate(self.staging_ui_pr(comments=[self.qa_receipt_comment()]), policy=self.staging_policy())
+        self.assertEqual(good.flow_qa_receipt_verdict, "PASSED", good.flow_qa_receipt_reason)
+        self.assertEqual(good.gate_verdict, "PASSED")
 
     def staging_ui_pr(self, receipt=None, *, files=None, comments=None):
         """A review-exempt staging PR whose diff reaches the order ticket UI."""
@@ -1735,7 +1772,7 @@ class TestGitHubPRGate(unittest.TestCase):
         self.assertEqual(result.qa_receipt_verdict, "PASSED")
         # A negative verdict for another revision does not touch this diff's receipt.
         elsewhere = self.qa_receipt_comment(
-            marker="FAIL", named="d" * 40, identity="d" * 40, when="2026-09-27T01:00:00Z"
+            marker="FAIL", named="d" * 40, identity="d" * 40, when="2026-09-27T01:00:00Z", flow=False
         )
         result = evaluate_pr_gate(
             self.staging_ui_pr(comments=[older, elsewhere]), policy=self.staging_policy()
