@@ -128,6 +128,28 @@ class TestDepthSurvey(unittest.TestCase):
         self.assertNotIn("pkg/orders_repo.py", [c.path for c in sv.candidates])
         self.assertIn("pkg/orders_repo.py", sv.skipped_adr)
 
+    def test_glossary_terms_are_cited_in_title_report_and_issue(self):
+        (self.root / "GLOSSARY.md").write_text(
+            "# Glossary\n\n| Term | Meaning | Where |\n| --- | --- | --- |\n"
+            "| **Order repo** | Persistence seam for orders. | [`pkg/orders_repo.py`](pkg/orders_repo.py) |\n"
+            "| **Cart** | Priced basket. | [`pkg/pricing.py`](pkg/pricing.py) |\n"
+            "| **Refund** | Money back. | [`pkg/other.py`](pkg/other.py) |\n", encoding="utf-8")
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "glossary")
+        sv = depth_survey.survey(self.root)
+        wrapper = {c.path: c for c in sv.candidates}["pkg/orders_repo.py"]
+        self.assertEqual(wrapper.domain_terms, ["Order repo"])
+        self.assertIn("Order repo", wrapper.title)
+        self.assertNotIn("Cart", wrapper.title)
+        self.assertIn("Order repo", depth_survey.render_markdown(sv))
+        self.assertIn("Order repo", depth_survey._sub_issue_body(wrapper, sv, None))
+
+    def test_no_glossary_leaves_candidates_uncited(self):
+        sv = depth_survey.survey(self.root)
+        wrapper = {c.path: c for c in sv.candidates}["pkg/orders_repo.py"]
+        self.assertEqual(wrapper.domain_terms, [])
+        self.assertEqual(wrapper.title, "Delete the orders_repo pass-through module")
+
     def test_filing_is_deduped_and_strong_only(self):
         sv = depth_survey.survey(self.root)
         strong = [c for c in sv.candidates if c.strength == "Strong"]
