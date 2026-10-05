@@ -144,6 +144,16 @@ class TestDepthSurvey(unittest.TestCase):
         self.assertIn("Order repo", depth_survey.render_markdown(sv))
         self.assertIn("Order repo", depth_survey._sub_issue_body(wrapper, sv, None))
 
+    def test_a_file_no_row_cites_takes_the_terms_of_its_directory(self):
+        (self.root / "GLOSSARY.md").write_text(
+            "| Term | Meaning | Where |\n| --- | --- | --- |\n"
+            "| **Cart** | Priced basket. | [`pkg/pricing.py`](pkg/pricing.py) |\n"
+            "| **Label** | Other area. | [`other/label.py`](other/label.py) |\n", encoding="utf-8")
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "glossary")
+        wrapper = {c.path: c for c in depth_survey.survey(self.root).candidates}["pkg/orders_repo.py"]
+        self.assertEqual(wrapper.domain_terms, ["Cart"])
+
     def test_no_glossary_leaves_candidates_uncited(self):
         sv = depth_survey.survey(self.root)
         wrapper = {c.path: c for c in sv.candidates}["pkg/orders_repo.py"]
