@@ -600,7 +600,7 @@ export class TelegramDaemon {
       ? this.options.pollerFactory(token, slot.stateDir, access, callbacks, correlation, pollerOptions)
       : new TelegramPoller(token, slot.stateDir, access, callbacks, correlation, pollerOptions);
 
-    let weekRoute: ((start: string | null) => Promise<unknown>) | undefined;
+    let weekRoute: ((query: { start: string | null; board: string | null; kind: string | null }) => Promise<unknown>) | undefined;
     const stopMiniApp = connectMiniApp({
       stateDir: slot.stateDir, token, allowedUsers: access.allowFrom,
       session: (userId, context) => {
@@ -645,7 +645,7 @@ export class TelegramDaemon {
         });
       },
       status: () => ({ polling: poller.running, slot: slot.slotId }),
-      week: start => (weekRoute ??= defaultWeekRoute(slot.stateDir))(start),
+      week: query => (weekRoute ??= defaultWeekRoute(slot.stateDir))(query),
       dashboard: (userId, sessionId) => {
         const session = sessionId ?? router.boundSession({ chatId: userId, topicId: "" });
         const raw = session ? poller.getMeta(`dashboard-snapshot:${session}`) : null;

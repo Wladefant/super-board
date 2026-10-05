@@ -65,12 +65,15 @@ CONFIG_SCHEMA_VERSION = 1
 #: The ledger. Excluded from its own snapshot; see the module docstring.
 MANIFEST_RELATIVE_PATH = ".claude/super-board/install-manifest.json"
 
-#: The four pipeline skills.
+#: The four pipeline skills, plus the two vendored design skills
+#: (MIT, https://github.com/mattpocock/skills; see LICENSES/).
 INSTALLED_SKILLS: tuple[str, ...] = (
     "super-board",
     "super-build",
     "super-qa",
     "super-review",
+    "codebase-design",
+    "improve-codebase-architecture",
 )
 
 #: Every executable entry point, all in ONE directory. The historical names are

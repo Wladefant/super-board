@@ -397,6 +397,11 @@ export function validateMutationPayload(action, step) {
   if (isTypeAction || isMarkedMutation) {
     const textVal = step.text ?? step.value ?? step.input;
     if (typeof textVal === 'string' && textVal.length > 0) {
+      // A number input cannot hold the "QA-" prefix. A step may opt in with numeric_only when the
+      // value is plain digits and the form is never submitted.
+      if (step.numeric_only === true && /^\d+(\.\d+)?$/.test(textVal)) {
+        return { valid: true };
+      }
       const requiresQaPrefix = isMarkedMutation || (step.selector && !step.selector.includes('search'));
       if (requiresQaPrefix && !textVal.startsWith('QA-')) {
         return {
@@ -692,6 +697,25 @@ async function stampDocumentIdentity(page) {
 }
 
 /**
+ * Returns the first element matching the selector that has a layout box, polling until timeoutMs.
+ * A page can render the same control twice (mobile and desktop copies) with one hidden by CSS.
+ */
+async function firstVisibleHandle(page, selector, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    for (const handle of await page.$$(selector)) {
+      const shown = await handle.evaluate((el) => {
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden';
+      });
+      if (shown) return handle;
+    }
+    if (Date.now() >= deadline) throw new Error(`No visible element for selector "${selector}"`);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+}
+
+/**
  * Evaluates in-page geometry and elementFromPoint for named checks.
  */
 async function inspectTargetElement(page, selector) {
@@ -797,6 +821,24 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
     preInspection = await inspectTargetElement(page, step.selector);
   }
 
+  // An optional tap (for example a consent banner that only appears for new visitors) is skipped
+  // with a passing note when its target never shows up.
+  if (step.optional && step.action === 'tap') {
+    const shown = await page.waitForSelector(step.selector, { timeout: 2500, visible: true }).catch(() => null);
+    if (!shown) {
+      page.off('load', onNav);
+      return {
+        flow: flow.id || 'default-flow',
+        step: step.id || 'step',
+        viewport: viewportKey,
+        theme,
+        passed: true,
+        checks: [{ name: 'optional_skipped', passed: true, detail: `Optional target "${step.selector}" not present; skipped` }],
+        screenshot: null
+      };
+    }
+  }
+
   // 3. Execute declarative action
   const timeoutMs = step.timeout_ms || 10000;
 
@@ -829,10 +871,38 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
 
     case 'type': {
       if (!step.selector) throw new Error('Action "type" requires "selector"');
-      await page.waitForSelector(step.selector, { timeout: timeoutMs });
-      await page.click(step.selector);
+      const typeTarget = await firstVisibleHandle(page, step.selector, timeoutMs);
+      const readPreview = async () => {
+        if (!step.preview_regex) return null;
+        return page.evaluate((src) => {
+          const m = new RegExp(src).exec(document.body.innerText);
+          return m ? m[1] ?? m[0] : null;
+        }, step.preview_regex);
+      };
+      const previewBefore = await readPreview();
+      await typeTarget.evaluate((el) => {
+        el.scrollIntoView({ block: 'center' });
+        el.focus();
+        if (typeof el.select === 'function') el.select();
+      });
       const textToType = step.text ?? step.value ?? '';
-      await page.type(step.selector, textToType, { delay: step.delay || 20 });
+      await typeTarget.type(textToType, { delay: step.delay || 20 });
+      if (step.preview_regex) {
+        const settle = Date.now() + 4000;
+        let previewAfter = await readPreview();
+        while (previewAfter === previewBefore && Date.now() < settle) {
+          await new Promise((resolve) => setTimeout(resolve, 200));
+          previewAfter = await readPreview();
+        }
+        const changed = previewBefore !== null && previewAfter !== null && previewAfter !== previewBefore;
+        checksResults.push({
+          name: 'preview_updates',
+          passed: changed,
+          detail: changed
+            ? `Preview changed from "${previewBefore}" to "${previewAfter}"`
+            : `Preview did not update (before "${previewBefore}", after "${previewAfter}")`
+        });
+      }
       break;
     }
 
@@ -849,8 +919,8 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
         });
       }
       if (step.selector) {
-        await page.waitForSelector(step.selector, { timeout: timeoutMs });
-        await page.focus(step.selector);
+        const focusTarget = await firstVisibleHandle(page, step.selector, timeoutMs);
+        await focusTarget.focus();
       }
       break;
     }

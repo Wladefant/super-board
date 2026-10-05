@@ -144,7 +144,7 @@ export const gitCommitCounter: CommitCounter = (cwd, startMs, endMs) => {
   // A commit shortly after the last message still belongs to the block.
   const until = new Date(endMs + 5 * 60_000).toISOString();
   // HEAD of the lane's own worktree: `--all` would credit a lane with its siblings' commits.
-  execFile("git", ["log", "HEAD", "--no-merges", "--format=%H", `--since=${new Date(startMs).toISOString()}`, `--until=${until}`],
+  execFile("git", ["log", "HEAD", "--first-parent", "--no-merges", "--format=%H", `--since=${new Date(startMs).toISOString()}`, `--until=${until}`],
     { cwd, timeout: 15_000, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }, (error, stdout) => {
       if (error) return resolve(null);
       resolve(stdout.split("\n").map(l => l.trim()).filter(l => /^[0-9a-f]{40}$/.test(l)).map(l => l.slice(0, 8)));

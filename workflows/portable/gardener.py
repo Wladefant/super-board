@@ -1883,6 +1883,58 @@ def install_task_scheduler_jobs(
     except subprocess.CalledProcessError as e:
         results[hourly_tn] = {"status": "error", "error": e.stderr.strip() or str(e)}
     return results
+
+
+SURVEY_REPOS: Tuple[Tuple[str, str], ...] = (
+    ("Wladefant/super-board", "main"),
+    ("Wladefant/veyyon", "main"),
+)
+
+
+SURVEY_DEFAULT_ISSUE_REPO = "Wladefant/super-board"  # the survey never defaults to polysimulator
+
+
+def install_depth_survey_task(
+    python_exe: str,
+    script_path: str,
+    log_dir: str = "C:/Users/wkiri/.veyyon/run/gardener",
+    repos: Tuple[Tuple[str, str], ...] = SURVEY_REPOS,
+    every_days: int = 3,
+) -> Dict[str, Any]:
+    """Registers the report-only depth survey (scope A) to run every few days.
+
+    The survey reads a clone only the Gardener owns (log_dir/survey-roots/<repo>), so it never
+    touches a working checkout. A failed fetch ends the run: a stale tree files nothing.
+    """
+    os.makedirs(log_dir, exist_ok=True)
+    py_path = str(Path(python_exe).resolve())
+    sc_path = str(Path(script_path).resolve())
+    lg_path = str(Path(log_dir).resolve())
+    lines = ["@echo off"]
+    for repo, branch in repos:
+        root = f"{lg_path}\\survey-roots\\{repo.replace('/', '__')}"
+        lines += [
+            f'if not exist "{root}\\.git" git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 clone --quiet "https://github.com/{repo}.git" "{root}" || exit /b 1',
+            f'git -C "{root}" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 fetch --quiet origin || exit /b 1',
+            f'git -C "{root}" checkout --quiet --detach origin/{branch} || exit /b 1',
+            f'"{py_path}" "{sc_path}" --survey-depth --repo-root "{root}" --issue-repo "{repo}" '
+            f'--state-dir "{lg_path}" --log-dir "{lg_path}" --survey-out "{lg_path}\\depth-survey"',
+        ]
+    cmd_file = Path(log_dir) / "gardener_survey.cmd"
+    cmd_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    name = "SuperboardGardenerDepthSurvey"
+    cmd = ["schtasks", "/create", "/tn", name, "/tr", f'"{cmd_file.resolve()}"',
+           "/sc", "daily", "/mo", str(every_days), "/st", "04:30", "/f"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60,
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return {name: {"status": "created", "output": proc.stdout.strip(), "cmd_file": str(cmd_file)}}
+    except subprocess.CalledProcessError as e:
+        return {name: {"status": "error", "error": e.stderr.strip() or str(e)}}
+    except subprocess.TimeoutExpired:
+        return {name: {"status": "error", "error": "schtasks timed out after 60 s"}}
+
+
 # ==============================================================================
 # Runner Pipeline
 # ==============================================================================
@@ -2055,6 +2107,35 @@ def auto_detect_repo_root() -> Path:
 
     return cwd
 
+def run_depth_survey_cli(
+    repo_root: Path,
+    issue_repo: str,
+    live: bool,
+    out_dir: Path,
+    summary_issue: Optional[int] = None,
+    max_new: int = 5,
+) -> int:
+    """`--survey-depth`: delegate to depth_survey.py (report-only, never edits code)."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import depth_survey
+
+    sv = depth_survey.survey(repo_root)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    report_path = out_dir / f"architecture-review-{repo_root.name}-{stamp}.html"
+    report_path.write_text(
+        depth_survey.render_report(sv, depth_survey.find_template()), encoding="utf-8"
+    )
+    print(depth_survey.render_markdown(sv, str(report_path)))
+    filed = depth_survey.file_candidates(sv, issue_repo, dry_run=not live, max_new=max_new)
+    for item in filed:
+        print(f"[{'LIVE' if live else 'DRY-RUN'}] {item['state']}: {item['title']} -> {item['url']}")
+    if live and summary_issue:
+        ok = depth_survey.post_summary(sv, issue_repo, summary_issue, str(report_path))
+        print(f"[{'OK' if ok else 'WARN'}] summary comment on {issue_repo}#{summary_issue}")
+    return 0
+
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(
@@ -2188,8 +2269,42 @@ def main() -> int:
         action="store_true",
         help="Bypass host RAM utilization safety check",
     )
+    parser.add_argument(
+        "--install-survey-task",
+        action="store_true",
+        help="Register the report-only depth survey (super-board and veyyon) as a Task Scheduler job, every 3 days",
+    )
+    parser.add_argument(
+        "--survey-depth",
+        action="store_true",
+        help="Report-only module-depth survey (git hot spots, deletion test per candidate). "
+             "With --live, files one sub-issue per Strong candidate under the standing parent. Never edits code.",
+    )
+    parser.add_argument(
+        "--survey-out",
+        type=str,
+        default=None,
+        help="Directory for the offline HTML depth report (default: <state-dir>/depth-survey)",
+    )
+    parser.add_argument(
+        "--survey-issue",
+        type=int,
+        default=None,
+        help="Issue number in --issue-repo that receives the survey summary comment (live only)",
+    )
 
     args = parser.parse_args()
+    if args.install_survey_task:
+        res = install_depth_survey_task(
+            python_exe=sys.executable,
+            script_path=str(Path(__file__).resolve()),
+            log_dir=args.log_dir or "C:/Users/wkiri/.veyyon/run/gardener",
+        )
+        print("[OK] Depth survey task installation results:")
+        for tn, info in res.items():
+            print(f"  * {tn}: {info}")
+        return 0
+
 
     if args.install_tasks:
         script_path = str(Path(__file__).resolve())
@@ -2237,6 +2352,16 @@ def main() -> int:
     if not repo_root.is_dir():
         print(f"Error: Target repository directory does not exist: {repo_root}", file=sys.stderr)
         return 1
+
+    if args.survey_depth:
+        return run_depth_survey_cli(
+            repo_root=repo_root,
+            issue_repo=SURVEY_DEFAULT_ISSUE_REPO if args.issue_repo == "Bavariance/polysimulator" else args.issue_repo,
+            live=args.live and not args.dry_run,
+            out_dir=Path(args.survey_out or Path(args.state_dir) / "depth-survey"),
+            summary_issue=args.survey_issue,
+            max_new=args.max_new_issues,
+        )
 
     report = run_gardener(
         repo_root=repo_root,
