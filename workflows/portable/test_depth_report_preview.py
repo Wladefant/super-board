@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
 Tests for depth_report_preview.py: the served SHA a capture reads, and what the preview serves.
-Tracking: https://github.com/Wladefant/super-board/issues/517
+Tracking: https://github.com/Wladefant/super-board/issues/517, https://github.com/Wladefant/super-board/issues/560
 """
 
+import contextlib
+import io
 import json
+import unittest.mock
 import os
 import socket
 import subprocess
@@ -121,6 +124,75 @@ class TestServeUntilStopped(unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertTrue(port_is_free(port), "the port must be free once the preview stops")
 
+
+class TestStartUpErrors(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        git(self.root, "init", "-q")
+        self.template = self.root / "report-template.html"
+        self.renderer = self.root / "depth_survey.py"
+        self.template.write_text("<style></style>", encoding="utf-8")
+        self.renderer.write_text("x = 1\n", encoding="utf-8")
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "init")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_busy_port_fails_before_survey_with_code_2_and_no_traceback(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        self.addCleanup(sock.close)
+
+        with unittest.mock.patch.object(preview.depth_survey, "survey") as mock_survey:
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = preview.main(["--repo-root", str(self.root), "--port", str(port)])
+
+            self.assertEqual(rc, 2)
+            lines = err.getvalue().strip().splitlines()
+            self.assertEqual(len(lines), 1, f"expected one line on stderr, got: {lines}")
+            self.assertIn(str(port), lines[0])
+            self.assertIn("--port", lines[0])
+            mock_survey.assert_not_called()
+
+    def test_repo_root_that_is_not_a_git_checkout_exits_code_2(self):
+        with tempfile.TemporaryDirectory() as empty_dir:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+            sock.close()
+
+            with unittest.mock.patch.object(preview, "serve_until_stopped") as mock_serve:
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    rc = preview.main(["--repo-root", empty_dir, "--port", str(port)])
+
+                self.assertEqual(rc, 2)
+                mock_serve.assert_not_called()
+                lines = err.getvalue().strip().splitlines()
+                self.assertEqual(len(lines), 1, f"expected one line on stderr, got: {lines}")
+                self.assertTrue("not a git" in lines[0].lower() or "checkout" in lines[0].lower())
+                self.assertTrue(port_is_free(port), "port must be free afterwards")
+
+    def test_survey_or_render_error_exits_nonzero_and_frees_port(self):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+
+        with unittest.mock.patch.object(preview.depth_survey, "find_template", side_effect=RuntimeError("template exploded")):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = preview.main(["--repo-root", str(self.root), "--port", str(port)])
+
+            self.assertNotEqual(rc, 0)
+            lines = err.getvalue().strip().splitlines()
+            self.assertEqual(len(lines), 1, f"expected one line on stderr, got: {lines}")
+            self.assertIn("template exploded", lines[0])
+            self.assertTrue(port_is_free(port), "port must be released on survey or render error")
 
 if __name__ == "__main__":
     unittest.main()

@@ -14,7 +14,9 @@ At start it runs `depth_survey.survey()` on --repo-root and renders the result t
 template code drew the page. `dirty` is true when that checkout has local changes to either file.
 Every response carries `x-served-sha`. `depth_report_capture.mjs` reads the SHA from here, never from
 the local branch (evidence provenance rule, https://github.com/Wladefant/super-board/issues/421).
-Tracking: https://github.com/Wladefant/super-board/issues/517
+Start-up errors exit with code 2 and one line on stderr: a busy port names the port and says to pass
+--port; a repo-root that is not a git checkout serves nothing and names the directory.
+Tracking: https://github.com/Wladefant/super-board/issues/517, https://github.com/Wladefant/super-board/issues/560
 """
 
 from __future__ import annotations
@@ -94,11 +96,34 @@ def main(argv=None) -> int:
     ap.add_argument("--limit", type=int, default=40)
     ap.add_argument("--port", type=int, default=4791)
     a = ap.parse_args(argv)
-    sv = depth_survey.survey(Path(a.repo_root), a.since_days, a.limit)
-    template = depth_survey.find_template()
-    version = served_identity(template, Path(depth_survey.__file__).resolve(), sv.sha)
-    page = depth_survey.render_report(sv, template).encode("utf-8")
-    server = ThreadingHTTPServer(("127.0.0.1", a.port), make_handler(page, version))
+
+    server = None
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", a.port), None, bind_and_activate=False)
+        server.server_bind()
+        server.server_activate()
+    except OSError:
+        if server is not None:
+            server.server_close()
+        print(f"depth_report_preview: port {a.port} is busy; pass --port to choose another", file=sys.stderr)
+        return 2
+    repo = Path(a.repo_root).resolve()
+    if not repo.is_dir() or _git(repo, "rev-parse", "--is-inside-work-tree") != "true":
+        server.server_close()
+        print(f"depth_report_preview: {a.repo_root} is not a git checkout", file=sys.stderr)
+        return 2
+
+    try:
+        sv = depth_survey.survey(repo, a.since_days, a.limit)
+        template = depth_survey.find_template()
+        version = served_identity(template, Path(depth_survey.__file__).resolve(), sv.sha)
+        page = depth_survey.render_report(sv, template).encode("utf-8")
+    except Exception as e:
+        server.server_close()
+        print(f"depth_report_preview: {e}", file=sys.stderr)
+        return 1
+
+    server.RequestHandlerClass = make_handler(page, version)
     print(f"depth report preview on http://127.0.0.1:{server.server_port} serving {template} at {version['sha']}"
           f"{' (dirty)' if version['dirty'] else ''}; {len(sv.candidates)} candidate(s) from {sv.repo_root}",
           flush=True)
