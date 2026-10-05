@@ -201,7 +201,7 @@ function buildReport(projects, noCommit, pullRequests, blocks) {
   const most = projects[0] ? `Most time: ${projects[0].project}, ${formatDuration(projects[0].ms)}.` : 'Most time: no lanes this week.';
   const next = noCommit.length
     ? `Next: resume ${noCommit.slice(0, 2).map(blockTitle).join(' and ')} first; ${noCommit.length === 1 ? 'it' : 'they'} stopped with no commit.`
-    : 'Next: every lane ended with a commit.';
+    : blocks.length ? 'Next: every lane ended with a commit.' : 'Next: start a lane from the board.';
   return [shipped, most, next];
 }
 

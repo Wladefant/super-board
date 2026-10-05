@@ -223,7 +223,9 @@ h1 { font-size: 28px; letter-spacing: -0.03em; margin-top: var(--s1); font-varia
     border-radius: var(--r-panel) var(--r-panel) 0 0; border-bottom: 0;
     padding-bottom: env(safe-area-inset-bottom);
   }
-  .sheet-handle { display: block; width: 40px; height: 4px; border-radius: 999px; background: #405077; margin: var(--s2) auto 0; }
+  /* A 20px-tall grab zone around the 4px bar swipes the sheet instead of scrolling it. */
+  .sheet-handle { display: block; height: 20px; touch-action: none; }
+  .sheet-handle::before { content: ''; display: block; width: 40px; height: 4px; margin: var(--s2) auto; border-radius: 999px; background: #405077; }
   .detail-head { touch-action: none; }
 }
 .agenda-list { display: grid; gap: var(--s2); }

@@ -168,7 +168,7 @@ function renderStats(summary) {
     el('span', { class: 'num' }, plural(summary.blocks.length, 'lane')),
     el('span', { 'aria-hidden': 'true', class: 'dot-sep' }, '·'),
     el('span', { class: 'num' }, plural(summary.commits, 'commit')),
-    nc ? el('span', { class: 'badge-nc' }, el('span', { class: 'swatch-nc', 'aria-hidden': 'true' }), `${nc} stopped with no commit`) : null,
+    ...(nc ? [el('span', { class: 'badge-nc' }, el('span', { class: 'swatch-nc', 'aria-hidden': 'true' }), `${nc} stopped with no commit`)] : []),
   );
 }
 
@@ -318,7 +318,7 @@ function renderSidebar(data, summary, colors, f) {
     el('span', { class: 'swatch-nc', '--c': colors.get(block.project), 'aria-hidden': 'true' }),
     el('span', { class: 'nc-text' }, el('span', { class: 'nc-title' }, blockTitle(block)),
       el('span', { class: 'muted num' }, `${block.project} · ${f.weekday.format(block.startMs)} ${f.time.format(block.startMs)} · ${formatDuration(block.endMs - block.startMs)}`)))))
-    : [el('li', { class: 'muted' }, 'Every lane ended with a commit.')]));
+    : [el('li', { class: 'muted' }, summary.blocks.length ? 'Every lane ended with a commit.' : 'No lanes ran.')]));
 
   const max = Math.max(...summary.days.map(d => d.ms), 1);
   $('perday').replaceChildren(...summary.days.map(day => el('li', {},
@@ -390,7 +390,7 @@ function openCard(trigger, card, data) {
   const ref = card.repo && card.number ? `${card.repo}#${card.number}` : TYPE_TEXT[card.type] || 'Card';
   openDialog(trigger, card.title, [
     el('dl', { class: 'meta' },
-      row('Board', board ? `${board.title} · ${kindLabel(board.kind)}` : card.boardId),
+      row('Board', board ? (kindLabel(board.kind) === board.title ? board.title : `${board.title} · ${kindLabel(board.kind)}`) : card.boardId),
       row('Item', `${ref} · ${STATE_TEXT[card.state] || card.state}`),
       row('Date', card.endAt && card.endAt > card.at ? `${f.dayLong.format(card.at)} – ${f.dayLong.format(card.endAt - 1)}` : f.dayLong.format(card.at))),
     el('p', { class: 'muted' }, SOURCE_TEXT[card.source] || (card.derived ? SOURCE_TEXT.activity : '')),
