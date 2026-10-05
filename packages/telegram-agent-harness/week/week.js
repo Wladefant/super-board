@@ -176,8 +176,7 @@ function renderAsOf(data, f) {
   const node = $('asof');
   node.hidden = !data.stale;
   if (!data.stale) return;
-  node.textContent = `Snapshot as of ${f.stamp.format(data.asOf)}`;
-  node.title = data.staleReason || 'The PC is not sending live data. This is the last stored snapshot.';
+  node.textContent = `Snapshot as of ${f.stamp.format(data.asOf)}. ${data.staleReason || 'The PC is not sending live data.'}`;
 }
 
 function blockLabel(block, f) {
