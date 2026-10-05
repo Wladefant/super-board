@@ -22,7 +22,6 @@ export const BOARD_STORAGE_KEY = 'superboard.week.board';
 export const ALL = 'all';
 export const UNASSIGNED = 'unassigned';
 const KIND_PREFIX = 'kind:';
-const HOUR = 3_600_000;
 
 export const KIND_LABELS = {
   'veyyon-lanes': 'Veyyon lanes',
@@ -108,6 +107,20 @@ function selectPullRequests(data, value) {
 /** Cards shown on a day: placed on it, or a planned range (at to endAt, exclusive) that covers it. */
 export function cardsOnDay(cards, day) {
   return cards.filter(c => (c.endAt && c.endAt > c.at ? c.at < day.dayEnd && c.endAt > day.dayStart : c.at >= day.dayStart && c.at < day.dayEnd));
+}
+
+/**
+ * Cards as bars over the days they cover: `from`/`to` are inclusive day indexes. Bars sort by first
+ * day, then longest first, so a CSS grid with dense flow packs them into as few rows as possible.
+ */
+export function cardSpans(cards, days) {
+  return cards
+    .map(card => {
+      const hits = days.flatMap((day, i) => (cardsOnDay([card], day).length ? [i] : []));
+      return hits.length ? { card, from: hits[0], to: hits[hits.length - 1] } : null;
+    })
+    .filter(span => span !== null)
+    .sort((a, b) => a.from - b.from || b.to - a.to || a.card.title.localeCompare(b.card.title));
 }
 
 /** Length of the union of [start, end) intervals clipped to [from, to): parallel time counts once. */
@@ -254,18 +267,18 @@ export function layoutDay(segments, maxColumns = 4) {
   return { placed, overflow };
 }
 
-/** Visible hour range for the grid: 9:00 to 24:00, widened to cover every segment. */
-export function hourRange(segmentsByDay, zone) {
-  let startHour = 9;
-  let endHour = 24;
+/**
+ * Hour the grid scrolls to first: the earliest start of a lane that begins that day. A lane that
+ * only continues past midnight does not count, so a 00:30 tail never hides the working day.
+ */
+export function firstHour(segmentsByDay, zone) {
+  let hour = 24;
   for (const day of segmentsByDay) {
     for (const seg of day) {
-      startHour = Math.min(startHour, Math.floor(minutesOfDay(seg.startMs, zone) / 60));
-      const endMin = seg.endMs - seg.startMs >= 24 * HOUR ? 1440 : minutesOfDay(seg.endMs, zone) || 1440;
-      endHour = Math.max(endHour, Math.ceil(endMin / 60));
+      if (seg.startMs === seg.block.startMs) hour = Math.min(hour, Math.floor(minutesOfDay(seg.startMs, zone) / 60));
     }
   }
-  return { startHour, endHour: Math.min(24, endHour) };
+  return hour === 24 ? 8 : hour;
 }
 
 /** Monday 00:00 local of the week containing `date` (a Date), as YYYY-MM-DD. */

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   ALL, INK, PROJECT_PALETTE, UNASSIGNED, boardOptions, contrastRatio, daySegments, isValidWeek, layoutDay,
-  cardsOnDay, mondayOf, resolveSelection, selectBlocks, selectCards, shiftWeek, summarize, unionMs,
+  cardSpans, cardsOnDay, firstHour, mondayOf, resolveSelection, selectBlocks, selectCards, shiftWeek, summarize, unionMs,
 } from "../week/week-model.js";
 import { BOARDS, makeWeek } from "./fixtures/week-fixture";
 
@@ -64,6 +64,9 @@ describe("board selection (#482 dropdown)", () => {
     expect(perDay[3]).not.toContain("Carrier rate import");
     const endsMonday = [{ ...cards[0], endAt: week.days[1].dayStart }];
     expect(week.days.map(day => cardsOnDay(endsMonday, day).length)).toEqual([1, 0, 0, 0, 0, 0, 0]);
+    const spans = cardSpans(cards, week.days).map((s: { card: { title: string }; from: number; to: number }) => [s.card.title, s.from, s.to]);
+    expect(spans[0]).toEqual(["Week view: UI with week grid", 0, 6]);
+    expect(spans).toContainEqual(["Carrier rate import", 2, 2]);
   });
 });
 
@@ -129,6 +132,14 @@ describe("grid layout", () => {
     const hidden = overflow.reduce((s: number, o: { segments: unknown[] }) => s + o.segments.length, 0);
     expect(placed.length + hidden).toBe(day.length);
     expect(overflow.length).toBeGreaterThan(0);
+  });
+
+  test("the grid opens at the first lane that starts, not at a tail past midnight", () => {
+    const segments = daySegments(week.blocks, week.days);
+    // Wednesday's 22:30 veyyon lane runs into Thursday 00:00; the earliest real start is Tuesday 08:30.
+    expect(segments[3].some((s: { startMs: number }) => s.startMs === week.days[3].dayStart)).toBe(true);
+    expect(firstHour(segments, week.zone)).toBe(8);
+    expect(firstHour(daySegments([], week.days), week.zone)).toBe(8);
   });
 });
 

@@ -1,7 +1,7 @@
 import { createClient, isTerminalAuthError, OPEN_FROM_TELEGRAM } from './client.js';
 import {
   ALL, BOARD_PARAM, BOARD_STORAGE_KEY, WEEK_PARAM,
-  blockBoards, blockTitle, boardOptions, cardsOnDay, commitCount, daySegments, formatDuration, hourRange,
+  blockBoards, blockTitle, boardOptions, cardSpans, cardsOnDay, commitCount, daySegments, firstHour, formatDuration,
   isValidWeek, kindLabel, layoutDay, minutesOfDay, mondayOf, projectColors, resolveSelection,
   selectBlocks, selectionLabel, shiftWeek, summarize,
 } from './week-model.js';
@@ -192,35 +192,54 @@ function renderGrid(data, summary, colors, f) {
     return;
   }
   const segments = daySegments(summary.blocks, data.days);
-  const { startHour, endHour } = hourRange(segments, data.zone);
-  const hours = endHour - startHour;
+  const hours = 24;
   const head = el('div', { class: 'grid-head' }, el('div', { class: 'gutter' }),
     data.days.map((day, i) => el('div', { class: 'day-head' },
       el('span', { class: 'day-name' }, f.dayLong.format(day.dayStart)),
       el('span', { class: 'day-hours num' }, formatDuration(summary.days[i].ms)))));
-  const cardsByDay = data.days.map(day => cardsOnDay(summary.cards, day));
-  const allDay = summary.cards.length ? el('div', { class: 'grid-allday' }, el('div', { class: 'gutter gutter-label' }, 'Cards'),
-    cardsByDay.map(cards => el('div', { class: 'allday-cell' }, cards.map(card => cardChip(card, data))))) : null;
+  // Cards sit in a 7-column grid: one bar per card across every day it covers.
+  const allDay = summary.cards.length ? el('div', { class: 'grid-allday' },
+    el('div', { class: 'gutter gutter-label' }, 'Cards'),
+    el('div', { class: 'allday-lines', 'aria-hidden': 'true' }, data.days.map(() => el('span'))),
+    el('div', { class: 'allday-bars' }, cardSpans(summary.cards, data.days).map(({ card, from, to }) =>
+      cardChip(card, data, { gridColumn: `${from + 1} / ${to + 2}` })))) : null;
   const gutter = el('div', { class: 'gutter hours', style: { height: `${hours * HOUR_PX}px` } },
-    Array.from({ length: hours }, (_, i) => el('span', { class: 'hour-label num', style: { top: `${i * HOUR_PX}px` } }, `${String(startHour + i).padStart(2, '0')}:00`)));
+    Array.from({ length: hours }, (_, i) => el('span', { class: 'hour-label num', style: { top: `${i * HOUR_PX}px` } }, `${String(i).padStart(2, '0')}:00`)));
+  const maxColumns = gridColumns();
   const columns = segments.map((segs, i) => {
-    const { placed, overflow } = layoutDay(segs);
-    const top = ms => ((Math.max(minutesOfDay(ms, data.zone), startHour * 60) - startHour * 60) / 60) * HOUR_PX;
+    const { placed, overflow } = layoutDay(segs, maxColumns);
+    const top = ms => (minutesOfDay(ms, data.zone) / 60) * HOUR_PX;
     const bottom = (s, e) => (e - s >= 24 * 3_600_000 || e >= data.days[i].dayEnd ? hours * HOUR_PX : top(e));
     const pos = (s, e, column, cols) => {
       const t = top(s);
       return { top: `${t}px`, height: `${Math.max(bottom(s, e) - t, 20)}px`, left: `calc(${(column / cols) * 100}% + 2px)`, width: `calc(${100 / cols}% - 4px)` };
     };
     return el('div', { class: 'day-col', style: { height: `${hours * HOUR_PX}px` }, role: 'group', 'aria-label': f.dayLong.format(data.days[i].dayStart) },
-      placed.map(seg => blockButton(seg.block, f, colors, { class: 'blk', style: pos(seg.startMs, seg.endMs, seg.column, seg.columns) },
-        { roomy: (bottom(seg.startMs, seg.endMs) - top(seg.startMs)) >= 40 })),
+      placed.map(seg => {
+        const height = bottom(seg.startMs, seg.endMs) - top(seg.startMs);
+        return blockButton(seg.block, f, colors, { class: height < 64 ? 'blk short' : 'blk', style: pos(seg.startMs, seg.endMs, seg.column, seg.columns) },
+          { roomy: height >= 40 });
+      }),
       overflow.map(group => el('button', {
         type: 'button', class: 'more', style: pos(group.startMs, group.endMs, group.column, group.columns),
         'aria-label': `${group.segments.length} more lanes from ${f.time.format(group.startMs)}`,
         onclick: event => openList(event.currentTarget, group.segments.map(s => s.block), f, colors),
       }, `+${group.segments.length}`)));
   });
-  grid.replaceChildren(head, allDay, el('div', { class: 'grid-body' }, gutter, columns));
+  // A refresh of the same week keeps the reader's scroll position; a new week opens at its first lane.
+  const prev = grid.querySelector('.grid-body');
+  const keep = prev && grid.dataset.week === String(data.weekStart) ? prev.scrollTop : null;
+  const body = el('div', { class: 'grid-body' }, gutter, columns);
+  grid.replaceChildren(head, allDay, body);
+  grid.dataset.week = String(data.weekStart);
+  grid.dataset.columns = String(maxColumns);
+  body.scrollTop = keep ?? Math.max(0, firstHour(segments, data.zone) * HOUR_PX - HOUR_PX / 2);
+}
+
+/** Side-by-side lanes per day: each needs about 60px to stay readable, so wide screens show more. */
+function gridColumns() {
+  const dayWidth = ($('grid').clientWidth - 56) / 7;
+  return Math.max(2, Math.min(4, Math.floor(dayWidth / 60)));
 }
 
 /** A lane as a button. `returnTo` receives focus after its detail closes (default: the button). */
@@ -237,10 +256,10 @@ function blockButton(block, f, colors, attrs, { roomy = false, withTime = false,
   nc ? el('span', { class: 'blk-nc' }, 'No commit') : null);
 }
 
-function cardChip(card, data) {
+function cardChip(card, data, style) {
   const board = data.boards.find(b => b.id === card.boardId);
   return el('button', {
-    type: 'button', class: `card-chip${card.derived ? ' derived' : ''}`, '--c': board?.color || '#b7c4dd',
+    type: 'button', class: `card-chip${card.derived ? ' derived' : ''}`, '--c': board?.color || '#b7c4dd', style,
     'aria-label': `${card.title}, ${board?.title || card.boardId} card${card.derived ? ', placed by activity' : ''}`,
     onclick: event => openCard(event.currentTarget, card, data),
   }, el('span', { class: 'card-title' }, card.title));
@@ -434,6 +453,10 @@ $('board').addEventListener('change', event => setBoard(event.target.value));
 $('prev').addEventListener('click', () => setWeek(shiftWeek(state.week, -1)));
 $('next').addEventListener('click', () => setWeek(shiftWeek(state.week, 1)));
 $('today').addEventListener('click', () => setWeek(mondayOf(new Date())));
+// A resize that changes how many lanes fit side by side re-lays the grid.
+window.addEventListener('resize', () => {
+  if (state.data && $('grid').dataset.columns && $('grid').dataset.columns !== String(gridColumns())) render();
+});
 
 load();
 setInterval(() => { if (!document.hidden && !dialog.open) load({ quiet: true }); }, REFRESH_MS);

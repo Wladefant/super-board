@@ -95,13 +95,19 @@ h1 { font-size: 28px; letter-spacing: -0.03em; margin-top: var(--s1); font-varia
 .agenda { display: none; }
 .grid { border: 1px solid var(--line); border-radius: var(--r-panel); background: var(--panel); overflow: hidden; }
 .grid-head, .grid-allday, .grid-body { display: grid; grid-template-columns: 56px repeat(7, minmax(0, 1fr)); }
-.grid-head { position: sticky; top: 0; z-index: 3; background: var(--panel); border-bottom: 1px solid var(--line); }
+.grid-head { background: var(--panel); border-bottom: 1px solid var(--line); }
+/* Head and card rows reserve the same scrollbar gutter as the body, so the day columns line up. */
+.grid-head, .grid-allday { overflow-y: hidden; scrollbar-gutter: stable; }
+/* All 24 hours scroll inside the grid; it opens at the first lane of the week. */
+.grid-body { height: clamp(360px, calc(100dvh - 300px), 1152px); overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
 .day-head { padding: var(--s3) var(--s2); display: grid; gap: 2px; border-left: 1px solid var(--line); font-size: 13px; }
 .day-name { font-weight: 600; }
 .day-hours { color: var(--muted); font-size: 12px; }
 .grid-allday { border-bottom: 1px solid var(--line); background: var(--panel-2); }
 .gutter-label { font-size: 12px; color: var(--muted); padding: var(--s2) var(--s1); text-align: right; }
-.allday-cell { border-left: 1px solid var(--line); padding: var(--s1); display: grid; gap: var(--s1); align-content: start; min-width: 0; }
+.allday-lines, .allday-bars { grid-column: 2 / -1; grid-row: 1; display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); }
+.allday-lines span { border-left: 1px solid var(--line); }
+.allday-bars { position: relative; grid-auto-flow: row dense; gap: var(--s1); padding: var(--s1); align-content: start; min-width: 0; }
 .hours { position: relative; }
 .hour-label { position: absolute; right: var(--s2); transform: translateY(-50%); font-size: 11px; color: var(--muted); }
 .hour-label:first-child { transform: none; }
@@ -116,7 +122,10 @@ h1 { font-size: 28px; letter-spacing: -0.03em; margin-top: var(--s1); font-varia
 }
 .blk:hover { filter: brightness(1.08); z-index: 2; }
 .blk:focus-visible { z-index: 4; outline: 3px solid #fff; outline-offset: 1px; }
-.blk-title { font-weight: 600; overflow-wrap: anywhere; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.blk-title { font-weight: 600; overflow-wrap: anywhere; hyphens: auto; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+/* Keep each line whole: a block too short for its content cuts lines off the bottom, never squeezes the title. */
+.blk > * { flex-shrink: 0; max-width: 100%; }
+.blk.short .blk-title { -webkit-line-clamp: 1; }
 .blk-meta { font-size: 11px; }
 .blk-nc { font-size: 10px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; }
 .blk.nc { background: var(--hatch), var(--c); box-shadow: inset 0 0 0 2px var(--red); }
