@@ -35,6 +35,7 @@ import {
   resolveDaemonSlots,
   type DaemonSlot,
 } from "./config";
+import { defaultWeekRoute } from "./week-service";
 import { getDaemonCommands, SlotRouter, type RouteTarget } from "./router";
 import {
   TerminalSessionControl,
@@ -599,6 +600,7 @@ export class TelegramDaemon {
       ? this.options.pollerFactory(token, slot.stateDir, access, callbacks, correlation, pollerOptions)
       : new TelegramPoller(token, slot.stateDir, access, callbacks, correlation, pollerOptions);
 
+    let weekRoute: ((start: string | null) => Promise<unknown>) | undefined;
     const stopMiniApp = connectMiniApp({
       stateDir: slot.stateDir, token, allowedUsers: access.allowFrom,
       session: (userId, context) => {
@@ -643,6 +645,7 @@ export class TelegramDaemon {
         });
       },
       status: () => ({ polling: poller.running, slot: slot.slotId }),
+      week: start => (weekRoute ??= defaultWeekRoute(slot.stateDir))(start),
       dashboard: (userId, sessionId) => {
         const session = sessionId ?? router.boundSession({ chatId: userId, topicId: "" });
         const raw = session ? poller.getMeta(`dashboard-snapshot:${session}`) : null;
@@ -688,6 +691,7 @@ export class TelegramDaemon {
       undefined,
       this.coordinator,
       slotSecret,
+      (sessionId, text) => this.control.deliver(sessionId, text, "auto"),
     );
   }
 

@@ -419,6 +419,9 @@ class GitHubPrRecap:
     before_after: List[BeforeAfterState] = field(default_factory=list)
     qa_evidence: Optional[QaEvidenceGate] = None
     is_synthetic_example: bool = False
+    # Done report (Wladefant/super-board#502): None renders as "none".
+    deleted: Optional[List[str]] = None
+    not_run: Optional[List[str]] = None
 
     def render(self) -> str:
         marker_begin = SECTION_BEGIN_FMT.format(section_id="pr_recap")
@@ -477,6 +480,9 @@ class GitHubPrRecap:
             md.append("")
 
         md.extend([
+            f"Deleted: {', '.join(self.deleted) if self.deleted else 'none'}",
+            f"Not run: {', '.join(self.not_run) if self.not_run else 'none'}",
+            "",
             "---",
             "*(This is a sticky PR recap comment. On subsequent pushes to this PR branch, this comment is updated in place.)*",
             marker_end,
