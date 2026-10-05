@@ -38,6 +38,7 @@ SOURCE_SUFFIXES = (".py", ".ts", ".tsx", ".js", ".mjs", ".cjs")
 SKIP_PARTS = {"node_modules", "dist", "build", ".next", "__pycache__", "vendor", "migrations", "alembic"}
 FINGERPRINT_PREFIX = "depth-survey"
 PARENT_TITLE = "Depth survey: standing parent"
+MAX_DIR_TERMS = 3
 
 
 @dataclass
@@ -288,7 +289,8 @@ def _cite_terms(c: Candidate, glossary: Dict[str, List[str]]) -> None:
     c.domain_terms = [term for term, files in glossary.items() if c.path in files]
     if not c.domain_terms:  # no row cites the file itself: use the rows that cite its directory
         folder = posixpath.dirname(c.path)
-        c.domain_terms = [term for term, files in glossary.items() if any(posixpath.dirname(f) == folder for f in files)]
+        near = [term for term, files in glossary.items() if any(posixpath.dirname(f) == folder for f in files)]
+        c.domain_terms = near if len(near) <= MAX_DIR_TERMS else []  # a catch-all directory names no one thing
     if c.domain_terms:
         c.title += f" ({', '.join(c.domain_terms)})"
         c.problem += f" Domain terms from GLOSSARY.md: {', '.join(c.domain_terms)}."
