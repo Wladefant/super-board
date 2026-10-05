@@ -25,10 +25,10 @@
     </div>
   </div>
   <div class="top-row controls">
-    <label class="board-pick">
-      <span class="board-pick-label">Calendar</span>
-      <select id="board" name="board"><option value="all">All boards</option></select>
-    </label>
+    <div class="board-pick">
+      <span class="board-pick-label" id="board-label">Calendar</span>
+      <button type="button" id="board" class="board-btn" aria-haspopup="listbox" aria-expanded="false" aria-labelledby="board-label board-value"><span id="board-value">All boards</span></button>
+    </div>
     <p id="stats" class="stats" aria-live="polite"></p>
     <p id="asof" class="asof" hidden></p>
   </div>
