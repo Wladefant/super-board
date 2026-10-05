@@ -23,6 +23,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
+import merge_guard  # noqa: E402  (sys.path set above)
 from merge_guard import (  # noqa: E402  (sys.path set above)
     check_command,
     clear_base_cache,
@@ -300,6 +301,62 @@ class DecisionTest(unittest.TestCase):
 
         base_calls_2 = [c for c in github.calls if c[:2] == ["gh", "api"] and "--jq" in c]
         self.assertEqual(len(base_calls_2), 1)
+
+    def files_runner(self, first_error):
+        """A runner whose first PR-files call fails with first_error, then answers normally."""
+        github = FakeGitHub({(REPO, 42): self.ui_pr(body=NOTE, comments=[RECEIPT])})
+        files_calls = []
+
+        def runner(cmd, cwd=None, timeout=None):
+            if cmd[:2] == ["gh", "api"] and "/files" in cmd[2]:
+                files_calls.append(cmd)
+                if len(files_calls) == 1:
+                    return 1, "", first_error
+            return github(cmd, cwd, timeout)
+
+        return runner, files_calls
+
+    def test_a_timed_out_pr_fetch_is_retried_once_and_then_decides(self):
+        runner, files_calls = self.files_runner("Command '['gh', 'api', ...] timed out after 40 seconds")
+        decision = check_command(f"gh pr merge 42 -R {REPO} --merge", None, runner=runner, state_dir=self.state)
+        self.assertFalse(decision["block"])
+        self.assertEqual(len(files_calls), 2)
+
+    def test_a_failed_pr_fetch_that_is_not_a_timeout_is_not_retried(self):
+        runner, files_calls = self.files_runner("HTTP 403: API rate limit exceeded")
+        decision = check_command(f"gh pr merge 42 -R {REPO} --merge", None, runner=runner, state_dir=self.state)
+        self.assertTrue(decision["block"])
+        self.assertIn("fails closed", decision["reason"])
+        self.assertEqual(len(files_calls), 1)
+
+    def test_no_retry_once_the_decision_budget_is_nearly_spent(self):
+        runner, files_calls = self.files_runner("Command '['gh', 'api', ...] timed out after 40 seconds")
+        original = merge_guard.DECISION_DEADLINE_SEC
+        merge_guard.DECISION_DEADLINE_SEC = merge_guard.RETRY_MIN_REMAINING_SEC - 1
+        try:
+            decision = check_command(f"gh pr merge 42 -R {REPO} --merge", None, runner=runner, state_dir=self.state)
+        finally:
+            merge_guard.DECISION_DEADLINE_SEC = original
+        self.assertTrue(decision["block"])
+        self.assertEqual(len(files_calls), 1)
+
+    def test_every_gh_call_is_clamped_to_the_decision_deadline(self):
+        merge_guard._start_deadline()
+        try:
+            merge_guard._deadline = merge_guard.time.monotonic() + 2
+            seen = []
+            real = merge_guard.subprocess.run
+            merge_guard.subprocess.run = lambda cmd, **kw: seen.append(kw["timeout"]) or real(
+                [sys.executable, "-c", "pass"], **{k: v for k, v in kw.items() if k != "timeout"}
+            )
+            try:
+                merge_guard._run(["gh", "api", "x"], None, timeout=40)
+            finally:
+                merge_guard.subprocess.run = real
+        finally:
+            merge_guard._clear_deadline()
+        self.assertLessEqual(seen[0], 2)
+        self.assertGreaterEqual(seen[0], 1)
 
 
 class FetchPrBaseTest(unittest.TestCase):

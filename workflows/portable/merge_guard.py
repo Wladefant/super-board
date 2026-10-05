@@ -54,6 +54,13 @@ MODES = ("enforce", "warn", "off")
 GH_TIMEOUT_SEC = 40
 BASE_TIMEOUT_SEC = 20
 BASE_CACHE_TTL_SEC = 300  # 5 minutes
+# One decision, every gh call included, ends inside this many seconds, so it always beats the
+# 120 s the superboard-merge-guard.ts hook gives the script. A timed-out gh call is retried once
+# only while more than RETRY_MIN_REMAINING_SEC of that budget is left.
+DECISION_DEADLINE_SEC = 100
+RETRY_MIN_REMAINING_SEC = 5
+TIMEOUT_MARK = "timed out after"  # inside str(subprocess.TimeoutExpired)
+_deadline: Optional[float] = None
 
 # A `feature-map:` line, with the markdown decoration lanes put in front of markers. The
 # note has to sit on the marker line: an empty marker followed by any next line is no note.
@@ -79,8 +86,25 @@ GH_VALUE_FLAGS = {
 }
 
 
+def _start_deadline() -> None:
+    global _deadline
+    _deadline = time.monotonic() + DECISION_DEADLINE_SEC
+
+
+def _clear_deadline() -> None:
+    global _deadline
+    _deadline = None
+
+
+def _remaining() -> Optional[float]:
+    return None if _deadline is None else _deadline - time.monotonic()
+
+
 def _run(cmd: List[str], cwd: Optional[str] = None, timeout: Optional[float] = None) -> Tuple[int, str, str]:
     t = timeout if timeout is not None else GH_TIMEOUT_SEC
+    left = _remaining()
+    if left is not None:
+        t = max(1.0, min(t, left))
     try:
         res = subprocess.run(
             cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -297,15 +321,24 @@ def parse_merge_commands(command: str) -> List[Dict[str, Any]]:
 
 
 # ------------------------------------------------------------------ PR data
+def _gh_call(cmd: List[str], runner: Runner, cwd: Optional[str] = None) -> Tuple[int, str, str]:
+    """Run one gh command; retry once, and only when it timed out and budget remains."""
+    rc, out, err = runner(cmd, cwd)
+    left = _remaining()
+    if rc != 0 and TIMEOUT_MARK in err and (left is None or left > RETRY_MIN_REMAINING_SEC):
+        rc, out, err = runner(cmd, cwd)
+    return rc, out, err
+
+
 def _gh_json(args: List[str], runner: Runner, cwd: Optional[str] = None) -> Any:
-    rc, out, err = runner(["gh", *args], cwd)
+    rc, out, err = _gh_call(["gh", *args], runner, cwd)
     if rc != 0:
         raise RuntimeError(f"gh {' '.join(args[:2])} failed: {err.strip() or out.strip()}")
     return json.loads(out)
 
 
 def _gh_pages(path: str, runner: Runner) -> List[Dict[str, Any]]:
-    rc, out, err = runner(["gh", "api", path, "--paginate"], None)
+    rc, out, err = _gh_call(["gh", "api", path, "--paginate"], runner)
     if rc != 0:
         raise RuntimeError(f"gh api {path} failed: {err.strip()}")
     from review_content import json_pages
@@ -431,6 +464,7 @@ def check_command(
             decision["reason"] = "merge guard is off"
         return decision
 
+    _start_deadline()
     blocked_reasons = []
     checkout = _polysim_checkout(cwd, runner)
     for target in targets:
@@ -480,6 +514,7 @@ def check_command(
         )
     else:
         decision["reason"] = "lane-brief bookends present on every merged PR"
+    _clear_deadline()
     _log(decision, command, cwd, state_dir)
     return decision
 
