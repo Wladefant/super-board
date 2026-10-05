@@ -14,6 +14,7 @@ import {
   markdownToTelegramHtml,
   redactSecrets,
 } from "./sanitizer";
+import { meterOutbound } from "./ste-meter";
 import { downloadInboundMedia, selectInboundMedia, type InboundMedia } from "./inbound-media";
 import { registerTelegramCommands, renderTelegramHelp } from "./command-registry";
 import { parseTelegramCommand } from "./command-parser";
@@ -571,6 +572,8 @@ export class TelegramPoller {
     /** `panel` draws on the group budget reserved for dashboards. */
     kind: "message" | "panel" = "message",
   ): Promise<TelegramSendMessageResponse | null> {
+    // Style metric only: never awaited, never blocks or changes the message.
+    void meterOutbound(text, replyMarkupOrParseMode === "HTML" ? "html" : "md", "telegram-send");
     const sanitized = redactSecrets(text);
     const formatted = replyMarkupOrParseMode === "HTML" ? sanitized : markdownToTelegramHtml(sanitized, defaultRepo);
     if (!formatted.trim()) return null;

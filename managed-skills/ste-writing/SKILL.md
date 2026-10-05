@@ -70,6 +70,23 @@ Use only when the operator asks for "strict STE" or the text is a safety-critica
 (data loss, security risk, outage). Then also: no "-ing" forms except technical nouns,
 no contractions, keep articles, and start a risk step with WARNING or CAUTION, then the command, then the risk.
 
+## Prompt for any agent
+
+Suwandi's prompt ([post](https://x.com/richardcsuwandi/status/2106617018225147907)). Paste it into an agent that does not load this skill:
+
+> Use ASD-STE100 as a guide for your responses. Write short sentences, use active voice, and keep terminology consistent. Relax the vocabulary rules when they make explanations awkward. Preserve technical precision and uncertainty.
+
+`ste_check.py rewrite-prompt <file>` prints this prompt, the findings, and the text.
+
+## Checker
+
+`python ~/.veyyon/workflows/ste_check.py check <file|->` scores a text from 0 to 100. It checks rules 2, 3, 6, 7, 8, 9, 11, 14 and 15: sentence length, passive voice, mixed terms, plain words and phrasal verbs, semicolons, idioms, paragraph length, and the state in line 1. It cannot check rules 1, 4, 5, 10, 12 and 13 or the guard rails, so read the text once yourself.
+
+- It warns and never blocks. `--fail-under N` makes it a gate. Blocking is the operator's decision.
+- The Telegram send path runs it on every outbound message and records counts in `~/.veyyon/run/ste-metrics.jsonl`.
+- Add `--strict` for the 100% mode checks that exist (contractions).
+- Source of the check list: [0xpili/simplified-technical-english](https://github.com/0xpili/simplified-technical-english) (`scripts/ste_check.py`). We do not use its 869-word approved list. ASD owns the dictionary, and the post says to relax the vocabulary rules.
+
 ## Before and after
 
 Before: "I wasn't able to determine yet why Main died again; it went down at 15:46 UTC with nothing in the logs, and this has now happened 13 times within the last week, always being terminated externally by Windows before our code could log anything."

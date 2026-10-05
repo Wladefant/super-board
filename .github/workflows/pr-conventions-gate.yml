@@ -37,6 +37,18 @@ jobs:
           GITHUB_ACTIONS: 'true'
           GH_TOKEN: ${{ github.token }}
 
+      - name: STE writing check (warning only)
+        if: always()
+        continue-on-error: true
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          printf '%s\n\n%s\n' "$PR_TITLE" "$PR_BODY" > "$RUNNER_TEMP/pr-text.md"
+          python3 workflows/portable/ste_check.py check --format md "$RUNNER_TEMP/pr-text.md" | tee "$RUNNER_TEMP/ste.txt"
+          score=$(head -n1 "$RUNNER_TEMP/ste.txt")
+          echo "::warning title=STE writing score::$score"
+
       # Done report (Wladefant/super-board#502): failing check; the dry run over the last 30 merged PRs is on the issue.
       - name: Check Deleted and Not run lines
         run: python3 workflows/portable/evidence_lint.py done-report-pr --repo "$GITHUB_REPOSITORY" --number "$PR_NUMBER"
