@@ -81,6 +81,11 @@ export interface PollerCallbacks {
    * the offset cannot advance, so no caller may silently discard it.
    */
   onLedgerFailure: (message: string) => void;
+  /**
+   * Reports that the private-chat menu could not be registered after every retry. Inbound is not
+   * affected, so this is not a ledger failure. When omitted the failure is not reported.
+   */
+  onMenuRegistrationFailure?: (message: string) => void;
 }
 
 /** Callback data of lane panel buttons (daemon/lane-panel.ts) starts with this. */
@@ -113,7 +118,23 @@ export function failedBeforeRequestSent(err: unknown): boolean {
   return typeof code === "string" && PRE_SEND_ERROR_CODES.has(code);
 }
 
+/** Waits between menu registration attempts: the burst of a daemon start has passed by the second try. */
+export const DEFAULT_REGISTRATION_RETRY_DELAYS_MS: readonly number[] = [5_000, 20_000, 60_000];
+
+function sleepUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) return reject(signal.reason);
+    const timer = setTimeout(() => { signal.removeEventListener("abort", onAbort); resolve(); }, ms);
+    const onAbort = () => { clearTimeout(timer); reject(signal.reason); };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
 export interface PollerOptions {
+  /** Waits before each retry of the menu registration; its length is the retry count. */
+  registrationRetryDelaysMs?: readonly number[];
+  /** Per-call timeout of setMyCommands. */
+  registrationTimeoutMs?: number;
   maxConflictRetries?: number;
   initialConflictBackoffMs?: number;
   maxConflictBackoffMs?: number;
@@ -750,22 +771,44 @@ export class TelegramPoller {
     }
   }
 
-  private async runPollLoop(): Promise<void> {
-    // The lease holder refreshes the operator's private menu on every startup.
-    // Registration failure must not disconnect an otherwise usable input channel.
-    if (this.accessConfig.dmPolicy !== "disabled" || this.options.forumChatId) {
+  /** Registers the menu in the background. A failure is reported as a menu failure, never as an inbound ledger failure. */
+  private async registerMenuWithRetry(): Promise<void> {
+    const signal = this.abortController?.signal;
+    const delays = this.options.registrationRetryDelaysMs ?? DEFAULT_REGISTRATION_RETRY_DELAYS_MS;
+    for (let attempt = 0; ; attempt++) {
+      if (!signal || signal.aborted) return;
       try {
         await registerTelegramCommands(
           this.botToken,
           this.accessConfig.allowFrom,
           Boolean(this.callbacks.onHarnessCommand),
-          this.abortController.signal,
+          signal,
           this.options.commands,
           this.options.forumChatId,
+          this.options.registrationTimeoutMs,
         );
+        return;
       } catch {
-        this.callbacks.onLedgerFailure("Telegram command registration failed; reconnect to retry the private-chat menu.");
+        if (attempt >= delays.length) {
+          this.callbacks.onMenuRegistrationFailure?.(
+            `Telegram command registration failed after ${attempt + 1} attempts; the private-chat menu is not verified. Inbound polling is unaffected.`,
+          );
+          return;
+        }
+        try {
+          await sleepUnlessAborted(delays[attempt]!, signal);
+        } catch {
+          return;
+        }
       }
+    }
+  }
+
+  private async runPollLoop(): Promise<void> {
+    // The lease holder refreshes the operator's private menu on every startup. The menu is
+    // cosmetic: it runs beside polling, never in front of it, and retries with backoff.
+    if (this.accessConfig.dmPolicy !== "disabled" || this.options.forumChatId) {
+      void this.registerMenuWithRetry();
     }
 
     // 1. Redrive any pending updates from previous crashed runs safely
