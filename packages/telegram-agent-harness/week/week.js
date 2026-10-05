@@ -3,7 +3,7 @@ import {
   ALL, BOARD_PARAM, BOARD_STORAGE_KEY, WEEK_PARAM,
   blockBoards, blockTitle, boardOptions, cardSpans, commitCount, daySegments, firstHour, formatDuration,
   isValidWeek, kindLabel, layoutDay, minutesOfDay, projectColors, resolveSelection,
-  selectBlocks, selectionLabel, shiftWeek, summarize, weekRequestStart, zoneIsoDate,
+  adjacentWeeks, selectBlocks, selectionLabel, summarize, weekRequestStart, zoneIsoDate,
 } from './week-model.js';
 
 const tg = window.Telegram?.WebApp;
@@ -89,6 +89,7 @@ async function load({ quiet = false } = {}) {
     state.data = data;
     // The server's week wins, so the URL and prev/next follow the week on screen.
     week = state.week = zoneIsoDate(data.weekStart, data.zone);
+    syncNav();
     state.board = resolveSelection(state.board, readStored(), data.boards || []);
     writeUrl();
     hideNotice();
@@ -470,18 +471,27 @@ function setBoard(value) {
 
 function setWeek(iso) {
   state.week = iso;
+  syncNav();
   writeUrl();
   load();
 }
 
+/** Prev and next stay disabled until a week is known: "This week" waits for the server to name it. */
+function syncNav() {
+  const nav = adjacentWeeks(state.week);
+  $('prev').disabled = !nav;
+  $('next').disabled = !nav;
+}
+
 $('board').addEventListener('change', event => setBoard(event.target.value));
-$('prev').addEventListener('click', () => { if (state.week) setWeek(shiftWeek(state.week, -1)); });
-$('next').addEventListener('click', () => { if (state.week) setWeek(shiftWeek(state.week, 1)); });
+$('prev').addEventListener('click', () => setWeek(adjacentWeeks(state.week).prev));
+$('next').addEventListener('click', () => setWeek(adjacentWeeks(state.week).next));
 $('today').addEventListener('click', () => setWeek(null));
 // A resize that changes how many lanes fit side by side re-lays the grid.
 window.addEventListener('resize', () => {
   if (state.data && $('grid').dataset.columns && $('grid').dataset.columns !== String(gridColumns())) render();
 });
 
+syncNav();
 load();
 setInterval(() => { if (!document.hidden && !dialog.open) load({ quiet: true }); }, REFRESH_MS);

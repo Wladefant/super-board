@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   ALL, INK, PROJECT_PALETTE, UNASSIGNED, boardOptions, contrastRatio, daySegments, isValidWeek, layoutDay,
   cardSpans, cardsOnDay, firstHour, resolveSelection, selectBlocks, selectCards, shiftWeek, summarize, unionMs,
-  weekRequestStart, zoneIsoDate,
+  adjacentWeeks, weekRequestStart, zoneIsoDate,
 } from "../week/week-model.js";
 import { weekStartOf } from "../daemon/week-summary";
 import { BOARDS, makeWeek } from "./fixtures/week-fixture";
@@ -153,6 +153,14 @@ describe("week navigation and colour", () => {
     expect(isValidWeek("2026-09-29")).toBe(false);
     expect(isValidWeek("2026-02-30")).toBe(false);
     expect(isValidWeek(null)).toBe(false);
+  });
+
+  test("prev and next have no target until a week is known (N6)", () => {
+    // "This week" before the server answers, or after its load failed: the buttons are disabled.
+    expect(adjacentWeeks(null)).toBeNull();
+    expect(adjacentWeeks("")).toBeNull();
+    expect(adjacentWeeks("2026-09-28")).toEqual({ prev: "2026-09-21", next: "2026-10-05" });
+    expect(adjacentWeeks("2026-10-26")).toEqual({ prev: "2026-10-19", next: "2026-11-02" }); // across the DST change
   });
 
   test("a requested week loads as that week whatever the browser and PC zones (B1)", () => {
