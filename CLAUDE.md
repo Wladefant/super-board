@@ -1,5 +1,9 @@
 # super-board — agent-facing notes
 
+Project stage: greenfield
+
+This is an operator-only tool with no external users. The shared rules are in `policies/default/AGENTS.md` section 14 (Change loop & project stage). A `live` rule there wins where it conflicts.
+
 This repo tracks five skills under `skills/`:
 
 - `super-board` — orchestrator (you, when invoked via `/super-board run`)
@@ -47,6 +51,22 @@ Workers (`super-build`, `super-qa`, `super-review`) share the dispatcher's `gh` 
 - Append `gh-quota-on-exit: graphql=<remaining> floor=<effective-floor> reset=<time>` to the PR handoff comment. Those four fields are the only quota fields that may be logged — never a token, header, cookie, or raw payload.
 
 See `skills/super-board/references/rate-limit-etiquette.md` for the full discipline.
+
+## Change loop
+
+Follow `policies/default/AGENTS.md` section 14 on every change:
+
+1. Docs first. No contradictions left.
+2. Tests for the behaviour, seen failing before the fix.
+3. The smallest implementation. No shims or aliases; update every caller.
+4. Clean up what the change made unused.
+5. The done report ends with `Deleted:` and `Not run:` (each a list or `none`).
+
+## Lessons
+
+Newest first. One `When X, do Y` line per operator correction, at most 20. Add with `workflows/portable/lessons.py add`. The same mistake twice means rewrite the line.
+
+- When results arrive per topic (per competitor, carrier or screen), do create one native sub-issue per topic and never post a comment per topic on the parent (operator, 2026-10-04, [Wladefant/shipnovo#133](https://github.com/Wladefant/shipnovo/issues/133)).
 
 ## Installation contract
 

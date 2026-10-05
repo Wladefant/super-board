@@ -9,7 +9,7 @@ body:
         ## Defect Intake & Closure Contract
         A defect is resolved **ONLY** when full QA proves the original defect is absent by re-running the exact original failure scenario, exercising regression paths, and documenting proof on the authoritative head SHA.
 
-        **Writing style:** write in plain, short sentences (about 80% ASD-STE100): one idea per sentence, active voice, 25 words or fewer. See the `ste-writing` managed skill.
+        **Writing style:** write in plain, short sentences (about 80% ASD-STE100): one idea per sentence, active voice, 25 words or fewer. See the `ste-writing` managed skill. Check the text with `python ~/.veyyon/workflows/ste_check.py check <file>` (warns, never blocks).
 
   - type: textarea
     id: scope

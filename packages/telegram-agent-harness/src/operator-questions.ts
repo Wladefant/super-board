@@ -38,6 +38,8 @@ export interface OperatorQuestionInput {
   recommendation: string;
   details_url?: string;
   request_id?: string;
+  /** False when the asking tool call does not wait: the answer must then be pushed into the session. Default true. */
+  wait?: boolean;
 }
 export interface QuestionAnswer {
   question_id: string;
@@ -66,6 +68,10 @@ export interface Question {
     topic_message_id?: number | null;
     topic_card_at?: number | null;
     session_finalized?: boolean;
+    /** False when the asker did not wait for the answer. */
+    wait?: boolean;
+    /** The answer was already injected into the asking session. */
+    answer_pushed?: boolean;
   };
 }
 interface Result {
@@ -228,6 +234,8 @@ export class OperatorQuestionService {
       (operation, payload, card) => this.python(operation, payload, card),
     private readonly coordinator?: BotPoolCoordinator,
     private readonly secret?: Buffer,
+    /** Injects a message into the asking session. Only the daemon can reach a session that is not this process. */
+    private readonly wake?: (sessionId: string, text: string) => Promise<unknown>,
   ) {}
 
   private async python(operation: string, payload: object, card: boolean): Promise<Result> {
@@ -308,9 +316,32 @@ export class OperatorQuestionService {
   /** Records an operator answer that arrived by button or reply, then closes the session copy. */
   async answer(id: string, eventId: string, input: { choice?: string; text?: string }): Promise<Question> {
     const result = await this.invoke("answer", { id, event_id: eventId, ...input }, true);
-    if (isClosed(result.question!)) await this.finalize(result.question!);
+    if (isClosed(result.question!)) {
+      await this.finalize(result.question!);
+      await this.pushAnswer(result.question!);
+    }
     else await this.publish(result, true);
     return result.question!;
+  }
+
+  /**
+   * A question asked with wait:false has no tool call that returns the answer, so the session would never
+   * see it. Inject exactly one message into the asking session; `answer_pushed` stops a replayed tap repeating it.
+   */
+  private async pushAnswer(question: Question): Promise<void> {
+    if (question.status !== "answered" || !question.answer || question.transport.wait !== false ||
+        question.transport.answer_pushed || !this.wake) return;
+    const answer = question.answer;
+    const label = question.options.find(option => option.id === answer.choice_id)?.label ?? answer.choice_id;
+    const parts = [`The operator answered your Telegram question ${question.decision_id} ("${question.question}").`];
+    if (label) parts.push(`Choice: ${label}.`);
+    if (answer.text) parts.push(`Text: ${answer.text}`);
+    try {
+      await this.wake(question.transport.session_id, parts.join(" "));
+      await this.invoke("cache", { id: question.decision_id, answer_pushed: true }, false);
+    } catch (error) {
+      this.report(`Question ${question.decision_id} is answered, but the answer did not reach its session: ${String(error)}`);
+    }
   }
 
   /** The operator answered somewhere else (terminal, prose the agent heard). */

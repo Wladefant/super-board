@@ -1,0 +1,278 @@
+{
+  "version": 1,
+  "generatedAt": "2026-10-05",
+  "boards": [
+    {
+      "id": "Bavariance/1",
+      "number": 1,
+      "owner": "Bavariance",
+      "title": "Polysimulator",
+      "kind": "polysimulator",
+      "url": "https://github.com/orgs/Bavariance/projects/1",
+      "dateField": "Target Date",
+      "color": "#6366f1",
+      "repos": [
+        "Bavariance/polysimulator"
+      ]
+    },
+    {
+      "id": "RealEst-AI/1",
+      "number": 1,
+      "owner": "RealEst-AI",
+      "title": "Chatbot Product Development",
+      "kind": "other",
+      "url": "https://github.com/orgs/RealEst-AI/projects/1",
+      "dateField": "End date",
+      "color": "#94a3b8",
+      "repos": [
+        "RealEst-AI/chatbot-core"
+      ]
+    },
+    {
+      "id": "RealEst-AI/2",
+      "number": 2,
+      "owner": "RealEst-AI",
+      "title": "Website Development",
+      "kind": "other",
+      "url": "https://github.com/orgs/RealEst-AI/projects/2",
+      "dateField": "End date",
+      "color": "#94a3b8",
+      "repos": [
+        "RealEst-AI/website"
+      ]
+    },
+    {
+      "id": "RealEst-AI/3",
+      "number": 3,
+      "owner": "RealEst-AI",
+      "title": "Business Decisions",
+      "kind": "other",
+      "url": "https://github.com/orgs/RealEst-AI/projects/3",
+      "dateField": "End date",
+      "color": "#94a3b8",
+      "repos": [
+        "RealEst-AI/business"
+      ]
+    },
+    {
+      "id": "RealEst-AI/4",
+      "number": 4,
+      "owner": "RealEst-AI",
+      "title": "ImmoMail",
+      "kind": "other",
+      "url": "https://github.com/orgs/RealEst-AI/projects/4",
+      "dateField": "End date",
+      "color": "#94a3b8",
+      "repos": [
+        "RealEst-AI/ImmoMail-Outlook-Addin",
+        "RealEst-AI/business"
+      ]
+    },
+    {
+      "id": "RealEst-AI/5",
+      "number": 5,
+      "owner": "RealEst-AI",
+      "title": "@Wladefant's untitled project",
+      "kind": "other",
+      "url": "https://github.com/orgs/RealEst-AI/projects/5",
+      "dateField": null,
+      "color": "#94a3b8",
+      "repos": []
+    },
+    {
+      "id": "RealEst-AI/6",
+      "number": 6,
+      "owner": "RealEst-AI",
+      "title": "web event organizer",
+      "kind": "other",
+      "url": "https://github.com/orgs/RealEst-AI/projects/6",
+      "dateField": "End date",
+      "color": "#94a3b8",
+      "repos": []
+    },
+    {
+      "id": "Wladefant/1",
+      "number": 1,
+      "owner": "Wladefant",
+      "title": "Infinity Tracker",
+      "kind": "polysimulator",
+      "url": "https://github.com/users/Wladefant/projects/1",
+      "dateField": null,
+      "color": "#6366f1",
+      "repos": [
+        "Bavariance/polysimulator"
+      ]
+    },
+    {
+      "id": "Wladefant/2",
+      "number": 2,
+      "owner": "Wladefant",
+      "title": "LEO Project",
+      "kind": "product-fork",
+      "url": "https://github.com/users/Wladefant/projects/2",
+      "dateField": "Target date",
+      "color": "#10b981",
+      "repos": [
+        "Wladefant/leo"
+      ]
+    },
+    {
+      "id": "Wladefant/3",
+      "number": 3,
+      "owner": "Wladefant",
+      "title": "Soundcore Second Brain",
+      "kind": "product-fork",
+      "url": "https://github.com/users/Wladefant/projects/3",
+      "dateField": "Target Date",
+      "color": "#10b981",
+      "repos": [
+        "Wladefant/soundcore-work-workflow"
+      ]
+    },
+    {
+      "id": "Wladefant/4",
+      "number": 4,
+      "owner": "Wladefant",
+      "title": "HeyLolo",
+      "kind": "product-fork",
+      "url": "https://github.com/users/Wladefant/projects/4",
+      "dateField": null,
+      "color": "#10b981",
+      "repos": [
+        "Wladefant/heylolo-api",
+        "Wladefant/heylolo-app"
+      ]
+    },
+    {
+      "id": "Wladefant/5",
+      "number": 5,
+      "owner": "Wladefant",
+      "title": "Superboard System",
+      "kind": "veyyon-lanes",
+      "url": "https://github.com/users/Wladefant/projects/5",
+      "dateField": "Target Date",
+      "color": "#22d3ee",
+      "repos": [
+        "Bavariance/polysimulator",
+        "Wladefant/shipnovo",
+        "Wladefant/super-board",
+        "Wladefant/veyyon"
+      ]
+    },
+    {
+      "id": "Wladefant/6",
+      "number": 6,
+      "owner": "Wladefant",
+      "title": "Master Board",
+      "kind": "veyyon-lanes",
+      "url": "https://github.com/users/Wladefant/projects/6",
+      "dateField": null,
+      "color": "#22d3ee",
+      "repos": [
+        "Bavariance/polysimulator",
+        "Wladefant/soundcore-work-workflow",
+        "Wladefant/super-board"
+      ]
+    },
+    {
+      "id": "Wladefant/7",
+      "number": 7,
+      "owner": "Wladefant",
+      "title": "ING QA Automation",
+      "kind": "ing",
+      "url": "https://github.com/users/Wladefant/projects/7",
+      "dateField": "Target Date",
+      "color": "#ef4444",
+      "repos": [
+        "Wladefant/ing-qa"
+      ]
+    },
+    {
+      "id": "Wladefant/8",
+      "number": 8,
+      "owner": "Wladefant",
+      "title": "Thibault Consulting",
+      "kind": "other",
+      "url": "https://github.com/users/Wladefant/projects/8",
+      "dateField": null,
+      "color": "#94a3b8",
+      "repos": []
+    },
+    {
+      "id": "Wladefant/9",
+      "number": 9,
+      "owner": "Wladefant",
+      "title": "Dubai Holding",
+      "kind": "other",
+      "url": "https://github.com/users/Wladefant/projects/9",
+      "dateField": "Target Date",
+      "color": "#94a3b8",
+      "repos": [
+        "Wladefant/dubai-holding"
+      ]
+    },
+    {
+      "id": "Wladefant/10",
+      "number": 10,
+      "owner": "Wladefant",
+      "title": "[SUPERSEDED] PolySimulator - use Bavariance Project 1",
+      "kind": "polysimulator",
+      "url": "https://github.com/users/Wladefant/projects/10",
+      "dateField": null,
+      "color": "#6366f1",
+      "repos": [
+        "Bavariance/polysimulator"
+      ]
+    },
+    {
+      "id": "Wladefant/11",
+      "number": 11,
+      "owner": "Wladefant",
+      "title": "Shipnovo",
+      "kind": "shipnovo",
+      "url": "https://github.com/users/Wladefant/projects/11",
+      "dateField": null,
+      "color": "#f59e0b",
+      "repos": [
+        "Wladefant/shipnovo"
+      ]
+    },
+    {
+      "id": "Wladefant/12",
+      "number": 12,
+      "owner": "Wladefant",
+      "title": "Elumi AI Website",
+      "kind": "product-fork",
+      "url": "https://github.com/users/Wladefant/projects/12",
+      "dateField": null,
+      "color": "#10b981",
+      "repos": [
+        "Wladefant/elumiai-website"
+      ]
+    },
+    {
+      "id": "Wladefant/13",
+      "number": 13,
+      "owner": "Wladefant",
+      "title": "FNSKU Warehouse Scanner",
+      "kind": "product-fork",
+      "url": "https://github.com/users/Wladefant/projects/13",
+      "dateField": null,
+      "color": "#10b981",
+      "repos": []
+    },
+    {
+      "id": "Wladefant/14",
+      "number": 14,
+      "owner": "Wladefant",
+      "title": "I-Garant UG — Abwicklung",
+      "kind": "other",
+      "url": "https://github.com/users/Wladefant/projects/14",
+      "dateField": null,
+      "color": "#94a3b8",
+      "repos": [
+        "Wladefant/dubai-holding"
+      ]
+    }
+  ]
+}

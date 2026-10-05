@@ -11,7 +11,9 @@ export function authorizedRelay(header: string | null, secret: string): boolean 
 
 export const SERVED_FILES: Record<string, string> = { "/": "index.html", "/app.js": "app.js", "/client.js": "client.js", "/style.css": "style.css" };
 
-export function startRelay(secret: string, port = 3000, baseDir: URL | string = import.meta.url) {
+export type FileResolver = (pathname: string) => string | undefined;
+
+export function startRelay(secret: string, port = 3000, baseDir: URL | string = import.meta.url, resolveFile: FileResolver = pathname => SERVED_FILES[pathname]) {
   if (secret.length < 43) throw new Error("RELAY_SECRET must contain at least 43 characters");
   let daemon: ServerWebSocket<undefined> | undefined;
   const pending = new Map<string, { finish: (response: Response) => void; timer: Timer }>();
@@ -64,7 +66,7 @@ export function startRelay(secret: string, port = 3000, baseDir: URL | string = 
           daemon?.send(JSON.stringify({ id, path: url.pathname, method: request.method, initData, appSession, body }));
         });
       }
-      const file = SERVED_FILES[url.pathname];
+      const file = resolveFile(url.pathname);
       if (!file) return new Response("Not found", { status: 404 });
       const asset = Bun.file(new URL(file, base));
       if (!(await asset.exists())) return new Response("Not found", { status: 404 });
