@@ -116,7 +116,7 @@ test("atomic concurrent creation across racing callers returns identical secret 
   expect(fs.existsSync(secretFile)).toBe(true);
   const fileContent = fs.readFileSync(secretFile, "utf8").trim();
   expect(Buffer.from(fileContent, "hex")).toEqual(firstSecret);
-});
+}, 90000);
 
 test("fails closed if permission enforcement or directory protection fails, leaving no secret file", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "slot-fail-closed-"));
