@@ -6,14 +6,14 @@
  *   startMs: number, endMs: number, firstMessage?: string, commits: number | null,
  *   noCommit: boolean, live?: boolean, title?: string, filesChanged?: number, boards?: string[] }} Block
  * @typedef {{ id: string, title: string, kind: string, color?: string, repos?: string[] }} Board
- * @typedef {{ boardId: string, title: string, url: string, repo: string, number: number,
- *   state: 'open'|'closed'|'merged', status: string|null, atMs: number,
- *   source: 'target'|'start'|'iteration'|'updated'|'closed'|'merged', derived: boolean, spanEndMs: number|null }} Card
+ * @typedef {{ boardId: string, kind: string, title: string, url: string | null, repo: string | null, number: number | null,
+ *   type: 'issue'|'pr'|'draft', state: 'OPEN'|'CLOSED'|'MERGED', at: number, endAt: number | null,
+ *   source: 'target'|'start'|'iteration'|'activity', derived: boolean }} Card
  * @typedef {{ version: 1, weekStart: number, weekEnd: number, zone: string, asOf: number, stale: boolean,
  *   staleReason?: string | null, totals: object, projects: { project: string, ms: number, sessionMs: number, boards: string[] }[],
  *   days: { dayStart: number, dayEnd: number, ms: number }[], blocks: Block[], noCommitBlocks: string[],
  *   report: [string, string, string], pullRequests: { repo: string, number: number, title: string, url: string,
- *   state: string, mergedAt: number | null, branch: string }[], boards: Board[], cards?: Card[] }} WeekData
+ *   state: string, mergedAt: string | null, branch: string }[], boards: Board[], cards?: Card[] }} WeekData
  */
 
 export const BOARD_PARAM = 'board';
@@ -105,6 +105,11 @@ function selectPullRequests(data, value) {
   return data.pullRequests.filter(pr => repos.has(pr.repo));
 }
 
+/** Cards shown on a day: placed on it, or a planned range (at to endAt, exclusive) that covers it. */
+export function cardsOnDay(cards, day) {
+  return cards.filter(c => (c.endAt && c.endAt > c.at ? c.at < day.dayEnd && c.endAt > day.dayStart : c.at >= day.dayStart && c.at < day.dayEnd));
+}
+
 /** Length of the union of [start, end) intervals clipped to [from, to): parallel time counts once. */
 export function unionMs(intervals, from = -Infinity, to = Infinity) {
   const clipped = intervals
@@ -176,9 +181,9 @@ export function summarize(data, value) {
 }
 
 function buildReport(projects, noCommit, pullRequests, blocks) {
-  const merged = pullRequests.filter(pr => pr.state === 'merged' || pr.mergedAt);
+  const merged = pullRequests.filter(pr => pr.mergedAt || String(pr.state).toUpperCase() === 'MERGED');
   const shipped = merged.length
-    ? `Shipped: ${merged.length} merged PR${merged.length === 1 ? '' : 's'}, latest ${merged.sort((a, b) => (b.mergedAt || 0) - (a.mergedAt || 0))[0].title}.`
+    ? `Shipped: ${merged.length} merged PR${merged.length === 1 ? '' : 's'}, latest ${[...merged].sort((a, b) => (Date.parse(b.mergedAt ?? '') || 0) - (Date.parse(a.mergedAt ?? '') || 0))[0].title}.`
     : `Shipped: no merged PRs; ${blocks.length} lane${blocks.length === 1 ? '' : 's'} ran.`;
   const most = projects[0] ? `Most time: ${projects[0].project}, ${formatDuration(projects[0].ms)}.` : 'Most time: no lanes this week.';
   const next = noCommit.length

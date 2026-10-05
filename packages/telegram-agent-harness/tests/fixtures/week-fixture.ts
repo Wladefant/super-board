@@ -1,47 +1,20 @@
-// Typed WeekData v1 fixtures for the Week view (GET /api/week contract, issue #477 / #482).
-// Mirrors daemon/week-summary.ts WeekData; replace the local interface with that import once it ships.
+// Typed fixtures for the Week view: WeekData from daemon/week-summary.ts (issue #477) plus the
+// additive cards contract of issue #482.
+import type { BoardInfo, WeekBlock, WeekData as BaseWeekData } from "../../daemon/week-summary";
 
-export interface WeekBlock {
-  sessionId: string;
-  project: string;
-  cwd: string;
-  tool: string;
-  model: string;
-  startMs: number;
-  endMs: number;
-  firstMessage: string;
-  commits: number | null;
-  noCommit: boolean;
-  live: boolean;
-  boards: string[];
-}
-
-export interface WeekBoard { id: string; title: string; kind: string; color: string; repos: string[]; projects: string[] }
+export type WeekBoard = BoardInfo & { projects: string[] };
 
 export interface WeekCard {
-  boardId: string; title: string; url: string; repo: string; number: number;
-  state: "open" | "closed" | "merged"; status: string | null; atMs: number;
-  source: "target" | "start" | "iteration" | "updated" | "closed" | "merged"; derived: boolean; spanEndMs: number | null;
+  boardId: string; kind: string; title: string; url: string | null; repo: string | null; number: number | null;
+  type: "issue" | "pr" | "draft"; state: "OPEN" | "CLOSED" | "MERGED";
+  /** Placement (ms); `endAt` is the exclusive end of a planned range. */
+  at: number; endAt: number | null;
+  source: "target" | "start" | "iteration" | "activity";
+  /** True when placed by activity (updatedAt, closedAt, mergedAt), not planned. */
+  derived: boolean;
 }
 
-export interface WeekData {
-  version: 1;
-  weekStart: number;
-  weekEnd: number;
-  zone: string;
-  asOf: number;
-  stale: boolean;
-  staleReason: string | null;
-  totals: { blocks: number; commits: number; noCommit: number; activeMs: number; sessionMs: number; projects: number };
-  projects: { project: string; ms: number; sessionMs: number; boards: string[] }[];
-  days: { dayStart: number; dayEnd: number; ms: number }[];
-  blocks: WeekBlock[];
-  noCommitBlocks: string[];
-  report: [string, string, string];
-  pullRequests: { repo: string; number: number; title: string; url: string; state: string; mergedAt: number | null; branch: string }[];
-  boards: WeekBoard[];
-  cards?: WeekCard[];
-}
+export type WeekData = BaseWeekData & { cards?: WeekCard[] };
 
 export type WeekScenario = "normal" | "empty" | "stale" | "busy";
 
@@ -89,6 +62,7 @@ function block(project: string, i: number, day: number, startH: number, durMin: 
     endMs: startMs + durMin * MIN,
     firstMessage: msgs[(i + day) % msgs.length],
     commits,
+    commitShas: Array.from({ length: commits ?? 0 }, (_, n) => `${project.slice(0, 3)}${day}${i}${n}`),
     noCommit: commits === 0,
     live,
     boards: PROJECT_BOARDS[project],
@@ -155,6 +129,7 @@ export function makeWeek(scenario: WeekScenario = "normal"): WeekData {
   });
   const noCommit = blocks.filter(b => b.noCommit);
   const day = (d: number, h: number) => WEEK_START + d * 24 * HOUR + h * HOUR;
+  const iso = (d: number, h: number) => new Date(day(d, h)).toISOString();
   return {
     version: 1,
     weekStart: WEEK_START,
@@ -179,17 +154,17 @@ export function makeWeek(scenario: WeekScenario = "normal"): WeekData {
       ? ["Shipped: 4 merged PRs, latest Week view data layer.", "Most time: super-board, 14h 45m.", "Next: resume Shipment list filters on mobile first; it stopped with no commit."]
       : ["Shipped: nothing merged this week.", "Most time: no lanes ran.", "Next: start a lane from the board."],
     pullRequests: scenario === "empty" ? [] : [
-      { repo: "Wladefant/super-board", number: 485, title: "Health check log file", url: "https://github.com/Wladefant/super-board/pull/485", state: "merged", mergedAt: day(4, 12), branch: "fix/health-log" },
-      { repo: "Wladefant/super-board", number: 486, title: "Week view data layer", url: "https://github.com/Wladefant/super-board/pull/486", state: "merged", mergedAt: day(6, 19), branch: "feat/week-data" },
-      { repo: "Bavariance/polysimulator", number: 5630, title: "Quick buy fill on hub cards", url: "https://github.com/Bavariance/polysimulator/pull/5630", state: "merged", mergedAt: day(1, 16), branch: "fix/quick-buy" },
-      { repo: "Wladefant/shipnovo", number: 210, title: "Carrier rate import", url: "https://github.com/Wladefant/shipnovo/pull/210", state: "merged", mergedAt: day(2, 15), branch: "feat/rates" },
+      { repo: "Wladefant/super-board", number: 485, title: "Health check log file", url: "https://github.com/Wladefant/super-board/pull/485", state: "MERGED", mergedAt: iso(4, 12), branch: "fix/health-log" },
+      { repo: "Wladefant/super-board", number: 486, title: "Week view data layer", url: "https://github.com/Wladefant/super-board/pull/486", state: "MERGED", mergedAt: iso(6, 19), branch: "feat/week-data" },
+      { repo: "Bavariance/polysimulator", number: 5630, title: "Quick buy fill on hub cards", url: "https://github.com/Bavariance/polysimulator/pull/5630", state: "MERGED", mergedAt: iso(1, 16), branch: "fix/quick-buy" },
+      { repo: "Wladefant/shipnovo", number: 210, title: "Carrier rate import", url: "https://github.com/Wladefant/shipnovo/pull/210", state: "MERGED", mergedAt: iso(2, 15), branch: "feat/rates" },
     ],
     boards: BOARDS,
     cards: scenario === "empty" ? [] : [
-      { boardId: "Wladefant/5", title: "Week view: UI with week grid", url: "https://github.com/Wladefant/super-board/issues/478", repo: "Wladefant/super-board", number: 478, state: "open", status: "Building", atMs: day(0, 0), source: "iteration", derived: false, spanEndMs: day(6, 24) },
-      { boardId: "Bavariance/1", title: "Hub card quick buy", url: "https://github.com/Bavariance/polysimulator/issues/5629", repo: "Bavariance/polysimulator", number: 5629, state: "closed", status: "Done", atMs: day(1, 0), source: "target", derived: false, spanEndMs: null },
-      { boardId: "Wladefant/11", title: "Carrier rate import", url: "https://github.com/Wladefant/shipnovo/issues/209", repo: "Wladefant/shipnovo", number: 209, state: "closed", status: null, atMs: day(2, 0), source: "closed", derived: true, spanEndMs: null },
-      { boardId: "Wladefant/7", title: "Runner capture provenance", url: "https://github.com/Wladefant/testing/issues/31", repo: "Wladefant/testing", number: 31, state: "open", status: "Ready", atMs: day(3, 0), source: "target", derived: false, spanEndMs: null },
+      { boardId: "Wladefant/5", kind: "veyyon-lanes", title: "Week view: UI with week grid", url: "https://github.com/Wladefant/super-board/issues/478", repo: "Wladefant/super-board", number: 478, type: "issue", state: "OPEN", at: day(0, 0), endAt: day(7, 0), source: "iteration", derived: false },
+      { boardId: "Bavariance/1", kind: "polysimulator", title: "Hub card quick buy", url: "https://github.com/Bavariance/polysimulator/issues/5629", repo: "Bavariance/polysimulator", number: 5629, type: "issue", state: "CLOSED", at: day(1, 0), endAt: null, source: "target", derived: false },
+      { boardId: "Wladefant/11", kind: "shipnovo", title: "Carrier rate import", url: "https://github.com/Wladefant/shipnovo/pull/210", repo: "Wladefant/shipnovo", number: 210, type: "pr", state: "MERGED", at: day(2, 15), endAt: null, source: "activity", derived: true },
+      { boardId: "Wladefant/7", kind: "ing", title: "Runner capture provenance", url: null, repo: null, number: null, type: "draft", state: "OPEN", at: day(3, 0), endAt: null, source: "target", derived: false },
     ],
   };
 }

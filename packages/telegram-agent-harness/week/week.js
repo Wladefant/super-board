@@ -1,7 +1,7 @@
 import { createClient, isTerminalAuthError, OPEN_FROM_TELEGRAM } from './client.js';
 import {
   ALL, BOARD_PARAM, BOARD_STORAGE_KEY, WEEK_PARAM,
-  blockBoards, blockTitle, boardOptions, commitCount, daySegments, formatDuration, hourRange,
+  blockBoards, blockTitle, boardOptions, cardsOnDay, commitCount, daySegments, formatDuration, hourRange,
   isValidWeek, kindLabel, layoutDay, minutesOfDay, mondayOf, projectColors, resolveSelection,
   selectBlocks, selectionLabel, shiftWeek, summarize,
 } from './week-model.js';
@@ -198,7 +198,7 @@ function renderGrid(data, summary, colors, f) {
     data.days.map((day, i) => el('div', { class: 'day-head' },
       el('span', { class: 'day-name' }, f.dayLong.format(day.dayStart)),
       el('span', { class: 'day-hours num' }, formatDuration(summary.days[i].ms)))));
-  const cardsByDay = data.days.map(day => summary.cards.filter(c => c.atMs >= day.dayStart && c.atMs < day.dayEnd));
+  const cardsByDay = data.days.map(day => cardsOnDay(summary.cards, day));
   const allDay = summary.cards.length ? el('div', { class: 'grid-allday' }, el('div', { class: 'gutter gutter-label' }, 'Cards'),
     cardsByDay.map(cards => el('div', { class: 'allday-cell' }, cards.map(card => cardChip(card, data))))) : null;
   const gutter = el('div', { class: 'gutter hours', style: { height: `${hours * HOUR_PX}px` } },
@@ -264,7 +264,7 @@ function renderAgenda(data, summary, colors, f) {
   const segments = daySegments(summary.blocks, data.days);
   agenda.replaceChildren(...data.days.map((day, i) => {
     const segs = [...segments[i]].sort((a, b) => a.startMs - b.startMs);
-    const cards = summary.cards.filter(c => c.atMs >= day.dayStart && c.atMs < day.dayEnd);
+    const cards = cardsOnDay(summary.cards, day);
     return el('section', { class: 'agenda-day', 'aria-labelledby': `agenda-${i}` },
       el('h2', { class: 'agenda-head', id: `agenda-${i}` },
         el('span', {}, f.dayLong.format(day.dayStart)),
@@ -360,21 +360,22 @@ const SOURCE_TEXT = {
   target: 'Placed by its Target date.',
   start: 'Placed by its Start date.',
   iteration: 'Placed by its Iteration.',
-  updated: 'Placed by its last update. This board has no date field, so the day is derived, not planned.',
-  closed: 'Placed by the day it closed. This board has no date field, so the day is derived, not planned.',
-  merged: 'Placed by the day its PR merged. This board has no date field, so the day is derived, not planned.',
+  activity: 'Placed by its last activity (update, close or merge). This board has no date field, so the day is derived, not planned.',
 };
+const TYPE_TEXT = { issue: 'Issue', pr: 'Pull request', draft: 'Draft' };
+const STATE_TEXT = { OPEN: 'open', CLOSED: 'closed', MERGED: 'merged' };
 
 function openCard(trigger, card, data) {
   const board = data.boards.find(b => b.id === card.boardId);
   const f = formatters(data.zone);
+  const ref = card.repo && card.number ? `${card.repo}#${card.number}` : TYPE_TEXT[card.type] || 'Card';
   openDialog(trigger, card.title, [
     el('dl', { class: 'meta' },
       row('Board', board ? `${board.title} · ${kindLabel(board.kind)}` : card.boardId),
-      row('Item', `${card.repo}#${card.number} · ${card.state}${card.status ? ` · ${card.status}` : ''}`),
-      row('Date', card.spanEndMs ? `${f.dayLong.format(card.atMs)} – ${f.dayLong.format(card.spanEndMs - 1)}` : f.dayLong.format(card.atMs))),
-    el('p', { class: 'muted' }, SOURCE_TEXT[card.source] || ''),
-    /^https:\/\/github\.com\//.test(card.url) ? el('a', { class: 'btn link-btn', href: card.url, target: '_blank', rel: 'noopener noreferrer' }, 'Open on GitHub') : null,
+      row('Item', `${ref} · ${STATE_TEXT[card.state] || card.state}`),
+      row('Date', card.endAt && card.endAt > card.at ? `${f.dayLong.format(card.at)} – ${f.dayLong.format(card.endAt - 1)}` : f.dayLong.format(card.at))),
+    el('p', { class: 'muted' }, SOURCE_TEXT[card.source] || (card.derived ? SOURCE_TEXT.activity : '')),
+    card.url && /^https:\/\/github\.com\//.test(card.url) ? el('a', { class: 'btn link-btn', href: card.url, target: '_blank', rel: 'noopener noreferrer' }, 'Open on GitHub') : null,
   ].filter(Boolean));
 }
 

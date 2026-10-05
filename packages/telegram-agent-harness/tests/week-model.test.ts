@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   ALL, INK, PROJECT_PALETTE, UNASSIGNED, boardOptions, contrastRatio, daySegments, isValidWeek, layoutDay,
-  mondayOf, resolveSelection, selectBlocks, selectCards, shiftWeek, summarize, unionMs,
+  cardsOnDay, mondayOf, resolveSelection, selectBlocks, selectCards, shiftWeek, summarize, unionMs,
 } from "../week/week-model.js";
 import { BOARDS, makeWeek } from "./fixtures/week-fixture";
 
@@ -55,6 +55,16 @@ describe("board selection (#482 dropdown)", () => {
     expect(selectCards(week, UNASSIGNED)).toHaveLength(0);
     expect(selectCards({ ...week, cards: undefined }, ALL)).toEqual([]);
   });
+
+  test("a planned range shows on every day it covers; endAt is exclusive", () => {
+    const cards = selectCards(week, ALL);
+    const perDay = week.days.map(day => cardsOnDay(cards, day).map((c: { title: string }) => c.title));
+    perDay.forEach(titles => expect(titles).toContain("Week view: UI with week grid"));
+    expect(perDay[2]).toContain("Carrier rate import");
+    expect(perDay[3]).not.toContain("Carrier rate import");
+    const endsMonday = [{ ...cards[0], endAt: week.days[1].dayStart }];
+    expect(week.days.map(day => cardsOnDay(endsMonday, day).length)).toEqual([1, 0, 0, 0, 0, 0, 0]);
+  });
 });
 
 describe("totals", () => {
@@ -83,6 +93,7 @@ describe("totals", () => {
     expect(report[0]).toStartWith("Shipped: 1 merged PR");
     expect(report[1]).toStartWith("Most time: shipnovo");
     expect(report[2]).toContain("Shipment list filters on mobile");
+    expect(summarize(week, "Wladefant/5").report[0]).toBe("Shipped: 2 merged PRs, latest Week view data layer.");
   });
 
   test("unknown commit counts are not counted as commits or as no-commit", () => {
