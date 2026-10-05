@@ -154,6 +154,14 @@ class TestDepthSurvey(unittest.TestCase):
         wrapper = {c.path: c for c in depth_survey.survey(self.root).candidates}["pkg/orders_repo.py"]
         self.assertEqual(wrapper.domain_terms, ["Cart"])
 
+    def test_a_directory_with_many_terms_is_not_cited(self):
+        rows = "".join(f"| **T{n}** | x. | [`pkg/f{n}.py`](pkg/f{n}.py) |\n" for n in range(4))
+        (self.root / "GLOSSARY.md").write_text("| Term | Meaning | Where |\n| --- | --- | --- |\n" + rows, encoding="utf-8")
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "glossary")
+        wrapper = {c.path: c for c in depth_survey.survey(self.root).candidates}["pkg/orders_repo.py"]
+        self.assertEqual(wrapper.domain_terms, [])
+
     def test_no_glossary_leaves_candidates_uncited(self):
         sv = depth_survey.survey(self.root)
         wrapper = {c.path: c for c in sv.candidates}["pkg/orders_repo.py"]
