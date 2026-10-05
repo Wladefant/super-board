@@ -30,11 +30,13 @@
     "1440x900": { "width": 1440, "height": 900 }
   },
   "requiredReceiptViewports": ["390x844", "1440x900"],
+  "$comment_hosts": "forbiddenHosts match the whole hostname. forbiddenHostMarkers match as a substring. A substring match on a domain would also refuse the staging host staging.polysimulator.com.",
   "forbiddenHosts": [
-    "zaraprptkegxqpvnsubu",
-    "akamai-iad-prod",
     "polysimulator.com",
+    "www.polysimulator.com",
     "app.polysimulator.com",
-    "prod.polysimulator.com"
-  ]
+    "prod.polysimulator.com",
+    "api.polysimulator.com"
+  ],
+  "forbiddenHostMarkers": ["zaraprptkegxqpvnsubu", "akamai-iad-prod"]
 }

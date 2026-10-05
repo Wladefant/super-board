@@ -11,16 +11,19 @@ import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 // Fail closed: the app host must be local or an allow-listed staging host. Production is refused by name.
 const STAGING_HOSTS: string[] = []; // e.g. ['staging.example.test']; never a production host
 const ALLOWED_HOSTS: string[] = ['localhost', '127.0.0.1', ...STAGING_HOSTS];
+// Exact production hostnames, and markers that refuse any host containing them.
+// A substring match on polysimulator.com would also refuse staging.polysimulator.com.
 const FORBIDDEN_HOSTS: string[] = [
-  'zaraprptkegxqpvnsubu',
-  'akamai-iad-prod',
   'polysimulator.com',
+  'www.polysimulator.com',
   'app.polysimulator.com',
   'prod.polysimulator.com',
+  'api.polysimulator.com',
 ];
+const FORBIDDEN_MARKERS: string[] = ['zaraprptkegxqpvnsubu', 'akamai-iad-prod'];
 const appUrl = process.env.APP_URL ?? 'http://127.0.0.1:3000';
 const appHost = new URL(appUrl).hostname.toLowerCase();
-if (FORBIDDEN_HOSTS.some((f) => appHost === f || appHost.includes(f)) || !ALLOWED_HOSTS.includes(appHost)) {
+if (FORBIDDEN_HOSTS.includes(appHost) || FORBIDDEN_MARKERS.some((m) => appHost.includes(m)) || !ALLOWED_HOSTS.includes(appHost)) {
   throw new Error(`E2E_HOST_NOT_ALLOWED: ${appHost} is not in the allow-list (${ALLOWED_HOSTS.join(', ')})`);
 }
 // END host-guard

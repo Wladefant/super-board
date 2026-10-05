@@ -66,7 +66,7 @@ def _is_assertion(step: Dict[str, Any]) -> bool:
 
 def _is_production(origin: str) -> bool:
     host = (urlparse(origin if "://" in origin else f"http://{origin}").hostname or "").lower()
-    return any(host == f or f in host for f in PINS["forbiddenHosts"])
+    return host in PINS["forbiddenHosts"] or any(m in host for m in PINS["forbiddenHostMarkers"])
 
 
 def evaluate(

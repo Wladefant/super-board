@@ -122,9 +122,8 @@ def scan_tree(repo: Path, allow_cache: bool) -> List[str]:
 def host_allowed(url: str, allowed: Iterable[str]) -> Optional[str]:
     """Return None when allowed, else the failing assertion id."""
     host = (urlparse(url if "://" in url else f"http://{url}").hostname or "").lower()
-    for forbidden in PINS["forbiddenHosts"]:
-        if host == forbidden or forbidden in host:
-            return "E2E_HOST_NOT_ALLOWED:forbidden-production-host"
+    if host in PINS["forbiddenHosts"] or any(m in host for m in PINS["forbiddenHostMarkers"]):
+        return "E2E_HOST_NOT_ALLOWED:forbidden-production-host"
     if host not in {h.lower() for h in allowed}:
         return "E2E_HOST_NOT_ALLOWED:not-in-allow-list"
     return None
@@ -151,9 +150,11 @@ def check_config(config_path: Path, package_json: Optional[Path]) -> List[str]:
             findings.append(f"FAIL {check_id}: {config_path.name}")
     # A forbidden host must not appear inside the allow-list literal.
     for m in re.finditer(r"(STAGING_HOSTS|ALLOWED_HOSTS)[^=]*=\s*\[([^\]]*)\]", text):
-        for forbidden in PINS["forbiddenHosts"]:
-            if forbidden in m.group(2):
-                findings.append(f"FAIL config-production-in-allow-list: {forbidden}")
+        for entry in re.findall(r"[\"'`]([^\"'`]+)[\"'`]", m.group(2)):
+            host = entry.lower()
+            hit = host if host in PINS["forbiddenHosts"] else next((k for k in PINS["forbiddenHostMarkers"] if k in host), None)
+            if hit:
+                findings.append(f"FAIL config-production-in-allow-list: {hit}")
     if package_json is not None:
         findings += check_package_pins(package_json)
     return findings

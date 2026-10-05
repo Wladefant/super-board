@@ -255,6 +255,12 @@ class ConfigTests(unittest.TestCase):
         )
         self.assertIn("config-production-in-allow-list", self.ids(self.check(text)))
 
+    def test_staging_subdomain_in_allow_list_passes(self):
+        text = TEMPLATE.read_text(encoding="utf-8").replace(
+            "const STAGING_HOSTS: string[] = [];", "const STAGING_HOSTS: string[] = ['staging.polysimulator.com'];"
+        )
+        self.assertNotIn("config-production-in-allow-list", self.ids(self.check(text)))
+
     def test_hosted_engine_login_and_literal_key_fail(self):
         base = TEMPLATE.read_text(encoding="utf-8")
         self.assertIn("config-hosted-engine", self.ids(self.check("import { kernel } from '@e2e-dev/kernel';\n" + base)))
@@ -294,6 +300,11 @@ class ConfigTests(unittest.TestCase):
             e2e_guard.host_allowed("https://x.zaraprptkegxqpvnsubu.supabase.co", allowed + ["x.zaraprptkegxqpvnsubu.supabase.co"]),
             "E2E_HOST_NOT_ALLOWED:forbidden-production-host",
         )
+        self.assertIsNone(e2e_guard.host_allowed("https://staging.polysimulator.com", allowed + ["staging.polysimulator.com"]))
+        self.assertEqual(
+            e2e_guard.host_allowed("https://api.polysimulator.com", allowed + ["api.polysimulator.com"]),
+            "E2E_HOST_NOT_ALLOWED:forbidden-production-host",
+        )
 
 
 @unittest.skipUnless(shutil.which("node"), "node is required")
@@ -327,6 +338,23 @@ class TemplateHostGuardRunsTests(unittest.TestCase):
             proc = self.run_block(url)
             self.assertNotEqual(proc.returncode, 0, url)
             self.assertIn("E2E_HOST_NOT_ALLOWED", proc.stderr, url)
+
+    def test_staging_subdomain_of_a_production_domain_is_allowed_only_when_listed(self):
+        text = TEMPLATE.read_text(encoding="utf-8")
+        block = re.search(r"// BEGIN host-guard(.*?)// END host-guard", text, re.S).group(1)
+        block = block.replace("const STAGING_HOSTS: string[] = [];", "const STAGING_HOSTS: string[] = ['staging.polysimulator.com'];")
+        base = {"PATH": __import__("os").environ["PATH"], "SystemRoot": __import__("os").environ.get("SystemRoot", "")}
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "guard.mts"
+            script.write_text(block + "\nconsole.log('HOST_OK ' + appHost);\n", encoding="utf-8")
+            ok = subprocess.run(["node", str(script)], capture_output=True, text=True, timeout=60,
+                                env={**base, "APP_URL": "https://staging.polysimulator.com"}, creationflags=NO_WINDOW)
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+            for bad in ("https://polysimulator.com", "https://api.polysimulator.com", "https://staging-api.polysimulator.com"):
+                proc = subprocess.run(["node", str(script)], capture_output=True, text=True, timeout=60,
+                                      env={**base, "APP_URL": bad}, creationflags=NO_WINDOW)
+                self.assertNotEqual(proc.returncode, 0, bad)
+                self.assertIn("E2E_HOST_NOT_ALLOWED", proc.stderr, bad)
 
 
 class RunnerTests(unittest.TestCase):
