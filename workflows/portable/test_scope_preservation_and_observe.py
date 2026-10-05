@@ -117,7 +117,7 @@ class TestScopePreservationAndObserve(unittest.TestCase):
             "--next-action",
             "Run local verification script",
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         self.assertEqual(proc.returncode, 0, f"CLI observe failed: {proc.stderr}")
         self.assertIn("[OK] Recorded failure observation", proc.stdout)
 
@@ -233,7 +233,7 @@ class TestScopePreservationAndObserve(unittest.TestCase):
             "req-crit-drop-01",
             "--strict",
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         self.assertEqual(proc.returncode, 1)
         self.assertIn("[ERROR]", proc.stdout)
         self.assertIn("Scope silently dropped", proc.stdout)
@@ -273,7 +273,7 @@ class TestScopePreservationAndObserve(unittest.TestCase):
             "req-crit-drop-auth-01",
             "--strict",
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         self.assertEqual(proc.returncode, 0, f"check --strict should succeed: {proc.stderr}")
 
     def test_check_strict_flags_unauthorized_state_regression(self):
@@ -315,7 +315,7 @@ class TestScopePreservationAndObserve(unittest.TestCase):
             "req-state-reg-01",
             "--strict",
         ]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         self.assertEqual(proc.returncode, 1)
         self.assertIn("[ERROR]", proc.stdout)
 

@@ -336,8 +336,11 @@ function Show-Status {
 
 function Install-DaemonTask {
     $self = Join-Path $PSScriptRoot "veyyon-telegram-daemon.ps1"
-    $action = New-ScheduledTaskAction -Execute "powershell.exe" `
-        -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$self`" start"
+    # wscript runs the command with window style 0: a console host started here would flash a window.
+    $hidden = Join-Path $env:USERPROFILE ".veyyon\run\run_hidden.vbs"
+    if (-not (Test-Path -PathType Leaf $hidden)) { throw "Missing $hidden. Run workflows/portable/hidden_window_audit.py fix first." }
+    $action = New-ScheduledTaskAction -Execute "wscript.exe" `
+        -Argument "`"$hidden`" powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$self`" start"
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
     $trigger.Delay = "PT5S"
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable

@@ -98,7 +98,7 @@ if (verb === "run") {
   ): Promise<{ proc: Subprocess; pid: number }> {
     const proc = Bun.spawn(["bun", daemonEntry, "run"], {
       stdout: "pipe",
-      stderr: "pipe",
+      stderr: "pipe", windowsHide: true,
     });
     cleanupProcs.push(proc);
 
@@ -131,7 +131,7 @@ if (verb === "run") {
       {
         stdin: "pipe",
         stdout: "pipe",
-        stderr: "pipe",
+        stderr: "pipe", windowsHide: true,
       }
     );
     cleanupProcs.push(proc);
@@ -170,7 +170,7 @@ if (verb === "run") {
         env: {
           ...process.env,
           ...extraEnv,
-        },
+        }, windowsHide: true,
       }
     );
     return {
@@ -306,7 +306,7 @@ if (verb === "run") {
       {
         stdin: "pipe",
         stdout: "pipe",
-        stderr: "pipe",
+        stderr: "pipe", windowsHide: true,
       }
     );
     cleanupProcs.push(wrapperProc);

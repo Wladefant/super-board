@@ -24,7 +24,7 @@ test("a non-GitHub remote resolves to nothing, so the configured default applies
 test("a directory's origin remote resolves, and a non-checkout yields undefined", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tg-github-repo-"));
   try {
-    const run = (...args: string[]) => Bun.spawnSync(["git", "-C", dir, ...args], { stdout: "ignore", stderr: "ignore" });
+    const run = (...args: string[]) => Bun.spawnSync(["git", "-C", dir, ...args], { stdout: "ignore", stderr: "ignore", windowsHide: true });
     const plain = path.join(dir, "plain");
     fs.mkdirSync(plain);
     expect(resolveGithubRepo(plain)).toBeUndefined();
@@ -48,7 +48,7 @@ test("a session with cwd bendhltool (remote Wladefant/shipnovo) links #46 to shi
 
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tg-shipnovo-"));
   try {
-    const run = (...args: string[]) => Bun.spawnSync(["git", "-C", dir, ...args], { stdout: "ignore", stderr: "ignore" });
+    const run = (...args: string[]) => Bun.spawnSync(["git", "-C", dir, ...args], { stdout: "ignore", stderr: "ignore", windowsHide: true });
     run("init", "-q");
     run("remote", "add", "origin", "https://github.com/Wladefant/shipnovo.git");
     const repo = resolveGithubRepo(dir);
@@ -86,7 +86,7 @@ test("a polysimulator cwd links bare #N to Bavariance/polysimulator as before", 
 
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tg-polysim-"));
   try {
-    const run = (...args: string[]) => Bun.spawnSync(["git", "-C", dir, ...args], { stdout: "ignore", stderr: "ignore" });
+    const run = (...args: string[]) => Bun.spawnSync(["git", "-C", dir, ...args], { stdout: "ignore", stderr: "ignore", windowsHide: true });
     run("init", "-q");
     run("remote", "add", "origin", "https://github.com/Bavariance/polysimulator.git");
     const repo = resolveGithubRepo(dir);

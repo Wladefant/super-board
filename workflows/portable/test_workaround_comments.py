@@ -196,7 +196,7 @@ class CommandLine(unittest.TestCase):
         self.commit('app/main.py', 'value = 1\n', 'base')
 
     def _git(self, *args):
-        result = subprocess.run(['git', '-C', str(self.repo), *args], capture_output=True, text=True)
+        result = subprocess.run(['git', '-C', str(self.repo), *args], capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout
 

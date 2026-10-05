@@ -193,6 +193,7 @@ class ProofOnlyModeTests(unittest.TestCase):
                 [sys.executable, "-B", str(CONFIG_CLI), "validate", "--config", str(path), "--json"],
                 capture_output=True,
                 text=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         self.assertEqual(result.returncode, 65)
         self.assertEqual(result.stdout.strip(), "")
@@ -322,6 +323,7 @@ class ActivationLadderTests(unittest.TestCase):
                     "--config", str(path), "--previous-mode", "off",
                 ],
                 capture_output=True, text=True, cwd=str(_SCRIPTS),
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         self.assertEqual(result.returncode, 65, result.stdout)
         self.assertIn("activation-ladder-skipped", result.stderr)
@@ -336,6 +338,7 @@ class ActivationLadderTests(unittest.TestCase):
                     "--issue-url", PROOF_URL,
                 ],
                 capture_output=True, text=True, cwd=str(_SCRIPTS),
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(json.loads(result.stdout)["transition_permitted"])
@@ -368,6 +371,7 @@ class ActivationCliTests(unittest.TestCase):
             capture_output=True,
             text=True,
             cwd=str(_SCRIPTS),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
 
     def test_cli_reports_a_refusal_as_machine_readable_json(self) -> None:

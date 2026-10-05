@@ -431,6 +431,7 @@ class TestCLIExecution(unittest.TestCase):
             [sys.executable, diag_script, "--state-dir", state_dir, "--summary"],
             capture_output=True,
             text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.assertEqual(res_sum.returncode, 0)
         self.assertIn("PORTABLE WORKFLOW AGGREGATE SYSTEM & REQUEST DIAGNOSTICS", res_sum.stdout)
@@ -442,6 +443,7 @@ class TestCLIExecution(unittest.TestCase):
             [sys.executable, diag_script, "--state-dir", state_dir, "--json"],
             capture_output=True,
             text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.assertEqual(res_json.returncode, 0)
         data = json.loads(res_json.stdout)
@@ -461,6 +463,7 @@ class TestCLIExecution(unittest.TestCase):
             [sys.executable, coord_script, "--state-dir", state_dir, "--diagnostics", "--summary"],
             capture_output=True,
             text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.assertEqual(res.returncode, 0)
         self.assertIn("PORTABLE WORKFLOW AGGREGATE SYSTEM & REQUEST DIAGNOSTICS", res.stdout)
@@ -475,6 +478,7 @@ class TestCLIExecution(unittest.TestCase):
             [sys.executable, driver_script, "--state-dir", state_dir, "--diagnostics"],
             capture_output=True,
             text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.assertEqual(res.returncode, 0)
         self.assertIn("PORTABLE WORKFLOW AGGREGATE SYSTEM & REQUEST DIAGNOSTICS", res.stdout)

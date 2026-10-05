@@ -109,7 +109,7 @@ export const isClosed = (question: Question): boolean => question.status === "an
 
 async function spawnQuestionStore(request: object): Promise<Result> {
   const proc = Bun.spawn(["python", path.join(import.meta.dir, "operator_questions.py")],
-    { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    { stdin: "pipe", stdout: "pipe", stderr: "pipe", windowsHide: true });
   proc.stdin.write(JSON.stringify(request));
   proc.stdin.end();
   const timeout = setTimeout(() => proc.kill(), 15_000);

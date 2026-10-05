@@ -631,6 +631,7 @@ class SuperboardExecutionAdapter:
                 capture_output=True,
                 text=True,
                 timeout=30,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             sha = req_head or "current_local_head"
             output = f"[REAL_WORKER_EXECUTION] cmd={' '.join(cmd)}\nExit: {res.returncode}\nStdout: {res.stdout.strip()}\nStderr: {res.stderr.strip()}"

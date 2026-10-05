@@ -146,7 +146,8 @@ def _gh_rate_limit() -> Any:
     # `gh_binary()`, not a literal — the same override every other GitHub call in
     # this runtime honours, so the quota read is exercisable without an account.
     result = subprocess.run(
-        [gh_binary(), "api", "rate_limit"], capture_output=True, text=True, timeout=30
+        [gh_binary(), "api", "rate_limit"], capture_output=True, text=True, timeout=30,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     if result.returncode != 0:
         return None

@@ -85,6 +85,7 @@ def _run(cmd: List[str], cwd: Optional[str] = None, timeout: Optional[float] = N
         res = subprocess.run(
             cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=t, cwd=cwd, stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return 1, "", str(exc)

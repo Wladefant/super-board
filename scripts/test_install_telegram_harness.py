@@ -241,11 +241,11 @@ class TestInstallTelegramHarness(unittest.TestCase):
         (pkg_dir / "src" / "index.ts").write_text("// test", encoding="utf-8")
 
         # Init git repo and commit
-        subprocess.run(["git", "-C", str(repo_dir), "init"], check=True, capture_output=True)
-        subprocess.run(["git", "-C", str(repo_dir), "config", "user.email", "test@example.com"], check=True)
-        subprocess.run(["git", "-C", str(repo_dir), "config", "user.name", "Test User"], check=True)
-        subprocess.run(["git", "-C", str(repo_dir), "add", "."], check=True, capture_output=True)
-        subprocess.run(["git", "-C", str(repo_dir), "commit", "-m", "initial"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo_dir), "init"], check=True, capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        subprocess.run(["git", "-C", str(repo_dir), "config", "user.email", "test@example.com"], check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        subprocess.run(["git", "-C", str(repo_dir), "config", "user.name", "Test User"], check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        subprocess.run(["git", "-C", str(repo_dir), "add", "."], check=True, capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        subprocess.run(["git", "-C", str(repo_dir), "commit", "-m", "initial"], check=True, capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
         # Dirty the repo
         (pkg_dir / "extension" / "guard.ts").write_text("// dirty change", encoding="utf-8")

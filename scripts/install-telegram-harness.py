@@ -250,6 +250,7 @@ def is_git_dirty(source_root: Path) -> Tuple[bool, str]:
             capture_output=True,
             text=True,
             check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         if res.returncode != 0:
             return False, ""
@@ -269,6 +270,7 @@ def get_git_info(source_root: Path) -> Tuple[str, str]:
             capture_output=True,
             text=True,
             check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         if res.returncode == 0 and res.stdout.strip():
             sha = res.stdout.strip()
@@ -281,6 +283,7 @@ def get_git_info(source_root: Path) -> Tuple[str, str]:
             capture_output=True,
             text=True,
             check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         if res.returncode == 0 and res.stdout.strip():
             repo = res.stdout.strip()

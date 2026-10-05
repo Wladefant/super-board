@@ -26,6 +26,7 @@ def test_watchdog_restarts_killed_server_without_client_and_honours_stop_and_cap
         capture_output=True,
         text=True,
         timeout=240,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "RESULT failures=0" in proc.stdout

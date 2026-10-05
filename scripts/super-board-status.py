@@ -429,7 +429,8 @@ def gh(*args: str, check: bool = True) -> str:
     """Run gh and return stdout. Exits 67 on failure when check=True."""
     try:
         proc = subprocess.run(
-            ["gh", *args], capture_output=True, text=True, encoding="utf-8", check=False
+            ["gh", *args], capture_output=True, text=True, encoding="utf-8", check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except FileNotFoundError:
         print("gh CLI not found on PATH", file=sys.stderr)

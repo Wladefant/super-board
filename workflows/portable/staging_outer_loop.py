@@ -523,7 +523,7 @@ def find_open_issue_by_key(repo: str, key: str) -> Optional[Dict[str, Any]]:
         "--limit", "10",
     ]
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         issues = json.loads(res.stdout or "[]")
         exact_target = f"outer-loop-key: {key}"
         for issue in issues:
@@ -544,7 +544,7 @@ def create_github_issue(repo: str, incident: Incident) -> Optional[str]:
         "--label", ",".join(incident.labels),
     ]
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return res.stdout.strip()
     except subprocess.CalledProcessError as e:
         sys.stderr.write(f"Error creating GitHub issue with labels: {e.stderr}\n")
@@ -557,7 +557,7 @@ def create_github_issue(repo: str, incident: Incident) -> Optional[str]:
             "--label", "kind:incident",
         ]
         try:
-            res = subprocess.run(fallback_cmd, capture_output=True, text=True, check=True)
+            res = subprocess.run(fallback_cmd, capture_output=True, text=True, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             return res.stdout.strip()
         except subprocess.CalledProcessError as e2:
             sys.stderr.write(f"Error creating GitHub issue with fallback labels: {e2.stderr}\n")
@@ -572,7 +572,7 @@ def add_github_comment(repo: str, issue_number: int, comment: str) -> bool:
         "--body", comment,
     ]
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return res.returncode == 0
     except subprocess.CalledProcessError as e:
         sys.stderr.write(f"Error commenting on GitHub issue #{issue_number}: {e.stderr}\n")
@@ -602,7 +602,7 @@ def send_telegram_alert(summary: str, link: str, dry_run: bool = False) -> bool:
         "--send",
     ]
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         if res.returncode != 0:
             sys.stderr.write(f"Warning: telegram_notifier.py exited {res.returncode}: {res.stderr}\n")
             return False

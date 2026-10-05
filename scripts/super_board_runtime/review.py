@@ -992,6 +992,7 @@ def _default_runner(command: Sequence[str], cwd: Path) -> Mapping[str, Any]:
         text=True,
         timeout=3600,
         stdin=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     return {"exit_code": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
 

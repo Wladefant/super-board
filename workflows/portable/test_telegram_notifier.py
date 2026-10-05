@@ -1229,6 +1229,7 @@ class TestCrossLanguageReplyRouting(unittest.TestCase):
             capture_output=True,
             text=True,
             timeout=120,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.assertEqual(proc.returncode, 0, f"probe failed: {proc.stderr}")
         return json.loads(proc.stdout.strip().splitlines()[-1])
@@ -1540,6 +1541,7 @@ class TestTelegramNotifierHardening(unittest.TestCase):
             capture_output=True,
             text=True,
             cwd=str(Path(__file__).parent),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         elapsed = time.time() - start_t
         self.assertNotEqual(proc.returncode, 0, "Subprocess must exit non-zero when deadline exceeded")
@@ -1800,7 +1802,7 @@ class TestSharedSendBudget(unittest.TestCase):
         import subprocess
         import sys
 
-        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child = subprocess.Popen([sys.executable, "-c", "pass"], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         child.wait()
         budget = telegram_budget.SharedBudget("1", self.dir)
         self._hold(budget, child.pid)
@@ -1840,7 +1842,7 @@ class TestSharedSendBudget(unittest.TestCase):
             self.assertIsNone(budget.update(lambda s: 1))
         self.assertTrue(budget.lock.exists())
         budget.lock.unlink()
-        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child = subprocess.Popen([sys.executable, "-c", "pass"], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         child.wait()
         self._hold(budget, child.pid)
         self.assertEqual(budget.update(lambda s: 1), 1)

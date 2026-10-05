@@ -79,7 +79,7 @@ def launch_script_path() -> Path:
 
 def _safe_version(command: list[str]) -> str | None:
     try:
-        completed = subprocess.run(command, text=True, capture_output=True, timeout=5, check=False)
+        completed = subprocess.run(command, text=True, capture_output=True, timeout=5, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (OSError, subprocess.TimeoutExpired):
         return None
     if completed.returncode != 0:
@@ -578,6 +578,7 @@ for ($i = $owned.Count - 1; $i -ge 0; $i--) {
         subprocess.run(
             ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
             env=env, text=True, capture_output=True, timeout=10, check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.TimeoutExpired):
         return
@@ -587,7 +588,7 @@ def _terminate_exact_process_tree(process: subprocess.Popen[str]) -> None:
     if process.poll() is not None:
         return
     if os.name == "nt":
-        subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], text=True, capture_output=True, check=False)
+        subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], text=True, capture_output=True, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     else:
         try:
             os.killpg(process.pid, 9)
@@ -606,7 +607,7 @@ def _run_fixture_process(
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         kwargs["start_new_session"] = True
-    process = subprocess.Popen(command, **kwargs)
+    process = subprocess.Popen(command, **kwargs, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     try:
         stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
@@ -1099,7 +1100,7 @@ def _run_bounded(command: list[str], cwd: Path, timeout_seconds: int) -> tuple[i
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         kwargs["start_new_session"] = True
-    process = subprocess.Popen(command, **kwargs)
+    process = subprocess.Popen(command, **kwargs, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     try:
         stdout, stderr = process.communicate(timeout=timeout_seconds)
         return process.returncode, False, stdout, stderr
@@ -1298,6 +1299,7 @@ def _run_single_live_probe(name: str) -> dict[str, Any]:
         validation = subprocess.run(
             ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(launch_script_path()), "-ValidateGatewayOnly", "-RequireExistingGateway", "-GatewayBaseUrl", APPROVED_UPSTREAM],
             text=True, capture_output=True, timeout=20, check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except subprocess.TimeoutExpired:
         return {"verified": False, "probe": name, "errors": [{"type": "timeout", "timeout_seconds": 120, "stage": "gateway_validation"}], "credentials_or_config_changes": False}

@@ -221,7 +221,7 @@ class TestFeatureMap(unittest.TestCase):
     def test_17_cli_validate_success(self):
         """CLI validate command exits 0 on valid repository map."""
         cmd = [sys.executable, str(Path(SCRIPT_DIR) / "feature_map.py"), "validate", "--repo-root", str(self.repo_root)]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         self.assertEqual(proc.returncode, 0, f"CLI validate failed: {proc.stderr}")
         self.assertIn("[PASS] Feature map valid", proc.stdout)
 
@@ -252,7 +252,7 @@ class TestFeatureMap(unittest.TestCase):
                 "--map", str(map_file),
                 "--repo-root", str(tmp_root),
             ]
-            proc = subprocess.run(cmd, capture_output=True, text=True)
+            proc = subprocess.run(cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             self.assertEqual(proc.returncode, 1)
             self.assertIn("[FAIL] Feature map validation failed", proc.stderr)
             self.assertIn("missing_file_xyz.py", proc.stderr)
@@ -265,6 +265,7 @@ class TestFeatureMap(unittest.TestCase):
             [sys.executable, script, "query", "routing", "--repo-root", str(self.repo_root)],
             capture_output=True,
             text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.assertEqual(p_query.returncode, 0)
         self.assertIn("routing", p_query.stdout)
@@ -275,6 +276,7 @@ class TestFeatureMap(unittest.TestCase):
             [sys.executable, script, "show", "build_slot", "--repo-root", str(self.repo_root)],
             capture_output=True,
             text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.assertEqual(p_show.returncode, 0)
         self.assertIn("Feature ID    : build_slot", p_show.stdout)
@@ -287,6 +289,7 @@ class TestFeatureMap(unittest.TestCase):
             [sys.executable, script, "list", "--json", "--repo-root", str(self.repo_root)],
             capture_output=True,
             text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.assertEqual(proc.returncode, 0)
         data = json.loads(proc.stdout)
@@ -381,7 +384,7 @@ class TestFeatureMap(unittest.TestCase):
                 "--map", str(map_file),
                 "--repo-root", str(tmp_root),
             ]
-            proc = subprocess.run(cmd, capture_output=True, text=True)
+            proc = subprocess.run(cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             self.assertEqual(proc.returncode, 0, f"generate --append failed: {proc.stderr}\nstdout: {proc.stdout}")
 
             # Load updated JSON and verify lossless preservation

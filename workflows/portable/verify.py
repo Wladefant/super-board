@@ -72,7 +72,7 @@ except ImportError:
 
     def fetch_pr_json(pr_number: int, repo: str = "Bavariance/polysimulator") -> Dict[str, Any]:
         cmd = ["gh", "pr", "view", str(pr_number), "--repo", repo, "--json", "number,headRefOid,baseRefOid,baseRefName,files,state,isDraft,labels"]
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return json.loads(res.stdout)
 
 
@@ -511,6 +511,7 @@ def run_backend_unit_tests(
                 capture_output=True,
                 text=True,
                 timeout=120,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             if res.returncode == 0:
                 return ScenarioCheckResult(
@@ -561,7 +562,7 @@ def run_backend_unit_tests(
     if os.path.isdir(backend_tests_dir):
         cmd = [sys.executable, "-m", "pytest", "backend/tests", "-q"]
         try:
-            res = subprocess.run(cmd, cwd=repo_root, capture_output=True, text=True, timeout=60)
+            res = subprocess.run(cmd, cwd=repo_root, capture_output=True, text=True, timeout=60, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             if res.returncode == 0:
                 return ScenarioCheckResult(
                     kind="backend_unit_tests",
@@ -630,6 +631,7 @@ def run_workflow_unit_tests(
                 capture_output=True,
                 text=True,
                 timeout=120,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             if res.returncode == 0:
                 return ScenarioCheckResult(
@@ -690,7 +692,7 @@ def run_workflow_unit_tests(
     for test_rel in tests_to_run:
         cmd = [sys.executable, "-B", test_rel]
         try:
-            res = subprocess.run(cmd, cwd=repo_root, capture_output=True, text=True, timeout=120)
+            res = subprocess.run(cmd, cwd=repo_root, capture_output=True, text=True, timeout=120, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             if res.returncode != 0:
                 return ScenarioCheckResult(
                     kind="workflow_unit_tests",
@@ -952,7 +954,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         # Check git diff against HEAD~1 or origin/main
         try:
-            res = subprocess.run(["git", "diff", "--name-only", "HEAD~1"], capture_output=True, text=True, cwd=args.repo_root)
+            res = subprocess.run(["git", "diff", "--name-only", "HEAD~1"], capture_output=True, text=True, cwd=args.repo_root, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             if res.returncode == 0 and res.stdout.strip():
                 files = [line.strip() for line in res.stdout.splitlines() if line.strip()]
         except Exception:
@@ -961,7 +963,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Resolve head_sha from git if still empty
     if not head_sha:
         try:
-            res = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=args.repo_root)
+            res = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, cwd=args.repo_root, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             if res.returncode == 0 and res.stdout.strip():
                 head_sha = res.stdout.strip()
         except Exception:

@@ -30,7 +30,7 @@ ENV = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COM
 
 
 def git(root, *args):
-    return subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True, text=True, env=ENV).stdout.strip()
+    return subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True, text=True, env=ENV, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout.strip()
 
 
 class TestServedIdentity(unittest.TestCase):

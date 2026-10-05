@@ -230,6 +230,7 @@ class ExitSummaryTests(unittest.TestCase):
                         capture_output=True,
                         text=True,
                         cwd=str(_SCRIPTS),
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                     )
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertIn(QUOTA_SUMMARY_PREFIX, result.stdout)
@@ -249,6 +250,7 @@ class ExitSummaryTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 cwd=str(_SCRIPTS),
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("unavailable", result.stdout)
@@ -319,6 +321,7 @@ class QuotaCliTests(unittest.TestCase):
             capture_output=True,
             text=True,
             cwd=str(_SCRIPTS),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
 
     def test_a_healthy_quota_exits_zero_with_json(self) -> None:

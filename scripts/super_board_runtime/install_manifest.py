@@ -437,6 +437,7 @@ def _git_head(root: Path) -> str:
         capture_output=True,
         text=True,
         timeout=60,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     return result.stdout.strip()
 

@@ -905,7 +905,7 @@ def fetch_github_comment_default(repo: str, comment_id: str) -> Dict[str, Any]:
         "--jq",
         "{id: .id, node_id: .node_id, user: .user.login, user_type: .user.type, body: .body, created_at: .created_at, updated_at: .updated_at, html_url: .html_url, issue_url: .issue_url, performed_via_github_app: (.performed_via_github_app != null)}",
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    res = subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     out = res.stdout.strip()
     if not out:
         raise ValueError(f"Empty response fetching comment {comment_id} from {repo}")
@@ -985,7 +985,7 @@ def fetch_github_comment_history_default(
             cmd.extend(["-F", f"cursor={cursor}"])
         cmd.extend(["-f", f"query={query}"])
 
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         out = res.stdout.strip()
         if not out:
             raise ValueError(f"Empty GraphQL response for comment {comment_id} ({resolved_node_id})")
@@ -3038,7 +3038,7 @@ class DecisionManager:
                         "--jq",
                         ".[] | {id: .id, node_id: .node_id, user: .user.login, user_type: .user.type, body: .body, created_at: .created_at, updated_at: .updated_at, html_url: .html_url, issue_url: .issue_url, performed_via_github_app: (.performed_via_github_app != null)}",
                     ]
-                    res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                    res = subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                     comments = []
                     for line in res.stdout.strip().splitlines():
                         if line.strip():
@@ -3548,7 +3548,7 @@ def post_decision_to_github_issue(
         "--body",
         body,
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    res = subprocess.run(cmd, capture_output=True, text=True, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     comment_url = res.stdout.strip()
 
     # Extract comment ID from URL if possible

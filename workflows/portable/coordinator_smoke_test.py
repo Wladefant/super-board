@@ -101,7 +101,7 @@ def test_standalone_coordinator_execution(export_dir: str):
         "--no-sync-decisions",
         "--json",
     ]
-    res = subprocess.run(cmd, cwd=export_dir, capture_output=True, text=True)
+    res = subprocess.run(cmd, cwd=export_dir, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     assert_true(res.returncode == 0, f"Coordinator exited code 0 (stderr: {res.stderr})")
 
     packet = json.loads(res.stdout)
@@ -135,7 +135,7 @@ def test_missing_optional_tools(export_dir: str):
         "--balance-file", fixture_path,
         "--json",
     ]
-    res = subprocess.run(cmd, cwd=export_dir, env=minimal_env, capture_output=True, text=True)
+    res = subprocess.run(cmd, cwd=export_dir, env=minimal_env, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     assert_true(res.returncode == 0, f"Coordinator executed cleanly with missing tools: {res.stderr}")
 
     packet = json.loads(res.stdout)
@@ -199,7 +199,7 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
         ]
         if req_id:
             c_cmd.extend(["--request-id", req_id])
-        c_res = subprocess.run(c_cmd, capture_output=True, text=True)
+        c_res = subprocess.run(c_cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         assert_true(c_res.returncode == 0, f"Coordinator run success: {c_res.stderr}")
         return json.loads(c_res.stdout)
 
@@ -224,7 +224,7 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
         "--labels", "area:harness,local_doc",
         "--next-action", "Draft documentation updates",
     ]
-    res = subprocess.run(add_local_cmd, capture_output=True, text=True)
+    res = subprocess.run(add_local_cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     assert_true(res.returncode == 0, f"Added synthetic local_doc request: {res.stderr}")
 
     # A1: Coordinator evaluates local_doc -> READY (preflight exempt)
@@ -250,7 +250,7 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
         "--authorized", "Wladefant",
         "--issue", "4555",
     ]
-    res = subprocess.run(ask_cmd, capture_output=True, text=True)
+    res = subprocess.run(ask_cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     assert_true(res.returncode == 0, f"Registered decision: {res.stderr}")
 
     p2 = run_coord(local_req_id)
@@ -272,7 +272,7 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
         "--comment-time-provenance", "api_verified",
         "--session", "00000000-0000-0000-0000-wrongsession",
     ]
-    res_rej = subprocess.run(rej_reply_cmd, capture_output=True, text=True)
+    res_rej = subprocess.run(rej_reply_cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     assert_true(res_rej.returncode == 0, f"Executed rejected reply: {res_rej.stderr}")
     assert_true("Session mismatch" in res_rej.stdout or "Session mismatch" in res_rej.stderr, "Output notes session mismatch")
     p_rej = run_coord(local_req_id)
@@ -292,7 +292,7 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
         "--comment-time-provenance", "api_verified",
         "--session", "00000000-0000-0000-0000-000000000001",
     ]
-    res = subprocess.run(reply_cmd, capture_output=True, text=True)
+    res = subprocess.run(reply_cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     assert_true(res.returncode == 0, f"Resolved decision via workflow: {res.stderr}")
 
     p3 = run_coord(local_req_id)
@@ -304,7 +304,7 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
         "update", local_req_id,
         "--state", "QA",
     ]
-    res = subprocess.run(qa_cmd, capture_output=True, text=True)
+    res = subprocess.run(qa_cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     assert_true(res.returncode == 0, f"Advanced local_doc to QA: {res.stderr}")
 
     p4 = run_coord(local_req_id)
@@ -320,7 +320,7 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
         "--criterion-status", "verified",
         "--criterion-evidence", "Local doc verified in PORTABLE.md",
     ]
-    subprocess.run(crit1_cmd, check=True)
+    subprocess.run(crit1_cmd, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
     crit2_cmd = [
         PYTHON_EXE, ledger_py,
@@ -330,7 +330,7 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
         "--criterion-status", "verified",
         "--criterion-evidence", "Smoke test passed in coordinator_smoke_test.py",
     ]
-    subprocess.run(crit2_cmd, check=True)
+    subprocess.run(crit2_cmd, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
     # In local_doc tasks, state advances QA -> review -> done
     rev_cmd = [
@@ -343,7 +343,7 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
         "--evidence-summary", "Synthetic QA stage completed",
         "--evidence-details", "Isolated coordinator smoke command exited 0",
     ]
-    subprocess.run(rev_cmd, check=True)
+    subprocess.run(rev_cmd, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
     proof_cmd = [
         PYTHON_EXE, ledger_py,
@@ -357,7 +357,7 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
         "--evidence-summary", "Synthetic review stage completed",
         "--evidence-details", "Isolated coordinator review smoke command exited 0",
     ]
-    res = subprocess.run(proof_cmd, capture_output=True, text=True)
+    res = subprocess.run(proof_cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     assert_true(res.returncode == 0, f"Completed local_doc to done: {res.stderr}")
 
     # =========================================================================
@@ -380,7 +380,7 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
         "--head", synthetic_head,
         "--next-action", "Run staging smoke verification",
     ]
-    res = subprocess.run(add_deploy_cmd, capture_output=True, text=True)
+    res = subprocess.run(add_deploy_cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     assert_true(res.returncode == 0, f"Added synthetic deployable request: {res.stderr}")
 
     # B1: Deployable task without staging evidence -> Coordinator BLOCK on preflight
@@ -426,7 +426,7 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
         "record-evidence",
         "--file", evidence_file,
     ]
-    res = subprocess.run(record_probe_cmd, capture_output=True, text=True)
+    res = subprocess.run(record_probe_cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     assert_true(res.returncode == 0, f"Recorded staging preflight evidence: {res.stderr}")
     # B3: With staging evidence recorded -> Coordinator READY
     p6 = run_coord(deploy_req_id)
@@ -456,7 +456,7 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
                 "--evidence-summary", "Synthetic deployable review completed",
                 "--evidence-details", "Isolated review command exited 0",
             ])
-        return subprocess.run(command, capture_output=True, text=True)
+        return subprocess.run(command, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
     illegal = set_state("awaiting authorization")
     assert_true(
@@ -477,6 +477,7 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
             ],
             capture_output=True,
             text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         assert_true(
             criterion_result.returncode == 0,
@@ -502,7 +503,7 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
         "--auth-notes", "Authorized by operator for staging integration",
         "--state", "integration",
     ]
-    res = subprocess.run(auth_cmd, capture_output=True, text=True)
+    res = subprocess.run(auth_cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     assert_true(res.returncode == 0, f"Authorized integration: {res.stderr}")
 
     to_live_cmd = [
@@ -511,7 +512,7 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
         "update", deploy_req_id,
         "--state", "live verification",
     ]
-    subprocess.run(to_live_cmd, check=True)
+    subprocess.run(to_live_cmd, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
     crit_dep1_cmd = [
         PYTHON_EXE, ledger_py,
@@ -521,7 +522,7 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
         "--criterion-status", "verified",
         "--criterion-evidence", "Container verified on staging",
     ]
-    subprocess.run(crit_dep1_cmd, check=True)
+    subprocess.run(crit_dep1_cmd, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
     crit_dep2_cmd = [
         PYTHON_EXE, ledger_py,
@@ -531,7 +532,7 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
         "--criterion-status", "verified",
         "--criterion-evidence", "Live verification signoff complete",
     ]
-    subprocess.run(crit_dep2_cmd, check=True)
+    subprocess.run(crit_dep2_cmd, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
     proof_dep_cmd = [
         PYTHON_EXE, ledger_py,
@@ -541,7 +542,7 @@ def _run_isolated_synthetic_request_lifecycle(export_dir: str, state_dir: str):
         "--verify-github-proof",
         "--state", "done",
     ]
-    res = subprocess.run(proof_dep_cmd, capture_output=True, text=True)
+    res = subprocess.run(proof_dep_cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     assert_true(res.returncode == 0, f"Completed deployable request to done: {res.stderr}")
 
     # B6: Now that all requests in synthetic ledger are done -> Coordinator emits DONE

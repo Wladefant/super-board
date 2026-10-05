@@ -117,6 +117,7 @@ def _gh_writer(target: Optional[str]):
             capture_output=True,
             text=True,
             timeout=60,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         if result.returncode != 0:
             raise PublicationError("publication-write-failed", "the GitHub write failed")

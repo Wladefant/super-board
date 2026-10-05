@@ -43,7 +43,7 @@ def fetch_github_sub_issues(repo: str, issue_number: int, timeout_sec: int = 10)
         raise ValueError(f"Invalid repository '{repo}' or issue number '{issue_number}'")
     cmd = ["gh", "api", "--paginate", "-q", ".[]", f"repos/{repo}/issues/{issue_number}/sub_issues?per_page=100"]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=timeout_sec)
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=timeout_sec, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except subprocess.TimeoutExpired as e:
         raise RuntimeError(f"gh api sub_issues timed out after {timeout_sec}s for {repo}#{issue_number}") from e
     except Exception as e:
@@ -757,7 +757,7 @@ def default_graphql_runner(query: str, variables: Dict[str, Any]) -> Dict[str, A
     cmd.extend(["-f", f"query={query}"])
 
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=30)
+        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except Exception as e:
         raise RuntimeError(f"Failed to execute gh api graphql subprocess: {e}")
 

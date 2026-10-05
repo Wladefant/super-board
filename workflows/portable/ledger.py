@@ -232,7 +232,7 @@ def fetch_github_sub_issues(
         output = stdout
     else:
         try:
-            res = subprocess.run(["gh"] + cmd_args, capture_output=True, text=True, timeout=timeout_sec)
+            res = subprocess.run(["gh"] + cmd_args, capture_output=True, text=True, timeout=timeout_sec, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except subprocess.TimeoutExpired as e:
             raise RuntimeError(f"gh api sub_issues timed out after {timeout_sec}s for {repo}#{issue_number}") from e
         except Exception as e:

@@ -277,6 +277,7 @@ class ConfigCliTests(unittest.TestCase):
             capture_output=True,
             text=True,
             cwd=str(_REPO_ROOT),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
 
     def test_valid_fixture_prints_sorted_json_and_exits_zero(self) -> None:

@@ -135,6 +135,7 @@ def verify_worktree(path_str: str, base_dir: str = "C:/Users/wkiri/development")
             capture_output=True,
             text=True,
             timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         branch = res_branch.stdout.strip()
     except Exception:
@@ -147,6 +148,7 @@ def verify_worktree(path_str: str, base_dir: str = "C:/Users/wkiri/development")
             capture_output=True,
             text=True,
             timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         sha = res_sha.stdout.strip()
     except Exception:
@@ -159,6 +161,7 @@ def verify_worktree(path_str: str, base_dir: str = "C:/Users/wkiri/development")
             capture_output=True,
             text=True,
             timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         dirty = bool(res_status.stdout.strip())
     except Exception:
@@ -172,6 +175,7 @@ def verify_worktree(path_str: str, base_dir: str = "C:/Users/wkiri/development")
             capture_output=True,
             text=True,
             timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         remote_url = res_remote.stdout.strip()
         m = re.search(r"github\.com[:/]([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+?)(?:\.git)?$", remote_url)
@@ -212,6 +216,7 @@ def get_gh_token() -> Optional[str]:
             text=True,
             timeout=5,
             stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         if res.returncode == 0 and res.stdout.strip():
             _GH_TOKEN = res.stdout.strip()
@@ -266,6 +271,7 @@ def query_github_pr(repo: str, pr_number: int) -> Dict[str, Any]:
                 timeout=5,
                 stdin=subprocess.DEVNULL,
                 env=env,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             if res.returncode != 0:
                 return {"error": res.stderr.strip() or f"PR #{pr_number} not found in {repo}"}
@@ -440,6 +446,7 @@ def extract_lane_telemetry(session_path: Path, recurse_history: bool = True) -> 
                                             text=True,
                                             timeout=5,
                                             stdin=subprocess.DEVNULL,
+                                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                                         )
                                         b = res_b.stdout.strip()
                                         if b and b not in ("main", "staging", "master", "HEAD"):

@@ -12,7 +12,7 @@ from super_board_runtime.idea import decompose, file_drafts
 
 def command(argv):
     return subprocess.run(argv, check=True, capture_output=True, text=True,
-                          encoding="utf-8", timeout=240).stdout.strip()
+                          encoding="utf-8", timeout=240, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout.strip()
 
 
 def main():

@@ -75,7 +75,7 @@ describe("veyyon-gui-host.ps1 launcher liveness, port checks, and stale pid hand
 
     const proc = Bun.spawn(["bun", tempScript, "gui", endpoint], {
       stdout: "pipe",
-      stderr: "pipe",
+      stderr: "pipe", windowsHide: true,
     });
     cleanupProcs.push(proc);
 
@@ -108,7 +108,7 @@ describe("veyyon-gui-host.ps1 launcher liveness, port checks, and stale pid hand
       {
         stdin: "pipe",
         stdout: "pipe",
-        stderr: "pipe",
+        stderr: "pipe", windowsHide: true,
       }
     );
     cleanupProcs.push(proc);
@@ -159,7 +159,7 @@ describe("veyyon-gui-host.ps1 launcher liveness, port checks, and stale pid hand
         env: {
           ...process.env,
           ...extraEnv,
-        },
+        }, windowsHide: true,
       }
     );
     return {

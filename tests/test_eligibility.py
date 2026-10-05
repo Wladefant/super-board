@@ -466,6 +466,7 @@ class PlanShapeAndCliTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 cwd=str(_SCRIPTS),
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
@@ -494,6 +495,7 @@ class PlanShapeAndCliTests(unittest.TestCase):
                     capture_output=True,
                     text=True,
                     cwd=str(_SCRIPTS),
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
 
         good_config = json.dumps(

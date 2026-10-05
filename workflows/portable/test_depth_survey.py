@@ -71,7 +71,7 @@ def refund(cart, reason):
 
 
 def git(root, *args):
-    subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True, env=ENV)
+    subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True, env=ENV, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
 def make_repo(tmp: Path) -> Path:

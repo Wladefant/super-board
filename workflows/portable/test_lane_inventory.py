@@ -65,14 +65,14 @@ class TestLaneInventory(unittest.TestCase):
     def test_verify_worktree_valid_git(self):
         git_dir = Path(self.temp_dir) / "test_repo"
         git_dir.mkdir()
-        subprocess.run(["git", "-C", str(git_dir), "init", "-b", "feat/my-feature"], capture_output=True, check=True)
-        subprocess.run(["git", "-C", str(git_dir), "config", "user.name", "Test"], capture_output=True, check=True)
-        subprocess.run(["git", "-C", str(git_dir), "config", "user.email", "test@test.com"], capture_output=True, check=True)
+        subprocess.run(["git", "-C", str(git_dir), "init", "-b", "feat/my-feature"], capture_output=True, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        subprocess.run(["git", "-C", str(git_dir), "config", "user.name", "Test"], capture_output=True, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        subprocess.run(["git", "-C", str(git_dir), "config", "user.email", "test@test.com"], capture_output=True, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         
         # Commit a file
         (git_dir / "test.txt").write_text("hello", encoding="utf-8")
-        subprocess.run(["git", "-C", str(git_dir), "add", "."], capture_output=True, check=True)
-        subprocess.run(["git", "-C", str(git_dir), "commit", "-m", "init"], capture_output=True, check=True)
+        subprocess.run(["git", "-C", str(git_dir), "add", "."], capture_output=True, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        subprocess.run(["git", "-C", str(git_dir), "commit", "-m", "init"], capture_output=True, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
         res = verify_worktree(str(git_dir))
         self.assertTrue(res["verified"])

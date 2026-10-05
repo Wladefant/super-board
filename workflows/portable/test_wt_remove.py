@@ -34,6 +34,7 @@ def run_git(*args: str, cwd: Path) -> str:
     r = subprocess.run(
         ["git", "-c", "user.name=t", "-c", "user.email=t@example.com", *args],
         cwd=cwd, capture_output=True, text=True, check=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     return r.stdout
 
@@ -193,7 +194,7 @@ class WtRemoveTest(unittest.TestCase):
     def test_busy_cwd_of_active_process_blocks_removal(self) -> None:
         if sys.platform != "win32":
             self.skipTest("process cwd scan is Windows-only")
-        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], cwd=str(self.wt))
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], cwd=str(self.wt), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         self.addCleanup(_kill, proc)
         self.assertEqual(self.remove(), 2)
         self.assert_untouched()
@@ -216,6 +217,7 @@ class WtRemoveTest(unittest.TestCase):
         r = subprocess.run(
             f'cmd /c ""{sys.executable}" "{script}" "{self.wt}" --dry-run"',
             capture_output=True, text=True, timeout=120, cwd=str(self.tmp),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.assertEqual(r.returncode, 0, f"stdout={r.stdout!r} stderr={r.stderr!r}")
         self.assertIn("dry run: nothing changed", r.stdout)

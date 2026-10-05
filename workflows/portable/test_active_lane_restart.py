@@ -31,7 +31,7 @@ class TestActiveLaneRestart(unittest.TestCase):
                 stream.write("import os, sys\nprint(os.getpid(), flush=True)\nsys.stdin.readline()\n")
             child = subprocess.Popen([sys.executable, "-u", child_script],
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.PIPE, text=True)
+                                     stderr=subprocess.PIPE, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             try:
                 self.assertEqual(int(child.stdout.readline()), child.pid)
                 handle = f"agent://fixture-child-{child.pid}"
@@ -60,7 +60,7 @@ class TestActiveLaneRestart(unittest.TestCase):
                     )
                 resumed = subprocess.run(
                     [sys.executable, restart_script, os.path.dirname(__file__), state,
-                     json.dumps(request)], capture_output=True, text=True, timeout=30)
+                     json.dumps(request)], capture_output=True, text=True, timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                 self.assertEqual(resumed.returncode, 0, resumed.stderr)
                 self.assertEqual(json.loads(resumed.stdout), dict(
                     run_id=ticket.run_id, state="background_dispatched", handle=handle,

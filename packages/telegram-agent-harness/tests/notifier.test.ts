@@ -3,14 +3,14 @@ import { resolve } from "node:path";
 
 test("portable notifier HTML and callback contracts", () => {
   const root = resolve(import.meta.dir, "../../..");
-  const result = Bun.spawnSync(["python", "-m", "unittest", "discover", "-s", "workflows/portable", "-p", "test_telegram_notifier.py"], { cwd: root });
+  const result = Bun.spawnSync(["python", "-m", "unittest", "discover", "-s", "workflows/portable", "-p", "test_telegram_notifier.py"], { cwd: root, windowsHide: true });
   if (result.exitCode !== 0) throw new Error(result.stderr.toString());
   expect(result.exitCode).toBe(0);
 }, 60_000);
 
 test("portable spacious card exact HTML contracts", () => {
   const root = resolve(import.meta.dir, "../../..");
-  const result = Bun.spawnSync(["python", "-m", "unittest", "discover", "-s", "workflows/portable", "-p", "test_telegram_cards.py"], { cwd: root });
+  const result = Bun.spawnSync(["python", "-m", "unittest", "discover", "-s", "workflows/portable", "-p", "test_telegram_cards.py"], { cwd: root, windowsHide: true });
   if (result.exitCode !== 0) throw new Error(result.stderr.toString());
   expect(result.exitCode).toBe(0);
 }, 60_000);
@@ -22,7 +22,7 @@ test.skipIf(!process.env.TG_NOTIFIER_INSTALLED_PATH)("installed notifier HTML an
     "workflows.portable.test_telegram_notifier.TestDecisionInteractiveCallback",
     "workflows.portable.test_telegram_notifier.TestTelegramNotificationAdapter.test_screenshot_is_native_photo_not_description"], {
     cwd: root,
-    env: { ...process.env, PYTHONPATH: process.env.TG_NOTIFIER_INSTALLED_PATH },
+    env: { ...process.env, PYTHONPATH: process.env.TG_NOTIFIER_INSTALLED_PATH }, windowsHide: true,
   });
   if (result.exitCode !== 0) throw new Error(result.stderr.toString());
   expect(result.exitCode).toBe(0);
@@ -30,7 +30,7 @@ test.skipIf(!process.env.TG_NOTIFIER_INSTALLED_PATH)("installed notifier HTML an
 
 test("operator question store Python contracts", () => {
   const pkg = resolve(import.meta.dir, "..");
-  const result = Bun.spawnSync(["python", "-m", "unittest", "discover", "-s", "tests", "-p", "test_operator_questions.py"], { cwd: pkg });
+  const result = Bun.spawnSync(["python", "-m", "unittest", "discover", "-s", "tests", "-p", "test_operator_questions.py"], { cwd: pkg, windowsHide: true });
   if (result.exitCode !== 0) throw new Error(result.stderr.toString());
   expect(result.exitCode).toBe(0);
 }, 60_000);

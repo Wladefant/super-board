@@ -457,7 +457,8 @@ class TestSessionCrashMonitor(unittest.TestCase):
 
         # 1. Spawn a short-lived disposable subprocess that exits with code 42
         proc = subprocess.Popen(
-            [sys.executable, "-c", "import sys, time; time.sleep(0.3); sys.exit(42)"]
+            [sys.executable, "-c", "import sys, time; time.sleep(0.3); sys.exit(42)"],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         pid = proc.pid
 
@@ -487,7 +488,8 @@ class TestSessionCrashMonitor(unittest.TestCase):
 
         # 2. Test planned stop on another real disposable subprocess
         proc2 = subprocess.Popen(
-            [sys.executable, "-c", "import sys, time; time.sleep(0.3); sys.exit(0)"]
+            [sys.executable, "-c", "import sys, time; time.sleep(0.3); sys.exit(0)"],
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         pid2 = proc2.pid
 

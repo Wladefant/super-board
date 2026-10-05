@@ -895,6 +895,7 @@ def refresh_from_usage(
                 capture_output=True,
                 text=True,
                 timeout=30,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             if proc.returncode != 0 or not proc.stdout.strip():
                 return snapshot

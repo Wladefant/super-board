@@ -342,7 +342,7 @@ def test_agent_continuation_capture_is_structural_and_redacted() -> None:
 def test_live_subcommands_require_approval_and_execute_gated_runner() -> None:
     script = SCRIPTS / "probe-routing.py"
     for command in (*probe_routing.LIVE_ALIAS_COMMANDS, "live-aliases"):
-        denied = subprocess.run([sys.executable, "-B", str(script), command], text=True, capture_output=True, check=False)
+        denied = subprocess.run([sys.executable, "-B", str(script), command], text=True, capture_output=True, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         assert denied.returncode == 64 and "approve-live-model-calls" in denied.stdout
 
     source = (SCRIPTS / "probe-routing.py").read_text(encoding="utf-8")
@@ -721,7 +721,7 @@ def test_recover_cli_redacts_and_uses_latest_correlated_response() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         fixture = Path(tmp) / "error.log"
         fixture.write_text("HTTP/1.1 200\nevent: error\ndata: {\"error\":{\"code\":\"context_length_exceeded\"},\"email\":\"person@example.com\",\"request_id\":\"req_RAW\"}\n\n", encoding="utf-8")
-        result = subprocess.run([sys.executable, str(SCRIPTS / "preflight.py"), "recover", str(fixture)], text=True, capture_output=True, check=False)
+        result = subprocess.run([sys.executable, str(SCRIPTS / "preflight.py"), "recover", str(fixture)], text=True, capture_output=True, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         assert result.returncode == 0 and "context" in result.stdout
         assert "person@example.com" not in result.stdout and "req_RAW" not in result.stdout
         fixture.write_text(
@@ -729,7 +729,7 @@ def test_recover_cli_redacts_and_uses_latest_correlated_response() -> None:
             "HTTP/1.1 400\nevent: error\ndata: {\"type\":\"error\",\"error\":{\"code\":\"context_length_exceeded\"}}\n\n",
             encoding="utf-8",
         )
-        latest = subprocess.run([sys.executable, str(SCRIPTS / "preflight.py"), "recover", str(fixture)], text=True, capture_output=True, check=False)
+        latest = subprocess.run([sys.executable, str(SCRIPTS / "preflight.py"), "recover", str(fixture)], text=True, capture_output=True, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         assert latest.returncode == 0
         recovered = json.loads(latest.stdout)
         assert recovered["category"] == "context" and recovered["retryable"] is False
@@ -738,7 +738,7 @@ def test_recover_cli_redacts_and_uses_latest_correlated_response() -> None:
             "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
             encoding="utf-8",
         )
-        literal = subprocess.run([sys.executable, str(SCRIPTS / "preflight.py"), "recover", str(fixture)], text=True, capture_output=True, check=False)
+        literal = subprocess.run([sys.executable, str(SCRIPTS / "preflight.py"), "recover", str(fixture)], text=True, capture_output=True, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         assert json.loads(literal.stdout)["category"] == "success"
 
 

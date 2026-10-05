@@ -148,6 +148,20 @@ PYTHONPATH="$(sb_native_path "$SOURCE_ROOT/scripts")" "$PY" -B "$VERIFY" verify 
   --repo-root "$(sb_native_path "$REPO_ROOT")" \
   --json
 
+# A scheduled task that runs python.exe, a .cmd file or powershell.exe opens a console window on
+# the operator's screen at every run (profile AGENTS.md section 13 item 10). Windows hosts only.
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    if [ -z "${SB_SKIP_HIDDEN_WINDOW_AUDIT:-}" ]; then
+      echo "→ checking that no scheduled task opens a console window"
+      "$PY" -B "$(sb_native_path "$SOURCE_ROOT/workflows/portable/hidden_window_audit.py")" audit || {
+        echo "install refused: fix with hidden_window_audit.py fix, or set SB_SKIP_HIDDEN_WINDOW_AUDIT=1" >&2
+        exit 65
+      }
+    fi
+    ;;
+esac
+
 cat <<'NEXT'
 
 ✓ installed and verified. next steps:

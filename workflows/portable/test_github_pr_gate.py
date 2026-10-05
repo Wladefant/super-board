@@ -68,7 +68,7 @@ class TestGitHubPRGate(unittest.TestCase):
         cls.addClassCleanup(os.chdir, previous)
         os.chdir(cls.repository.name)
         def git(*args):
-            return subprocess.check_output(["git", *args], stderr=subprocess.DEVNULL).decode().strip()
+            return subprocess.check_output(["git", *args], stderr=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).decode().strip()
         git("init", "-b", "fixture-base")
         git("config", "user.name", "Wladimir Kirjanovs")
         git("config", "user.email", "wladefant@gmail.com")
@@ -1020,6 +1020,7 @@ class TestGitHubPRGate(unittest.TestCase):
                     text=True,
                     env=env,
                     timeout=20,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 )
 
             valid = self.make_review_artifact(

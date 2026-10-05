@@ -126,6 +126,7 @@ def _gh_pull_request_view(url: str) -> Any:
         capture_output=True,
         text=True,
         timeout=60,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     if result.returncode != 0:
         return None
@@ -228,7 +229,7 @@ class QaWorktree:
 
 
 def _default_git(argv: Sequence[str]) -> None:
-    subprocess.run(["git", *argv], check=True, capture_output=True, text=True, timeout=600)
+    subprocess.run(["git", *argv], check=True, capture_output=True, text=True, timeout=600, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
 @contextmanager
@@ -884,6 +885,7 @@ def _gh_commit_status_conclusion(
             capture_output=True,
             text=True,
             timeout=60,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -937,6 +939,7 @@ def _gh_commit_status_writer(
             capture_output=True,
             text=True,
             timeout=60,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         if result.returncode != 0:
             raise QaError(

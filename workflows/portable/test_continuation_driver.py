@@ -781,16 +781,17 @@ class TestInstalledDriverCliRepoRoot(_Fixture):
     def _make_repo(self) -> tuple[str, str]:
         repo = os.path.join(self.tmp, "repo")
         os.makedirs(repo)
-        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
-        subprocess.run(["git", "config", "user.email", "t@localhost"], cwd=repo, check=True)
-        subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True)
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        subprocess.run(["git", "config", "user.email", "t@localhost"], cwd=repo, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         with open(os.path.join(repo, "seed.txt"), "w", encoding="utf-8") as fh:
             fh.write("seed\n")
-        subprocess.run(["git", "add", "seed.txt"], cwd=repo, check=True)
-        subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=repo, check=True)
+        subprocess.run(["git", "add", "seed.txt"], cwd=repo, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=repo, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         head = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
             capture_output=True, text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         ).stdout.strip()
         return repo, head
 
@@ -858,6 +859,7 @@ class TestInstalledDriverCliRepoRoot(_Fixture):
             text=True,
             timeout=60,
             shell=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
 
     def test_cli_runs_worker_in_explicit_real_repository(self):
@@ -885,6 +887,7 @@ class TestInstalledDriverCliRepoRoot(_Fixture):
             text=True,
             timeout=30,
             shell=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.assertEqual(proc.returncode, 64)
         self.assertIn("--repo-root is required", proc.stderr)
@@ -946,16 +949,17 @@ class TestNativeBackgroundPending(_Fixture):
     def test_cli_unpark_creates_fresh_attempt_only_for_terminal_blocked_native(self):
         repo = os.path.join(self.tmp, "repo")
         os.makedirs(repo)
-        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
-        subprocess.run(["git", "config", "user.email", "t@localhost"], cwd=repo, check=True)
-        subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True)
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        subprocess.run(["git", "config", "user.email", "t@localhost"], cwd=repo, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         with open(os.path.join(repo, "seed.txt"), "w", encoding="utf-8") as fh:
             fh.write("seed\n")
-        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
-        subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=repo, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=repo, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         head = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=repo, check=True,
             capture_output=True, text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         ).stdout.strip()
         backend = WorkerBackend(state_dir=self.tmp)
         request = {
@@ -998,6 +1002,7 @@ class TestNativeBackgroundPending(_Fixture):
         check = subprocess.run(
             ["git", "show", "HEAD:seed.txt"], cwd=repo,
             capture_output=True, text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         valid = {
             "stage": "qa",
@@ -1056,6 +1061,7 @@ class TestNativeCheckExpectationReconcile(_Fixture):
         return subprocess.run(
             ["git", *args], cwd=self.repo, capture_output=True, text=True,
             check=False, shell=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
 
     def _commit(self, name, body, message):
@@ -1292,13 +1298,13 @@ class TestContinuationDriverTelegramNotifications(_Fixture):
     def _setup_git_repo(self) -> str:
         repo = os.path.join(self.tmp, "repo")
         os.makedirs(repo, exist_ok=True)
-        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
-        subprocess.run(["git", "config", "user.email", "t@localhost"], cwd=repo, check=True)
-        subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True)
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        subprocess.run(["git", "config", "user.email", "t@localhost"], cwd=repo, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         with open(os.path.join(repo, "seed.txt"), "w", encoding="utf-8") as f:
             f.write("seed\n")
-        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
-        subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=repo, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        subprocess.run(["git", "commit", "-q", "-m", "seed"], cwd=repo, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return repo
 
     def _add_request(self, req_id: str, state: str = "implementation", issue_number: int = 100):
