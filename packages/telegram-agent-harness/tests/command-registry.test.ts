@@ -51,7 +51,7 @@ test("registration failures never disclose token-bearing transport errors", asyn
   await expect(registerTelegramCommands("SECRET", ["101"])).rejects.toThrow("Telegram command registration failed;");
 });
 
-test("real poller startup registers before polling and still polls after registration fails", async () => {
+test("real poller startup starts registration beside polling and a failed registration is not a ledger failure", async () => {
   for (const registrationOk of [true, false]) {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tg-start-registry-"));
     const calls: string[] = [], failures: string[] = [];
@@ -65,7 +65,7 @@ test("real poller startup registers before polling and still polls after registr
     try {
       await poller.start();
       expect(calls).toEqual(["register", "poll"]);
-      expect(failures.length).toBe(registrationOk ? 0 : 1);
+      expect(failures.length).toBe(0);
     } finally { poller.stop(); fs.rmSync(dir, { recursive: true, force: true }); }
   }
 });

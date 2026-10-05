@@ -568,6 +568,9 @@ export class TelegramDaemon {
       onLedgerFailure: (message: string) => {
         this.log(`Slot ${slot.slotId} inbound ledger failure: ${message}. Inbound Telegram updates are not being recorded.`);
       },
+      onMenuRegistrationFailure: (message: string) => {
+        this.log(`Slot ${slot.slotId} menu: ${message}`);
+      },
       onConflict: (diagnosis: string, attempt: number, maxAttempts: number) => {
         this.log(`Slot ${slot.slotId} HTTP 409 conflict (attempt ${attempt}/${maxAttempts}): ${diagnosis}`);
       },

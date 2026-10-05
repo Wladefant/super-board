@@ -70,6 +70,9 @@ export interface TelegramCommandItem {
   description: string;
 }
 
+/** Per-call budget for setMyCommands. A startup burst of many bots needs more than the old 5 s. */
+export const DEFAULT_REGISTRATION_TIMEOUT_MS = 15_000;
+
 /**
  * Registers the command menu for every allowlisted operator's private chat, and for
  * a forum slot's own supergroup when it has one. No other group is ever registered:
@@ -83,6 +86,7 @@ export async function registerTelegramCommands(
   signal?: AbortSignal,
   customCommands?: readonly TelegramCommandItem[],
   forumChatId?: string,
+  timeoutMs = DEFAULT_REGISTRATION_TIMEOUT_MS,
 ): Promise<void> {
   const commands: readonly TelegramCommandItem[] = Array.isArray(hasHarness)
     ? hasHarness
@@ -95,7 +99,7 @@ export async function registerTelegramCommands(
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ commands, scope: { type: "chat", chat_id: chatId }, language_code: "" }),
-        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(5000)]) : AbortSignal.timeout(5000),
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs),
       }, { kind: "other" });
       const result = await response.json() as { ok?: boolean };
       if (!response.ok || result.ok !== true) throw new Error("Registration refused");
@@ -110,7 +114,7 @@ export async function registerTelegramCommands(
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ commands, scope: { type: "all_group_chats" }, language_code: "" }),
-        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(5000)]) : AbortSignal.timeout(5000),
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs),
       }, { kind: "other" });
     } catch {
       // Best-effort scope fallback; chat-specific scope is primary
