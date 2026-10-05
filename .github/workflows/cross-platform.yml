@@ -210,6 +210,9 @@ jobs:
       - name: github pr gate
         run: python -B workflows/portable/test_github_pr_gate.py
 
+      - name: e2e integration tools
+        run: python -B workflows/e2e/test_e2e.py
+
       - name: lane-brief merge guard
         run: python -B workflows/portable/test_merge_guard.py
 

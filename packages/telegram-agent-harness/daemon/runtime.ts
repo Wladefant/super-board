@@ -35,7 +35,7 @@ import {
   resolveDaemonSlots,
   type DaemonSlot,
 } from "./config";
-import { defaultWeekRoute } from "./week-service";
+import { defaultWeekRoute, readBoardsFile } from "./week-service";
 import { getDaemonCommands, SlotRouter, type RouteTarget } from "./router";
 import {
   TerminalSessionControl,
@@ -646,6 +646,7 @@ export class TelegramDaemon {
       },
       status: () => ({ polling: poller.running, slot: slot.slotId }),
       week: query => (weekRoute ??= defaultWeekRoute(slot.stateDir))(query),
+      boards: readBoardsFile,
       dashboard: (userId, sessionId) => {
         const session = sessionId ?? router.boundSession({ chatId: userId, topicId: "" });
         const raw = session ? poller.getMeta(`dashboard-snapshot:${session}`) : null;
