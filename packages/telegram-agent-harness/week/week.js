@@ -117,7 +117,9 @@ function showError(error) {
   const notice = $('notice');
   notice.hidden = false;
   notice.className = 'notice notice-error';
-  notice.replaceChildren(el('span', {}, message), auth ? null : el('button', { type: 'button', class: 'btn', onclick: () => load() }, 'Try again'));
+  const noticeNodes = [el('span', {}, message)];
+  if (!auth) noticeNodes.push(el('button', { type: 'button', class: 'btn', onclick: () => load() }, 'Try again'));
+  notice.replaceChildren(...noticeNodes);
   const placeholder = auth ? 'Sign in to see the week.' : 'No data loaded.';
   // Data from another week must not sit under this week's title: clear it, keep only the board list.
   if (state.data && (!state.week || zoneIsoDate(state.data.weekStart, state.data.zone) !== state.week)) clearData();

@@ -119,6 +119,22 @@ class Installation(unittest.TestCase):
         optional = manifest.get("export", {}).get("optional_files", [])
         self.assertIn("routing_smoke_test.py", optional, "routing_smoke_test.py must be in runtime optional_files")
 
+    def test_ste_checker_is_installed_and_drift_checked(self):
+        self.assertIn("ste_check.py", RUNTIME_FILES)
+        self.assertIn("test_ste_check.py", RUNTIME_FILES)
+        self.assertTrue(synchronize(self.source, self.profile, self.runtime))
+        for name in ("ste_check.py", "test_ste_check.py"):
+            with self.subTest(name=name):
+                installed = self.runtime / name
+                self.assertEqual(installed.read_bytes(), (self.source / "workflows/portable" / name).read_bytes())
+                installed.write_bytes(b"stale ste")
+                report = io.StringIO()
+                with contextlib.redirect_stdout(report):
+                    self.assertFalse(synchronize(self.source, self.profile, self.runtime, check=True))
+                self.assertIn(f"DRIFT: {name}", report.getvalue())
+                self.assertEqual(installed.read_bytes(), b"stale ste")
+                self.assertTrue(synchronize(self.source, self.profile, self.runtime))
+
     def test_isolated_installation_runtime_required_files_import_without_pyyaml(self):
         """Observable installer contract: runtime required files import without undeclared PyYAML dependency."""
         import importlib

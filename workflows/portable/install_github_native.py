@@ -50,6 +50,8 @@ RUNTIME_FILES = (
     "session_crash_monitor.py", "test_session_crash_monitor.py",
     # Mechanically verified lane inventory and crash recovery audit.
     "lane_inventory.py", "test_lane_inventory.py",
+    # STE writing style checker and regression suite (Wladefant/super-board#525).
+    "ste_check.py", "test_ste_check.py",
 )
 # Veyyon extensions, installed into the profile's own `extensions/` dir beside AGENTS.md,
 # where Veyyon loads them for every session of that profile.
