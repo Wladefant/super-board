@@ -82,6 +82,7 @@ class RunFlow(unittest.TestCase):
         self.patches = [
             mock.patch.object(h, "load_pat", return_value="x"),
             mock.patch.object(h, "verify_staging_only"),
+            mock.patch.object(h, "STATE_DIR", self.tmp),
         ]
         for p in self.patches:
             p.start()
