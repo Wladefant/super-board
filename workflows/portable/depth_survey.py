@@ -25,6 +25,7 @@ import datetime
 import hashlib
 import html
 import json
+import posixpath
 import re
 import subprocess
 import sys
@@ -283,8 +284,11 @@ def glossary_terms(root: Path) -> Dict[str, List[str]]:
 
 
 def _cite_terms(c: Candidate, glossary: Dict[str, List[str]]) -> None:
-    """Name the candidate in the repo's own nouns: every term whose Where column cites this file."""
+    """Name the candidate in the repo's own nouns: terms whose Where column cites this file, else its directory."""
     c.domain_terms = [term for term, files in glossary.items() if c.path in files]
+    if not c.domain_terms:  # no row cites the file itself: use the rows that cite its directory
+        folder = posixpath.dirname(c.path)
+        c.domain_terms = [term for term, files in glossary.items() if any(posixpath.dirname(f) == folder for f in files)]
     if c.domain_terms:
         c.title += f" ({', '.join(c.domain_terms)})"
         c.problem += f" Domain terms from GLOSSARY.md: {', '.join(c.domain_terms)}."
