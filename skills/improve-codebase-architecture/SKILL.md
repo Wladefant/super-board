@@ -1,13 +1,16 @@
 ---
 name: improve-codebase-architecture
-description: Scan a codebase for deepening opportunities, present them as a visual HTML report, then grill through whichever one you pick.
+description: Survey a codebase for deepening opportunities, apply the deletion test to each, present them as an offline HTML report, then stop and ask which one to pursue. Report-only by default; never edits code.
 disable-model-invocation: true
 ---
 <!--
-Vendored from https://github.com/mattpocock/skills at commit 24fe0ef7737efae15c87225755e9f6f5965e4888
+Adapted from https://github.com/mattpocock/skills at commit 24fe0ef7737efae15c87225755e9f6f5965e4888
 Upstream path: skills/engineering/improve-codebase-architecture/SKILL.md
 Copyright (c) 2026 Matt Pocock. Used under the MIT License, reproduced below.
-Local changes: none in this commit (byte-identical body).
+Local changes (super-board, issue #513): exploration runs through Veyyon `task` lanes instead of
+the Claude Code Explore tool; the report is one offline file with no CDN; report-only is the
+default and the grilling loop is opt-in and bounded; the report is kept as a lane artifact and
+attached to a GitHub issue; every candidate shows a deletion-test result.
 
 MIT License
 
@@ -36,64 +39,68 @@ SOFTWARE.
 
 Surface architectural friction and propose **deepening opportunities**: refactors that turn shallow modules into deep ones. The aim is testability and AI-navigability.
 
-This command is _informed_ by the project's domain model and built on a shared design vocabulary:
+Built on the `codebase-design` skill. Read it first and use its seven terms exactly (**module**, **interface**, **depth**, **seam**, **adapter**, **leverage**, **locality**). Never write "component," "service," "API," or "boundary" for design talk. Domain nouns come from `GLOSSARY.md`; decisions in `docs/adr/` are not re-litigated.
 
-- Call the Skill tool with "codebase-design" for the architecture vocabulary (**module**, **interface**, **depth**, **seam**, **adapter**, **leverage**, **locality**) and its principles (the deletion test, "the interface is the test surface", "one adapter = hypothetical seam, two = real"). Use these terms exactly in every suggestion, and don't drift into "component," "service," "API," or "boundary."
-- The domain language in `GLOSSARY.md` gives names to good seams; ADRs in `docs/adr/` record decisions this command should not re-litigate.
+## Modes
+
+- **`--report-only` (default).** Explore, write the report, attach it, stop, and ask "Which of these would you like to explore?". The run changes no code file. `git status` is clean except the report artifact.
+- **`--grill <candidate>`.** Only after a person picks a candidate. Walk that one candidate's decision tree (constraints, dependencies, shape of the deepened module, what sits behind the seam, which tests survive). Stop after the decision. Do not start a second candidate and do not run past the decision.
+
+Scheduled runs (Gardener `--survey-depth`) are always `--report-only`.
 
 ## Process
 
-### 1. Explore
+### 1. Explore (Veyyon lanes)
 
-**Scope before you scan: YAGNI.** Deepening a module pays off by making future changes to it easier, so put extra weight on the parts of the codebase that have recently changed. Decide *where* to look before you look:
+**Scope before you scan.** Deepening pays off where code keeps changing. If the caller named a direction, take it. Otherwise run `git log --since=90.days --name-only --pretty=format:` and rank files by touch count. Those hot spots pull attention first. If changes are scattered, widen the net.
 
-- If the user named a direction (a module, a subsystem, a pain point), take it, and skip the inference below.
-- Otherwise, walk back a good stretch of the commit history (`git log --oneline`) to find the codebase's hot spots, the files and areas that keep coming up, and let those paths pull your attention first. If the changes are scattered with no clear hot spot, widen the net.
+Read `GLOSSARY.md` and the ADRs in the area first.
 
-Read the project's domain glossary (`GLOSSARY.md`) and any ADRs in the area you're touching first.
+Then delegate with the Veyyon `task` tool, not a harness-specific Explore tool:
 
-Then spawn a sub-agent to walk the codebase. Don't follow rigid heuristics; explore organically and note where you experience friction:
+1. **Scan lane** (`task`, Flash): list hot-spot modules with interface size versus implementation size, pass-through wrappers, call counts per module, and test reach. Facts only, no judgment.
+2. **Judgment lane** (`sonnet`): take the scan result and apply the deletion test and the friction questions below. Output candidates with files, problem, solution, benefit, strength.
+
+With no `task` tool available, do both steps inline. Do not skip the deletion test.
+
+Friction questions:
 
 - Where does understanding one concept require bouncing between many small modules?
-- Where are modules **shallow**, with an interface nearly as complex as the implementation?
-- Where have pure functions been extracted just for testability, but the real bugs hide in how they're called (no **locality**)?
-- Where do tightly-coupled modules leak across their seams?
-- Which parts of the codebase are untested, or hard to test through their current interface?
+- Where is a module **shallow**, with an interface nearly as complex as the implementation?
+- Where were pure functions extracted only for testability, while the real bugs hide in how they are called (no **locality**)?
+- Where do tightly coupled modules leak across their seams?
+- Which parts are untested, or hard to test through their current interface?
 
-Apply the **deletion test** to anything you suspect is shallow: would deleting it concentrate complexity, or just move it? A "yes, concentrates" is the signal you want.
+### 2. Deletion test (mandatory, per candidate)
 
-### 2. Present candidates as an HTML report
+Imagine deleting the module. Write one of these results on every candidate:
 
-Write a self-contained HTML file to the OS temp directory so nothing lands in the repo. Resolve the temp dir from `$TMPDIR`, falling back to `/tmp` (or `%TEMP%` on Windows), and write to `<tmpdir>/architecture-review-<timestamp>.html` so each run gets a fresh file. Open it for the user (`xdg-open <path>` on Linux, `open <path>` on macOS, `start <path>` on Windows) and tell them the absolute path.
+- `pass-through`: complexity vanishes; the module earned nothing. Deleting it is the deepening.
+- `concentrates`: complexity reappears across N callers; the module earns its keep, but its interface is too wide. Deepen it.
+- `inconclusive`: say what evidence is missing.
 
-The report uses **Tailwind via CDN** for layout and styling, and **Mermaid via CDN** for diagrams where a graph/flow/sequence reliably communicates the structure. Mix Mermaid with hand-crafted CSS/SVG visuals: use Mermaid when relationships are graph-shaped (call graphs, dependencies, sequences), and hand-built divs/SVG when you want something more editorial (mass diagrams, cross-sections, collapse animations). Each candidate gets a **before/after visualisation**. Be visual.
+A candidate with no recorded result is not reported. One adapter at a seam is a hypothetical seam; call that out.
 
-For each candidate, render a card with:
+### 3. Report (offline, kept)
 
-- **Files**: which files/modules are involved
-- **Problem**: why the current architecture is causing friction
-- **Solution**: plain English description of what would change
-- **Benefits**: explained in terms of locality and leverage, and how tests would improve
-- **Before / After diagram**: side-by-side, custom-drawn, illustrating the shallowness and the deepening
-- **Recommendation strength**: one of `Strong`, `Worth exploring`, `Speculative`, rendered as a badge
+Write ONE self-contained HTML file from `report-template.html`. See [HTML-REPORT.md](HTML-REPORT.md). Rules:
 
-End the report with a **Top recommendation** section: which candidate you'd tackle first and why.
+- Inline CSS and hand-built SVG only. No CDN, no remote font, no script that fetches. The file must render identically with the network blocked.
+- Save it under the lane artifact directory as `architecture-review-<repo>-<UTC timestamp>.html`. Never leave it only in a temp directory.
+- Attach it to a GitHub issue: the standing survey issue for the repo, or the issue that asked for the run. A bare path on one machine is not delivery. Post the candidate titles, strengths and deletion-test results as the comment body; the HTML is the attachment or a commit-pinned link.
+- Each candidate card: files, problem, solution, benefits in terms of locality and leverage, before/after diagram, recommendation strength (`Strong`, `Worth exploring`, `Speculative`), deletion-test result.
+- End with a **Top recommendation**.
+- **ADR conflicts**: surface a candidate that contradicts an ADR only when the friction justifies reopening it, and mark it on the card.
 
-**Use GLOSSARY.md vocabulary for the domain, and the `/codebase-design` vocabulary for the architecture.** If `GLOSSARY.md` defines "Order," talk about "the Order intake module," not "the FooBarHandler," and not "the Order service."
+Do NOT propose interfaces yet. After the report is attached, stop and ask: "Which of these would you like to explore?"
 
-**ADR conflicts**: if a candidate contradicts an existing ADR, only surface it when the friction is real enough to warrant revisiting the ADR. Mark it clearly in the card (e.g. a warning callout: _"contradicts ADR-0007, but worth reopening because…"_). Don't list every theoretical refactor an ADR forbids.
+### 4. Grilling (only on request)
 
-See [HTML-REPORT.md](HTML-REPORT.md) for the full HTML scaffold, diagram patterns, and styling guidance.
+When a person picks a candidate, use the `grilling` skill if present, else ask the questions directly, one at a time. Side effects as decisions settle:
 
-Do NOT propose interfaces yet. After the file is written, ask the user: "Which of these would you like to explore?"
+- A deepened module named after a concept missing from `GLOSSARY.md`: add the term.
+- A fuzzy term sharpened: update `GLOSSARY.md` there.
+- A candidate rejected for a load-bearing reason: offer an ADR so later surveys skip it. Skip ephemeral reasons.
+- Alternative interfaces wanted: use the design-it-twice pattern in `codebase-design`.
 
-### 3. Grilling loop
-
-Once the user picks a candidate, call the Skill tool with "grilling" to walk the decision tree with them: constraints, dependencies, the shape of the deepened module, what sits behind the seam, what tests survive.
-
-Side effects happen inline as decisions crystallize; call the Skill tool with "domain-modeling" to keep the domain model current as you go:
-
-- **Naming a deepened module after a concept not in `GLOSSARY.md`?** Add the term to `GLOSSARY.md`. Create the file lazily if it doesn't exist.
-- **Sharpening a fuzzy term during the conversation?** Update `GLOSSARY.md` right there.
-- **User rejects the candidate with a load-bearing reason?** Offer an ADR, framed as: _"Want me to record this as an ADR so future architecture reviews don't re-suggest it?"_ Only offer when the reason would actually be needed by a future explorer to avoid re-suggesting the same thing; skip ephemeral reasons ("not worth it right now") and self-evident ones.
-- **Want to explore alternative interfaces for the deepened module?** Call the Skill tool with "codebase-design" and use its design-it-twice parallel sub-agent pattern.
+End the grilling when the decision is recorded.
