@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0b1020">
+<title>Week · Superboard</title>
+<link rel="stylesheet" href="week.css">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<script type="module" src="week.js"></script>
+</head>
+<body>
+<a class="skip" href="#calendar">Skip to calendar</a>
+<header class="top">
+  <div class="top-row">
+    <div class="heading">
+      <p class="eyebrow">Superboard · Week</p>
+      <h1 id="week-title">This week</h1>
+    </div>
+    <div class="week-nav" role="group" aria-label="Choose week">
+      <button type="button" id="prev" class="icon-btn" aria-label="Previous week"><span aria-hidden="true">‹</span></button>
+      <button type="button" id="today" class="btn">This week</button>
+      <button type="button" id="next" class="icon-btn" aria-label="Next week"><span aria-hidden="true">›</span></button>
+    </div>
+  </div>
+  <div class="top-row controls">
+    <label class="board-pick">
+      <span class="board-pick-label">Calendar</span>
+      <select id="board" name="board"><option value="all">All boards</option></select>
+    </label>
+    <p id="stats" class="stats" aria-live="polite"></p>
+    <p id="asof" class="asof" hidden></p>
+  </div>
+</header>
+<div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
+<main class="layout">
+  <section id="calendar" class="calendar" tabindex="-1" aria-label="Week calendar" aria-busy="true">
+    <div id="grid" class="grid"></div>
+    <div id="agenda" class="agenda"></div>
+  </section>
+  <aside class="sidebar" aria-label="Week summary">
+    <section class="panel" aria-labelledby="total-h">
+      <h2 id="total-h" class="panel-title">Time</h2>
+      <p class="total"><span id="total" class="num">–</span> <span id="total-sub" class="muted"></span></p>
+      <div id="segments" class="segments" aria-hidden="true"></div>
+      <ul id="projects" class="legend"></ul>
+      <p id="parallel" class="footnote"></p>
+    </section>
+    <section class="panel" aria-labelledby="report-h">
+      <h2 id="report-h" class="panel-title">Weekly report</h2>
+      <ul id="report" class="report"></ul>
+    </section>
+    <section class="panel" aria-labelledby="nocommit-h">
+      <h2 id="nocommit-h" class="panel-title">Stopped with no commit</h2>
+      <ul id="nocommit" class="nocommit"></ul>
+    </section>
+    <section class="panel" aria-labelledby="days-h">
+      <h2 id="days-h" class="panel-title">Hours per day</h2>
+      <ul id="perday" class="perday"></ul>
+    </section>
+  </aside>
+</main>
+<dialog id="detail" class="detail" aria-labelledby="detail-title">
+  <div class="sheet-handle" aria-hidden="true"></div>
+  <div class="detail-head">
+    <h2 id="detail-title"></h2>
+    <button type="button" class="icon-btn" id="detail-close" aria-label="Close"><span aria-hidden="true">×</span></button>
+  </div>
+  <div id="detail-body" class="detail-body"></div>
+</dialog>
+</body>
+</html>
