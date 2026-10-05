@@ -13,7 +13,9 @@ matching `FLOW-QA` receipt.
 ## Files
 
 - Runner: `workflows/portable/flow_qa_runner.mjs` (installed as `~/.veyyon/workflows/flow_qa_runner.mjs`, flows in `~/.veyyon/workflows/flows/`).
-- Flow definitions: `workflows/portable/flows/<project>.json` (`polysimulator`, `shipnovo`).
+- Flow definitions: `workflows/portable/flows/<project>.json` (`polysimulator`, `shipnovo`, `superboard-week`).
+  `superboard-week` runs against the Week view fixture preview
+  (`bun scripts/week-preview.ts` in `packages/telegram-agent-harness`), which serves `/api/version`.
 - Gate: `github_pr_gate.py`, function `evaluate_flow_qa_receipt`.
 
 ## Steps

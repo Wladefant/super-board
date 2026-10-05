@@ -5,7 +5,8 @@
 //   bun scripts/week-preview.ts [--port 4790] [--root <package dir to serve>]
 //
 // The page URL picks the fixture: ?scenario=normal|empty|stale|busy|error|loading (read from Referer).
-// GET /__served returns the git SHA of the served tree, so captures prove what they show.
+// GET /__served (and /api/version, which the Flow QA runner reads) returns the git SHA of the served tree,
+// so captures and FLOW-QA receipts prove what they show.
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { extname, join, resolve } from "node:path";
@@ -46,7 +47,7 @@ const server = Bun.serve({
     const url = new URL(req.url);
     const headers = { "x-served-sha": sha };
     const withSha = (res: Response) => { res.headers.set("x-served-sha", sha); return res; };
-    if (url.pathname === "/__served") return Response.json({ sha, dirty, root }, { headers });
+    if (url.pathname === "/__served" || url.pathname === "/api/version") return Response.json({ sha, dirty, root }, { headers });
     if (url.pathname === "/api/session" && req.method === "POST") return Response.json({ appSession: "preview" }, { headers });
     if (url.pathname === "/api/week") {
       const scenario = scenarioOf(req);
