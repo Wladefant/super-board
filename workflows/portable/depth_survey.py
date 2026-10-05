@@ -98,7 +98,7 @@ def _gh(*args: str, timeout: int = 60) -> Tuple[int, str]:
 
 def hot_spots(root: Path, since_days: int = 90, limit: int = 40) -> List[Tuple[str, int]]:
     """Source files ranked by how often `git log` touched them: where deepening pays off."""
-    out = _git(root, "log", f"--since={since_days}.days", "--name-only", "--pretty=format:")
+    out = _git(root, "log", f"--since={since_days}.days", "--name-only", "--pretty=format:", timeout=600)
     counts: Dict[str, int] = {}
     for line in out.splitlines():
         p = line.strip().replace("\\", "/")
