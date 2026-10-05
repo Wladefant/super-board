@@ -136,28 +136,31 @@ export function scanSessionRoot(root: string, sinceMs: number): SessionBlock[] {
 }
 
 /** Commit counts per block. Injected so tests need no git and a missing worktree yields null (unknown). */
-export type CommitCounter = (cwd: string, startMs: number, endMs: number) => Promise<number | null>;
+export type CommitCounter = (cwd: string, startMs: number, endMs: number) => Promise<string[] | null>;
 
 export const gitCommitCounter: CommitCounter = (cwd, startMs, endMs) => {
   const { promise, resolve } = Promise.withResolvers<number | null>();
   if (!cwd || !fs.existsSync(cwd)) { resolve(null); return promise; }
   // A commit shortly after the last message still belongs to the block.
   const until = new Date(endMs + 5 * 60_000).toISOString();
-  execFile("git", ["log", "--all", "--no-merges", "--format=%H", `--since=${new Date(startMs).toISOString()}`, `--until=${until}`],
+  // HEAD of the lane's own worktree: `--all` would credit a lane with its siblings' commits.
+  execFile("git", ["log", "HEAD", "--no-merges", "--format=%H", `--since=${new Date(startMs).toISOString()}`, `--until=${until}`],
     { cwd, timeout: 15_000, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }, (error, stdout) => {
       if (error) return resolve(null);
-      resolve(stdout.split("\n").filter(l => /^[0-9a-f]{40}$/.test(l.trim())).length);
+      resolve(stdout.split("\n").map(l => l.trim()).filter(l => /^[0-9a-f]{40}$/.test(l)).map(l => l.slice(0, 8)));
     });
   return promise;
 };
 
-export async function withCommits(blocks: SessionBlock[], count: CommitCounter, fleet?: FleetSnapshot | null): Promise<WeekBlock[]> {
+export async function withCommits(blocks: SessionBlock[], count: CommitCounter, fleet?: { lanes: Pick<FleetSnapshot["lanes"][number], "id" | "status">[] } | null): Promise<WeekBlock[]> {
   const runningSessions = new Set((fleet?.lanes ?? []).filter(l => l.status === "running").map(l => l.id.split("/")[0]!));
   const out: WeekBlock[] = [];
   // Sequential on purpose: one `git` process at a time keeps the daemon light.
   for (const block of blocks) {
-    const commits = await count(block.cwd, block.startMs, block.endMs);
-    out.push({ ...block, commits, noCommit: commits === 0, boards: [], live: runningSessions.has(block.sessionId) && block === lastBlockOf(blocks, block.sessionId) });
+    const shas = await count(block.cwd, block.startMs, block.endMs);
+    const live = runningSessions.has(block.sessionId) && block === lastBlockOf(blocks, block.sessionId);
+    // A running lane may still commit, and unreadable git is unknown: neither is flagged.
+    out.push({ ...block, commits: shas ? shas.length : null, commitShas: shas ?? [], noCommit: shas !== null && shas.length === 0 && !live, boards: [], live });
   }
   return out;
 }

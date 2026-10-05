@@ -14,6 +14,8 @@ import type { WeekPullRequest } from "./week-summary";
 export const GITHUB_CACHE_MS = 5 * 60_000;
 /** Estimated GraphQL points of one search query (cost 1 per owner) plus margin. */
 export const GITHUB_QUERY_COST = 10;
+/** After a refused or failed read, serve the last result for this long before asking the guard again. */
+export const GITHUB_RETRY_MS = 60_000;
 
 export interface GithubReaderDeps {
   now(): number;
@@ -51,12 +53,22 @@ export function parsePullRequests(raw: unknown): WeekPullRequest[] {
 
 export class GithubReader {
   private last: GithubResult | null = null;
+  private inflight: Promise<GithubResult> | null = null;
+  private checkedAt = 0;
 
   constructor(private readonly deps: GithubReaderDeps, private readonly owners: string[], private readonly cacheMs = GITHUB_CACHE_MS) {}
 
-  async read(sinceMs: number): Promise<GithubResult> {
+  read(sinceMs: number): Promise<GithubResult> {
+    // One refresh at a time: concurrent requests share it instead of each taking a quota reading.
+    this.inflight ??= this.refresh(sinceMs).finally(() => { this.inflight = null; });
+    return this.inflight;
+  }
+
+  private async refresh(sinceMs: number): Promise<GithubResult> {
     const now = this.deps.now();
     if (this.last && !this.last.stale && now - this.last.fetchedAt < this.cacheMs) return this.last;
+    if (this.last?.stale && now - this.checkedAt < GITHUB_RETRY_MS) return this.last;
+    this.checkedAt = now;
     const code = await this.deps.guard(GITHUB_QUERY_COST * this.owners.length);
     if (code !== 0) return this.stale(now, code === 75 ? "GitHub quota reserve reached; showing the last snapshot." : "GitHub guard unavailable; showing the last snapshot.");
     try {

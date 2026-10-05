@@ -60,11 +60,9 @@ export class WeekService {
     const weekStart = weekStartOf(start, this.zone);
     const weekEnd = addDays(weekStart, 7, this.zone);
     const cached = this.options.store.lastSnapshot(weekStart);
-    // A finished week never changes; the current week is rebuilt once its snapshot is stale.
-    if (cached && (now >= weekEnd + 86_400_000 || !snapshotStaleness(cached.asOf, now).stale)) {
-      const aged = snapshotStaleness(cached.asOf, now).stale;
-      return { ...cached, stale: cached.stale || aged, staleReason: cached.staleReason ?? (aged ? "Snapshot is old; showing it as of its time." : null) };
-    }
+    // A snapshot built after the week ended is final. One built mid-week is rebuilt once the week is over.
+    if (cached && cached.asOf >= weekEnd) return cached;
+    if (cached && !snapshotStaleness(cached.asOf, now).stale) return cached;
     try {
       for (const root of this.options.sessionRoots) this.options.store.appendBlocks(scanSessionRoot(root, weekStart));
       const fleet = await (this.options.fleet?.() ?? Promise.resolve(null)).catch(() => null);

@@ -23,7 +23,7 @@ const BOARDS: BoardInfo[] = [
 ];
 
 function block(over: Partial<WeekBlock> & { startMs: number; endMs: number }): WeekBlock {
-  return { sessionId: "s", project: "super-board", cwd: "C:/x/super-board", tool: "veyyon", model: null, firstMessage: null, commits: 1, noCommit: false, boards: [], live: false, ...over };
+  return { sessionId: "s", project: "super-board", cwd: "C:/x/super-board", tool: "veyyon", model: null, firstMessage: null, commits: 1, commitShas: ["aaaaaaaa"], noCommit: false, boards: [], live: false, ...over };
 }
 
 describe("session blocks", () => {
@@ -57,11 +57,23 @@ describe("session blocks", () => {
     expect(projectOf("C:\\dev\\polysimulator\\.wt-fix-1")).toBe("polysimulator");
   });
 
-  test("no-commit flag: zero commits flags, unreadable git does not", async () => {
-    const base: SessionBlock[] = [0, 1, 2].map(i => ({ sessionId: `s${i}`, project: "p", cwd: `c${i}`, tool: "veyyon", model: null, startMs: T0, endMs: T0 + HOUR, firstMessage: null }));
-    const counts: Record<string, number | null> = { c0: 0, c1: 3, c2: null };
-    const out = await withCommits(base, async cwd => counts[cwd] ?? null);
-    expect(out.map(b => [b.commits, b.noCommit])).toEqual([[0, true], [3, false], [null, false]]);
+  test("no-commit flag: zero commits flags; unreadable git and a running lane do not", async () => {
+    const base: SessionBlock[] = [0, 1, 2, 3].map(i => ({ sessionId: `s${i}`, project: "p", cwd: `c${i}`, tool: "veyyon", model: null, startMs: T0, endMs: T0 + HOUR, firstMessage: null }));
+    const counts: Record<string, string[] | null> = { c0: [], c1: ["a1", "a2", "a3"], c2: null, c3: [] };
+    const fleet = { lanes: [{ id: "s3", status: "running" as const }] };
+    const out = await withCommits(base, async cwd => counts[cwd] ?? null, fleet);
+    expect(out.map(b => [b.commits, b.noCommit])).toEqual([[0, true], [3, false], [null, false], [0, false]]);
+  });
+
+  test("the same commit seen by two overlapping blocks is counted once in the totals", () => {
+    const data = summarizeWeek({
+      weekStart: weekStartOf(T0, "UTC"), zone: "UTC", asOf: T0, boards: BOARDS,
+      blocks: [
+        block({ sessionId: "a", startMs: T0, endMs: T0 + HOUR, commits: 2, commitShas: ["c1", "c2"] }),
+        block({ sessionId: "b", startMs: T0, endMs: T0 + HOUR, commits: 2, commitShas: ["c2", "c3"] }),
+      ],
+    });
+    expect(data.totals.commits).toBe(3);
   });
 });
 
@@ -145,7 +157,7 @@ describe("store and service", () => {
       ].join("\n");
       fs.writeFileSync(path.join(dir, "a.jsonl"), session);
       let counted = 0;
-      const service = new WeekService({ store, sessionRoots: [dir], boards: BOARDS, zone: "UTC", now: () => now, countCommits: async () => { counted++; return 0; } });
+      const service = new WeekService({ store, sessionRoots: [dir], boards: BOARDS, zone: "UTC", now: () => now, countCommits: async () => { counted++; return []; } });
       const first = await service.get(T0);
       expect(first.asOf).toBe(now);
       expect(first.totals.noCommit).toBe(1);

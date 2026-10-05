@@ -26,6 +26,8 @@ export interface SessionBlock {
 export interface WeekBlock extends SessionBlock {
   /** Commits made in the block window in the lane's worktree; null = could not be read. */
   commits: number | null;
+  /** Short hashes of those commits; totals de-duplicate by hash when blocks overlap. */
+  commitShas: string[];
   noCommit: boolean;
   /** Registry ids of the boards this block's project belongs to; empty = unassigned. */
   boards: string[];
@@ -198,7 +200,7 @@ export function summarizeWeek(input: SummaryInput): WeekData {
   }
 
   const noCommit = blocks.filter(b => b.noCommit);
-  const commits = blocks.reduce((sum, b) => sum + (b.commits ?? 0), 0);
+  const commits = new Set(blocks.flatMap(b => b.commitShas)).size;
   const activeMs = unionMs(clip(all, weekStart, weekEnd));
   const sessionMs = clip(all, weekStart, weekEnd).reduce((sum, [s, e]) => sum + (e - s), 0);
   const prs = input.pullRequests ?? [];
