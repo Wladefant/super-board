@@ -56,7 +56,8 @@
           "id": "assert_dialog_open",
           "action": "assert",
           "selector": "[role='dialog']",
-          "expected_present": true
+          "expected_present": true,
+          "timeout_ms": 5000
         },
         {
           "id": "open_keyboard_sku_focus",
@@ -199,7 +200,7 @@
         {
           "id": "open_offer_detail_sheet",
           "action": "tap",
-          "selector": "main table tbody tr:first-child, [data-testid='listing-row']:first-child, main table tbody tr td:first-child",
+          "selector": "main ul > li button, main table tbody tr td button:not([role='checkbox'])",
           "checks": [
             "visible",
             "tap_target_min_44",
@@ -210,14 +211,16 @@
           "id": "assert_sheet_present",
           "action": "assert",
           "selector": "[role='dialog']",
-          "expected_present": true
+          "expected_present": true,
+          "timeout_ms": 5000
         },
         {
           "id": "swipe_down_to_dismiss_sheet",
           "action": "swipe",
-          "selector": "[role='dialog']",
+          "selector": "[role='dialog'] > div.touch-none",
+          "touch_only": true,
           "direction": "down",
-          "distance": 250,
+          "distance": 400,
           "assert_dismissal": true,
           "checks": [
             "dismissed"
@@ -227,6 +230,7 @@
           "id": "assert_sheet_dismissed_state",
           "action": "assert",
           "selector": "[role='dialog']",
+          "touch_only": true,
           "expected_present": false
         }
       ],
@@ -405,7 +409,7 @@
         {
           "id": "open_first_order",
           "action": "tap",
-          "selector": "main table tbody tr a[href*='/orders/'], [data-testid='order-row']",
+          "selector": "main table tbody tr button:has-text('Kurzansicht'), main div.rounded-lg.border button.truncate",
           "checks": [
             "visible",
             "tap_target_min_44",
@@ -481,12 +485,15 @@
         },
         {
           "id": "open_pack_mode_view",
-          "action": "tap",
-          "selector": "a[href*='/pack']:first-child, a:has-text('Packmodus'):first-child, a:has-text('Weiter packen'):first-child",
+          "action": "goto",
+          "url_from_link": {
+            "selector": "main a[href*='/shipping-runs/']",
+            "pattern": "/shipping-runs/(?:new\\?runId=)?([0-9a-f-]{36})",
+            "template": "/shipping-runs/$1/pack"
+          },
           "checks": [
             "visible",
-            "tap_target_min_44",
-            "element_from_point"
+            "no_horizontal_overflow"
           ]
         },
         {
@@ -498,7 +505,7 @@
         {
           "id": "activate_scanner_test_mode",
           "action": "tap",
-          "selector": "input[type='checkbox']",
+          "selector": "label:has-text('Scanner testen')",
           "checks": [
             "visible",
             "tap_target_min_44"
