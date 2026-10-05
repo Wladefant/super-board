@@ -77,6 +77,16 @@ def make_handler(page: bytes, version: dict):
     return Handler
 
 
+def serve_until_stopped(server: ThreadingHTTPServer) -> None:
+    """Serve until shutdown() or Ctrl+C, then close the listening socket so the port is free again."""
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Serve one rendered depth-survey report with its served SHA.")
     ap.add_argument("--repo-root", default=".")
@@ -92,7 +102,7 @@ def main(argv=None) -> int:
     print(f"depth report preview on http://127.0.0.1:{server.server_port} serving {template} at {version['sha']}"
           f"{' (dirty)' if version['dirty'] else ''}; {len(sv.candidates)} candidate(s) from {sv.repo_root}",
           flush=True)
-    server.serve_forever()
+    serve_until_stopped(server)
     return 0
 
 

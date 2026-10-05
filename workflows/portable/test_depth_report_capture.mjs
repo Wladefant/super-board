@@ -27,21 +27,27 @@ svg{width:300px;background:#fff} text{font:11px sans-serif;fill:#111} rect{fill:
 <body><p class="faint">Too faint to read.</p><div class="wide"></div><img src="https://example.invalid/x.png" alt="">
 <svg viewBox="0 0 320 200"><rect x="10" y="10" width="30" height="40"/><text x="14" y="34">a-long-module-name</text></svg></body></html>`;
 
+const HANG = Symbol('hang');
+
 function serve(page, version) {
   const server = http.createServer((req, res) => {
-    if (req.url === '/api/version') { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(version)); return; }
+    if (req.url === '/api/version') {
+      if (version === HANG) return; // never answers
+      res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(version)); return;
+    }
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
     res.end(page);
   });
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(server)));
 }
 
-async function run(page, version, expectedSha = SHA) {
+async function run(page, version, expectedSha = SHA, versionTimeoutMs = 10000) {
   const server = await serve(page, version);
   const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'depth-capture-'));
   try {
-    return await capture({ baseUrl: `http://127.0.0.1:${server.address().port}`, expectedSha, outputDir });
+    return await capture({ baseUrl: `http://127.0.0.1:${server.address().port}`, expectedSha, outputDir, versionTimeoutMs });
   } finally {
+    server.closeAllConnections();
     server.close();
   }
 }
@@ -68,4 +74,10 @@ test('a served SHA that differs from the expected one is refused before any capt
 
 test('a dirty served tree is refused', async () => {
   await assert.rejects(run(CLEAN, { sha: SHA, dirty: true }), /local changes/);
+});
+
+test('a version endpoint that never answers is refused within the timeout', async () => {
+  const started = Date.now();
+  await assert.rejects(run(CLEAN, HANG, SHA, 500), /Served SHA check failed: GET \/api\/version/);
+  assert.ok(Date.now() - started < 5000, 'the capture must not wait past its version timeout');
 });
