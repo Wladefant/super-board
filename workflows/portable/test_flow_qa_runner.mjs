@@ -803,3 +803,26 @@ test('firstVisibleHandle skips a laid-out input inside an inert or aria-hidden c
     await browser.close();
   }
 });
+
+test('firstVisibleHandle prefers the field in an open sheet over a laid-out inline copy under the overlay', async () => {
+  const puppeteer = resolvePuppeteer();
+  const browser = await puppeteer.launch({
+    executablePath: resolveExecutablePath(),
+    headless: 'new',
+    args: ['--no-sandbox', '--disable-gpu']
+  });
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width: 390, height: 844 });
+    // Inline panel sits far down the page and comes first in DOM order; the sheet is a fixed overlay.
+    await page.setContent(`
+      <div style="height:1400px"></div>
+      <input type="number" id="inline">
+      <div style="height:600px"></div>
+      <div style="position:fixed;inset:0;background:#fff;z-index:10"><input type="number" id="sheet"></div>`);
+    const handle = await firstVisibleHandle(page, "input[type='number']", 1000);
+    assert.equal(await handle.evaluate((el) => el.id), 'sheet');
+  } finally {
+    await browser.close();
+  }
+});

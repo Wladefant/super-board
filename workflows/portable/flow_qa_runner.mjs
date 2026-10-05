@@ -802,6 +802,30 @@ async function isShown(page, handle) {
 }
 
 /**
+ * First match a user can act on. A page can hold several laid-out copies of one control (an inline
+ * trade panel in the page body AND the same field inside an open bottom sheet). With one shown copy
+ * that is the answer. With several, prefer the first whose centre is hit by elementFromPoint once
+ * scrolled into view, so a copy sitting under the sheet's overlay loses to the one in the sheet.
+ */
+async function pickShown(page, handles) {
+  const shown = [];
+  for (const handle of handles) {
+    if (await isShown(page, handle)) shown.push(handle);
+  }
+  if (shown.length < 2) return shown[0] || null;
+  for (const handle of shown) {
+    const reachable = await page.evaluate((el) => {
+      el.scrollIntoView({ block: 'center', inline: 'nearest' });
+      const r = el.getBoundingClientRect();
+      const at = document.elementFromPoint(Math.round(r.x + r.width / 2), Math.round(r.y + r.height / 2));
+      return !!at && (at === el || el.contains(at));
+    }, handle);
+    if (reachable) return handle;
+  }
+  return shown[0];
+}
+
+/**
  * Polls until the selector matches (and, with `visible`, a match has a layout box).
  * Returns the first visible match, else the first match; null on timeout.
  * A page can render the same control twice (mobile and desktop copies) with one hidden by CSS.
@@ -810,9 +834,8 @@ async function waitForTarget(page, selector, timeoutMs, { visible = true } = {})
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const handles = await queryAll(page, selector);
-    for (const handle of handles) {
-      if (await isShown(page, handle)) return handle;
-    }
+    const shown = await pickShown(page, handles);
+    if (shown) return shown;
     if (!visible && handles.length > 0) return handles[0];
     if (Date.now() >= deadline) return null;
     await new Promise((resolve) => setTimeout(resolve, 200));
@@ -828,10 +851,7 @@ export async function firstVisibleHandle(page, selector, timeoutMs) {
 /** The element a step acts on right now: first visible match, else first match, else null. */
 async function currentTarget(page, selector) {
   const handles = await queryAll(page, selector);
-  for (const handle of handles) {
-    if (await isShown(page, handle)) return handle;
-  }
-  return handles[0] || null;
+  return (await pickShown(page, handles)) || handles[0] || null;
 }
 
 /**
