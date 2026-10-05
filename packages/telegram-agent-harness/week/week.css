@@ -201,7 +201,8 @@ h1 { font-size: 28px; letter-spacing: -0.03em; margin-top: var(--s1); font-varia
 
 /* ---- mobile ---- */
 @media (max-width: 1199px) {
-  .layout { grid-template-columns: minmax(0, 1fr) 300px; }
+  .layout { grid-template-columns: minmax(0, 1fr); }
+  .sidebar { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
 }
 @media (max-width: 899px) {
   .top { padding: var(--s4); padding-top: max(var(--s4), env(safe-area-inset-top)); }
@@ -211,6 +212,7 @@ h1 { font-size: 28px; letter-spacing: -0.03em; margin-top: var(--s1); font-varia
   .board-pick select { min-width: 0; width: 100%; font-size: 16px; }
   .notice { margin: var(--s3) var(--s4) 0; }
   .layout { grid-template-columns: minmax(0, 1fr); padding: var(--s4); gap: var(--s4); padding-bottom: max(var(--s6), env(safe-area-inset-bottom)); }
+  .sidebar { grid-template-columns: minmax(0, 1fr); }
   .grid { display: none; }
   .agenda { display: grid; gap: var(--s4); }
   .agenda-head {
