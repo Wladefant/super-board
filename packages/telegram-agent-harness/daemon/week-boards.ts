@@ -11,7 +11,7 @@
  */
 import type { GithubReaderDeps } from "./week-github";
 import { GITHUB_CACHE_MS, GITHUB_QUERY_COST, GITHUB_RETRY_MS } from "./week-github";
-import { summarizeWeek, type BoardInfo, type WeekBlock, type WeekCard, type WeekData } from "./week-summary";
+import { addDays, calendarDay, summarizeWeek, type BoardInfo, type WeekBlock, type WeekCard, type WeekData } from "./week-summary";
 
 const DAY_MS = 86_400_000;
 const ITEMS_PER_BOARD = 100;
@@ -63,8 +63,8 @@ function obj(value: unknown): Record<string, unknown> | null {
 
 function ms(value: unknown): number | null {
   if (typeof value !== "string") return null;
-  // A bare date is a calendar day: noon UTC keeps it inside that day for every zone.
-  const t = Date.parse(/^\d{4}-\d{2}-\d{2}$/.test(value) ? `${value}T12:00:00Z` : value);
+  // A bare date is a calendar day, kept as UTC midnight of that date (see calendarDay); never as a moment.
+  const t = Date.parse(/^\d{4}-\d{2}-\d{2}$/.test(value) ? `${value}T00:00:00Z` : value);
   return Number.isFinite(t) ? t : null;
 }
 
@@ -123,7 +123,10 @@ export function parseCards(raw: unknown, boards: BoardInfo[]): { cards: RawCard[
 // ------------------------------------------------------------------ placement
 
 /** Place raw cards in one week. Pure: the same input always gives the same cards. */
-export function placeCards(raw: RawCard[], boards: BoardInfo[], weekStart: number, weekEnd: number): WeekCard[] {
+export function placeCards(raw: RawCard[], boards: BoardInfo[], weekStart: number, weekEnd: number, zone: string): WeekCard[] {
+  // Planned dates are calendar days: compare them with the week's calendar days, then map back to local midnights.
+  const calStart = calendarDay(weekStart, zone), calEnd = calendarDay(weekEnd, zone);
+  const toLocal = (cal: number) => addDays(weekStart, Math.round((cal - calStart) / DAY_MS), zone);
   const kindOf = new Map(boards.map(b => [b.id, b.kind]));
   const out: WeekCard[] = [];
   for (const card of raw) {
@@ -132,9 +135,9 @@ export function placeCards(raw: RawCard[], boards: BoardInfo[], weekStart: numbe
     const base = { boardId: card.boardId, kind: kindOf.get(card.boardId) ?? "other", title: card.title, url: card.url, repo: card.repo, number: card.number, type: card.type, state: card.state };
     if (starts.length > 0) {
       const from = Math.min(...starts), to = Math.max(...ends);
-      if (from < weekEnd && to > weekStart) {
+      if (from < calEnd && to > calStart) {
         const source: WeekCard["source"] = card.target !== null ? "target" : card.iterationStart !== null ? "iteration" : "start";
-        out.push({ ...base, at: from, endAt: to - from > DAY_MS ? to : null, source, derived: false });
+        out.push({ ...base, at: toLocal(from), endAt: to - from > DAY_MS ? toLocal(to) : null, source, derived: false });
         continue;
       }
     }

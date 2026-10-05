@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { buildCardsQuery, CardsReader, filterWeek, parseCards, placeCards } from "../daemon/week-boards";
 import { GithubReader, type GithubReaderDeps } from "../daemon/week-github";
-import { summarizeWeek, weekStartOf, type BoardInfo, type WeekBlock } from "../daemon/week-summary";
+import { addDays, summarizeWeek, weekStartOf, type BoardInfo, type WeekBlock } from "../daemon/week-summary";
 
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
@@ -61,7 +61,7 @@ function raw() {
 }
 
 describe("card placement", () => {
-  const cards = placeCards(raw(), BOARDS, WEEK_START, WEEK_END);
+  const cards = placeCards(raw(), BOARDS, WEEK_START, WEEK_END, "UTC");
   const byKey = new Map(cards.map(c => [`${c.boardId}#${c.number}`, c]));
 
   test("planned dates place a card; activity places the rest and says so", () => {
@@ -79,11 +79,26 @@ describe("card placement", () => {
   test("negative control: no planned date in the week and no activity in the week means the card is absent", () => {
     expect(byKey.has("Wladefant/5#3")).toBe(false);
     expect(byKey.has("Bavariance/11#22")).toBe(false);
-    expect(placeCards(raw(), BOARDS, WEEK_END + 30 * DAY, WEEK_END + 37 * DAY)).toEqual([]);
+    expect(placeCards(raw(), BOARDS, WEEK_END + 30 * DAY, WEEK_END + 37 * DAY, "UTC")).toEqual([]);
   });
 
   test("a board with more items than its 100-item window is reported as truncated", () => {
     expect(parseCards(RESPONSES.Bavariance, [BOARDS[1]!, BOARDS[2]!]).truncatedBoards).toEqual(["Bavariance/11"]);
+  });
+});
+
+describe("calendar-day placement", () => {
+  const sunday = parseCards({ data: { repositoryOwner: { b0: board([[issue("Wladefant/super-board", 50), [date("Target Date", "2026-10-11")], OLD]]) } } }, [BOARDS[0]!]).cards;
+
+  test("a Sunday target date lands in exactly one week, in UTC and in a zone ahead of UTC", () => {
+    for (const zone of ["UTC", "Europe/Berlin", "Pacific/Auckland"]) {
+      const week1 = weekStartOf(T0, zone);
+      const week2 = weekStartOf(T0 + 7 * DAY, zone);
+      const a = placeCards(sunday, BOARDS, week1, addDays(week1, 7, zone), zone);
+      const b = placeCards(sunday, BOARDS, week2, addDays(week2, 7, zone), zone);
+      expect([zone, a.length, b.length]).toEqual([zone, 1, 0]);
+      expect(a[0]!.at).toBe(addDays(week1, 6, zone)); // Sunday local midnight
+    }
   });
 });
 
@@ -100,7 +115,7 @@ describe("board and kind filters", () => {
       { repo: "Bavariance/polysimulator", number: 2, title: "y", url: "u", state: "OPEN", mergedAt: null, branch: "b" },
       { repo: "Other/repo", number: 3, title: "z", url: "u", state: "OPEN", mergedAt: null, branch: "b" },
     ],
-    cards: placeCards(raw(), BOARDS, WEEK_START, WEEK_END),
+    cards: placeCards(raw(), BOARDS, WEEK_START, WEEK_END, "UTC"),
   });
   const view = (board: string | null, kind: string | null = null) => filterWeek(full, { board, kind }, "UTC");
 

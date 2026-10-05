@@ -77,7 +77,7 @@ export class WeekService {
       const cards = this.options.cards ? await this.options.cards.read() : null;
       const data = summarizeWeek({
         blocks, weekStart, zone: this.zone, asOf: now, boards: this.options.boards,
-        pullRequests: github?.pullRequests, cards: cards ? placeCards(cards.cards, this.options.boards, weekStart, weekEnd) : undefined,
+        pullRequests: github?.pullRequests, cards: cards ? placeCards(cards.cards, this.options.boards, weekStart, weekEnd, this.zone) : undefined,
         stale: (github?.stale ?? false) || (cards?.stale ?? false),
         staleReason: github?.staleReason ?? cards?.staleReason ?? null,
       });

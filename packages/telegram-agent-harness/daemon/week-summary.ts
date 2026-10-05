@@ -118,6 +118,12 @@ function localMidnight(year: number, month: number, day: number, zone: string): 
   return guess;
 }
 
+/** The local calendar date of `ms` as UTC midnight of that date: comparable with date-only fields. */
+export function calendarDay(ms: number, zone: string): number {
+  const p = parts(ms, zone);
+  return Date.UTC(p.year, p.month - 1, p.day);
+}
+
 /** Start of the local day containing `ms`. */
 export function dayStartOf(ms: number, zone: string): number {
   const p = parts(ms, zone);
