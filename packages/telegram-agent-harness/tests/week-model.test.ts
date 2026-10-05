@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import {
   ALL, INK, PROJECT_PALETTE, UNASSIGNED, boardOptions, contrastRatio, daySegments, isValidWeek, layoutDay,
-  cardSpans, cardsOnDay, firstHour, mondayOf, resolveSelection, selectBlocks, selectCards, shiftWeek, summarize, unionMs,
+  cardSpans, cardsOnDay, firstHour, resolveSelection, selectBlocks, selectCards, shiftWeek, summarize, unionMs,
+  weekRequestStart, zoneIsoDate,
 } from "../week/week-model.js";
+import { weekStartOf } from "../daemon/week-summary";
 import { BOARDS, makeWeek } from "./fixtures/week-fixture";
 
 const HOUR = 3_600_000;
@@ -144,15 +146,34 @@ describe("grid layout", () => {
 });
 
 describe("week navigation and colour", () => {
-  test("weeks start on Monday and move by seven days", () => {
-    expect(mondayOf(new Date(2026, 9, 4))).toBe("2026-09-28"); // Sunday
-    expect(mondayOf(new Date(2026, 8, 28))).toBe("2026-09-28"); // Monday
+  test("weeks move by seven days and only Mondays are valid", () => {
     expect(shiftWeek("2026-09-28", 1)).toBe("2026-10-05");
     expect(shiftWeek("2026-10-26", -1)).toBe("2026-10-19"); // across the DST change
     expect(isValidWeek("2026-09-28")).toBe(true);
     expect(isValidWeek("2026-09-29")).toBe(false);
     expect(isValidWeek("2026-02-30")).toBe(false);
     expect(isValidWeek(null)).toBe(false);
+  });
+
+  test("a requested week loads as that week whatever the browser and PC zones (B1)", () => {
+    const savedZone = process.env.TZ;
+    process.env.TZ = "Asia/Tokyo";
+    try {
+      // Negative control: the old request (browser-local midnight) is Sunday 17:00 in Berlin,
+      // so a Berlin PC served the week before.
+      const old = new Date(2026, 8, 28).getTime();
+      expect(old).toBe(Date.UTC(2026, 8, 27, 15));
+      expect(zoneIsoDate(weekStartOf(old, "Europe/Berlin"), "Europe/Berlin")).toBe("2026-09-21");
+      // The fix: noon UTC on the Monday floors to that Monday in every PC zone from UTC-12 to UTC+14.
+      for (const zone of ["Etc/GMT+12", "America/Los_Angeles", "UTC", "Europe/Berlin", "Asia/Tokyo", "Pacific/Kiritimati"]) {
+        for (const iso of ["2026-09-28", "2026-10-26", "2026-11-02", "2027-01-04"]) {
+          expect(zoneIsoDate(weekStartOf(weekRequestStart(iso), zone), zone)).toBe(iso);
+        }
+      }
+    } finally {
+      if (savedZone === undefined) delete process.env.TZ;
+      else process.env.TZ = savedZone;
+    }
   });
 
   test("every project colour keeps 4.5:1 contrast with the block text", () => {

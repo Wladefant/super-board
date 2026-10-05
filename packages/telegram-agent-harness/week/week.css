@@ -144,6 +144,7 @@ h1 { font-size: 28px; letter-spacing: -0.03em; margin-top: var(--s1); font-varia
 }
 .card-chip.derived { border-style: dashed; border-left-style: solid; }
 .card-title { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card-range { display: block; margin-top: 2px; color: var(--muted); font-size: 12px; }
 
 /* ---- sidebar ---- */
 .sidebar { display: grid; gap: var(--s4); min-width: 0; }

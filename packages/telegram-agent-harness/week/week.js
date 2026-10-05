@@ -1,9 +1,9 @@
 import { createClient, isTerminalAuthError, OPEN_FROM_TELEGRAM } from './client.js';
 import {
   ALL, BOARD_PARAM, BOARD_STORAGE_KEY, WEEK_PARAM,
-  blockBoards, blockTitle, boardOptions, cardSpans, cardsOnDay, commitCount, daySegments, firstHour, formatDuration,
-  isValidWeek, kindLabel, layoutDay, minutesOfDay, mondayOf, projectColors, resolveSelection,
-  selectBlocks, selectionLabel, shiftWeek, summarize,
+  blockBoards, blockTitle, boardOptions, cardSpans, commitCount, daySegments, firstHour, formatDuration,
+  isValidWeek, kindLabel, layoutDay, minutesOfDay, projectColors, resolveSelection,
+  selectBlocks, selectionLabel, shiftWeek, summarize, weekRequestStart, zoneIsoDate,
 } from './week-model.js';
 
 const tg = window.Telegram?.WebApp;
@@ -23,9 +23,10 @@ const state = {
   trigger: null,
 };
 
+/** The Monday (YYYY-MM-DD) in the URL, or null for the PC's current week. */
 function initialWeek() {
   const value = new URLSearchParams(location.search).get(WEEK_PARAM);
-  return isValidWeek(value) ? value : mondayOf(new Date());
+  return isValidWeek(value) ? value : null;
 }
 
 function readStored() {
@@ -56,7 +57,7 @@ function formatters(zone) {
     time: make({ hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }),
     weekday: make({ weekday: 'short' }),
     dayLong: make({ weekday: 'short', day: 'numeric', month: 'short' }),
-    monthDay: new Intl.DateTimeFormat('en-US', { timeZone: zone, month: 'short', day: 'numeric' }),
+    monthDay: make({ month: 'short', day: 'numeric' }),
     stamp: make({ weekday: 'short', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }),
   };
   return fmt;
@@ -67,7 +68,8 @@ const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 // ---- URL and storage ----
 function writeUrl() {
   const params = new URLSearchParams(location.search);
-  params.set(WEEK_PARAM, state.week);
+  if (state.week) params.set(WEEK_PARAM, state.week);
+  else params.delete(WEEK_PARAM);
   params.set(BOARD_PARAM, state.board);
   history.replaceState(null, '', `${location.pathname}?${params}${location.hash}`);
 }
@@ -76,14 +78,17 @@ function writeUrl() {
 async function load({ quiet = false } = {}) {
   if (state.loading) return;
   state.loading = true;
-  const week = state.week;
+  let week = state.week;
   if (!quiet) showLoading();
   try {
-    const [y, m, d] = week.split('-').map(Number);
-    const data = await request(`/api/week?start=${new Date(y, m - 1, d).getTime()}`);
+    // No `start` asks the server for the PC's current week. A given week goes as noon UTC on its Monday,
+    // so a browser in another zone than the PC still gets that week.
+    const data = await request(week ? `/api/week?start=${weekRequestStart(week)}` : '/api/week');
     if (week !== state.week) return;
     if (data?.version !== 1 || !Array.isArray(data.blocks)) throw new Error('The server sent a week format this page does not know.');
     state.data = data;
+    // The server's week wins, so the URL and prev/next follow the week on screen.
+    week = state.week = zoneIsoDate(data.weekStart, data.zone);
     state.board = resolveSelection(state.board, readStored(), data.boards || []);
     writeUrl();
     hideNotice();
@@ -99,7 +104,7 @@ async function load({ quiet = false } = {}) {
 
 function showLoading() {
   $('calendar').setAttribute('aria-busy', 'true');
-  $('week-title').textContent = weekTitleFromIso(state.week);
+  $('week-title').textContent = state.week ? weekTitleFromIso(state.week) : 'This week';
   $('grid').replaceChildren(el('p', { class: 'placeholder' }, 'Loading week…'));
   $('agenda').replaceChildren(el('p', { class: 'placeholder' }, 'Loading week…'));
 }
@@ -112,10 +117,23 @@ function showError(error) {
   notice.hidden = false;
   notice.className = 'notice notice-error';
   notice.replaceChildren(el('span', {}, message), auth ? null : el('button', { type: 'button', class: 'btn', onclick: () => load() }, 'Try again'));
+  const placeholder = auth ? 'Sign in to see the week.' : 'No data loaded.';
+  // Data from another week must not sit under this week's title: clear it, keep only the board list.
+  if (state.data && (!state.week || zoneIsoDate(state.data.weekStart, state.data.zone) !== state.week)) clearData();
   if (!state.data) {
-    $('grid').replaceChildren(el('p', { class: 'placeholder' }, auth ? 'Sign in to see the week.' : 'No data loaded.'));
-    $('agenda').replaceChildren(el('p', { class: 'placeholder' }, auth ? 'Sign in to see the week.' : 'No data loaded.'));
+    $('grid').replaceChildren(el('p', { class: 'placeholder' }, placeholder));
+    $('agenda').replaceChildren(el('p', { class: 'placeholder' }, placeholder));
   }
+}
+
+function clearData() {
+  const boards = state.data.boards || [];
+  state.data = null;
+  renderBoardSelect(boards, null);
+  $('stats').replaceChildren();
+  $('asof').hidden = true;
+  $('total').textContent = '–';
+  for (const id of ['total-sub', 'segments', 'projects', 'parallel', 'report', 'nocommit', 'perday']) $(id).replaceChildren();
 }
 
 function hideNotice() {
@@ -125,10 +143,8 @@ function hideNotice() {
 
 function weekTitleFromIso(iso) {
   const [y, m, d] = iso.split('-').map(Number);
-  const start = new Date(y, m - 1, d);
-  const end = new Date(y, m - 1, d + 6);
-  const f = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' });
-  return `${f.format(start)} – ${f.format(end)}`;
+  const f = new Intl.DateTimeFormat('en-GB', { timeZone: 'UTC', month: 'short', day: 'numeric' });
+  return `${f.format(Date.UTC(y, m - 1, d))} – ${f.format(Date.UTC(y, m - 1, d + 6))}`;
 }
 
 // ---- render ----
@@ -140,7 +156,7 @@ function render() {
   const colors = projectColors(data);
   $('calendar').setAttribute('aria-busy', 'false');
   $('week-title').textContent = `${f.monthDay.format(data.weekStart)} – ${f.monthDay.format(data.weekEnd - 1)}`;
-  renderBoardSelect(data);
+  renderBoardSelect(data.boards || [], value => selectBlocks(data, value).length);
   renderStats(summary);
   renderAsOf(data, f);
   renderGrid(data, summary, colors, f);
@@ -148,11 +164,11 @@ function render() {
   renderSidebar(data, summary, colors, f);
 }
 
-function renderBoardSelect(data) {
+/** `count` gives the lanes per option; null leaves the counts out (no week loaded). */
+function renderBoardSelect(boards, count) {
   const select = $('board');
-  const opts = boardOptions(data.boards || []);
-  const count = value => selectBlocks(data, value).length;
-  const option = o => el('option', { value: o.value, selected: o.value === state.board }, `${o.label} · ${plural(count(o.value), 'lane')}`);
+  const opts = boardOptions(boards);
+  const option = o => el('option', { value: o.value, selected: o.value === state.board }, count ? `${o.label} · ${plural(count(o.value), 'lane')}` : o.label);
   select.replaceChildren(
     option(opts.all),
     opts.kinds.length ? el('optgroup', { label: 'Calendars by kind' }, opts.kinds.map(option)) : null,
@@ -255,13 +271,21 @@ function blockButton(block, f, colors, attrs, { roomy = false, withTime = false,
   nc ? el('span', { class: 'blk-nc' }, 'No commit') : null);
 }
 
-function cardChip(card, data, style) {
+/** "Mon 28 Sept – Sun 4 Oct" for a planned range over more than one day (endAt is exclusive), else null. */
+function cardRange(card, f) {
+  if (!(card.endAt > card.at)) return null;
+  const from = f.dayLong.format(card.at);
+  const to = f.dayLong.format(card.endAt - 1);
+  return from === to ? null : `${from} – ${to}`;
+}
+
+function cardChip(card, data, style, range = null) {
   const board = data.boards.find(b => b.id === card.boardId);
   return el('button', {
     type: 'button', class: `card-chip${card.derived ? ' derived' : ''}`, '--c': board?.color || '#b7c4dd', style,
-    'aria-label': `${card.title}, ${board?.title || card.boardId} card${card.derived ? ', placed by activity' : ''}`,
+    'aria-label': `${card.title}, ${board?.title || card.boardId} card${card.derived ? ', placed by activity' : ''}${range ? `, ${range}` : ''}`,
     onclick: event => openCard(event.currentTarget, card, data),
-  }, el('span', { class: 'card-title' }, card.title));
+  }, el('span', { class: 'card-title' }, card.title), range ? el('span', { class: 'card-range num' }, range) : null);
 }
 
 function emptyMessage(data) {
@@ -280,15 +304,17 @@ function renderAgenda(data, summary, colors, f) {
     return;
   }
   const segments = daySegments(summary.blocks, data.days);
+  // A card shows once, on its first day in this week; a range card carries its dates.
+  const spans = cardSpans(summary.cards, data.days);
   agenda.replaceChildren(...data.days.map((day, i) => {
     const segs = [...segments[i]].sort((a, b) => a.startMs - b.startMs);
-    const cards = cardsOnDay(summary.cards, day);
+    const cards = spans.filter(span => span.from === i).map(span => span.card);
     return el('section', { class: 'agenda-day', 'aria-labelledby': `agenda-${i}` },
       el('h2', { class: 'agenda-head', id: `agenda-${i}` },
         el('span', {}, f.dayLong.format(day.dayStart)),
         el('span', { class: 'num muted' }, summary.days[i].ms ? formatDuration(summary.days[i].ms) : 'No lanes')),
       segs.length || cards.length ? el('ul', { class: 'agenda-list' },
-        cards.map(card => el('li', {}, cardChip(card, data))),
+        cards.map(card => el('li', {}, cardChip(card, data, null, cardRange(card, f)))),
         segs.map(seg => el('li', {}, blockButton(seg.block, f, colors, { class: 'row' }, { roomy: true, withTime: true })))) : null);
   }));
 }
@@ -391,7 +417,7 @@ function openCard(trigger, card, data) {
     el('dl', { class: 'meta' },
       row('Board', board ? (kindLabel(board.kind) === board.title ? board.title : `${board.title} · ${kindLabel(board.kind)}`) : card.boardId),
       row('Item', `${ref} · ${STATE_TEXT[card.state] || card.state}`),
-      row('Date', card.endAt && card.endAt > card.at ? `${f.dayLong.format(card.at)} – ${f.dayLong.format(card.endAt - 1)}` : f.dayLong.format(card.at))),
+      row('Date', cardRange(card, f) || f.dayLong.format(card.at))),
     el('p', { class: 'muted' }, SOURCE_TEXT[card.source] || (card.derived ? SOURCE_TEXT.activity : '')),
     card.url && /^https:\/\/github\.com\//.test(card.url) ? el('a', { class: 'btn link-btn', href: card.url, target: '_blank', rel: 'noopener noreferrer' }, 'Open on GitHub') : null,
   ].filter(Boolean));
@@ -449,9 +475,9 @@ function setWeek(iso) {
 }
 
 $('board').addEventListener('change', event => setBoard(event.target.value));
-$('prev').addEventListener('click', () => setWeek(shiftWeek(state.week, -1)));
-$('next').addEventListener('click', () => setWeek(shiftWeek(state.week, 1)));
-$('today').addEventListener('click', () => setWeek(mondayOf(new Date())));
+$('prev').addEventListener('click', () => { if (state.week) setWeek(shiftWeek(state.week, -1)); });
+$('next').addEventListener('click', () => { if (state.week) setWeek(shiftWeek(state.week, 1)); });
+$('today').addEventListener('click', () => setWeek(null));
 // A resize that changes how many lanes fit side by side re-lays the grid.
 window.addEventListener('resize', () => {
   if (state.data && $('grid').dataset.columns && $('grid').dataset.columns !== String(gridColumns())) render();

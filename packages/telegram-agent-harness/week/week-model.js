@@ -281,11 +281,21 @@ export function firstHour(segmentsByDay, zone) {
   return hour === 24 ? 8 : hour;
 }
 
-/** Monday 00:00 local of the week containing `date` (a Date), as YYYY-MM-DD. */
-export function mondayOf(date) {
-  const d = new Date(date.getFullYear(), date.getMonth(), date.getDate());
-  d.setDate(d.getDate() - ((d.getDay() + 6) % 7));
-  return isoDate(d);
+/**
+ * The `start` instant sent for the week whose Monday is `iso`: noon UTC on that date. The server
+ * floors `start` to a Monday in the PC's zone, and noon UTC falls on that Monday or the Tuesday after
+ * it in every zone from UTC-12 to UTC+14, so the browser's own zone never shifts the week.
+ */
+export function weekRequestStart(iso) {
+  const [y, m, d] = iso.split('-').map(Number);
+  return Date.UTC(y, m - 1, d, 12);
+}
+
+/** The calendar date of `ms` in `zone`, as YYYY-MM-DD. */
+export function zoneIsoDate(ms, zone) {
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: zone, year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(ms);
+  const part = type => parts.find(p => p.type === type).value;
+  return `${part('year')}-${part('month')}-${part('day')}`;
 }
 
 export function isoDate(d) {
