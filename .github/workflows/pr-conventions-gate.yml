@@ -36,3 +36,10 @@ jobs:
           GITHUB_EVENT_PATH: ${{ github.event_path }}
           GITHUB_ACTIONS: 'true'
           GH_TOKEN: ${{ github.token }}
+
+      # Done report (Wladefant/super-board#502): warn-only dry run; the flip to failing is a one-line change.
+      - name: Check Deleted and Not run lines
+        run: python3 workflows/portable/evidence_lint.py done-report-pr --repo "$GITHUB_REPOSITORY" --number "$PR_NUMBER" --warn-only
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}

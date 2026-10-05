@@ -18,6 +18,11 @@ Fixes #
 - Verification Command: 
 - Evidence / Run URL: 
 
+## Done Report
+<!-- Mandatory. Each line is a list, or `none`. Checked by evidence_lint.py done-report-pr. -->
+Deleted: 
+Not run: 
+
 ## Convention & Baseline Checklist
 - [ ] Single deliverable: Confined strictly to the linked issue scope (no bundled refactors)
 - [ ] Merge commits only: Synced forward with `git merge origin/main --no-ff`; no rebase, no squash

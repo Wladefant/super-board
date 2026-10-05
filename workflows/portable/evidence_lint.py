@@ -11,8 +11,18 @@ or local paths, file:// URLs, third-party hosts, branch-named raw/blob refs,
 release-asset URLs (404 through GitHub's image proxy on private repos), and
 HTML <img>/<video> tags (broken in issue views, sanitized in comments).
 
+The done report (profile AGENTS.md section 14, Wladefant/super-board#502): a PR body or
+lane handoff must carry a `Deleted:` line and a `Not run:` line, each a list or `none`.
+`Deleted: none` is flagged when the diff deletes files.
+
 Subcommands:
   lint <file|->                     lint Markdown text, exit 1 on any violation
+  done-report <file|-> [--deleted PATH ...] [--warn-only]
+                                    check the two done-report lines in a body
+  done-report-pr --repo R --number N [--warn-only]
+                                    same check for a PR body, deletions read from the PR files
+  done-report-sweep --repo R [--limit 30]
+                                    dry run over recent merged PRs, always exit 0
   verify-posted <github-url> [--retries N]
                                     fetch the rendered HTML of a posted PR/issue
                                     body or comment and require every media URL
@@ -114,6 +124,60 @@ def lint_text(text: str) -> List[Violation]:
     return found
 
 
+# ------------------------------------------------------------ done report
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def _report_line(body: str, label: str) -> Optional[str]:
+    """Value of the `label:` line outside code and HTML comments; None when absent or empty."""
+    text = _HTML_COMMENT_RE.sub("", _strip_code(body))
+    m = re.search(rf"^[ \t]*(?:[-*][ \t]+)?(?:\*\*)?{label}:(?:\*\*)?[ \t]*(\S[^\n]*)$", text, re.MULTILINE)
+    return m.group(1).strip() if m else None
+
+
+def lint_done_report(body: str, deleted_files: Optional[List[str]] = None) -> List[Violation]:
+    """Violations of the done-report contract; `deleted_files` are paths the diff removes."""
+    found: List[Violation] = []
+    deleted = _report_line(body, "Deleted")
+    not_run = _report_line(body, "Not run")
+    if deleted is None:
+        found.append(Violation("missing-deleted", "Deleted:", "add a `Deleted:` line (a list, or `none`)"))
+    elif deleted_files and deleted.lower().startswith("none"):
+        found.append(Violation("deleted-mismatch", deleted_files[0],
+                               f"says `Deleted: none` but the diff deletes {len(deleted_files)} file(s)"))
+    if not_run is None:
+        found.append(Violation("missing-not-run", "Not run:", "add a `Not run:` line (checks you skipped, or `none`)"))
+    return found
+
+
+def _gh_json(args: List[str], timeout: int = 60):
+    proc = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=timeout,
+                          creationflags=_NO_WINDOW)
+    if proc.returncode != 0:
+        raise RuntimeError(f"gh {' '.join(args[:3])} failed: {proc.stderr.strip()[:300]}")
+    return json.loads(proc.stdout)
+
+
+def _deleted_paths(files: List[dict]) -> List[str]:
+    return [f["path"] for f in files if f.get("changeType") == "DELETED"]
+
+
+def _is_bot(pr: dict) -> bool:
+    return str((pr.get("author") or {}).get("login", "")).endswith("[bot]") or (pr.get("author") or {}).get("is_bot", False)
+
+
+def sweep(repo: str, limit: int) -> List[dict]:
+    prs = _gh_json(["pr", "list", "--repo", repo, "--state", "merged", "--limit", str(limit),
+                    "--json", "number,body,files,author,url"], timeout=120)
+    rows = []
+    for pr in prs:
+        violations = [] if _is_bot(pr) else lint_done_report(pr.get("body") or "", _deleted_paths(pr.get("files") or []))
+        rows.append({"number": pr["number"], "url": pr["url"], "bot": _is_bot(pr),
+                     "violations": [v.form for v in violations]})
+    return rows
+
+
 # ------------------------------------------------------------ verify-posted
 class _MediaCollector(HTMLParser):
     def __init__(self) -> None:
@@ -186,6 +250,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     lp = sub.add_parser("lint")
     lp.add_argument("file", help="Markdown file, or - for stdin")
+    dp = sub.add_parser("done-report")
+    dp.add_argument("file", help="Markdown file, or - for stdin")
+    dp.add_argument("--deleted", nargs="*", default=[], help="paths the diff deletes")
+    dp.add_argument("--warn-only", action="store_true")
+    pp = sub.add_parser("done-report-pr")
+    pp.add_argument("--repo", required=True)
+    pp.add_argument("--number", required=True)
+    pp.add_argument("--warn-only", action="store_true")
+    sp = sub.add_parser("done-report-sweep")
+    sp.add_argument("--repo", required=True)
+    sp.add_argument("--limit", type=int, default=30)
     vp = sub.add_parser("verify-posted")
     vp.add_argument("url")
     vp.add_argument("--retries", type=int, default=3)
@@ -198,6 +273,32 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(v)
         print(f"evidence-lint: {len(violations)} violation(s)")
         return 1 if violations else 0
+
+    if args.cmd == "done-report-sweep":
+        rows = sweep(args.repo, args.limit)
+        bad = [r for r in rows if r["violations"]]
+        for r in rows:
+            state = "bot-exempt" if r["bot"] else ("WOULD FAIL " + ",".join(r["violations"]) if r["violations"] else "ok")
+            print(f"{r['url']} {state}")
+        print(f"done-report-sweep: {len(rows)} PRs, {len(rows) - len(bad)} ok, {len(bad)} would fail (dry run, exit 0)")
+        return 0
+
+    if args.cmd in ("done-report", "done-report-pr"):
+        if args.cmd == "done-report":
+            text = sys.stdin.read() if args.file == "-" else open(args.file, encoding="utf8").read()
+            deleted_files = list(args.deleted)
+        else:
+            pr = _gh_json(["pr", "view", args.number, "--repo", args.repo, "--json", "body,files,author"])
+            if _is_bot(pr):
+                print("done-report: bot author, exempt")
+                return 0
+            text, deleted_files = pr.get("body") or "", _deleted_paths(pr.get("files") or [])
+        violations = lint_done_report(text, deleted_files)
+        label = "WARN" if args.warn_only else "FAIL"
+        for v in violations:
+            print(f"{label} {v}")
+        print(f"done-report: {len(violations)} violation(s){' (warn-only)' if args.warn_only and violations else ''}")
+        return 1 if violations and not args.warn_only else 0
 
     passed, results = verify_posted(args.url, retries=args.retries)
     for r in results:
