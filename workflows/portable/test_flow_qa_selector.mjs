@@ -210,3 +210,49 @@ test('cleanup with repeat and then deletes every matching row through its confir
     fs.rmSync(outputDir, { recursive: true, force: true });
   }
 });
+
+test('goto url_from_link builds the target from a link on the page and fails when none matches', async () => {
+  const puppeteer = resolvePuppeteer();
+  const browser = await puppeteer.launch({ executablePath: resolveExecutablePath() || undefined, headless: 'new', args: ['--no-sandbox'] });
+  const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'flowqa-link-'));
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1440, height: 900 });
+    await page.setContent(`<main><a href="/shipping-runs/new?runId=11111111-2222-3333-4444-555555555555">x</a></main>`);
+    const ctx = { flow: { id: 'f' }, baseUrl: 'http://localhost:1', outputDir, flowConstraints: {} };
+    const step = {
+      id: 'g', action: 'goto',
+      url_from_link: { selector: "main a[href*='/shipping-runs/']", pattern: '/shipping-runs/(?:new\\?runId=)?([0-9a-f-]{36})', template: '/shipping-runs/$1/pack' }
+    };
+    const missing = { ...step, url_from_link: { ...step.url_from_link, pattern: '/nothing/([0-9]+)' } };
+    await assert.rejects(() => executeStep(page, null, missing, '1440x900', 'light', ctx), /No link matching/);
+    const requested = [];
+    page.on('request', (req) => requested.push(req.url()));
+    await executeStep(page, null, step, '1440x900', 'light', ctx).catch(() => {});
+    assert.ok(
+      requested.includes('http://localhost:1/shipping-runs/11111111-2222-3333-4444-555555555555/pack'),
+      `requested: ${requested.join(', ')}`
+    );
+  } finally {
+    await browser.close();
+    fs.rmSync(outputDir, { recursive: true, force: true });
+  }
+});
+
+test('touch_only steps pass with a skip note on a desktop viewport', async () => {
+  const puppeteer = resolvePuppeteer();
+  const browser = await puppeteer.launch({ executablePath: resolveExecutablePath() || undefined, headless: 'new', args: ['--no-sandbox'] });
+  const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'flowqa-touch-'));
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1440, height: 900 });
+    await page.setContent('<main><div role="dialog">open</div></main>');
+    const res = await executeStep(page, null, { id: 's', action: 'assert', selector: "[role='dialog']", touch_only: true, expected_present: false },
+      '1440x900', 'light', { flow: { id: 'f' }, baseUrl: 'http://localhost', outputDir, flowConstraints: {} });
+    assert.equal(res.passed, true);
+    assert.equal(res.checks[0].name, 'touch_only_skipped');
+  } finally {
+    await browser.close();
+    fs.rmSync(outputDir, { recursive: true, force: true });
+  }
+});

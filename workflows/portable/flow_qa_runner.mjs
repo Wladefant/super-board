@@ -940,6 +940,20 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
     preInspection = await inspectTargetElement(page, step.selector);
   }
 
+  // A touch-only step (a swipe, which only phone sheets answer) is skipped with a passing note on a desktop viewport.
+  if (step.touch_only && !vpConfig.hasTouch) {
+    page.off('load', onNav);
+    return {
+      flow: flow.id || 'default-flow',
+      step: step.id || 'step',
+      viewport: viewportKey,
+      theme,
+      passed: true,
+      checks: [{ name: 'touch_only_skipped', passed: true, detail: 'Touch-only step; skipped on a non-touch viewport' }],
+      screenshot: null
+    };
+  }
+
   // An optional tap (for example a consent banner that only appears for new visitors) is skipped
   // with a passing note when its target never shows up.
   if (step.optional && step.action === 'tap') {
@@ -963,9 +977,20 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
 
   switch (step.action) {
     case 'goto': {
-      const targetUrl = step.url.startsWith('http')
-        ? step.url
-        : `${baseUrl.replace(/\/+$/, '')}/${step.url.replace(/^\/+/, '')}`;
+      let stepUrl = step.url;
+      if (!stepUrl && step.url_from_link) {
+        // Build the target from a link on the current page, for example a run id that is only known at run time.
+        const { selector, pattern, template } = step.url_from_link;
+        const hrefs = await page.$$eval(selector, (els) => els.map((el) => el.getAttribute('href') || ''));
+        const re = new RegExp(pattern);
+        const hit = hrefs.map((h) => re.exec(h)).find(Boolean);
+        if (!hit) throw new Error(`No link matching "${pattern}" under "${selector}" for goto`);
+        stepUrl = template.replace(/\$(\d)/g, (_, n) => hit[Number(n)] || '');
+      }
+      if (!stepUrl) throw new Error('Action "goto" requires "url" or "url_from_link"');
+      const targetUrl = stepUrl.startsWith('http')
+        ? stepUrl
+        : `${baseUrl.replace(/\/+$/, '')}/${stepUrl.replace(/^\/+/, '')}`;
       assertNotProduction(targetUrl);
       await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
       break;
@@ -1153,6 +1178,13 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
 
   // Small stabilization delay
   await new Promise(r => setTimeout(r, 60));
+  // A swiped sheet animates out; give it up to 1.5 s before judging whether it was dismissed.
+  if (step.action === 'swipe' && step.assert_dismissal && step.selector) {
+    const settleDeadline = Date.now() + 1500;
+    while (Date.now() < settleDeadline && (await inspectTargetElement(page, step.selector))) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  }
 
   // Remove navigation listener
   page.off('load', onNav);
