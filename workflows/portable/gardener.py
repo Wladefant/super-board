@@ -1891,6 +1891,9 @@ SURVEY_REPOS: Tuple[Tuple[str, str], ...] = (
 )
 
 
+SURVEY_DEFAULT_ISSUE_REPO = "Wladefant/super-board"  # the survey never defaults to polysimulator
+
+
 def install_depth_survey_task(
     python_exe: str,
     script_path: str,
@@ -1911,8 +1914,8 @@ def install_depth_survey_task(
     for repo, branch in repos:
         root = f"{lg_path}\\survey-roots\\{repo.replace('/', '__')}"
         lines += [
-            f'if not exist "{root}\\.git" git clone --quiet "https://github.com/{repo}.git" "{root}" || exit /b 1',
-            f'git -C "{root}" fetch --quiet origin || exit /b 1',
+            f'if not exist "{root}\\.git" git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 clone --quiet "https://github.com/{repo}.git" "{root}" || exit /b 1',
+            f'git -C "{root}" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 fetch --quiet origin || exit /b 1',
             f'git -C "{root}" checkout --quiet --detach origin/{branch} || exit /b 1',
             f'"{py_path}" "{sc_path}" --survey-depth --repo-root "{root}" --issue-repo "{repo}" '
             f'--state-dir "{lg_path}" --log-dir "{lg_path}" --survey-out "{lg_path}\\depth-survey"',
@@ -1923,10 +1926,13 @@ def install_depth_survey_task(
     cmd = ["schtasks", "/create", "/tn", name, "/tr", f'"{cmd_file.resolve()}"',
            "/sc", "daily", "/mo", str(every_days), "/st", "04:30", "/f"]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60,
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return {name: {"status": "created", "output": proc.stdout.strip(), "cmd_file": str(cmd_file)}}
     except subprocess.CalledProcessError as e:
         return {name: {"status": "error", "error": e.stderr.strip() or str(e)}}
+    except subprocess.TimeoutExpired:
+        return {name: {"status": "error", "error": "schtasks timed out after 60 s"}}
 
 
 # ==============================================================================
@@ -2350,7 +2356,7 @@ def main() -> int:
     if args.survey_depth:
         return run_depth_survey_cli(
             repo_root=repo_root,
-            issue_repo=args.issue_repo,
+            issue_repo=SURVEY_DEFAULT_ISSUE_REPO if args.issue_repo == "Bavariance/polysimulator" else args.issue_repo,
             live=args.live and not args.dry_run,
             out_dir=Path(args.survey_out or Path(args.state_dir) / "depth-survey"),
             summary_issue=args.survey_issue,
