@@ -10,7 +10,10 @@ import { dlopen, FFIType, ptr } from "bun:ffi";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { getTokenFingerprint } from "./sanitizer";
+import { computeTokenHmac } from "../daemon/lane-panel";
+import type { DaemonStore } from "../daemon/store";
 import type {
   AccessConfig,
   BotLeaseRecord,
@@ -299,7 +302,12 @@ export class BotPoolCoordinator {
   private manifestPath: string;
   private channelsDir: string;
   private activeHeartbeatTimers = new Map<string, Timer>();
-
+  private auditStore?: Pick<DaemonStore, "auditControl"> & Partial<Pick<DaemonStore, "getControlAudit">>;
+  private daemonSecret?: Buffer;
+  private slotSecrets = new Map<string, Buffer>();
+  private tokenSlots = new Map<string, string>();
+  private sessionSlots = new Map<string, string>();
+  private secretResolver?: (record: DecisionCallbackRecord) => Buffer | undefined;
   constructor(
     dbPath: string = getDefaultPoolDbPath(),
     manifestPath: string = getDefaultManifestPath(),
@@ -393,9 +401,13 @@ export class BotPoolCoordinator {
         question_hash  TEXT NOT NULL,
         expires_at     REAL NOT NULL,
         consumed_at    REAL,
-        created_at     REAL NOT NULL
+        created_at     REAL NOT NULL,
+        slot_id        TEXT
       );
     `);
+    try {
+      this.db.run("ALTER TABLE decision_callbacks ADD COLUMN slot_id TEXT;");
+    } catch {}
     this.db.run("CREATE INDEX IF NOT EXISTS idx_decision_callbacks_dec_choice ON decision_callbacks(decision_id, choice_id);");
     this.db.run("CREATE INDEX IF NOT EXISTS idx_decision_callbacks_session ON decision_callbacks(session_id);");
   }
@@ -1135,14 +1147,18 @@ export class BotPoolCoordinator {
     };
   }
 
-  public recordDecisionCallback(record: DecisionCallbackRecord): boolean {
+  public recordDecisionCallback(record: DecisionCallbackRecord & { slotId?: string }): boolean {
     this.ensureDbOpen();
+    if (record.slotId) {
+      this.tokenSlots.set(record.callbackToken, record.slotId);
+      this.sessionSlots.set(record.sessionId, record.slotId);
+    }
     try {
       this.db.run(
         `INSERT INTO decision_callbacks (
           callback_token, decision_id, choice_id, session_id,
-          chat_id, user_id, question_hash, expires_at, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          chat_id, user_id, question_hash, expires_at, created_at, slot_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(callback_token) DO NOTHING;`,
         [
           record.callbackToken,
@@ -1154,6 +1170,7 @@ export class BotPoolCoordinator {
           record.questionHash,
           record.expiresAt,
           record.createdAt,
+          record.slotId ?? this.tokenSlots.get(record.callbackToken) ?? null,
         ],
       );
       return true;
@@ -1162,13 +1179,14 @@ export class BotPoolCoordinator {
     }
   }
 
-  public lookupDecisionCallback(callbackToken: string): DecisionCallbackRecord | null {
+  public lookupDecisionCallback(callbackToken: string): (DecisionCallbackRecord & { slotId?: string }) | null {
     this.ensureDbOpen();
     try {
       const row = this.db
         .query("SELECT * FROM decision_callbacks WHERE callback_token = ?")
         .get(callbackToken) as Record<string, unknown> | null;
       if (!row) return null;
+      const slotId = typeof row.slot_id === "string" ? row.slot_id : this.tokenSlots.get(callbackToken);
       return {
         callbackToken: String(row.callback_token),
         decisionId: String(row.decision_id),
@@ -1180,20 +1198,148 @@ export class BotPoolCoordinator {
         expiresAt: Number(row.expires_at),
         consumedAt: row.consumed_at != null ? Number(row.consumed_at) : null,
         createdAt: Number(row.created_at),
+        slotId,
       };
     } catch {
       return null;
     }
   }
+  public setAuditStore(auditStore?: Pick<DaemonStore, "auditControl"> & Partial<Pick<DaemonStore, "getControlAudit">>): void {
+    this.auditStore = auditStore;
+  }
 
-  public consumeDecisionCallback(callbackToken: string, now?: number): boolean {
+  public setDaemonSecret(secret?: Buffer): void {
+    this.daemonSecret = secret;
+  }
+
+  public setSlotSecret(slotId: string, secret?: Buffer): void {
+    if (secret) {
+      this.slotSecrets.set(slotId, secret);
+    } else {
+      this.slotSecrets.delete(slotId);
+    }
+  }
+
+  public getSlotSecret(slotId: string): Buffer | undefined {
+    return this.slotSecrets.get(slotId);
+  }
+
+  public getSlotSecretForSession(sessionId: string): Buffer | undefined {
+    const slotId = this.sessionSlots.get(sessionId);
+    return slotId ? this.slotSecrets.get(slotId) : undefined;
+  }
+
+  public auditRejectedDecision(callbackToken: string, eventId: string, userId: string, reason: string): void {
+    if (!this.auditStore || !eventId) return;
+    const record = this.lookupDecisionCallback(callbackToken);
+    const sessionId = record?.sessionId ?? "unknown";
+    const auditUserId = userId || record?.userId || "unknown";
+    this.auditStore.auditControl({
+      eventId,
+      userId: auditUserId,
+      action: "answer",
+      sessionId,
+      result: reason,
+      at: Date.now(),
+    });
+  }
+
+  public auditControl(input: {
+    eventId: string;
+    userId: string;
+    action: string;
+    sessionId: string;
+    result: string;
+    at: number;
+  }): void {
+    this.auditStore?.auditControl(input);
+  }
+
+  public setSecretResolver(resolver?: (record: DecisionCallbackRecord) => Buffer | undefined): void {
+    this.secretResolver = resolver;
+  }
+
+  public issueDecisionCallback(input: {
+    decisionId: string;
+    choiceId: string;
+    sessionId: string;
+    chatId: string;
+    userId: string;
+    slotId?: string;
+    secret?: Buffer;
+    topicId?: string;
+    questionHash?: string;
+    expiresAt?: number;
+    ttlSeconds?: number;
+    now?: number;
+  }): DecisionCallbackRecord {
+    const sec = input.secret
+      ?? (input.slotId ? this.slotSecrets.get(input.slotId) : undefined)
+      ?? this.daemonSecret;
+    if (!sec) {
+      throw new Error("Cannot issue signed decision callback: slot or daemon secret is required");
+    }
+    const now = input.now ?? Date.now() / 1000;
+    const expiresAt = input.expiresAt ?? (now + (input.ttlSeconds ?? 86400));
+    const nonce = randomBytes(9).toString("base64url");
+    const topicId = input.topicId ?? "";
+    const sig = computeTokenHmac(
+      sec,
+      input.sessionId,
+      input.chatId,
+      topicId,
+      input.userId,
+      Math.floor(expiresAt),
+      input.choiceId,
+      nonce,
+    );
+    const callbackToken = `ans:${nonce}:${sig}`;
+    const record: DecisionCallbackRecord & { slotId?: string } = {
+      callbackToken,
+      decisionId: input.decisionId,
+      choiceId: input.choiceId,
+      sessionId: input.sessionId,
+      chatId: input.chatId,
+      userId: input.userId,
+      questionHash: input.questionHash ?? "",
+      expiresAt,
+      consumedAt: null,
+      createdAt: now,
+      slotId: input.slotId,
+    };
+    if (input.slotId) {
+      this.tokenSlots.set(callbackToken, input.slotId);
+      this.sessionSlots.set(input.sessionId, input.slotId);
+    }
+    this.recordDecisionCallback(record);
+    return record;
+  }
+
+  public consumeDecisionCallback(callbackToken: string, now?: number, eventId?: string): boolean {
     this.ensureDbOpen();
+    if (eventId && this.auditStore?.getControlAudit?.(eventId)) {
+      return false;
+    }
     try {
       const nowTs = now ?? Date.now() / 1000;
       const res = this.db.run(
         "UPDATE decision_callbacks SET consumed_at = ? WHERE callback_token = ? AND consumed_at IS NULL",
         [nowTs, callbackToken],
       );
+      if (res.changes > 0 && this.auditStore) {
+        const record = this.lookupDecisionCallback(callbackToken);
+        if (record) {
+          const evId = eventId ?? `evt-ans-${record.decisionId}-${Math.floor(nowTs * 1000)}`;
+          this.auditStore.auditControl({
+            eventId: evId,
+            userId: record.userId,
+            action: "answer",
+            sessionId: record.sessionId,
+            result: "ok",
+            at: Math.floor(nowTs * 1000),
+          });
+        }
+      }
       return res.changes > 0;
     } catch {
       return false;
@@ -1206,16 +1352,124 @@ export class BotPoolCoordinator {
     chatId: string,
     expectedSessionId: string,
     decisionsPath?: string,
+    options?: {
+      secret?: Buffer;
+      secretResolver?: (record: DecisionCallbackRecord) => Buffer | undefined;
+      auditStore?: Pick<DaemonStore, "auditControl"> & Partial<Pick<DaemonStore, "getControlAudit">>;
+      eventId?: string;
+      now?: number;
+      skipAudit?: boolean;
+      topicId?: string;
+    },
   ): DecisionCallbackResolution {
+    const auditStore = options?.auditStore ?? this.auditStore;
+    const now = options?.now ?? Date.now() / 1000;
+    const nowMs = Math.floor(now * 1000);
+    const eventId = options?.eventId ?? `evt-val-${randomBytes(6).toString("hex")}`;
+    if (options?.eventId && !options?.skipAudit && auditStore?.getControlAudit?.(options.eventId)) {
+      const record = this.lookupDecisionCallback(callbackToken);
+      return {
+        decision: "reject_already_consumed",
+        record: record ?? undefined,
+        detail: `Duplicate event id '${options.eventId}' has already been processed.`,
+      };
+    }
+
+
+    const audit = (action: string, result: string, sessId: string, uId: string) => {
+      if (!options?.skipAudit && auditStore) {
+        auditStore.auditControl({
+          eventId,
+          userId: uId,
+          action,
+          sessionId: sessId,
+          result,
+          at: nowMs,
+        });
+      }
+    };
+
     const record = this.lookupDecisionCallback(callbackToken);
     if (!record) {
+      const isForgedShape = callbackToken.includes(":");
+      audit("answer", isForgedShape ? "forged" : "unknown", expectedSessionId || "unknown", String(userId));
       return {
         decision: "reject_unknown",
         detail: "Callback token not recognized or forged.",
       };
     }
 
+    const recordWithSlot = record as (DecisionCallbackRecord & { slotId?: string });
+    const slotId = recordWithSlot.slotId ?? this.tokenSlots.get(callbackToken);
+    const sec = options?.secret
+      ?? (slotId ? this.slotSecrets.get(slotId) : undefined)
+      ?? options?.secretResolver?.(record)
+      ?? this.secretResolver?.(record)
+      ?? this.daemonSecret;
+
+    const signingEnabled = Boolean(sec || this.slotSecrets.size > 0 || this.daemonSecret);
+    const isAttachCallback = record.decisionId.startsWith("attach:");
+
+    if (signingEnabled && !isAttachCallback) {
+      const isSigned = record.callbackToken.startsWith("ans:") && record.callbackToken.includes(":");
+      if (!isSigned) {
+        audit("answer", "forged", record.sessionId, String(userId));
+        return {
+          decision: "reject_unknown",
+          record,
+          detail: "Unsigned question tokens rejected when signing is enabled.",
+        };
+      }
+    }
+
+    if (!isAttachCallback && record.callbackToken.startsWith("ans:") && record.callbackToken.includes(":")) {
+      const colonIdx = record.callbackToken.lastIndexOf(":");
+      const sig = record.callbackToken.slice(colonIdx + 1);
+      const rest = record.callbackToken.slice(0, colonIdx);
+      const nonce = rest.includes(":") ? rest.slice(rest.lastIndexOf(":") + 1) : rest;
+      const topicId = options?.topicId ?? "";
+
+      const verifyWith = (secretToTry: Buffer): boolean => {
+        const checkSig = (tId: string) => {
+          const expectedSig = computeTokenHmac(
+            secretToTry,
+            record.sessionId,
+            record.chatId,
+            tId,
+            record.userId,
+            Math.floor(record.expiresAt),
+            record.choiceId,
+            nonce,
+          );
+          const sigBuf = Buffer.from(sig);
+          const expBuf = Buffer.from(expectedSig);
+          return sigBuf.length === expBuf.length && timingSafeEqual(sigBuf, expBuf);
+        };
+        return checkSig(topicId) || (topicId ? checkSig("") : false);
+      };
+
+      let valid = sec ? verifyWith(sec) : false;
+      if (!valid && !options?.secret && this.slotSecrets.size > 0) {
+        for (const slotSec of this.slotSecrets.values()) {
+          if (verifyWith(slotSec)) {
+            valid = true;
+            break;
+          }
+        }
+      }
+
+      if (signingEnabled && !valid) {
+        audit("answer", "forged", record.sessionId, String(userId));
+        return {
+          decision: "reject_unknown",
+          record,
+          detail: "Callback token signature verification failed; forged token.",
+        };
+      }
+    }
+
     if (record.userId !== String(userId) || record.chatId !== String(chatId)) {
+      audit("answer", "unauthorized", record.sessionId, String(userId));
       return {
         decision: "reject_unauthorized",
         record,
@@ -1224,6 +1478,7 @@ export class BotPoolCoordinator {
     }
 
     if (record.sessionId !== expectedSessionId) {
+      audit("answer", "reject_foreign_session", record.sessionId, String(userId));
       return {
         decision: "reject_foreign_session",
         record,
@@ -1231,8 +1486,8 @@ export class BotPoolCoordinator {
       };
     }
 
-    const now = Date.now() / 1000;
     if (now > record.expiresAt) {
+      audit("answer", "expired", record.sessionId, String(userId));
       return {
         decision: "reject_expired",
         record,
@@ -1241,6 +1496,7 @@ export class BotPoolCoordinator {
     }
 
     if (record.consumedAt !== null) {
+      audit("answer", "replay", record.sessionId, String(userId));
       return {
         decision: "reject_already_consumed",
         record,
@@ -1248,7 +1504,6 @@ export class BotPoolCoordinator {
       };
     }
 
-    // Check canonical decisions file if available
     const decFile = decisionsPath || path.join(os.homedir(), ".veyyon", "workflows", "decisions.json");
     if (fs.existsSync(decFile)) {
       try {
@@ -1256,6 +1511,7 @@ export class BotPoolCoordinator {
         const data = JSON.parse(content);
         const dec = data?.decisions?.[record.decisionId];
         if (dec && (dec.status === "answered" || dec.answer != null)) {
+          audit("answer", "already_answered", record.sessionId, String(userId));
           return {
             decision: "reject_already_answered",
             record,
