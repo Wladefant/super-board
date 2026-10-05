@@ -55,6 +55,7 @@ class Candidate:
     title: str = ""
     problem: str = ""
     solution: str = ""
+    domain_terms: List[str] = field(default_factory=list)  # GLOSSARY.md terms whose "Where" cites this file
 
     @property
     def depth_ratio(self) -> float:
@@ -238,6 +239,7 @@ def survey(repo_root: Path, since_days: int = 90, limit: int = 40, min_public: i
     """Read-only. Never edits a file in `repo_root`."""
     root = Path(repo_root).resolve()
     sha = _git(root, "rev-parse", "HEAD").strip() or "unknown"
+    glossary = glossary_terms(root)
     spots = hot_spots(root, since_days, limit)
     rejected = _rejected_adr_text(root)
     result = Survey(str(root), datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
@@ -254,6 +256,7 @@ def survey(repo_root: Path, since_days: int = 90, limit: int = 40, min_public: i
         cand = Candidate(rel, touches, interface, impl, _callers(root, rel), passthrough, public,
                          "inconclusive", "", "Speculative", _fingerprint(rel))
         _judge(cand)
+        _cite_terms(cand, glossary)
         if rel in rejected or cand.fingerprint in rejected:
             result.skipped_adr.append(rel)
             continue
@@ -263,6 +266,28 @@ def survey(repo_root: Path, since_days: int = 90, limit: int = 40, min_public: i
     order = {"Strong": 0, "Worth exploring": 1, "Speculative": 2}
     result.candidates.sort(key=lambda c: (order[c.strength], -c.touches, c.path))
     return result
+
+
+def glossary_terms(root: Path) -> Dict[str, List[str]]:
+    """GLOSSARY.md rows as {term: [cited paths]}. Empty when the repo has no glossary."""
+    path = root / "GLOSSARY.md"
+    if not path.is_file():
+        return {}
+    terms: Dict[str, List[str]] = {}
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        cells = [x.strip() for x in line.strip().strip("|").split("|")]
+        m = re.fullmatch(r"\*\*(.+?)\*\*", cells[0]) if len(cells) >= 3 else None
+        if m:
+            terms[m.group(1)] = re.findall(r"\]\(([^)#\s]+)\)", cells[-1])
+    return terms
+
+
+def _cite_terms(c: Candidate, glossary: Dict[str, List[str]]) -> None:
+    """Name the candidate in the repo's own nouns: every term whose Where column cites this file."""
+    c.domain_terms = [term for term, files in glossary.items() if c.path in files]
+    if c.domain_terms:
+        c.title += f" ({', '.join(c.domain_terms)})"
+        c.problem += f" Domain terms from GLOSSARY.md: {', '.join(c.domain_terms)}."
 
 
 def _rejected_adr_text(root: Path) -> Set[str]:
@@ -408,7 +433,7 @@ def find_template() -> Path:
 
 def render_markdown(sv: Survey, report_path: Optional[str] = None) -> str:
     rows = "\n".join(
-        f"| {c.strength} | `{c.path}` | {c.deletion_test} | {c.touches} | {c.callers} | {c.evidence} |" for c in sv.candidates)
+        f"| {c.strength} | `{c.path}`{' (' + ', '.join(c.domain_terms) + ')' if c.domain_terms else ''} | {c.deletion_test} | {c.touches} | {c.callers} | {c.evidence} |" for c in sv.candidates)
     head = (f"## Depth survey {sv.timestamp}\n\nCommit `{sv.sha[:12]}`, {sv.hot_files_scanned} hot files from the last "
             f"{sv.since_days} days, {len(sv.candidates)} candidate(s), {len(sv.skipped_adr)} skipped by ADR. "
             "Report only: no code was changed.\n\n")

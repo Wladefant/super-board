@@ -48,7 +48,8 @@ import {
   checkInputFocusInViewport,
   checkNoDocumentReload,
   checkSwipeDismissal,
-  runFlows
+  runFlows,
+  firstVisibleHandle
 } from './flow_qa_runner.mjs';
 
 // ============================================================================
@@ -767,4 +768,61 @@ test('formatReceipt binds PASS to the served sha and fails closed otherwise', as
   assert.match(noSha, /^FLOW-QA: FAIL\n/, 'a pass with no verified served sha must not print PASS');
   const zero = formatReceipt({ passed: true, served_sha: sha, assertions: { passed: 0, failed: 0 }, viewports: ['390x844'] });
   assert.match(zero, /^FLOW-QA: FAIL /, 'zero assertions is never a pass');
+});
+
+// ============================================================================
+// 10. Target lookup skips controls behind an open drawer (inert / aria-hidden)
+// ============================================================================
+
+test('firstVisibleHandle skips a laid-out input inside an inert or aria-hidden container', async () => {
+  const puppeteer = resolvePuppeteer();
+  const browser = await puppeteer.launch({
+    executablePath: resolveExecutablePath(),
+    headless: 'new',
+    args: ['--no-sandbox', '--disable-gpu']
+  });
+  try {
+    const page = await browser.newPage();
+    // The hidden-from-users inputs come FIRST in DOM order and have a layout box,
+    // like the positions panel "Quantity to sell" input behind the open trade drawer.
+    await page.setContent(`
+      <div inert><input type="number" id="behind-inert"></div>
+      <div aria-hidden="true"><input type="number" id="behind-aria"></div>
+      <input type="number" id="real">`);
+    const handle = await firstVisibleHandle(page, "input[type='number']", 1000);
+    const id = await handle.evaluate((el) => el.id);
+    assert.equal(id, 'real', 'must pick the reachable input, not the first laid-out one');
+
+    await page.setContent(`<div inert><input type="number"></div>`);
+    await assert.rejects(
+      () => firstVisibleHandle(page, "input[type='number']", 400),
+      /No visible element/,
+      'only unreachable matches must fail with a named error'
+    );
+  } finally {
+    await browser.close();
+  }
+});
+
+test('firstVisibleHandle prefers the field in an open sheet over a laid-out inline copy under the overlay', async () => {
+  const puppeteer = resolvePuppeteer();
+  const browser = await puppeteer.launch({
+    executablePath: resolveExecutablePath(),
+    headless: 'new',
+    args: ['--no-sandbox', '--disable-gpu']
+  });
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width: 390, height: 844 });
+    // Inline panel sits far down the page and comes first in DOM order; the sheet is a fixed overlay.
+    await page.setContent(`
+      <div style="height:1400px"></div>
+      <input type="number" id="inline">
+      <div style="height:600px"></div>
+      <div style="position:fixed;inset:0;background:#fff;z-index:10"><input type="number" id="sheet"></div>`);
+    const handle = await firstVisibleHandle(page, "input[type='number']", 1000);
+    assert.equal(await handle.evaluate((el) => el.id), 'sheet');
+  } finally {
+    await browser.close();
+  }
 });

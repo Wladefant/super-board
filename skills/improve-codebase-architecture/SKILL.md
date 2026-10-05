@@ -56,6 +56,8 @@ Scheduled runs (Gardener `--survey-depth`) are always `--report-only`.
 
 Read `GLOSSARY.md` and the ADRs in the area first.
 
+The scheduled `depth_survey.py` does the same: it reads `GLOSSARY.md` and adds every term whose "Where" column cites a candidate's file to the candidate title, the report row and the sub-issue.
+
 Then delegate with the Veyyon `task` tool, not a harness-specific Explore tool:
 
 1. **Scan lane** (`task`, Flash): list hot-spot modules with interface size versus implementation size, pass-through wrappers, call counts per module, and test reach. Facts only, no judgment.

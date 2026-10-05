@@ -1,0 +1,127 @@
+{
+  "schema": "flow-qa/v1",
+  "project": "polysimulator-trade-loop",
+  "version": "1.0.0",
+  "description": "Staging-only Flow QA for the /profile trade loop (issue 5852): position row Trades link, market-filtered history, row link back to the market, Show all trades, section clear of the sticky navbar. Needs a signed-in account with at least one position that has fills.",
+  "viewports": [
+    "390x844",
+    "390x420",
+    "1440x900"
+  ],
+  "themes": [
+    "light",
+    "dark"
+  ],
+  "flows": [
+    {
+      "id": "profile_trade_loop",
+      "name": "Profile trade loop",
+      "description": "Holding -> filtered fills -> market -> back, without full page reloads on in-profile navigation.",
+      "allowed_actions": [
+        "goto",
+        "tap",
+        "assert"
+      ],
+      "forbidden_actions": [
+        "eval",
+        "real_money_transaction",
+        "prod_access",
+        "delete_database"
+      ],
+      "steps": [
+        {
+          "id": "goto_profile",
+          "action": "goto",
+          "url": "/profile",
+          "checks": [
+            "visible",
+            "no_horizontal_overflow"
+          ]
+        },
+        {
+          "id": "dismiss_consent_banner",
+          "action": "tap",
+          "selector": "[aria-labelledby='consent-title'] button",
+          "optional": true
+        },
+        {
+          "id": "assert_position_trades_link_present",
+          "action": "assert",
+          "selector": "a[aria-label^='Trades in ']",
+          "expected_present": true
+        },
+        {
+          "id": "tap_trades_link_filters_history",
+          "action": "tap",
+          "selector": "a[aria-label^='Trades in ']",
+          "expected_url": "^/profile\\?tab=history&market=",
+          "no_document_reload": true,
+          "checks": [
+            "visible",
+            "tap_target_min_44",
+            "element_from_point",
+            "no_document_reload"
+          ]
+        },
+        {
+          "id": "assert_history_section_clear_of_sticky_navbar",
+          "action": "assert",
+          "selector": "#history-section",
+          "expected_present": true,
+          "checks": [
+            "clear_of_sticky_header"
+          ]
+        },
+        {
+          "id": "assert_filter_chip_present",
+          "action": "assert",
+          "selector": "#history-section a[href='/profile?tab=history']",
+          "expected_present": true
+        },
+        {
+          "id": "tap_show_all_trades_clears_filter",
+          "action": "tap",
+          "selector": "#history-section a[href='/profile?tab=history']",
+          "expected_url": "^/profile\\?tab=history$",
+          "no_document_reload": true,
+          "checks": [
+            "visible",
+            "tap_target_min_44",
+            "element_from_point",
+            "no_document_reload"
+          ]
+        },
+        {
+          "id": "assert_filter_chip_gone",
+          "action": "assert",
+          "selector": "#history-section a[href='/profile?tab=history']",
+          "expected_present": false
+        },
+        {
+          "id": "tap_trades_link_again",
+          "action": "tap",
+          "selector": "a[aria-label^='Trades in ']",
+          "expected_url": "^/profile\\?tab=history&market=",
+          "no_document_reload": true,
+          "checks": [
+            "visible",
+            "element_from_point",
+            "no_document_reload"
+          ]
+        },
+        {
+          "id": "tap_filtered_row_opens_market",
+          "action": "tap",
+          "selector": "#history-section a.block[href^='/markets/']",
+          "expected_url": "^/markets/",
+          "checks": [
+            "visible",
+            "tap_target_min_44",
+            "element_from_point"
+          ]
+        }
+      ],
+      "cleanup": []
+    }
+  ]
+}
