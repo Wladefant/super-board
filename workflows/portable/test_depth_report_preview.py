@@ -6,6 +6,7 @@ Tracking: https://github.com/Wladefant/super-board/issues/517
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -94,6 +95,31 @@ class TestHandler(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as err:
             urllib.request.urlopen(f"{self.base}/fonts/x.woff2", timeout=10)
         self.assertEqual(err.exception.code, 404)
+
+
+def port_is_free(port: int) -> bool:
+    """True when a plain socket (no SO_REUSEADDR) can bind the port: nothing holds it any more."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+class TestServeUntilStopped(unittest.TestCase):
+    def test_stopping_the_preview_releases_its_port(self):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), preview.make_handler(b"x", {"sha": "a" * 40}))
+        port = server.server_port
+        thread = threading.Thread(target=preview.serve_until_stopped, args=(server,), daemon=True)
+        thread.start()
+        self.assertFalse(port_is_free(port), "the port must be held while the preview serves")
+        server.shutdown()
+        thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(port_is_free(port), "the port must be free once the preview stops")
 
 
 if __name__ == "__main__":

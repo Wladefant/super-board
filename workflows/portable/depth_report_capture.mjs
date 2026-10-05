@@ -27,7 +27,6 @@ import {
   THEMES,
   assertNotProduction,
   checkNoHorizontalOverflow,
-  checkVersionEndpoint,
   resolveExecutablePath,
   resolvePuppeteer
 } from './flow_qa_runner.mjs';
@@ -97,13 +96,25 @@ function inspectPage() {
   return { contrast, labels, scrollWidth: document.documentElement.scrollWidth };
 }
 
-export async function capture({ baseUrl, expectedSha, outputDir }) {
+/** One read of GET /api/version, bounded by a timeout: refuses a wrong SHA or a dirty tree. */
+async function readServedVersion(baseUrl, expectedSha, timeoutMs) {
+  const res = await fetch(`${baseUrl.replace(/\/+$/, '')}/api/version`, {
+    headers: { Accept: 'application/json' },
+    signal: AbortSignal.timeout(timeoutMs)
+  }).catch((err) => { throw new Error(`Served SHA check failed: GET /api/version: ${err.message}`); });
+  if (!res.ok) throw new Error(`Served SHA check failed: GET /api/version returned HTTP ${res.status}`);
+  const served = await res.json();
+  if (String(served.sha || '').toLowerCase() !== expectedSha.toLowerCase()) {
+    throw new Error(`Served SHA check failed: got "${served.sha}", expected "${expectedSha}"`);
+  }
+  if (served.dirty) throw new Error(`The served tree at ${served.sha} has local changes; commit them first`);
+  return served;
+}
+
+export async function capture({ baseUrl, expectedSha, outputDir, versionTimeoutMs = 10000 }) {
   assertNotProduction(baseUrl);
   if (!/^[0-9a-f]{40}$/i.test(expectedSha || '')) throw new Error('--expected-sha must be a 40-hex commit');
-  const version = await checkVersionEndpoint(baseUrl, expectedSha);
-  if (!version.passed) throw new Error(`Served SHA check failed: ${version.detail}`);
-  const served = await (await fetch(`${baseUrl.replace(/\/+$/, '')}/api/version`)).json();
-  if (served.dirty) throw new Error(`The served tree at ${served.sha} has local changes; commit them first`);
+  const served = await readServedVersion(baseUrl, expectedSha, versionTimeoutMs);
   fs.mkdirSync(outputDir, { recursive: true });
 
   const origin = new URL(baseUrl).origin;
@@ -111,6 +122,8 @@ export async function capture({ baseUrl, expectedSha, outputDir }) {
   const browser = await puppeteer.launch({
     executablePath: resolveExecutablePath(),
     headless: 'new',
+    // No windowsHide here: @puppeteer/browsers spawns Chrome with only detached/env/stdio and drops it.
+    // chrome.exe is a GUI-subsystem binary, so headless Chrome opens no console window (policy §13.10).
     args: ['--no-sandbox', '--disable-gpu', '--log-level=3']
   });
   const shots = [];
