@@ -136,6 +136,7 @@ def evaluate(
         out["missing_viewports"] = missing
     if require_replay and (out["model_calls"] > 0 or out["cache_missed"] > 0):
         reasons.append("replay_not_clean")
+    out["replay_check"] = "required" if require_replay else "skipped"
 
     if not served_sha or not SHA_RE.match(served_sha):
         reasons.append("served_sha_unverified")
@@ -158,6 +159,8 @@ def render(ev: Dict[str, Any], served_sha: Optional[str]) -> str:
     lines.append(
         f"E2E-CACHE replayed={ev['cache_replayed']} missed={ev['cache_missed']} model_calls={ev['model_calls']}"
     )
+    if ev.get("replay_check") == "skipped":
+        lines.append("E2E-REPLAY-CHECK skipped (--allow-model-calls)")
     return "\n".join(lines) + "\n"
 
 

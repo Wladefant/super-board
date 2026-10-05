@@ -37,8 +37,8 @@ if (appRefusal) {
   throw new Error(`E2E_HOST_NOT_ALLOWED: ${appHost} (${appRefusal}); allowed: ${ALLOWED_HOSTS.join(', ')}`);
 }
 // Request level: every network request of a page goes through this check (e2e.request-guard.ts calls it from
-// browser.route and aborts the request). It covers images, scripts, fetch, websockets and iframes, not only the
-// document. Only http(s) and ws(s) are checked; data:, blob: and about: never leave the browser.
+// browser.route and aborts the request). It covers subresources, iframe and popup documents, not only the top
+// document (proven by fixture/tests/request-guard.e2e.ts). WebSocket traffic is not proven. Only http(s) and ws(s) are checked; data:, blob: and about: never leave the browser.
 export const requestHostRefusal = (rawUrl: string): string | null => {
   let u: URL;
   try {

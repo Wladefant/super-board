@@ -4,7 +4,7 @@ import { installRequestGuard } from '../e2e.request-guard.ts';
 
 installRequestGuard();
 
-test('request guard: a request to a host outside the allow-list is aborted, our own host passes', async ({ app, screen }) => {
+test('request guard: fetch, iframe and popup to a host outside the allow-list never leave the browser', async ({ app, screen }) => {
   await app.open('/probe.html');
-  await expect(screen.getByRole('status')).toHaveText('allowed-own,blocked-other');
+  await expect(screen.getByRole('status')).toHaveText('allowed-own,blocked-other,hits=0');
 });
