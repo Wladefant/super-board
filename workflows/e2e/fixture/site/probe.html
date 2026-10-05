@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Probe</title></head>
+<body>
+<h1>Probe</h1>
+<div role="status" id="status">pending</div>
+<script>
+// Our own host must pass. Every request to a host outside the allow-list must be aborted. 127.0.0.2 is not in the
+// allow-list and the fixture server counts what reaches it, so hits=0 proves nothing left the browser:
+// not the fetch, not the iframe document, not the popup document.
+const outside = 'http://127.0.0.2:' + location.port + '/';
+const own = fetch('/ok.txt').then(() => true, () => false);
+const other = fetch(outside + 'hit', { mode: 'no-cors' }).then(() => true, () => false);
+const frame = document.createElement('iframe');
+frame.src = outside + 'frame';
+document.body.appendChild(frame);
+window.open(outside + 'popup', '_blank');
+Promise.all([own, other, new Promise((r) => setTimeout(r, 1500))])
+  .then(([a, b]) => fetch('/api/hits', { cache: 'no-store' }).then((r) => r.text()).then((hits) => {
+    document.getElementById('status').textContent =
+      (a ? 'allowed-own' : 'own-failed') + ',' + (b ? 'leaked' : 'blocked-other') + ',hits=' + hits;
+  }));
+</script>
+</body></html>
