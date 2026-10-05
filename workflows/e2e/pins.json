@@ -1,0 +1,43 @@
+{
+  "$comment": "Single source of truth for the e2e integration (https://github.com/Wladefant/super-board/issues/473). Exact versions only. Change in a PR after reading the upstream changelog; e2e is pre-1.0 and config can break between minors.",
+  "packages": {
+    "e2e": "0.17.0",
+    "@e2e-dev/web": "0.12.0",
+    "ai": "7.0.0",
+    "zod": "4.1.8",
+    "@ai-sdk/openai-compatible": "3.0.62"
+  },
+  "node": ">=22.12",
+  "forbiddenPackages": ["@e2e-dev/kernel", "@e2e-dev/eas", "@e2e-dev/mobile"],
+  "model": {
+    "provider": "opencode-go",
+    "baseURL": "https://opencode.ai/zen/go/v1",
+    "model": "qwen3.8-flash",
+    "providerOptions": { "opencodeGo": { "enable_thinking": false } },
+    "keyEnv": "E2E_MODEL_API_KEY",
+    "authStore": "~/.veyyon/shared-auth/agent.db",
+    "authProvider": "opencode-go"
+  },
+  "env": {
+    "E2E_TELEMETRY_DISABLED": "1",
+    "DO_NOT_TRACK": "1"
+  },
+  "cacheModeDefault": "read-only",
+  "cacheModeRecord": "read-write",
+  "viewports": {
+    "390x844": { "width": 390, "height": 844 },
+    "390x420": { "width": 390, "height": 420 },
+    "1440x900": { "width": 1440, "height": 900 }
+  },
+  "requiredReceiptViewports": ["390x844", "1440x900"],
+  "forbiddenHosts": [
+    "polysimulator.com",
+    "www.polysimulator.com",
+    "app.polysimulator.com",
+    "prod.polysimulator.com"
+  ],
+  "forbiddenHostTokens": [
+    "zaraprptkegxqpvnsubu",
+    "akamai-iad-prod"
+  ]
+}

@@ -257,6 +257,48 @@ class TestGitHubPRGate(unittest.TestCase):
         self.assertEqual(good.flow_qa_receipt_verdict, "PASSED", good.flow_qa_receipt_reason)
         self.assertEqual(good.gate_verdict, "PASSED")
 
+    def test_e2e_receipt_output_is_accepted_and_failures_are_blocked_by_the_gate(self):
+        """The e2e wrapper's receipt text (workflows/e2e/e2e_receipt.py) is what the gate reads."""
+        import sys as _sys
+        from pathlib import Path as _Path
+
+        _sys.path.insert(0, str(_Path(__file__).resolve().parents[1] / "e2e"))
+        import e2e_receipt
+
+        def report(failing=0):
+            steps = [{"kind": "assertion", "status": "failed" if i < failing else "passed"} for i in range(2)]
+            targets = ("390x844", "1440x900")
+            return {
+                "schemaVersion": "report-1",
+                "run": {
+                    "status": "passed" if not failing else "failed",
+                    "errors": [],
+                    "targets": [{"id": t, "baseOrigin": "http://127.0.0.1:3000"} for t in targets],
+                    "results": [
+                        {"selected": True, "targetId": t, "status": "failed" if failing else "passed",
+                         "attempts": [{"status": "passed", "steps": steps}]}
+                        for t in targets
+                    ],
+                },
+            }
+
+        def text(rep, served):
+            ev = e2e_receipt.evaluate(rep, self.head_sha, served, ["390x844", "1440x900"])
+            return e2e_receipt.render(ev, served)
+
+        ok = evaluate_pr_gate(
+            self.staging_ui_pr(comments=[self.qa_receipt_comment(flow=False, extra=text(report(), self.head_sha))]),
+            policy=self.staging_policy(),
+        )
+        self.assertEqual(ok.flow_qa_receipt_verdict, "PASSED", ok.flow_qa_receipt_reason)
+        for label, rep, served in (("failed assertion", report(1), self.head_sha), ("stale sha", report(), "1" * 40)):
+            with self.subTest(case=label):
+                bad = evaluate_pr_gate(
+                    self.staging_ui_pr(comments=[self.qa_receipt_comment(flow=False, extra=text(rep, served))]),
+                    policy=self.staging_policy(),
+                )
+                self.assertEqual(bad.flow_qa_receipt_verdict, "REQUIRED", bad.flow_qa_receipt_reason)
+
     def staging_ui_pr(self, receipt=None, *, files=None, comments=None):
         """A review-exempt staging PR whose diff reaches the order ticket UI."""
         pr = copy.deepcopy(self.mock_pr)
