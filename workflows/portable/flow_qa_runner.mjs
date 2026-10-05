@@ -697,22 +697,141 @@ async function stampDocumentIdentity(page) {
 }
 
 /**
- * Returns the first element matching the selector that has a layout box, polling until timeoutMs.
+ * Splits a flow selector into comma-separated alternatives and lifts every top-level
+ * `:has-text('...')` out of each one. This is the only non-CSS selector form flows may use:
+ * the subject element (the last compound) must contain the text, compared case-insensitively
+ * with whitespace collapsed, like Playwright's `:has-text`. Everything else is plain CSS.
+ * Returns [{ css, texts }] where `texts` may be empty.
+ */
+export function parseSelector(selector) {
+  const parts = [];
+  let current = '';
+  let depth = 0;
+  let quote = null;
+  const flush = () => {
+    if (current.trim()) parts.push(current.trim());
+    current = '';
+  };
+  for (let i = 0; i < selector.length; i++) {
+    const ch = selector[i];
+    if (quote) {
+      if (ch === '\\') { current += ch + (selector[++i] ?? ''); continue; }
+      if (ch === quote) quote = null;
+    } else if (ch === '"' || ch === "'") quote = ch;
+    else if (ch === '(' || ch === '[') depth++;
+    else if (ch === ')' || ch === ']') depth--;
+    else if (ch === ',' && depth === 0) { flush(); continue; }
+    current += ch;
+  }
+  flush();
+  if (parts.length === 0) throw new Error(`Empty selector "${selector}"`);
+
+  const marker = ':has-text(';
+  return parts.map((part) => {
+    const texts = [];
+    const textAt = [];
+    let css = '';
+    let i = 0;
+    let level = 0;
+    let q = null;
+    while (i < part.length) {
+      const ch = part[i];
+      if (!q && level === 0 && part.startsWith(marker, i)) {
+        const open = part[i + marker.length];
+        if (open !== "'" && open !== '"') throw new Error(`:has-text needs a quoted string in "${selector}"`);
+        const start = i + marker.length + 1;
+        let end = start;
+        while (end < part.length && part[end] !== open) end += part[end] === '\\' ? 2 : 1;
+        if (part[end + 1] !== ')') throw new Error(`Unterminated :has-text in "${selector}"`);
+        texts.push(part.slice(start, end).replace(/\\(.)/g, '$1'));
+        textAt.push(css.length);
+        i = end + 2;
+        continue;
+      }
+      if (q) { if (ch === '\\') { css += ch + (part[++i] ?? ''); i++; continue; } if (ch === q) q = null; }
+      else if (ch === '"' || ch === "'") q = ch;
+      else if (ch === '(' || ch === '[') level++;
+      else if (ch === ')' || ch === ']') level--;
+      css += ch;
+      i++;
+    }
+    // :has-text filters the subject element, so nothing but the subject's own qualifiers may follow it.
+    for (const at of textAt) {
+      const after = css.slice(at).replace(/\([^)]*\)|\[[^\]]*\]/g, '');
+      if (/[\s>+~]/.test(after)) throw new Error(`:has-text must be on the last compound of "${part}"`);
+    }
+    return { css: css.trim() === '' || /[\s>+~]$/.test(css) ? `${css}*` : css, texts };
+  });
+}
+
+/**
+ * Runs in the page: every element matching any parsed alternative, in document order, once.
+ * Self-contained because Puppeteer serialises it.
+ */
+export function selectInPage(parts) {
+  const norm = (value) => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const found = new Set();
+  for (const { css, texts } of parts) {
+    for (const el of document.querySelectorAll(css)) {
+      const content = norm(el.textContent);
+      if (texts.every((t) => content.includes(norm(t)))) found.add(el);
+    }
+  }
+  return [...found].sort((a, b) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1));
+}
+
+/** Handles for every element the flow selector matches, in document order. */
+async function queryAll(page, selector) {
+  const list = await page.evaluateHandle(selectInPage, parseSelector(selector));
+  const handles = [];
+  for (const prop of (await list.getProperties()).values()) {
+    const el = prop.asElement();
+    if (el) handles.push(el);
+  }
+  await list.dispose();
+  return handles;
+}
+
+// Handles go through page.evaluate: ElementHandle.evaluate throws inside Puppeteer's call-site
+// capture under Node 24 ("Cannot read properties of undefined (reading 'toString')").
+async function isShown(page, handle) {
+  return page.evaluate((el) => {
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden' && !el.closest('[inert],[aria-hidden="true"]');
+  }, handle);
+}
+
+/**
+ * Polls until the selector matches (and, with `visible`, a match has a layout box).
+ * Returns the first visible match, else the first match; null on timeout.
  * A page can render the same control twice (mobile and desktop copies) with one hidden by CSS.
  */
-export async function firstVisibleHandle(page, selector, timeoutMs) {
+async function waitForTarget(page, selector, timeoutMs, { visible = true } = {}) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    for (const handle of await page.$$(selector)) {
-      const shown = await handle.evaluate((el) => {
-        const r = el.getBoundingClientRect();
-        return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden' && !el.closest('[inert],[aria-hidden="true"]');
-      });
-      if (shown) return handle;
+    const handles = await queryAll(page, selector);
+    for (const handle of handles) {
+      if (await isShown(page, handle)) return handle;
     }
-    if (Date.now() >= deadline) throw new Error(`No visible element for selector "${selector}"`);
+    if (!visible && handles.length > 0) return handles[0];
+    if (Date.now() >= deadline) return null;
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
+}
+
+export async function firstVisibleHandle(page, selector, timeoutMs) {
+  const handle = await waitForTarget(page, selector, timeoutMs);
+  if (!handle) throw new Error(`No visible element for selector "${selector}"`);
+  return handle;
+}
+
+/** The element a step acts on right now: first visible match, else first match, else null. */
+async function currentTarget(page, selector) {
+  const handles = await queryAll(page, selector);
+  for (const handle of handles) {
+    if (await isShown(page, handle)) return handle;
+  }
+  return handles[0] || null;
 }
 
 /**
@@ -720,14 +839,10 @@ export async function firstVisibleHandle(page, selector, timeoutMs) {
  */
 async function inspectTargetElement(page, selector, scroll = true) {
   if (!selector) return null;
-  return page.evaluate((sel, doScroll) => {
-    const all = Array.from(document.querySelectorAll(sel));
-    const el = all.find((c) => {
-      const r = c.getBoundingClientRect();
-      return r.width > 0 && r.height > 0 && getComputedStyle(c).visibility !== 'hidden' && !c.closest('[inert],[aria-hidden="true"]');
-    }) || all[0] || null;
-    if (el && doScroll) el.scrollIntoView({ block: 'center', inline: 'nearest' });
-    if (!el) return null;
+  const handle = await currentTarget(page, selector);
+  if (!handle) return null;
+  return page.evaluate((el, doScroll) => {
+    if (doScroll) el.scrollIntoView({ block: 'center', inline: 'nearest' });
 
     const rect = el.getBoundingClientRect();
     const style = window.getComputedStyle(el);
@@ -771,7 +886,7 @@ async function inspectTargetElement(page, selector, scroll = true) {
       pointElementInfo: { isTargetOrDescendant, coveringElementDescription },
       isConnected: el.isConnected
     };
-  }, selector, scroll);
+  }, handle, scroll);
 }
 
 /**
@@ -845,7 +960,7 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
   // An optional tap (for example a consent banner that only appears for new visitors) is skipped
   // with a passing note when its target never shows up.
   if (step.optional && step.action === 'tap') {
-    const shown = await page.waitForSelector(step.selector, { timeout: 2500, visible: true }).catch(() => null);
+    const shown = await waitForTarget(page, step.selector, 2500);
     if (!shown) {
       page.off('load', onNav);
       return {
@@ -878,6 +993,8 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
       await firstVisibleHandle(page, step.selector, timeoutMs);
       const target = await inspectTargetElement(page, step.selector);
       if (!target) throw new Error(`Target "${step.selector}" not found for tap`);
+      // The tap's own checks judge the control as it was when tapped: afterwards a dialog it opened
+      // covers it, which is not a defect.
       preInspection = target;
 
       const cx = target.rect.x + target.rect.width / 2;
@@ -886,7 +1003,7 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
       if (vpConfig.hasTouch && cdpSession) {
         await dispatchCdpTap(cdpSession, cx, cy);
       } else {
-        await page.mouse.click(cx, cy);
+        await (await currentTarget(page, step.selector)).click();
       }
       break;
     }
@@ -902,11 +1019,11 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
         }, step.preview_regex);
       };
       const previewBefore = await readPreview();
-      await typeTarget.evaluate((el) => {
+      await page.evaluate((el) => {
         el.scrollIntoView({ block: 'center' });
         el.focus();
         if (typeof el.select === 'function') el.select();
-      });
+      }, typeTarget);
       const textToType = step.text ?? step.value ?? '';
       await typeTarget.type(textToType, { delay: step.delay || 20 });
       if (step.preview_regex) {
@@ -953,7 +1070,7 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
       const direction = (step.direction || 'left').toLowerCase();
 
       if (step.selector) {
-        await page.waitForSelector(step.selector, { timeout: timeoutMs });
+        await waitForTarget(page, step.selector, timeoutMs, { visible: false });
         const target = await inspectTargetElement(page, step.selector);
         if (!target) throw new Error(`Target "${step.selector}" not found for swipe`);
         startX = target.rect.x + target.rect.width / 2;
@@ -992,9 +1109,9 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
     case 'assert': {
       if (step.selector) {
         if (step.expected_present !== false) {
-          await page.waitForSelector(step.selector, { timeout: 10000 }).catch(() => null);
+          await waitForTarget(page, step.selector, timeoutMs, { visible: false });
         }
-        const el = await page.$(step.selector);
+        const el = await currentTarget(page, step.selector);
         const exists = !!el;
         if (step.expected_present !== false && !exists) {
           checksResults.push({
@@ -1027,7 +1144,7 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
 
     case 'upload': {
       if (!step.selector || !step.file) throw new Error('Action "upload" requires "selector" and "file"');
-      const input = await page.$(step.selector);
+      const input = await currentTarget(page, step.selector);
       if (!input) throw new Error(`File input "${step.selector}" not found`);
       const resolvedFile = path.resolve(step.file);
       await input.uploadFile(resolvedFile);
@@ -1036,8 +1153,20 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
 
     case 'cleanup': {
       if (step.selector) {
-        const el = await page.$(step.selector);
-        if (el) await el.click();
+        // Give a control that a previous cleanup click opens (a confirm dialog) a moment to render.
+        // `repeat` clicks again while the control is still present (one row per uploaded page);
+        // `then` is the confirm control clicked after each click.
+        const rounds = step.repeat || 1;
+        for (let round = 0; round < rounds; round++) {
+          const el = await waitForTarget(page, step.selector, round === 0 ? step.timeout_ms || 1500 : 600, { visible: false });
+          if (!el) break;
+          await el.click();
+          if (step.then) {
+            const confirm = await waitForTarget(page, step.then, 3000, { visible: false });
+            if (confirm) await confirm.click();
+            await new Promise((resolve) => setTimeout(resolve, 1200));
+          }
+        }
       }
       break;
     }
@@ -1064,14 +1193,15 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
   const requestedChecks = Array.isArray(step.checks) ? step.checks : [];
 
   // Check: visible
+  const atTapTime = step.action === 'tap' ? preInspection || postInspection : postInspection || preInspection;
   if (step.selector && (requestedChecks.includes('visible') || step.action === 'tap')) {
-    const insp = postInspection || preInspection;
+    const insp = atTapTime;
     checksResults.push(checkVisible(insp?.rect, insp?.style));
   }
 
   // Check: element_from_point (covered fails)
   if (requestedChecks.includes('element_from_point') || requestedChecks.includes('covered')) {
-    const insp = postInspection || preInspection;
+    const insp = atTapTime;
     checksResults.push(checkCovered(insp?.rect, insp?.pointElementInfo));
   }
 
@@ -1296,12 +1426,31 @@ export async function runFlows(options = {}) {
 
           const steps = Array.isArray(flow.steps) ? flow.steps : [];
           for (const step of steps) {
-            const stepResult = await executeStep(page, cdpSession, step, vpKey, theme, {
-              flow,
-              baseUrl,
-              outputDir,
-              flowConstraints
-            });
+            let stepResult;
+            let stepErrored = false;
+            try {
+              stepResult = await executeStep(page, cdpSession, step, vpKey, theme, {
+                flow,
+                baseUrl,
+                outputDir,
+                flowConstraints
+              });
+            } catch (stepErr) {
+              // A flow bug or a safety refusal stops the run. A missing control or a timeout is a
+              // real UI result: record it as a failed check, skip the rest of this flow and
+              // viewport, and still run the cleanup below.
+              if (['ActionValidationError', 'MutationPrefixError', 'ProductionForbiddenError'].includes(stepErr.name)) throw stepErr;
+              stepErrored = true;
+              stepResult = {
+                flow: flow.id || 'default-flow',
+                step: step.id || 'step',
+                viewport: vpKey,
+                theme,
+                passed: false,
+                checks: [{ name: 'step_error', passed: false, detail: stepErr.message }],
+                screenshot: null
+              };
+            }
 
             allStepReports.push(stepResult);
 
@@ -1309,6 +1458,7 @@ export async function runFlows(options = {}) {
               if (chk.passed) totalAssertionsPassed++;
               else totalAssertionsFailed++;
             }
+            if (stepErrored) break;
           }
 
           // Execute cleanup steps (fail-closed obligation)

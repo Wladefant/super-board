@@ -205,6 +205,25 @@
       ],
       "owning_issue": "https://github.com/Wladefant/super-board/issues/431",
       "risk": "high"
+    },
+    "e2e": {
+      "name": "Agentic e2e tests (tester-army/e2e)",
+      "description": "Pinned e2e runner with cached replay, host allow-list with request-level abort, FLOW-QA receipt, managed e2e skill.",
+      "entry_files": [
+        "workflows/e2e/e2e_run.py",
+        "workflows/e2e/e2e_receipt.py",
+        "workflows/e2e/e2e_guard.py",
+        "workflows/e2e/e2e.config.template.ts",
+        "managed-skills/e2e/SKILL.md"
+      ],
+      "tests": [
+        "workflows/e2e/test_e2e.py"
+      ],
+      "owning_issue": "473",
+      "risk": "medium",
+      "docs": [
+        "workflows/e2e/POLICY.md"
+      ]
     }
   }
 }

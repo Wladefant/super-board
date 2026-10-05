@@ -1,0 +1,81 @@
+{
+  "schema": "flow-qa/v1",
+  "project": "superboard-week",
+  "version": "1.0.0",
+  "description": "Flow QA for the Superboard Week view against the fixture preview (bun scripts/week-preview.ts in packages/telegram-agent-harness). Covers week navigation, the detail dialog, prev/next disabled until a week is known, the error and loading states, the busy week and the calendar select with the keyboard open. Read-only: the page has no data mutations.",
+  "viewports": [
+    "390x844",
+    "390x420",
+    "1440x900"
+  ],
+  "themes": [
+    "light",
+    "dark"
+  ],
+  "flows": [
+    {
+      "id": "week_nav_and_detail",
+      "name": "Step through weeks and open a lane",
+      "description": "Loads a week, taps prev, next and This week without a reload, opens a stopped lane from the summary and closes it again.",
+      "allowed_actions": ["goto", "tap", "assert", "cleanup", "keyboard-open"],
+      "forbidden_actions": ["eval", "prod_access"],
+      "steps": [
+        { "id": "goto_week", "action": "goto", "url": "/?scenario=normal&week=2026-09-28&board=all" },
+        { "id": "wait_week_loaded", "action": "assert", "selector": "#calendar[aria-busy='false']", "expected_present": true },
+        { "id": "assert_title", "action": "assert", "selector": "#week-title", "expected_text": "28 Sept" },
+        { "id": "assert_prev_enabled", "action": "assert", "selector": "#prev:not([disabled])", "expected_present": true },
+        { "id": "assert_lanes_loaded", "action": "assert", "selector": "#stats", "expected_text": "lanes" },
+        { "id": "tap_next", "action": "tap", "selector": "#next", "no_document_reload": true, "checks": ["visible", "tap_target_min_44", "element_from_point", "no_document_reload"] },
+        { "id": "tap_prev", "action": "tap", "selector": "#prev", "no_document_reload": true, "checks": ["visible", "tap_target_min_44", "element_from_point", "no_document_reload"] },
+        { "id": "tap_this_week", "action": "tap", "selector": "#today", "no_document_reload": true, "checks": ["visible", "tap_target_min_44", "element_from_point", "no_document_reload"] },
+        { "id": "assert_nav_enabled_after_load", "action": "assert", "selector": "#next:not([disabled])", "expected_present": true },
+        { "id": "open_stopped_lane", "action": "tap", "selector": "#nocommit button", "no_document_reload": true, "checks": ["visible", "tap_target_min_44", "no_document_reload"] },
+        { "id": "assert_detail_open", "action": "assert", "selector": "#detail[open] #detail-title", "expected_present": true },
+        { "id": "assert_close_unobstructed", "action": "assert", "selector": "#detail[open] #detail-close", "checks": ["visible", "element_from_point"] },
+        { "id": "close_detail", "action": "cleanup", "selector": "#detail-close" },
+        { "id": "assert_detail_closed", "action": "assert", "selector": "#detail:not([open])", "expected_present": true },
+        { "id": "focus_calendar_select", "action": "keyboard-open", "selector": "#board", "checks": ["visible", "tap_target_min_44", "element_from_point", "input_focus_in_viewport"] }
+      ],
+      "cleanup": []
+    },
+    {
+      "id": "week_nav_disabled_until_known",
+      "name": "Prev and next wait for a known week",
+      "description": "While This week is loading, and after its load failed, prev and next are disabled; This week and Try again stay usable.",
+      "allowed_actions": ["goto", "tap", "assert"],
+      "forbidden_actions": ["eval", "prod_access"],
+      "steps": [
+        { "id": "goto_loading", "action": "goto", "url": "/?scenario=loading" },
+        { "id": "assert_loading_text", "action": "assert", "selector": "#calendar[aria-busy='true']", "expected_text": "Loading week" },
+        { "id": "assert_prev_disabled_loading", "action": "assert", "selector": "#prev[disabled]", "expected_present": true },
+        { "id": "assert_next_disabled_loading", "action": "assert", "selector": "#next[disabled]", "expected_present": true },
+        { "id": "goto_error", "action": "goto", "url": "/?scenario=error" },
+        { "id": "assert_error_notice", "action": "assert", "selector": ".notice-error", "expected_text": "Could not load this week" },
+        { "id": "assert_prev_disabled_error", "action": "assert", "selector": "#prev[disabled]", "expected_present": true },
+        { "id": "assert_next_disabled_error", "action": "assert", "selector": "#next[disabled]", "expected_present": true },
+        { "id": "tap_try_again", "action": "tap", "selector": ".notice-error button", "no_document_reload": true, "checks": ["visible", "tap_target_min_44", "element_from_point", "no_document_reload"] },
+        { "id": "assert_still_disabled", "action": "assert", "selector": "#prev[disabled]", "expected_present": true },
+        { "id": "tap_this_week_on_error", "action": "tap", "selector": "#today", "no_document_reload": true, "checks": ["visible", "tap_target_min_44", "element_from_point", "no_document_reload"] }
+      ],
+      "cleanup": []
+    },
+    {
+      "id": "week_busy_day",
+      "name": "A day with 40 lanes",
+      "description": "The busy fixture puts 40 lanes on one day. The page stays inside the viewport and the first lane opens.",
+      "allowed_actions": ["goto", "tap", "assert", "cleanup"],
+      "forbidden_actions": ["eval", "prod_access"],
+      "steps": [
+        { "id": "goto_busy", "action": "goto", "url": "/?scenario=busy&week=2026-09-28&board=all" },
+        { "id": "wait_busy_loaded", "action": "assert", "selector": "#calendar[aria-busy='false']", "expected_present": true },
+        { "id": "assert_busy_loaded", "action": "assert", "selector": "#stats", "expected_text": "57 lanes" },
+        { "id": "open_overflow_list", "action": "tap", "selector": ".grid .more", "optional": true, "no_document_reload": true, "checks": ["visible", "no_document_reload"] },
+        { "id": "close_overflow_list", "action": "cleanup", "selector": "#detail[open] #detail-close" },
+        { "id": "open_agenda_lane", "action": "tap", "selector": ".agenda .row", "optional": true, "no_document_reload": true, "checks": ["visible", "tap_target_min_44", "no_document_reload"] },
+        { "id": "close_agenda_lane", "action": "cleanup", "selector": "#detail[open] #detail-close" },
+        { "id": "assert_busy_closed", "action": "assert", "selector": "#detail:not([open])", "expected_present": true }
+      ],
+      "cleanup": []
+    }
+  ]
+}
