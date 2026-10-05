@@ -12,7 +12,9 @@ Each test builds a throwaway git repo and checks an observable behaviour:
   - `gardener.py --survey-depth` path runs end to end, dry-run, and writes the report
 """
 
+import dataclasses
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -143,6 +145,17 @@ class TestDepthSurvey(unittest.TestCase):
         self.assertNotIn("<script", page)
         self.assertEqual(page.count('class="candidate"'), page.count("Deletion test:"))
         self.assertGreater(page.count("Deletion test:"), 0)
+
+    def test_report_svg_ids_are_unique_and_every_marker_reference_resolves(self):
+        sv = depth_survey.survey(self.root)
+        self.assertTrue(sv.candidates)
+        sv.candidates.append(dataclasses.replace(sv.candidates[0], path="pkg/other_repo.py"))
+        page = depth_survey.render_report(sv, TEMPLATE)
+        ids = re.findall(r'\bid="([^"]+)"', page)
+        self.assertEqual(len(ids), len(set(ids)), "duplicate element ids break marker references")
+        refs = re.findall(r"url\(#([^)]+)\)", page)
+        self.assertTrue(refs)
+        self.assertEqual(sorted(set(refs) - set(ids)), [])
 
     def test_gardener_survey_path_writes_report_in_dry_run(self):
         outer = tempfile.TemporaryDirectory()

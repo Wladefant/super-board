@@ -37,7 +37,7 @@ Copy `report-template.html`, repeat the `<article class="candidate">` block once
 
 ## Header
 
-Repo name, date, and a compact legend: solid box = module, dashed line = seam, red arrow = leakage, thick dark box = deep module. No introduction paragraph. Straight into the candidates.
+Repo name, date, and a compact legend: solid box = module, bar on a box = its interface, dashed line = seam, red arrow = leakage, thick dark box = deep module. No introduction paragraph. Straight into the candidates.
 
 ## Candidate card
 
@@ -63,7 +63,7 @@ Pick the pattern that fits the candidate. Mix them. Don't make every diagram loo
 
 ### SVG graph (the workhorse for dependencies / call flow)
 
-Use hand-built inline SVG when the point is "X calls Y calls Z, and look at the mess." Draw modules as `<rect>` plus `<text>`, calls as `<path>` with a marker arrow, a leaking call as a red `<path>`, and a seam as a dashed `<line>` (class `seam`). The template has a before/after pair to copy. No Mermaid.
+Use hand-built inline SVG when the point is "X calls Y calls Z, and look at the mess." Draw modules as `<rect>` plus centred `<text>` (`text-anchor="middle"`), a module's interface as a filled bar on its edge (class `iface`; wide bar = shallow, narrow bar = deep), calls as `<path class="call">` with a marker arrow, a leaking call as `<path class="leak">`, and a seam as a dashed `<line>` (class `seam`). Set `marker-end` on each path and give each SVG its own marker ids (`call-<candidate-id>-before`, `leak-<candidate-id>-before`), because ids are global to the page. The template has a before/after pair to copy. No Mermaid.
 
 ### Hand-built boxes-and-arrows (for the "after" deep module)
 
