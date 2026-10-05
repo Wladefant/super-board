@@ -7,12 +7,20 @@
     "idea-intake": {
       "name": "Single-sentence Idea Intake",
       "description": "Draft, independently judge, lint and rewrite issues before explicit filing.",
-      "entry_files": ["scripts/super-board-idea.py", "scripts/super_board_runtime/idea.py"],
-      "tests": ["tests/test_idea_intake.py", "tests/test_intake_normalizer.py"],
+      "entry_files": [
+        "scripts/super-board-idea.py",
+        "scripts/super_board_runtime/idea.py"
+      ],
+      "tests": [
+        "tests/test_idea_intake.py",
+        "tests/test_intake_normalizer.py"
+      ],
       "owning_issue": "https://github.com/Wladefant/super-board/issues/2",
       "risk": "low",
       "cli_command": "python scripts/super-board-idea.py --help",
-      "docs": ["skills/super-board/references/idea.md"]
+      "docs": [
+        "skills/super-board/references/idea.md"
+      ]
     },
     "routing": {
       "name": "Model Routing & Usage Telemetry",
@@ -162,6 +170,21 @@
         "telegram_attachment",
         "TelegramPoller"
       ]
+    },
+    "telegram-session-controls": {
+      "name": "Telegram session controls",
+      "description": "Signed operator-only Stop confirmation, force-reply Steer and Follow-up, and labelled question answers with audit rows",
+      "entry_files": [
+        "packages/telegram-agent-harness/daemon/lane-panel.ts",
+        "packages/telegram-agent-harness/daemon/runtime.ts"
+      ],
+      "tests": [
+        "packages/telegram-agent-harness/tests/lane-panel.test.ts",
+        "packages/telegram-agent-harness/tests/poller-signed-controls.test.ts",
+        "packages/telegram-agent-harness/tests/question-answer-controls.test.ts"
+      ],
+      "owning_issue": "https://github.com/Wladefant/super-board/issues/431",
+      "risk": "high"
     }
   }
 }

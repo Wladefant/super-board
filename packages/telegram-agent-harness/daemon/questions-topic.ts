@@ -10,7 +10,8 @@
 import { escapeHtml } from "../extension/sanitizer";
 import { isClosed, type Question, type QuestionStore } from "../src/operator-questions";
 import type { DaemonStore } from "./store";
-
+import { getDaemonSecret } from "./lane-panel";
+import type { BotPoolCoordinator } from "../extension/coordinator";
 export type TopicOutcome = "ok" | "gone" | "error";
 
 export interface QuestionsTransport {
@@ -43,6 +44,23 @@ export interface QuestionsTopicOptions {
   log?: (message: string) => void;
   digestIntervalMs?: number;
   cardRefreshMs?: number;
+  coordinator?: BotPoolCoordinator;
+}
+
+interface InlineKeyboardButton {
+  text: string;
+  callback_data?: string;
+}
+
+interface InlineKeyboardMarkup {
+  inline_keyboard: InlineKeyboardButton[][];
+}
+
+function isInlineKeyboardMarkup(value: unknown): value is InlineKeyboardMarkup {
+  if (!value || typeof value !== "object" || !("inline_keyboard" in value)) {
+    return false;
+  }
+  return Array.isArray(value.inline_keyboard);
 }
 
 interface DigestState { at: number; seen: string[]; messageId: number | null }
@@ -128,6 +146,38 @@ export class QuestionsTopic {
     return run;
   }
 
+  /**
+   * Signs reply markup with HMAC-signed Answer tokens bound to session, chat, operator and expiry.
+   */
+  private signMarkup(question: Question, markup?: Record<string, unknown>): Record<string, unknown> | undefined {
+    if (!this.options.coordinator || !isInlineKeyboardMarkup(markup)) {
+      return markup;
+    }
+    const secret = this.options.coordinator?.getSlotSecret(this.options.slotId)
+      ?? getDaemonSecret(this.options.store, this.options.slotId);
+    const ttlSeconds = (this.options.cardRefreshMs ?? 24 * 3_600_000) / 1000;
+    const now = this.now() / 1000;
+    const signedRows = markup.inline_keyboard.map(row => row.map(btn => {
+      if (!btn.callback_data) return btn;
+      if (btn.callback_data.startsWith("ans:")) return btn;
+      const original = this.options.coordinator!.lookupDecisionCallback(btn.callback_data);
+      const choiceId = original?.choiceId ?? btn.callback_data;
+      const record = this.options.coordinator!.issueDecisionCallback({
+        decisionId: question.decision_id,
+        choiceId,
+        sessionId: question.transport.session_id,
+        chatId: this.options.chatId,
+        userId: question.transport.user_id,
+        slotId: this.options.slotId,
+        secret,
+        ttlSeconds,
+        now,
+      });
+      return { ...btn, callback_data: record.callbackToken };
+    }));
+    return { ...markup, inline_keyboard: signedRows };
+  }
+
   /** Telegram cannot list a topic, so a copy deleted by hand shows only when an edit finds it missing. */
   private async probeCopies(open: Question[]): Promise<void> {
     for (const question of open) {
@@ -135,7 +185,7 @@ export class QuestionsTopic {
       if (!messageId) continue;
       let fresh;
       try { fresh = await this.options.ledger.cardFor(question.decision_id); } catch { continue; }
-      const outcome = await this.options.transport.edit(messageId, this.copyText(fresh.question, fresh.card.text), fresh.card.reply_markup);
+      const outcome = await this.options.transport.edit(messageId, this.copyText(fresh.question, fresh.card.text), this.signMarkup(fresh.question, fresh.card.reply_markup));
       if (outcome === "gone") await this.options.ledger.cache(question.decision_id, { topic_message_id: null });
     }
   }
@@ -146,7 +196,7 @@ export class QuestionsTopic {
     if (!messageId) return this.request(0);
     try {
       const { question, card } = await this.options.ledger.cardFor(id);
-      const outcome = await this.options.transport.edit(messageId, this.copyText(question, card.text), card.reply_markup);
+      const outcome = await this.options.transport.edit(messageId, this.copyText(question, card.text), this.signMarkup(question, card.reply_markup));
       if (outcome === "gone") await this.options.ledger.cache(id, { topic_message_id: null });
       if (outcome !== "ok") this.request(0);
     } catch { this.request(0); }
@@ -190,7 +240,7 @@ export class QuestionsTopic {
     for (const stale of tail) {
       let fresh;
       try { fresh = await ledger.cardFor(stale.decision_id); } catch { continue; } // closed meanwhile
-      const sent = await transport.send(thread, this.copyText(fresh.question, fresh.card.text), fresh.card.reply_markup,
+      const sent = await transport.send(thread, this.copyText(fresh.question, fresh.card.text), this.signMarkup(fresh.question, fresh.card.reply_markup),
         { sessionId: fresh.question.transport.session_id, decisionId: fresh.question.decision_id });
       if (sent === "gone") return this.topicLost(mayRestart);
       if (sent === "error") return this.retry("could not post a question");

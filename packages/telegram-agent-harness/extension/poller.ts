@@ -23,9 +23,11 @@ import {
 } from "./outbound-media";
 import type {
   AccessConfig,
+  ActiveDeliveryContext,
   GroupAccessConfig,
   MessageCorrelationBridge,
   OutboundMessageCorrelation,
+  PanelCallbackContext,
   TelegramGetUpdatesResponse,
   TelegramSendMessageResponse,
   TelegramUpdate,
@@ -53,9 +55,20 @@ export interface PollerCallbacks {
    * second tap is told it is already stopping); `run` acts on the click from the inbound ledger.
    */
   lanePanel?: {
-    peek: (data: string) => string;
-    run: (data: string) => Promise<void>;
+    peek: (data: string, context?: PanelCallbackContext) => string;
+    run: (data: string, context?: PanelCallbackContext) => Promise<void>;
+    auditRejected?: (data: string, context?: PanelCallbackContext, reason?: string) => void | Promise<void>;
   };
+  /**
+   * Explicit audit-only callback hook for rejected interactive actions (`lp:` and `Answer` tokens).
+   * Invoked when an update is rejected by authorization, policy, origin, or thread checks.
+   * MUST NOT execute any control actions.
+   */
+  onRejectedControl?: (
+    token: string,
+    context: PanelCallbackContext,
+    reason: string,
+  ) => void | Promise<void>;
   /**
    * Reports an HTTP 409 conflict when Telegram getUpdates reports another poller
    * instance is polling with the same bot token.
@@ -71,6 +84,7 @@ export interface PollerCallbacks {
 
 /** Callback data of lane panel buttons (daemon/lane-panel.ts) starts with this. */
 export const LANE_PANEL_CALLBACK_PREFIX = "lp:";
+export const PANEL_EXPIRED_ANSWER = "⌛ Expired. Use the buttons on the current panel.";
 
 /**
  * Stamps every inbound turn with the Telegram account it came from. A Telegram account
@@ -242,6 +256,7 @@ export class TelegramPoller {
    * never a second row in flight to read a stale value.
    */
   private activeThreadId: number | undefined;
+  private activeContext?: ActiveDeliveryContext;
 
   public get running(): boolean {
     return this.isRunning;
@@ -389,6 +404,15 @@ export class TelegramPoller {
    */
   public getActiveThreadId(): number | undefined {
     return this.activeThreadId;
+  }
+  public getActiveDeliveryContext(): ActiveDeliveryContext | undefined {
+    return this.activeContext;
+  }
+  public getActiveUserId(): string | undefined {
+    return this.activeContext?.userId;
+  }
+  public getActiveReplyToMessageId(): number | undefined {
+    return this.activeContext?.replyToMessageId;
   }
   public getMessageThreadId(): number | undefined {
     return this.messageThreadId;
@@ -805,7 +829,7 @@ export class TelegramPoller {
             // can hold up the serial ledger queue. This acknowledges receipt only.
             // A lane panel click is answered with its outcome here, since a query is answered only once.
             await Promise.all(data.result.flatMap(update => update.callback_query
-              ? [this.answerCallbackQuery(update.callback_query.id, this.receiptAnswer(update.callback_query))]
+              ? [this.answerCallbackQuery(update.callback_query.id, this.receiptAnswer(update.callback_query, update.update_id))]
               : []));
           } catch (err: unknown) {
             this.callbacks.onLedgerFailure(
@@ -827,13 +851,44 @@ export class TelegramPoller {
     }
   }
 
-  /** The answer to a click at receipt. Only an allowlisted operator learns anything about a panel token. */
-  private receiptAnswer(callback: NonNullable<TelegramUpdate["callback_query"]>): string {
+  /** The answer to a click at receipt. An authorized operator learns action outcome; unauthorized taps answer rejection. */
+  private receiptAnswer(callback: NonNullable<TelegramUpdate["callback_query"]>, updateId?: number): string {
     const data = callback.data ?? "";
-    if (data.startsWith(LANE_PANEL_CALLBACK_PREFIX) && this.callbacks.lanePanel
-        && this.accessConfig.allowFrom.includes(String(callback.from.id))) {
-      return this.callbacks.lanePanel.peek(data);
+    const isBot = Boolean(callback.from.is_bot);
+    const chatId = callback.message ? String(callback.message.chat.id) : String(callback.from.id);
+    const fromId = String(callback.from.id);
+    const isDirectMessage = chatId === fromId;
+    const group = isDirectMessage ? null : this.groupAccess(chatId);
+    const isAllowed = this.accessConfig.allowFrom.includes(fromId)
+      && (isDirectMessage || (group !== null && (group.allowFrom === undefined || group.allowFrom.includes(fromId))));
+    const isDmDisabled = this.accessConfig.dmPolicy === "disabled";
+    const isWrongThread = this.messageThreadId !== undefined
+      && callback.message?.message_thread_id !== this.messageThreadId;
+
+    if (data.startsWith(LANE_PANEL_CALLBACK_PREFIX)) {
+      if (!this.callbacks.lanePanel || isBot || !isAllowed || isDmDisabled || isWrongThread) {
+        return PANEL_EXPIRED_ANSWER;
+      }
+      const topicId = callback.message?.message_thread_id && callback.message.message_thread_id > 1
+        ? String(callback.message.message_thread_id)
+        : "";
+      const context: PanelCallbackContext = {
+        userId: fromId,
+        chatId,
+        topicId,
+        eventId: typeof updateId === "number" ? `update:${updateId}` : `update:cb_${callback.id}`,
+        messageId: callback.message?.message_id,
+      };
+      return this.callbacks.lanePanel.peek(data, context);
     }
+
+    if (isBot || !isAllowed || isDmDisabled || isWrongThread) {
+      if (isDmDisabled) return "Selection rejected: Direct message policy is disabled.";
+      if (isWrongThread) return "Selection rejected: Wrong topic thread.";
+      if (isBot) return "Selection rejected: Non-operator origin.";
+      return "Selection rejected: Unauthorized account.";
+    }
+
     return "Received; checking selection.";
   }
 
@@ -986,10 +1041,17 @@ export class TelegramPoller {
     // updates that do, and neither is a topic a session can be bound to.
     this.activeThreadId =
       typeof row.message_thread_id === "number" && row.message_thread_id > 1 ? row.message_thread_id : undefined;
+    this.activeContext = {
+      userId: row.user_id,
+      chatId: row.chat_id,
+      replyToMessageId: typeof row.reply_to_message_id === "number" ? row.reply_to_message_id : undefined,
+      threadId: this.activeThreadId,
+    };
     try {
       await this.dispatchLedgerRow(row);
     } finally {
       this.activeThreadId = undefined;
+      this.activeContext = undefined;
     }
   }
 
@@ -1029,6 +1091,48 @@ export class TelegramPoller {
     );
   }
 
+  private readonly processedAuditEvents = new Set<string>();
+
+  private async auditRejectedAction(
+    callbackToken: string,
+    context: PanelCallbackContext,
+    reason: string,
+  ): Promise<void> {
+    if (context.eventId) {
+      if (this.processedAuditEvents.has(context.eventId)) {
+        return;
+      }
+      this.processedAuditEvents.add(context.eventId);
+      if (this.processedAuditEvents.size > 10_000) {
+        const first = this.processedAuditEvents.values().next().value;
+        if (first) this.processedAuditEvents.delete(first);
+      }
+    }
+
+    try {
+      if (this.callbacks.onRejectedControl) {
+        await this.callbacks.onRejectedControl(callbackToken, context, reason);
+        return;
+      }
+
+      if (callbackToken.startsWith(LANE_PANEL_CALLBACK_PREFIX)) {
+        if (this.callbacks.lanePanel?.auditRejected) {
+          await this.callbacks.lanePanel.auditRejected(callbackToken, context, reason);
+        }
+      } else if (this.correlation?.auditRejectedCallback) {
+        this.correlation.auditRejectedCallback(
+          callbackToken,
+          context.userId,
+          context.chatId,
+          context.eventId,
+          reason,
+        );
+      }
+    } catch (err: unknown) {
+      this.options.log?.(`Failed to audit rejected control (${reason}): ${String(err)}`);
+    }
+  }
+
   private async dispatchLedgerRow(row: LedgerRow): Promise<void> {
     // Mark as in-flight PROCESSING
     this.db.run("UPDATE update_ledger SET status = 'PROCESSING' WHERE update_id = ?", [row.update_id]);
@@ -1043,9 +1147,33 @@ export class TelegramPoller {
 
     const chatId = row.chat_id;
     const fromId = row.user_id;
+    const callbackToken = row.callback_data || row.text || "";
+    const isCallback = row.is_callback === 1 || Boolean(row.callback_query_id);
+    const isLanePanel = isCallback && callbackToken.startsWith(LANE_PANEL_CALLBACK_PREFIX);
+    const isControlCallback = isCallback && !callbackToken.startsWith("ap:") && callbackToken.length > 0;
+    const cbQueryId = row.callback_query_id || "";
+
+    const panelContext: PanelCallbackContext | undefined = isCallback
+      ? {
+          userId: fromId,
+          chatId,
+          topicId:
+            typeof row.message_thread_id === "number" && row.message_thread_id > 1
+              ? String(row.message_thread_id)
+              : "",
+          eventId: `update:${row.update_id}`,
+          messageId: typeof row.reply_to_message_id === "number" ? row.reply_to_message_id : undefined,
+        }
+      : undefined;
 
     // 1. dmPolicy check
     if (this.accessConfig.dmPolicy === "disabled") {
+      if (isControlCallback && panelContext) {
+        await this.auditRejectedAction(callbackToken, panelContext, "dm_policy_disabled");
+      }
+      if (cbQueryId && !isLanePanel) {
+        await this.answerCallbackQuery(cbQueryId, "Selection rejected: Direct message policy is disabled.", true);
+      }
       this.db.run(
         "UPDATE update_ledger SET status = 'REJECTED', error = 'DM_POLICY_DISABLED' WHERE update_id = ?",
         [row.update_id],
@@ -1068,6 +1196,12 @@ export class TelegramPoller {
     const isAllowed = operatorIsAllowed
       && (isDirectMessage || (group !== null && (group.allowFrom === undefined || group.allowFrom.includes(fromId))));
     if (!isAllowed) {
+      if (isControlCallback && panelContext) {
+        await this.auditRejectedAction(callbackToken, panelContext, "unauthorized");
+      }
+      if (cbQueryId && !isLanePanel) {
+        await this.answerCallbackQuery(cbQueryId, "Selection rejected: Unauthorized account.", true);
+      }
       this.db.run(
         "UPDATE update_ledger SET status = 'REJECTED', error = 'UNAUTHORIZED' WHERE update_id = ?",
         [row.update_id],
@@ -1079,10 +1213,22 @@ export class TelegramPoller {
     // Telegram authenticates an account, not the human or automation at its keyboard.
     // Bot-authored/unknown input is never admitted as an operator turn.
     if (row.sender_origin !== "telegram_account") {
+      if (isControlCallback && panelContext) {
+        await this.auditRejectedAction(callbackToken, panelContext, "non_operator_origin");
+      }
+      if (cbQueryId && !isLanePanel) {
+        await this.answerCallbackQuery(cbQueryId, "Selection rejected: Non-operator origin.", true);
+      }
       this.db.run("UPDATE update_ledger SET status = 'REJECTED', error = 'NON_OPERATOR_ORIGIN' WHERE update_id = ?", [row.update_id]);
       return;
     }
     if (this.messageThreadId !== undefined && row.message_thread_id !== this.messageThreadId) {
+      if (isControlCallback && panelContext) {
+        await this.auditRejectedAction(callbackToken, panelContext, "wrong_thread");
+      }
+      if (cbQueryId && !isLanePanel) {
+        await this.answerCallbackQuery(cbQueryId, "Selection rejected: Wrong topic thread.", true);
+      }
       this.db.run("UPDATE update_ledger SET status = 'REJECTED', error = 'WRONG_THREAD' WHERE update_id = ?", [row.update_id]);
       return;
     }
@@ -1091,7 +1237,6 @@ export class TelegramPoller {
 
     // 3. Callback query handling for interactive decision buttons
     if (row.is_callback === 1 || Boolean(row.callback_query_id)) {
-      const callbackToken = row.callback_data || row.text || "";
       const cbQueryId = row.callback_query_id || "";
       if (callbackToken.startsWith("ap:")) {
         if (cbQueryId) await this.answerCallbackQuery(cbQueryId, "Telegram tool-call approvals are obsolete. Nothing was authorized or executed.", true);
@@ -1102,7 +1247,7 @@ export class TelegramPoller {
 
       if (callbackToken.startsWith(LANE_PANEL_CALLBACK_PREFIX)) {
         // Answered at receipt; a stale token was told it expired there, and `run` ignores it.
-        await this.callbacks.lanePanel?.run(callbackToken);
+        await this.callbacks.lanePanel?.run(callbackToken, panelContext);
         this.db.run("UPDATE update_ledger SET status = 'COMPLETED' WHERE update_id = ?", [row.update_id]);
         return;
       }
@@ -1118,7 +1263,7 @@ export class TelegramPoller {
         return;
       }
 
-      const resolution = this.correlation.resolveCallback(callbackToken, fromId, chatId);
+      const resolution = this.correlation.resolveCallback(callbackToken, fromId, chatId, `update:${row.update_id}`);
       if (resolution.decision !== "deliver" || !resolution.record) {
         if (cbQueryId) {
           await this.answerCallbackQuery(cbQueryId, `Selection rejected: ${resolution.detail}`, true);
@@ -1141,7 +1286,7 @@ export class TelegramPoller {
           throw new Error("Question delivery unavailable. Reply to the original question when the channel reconnects.");
         }
         await this.callbacks.onQuestionAnswer(record.decisionId, `update:${row.update_id}`, { choice: record.choiceId });
-        if (!this.correlation.consumeCallback(callbackToken)) {
+        if (!this.correlation.consumeCallback(callbackToken, `update:${row.update_id}`)) {
           this.callbacks.onLedgerFailure(`Question callback ${row.update_id} saved but consumption was not confirmed`);
         }
         this.db.run("UPDATE update_ledger SET status = 'COMPLETED', correlated_session_id = ? WHERE update_id = ?",
@@ -1170,7 +1315,7 @@ export class TelegramPoller {
         [`Callback identity: ${record.callbackToken}`, row.reply_to_text].filter(Boolean).join("\n"));
       // At-least-once across a crash between delivery and consumption: never
       // irreversibly discard a choice before the session has accepted it.
-      if (!this.correlation.consumeCallback(callbackToken)) {
+      if (!this.correlation.consumeCallback(callbackToken, `update:${row.update_id}`)) {
         this.callbacks.onLedgerFailure(`Callback ${row.update_id} delivered but consumption was not confirmed`);
       }
 
