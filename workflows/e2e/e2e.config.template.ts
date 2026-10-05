@@ -22,7 +22,7 @@ const FORBIDDEN_EXACT_HOSTS: string[] = [
 ];
 const FORBIDDEN_HOST_TOKENS: string[] = ['zaraprptkegxqpvnsubu', 'akamai-iad-prod'];
 const ALLOWED_HOSTS: string[] = ['localhost', '127.0.0.1', ...STAGING_HOSTS].map(normHostName);
-const hostRefusal = (rawHost: string): string | null => {
+export const hostRefusal = (rawHost: string): string | null => {
   const host = normHostName(rawHost);
   if (FORBIDDEN_EXACT_HOSTS.includes(host) || FORBIDDEN_HOST_TOKENS.some((t) => host.includes(t))) {
     return 'forbidden-production-host';
@@ -36,9 +36,22 @@ const appRefusal = hostRefusal(appHost);
 if (appRefusal) {
   throw new Error(`E2E_HOST_NOT_ALLOWED: ${appHost} (${appRefusal}); allowed: ${ALLOWED_HOSTS.join(', ')}`);
 }
+// Request level: every network request of a page goes through this check (e2e.request-guard.ts calls it from
+// browser.route and aborts the request). It covers subresources, iframe and popup documents, not only the top
+// document (proven by fixture/tests/request-guard.e2e.ts). WebSocket traffic is not proven. Only http(s) and ws(s) are checked; data:, blob: and about: never leave the browser.
+export const requestHostRefusal = (rawUrl: string): string | null => {
+  let u: URL;
+  try {
+    u = new URL(rawUrl);
+  } catch {
+    return 'unparseable-url';
+  }
+  if (!['http:', 'https:', 'ws:', 'wss:'].includes(u.protocol)) return null;
+  return hostRefusal(u.hostname);
+};
 // Runs before the page's own scripts in every document and frame. A navigation or redirect that lands on a
-// host outside the allow-list is stopped and blanked, so no later step can act there. The request-level check
-// of every redirect hop from APP_URL is done by e2e_run.py before the run starts.
+// host outside the allow-list is stopped and blanked, so no later step can act there. The redirect hops from
+// APP_URL are also checked by e2e_run.py before the run starts.
 const NAV_GUARD = `(() => {
   const allowed = ${JSON.stringify(ALLOWED_HOSTS)};
   const host = location.hostname.toLowerCase().replace(/\\.+$/, '');
@@ -56,6 +69,8 @@ const go = createOpenAICompatible({
   name: 'opencode-go',
   baseURL: process.env.E2E_MODEL_BASE_URL ?? 'https://opencode.ai/zen/go/v1',
   apiKey: process.env.E2E_MODEL_API_KEY,
+  // OpenCode Go refuses requests without this header ("missing x-opencode-session").
+  headers: { 'x-opencode-session': process.env.E2E_SESSION_ID ?? 'superboard-e2e' },
 });
 const model = go.chatModel(process.env.E2E_MODEL ?? 'qwen3.8-flash');
 const providerOptions = { opencodeGo: { enable_thinking: false } };

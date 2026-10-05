@@ -91,6 +91,7 @@ Write ONE self-contained HTML file from `report-template.html`. See [HTML-REPORT
 - Each candidate card: files, problem, solution, benefits in terms of locality and leverage, before/after diagram, recommendation strength (`Strong`, `Worth exploring`, `Speculative`), deletion-test result.
 - End with a **Top recommendation**.
 - **ADR conflicts**: surface a candidate that contradicts an ADR only when the friction justifies reopening it, and mark it on the card.
+- **Template changes**: a change to `report-template.html` or to the renderer in `workflows/portable/depth_survey.py` ships with screenshots of a real report. Serve it with `python workflows/portable/depth_report_preview.py --repo-root <repo>`, then run `node workflows/portable/depth_report_capture.mjs --base-url http://127.0.0.1:4791 --expected-sha <committed head>`. The capture reads the served SHA, blocks the network, and checks overflow, text contrast and diagram labels at 1440 and 390, light and dark. Take a build slot for the browser.
 
 Do NOT propose interfaces yet. After the report is attached, stop and ask: "Which of these would you like to explore?"
 
