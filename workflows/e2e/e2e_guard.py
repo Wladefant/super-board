@@ -19,7 +19,9 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
+import urllib.error
+import urllib.request
 
 HERE = Path(__file__).resolve().parent
 PINS = json.loads((HERE / "pins.json").read_text(encoding="utf-8"))
@@ -119,15 +121,62 @@ def scan_tree(repo: Path, allow_cache: bool) -> List[str]:
     return findings
 
 
+def norm_host(url_or_host: str) -> str:
+    """Lowercase hostname without userinfo, port, brackets or trailing dots."""
+    text = url_or_host.strip()
+    parsed = urlparse(text if "://" in text else f"http://{text}")
+    return (parsed.hostname or "").lower().rstrip(".")
+
+
+def is_forbidden_host(host: str) -> bool:
+    """Production deny-list: exact hosts, plus tokens (project refs) that may sit inside a longer host."""
+    return host in PINS["forbiddenHosts"] or any(token in host for token in PINS["forbiddenHostTokens"])
+
+
 def host_allowed(url: str, allowed: Iterable[str]) -> Optional[str]:
-    """Return None when allowed, else the failing assertion id."""
-    host = (urlparse(url if "://" in url else f"http://{url}").hostname or "").lower()
-    for forbidden in PINS["forbiddenHosts"]:
-        if host == forbidden or forbidden in host:
-            return "E2E_HOST_NOT_ALLOWED:forbidden-production-host"
-    if host not in {h.lower() for h in allowed}:
+    """Return None when allowed, else the failing assertion id. Allow-list entries match the host or any subdomain."""
+    host = norm_host(url)
+    if is_forbidden_host(host):
+        return "E2E_HOST_NOT_ALLOWED:forbidden-production-host"
+    entries = [norm_host(a) for a in allowed]
+    if not host or not any(host == a or host.endswith("." + a) for a in entries):
         return "E2E_HOST_NOT_ALLOWED:not-in-allow-list"
     return None
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):  # noqa: D401
+        return None
+
+
+def open_no_redirect(url: str, timeout: float = 10.0, accept: str = "*/*"):
+    """GET without following redirects; a 3xx comes back as an HTTPError carrying the Location header."""
+    opener = urllib.request.build_opener(_NoRedirect)
+    req = urllib.request.Request(url, headers={"accept": accept})
+    return opener.open(req, timeout=timeout)
+
+
+def check_redirects(url: str, allowed: Iterable[str], timeout: float = 10.0, max_hops: int = 5) -> Optional[str]:
+    """Check the start URL and every redirect hop against the allow-list; None when all hops pass.
+    An unreachable app is not a refusal: e2e itself reports it."""
+    allowed = list(allowed)
+    current = url
+    for _ in range(max_hops + 1):
+        refusal = host_allowed(current, allowed)
+        if refusal:
+            return f"{refusal} (hop {norm_host(current)})"
+        try:
+            res = open_no_redirect(current, timeout)
+            code, location = res.status, res.headers.get("Location")
+        except urllib.error.HTTPError as exc:
+            code, location = exc.code, exc.headers.get("Location")
+        except OSError:
+            return None
+        if code in (301, 302, 303, 307, 308) and location:
+            current = urljoin(current, location)
+            continue
+        return None
+    return "E2E_HOST_NOT_ALLOWED:too-many-redirects"
 
 
 def _strip_comments(text: str) -> str:
@@ -135,25 +184,31 @@ def _strip_comments(text: str) -> str:
     return re.sub(r"(?<!:)//.*$", "", text, flags=re.M)
 
 
+def _guard_block(raw: str) -> Optional[str]:
+    m = re.search(r"// BEGIN host-guard\r?\n(.*?)// END host-guard", raw, re.S)
+    return m.group(1).replace("\r\n", "\n") if m else None
+
+
 def check_config(config_path: Path, package_json: Optional[Path]) -> List[str]:
     raw = config_path.read_text(encoding="utf-8")
     text = _strip_comments(raw)
     findings: List[str] = []
-    if "BEGIN host-guard" not in raw or "E2E_HOST_NOT_ALLOWED" not in text:
+    block = _guard_block(raw)
+    if block is None:
         findings.append("FAIL config-host-guard-missing: the host allow-list block is absent")
-    if "ALLOWED_HOSTS" not in text:
-        findings.append("FAIL config-allow-list-missing: no ALLOWED_HOSTS")
+    elif block != _guard_block((HERE / "e2e.config.template.ts").read_text(encoding="utf-8")):
+        findings.append("FAIL config-host-guard-modified: the host-guard block differs from workflows/e2e/e2e.config.template.ts")
     if "E2E_CACHE_MODE" not in text or "'read-only'" not in text:
         findings.append("FAIL config-cache-default: cache must default to 'read-only' (cached replay is the default)")
     for check_id, pat in CONFIG_FORBIDDEN:
         # Comments are stripped first, so explanatory text cannot trip a check.
         if pat.search(text):
             findings.append(f"FAIL {check_id}: {config_path.name}")
-    # A forbidden host must not appear inside the allow-list literal.
-    for m in re.finditer(r"(STAGING_HOSTS|ALLOWED_HOSTS)[^=]*=\s*\[([^\]]*)\]", text):
-        for forbidden in PINS["forbiddenHosts"]:
-            if forbidden in m.group(2):
-                findings.append(f"FAIL config-production-in-allow-list: {forbidden}")
+    # A production host must not appear inside the allow-list literal.
+    for m in re.finditer(r"(STAGING_HOSTS|ALLOWED_HOSTS)[^=\n]*=\s*\[([^\]]*)\]", text):
+        for entry in re.findall(r"['\"]([^'\"]+)['\"]", m.group(2)):
+            if is_forbidden_host(norm_host(entry)):
+                findings.append(f"FAIL config-production-in-allow-list: {entry}")
     if package_json is not None:
         findings += check_package_pins(package_json)
     return findings

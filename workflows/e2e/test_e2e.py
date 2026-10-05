@@ -5,15 +5,20 @@ Every test names the assertion id it defends (FAIL <check-id> / FLOW-QA-REASON <
 """
 from __future__ import annotations
 
+import http.server
 import io
 import json
+import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+import urllib.error
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
@@ -284,28 +289,68 @@ class ConfigTests(unittest.TestCase):
     def test_host_function(self):
         allowed = ["localhost", "127.0.0.1"]
         self.assertIsNone(e2e_guard.host_allowed("http://127.0.0.1:3000", allowed))
+        forbidden = "E2E_HOST_NOT_ALLOWED:forbidden-production-host"
+        for prod in ("https://polysimulator.com", "https://POLYSIMULATOR.COM.", "https://app.polysimulator.com:443/x",
+                     "http://localhost@polysimulator.com", "https://x.zaraprptkegxqpvnsubu.supabase.co"):
+            self.assertEqual(e2e_guard.host_allowed(prod, allowed + ["x.zaraprptkegxqpvnsubu.supabase.co"]), forbidden, prod)
+        self.assertEqual(e2e_guard.host_allowed("https://example.org", allowed), "E2E_HOST_NOT_ALLOWED:not-in-allow-list")
+        self.assertEqual(e2e_guard.host_allowed("http://127.0.0.1.nip.io", allowed), "E2E_HOST_NOT_ALLOWED:not-in-allow-list")
+
+    def test_normalization_before_matching(self):
+        allowed = ["localhost"]
+        for ok in ("http://LOCALHOST:3000", "http://user:pw@localhost:3000/a", "http://app.localhost"):
+            self.assertIsNone(e2e_guard.host_allowed(ok, allowed), ok)
+        self.assertIsNotNone(e2e_guard.host_allowed("http://evillocalhost", allowed))
+
+    def test_staging_host_under_the_product_domain_can_be_allowed(self):
+        staging = ["staging.polysimulator.com"]
+        self.assertIsNone(e2e_guard.host_allowed("https://staging.polysimulator.com", staging))
+        self.assertIsNone(e2e_guard.host_allowed("https://x.staging.polysimulator.com", staging))
         self.assertEqual(
-            e2e_guard.host_allowed("https://polysimulator.com", allowed), "E2E_HOST_NOT_ALLOWED:forbidden-production-host"
+            e2e_guard.host_allowed("https://polysimulator.com", staging), "E2E_HOST_NOT_ALLOWED:forbidden-production-host"
         )
         self.assertEqual(
-            e2e_guard.host_allowed("https://example.org", allowed), "E2E_HOST_NOT_ALLOWED:not-in-allow-list"
+            e2e_guard.host_allowed("https://app.polysimulator.com", staging), "E2E_HOST_NOT_ALLOWED:forbidden-production-host"
         )
         self.assertEqual(
-            e2e_guard.host_allowed("https://x.zaraprptkegxqpvnsubu.supabase.co", allowed + ["x.zaraprptkegxqpvnsubu.supabase.co"]),
-            "E2E_HOST_NOT_ALLOWED:forbidden-production-host",
+            e2e_guard.host_allowed("https://other.polysimulator.com", staging), "E2E_HOST_NOT_ALLOWED:not-in-allow-list"
         )
+        template = TEMPLATE.read_text(encoding="utf-8").replace(
+            "const STAGING_HOSTS: string[] = [];", "const STAGING_HOSTS: string[] = ['staging.polysimulator.com'];"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "e2e.config.ts"
+            cfg.write_text(template, encoding="utf-8")
+            self.assertEqual(e2e_guard.check_config(cfg, None), [])
+
+    def test_weakened_guard_block_is_modified(self):
+        weak = TEMPLATE.read_text(encoding="utf-8").replace(
+            "if (appRefusal) {", "if (false && appRefusal) {"
+        )
+        self.assertIn("config-host-guard-modified", self.ids(self.check(weak)))
 
 
-@unittest.skipUnless(shutil.which("node"), "node is required")
+def node_can_strip_types():
+    if not shutil.which("node"):
+        return False
+    out = subprocess.run(["node", "--version"], capture_output=True, text=True, timeout=30, creationflags=NO_WINDOW).stdout
+    return bool(re.match(r"v(2[4-9]|[3-9]\d)\.", out.strip()))
+
+
+@unittest.skipUnless(node_can_strip_types(), "node >= 24 is required to run the template block directly")
 class TemplateHostGuardRunsTests(unittest.TestCase):
     """Run the template's own host-guard block under node (type stripping), not a copy of it."""
 
-    def run_block(self, app_url):
+    def run_block(self, app_url, staging=""):
         text = TEMPLATE.read_text(encoding="utf-8")
         block = re.search(r"// BEGIN host-guard(.*?)// END host-guard", text, re.S).group(1)
         with tempfile.TemporaryDirectory() as tmp:
             script = Path(tmp) / "guard.mts"
-            script.write_text(block + "\nconsole.log('HOST_OK ' + appHost);\n", encoding="utf-8")
+            script.write_text(
+                f"const STAGING_HOSTS: string[] = [{staging}];\n" + block + "\nconsole.log('HOST_OK ' + appHost);\n"
+                "console.log('GUARD ' + NAV_GUARD.includes('E2E_HOST_NOT_ALLOWED'));\n",
+                encoding="utf-8",
+            )
             env = {"PATH": __import__("os").environ["PATH"], "SystemRoot": __import__("os").environ.get("SystemRoot", "")}
             if app_url:
                 env["APP_URL"] = app_url
@@ -317,16 +362,131 @@ class TemplateHostGuardRunsTests(unittest.TestCase):
         proc = self.run_block("http://127.0.0.1:3000")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("HOST_OK 127.0.0.1", proc.stdout)
+        self.assertIn("GUARD true", proc.stdout)
 
     def test_default_url_is_local(self):
         proc = self.run_block(None)
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
     def test_production_host_throws_E2E_HOST_NOT_ALLOWED(self):
-        for url in ("https://polysimulator.com", "https://app.polysimulator.com", "https://example.org"):
+        for url in ("https://polysimulator.com", "https://app.polysimulator.com", "https://example.org",
+                    "https://POLYSIMULATOR.COM.", "http://localhost@polysimulator.com"):
             proc = self.run_block(url)
             self.assertNotEqual(proc.returncode, 0, url)
             self.assertIn("E2E_HOST_NOT_ALLOWED", proc.stderr, url)
+
+    def test_staging_subdomain_of_the_product_domain_is_allowed_when_listed(self):
+        proc = self.run_block("https://staging.polysimulator.com:8443/x", "'staging.polysimulator.com'")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("HOST_OK staging.polysimulator.com", proc.stdout)
+        proc = self.run_block("https://app.polysimulator.com", "'staging.polysimulator.com'")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("forbidden-production-host", proc.stderr)
+
+
+class _Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):  # noqa: N802
+        routes = self.server.routes
+        status, headers, body = routes.get(self.path, (404, {}, b""))
+        self.send_response(status)
+        for key, value in headers.items():
+            self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+class RedirectTests(unittest.TestCase):
+    def setUp(self):
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.server.routes = {}
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def test_clean_page_and_same_host_redirect_pass(self):
+        self.server.routes = {"/": (302, {"Location": "/home"}, b""), "/home": (200, {}, b"ok")}
+        self.assertIsNone(e2e_guard.check_redirects(self.base + "/", ["127.0.0.1"]))
+
+    def test_redirect_to_production_is_refused(self):
+        self.server.routes = {"/": (302, {"Location": "https://polysimulator.com/login"}, b"")}
+        found = e2e_guard.check_redirects(self.base + "/", ["127.0.0.1"])
+        self.assertIn("E2E_HOST_NOT_ALLOWED:forbidden-production-host", found)
+
+    def test_redirect_to_unlisted_host_on_a_later_hop_is_refused(self):
+        self.server.routes = {
+            "/": (301, {"Location": "/a"}, b""),
+            "/a": (307, {"Location": "https://example.org/"}, b""),
+        }
+        found = e2e_guard.check_redirects(self.base + "/", ["127.0.0.1"])
+        self.assertIn("E2E_HOST_NOT_ALLOWED:not-in-allow-list", found)
+
+    def test_redirect_loop_is_refused(self):
+        self.server.routes = {"/": (302, {"Location": "/"}, b"")}
+        self.assertEqual(e2e_guard.check_redirects(self.base + "/", ["127.0.0.1"]), "E2E_HOST_NOT_ALLOWED:too-many-redirects")
+
+    def test_runner_refuses_before_starting_node(self):
+        self.server.routes = {"/": (302, {"Location": "https://polysimulator.com/"}, b"")}
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = Path(tmp) / "node_modules" / "e2e" / "dist" / "cli"
+            bin_dir.mkdir(parents=True)
+            (bin_dir / "bin.js").write_text("console.log('SHOULD_NOT_RUN');\n", encoding="utf-8")
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                rc = e2e_run.main(["--dir", tmp, "--no-slot", "--app-url", self.base + "/"])
+            self.assertEqual(rc, 2)
+            self.assertIn("forbidden-production-host", err.getvalue())
+            self.assertNotIn("SHOULD_NOT_RUN", out.getvalue())
+
+    def test_served_sha_read_does_not_follow_a_redirect(self):
+        self.server.routes = {"/api/version": (302, {"Location": "https://polysimulator.com/api/version"}, b"")}
+        with self.assertRaises(urllib.error.HTTPError):
+            e2e_receipt.fetch_served_sha(self.base)
+        self.server.routes = {"/api/version": (200, {"Content-Type": "application/json"}, json.dumps({"sha": HEAD}).encode())}
+        self.assertEqual(e2e_receipt.fetch_served_sha(self.base), HEAD)
+
+    def test_served_sha_read_refuses_a_host_outside_the_allow_list(self):
+        with self.assertRaises(ValueError):
+            e2e_receipt.fetch_served_sha("https://polysimulator.com")
+
+    def test_replay_must_be_clean_when_required(self):
+        dirty = make_report(model_calls=2)
+        ev = e2e_receipt.evaluate(dirty, HEAD, HEAD, ["390x844", "1440x900"], require_replay=True)
+        self.assertIn("replay_not_clean", ev["reasons"])
+        ev = e2e_receipt.evaluate(dirty, HEAD, HEAD, ["390x844", "1440x900"])
+        self.assertEqual(ev["reasons"], [])
+        missed = make_report(cache_mode="missed")
+        ev = e2e_receipt.evaluate(missed, HEAD, HEAD, ["390x844", "1440x900"], require_replay=True)
+        self.assertIn("replay_not_clean", ev["reasons"])
+        clean = e2e_receipt.evaluate(make_report(), HEAD, HEAD, ["390x844", "1440x900"], require_replay=True)
+        self.assertEqual(clean["reasons"], [])
+
+    def test_timeout_kills_the_whole_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = Path(tmp) / "node_modules" / "e2e" / "dist" / "cli"
+            bin_dir.mkdir(parents=True)
+            (bin_dir / "bin.js").write_text("setInterval(() => {}, 1000);\n", encoding="utf-8")
+            killed = []
+            with mock.patch.object(e2e_run, "kill_tree", side_effect=lambda pid: (killed.append(pid), os.kill(pid, signal.SIGTERM))), \
+                    mock.patch.object(e2e_run, "disable_telemetry"), redirect_stderr(io.StringIO()):
+                rc = e2e_run.main(["--dir", tmp, "--no-slot", "--timeout", "-59", "--app-url", self.base + "/"])
+            self.assertEqual(rc, 124)
+            self.assertEqual(len(killed), 1)
+
+    def test_runner_disables_telemetry_before_the_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = Path(tmp) / "node_modules" / "e2e" / "dist" / "cli"
+            bin_dir.mkdir(parents=True)
+            (bin_dir / "bin.js").write_text("require('fs').appendFileSync('calls.log', process.argv.slice(2).join(' ') + '\\n');\n", encoding="utf-8")
+            with redirect_stdout(io.StringIO()):
+                rc = e2e_run.main(["--dir", tmp, "--no-slot", "--app-url", self.base + "/"])
+            self.assertEqual(rc, 0)
+            self.assertEqual((Path(tmp) / "calls.log").read_text().split("\n")[:2], ["telemetry disable", "run"])
 
 
 class RunnerTests(unittest.TestCase):

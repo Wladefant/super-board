@@ -7,22 +7,46 @@ import type { E2EConfig } from 'e2e';
 import { web } from '@e2e-dev/web';
 import { createOpenAICompatible } from '@ai-sdk/openai-compatible';
 
+// Per repo, edit only this list. Exact hosts or parent domains (subdomains match). Never a production host.
+const STAGING_HOSTS: string[] = []; // e.g. ['staging.example.test']
+
 // BEGIN host-guard
-// Fail closed: the app host must be local or an allow-listed staging host. Production is refused by name.
-const STAGING_HOSTS: string[] = []; // e.g. ['staging.example.test']; never a production host
-const ALLOWED_HOSTS: string[] = ['localhost', '127.0.0.1', ...STAGING_HOSTS];
-const FORBIDDEN_HOSTS: string[] = [
-  'zaraprptkegxqpvnsubu',
-  'akamai-iad-prod',
+// Fail closed. Do not edit this block: `e2e_guard.py config` compares it with the template byte for byte.
+const normHostName = (h: string): string => h.toLowerCase().replace(/\.+$/, '');
+// Production deny-list: exact hosts, plus tokens (project refs) that can sit inside a longer host.
+const FORBIDDEN_EXACT_HOSTS: string[] = [
   'polysimulator.com',
+  'www.polysimulator.com',
   'app.polysimulator.com',
   'prod.polysimulator.com',
 ];
+const FORBIDDEN_HOST_TOKENS: string[] = ['zaraprptkegxqpvnsubu', 'akamai-iad-prod'];
+const ALLOWED_HOSTS: string[] = ['localhost', '127.0.0.1', ...STAGING_HOSTS].map(normHostName);
+const hostRefusal = (rawHost: string): string | null => {
+  const host = normHostName(rawHost);
+  if (FORBIDDEN_EXACT_HOSTS.includes(host) || FORBIDDEN_HOST_TOKENS.some((t) => host.includes(t))) {
+    return 'forbidden-production-host';
+  }
+  if (!ALLOWED_HOSTS.some((a) => host === a || host.endsWith('.' + a))) return 'not-in-allow-list';
+  return null;
+};
 const appUrl = process.env.APP_URL ?? 'http://127.0.0.1:3000';
-const appHost = new URL(appUrl).hostname.toLowerCase();
-if (FORBIDDEN_HOSTS.some((f) => appHost === f || appHost.includes(f)) || !ALLOWED_HOSTS.includes(appHost)) {
-  throw new Error(`E2E_HOST_NOT_ALLOWED: ${appHost} is not in the allow-list (${ALLOWED_HOSTS.join(', ')})`);
+const appHost = normHostName(new URL(appUrl).hostname);
+const appRefusal = hostRefusal(appHost);
+if (appRefusal) {
+  throw new Error(`E2E_HOST_NOT_ALLOWED: ${appHost} (${appRefusal}); allowed: ${ALLOWED_HOSTS.join(', ')}`);
 }
+// Runs before the page's own scripts in every document and frame. A navigation or redirect that lands on a
+// host outside the allow-list is stopped and blanked, so no later step can act there. The request-level check
+// of every redirect hop from APP_URL is done by e2e_run.py before the run starts.
+const NAV_GUARD = `(() => {
+  const allowed = ${JSON.stringify(ALLOWED_HOSTS)};
+  const host = location.hostname.toLowerCase().replace(/\\.+$/, '');
+  if (!host || allowed.some((a) => host === a || host.endsWith('.' + a))) return;
+  window.stop();
+  document.documentElement.innerHTML = '<title>E2E_HOST_NOT_ALLOWED</title>';
+  throw new Error('E2E_HOST_NOT_ALLOWED: ' + host);
+})();`;
 // END host-guard
 
 // Model route: OpenCode Go (OpenAI-compatible), our own API key, Flash class, thinking off.
@@ -50,9 +74,9 @@ export default {
   },
   // Target names are the viewports. e2e_receipt.py reads them for FLOW-QA-VIEWPORTS.
   targets: [
-    { name: '390x844', engine: web({ viewport: { width: 390, height: 844 } }), app },
-    { name: '390x420', engine: web({ viewport: { width: 390, height: 420 } }), app },
-    { name: '1440x900', engine: web({ viewport: { width: 1440, height: 900 } }), app },
+    { name: '390x844', engine: web({ viewport: { width: 390, height: 844 }, initScripts: [NAV_GUARD] }), app },
+    { name: '390x420', engine: web({ viewport: { width: 390, height: 420 }, initScripts: [NAV_GUARD] }), app },
+    { name: '1440x900', engine: web({ viewport: { width: 1440, height: 900 }, initScripts: [NAV_GUARD] }), app },
   ],
   workers: 1,
 } satisfies E2EConfig;

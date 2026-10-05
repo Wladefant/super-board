@@ -22,6 +22,9 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import e2e_guard  # noqa: E402
+
 HERE = Path(__file__).resolve().parent
 PINS = json.loads((HERE / "pins.json").read_text(encoding="utf-8"))
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -64,6 +67,30 @@ def mask(text: str, key: Optional[str]) -> str:
     return text.replace(key, "***") if key else text
 
 
+def preflight(app_url: str, extra_hosts: List[str]) -> Optional[str]:
+    """Refuse a start URL, or any redirect hop from it, outside the allow-list."""
+    return e2e_guard.check_redirects(app_url, ["localhost", "127.0.0.1", *extra_hosts])
+
+
+def disable_telemetry(entry: Path, project: Path, env: Dict[str, str]) -> None:
+    """`e2e telemetry disable` (writes the per-machine opt-out). A failure is logged, the env switch still holds."""
+    try:
+        subprocess.run(
+            ["node", str(entry), "telemetry", "disable"], cwd=str(project), env=env,
+            capture_output=True, text=True, timeout=30, creationflags=CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"e2e_run: telemetry disable not confirmed ({exc}); E2E_TELEMETRY_DISABLED=1 still set", file=sys.stderr)
+
+
+def kill_tree(pid: int) -> None:
+    """Kill the whole process tree (build_slot.py, its shell, node, the browser)."""
+    try:
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)], capture_output=True, timeout=30, creationflags=CREATE_NO_WINDOW)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     extra: List[str] = []
@@ -77,6 +104,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--slot-name", default="e2e-run")
     ap.add_argument("--no-slot", action="store_true", help="skip build_slot.py (tests only)")
     ap.add_argument("--app-url", help="sets APP_URL for the config's host guard")
+    ap.add_argument("--allow-host", action="append", default=[], help="extra staging host (exact or dot-suffix); repeatable")
     args = ap.parse_args(argv)
 
     project = Path(args.dir).resolve()
@@ -95,17 +123,26 @@ def main(argv: Optional[List[str]] = None) -> int:
     cmd = ["node", str(entry), "run", *extra]
     if not args.no_slot:
         cmd = [sys.executable, str(BUILD_SLOT), "run", args.slot_name, "--timeout", str(args.timeout), "--cwd", str(project), "--", *cmd]
+    pre = preflight(args.app_url or env.get("APP_URL") or "http://127.0.0.1:3000", args.allow_host)
+    if pre:
+        print(f"e2e_run: refused: {pre}", file=sys.stderr)
+        return 2
+    disable_telemetry(entry, project, env)
+    popen = subprocess.Popen(
+        cmd, cwd=str(project), env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        creationflags=CREATE_NO_WINDOW,
+    )
     try:
-        proc = subprocess.run(
-            cmd, cwd=str(project), env=env, capture_output=True, text=True,
-            timeout=args.timeout + 60, creationflags=CREATE_NO_WINDOW,
-        )
+        out, err = popen.communicate(timeout=args.timeout + 60)
     except subprocess.TimeoutExpired:
+        kill_tree(popen.pid)
+        popen.communicate()
         print(f"e2e_run: timed out after {args.timeout}s", file=sys.stderr)
         return 124
-    sys.stdout.write(mask(proc.stdout, key))
-    sys.stderr.write(mask(proc.stderr, key))
-    return proc.returncode
+    sys.stdout.write(mask(out, key))
+    sys.stderr.write(mask(err, key))
+    return popen.returncode
+
 
 
 if __name__ == "__main__":

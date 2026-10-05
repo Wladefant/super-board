@@ -31,10 +31,13 @@
   },
   "requiredReceiptViewports": ["390x844", "1440x900"],
   "forbiddenHosts": [
-    "zaraprptkegxqpvnsubu",
-    "akamai-iad-prod",
     "polysimulator.com",
+    "www.polysimulator.com",
     "app.polysimulator.com",
     "prod.polysimulator.com"
+  ],
+  "forbiddenHostTokens": [
+    "zaraprptkegxqpvnsubu",
+    "akamai-iad-prod"
   ]
 }
