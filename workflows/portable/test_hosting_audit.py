@@ -139,9 +139,6 @@ class Drift(unittest.TestCase):
         f = h.find_drift([man()], [dk()], {}, [{"host": "cloudflare-r2", "name": "stray-bucket"}])
         self.assertEqual(rules(f), [h.R_CF_UNMANIFESTED])
 
-    def test_unreachable_sources_produce_no_false_drift(self):
-        self.assertEqual(h.find_drift([man()], None, {}, None), [])
-
     def test_missing_and_invalid_manifests(self):
         f = h.find_drift([man()], [dk()], {}, None, missing_repos=["Wladefant/x"], invalid=["github:Wladefant/y: stage must be one of"])
         self.assertEqual(rules(f), [h.R_INVALID, h.R_MISSING])
@@ -165,13 +162,13 @@ class Sources(unittest.TestCase):
 
     def test_cloudflare_inventory_reads_four_resource_kinds(self):
         data = {
-            "/accounts": {"result": [{"id": "acc"}]},
-            "/accounts/acc/pages/projects": {"result": [{"name": "site"}]},
-            "/accounts/acc/workers/scripts": {"result": [{"id": "worker1"}]},
-            "/accounts/acc/r2/buckets": {"result": {"buckets": [{"name": "bkt"}]}},
-            "/accounts/acc/d1/database": {"result": [{"name": "db1"}]},
+            "/accounts": {"success": True, "result": [{"id": "acc"}]},
+            "/accounts/acc/pages/projects": {"success": True, "result": [{"name": "site"}]},
+            "/accounts/acc/workers/scripts": {"success": True, "result": [{"id": "worker1"}]},
+            "/accounts/acc/r2/buckets": {"success": True, "result": {"buckets": [{"name": "bkt"}]}},
+            "/accounts/acc/d1/database": {"success": True, "result": [{"name": "db1"}]},
         }
-        inv = h.cloudflare_inventory("t", fetch=lambda p: data[p])
+        inv = h.cloudflare_inventory("t", fetch=lambda p: data[p.split("?")[0]])
         self.assertEqual(sorted((r["host"], r["name"]) for r in inv), [
             ("cloudflare-d1", "db1"), ("cloudflare-pages", "site"), ("cloudflare-r2", "bkt"), ("cloudflare-workers", "worker1")])
 
@@ -202,6 +199,124 @@ class IssueEdit(unittest.TestCase):
         text = h.render_block([man(step="Move DB.", comps=[comp(cost=None)])], [], {}, [], "now")
         self.assertIn("1 component(s) with no cost yet", text)
         self.assertIn("Move DB.", text)
+
+
+class FailClosed(unittest.TestCase):
+    """A source that cannot be read must stop the audit loudly, never read as 'no drift'."""
+
+    def cf(self, data):
+        return lambda path: data[path.split("?")[0]] if "?" not in path or path.split("?")[0] in data else data[path]
+
+    def test_cloudflare_error_body_is_a_failure(self):
+        bad = {"/accounts": {"success": False, "errors": [{"code": 9109, "message": "invalid token"}], "result": None}}
+        with self.assertRaises(h.SourceError):
+            h.cloudflare_inventory("t", fetch=lambda p: bad[p.split("?")[0]])
+
+    def test_cloudflare_zero_accounts_is_a_failure(self):
+        empty = {"/accounts": {"success": True, "result": [], "result_info": {"page": 1, "total_pages": 1}}}
+        with self.assertRaises(h.SourceError):
+            h.cloudflare_inventory("t", fetch=lambda p: empty[p.split("?")[0]])
+
+    def test_cloudflare_resource_error_is_a_failure(self):
+        def fetch(p):
+            if p.startswith("/accounts?") or p == "/accounts":
+                return {"success": True, "result": [{"id": "acc"}], "result_info": {"page": 1, "total_pages": 1}}
+            return {"success": False, "errors": [{"message": "forbidden"}], "result": None}
+        with self.assertRaises(h.SourceError):
+            h.cloudflare_inventory("t", fetch=fetch)
+
+    def test_cloudflare_pagination_reads_every_page(self):
+        def fetch(p):
+            path, _, query = p.partition("?")
+            if path == "/accounts":
+                return {"success": True, "result": [{"id": "acc"}], "result_info": {"page": 1, "total_pages": 1}}
+            if path.endswith("/pages/projects"):
+                page = int(dict(q.split("=") for q in query.split("&")).get("page", "1"))
+                return {"success": True, "result": [{"name": f"site{page}"}], "result_info": {"page": page, "total_pages": 2}}
+            return {"success": True, "result": [], "result_info": {"page": 1, "total_pages": 1}}
+        inv = h.cloudflare_inventory("t", fetch=fetch)
+        self.assertEqual(sorted(r["name"] for r in inv), ["site1", "site2"])
+
+    def test_dokploy_domain_lookup_failure_is_a_failure(self):
+        def fetch(proc, params=None):
+            if proc == "project.all":
+                return [{"name": "P", "environments": [{"name": "production", "applications": [
+                    {"applicationId": "A", "name": "app", "applicationStatus": "done"}], "compose": []}]}]
+            raise h.urllib.error.URLError("boom")
+        with self.assertRaises(h.SourceError):
+            h.dokploy_inventory("k", fetch=fetch)
+
+    def test_dokploy_unauthorized_is_a_failure(self):
+        def fetch(proc, params=None):
+            raise h.urllib.error.HTTPError("u", 401, "Unauthorized", {}, None)
+        with self.assertRaises(h.SourceError):
+            h.dokploy_inventory("k", fetch=fetch)
+
+    def _run(self, key, token_text, extra=None):
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        tmp = Path(tempfile.mkdtemp())
+        tok = tmp / "cf.txt"
+        if token_text is not None:
+            tok.write_text(token_text, encoding="utf-8")
+        posted = {}
+        patches = [
+            mock.patch.object(h, "STATE_DIR", tmp),
+            mock.patch.object(h, "CF_TOKEN_FILE", tok),
+            mock.patch.object(h, "github_repo_names", lambda: ["Wladefant/super-board"]),
+            mock.patch.object(h, "github_manifests", lambda names: ([], ["Wladefant/super-board"] + list(h.TRACKED_REPOS))),
+            mock.patch.object(h, "local_manifests", lambda: []),
+            mock.patch.object(h, "load_dokploy_key", lambda: key),
+            mock.patch.object(h, "dokploy_inventory", (extra or {}).get("dokploy", lambda k: [])),
+            mock.patch.object(h, "cloudflare_inventory", (extra or {}).get("cf", lambda t: [])),
+            mock.patch.object(h, "probe_urls", lambda urls: {}),
+            mock.patch.object(h, "find_tracking_issue", lambda n=None: {"number": 1, "url": "u", "body": ""}),
+            mock.patch.object(h, "edit_issue_body", lambda n, b: posted.update(body=b)),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            rc = h.run(True, None)
+        finally:
+            for p in patches:
+                p.stop()
+        return rc, posted.get("body", "")
+
+    def test_missing_dokploy_key_and_cloudflare_token_exit_nonzero_and_say_unchecked(self):
+        rc, body = self._run(None, None)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("UNCHECKED", body)
+        self.assertIn("Dokploy", body)
+        self.assertIn("Cloudflare", body)
+        self.assertNotIn("No drift found.", body)
+
+    def test_failing_dokploy_source_exits_nonzero(self):
+        def boom(k):
+            raise h.SourceError("Dokploy rejected the key (401)")
+        rc, body = self._run("key", "token", {"dokploy": boom})
+        self.assertNotEqual(rc, 0)
+        self.assertIn("UNCHECKED", body)
+
+    def test_all_sources_readable_and_clean_exits_zero(self):
+        rc, body = self._run("key", "token")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("UNCHECKED", body)
+
+    def test_unchecked_block_never_claims_no_drift(self):
+        text = h.render_block([man()], [], {}, [], "now", unchecked=["Dokploy: key missing"])
+        self.assertIn("UNCHECKED", text)
+        self.assertNotIn("No drift found.", text)
+
+    def test_uncaught_error_is_logged_and_nonzero(self):
+        import tempfile
+        from pathlib import Path
+        from unittest import mock
+        tmp = Path(tempfile.mkdtemp())
+        with mock.patch.object(h, "STATE_DIR", tmp), mock.patch.object(h, "run", side_effect=KeyError("kaboom")):
+            rc = h.main(["--live"])
+        self.assertEqual(rc, 3)
+        self.assertIn("kaboom", (tmp / "audit.log").read_text(encoding="utf-8"))
 
 
 class HiddenTask(unittest.TestCase):

@@ -31,7 +31,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+import traceback
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+
+class SourceError(RuntimeError):
+    """A source (Dokploy, Cloudflare) could not be read in full. The audit marks it UNCHECKED."""
 
 SCHEMA_VERSION = 1
 HOSTS = (
@@ -279,7 +284,9 @@ def github_manifests(names: List[str], batch: int = 40) -> Tuple[List[Tuple[str,
                 f'{{ nameWithOwner object(expression:{json.dumps(ref + ":hosting.json")}) {{ ... on Blob {{ text }} }} }}'
             )
         data = json.loads(_gh(["api", "graphql", "-f", "query={" + " ".join(parts) + "}"]))
-        for node in (data.get("data") or {}).values():
+        if not isinstance(data.get("data"), dict):
+            raise RuntimeError("GraphQL returned no data")
+        for node in data["data"].values():
             if not node:
                 continue
             readable.append(node["nameWithOwner"])
@@ -315,11 +322,24 @@ def dokploy_inventory(key: str, base: str = DOKPLOY_BASE, fetch=None) -> List[Di
     """Applications and compose stacks from project.all, with the live host names. Read-only GETs.
 
     Only id, name, status and domain host names are kept: Dokploy responses also carry env secrets.
+    Any failed request (401, network, bad body) raises SourceError: a partial inventory is never returned.
     """
-    get = fetch or (lambda proc, params=None: _http_json(
+    raw = fetch or (lambda proc, params=None: _http_json(
         f"{base}/{proc}" + ("?" + urllib.parse.urlencode(params) if params else ""), {"x-api-key": key}))
+
+    def get(proc: str, params: Optional[Dict[str, str]] = None) -> Any:
+        try:
+            return raw(proc, params)
+        except urllib.error.HTTPError as exc:
+            raise SourceError(f"{proc} answered HTTP {exc.code}") from None
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            raise SourceError(f"{proc} failed: {exc.__class__.__name__}") from None
+
+    projects = get("project.all")
+    if not isinstance(projects, list):
+        raise SourceError("project.all did not return a list")
     items: List[Dict[str, Any]] = []
-    for p in get("project.all"):
+    for p in projects:
         for env in p.get("environments") or []:
             for kind, field, id_key, status_key in (
                 ("application", "applications", "applicationId", "applicationStatus"),
@@ -335,11 +355,37 @@ def dokploy_inventory(key: str, base: str = DOKPLOY_BASE, fetch=None) -> List[Di
             continue
         proc, pkey = (("domain.byApplicationId", "applicationId") if it["kind"] == "application"
                       else ("domain.byComposeId", "composeId"))
-        try:
-            it["hosts"] = [d["host"] for d in get(proc, {pkey: it["id"]}) if d.get("host")]
-        except (urllib.error.URLError, OSError, ValueError):
-            it["hosts"] = []
+        domains = get(proc, {pkey: it["id"]})
+        if not isinstance(domains, list):
+            raise SourceError(f"{proc} did not return a list")
+        it["hosts"] = [d["host"] for d in domains if d.get("host")]
     return items
+
+
+def _cf_pages(get, path: str) -> List[Any]:
+    """Every item of a Cloudflare list endpoint. An error body is a failure, not an empty list."""
+    items: List[Any] = []
+    page, cursor = 1, None
+    for _ in range(200):
+        q = f"per_page=50&page={page}" + (f"&cursor={urllib.parse.quote(cursor)}" if cursor else "")
+        body = get(f"{path}?{q}")
+        if not isinstance(body, dict) or body.get("success") is not True:
+            errs = body.get("errors") if isinstance(body, dict) else None
+            msg = "; ".join(str(e.get("message", e)) for e in (errs or [])[:3]) or "no success flag"
+            raise SourceError(f"{path} failed: {msg}")
+        res = body.get("result") or []
+        if isinstance(res, dict):  # r2 wraps the list in {"buckets": [...]}
+            res = res.get("buckets") or []
+        items += res
+        info = body.get("result_info") or {}
+        if info.get("cursor"):
+            cursor = info["cursor"]
+            continue
+        if page < int(info.get("total_pages") or 1):
+            page += 1
+            continue
+        return items
+    raise SourceError(f"{path}: pagination did not end")
 
 
 def cloudflare_inventory(token: str, fetch=None) -> List[Dict[str, str]]:
@@ -347,7 +393,10 @@ def cloudflare_inventory(token: str, fetch=None) -> List[Dict[str, str]]:
     api = "https://api.cloudflare.com/client/v4"
     get = fetch or (lambda path: _http_json(api + path, {"Authorization": f"Bearer {token}"}))
     out: List[Dict[str, str]] = []
-    for acct in get("/accounts").get("result") or []:
+    accounts = _cf_pages(get, "/accounts")
+    if not accounts:
+        raise SourceError("the token sees no Cloudflare account")
+    for acct in accounts:
         a = acct["id"]
         for host, path, pick in (
             ("cloudflare-pages", f"/accounts/{a}/pages/projects", lambda x: x.get("name")),
@@ -355,10 +404,7 @@ def cloudflare_inventory(token: str, fetch=None) -> List[Dict[str, str]]:
             ("cloudflare-r2", f"/accounts/{a}/r2/buckets", lambda x: x.get("name")),
             ("cloudflare-d1", f"/accounts/{a}/d1/database", lambda x: x.get("name")),
         ):
-            res = get(path).get("result") or []
-            if isinstance(res, dict):  # r2 wraps the list in {"buckets": [...]}
-                res = res.get("buckets") or []
-            out += [{"host": host, "name": pick(x)} for x in res if pick(x)]
+            out += [{"host": host, "name": pick(x)} for x in _cf_pages(get, path) if pick(x)]
     return out
 
 
@@ -412,8 +458,9 @@ def md_table(head: List[str], rows: List[List[str]]) -> str:
 
 def render_block(
     manifests: List[Dict[str, Any]], findings: List[Dict[str, str]], url_status: Dict[str, Optional[int]],
-    notes: List[str], now_iso: str,
+    notes: List[str], now_iso: str, unchecked: Optional[List[str]] = None,
 ) -> str:
+    unchecked = unchecked or []
     total = sum(c.get("monthly_cost_usd") or 0 for m in manifests for c in m["components"])
     unknown = sum(1 for m in manifests for c in m["components"] if c.get("monthly_cost_usd") is None)
     steps = [[m["project"], m["stage"], m["dns"]["provider"], m.get("next_migration_step") or "-"]
@@ -424,18 +471,23 @@ def render_block(
         "",
         f"{len(manifests)} manifest(s). Known monthly cost: {total:.2f} USD ({unknown} component(s) with no cost yet).",
         "",
-        "### Drift",
-        "",
     ]
+    if unchecked:
+        out += ["### UNCHECKED", "", "The audit could not read these sources. Treat the drift list as incomplete.", ""]
+        out += [f"- UNCHECKED {u}" for u in unchecked]
+        out.append("")
+    out += ["### Drift", ""]
     if findings:
         out.append(md_table(["Rule", "Project", "Subject", "Detail"],
                             [[f["rule"], f["project"], f["subject"], f["detail"]] for f in findings]))
+    elif unchecked:
+        out.append("No drift in the sources that were read. The drift check is incomplete.")
     else:
         out.append("No drift found.")
     out += ["", "### Components", "", md_table(["Project", "Component", "Host", "URL", "Status", "USD/mo"], component_rows(manifests, url_status)),
             "", "### Next migration step", "", md_table(["Project", "Stage", "DNS", "Next step"], steps)]
     if notes:
-        out += ["", "### Not checked", ""] + [f"- {n}" for n in notes]
+        out += ["", "### Notes", ""] + [f"- {n}" for n in notes]
     out.append(BLOCK_END)
     return "\n".join(out)
 
@@ -502,7 +554,9 @@ def log(msg: str) -> None:
 
 
 def collect(args: argparse.Namespace):
+    """Gather everything. A source that cannot be read goes into `unchecked`, never into 'no drift'."""
     notes: List[str] = []
+    unchecked: List[str] = []
     texts: Dict[str, Tuple[str, str]] = {}
     readable: List[str] = []
     try:
@@ -511,7 +565,7 @@ def collect(args: argparse.Namespace):
         for src, text in found:
             texts[src] = (src, text)
     except (RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
-        notes.append(f"GitHub manifests unreadable: {exc}")
+        unchecked.append(f"GitHub manifests: {exc}")
     for src, text in local_manifests():
         texts[src] = (src, text)
 
@@ -530,17 +584,19 @@ def collect(args: argparse.Namespace):
     missing = [r for r in TRACKED_REPOS if r in readable and r not in from_repos]
     unread = [r for r in TRACKED_REPOS if r not in readable]
     if unread and readable:
-        notes.append("repos not readable with the current gh login: " + ", ".join(unread))
+        unchecked.append("tracked repos not readable with the current gh login: " + ", ".join(unread))
 
     dokploy = None
     key = load_dokploy_key()
     if not key:
-        notes.append("Dokploy skipped: DOKPLOY_API_KEY not found")
+        unchecked.append("Dokploy: DOKPLOY_API_KEY not found")
     else:
         try:
             dokploy = dokploy_inventory(key)
-        except (urllib.error.URLError, OSError, ValueError) as exc:
-            notes.append(f"Dokploy unreachable: {exc.__class__.__name__}")
+        except SourceError as exc:
+            unchecked.append(f"Dokploy: {exc}")
+        except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as exc:
+            unchecked.append(f"Dokploy: {exc.__class__.__name__}")
 
     cloudflare = None
     try:
@@ -548,38 +604,44 @@ def collect(args: argparse.Namespace):
     except OSError:
         token = ""
     if not token:
-        notes.append("Cloudflare skipped: token file shared-auth/cloudflare_api_token.txt is not there yet")
+        unchecked.append("Cloudflare: token file shared-auth/cloudflare_api_token.txt is not there yet")
     else:
         try:
             cloudflare = cloudflare_inventory(token)
-        except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
-            notes.append(f"Cloudflare unreachable: {exc.__class__.__name__}")
+        except SourceError as exc:
+            unchecked.append(f"Cloudflare: {exc}")
+        except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as exc:
+            unchecked.append(f"Cloudflare: {exc.__class__.__name__}")
 
     urls = [c["url"] for m in manifests for c in m["components"] if c.get("url")]
     url_status = probe_urls(urls)
-    return manifests, dokploy, url_status, cloudflare, missing, invalid, notes
+    return manifests, dokploy, url_status, cloudflare, missing, invalid, notes, unchecked
 
 
 def run(live: bool, issue: Optional[int]) -> int:
-    manifests, dokploy, url_status, cloudflare, missing, invalid, notes = collect(argparse.Namespace())
+    """Exit 0 clean, 1 tracking issue not edited, 2 some source was UNCHECKED, 3 uncaught error (see main)."""
+    manifests, dokploy, url_status, cloudflare, missing, invalid, notes, unchecked = collect(argparse.Namespace())
     findings = find_drift(manifests, dokploy, url_status, cloudflare, missing, invalid)
     now_iso = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    block = render_block(manifests, findings, url_status, notes, now_iso)
+    block = render_block(manifests, findings, url_status, notes, now_iso, unchecked)
     if sys.stdout is not None:
         print(block)
-    log(f"audit manifests={len(manifests)} findings={len(findings)} notes={len(notes)} live={live}")
+    log(f"audit manifests={len(manifests)} findings={len(findings)} unchecked={len(unchecked)} live={live}")
+    for u in unchecked:
+        log(f"UNCHECKED: {u}")
+    done = 2 if unchecked else 0
     if not live:
         log("dry run: tracking issue not edited")
-        return 0
+        return done
     try:
         tracking = find_tracking_issue(issue)
         new_body = plan_issue_edit(tracking.get("body") or "", block)
         if new_body is None:
             log(f"tracking issue {tracking['url']} already current: no edit")
-            return 0
+            return done
         edit_issue_body(tracking["number"], new_body)
         log(f"tracking issue {tracking['url']} edited")
-        return 0
+        return done
     except (RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
         log(f"tracking issue not edited: {exc}")
         return 1
@@ -591,17 +653,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--issue", type=int, help="tracking issue number (default: find by title)")
     ap.add_argument("--check", nargs="+", metavar="FILE", help="validate hosting.json file(s) against the schema and exit")
     args = ap.parse_args(argv)
-    if args.check:
-        bad = 0
-        for f in args.check:
-            _, errs = parse_manifest(Path(f).read_text(encoding="utf-8"), f)
-            for e in errs:
-                print(e)
-            bad += bool(errs)
-            if not errs:
-                print(f"{f}: ok")
-        return 1 if bad else 0
-    return run(args.live, args.issue)
+    try:
+        if args.check:
+            bad = 0
+            for f in args.check:
+                _, errs = parse_manifest(Path(f).read_text(encoding="utf-8"), f)
+                for e in errs:
+                    print(e)
+                bad += bool(errs)
+                if not errs:
+                    print(f"{f}: ok")
+            return 1 if bad else 0
+        return run(args.live, args.issue)
+    except Exception:  # pythonw has no console: the log file is the only place this can be seen
+        log("uncaught error:\n" + traceback.format_exc())
+        return 3
 
 
 if __name__ == "__main__":
