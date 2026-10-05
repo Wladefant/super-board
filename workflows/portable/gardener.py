@@ -1938,8 +1938,7 @@ def install_depth_survey_task(
     cmd = ["schtasks", "/create", "/tn", name, "/tr", _hidden_tr(cmd_file.resolve()),
            "/sc", "daily", "/mo", str(every_days), "/st", "04:30", "/f"]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60,
-                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return {name: {"status": "created", "output": proc.stdout.strip(), "cmd_file": str(cmd_file)}}
     except subprocess.CalledProcessError as e:
         return {name: {"status": "error", "error": e.stderr.strip() or str(e)}}

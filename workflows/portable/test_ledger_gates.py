@@ -223,6 +223,7 @@ os._exit(42)
             [sys.executable, "-B", crash_script],
             capture_output=True,
             timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.assertEqual(
             proc.returncode,
@@ -322,7 +323,7 @@ sys.exit(0)
         updates_per_proc = 5
         procs = []
         for p_idx in range(num_procs):
-            p = subprocess.Popen([sys.executable, "-B", proc_script, str(p_idx), str(updates_per_proc)])
+            p = subprocess.Popen([sys.executable, "-B", proc_script, str(p_idx), str(updates_per_proc)], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             procs.append(p)
 
         for p in procs:

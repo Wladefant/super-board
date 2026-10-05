@@ -402,6 +402,7 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 timeout=120,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             self.assertEqual(proc.returncode, 0, f"probe failed: {proc.stderr}")
             return json.loads(proc.stdout.strip().splitlines()[-1])
@@ -557,7 +558,7 @@ class TestSuperboardExecutionAdapter(unittest.TestCase):
         # Installed workflows need not live below a git repository.
         probe_repo = os.path.join(self.test_dir, "probe-repository")
         os.makedirs(probe_repo)
-        subprocess.run(["git", "init", probe_repo], check=True, capture_output=True)
+        subprocess.run(["git", "init", probe_repo], check=True, capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         adapter = SuperboardExecutionAdapter(
             state_dir=self.state_dir,
             fake_executor=False,

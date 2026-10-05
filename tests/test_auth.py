@@ -343,6 +343,7 @@ class AuthCliTests(unittest.TestCase):
                     TOKEN_ENV_VAR: FINE_GRAINED,
                     LOGIN_ENV_VAR: "superboard-machine",
                 },
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         self.assertEqual(result.returncode, 69, result.stderr)
         self.assertNotIn(FINE_GRAINED, result.stdout + result.stderr)
@@ -356,6 +357,7 @@ class AuthCliTests(unittest.TestCase):
                 [sys.executable, "-B", str(_AUTH_CLI), "preflight", "--config", str(path), "--mode", "app"],
                 capture_output=True,
                 text=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         self.assertEqual(result.returncode, 64)
         self.assertEqual(result.stdout.strip(), "")

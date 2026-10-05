@@ -8,7 +8,7 @@ from review_content import evaluate, git, content_identity, json_pages, target_s
 def wide_context_patch_id(base, sha, cwd):
     """The pre-rule identity: patch-id of the diff *with* its context lines."""
     ancestor = git('merge-base', base, sha, cwd=cwd)
-    diff = subprocess.check_output(['git', 'diff', '--binary', ancestor + '..' + sha], cwd=cwd)
+    diff = subprocess.check_output(['git', 'diff', '--binary', ancestor + '..' + sha], cwd=cwd, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     return git('patch-id', '--stable', cwd=cwd, input=diff).split()[0]
 
 
@@ -48,7 +48,7 @@ class ContentReviews(unittest.TestCase):
         self.commit('app' if conflict else 'other', 'base advancement\n')
         self.g('update-ref', 'refs/remotes/origin/staging', self.g('rev-parse', 'HEAD'))
         self.g('checkout', 'feature')
-        result = subprocess.run(['git', 'merge', '--no-ff', 'origin/staging', '-m', 'sync'], cwd=self.cwd, capture_output=True)
+        result = subprocess.run(['git', 'merge', '--no-ff', 'origin/staging', '-m', 'sync'], cwd=self.cwd, capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         if conflict:
             self.assertNotEqual(result.returncode, 0)
             self.commit('app', 'manual resolution\n')
@@ -74,7 +74,7 @@ class ContentReviews(unittest.TestCase):
         self.g('update-ref', 'refs/remotes/origin/staging', self.g('rev-parse', 'HEAD'))
         self.g('checkout', 'feature')
         merged = subprocess.run(['git', 'merge', '--no-ff', 'origin/staging', '-m', 'sync'],
-                                cwd=self.cwd, capture_output=True)
+                                cwd=self.cwd, capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         self.assertEqual(merged.returncode, 0)
         head = self.g('rev-parse', 'HEAD')
         # Context lines are what moved: the wide-context identity differs, the
@@ -103,7 +103,7 @@ class ContentReviews(unittest.TestCase):
         self.g('update-ref', 'refs/remotes/origin/staging', self.g('rev-parse', 'HEAD'))
         self.g('checkout', 'feature')
         merged = subprocess.run(['git', 'merge', '--no-ff', 'origin/staging', '-m', 'sync'],
-                                cwd=self.cwd, capture_output=True)
+                                cwd=self.cwd, capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         self.assertNotEqual(merged.returncode, 0, 'the base rewrote the line next to the PR hunk')
         # Resolution keeps staging's neighbouring line and the PR's own changed line.
         self.commit('app', nine.format('pr').replace('l4\n', 'l4 staged\n'))

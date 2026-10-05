@@ -784,7 +784,7 @@ class TestRecoveryCLI(DecisionLifecycleTestBase):
             self.ledger_path,
             *cli_args,
         ]
-        return subprocess.run(cmd, capture_output=True, text=True)
+        return subprocess.run(cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
     def _poison(self):
         raw = self._raw_store()
@@ -1406,7 +1406,7 @@ class TestPreservedReviewerRecoveryReproducers(unittest.TestCase):
             self.ledger_path,
             *cli_args,
         ]
-        return subprocess.run(cmd, capture_output=True, text=True)
+        return subprocess.run(cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
     def test_the_terminal_demo_record_is_refused_and_finished_work_is_untouched(self):
         demo_before = self.ledger.get_request(self.DEMO_REQ)

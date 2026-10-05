@@ -167,6 +167,7 @@ def run_cli(args, cwd=None):
         capture_output=True,
         text=True,
         cwd=cwd or SCRIPT_DIR,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     return proc
 
@@ -1086,6 +1087,7 @@ class TestLedgerCriteriaIntake(unittest.TestCase):
                 "--owner", "lane", "--task-type", "local",
             ],
             capture_output=True, text=True, cwd=SCRIPT_DIR,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
 
     def test_json_array_of_description_strings_is_accepted(self):
@@ -1307,7 +1309,7 @@ class TestIntendedFailuresAreNotRecurrence(GuardTestCase):
 
 
 def git(repo, *args):
-    subprocess.run(["git"] + list(args), cwd=repo, check=True, capture_output=True, text=True)
+    subprocess.run(["git"] + list(args), cwd=repo, check=True, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
 def make_repo(path):
@@ -1321,7 +1323,8 @@ def make_repo(path):
     git(path, "add", "README.md")
     git(path, "commit", "-q", "-m", "fixture")
     head = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=path, capture_output=True, text=True, check=True
+        ["git", "rev-parse", "HEAD"], cwd=path, capture_output=True, text=True, check=True,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     return head.stdout.strip()
 
@@ -1348,6 +1351,7 @@ def commit_files(repo, files, message="fixture change"):
         return subprocess.run(
             ["git"] + list(args), cwd=repo, env=env,
             capture_output=True, text=True, check=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         ).stdout.strip()
 
     written = []
@@ -2923,6 +2927,7 @@ class TestCorrectiveProofIsBoundToTheFailuresLineage(GuardTestCase):
         return subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=self.repo,
             capture_output=True, text=True, check=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         ).stdout.strip()
 
     def record(self, **kwargs):
@@ -3342,6 +3347,7 @@ class TestCorrectiveProofRunsOnTheCorrectedFailingTree(GuardTestCase):
         trunk = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=self.repo,
             capture_output=True, text=True, check=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         ).stdout.strip()
         self.before = self._commit(
             {
@@ -3387,6 +3393,7 @@ class TestCorrectiveProofRunsOnTheCorrectedFailingTree(GuardTestCase):
         return subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=self.repo,
             capture_output=True, text=True, check=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         ).stdout.strip()
 
     def observe(self, minute, head=None, **kwargs):
@@ -3760,11 +3767,13 @@ class TestCorrectiveProofRunsOnTheCorrectedFailingTree(GuardTestCase):
         tree = subprocess.run(
             ["git", "rev-parse", "HEAD^{tree}"], cwd=self.repo,
             capture_output=True, text=True, check=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         ).stdout.strip()
         env = dict(os.environ, GIT_COMMITTER_DATE=when, GIT_AUTHOR_DATE=when)
         return subprocess.run(
             ["git", "commit-tree", tree, "-p", "HEAD", "-m", message],
             cwd=self.repo, env=env, capture_output=True, text=True, check=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         ).stdout.strip()
 
     def test_a_headless_failure_binds_only_a_head_committed_after_it(self):

@@ -27,7 +27,7 @@ const res = evaluatePR(input.pr, options);
 console.log(JSON.stringify(res));
 """
     payload = json.dumps({"pr": pr_dict, "sub_issues": sub_issues or [], "fetcher_error": fetcher_error})
-    proc = subprocess.run(["node", "-e", script], input=payload, capture_output=True, text=True, check=True)
+    proc = subprocess.run(["node", "-e", script], input=payload, capture_output=True, text=True, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     return json.loads(proc.stdout)
 
 

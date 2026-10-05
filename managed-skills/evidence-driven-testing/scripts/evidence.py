@@ -102,7 +102,7 @@ def ffmpeg_output(*arguments: str) -> str:
         text=True,
         capture_output=True,
         check=False,
-        **SUBPROCESS_FLAGS,
+        **SUBPROCESS_FLAGS,  # hidden-window-ok: SUBPROCESS_FLAGS carries creationflags
     )
     return result.stdout + result.stderr
 
@@ -115,7 +115,7 @@ def ffmpeg_capability(argument: str, needle: str) -> dict[str, object]:
         text=True,
         capture_output=True,
         check=False,
-        **SUBPROCESS_FLAGS,
+        **SUBPROCESS_FLAGS,  # hidden-window-ok: SUBPROCESS_FLAGS carries creationflags
     )
     output = result.stdout + result.stderr
     return {"available": result.returncode == 0 and needle in output}
@@ -484,7 +484,7 @@ def spawn_detached(command: list[str], log_file: Any, env: dict[str, str]) -> su
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
     else:
         kwargs["start_new_session"] = True
-    return subprocess.Popen(command, **kwargs)
+    return subprocess.Popen(command, **kwargs)  # hidden-window-ok: kwargs always sets creationflags on Windows
 
 
 def uses_supervisor() -> bool:
@@ -703,7 +703,7 @@ def command_supervise(args: argparse.Namespace) -> int:
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     with log_path.open("ab") as log_file:
         try:
-            child = subprocess.Popen(command, stdout=log_file, **kwargs)
+            child = subprocess.Popen(command, stdout=log_file, **kwargs, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except OSError as error:
             atomic_write_json(exit_record, {"returncode": None, "exited_at": utc_now(), "requested": False, "error": str(error)})
             return 1
@@ -981,7 +981,7 @@ def probe_video(path: Path) -> dict[str, Any]:
         text=True,
         capture_output=True,
         check=False,
-        **SUBPROCESS_FLAGS,
+        **SUBPROCESS_FLAGS,  # hidden-window-ok: SUBPROCESS_FLAGS carries creationflags
     )
     if result.returncode != 0:
         raise EvidenceError(f"ffprobe failed for {path}: {result.stderr.strip()}")
@@ -1094,7 +1094,7 @@ def render_video(raw_video: Path, final_video: Path, subtitles: Path, has_annota
         text=True,
         capture_output=True,
         check=False,
-        **SUBPROCESS_FLAGS,
+        **SUBPROCESS_FLAGS,  # hidden-window-ok: SUBPROCESS_FLAGS carries creationflags
     )
     if result.returncode != 0:
         raise EvidenceError(f"annotation render failed: {result.stderr.strip()}")

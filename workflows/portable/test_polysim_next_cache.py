@@ -19,13 +19,13 @@ import polysim_next_cache as nc  # noqa: E402  (path set up above)
 
 def make_dir_link(target: Path, link: Path) -> None:
     if os.name == "nt":
-        subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], check=True, capture_output=True)
+        subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], check=True, capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     else:
         os.symlink(target, link, target_is_directory=True)
 
 
 def git(cwd: Path, *args: str) -> str:
-    return subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True).stdout.strip()
+    return subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout.strip()
 
 
 def write_pack(webpack: Path, *worktrees: str) -> None:

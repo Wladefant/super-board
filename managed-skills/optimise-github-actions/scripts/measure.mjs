@@ -5,7 +5,7 @@
 // Usage: node measure.mjs OWNER/REPO [--days 14] [--out jobs.json] [--budget 1500] [--time-limit 420] [--every K] [--cache DIR] [--concurrency 3]
 // Needs: Node 18+ and the GitHub CLI (`gh auth login`) with read access to Actions.
 // Source: github.com/enesgules/dotfiles (skills/optimise-github-actions) at d1e9b65f4dd4760e0f8b835eaeac510ca0918935,
-// vetted: only `gh api` GET calls via execFile (no shell), writes only --out and the cache dir.
+// vetted: only `gh api` GET calls via execFile (no shell), writes only --out and the cache dir. hidden-window-ok: prose describing the calls below, not a call
 //
 // Billing follows GitHub's rules for standard hosted runners: each job rounds up
 // to a whole minute, Windows counts twice, macOS ten times, and skipped jobs are

@@ -43,6 +43,7 @@ PY = sys.executable
 def _git(repo, *args):
     return subprocess.run(
         ["git", *args], cwd=repo, capture_output=True, text=True, shell=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
 
 

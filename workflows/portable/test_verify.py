@@ -471,7 +471,7 @@ class TestGateConsumption(unittest.TestCase):
         os.chdir(cls.repository.name)
 
         def git(*args):
-            return subprocess.check_output(["git", *args], stderr=subprocess.DEVNULL).decode().strip()
+            return subprocess.check_output(["git", *args], stderr=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).decode().strip()
 
         git("init", "-b", "fixture-base")
         git("config", "user.name", "Wladimir Kirjanovs")
@@ -676,7 +676,7 @@ class TestVerifyCLI(unittest.TestCase):
             "--receipt-out", receipt_out,
             "--json",
         ]
-        res = subprocess.run(cmd, capture_output=True, text=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         self.assertEqual(res.returncode, 0, f"CLI stderr: {res.stderr}")
         self.assertTrue(os.path.exists(receipt_out))
         with open(receipt_out, "r", encoding="utf-8") as rf:
@@ -694,7 +694,7 @@ class TestVerifyCLI(unittest.TestCase):
             "--repo-root", self.repo_root,
             "--json",
         ]
-        res = subprocess.run(cmd, capture_output=True, text=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         self.assertEqual(res.returncode, 2)
         data = json.loads(res.stdout)
         self.assertEqual(data["status"], "FAILED")

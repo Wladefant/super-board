@@ -319,6 +319,7 @@ class TestBuildSlot(unittest.TestCase):
             capture_output=True,
             text=True,
             env=env,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.assertEqual(p_stat.returncode, 0)
         self.assertIn("Status:      FREE", p_stat.stdout)
@@ -329,6 +330,7 @@ class TestBuildSlot(unittest.TestCase):
             capture_output=True,
             text=True,
             env=env,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.assertEqual(p_json.returncode, 0)
         data = json.loads(p_json.stdout)
@@ -355,6 +357,7 @@ class TestBuildSlot(unittest.TestCase):
             capture_output=True,
             text=True,
             env=env,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.assertEqual(p_acq.returncode, 0)
 
@@ -375,6 +378,7 @@ class TestBuildSlot(unittest.TestCase):
             capture_output=True,
             text=True,
             env=env,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.assertEqual(p_reacq.returncode, 0)
         self.assertIn("already held", p_reacq.stdout)
@@ -385,6 +389,7 @@ class TestBuildSlot(unittest.TestCase):
             capture_output=True,
             text=True,
             env=env,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.assertEqual(p_stat2.returncode, 0)
         self.assertIn("Status:      LOCKED", p_stat2.stdout)
@@ -396,6 +401,7 @@ class TestBuildSlot(unittest.TestCase):
             capture_output=True,
             text=True,
             env=env,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.assertEqual(p_rel.returncode, 0)
 
@@ -405,6 +411,7 @@ class TestBuildSlot(unittest.TestCase):
             capture_output=True,
             text=True,
             env=env,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.assertEqual(p_stat3.returncode, 0)
         self.assertIn("Status:      FREE", p_stat3.stdout)
@@ -436,6 +443,7 @@ class TestBuildSlot(unittest.TestCase):
             p = subprocess.Popen(
                 [sys.executable, "-c", worker_code, w_name, script, self.run_dir, record_file],
                 env=env,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             procs.append(p)
             # Wait until w_name has enqueued or acquired before launching next to guarantee arrival ordering
@@ -682,6 +690,7 @@ class TestBuildSlot(unittest.TestCase):
             [sys.executable, script, "--run-dir", self.run_dir, "acquire", "test-lane", "--poll-interval", "65.0"],
             capture_output=True,
             text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.assertEqual(p.returncode, 2)
         self.assertIn("must be less than queue_stale_heartbeat_after", p.stderr)
@@ -1413,6 +1422,7 @@ class TestBuildSlot(unittest.TestCase):
             text=True,
             env=env,
             timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         elapsed = time.monotonic() - started
         self.assertEqual(proc.returncode, 1)
@@ -1435,6 +1445,7 @@ class TestBuildSlot(unittest.TestCase):
             [sys.executable, script, "--help"],
             capture_output=True,
             text=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.assertEqual(proc.returncode, 0, f"--help failed with stderr: {proc.stderr}")
         self.assertIn("Check system RAM percentage against threshold", proc.stdout)
@@ -1513,14 +1524,14 @@ class TestBuildSlot(unittest.TestCase):
 
     def _exited_pid(self) -> int:
         """PID of a real process that has already exited (faithful 'dead' for is_pid_alive)."""
-        p = subprocess.Popen([sys.executable, "-c", "pass"])
+        p = subprocess.Popen([sys.executable, "-c", "pass"], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         p.wait()
         self.assertFalse(is_pid_alive(p.pid))
         return p.pid
 
     def _live_process(self) -> subprocess.Popen:
         """A real process that stays alive for the test; killed on cleanup."""
-        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         self.addCleanup(p.wait)
         self.addCleanup(p.kill)
         self.assertTrue(is_pid_alive(p.pid))
@@ -1653,6 +1664,7 @@ class TestBuildSlot(unittest.TestCase):
              "print(os.getpid(), build_slot.find_long_lived_owner_pid())",
              SCRIPT_DIR],
             capture_output=True, text=True, check=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         probe_pid, owner_pid = (int(x) for x in probe.stdout.split())
         self.assertNotEqual(owner_pid, probe_pid)
@@ -2066,6 +2078,7 @@ class TestBuildSlot(unittest.TestCase):
             text=True,
             timeout=10,
             env=env,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.assertEqual(proc.returncode, 1)
         timeout_msg = "Timed out after 0.1s waiting for build slot lock (lane 'waiter-lane'"
@@ -2078,6 +2091,7 @@ class TestBuildSlot(unittest.TestCase):
             capture_output=True,
             text=True,
             timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         self.assertEqual(proc_rel.returncode, 1)
         release_msg = "ERROR: Refusing to release build slot lock:"

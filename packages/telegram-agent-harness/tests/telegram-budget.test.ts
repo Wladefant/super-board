@@ -192,7 +192,7 @@ describe("shared budget file", () => {
   };
 
   test("a lock left by a dead process is swept at once", async () => {
-    const dead = Bun.spawnSync([process.execPath, "-e", "0"]).pid;
+    const dead = Bun.spawnSync([process.execPath, "-e", "0"], { windowsHide: true }).pid;
     heldBy(dead);
     const budget = new SharedBudget("1", dir);
     expect(await budget.update((state) => reserve(state, "7", "message", Date.now(), CFG).waitMs)).toBe(0);
@@ -230,7 +230,7 @@ describe("shared budget file", () => {
     expect(await budget.update(() => 1)).toBeUndefined();
     expect(fs.existsSync(lockFile())).toBe(true);
     fs.unlinkSync(lockFile());
-    heldBy(Bun.spawnSync([process.execPath, "-e", "0"]).pid);
+    heldBy(Bun.spawnSync([process.execPath, "-e", "0"], { windowsHide: true }).pid);
     expect(await budget.update(() => 1)).toBe(1);
     expect(fs.readdirSync(dir).sort()).toEqual(["1.json"]);
   });

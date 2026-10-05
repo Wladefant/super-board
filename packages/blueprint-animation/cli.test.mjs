@@ -7,7 +7,7 @@ import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {chromium} from 'playwright';
 const here=path.dirname(fileURLToPath(import.meta.url));
-function run(args){const result=spawnSync(process.execPath,[path.join(here,'cli.mjs'),...args],{encoding:'utf8',timeout:30000});assert.equal(result.error,undefined);return result;}
+function run(args){const result=spawnSync(process.execPath,[path.join(here,'cli.mjs'),...args],{encoding:'utf8',timeout:30000, windowsHide: true});assert.equal(result.error,undefined);return result;}
 test('capture rejects impossible or nonnumeric seek times before browser launch',()=>{
  for(const value of ['-5','999','abc','']){const result=run(['capture','--times',value]);assert.notEqual(result.status,0);assert.match(result.stderr,/Capture times must be finite/);assert.doesNotMatch(result.stderr,/TimeoutError/);}
 });

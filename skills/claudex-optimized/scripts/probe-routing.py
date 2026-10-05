@@ -607,7 +607,7 @@ def _run_fixture_process(
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         kwargs["start_new_session"] = True
-    process = subprocess.Popen(command, **kwargs)
+    process = subprocess.Popen(command, **kwargs, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     try:
         stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
@@ -1100,7 +1100,7 @@ def _run_bounded(command: list[str], cwd: Path, timeout_seconds: int) -> tuple[i
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         kwargs["start_new_session"] = True
-    process = subprocess.Popen(command, **kwargs)
+    process = subprocess.Popen(command, **kwargs, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     try:
         stdout, stderr = process.communicate(timeout=timeout_seconds)
         return process.returncode, False, stdout, stderr

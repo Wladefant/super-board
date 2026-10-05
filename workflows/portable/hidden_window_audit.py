@@ -14,7 +14,8 @@ Verbs:
                --dry-run prints the plan
   watch        poll the desktop for NEW visible console windows for N seconds and log each one
                (process, parent chain, command line, all redacted); exit 1 when any appear
-  scan-source  report subprocess/spawn/exec calls with no CREATE_NO_WINDOW / windowsHide
+  scan-source  report subprocess/spawn/exec calls with no CREATE_NO_WINDOW / windowsHide;
+               exit 1 on any (a call may carry a `hidden-window-ok: <reason>` comment)
 
 The test for "console host" is the executable's PE subsystem (CUI = console), not a name list,
 so a new tool is caught without editing this file. wscript.exe and pythonw.exe are GUI programs.
@@ -24,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import ctypes
 import json
 import os
 import re
@@ -49,6 +51,10 @@ WSCRIPT = r"%SystemRoot%\System32\wscript.exe"
 CONSOLE_SCRIPT_SUFFIXES = (".bat", ".cmd")
 CONSOLE_WINDOW_CLASSES = ("ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS")
 SUBSYSTEM_CUI = 3
+
+
+class AuditError(RuntimeError):
+    """The audit could not see the task list. It must fail, never pass."""
 
 
 def _run(argv: List[str], timeout: int = 60) -> subprocess.CompletedProcess:
@@ -122,11 +128,13 @@ def classify_command(command: str) -> Tuple[bool, str]:
         return True, "batch file runs in cmd.exe"
     exe = resolve_exe(cmd)
     if exe is None:
-        return False, "executable not found; not judged"
+        return True, "executable not found; cannot prove it is hidden"
     sub = pe_subsystem(exe)
     if sub == SUBSYSTEM_CUI:
         return True, f"{os.path.basename(exe)} is a console program"
-    return False, "GUI program" if sub is not None else "not a PE file; not judged"
+    if sub is None:
+        return True, f"{os.path.basename(exe)} is not a readable PE file; cannot prove it is hidden"
+    return False, "GUI program"
 
 
 # --------------------------------------------------------------------------- scheduled tasks
@@ -144,6 +152,7 @@ class TaskInfo:
     enabled: bool
     actions: List[TaskAction] = field(default_factory=list)
     xml: str = ""
+    error: str = ""
 
 
 @dataclass
@@ -158,11 +167,14 @@ class Finding:
 def parse_tasks_xml(blob: str) -> List[TaskInfo]:
     """Split `schtasks /query /xml ONE` output (one <Task> per `<!-- \\name -->` comment)."""
     tasks: List[TaskInfo] = []
+    matched = set()
     for m in re.finditer(r"<!--\s*(.*?)\s*-->\s*(<Task\b.*?</Task>)", blob, re.S):
         name, body = m.group(1), m.group(2)
+        matched.add(name)
         try:
             root = ET.fromstring(body)
-        except ET.ParseError:
+        except ET.ParseError as exc:
+            tasks.append(TaskInfo(name, True, True, [], body, error=f"task XML does not parse: {exc}"))
             continue
         logon = root.findtext("t:Principals/t:Principal/t:LogonType", default="", namespaces=NS)
         enabled = root.findtext("t:Settings/t:Enabled", default="true", namespaces=NS).strip().lower() != "false"
@@ -171,13 +183,21 @@ def parse_tasks_xml(blob: str) -> List[TaskInfo]:
             for e in root.findall("t:Actions/t:Exec", NS)
         ]
         tasks.append(TaskInfo(name, logon == "InteractiveToken", enabled, actions, body))
+    for m in re.finditer(r"<!--\s*(\\[^>]*?)\s*-->", blob):
+        if m.group(1) not in matched:
+            tasks.append(TaskInfo(m.group(1), True, True, [], "", error="task header has no complete <Task> body"))
     return tasks
 
 
 def load_tasks() -> List[TaskInfo]:
     proc = _run(["schtasks", "/query", "/xml", "ONE"], timeout=180)
+    if proc.returncode != 0:
+        raise AuditError(f"schtasks /query failed with exit {proc.returncode}: {proc.stderr.decode('utf-8', 'replace').strip()[:300]}")
     blob = proc.stdout.decode("utf-16") if proc.stdout[:2] == b"\xff\xfe" else proc.stdout.decode("utf-8", "replace")
-    return parse_tasks_xml(blob)
+    tasks = parse_tasks_xml(blob)
+    if not tasks:
+        raise AuditError("schtasks /query returned no tasks; refusing to report a clean audit")
+    return tasks
 
 
 def is_ours_to_audit(task: TaskInfo) -> bool:
@@ -188,7 +208,12 @@ def is_ours_to_audit(task: TaskInfo) -> bool:
 def audit_tasks(tasks: Iterable[TaskInfo], include_disabled: bool = False) -> List[Finding]:
     found: List[Finding] = []
     for task in tasks:
-        if not is_ours_to_audit(task) or not task.interactive:
+        if not is_ours_to_audit(task):
+            continue
+        if task.error:
+            found.append(Finding(task.name, "", "", task.error, task.enabled))
+            continue
+        if not task.interactive:
             continue
         if not task.enabled and not include_disabled:
             continue
@@ -199,19 +224,55 @@ def audit_tasks(tasks: Iterable[TaskInfo], include_disabled: bool = False) -> Li
     return found
 
 
+TR_LIMIT = 261  # schtasks /tr rejects longer strings
+
+
+def split_command_line(line: str) -> List[str]:
+    """argv as CommandLineToArgvW (and so every Windows program) would split `line`."""
+    if not line.strip():
+        return []
+    if sys.platform == "win32":
+        shell32 = ctypes.windll.shell32
+        shell32.CommandLineToArgvW.restype = ctypes.POINTER(ctypes.c_wchar_p)
+        n = ctypes.c_int(0)
+        arr = shell32.CommandLineToArgvW("x " + line, ctypes.byref(n))
+        try:
+            return [arr[k] for k in range(1, n.value)]
+        finally:
+            ctypes.windll.kernel32.LocalFree(arr)
+    import shlex
+    return shlex.split(line, posix=False)
+
+
+def _launcher_arg(arg: str) -> str:
+    """One argv entry as run_hidden.vbs receives it. WScript cannot carry a literal quote,
+    so `"` travels as %22 and `%` as %25; the launcher decodes both. Empty or spaced
+    entries are wrapped in quotes."""
+    enc = arg.replace("%", "%25").replace('"', "%22")
+    return f'"{enc}"' if enc == "" or " " in enc or "\t" in enc else enc
+
+
+def _launcher_args(command_line: str) -> str:
+    return " ".join(_launcher_arg(a) for a in split_command_line(command_line))
+
+
 def hidden_tr(command_line: str) -> str:
     """The schtasks /tr string that runs `command_line` with window style 0 (installers use this).
 
     command_line is the program path, quoted if it has spaces, plus its arguments. The caller
-    runs ensure_launcher() before it registers the task.
+    runs ensure_launcher() before it registers the task. Raises ValueError past schtasks' limit.
     """
-    return f'wscript.exe "{LAUNCHER}" {command_line}'
+    tr = f'wscript.exe "{LAUNCHER}" {_launcher_args(command_line)}'
+    if len(tr) > TR_LIMIT:
+        raise ValueError(f"schtasks /tr is {len(tr)} characters; the limit is {TR_LIMIT}. Shorten the command line.")
+    return tr
 
 
 def hidden_exec(command: str, arguments: str, launcher: Path = LAUNCHER) -> Tuple[str, str]:
     """The (Command, Arguments) pair that runs the same program with window style 0."""
-    original = f'"{command}"' if " " in command and not command.startswith('"') else command
-    return WSCRIPT, f'"{launcher}" {original} {arguments}'.rstrip()
+    head = _launcher_arg(command.strip().strip('"'))
+    tail = _launcher_args(arguments)
+    return WSCRIPT, f'"{launcher}" {head} {tail}'.rstrip()
 
 
 def rewrite_task_xml(xml: str, launcher: Path = LAUNCHER) -> str:
@@ -345,25 +406,67 @@ def watch(seconds: float, log_path: Path, interval: float = 0.05) -> List[Dict[s
 
 # --------------------------------------------------------------------------- source scan
 
-PY_SPAWN = {"run", "Popen", "call", "check_call", "check_output"}
+PY_SPAWN = {"run", "Popen", "call", "check_call", "check_output", "getoutput", "getstatusoutput"}
+OS_SPAWN = {"system", "popen"}
 JS_SPAWN = re.compile(r"\b(spawn|spawnSync|execFile|execFileSync|exec|execSync)\s*\(")
+ALLOW_MARK = "hidden-window-ok:"  # a call carrying this comment, with a reason, is skipped
 
 
-def scan_python(path: Path) -> List[Tuple[int, str]]:
-    """Lines that call subprocess.run/Popen/... without creationflags."""
-    try:
-        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
-    except SyntaxError:
-        return []
-    hits: List[Tuple[int, str]] = []
+def _marked(lines: List[str], first: int, last: int) -> bool:
+    return any(ALLOW_MARK in ln for ln in lines[max(0, first - 2):last])
+
+
+def spawn_calls(tree: ast.AST) -> List[Tuple[ast.Call, str, bool]]:
+    """Every process-starting call in a parsed file: (call node, name, cannot_take_flags)."""
+    mods, funcs, os_mods, os_funcs = set(), {}, set(), {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name == "subprocess":
+                    mods.add(a.asname or "subprocess")
+                elif a.name == "os":
+                    os_mods.add(a.asname or "os")
+        elif isinstance(node, ast.ImportFrom) and node.level == 0:
+            for a in node.names:
+                if node.module == "subprocess" and a.name in PY_SPAWN:
+                    funcs[a.asname or a.name] = a.name
+                elif node.module == "os" and a.name in OS_SPAWN:
+                    os_funcs[a.asname or a.name] = a.name
+    found: List[Tuple[ast.Call, str, bool]] = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         fn = node.func
-        if isinstance(fn, ast.Attribute) and fn.attr in PY_SPAWN and isinstance(fn.value, ast.Name) and fn.value.id == "subprocess":
-            if not any(k.arg == "creationflags" or k.arg is None for k in node.keywords):
-                hits.append((node.lineno, f"subprocess.{fn.attr}"))
-    return hits
+        if isinstance(fn, ast.Attribute) and isinstance(fn.value, ast.Name):
+            if fn.value.id in mods and fn.attr in PY_SPAWN:
+                found.append((node, f"subprocess.{fn.attr}", False))
+            elif fn.value.id in os_mods and fn.attr in OS_SPAWN:
+                found.append((node, f"os.{fn.attr}", True))
+        elif isinstance(fn, ast.Name):
+            if fn.id in funcs:
+                found.append((node, f"subprocess.{funcs[fn.id]}", False))
+            elif fn.id in os_funcs:
+                found.append((node, f"os.{os_funcs[fn.id]}", True))
+    return found
+
+
+def scan_python(path: Path) -> List[Tuple[int, str]]:
+    """Lines that start a process without creationflags, or that the scan cannot read."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    lines = text.splitlines()
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError) as exc:
+        return [] if ALLOW_MARK in text else [(getattr(exc, "lineno", None) or 1, "unparseable file: not scanned")]
+    hits: List[Tuple[int, str]] = []
+    for node, what, flagless in spawn_calls(tree):
+        if _marked(lines, node.lineno, getattr(node, "end_lineno", node.lineno)):
+            continue
+        if flagless:
+            hits.append((node.lineno, f"{what} cannot hide its window; use subprocess with creationflags"))
+        elif not any(k.arg == "creationflags" for k in node.keywords):
+            hits.append((node.lineno, what + (" with **kwargs (flags unproven)" if any(k.arg is None for k in node.keywords) else "")))
+    return sorted(hits)
 
 
 def _call_span(text: str, start: int) -> str:
@@ -389,8 +492,9 @@ def scan_js(path: Path) -> List[Tuple[int, str]]:
             if "child_process." not in lead and "cp." not in lead and "Bun." not in lead:
                 continue
         span = _call_span(text, m.end() - 1)
-        if "windowsHide" not in span:
-            hits.append((text.count("\n", 0, m.start()) + 1, m.group(1)))
+        line_no = text.count("\n", 0, m.start()) + 1
+        if "windowsHide" not in span and ALLOW_MARK not in span and ALLOW_MARK not in "\n".join(text.splitlines()[max(0, line_no - 2):line_no]):
+            hits.append((line_no, m.group(1)))
     return hits
 
 
@@ -400,7 +504,7 @@ def scan_source(roots: Iterable[Path]) -> List[Tuple[str, int, str]]:
     for root in roots:
         files = [root] if root.is_file() else (p for p in root.rglob("*") if p.is_file())
         for p in files:
-            if skip & set(p.parts) or p.name.startswith("test_") or ".test." in p.name:
+            if skip & set(p.parts):
                 continue
             if p.suffix == ".py":
                 hits = scan_python(p)
@@ -418,7 +522,11 @@ def cmd_audit(args: argparse.Namespace) -> int:
     if sys.platform != "win32":
         print("hidden_window_audit: not Windows, nothing to audit")
         return 0
-    findings = audit_tasks(load_tasks(), include_disabled=args.include_disabled)
+    try:
+        findings = audit_tasks(load_tasks(), include_disabled=args.include_disabled)
+    except AuditError as exc:
+        print(f"hidden_window_audit: cannot audit: {exc}", file=sys.stderr)
+        return 2
     if args.json:
         print(json.dumps([f.__dict__ for f in findings], indent=2))
     for f in findings:
@@ -431,16 +539,26 @@ def cmd_audit(args: argparse.Namespace) -> int:
 
 
 def cmd_fix(args: argparse.Namespace) -> int:
-    tasks = load_tasks()
-    todo = [t for t in tasks if is_ours_to_audit(t) and t.interactive and any(classify_command(a.command)[0] for a in t.actions)]
+    if sys.platform != "win32":
+        print("hidden_window_audit fix: Windows only", file=sys.stderr)
+        return 2
+    try:
+        tasks = load_tasks()
+    except AuditError as exc:
+        print(f"hidden_window_audit: cannot fix: {exc}", file=sys.stderr)
+        return 2
+    broken = [t for t in tasks if is_ours_to_audit(t) and t.error]
+    for t in broken:
+        print(f"CANNOT FIX {t.name}: {t.error}", file=sys.stderr)
+    todo = [t for t in tasks if is_ours_to_audit(t) and not t.error and t.interactive and any(classify_command(a.command)[0] for a in t.actions)]
     if args.only:
         todo = [t for t in todo if t.name.lstrip("\\") in args.only]
     if not todo:
         print("nothing to fix")
-        return 0
+        return 1 if broken else 0
     if not args.dry_run:
         ensure_launcher()
-    rc = 0
+    rc = 1 if broken else 0
     for t in todo:
         new_xml = rewrite_task_xml(t.xml)
         if args.dry_run:
@@ -465,7 +583,7 @@ def cmd_scan(args: argparse.Namespace) -> int:
     for f, ln, what in hits:
         print(f"{f}:{ln}: {what} without CREATE_NO_WINDOW/windowsHide")
     print(f"{len(hits)} unflagged spawn call(s)")
-    return 1 if hits and args.strict else 0
+    return 1 if hits and not args.report_only else 0
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -485,7 +603,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     w.set_defaults(fn=cmd_watch)
     s = sub.add_parser("scan-source")
     s.add_argument("roots", nargs="+")
-    s.add_argument("--strict", action="store_true")
+    s.add_argument("--report-only", action="store_true", help="print findings but exit 0")
     s.set_defaults(fn=cmd_scan)
     args = ap.parse_args(argv)
     return args.fn(args)

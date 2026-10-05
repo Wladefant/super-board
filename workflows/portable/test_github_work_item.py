@@ -209,7 +209,7 @@ class PreservedReviewBehavior(unittest.TestCase):
         self.head = self.change("value = 2\n", "feature")
 
     def git(self, *args):
-        return subprocess.check_output(["git", *args], cwd=self.repo, stderr=subprocess.DEVNULL).decode().strip()
+        return subprocess.check_output(["git", *args], cwd=self.repo, stderr=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).decode().strip()
 
     def change(self, text, message):
         (self.repo / "code.py").write_text(text)

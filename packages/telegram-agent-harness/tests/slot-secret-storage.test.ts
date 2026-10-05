@@ -70,7 +70,7 @@ test("per-slot secret file enforces restricted permissions (Windows owner-only A
 
   if (process.platform === "win32") {
     // Check icacls output on Windows
-    const fileAcl = spawnSync("icacls.exe", [secretFile], { encoding: "utf8" });
+    const fileAcl = spawnSync("icacls.exe", [secretFile], { encoding: "utf8", windowsHide: true });
     expect(fileAcl.status).toBe(0);
     // Inheritance is removed (/inheritance:r)
     expect(fileAcl.stdout.includes("(I)")).toBe(false);
@@ -80,7 +80,7 @@ test("per-slot secret file enforces restricted permissions (Windows owner-only A
       expect(fileAcl.stdout.toLowerCase().includes(currentUser.toLowerCase())).toBe(true);
     }
 
-    const dirAcl = spawnSync("icacls.exe", [secretsDir], { encoding: "utf8" });
+    const dirAcl = spawnSync("icacls.exe", [secretsDir], { encoding: "utf8", windowsHide: true });
     expect(dirAcl.status).toBe(0);
     expect(dirAcl.stdout.includes("(I)")).toBe(false);
   } else {
@@ -153,12 +153,12 @@ test("existing valid keys lose broad explicit grants before read", () => {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, "ab".repeat(32), { mode: 0o666 });
   if (process.platform === "win32") {
-    const grant = spawnSync("icacls.exe", [file, "/grant", "*S-1-1-0:(R)"], { encoding: "utf8", timeout: 15000 });
+    const grant = spawnSync("icacls.exe", [file, "/grant", "*S-1-1-0:(R)"], { encoding: "utf8", timeout: 15000, windowsHide: true });
     expect(grant.status).toBe(0);
   } else fs.chmodSync(file, 0o666);
   expect(getDaemonSecret({ stateDir: dir }, "existing")).toEqual(Buffer.from("ab".repeat(32), "hex"));
   if (process.platform === "win32") {
-    const acl = spawnSync("icacls.exe", [file], { encoding: "utf8", timeout: 15000 });
+    const acl = spawnSync("icacls.exe", [file], { encoding: "utf8", timeout: 15000, windowsHide: true });
     expect(acl.status).toBe(0);
     expect(acl.stdout).not.toContain("Everyone");
     expect(acl.stdout).not.toContain("(I)");
