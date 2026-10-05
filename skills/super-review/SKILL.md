@@ -73,6 +73,9 @@ If the input is ambiguous, default to reviewing the current branch against its u
      - calendar days use `date`, not `timestamptz`;
      - structured `AppError({ error_code, context })`;
      - jsonb writes are Zod-validated.
+   - **Depth check (vocabulary: `codebase-design`).** Name every design finding with the seven terms of [`skills/codebase-design/SKILL.md`](https://github.com/Wladefant/super-board/blob/main/skills/codebase-design/SKILL.md): module, interface, depth, seam, adapter, leverage, locality. Do not write "component", "service", "API" or "boundary" for these ideas.
+   - For every module the diff adds, ask: is it shallow (an interface nearly as large as its implementation)? Apply the **deletion test**: imagine deleting the module. If the complexity vanishes, it was a pass-through, so report it as a **Should fix** finding with the callers that would call the target directly. If the complexity reappears in its callers, it was earning its keep, so say nothing. State the result as `deletion-test: pass-through | concentrates | inconclusive` with one line of evidence.
+   - A new seam needs two adapters (one real, one test) or a stated reason. One adapter is an indirection, not a seam.
 
 3. **Classify findings**
    - **Blocker:** correctness, data loss, security, auth, migrations, money, customer-visible broken behavior, or failing required tests.
