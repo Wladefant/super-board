@@ -108,7 +108,8 @@ class OperatorQuestions:
                                   "events": [], "problem": payload.get("problem", ""),
                                   "impact": payload.get("impact", ""), "details_url": payload.get("details_url"),
                                   "created_ts": now, "message_id": None, "topic_message_id": None,
-                                  "topic_card_at": None, "session_finalized": False},
+                                  "topic_card_at": None, "session_finalized": False,
+                                  "wait": payload.get("wait") is not False, "answer_pushed": False},
                 }
                 questions[identifier] = record
             else:
@@ -175,7 +176,7 @@ class OperatorQuestions:
 
     def cache(self, payload: dict) -> dict:
         """Daemon-owned Telegram message ids. Cache only: the question state never depends on them."""
-        allowed = ("topic_message_id", "topic_card_at", "session_finalized")
+        allowed = ("topic_message_id", "topic_card_at", "session_finalized", "answer_pushed")
         with FileLock(self.manager.lock_path):
             data = self.manager._load_data_unlocked()
             record = data["decisions"].get(payload.get("id"))
