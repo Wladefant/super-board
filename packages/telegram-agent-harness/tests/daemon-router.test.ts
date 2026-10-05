@@ -296,6 +296,22 @@ describe("forum topic routing", () => {
     expect(relayed).toEqual([{ target: { chatId: FORUM_CHAT, topicId: "9" }, markdown: "from a" }]);
   });
 
+  test("a delivery that failed or was lost after the ack is reported to the session's own topic only", async () => {
+    const fake = fakeControl([summary("sess-a", "C:/dev/a"), summary("sess-b", "C:/dev/b")]);
+    const router = buildRouter({}, fake.control, fakeTopics());
+    await router.bind(TOPIC_9, "sess-a", "C:/dev/a");
+    await router.bind(TOPIC_14, "sess-b", "C:/dev/b");
+
+    await router.onSessionEvent({ kind: "delivery", sessionId: "sess-a", messageId: "m1", state: "failed", error: "Error: Terminal is not ready" });
+    await router.onSessionEvent({ kind: "delivery", sessionId: "sess-a", messageId: "m2", state: "lost", error: "the connection closed" });
+    expect(relayed.map(item => item.target)).toEqual([
+      { chatId: FORUM_CHAT, topicId: "9" },
+      { chatId: FORUM_CHAT, topicId: "9" },
+    ]);
+    expect(relayed[0]!.markdown).toContain("Not delivered: Error: Terminal is not ready");
+    expect(relayed[1]!.markdown).toContain("Not confirmed: the connection closed");
+  });
+
   test("the General topic is a lobby: plain text binds nothing and says where to go", async () => {
     const fake = fakeControl();
     const router = buildRouter({}, fake.control, fakeTopics());

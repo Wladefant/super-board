@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import { TerminalSessionControl } from "../daemon/session-control";
+import { TerminalSessionControl, type SessionEvent } from "../daemon/session-control";
 
 const cleanup: (() => void)[] = [];
 afterEach(() => { for (const close of cleanup.splice(0).reverse()) close(); });
@@ -12,7 +12,7 @@ afterEach(() => { for (const close of cleanup.splice(0).reverse()) close(); });
 type Request = { id: string; op: string; text?: string; ack?: boolean; messageId?: string };
 
 /** `onDeliver` decides what the fake session writes for each deliver request; it may write later. */
-async function session(root: string, sessionId: string, onDeliver: (request: Request, reply: (frame: object) => void) => void) {
+async function session(root: string, sessionId: string, onDeliver: (request: Request, reply: (frame: object) => void) => void, holdSubscribe?: Promise<void>) {
   const token = (crypto.randomUUID() + crypto.randomUUID()).replaceAll("-", "");
   const nonce = crypto.randomUUID();
   const endpoint = process.platform === "win32" ? `\\\\.\\pipe\\veyyon-terminal-${nonce}` : path.join(root, `${nonce}.sock`);
@@ -33,6 +33,7 @@ async function session(root: string, sessionId: string, onDeliver: (request: Req
         const request = JSON.parse(buffer.slice(0, end)) as Request;
         buffer = buffer.slice(end + 1);
         if (request.op === "deliver") { received.push(request); onDeliver(request, reply); continue; }
+        if (request.op === "subscribe" && holdSubscribe) { void holdSubscribe.then(() => reply({ id: request.id, ok: true, result: true })); continue; }
         reply({ id: request.id, ok: true, result: true });
       }
     });
@@ -50,15 +51,17 @@ async function session(root: string, sessionId: string, onDeliver: (request: Req
   return { received, closed, sockets };
 }
 
-function context(replyTimeoutMs: number) {
+function context(replyTimeoutMs: number, subscribeTimeoutMs?: number) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "deliver-pending-"));
   cleanup.push(() => fs.rmSync(root, { recursive: true, force: true }));
   const logs: string[] = [];
+  const events: SessionEvent[] = [];
   const waiters: { match: RegExp; done: () => void }[] = [];
   const control = new TerminalSessionControl({
     configRoot: root,
     replyTimeoutMs,
-    onEvent: () => {},
+    subscribeTimeoutMs,
+    onEvent: event => events.push(event),
     onLog: message => {
       logs.push(message);
       for (const waiter of waiters.splice(0)) { if (waiter.match.test(message)) waiter.done(); else waiters.push(waiter); }
@@ -71,7 +74,7 @@ function context(replyTimeoutMs: number) {
     waiters.push({ match, done: resolve });
     return promise;
   };
-  return { root, logs, control, logged };
+  return { root, logs, events, control, logged };
 }
 
 test("an acked delivery returns on the ack and reports the terminal's outcome from the event", async () => {
@@ -89,7 +92,7 @@ test("an acked delivery returns on the ack and reports the terminal's outcome fr
 });
 
 test("a failure the terminal reports after the ack is logged as failed", async () => {
-  const { root, control, logged } = context(5_000);
+  const { root, events, control, logged } = context(5_000);
   const sessionId = "fails";
   await session(root, sessionId, (request, reply) => {
     reply({ id: request.id, ok: true, result: { accepted: true, messageId: request.messageId, state: "pending" } });
@@ -97,6 +100,8 @@ test("a failure the terminal reports after the ack is logged as failed", async (
   });
   await control.deliver(sessionId, "hello");
   await logged(/failed in the terminal: Error: boom/);
+  // The operator was told "queued"; the failure must reach the router, not only the log.
+  expect(events).toContainEqual({ kind: "delivery", sessionId, messageId: expect.any(String), state: "failed", error: "Error: boom" });
 });
 
 test("a session that misses the deadline leaves the delivery pending: no close, no retry, late reply confirmed", async () => {
@@ -120,4 +125,41 @@ test("a session that misses the deadline leaves the delivery pending: no close, 
   expect(await control.deliver(sessionId, "second")).toBe("started");
   expect(fake.received.map(request => request.text)).toEqual(["first", "second"]);
   expect(fake.closed).toEqual([]);
+});
+
+test("a connection that dies while a delivery is pending reports the message as lost", async () => {
+  const { root, logs, events, control, logged } = context(100);
+  const sessionId = "dies";
+  const fake = await session(root, sessionId, () => {});
+  expect(await control.deliver(sessionId, "first")).toBe("queued");
+  expect(events).toEqual([]);
+  for (const socket of fake.sockets) socket.destroy();
+  await logged(/lost: the connection to the session closed/);
+  expect(events).toContainEqual({ kind: "delivery", sessionId, messageId: expect.any(String), state: "lost", error: expect.stringContaining("closed") });
+  expect(logs.filter(line => /lost:/.test(line)).length).toBe(1);
+});
+
+test("a late rejection reaches the router as a failed delivery", async () => {
+  const { root, events, control, logged } = context(100);
+  const sessionId = "rejects";
+  let answer: (() => void) | undefined;
+  await session(root, sessionId, (request, reply) => { answer = () => reply({ id: request.id, ok: false, error: "Error: Terminal busy: too many deliveries pending; retry later" }); });
+  await control.deliver(sessionId, "first");
+  answer?.();
+  await logged(/rejected late/);
+  expect(events).toContainEqual({ kind: "delivery", sessionId, messageId: expect.any(String), state: "failed", error: expect.stringContaining("busy") });
+});
+
+test("a session that is slow to answer the first request does not make deliver fail", async () => {
+  const { root, control } = context(50, 5_000);
+  const sessionId = "stalled";
+  const hold = Promise.withResolvers<void>();
+  const fake = await session(root, sessionId, (request, reply) => reply({ id: request.id, ok: true, result: { accepted: true, messageId: request.messageId, state: "pending" } }), hold.promise);
+  const delivery = control.deliver(sessionId, "after restart");
+  // Well past the 50 ms reply deadline the subscribe is still unanswered; the connection must stay open.
+  await Bun.sleep(200);
+  expect(fake.closed).toEqual([]);
+  hold.resolve();
+  expect(await delivery).toBe("queued");
+  expect(fake.received.map(request => request.text)).toEqual(["after restart"]);
 });

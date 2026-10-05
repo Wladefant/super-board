@@ -472,6 +472,17 @@ export class SlotRouter {
     if (event.kind === "streaming") return;
     const routes = this.options.store.routesForSession(event.sessionId).filter(route => route.slotId === this.slotId);
     if (routes.length === 0) return;
+    if (event.kind === "delivery") {
+      // The operator was told "queued"; this is the only place left to say it did not arrive.
+      const notice = event.state === "lost"
+        ? `⚠️ Not confirmed: ${event.error}. Send the message again if the session does not answer.`
+        : `⚠️ Not delivered: ${event.error}. Send the message again.`;
+      for (const route of routes) {
+        await this.options.relay({ chatId: route.chatId, topicId: route.topicId }, notice, event.sessionId).catch(error =>
+          this.options.log(`Slot ${this.slotId}: delivery notice to chat ${route.chatId} failed: ${error instanceof Error ? error.message : String(error)}`));
+      }
+      return;
+    }
     const agentMessages = event.kind === "appended"
       ? this.options.store.recentAgentMessages(event.sessionId, Date.now() - AGENT_MESSAGE_DEDUPE_WINDOW_MS)
       : [];
