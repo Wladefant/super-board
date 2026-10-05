@@ -1087,7 +1087,7 @@ export async function runFlows(options = {}) {
   }
 
   // 4. Load flow definitions
-  const resolvedFlowPath = flowDataPath || path.resolve(process.cwd(), `workflows/portable/flows/${project}.json`);
+  const resolvedFlowPath = flowDataPath || path.join(path.dirname(fileURLToPath(import.meta.url)), 'flows', `${project}.json`);
   const allFlows = loadFlowData(resolvedFlowPath);
   const flowsToRun = flowId ? allFlows.filter(f => f.id === flowId) : allFlows;
 
