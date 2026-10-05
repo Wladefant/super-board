@@ -1,20 +1,5 @@
-// Typed fixtures for the Week view: WeekData from daemon/week-summary.ts (issue #477) plus the
-// additive cards contract of issue #482.
-import type { BoardInfo, WeekBlock, WeekData as BaseWeekData } from "../../daemon/week-summary";
-
-export type WeekBoard = BoardInfo & { projects: string[] };
-
-export interface WeekCard {
-  boardId: string; kind: string; title: string; url: string | null; repo: string | null; number: number | null;
-  type: "issue" | "pr" | "draft"; state: "OPEN" | "CLOSED" | "MERGED";
-  /** Placement (ms); `endAt` is the exclusive end of a planned range. */
-  at: number; endAt: number | null;
-  source: "target" | "start" | "iteration" | "activity";
-  /** True when placed by activity (updatedAt, closedAt, mergedAt), not planned. */
-  derived: boolean;
-}
-
-export type WeekData = BaseWeekData & { cards?: WeekCard[] };
+// Typed fixtures for the Week view, in the WeekData shape of daemon/week-summary.ts (issues #477 and #482).
+import type { BoardInfo, WeekBlock, WeekCard, WeekData } from "../../daemon/week-summary";
 
 export type WeekScenario = "normal" | "empty" | "stale" | "busy";
 
@@ -23,11 +8,11 @@ const MIN = 60_000;
 /** Monday 2026-09-28 00:00 Europe/Berlin (UTC+2, no DST change in this week). */
 export const WEEK_START = Date.UTC(2026, 8, 27, 22);
 
-export const BOARDS: WeekBoard[] = [
-  { id: "Wladefant/5", title: "Superboard", kind: "veyyon-lanes", color: "#8ab4ff", repos: ["Wladefant/super-board", "Wladefant/veyyon"], projects: ["super-board", "veyyon"] },
-  { id: "Bavariance/1", title: "PolySimulator", kind: "polysimulator", color: "#f5c06b", repos: ["Bavariance/polysimulator"], projects: ["polysimulator"] },
-  { id: "Wladefant/11", title: "Shipnovo", kind: "shipnovo", color: "#7ee0b8", repos: ["Wladefant/shipnovo"], projects: ["shipnovo"] },
-  { id: "Wladefant/7", title: "ING TestING", kind: "ing", color: "#d9a6ff", repos: ["Wladefant/testing"], projects: ["testing"] },
+export const BOARDS: (BoardInfo & { projects: string[] })[] = [
+  { id: "Wladefant/5", title: "Superboard", kind: "veyyon-lanes", color: "#8ab4ff", repos: ["Wladefant/super-board", "Wladefant/veyyon"], owner: "Wladefant", number: 5, dateField: null, projects: ["super-board", "veyyon"] },
+  { id: "Bavariance/1", title: "PolySimulator", kind: "polysimulator", color: "#f5c06b", repos: ["Bavariance/polysimulator"], owner: "Bavariance", number: 1, dateField: "Target", projects: ["polysimulator"] },
+  { id: "Wladefant/11", title: "Shipnovo", kind: "shipnovo", color: "#7ee0b8", repos: ["Wladefant/shipnovo"], owner: "Wladefant", number: 11, dateField: null, projects: ["shipnovo"] },
+  { id: "Wladefant/7", title: "ING TestING", kind: "ing", color: "#d9a6ff", repos: ["Wladefant/testing"], owner: "Wladefant", number: 7, dateField: null, projects: ["testing"] },
 ];
 
 const PROJECT_BOARDS: Record<string, string[]> = {
@@ -130,6 +115,13 @@ export function makeWeek(scenario: WeekScenario = "normal"): WeekData {
   const noCommit = blocks.filter(b => b.noCommit);
   const day = (d: number, h: number) => WEEK_START + d * 24 * HOUR + h * HOUR;
   const iso = (d: number, h: number) => new Date(day(d, h)).toISOString();
+  const cards: WeekCard[] = scenario === "empty" ? [] : [
+    { boardId: "Wladefant/5", kind: "veyyon-lanes", title: "Week view: UI with week grid", url: "https://github.com/Wladefant/super-board/issues/478", repo: "Wladefant/super-board", number: 478, type: "issue", state: "OPEN", at: day(0, 0), endAt: day(7, 0), source: "iteration", derived: false },
+    { boardId: "Bavariance/1", kind: "polysimulator", title: "Hub card quick buy", url: "https://github.com/Bavariance/polysimulator/issues/5629", repo: "Bavariance/polysimulator", number: 5629, type: "issue", state: "CLOSED", at: day(1, 0), endAt: null, source: "target", derived: false },
+    { boardId: "Wladefant/11", kind: "shipnovo", title: "Carrier rate import", url: "https://github.com/Wladefant/shipnovo/pull/210", repo: "Wladefant/shipnovo", number: 210, type: "pr", state: "MERGED", at: day(2, 15), endAt: null, source: "activity", derived: true },
+    { boardId: "Wladefant/7", kind: "ing", title: "Runner capture provenance", url: null, repo: null, number: null, type: "draft", state: "OPEN", at: day(3, 0), endAt: null, source: "target", derived: false },
+  ];
+  const derived = cards.filter(c => c.derived).length;
   return {
     version: 1,
     weekStart: WEEK_START,
@@ -159,12 +151,8 @@ export function makeWeek(scenario: WeekScenario = "normal"): WeekData {
       { repo: "Bavariance/polysimulator", number: 5630, title: "Quick buy fill on hub cards", url: "https://github.com/Bavariance/polysimulator/pull/5630", state: "MERGED", mergedAt: iso(1, 16), branch: "fix/quick-buy" },
       { repo: "Wladefant/shipnovo", number: 210, title: "Carrier rate import", url: "https://github.com/Wladefant/shipnovo/pull/210", state: "MERGED", mergedAt: iso(2, 15), branch: "feat/rates" },
     ],
-    boards: BOARDS,
-    cards: scenario === "empty" ? [] : [
-      { boardId: "Wladefant/5", kind: "veyyon-lanes", title: "Week view: UI with week grid", url: "https://github.com/Wladefant/super-board/issues/478", repo: "Wladefant/super-board", number: 478, type: "issue", state: "OPEN", at: day(0, 0), endAt: day(7, 0), source: "iteration", derived: false },
-      { boardId: "Bavariance/1", kind: "polysimulator", title: "Hub card quick buy", url: "https://github.com/Bavariance/polysimulator/issues/5629", repo: "Bavariance/polysimulator", number: 5629, type: "issue", state: "CLOSED", at: day(1, 0), endAt: null, source: "target", derived: false },
-      { boardId: "Wladefant/11", kind: "shipnovo", title: "Carrier rate import", url: "https://github.com/Wladefant/shipnovo/pull/210", repo: "Wladefant/shipnovo", number: 210, type: "pr", state: "MERGED", at: day(2, 15), endAt: null, source: "activity", derived: true },
-      { boardId: "Wladefant/7", kind: "ing", title: "Runner capture provenance", url: null, repo: null, number: null, type: "draft", state: "OPEN", at: day(3, 0), endAt: null, source: "target", derived: false },
-    ],
+    boards: BOARDS.map(b => ({ ...b, cards: cards.filter(c => c.boardId === b.id).length })),
+    cards,
+    cardTotals: { cards: cards.length, planned: cards.length - derived, derived },
   };
 }
