@@ -1,7 +1,10 @@
 /* Week view. Palette follows miniapp/style.css; one 4px spacing scale; radii 16 (panels) > 10 (controls) > 6 (blocks).
-   Two schemes: dark (below) and light (:root[data-scheme="light"]). week.js picks one from Telegram's colorScheme, or
-   from prefers-color-scheme outside Telegram, and lays Telegram's own surface and text colours over it (Refs #562).
-   tests/week-theme.test.ts checks every text pair for 4.5:1 and every border, lane and ring for 3:1 in both schemes. */
+   Two schemes: dark (below) and light (:root[data-scheme="light"]). scheme.js picks one before the first paint, from
+   Telegram's colorScheme or, outside Telegram, from prefers-color-scheme; week.js lays Telegram's own surface and
+   text colours over it (Refs #562).
+   tests/week-theme.test.ts checks every text pair for 4.5:1 and every control border, lane and ring for 3:1 in both schemes.
+   --line is decorative and exempt (WCAG 1.4.11): it separates panels, grid rows and days. No control depends on it:
+   a control bordered with --line is also marked by its text and a 3:1 lane or board strip. */
 :root {
   --bg: #0b1020;
   --panel: #121a2e;

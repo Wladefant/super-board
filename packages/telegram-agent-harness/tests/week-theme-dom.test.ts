@@ -1,9 +1,10 @@
 // The Week page takes its colours from Telegram's theme and follows a theme change while it is open;
-// outside Telegram it follows prefers-color-scheme (Refs #562).
+// outside Telegram it follows prefers-color-scheme (Refs #562). The scheme is set before the first paint.
 //
-// Loads the real `week/index.html` and `week/week.js` into happy-dom. The Telegram stand-in has the
+// Loads the real `week/index.html`, its scripts and week.css into happy-dom. The Telegram stand-in has the
 // parts of telegram-web-app.js the page uses: themeParams, colorScheme, onEvent and the header colours.
 import { afterEach, describe, expect, test } from "bun:test";
+import { contrastRatio } from "../week/week-model.js";
 import { openWeekPage, type WeekPage } from "./fixtures/week-dom";
 
 const LIGHT = { bg_color: "#ffffff", text_color: "#000000", hint_color: "#999999", link_color: "#2481cc", secondary_bg_color: "#efeff3", section_bg_color: "#ffffff", section_separator_color: "#c8c7cc" };
@@ -37,6 +38,23 @@ afterEach(async () => { await page?.close(); page = null; });
 const root = () => page!.window.document.documentElement;
 const token = (name: string) => root().style.getPropertyValue(name);
 
+describe("before the first paint (the module week.js has not run yet)", () => {
+  test("in Telegram, Telegram's light scheme is set over a dark system", async () => {
+    page = await openWeekPage(signedOut, "/", { telegram: telegram(LIGHT, "light"), prefersColorScheme: "dark", scripts: "classic" });
+    expect(root().dataset.scheme).toBe("light");
+  });
+
+  test.each(["light", "dark"] as const)("outside Telegram, prefers-color-scheme %s is set", async scheme => {
+    page = await openWeekPage(signedOut, "/", { prefersColorScheme: scheme, scripts: "classic" });
+    expect(root().dataset.scheme).toBe(scheme);
+  });
+
+  test("telegram-web-app.js in a plain browser (no theme) leaves a dark system dark", async () => {
+    page = await openWeekPage(signedOut, "/", { telegram: telegram({}, "light"), prefersColorScheme: "dark", scripts: "classic" });
+    expect(root().dataset.scheme).toBe("dark");
+  });
+});
+
 describe("in Telegram", () => {
   test("the page takes Telegram's colours and scheme, and follows a theme change while open", async () => {
     const tg = telegram(LIGHT, "light");
@@ -61,6 +79,25 @@ describe("in Telegram", () => {
     expect(root().dataset.scheme).toBe("light");
     expect(token("--bg")).toBe("");
     expect(token("--text")).toBe("");
+  });
+
+  test("on a custom Telegram surface, status and lane colours are moved until they keep AA", async () => {
+    // A grey-blue light theme: week.css's light --amber (#8a5300) is 3.7:1 on its background, its red ring 3.3:1.
+    const custom = { bg_color: "#c0c8d0", secondary_bg_color: "#c0c8d0", section_bg_color: "#c8d0d8", text_color: "#000000", hint_color: "#333333", link_color: "#1a4fa0" };
+    const tg = telegram(custom, "light");
+    page = await openWeekPage(signedOut, "/", { telegram: tg });
+    expect(contrastRatio("#8a5300", custom.secondary_bg_color)).toBeLessThan(4.5);
+    expect(contrastRatio(token("--amber"), token("--amber-tint"))).toBeGreaterThanOrEqual(4.5);
+    for (const surface of [custom.secondary_bg_color, custom.section_bg_color]) {
+      expect(contrastRatio(token("--amber"), surface)).toBeGreaterThanOrEqual(4.5);
+      expect(contrastRatio(token("--red-text"), surface)).toBeGreaterThanOrEqual(4.5);
+      expect(contrastRatio(token("--red"), surface)).toBeGreaterThanOrEqual(3);
+      for (let lane = 0; lane < 10; lane += 1) expect(contrastRatio(token(`--lane-${lane}`), surface)).toBeGreaterThanOrEqual(3);
+    }
+    // A switch to Telegram's dark theme starts again from week.css's dark colours, not from the moved light ones.
+    tg.changeTheme(DARK, "dark");
+    expect(token("--lane-0")).toBe("#8ab4ff");
+    expect(token("--red-text")).toBe("#ffb4b4");
   });
 });
 

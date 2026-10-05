@@ -1,5 +1,6 @@
 // Week view colours (Refs #562): both schemes in week.css, and the Telegram theme mapped onto them,
 // keep WCAG AA. Text 4.5:1; control borders, lane fills, the status ring and the focus ring 3:1.
+// --line is not checked: it is decorative (see the head of week.css).
 // The colours come from the shipped week.css, so a palette edit that breaks a pair fails here.
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
@@ -100,12 +101,36 @@ describe("Telegram theme", () => {
     ["light", TELEGRAM_LIGHT, LIGHT],
     ["dark", TELEGRAM_DARK, DARK],
   ])("Telegram's default %s theme sets the surfaces and keeps AA contrast", (_, params, scheme) => {
-    const theme = telegramTokens(params)!;
+    const theme = telegramTokens(params, scheme)!;
     expect(theme["--bg"]).toBe(params.secondary_bg_color);
     expect(theme["--panel"]).toBe(params.section_bg_color);
     expect(theme["--text"]).toBe(params.text_color);
     expect(theme["--line"]).toBe(params.section_separator_color);
     expect(failures({ ...scheme, ...theme })).toEqual([]);
+  });
+
+  // Custom themes users can pick, at the edges of what still reads: Telegram's text stays 4.5:1 on them,
+  // but the scheme's own status and lane colours would not keep AA without being moved.
+  const CUSTOM: [string, Record<string, string>, Record<string, string>][] = [
+    ["grey-blue light", { bg_color: "#c0c8d0", secondary_bg_color: "#c0c8d0", section_bg_color: "#c8d0d8", text_color: "#000000", hint_color: "#333333", link_color: "#1a4fa0" }, LIGHT],
+    ["warm light", { bg_color: "#e8d9b5", secondary_bg_color: "#dcc9a0", section_bg_color: "#efe3c6", text_color: "#1a1206", hint_color: "#5c4b2a", link_color: "#7a3d00" }, LIGHT],
+    ["mid-grey dark", { bg_color: "#4a4f58", secondary_bg_color: "#40454d", section_bg_color: "#4a4f58", text_color: "#ffffff", hint_color: "#d0d4da", link_color: "#cfe0ff" }, DARK],
+    ["tinted dark", { bg_color: "#18222d", secondary_bg_color: "#131a22", section_bg_color: "#1f2b38", text_color: "#f5f5f5", hint_color: "#7e8b99", link_color: "#62bcf9" }, DARK],
+  ];
+
+  test.each(CUSTOM)("custom %s theme: status and lane colours are moved until every pair keeps AA", (_, params, scheme) => {
+    expect(failures({ ...scheme, ...telegramTokens(params, scheme)! })).toEqual([]);
+  });
+
+  test("the custom themes above do break AA when the scheme's colours are not moved", () => {
+    const unmoved = CUSTOM.flatMap(([, params, scheme]) => failures({ ...scheme, ...telegramTokens(params)! }));
+    expect(unmoved.length).toBeGreaterThan(0);
+  });
+
+  test("a colour that already keeps AA on Telegram's surfaces is kept as week.css has it", () => {
+    const theme = telegramTokens(TELEGRAM_DARK, DARK)!;
+    for (const lane of LANES) expect(theme[lane]).toBe(DARK[lane]);
+    expect(theme["--red-text"]).toBe(DARK["--red-text"]);
   });
 
   test("hint and link colours too faint to read are pulled toward the text colour until they reach 4.5:1", () => {
