@@ -307,6 +307,11 @@ export function shiftWeek(iso, weeks) {
   return isoDate(new Date(y, m - 1, d + weeks * 7));
 }
 
+/** The weeks prev and next open, or null while the week on screen is unknown (no week loaded yet). */
+export function adjacentWeeks(iso) {
+  return iso ? { prev: shiftWeek(iso, -1), next: shiftWeek(iso, 1) } : null;
+}
+
 export function isValidWeek(value) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(value || '')) return false;
   const [y, m, d] = value.split('-').map(Number);

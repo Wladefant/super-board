@@ -47,7 +47,8 @@ h1 { font-size: 28px; letter-spacing: -0.03em; margin-top: var(--s1); font-varia
 }
 .btn { padding: 0 var(--s4); }
 .icon-btn { min-width: 44px; padding: 0; font-size: 22px; line-height: 1; }
-.btn:hover, .icon-btn:hover { background: #2c4070; }
+.btn:hover, .icon-btn:hover:enabled { background: #2c4070; }
+.icon-btn:disabled { opacity: 0.4; cursor: default; }
 .link-btn { color: var(--text); text-decoration: none; margin-top: var(--s4); }
 
 .board-pick { display: flex; align-items: center; gap: var(--s3); }
