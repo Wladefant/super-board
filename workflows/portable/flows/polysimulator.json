@@ -1,0 +1,212 @@
+{
+  "schema": "flow-qa/v1",
+  "project": "polysimulator",
+  "version": "1.0.0",
+  "description": "Staging-only Flow QA definitions for PolySimulator covering markets navigation, trade panel interaction, and order book/activity tabs without document reload.",
+  "viewports": [
+    "390x844",
+    "390x420",
+    "1440x900"
+  ],
+  "themes": [
+    "light",
+    "dark"
+  ],
+  "flows": [
+    {
+      "id": "markets_navigation_and_filters",
+      "name": "Maerkte-Uebersicht und Kategorie-Navigation",
+      "description": "Prueft das Laden der Maerkte-Uebersicht auf PolySimulator Staging, Navigation zwischen Kategorien und Verhindern von horizontalem Overflow auf mobilen Viewports.",
+      "allowed_actions": [
+        "goto",
+        "tap",
+        "assert"
+      ],
+      "forbidden_actions": [
+        "eval",
+        "delete_database",
+        "prod_access"
+      ],
+      "steps": [
+        {
+          "id": "goto_markets_page",
+          "action": "goto",
+          "url": "/markets",
+          "checks": [
+            "visible",
+            "no_horizontal_overflow"
+          ]
+        },
+        {
+          "id": "assert_market_feed_present",
+          "action": "assert",
+          "selector": "[data-testid='market-card'], .market-card, main article, main a[href*='/markets/']",
+          "expected_present": true
+        },
+        {
+          "id": "switch_category_tab",
+          "action": "tap",
+          "selector": "nav[role='tablist'] button:nth-child(2), [data-testid='category-filter']:nth-child(2), button:has-text('Crypto')",
+          "no_document_reload": true,
+          "checks": [
+            "visible",
+            "tap_target_min_44",
+            "element_from_point",
+            "no_document_reload"
+          ]
+        },
+        {
+          "id": "assert_filtered_markets_container",
+          "action": "assert",
+          "selector": "main",
+          "expected_present": true
+        }
+      ],
+      "cleanup": []
+    },
+    {
+      "id": "market_trade_panel_interaction",
+      "name": "Markt-Detailseite und Trade-Panel Eingabemaske",
+      "description": "Oeffnet die Detailseite eines Marktes auf Staging, waehlt den Outcome 'Yes' und prueft die Share-Eingabemaske mit Vorberechnung im isolierten Staging-Bereich.",
+      "allowed_actions": [
+        "goto",
+        "tap",
+        "type",
+        "assert",
+        "cleanup"
+      ],
+      "forbidden_actions": [
+        "eval",
+        "real_money_transaction",
+        "prod_access",
+        "delete_database"
+      ],
+      "steps": [
+        {
+          "id": "goto_markets_overview",
+          "action": "goto",
+          "url": "/markets",
+          "checks": [
+            "visible",
+            "no_horizontal_overflow"
+          ]
+        },
+        {
+          "id": "open_first_market_detail",
+          "action": "tap",
+          "selector": "a[href*='/markets/']:first-child, [data-testid='market-card']:first-child a",
+          "checks": [
+            "visible",
+            "tap_target_min_44",
+            "element_from_point"
+          ]
+        },
+        {
+          "id": "assert_trade_panel_visible",
+          "action": "assert",
+          "selector": "[data-testid='trade-panel'], form, button:has-text('Buy Yes'), button:has-text('Yes')",
+          "expected_present": true
+        },
+        {
+          "id": "select_buy_yes_outcome",
+          "action": "tap",
+          "selector": "button:has-text('Buy Yes'), [data-testid='outcome-yes'], button:has-text('Yes')",
+          "checks": [
+            "visible",
+            "tap_target_min_44",
+            "element_from_point"
+          ]
+        },
+        {
+          "id": "type_test_share_amount",
+          "action": "type",
+          "selector": "input[type='number'], input[placeholder*='0'], input[name='amount']",
+          "text": "QA-10",
+          "mutation": true,
+          "checks": [
+            "visible"
+          ]
+        },
+        {
+          "id": "assert_return_calculation_displayed",
+          "action": "assert",
+          "selector": "[data-testid='estimated-return'], div:has-text('Return'), div:has-text('Total')"
+        }
+      ],
+      "cleanup": [
+        {
+          "id": "cleanup_reset_amount_field",
+          "action": "type",
+          "selector": "input[type='number'], input[placeholder*='0'], input[name='amount']",
+          "text": "QA-0",
+          "mutation": true
+        }
+      ]
+    },
+    {
+      "id": "order_book_and_activity_tabs",
+      "name": "Orderbuch und Aktivitaets-Tabs ohne Seiten-Reload",
+      "description": "Prueft den Wechsel zwischen Orderbuch und kuerzlichen Trades auf der Marktdetailseite ohne Dokument-Reload auf Staging.",
+      "allowed_actions": [
+        "goto",
+        "tap",
+        "assert"
+      ],
+      "forbidden_actions": [
+        "eval",
+        "prod_access",
+        "delete_database"
+      ],
+      "steps": [
+        {
+          "id": "goto_markets_list",
+          "action": "goto",
+          "url": "/markets",
+          "checks": [
+            "visible",
+            "no_horizontal_overflow"
+          ]
+        },
+        {
+          "id": "open_market_item",
+          "action": "tap",
+          "selector": "a[href*='/markets/']:first-child",
+          "checks": [
+            "visible",
+            "tap_target_min_44"
+          ]
+        },
+        {
+          "id": "switch_to_order_book_tab",
+          "action": "tap",
+          "selector": "button:has-text('Order Book'), [data-testid='tab-order-book']",
+          "no_document_reload": true,
+          "checks": [
+            "visible",
+            "tap_target_min_44",
+            "element_from_point",
+            "no_document_reload"
+          ]
+        },
+        {
+          "id": "switch_to_activity_tab",
+          "action": "tap",
+          "selector": "button:has-text('Activity'), button:has-text('Trades'), [data-testid='tab-activity']",
+          "no_document_reload": true,
+          "checks": [
+            "visible",
+            "tap_target_min_44",
+            "element_from_point",
+            "no_document_reload"
+          ]
+        },
+        {
+          "id": "assert_activity_feed_present",
+          "action": "assert",
+          "selector": "table, [data-testid='trades-list'], main"
+        }
+      ],
+      "cleanup": []
+    }
+  ]
+}
