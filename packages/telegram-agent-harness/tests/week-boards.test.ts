@@ -23,8 +23,9 @@ const iteration = (startDate: string, duration: number) => ({ __typename: "Proje
 const iso = (ms: number) => new Date(ms).toISOString();
 
 // Each item is [content, field values, updatedAt].
-function board(items: [Record<string, unknown> | null, unknown[], number][], hasNextPage = false) {
-  return { items: { pageInfo: { hasNextPage }, nodes: items.map(([content, values, updatedAt]) => ({ updatedAt: iso(updatedAt), content, fieldValues: { nodes: values } })) } };
+function board(items: [Record<string, unknown> | null, unknown[], number][], total = items.length) {
+  const nodes = items.map(([content, values, updatedAt]) => ({ updatedAt: iso(updatedAt), content, fieldValues: { nodes: values } }));
+  return { items: { totalCount: total, nodes } };
 }
 
 const OLD = WEEK_START - 20 * DAY;
@@ -47,7 +48,7 @@ const RESPONSES: Record<string, unknown> = {
       [issue("Bavariance/shipnovo", 21, { state: "CLOSED", closedAt: iso(MID) }), [], OLD],  // closed in the week: derived
       [issue("Bavariance/shipnovo", 22), [], OLD],                                           // no date field, no activity: absent
       [null, [], MID],                                                                       // redacted item: skipped
-    ], true),
+    ], 450),
   } } },
 };
 
@@ -81,7 +82,7 @@ describe("card placement", () => {
     expect(placeCards(raw(), BOARDS, WEEK_END + 30 * DAY, WEEK_END + 37 * DAY)).toEqual([]);
   });
 
-  test("a board with more items than one page is reported as truncated", () => {
+  test("a board with more items than its 100-item window is reported as truncated", () => {
     expect(parseCards(RESPONSES.Bavariance, [BOARDS[1]!, BOARDS[2]!]).truncatedBoards).toEqual(["Bavariance/11"]);
   });
 });
@@ -158,6 +159,7 @@ describe("cards reader", () => {
     expect(calls.guard).toBe(1);
     expect(calls.graphql).toHaveLength(2); // Wladefant, Bavariance: three boards, two owners
     expect(first.cards).toHaveLength(raw().length);
+    expect(calls.graphql.every(q => q.includes("items(last: 100)"))).toBe(true);
     tick(60_000);
     await Promise.all([reader.read(), reader.read()]);
     expect(calls.guard).toBe(1);

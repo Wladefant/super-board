@@ -37,8 +37,7 @@ export interface CardsResult { cards: RawCard[]; fetchedAt: number; stale: boole
 
 // ------------------------------------------------------------------ query and parse
 
-const ITEM_FIELDS = `pageInfo { hasNextPage }
-  nodes { updatedAt
+const NODE_FIELDS = `nodes { updatedAt
     content { __typename
       ... on Issue { number title url state closedAt repository { nameWithOwner } }
       ... on PullRequest { number title url state closedAt mergedAt repository { nameWithOwner } }
@@ -47,9 +46,14 @@ const ITEM_FIELDS = `pageInfo { hasNextPage }
       ... on ProjectV2ItemFieldDateValue { date field { ... on ProjectV2FieldCommon { name } } }
       ... on ProjectV2ItemFieldIterationValue { startDate duration field { ... on ProjectV2FieldCommon { name } } } } } }`;
 
-/** One query per owner; each board of that owner is an aliased `projectV2` inside it. */
+/**
+ * One query per owner; each board is an aliased `projectV2`. The GraphQL page limit is 100 and a wider
+ * window times out (HTTP 504, measured on 14 boards), so each board is read as its LAST 100 items: new
+ * cards are appended at the end, where the week's activity is. A board with more items than that is
+ * reported as truncated.
+ */
 export function buildCardsQuery(owner: string, boards: BoardInfo[]): string {
-  const projects = boards.map((b, i) => `b${i}: projectV2(number: ${b.number}) { items(first: ${ITEMS_PER_BOARD}) { ${ITEM_FIELDS} } }`);
+  const projects = boards.map((b, i) => `b${i}: projectV2(number: ${b.number}) { items(last: ${ITEMS_PER_BOARD}) { totalCount ${NODE_FIELDS} } }`);
   return `query { repositoryOwner(login: ${JSON.stringify(owner)}) { ... on ProjectV2Owner { ${projects.join("\n")} } } }`;
 }
 
@@ -77,8 +81,8 @@ export function parseCards(raw: unknown, boards: BoardInfo[]): { cards: RawCard[
   boards.forEach((board, i) => {
     const items = obj(obj(owner[`b${i}`])?.items);
     if (!items) return;
-    if (obj(items.pageInfo)?.hasNextPage === true) truncatedBoards.push(board.id);
     const nodes = Array.isArray(items.nodes) ? items.nodes : [];
+    if (typeof items.totalCount === "number" && items.totalCount > nodes.length) truncatedBoards.push(board.id);
     for (const node of nodes) {
       const item = obj(node);
       const content = obj(item?.content);
