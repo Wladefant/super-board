@@ -3,7 +3,7 @@
 // The colours come from the shipped week.css, so a palette edit that breaks a pair fails here.
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { contrastRatio, telegramTokens } from "../week/week-model.js";
+import { contrastRatio, mixColors, telegramTokens } from "../week/week-model.js";
 
 const css = readFileSync(new URL("../week/week.css", import.meta.url), "utf8").replace(/\/\*[\s\S]*?\*\//g, "");
 
@@ -76,6 +76,23 @@ describe("week.css schemes", () => {
 
   test("the dark scheme keeps AA contrast", () => expect(failures(DARK)).toEqual([]));
   test("the light scheme keeps AA contrast", () => expect(failures(LIGHT)).toEqual([]));
+
+  test("every board colour in boards.json, as the card chip shows it, keeps 3:1 on the surfaces of both schemes", () => {
+    const boards: { id: string; color: string }[] = JSON.parse(readFileSync(new URL("../week/boards.json", import.meta.url), "utf8")).boards;
+    expect(boards.length).toBeGreaterThan(0);
+    const out: string[] = [];
+    for (const [name, t] of [["dark", DARK], ["light", LIGHT]] as const) {
+      const tone = Number.parseFloat(t["--board-tone"]) / 100;
+      for (const board of boards) {
+        const shown = mixColors(t["--text"], board.color, tone);
+        for (const bg of ["--bg", "--panel"]) {
+          const ratio = contrastRatio(shown, t[bg]);
+          if (!(ratio >= 3)) out.push(`${name}: ${board.id} ${board.color} on ${bg}: ${ratio.toFixed(2)}`);
+        }
+      }
+    }
+    expect(out).toEqual([]);
+  });
 });
 
 describe("Telegram theme", () => {

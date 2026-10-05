@@ -36,6 +36,8 @@
   --lane-8: #a8e6a1;
   --lane-9: #f2a7d0;
   --lane-hover: brightness(1.08);
+  /* Board colours (boards.json) mark card chips; the light scheme mixes them toward the text colour for 3:1. */
+  --board-tone: 100%;
   --hatch: repeating-linear-gradient(135deg, rgb(11 16 32 / 0.34) 0 2px, transparent 2px 8px);
   --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s6: 24px; --s8: 32px;
   --r-panel: 16px; --r-ctl: 10px; --r-blk: 6px;
@@ -80,6 +82,7 @@
   --lane-8: #2e7d32;
   --lane-9: #b5307a;
   --lane-hover: brightness(0.92);
+  --board-tone: 60%;
   --hatch: repeating-linear-gradient(135deg, rgb(255 255 255 / 0.3) 0 2px, transparent 2px 8px);
   color-scheme: light;
 }
@@ -206,6 +209,7 @@ h1 { font-size: 28px; letter-spacing: -0.03em; margin-top: var(--s1); font-varia
 .card-chip {
   width: 100%; min-height: 28px; padding: var(--s1) var(--s2); text-align: left; font-size: 12px;
   background: var(--panel); color: var(--text); border: 1px solid var(--line); border-left: 4px solid var(--c); border-radius: var(--r-blk);
+  border-left-color: color-mix(in srgb, var(--c) var(--board-tone), var(--text));
 }
 .card-chip.derived { border-style: dashed; border-left-style: solid; }
 .card-title { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
