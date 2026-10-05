@@ -1,0 +1,16 @@
+{
+  "schema": "flow-qa/v1",
+  "project": "shipnovo",
+  "served_sha": "unknown",
+  "expected_sha": "unknown",
+  "passed": false,
+  "assertions": {
+    "passed": 0,
+    "failed": 1
+  },
+  "steps": [],
+  "cleanup": {
+    "passed": true
+  },
+  "error": "Served SHA check failed: Failed to query /api/version: fetch failed"
+}

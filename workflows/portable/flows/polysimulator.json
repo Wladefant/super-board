@@ -38,6 +38,12 @@
           ]
         },
         {
+          "id": "dismiss_consent_banner",
+          "action": "tap",
+          "selector": "[aria-labelledby='consent-title'] button",
+          "optional": true
+        },
+        {
           "id": "assert_market_feed_present",
           "action": "assert",
           "selector": "main a[href^='/markets/']",
@@ -67,11 +73,13 @@
     {
       "id": "market_trade_panel_interaction",
       "name": "Markt-Detailseite und Trade-Panel Eingabemaske",
-      "description": "Opens a market detail page from the list and checks the trade panel amount input exists. No order is placed.",
+      "description": "Opens a market detail page, focuses the amount field with the keyboard open, types 1 and checks the shares preview updates. The order is never submitted.",
       "allowed_actions": [
         "goto",
         "tap",
         "assert",
+        "keyboard-open",
+        "type",
         "cleanup"
       ],
       "forbidden_actions": [
@@ -91,6 +99,12 @@
           ]
         },
         {
+          "id": "dismiss_consent_banner",
+          "action": "tap",
+          "selector": "[aria-labelledby='consent-title'] button",
+          "optional": true
+        },
+        {
           "id": "open_first_market_detail",
           "action": "tap",
           "selector": "main a[aria-label][href^='/markets/']",
@@ -107,10 +121,40 @@
           "expected_present": true
         },
         {
-          "id": "assert_amount_input_present",
-          "action": "assert",
+          "id": "open_mobile_trade_drawer",
+          "action": "tap",
+          "selector": "[data-testid='sticky-buy-up-btn']",
+          "optional": true,
+          "checks": [
+            "visible",
+            "tap_target_min_44",
+            "element_from_point"
+          ]
+        },
+        {
+          "id": "open_amount_sheet",
+          "action": "tap",
+          "selector": "[data-testid='sticky-open-sheet-edit']",
+          "optional": true,
+          "checks": [
+            "tap_target_min_44"
+          ]
+        },
+        {
+          "id": "focus_amount_field",
+          "action": "keyboard-open",
           "selector": "input[type='number']",
-          "expected_present": true
+          "checks": [
+            "input_focus_in_viewport"
+          ]
+        },
+        {
+          "id": "type_numeric_amount",
+          "action": "type",
+          "selector": "input[type='number']",
+          "text": "1",
+          "numeric_only": true,
+          "preview_regex": "≈\\s*([\\d.,]+)\\s*shares"
         }
       ],
       "cleanup": []
@@ -138,6 +182,12 @@
             "visible",
             "no_horizontal_overflow"
           ]
+        },
+        {
+          "id": "dismiss_consent_banner",
+          "action": "tap",
+          "selector": "[aria-labelledby='consent-title'] button",
+          "optional": true
         },
         {
           "id": "open_market_item",
