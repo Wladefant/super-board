@@ -17,6 +17,12 @@ Super Build is the canonical builder. Do not use a separate `build-feature` work
 
 Super Build may implement, test, commit, merge worker branches, close completed issues, and move project cards to `Done`. It should not invent new product scope beyond the issue body. If the issue needs product/design/security judgment, apply the human-gate or WIP-partial path instead of guessing.
 
+## Design vocabulary and the deletion test
+
+Describe module design with the seven terms of [`skills/codebase-design/SKILL.md`](https://github.com/Wladefant/super-board/blob/main/skills/codebase-design/SKILL.md): module, interface, depth, seam, adapter, leverage, locality. Do not write "component", "service", "API" or "boundary" for these ideas in code comments, commit messages or PR text.
+
+Before a worker adds a new module, it applies the deletion test: if deleting the module would only move its calls to the target, do not add it. Prefer a deep module (small interface, much behavior behind it) over a thin wrapper. Depth-survey candidates (`gardener.py --survey-depth`, issue label `kind:gardener`) are ordinary `Ready` issues. Super Build executes them like any other issue and does not widen their scope.
+
 ## Configuration
 
 The orchestrator needs to know which project board to read. There are two modes:

@@ -95,6 +95,12 @@ export class WeekService {
   }
 }
 
+/** The raw board list the week view ships with; read per request so an edit shows without a restart. */
+export function readBoardsFile(): unknown {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  return JSON.parse(fs.readFileSync(path.join(here, "..", "week", "boards.json"), "utf8"));
+}
+
 /** Production wiring for the daemon: one store under the slot state dir, guard-gated GitHub owners from boards.json. */
 export function defaultWeekRoute(stateDir: string, fleet?: () => Promise<FleetSnapshot | null>): (query: WeekQuery) => Promise<WeekData> {
   const here = path.dirname(fileURLToPath(import.meta.url));

@@ -268,7 +268,7 @@ describe("GET /api/week and static files", () => {
   test("static allow-list serves flat web files and the shared client, refuses everything else", () => {
     expect(resolveWeekFile("/")).toBe("index.html");
     expect(resolveWeekFile("/week.js")).toBe("week.js");
-    expect(resolveWeekFile("/boards.json")).toBe("boards.json");
+    expect(resolveWeekFile("/boards.json")).toBeUndefined();
     expect(resolveWeekFile("/miniapp/client.js")).toBe("../miniapp/client.js");
     expect(resolveWeekFile("/../secret.json")).toBeUndefined();
     expect(resolveWeekFile("/a/b.js")).toBeUndefined();

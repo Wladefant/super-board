@@ -32,7 +32,8 @@ import sys
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import e2e_guard  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 PINS = json.loads((HERE / "pins.json").read_text(encoding="utf-8"))
@@ -43,10 +44,13 @@ ASSERTION_KINDS = {"assertion"}
 ASSERTION_APIS = {"agent.assert", "agent.waitFor"}
 
 
-def fetch_served_sha(base_url: str, timeout: float = 15.0) -> Optional[str]:
+def fetch_served_sha(base_url: str, timeout: float = 15.0, allowed: Optional[List[str]] = None) -> Optional[str]:
+    """Read /api/version without following redirects; the host must pass the allow-list."""
     url = base_url.rstrip("/") + "/api/version"
-    req = urllib.request.Request(url, headers={"accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as res:  # noqa: S310 (caller supplies a local/staging URL)
+    refusal = e2e_guard.host_allowed(url, allowed or ["localhost", "127.0.0.1"])
+    if refusal:
+        raise ValueError(refusal)
+    with e2e_guard.open_no_redirect(url, timeout, "application/json") as res:
         data = json.loads(res.read().decode("utf-8"))
     for key in ("sha", "served_sha", "version", "git_sha"):
         value = data.get(key)
@@ -65,12 +69,12 @@ def _is_assertion(step: Dict[str, Any]) -> bool:
 
 
 def _is_production(origin: str) -> bool:
-    host = (urlparse(origin if "://" in origin else f"http://{origin}").hostname or "").lower()
-    return host in PINS["forbiddenHosts"] or any(m in host for m in PINS["forbiddenHostMarkers"])
+    return e2e_guard.is_forbidden_host(e2e_guard.norm_host(origin))
 
 
 def evaluate(
-    report: Any, expected_sha: str, served_sha: Optional[str], required_viewports: List[str]
+    report: Any, expected_sha: str, served_sha: Optional[str], required_viewports: List[str],
+    require_replay: bool = False,
 ) -> Dict[str, Any]:
     reasons: List[str] = []
     out: Dict[str, Any] = {
@@ -126,6 +130,8 @@ def evaluate(
     if missing:
         reasons.append("missing_viewports")
         out["missing_viewports"] = missing
+    if require_replay and (out["model_calls"] > 0 or out["cache_missed"] > 0):
+        reasons.append("replay_not_clean")
 
     if not served_sha or not SHA_RE.match(served_sha):
         reasons.append("served_sha_unverified")
@@ -157,6 +163,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--expected-sha", required=True)
     ap.add_argument("--served-sha")
     ap.add_argument("--base-url")
+    ap.add_argument("--allow-host", action="append", default=[], help="extra staging host for the /api/version read; repeatable")
+    ap.add_argument("--require-replay", action="store_true", help="fail when any model call or cache miss happened")
     ap.add_argument("--viewports", default=",".join(PINS["requiredReceiptViewports"]),
                     help="required viewports (comma list); the gate needs 390x844 and 1440x900")
     ap.add_argument("--out")
@@ -165,7 +173,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     served = args.served_sha
     if not served and args.base_url:
         try:
-            served = fetch_served_sha(args.base_url)
+            served = fetch_served_sha(args.base_url, allowed=["localhost", "127.0.0.1", *args.allow_host])
         except Exception as exc:  # network error is a FAIL, not a crash
             print(f"served sha read failed: {exc}", file=sys.stderr)
     try:
@@ -173,7 +181,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     except (OSError, ValueError):
         report = None
     required = [v for v in args.viewports.split(",") if v]
-    ev = evaluate(report, args.expected_sha, served, required)
+    ev = evaluate(report, args.expected_sha, served, required, require_replay=args.require_replay)
     text = render(ev, served)
     if args.out:
         Path(args.out).write_text(text, encoding="utf-8")

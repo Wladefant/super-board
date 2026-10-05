@@ -113,6 +113,26 @@
       ],
       "cli_command": "python -B workflows/portable/test_gardener.py"
     },
+    "depth_survey": {
+      "name": "Gardener Module Depth Survey",
+      "description": "Report-only survey of shallow modules in hot files with a deletion test per candidate and an offline single-file HTML report. Run with gardener.py --survey-depth.",
+      "entry_files": [
+        "workflows/portable/depth_survey.py",
+        "workflows/portable/gardener.py",
+        "skills/improve-codebase-architecture/SKILL.md"
+      ],
+      "tests": [
+        "workflows/portable/test_depth_survey.py"
+      ],
+      "owning_issue": "https://github.com/Wladefant/super-board/issues/510",
+      "risk": "low",
+      "components": [
+        "DepthSurvey",
+        "DeletionTest",
+        "OfflineReport"
+      ],
+      "cli_command": "python -B workflows/portable/test_depth_survey.py"
+    },
     "build_slot": {
       "name": "Build & Browser Slot Arbiter",
       "description": "Host-level resource arbiter managing exclusive access to heavy tasks (next build, dev Chromium) with FIFO queuing, RAM threshold guards, and stale lock reclamation.",

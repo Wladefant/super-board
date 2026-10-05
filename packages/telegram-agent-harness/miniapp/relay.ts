@@ -13,7 +13,8 @@ export const SERVED_FILES: Record<string, string> = { "/": "index.html", "/app.j
 
 export type FileResolver = (pathname: string) => string | undefined;
 
-export function startRelay(secret: string, port = 3000, baseDir: URL | string = import.meta.url, resolveFile: FileResolver = pathname => SERVED_FILES[pathname]) {
+/** `authenticated` maps a public path to the `/api/` route it is answered from, so the daemon checks the app session first. */
+export function startRelay(secret: string, port = 3000, baseDir: URL | string = import.meta.url, resolveFile: FileResolver = pathname => SERVED_FILES[pathname], authenticated: Readonly<Record<string, string>> = {}) {
   if (secret.length < 43) throw new Error("RELAY_SECRET must contain at least 43 characters");
   let daemon: ServerWebSocket<undefined> | undefined;
   const pending = new Map<string, { finish: (response: Response) => void; timer: Timer }>();
@@ -34,11 +35,12 @@ export function startRelay(secret: string, port = 3000, baseDir: URL | string = 
         if (server.upgrade(request, { data: undefined })) return;
         return new Response("WebSocket required", { status: 400 });
       }
-      if (url.pathname.startsWith("/api/")) {
+      const apiPath = Object.hasOwn(authenticated, url.pathname) ? authenticated[url.pathname]! : url.pathname.startsWith("/api/") ? url.pathname : undefined;
+      if (apiPath) {
         const initData = request.headers.get("x-telegram-init-data") ?? "";
         const appSession = request.headers.get("x-miniapp-session") ?? "";
         const launch = new URLSearchParams(initData);
-        const shaped = url.pathname === "/api/session"
+        const shaped = apiPath === "/api/session"
           ? request.method === "POST" && initData.length <= 16384 && /^[a-f0-9]{64}$/.test(launch.get("hash") ?? "") && /^\d+$/.test(launch.get("auth_date") ?? "") && Boolean(launch.get("user"))
           : /^\d+\.\d+\.[a-f0-9]{32}\.[a-f0-9]{64}$/.test(appSession);
         if (!shaped) return Response.json({ error: "Open this app from Telegram again to authenticate." }, { status: 401 });
@@ -63,7 +65,7 @@ export function startRelay(secret: string, port = 3000, baseDir: URL | string = 
         return new Promise<Response>(resolve => {
           const timer = setTimeout(() => { pending.delete(id); resolve(unavailable()); }, 10000);
           pending.set(id, { finish: resolve, timer });
-          daemon?.send(JSON.stringify({ id, path: url.pathname, method: request.method, initData, appSession, body }));
+          daemon?.send(JSON.stringify({ id, path: apiPath, method: request.method, initData, appSession, body }));
         });
       }
       const file = resolveFile(url.pathname);
