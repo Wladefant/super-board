@@ -24,6 +24,15 @@ Violations flagged:
       one native sub-issue each, never in comments on the parent
       (https://github.com/Wladefant/super-board/issues/419).
 
+  (f) A tracked repo's default-branch AGENTS.md (or CLAUDE.md) with no `Project stage:` line,
+      more than one, or a value other than greenfield/live (`stage_line_invalid`).
+  (g) The same file with no `## Lessons` section or more than POLICY_LESSON_CAP lessons
+      (`lessons_section_invalid`).
+  (h) A repo marked `live` whose text permits skipping migrations or compatibility
+      (`live_repo_permits_skipping_compat`).
+  (f)-(h) run with --policy-docs; the repos are listed in --policy-repos
+  (https://github.com/Wladefant/super-board/issues/504).
+
 Options:
   --repo <owner/repo>   Target repository (default: Wladefant/super-board or GITHUB_REPOSITORY).
   --issue <number>      Audit a single issue instead of full repository.
@@ -114,6 +123,7 @@ class AuditSummary:
     research_recommendations_without_subissues: int = 0
     topic_comment_dumps_without_subissues: int = 0
     premature_closes: int = 0
+    policy_doc_violations: int = 0
 
 
 @dataclass
@@ -262,10 +272,19 @@ class GitHubClient:
                 text=True,
                 timeout=self.timeout_sec,
                 shell=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             return res.returncode, res.stdout, res.stderr
         except Exception as e:
             return 1, "", str(e)
+
+    def get_file(self, repo: str, path: str, ref: str) -> Optional[str]:
+        """Return a repository file's text at `ref`, or None when it does not exist."""
+        rc, stdout, _ = self._run_gh([
+            "api", f"repos/{repo}/contents/{path}?ref={ref}",
+            "-H", "Accept: application/vnd.github.raw+json",
+        ])
+        return stdout if rc == 0 else None
 
     def get_issues(self, repo: str, state: str = "all") -> List[Dict[str, Any]]:
         """Fetch all non-PR issues in the repository."""
@@ -745,6 +764,91 @@ def audit_premature_closes(
     return findings, scanned
 
 
+# Checks (f)-(h): the project stage, Lessons cap and live-repo compatibility text.
+POLICY_FILES = ("AGENTS.md", "CLAUDE.md")
+POLICY_LESSON_CAP = 20
+POLICY_REPOS_DEFAULT = (
+    "Wladefant/super-board@main",
+    "Wladefant/veyyon@main",
+    "Wladefant/komo@main",
+    "Wladefant/shipnovo@main",
+    "Bavariance/polysimulator@staging",
+)
+STAGE_LINE_RE = re.compile(r"(?m)^Project stage:[ \t]*(\S*)")
+LESSONS_HEADING_RE = re.compile(r"(?m)^## +Lessons[ \t]*$")
+# A line that lets work skip migrations or compatibility.
+SKIP_COMPAT_RE = re.compile(
+    r"(?i)\b(?:skip(?:ping)?|ignore|ignoring|no need for|don'?t need|do not need|not need)\s+(?:a\s+|any\s+|the\s+)?"
+    r"(?:migrations?|backwards?[- ]compat\w*|compatibility|deprecation)\b"
+    r"|\bbreaking changes? (?:are|is) (?:fine|ok|allowed)\b"
+)
+# A line that forbids or describes the other stage is not a permission.
+SKIP_COMPAT_EXEMPT_RE = re.compile(r"(?i)\b(?:never|must not|do not skip|don'?t skip|not allowed|forbidden|greenfield|unless|rather than)\b")
+
+
+def lessons_lines(text: str) -> Optional[List[str]]:
+    """The `- ` lines inside `## Lessons`, or None when the section is missing."""
+    lines = text.splitlines()
+    start = next((i for i, l in enumerate(lines) if LESSONS_HEADING_RE.match(l)), None)
+    if start is None:
+        return None
+    out: List[str] = []
+    for l in lines[start + 1:]:
+        if l.startswith("## "):
+            break
+        if l.startswith("- "):
+            out.append(l)
+    return out
+
+
+def audit_policy_text(repo: str, ref: str, path: str, text: str) -> List[Finding]:
+    """Checks (f)-(h) on one policy file. Pure: no network."""
+    url = f"https://github.com/{repo}/blob/{ref}/{path}"
+    where = {"repo": repo, "ref": ref, "file": path}
+
+    def finding(category: str, **details: Any) -> Finding:
+        return Finding(category=category, issue_number=0, title=f"{repo}@{ref} {path}", url=url,
+                       details={**where, **details})
+
+    out: List[Finding] = []
+    stages = STAGE_LINE_RE.findall(text)
+    if len(stages) != 1 or stages[0].lower() not in ("greenfield", "live"):
+        out.append(finding("stage_line_invalid", stage_lines=stages))
+    lessons = lessons_lines(text)
+    if lessons is None:
+        out.append(finding("lessons_section_invalid", problem="no '## Lessons' section"))
+    elif len(lessons) > POLICY_LESSON_CAP:
+        out.append(finding("lessons_section_invalid", problem=f"{len(lessons)} lessons, cap {POLICY_LESSON_CAP}"))
+    if len(stages) == 1 and stages[0].lower() == "live":
+        for line in text.splitlines():
+            if SKIP_COMPAT_RE.search(line) and not SKIP_COMPAT_EXEMPT_RE.search(line):
+                out.append(finding("live_repo_permits_skipping_compat", line=line.strip()[:200]))
+    return out
+
+
+def audit_policy_docs(
+    repos: List[str], client: Optional[GitHubClient] = None
+) -> Tuple[List[Finding], int]:
+    """Checks (f)-(h) over `owner/repo@branch` entries. Read-only. Returns (findings, repos scanned)."""
+    client = client or GitHubClient()
+    findings: List[Finding] = []
+    for entry in repos:
+        repo, _, ref = entry.partition("@")
+        ref = ref or "main"
+        for path in POLICY_FILES:
+            text = client.get_file(repo, path, ref)
+            if text is not None and (path == POLICY_FILES[0] or LESSONS_HEADING_RE.search(text) or STAGE_LINE_RE.search(text)):
+                findings.extend(audit_policy_text(repo, ref, path, text))
+                break
+        else:
+            findings.append(Finding(
+                category="stage_line_invalid", issue_number=0, title=f"{repo}@{ref}",
+                url=f"https://github.com/{repo}/tree/{ref}",
+                details={"repo": repo, "ref": ref, "problem": "no AGENTS.md or CLAUDE.md"},
+            ))
+    return findings, len(repos)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Enforce adopt-or-reject rule and parent/sub-issue integrity."
@@ -803,10 +907,40 @@ def main() -> None:
         help=f"Look-back window in days for check (e) (default: {PREMATURE_CLOSE_DAYS})",
     )
 
+    parser.add_argument(
+        "--policy-docs",
+        action="store_true",
+        help="Also run checks (f)-(h): project stage line, Lessons cap, live-repo compatibility text",
+    )
+    parser.add_argument(
+        "--only-policy-docs",
+        action="store_true",
+        help="Run only checks (f)-(h) (read-only)",
+    )
+    parser.add_argument(
+        "--policy-repos",
+        default=",".join(POLICY_REPOS_DEFAULT),
+        help="Comma-separated owner/repo@branch list for checks (f)-(h)",
+    )
+
     args = parser.parse_args()
+    policy_repos = [r.strip() for r in args.policy_repos.split(",") if r.strip()]
 
     close_repos = [r.strip() for r in args.close_repos.split(",") if r.strip()] if args.close_repos else [args.repo]
-    if args.only_premature_closes:
+    if args.only_policy_docs:
+        pd_findings, pd_scanned = audit_policy_docs(policy_repos)
+        result = AuditResult(
+            repo=",".join(policy_repos),
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            status="fail" if pd_findings else "pass",
+            summary=AuditSummary(
+                total_issues_scanned=pd_scanned,
+                total_findings=len(pd_findings),
+                policy_doc_violations=len(pd_findings),
+            ),
+            findings=pd_findings,
+        )
+    elif args.only_premature_closes:
         pc_findings, pc_scanned = audit_premature_closes(close_repos, days=args.close_days)
         result = AuditResult(
             repo=",".join(close_repos),
@@ -828,6 +962,13 @@ def main() -> None:
             premature_close_repos=close_repos if args.premature_closes else None,
             premature_close_days=args.close_days,
         )
+
+    if args.policy_docs and not args.only_policy_docs:
+        pd_findings, _ = audit_policy_docs(policy_repos)
+        result.findings.extend(pd_findings)
+        result.summary.policy_doc_violations = len(pd_findings)
+        result.summary.total_findings += len(pd_findings)
+        result.status = "fail" if result.findings else "pass"
 
     if args.json:
         print(json.dumps(result.to_dict(), indent=2))
