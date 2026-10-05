@@ -273,6 +273,12 @@ def log(msg: str) -> None:
     line = f"{dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} {msg}"
     if sys.stdout is not None:
         print(line)
+    try:  # pythonw has no stdout; the log file is the record of an unattended run
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(STATE_DIR / "health.log", "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except OSError:
+        pass
 
 
 def run(live: bool, force: bool, state_dir: Path, min_hours: float, hours: int, post=post_comment) -> int:
