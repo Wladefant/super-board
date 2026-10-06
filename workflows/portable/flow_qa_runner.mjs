@@ -1588,6 +1588,57 @@ export function loadFlowData(flowFilePath) {
 }
 
 /**
+ * Opens a page for the flows with the cookies of the storage state. Native dialogs (`confirm`,
+ * `alert`) are accepted the way a user confirms them: an open dialog blocks every CDP call on the
+ * page, so one left open stalls the run.
+ */
+export async function openFlowPage(browser, storageState = null) {
+  const page = await browser.newPage();
+  const cdpSession = await page.createCDPSession();
+  page.on('dialog', (dialog) => { dialog.accept().catch(() => {}); });
+  page.on('response', (res) => {
+    if (res.url().includes('products')) {
+      console.log(`[HTTP_RESP] ${res.status()} ${res.request().method()} ${res.url()}`);
+    }
+  });
+  if (storageState && fs.existsSync(storageState)) {
+    const stateContent = JSON.parse(fs.readFileSync(storageState, 'utf8'));
+    if (Array.isArray(stateContent.cookies)) {
+      await page.setCookie(...stateContent.cookies);
+    }
+  }
+  return { page, cdpSession };
+}
+
+async function applyViewport(page, vp, theme) {
+  await page.setViewport({
+    width: vp.width,
+    height: vp.height,
+    isMobile: vp.isMobile,
+    hasTouch: vp.hasTouch,
+    deviceScaleFactor: vp.deviceScaleFactor
+  });
+  await page.emulateMediaFeatures([{ name: 'prefers-color-scheme', value: theme }]);
+}
+
+/**
+ * Sets viewport and colour scheme for the next run. When a step closed or broke the page, the run
+ * continues on a fresh page with the same cookies instead of failing every remaining viewport.
+ */
+export async function prepareFlowPage(browser, current, storageState, vp, theme) {
+  try {
+    if (current.page.isClosed()) throw new Error('page closed');
+    await applyViewport(current.page, vp, theme);
+    return current;
+  } catch (_) {
+    await current.page.close().catch(() => {});
+    const fresh = await openFlowPage(browser, storageState);
+    await applyViewport(fresh.page, vp, theme);
+    return fresh;
+  }
+}
+
+/**
  * Executes flow QA suite and generates flow-qa/v1 report.
  */
 export async function runFlows(options = {}) {
@@ -1642,7 +1693,10 @@ export async function runFlows(options = {}) {
   const puppeteer = resolvePuppeteer();
   const chromePath = executablePath || resolveExecutablePath();
 
+  // CDP calls have no per-call timeout: on a loaded host a slow call is not a UI failure. The
+  // `build_slot.py run --timeout` around the runner bounds the whole run.
   const browser = await puppeteer.launch({
+    protocolTimeout: 0,
     executablePath: chromePath,
     headless: headless ? 'new' : false,
     args: [
@@ -1660,21 +1714,7 @@ export async function runFlows(options = {}) {
   let totalAssertionsFailed = 0;
 
   try {
-    const page = await browser.newPage();
-    const cdpSession = await page.createCDPSession();
-    page.on('response', (res) => {
-      if (res.url().includes('products')) {
-        console.log(`[HTTP_RESP] ${res.status()} ${res.request().method()} ${res.url()}`);
-      }
-    });
-
-    // Load storage state if provided
-    if (storageState && fs.existsSync(storageState)) {
-      const stateContent = JSON.parse(fs.readFileSync(storageState, 'utf8'));
-      if (Array.isArray(stateContent.cookies)) {
-        await page.setCookie(...stateContent.cookies);
-      }
-    }
+    let current = await openFlowPage(browser, storageState);
 
     for (const flow of flowsToRun) {
       const flowConstraints = {
@@ -1687,18 +1727,8 @@ export async function runFlows(options = {}) {
         if (!vp) continue;
 
         for (const theme of themes) {
-          // Set viewport and theme
-          await page.setViewport({
-            width: vp.width,
-            height: vp.height,
-            isMobile: vp.isMobile,
-            hasTouch: vp.hasTouch,
-            deviceScaleFactor: vp.deviceScaleFactor
-          });
-
-          await page.emulateMediaFeatures([
-            { name: 'prefers-color-scheme', value: theme }
-          ]);
+          current = await prepareFlowPage(browser, current, storageState, vp, theme);
+          const { page, cdpSession } = current;
 
           const steps = Array.isArray(flow.steps) ? flow.steps : [];
           for (const step of steps) {

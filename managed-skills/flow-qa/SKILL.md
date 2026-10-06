@@ -65,6 +65,9 @@ focused input inside the viewport with the keyboard open, no document reload, sw
 A `goto` returns at DOMContentLoaded, so the opened page can fire its own `load` event during the next
 step. That late `load` keeps the document identity token and does not count as a reload. A new document does.
 Mutations use a `QA-` prefix and each flow cleans up. A failed cleanup fails the run.
+The runner accepts native dialogs (`confirm`, `alert`) like a user. When a step closes the page, the next
+viewport starts on a new page with the same cookies. CDP calls have no own timeout, so always start the
+runner through `build_slot.py run --timeout`.
 
 ## Failure
 
