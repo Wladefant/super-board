@@ -831,10 +831,19 @@ class OuterLoopIntake:
 
         try:
             # 1. Update Labels and Milestone via gh issue edit
-            if plan.labels_to_add or plan.labels_to_remove or plan.target_milestone:
+            # Other repos (e.g. shipnovo) keep their own label set: add only labels they have.
+            labels_to_add = plan.labels_to_add
+            if labels_to_add:
+                known = set(
+                    self.cli_runner(
+                        ["label", "list", "--repo", repo_slug, "--limit", "300", "--json", "name", "-q", ".[].name"]
+                    ).split("\n")
+                )
+                labels_to_add = [label for label in labels_to_add if label in known]
+            if labels_to_add or plan.labels_to_remove or plan.target_milestone:
                 edit_args = ["issue", "edit", str(plan.issue_number), "--repo", repo_slug]
-                if plan.labels_to_add:
-                    edit_args.extend(["--add-label", ",".join(plan.labels_to_add)])
+                if labels_to_add:
+                    edit_args.extend(["--add-label", ",".join(labels_to_add)])
                 if plan.labels_to_remove:
                     edit_args.extend(["--remove-label", ",".join(plan.labels_to_remove)])
                 if plan.target_milestone:
@@ -842,7 +851,7 @@ class OuterLoopIntake:
 
                 self.cli_runner(edit_args)
                 writes += 1
-                actions.append(f"Updated issue metadata: add={plan.labels_to_add}, remove={plan.labels_to_remove}, ms={plan.target_milestone}")
+                actions.append(f"Updated issue metadata: add={labels_to_add}, remove={plan.labels_to_remove}, ms={plan.target_milestone}")
 
             # 2. Project Enrollment
             item_id = plan.project_item_id
