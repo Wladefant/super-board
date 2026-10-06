@@ -11,6 +11,7 @@ Windows-safe (no fcntl), crash-resilient lock file.
 Commands:
     acquire <name> [--timeout SEC] [--heartbeat-stale-after SEC] [--poll-interval SEC] [--force] [--next-dir DIR]
     run <name> [--timeout SEC] [--priority] [--force] [--cwd DIR] [--next-dir DIR] [--heartbeat-stale-after SEC] -- <cmd...>
+    heartbeat <name>
     release <name>
     status [--json]
 
@@ -25,13 +26,14 @@ Invariants:
     - Acquire wait loops write heartbeats before queue cleaning, re-enqueue if pruned,
       and clean up queue entries via try/finally on timeout, exit, or exception.
     - Release by non-owner is strictly refused.
-    - Stale locks are reclaimed with a logged notice. A live holder is never reclaimed on
+    - Stale locks are reclaimed with a logged notice. A live `run` holder is never reclaimed on
       age alone. A `run` lock lives exactly as long as its wrapper process (the
       `build_slot.py run` PID, which heartbeats every 5s, waits for the command and releases
       in `finally`): a dead wrapper is reclaimed after the 60s grace period, and a live one
       only once its heartbeat is older than --heartbeat-stale-after [default 5m] (hung).
-      Other locks (`acquire` mode has no process left to heartbeat): only when the owner PID
-      is dead past the grace period.
+      Other locks (`acquire` mode has no process left to heartbeat): when the owner PID is
+      dead past the grace period, or when the owner PID is alive (it is the lane's host,
+      which outlives a lane that never released) but the heartbeat is older than 30 min (#620).
     - A reclaim renames the lock dir to a unique tombstone and deletes it only if the
       tombstone still holds the lock that was judged stale; otherwise it is put back. A
       reclaim never deletes a lock other than the one it judged stale.
@@ -80,6 +82,7 @@ SLOT_LOCK_DIR_NAMES = [
 QUEUE_FILE_NAME = "build-slot.queue.json"
 QUEUE_LOCK_NAME = "build-slot-queue.lock"
 INFO_FILE_NAME = "info.json"
+DEFAULT_ACQUIRE_HOLDER_STALE_SECONDS = 30 * 60  # a live-PID `acquire` holder silent this long was abandoned (#620)
 
 DEFAULT_LOCK_HEARTBEAT_STALE_SECONDS = 5 * 60  # a live `run` holder silent this long is hung
 DEFAULT_POLL_INTERVAL_SECONDS = 5.0
@@ -1311,10 +1314,11 @@ class BuildSlotManager:
         self,
         heartbeat_stale_after: float = DEFAULT_LOCK_HEARTBEAT_STALE_SECONDS,
         pid_dead_grace_period: Optional[float] = None,
+        acquire_holder_stale_after: float = DEFAULT_ACQUIRE_HOLDER_STALE_SECONDS,
     ) -> bool:
         """
-        Checks if the currently held lock is stale. A live holder is never reclaimed on age
-        alone: a build that runs past any fixed age must keep its slot.
+        Checks if the currently held lock is stale. A live `run` holder is never reclaimed on
+        age alone: a build that runs past any fixed age must keep its slot.
         A heartbeat counts as fresh when younger than the grace period (default 60s).
         Reclaims it if:
           1. `run` lock (has wrapper_pid): the wrapper is dead, the lock is older than the
@@ -1323,7 +1327,10 @@ class BuildSlotManager:
              A dead wrapped command (a shim or launcher) never frees the slot: the wrapper
              waits for its command and releases in `finally`.
           2. Other locks (`acquire` mode, which has no process left to heartbeat): owner
-             PID is dead AND lock age exceeds grace period (and heartbeat not fresh).
+             PID is dead AND lock age exceeds grace period (and heartbeat not fresh); or the
+             owner PID is alive (the lane's host) but the heartbeat, or the lock age when
+             there is none, is older than acquire_holder_stale_after (30 min): the lane
+             ended without releasing (#620).
           3. Corrupt lock directory older than 10s grace period.
         Returns True if a stale lock was reclaimed, False otherwise.
         """
@@ -1393,7 +1400,19 @@ class BuildSlotManager:
                                 f"run wrapper PID {wrapper_pid} is dead and lock age exceeds grace period "
                                 f"({age:.1f}s >= {effective_grace:.1f}s, owner='{owner}', slot {slot_idx})"
                             )
-                    elif pid > 0 and not self.is_pid_alive(pid):
+                    elif pid > 0 and self.is_pid_alive(pid):
+                        # `acquire` mode records the lane's long-lived host PID, which outlives
+                        # a lane that ended without releasing (#620). Heartbeat silence, or
+                        # lock age when no heartbeat was ever written, is the only signal left.
+                        silence = hb_age if hb_age is not None else age
+                        if silence >= acquire_holder_stale_after:
+                            is_stale = True
+                            reason = (
+                                f"acquire owner PID {pid} is alive but silent "
+                                f"({silence:.1f}s >= {acquire_holder_stale_after:.1f}s, "
+                                f"owner='{owner}', slot {slot_idx})"
+                            )
+                    elif pid > 0:
                         # Never reclaim a lock younger than the grace period (e.g. 60s),
                         # or whose heartbeat is fresh (< 60s).
                         if age < effective_grace or is_hb_fresh:
@@ -2159,6 +2178,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p_rel = subparsers.add_parser("release", help="Release build slot lock (refused if not owner)")
     p_rel.add_argument("name", help="Lane or worker identifier releasing the slot")
 
+    # heartbeat <name>
+    p_hb = subparsers.add_parser(
+        "heartbeat",
+        help="Refresh the heartbeat of the slot held by <name> (a long `acquire` build calls this to keep its slot)",
+    )
+    p_hb.add_argument("name", help="Lane or worker identifier holding the slot")
+
     # status [--json]
     p_stat = subparsers.add_parser("status", help="Print current lock owner, age, and FIFO queue")
     p_stat.add_argument(
@@ -2341,6 +2367,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             heartbeat_stale_after=args.heartbeat_stale_after,
             next_dir=getattr(args, "next_dir", None),
         )
+
+    elif args.command == "heartbeat":
+        if manager.heartbeat_lock(name=args.name):
+            print(f"Refreshed build slot heartbeat for '{args.name}'")
+            return 0
+        print(f"ERROR: No build slot is held by '{args.name}'.", file=sys.stderr)
+        return 1
 
     elif args.command == "release":
         success = manager.release(name=args.name)
