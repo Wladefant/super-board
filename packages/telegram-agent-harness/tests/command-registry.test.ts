@@ -78,6 +78,8 @@ test("daemon registration includes /sessions, /new, /attach from daemon router",
   expect(commandNames).toContain("attach");
   expect(commandNames).toContain("detach");
   expect(commandNames).toContain("where");
+  expect(commandNames).toContain("app");
+  expect(commandNames).toContain("week");
 
   const calls: Registration[] = [];
   globalThis.fetch = (async (_url, init) => {

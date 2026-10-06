@@ -786,6 +786,7 @@ describe("routing commands", () => {
     const commands = getDaemonCommands();
     const names = commands.map(c => c.command);
     expect(names).toContain("app");
+    expect(names).toContain("week");
     expect(names).toContain("sessions");
     expect(names).toContain("attach");
     expect(names).toContain("new");
@@ -804,6 +805,7 @@ describe("routing commands", () => {
     expect(help).toContain("/where");
     expect(help).toContain("/detach");
     expect(help).toContain("/app");
+    expect(help).toContain("/week");
     expect(help).toContain("/reload");
   });
 
