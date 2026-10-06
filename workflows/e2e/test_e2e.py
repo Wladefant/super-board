@@ -319,6 +319,16 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(len(desc_lines), 1)
         self.assertGreater(len(desc_lines[0].split("description:")[1].strip()), 20)
 
+    def test_policy_documents_flow_qa_boundary(self):
+        policy = (HERE / "POLICY.md").read_text(encoding="utf-8")
+        self.assertIn("Flow QA integration & replacement boundary", policy)
+        self.assertIn("https://github.com/Wladefant/super-board/issues/487", policy)
+        self.assertIn("What e2e replaces", policy)
+        self.assertIn("What remains", policy)
+        self.assertIn("github_pr_gate.py", policy)
+        self.assertIn("390x844", policy)
+        self.assertIn("1440x900", policy)
+
     def test_policy_documents_slice_1_and_slice_2(self):
         policy = (HERE / "POLICY.md").read_text(encoding="utf-8")
         self.assertIn("https://github.com/Wladefant/super-board/issues/475", policy)

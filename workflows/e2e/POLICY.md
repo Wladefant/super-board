@@ -3,6 +3,7 @@
 Parent: https://github.com/Wladefant/super-board/issues/473.
 Slice 1 (Windows spike and version pin): https://github.com/Wladefant/super-board/issues/475.
 Slice 2 (Model and secrets policy): https://github.com/Wladefant/super-board/issues/476.
+Slice 4 (Flow QA integration and replacement boundary): https://github.com/Wladefant/super-board/issues/487.
 Pins: `pins.json`. Template: `e2e.config.template.ts`. Checks: `e2e_guard.py`. Runner: `e2e_run.py`.
 
 ## Windows spike findings and platform caveats
@@ -51,3 +52,19 @@ We use exact versions only. No caret or tilde is allowed.
 6. The config fails closed. The app host must be `localhost`, `127.0.0.1` or a listed staging host. Production hostnames are refused by exact name (`polysimulator.com`, `api.polysimulator.com`, ...) and by marker (`zaraprptkegxqpvnsubu`, `akamai-iad-prod`). Failing id: `E2E_HOST_NOT_ALLOWED`.
 7. Never run `e2e --version`, `e2e init` or `e2e login` from a lane. `init` spawns `npm install` with no hidden window.
 8. Heavy runs go through `build_slot.py`, one browser at a time, with a timeout.
+
+## Flow QA integration & replacement boundary
+
+Parent: https://github.com/Wladefant/super-board/issues/473. Slice 4: https://github.com/Wladefant/super-board/issues/487.
+Receipt generator: `workflows/e2e/e2e_receipt.py`. Merge gate reader: `workflows/portable/github_pr_gate.py`.
+
+### What e2e replaces
+1. Ad-hoc browser test scripts: instead of custom Playwright or Puppeteer driver scripts, lanes use `e2e` with pinned packages (`e2e@0.17.0`, `@e2e-dev/web@0.12.0`) and cached replay.
+2. Separate test runners for interactive web flows: `e2e` runs recorded flows and agentic navigation with zero model calls on replay.
+
+### What remains (Flow QA invariants)
+1. Single authoritative gate: `github_pr_gate.py` remains the only merge gate reader. It consumes the `FLOW-QA: PASS <served-sha>` receipt produced by `e2e_receipt.py`.
+2. Required viewport matrix: tests must cover `390x844` (mobile portrait), `390x420` (mobile with keyboard open), and `1440x900` (desktop).
+3. Tap targets and layout rules: 44 px minimum tap targets, no horizontal scroll overflow, and active focus visibility.
+4. Content-bound served SHA: the receipt binds the test run to `/api/version` on the served host. A mismatched or unverified SHA causes `FLOW-QA-REASON served_sha_mismatch` and fails the gate.
+5. Deterministic scripted flows: `workflows/portable/flow_qa_runner.mjs` remains available for lightweight YAML flow definitions (`flow.yaml`). `e2e` handles full agentic and stateful browser flows; both bridge into the same `FLOW-QA:` receipt format.
