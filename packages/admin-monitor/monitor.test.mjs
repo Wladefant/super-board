@@ -95,3 +95,22 @@ test("healthy unchanged target causes no KV write", async () => {
   await runChecks(env, [{ name: "a", url: "https://a" }], fetchImpl, 1);
   assert.equal(puts, 0);
 });
+
+test("KV put failing never repeats a DOWN: nothing is sent while KV is broken", async () => {
+  const env = fakeEnv();
+  const tg = [];
+  const fetchImpl = async (url, opts) => {
+    if (url.startsWith("https://api.telegram.org/")) { tg.push(JSON.parse(opts.body)); return { ok: true, status: 200 }; }
+    throw new Error("down");
+  };
+  const targets = [{ name: "svc-a", url: "https://a.example" }];
+  await runChecks(env, targets, fetchImpl, 0);
+  const put = env.STATE.put;
+  env.STATE.put = async () => { throw new Error("kv down"); };
+  for (const t of [300000, 600000, 900000]) await runChecks(env, targets, fetchImpl, t).catch(() => {});
+  assert.equal(tg.length, 0);
+  env.STATE.put = put;
+  await runChecks(env, targets, fetchImpl, 1200000);
+  await runChecks(env, targets, fetchImpl, 1500000);
+  assert.equal(tg.length, 1);
+});

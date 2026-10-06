@@ -70,8 +70,14 @@ export async function runChecks(env, targets, fetchImpl = fetch, now = Date.now(
       } catch {
         prev = null;
       }
-      const { state, notify } = step(prev, isUp(status), now);
+      const { state, notify: fresh } = step(prev, isUp(status), now);
+      // A notice whose send never finished stays in state.pending and goes out first.
+      const notify = prev?.pending || fresh;
+      const later = prev?.pending ? fresh : null;
       if (notify) {
+        // Persist the pending notice BEFORE sending: if KV is down we send nothing, so a broken KV
+        // can never cause a repeated message every run.
+        await env.STATE.put(key, JSON.stringify({ ...state, pending: notify }));
         const text = formatMessage(t, notify, env.ADMIN_BASE_URL, now);
         const r = await fetchImpl(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
           method: "POST",
@@ -79,14 +85,13 @@ export async function runChecks(env, targets, fetchImpl = fetch, now = Date.now(
           body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text, parse_mode: "HTML", disable_web_page_preview: true }),
           signal: AbortSignal.timeout(TIMEOUT_MS),
         });
-        // State is written only after the send succeeded, so a failed send is retried on the next run.
+        // On a failed send the pending notice stays in KV and is retried on the next run.
         if (!r.ok) throw new Error(`telegram sendMessage failed: ${r.status}`);
         sent.push({ name: t.name, kind: notify.kind });
-      }
-      // KV writes are limited per day: write only when the state changed.
-      const next = JSON.stringify(state);
-      if (next !== JSON.stringify({ fails: 0, down: false, since: 0, ...(prev || {}) })) {
-        await env.STATE.put(key, next);
+        await env.STATE.put(key, JSON.stringify(later ? { ...state, pending: later } : state));
+      } else if (JSON.stringify(state) !== JSON.stringify({ fails: 0, down: false, since: 0, ...(prev || {}) })) {
+        // KV writes are limited per day: write only when the state changed.
+        await env.STATE.put(key, JSON.stringify(state));
       }
     } catch (e) {
       errors.push(`${t.name}: ${e.message}`);
