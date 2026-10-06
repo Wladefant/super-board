@@ -349,6 +349,20 @@ function readable(color, toward, backgrounds, min) {
   return toward;
 }
 
+/**
+ * Status text `color` on its tint, `base` mixed 10% into `bg`: `{ fg, tint }` keeping 4.5:1 on the tint and
+ * on `others`. The text is pulled toward `text` first; when even `text` does not read on the tint, the tint
+ * fades toward `bg` in tenths. At no tint it is `bg`, where `text` keeps 4.5:1, so the loop always ends.
+ */
+function onTint(color, base, text, bg, others) {
+  for (let step = 10; ; step -= 1) {
+    const tint = mixColors(bg, base, step / 100);
+    const backgrounds = [...others, tint];
+    const fg = readable(color, text, backgrounds, 4.5);
+    if (step === 0 || backgrounds.every(back => contrastRatio(fg, back) >= 4.5)) return { fg, tint };
+  }
+}
+
 const HEX = /^#[0-9a-f]{6}$/i;
 
 /** The scheme's colours that are drawn on the page surfaces; telegramTokens re-checks them on Telegram's. */
@@ -360,8 +374,9 @@ export const SURFACE_BOUND = ['--red', '--red-text', '--amber', ...Array.from({ 
  * Telegram supplies the surfaces and the text. Users pick those colours, so muted and accent text are
  * pulled toward the text colour until they keep 4.5:1, and control borders until 3:1 (WCAG AA).
  * `own` holds the scheme's SURFACE_BOUND colours from week.css. Each one is pulled toward the text colour
- * the same way: status text to 4.5:1, the status ring and lane fills to 3:1. Their tints and edges become
- * solid colours derived from them, so every pair stays checkable.
+ * the same way: status text to 4.5:1 on its tint, the status ring and lane fills to 3:1. Their tints and
+ * edges become solid colours derived from them, so every pair stays checkable. A tint that no text colour
+ * reads on is faded toward the page surface (onTint).
  */
 export function telegramTokens(params, own = {}) {
   const pick = (...keys) => keys.map(key => params?.[key]).find(value => HEX.test(value ?? ''));
@@ -387,13 +402,13 @@ export function telegramTokens(params, own = {}) {
     Object.assign(tokens, { '--red': red, '--red-edge': red, '--red-tint': mixColors(bg, red, 0.1) });
   }
   if (color('--red-text')) {
-    const tint = tokens['--red-tint'] ?? mixColors(bg, color('--red-text'), 0.1);
-    tokens['--red-text'] = readable(color('--red-text'), text, [panel, surfaces[2], tint], 4.5);
+    const { fg, tint } = onTint(color('--red-text'), tokens['--red'] ?? color('--red-text'), text, bg, [panel, surfaces[2]]);
+    tokens['--red-text'] = fg;
+    if (tokens['--red-tint']) tokens['--red-tint'] = tint;
   }
   if (color('--amber')) {
-    const tint = mixColors(bg, color('--amber'), 0.1);
-    const amber = readable(color('--amber'), text, [tint], 4.5);
-    Object.assign(tokens, { '--amber': amber, '--amber-edge': amber, '--amber-tint': tint });
+    const { fg: amber, tint } = onTint(color('--amber'), color('--amber'), text, bg, []);
+    Object.assign(tokens, { '--amber': amber, '--amber-edge': readable(amber, text, [bg, panel], 3), '--amber-tint': tint });
   }
   for (const name of SURFACE_BOUND.filter(name => name.startsWith('--lane-') && color(name))) {
     tokens[name] = readable(color(name), text, [bg, panel], 3);
