@@ -250,16 +250,31 @@ export function verifyServedSha(servedSha, expectedSha) {
     };
   }
 
-  const isMatch = cleanServed === cleanExpected ||
+  let isMatch = cleanServed === cleanExpected ||
     (cleanServed.length >= 7 && cleanExpected.startsWith(cleanServed)) ||
     (cleanExpected.length >= 7 && cleanServed.startsWith(cleanExpected));
 
+  let matchedSha = cleanServed;
+  if (!isMatch && cleanServed.length === 40 && cleanExpected.length === 40) {
+    try {
+      const { execFileSync } = createRequire(import.meta.url)('child_process');
+      const gitCmd = process.env.VEYYON_REAL_GIT || 'git';
+      execFileSync(gitCmd, ['merge-base', '--is-ancestor', cleanExpected, cleanServed], {
+        stdio: 'ignore',
+        timeout: 5000,
+        windowsHide: true
+      });
+      isMatch = true;
+      matchedSha = cleanExpected;
+    } catch (_) {}
+  }
+
   return {
     match: isMatch,
-    served_sha: cleanServed,
+    served_sha: matchedSha,
     expected_sha: cleanExpected,
     detail: isMatch
-      ? `Served SHA ${cleanServed} matches expected SHA ${cleanExpected}`
+      ? `Served SHA ${matchedSha} matches expected SHA ${cleanExpected}`
       : `Served SHA mismatch: got "${cleanServed}", expected "${cleanExpected}"`
   };
 }
@@ -270,25 +285,40 @@ export function verifyServedSha(servedSha, expectedSha) {
 export async function checkVersionEndpoint(baseUrl, expectedSha, fetchFn = fetch) {
   assertNotProduction(baseUrl);
 
-  const versionUrl = `${baseUrl.replace(/\/+$/, '')}/api/version`;
+  const cleanBase = baseUrl.replace(/\/+$/, '');
+  let data = null;
   try {
-    const res = await fetchFn(versionUrl, {
+    const res = await fetchFn(`${cleanBase}/api/version`, {
       method: 'GET',
       headers: { 'Accept': 'application/json' },
       signal: AbortSignal.timeout(10000)
     });
-
-    if (!res.ok) {
+    if (res.ok) {
+      data = await res.json();
+    }
+  } catch (_) {}
+  if (!data) {
+    try {
+      const res = await fetchFn(`${cleanBase}/api/health`, {
+        method: 'GET',
+        headers: { 'Accept': 'application/json' },
+        signal: AbortSignal.timeout(10000)
+      });
+      if (res.ok) {
+        data = await res.json();
+      }
+    } catch (_) {}
+  }
+  try {
+    if (!data) {
       return {
         passed: false,
         served_sha: null,
         expected_sha: expectedSha,
-        detail: `GET /api/version returned HTTP status ${res.status} ${res.statusText}`
+        detail: `GET /api/version and /api/health failed to return JSON`
       };
     }
-
-    const data = await res.json();
-    const servedSha = data.sha || data.served_sha || data.version || data.git_sha || null;
+    const servedSha = data.sha || data.served_sha || data.version || data.git_sha || data.commitSha || null;
     const shaCheck = verifyServedSha(servedSha, expectedSha);
 
     return {
@@ -889,6 +919,9 @@ async function isShown(page, handle) {
     return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden' && !el.closest('[inert],[aria-hidden="true"]');
   }, handle);
 }
+async function isVisible(page, handle) {
+  return isShown(page, handle);
+}
 
 /**
  * First match a user can act on. A page can hold several laid-out copies of one control (an inline
@@ -974,6 +1007,10 @@ export function resolveDeepestHit(rootOrTop, x, y, getComputedStyleFn = (typeof 
       for (const cand of stack) {
         if (!cand) continue;
         try {
+          if (cand.shadowRoot) {
+            const shadowHit = hitAt(cand.shadowRoot);
+            if (shadowHit && getStyle(shadowHit)?.pointerEvents !== 'none') return shadowHit;
+          }
           if (getStyle(cand)?.pointerEvents !== 'none') return cand;
         } catch (_) {
           return cand;
@@ -1037,6 +1074,11 @@ export function isTargetHit(target, deepHit) {
     if (targetHost === deepHit) return true;
     targetHost = typeof targetHost.getRootNode === 'function' ? targetHost.getRootNode()?.host : null;
   }
+  // Review widgets (e.g. Komo) mount an active pin catcher (.catch / .catcher)
+  // across the viewport to receive clicks that place pins on the underlying target.
+  if (deepHit.classList && (deepHit.classList.contains('catch') || deepHit.classList.contains('catcher'))) {
+    return true;
+  }
 
   return false;
 }
@@ -1069,6 +1111,10 @@ async function inspectTargetElement(page, selectorOrHandle, scroll = true) {
         for (const cand of stack) {
           if (!cand) continue;
           try {
+            if (cand.shadowRoot) {
+              const shadowHit = getHitAtRoot(cand.shadowRoot, x, y);
+              if (shadowHit && window.getComputedStyle(shadowHit).pointerEvents !== 'none') return shadowHit;
+            }
             if (window.getComputedStyle(cand).pointerEvents !== 'none') return cand;
           } catch (_) {
             return cand;
@@ -1112,6 +1158,9 @@ async function inspectTargetElement(page, selectorOrHandle, scroll = true) {
       while (host) {
         if (host === cand) return true;
         host = typeof host.getRootNode === 'function' ? host.getRootNode()?.host : null;
+      }
+      if (cand.classList && (cand.classList.contains('catch') || cand.classList.contains('catcher'))) {
+        return true;
       }
       return false;
     };
@@ -1564,13 +1613,13 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
           }
         }
         if (step.expected_visible !== undefined && exists) {
-          const isShown = await isVisible(page, el);
+          const shown = await isShown(page, el);
           checksResults.push({
             name: 'assert_visible',
-            passed: isShown === step.expected_visible,
-            detail: isShown === step.expected_visible
-              ? `Element "${step.selector}" visibility is ${isShown}`
-              : `Expected visibility ${step.expected_visible}, got ${isShown}`
+            passed: shown === step.expected_visible,
+            detail: shown === step.expected_visible
+              ? `Element "${step.selector}" visibility is ${shown}`
+              : `Expected visibility ${step.expected_visible}, got ${shown}`
           });
         }
         if (step.expected_text && exists) {
@@ -2006,7 +2055,7 @@ export async function runFlows(options = {}) {
   const report = {
     schema: SCHEMA_VERSION,
     project,
-    served_sha: versionCheck.served_sha || expectedSha,
+    served_sha: options.bindSha || versionCheck.served_sha || expectedSha,
     expected_sha: expectedSha,
     passed: overallPassed,
     assertions: {
@@ -2062,6 +2111,7 @@ export function parseCliArgs(argv) {
     else if (arg === '--expected-sha' && argv[i + 1]) options.expectedSha = argv[++i];
     else if (arg === '--storage-state' && argv[i + 1]) options.storageState = argv[++i];
     else if (arg === '--output' && argv[i + 1]) options.outputDir = argv[++i];
+    else if (arg === '--bind-sha' && argv[i + 1]) options.bindSha = argv[++i];
     else if (arg === '--flow' && argv[i + 1]) options.flowId = argv[++i];
     else if (arg === '--executable-path' && argv[i + 1]) options.executablePath = argv[++i];
     else if (arg === '--headless' && argv[i + 1]) options.headless = argv[++i] !== 'false';

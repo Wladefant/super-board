@@ -791,8 +791,8 @@
         {
           "id": "reveal_komo_toolbar",
           "action": "hover",
-          "selector": "[aria-label='Show review toolbar'], button[aria-label^='Add comment'], .toolbar, [data-branch-comments]",
-          "settle_ms": 300
+          "selector": ".toolbar, button[aria-label^='Add comment'], [aria-label='Show review toolbar'], [data-branch-comments]",
+          "settle_ms": 400
         },
         {
           "id": "tap_add_comment",
