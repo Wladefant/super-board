@@ -49,6 +49,7 @@ import {
   checkNoDocumentReload,
   checkSwipeDismissal,
   runFlows,
+  executeStep,
   firstVisibleHandle
 } from './flow_qa_runner.mjs';
 
@@ -940,5 +941,58 @@ test('obstruction_overlay causes element_from_point check to fail with obstructi
   } finally {
     server.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('no_document_reload ignores the late load event of the page a goto left at domcontentloaded; a real reload still fails', async () => {
+  // goto resolves at domcontentloaded. A slow image holds back the load event of that same document
+  // until the next step runs. That late load is not a reload. A tap that reloads the page is.
+  const GIF = Buffer.from('R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==', 'base64');
+  let releaseImage = null;
+  let imageRequests = 0;
+  const server = http.createServer((req, res) => {
+    if (req.url.startsWith('/slow.gif')) {
+      const send = () => { if (!res.headersSent) { res.writeHead(200, { 'Content-Type': 'image/gif' }); res.end(GIF); } };
+      if (imageRequests++ === 0) releaseImage = send; else send();
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end(`<!DOCTYPE html><html><body>
+      <button id="client" style="width:120px;height:48px" onclick="document.title='opened'">Oeffnen</button>
+      <button id="reload" style="width:120px;height:48px" onclick="location.reload()">Neu laden</button>
+      <img src="/slow.gif" width="1" height="1" alt=""></body></html>`);
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const puppeteer = resolvePuppeteer();
+  const browser = await puppeteer.launch({ executablePath: resolveExecutablePath() || undefined, headless: 'new', args: ['--no-sandbox'] });
+  const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'flowqa-lateload-'));
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1440, height: 900 });
+    const ctx = { flow: { id: 'f' }, baseUrl: `http://127.0.0.1:${server.address().port}`, outputDir, flowConstraints: {} };
+    await executeStep(page, null, { id: 'goto', action: 'goto', url: '/' }, '1440x900', 'light', ctx);
+    assert.equal(await page.evaluate(() => document.readyState), 'interactive', 'goto returned before the load event');
+
+    let loads = 0;
+    page.on('load', () => { loads++; });
+    setTimeout(() => releaseImage(), 100);
+    const tap = await executeStep(page, null,
+      { id: 'client', action: 'tap', selector: '#client', no_document_reload: true }, '1440x900', 'light', ctx);
+    assert.equal(loads, 1, 'the late load event of the same document fired during the tap step');
+    assert.equal(await page.title(), 'opened');
+    const kept = tap.checks.find((c) => c.name === 'no_document_reload');
+    assert.equal(kept.passed, true, kept.detail);
+
+    // Negative control: the tap reloads the page, so the check must fail.
+    const reload = await executeStep(page, null,
+      { id: 'reload', action: 'tap', selector: '#reload', no_document_reload: true }, '1440x900', 'light', ctx);
+    const reloaded = reload.checks.find((c) => c.name === 'no_document_reload');
+    assert.equal(reloaded.passed, false, 'a real reload fails no_document_reload');
+  } finally {
+    if (releaseImage) releaseImage();
+    await browser.close();
+    server.closeAllConnections();
+    server.close();
+    fs.rmSync(outputDir, { recursive: true, force: true });
   }
 });
