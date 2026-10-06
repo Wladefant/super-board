@@ -155,10 +155,11 @@ class TestBuildSlot(unittest.TestCase):
         self.assertTrue(manager.acquire("new-lane", timeout=2.0, poll_interval=0.05))
         self.assertTrue(manager.release("new-lane"))
 
-    def test_live_acquire_owner_never_reclaimed_on_age(self):
+    def test_live_acquire_owner_with_fresh_heartbeat_never_reclaimed_on_age(self):
         """
-        #315: an `acquire` lock whose owner is alive keeps the slot however old it is. The old
-        30-minute age rule freed slots under builds that were still running.
+        #315, narrowed by #620: an `acquire` lock whose owner is alive and that keeps
+        heartbeating (`build_slot.py heartbeat <name>`) keeps the slot however old it is.
+        Silence past 30 minutes is what frees an abandoned slot.
         """
         manager = BuildSlotManager(run_dir=self.run_dir)
         os.makedirs(manager.lock_dir, exist_ok=True)
@@ -168,7 +169,7 @@ class TestBuildSlot(unittest.TestCase):
             "pid": os.getpid(),
             "acquired_at": datetime.datetime.fromtimestamp(past_epoch, datetime.timezone.utc).isoformat(),
             "acquired_at_epoch": past_epoch,
-            "heartbeat_at_epoch": past_epoch,
+            "heartbeat_at_epoch": time.time() - 5.0,
         }
         with open(manager.info_file, "w", encoding="utf-8") as f:
             json.dump(info, f)
@@ -1582,6 +1583,94 @@ class TestBuildSlot(unittest.TestCase):
             self.assertFalse(manager.check_stale_and_reclaim(), stderr.getvalue())
             self.assertFalse(manager.check_stale_and_reclaim(pid_dead_grace_period=1.0), stderr.getvalue())
         self.assertTrue(os.path.isdir(manager.lock_dir))
+
+    def _write_acquire_lock(self, manager, owner_pid, age, hb_age):
+        """An `acquire`-mode lock: no wrapper_pid, owner is the lane's long-lived host PID."""
+        now = time.time()
+        os.mkdir(manager.lock_dir)
+        info = {
+            "owner": "abandoned-lane",
+            "pid": owner_pid,
+            "token": "acq-tok",
+            "acquired_at_epoch": now - age,
+            "heartbeat_at_epoch": now - hb_age,
+        }
+        with open(manager.info_file, "w", encoding="utf-8") as f:
+            json.dump(info, f)
+
+    def test_abandoned_acquire_holder_with_live_host_pid_reclaimed_after_30_min(self):
+        """
+        #620: lanes acquired a slot and ended without release. Their recorded owner PID is the
+        veyyon host, which stays alive, so the dead-PID rule never fired and the slot stayed
+        held for hours. A live owner of an `acquire` lock silent for 30 min is reclaimed.
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        host = self._live_process()
+        self._write_acquire_lock(manager, host.pid, age=134 * 60.0, hb_age=134 * 60.0)
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            self.assertTrue(manager.check_stale_and_reclaim(), stderr.getvalue())
+        self.assertFalse(os.path.isdir(manager.lock_dir))
+        self.assertIn(f"acquire owner PID {host.pid} is alive but silent", stderr.getvalue())
+
+    def test_acquire_holder_with_live_pid_silent_under_30_min_not_reclaimed(self):
+        """#620 negative control: a live `acquire` holder below the 30 min limit keeps its slot."""
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        host = self._live_process()
+        self._write_acquire_lock(manager, host.pid, age=29 * 60.0, hb_age=29 * 60.0)
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            self.assertFalse(manager.check_stale_and_reclaim(), stderr.getvalue())
+        self.assertTrue(os.path.isdir(manager.lock_dir))
+
+    def test_acquire_holder_with_live_pid_and_fresh_heartbeat_not_reclaimed(self):
+        """#620 negative control: a holder that keeps heartbeating keeps its slot at any age."""
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        host = self._live_process()
+        self._write_acquire_lock(manager, host.pid, age=3 * 3600.0, hb_age=5.0)
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            self.assertFalse(manager.check_stale_and_reclaim(), stderr.getvalue())
+        self.assertTrue(os.path.isdir(manager.lock_dir))
+
+    def test_acquire_holder_with_dead_pid_reclaimed_after_grace(self):
+        """#620 repro as filed: a dead owner PID past the grace period is reclaimed on the next check."""
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        self._write_acquire_lock(manager, self._exited_pid(), age=120.0, hb_age=120.0)
+
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            self.assertTrue(manager.check_stale_and_reclaim(), stderr.getvalue())
+        self.assertFalse(os.path.isdir(manager.lock_dir))
+
+    def test_cli_heartbeat_keeps_long_acquire_holder_alive(self):
+        """#620: `heartbeat <name>` refreshes the slot, so a build past 30 min is not reclaimed."""
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        host = self._live_process()
+        self._write_acquire_lock(manager, host.pid, age=3 * 3600.0, hb_age=3 * 3600.0)
+        with open(manager.info_file, encoding="utf-8") as f:
+            owner = json.load(f)["owner"]
+
+        script = os.path.abspath(build_slot.__file__)
+        proc = subprocess.run(
+            [sys.executable, script, "--run-dir", self.run_dir, "heartbeat", owner],
+            capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with redirect_stderr(io.StringIO()):
+            self.assertFalse(manager.check_stale_and_reclaim())
+        self.assertTrue(os.path.isdir(manager.lock_dir))
+
+        missing = subprocess.run(
+            [sys.executable, script, "--run-dir", self.run_dir, "heartbeat", "nobody"],
+            capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        self.assertEqual(missing.returncode, 1)
 
     def test_live_run_wrapper_with_stale_heartbeat_reclaimed(self):
         """A live wrapper whose heartbeat is older than 5 minutes has hung and is reclaimed."""
