@@ -11,6 +11,7 @@ Usage:
     python host_status.py              # human-readable
     python host_status.py --json       # machine-readable JSON
     python host_status.py --drive D:   # check a different drive (default C:\ on Windows, / on POSIX)
+    python host_status.py --timeout 20 # give up after 20 s: state no_spawn, exit code 3 (default 20)
 
 No external dependencies — stdlib only.
 """
@@ -22,6 +23,7 @@ import os
 import platform
 import shutil
 import sys
+import threading
 from typing import Any
 
 
@@ -178,6 +180,7 @@ RAM_WAIT_PCT = 90
 RAM_REAP_PCT = 85
 DISK_NO_SPAWN_GB = 20
 DISK_REAP_GB = 30
+DEFAULT_TIMEOUT_SECONDS = 20.0
 
 
 def classify(ram_percent: float, disk_free_gb: float) -> tuple[str, list[str]]:
@@ -266,19 +269,45 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Path or drive to check free space for (default: C:\\ on Windows, / on POSIX)",
     )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT_SECONDS,
+        help=(
+            "Seconds before the probe gives up and reports state no_spawn with exit code 3 "
+            f"(default: {DEFAULT_TIMEOUT_SECONDS:g})"
+        ),
+    )
     return parser.parse_args(argv)
+
+
+def _expire(use_json: bool, timeout: float) -> None:
+    """Deadline hit: answer the fail-safe state and end the process, whatever is stalled."""
+    reasons = [f"host_status timed out after {timeout:g}s (host overloaded)"]
+    if use_json:
+        print(json.dumps({"ram": None, "disk": None, "state": "no_spawn", "reasons": reasons}), flush=True)
+    else:
+        print(f"RAM:  unavailable  [no_spawn: {reasons[0]}]\nDisk: unavailable\nState: no_spawn", flush=True)
+    os._exit(3)
 
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv if argv is not None else sys.argv[1:])
 
-    ram = get_ram()
+    # A probe stalled by a thrashing host must answer no_spawn, not hang its caller (#620).
+    watchdog = threading.Timer(args.timeout, _expire, args=(args.use_json, args.timeout))
+    watchdog.daemon = True
+    watchdog.start()
     try:
-        disk = get_disk(args.drive)
-    except OSError as exc:
-        print(f"host_status.py: error: {exc}", file=sys.stderr)
-        sys.exit(2)
-    state, reasons = classify(ram["percent"], disk["free_gb"])
+        ram = get_ram()
+        try:
+            disk = get_disk(args.drive)
+        except OSError as exc:
+            print(f"host_status.py: error: {exc}", file=sys.stderr)
+            sys.exit(2)
+        state, reasons = classify(ram["percent"], disk["free_gb"])
+    finally:
+        watchdog.cancel()
 
     if args.use_json:
         print(format_json(ram, disk, state, reasons))

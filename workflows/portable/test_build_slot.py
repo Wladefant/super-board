@@ -208,6 +208,71 @@ class TestBuildSlot(unittest.TestCase):
         self.assertIn("system RAM remains at 95.0%", stderr_buf.getvalue())
         self.assertEqual(manager.clean_queue(), [])
 
+    def test_ram_guard_admits_head_when_idle_and_ram_stays_high(self):
+        """
+        #620: at >= 95% RAM with no build slot held, waiting frees nothing of ours, so the
+        queue head starved for hours. After ram_guard_idle_admit_after it is admitted.
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir, ram_guard_idle_admit_after=0.3, acquisition_stagger=0)
+        with mock.patch.object(build_slot, "get_system_ram_percent", return_value=98.0):
+            with redirect_stderr(io.StringIO()):
+                started = time.monotonic()
+                self.assertTrue(manager.acquire("idle-lane", timeout=5.0, poll_interval=0.02))
+                self.assertGreaterEqual(time.monotonic() - started, 0.3)
+            self.assertTrue(manager.release("idle-lane"))
+
+    def test_ram_guard_still_waits_when_a_slot_is_held(self):
+        """#620 negative control: with a build running, high RAM keeps the guard on past the idle limit."""
+        manager = BuildSlotManager(run_dir=self.run_dir, ram_guard_idle_admit_after=0.1, acquisition_stagger=0)
+        with mock.patch.object(build_slot, "get_system_ram_percent", return_value=50.0):
+            self.assertTrue(manager.acquire("running-lane", timeout=2.0, poll_interval=0.02))
+        with mock.patch.object(build_slot, "get_system_ram_percent", return_value=98.0):
+            with redirect_stderr(io.StringIO()):
+                self.assertFalse(manager.acquire("waiting-lane", timeout=0.6, poll_interval=0.02))
+        self.assertTrue(manager.release("running-lane"))
+
+    def test_ram_guard_idle_admit_default_is_bounded(self):
+        self.assertTrue(0 < build_slot.DEFAULT_RAM_GUARD_IDLE_ADMIT_SECONDS <= 600)
+
+    def test_release_frees_slot_even_when_queue_lock_times_out(self):
+        """#620: release must not fail after the slot is gone because the queue file is busy."""
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        self.assertTrue(manager.acquire("busy-queue-lane", timeout=2.0, poll_interval=0.02))
+        with mock.patch.object(manager, "dequeue", side_effect=TimeoutError("queue lock busy")):
+            with redirect_stderr(io.StringIO()):
+                self.assertTrue(manager.release("busy-queue-lane"))
+        self.assertFalse(os.path.isdir(manager.lock_dir))
+
+    def test_release_deadline_ends_stalled_process_with_exit_124(self):
+        """#620: a release stalled by a thrashing host exits 124 instead of hanging its caller."""
+        script_dir = os.path.dirname(os.path.abspath(build_slot.__file__))
+        code = (
+            "import sys, time; sys.path.insert(0, sys.argv[1]); import build_slot; "
+            "build_slot._arm_deadline(0.5, 'release'); time.sleep(60)"
+        )
+        started = time.monotonic()
+        proc = subprocess.run(
+            [sys.executable, "-c", code, script_dir],
+            capture_output=True, text=True, timeout=45, stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        self.assertEqual(proc.returncode, 124, proc.stderr)
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertIn("release timed out after 0.5s", proc.stderr)
+
+    def test_cli_release_accepts_timeout_and_completes(self):
+        """#620: the new --timeout option does not disturb a normal release."""
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        self.assertTrue(manager.acquire("cli-rel-lane", timeout=2.0, poll_interval=0.02))
+        proc = subprocess.run(
+            [sys.executable, os.path.abspath(build_slot.__file__), "--run-dir", self.run_dir,
+             "release", "cli-rel-lane", "--timeout", "30"],
+            capture_output=True, text=True, timeout=45, stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(os.path.isdir(manager.lock_dir))
+
     def test_ram_guard_force_bypasses_at_96_percent(self):
         """At 96% RAM (>= 95%), --force bypasses the RAM guard and acquires."""
         manager = BuildSlotManager(run_dir=self.run_dir)

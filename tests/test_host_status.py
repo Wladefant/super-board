@@ -339,12 +339,54 @@ class TestMainHermetic:
                 assert exc.code == 2
         assert "host_status.py: error:" in err_buf.getvalue()
 
+
+class TestDeadline:
+    """#620: a probe that stalls on a thrashing host must answer no_spawn, never hang."""
+
+    @staticmethod
+    def _run_stalled(extra: list[str]) -> tuple[int, str, float]:
+        import subprocess
+        import time
+
+        portable = str(Path(__file__).resolve().parent.parent / "workflows" / "portable")
+        code = (
+            "import sys, time; sys.path.insert(0, sys.argv[1]); import host_status; "
+            "host_status.get_ram = lambda: time.sleep(60); "
+            "host_status.main(sys.argv[2:])"
+        )
+        started = time.monotonic()
+        proc = subprocess.run(
+            [sys.executable, "-c", code, portable, *extra],
+            capture_output=True, text=True, timeout=45, stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return proc.returncode, proc.stdout, time.monotonic() - started
+
+    def test_stalled_probe_json_reports_no_spawn_after_timeout(self) -> None:
+        rc, out, elapsed = self._run_stalled(["--json", "--timeout", "0.5"])
+        assert rc == 3
+        assert elapsed < 20
+        data = json.loads(out)
+        assert data["state"] == "no_spawn"
+        assert data["ram"] is None and data["disk"] is None
+        assert "timed out" in data["reasons"][0]
+
+    def test_stalled_probe_human_reports_no_spawn_after_timeout(self) -> None:
+        rc, out, elapsed = self._run_stalled(["--timeout", "0.5"])
+        assert rc == 3
+        assert "State: no_spawn" in out
+
+    def test_default_timeout_is_bounded(self) -> None:
+        assert 0 < host_status.DEFAULT_TIMEOUT_SECONDS <= 60
+
+
 def _run() -> int:
     """Standalone runner for CI environments without pytest."""
     classes = [
         TestClassify(),
         TestFormatHuman(),
         TestFormatJson(),
+        TestDeadline(),
         TestPortability(),
         TestMainHermetic(),
     ]

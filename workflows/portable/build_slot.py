@@ -91,8 +91,27 @@ DEFAULT_QUEUE_STALE_HEARTBEAT_SECONDS = 60.0  # reclaim if heartbeat older than 
 DEFAULT_QUEUE_STALE_FALLBACK_SECONDS = 30 * 60  # 30 minutes fallback for legacy entries without heartbeat
 DEFAULT_RAM_GUARD_THRESHOLD_PERCENT = 95.0
 DEFAULT_ACQUISITION_STAGGER_SECONDS = 45.0
+DEFAULT_RAM_GUARD_IDLE_ADMIT_SECONDS = 120.0  # with no slot held, a lane queued this long passes the RAM guard (#620)
+DEFAULT_RELEASE_TIMEOUT_SECONDS = 30.0
 LAST_ACQUIRED_FILE_NAME = "last-acquired-at.json"
 DEFAULT_PID_DEAD_GRACE_PERIOD_SECONDS = 60.0  # never reclaim a dead-PID lock younger than 60s
+
+def _arm_deadline(seconds: float, what: str) -> threading.Timer:
+    """
+    Ends the process with exit code 124 if it is still running after `seconds`. A command
+    stalled by a thrashing host must fail its caller, not hang it (#620). The caller
+    cancels the returned timer when it finishes in time.
+    """
+
+    def _expire() -> None:
+        print(f"ERROR: {what} timed out after {seconds:g}s", file=sys.stderr, flush=True)
+        os._exit(124)
+
+    timer = threading.Timer(seconds, _expire)
+    timer.daemon = True
+    timer.start()
+    return timer
+
 
 def get_system_ram_percent() -> Optional[float]:
     """
@@ -747,6 +766,7 @@ class BuildSlotManager:
         pid_dead_grace_period: Optional[float] = None,
         max_slots: Optional[int] = None,
         ram_guard_threshold: float = DEFAULT_RAM_GUARD_THRESHOLD_PERCENT,
+        ram_guard_idle_admit_after: Optional[float] = None,
         acquisition_stagger: Optional[float] = None,
     ):
         self.run_dir = os.path.abspath(run_dir or DEFAULT_RUN_DIR)
@@ -770,6 +790,9 @@ class BuildSlotManager:
             except ValueError:
                 pass
         self.ram_guard_threshold = float(ram_guard_threshold)
+        self.ram_guard_idle_admit_after = float(
+            DEFAULT_RAM_GUARD_IDLE_ADMIT_SECONDS if ram_guard_idle_admit_after is None else ram_guard_idle_admit_after
+        )
         if acquisition_stagger is not None:
             self.acquisition_stagger = float(acquisition_stagger)
         else:
@@ -1167,6 +1190,19 @@ class BuildSlotManager:
             self._write_queue(queue)
             return True
 
+    def _any_slot_held(self) -> bool:
+        return any(os.path.isdir(s_dir) for s_dir in self.slot_dirs)
+
+    def _dequeue_best_effort(self, name: str, token: Optional[str]) -> None:
+        """
+        Queue cleanup after the slot is already freed. A busy or locked queue file must not
+        turn a completed release into a failure or a hang; clean_queue sweeps leftovers (#620).
+        """
+        try:
+            self.dequeue(name, token=token)
+        except (TimeoutError, PermissionError, OSError) as exc:
+            print(f"WARNING: '{name}' released its slot but queue cleanup was skipped: {exc}", file=sys.stderr)
+
     def dequeue(
         self,
         name: Optional[str] = None,
@@ -1561,7 +1597,17 @@ class BuildSlotManager:
 
                 # 3. Dynamic RAM evaluation at acquisition
                 curr_ram = get_system_ram_percent()
-                if curr_ram is not None and curr_ram >= self.ram_guard_threshold and not force:
+                ram_blocked = curr_ram is not None and curr_ram >= self.ram_guard_threshold and not force
+                if (
+                    ram_blocked
+                    and not self._any_slot_held()
+                    and time.time() - start_time >= self.ram_guard_idle_admit_after
+                ):
+                    # No build slot is held: waiting frees nothing of ours, and the host
+                    # pressure comes from elsewhere. Pass the guard (queue-head order still
+                    # applies below) rather than starve the queue forever (#620).
+                    ram_blocked = False
+                if ram_blocked:
                     # System RAM is >= 95%, refuse acquisition until it drops
                     if timeout is not None:
                         elapsed = time.time() - start_time
@@ -1749,12 +1795,12 @@ class BuildSlotManager:
                 msg = f"Released build slot lock for '{name}'"
                 print(msg)
                 logger.info(msg)
-            self.dequeue(name, token=token)
+            self._dequeue_best_effort(name, token)
             return True
 
         if not held_slots:
             # Already free; remove name from queue if lingering
-            self.dequeue(name, token=token)
+            self._dequeue_best_effort(name, token)
             msg = f"Build slot lock is already free (release called for '{name}')"
             print(msg)
             return True
@@ -2177,6 +2223,15 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     # release <name>
     p_rel = subparsers.add_parser("release", help="Release build slot lock (refused if not owner)")
     p_rel.add_argument("name", help="Lane or worker identifier releasing the slot")
+    p_rel.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_RELEASE_TIMEOUT_SECONDS,
+        help=(
+            "Seconds before a stalled release gives up with exit code 124 "
+            f"(default: {DEFAULT_RELEASE_TIMEOUT_SECONDS:g})"
+        ),
+    )
 
     # heartbeat <name>
     p_hb = subparsers.add_parser(
@@ -2376,6 +2431,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     elif args.command == "release":
+        _arm_deadline(args.timeout, "release")
         success = manager.release(name=args.name)
         return 0 if success else 1
 
