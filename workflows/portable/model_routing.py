@@ -148,14 +148,11 @@ def codex_available() -> bool:
 
 MODEL_GROK_DORMANT = "xai-oauth/grok-4.6:high"
 
-# Antigravity serves Claude and GPT from ONE shared pool with a 5h and a weekly window per
-# Google account (`veyyon usage --json`: limit id `google-antigravity:claude-gpt:default:5h|weekly`,
-# measured 2026-10-03). It is small: one tiny 'ok' prompt on Opus 5.5 cost 1.28% of the 5h and
-# 0.64% of the weekly window, so real lane work spends it in a handful of messages. It is NOT a
-# default tier. Only the `agc-opus` / `agc-sonnet` roles use it, gated by `ag_claude_allowance`
-# (low per-window caps), and they never fall back to direct Anthropic.
-# Catalog IDs (models.db, 2026-10-03): claude-{opus,sonnet}-5-5-{low,medium,high}.
-MODEL_AG_CLAUDE_OPUS = "google-antigravity/claude-opus-5-5-medium"
+# Antigravity Claude/GPT shares 5h and weekly account windows. Anthropic direct
+# carries most Sonnet/Opus lanes (operator 2026-10-04). Antigravity serves a few
+# explicit agc-* lanes and overflow when direct Anthropic is exhausted or rate-limited.
+# ag_claude_allowance checks exhaustion, not an artificial rare-use cap.
+MODEL_AG_CLAUDE_OPUS = "google-antigravity/claude-opus-5-5-high"
 MODEL_AG_CLAUDE_SONNET = "google-antigravity/claude-sonnet-5-5-medium"
 MODEL_AG_GPT_OSS = "google-antigravity/gpt-oss-120b"
 
@@ -405,6 +402,7 @@ ROLE_FALLBACK_LADDERS: Dict[str, List[str]] = {
         MODEL_CODEX_SOL,
         MODEL_CODEX_SOL_FALLBACK,
         MODEL_CLAUDE_SONNET_55,
+        MODEL_AG_CLAUDE_SONNET,
         MODEL_GO_GLM53,
         MODEL_DEEPSEEK_PRO,
     ],
@@ -412,20 +410,26 @@ ROLE_FALLBACK_LADDERS: Dict[str, List[str]] = {
         MODEL_CODEX_SOL,
         MODEL_CODEX_SOL_FALLBACK,
         MODEL_CLAUDE_SONNET_55,
+        MODEL_AG_CLAUDE_SONNET,
         MODEL_GO_GLM53,
         MODEL_GO_QWEN38_MAX,
         MODEL_DEEPSEEK_PRO,
     ],
-    # Antigravity Claude slices: small allowance, never direct Anthropic and never the paid
-    # Chinese tiers (GLM, Qwen; operator decision 2026-10-03). Opus (UI/design) has no other rung,
-    # so an over-cap or exhausted window pauses it. Sonnet (judgment) continues on Codex Sol and
-    # then pauses. DeepSeek is left out: ds-task is capped at 2 lanes and never takes judgment slices.
-    "agc-opus": [MODEL_AG_CLAUDE_OPUS],
-    "agc-sonnet": [
+    # Normal Sonnet: direct Anthropic, Antigravity overflow, then Codex Sol.
+    "sonnet": [
+        MODEL_CLAUDE_SONNET_55,
         MODEL_AG_CLAUDE_SONNET,
         MODEL_CODEX_SOL,
         MODEL_CODEX_SOL_FALLBACK,
     ],
+    # Normal Opus: direct Anthropic, then Antigravity overflow.
+    "opus": [
+        MODEL_CLAUDE_OPUS_55,
+        MODEL_AG_CLAUDE_OPUS,
+    ],
+    # agc aliases are AG-only (opus uses the same high ID).
+    "agc-opus": [MODEL_AG_CLAUDE_OPUS],
+    "agc-sonnet": [MODEL_AG_CLAUDE_SONNET],
 }
 
 
@@ -433,41 +437,73 @@ AG_CLAUDE_MODEL_PREFIX = "google-antigravity/claude-"
 AG_CLAUDE_ROLES = frozenset({"agc-opus", "agc-sonnet"})
 
 
-def ag_claude_allowance(snapshot: Optional[Any]) -> Tuple[bool, str]:
-    """Whether the small Antigravity Claude pool may take one more slice, with the reason.
+def ag_claude_allowance(snapshot: Optional[Any], now: Optional[datetime.datetime] = None) -> Tuple[bool, str]:
+    """Whether the Antigravity Claude pool is available to serve requests.
 
-    The pool is shared by Claude and GPT and metered per Google account in a 5h and a weekly
-    window. An account is usable only while BOTH windows are reported, unexhausted, under
-    AG_CLAUDE_WINDOW_CAPS and above the AG_FAMILY_MIN_REMAINING reserve. One usable account is
-    enough. A snapshot that does not report the pool is never assumed to have headroom.
+    Exhaustion check across both known windows (5h and weekly) per Google account.
+    An account is usable only while BOTH windows are reported and unexhausted (no active
+    429 or reset strictly in the future, and used fraction strictly below 100%).
+    One usable account is enough (account isolation). A snapshot that does not report
+    the pool is never assumed to have headroom.
     """
     if snapshot is None:
         return False, "no quota snapshot: Antigravity Claude headroom is unknown"
-    by_account: Dict[str, Dict[str, Any]] = {}
-    for entry in getattr(snapshot, "entries", {}).values():
-        if entry.provider == AG_ANTHROPIC_PROVIDER:
-            by_account.setdefault(entry.account, {})[entry.window_id.split(":")[-1]] = entry
+    entries = getattr(snapshot, "entries", None)
+    if entries is None:
+        return False, "no quota snapshot: Antigravity Claude headroom is unknown"
+
+    effective_now = now
+    if effective_now is None:
+        effective_now = getattr(snapshot, "now", None)
+        if effective_now is None:
+            effective_now = datetime.datetime.now(datetime.timezone.utc)
+    if effective_now.tzinfo is None:
+        effective_now = effective_now.replace(tzinfo=datetime.timezone.utc)
+
+    # 429 safety: a recorded rate limit on the family closes the pool for all accounts.
+    active_429 = [
+        e for e in entries.values()
+        if getattr(e, "provider", None) == AG_ANTHROPIC_PROVIDER
+        and (getattr(e, "source", None) == "429" or getattr(e, "account", None) == "default")
+        and (e.is_exhausted(effective_now) if hasattr(e, "is_exhausted") else bool(getattr(e, "exhausted_until", None)))
+    ]
+    if active_429:
+        soonest = min(active_429, key=lambda r: getattr(r, "exhausted_until", None) or "")
+        return False, f"Antigravity Claude pool rate-limited until {soonest.exhausted_until}"
+
+    by_account: Dict[str, Dict[str, QuotaWindowEntry]] = {}
+    for entry in entries.values():
+        if entry.provider != AG_ANTHROPIC_PROVIDER:
+            continue
+        norm_key = entry.window_id.lower().strip()
+        if "5h" in norm_key:
+            norm_key = "5h"
+        elif "weekly" in norm_key or "7d" in norm_key:
+            norm_key = "weekly"
+        by_account.setdefault(entry.account, {})[norm_key] = entry
+
     if not by_account:
         return False, "Antigravity Claude pool is not reported by the usage snapshot"
+
     reasons: List[str] = []
     for account, windows in sorted(by_account.items()):
         blocked = ""
-        for window_id, cap in AG_CLAUDE_WINDOW_CAPS.items():
+        for window_id in ("5h", "weekly"):
             entry = windows.get(window_id)
             if entry is None:
-                blocked = f"{window_id} window not reported"
-            elif entry.is_exhausted():
-                blocked = f"{window_id} window exhausted until {entry.exhausted_until}"
-            elif entry.used_fraction >= cap:
-                blocked = f"{window_id} window {entry.used_fraction * 100:.0f}% used >= {cap * 100:.0f}% cap"
-            elif 1.0 - entry.used_fraction <= AG_FAMILY_MIN_REMAINING:
-                blocked = f"{window_id} window inside the {AG_FAMILY_MIN_REMAINING * 100:.0f}% reserve"
-            if blocked:
+                blocked = f"{account} missing {window_id} window"
+                break
+            if entry.is_exhausted(effective_now):
+                blocked = f"{account} {window_id} window exhausted until {entry.exhausted_until}"
+                break
+            if entry.used_fraction >= 1.0:
+                blocked = f"{account} {window_id} window 100% used"
                 break
         if not blocked:
-            return True, f"account {account} is under the Antigravity Claude caps"
-        reasons.append(f"{account}: {blocked}")
-    return False, "; ".join(reasons)
+            return True, f"Antigravity Claude pool usable via account {account}"
+        reasons.append(blocked)
+
+    return False, "all Antigravity Claude accounts exhausted: " + "; ".join(reasons)
 
 
 def resolve_role_model(role: str, quota_snapshot: Optional[Any] = None) -> Optional[str]:
@@ -529,7 +565,7 @@ def is_agent_role_available(role: str) -> bool:
         if model.startswith("openai-codex/"):
             if not codex_available() or is_unsupported_codex_model(model):
                 return resolve_role_model(role) is not None
-    if role in AG_CLAUDE_ROLES:
+    if role in ("sonnet", "opus", "agc-opus", "agc-sonnet") or role in AG_CLAUDE_ROLES:
         return resolve_role_model(role) is not None
     return True
 
@@ -630,11 +666,11 @@ ANTHROPIC_WORKER_MIN_HEADROOM = 1.10
 ANTHROPIC_BOTTLENECK_MAX_USED = 0.80
 # An Antigravity family below this remaining fraction is left alone for the day.
 AG_FAMILY_MIN_REMAINING = 0.10
-# Antigravity Claude is a small separately tracked allowance: a slice is routed to it only while
-# EVERY window of at least one account is below its cap (fraction used), so most of the pool stays
-# for later. Over the cap the slice pauses or takes the role's non-Anthropic ladder.
-AG_CLAUDE_MAX_USED_5H = 0.30
-AG_CLAUDE_MAX_USED_WEEKLY = 0.25
+# Antigravity Claude is the normal first rung for Sonnet/Opus class work (2026-10-04).
+# ag_claude_allowance performs a strict exhaustion check across both known windows (5h and weekly),
+# with no artificial percentage caps or rare-use reserve gates.
+AG_CLAUDE_MAX_USED_5H = 1.0
+AG_CLAUDE_MAX_USED_WEEKLY = 1.0
 AG_CLAUDE_WINDOW_CAPS: Dict[str, float] = {"5h": AG_CLAUDE_MAX_USED_5H, "weekly": AG_CLAUDE_MAX_USED_WEEKLY}
 AG_ANTHROPIC_PROVIDER = "google-antigravity:anthropic"
 AG_OPENAI_PROVIDER = "google-antigravity:openai"
@@ -834,14 +870,10 @@ def model_to_agent_role(model_id: str, task_type: TaskType, risk_level: RiskLeve
     if model_id == MODEL_GEMINI_PRO:
         return "gemini-pro"
     if model_id.startswith("google-antigravity/"):
-        if _model_base(model_id) == MODEL_AG_CLAUDE_OPUS:
+        if _model_base(model_id) == MODEL_AG_CLAUDE_OPUS or "claude-opus" in model_id:
             return "agc-opus"
-        if _model_base(model_id) == MODEL_AG_CLAUDE_SONNET:
+        if _model_base(model_id) == MODEL_AG_CLAUDE_SONNET or "claude-sonnet" in model_id:
             return "agc-sonnet"
-        if "claude-opus" in model_id:
-            return "reviewer"
-        if "claude-sonnet" in model_id:
-            return "ag-sonnet"
         if "gpt-oss" in model_id:
             return "ag-gpt"
     if "flash-lite" in model_id:
@@ -1623,15 +1655,19 @@ class ResetAwareModelSelector:
         )
         codex_usable = codex_ok and not codex_throttled
 
-        # Antigravity Claude runs on a free daily window. Only a window the snapshot
-        # actually reports counts; an unreported family is not assumed to exist.
-        ag_claude_ok = (
-            ag_anthropic_meta["status"] == "ok"
-            and ag_anthropic_meta["remaining_fraction"] >= AG_FAMILY_MIN_REMAINING
-        )
-        ag_claude_note = (
-            f"Antigravity Claude daily window: {ag_anthropic_meta['remaining_fraction']*100:.1f}% unused, "
-            f"resets in {ag_anthropic_meta['hours_to_reset']:.1f}h"
+        # Antigravity Claude pool allowance & exhaustion (2026-10-04):
+        # Strict exhaustion check across 5h/weekly account windows, with account isolation and no rare-use reserve gate.
+        ag_allowance_ok, ag_allowance_reason = ag_claude_allowance(self.quota_snapshot(), now=self.current_datetime())
+        ag_sonnet_exhaustion = self.provider_exhaustion_reason(MODEL_AG_CLAUDE_SONNET)
+        ag_sonnet_available = ag_allowance_ok and (ag_sonnet_exhaustion is None)
+        ag_sonnet = _Rung(
+            MODEL_AG_CLAUDE_SONNET,
+            ag_sonnet_available and (
+                not anthropic_meta["is_available"]
+                or self.provider_exhaustion_reason(MODEL_CLAUDE_SONNET_55) is not None
+            ),
+            f"Antigravity Claude Sonnet 5.5 overflow after Anthropic exhaustion ({ag_allowance_reason}).",
+            pace_group=PACE_GROUP_STRONG,
         )
 
         # 3. Direct Anthropic 7d window is the orchestrator's budget. Slack exists only while
@@ -1874,6 +1910,7 @@ class ResetAwareModelSelector:
                 astra_on_pace,
                 sol_context_promo,
                 sol_context_on_pace,
+                ag_sonnet,
                 sonnet_surplus,
                 sonnet_on_pace,
                 astra_emergency,
@@ -1903,6 +1940,7 @@ class ResetAwareModelSelector:
                     astra_on_pace,
                     sol_review_promo,
                     sol_review_on_pace,
+                    ag_sonnet,
                     sonnet_surplus,
                     sonnet_on_pace,
                     go_glm53,
@@ -1925,6 +1963,7 @@ class ResetAwareModelSelector:
                 go_glm53,
                 sol_worker_promo,
                 sol_worker_on_pace,
+                ag_sonnet,
                 sonnet_surplus,
                 sonnet_on_pace,
                 deepseek_pro,
@@ -1939,6 +1978,7 @@ class ResetAwareModelSelector:
                 sol_review_promo,
                 go_glm53,
                 sol_review_on_pace,
+                ag_sonnet,
                 sonnet_surplus,
                 sonnet_on_pace,
                 glm,
@@ -1974,6 +2014,7 @@ class ResetAwareModelSelector:
                 go_glm53,
                 *band,
                 sol_review_on_pace,
+                ag_sonnet,
                 sonnet_surplus,
                 sonnet_on_pace,
                 go_glm53_flash,
@@ -2386,7 +2427,10 @@ def compute_window_burn_paces(
 
 def get_recommended_lanes(selector: ResetAwareModelSelector) -> Dict[str, str]:
     """Map each standard role to its task-class-specific model."""
-    reviewer_str = MODEL_CODEX_SOL if codex_available() else MODEL_CLAUDE_SONNET_55
+    snapshot = selector.quota_snapshot()
+    sonnet_model = resolve_role_model("sonnet", snapshot) or MODEL_CLAUDE_SONNET_55
+    opus_model = resolve_role_model("opus", snapshot) or MODEL_CLAUDE_OPUS_55
+    reviewer_str = MODEL_CODEX_SOL if codex_available() else (resolve_role_model("reviewer", snapshot) or sonnet_model)
     if not codex_available():
         anthropic_pace = selector.pace_by_provider().get("anthropic")
         if anthropic_pace and anthropic_pace.throttled:
@@ -2395,8 +2439,8 @@ def get_recommended_lanes(selector: ResetAwareModelSelector) -> Dict[str, str]:
     return {
         "reviewer": reviewer_str,
         "task": MODEL_GEMINI_FLASH,
-        "sonnet": MODEL_CLAUDE_SONNET_55,
-        "opus": MODEL_CLAUDE_OPUS_55,
+        "sonnet": sonnet_model,
+        "opus": opus_model,
         "astra-ux": MODEL_CODEX_ASTRA,
         "ds-pro": MODEL_DEEPSEEK_PRO,
         "ds-task": MODEL_DEEPSEEK_FLASH,
@@ -2407,6 +2451,8 @@ def get_recommended_lanes(selector: ResetAwareModelSelector) -> Dict[str, str]:
         "web-thinker": MODEL_CHATGPT_WEB,
         "codex-worker": MODEL_CODEX_WORKER,
         "codex-reviewer": MODEL_CODEX_SOL,
+        "agc-opus": resolve_role_model("agc-opus", snapshot) or MODEL_AG_CLAUDE_OPUS,
+        "agc-sonnet": resolve_role_model("agc-sonnet", snapshot) or MODEL_AG_CLAUDE_SONNET,
     }
 
 

@@ -260,7 +260,10 @@ def parse_api_stats(line: str) -> Optional[Dict[str, int]]:
         if data.get("logger") == "api.stats":
             stats_data = data.get("data") if isinstance(data.get("data"), dict) else data
             req_count = int(stats_data.get("request_count", 0))
-            err_count = int(stats_data.get("error_count", 0))
+            # Only 5xx count as server errors. error_count also counts 4xx (401/404 from clients), which
+            # tripped false spikes (#6026, #6032). Older containers lack server_error_count; fall back.
+            err_key = "server_error_count" if "server_error_count" in stats_data else "error_count"
+            err_count = int(stats_data.get(err_key, 0))
             return {"requests": req_count, "errors": err_count}
     except Exception:
         pass

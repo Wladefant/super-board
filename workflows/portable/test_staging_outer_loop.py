@@ -526,6 +526,29 @@ class TestStagingOuterLoopSpikeThresholds(unittest.TestCase):
         self.assertEqual(incidents[0].service, "backend")
         self.assertEqual(incidents[0].key, "spike:backend:2026-09-26T22")
 
+
+    def test_parse_api_stats_server_error_count_precedence_over_4xx(self):
+        # Only 5xx count as server errors. error_count also counts 4xx (401/404 from clients).
+        # When server_error_count is present, it must take precedence over error_count.
+        line_with_server_errors = (
+            '2026-10-05T06:00:00Z {"logger": "api.stats", "data": '
+            '{"request_count": 100, "error_count": 25, "server_error_count": 2}}'
+        )
+        stats = parse_api_stats(line_with_server_errors)
+        self.assertIsNotNone(stats)
+        self.assertEqual(stats["requests"], 100)
+        self.assertEqual(stats["errors"], 2)
+
+        # Older containers without server_error_count fall back to error_count
+        line_fallback = (
+            '2026-10-05T06:00:00Z {"logger": "api.stats", "data": '
+            '{"request_count": 100, "error_count": 5}}'
+        )
+        stats_fb = parse_api_stats(line_fallback)
+        self.assertIsNotNone(stats_fb)
+        self.assertEqual(stats_fb["requests"], 100)
+        self.assertEqual(stats_fb["errors"], 5)
+
     def test_error_line_count_boundary_49_does_not_trigger(self):
         # 49 ERROR lines in 10 minutes -> NO spike
         containers = [{"name": "polysimulator-staging-iad-v09j4g-backend-daemon-1", "containerId": "c2"}]
