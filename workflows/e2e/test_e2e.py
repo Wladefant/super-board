@@ -286,6 +286,17 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(e2e_guard.PINS["model"]["model"], "qwen3.8-flash")
         self.assertFalse(e2e_guard.PINS["model"]["providerOptions"]["opencodeGo"]["enable_thinking"])
 
+    def test_policy_documents_slice_1_and_slice_2(self):
+        policy = (HERE / "POLICY.md").read_text(encoding="utf-8")
+        self.assertIn("https://github.com/Wladefant/super-board/issues/475", policy)
+        self.assertIn("https://github.com/Wladefant/super-board/issues/476", policy)
+        self.assertIn("Windows spike findings and platform caveats", policy)
+        self.assertIn("e2e@0.17.0", policy)
+        self.assertIn("@e2e-dev/web@0.12.0", policy)
+        self.assertIn("Telemetry is on by default upstream", policy)
+        self.assertIn("Zero-secret cache replay", policy)
+        self.assertIn("Mobile engine restriction", policy)
+
     def test_host_function(self):
         allowed = ["localhost", "127.0.0.1"]
         self.assertIsNone(e2e_guard.host_allowed("http://127.0.0.1:3000", allowed))
