@@ -51,6 +51,7 @@ export const ALLOWED_ACTIONS = [
   'goto',
   'tap',
   'type',
+  'hover',
   'keyboard-open',
   'swipe',
   'assert',
@@ -379,6 +380,18 @@ export function validateSafeAction(step, flowConstraints = {}) {
     }
   }
 
+  // 6. Action-specific validation
+  if (action === 'hover') {
+    const hasSelector = typeof step.selector === 'string' && step.selector.trim().length > 0;
+    const hasCoords = step.x !== undefined && step.y !== undefined && !isNaN(Number(step.x)) && !isNaN(Number(step.y));
+    if (!hasSelector && !hasCoords) {
+      return {
+        valid: false,
+        error: `Action "hover" requires "selector" or "x" and "y" in step "${step.id || 'anonymous'}"`
+      };
+    }
+  }
+
   return { valid: true };
 }
 
@@ -409,6 +422,16 @@ export function validateMutationPayload(action, step) {
           error: `Mutation field value "${textVal}" for selector "${step.selector || 'unknown'}" must begin with "QA-" prefix`
         };
       }
+    }
+  }
+
+  if (action === 'cleanup') {
+    const targetText = step.target_text ?? step.text ?? step.match_text;
+    if (typeof targetText === 'string' && targetText.length > 0 && !targetText.startsWith('QA-')) {
+      return {
+        valid: false,
+        error: `Cleanup target text "${targetText}" for step "${step.id || 'anonymous'}" must begin with "QA-" prefix`
+      };
     }
   }
 
@@ -933,6 +956,92 @@ async function currentTarget(page, selector) {
 }
 
 /**
+ * Resolves the topmost hit element at (x, y), drilling recursively into open shadow roots.
+ *
+ * @param {Document|ShadowRoot|Element} rootOrTop - Starting document or top hit element
+ * @param {number} x - Viewport horizontal coordinate
+ * @param {number} y - Viewport vertical coordinate
+ * @param {Function} [getComputedStyleFn] - Optional window.getComputedStyle function
+ * @returns {Element|null} - Deepest element hit at (x, y)
+ */
+export function resolveDeepestHit(rootOrTop, x, y, getComputedStyleFn = (typeof window !== 'undefined' ? window.getComputedStyle : null)) {
+  const getStyle = getComputedStyleFn || (() => ({ pointerEvents: 'auto' }));
+
+  const hitAt = (scope) => {
+    if (!scope) return null;
+    if (typeof scope.elementsFromPoint === 'function') {
+      const stack = scope.elementsFromPoint(x, y) || [];
+      for (const cand of stack) {
+        if (!cand) continue;
+        try {
+          if (getStyle(cand)?.pointerEvents !== 'none') return cand;
+        } catch (_) {
+          return cand;
+        }
+      }
+      return stack[0] || null;
+    }
+    if (typeof scope.elementFromPoint === 'function') {
+      return scope.elementFromPoint(x, y);
+    }
+    return null;
+  };
+
+  let current = null;
+  if (rootOrTop && typeof rootOrTop.elementsFromPoint === 'function') {
+    current = hitAt(rootOrTop);
+  } else if (rootOrTop) {
+    current = rootOrTop;
+  }
+
+  while (current && current.shadowRoot) {
+    const deeper = hitAt(current.shadowRoot);
+    if (!deeper || deeper === current) break;
+    current = deeper;
+  }
+
+  return current;
+}
+
+/**
+ * Evaluates whether `target` counts as hit by `deepHit`.
+ * A control inside a shadow root counts as hit when it or its descendant is the topmost
+ * deep element; the shadow host alone does not make the check fail for controls inside its shadow root.
+ *
+ * @param {Element} target - The control expected to be hit
+ * @param {Element} deepHit - The element resolved at (x, y)
+ * @returns {boolean}
+ */
+export function isTargetHit(target, deepHit) {
+  if (!target || !deepHit) return false;
+  if (target === deepHit) return true;
+
+  if (typeof target.contains === 'function' && target.contains(deepHit)) {
+    return true;
+  }
+
+  let curr = deepHit;
+  while (curr) {
+    if (curr === target) return true;
+    const parent = curr.parentElement;
+    if (parent) {
+      curr = parent;
+    } else {
+      const root = typeof curr.getRootNode === 'function' ? curr.getRootNode() : null;
+      curr = root && root !== curr ? root.host : null;
+    }
+  }
+
+  let targetHost = typeof target.getRootNode === 'function' ? target.getRootNode()?.host : null;
+  while (targetHost) {
+    if (targetHost === deepHit) return true;
+    targetHost = typeof targetHost.getRootNode === 'function' ? targetHost.getRootNode()?.host : null;
+  }
+
+  return false;
+}
+
+/**
  * Evaluates in-page geometry and elementFromPoint for named checks.
  */
 async function inspectTargetElement(page, selectorOrHandle, scroll = true) {
@@ -953,22 +1062,64 @@ async function inspectTargetElement(page, selectorOrHandle, scroll = true) {
     let isTargetOrDescendant = false;
     let coveringElementDescription = '';
 
-    const getHitElement = (x, y) => {
-      if (x < 0 || y < 0 || x >= window.innerWidth || y >= window.innerHeight) return null;
-      if (typeof document.elementsFromPoint === 'function') {
-        const stack = document.elementsFromPoint(x, y);
+    const getHitAtRoot = (root, x, y) => {
+      if (!root) return null;
+      if (typeof root.elementsFromPoint === 'function') {
+        const stack = root.elementsFromPoint(x, y) || [];
         for (const cand of stack) {
-          if (window.getComputedStyle(cand).pointerEvents !== 'none') return cand;
+          if (!cand) continue;
+          try {
+            if (window.getComputedStyle(cand).pointerEvents !== 'none') return cand;
+          } catch (_) {
+            return cand;
+          }
         }
         return stack[0] || null;
       }
-      return document.elementFromPoint(x, y);
+      if (typeof root.elementFromPoint === 'function') {
+        return root.elementFromPoint(x, y);
+      }
+      return null;
+    };
+
+    const getDeepestHitElement = (x, y) => {
+      if (x < 0 || y < 0 || x >= window.innerWidth || y >= window.innerHeight) return null;
+      let top = getHitAtRoot(document, x, y);
+      while (top && top.shadowRoot) {
+        const deep = getHitAtRoot(top.shadowRoot, x, y);
+        if (!deep || deep === top) break;
+        top = deep;
+      }
+      return top;
+    };
+
+    const isHitOnTarget = (target, cand) => {
+      if (!target || !cand) return false;
+      if (target === cand) return true;
+      if (typeof target.contains === 'function' && target.contains(cand)) return true;
+      let curr = cand;
+      while (curr) {
+        if (curr === target) return true;
+        const parent = curr.parentElement;
+        if (parent) {
+          curr = parent;
+        } else {
+          const root = typeof curr.getRootNode === 'function' ? curr.getRootNode() : null;
+          curr = root && root !== curr ? root.host : null;
+        }
+      }
+      let host = typeof target.getRootNode === 'function' ? target.getRootNode()?.host : null;
+      while (host) {
+        if (host === cand) return true;
+        host = typeof host.getRootNode === 'function' ? host.getRootNode()?.host : null;
+      }
+      return false;
     };
 
     if (cx >= 0 && cx <= window.innerWidth && cy >= 0 && cy <= window.innerHeight) {
-      atPoint = getHitElement(cx, cy);
+      atPoint = getDeepestHitElement(cx, cy);
       if (atPoint) {
-        isTargetOrDescendant = atPoint === el || el.contains(atPoint);
+        isTargetOrDescendant = isHitOnTarget(el, atPoint);
         if (!isTargetOrDescendant) {
           coveringElementDescription = `${atPoint.tagName.toLowerCase()}${atPoint.className ? '.' + atPoint.className.toString().trim().replace(/\\s+/g, '.') : ''}${atPoint.id ? '#' + atPoint.id : ''}`;
         }
@@ -978,8 +1129,8 @@ async function inspectTargetElement(page, selectorOrHandle, scroll = true) {
     // Effective hit area: probe outward from the centre while elementFromPoint still lands on the target.
     // Counts padding and ::before overlays that getBoundingClientRect() does not.
     const hits = (x, y) => {
-      const a = getHitElement(x, y);
-      return !!a && (a === el || el.contains(a));
+      const a = getDeepestHitElement(x, y);
+      return !!a && isHitOnTarget(el, a);
     };
     const reach = (dx, dy) => {
       let n = 0;
@@ -1185,6 +1336,41 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
       break;
     }
 
+    case 'hover': {
+      let cx;
+      let cy;
+      if (step.selector) {
+        let hoverHandle = await firstVisibleHandle(page, step.selector, timeoutMs);
+        await page.evaluate((el) => {
+          if (el && typeof el.scrollIntoView === 'function') {
+            el.scrollIntoView({ block: 'center', inline: 'nearest' });
+          }
+        }, hoverHandle);
+        await new Promise((r) => setTimeout(r, 100));
+        let target = await inspectTargetElement(page, hoverHandle, false);
+        if (!target && step.optional) {
+          break;
+        }
+        if (!target) throw new Error(`Target "${step.selector}" not found for hover`);
+        cx = target.rect.x + target.rect.width / 2;
+        cy = target.rect.y + target.rect.height / 2;
+        preInspection = target;
+      } else if (step.x !== undefined && step.y !== undefined) {
+        cx = Number(step.x);
+        cy = Number(step.y);
+      } else {
+        throw new Error('Action "hover" requires "selector" or "x" and "y"');
+      }
+
+      await page.mouse.move(cx, cy);
+
+      const settleMs = step.settle_ms ?? step.wait_ms ?? 200;
+      if (settleMs > 0) {
+        await new Promise((r) => setTimeout(r, settleMs));
+      }
+      break;
+    }
+
     case 'tap': {
       if (!step.selector) throw new Error('Action "tap" requires "selector"');
       let tapHandle = await firstVisibleHandle(page, step.selector, timeoutMs);
@@ -1377,6 +1563,16 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
             });
           }
         }
+        if (step.expected_visible !== undefined && exists) {
+          const isShown = await isVisible(page, el);
+          checksResults.push({
+            name: 'assert_visible',
+            passed: isShown === step.expected_visible,
+            detail: isShown === step.expected_visible
+              ? `Element "${step.selector}" visibility is ${isShown}`
+              : `Expected visibility ${step.expected_visible}, got ${isShown}`
+          });
+        }
         if (step.expected_text && exists) {
           const deadline = Date.now() + Math.min(timeoutMs, 6000);
           let text = '';
@@ -1416,6 +1612,12 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
         if (overlay) overlay.remove();
       }).catch(() => {});
       if (step.selector) {
+        if (step.target_text || step.only_qa_threads || step.require_qa_prefix) {
+          const prefix = step.target_text || 'QA-';
+          if (!prefix.startsWith('QA-')) {
+            throw new Error(`Cleanup step "${step.id || 'anonymous'}" refused: target prefix "${prefix}" does not start with "QA-"`);
+          }
+        }
         // Give a control that a previous cleanup click opens (a confirm dialog) a moment to render.
         // `repeat` clicks again while the control is still present (one row per uploaded page);
         // `then` is the confirm control clicked after each click.
@@ -1423,6 +1625,16 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
         for (let round = 0; round < rounds; round++) {
           const el = await waitForTarget(page, step.selector, round === 0 ? step.timeout_ms || 1500 : 600, { visible: false });
           if (!el) break;
+          if (step.target_text) {
+            const isQa = await page.evaluate((targetEl, expectedPrefix) => {
+              const scope = targetEl.closest('.thread, .comment, [data-thread], [data-comment], [role="article"], tr, li') || targetEl.parentElement || targetEl;
+              const text = scope.textContent || '';
+              return text.includes(expectedPrefix) || text.trim().startsWith(expectedPrefix);
+            }, el, step.target_text);
+            if (!isQa) {
+              throw new Error(`Cleanup step "${step.id || 'anonymous'}" refused to delete target: text does not match "${step.target_text}"`);
+            }
+          }
           await el.click();
           if (step.then) {
             const confirm = await waitForTarget(page, step.then, 3000, { visible: false });

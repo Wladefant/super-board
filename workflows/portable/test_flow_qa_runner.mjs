@@ -52,7 +52,9 @@ import {
   executeStep,
   firstVisibleHandle,
   openFlowPage,
-  prepareFlowPage
+  prepareFlowPage,
+  resolveDeepestHit,
+  isTargetHit
 } from './flow_qa_runner.mjs';
 
 // ============================================================================
@@ -195,7 +197,7 @@ test('checkVersionEndpoint verifies /api/version response correctly', async () =
 
 test('validateSafeAction permits allowed safe actions (Positive Control)', () => {
   for (const act of ALLOWED_ACTIONS) {
-    const res = validateSafeAction({ id: 's1', action: act });
+    const res = validateSafeAction({ id: 's1', action: act, selector: '.target' });
     assert.equal(res.valid, true, `Action "${act}" must be valid`);
   }
 });
@@ -1041,5 +1043,144 @@ test('prepareFlowPage replaces a closed page with a fresh one that keeps the sto
   } finally {
     await browser.close();
     fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+// ============================================================================
+// 12. Shadow-root Hit Test, Hover Action, and Komo Dialog Pin Flow
+// ============================================================================
+
+test('resolveDeepestHit and isTargetHit drill into open shadow roots (Positive & Negative Controls)', () => {
+  // Mock element hierarchy:
+  // document
+  //   -> backdrop (light DOM covering element)
+  //   -> host (custom element with open shadowRoot)
+  //        -> shadowRoot
+  //             -> toolbar
+  //                  -> addBtn
+  //                       -> icon
+  const icon = { tagName: 'svg', className: 'icon', parentElement: null, getRootNode: null };
+  const addBtn = { tagName: 'button', className: 'add-btn', parentElement: null, getRootNode: null, contains: (c) => c === icon };
+  icon.parentElement = addBtn;
+
+  const toolbar = { tagName: 'div', className: 'toolbar', parentElement: null, getRootNode: null, contains: (c) => c === addBtn || c === icon };
+  addBtn.parentElement = toolbar;
+
+  const shadowRoot = {
+    elementsFromPoint: (x, y) => [icon, addBtn, toolbar],
+    elementFromPoint: (x, y) => icon
+  };
+  toolbar.getRootNode = () => shadowRoot;
+  addBtn.getRootNode = () => shadowRoot;
+  icon.getRootNode = () => shadowRoot;
+
+  const host = {
+    tagName: 'div',
+    id: 'komo-host',
+    shadowRoot,
+    parentElement: null,
+    getRootNode: null,
+    contains: () => false // standard DOM: host.contains does not cross shadow boundary
+  };
+  shadowRoot.host = host;
+
+  const backdrop = {
+    tagName: 'div',
+    className: 'modal-backdrop',
+    parentElement: null,
+    getRootNode: null,
+    contains: () => false
+  };
+
+  const docWithHost = {
+    elementsFromPoint: (x, y) => [host],
+    elementFromPoint: (x, y) => host
+  };
+
+  // Positive Control 1: Top element is host, resolveDeepestHit drills into shadowRoot to find icon
+  const deepHit = resolveDeepestHit(docWithHost, 100, 100);
+  assert.equal(deepHit, icon, 'Deepest hit must be the innermost element inside shadowRoot');
+
+  // Positive Control 2: Target control is addBtn, deepHit is child icon -> isTargetHit must be true
+  assert.equal(isTargetHit(addBtn, deepHit), true, 'Target control inside shadow root must count as hit when descendant is hit');
+
+  // Positive Control 3: Target control is addBtn, deepHit is addBtn itself -> isTargetHit must be true
+  assert.equal(isTargetHit(addBtn, addBtn), true, 'Target control inside shadow root must count as hit when target is hit');
+
+  // Positive Control 4: Shadow host alone must not make the check fail for controls inside its shadow root
+  assert.equal(isTargetHit(addBtn, host), true, 'Shadow host alone must not make check fail for controls inside its shadow root');
+
+  // Negative Control 1: Backdrop in light DOM covers host -> deepHit is backdrop
+  const docWithBackdrop = {
+    elementsFromPoint: (x, y) => [backdrop, host],
+    elementFromPoint: (x, y) => backdrop
+  };
+  const coveredHit = resolveDeepestHit(docWithBackdrop, 100, 100);
+  assert.equal(coveredHit, backdrop);
+  assert.equal(isTargetHit(addBtn, coveredHit), false, 'Control inside shadow root must not count as hit when covered by light DOM backdrop');
+
+  // Negative Control 2: Another control inside shadowRoot covers target
+  const otherControl = { tagName: 'div', className: 'tooltip', parentElement: toolbar, getRootNode: () => shadowRoot };
+  assert.equal(isTargetHit(addBtn, otherControl), false, 'Control must not count as hit when different element in shadow root is hit');
+});
+
+test('validateSafeAction permits hover action with selector or coordinates', () => {
+  // Positive control 1: hover with selector
+  const validSel = validateSafeAction({ id: 'hover-toolbar', action: 'hover', selector: 'button[aria-label^="Add comment"]' });
+  assert.equal(validSel.valid, true);
+
+  // Positive control 2: hover with x/y
+  const validCoords = validateSafeAction({ id: 'hover-pt', action: 'hover', x: 200, y: 300 });
+  assert.equal(validCoords.valid, true);
+
+  // Negative control 1: hover missing both selector and coordinates
+  const missingTarget = validateSafeAction({ id: 'hover-none', action: 'hover' });
+  assert.equal(missingTarget.valid, false);
+  assert.ok(missingTarget.error.includes('requires "selector" or "x" and "y"'));
+
+  // Negative control 2: hover constrained by flow constraints
+  const constrained = validateSafeAction(
+    { id: 'hover-disallowed', action: 'hover', selector: '.nav' },
+    { allowed_actions: ['goto', 'tap'] }
+  );
+  assert.equal(constrained.valid, false);
+  assert.ok(constrained.error.includes('not permitted by flow constraints'));
+});
+
+test('validateMutationPayload enforces QA- prefix on cleanup target_text', () => {
+  // Positive control: cleanup with QA- prefixed target_text
+  const validCleanup = validateMutationPayload('cleanup', { action: 'cleanup', target_text: 'QA- dialog stays open' });
+  assert.equal(validCleanup.valid, true);
+
+  // Negative control: cleanup targeting non-QA thread
+  const invalidCleanup = validateMutationPayload('cleanup', { action: 'cleanup', target_text: 'Production customer thread' });
+  assert.equal(invalidCleanup.valid, false);
+  assert.ok(invalidCleanup.error.includes('must begin with "QA-" prefix'));
+});
+
+test('flows/shipnovo.json defines komo-dialog-pin flow with required steps and cleanup', () => {
+  const flowsPath = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Z]:)/, '$1')), 'flows', 'shipnovo.json');
+  assert.ok(fs.existsSync(flowsPath), 'flows/shipnovo.json must exist');
+  const data = JSON.parse(fs.readFileSync(flowsPath, 'utf-8'));
+  const komoFlow = data.flows?.find((f) => f.id === 'komo-dialog-pin');
+  assert.ok(komoFlow, 'Flow "komo-dialog-pin" must be defined in flows/shipnovo.json');
+  assert.equal(komoFlow.id, 'komo-dialog-pin');
+
+  const stepActions = komoFlow.steps.map((s) => s.action);
+  assert.ok(stepActions.includes('goto'), 'Flow must navigate to /messages');
+  assert.ok(stepActions.includes('hover'), 'Flow must include hover action to reveal toolbar');
+  assert.ok(stepActions.includes('type'), 'Flow must type comment');
+  assert.ok(stepActions.includes('assert'), 'Flow must assert dialog still visible');
+
+  // Verify type step text starts with QA-
+  const typeStep = komoFlow.steps.find((s) => s.action === 'type');
+  assert.ok(typeStep?.text?.startsWith('QA-'), 'Comment text must start with "QA-"');
+
+  // Verify cleanup refuses non-QA deletion
+  assert.ok(Array.isArray(komoFlow.cleanup) && komoFlow.cleanup.length > 0, 'Flow must have cleanup steps');
+  for (const c of komoFlow.cleanup) {
+    if (c.target_text) {
+      assert.ok(c.target_text.startsWith('QA-'), 'Cleanup target_text must start with "QA-"');
+    }
   }
 });
