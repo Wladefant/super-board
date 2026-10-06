@@ -100,9 +100,14 @@ def build_message(host: Optional[str], bad: Optional[List[str]], down: List[Tupl
 
 
 def get_host() -> Optional[str]:
+    """Read the metrics agent through SSH (loopback on the host), so the token never crosses plain http."""
     try:
-        req = urllib.request.Request(METRICS_URL, headers={"Authorization": f"Bearer {read_secret(METRICS_TOKEN_FILE)}"})
-        return host_line(json.load(urllib.request.urlopen(req, timeout=HTTP_TIMEOUT))[0])
+        cfg = f'header = "Authorization: Bearer {read_secret(METRICS_TOKEN_FILE)}"\n'
+        p = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", SSH_HOST,
+                            "curl -s -m 10 -K - http://127.0.0.1:4500/metrics?limit=1"],
+                           input=cfg, capture_output=True, text=True, timeout=SSH_TIMEOUT,
+                           creationflags=CREATE_NO_WINDOW)
+        return host_line(json.loads(p.stdout)[0]) if p.returncode == 0 else None
     except Exception:
         return None
 

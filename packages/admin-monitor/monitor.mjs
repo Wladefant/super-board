@@ -58,21 +58,40 @@ async function probe(url, fetchImpl) {
 
 export async function runChecks(env, targets, fetchImpl = fetch, now = Date.now()) {
   const sent = [];
+  const errors = [];
   for (const t of targets) {
-    const status = await probe(t.url, fetchImpl);
-    const raw = await env.STATE.get(`t:${t.name}`);
-    const { state, notify } = step(raw ? JSON.parse(raw) : null, isUp(status), now);
-    await env.STATE.put(`t:${t.name}`, JSON.stringify(state));
-    if (notify) {
-      const text = formatMessage(t, notify, env.ADMIN_BASE_URL, now);
-      const r = await fetchImpl(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text, parse_mode: "HTML", disable_web_page_preview: true }),
-      });
-      if (!r.ok) throw new Error(`telegram sendMessage failed: ${r.status}`);
-      sent.push({ name: t.name, kind: notify.kind });
+    try {
+      const status = await probe(t.url, fetchImpl);
+      const key = `t:${t.name}`;
+      const raw = await env.STATE.get(key);
+      let prev = null;
+      try {
+        prev = raw ? JSON.parse(raw) : null;
+      } catch {
+        prev = null;
+      }
+      const { state, notify } = step(prev, isUp(status), now);
+      if (notify) {
+        const text = formatMessage(t, notify, env.ADMIN_BASE_URL, now);
+        const r = await fetchImpl(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ chat_id: env.TELEGRAM_CHAT_ID, text, parse_mode: "HTML", disable_web_page_preview: true }),
+          signal: AbortSignal.timeout(TIMEOUT_MS),
+        });
+        // State is written only after the send succeeded, so a failed send is retried on the next run.
+        if (!r.ok) throw new Error(`telegram sendMessage failed: ${r.status}`);
+        sent.push({ name: t.name, kind: notify.kind });
+      }
+      // KV writes are limited per day: write only when the state changed.
+      const next = JSON.stringify(state);
+      if (next !== JSON.stringify({ fails: 0, down: false, since: 0, ...(prev || {}) })) {
+        await env.STATE.put(key, next);
+      }
+    } catch (e) {
+      errors.push(`${t.name}: ${e.message}`);
     }
   }
+  if (errors.length) throw new Error(errors.join("; "));
   return sent;
 }
