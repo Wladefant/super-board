@@ -5,7 +5,7 @@ Status: accepted
 ## Context
 GitHub Projects (v2) has three layouts: Table, Board and Roadmap. It has no calendar layout.
 
-A live check of the boards on 2026-10-06 ([#483](https://github.com/Wladefant/super-board/issues/483)) covered 14 user Projects plus Bavariance Project 1. Roadmap views exist on Projects 2, 3, 5 and 7 and on Bavariance 1. 9 of the 15 boards have no date or iteration field, so a Roadmap cannot place their cards. The Roadmap zoom levels are Month, Quarter and Year. Date fields hold a day, not a time.
+A live check of the boards on 2026-10-06 ([#483](https://github.com/Wladefant/super-board/issues/483)) covered 14 user Projects plus Bavariance Project 1. Roadmap views exist on Projects 2, 3, 5 and 7 and on Bavariance 1. 9 of the 15 boards have no date or iteration field, so a Roadmap cannot place their cards. Project 5 has a Target Date and an Iteration field, but 0 of its 810 items carry a value, so its Roadmap shows no bars. The Roadmap zoom levels are Month, Quarter and Year. Date fields hold a day, not a time.
 
 ## Decision
 The hosted Week view builds only what GitHub cannot show:
