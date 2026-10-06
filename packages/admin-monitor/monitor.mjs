@@ -32,8 +32,13 @@ export function escapeHtml(v) {
   return String(v).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+export function adminLink(target, adminBase) {
+  if (target.admin) return target.admin;
+  return `${adminBase}/services/${encodeURIComponent(target.name)}`;
+}
+
 export function formatMessage(target, notify, adminBase, now) {
-  const link = `${adminBase}/services/${encodeURIComponent(target.name)}`;
+  const link = adminLink(target, adminBase);
   const name = escapeHtml(target.name);
   if (notify.kind === "down") {
     return `<b>DOWN</b> ${name}\n${escapeHtml(target.url)}\n<a href="${link}">Open in admin</a>`;

@@ -1,0 +1,11 @@
+{
+  "name": "admin-monitor",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test monitor.test.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  }
+}

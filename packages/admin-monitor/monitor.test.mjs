@@ -1,6 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { step, isUp, runChecks, formatMessage } from "./monitor.mjs";
+import { step, isUp, runChecks, formatMessage, adminLink } from "./monitor.mjs";
+
+test("adminLink: explicit admin wins, default is /services/<name>", () => {
+  assert.equal(adminLink({ name: "x", admin: "https://h" }, "https://a"), "https://h");
+  assert.equal(adminLink({ name: "pinthread-api" }, "https://a"), "https://a/services/pinthread-api");
+});
 
 test("isUp: 4xx is up, 5xx and 0 are down", () => {
   assert.equal(isUp(200), true);
