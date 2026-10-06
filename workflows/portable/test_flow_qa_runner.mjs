@@ -50,7 +50,9 @@ import {
   checkSwipeDismissal,
   runFlows,
   executeStep,
-  firstVisibleHandle
+  firstVisibleHandle,
+  openFlowPage,
+  prepareFlowPage
 } from './flow_qa_runner.mjs';
 
 // ============================================================================
@@ -994,5 +996,50 @@ test('no_document_reload ignores the late load event of the page a goto left at 
     server.closeAllConnections();
     server.close();
     fs.rmSync(outputDir, { recursive: true, force: true });
+  }
+});
+
+test('openFlowPage accepts a native confirm, so later CDP calls on the page do not stall', async () => {
+  const puppeteer = resolvePuppeteer();
+  const browser = await puppeteer.launch({ executablePath: resolveExecutablePath() || undefined, headless: 'new', args: ['--no-sandbox', '--disable-gpu'] });
+  try {
+    const { page } = await openFlowPage(browser);
+    await page.setContent('<body></body>');
+    await page.evaluate(() => {
+      setTimeout(() => { document.body.dataset.answer = window.confirm('Delete QA-row?') ? 'yes' : 'no'; }, 0);
+    });
+    const answer = await Promise.race([
+      page.waitForFunction(() => document.body.dataset.answer, { timeout: 0 }).then((h) => h.jsonValue()),
+      new Promise((resolve) => setTimeout(() => resolve('stalled behind the open dialog'), 3000))
+    ]);
+    assert.equal(answer, 'yes');
+  } finally {
+    await browser.close();
+  }
+});
+
+test('prepareFlowPage replaces a closed page with a fresh one that keeps the storage-state cookies', async () => {
+  const puppeteer = resolvePuppeteer();
+  const browser = await puppeteer.launch({ executablePath: resolveExecutablePath() || undefined, headless: 'new', args: ['--no-sandbox', '--disable-gpu'] });
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), 'flowqa-state-'));
+  const storageState = path.join(stateDir, 'state.json');
+  fs.writeFileSync(storageState, JSON.stringify({ cookies: [{ name: 'qa_session', value: 'QA-1', domain: '127.0.0.1', path: '/' }] }));
+  try {
+    const vp = { width: 390, height: 844, isMobile: true, hasTouch: true, deviceScaleFactor: 1 };
+    const first = await openFlowPage(browser, storageState);
+    const same = await prepareFlowPage(browser, first, storageState, vp, 'dark');
+    assert.equal(same.page, first.page, 'a live page is reused');
+
+    await first.page.close();
+    const fresh = await prepareFlowPage(browser, first, storageState, vp, 'dark');
+    assert.notEqual(fresh.page, first.page);
+    const { width, height, hasTouch } = fresh.page.viewport();
+    assert.deepEqual({ width, height, hasTouch }, { width: 390, height: 844, hasTouch: true });
+    assert.equal(fresh.page.isClosed(), false);
+    const cookies = await fresh.page.cookies('http://127.0.0.1/');
+    assert.equal(cookies.find((c) => c.name === 'qa_session')?.value, 'QA-1');
+  } finally {
+    await browser.close();
+    fs.rmSync(stateDir, { recursive: true, force: true });
   }
 });
