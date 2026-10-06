@@ -286,6 +286,39 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(e2e_guard.PINS["model"]["model"], "qwen3.8-flash")
         self.assertFalse(e2e_guard.PINS["model"]["providerOptions"]["opencodeGo"]["enable_thinking"])
 
+    def test_e2e_skill_file_and_catalog(self):
+        repo_root = HERE.parent.parent
+        skill_file = repo_root / "managed-skills" / "e2e" / "SKILL.md"
+        self.assertTrue(skill_file.exists(), f"SKILL.md not found at {skill_file}")
+        text = skill_file.read_text(encoding="utf-8")
+        self.assertTrue(text.startswith("---\nname: e2e\n"), "SKILL.md must start with e2e frontmatter")
+        self.assertIn("description:", text)
+        self.assertIn("tester-army/e2e", text)
+        self.assertIn("workflows/e2e/pins.json", text)
+        self.assertIn("qwen3.8-flash", text)
+        self.assertIn("e2e_receipt.py", text)
+        self.assertIn("e2e_run.py", text)
+        self.assertIn("e2e_guard.py", text)
+
+        readme_file = repo_root / "managed-skills" / "README.md"
+        self.assertTrue(readme_file.exists(), f"README.md not found at {readme_file}")
+        readme_content = readme_file.read_text(encoding="utf-8")
+        self.assertIn("| [`e2e`](./e2e/SKILL.md) |", readme_content)
+        self.assertIn("super-board#486", readme_content)
+
+    def test_e2e_skill_frontmatter_is_valid(self):
+        repo_root = HERE.parent.parent
+        skill_file = repo_root / "managed-skills" / "e2e" / "SKILL.md"
+        text = skill_file.read_text(encoding="utf-8")
+        parts = text.split("---\n", 2)
+        self.assertGreaterEqual(len(parts), 3)
+        frontmatter = parts[1]
+        self.assertIn("name: e2e", frontmatter)
+        self.assertIn("description:", frontmatter)
+        desc_lines = [l for l in frontmatter.splitlines() if l.startswith("description:")]
+        self.assertEqual(len(desc_lines), 1)
+        self.assertGreater(len(desc_lines[0].split("description:")[1].strip()), 20)
+
     def test_policy_documents_slice_1_and_slice_2(self):
         policy = (HERE / "POLICY.md").read_text(encoding="utf-8")
         self.assertIn("https://github.com/Wladefant/super-board/issues/475", policy)
