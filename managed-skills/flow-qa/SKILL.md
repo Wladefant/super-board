@@ -14,6 +14,11 @@ matching `FLOW-QA` receipt.
 
 - Runner: `workflows/portable/flow_qa_runner.mjs` (installed as `~/.veyyon/workflows/flow_qa_runner.mjs`, flows in `~/.veyyon/workflows/flows/`).
 - Flow definitions: `workflows/portable/flows/<project>.json` (`polysimulator`, `shipnovo`, `superboard-week`).
+  `shipnovo` defines the native article lifecycle flow (`article_lifecycle_native`).
+  The flow creates a unique `QA-` article, tests virtual keyboard focus (390x420), exercises tabs, and saves.
+  It opens row edit (`<sku> bearbeiten`) and dismisses the sheet via CDP touch swipe on mobile.
+  On 1440x900, it uses desktop close controls.
+  It deletes the article through row actions (`Weitere Aktionen für <sku>` -> `Artikel löschen` -> confirm).
   `superboard-week` runs against the Week view fixture preview
   (`bun scripts/week-preview.ts` in `packages/telegram-agent-harness`), which serves `/api/version`.
 - Gate: `github_pr_gate.py`, function `evaluate_flow_qa_receipt`.

@@ -2,7 +2,7 @@
   "schema": "flow-qa/v1",
   "project": "shipnovo",
   "version": "1.0.0",
-  "description": "Content-bound real user Flow QA definitions for Shipnovo covering article create/edit keyboard, phone row edit reachability, offer sheet swipe dismissal, return tabs single row, DHL PDF upload no-dead-end, order edit internal notes, and packing mode scan with stop before ship confirmation.",
+  "description": "Content-bound real user Flow QA definitions for Shipnovo covering native article lifecycle (create, edit, save, tabs, keyboard focus, mobile touch swipe dismissal, desktop close, and delete with failure-safe cleanup), phone row edit reachability, offer sheet swipe dismissal, return tabs single row, DHL PDF upload no-dead-end, order edit internal notes, and packing mode scan with stop before ship confirmation.",
   "viewports": [
     "390x844",
     "390x420",
@@ -14,14 +14,15 @@
   ],
   "flows": [
     {
-      "id": "article_create_edit_keyboard",
-      "name": "Artikel anlegen und bearbeiten bei geoeffneter Tastatur",
-      "description": "Erfasst einen internen Artikel mit QA-Praefix, prueft Tastaturfokus und Dialoglayout auf mobilen Viewports (390x420 und 390x844) und prueft, dass der Speichern-Button erreichbar ist. Speichert nie: der Dialog wird im Cleanup geschlossen, damit im echten Konto nichts bestehen bleibt.",
+      "id": "article_lifecycle_native",
+      "name": "Nativer Artikel-Lebenszyklus mit Tastatur, Tabs, Bearbeitung und Loeschung",
+      "description": "Erfasst einen eindeutigen internen Artikel (QA-ART-489-NAT), prueft Tastaturfokus und Viewport bei geoeffneter Tastatur (390x420), bedient Tabs, speichert den Artikel, prueft die gespeicherte Zeile, oeffnet die Zeilenbearbeitung ('<sku> bearbeiten'), schliesst das Sheet per nativem CDP-Touch-Swipe auf Mobile (390x844 und 390x420) sowie per Desktop-Schliessen-Control auf 1440x900, loescht den Artikel ueber das Aktionsmenue ('Weitere Aktionen fuer <sku>' -> 'Artikel loeschen' -> Bestaetigung) und fuehrt ein fehlschlagsicheres Cleanup nur des eigenen Artikels aus.",
       "allowed_actions": [
         "goto",
         "tap",
         "type",
         "keyboard-open",
+        "swipe",
         "assert",
         "cleanup"
       ],
@@ -73,7 +74,7 @@
           "id": "type_sku",
           "action": "type",
           "selector": "input[name='sku']",
-          "text": "QA-ART-FLOW-459",
+          "text": "QA-ART-489-NAT",
           "mutation": true,
           "checks": [
             "visible"
@@ -83,7 +84,7 @@
           "id": "type_title",
           "action": "type",
           "selector": "input[name='title']",
-          "text": "QA-Flow Testartikel Mobile",
+          "text": "QA-Flow 489 Native Artikel",
           "mutation": true,
           "checks": [
             "visible"
@@ -93,28 +94,221 @@
           "id": "type_variant",
           "action": "type",
           "selector": "input[name='variant']",
-          "text": "QA-Blau-M",
+          "text": "QA-Var-Schwarz-L",
           "mutation": true,
           "checks": [
             "visible"
           ]
         },
         {
-          "id": "assert_save_button_reachable_not_tapped",
-          "action": "assert",
+          "id": "tap_shipping_tab",
+          "action": "tap",
+          "selector": "[role='dialog'] button:has-text('Versandvorgaben')",
+          "checks": [
+            "visible",
+            "element_from_point"
+          ]
+        },
+        {
+          "id": "tap_storage_tab",
+          "action": "tap",
+          "selector": "[role='dialog'] button:has-text('Lagerplätze')",
+          "checks": [
+            "visible",
+            "element_from_point"
+          ]
+        },
+        {
+          "id": "save_created_article",
+          "action": "tap",
           "selector": "[role='dialog'] button[type='submit'], [role='dialog'] button:has-text('Artikel speichern')",
-          "expected_present": true,
           "checks": [
             "visible",
             "tap_target_min_44"
           ]
+        },
+        {
+          "id": "assert_create_dialog_closed",
+          "action": "assert",
+          "selector": "[role='dialog']",
+          "expected_present": false,
+          "timeout_ms": 8000
+        },
+        {
+          "id": "assert_article_saved_in_table",
+          "action": "assert",
+          "selector": "button[aria-label='QA-ART-489-NAT bearbeiten'], table tr:has-text('QA-ART-489-NAT')",
+          "expected_present": true,
+          "timeout_ms": 8000,
+          "checks": [
+            "visible"
+          ]
+        },
+        {
+          "id": "tap_row_edit_button",
+          "action": "tap",
+          "selector": "button[aria-label='QA-ART-489-NAT bearbeiten']",
+          "checks": [
+            "visible",
+            "element_from_point",
+            "tap_target_min_44"
+          ]
+        },
+        {
+          "id": "assert_edit_sheet_open",
+          "action": "assert",
+          "selector": "[role='dialog']",
+          "expected_present": true,
+          "timeout_ms": 5000
+        },
+        {
+          "id": "type_updated_title",
+          "action": "type",
+          "selector": "[role='dialog'] input[name='title']",
+          "text": "QA-Flow 489 Native Artikel Editiert",
+          "mutation": true,
+          "checks": [
+            "visible"
+          ]
+        },
+        {
+          "id": "save_edited_article",
+          "action": "tap",
+          "selector": "[role='dialog'] button[type='submit'], [role='dialog'] button:has-text('Artikel speichern')",
+          "checks": [
+            "visible",
+            "tap_target_min_44"
+          ]
+        },
+        {
+          "id": "assert_edit_dialog_closed_after_save",
+          "action": "assert",
+          "selector": "[role='dialog']",
+          "expected_present": false,
+          "timeout_ms": 8000
+        },
+        {
+          "id": "assert_edited_title_in_table",
+          "action": "assert",
+          "selector": "table",
+          "expected_text": "QA-Flow 489 Native Artikel Editiert",
+          "checks": [
+            "visible"
+          ]
+        },
+        {
+          "id": "tap_row_edit_again_for_sheet_dismissal",
+          "action": "tap",
+          "selector": "button[aria-label='QA-ART-489-NAT bearbeiten']",
+          "checks": [
+            "visible",
+            "element_from_point",
+            "tap_target_min_44"
+          ]
+        },
+        {
+          "id": "assert_sheet_open_for_dismissal",
+          "action": "assert",
+          "selector": "[role='dialog']",
+          "expected_present": true,
+          "timeout_ms": 5000
+        },
+        {
+          "id": "dismiss_mobile_sheet_via_cdp_touch_swipe",
+          "action": "swipe",
+          "selector": "[role='dialog'] div.touch-none, [role='dialog'] > div.touch-none",
+          "touch_only": true,
+          "direction": "down",
+          "distance": 450,
+          "assert_dismissal": true,
+          "checks": [
+            "dismissed"
+          ]
+        },
+        {
+          "id": "close_desktop_sheet_via_close_button",
+          "action": "tap",
+          "selector": "[role='dialog'] button:has-text('Abbrechen'), [role='dialog'] button[aria-label='Schließen'], [role='dialog'] button:has-text('Schließen')",
+          "desktop_only": true,
+          "checks": [
+            "visible",
+            "element_from_point"
+          ]
+        },
+        {
+          "id": "assert_sheet_dismissed",
+          "action": "assert",
+          "selector": "[role='dialog']",
+          "expected_present": false,
+          "timeout_ms": 6000
+        },
+        {
+          "id": "open_row_more_actions_menu",
+          "action": "tap",
+          "selector": "button[aria-label='Weitere Aktionen für QA-ART-489-NAT']",
+          "checks": [
+            "visible",
+            "element_from_point",
+            "tap_target_min_44"
+          ]
+        },
+        {
+          "id": "tap_delete_menu_item",
+          "action": "tap",
+          "selector": "[role='menuitem']:has-text('Artikel löschen'), [role='menu'] div:has-text('Artikel löschen')",
+          "checks": [
+            "visible",
+            "element_from_point"
+          ]
+        },
+        {
+          "id": "assert_delete_confirm_dialog_open",
+          "action": "assert",
+          "selector": "[role='alertdialog'], [role='dialog']",
+          "expected_present": true,
+          "timeout_ms": 5000
+        },
+        {
+          "id": "confirm_article_deletion",
+          "action": "tap",
+          "selector": "[role='alertdialog'] button:has-text('Artikel löschen'), [role='dialog'] button:has-text('Artikel löschen')",
+          "checks": [
+            "visible",
+            "element_from_point",
+            "tap_target_min_44"
+          ]
+        },
+        {
+          "id": "assert_delete_dialog_closed",
+          "action": "assert",
+          "selector": "[role='dialog']:has-text('Artikel löschen'), [role='alertdialog']",
+          "expected_present": false,
+          "timeout_ms": 8000
+        },
+        {
+          "id": "assert_article_deleted_from_table",
+          "action": "assert",
+          "selector": "button[aria-label='QA-ART-489-NAT bearbeiten']",
+          "expected_present": false,
+          "timeout_ms": 5000
         }
       ],
       "cleanup": [
         {
           "id": "cleanup_close_dialog_if_open",
           "action": "cleanup",
-          "selector": "[role='dialog'] button:has-text('Abbrechen'), [role='dialog'] button[aria-label='Close'], [role='dialog'] button[aria-label='Schließen']"
+          "selector": "[role='dialog'] button:has-text('Abbrechen'), [role='dialog'] button[aria-label='Schließen'], [role='alertdialog'] button:has-text('Abbrechen')"
+        },
+        {
+          "id": "cleanup_open_more_actions_if_row_exists",
+          "action": "cleanup",
+          "selector": "button[aria-label='Weitere Aktionen für QA-ART-489-NAT']",
+          "then": "[role='menuitem']:has-text('Artikel löschen')"
+        },
+        {
+          "id": "cleanup_confirm_delete_if_dialog_open",
+          "action": "cleanup",
+          "selector": "[role='alertdialog'] button:has-text('Artikel löschen'), [role='dialog'] button:has-text('Artikel löschen')"
         }
       ]
     },

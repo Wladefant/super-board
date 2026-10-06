@@ -971,6 +971,32 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
   const onNav = () => { navObserved = true; };
   page.once('load', onNav);
 
+  // Inject deliberate real-DOM overlay for obstruction negative control checks
+  if (step.obstruction_overlay || step.inject_overlay) {
+    await page.evaluate(() => {
+      let overlay = document.getElementById('__flow_qa_obstruction_overlay__');
+      if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.id = '__flow_qa_obstruction_overlay__';
+        overlay.style.position = 'fixed';
+        overlay.style.top = '0';
+        overlay.style.left = '0';
+        overlay.style.width = '100vw';
+        overlay.style.height = '100vh';
+        overlay.style.zIndex = '999999';
+        overlay.style.backgroundColor = 'rgba(255, 0, 0, 0.4)';
+        overlay.style.pointerEvents = 'auto';
+        document.body.appendChild(overlay);
+      }
+    });
+  }
+  if (step.remove_obstruction_overlay) {
+    await page.evaluate(() => {
+      const overlay = document.getElementById('__flow_qa_obstruction_overlay__');
+      if (overlay) overlay.remove();
+    });
+  }
+
   // Pre-action target inspection
   let preInspection = null;
   if (step.selector) {
@@ -990,6 +1016,20 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
       screenshot: null
     };
   }
+  // A desktop-only step (e.g. desktop close control on non-touch viewports) is skipped with a passing note on touch or mobile viewports.
+  if (step.desktop_only && (vpConfig.hasTouch || vpConfig.isMobile)) {
+    page.off('load', onNav);
+    return {
+      flow: flow.id || 'default-flow',
+      step: step.id || 'step',
+      viewport: viewportKey,
+      theme,
+      passed: true,
+      checks: [{ name: 'desktop_only_skipped', passed: true, detail: 'Desktop-only step; skipped on mobile/touch viewport' }],
+      screenshot: null
+    };
+  }
+
 
   // An optional tap (for example a consent banner that only appears for new visitors) is skipped
   // with a passing note when its target never shows up.
@@ -1035,7 +1075,13 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
 
     case 'tap': {
       if (!step.selector) throw new Error('Action "tap" requires "selector"');
-      await firstVisibleHandle(page, step.selector, timeoutMs);
+      const tapHandle = await firstVisibleHandle(page, step.selector, timeoutMs);
+      await page.evaluate((el) => {
+        if (el && typeof el.scrollIntoView === 'function') {
+          el.scrollIntoView({ block: 'center', inline: 'center' });
+        }
+      }, tapHandle);
+      await new Promise(r => setTimeout(r, 150));
       const target = await inspectTargetElement(page, step.selector);
       if (!target) throw new Error(`Target "${step.selector}" not found for tap`);
       // The tap's own checks judge the control as it was when tapped: afterwards a dialog it opened
@@ -1048,7 +1094,7 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
       if (vpConfig.hasTouch && cdpSession) {
         await dispatchCdpTap(cdpSession, cx, cy);
       } else {
-        await (await currentTarget(page, step.selector)).click();
+        await page.mouse.click(cx, cy);
       }
       break;
     }
@@ -1069,6 +1115,7 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
         el.focus();
         if (typeof el.select === 'function') el.select();
       }, typeTarget);
+      await page.keyboard.press('Backspace');
       const textToType = step.text ?? step.value ?? '';
       await typeTarget.type(textToType, { delay: step.delay || 20 });
       if (step.preview_regex) {
@@ -1155,6 +1202,13 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
       if (step.selector) {
         if (step.expected_present !== false) {
           await waitForTarget(page, step.selector, timeoutMs, { visible: false });
+        } else {
+          const deadline = Date.now() + Math.min(timeoutMs, 6000);
+          while (Date.now() < deadline) {
+            const cand = await currentTarget(page, step.selector);
+            if (!cand) break;
+            await new Promise(r => setTimeout(r, 100));
+          }
         }
         const el = await currentTarget(page, step.selector);
         const exists = !!el;
@@ -1197,6 +1251,10 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
     }
 
     case 'cleanup': {
+      await page.evaluate(() => {
+        const overlay = document.getElementById('__flow_qa_obstruction_overlay__');
+        if (overlay) overlay.remove();
+      }).catch(() => {});
       if (step.selector) {
         // Give a control that a previous cleanup click opens (a confirm dialog) a moment to render.
         // `repeat` clicks again while the control is still present (one row per uploaded page);
