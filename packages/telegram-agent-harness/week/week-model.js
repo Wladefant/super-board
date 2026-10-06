@@ -363,10 +363,33 @@ function onTint(color, base, text, bg, others) {
   }
 }
 
+/**
+ * Lane fills and the block ink drawn on them (Refs #631): every fill keeps 3:1 on `surfaces` and the ink 4.5:1
+ * on every fill. The scheme's `ink` is kept when that works, else black, else white. A fill is pulled toward
+ * the text colour first, then toward the pole away from the ink. Null when no ink works for every fill.
+ */
+function laneTokens(lanes, ink, text, surfaces) {
+  for (const candidate of [...new Set([ink, '#000000', '#ffffff'])]) {
+    const pole = contrastRatio(candidate, '#000000') > contrastRatio(candidate, '#ffffff') ? '#000000' : '#ffffff';
+    const fill = color => {
+      for (const toward of [text, pole === '#000000' ? '#ffffff' : '#000000']) {
+        for (let step = 0; step <= 20; step += 1) {
+          const mixed = mixColors(color, toward, step / 20);
+          if (contrastRatio(candidate, mixed) >= 4.5 && surfaces.every(back => contrastRatio(mixed, back) >= 3)) return mixed;
+        }
+      }
+      return null;
+    };
+    const fills = Object.fromEntries(Object.entries(lanes).map(([name, color]) => [name, fill(color)]));
+    if (Object.values(fills).every(Boolean)) return { '--ink': candidate, ...fills };
+  }
+  return null;
+}
+
 const HEX = /^#[0-9a-f]{6}$/i;
 
-/** The scheme's colours that are drawn on the page surfaces; telegramTokens re-checks them on Telegram's. */
-export const SURFACE_BOUND = ['--red', '--red-text', '--amber', ...Array.from({ length: 10 }, (_, i) => `--lane-${i}`)];
+/** The scheme's colours that telegramTokens re-checks on Telegram's surfaces: status colours, lane fills and the ink on them. */
+export const SURFACE_BOUND = ['--red', '--red-text', '--amber', '--ink', ...Array.from({ length: 10 }, (_, i) => `--lane-${i}`)];
 
 /**
  * Week view tokens from Telegram's theme (Telegram.WebApp.themeParams), or null when there is none
@@ -376,7 +399,7 @@ export const SURFACE_BOUND = ['--red', '--red-text', '--amber', ...Array.from({ 
  * `own` holds the scheme's SURFACE_BOUND colours from week.css. Each one is pulled toward the text colour
  * the same way: status text to 4.5:1 on its tint, the status ring and lane fills to 3:1. Their tints and
  * edges become solid colours derived from them, so every pair stays checkable. A tint that no text colour
- * reads on is faded toward the page surface (onTint).
+ * reads on is faded toward the page surface (onTint). The block ink keeps 4.5:1 on every lane fill (laneTokens).
  */
 export function telegramTokens(params, own = {}) {
   const pick = (...keys) => keys.map(key => params?.[key]).find(value => HEX.test(value ?? ''));
@@ -410,8 +433,9 @@ export function telegramTokens(params, own = {}) {
     const { fg: amber, tint } = onTint(color('--amber'), color('--amber'), text, bg, []);
     Object.assign(tokens, { '--amber': amber, '--amber-edge': readable(amber, text, [bg, panel], 3), '--amber-tint': tint });
   }
-  for (const name of SURFACE_BOUND.filter(name => name.startsWith('--lane-') && color(name))) {
-    tokens[name] = readable(color(name), text, [bg, panel], 3);
-  }
+  const lanes = Object.fromEntries(SURFACE_BOUND.filter(name => name.startsWith('--lane-') && color(name)).map(name => [name, color(name)]));
+  const inked = color('--ink') && laneTokens(lanes, color('--ink'), text, [bg, panel]);
+  if (inked) Object.assign(tokens, inked);
+  else for (const [name, lane] of Object.entries(lanes)) tokens[name] = readable(lane, text, [bg, panel], 3);
   return tokens;
 }

@@ -133,9 +133,11 @@ describe("Telegram theme", () => {
     expect(theme["--red-text"]).toBe(DARK["--red-text"]);
   });
 
-  // Refs https://github.com/Wladefant/super-board/issues/611: the red and amber status text sits on its own
-  // tint. Random themes (seeded, so a failure reproduces) cover the edges a hand-picked list misses.
-  test("on random readable themes, red and amber keep AA on their tints and on the surfaces", () => {
+  /**
+   * Failures matching `only` on random readable themes, seeded so a failure reproduces: 20,000 random
+   * themeParams, each mapped onto both schemes. Random themes cover the edges a hand-picked list misses.
+   */
+  function sweep(only: RegExp): { readable: number; out: string[] } {
     let seed = 611;
     const random = () => {
       seed = (seed + 0x6d2b79f5) | 0;
@@ -152,13 +154,33 @@ describe("Telegram theme", () => {
         const theme = telegramTokens(params, scheme);
         if (!theme) continue;
         readable += 1;
-        for (const failure of failures({ ...scheme, ...theme }).filter(line => /^--(red|amber)/.test(line))) {
+        for (const failure of failures({ ...scheme, ...theme }).filter(line => only.test(line))) {
           out.push(`${JSON.stringify(params)} ${scheme === LIGHT ? "light" : "dark"}: ${failure}`);
         }
       }
     }
+    return { readable, out };
+  }
+
+  // Refs https://github.com/Wladefant/super-board/issues/611: the red and amber status text sits on its own tint.
+  test("on random readable themes, red and amber keep AA on their tints and on the surfaces", () => {
+    const { readable, out } = sweep(/^--(red|amber)/);
     expect(readable).toBeGreaterThan(500);
     expect(out.slice(0, 5)).toEqual([]);
+  });
+
+  // Refs https://github.com/Wladefant/super-board/issues/631: block text (--ink) sits on the lane fill.
+  test("on random readable themes, block ink keeps 4.5:1 on every lane fill and every lane keeps 3:1 on the surfaces", () => {
+    const { readable, out } = sweep(/^--(ink|lane)/);
+    expect(readable).toBeGreaterThan(500);
+    expect(out.slice(0, 5)).toEqual([]);
+  });
+
+  test("Telegram's default themes keep the lane and ink colours of week.css", () => {
+    const pick = (t: Record<string, string>) => Object.fromEntries(["--ink", ...LANES].map(name => [name, t[name]]));
+    for (const [params, scheme] of [[TELEGRAM_LIGHT, LIGHT], [TELEGRAM_DARK, DARK]] as const) {
+      expect(pick({ ...scheme, ...telegramTokens(params, scheme)! })).toEqual(pick(scheme));
+    }
   });
 
   test("Telegram's default themes keep the red and amber colours they had before the tint check", () => {
