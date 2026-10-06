@@ -1,4 +1,3 @@
-FLOW-QA: FAIL
-FLOW-QA-ASSERTIONS pass=0 fail=1
-FLOW-QA-VIEWPORTS 
-Error: Served SHA check failed: Failed to query /api/version: fetch failed
+FLOW-QA: PASS 5799bd0eb26526707a2f39eae88ddb80e81782aa
+FLOW-QA-ASSERTIONS pass=348 fail=0
+FLOW-QA-VIEWPORTS 390x844,390x420,1440x900

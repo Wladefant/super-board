@@ -826,3 +826,119 @@ test('firstVisibleHandle prefers the field in an open sheet over a laid-out inli
     await browser.close();
   }
 });
+
+test('desktop_only steps pass with a skip note on touch and mobile viewports', async () => {
+  const EXPECTED_SHA = '915086acdf8a9061b4dae420935e876183046d9b';
+  let server;
+  let port;
+  await new Promise((resolve) => {
+    server = http.createServer((req, res) => {
+      if (req.url === '/api/version') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ sha: EXPECTED_SHA }));
+      } else {
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end('<!DOCTYPE html><html><body><button id="desk-btn" style="width:50px;height:50px">Close</button></body></html>');
+      }
+    });
+    server.listen(0, '127.0.0.1', () => {
+      port = server.address().port;
+      resolve();
+    });
+  });
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'desk-flow-'));
+  const flowJsonPath = path.join(tmpDir, 'desk-flow.json');
+  fs.writeFileSync(flowJsonPath, JSON.stringify({
+    flows: [{
+      id: 'desk-only-flow',
+      steps: [
+        { id: 'goto-page', action: 'goto', url: '/' },
+        { id: 'close-desktop', action: 'tap', selector: '#desk-btn', desktop_only: true }
+      ]
+    }]
+  }));
+  try {
+    const report = await runFlows({
+      baseUrl,
+      expectedSha: EXPECTED_SHA,
+      outputDir: tmpDir,
+      flowDataPath: flowJsonPath,
+      viewports: ['390x844', '1440x900'],
+      themes: ['light']
+    });
+    assert.equal(report.passed, true);
+    const mobileStep = report.steps.find(s => s.step === 'close-desktop' && s.viewport === '390x844');
+    assert.ok(mobileStep);
+    assert.equal(mobileStep.checks[0].name, 'desktop_only_skipped');
+    const deskStep = report.steps.find(s => s.step === 'close-desktop' && s.viewport === '1440x900');
+    assert.ok(deskStep);
+    assert.notEqual(deskStep.checks[0].name, 'desktop_only_skipped');
+  } finally {
+    server.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('obstruction_overlay causes element_from_point check to fail with obstruction detail (Negative Control)', async () => {
+  const EXPECTED_SHA = '915086acdf8a9061b4dae420935e876183046d9b';
+  let server;
+  let port;
+  await new Promise((resolve) => {
+    server = http.createServer((req, res) => {
+      if (req.url === '/api/version') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ sha: EXPECTED_SHA }));
+      } else {
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end('<!DOCTYPE html><html><body><button id="target-btn" style="width:100px;height:50px">Click Me</button></body></html>');
+      }
+    });
+    server.listen(0, '127.0.0.1', () => {
+      port = server.address().port;
+      resolve();
+    });
+  });
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'obstr-flow-'));
+  const flowJsonPath = path.join(tmpDir, 'obstr-flow.json');
+  fs.writeFileSync(flowJsonPath, JSON.stringify({
+    flows: [{
+      id: 'obstruction-negative-control-flow',
+      steps: [
+        { id: 'goto-page', action: 'goto', url: '/' },
+        {
+          id: 'tap-covered-target',
+          action: 'tap',
+          selector: '#target-btn',
+          obstruction_overlay: true,
+          checks: ['visible', 'element_from_point']
+        }
+      ],
+      cleanup: [
+        { id: 'clean-overlay', action: 'cleanup' }
+      ]
+    }]
+  }));
+  try {
+    const report = await runFlows({
+      baseUrl,
+      expectedSha: EXPECTED_SHA,
+      outputDir: tmpDir,
+      flowDataPath: flowJsonPath,
+      viewports: ['390x844'],
+      themes: ['light']
+    });
+    assert.equal(report.passed, false, 'Report must fail when target is obstructed');
+    const stepReport = report.steps.find(s => s.step === 'tap-covered-target');
+    assert.ok(stepReport);
+    assert.equal(stepReport.passed, false);
+    const coveredCheck = stepReport.checks.find(c => c.name === 'element_from_point');
+    assert.ok(coveredCheck);
+    assert.equal(coveredCheck.passed, false);
+    assert.ok(coveredCheck.detail.includes('Target covered by'));
+  } finally {
+    server.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});

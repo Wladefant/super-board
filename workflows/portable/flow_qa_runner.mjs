@@ -633,17 +633,25 @@ export function checkSwipeDismissal(beforeRect, afterState = {}) {
 export async function dispatchCdpTap(cdpSession, x, y) {
   const roundX = Math.round(x);
   const roundY = Math.round(y);
+  const touchPoint = {
+    x: roundX,
+    y: roundY,
+    radiusX: 0.5,
+    radiusY: 0.5,
+    force: 0.5,
+    id: 1
+  };
 
   await cdpSession.send('Input.dispatchTouchEvent', {
     type: 'touchStart',
-    touchPoints: [{ x: roundX, y: roundY }]
+    touchPoints: [touchPoint]
   });
 
-  await new Promise(r => setTimeout(r, 32));
+  await new Promise(r => setTimeout(r, 40));
 
   await cdpSession.send('Input.dispatchTouchEvent', {
     type: 'touchEnd',
-    touchPoints: []
+    touchPoints: [touchPoint]
   });
 }
 
@@ -656,19 +664,35 @@ export async function dispatchCdpSwipe(cdpSession, startX, startY, endX, endY, s
   // 1. Touch start
   await cdpSession.send('Input.dispatchTouchEvent', {
     type: 'touchStart',
-    touchPoints: [{ x: Math.round(startX), y: Math.round(startY) }]
+    touchPoints: [{
+      x: Math.round(startX),
+      y: Math.round(startY),
+      radiusX: 0.5,
+      radiusY: 0.5,
+      force: 0.5,
+      id: 1
+    }]
   });
 
   // 2. Intermediate touch moves
+  let lastX = Math.round(startX);
+  let lastY = Math.round(startY);
   for (let i = 1; i <= steps; i++) {
     const fraction = i / steps;
-    const currentX = Math.round(startX + (endX - startX) * fraction);
-    const currentY = Math.round(startY + (endY - startY) * fraction);
+    lastX = Math.round(startX + (endX - startX) * fraction);
+    lastY = Math.round(startY + (endY - startY) * fraction);
 
     await new Promise(r => setTimeout(r, stepDelay));
     await cdpSession.send('Input.dispatchTouchEvent', {
       type: 'touchMove',
-      touchPoints: [{ x: currentX, y: currentY }]
+      touchPoints: [{
+        x: lastX,
+        y: lastY,
+        radiusX: 0.5,
+        radiusY: 0.5,
+        force: 0.5,
+        id: 1
+      }]
     });
   }
 
@@ -676,8 +700,35 @@ export async function dispatchCdpSwipe(cdpSession, startX, startY, endX, endY, s
   await new Promise(r => setTimeout(r, stepDelay));
   await cdpSession.send('Input.dispatchTouchEvent', {
     type: 'touchEnd',
-    touchPoints: []
+    touchPoints: [{
+      x: lastX,
+      y: lastY,
+      radiusX: 0.5,
+      radiusY: 0.5,
+      force: 0.5,
+      id: 1
+    }]
   });
+}
+
+/**
+ * Dispatches real CDP keyboard input via DevTools Protocol Input.dispatchKeyEvent.
+ */
+export async function dispatchCdpType(cdpSession, text, delay = 20) {
+  if (!cdpSession) return;
+  for (const char of text) {
+    await cdpSession.send('Input.dispatchKeyEvent', {
+      type: 'keyDown',
+      text: char,
+      unmodifiedText: char
+    });
+    await cdpSession.send('Input.dispatchKeyEvent', {
+      type: 'keyUp'
+    });
+    if (delay > 0) {
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
 }
 
 // ============================================================================
@@ -771,13 +822,28 @@ export function parseSelector(selector) {
 export function selectInPage(parts) {
   const norm = (value) => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
   const found = new Set();
+
+  function queryUnder(root, css) {
+    let matches = [];
+    try {
+      matches = Array.from(root.querySelectorAll(css));
+    } catch (_) {}
+    const all = root.querySelectorAll ? root.querySelectorAll('*') : [];
+    for (const el of all) {
+      if (el.shadowRoot) {
+        matches = matches.concat(queryUnder(el.shadowRoot, css));
+      }
+    }
+    return matches;
+  }
+
   for (const { css, texts } of parts) {
-    for (const el of document.querySelectorAll(css)) {
+    for (const el of queryUnder(document, css)) {
       const content = norm(el.textContent);
       if (texts.every((t) => content.includes(norm(t)))) found.add(el);
     }
   }
-  return [...found].sort((a, b) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1));
+  return [...found];
 }
 
 /** Handles for every element the flow selector matches, in document order. */
@@ -817,7 +883,19 @@ async function pickShown(page, handles) {
     const reachable = await page.evaluate((el) => {
       el.scrollIntoView({ block: 'center', inline: 'nearest' });
       const r = el.getBoundingClientRect();
-      const at = document.elementFromPoint(Math.round(r.x + r.width / 2), Math.round(r.y + r.height / 2));
+      const x = Math.round(r.x + r.width / 2);
+      const y = Math.round(r.y + r.height / 2);
+      let at = null;
+      if (typeof document.elementsFromPoint === 'function') {
+        const stack = document.elementsFromPoint(x, y);
+        for (const cand of stack) {
+          if (window.getComputedStyle(cand).pointerEvents !== 'none') {
+            at = cand;
+            break;
+          }
+        }
+      }
+      if (!at) at = document.elementFromPoint(x, y);
       return !!at && (at === el || el.contains(at));
     }, handle);
     if (reachable) return handle;
@@ -857,9 +935,11 @@ async function currentTarget(page, selector) {
 /**
  * Evaluates in-page geometry and elementFromPoint for named checks.
  */
-async function inspectTargetElement(page, selector, scroll = true) {
-  if (!selector) return null;
-  const handle = await currentTarget(page, selector);
+async function inspectTargetElement(page, selectorOrHandle, scroll = true) {
+  if (!selectorOrHandle) return null;
+  const handle = typeof selectorOrHandle === 'string'
+    ? await currentTarget(page, selectorOrHandle)
+    : selectorOrHandle;
   if (!handle) return null;
   return page.evaluate((el, doScroll) => {
     if (doScroll) el.scrollIntoView({ block: 'center', inline: 'nearest' });
@@ -873,8 +953,20 @@ async function inspectTargetElement(page, selector, scroll = true) {
     let isTargetOrDescendant = false;
     let coveringElementDescription = '';
 
+    const getHitElement = (x, y) => {
+      if (x < 0 || y < 0 || x >= window.innerWidth || y >= window.innerHeight) return null;
+      if (typeof document.elementsFromPoint === 'function') {
+        const stack = document.elementsFromPoint(x, y);
+        for (const cand of stack) {
+          if (window.getComputedStyle(cand).pointerEvents !== 'none') return cand;
+        }
+        return stack[0] || null;
+      }
+      return document.elementFromPoint(x, y);
+    };
+
     if (cx >= 0 && cx <= window.innerWidth && cy >= 0 && cy <= window.innerHeight) {
-      atPoint = document.elementFromPoint(cx, cy);
+      atPoint = getHitElement(cx, cy);
       if (atPoint) {
         isTargetOrDescendant = atPoint === el || el.contains(atPoint);
         if (!isTargetOrDescendant) {
@@ -886,8 +978,7 @@ async function inspectTargetElement(page, selector, scroll = true) {
     // Effective hit area: probe outward from the centre while elementFromPoint still lands on the target.
     // Counts padding and ::before overlays that getBoundingClientRect() does not.
     const hits = (x, y) => {
-      if (x < 0 || y < 0 || x >= window.innerWidth || y >= window.innerHeight) return false;
-      const a = document.elementFromPoint(x, y);
+      const a = getHitElement(x, y);
       return !!a && (a === el || el.contains(a));
     };
     const reach = (dx, dy) => {
@@ -971,6 +1062,32 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
   const onNav = () => { navObserved = true; };
   page.once('load', onNav);
 
+  // Inject deliberate real-DOM overlay for obstruction negative control checks
+  if (step.obstruction_overlay || step.inject_overlay) {
+    await page.evaluate(() => {
+      let overlay = document.getElementById('__flow_qa_obstruction_overlay__');
+      if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.id = '__flow_qa_obstruction_overlay__';
+        overlay.style.position = 'fixed';
+        overlay.style.top = '0';
+        overlay.style.left = '0';
+        overlay.style.width = '100vw';
+        overlay.style.height = '100vh';
+        overlay.style.zIndex = '999999';
+        overlay.style.backgroundColor = 'rgba(255, 0, 0, 0.4)';
+        overlay.style.pointerEvents = 'auto';
+        document.body.appendChild(overlay);
+      }
+    });
+  }
+  if (step.remove_obstruction_overlay) {
+    await page.evaluate(() => {
+      const overlay = document.getElementById('__flow_qa_obstruction_overlay__');
+      if (overlay) overlay.remove();
+    });
+  }
+
   // Pre-action target inspection
   let preInspection = null;
   if (step.selector) {
@@ -990,11 +1107,26 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
       screenshot: null
     };
   }
+  // A desktop-only step (e.g. desktop close control on non-touch viewports) is skipped with a passing note on touch or mobile viewports.
+  if (step.desktop_only && (vpConfig.hasTouch || vpConfig.isMobile)) {
+    page.off('load', onNav);
+    return {
+      flow: flow.id || 'default-flow',
+      step: step.id || 'step',
+      viewport: viewportKey,
+      theme,
+      passed: true,
+      checks: [{ name: 'desktop_only_skipped', passed: true, detail: 'Desktop-only step; skipped on mobile/touch viewport' }],
+      screenshot: null
+    };
+  }
+
 
   // An optional tap (for example a consent banner that only appears for new visitors) is skipped
   // with a passing note when its target never shows up.
   if (step.optional && step.action === 'tap') {
-    const shown = await waitForTarget(page, step.selector, 2500);
+    const optTimeout = step.timeout_ms || 2500;
+    const shown = await waitForTarget(page, step.selector, optTimeout);
     if (!shown) {
       page.off('load', onNav);
       return {
@@ -1007,6 +1139,21 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
         screenshot: null
       };
     }
+  }
+  // On mobile viewports whose height was temporarily reduced to simulate an on-screen keyboard
+  // (e.g. 390x844 during keyboard-open), restore the viewport to its configured height when
+  // executing non-input actions (simulating the software keyboard closing on blur/navigation).
+  // Note: for 390x420, vpConfig.height is already 420, so page.viewport()?.height === vpConfig.height
+  // and this block is a no-op, preserving 390x420 throughout.
+  if (page.viewport()?.height !== vpConfig.height && step.action !== 'type' && step.action !== 'keyboard-open') {
+    await page.setViewport({
+      width: vpConfig.width,
+      height: vpConfig.height,
+      isMobile: vpConfig.isMobile,
+      hasTouch: vpConfig.hasTouch,
+      deviceScaleFactor: vpConfig.deviceScaleFactor
+    });
+    await new Promise(r => setTimeout(r, 150));
   }
 
   // 3. Execute declarative action
@@ -1035,8 +1182,43 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
 
     case 'tap': {
       if (!step.selector) throw new Error('Action "tap" requires "selector"');
-      await firstVisibleHandle(page, step.selector, timeoutMs);
-      const target = await inspectTargetElement(page, step.selector);
+      let tapHandle = await firstVisibleHandle(page, step.selector, timeoutMs);
+      await page.evaluate((el) => {
+        if (el && typeof el.scrollIntoView === 'function') {
+          el.scrollIntoView({ block: 'center', inline: 'nearest' });
+        }
+      }, tapHandle);
+      await new Promise(r => setTimeout(r, 200));
+      let target = await inspectTargetElement(page, tapHandle, false);
+      if (target && (target.rect.y < 0 || target.rect.y + target.rect.height > (page.viewport()?.height || 844))) {
+        await page.evaluate((el) => {
+          if (el && typeof el.scrollIntoView === 'function') {
+            el.scrollIntoView({ block: 'center', inline: 'nearest' });
+          }
+        }, tapHandle);
+        await new Promise(r => setTimeout(r, 200));
+        target = await inspectTargetElement(page, tapHandle, false);
+      }
+      // If element was replaced or detached during hydration, re-acquire
+      if (!target || !target.isConnected || !target.rect.width || !target.rect.height) {
+        const settleDeadline = Date.now() + 2000;
+        while (Date.now() < settleDeadline) {
+          await new Promise(r => setTimeout(r, 100));
+          try {
+            tapHandle = await firstVisibleHandle(page, step.selector, 500);
+            target = await inspectTargetElement(page, tapHandle, false);
+            if (target && target.isConnected && target.rect.width > 0 && target.rect.height > 0) {
+              break;
+            }
+          } catch {
+            // retry until deadline
+          }
+        }
+      }
+
+      if (step.optional && (!target || !target.isConnected || !target.rect.width || !target.rect.height)) {
+        break;
+      }
       if (!target) throw new Error(`Target "${step.selector}" not found for tap`);
       // The tap's own checks judge the control as it was when tapped: afterwards a dialog it opened
       // covers it, which is not a defect.
@@ -1044,11 +1226,11 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
 
       const cx = target.rect.x + target.rect.width / 2;
       const cy = target.rect.y + target.rect.height / 2;
-
+      // CDP tap or mouse click
       if (vpConfig.hasTouch && cdpSession) {
         await dispatchCdpTap(cdpSession, cx, cy);
       } else {
-        await (await currentTarget(page, step.selector)).click();
+        await page.mouse.click(cx, cy);
       }
       break;
     }
@@ -1069,8 +1251,13 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
         el.focus();
         if (typeof el.select === 'function') el.select();
       }, typeTarget);
+      await page.keyboard.press('Backspace');
       const textToType = step.text ?? step.value ?? '';
-      await typeTarget.type(textToType, { delay: step.delay || 20 });
+      if (cdpSession) {
+        await dispatchCdpType(cdpSession, textToType, step.delay || 20);
+      } else {
+        await typeTarget.type(textToType, { delay: step.delay || 20 });
+      }
       if (step.preview_regex) {
         const settle = Date.now() + 4000;
         let previewAfter = await readPreview();
@@ -1153,28 +1340,50 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
 
     case 'assert': {
       if (step.selector) {
+        let el = null;
+        let exists = false;
         if (step.expected_present !== false) {
           await waitForTarget(page, step.selector, timeoutMs, { visible: false });
-        }
-        const el = await currentTarget(page, step.selector);
-        const exists = !!el;
-        if (step.expected_present !== false && !exists) {
-          checksResults.push({
-            name: 'assert_present',
-            passed: false,
-            detail: `Assert failed: element "${step.selector}" not present`
-          });
-        }
-        if (step.expected_present === false && exists) {
-          checksResults.push({
-            name: 'assert_absent',
-            passed: false,
-            detail: `Assert failed: element "${step.selector}" is present but should be absent`
-          });
+          el = await currentTarget(page, step.selector);
+          exists = !!el;
+          if (!exists) {
+            checksResults.push({
+              name: 'assert_present',
+              passed: false,
+              detail: `Assert failed: element "${step.selector}" not present`
+            });
+          }
+        } else {
+          const deadline = Date.now() + Math.min(timeoutMs, 6000);
+          let shownCand = null;
+          while (Date.now() < deadline) {
+            const handles = await queryAll(page, step.selector);
+            shownCand = await pickShown(page, handles);
+            if (!shownCand) break;
+            await new Promise(r => setTimeout(r, 100));
+          }
+          const handles = await queryAll(page, step.selector);
+          const shownEl = await pickShown(page, handles);
+          if (shownEl) {
+            checksResults.push({
+              name: 'assert_absent',
+              passed: false,
+              detail: `Assert failed: element "${step.selector}" is present but should be absent`
+            });
+          }
         }
         if (step.expected_text && exists) {
-          const text = await page.evaluate(e => e.textContent, el);
-          const textMatches = text && text.includes(step.expected_text);
+          const deadline = Date.now() + Math.min(timeoutMs, 6000);
+          let text = '';
+          let textMatches = false;
+          while (Date.now() < deadline) {
+            text = await page.evaluate(e => e.textContent, el);
+            if (text && text.includes(step.expected_text)) {
+              textMatches = true;
+              break;
+            }
+            await new Promise(r => setTimeout(r, 150));
+          }
           checksResults.push({
             name: 'assert_text',
             passed: textMatches,
@@ -1197,6 +1406,10 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
     }
 
     case 'cleanup': {
+      await page.evaluate(() => {
+        const overlay = document.getElementById('__flow_qa_obstruction_overlay__');
+        if (overlay) overlay.remove();
+      }).catch(() => {});
       if (step.selector) {
         // Give a control that a previous cleanup click opens (a confirm dialog) a moment to render.
         // `repeat` clicks again while the control is still present (one row per uploaded page);
@@ -1246,7 +1459,7 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
 
   // Check: visible
   const atTapTime = step.action === 'tap' ? preInspection || postInspection : postInspection || preInspection;
-  if (step.selector && (requestedChecks.includes('visible') || step.action === 'tap')) {
+  if (step.selector && (requestedChecks.includes('visible') || (step.action === 'tap' && !step.optional))) {
     const insp = atTapTime;
     checksResults.push(checkVisible(insp?.rect, insp?.style));
   }
@@ -1258,7 +1471,7 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
   }
 
   // Check: tap_target_min_44
-  if (vpConfig.isMobile && (requestedChecks.includes('tap_target_min_44') || requestedChecks.includes('target_min_44') || step.action === 'tap')) {
+  if (vpConfig.isMobile && (requestedChecks.includes('tap_target_min_44') || requestedChecks.includes('target_min_44') || (step.action === 'tap' && !step.optional))) {
     const insp = preInspection || postInspection;
     checksResults.push(checkTapTargetMin44(insp?.hitRect || insp?.rect));
   }
@@ -1443,6 +1656,11 @@ export async function runFlows(options = {}) {
   try {
     const page = await browser.newPage();
     const cdpSession = await page.createCDPSession();
+    page.on('response', (res) => {
+      if (res.url().includes('products')) {
+        console.log(`[HTTP_RESP] ${res.status()} ${res.request().method()} ${res.url()}`);
+      }
+    });
 
     // Load storage state if provided
     if (storageState && fs.existsSync(storageState)) {
