@@ -5,6 +5,8 @@ import copy
 import json
 import os
 import sys
+import types
+import subprocess
 import unittest
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -317,6 +319,47 @@ class FailClosed(unittest.TestCase):
             rc = h.main(["--live"])
         self.assertEqual(rc, 3)
         self.assertIn("kaboom", (tmp / "audit.log").read_text(encoding="utf-8"))
+
+
+class HostDisk(unittest.TestCase):
+    """The Dokploy host disk check: pass, under the limit, and fail closed when the read fails."""
+
+    DF = "Filesystem     1024-blocks      Used Available Capacity Mounted on\n/dev/sda1        200000000 150000000  %d  %d%% /\n"
+
+    @staticmethod
+    def fake(stdout="", rc=0, exc=None):
+        def run(argv):
+            if exc:
+                raise exc
+            return types.SimpleNamespace(returncode=rc, stdout=stdout)
+        return run
+
+    def test_enough_free_disk_is_not_drift(self):
+        self.assertEqual(h.find_drift([man()], [dk()], {"https://a.example.de": 200}, None, disk=(30_000_000, 200_000_000)), [])
+
+    def test_exactly_at_the_limit_is_not_drift(self):
+        self.assertEqual(h.find_drift([], [], {}, None, disk=(30_000_000, 200_000_000)), [])
+
+    def test_under_15_percent_is_drift(self):
+        f = h.find_drift([], [], {}, None, disk=(29_000_000, 200_000_000))
+        self.assertEqual(rules(f), [h.R_DISK_LOW])
+        self.assertIn("14.5% free", f[0]["detail"])
+
+    def test_df_output_is_parsed_from_the_available_column(self):
+        run = self.fake(self.DF % (47784932, 77))
+        self.assertEqual(h.host_disk(run), (47784932, 200000000))
+
+    def test_failed_ssh_raises_source_error(self):
+        for run in (self.fake(rc=255), self.fake(stdout="", rc=0),
+                    self.fake(exc=subprocess.TimeoutExpired("ssh", 30)), self.fake(exc=FileNotFoundError())):
+            with self.assertRaises(h.SourceError):
+                h.host_disk(run)
+
+    def test_garbage_df_output_raises_source_error(self):
+        zero = self.DF.replace("200000000", "0") % (1, 1)
+        for out in ("hello", "Filesystem\nx y z", zero):
+            with self.assertRaises(h.SourceError):
+                h.host_disk(self.fake(stdout=out))
 
 
 class HiddenTask(unittest.TestCase):

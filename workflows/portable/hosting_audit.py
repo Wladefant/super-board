@@ -10,7 +10,7 @@ changes nothing makes no edit.
   python hosting_audit.py            # dry run: print only, change nothing
   python hosting_audit.py --live     # also edit the tracking issue (one deduped edit)
 
-Drift rules: unmanifested-live-app, manifest-url-down, supabase-in-use, no-home,
+Drift rules: host-disk-low (under 15% free), unmanifested-live-app, manifest-url-down, supabase-in-use, no-home,
 stale-dokploy-id, cloudflare-unmanifested, missing-manifest, invalid-manifest.
 Everything is read-only except the single issue edit under --live.
 Never prints a secret. PolySimulator production is never probed.
@@ -83,6 +83,12 @@ R_STALE_ID = "stale-dokploy-id"
 R_CF_UNMANIFESTED = "cloudflare-unmanifested"
 R_MISSING = "missing-manifest"
 R_INVALID = "invalid-manifest"
+R_DISK_LOW = "host-disk-low"
+
+# Read-only disk source: `df -P /` on the Dokploy host over SSH (the Dokploy disk endpoints answer 404).
+DOKPLOY_SSH_HOST = "hostinger-dokploy"
+DISK_MIN_FREE_PCT = 15.0
+SSH_TIMEOUT = 30
 
 
 # ------------------------------------------------------------------ manifest schema
@@ -180,9 +186,17 @@ def find_drift(
     cloudflare: Optional[List[Dict[str, str]]],
     missing_repos: Iterable[str] = (),
     invalid: Iterable[str] = (),
+    disk: Optional[Tuple[int, int]] = None,
 ) -> List[Dict[str, str]]:
-    """Pure drift evaluation. dokploy/cloudflare are None when that source was unreachable."""
+    """Pure drift evaluation. dokploy/cloudflare/disk are None when that source was unreachable.
+
+    disk is (free_kb, total_kb) of the Dokploy host root filesystem.
+    """
     out: List[Dict[str, str]] = []
+    if disk is not None:
+        pct = 100.0 * disk[0] / disk[1]
+        if pct < DISK_MIN_FREE_PCT:
+            out.append(_finding(R_DISK_LOW, "-", "dokploy-host", f"{pct:.1f}% free ({disk[0] / 1048576:.1f} GB of {disk[1] / 1048576:.1f} GB), limit {DISK_MIN_FREE_PCT:.0f}%"))
     for msg in invalid:
         out.append(_finding(R_INVALID, "-", msg.split(":", 1)[0], msg))
     for repo in missing_repos:
@@ -408,6 +422,31 @@ def cloudflare_inventory(token: str, fetch=None) -> List[Dict[str, str]]:
     return out
 
 
+def parse_df(text: str) -> Tuple[int, int]:
+    """(free_kb, total_kb) from `df -P /` output. Anything else raises SourceError."""
+    rows = [ln.split() for ln in text.strip().splitlines()]
+    if len(rows) != 2 or len(rows[1]) < 6 or not (rows[1][1].isdigit() and rows[1][3].isdigit()):
+        raise SourceError("df output not understood")
+    total, free = int(rows[1][1]), int(rows[1][3])
+    if total <= 0:
+        raise SourceError("df reported a zero-size filesystem")
+    return free, total
+
+
+def host_disk(run=None) -> Tuple[int, int]:
+    """Free and total KB of / on the Dokploy host. Read-only. Any failure raises SourceError."""
+    run = run or (lambda argv: subprocess.run(
+        argv, capture_output=True, text=True, timeout=SSH_TIMEOUT,
+        creationflags=CREATE_NO_WINDOW, stdin=subprocess.DEVNULL))
+    try:
+        r = run(["ssh", "-n", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", DOKPLOY_SSH_HOST, "df -P /"])
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SourceError(f"ssh {exc.__class__.__name__}") from None
+    if r.returncode != 0 or not r.stdout:
+        raise SourceError(f"ssh df failed (rc={r.returncode})")
+    return parse_df(r.stdout)
+
+
 def probe_urls(urls: Iterable[str], opener=None) -> Dict[str, Optional[int]]:
     """GET each URL once. Status code, or None when nothing answered. Protected hosts are skipped."""
     todo = sorted({u for u in urls if u and not is_protected_host(u)})
@@ -613,15 +652,22 @@ def collect(args: argparse.Namespace):
         except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError) as exc:
             unchecked.append(f"Cloudflare: {exc.__class__.__name__}")
 
+    disk = None
+    try:
+        disk = host_disk()
+        notes.append(f"Dokploy host disk: {100.0 * disk[0] / disk[1]:.1f}% free ({disk[0] / 1048576:.1f} GB of {disk[1] / 1048576:.1f} GB)")
+    except SourceError as exc:
+        unchecked.append(f"Dokploy host disk: {exc}")
+
     urls = [c["url"] for m in manifests for c in m["components"] if c.get("url")]
     url_status = probe_urls(urls)
-    return manifests, dokploy, url_status, cloudflare, missing, invalid, notes, unchecked
+    return manifests, dokploy, url_status, cloudflare, missing, invalid, notes, unchecked, disk
 
 
 def run(live: bool, issue: Optional[int]) -> int:
     """Exit 0 clean, 1 tracking issue not edited, 2 some source was UNCHECKED, 3 uncaught error (see main)."""
-    manifests, dokploy, url_status, cloudflare, missing, invalid, notes, unchecked = collect(argparse.Namespace())
-    findings = find_drift(manifests, dokploy, url_status, cloudflare, missing, invalid)
+    manifests, dokploy, url_status, cloudflare, missing, invalid, notes, unchecked, disk = collect(argparse.Namespace())
+    findings = find_drift(manifests, dokploy, url_status, cloudflare, missing, invalid, disk)
     now_iso = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     block = render_block(manifests, findings, url_status, notes, now_iso, unchecked)
     if sys.stdout is not None:
