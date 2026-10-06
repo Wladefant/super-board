@@ -168,13 +168,20 @@ class MockGraphQLRunner:
 
 
 class MockCLIRunner:
-    """Mock CLI runner tracking gh issue edit calls."""
+    """Mock CLI runner tracking gh issue edit calls; `gh label list` answers from `labels`."""
 
-    def __init__(self):
+    def __init__(self, labels=("kind:bug", "kind:feature", "area:workflow", "area:harness", "risk:low")):
         self.commands: List[List[str]] = []
+        self.labels = list(labels)
+
+    @property
+    def edits(self) -> List[List[str]]:
+        return [command for command in self.commands if command[0] == "issue"]
 
     def __call__(self, args: List[str]) -> str:
         self.commands.append(args)
+        if args[0] == "label":
+            return "\n".join(self.labels) + "\n"
         return "https://github.com/Wladefant/super-board/issues/101\n"
 
 
@@ -591,8 +598,20 @@ class TestOuterLoopIntake(unittest.TestCase):
         result = self.intake.apply_triage(plan, dry_run=False)
         self.assertTrue(result.ok)
         self.assertEqual(result.github_writes, 3)  # 1 issue edit + 1 project enroll + 1 status update
-        self.assertEqual(len(self.mock_cli.commands), 1)
+        self.assertEqual(len(self.mock_cli.edits), 1)
         self.assertEqual(len(self.mock_gql.mutations_executed), 2)
+
+    def test_21_labels_the_target_repo_lacks_are_not_added(self):
+        """A repo with its own label set (shipnovo) must not fail on canonical labels it lacks."""
+        self.mock_cli.labels = ["kind:bug", "risk:low", "area:orders"]
+        plan = self.intake.plan_triage(owner="Wladefant", repo="super-board", issue_number=101)
+        self.assertIn("area:workflow", plan.labels_to_add)
+
+        result = self.intake.apply_triage(plan, dry_run=False)
+        self.assertTrue(result.ok)
+        (edit,) = self.mock_cli.edits
+        added = edit[edit.index("--add-label") + 1].split(",")
+        self.assertEqual(sorted(added), ["kind:bug", "risk:low"])
 
 
 def main():
