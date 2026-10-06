@@ -5,7 +5,7 @@ description: "Real user-flow QA for UI PRs: drive the served build in Chromium a
 
 # Flow QA
 
-A page that opens is not a flow that works. Flow QA does what a user does: tap, type,
+A page that opens is not a flow that works. Flow QA does what a user does: tap, type, hover,
 swipe a sheet closed, switch tabs, open the keyboard. It checks each step.
 The UI merge gate (`github_pr_gate.py`) blocks a PolySimulator `staging` UI PR without a
 matching `FLOW-QA` receipt.
@@ -14,7 +14,7 @@ matching `FLOW-QA` receipt.
 
 - Runner: `workflows/portable/flow_qa_runner.mjs` (installed as `~/.veyyon/workflows/flow_qa_runner.mjs`, flows in `~/.veyyon/workflows/flows/`).
 - Flow definitions: `workflows/portable/flows/<project>.json` (`polysimulator`, `shipnovo`, `superboard-week`).
-  `shipnovo` defines the native article lifecycle flow (`article_lifecycle_native`).
+  `shipnovo` defines the native article lifecycle flow (`article_lifecycle_native`) and the Komo review toolbar dialog pin flow (`komo-dialog-pin`).
   The flow creates a unique `QA-` article, tests virtual keyboard focus (390x420), exercises tabs, and saves.
   It opens row edit (`<sku> bearbeiten`) and dismisses the sheet via CDP touch swipe on mobile.
   On 1440x900, it uses desktop close controls.
@@ -60,11 +60,12 @@ matching `FLOW-QA` receipt.
 
 ## Checks per step
 
-visible, not covered (element at point), tap target 44 px or more, no horizontal overflow,
+visible, not covered (element at point, drilling into open shadow roots without host occlusion), tap target 44 px or more, no horizontal overflow,
 focused input inside the viewport with the keyboard open, no document reload, swipe dismissal.
+Actions include `goto`, `tap`, `type`, `hover` (center of element or x/y with settle wait), `keyboard-open`, `swipe`, `assert`, `upload`, and `cleanup`.
 A `goto` returns at DOMContentLoaded, so the opened page can fire its own `load` event during the next
 step. That late `load` keeps the document identity token and does not count as a reload. A new document does.
-Mutations use a `QA-` prefix and each flow cleans up. A failed cleanup fails the run.
+Mutations use a `QA-` prefix and each flow cleans up. Cleanup steps deleting threads or mutations strictly refuse any target not prefixed with `QA-`. A failed cleanup fails the run.
 The runner accepts native dialogs (`confirm`, `alert`) like a user. When a step closes the page, the next
 viewport starts on a new page with the same cookies. CDP calls have no own timeout, so always start the
 runner through `build_slot.py run --timeout`.

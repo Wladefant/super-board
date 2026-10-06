@@ -743,6 +743,111 @@
         }
       ],
       "cleanup": []
+    },
+    {
+      "id": "komo-dialog-pin",
+      "name": "Komo Pinthread Dialog-Dismiss Regression (Nachrichteneinstellungen)",
+      "description": "Oeffnet /messages im angemeldeten Konto, oeffnet den Dialog Nachrichteneinstellungen, hovert ueber die Komo-Toolbar (Shadow Root), klickt 'Add comment', pinnt auf den Dialog-Absatz, tippt einen 'QA-'-Kommentar, sendet ab, prueft dass [role='dialog'] geoeffnet bleibt, und bereinigt ausschliesslich den QA-Thread.",
+      "allowed_actions": [
+        "goto",
+        "tap",
+        "hover",
+        "type",
+        "assert",
+        "cleanup"
+      ],
+      "forbidden_actions": [
+        "eval",
+        "delete_database",
+        "ebay_publish",
+        "purchase_label",
+        "confirm_ship"
+      ],
+      "steps": [
+        {
+          "id": "goto_messages",
+          "action": "goto",
+          "url": "/messages"
+        },
+        {
+          "id": "open_settings_dialog",
+          "action": "tap",
+          "selector": "button[aria-label='Nachrichteneinstellungen']",
+          "checks": [
+            "visible",
+            "element_from_point"
+          ]
+        },
+        {
+          "id": "assert_dialog_open",
+          "action": "assert",
+          "selector": "[role='dialog']",
+          "expected_present": true,
+          "expected_visible": true,
+          "checks": [
+            "visible"
+          ]
+        },
+        {
+          "id": "reveal_komo_toolbar",
+          "action": "hover",
+          "selector": "[aria-label='Show review toolbar'], button[aria-label^='Add comment'], .toolbar, [data-branch-comments]",
+          "settle_ms": 300
+        },
+        {
+          "id": "tap_add_comment",
+          "action": "tap",
+          "selector": "button[aria-label^='Add comment'], [aria-label^='Add comment']",
+          "checks": [
+            "visible",
+            "element_from_point"
+          ]
+        },
+        {
+          "id": "pin_on_dialog_paragraph",
+          "action": "tap",
+          "selector": "[role='dialog'] :has-text('Standards für die Bearbeitung und Antworten'), [role='dialog'] p, [role='dialog'] [data-slot='dialog-description']",
+          "checks": [
+            "visible",
+            "element_from_point"
+          ]
+        },
+        {
+          "id": "type_qa_comment",
+          "action": "type",
+          "selector": "textarea[data-focus-key='body'], textarea[aria-label='Comment'], textarea",
+          "text": "QA- dialog stays open"
+        },
+        {
+          "id": "submit_comment",
+          "action": "tap",
+          "selector": "button[aria-label='Post comment'], button:has-text('Post comment'), button[type='submit']"
+        },
+        {
+          "id": "assert_dialog_still_visible",
+          "action": "assert",
+          "selector": "[role='dialog']",
+          "expected_present": true,
+          "expected_visible": true,
+          "checks": [
+            "visible"
+          ]
+        }
+      ],
+      "cleanup": [
+        {
+          "id": "cleanup_close_dialog_if_open",
+          "action": "cleanup",
+          "selector": "[role='dialog'] button[aria-label='Schließen'], [role='dialog'] button:has-text('Schließen'), [role='dialog'] button:has-text('Abbrechen')"
+        },
+        {
+          "id": "cleanup_delete_qa_thread",
+          "action": "cleanup",
+          "selector": "summary[aria-label='Comment actions'], [aria-label='Comment actions']",
+          "then": "[role='menuitem']:has-text('Delete')",
+          "target_text": "QA-"
+        }
+      ]
     }
   ]
 }
