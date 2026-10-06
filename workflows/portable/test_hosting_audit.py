@@ -162,6 +162,31 @@ class Sources(unittest.TestCase):
                          [("A", "done", ["app.example.de"]), ("C", "idle", [])])
         self.assertNotIn("hunter2", json.dumps(items))
 
+    def test_dokploy_inventory_reads_databases_through_their_own_endpoints(self):
+        secret = "DATABASE_URL=postgres://u:hunter2@db/x"
+        calls = []
+
+        def fetch(proc, params=None):
+            calls.append((proc, params))
+            if proc == "project.all":
+                return [{"name": "P", "environments": [{"name": "production", "applications": [], "compose": [],
+                                                         "postgres": [{"postgresId": "PG"}], "redis": [{"redisId": "RD"}]}]}]
+            if proc == "postgres.one":
+                return {"postgresId": "PG", "name": "demo-db", "applicationStatus": "done", "databasePassword": "hunter2", "env": secret}
+            if proc == "redis.one":
+                return {"redisId": "RD", "name": "demo-cache", "applicationStatus": "idle"}
+            raise AssertionError(proc)
+
+        items = h.dokploy_inventory("k", fetch=fetch)
+        self.assertEqual([(i["id"], i["name"], i["kind"], i["status"], i["hosts"]) for i in items],
+                         [("PG", "demo-db", "database", "done", []), ("RD", "demo-cache", "database", "idle", [])])
+        self.assertIn(("postgres.one", {"postgresId": "PG"}), calls)
+        self.assertNotIn("hunter2", json.dumps(items))
+        # A manifest db component with that id is no longer a stale id.
+        comp = {"name": "demo-db", "kind": "db", "host": "dokploy-db", "url": None, "dokploy_app_id": "PG", "monthly_cost_usd": None}
+        f = h.find_drift([man(comps=[comp])], items, {}, None)
+        self.assertNotIn(h.R_STALE_ID, [x["rule"] for x in f])
+
     def test_cloudflare_inventory_reads_four_resource_kinds(self):
         data = {
             "/accounts": {"success": True, "result": [{"id": "acc"}]},
