@@ -1,8 +1,8 @@
 {
   "schema": "flow-qa/v1",
   "project": "superboard-week",
-  "version": "1.1.2",
-  "description": "Flow QA for the Superboard Week view against the fixture preview (bun scripts/week-preview.ts in packages/telegram-agent-harness). Covers week navigation, the detail dialog, prev/next disabled until a week is known, the error and loading states, the busy week, the calendar switcher in a short viewport, and picking a calendar from its listbox (popover on desktop, bottom sheet on a phone). Read-only: the page has no data mutations, and the page has no text input, so no step opens a soft keyboard.",
+  "version": "1.2.0",
+  "description": "Flow QA for the Superboard Week view against the fixture preview (bun scripts/week-preview.ts in packages/telegram-agent-harness). Covers week navigation, the detail dialog, prev/next disabled until a week is known, the error and loading states, the busy week, the calendar switcher in a short viewport, picking a calendar from its listbox (popover on desktop, bottom sheet on a phone), the calendar choice surviving a reload, opening a lane and closing its sheet by swipe (close button on desktop), the weekly report and a no-commit lane, the expired-session notice and the stale-snapshot badge. Read-only: the page has no data mutations, and the page has no text input, so no step opens a soft keyboard.",
   "viewports": [
     "390x844",
     "390x420",
@@ -99,6 +99,103 @@
         { "id": "open_agenda_lane", "action": "tap", "selector": ".agenda .row", "optional": true, "no_document_reload": true, "checks": ["visible", "tap_target_min_44", "no_document_reload"] },
         { "id": "close_agenda_lane", "action": "cleanup", "selector": "#detail[open] #detail-close" },
         { "id": "assert_busy_closed", "action": "assert", "selector": "#detail:not([open])", "expected_present": true }
+      ],
+      "cleanup": []
+    },
+    {
+      "id": "week_open_block_and_dismiss",
+      "name": "Open a lane and close it by swipe",
+      "description": "Opens the first lane of the calendar (grid block on desktop, agenda row on a phone). On a touch screen the bottom sheet closes with a swipe down on its handle; on desktop the popover closes with its close button. Then the picker sheet closes by swipe without changing the calendar.",
+      "allowed_actions": ["goto", "tap", "swipe", "assert"],
+      "forbidden_actions": ["eval", "prod_access"],
+      "steps": [
+        { "id": "goto_week_block", "action": "goto", "url": "/?scenario=normal&week=2026-09-28&board=all" },
+        { "id": "wait_week_loaded_block", "action": "assert", "selector": "#calendar[aria-busy='false']", "expected_present": true },
+        { "id": "open_first_lane", "action": "tap", "selector": "#grid button.blk:not(.short), #agenda button.row", "no_document_reload": true, "checks": ["visible", "tap_target_min_44", "element_from_point", "no_document_reload"] },
+        { "id": "assert_lane_detail_open", "action": "assert", "selector": "#detail[open] .meta", "expected_text": "When" },
+        { "id": "swipe_lane_sheet_closed", "action": "swipe", "selector": "#detail[open] .sheet-handle", "touch_only": true, "direction": "down", "distance": 300, "assert_dismissal": true, "checks": ["dismissed"] },
+        { "id": "close_lane_popover", "action": "tap", "selector": "#detail[open] #detail-close", "desktop_only": true, "no_document_reload": true, "checks": ["visible", "element_from_point", "no_document_reload"] },
+        { "id": "assert_lane_detail_closed", "action": "assert", "selector": "#detail:not([open])", "expected_present": true },
+        { "id": "open_picker_to_dismiss", "action": "tap", "selector": "#board", "no_document_reload": true, "checks": ["visible", "tap_target_min_44", "element_from_point", "no_document_reload"] },
+        { "id": "assert_picker_open_dismiss", "action": "assert", "selector": "#detail[open] [role=listbox]", "expected_present": true },
+        { "id": "swipe_picker_sheet_closed", "action": "swipe", "selector": "#detail[open] .sheet-handle", "touch_only": true, "direction": "down", "distance": 300, "assert_dismissal": true, "checks": ["dismissed"] },
+        { "id": "close_picker_popover", "action": "tap", "selector": "#detail[open] #detail-close", "desktop_only": true, "no_document_reload": true, "checks": ["visible", "element_from_point", "no_document_reload"] },
+        { "id": "assert_picker_closed_dismiss", "action": "assert", "selector": "#board[aria-expanded='false']", "expected_present": true },
+        { "id": "assert_label_unchanged", "action": "assert", "selector": "#board-value", "expected_text": "All boards" }
+      ],
+      "cleanup": []
+    },
+    {
+      "id": "week_calendar_persists",
+      "name": "Calendar choice survives a reload",
+      "description": "Picks Shipnovo, reloads the page without the board parameter, and checks the switcher and the lane count still show Shipnovo. Then picks All boards and checks that choice survives a reload too, which also leaves the stored choice as it was.",
+      "allowed_actions": ["goto", "tap", "assert"],
+      "forbidden_actions": ["eval", "prod_access"],
+      "steps": [
+        { "id": "goto_week_persist", "action": "goto", "url": "/?scenario=normal&week=2026-09-28&board=all" },
+        { "id": "wait_week_loaded_persist", "action": "assert", "selector": "#calendar[aria-busy='false']", "expected_present": true },
+        { "id": "open_picker_persist", "action": "tap", "selector": "#board", "no_document_reload": true, "checks": ["visible", "tap_target_min_44", "element_from_point", "no_document_reload"] },
+        { "id": "pick_shipnovo_persist", "action": "tap", "selector": "#detail [role=option][data-value='kind:shipnovo']", "no_document_reload": true, "checks": ["visible", "tap_target_min_44", "element_from_point", "no_document_reload"] },
+        { "id": "assert_label_shipnovo_persist", "action": "assert", "selector": "#board-value", "expected_text": "Shipnovo" },
+        { "id": "reload_without_board", "action": "goto", "url": "/?scenario=normal&week=2026-09-28" },
+        { "id": "wait_reloaded_shipnovo", "action": "assert", "selector": "#calendar[aria-busy='false']", "expected_present": true },
+        { "id": "assert_reloaded_label_shipnovo", "action": "assert", "selector": "#board-value", "expected_text": "Shipnovo" },
+        { "id": "assert_reloaded_stats_shipnovo", "action": "assert", "selector": "#stats", "expected_text": "4 lanes" },
+        { "id": "open_picker_restore", "action": "tap", "selector": "#board", "no_document_reload": true, "checks": ["visible", "tap_target_min_44", "element_from_point", "no_document_reload"] },
+        { "id": "pick_all_boards_restore", "action": "tap", "selector": "#detail [role=option][data-value='all']", "no_document_reload": true, "checks": ["visible", "tap_target_min_44", "element_from_point", "no_document_reload"] },
+        { "id": "reload_after_restore", "action": "goto", "url": "/?scenario=normal&week=2026-09-28" },
+        { "id": "wait_reloaded_all", "action": "assert", "selector": "#calendar[aria-busy='false']", "expected_present": true },
+        { "id": "assert_reloaded_label_all", "action": "assert", "selector": "#board-value", "expected_text": "All boards" }
+      ],
+      "cleanup": []
+    },
+    {
+      "id": "week_report_and_nocommit",
+      "name": "Read the weekly report and open a no-commit lane",
+      "description": "Checks the weekly report shows its Shipped, Most time and Next lines, then taps the first lane that stopped with no commit and checks its detail says so.",
+      "allowed_actions": ["goto", "tap", "assert", "cleanup"],
+      "forbidden_actions": ["eval", "prod_access"],
+      "steps": [
+        { "id": "goto_week_report", "action": "goto", "url": "/?scenario=normal&week=2026-09-28&board=all" },
+        { "id": "wait_week_loaded_report", "action": "assert", "selector": "#calendar[aria-busy='false']", "expected_present": true },
+        { "id": "assert_report_shipped", "action": "assert", "selector": "#report", "expected_text": "Shipped: 4 merged PRs" },
+        { "id": "assert_report_most_time", "action": "assert", "selector": "#report", "expected_text": "Most time:" },
+        { "id": "assert_report_next", "action": "assert", "selector": "#report", "expected_text": "Next:" },
+        { "id": "tap_nocommit_lane", "action": "tap", "selector": "#nocommit button.nc-item", "no_document_reload": true, "checks": ["visible", "tap_target_min_44", "element_from_point", "no_document_reload"] },
+        { "id": "assert_nocommit_badge", "action": "assert", "selector": "#detail[open] .badge-nc", "expected_text": "Stopped with no commit" },
+        { "id": "assert_nocommit_commits_row", "action": "assert", "selector": "#detail[open] .meta", "expected_text": "No commit" },
+        { "id": "close_nocommit_detail", "action": "cleanup", "selector": "#detail[open] #detail-close" },
+        { "id": "assert_nocommit_closed", "action": "assert", "selector": "#detail:not([open])", "expected_present": true }
+      ],
+      "cleanup": []
+    },
+    {
+      "id": "week_expired_session",
+      "name": "Open with an expired session",
+      "description": "The preview answers /api/session and /api/week with 401, like the daemon for old initData. The page asks the user to reopen it from the bot, offers no Try again button, and shows no lanes.",
+      "allowed_actions": ["goto", "assert"],
+      "forbidden_actions": ["eval", "prod_access"],
+      "steps": [
+        { "id": "goto_expired", "action": "goto", "url": "/?scenario=expired&week=2026-09-28&board=all" },
+        { "id": "assert_reopen_notice", "action": "assert", "selector": ".notice-error", "expected_text": "Open the Week view from the Superboard bot in Telegram to sign in.", "checks": ["visible"] },
+        { "id": "assert_no_try_again", "action": "assert", "selector": ".notice-error button", "expected_present": false },
+        { "id": "assert_sign_in_placeholder", "action": "assert", "selector": "#calendar", "expected_text": "Sign in to see the week." },
+        { "id": "assert_no_lanes_expired", "action": "assert", "selector": "#calendar button.blk, #calendar button.row", "expected_present": false }
+      ],
+      "cleanup": []
+    },
+    {
+      "id": "week_daemon_offline_stale",
+      "name": "Open while the PC is offline",
+      "description": "The stale fixture is the last snapshot the PC pushed. The page shows the as-of badge with the reason and still shows the lanes.",
+      "allowed_actions": ["goto", "assert"],
+      "forbidden_actions": ["eval", "prod_access"],
+      "steps": [
+        { "id": "goto_stale", "action": "goto", "url": "/?scenario=stale&week=2026-09-28&board=all" },
+        { "id": "wait_stale_loaded", "action": "assert", "selector": "#calendar[aria-busy='false']", "expected_present": true },
+        { "id": "assert_stale_badge", "action": "assert", "selector": "#asof:not([hidden])", "expected_text": "Snapshot as of", "checks": ["visible"] },
+        { "id": "assert_stale_reason", "action": "assert", "selector": "#asof", "expected_text": "The PC was offline" },
+        { "id": "assert_stale_lanes", "action": "assert", "selector": "#stats", "expected_text": "lanes" }
       ],
       "cleanup": []
     }

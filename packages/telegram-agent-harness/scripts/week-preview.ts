@@ -4,7 +4,9 @@
 //
 //   bun scripts/week-preview.ts [--port 4790] [--root <package dir to serve>]
 //
-// The page URL picks the fixture: ?scenario=normal|empty|stale|busy|error|loading (read from Referer).
+// The page URL picks the fixture: ?scenario=normal|empty|stale|busy|error|loading|expired (read from Referer).
+// "expired" answers /api/session and /api/week with 401 Unauthorized, like the daemon for an initData older
+// than 5 minutes or an app session older than 8 hours (daemon/miniapp-auth.ts).
 // GET /__served (and /api/version, which the Flow QA runner reads) returns the git SHA of the served tree,
 // so captures and FLOW-QA receipts prove what they show.
 import { execFileSync } from "node:child_process";
@@ -25,7 +27,8 @@ const sha = git("rev-parse", "HEAD");
 const dirty = git("status", "--porcelain", "--", ".").length > 0;
 
 const TYPES: Record<string, string> = { ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".json": "application/json", ".svg": "image/svg+xml" };
-const SCENARIOS: Record<string, true> = { normal: true, empty: true, stale: true, busy: true, error: true, loading: true };
+const SCENARIOS: Record<string, true> = { normal: true, empty: true, stale: true, busy: true, error: true, loading: true, expired: true };
+const UNAUTHORIZED = { error: "Unauthorized" };
 
 function scenarioOf(req: Request): string {
   const referer = req.headers.get("referer");
@@ -48,7 +51,10 @@ const server = Bun.serve({
     const headers = { "x-served-sha": sha };
     const withSha = (res: Response) => { res.headers.set("x-served-sha", sha); return res; };
     if (url.pathname === "/__served" || url.pathname === "/api/version") return Response.json({ sha, dirty, root }, { headers });
-    if (url.pathname === "/api/session" && req.method === "POST") return Response.json({ appSession: "preview" }, { headers });
+    if (url.pathname === "/api/session" && req.method === "POST") {
+      if (scenarioOf(req) === "expired") return Response.json(UNAUTHORIZED, { status: 401, headers });
+      return Response.json({ appSession: "preview" }, { headers });
+    }
     if (url.pathname === "/api/week") {
       // no-store like the relay. "loading" sends its headers and one space, then never ends the body:
       // a never-answered request would hold Chrome's cache lock on /api/week and stall the next page's
@@ -60,6 +66,7 @@ const server = Bun.serve({
         return new Response(body, { headers: { ...api, "content-type": "application/json" } });
       }
       if (scenario === "error") return Response.json({ error: "The relay is not connected." }, { status: 502, headers: api });
+      if (scenario === "expired") return Response.json(UNAUTHORIZED, { status: 401, headers: api });
       return Response.json(makeWeek(scenario as WeekScenario), { headers: api });
     }
     if (url.pathname === "/miniapp/client.js") return withSha(file(join(root, "miniapp", "client.js")));
