@@ -91,7 +91,10 @@ export function getDaemonCommands(): DaemonCommandDescriptor[] {
   const routerCommands = ROUTER_COMMANDS.map(({ command, description }) => ({ command, description }));
   const baseCommands = availableCommands(true).map(({ command, description }) => ({ command, description }));
   const seen = new Set<string>();
-  const result: DaemonCommandDescriptor[] = [{ command: "app", description: "Open the Superboard Mini App" }];
+  const result: DaemonCommandDescriptor[] = [
+    { command: "app", description: "Open the Superboard Mini App" },
+    { command: "week", description: "Open the Superboard Week view" },
+  ];
   for (const item of [...routerCommands, ...baseCommands]) {
     if (!seen.has(item.command)) {
       seen.add(item.command);

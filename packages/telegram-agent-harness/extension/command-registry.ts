@@ -10,6 +10,7 @@ export const DAEMON_ROUTING_COMMANDS = [
   { command: "detach", description: "Detach this chat from the current session", group: "Routing & Workspaces", syntax: "/detach", harness: false },
   { command: "topics", description: "List session topics (forum mode)", group: "Routing & Workspaces", syntax: "/topics", harness: false },
   { command: "app", description: "Open the Superboard Mini App", group: "Routing & Workspaces", syntax: "/app", harness: false },
+  { command: "week", description: "Open the Superboard Week view", group: "Routing & Workspaces", syntax: "/week", harness: false },
 ] as const;
 
 /** The menu and help are projections of the same supported command surface. */

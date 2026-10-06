@@ -447,7 +447,7 @@ export class TelegramDaemon {
         // is the one it is dispatching right now.
         const target: RouteTarget = { chatId, topicId: currentTarget().topicId };
         const send = async (html: string): Promise<void> => sendTo(target, html, "HTML");
-        if (/^\/app(?:@\w+)?\s*$/i.test(text)) {
+        if (/^\/(?:app|week)(?:@\w+)?\s*$/i.test(text)) {
           const rawUrl = miniAppUrl(slot.stateDir);
           const threadId = target.topicId ? Number(target.topicId) : undefined;
           if (rawUrl) {
@@ -456,10 +456,11 @@ export class TelegramDaemon {
               topicId: target.topicId || undefined,
               sessionId: boundSession || undefined,
             });
+            const isWeek = /^\/week/i.test(text);
             await poller.sendTelegramMessage(
               chatId,
-              "Open your Superboard dashboard",
-              { inline_keyboard: [[{ text: "Open Superboard", web_app: { url } }]] },
+              isWeek ? "Open the Superboard Week view" : "Open your Superboard dashboard",
+              { inline_keyboard: [[{ text: isWeek ? "Open Week view" : "Open Superboard", web_app: { url } }]] },
               undefined,
               undefined,
               undefined,
