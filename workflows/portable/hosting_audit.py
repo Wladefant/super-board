@@ -47,6 +47,8 @@ STAGES = ("greenfield", "live")
 KINDS = ("web", "api", "db", "worker", "static", "storage", "other")
 DNS_PROVIDERS = ("cloudflare", "hostinger", "other", "none")
 LIVE_STATUSES = ("done", "running")
+# Dokploy database kinds: project.all gives only their ids, so each one is read through <kind>.one.
+DB_KINDS = ("postgres", "mysql", "mariadb", "mongo", "redis", "libsql")
 
 ISSUE_REPO = "Wladefant/super-board"
 ISSUE_TITLE = "Projects live on Dokploy"
@@ -59,7 +61,7 @@ EXTRA_REPOS = ("Bavariance/polysimulator",)
 REPO_REFS = {"Bavariance/polysimulator": "staging"}
 # Repos that MUST carry a hosting.json. A missing one is drift.
 TRACKED_REPOS = (
-    "Wladefant/super-board", "Wladefant/shipnovo", "Wladefant/komo",
+    "Wladefant/super-board", "Wladefant/shipnovo", "Wladefant/pinthread",
     "Wladefant/veyyon", "Bavariance/polysimulator",
     "Wladefant/agent-native-platform", "Wladefant/soundcore-work-workflow",
     "Wladefant/FNSKUWarehouseScanner", "Wladefant/heylolo-app",
@@ -364,8 +366,21 @@ def dokploy_inventory(key: str, base: str = DOKPLOY_BASE, fetch=None) -> List[Di
                         "id": a.get(id_key), "name": a.get("name"), "kind": kind,
                         "status": a.get(status_key), "project": p["name"], "env": env["name"], "hosts": [],
                     })
+            # project.all lists a database as its id only; name and status come from <kind>.one.
+            for kind in DB_KINDS:
+                for a in env.get(kind) or []:
+                    db_id = a.get(f"{kind}Id")
+                    if not db_id:
+                        continue
+                    one = get(f"{kind}.one", {f"{kind}Id": db_id})
+                    if not isinstance(one, dict):
+                        raise SourceError(f"{kind}.one did not return an object")
+                    items.append({
+                        "id": db_id, "name": one.get("name"), "kind": "database",
+                        "status": one.get("applicationStatus"), "project": p["name"], "env": env["name"], "hosts": [],
+                    })
     for it in items:
-        if it["status"] not in LIVE_STATUSES or PROTECTED_NAME_RE.match(it["name"] or ""):
+        if it["kind"] == "database" or it["status"] not in LIVE_STATUSES or PROTECTED_NAME_RE.match(it["name"] or ""):
             continue
         proc, pkey = (("domain.byApplicationId", "applicationId") if it["kind"] == "application"
                       else ("domain.byComposeId", "composeId"))
