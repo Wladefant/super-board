@@ -133,6 +133,46 @@ describe("Telegram theme", () => {
     expect(theme["--red-text"]).toBe(DARK["--red-text"]);
   });
 
+  // Refs https://github.com/Wladefant/super-board/issues/611: the red and amber status text sits on its own
+  // tint. Random themes (seeded, so a failure reproduces) cover the edges a hand-picked list misses.
+  test("on random readable themes, red and amber keep AA on their tints and on the surfaces", () => {
+    let seed = 611;
+    const random = () => {
+      seed = (seed + 0x6d2b79f5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const hex = () => `#${Math.floor(random() * 0x1000000).toString(16).padStart(6, "0")}`;
+    let readable = 0;
+    const out: string[] = [];
+    for (let i = 0; i < 20000; i += 1) {
+      const params = { bg_color: hex(), secondary_bg_color: hex(), section_bg_color: hex(), text_color: hex(), hint_color: hex(), link_color: hex() };
+      for (const scheme of [LIGHT, DARK]) {
+        const theme = telegramTokens(params, scheme);
+        if (!theme) continue;
+        readable += 1;
+        for (const failure of failures({ ...scheme, ...theme }).filter(line => /^--(red|amber)/.test(line))) {
+          out.push(`${JSON.stringify(params)} ${scheme === LIGHT ? "light" : "dark"}: ${failure}`);
+        }
+      }
+    }
+    expect(readable).toBeGreaterThan(500);
+    expect(out.slice(0, 5)).toEqual([]);
+  });
+
+  test("Telegram's default themes keep the red and amber colours they had before the tint check", () => {
+    const pick = (t: Record<string, string>) => Object.fromEntries(Object.entries(t).filter(([name]) => /^--(red|amber)/.test(name)));
+    expect(pick(telegramTokens(TELEGRAM_LIGHT, LIGHT)!)).toEqual({
+      "--red": "#c62828", "--red-edge": "#c62828", "--red-tint": "#ebdbdf", "--red-text": "#a61b1b",
+      "--amber": "#8a5300", "--amber-edge": "#8a5300", "--amber-tint": "#e5dfdb",
+    });
+    expect(pick(telegramTokens(TELEGRAM_DARK, DARK)!)).toEqual({
+      "--red": "#ff6b6b", "--red-edge": "#ff6b6b", "--red-tint": "#332425", "--red-text": "#ffb4b4",
+      "--amber": "#f5c06b", "--amber-edge": "#f5c06b", "--amber-tint": "#322c25",
+    });
+  });
+
   test("hint and link colours too faint to read are pulled toward the text colour until they reach 4.5:1", () => {
     const faint = { bg_color: "#ffffff", text_color: "#111111", hint_color: "#f2f2f2", link_color: "#fafafa" };
     const theme = telegramTokens(faint)!;
