@@ -10,3 +10,4 @@ Format: `NNNN-short-title.md` with Status, Context, Decision, Consequences. Keep
 | [0002](0002-coordinator-never-merges-or-self-spawns.md) | The coordinator and reviewers never merge, deploy or spawn themselves |
 | [0003](0003-depth-survey-is-report-only.md) | The depth survey only reports; a person picks the candidate |
 | [0004](0004-build-slot-is-a-local-directory-lock.md) | The build slot is a local atomic directory lock with a FIFO queue |
+| [0005](0005-week-view-fills-github-gaps-cards-stay-in-github.md) | The Week view fills only GitHub's gaps; it is read-only for cards and links to GitHub for edits |
