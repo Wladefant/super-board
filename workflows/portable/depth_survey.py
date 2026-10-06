@@ -450,21 +450,35 @@ def render_markdown(sv: Survey, report_path: Optional[str] = None) -> str:
 
 # --------------------------------------------------------------------------- filing (live only)
 
+_SEARCH_PAGE = 100
+_SEARCH_MAX_PAGES = 10  # the GitHub search API serves at most 1000 results
+
+
 def _existing_fingerprints(repo: str) -> Set[str]:
-    rc, out = _gh("issue", "list", "-R", repo, "--state", "all", "--search", f"{FINGERPRINT_PREFIX} in:body",
-                  "--limit", "200", "--json", "body")
-    if rc != 0:
-        raise RuntimeError(f"cannot read existing survey issues from {repo}: {out.strip()}")
+    """Fingerprints of every survey issue in any state, paged so old ones are not forgotten past 200."""
     seen: Set[str] = set()
-    for issue in json.loads(out or "[]"):
-        seen.update(re.findall(FINGERPRINT_PREFIX + r":[0-9a-f]{12}", issue.get("body") or ""))
+    for page in range(1, _SEARCH_MAX_PAGES + 1):
+        rc, out = _gh("api", "-X", "GET", "search/issues", "-f", f"q=repo:{repo} {FINGERPRINT_PREFIX} in:body",
+                      "-f", f"per_page={_SEARCH_PAGE}", "-f", f"page={page}")
+        if rc != 0:
+            raise RuntimeError(f"cannot read existing survey issues from {repo}: {out.strip()}")
+        items = json.loads(out or "{}").get("items", [])
+        for issue in items:
+            seen.update(re.findall(FINGERPRINT_PREFIX + r":[0-9a-f]{12}", issue.get("body") or ""))
+        if len(items) < _SEARCH_PAGE:
+            return seen
+    print(f"[WARN] dedupe search hit the {_SEARCH_PAGE * _SEARCH_MAX_PAGES}-result cap in {repo}; older fingerprints may be unseen",
+          file=sys.stderr)
     return seen
 
 
 def _standing_parent(repo: str, dry_run: bool) -> Optional[int]:
     rc, out = _gh("issue", "list", "-R", repo, "--state", "open", "--search", f'"{PARENT_TITLE}" in:title',
                   "--json", "number,title")
-    if rc == 0:
+    if rc != 0:
+        if not dry_run:
+            raise RuntimeError(f"cannot search for the standing parent in {repo}: {out.strip()}")
+    else:
         for issue in json.loads(out or "[]"):
             if issue["title"] == PARENT_TITLE:
                 return issue["number"]
@@ -544,8 +558,12 @@ def file_candidates(sv: Survey, repo: str, dry_run: bool = True, max_new: int = 
         number = url.rsplit("/", 1)[-1]
         if parent:
             rc2, nid = _gh("api", f"repos/{repo}/issues/{number}", "-q", ".id")
+            linked = False
             if rc2 == 0:
-                _gh("api", "-X", "POST", f"repos/{repo}/issues/{parent}/sub_issues", "-F", f"sub_issue_id={nid.strip()}")
+                rc3, _ = _gh("api", "-X", "POST", f"repos/{repo}/issues/{parent}/sub_issues", "-F", f"sub_issue_id={nid.strip()}")
+                linked = rc3 == 0
+            if not linked:
+                print(f"[WARN] created {url} but could not link it as a sub-issue of #{parent}; it is orphaned", file=sys.stderr)
         seen.add(c.fingerprint)
         results.append({"fingerprint": c.fingerprint, "title": c.title, "state": "created", "url": url})
     return results
