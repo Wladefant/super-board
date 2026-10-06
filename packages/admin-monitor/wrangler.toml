@@ -1,0 +1,19 @@
+name = "admin-monitor"
+main = "worker.mjs"
+compatibility_date = "2026-10-01"
+workers_dev = false
+preview_urls = false
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[vars]
+ADMIN_BASE_URL = "https://admin.pinthread.dev"
+TELEGRAM_CHAT_ID = "1247617658"
+
+# KV namespace "admin-monitor-state" (created with cf kv namespaces create).
+[[kv_namespaces]]
+binding = "STATE"
+id = "39b77cc3779f40cd90b4a0b8f1649467"
+
+# Secret TELEGRAM_BOT_TOKEN is uploaded at deploy time with: wrangler deploy --secrets-file <json>. Never in this file.
