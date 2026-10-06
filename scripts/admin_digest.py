@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 AUTH = Path.home() / ".veyyon" / "shared-auth"
 BOT_TOKEN_FILE = AUTH / "telegram_admin_bot_token.txt"
 METRICS_TOKEN_FILE = AUTH / "dokploy_hostinger_metrics_token.txt"
-METRICS_URL = "http://145.223.98.52:4500/metrics?limit=1"
+
 SSH_HOST = "hostinger-dokploy"
 CHAT_ID = "1247617658"
 TARGETS = Path(__file__).resolve().parent.parent / "packages" / "admin-monitor" / "targets.json"
@@ -99,7 +99,7 @@ def build_message(host: Optional[str], bad: Optional[List[str]], down: List[Tupl
     return "\n".join(lines)
 
 
-def get_host() -> Optional[str]:
+def get_metrics() -> Optional[Dict[str, Any]]:
     """Read the metrics agent through SSH (loopback on the host), so the token never crosses plain http."""
     try:
         cfg = f'header = "Authorization: Bearer {read_secret(METRICS_TOKEN_FILE)}"\n'
@@ -107,9 +107,14 @@ def get_host() -> Optional[str]:
                             "curl -s -m 10 -K - http://127.0.0.1:4500/metrics?limit=1"],
                            input=cfg, capture_output=True, text=True, timeout=SSH_TIMEOUT,
                            creationflags=CREATE_NO_WINDOW)
-        return host_line(json.loads(p.stdout)[0]) if p.returncode == 0 else None
+        return json.loads(p.stdout)[0] if p.returncode == 0 else None
     except Exception:
         return None
+
+
+def get_host() -> Optional[str]:
+    m = get_metrics()
+    return host_line(m) if m else None
 
 
 def get_bad_containers() -> Optional[List[str]]:
