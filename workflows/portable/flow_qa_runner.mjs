@@ -1054,12 +1054,17 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
 
   // Stamp document ID before action
   let docIdBefore = null;
-  let navObserved = false;
   try {
     docIdBefore = await stampDocumentIdentity(page);
   } catch (_) {}
 
-  const onNav = () => { navObserved = true; };
+  // A `load` event counts as a navigation only when it belongs to a new document. A goto resolves at
+  // domcontentloaded, so the late `load` of the page it opened can fire during the next step; that
+  // document still carries its identity token. A new or unreadable document reads as null.
+  const loadDocIds = [];
+  const onNav = () => {
+    loadDocIds.push(page.evaluate(() => window.__FLOW_QA_DOC_ID__ || null).catch(() => null));
+  };
   page.once('load', onNav);
 
   // Inject deliberate real-DOM overlay for obstruction negative control checks
@@ -1489,6 +1494,7 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
 
   // Check: no_document_reload
   if (requestedChecks.includes('no_document_reload') || step.no_document_reload) {
+    const navObserved = (await Promise.all(loadDocIds)).some((id) => id !== docIdBefore);
     checksResults.push(checkNoDocumentReload(docIdBefore, docIdAfter, navObserved));
   }
 

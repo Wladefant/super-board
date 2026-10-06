@@ -62,6 +62,8 @@ matching `FLOW-QA` receipt.
 
 visible, not covered (element at point), tap target 44 px or more, no horizontal overflow,
 focused input inside the viewport with the keyboard open, no document reload, swipe dismissal.
+A `goto` returns at DOMContentLoaded, so the opened page can fire its own `load` event during the next
+step. That late `load` keeps the document identity token and does not count as a reload. A new document does.
 Mutations use a `QA-` prefix and each flow cleans up. A failed cleanup fails the run.
 
 ## Failure
