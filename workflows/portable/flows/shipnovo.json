@@ -44,6 +44,20 @@
           ]
         },
         {
+          "id": "open_review_tools_menu_if_present",
+          "action": "tap",
+          "selector": "button[aria-label='More review tools']",
+          "optional": true,
+          "timeout_ms": 3000
+        },
+        {
+          "id": "stow_review_toolbar_if_present",
+          "action": "tap",
+          "selector": "button[aria-label='Hide toolbar']",
+          "optional": true,
+          "timeout_ms": 3000
+        },
+        {
           "id": "open_article_dialog",
           "action": "tap",
           "selector": "button[aria-label='Artikel anlegen'], button:has-text('Artikel anlegen'), [data-testid='btn-create-article']",

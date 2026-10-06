@@ -1,16 +1,3603 @@
 {
   "schema": "flow-qa/v1",
   "project": "shipnovo",
-  "served_sha": "unknown",
-  "expected_sha": "unknown",
-  "passed": false,
+  "served_sha": "5799bd0eb26526707a2f39eae88ddb80e81782aa",
+  "expected_sha": "",
+  "passed": true,
   "assertions": {
-    "passed": 0,
-    "failed": 1
+    "passed": 348,
+    "failed": 0
   },
-  "steps": [],
+  "viewports": [
+    "390x844",
+    "390x420",
+    "1440x900"
+  ],
+  "steps": [
+    {
+      "flow": "article_lifecycle_native",
+      "step": "goto_products_page",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-goto_products_page-390x844-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "open_review_tools_menu_if_present",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-open_review_tools_menu_if_present-390x844-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "stow_review_toolbar_if_present",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-stow_review_toolbar_if_present-390x844-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "open_article_dialog",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (44x44px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (350, 124)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 44x44px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-open_article_dialog-390x844-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_dialog_open",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_dialog_open-390x844-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "open_keyboard_sku_focus",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (350x44px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (195, 223)"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        },
+        {
+          "name": "input_focus_in_viewport",
+          "passed": true,
+          "detail": "Focused input rect [top: 201, bottom: 245, left: 20, right: 370] is within visual viewport (390x844px)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-open_keyboard_sku_focus-390x844-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "type_sku",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (350x44px)"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-type_sku-390x844-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "type_title",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (350x44px)"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-type_title-390x844-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "type_variant",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (350x44px)"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-type_variant-390x844-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "tap_shipping_tab",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (348x72px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (195, 435)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 121x73px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-tap_shipping_tab-390x844-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "tap_storage_tab",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (348x50px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (195, 435)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 121x50px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-tap_storage_tab-390x844-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "save_created_article",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (350x44px)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 121x45px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-save_created_article-390x844-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_create_dialog_closed",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_create_dialog_closed-390x844-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_article_saved_in_table",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (44x44px)"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_article_saved_in_table-390x844-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "tap_row_edit_button",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (44x44px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (193, 289)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 44x45px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-tap_row_edit_button-390x844-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_edit_sheet_open",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_edit_sheet_open-390x844-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "type_updated_title",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (350x44px)"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-type_updated_title-390x844-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "save_edited_article",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (350x44px)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 121x44px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-save_edited_article-390x844-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_edit_dialog_closed_after_save",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_edit_dialog_closed_after_save-390x844-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_edited_title_in_table",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "assert_text",
+          "passed": true,
+          "detail": "Text contains \"QA-Flow 489 Native Artikel Editiert\""
+        },
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (902x186px)"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_edited_title_in_table-390x844-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "tap_row_edit_again_for_sheet_dismissal",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (44x44px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (193, 289)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 44x45px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-tap_row_edit_again_for_sheet_dismissal-390x844-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_sheet_open_for_dismissal",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_sheet_open_for_dismissal-390x844-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "dismiss_mobile_sheet_via_cdp_touch_swipe",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        },
+        {
+          "name": "dismissed",
+          "passed": true,
+          "detail": "Element successfully dismissed after swipe (removed)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-dismiss_mobile_sheet_via_cdp_touch_swipe-390x844-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "close_desktop_sheet_via_close_button",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "desktop_only_skipped",
+          "passed": true,
+          "detail": "Desktop-only step; skipped on mobile/touch viewport"
+        }
+      ],
+      "screenshot": null
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_sheet_dismissed",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_sheet_dismissed-390x844-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "open_row_more_actions_menu",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (44x44px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (337, 289)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 44x45px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-open_row_more_actions_menu-390x844-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "tap_delete_menu_item",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (137x44px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (285, 342)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 121x45px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-tap_delete_menu_item-390x844-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_delete_confirm_dialog_open",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_delete_confirm_dialog_open-390x844-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "confirm_article_deletion",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (350x44px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (195, 674)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 121x44px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-confirm_article_deletion-390x844-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_delete_dialog_closed",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_delete_dialog_closed-390x844-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_article_deleted_from_table",
+      "viewport": "390x844",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_article_deleted_from_table-390x844-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "goto_products_page",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-goto_products_page-390x844-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "open_review_tools_menu_if_present",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "optional_skipped",
+          "passed": true,
+          "detail": "Optional target \"button[aria-label='More review tools']\" not present; skipped"
+        }
+      ],
+      "screenshot": null
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "stow_review_toolbar_if_present",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "optional_skipped",
+          "passed": true,
+          "detail": "Optional target \"button[aria-label='Hide toolbar']\" not present; skipped"
+        }
+      ],
+      "screenshot": null
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "open_article_dialog",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (44x44px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (350, 124)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 44x44px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-open_article_dialog-390x844-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_dialog_open",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_dialog_open-390x844-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "open_keyboard_sku_focus",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (350x44px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (195, 223)"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        },
+        {
+          "name": "input_focus_in_viewport",
+          "passed": true,
+          "detail": "Focused input rect [top: 201, bottom: 245, left: 20, right: 370] is within visual viewport (390x844px)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-open_keyboard_sku_focus-390x844-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "type_sku",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (350x44px)"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-type_sku-390x844-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "type_title",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (350x44px)"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-type_title-390x844-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "type_variant",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (350x44px)"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-type_variant-390x844-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "tap_shipping_tab",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (348x72px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (195, 435)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 121x73px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-tap_shipping_tab-390x844-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "tap_storage_tab",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (348x50px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (195, 435)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 121x50px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-tap_storage_tab-390x844-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "save_created_article",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (350x44px)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 121x45px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-save_created_article-390x844-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_create_dialog_closed",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_create_dialog_closed-390x844-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_article_saved_in_table",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (44x44px)"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_article_saved_in_table-390x844-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "tap_row_edit_button",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (44x44px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (193, 289)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 44x45px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-tap_row_edit_button-390x844-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_edit_sheet_open",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_edit_sheet_open-390x844-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "type_updated_title",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (350x44px)"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-type_updated_title-390x844-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "save_edited_article",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (350x44px)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 121x44px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-save_edited_article-390x844-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_edit_dialog_closed_after_save",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_edit_dialog_closed_after_save-390x844-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_edited_title_in_table",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "assert_text",
+          "passed": true,
+          "detail": "Text contains \"QA-Flow 489 Native Artikel Editiert\""
+        },
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (902x186px)"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_edited_title_in_table-390x844-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "tap_row_edit_again_for_sheet_dismissal",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (44x44px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (193, 289)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 44x45px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-tap_row_edit_again_for_sheet_dismissal-390x844-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_sheet_open_for_dismissal",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_sheet_open_for_dismissal-390x844-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "dismiss_mobile_sheet_via_cdp_touch_swipe",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        },
+        {
+          "name": "dismissed",
+          "passed": true,
+          "detail": "Element successfully dismissed after swipe (removed)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-dismiss_mobile_sheet_via_cdp_touch_swipe-390x844-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "close_desktop_sheet_via_close_button",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "desktop_only_skipped",
+          "passed": true,
+          "detail": "Desktop-only step; skipped on mobile/touch viewport"
+        }
+      ],
+      "screenshot": null
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_sheet_dismissed",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_sheet_dismissed-390x844-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "open_row_more_actions_menu",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (44x44px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (337, 289)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 44x45px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-open_row_more_actions_menu-390x844-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "tap_delete_menu_item",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (137x44px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (285, 342)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 121x45px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-tap_delete_menu_item-390x844-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_delete_confirm_dialog_open",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_delete_confirm_dialog_open-390x844-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "confirm_article_deletion",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (350x44px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (195, 674)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 121x44px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-confirm_article_deletion-390x844-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_delete_dialog_closed",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_delete_dialog_closed-390x844-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_article_deleted_from_table",
+      "viewport": "390x844",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_article_deleted_from_table-390x844-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "goto_products_page",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-goto_products_page-390x420-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "open_review_tools_menu_if_present",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "optional_skipped",
+          "passed": true,
+          "detail": "Optional target \"button[aria-label='More review tools']\" not present; skipped"
+        }
+      ],
+      "screenshot": null
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "stow_review_toolbar_if_present",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "optional_skipped",
+          "passed": true,
+          "detail": "Optional target \"button[aria-label='Hide toolbar']\" not present; skipped"
+        }
+      ],
+      "screenshot": null
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "open_article_dialog",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (44x44px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (350, 124)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 44x44px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-open_article_dialog-390x420-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_dialog_open",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_dialog_open-390x420-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "open_keyboard_sku_focus",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (350x44px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (195, 223)"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        },
+        {
+          "name": "input_focus_in_viewport",
+          "passed": true,
+          "detail": "Focused input rect [top: 201, bottom: 245, left: 20, right: 370] is within visual viewport (390x420px)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-open_keyboard_sku_focus-390x420-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "type_sku",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (350x44px)"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-type_sku-390x420-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "type_title",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (350x44px)"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-type_title-390x420-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "type_variant",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (350x44px)"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-type_variant-390x420-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "tap_shipping_tab",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (348x72px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (195, 223)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 121x73px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-tap_shipping_tab-390x420-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "tap_storage_tab",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (348x50px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (195, 223)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 121x50px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-tap_storage_tab-390x420-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "save_created_article",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (170x44px)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 121x45px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-save_created_article-390x420-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_create_dialog_closed",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_create_dialog_closed-390x420-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_article_saved_in_table",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (44x44px)"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_article_saved_in_table-390x420-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "tap_row_edit_button",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (44x44px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (193, 249)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 44x45px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-tap_row_edit_button-390x420-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_edit_sheet_open",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_edit_sheet_open-390x420-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "type_updated_title",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (350x44px)"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-type_updated_title-390x420-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "save_edited_article",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (170x44px)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 121x44px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-save_edited_article-390x420-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_edit_dialog_closed_after_save",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_edit_dialog_closed_after_save-390x420-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_edited_title_in_table",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "assert_text",
+          "passed": true,
+          "detail": "Text contains \"QA-Flow 489 Native Artikel Editiert\""
+        },
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (902x186px)"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_edited_title_in_table-390x420-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "tap_row_edit_again_for_sheet_dismissal",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (44x44px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (193, 249)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 44x45px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-tap_row_edit_again_for_sheet_dismissal-390x420-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_sheet_open_for_dismissal",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_sheet_open_for_dismissal-390x420-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "dismiss_mobile_sheet_via_cdp_touch_swipe",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        },
+        {
+          "name": "dismissed",
+          "passed": true,
+          "detail": "Element successfully dismissed after swipe (removed)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-dismiss_mobile_sheet_via_cdp_touch_swipe-390x420-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "close_desktop_sheet_via_close_button",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "desktop_only_skipped",
+          "passed": true,
+          "detail": "Desktop-only step; skipped on mobile/touch viewport"
+        }
+      ],
+      "screenshot": null
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_sheet_dismissed",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_sheet_dismissed-390x420-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "open_row_more_actions_menu",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (44x44px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (337, 249)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 44x45px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-open_row_more_actions_menu-390x420-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "tap_delete_menu_item",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (137x44px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (285, 302)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 121x45px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-tap_delete_menu_item-390x420-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_delete_confirm_dialog_open",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_delete_confirm_dialog_open-390x420-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "confirm_article_deletion",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (170x44px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (285, 390)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 121x44px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-confirm_article_deletion-390x420-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_delete_dialog_closed",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_delete_dialog_closed-390x420-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_article_deleted_from_table",
+      "viewport": "390x420",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_article_deleted_from_table-390x420-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "goto_products_page",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-goto_products_page-390x420-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "open_review_tools_menu_if_present",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "optional_skipped",
+          "passed": true,
+          "detail": "Optional target \"button[aria-label='More review tools']\" not present; skipped"
+        }
+      ],
+      "screenshot": null
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "stow_review_toolbar_if_present",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "optional_skipped",
+          "passed": true,
+          "detail": "Optional target \"button[aria-label='Hide toolbar']\" not present; skipped"
+        }
+      ],
+      "screenshot": null
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "open_article_dialog",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (44x44px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (350, 124)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 44x44px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-open_article_dialog-390x420-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_dialog_open",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_dialog_open-390x420-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "open_keyboard_sku_focus",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (350x44px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (195, 223)"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        },
+        {
+          "name": "input_focus_in_viewport",
+          "passed": true,
+          "detail": "Focused input rect [top: 201, bottom: 245, left: 20, right: 370] is within visual viewport (390x420px)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-open_keyboard_sku_focus-390x420-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "type_sku",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (350x44px)"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-type_sku-390x420-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "type_title",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (350x44px)"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-type_title-390x420-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "type_variant",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (350x44px)"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-type_variant-390x420-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "tap_shipping_tab",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (348x72px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (195, 223)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 121x73px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-tap_shipping_tab-390x420-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "tap_storage_tab",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (348x50px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (195, 223)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 121x50px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-tap_storage_tab-390x420-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "save_created_article",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (170x44px)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 121x45px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-save_created_article-390x420-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_create_dialog_closed",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_create_dialog_closed-390x420-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_article_saved_in_table",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (44x44px)"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_article_saved_in_table-390x420-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "tap_row_edit_button",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (44x44px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (193, 249)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 44x45px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-tap_row_edit_button-390x420-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_edit_sheet_open",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_edit_sheet_open-390x420-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "type_updated_title",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (350x44px)"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-type_updated_title-390x420-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "save_edited_article",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (170x44px)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 121x44px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-save_edited_article-390x420-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_edit_dialog_closed_after_save",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_edit_dialog_closed_after_save-390x420-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_edited_title_in_table",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "assert_text",
+          "passed": true,
+          "detail": "Text contains \"QA-Flow 489 Native Artikel Editiert\""
+        },
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (902x186px)"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_edited_title_in_table-390x420-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "tap_row_edit_again_for_sheet_dismissal",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (44x44px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (193, 249)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 44x45px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-tap_row_edit_again_for_sheet_dismissal-390x420-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_sheet_open_for_dismissal",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_sheet_open_for_dismissal-390x420-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "dismiss_mobile_sheet_via_cdp_touch_swipe",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        },
+        {
+          "name": "dismissed",
+          "passed": true,
+          "detail": "Element successfully dismissed after swipe (removed)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-dismiss_mobile_sheet_via_cdp_touch_swipe-390x420-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "close_desktop_sheet_via_close_button",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "desktop_only_skipped",
+          "passed": true,
+          "detail": "Desktop-only step; skipped on mobile/touch viewport"
+        }
+      ],
+      "screenshot": null
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_sheet_dismissed",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_sheet_dismissed-390x420-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "open_row_more_actions_menu",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (44x44px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (337, 249)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 44x45px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-open_row_more_actions_menu-390x420-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "tap_delete_menu_item",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (137x44px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (285, 302)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 121x45px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-tap_delete_menu_item-390x420-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_delete_confirm_dialog_open",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_delete_confirm_dialog_open-390x420-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "confirm_article_deletion",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (170x44px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (285, 390)"
+        },
+        {
+          "name": "tap_target_min_44",
+          "passed": true,
+          "detail": "Tap target size 121x44px meets minimum 44x44px standard"
+        },
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-confirm_article_deletion-390x420-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_delete_dialog_closed",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_delete_dialog_closed-390x420-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_article_deleted_from_table",
+      "viewport": "390x420",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 390px <= innerWidth 390px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_article_deleted_from_table-390x420-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "goto_products_page",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 1440px <= innerWidth 1440px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-goto_products_page-1440x900-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "open_review_tools_menu_if_present",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "optional_skipped",
+          "passed": true,
+          "detail": "Optional target \"button[aria-label='More review tools']\" not present; skipped"
+        }
+      ],
+      "screenshot": null
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "stow_review_toolbar_if_present",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "optional_skipped",
+          "passed": true,
+          "detail": "Optional target \"button[aria-label='Hide toolbar']\" not present; skipped"
+        }
+      ],
+      "screenshot": null
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "open_article_dialog",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (149x40px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (1334, 126)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-open_article_dialog-1440x900-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_dialog_open",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [],
+      "screenshot": "article_lifecycle_native-assert_dialog_open-1440x900-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "open_keyboard_sku_focus",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (353x40px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (538, 201)"
+        },
+        {
+          "name": "input_focus_in_viewport",
+          "passed": true,
+          "detail": "Focused input rect [top: 181, bottom: 221, left: 361, right: 714] is within visual viewport (1440x900px)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-open_keyboard_sku_focus-1440x900-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "type_sku",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (353x40px)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-type_sku-1440x900-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "type_title",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (353x40px)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-type_title-1440x900-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "type_variant",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (353x40px)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-type_variant-1440x900-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "tap_shipping_tab",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (716x50px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (720, 450)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-tap_shipping_tab-1440x900-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "tap_storage_tab",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (716x50px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (720, 450)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-tap_storage_tab-1440x900-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "save_created_article",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (145x40px)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-save_created_article-1440x900-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_create_dialog_closed",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [],
+      "screenshot": "article_lifecycle_native-assert_create_dialog_closed-1440x900-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_article_saved_in_table",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (32x32px)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_article_saved_in_table-1440x900-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "tap_row_edit_button",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (32x32px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (1271, 337)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-tap_row_edit_button-1440x900-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_edit_sheet_open",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [],
+      "screenshot": "article_lifecycle_native-assert_edit_sheet_open-1440x900-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "type_updated_title",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (353x40px)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-type_updated_title-1440x900-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "save_edited_article",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (145x40px)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-save_edited_article-1440x900-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_edit_dialog_closed_after_save",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [],
+      "screenshot": "article_lifecycle_native-assert_edit_dialog_closed_after_save-1440x900-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_edited_title_in_table",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "assert_text",
+          "passed": true,
+          "detail": "Text contains \"QA-Flow 489 Native Artikel Editiert\""
+        },
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (1126x186px)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_edited_title_in_table-1440x900-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "tap_row_edit_again_for_sheet_dismissal",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (32x32px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (1271, 337)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-tap_row_edit_again_for_sheet_dismissal-1440x900-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_sheet_open_for_dismissal",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [],
+      "screenshot": "article_lifecycle_native-assert_sheet_open_for_dismissal-1440x900-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "dismiss_mobile_sheet_via_cdp_touch_swipe",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "touch_only_skipped",
+          "passed": true,
+          "detail": "Touch-only step; skipped on a non-touch viewport"
+        }
+      ],
+      "screenshot": null
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "close_desktop_sheet_via_close_button",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (110x40px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (871, 831)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-close_desktop_sheet_via_close_button-1440x900-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_sheet_dismissed",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [],
+      "screenshot": "article_lifecycle_native-assert_sheet_dismissed-1440x900-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "open_row_more_actions_menu",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (32x32px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (1379, 337)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-open_row_more_actions_menu-1440x900-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "tap_delete_menu_item",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (137x36px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (1321, 380)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-tap_delete_menu_item-1440x900-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_delete_confirm_dialog_open",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [],
+      "screenshot": "article_lifecycle_native-assert_delete_confirm_dialog_open-1440x900-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "confirm_article_deletion",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (131x40px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (885, 530)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-confirm_article_deletion-1440x900-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_delete_dialog_closed",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [],
+      "screenshot": "article_lifecycle_native-assert_delete_dialog_closed-1440x900-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_article_deleted_from_table",
+      "viewport": "1440x900",
+      "theme": "light",
+      "passed": true,
+      "checks": [],
+      "screenshot": "article_lifecycle_native-assert_article_deleted_from_table-1440x900-light.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "goto_products_page",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "no_horizontal_overflow",
+          "passed": true,
+          "detail": "No horizontal overflow: scrollWidth 1440px <= innerWidth 1440px"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-goto_products_page-1440x900-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "open_review_tools_menu_if_present",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "optional_skipped",
+          "passed": true,
+          "detail": "Optional target \"button[aria-label='More review tools']\" not present; skipped"
+        }
+      ],
+      "screenshot": null
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "stow_review_toolbar_if_present",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "optional_skipped",
+          "passed": true,
+          "detail": "Optional target \"button[aria-label='Hide toolbar']\" not present; skipped"
+        }
+      ],
+      "screenshot": null
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "open_article_dialog",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (149x40px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (1334, 126)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-open_article_dialog-1440x900-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_dialog_open",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [],
+      "screenshot": "article_lifecycle_native-assert_dialog_open-1440x900-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "open_keyboard_sku_focus",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (353x40px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (538, 201)"
+        },
+        {
+          "name": "input_focus_in_viewport",
+          "passed": true,
+          "detail": "Focused input rect [top: 181, bottom: 221, left: 361, right: 714] is within visual viewport (1440x900px)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-open_keyboard_sku_focus-1440x900-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "type_sku",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (353x40px)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-type_sku-1440x900-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "type_title",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (353x40px)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-type_title-1440x900-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "type_variant",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (353x40px)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-type_variant-1440x900-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "tap_shipping_tab",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (716x50px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (720, 450)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-tap_shipping_tab-1440x900-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "tap_storage_tab",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (716x50px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (720, 450)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-tap_storage_tab-1440x900-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "save_created_article",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (145x40px)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-save_created_article-1440x900-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_create_dialog_closed",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [],
+      "screenshot": "article_lifecycle_native-assert_create_dialog_closed-1440x900-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_article_saved_in_table",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (32x32px)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_article_saved_in_table-1440x900-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "tap_row_edit_button",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (32x32px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (1271, 337)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-tap_row_edit_button-1440x900-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_edit_sheet_open",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [],
+      "screenshot": "article_lifecycle_native-assert_edit_sheet_open-1440x900-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "type_updated_title",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (353x40px)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-type_updated_title-1440x900-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "save_edited_article",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (145x40px)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-save_edited_article-1440x900-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_edit_dialog_closed_after_save",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [],
+      "screenshot": "article_lifecycle_native-assert_edit_dialog_closed_after_save-1440x900-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_edited_title_in_table",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "assert_text",
+          "passed": true,
+          "detail": "Text contains \"QA-Flow 489 Native Artikel Editiert\""
+        },
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (1126x186px)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-assert_edited_title_in_table-1440x900-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "tap_row_edit_again_for_sheet_dismissal",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (32x32px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (1271, 337)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-tap_row_edit_again_for_sheet_dismissal-1440x900-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_sheet_open_for_dismissal",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [],
+      "screenshot": "article_lifecycle_native-assert_sheet_open_for_dismissal-1440x900-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "dismiss_mobile_sheet_via_cdp_touch_swipe",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "touch_only_skipped",
+          "passed": true,
+          "detail": "Touch-only step; skipped on a non-touch viewport"
+        }
+      ],
+      "screenshot": null
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "close_desktop_sheet_via_close_button",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (110x40px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (871, 831)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-close_desktop_sheet_via_close_button-1440x900-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_sheet_dismissed",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [],
+      "screenshot": "article_lifecycle_native-assert_sheet_dismissed-1440x900-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "open_row_more_actions_menu",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (32x32px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (1379, 337)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-open_row_more_actions_menu-1440x900-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "tap_delete_menu_item",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (137x36px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (1321, 380)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-tap_delete_menu_item-1440x900-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_delete_confirm_dialog_open",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [],
+      "screenshot": "article_lifecycle_native-assert_delete_confirm_dialog_open-1440x900-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "confirm_article_deletion",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [
+        {
+          "name": "visible",
+          "passed": true,
+          "detail": "Target is visible (131x40px)"
+        },
+        {
+          "name": "element_from_point",
+          "passed": true,
+          "detail": "Target is unobstructed at center (885, 530)"
+        }
+      ],
+      "screenshot": "article_lifecycle_native-confirm_article_deletion-1440x900-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_delete_dialog_closed",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [],
+      "screenshot": "article_lifecycle_native-assert_delete_dialog_closed-1440x900-dark.png"
+    },
+    {
+      "flow": "article_lifecycle_native",
+      "step": "assert_article_deleted_from_table",
+      "viewport": "1440x900",
+      "theme": "dark",
+      "passed": true,
+      "checks": [],
+      "screenshot": "article_lifecycle_native-assert_article_deleted_from_table-1440x900-dark.png"
+    }
+  ],
   "cleanup": {
     "passed": true
-  },
-  "error": "Served SHA check failed: Failed to query /api/version: fetch failed"
+  }
 }
