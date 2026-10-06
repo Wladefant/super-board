@@ -212,6 +212,107 @@ class TestDepthSurvey(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             depth_survey.file_candidates(sv, "o/r", dry_run=False)
 
+    def _recording_gh(self, handler):
+        calls = []
+
+        def fake(*args, **kwargs):
+            calls.append(args)
+            return handler(args)
+
+        depth_survey._gh = fake
+        return calls
+
+    def _many_strong(self, n):
+        sv = depth_survey.survey(self.root)
+        base = next(c for c in sv.candidates if c.strength == "Strong")
+        sv.candidates = [dataclasses.replace(base, path=f"pkg/m{i}.py", fingerprint=f"depth-survey:{i:012x}",
+                                             title=f"t{i}") for i in range(n)]
+        return sv
+
+    def test_live_filing_fails_closed_when_standing_parent_search_errors(self):
+        sv = self._many_strong(1)
+        calls = self._recording_gh(lambda a: (1, "boom") if a[:2] == ("issue", "list") else (0, "https://x/issues/9"))
+        with self.assertRaises(RuntimeError):
+            depth_survey.file_candidates(sv, "o/r", dry_run=False, seen=set())
+        self.assertFalse([c for c in calls if c[:2] == ("issue", "create")])
+
+    def test_failed_sub_issue_link_warns(self):
+        sv = self._many_strong(1)
+
+        def handler(a):
+            if a[:2] == ("issue", "list"):
+                return 0, '[{"number": 7, "title": "%s"}]' % depth_survey.PARENT_TITLE
+            if a[:2] == ("issue", "create"):
+                return 0, "https://github.com/o/r/issues/10"
+            if a[0] == "api" and "POST" in a:
+                return 1, "denied"
+            return 0, "123"
+
+        self._recording_gh(handler)
+        import contextlib
+        import io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            res = depth_survey.file_candidates(sv, "o/r", dry_run=False, seen=set())
+        self.assertEqual(res[0]["state"], "created")
+        self.assertIn("[WARN]", err.getvalue())
+        self.assertIn("10", err.getvalue())
+
+    def test_dedupe_search_pages_past_200(self):
+        import json
+        pages = {1: 100, 2: 100, 3: 5}
+        asked = []
+
+        def handler(a):
+            page = int(next(x.split("=")[1] for x in a if x.startswith("page=")))
+            asked.append(page)
+            n = pages.get(page, 0)
+            base = (page - 1) * 100
+            items = [{"body": f"<!-- fingerprint: depth-survey:{base + i:012x} -->"} for i in range(n)]
+            return 0, json.dumps({"items": items})
+
+        self._recording_gh(handler)
+        seen = depth_survey._existing_fingerprints("o/r")
+        self.assertEqual(asked, [1, 2, 3])
+        self.assertEqual(len(seen), 205)
+
+    def test_max_new_is_clamped_to_five(self):
+        sv = self._many_strong(9)
+        res = depth_survey.file_candidates(sv, "o/r", dry_run=True, max_new=50, seen=set())
+        self.assertEqual(len(res), 5)
+
+    def test_no_issue_create_without_live(self):
+        calls = self._recording_gh(lambda a: (0, "[]") if a[:2] == ("issue", "list") else (0, "{}"))
+        outer = tempfile.TemporaryDirectory()
+        self.addCleanup(outer.cleanup)
+        run_depth_survey_cli(self.root, "o/r", live=False, out_dir=Path(outer.name))
+        self.assertFalse([c for c in calls if "create" in c or "POST" in c])
+
+    def test_install_depth_survey_task_writes_cmd_and_runs_schtasks_hidden(self):
+        import gardener
+        outer = tempfile.TemporaryDirectory()
+        self.addCleanup(outer.cleanup)
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["cmd"], seen["kw"] = cmd, kw
+            return subprocess.CompletedProcess(cmd, 0, stdout="OK\n", stderr="")
+
+        real = gardener.subprocess.run
+        gardener.subprocess.run = fake_run
+        self.addCleanup(setattr, gardener.subprocess, "run", real)
+        res = gardener.install_depth_survey_task(sys.executable, str(Path(gardener.__file__)), log_dir=outer.name)
+        entry = res["SuperboardGardenerDepthSurvey"]
+        self.assertEqual(entry["status"], "created")
+        self.assertEqual(seen["cmd"][:2], ["schtasks", "/create"])
+        self.assertEqual(seen["kw"]["timeout"], 60)
+        self.assertEqual(seen["kw"]["creationflags"], getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        text = Path(entry["cmd_file"]).read_text(encoding="utf-8")
+        self.assertIn("--survey-depth", text)
+        self.assertNotIn("--live", text)
+        for repo, _ in gardener.SURVEY_REPOS:
+            self.assertIn(f'--issue-repo "{repo}"', text)
+
 
 if __name__ == "__main__":
     unittest.main()
