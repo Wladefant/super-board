@@ -1,0 +1,333 @@
+{
+  "schema": "flow-qa/v1",
+  "project": "pinthread-site",
+  "version": "1.1.0",
+  "description": "Flow QA for the pinthread.dev marketing site and docs (packages/pinthread-site). Covers the sign-up path from the landing page and pricing, the install tabs, the copy buttons, the MCP tabs and the docs navigation menu. Read-only: the site has no data mutations. Serve the built dist with a server that answers /api/version from the pinthread-build meta tag.",
+  "viewports": [
+    "390x844",
+    "390x420",
+    "1440x900"
+  ],
+  "themes": [
+    "light",
+    "dark"
+  ],
+  "flows": [
+    {
+      "id": "landing_to_signup",
+      "name": "Find the price and the sign-up button",
+      "description": "Opens the landing page, checks the header sign-up button, jumps to pricing, checks the Free plan at $0 and taps its sign-up button, which opens the dashboard sign-in page.",
+      "allowed_actions": [
+        "goto",
+        "tap",
+        "assert"
+      ],
+      "forbidden_actions": [
+        "eval",
+        "prod_access"
+      ],
+      "steps": [
+        {
+          "id": "goto_home",
+          "action": "goto",
+          "url": "/"
+        },
+        {
+          "id": "assert_header_signup",
+          "action": "assert",
+          "selector": "a.lp-header-cta[href='/dashboard/']",
+          "expected_text": "Sign up free",
+          "checks": [
+            "visible",
+            "element_from_point",
+            "tap_target_min_44"
+          ]
+        },
+        {
+          "id": "assert_no_early_access",
+          "action": "assert",
+          "selector": "a[href*='early-access'], a[href*='waitlist']",
+          "expected_present": false
+        },
+        {
+          "id": "tap_pricing_nav",
+          "action": "tap",
+          "selector": "a.lp-nav-wide[href='#pricing']",
+          "optional": true,
+          "no_document_reload": true,
+          "checks": [
+            "visible",
+            "element_from_point",
+            "no_document_reload"
+          ]
+        },
+        {
+          "id": "goto_pricing",
+          "action": "goto",
+          "url": "/#pricing"
+        },
+        {
+          "id": "assert_free_price",
+          "action": "assert",
+          "selector": ".lp-plan-featured .lp-plan-amount",
+          "expected_text": "$0"
+        },
+        {
+          "id": "assert_free_limits",
+          "action": "assert",
+          "selector": ".lp-plan-featured ul",
+          "expected_text": "10 projects"
+        },
+        {
+          "id": "assert_plan_signup",
+          "action": "assert",
+          "selector": ".lp-plan-featured a.lp-plan-cta[href='/dashboard/']",
+          "expected_text": "Get started free"
+        },
+        {
+          "id": "tap_plan_signup",
+          "action": "tap",
+          "selector": ".lp-plan-featured a.lp-plan-cta[href='/dashboard/']",
+          "checks": [
+            "visible",
+            "element_from_point",
+            "tap_target_min_44"
+          ]
+        }
+      ],
+      "cleanup": []
+    },
+    {
+      "id": "install_script_tag",
+      "name": "Pick a setup and copy the script tag",
+      "description": "Opens Install, switches through the four setup tabs without a reload, and taps a copy button.",
+      "allowed_actions": [
+        "goto",
+        "tap",
+        "assert"
+      ],
+      "forbidden_actions": [
+        "eval",
+        "prod_access"
+      ],
+      "steps": [
+        {
+          "id": "goto_install",
+          "action": "goto",
+          "url": "/install/"
+        },
+        {
+          "id": "assert_signup_link",
+          "action": "assert",
+          "selector": "main a[href='/dashboard/']",
+          "expected_text": "Sign up"
+        },
+        {
+          "id": "tap_tab_nextjs",
+          "action": "tap",
+          "selector": "#install-tab-1",
+          "no_document_reload": true,
+          "checks": [
+            "visible",
+            "element_from_point",
+            "tap_target_min_44",
+            "no_document_reload"
+          ]
+        },
+        {
+          "id": "assert_tab_nextjs",
+          "action": "assert",
+          "selector": "#install-tab-1[aria-selected='true']",
+          "expected_present": true
+        },
+        {
+          "id": "tap_tab_astro",
+          "action": "tap",
+          "selector": "#install-tab-2",
+          "no_document_reload": true,
+          "checks": [
+            "visible",
+            "element_from_point",
+            "tap_target_min_44",
+            "no_document_reload"
+          ]
+        },
+        {
+          "id": "tap_tab_builders",
+          "action": "tap",
+          "selector": "#install-tab-3",
+          "no_document_reload": true,
+          "checks": [
+            "visible",
+            "element_from_point",
+            "tap_target_min_44",
+            "no_document_reload"
+          ]
+        },
+        {
+          "id": "tap_tab_html",
+          "action": "tap",
+          "selector": "#install-tab-0",
+          "no_document_reload": true,
+          "checks": [
+            "visible",
+            "element_from_point",
+            "tap_target_min_44",
+            "no_document_reload"
+          ]
+        },
+        {
+          "id": "assert_embed_src",
+          "action": "assert",
+          "selector": "#install-panel-0",
+          "expected_text": "https://pinthread.dev/embed.js"
+        },
+        {
+          "id": "tap_copy",
+          "action": "tap",
+          "selector": "#install-panel-0 .copy-btn",
+          "no_document_reload": true,
+          "checks": [
+            "visible",
+            "element_from_point",
+            "tap_target_min_44",
+            "no_document_reload"
+          ]
+        }
+      ],
+      "cleanup": []
+    },
+    {
+      "id": "agent_mcp_setup",
+      "name": "Connect a coding agent over MCP",
+      "description": "Opens For your agent, switches the MCP client tabs and checks the remote MCP URL.",
+      "allowed_actions": [
+        "goto",
+        "tap",
+        "assert"
+      ],
+      "forbidden_actions": [
+        "eval",
+        "prod_access"
+      ],
+      "steps": [
+        {
+          "id": "goto_agent",
+          "action": "goto",
+          "url": "/agent-prompts/"
+        },
+        {
+          "id": "assert_mcp_url",
+          "action": "assert",
+          "selector": "#mcp",
+          "expected_text": "https://pinthread.dev/mcp"
+        },
+        {
+          "id": "tap_mcp_codex",
+          "action": "tap",
+          "selector": "#mcp-tab-1",
+          "no_document_reload": true,
+          "checks": [
+            "visible",
+            "element_from_point",
+            "tap_target_min_44",
+            "no_document_reload"
+          ]
+        },
+        {
+          "id": "assert_mcp_codex",
+          "action": "assert",
+          "selector": "#mcp-tab-1[aria-selected='true']",
+          "expected_present": true
+        },
+        {
+          "id": "tap_mcp_cursor",
+          "action": "tap",
+          "selector": "#mcp-tab-2",
+          "no_document_reload": true,
+          "checks": [
+            "visible",
+            "element_from_point",
+            "tap_target_min_44",
+            "no_document_reload"
+          ]
+        },
+        {
+          "id": "tap_mcp_other",
+          "action": "tap",
+          "selector": "#mcp-tab-3",
+          "no_document_reload": true,
+          "checks": [
+            "visible",
+            "element_from_point",
+            "tap_target_min_44",
+            "no_document_reload"
+          ]
+        }
+      ],
+      "cleanup": []
+    },
+    {
+      "id": "docs_navigation",
+      "name": "Open and close the docs menu",
+      "description": "On phones, opens the docs navigation, checks the sign-up link inside it and closes it again. On desktop the sidebar is always visible.",
+      "allowed_actions": [
+        "goto",
+        "tap",
+        "assert"
+      ],
+      "forbidden_actions": [
+        "eval",
+        "prod_access"
+      ],
+      "steps": [
+        {
+          "id": "goto_configuration",
+          "action": "goto",
+          "url": "/configuration/"
+        },
+        {
+          "id": "assert_branch_attr",
+          "action": "assert",
+          "selector": "main",
+          "expected_text": "data-branch"
+        },
+        {
+          "id": "open_menu",
+          "action": "tap",
+          "selector": ".nav-toggle[aria-expanded='false']",
+          "optional": true,
+          "no_document_reload": true,
+          "checks": [
+            "visible",
+            "element_from_point",
+            "tap_target_min_44",
+            "no_document_reload"
+          ]
+        },
+        {
+          "id": "assert_sidebar_signup",
+          "action": "assert",
+          "selector": ".sidebar-cta[href='/dashboard/']",
+          "expected_text": "Get started free",
+          "checks": [
+            "visible",
+            "element_from_point"
+          ]
+        },
+        {
+          "id": "close_menu",
+          "action": "tap",
+          "selector": ".nav-toggle[aria-expanded='true']",
+          "optional": true,
+          "no_document_reload": true,
+          "checks": [
+            "visible",
+            "no_document_reload"
+          ]
+        }
+      ],
+      "cleanup": []
+    }
+  ]
+}
