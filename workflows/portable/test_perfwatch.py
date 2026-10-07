@@ -257,6 +257,20 @@ class Publishing(unittest.TestCase):
         self.assertEqual(len(gh.writes()), cfg["caps"]["issue_writes"])
         self.assertEqual(len(st["pending"]), 2)
 
+    def test_open_issue_cap_boundary(self):
+        cfg = copy.deepcopy(CFG)
+        cfg["caps"]["open_issues"] = 2
+        cfg["projects"] = [{"name": f"p{i}", "repo": "o/r", "hosts": [], "targets": [{"name": "x", "kind": "http", "url": "https://h/"}]} for i in range(3)]
+        st = confirmed_state("p0/x", "p1/x", "p2/x")
+        for k in ("p0/x", "p1/x"):
+            st["targets"][k]["issue"] = {"repo": "o/r", "number": 1, "url": "u"}
+            st["targets"][k]["status"] = "confirmed"
+        st["pending"] = [e for e in st["pending"] if e["key"] == "p2/x"]
+        gh = FakeGh()
+        pw.Publisher(cfg, gh).publish(st)
+        self.assertEqual(gh.writes(), [])
+        self.assertEqual(len(st["pending"]), 1)
+
     def test_dry_run_writes_nothing(self):
         st, gh = confirmed_state(K), FakeGh()
         pub = pw.Publisher(CFG, gh, dry=True)
@@ -327,6 +341,44 @@ class RunPurity(unittest.TestCase):
             pw.run(True, False, Path(d), CFG, collect=self._collect(400.0), gh=gh, host=lambda: {"state": "ok"},
                    now=t0 + dt.timedelta(minutes=10))
             self.assertEqual(json.loads((Path(d) / "state.json").read_text())["runs"], 1)
+
+
+class Robustness(unittest.TestCase):
+    def test_corrupt_state_is_backed_up_not_silently_reset(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "state.json").write_text("{broken", encoding="utf-8")
+            st = pw.load_state(Path(d))
+            self.assertEqual(st["runs"], 0)
+            self.assertTrue(any(n.startswith("state.json.corrupt-") for n in os.listdir(d)))
+
+    def test_lock_blocks_second_run_and_releases(self):
+        with tempfile.TemporaryDirectory() as d:
+            with pw.RunLock(Path(d)) as a:
+                self.assertTrue(a.held)
+                with pw.RunLock(Path(d)) as b:
+                    self.assertFalse(b.held)
+            with pw.RunLock(Path(d)) as c:
+                self.assertTrue(c.held)
+
+    def test_gh_timeout_keeps_event_pending(self):
+        def boom(args, inp=None):
+            raise pw.PerfError("gh timed out")
+        st = confirmed_state(K)
+        pub = pw.Publisher(CFG, boom)
+        pub.publish(st)
+        self.assertEqual(len(st["pending"]), 1)
+
+    def test_find_issue_pages(self):
+        pages = []
+
+        def gh(args, inp=None):
+            pages.append(args[1])
+            if args[1].endswith("&page=1"):
+                return json.dumps([{"number": i, "state": "open", "body": "x"} for i in range(100)])
+            return json.dumps([{"number": 500, "state": "open", "html_url": "u", "body": pw.MARKER.format(key=K)}])
+        hit = pw.Publisher(CFG, gh).find_issue("o/r", K)
+        self.assertEqual(hit["number"], 500)
+        self.assertEqual(len(pages), 2)
 
 
 class ReplayTest(unittest.TestCase):

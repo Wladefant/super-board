@@ -37,6 +37,7 @@ import re
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -502,8 +503,11 @@ def host_state(run: Optional[Callable[..., Any]] = None) -> Dict[str, Any]:
 
 
 def default_gh(args: List[str], inp: Optional[str] = None) -> str:
-    r = subprocess.run(["gh"] + args, capture_output=True, text=True, timeout=GH_TIMEOUT, input=inp,
-                       stdin=None if inp is not None else subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW)
+    try:
+        r = subprocess.run(["gh"] + args, capture_output=True, text=True, timeout=GH_TIMEOUT, input=inp,
+                           stdin=None if inp is not None else subprocess.DEVNULL, creationflags=CREATE_NO_WINDOW)
+    except subprocess.TimeoutExpired:
+        raise PerfError(f"gh {' '.join(args[:2])} timed out after {GH_TIMEOUT}s") from None
     if r.returncode != 0:
         raise PerfError(f"gh {' '.join(args[:2])} failed rc={r.returncode}: {(r.stderr or '')[:160]}")
     return r.stdout
@@ -594,7 +598,12 @@ class Publisher:
         return json.loads(out) if out.strip() else None
 
     def find_issue(self, repo: str, key: str) -> Optional[Dict[str, Any]]:
-        rows = self._api([f"repos/{repo}/issues?state=all&labels={LABEL}&per_page=50"]) or []
+        rows: List[Dict[str, Any]] = []
+        for page in range(1, 11):
+            chunk = self._api([f"repos/{repo}/issues?state=all&labels={LABEL}&per_page=100&page={page}"]) or []
+            rows += chunk
+            if len(chunk) < 100:
+                break
         marker = MARKER.format(key=key)
         hits = [r for r in rows if "pull_request" not in r and marker in (r.get("body") or "")]
         hits.sort(key=lambda r: (r["state"] != "open", -r["number"]))
@@ -640,7 +649,7 @@ class Publisher:
                 self.writes += 1
             t["issue"] = {"repo": repo, "number": issue["number"], "url": issue["html_url"]}
             return True
-        if open_now > self.cfg["caps"]["open_issues"]:
+        if open_now >= self.cfg["caps"]["open_issues"]:
             self.actions.append(f"HOLD {key}: {open_now} PerfWatch issues already open (cap {self.cfg['caps']['open_issues']})")
             return False
         if existing:
@@ -748,17 +757,63 @@ def log(msg: str, to_file: bool = True) -> None:
 
 
 def load_state(state_dir: Path) -> Dict[str, Any]:
+    f = state_dir / "state.json"
+    if not f.exists():
+        return new_state()
     try:
-        return json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        return json.loads(f.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        bak = state_dir / f"state.json.corrupt-{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+        try:
+            os.replace(f, bak)
+        except OSError:
+            pass
+        log(f"ERROR: state.json unreadable ({exc.__class__.__name__}); backed up to {bak.name}; baselines restart")
         return new_state()
 
 
 def save_state(state_dir: Path, state: Dict[str, Any]) -> None:
     state_dir.mkdir(parents=True, exist_ok=True)
-    tmp = state_dir / "state.json.tmp"
-    tmp.write_text(json.dumps(state, indent=1, sort_keys=True), encoding="utf-8")
+    fd, tmp = tempfile.mkstemp(prefix="state.", suffix=".tmp", dir=state_dir)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(state, indent=1, sort_keys=True))
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp, state_dir / "state.json")
+
+
+class RunLock:
+    """One run at a time. A lock older than 30 min belongs to a dead run and is taken over."""
+
+    def __init__(self, state_dir: Path) -> None:
+        self.path = state_dir / "run.lock"
+        self.held = False
+
+    def __enter__(self) -> "RunLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        for _ in range(2):
+            try:
+                fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, str(os.getpid()).encode())
+                os.close(fd)
+                self.held = True
+                return self
+            except FileExistsError:
+                try:
+                    if time.time() - self.path.stat().st_mtime > 1800:
+                        self.path.unlink()
+                        continue
+                except OSError:
+                    pass
+                return self
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        if self.held:
+            try:
+                self.path.unlink()
+            except OSError:
+                pass
 
 
 def load_config(path: Path = CONFIG_PATH) -> Dict[str, Any]:
@@ -787,6 +842,18 @@ def run(live: bool, force: bool, state_dir: Path, cfg: Dict[str, Any],
         now: Optional[dt.datetime] = None, out: Callable[[str], None] = print) -> int:
     global LOG_DIR
     LOG_DIR = state_dir
+    if live:
+        with RunLock(state_dir) as lock:
+            if not lock.held:
+                log("skip: another PerfWatch run holds the lock")
+                return 0
+            return _run(live, force, state_dir, cfg, collect, gh, host, now, out)
+    return _run(live, force, state_dir, cfg, collect, gh, host, now, out)
+
+
+def _run(live: bool, force: bool, state_dir: Path, cfg: Dict[str, Any], collect: Callable[..., Any],
+         gh: Callable[..., str], host: Callable[[], Dict[str, Any]], now: Optional[dt.datetime],
+         out: Callable[[str], None]) -> int:
     now = now or dt.datetime.now(dt.timezone.utc)
     now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
     state = load_state(state_dir)
@@ -815,9 +882,12 @@ def run(live: bool, force: bool, state_dir: Path, cfg: Dict[str, Any],
     fp = status_fingerprint(work, notes) + ("|suspect" if suspect else "")
     if work.get("status_fp") != fp:
         ti = cfg["tracking_issue"]
-        gh(["api", f"repos/{ti['repo']}/issues/{ti['number']}/comments", "-f", f"body={digest}", "--jq", ".html_url"])
-        work["status_fp"] = fp
-        log("digest comment posted on the tracking issue")
+        try:
+            gh(["api", f"repos/{ti['repo']}/issues/{ti['number']}/comments", "-f", f"body={digest}", "--jq", ".html_url"])
+            work["status_fp"] = fp
+            log("digest comment posted on the tracking issue")
+        except PerfError as exc:
+            log(f"digest comment failed, will retry next run: {exc}")
     save_state(state_dir, work)
     log(f"run {work['runs']} done: {len(events)} event(s), suspect={suspect}, {pub.writes} issue write(s)")
     for a in actions:
