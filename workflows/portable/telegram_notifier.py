@@ -235,6 +235,7 @@ def _governed_urlopen(
     timeout: float = DEFAULT_HTTP_TIMEOUT,
     deadline: float = DEFAULT_HARD_DEADLINE_SECONDS,
     budget: Any = None,
+    bot_budget: Any = None,
     now_ms: Any = None,
     sleep: Any = None,
 ) -> bytes:
@@ -247,6 +248,8 @@ def _governed_urlopen(
     """
     if budget is None:
         budget = telegram_budget.budget_for(token.split(":", 1)[0], chat_id)
+        # A group send books in the chat's file; a bot-wide 429 is recorded in the bot's own file.
+        bot_budget = telegram_budget.budget_for(token.split(":", 1)[0])
     now_ms = now_ms or (lambda: time.time() * 1000)
     sleep = sleep or time.sleep
     started = now_ms()
@@ -255,7 +258,24 @@ def _governed_urlopen(
         return deadline * 1000 - (now_ms() - started)
 
     for attempt in range(2):
-        telegram_budget.acquire(budget, chat_id, "message", max_wait_ms=remaining_ms(), now_ms=now_ms, sleep=sleep)
+        # Re-check the bot-wide block after every sleep and after the group acquire (which can itself
+        # sleep): a block can grow or appear while this send waits. Leave the loop only when none is active.
+        # The slot is booked once per attempt; a block found after the booking is slept through without
+        # booking a second slot (the booked time is already past once the block ends).
+        booked = False
+        while True:
+            if bot_budget is not None and bot_budget is not budget:
+                now = now_ms()
+                blocked_ms = bot_budget.update(lambda state: max(0, state.get("botBlockedUntil", 0) - now), now) or 0
+                if blocked_ms > 0:
+                    if blocked_ms > remaining_ms():
+                        raise telegram_budget.BudgetBlocked(int(blocked_ms), "retry_after")
+                    sleep(blocked_ms / 1000)
+                    continue
+            if booked:
+                break
+            telegram_budget.acquire(budget, chat_id, "message", max_wait_ms=remaining_ms(), now_ms=now_ms, sleep=sleep)
+            booked = True
         try:
             return _safe_urlopen(req, timeout=timeout, deadline=max(1.0, remaining_ms() / 1000))
         except urllib.error.HTTPError as err:
