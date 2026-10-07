@@ -899,6 +899,41 @@ export function selectInPage(parts) {
   return [...found];
 }
 
+/**
+ * True for the error Puppeteer raises when a navigation destroys the execution context under a call.
+ */
+export function isDestroyedContextError(err) {
+  return /Execution context was destroyed|Cannot find context with specified id/.test(String(err?.message ?? err));
+}
+
+/** Waits until the page has a live document that is done loading; never throws. */
+async function settleNavigation(page, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      if ((await page.evaluate(() => document.readyState)) !== 'loading') return;
+    } catch (_) {
+      // The context is still being replaced; poll again.
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+/**
+ * Runs `fn`. When a navigation destroys its execution context, waits for the new document to
+ * settle and runs `fn` once more on it. A second failure, or any other error, propagates, so a
+ * lookup that could not be made never reads as "absent", "not covered" or "no overflow".
+ */
+export async function retryOnNavigation(page, fn) {
+  try {
+    return await fn();
+  } catch (err) {
+    if (!isDestroyedContextError(err)) throw err;
+    await settleNavigation(page);
+    return fn();
+  }
+}
+
 /** Handles for every element the flow selector matches, in document order. */
 async function queryAll(page, selector) {
   const list = await page.evaluateHandle(selectInPage, parseSelector(selector));
@@ -967,8 +1002,10 @@ async function pickShown(page, handles) {
 async function waitForTarget(page, selector, timeoutMs, { visible = true } = {}) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    const handles = await queryAll(page, selector);
-    const shown = await pickShown(page, handles);
+    const { handles, shown } = await retryOnNavigation(page, async () => {
+      const found = await queryAll(page, selector);
+      return { handles: found, shown: await pickShown(page, found) };
+    });
     if (shown) return shown;
     if (!visible && handles.length > 0) return handles[0];
     if (Date.now() >= deadline) return null;
@@ -982,8 +1019,15 @@ export async function firstVisibleHandle(page, selector, timeoutMs) {
   return handle;
 }
 
-/** The element a step acts on right now: first visible match, else first match, else null. */
-async function currentTarget(page, selector) {
+/**
+ * The element a step acts on right now: first visible match, else first match, else null.
+ * A navigation under the lookup is retried once on the new document; a second failure throws.
+ */
+function currentTarget(page, selector) {
+  return retryOnNavigation(page, () => currentTargetOnce(page, selector));
+}
+
+async function currentTargetOnce(page, selector) {
   const handles = await queryAll(page, selector);
   return (await pickShown(page, handles)) || handles[0] || null;
 }
@@ -1087,9 +1131,13 @@ export function isTargetHit(target, deepHit) {
  * Evaluates in-page geometry and elementFromPoint for named checks.
  */
 async function inspectTargetElement(page, selectorOrHandle, scroll = true) {
+  return retryOnNavigation(page, () => inspectTargetElementOnce(page, selectorOrHandle, scroll));
+}
+
+async function inspectTargetElementOnce(page, selectorOrHandle, scroll) {
   if (!selectorOrHandle) return null;
   const handle = typeof selectorOrHandle === 'string'
-    ? await currentTarget(page, selectorOrHandle)
+    ? await currentTargetOnce(page, selectorOrHandle)
     : selectorOrHandle;
   if (!handle) return null;
   return page.evaluate((el, doScroll) => {
@@ -1204,19 +1252,19 @@ async function inspectTargetElement(page, selectorOrHandle, scroll = true) {
  * Inspects page horizontal scroll geometry.
  */
 async function inspectPageGeometry(page) {
-  return page.evaluate(() => {
+  return retryOnNavigation(page, () => page.evaluate(() => {
     return {
       scrollWidth: Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth || 0),
       innerWidth: window.innerWidth
     };
-  });
+  }));
 }
 
 /**
  * Inspects currently focused input element geometry.
  */
 async function inspectFocusedElement(page) {
-  return page.evaluate(() => {
+  return retryOnNavigation(page, () => page.evaluate(() => {
     const active = document.activeElement;
     if (!active || active === document.body) return null;
     const rect = active.getBoundingClientRect();
@@ -1224,7 +1272,7 @@ async function inspectFocusedElement(page) {
       tagName: active.tagName.toLowerCase(),
       rect: { top: rect.top, bottom: rect.bottom, left: rect.left, right: rect.right, width: rect.width, height: rect.height }
     };
-  });
+  }));
 }
 
 /**
@@ -1597,13 +1645,11 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
           const deadline = Date.now() + Math.min(timeoutMs, 6000);
           let shownCand = null;
           while (Date.now() < deadline) {
-            const handles = await queryAll(page, step.selector);
-            shownCand = await pickShown(page, handles);
+            shownCand = await retryOnNavigation(page, async () => pickShown(page, await queryAll(page, step.selector)));
             if (!shownCand) break;
             await new Promise(r => setTimeout(r, 100));
           }
-          const handles = await queryAll(page, step.selector);
-          const shownEl = await pickShown(page, handles);
+          const shownEl = await retryOnNavigation(page, async () => pickShown(page, await queryAll(page, step.selector)));
           if (shownEl) {
             checksResults.push({
               name: 'assert_absent',

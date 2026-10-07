@@ -54,7 +54,9 @@ import {
   openFlowPage,
   prepareFlowPage,
   resolveDeepestHit,
-  isTargetHit
+  isTargetHit,
+  retryOnNavigation,
+  isDestroyedContextError
 } from './flow_qa_runner.mjs';
 
 // ============================================================================
@@ -994,6 +996,93 @@ test('no_document_reload ignores the late load event of the page a goto left at 
     assert.equal(reloaded.passed, false, 'a real reload fails no_document_reload');
   } finally {
     if (releaseImage) releaseImage();
+    await browser.close();
+    server.closeAllConnections();
+    server.close();
+    fs.rmSync(outputDir, { recursive: true, force: true });
+  }
+});
+
+const DESTROYED = () => new Error('Execution context was destroyed, most likely because of a navigation.');
+const settledPage = { evaluate: async () => 'complete' };
+
+test('retryOnNavigation retries once after a destroyed context and returns the second result', async () => {
+  let calls = 0;
+  const out = await retryOnNavigation(settledPage, async () => {
+    calls++;
+    if (calls === 1) throw DESTROYED();
+    return 'new-document';
+  });
+  assert.equal(out, 'new-document');
+  assert.equal(calls, 2);
+});
+
+test('retryOnNavigation fails the step when the second attempt is destroyed too, and never retries other errors', async () => {
+  let calls = 0;
+  await assert.rejects(
+    retryOnNavigation(settledPage, async () => { calls++; throw DESTROYED(); }),
+    isDestroyedContextError
+  );
+  assert.equal(calls, 2, 'exactly one retry');
+  calls = 0;
+  await assert.rejects(
+    retryOnNavigation(settledPage, async () => { calls++; throw new Error('boom'); }),
+    /boom/
+  );
+  assert.equal(calls, 1, 'other errors are not retried');
+});
+
+test('an absent assertion does not pass while every lookup hits a destroyed context (Negative Control)', async () => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end('<!DOCTYPE html><html><body><button id="x">x</button></body></html>');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const browser = await resolvePuppeteer().launch({ executablePath: resolveExecutablePath() || undefined, headless: 'new', args: ['--no-sandbox'] });
+  const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'flowqa-failclosed-'));
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1440, height: 900 });
+    const ctx = { flow: { id: 'f' }, baseUrl: `http://127.0.0.1:${server.address().port}`, outputDir, flowConstraints: {} };
+    await executeStep(page, null, { id: 'goto', action: 'goto', url: '/' }, '1440x900', 'light', ctx);
+    const real = page.evaluateHandle.bind(page);
+    page.evaluateHandle = async () => { throw DESTROYED(); };
+    await assert.rejects(
+      executeStep(page, null, { id: 'gone', action: 'assert', selector: '#x', expected_present: false, timeout_ms: 500 }, '1440x900', 'light', ctx),
+      isDestroyedContextError
+    );
+    page.evaluateHandle = real;
+    const present = await executeStep(page, null, { id: 'still', action: 'assert', selector: '#x', expected_present: false, timeout_ms: 500 }, '1440x900', 'light', ctx);
+    assert.equal(present.checks.find((c) => c.name === 'assert_absent')?.passed, false, 'a present element still fails assert_absent');
+  } finally {
+    await browser.close();
+    server.closeAllConnections();
+    server.close();
+    fs.rmSync(outputDir, { recursive: true, force: true });
+  }
+});
+
+test('a tap that navigates away still passes and the next page is judged on its own document', async () => {
+  const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end(req.url === '/next'
+      ? '<!DOCTYPE html><html><body><h1 id="arrived">arrived</h1></body></html>'
+      : '<!DOCTYPE html><html><body><a id="go" href="/next" style="display:block;width:160px;height:48px">Go</a></body></html>');
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const browser = await resolvePuppeteer().launch({ executablePath: resolveExecutablePath() || undefined, headless: 'new', args: ['--no-sandbox'] });
+  const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'flowqa-navtap-'));
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1440, height: 900 });
+    const ctx = { flow: { id: 'f' }, baseUrl: `http://127.0.0.1:${server.address().port}`, outputDir, flowConstraints: {} };
+    await executeStep(page, null, { id: 'goto', action: 'goto', url: '/' }, '1440x900', 'light', ctx);
+    const tap = await executeStep(page, null, { id: 'go', action: 'tap', selector: '#go', checks: ['visible', 'covered'] }, '1440x900', 'light', ctx);
+    assert.ok(tap.checks.length > 0 && tap.checks.every((c) => c.passed), JSON.stringify(tap.checks));
+    assert.ok(page.url().endsWith('/next'));
+    const absent = await executeStep(page, null, { id: 'gone', action: 'assert', selector: '#go', expected_present: false, timeout_ms: 500 }, '1440x900', 'light', ctx);
+    assert.ok(absent.checks.every((c) => c.passed), 'the old link is absent on the new document');
+  } finally {
     await browser.close();
     server.closeAllConnections();
     server.close();
