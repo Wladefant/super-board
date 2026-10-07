@@ -1726,6 +1726,41 @@ class TestSharedSendBudget(unittest.TestCase):
                               now_ms=self.clock.now_ms, sleep=self.clock.sleep)
         self.assertGreaterEqual(telegram.sent[0]["at"] - start, 5000)
 
+    def _group_send_with_sleep_hook(self, hook):
+        telegram = _FakeTelegram(self.clock)
+        group = telegram_budget.SharedBudget("chat_-100", self.dir)
+        bot = telegram_budget.SharedBudget("1", self.dir)
+        calls = []
+
+        def sleep(seconds):
+            self.clock.sleep(seconds)
+            calls.append(seconds)
+            if len(calls) == 1:
+                hook(bot)
+
+        req = urllib.request.Request("https://api.telegram.org/bot1:T/sendMessage", data=json.dumps({"chat_id": "-100"}).encode())
+        start = self.clock.now_ms()
+        with patch("telegram_notifier._safe_urlopen", side_effect=telegram.urlopen):
+            _governed_urlopen(req, "1:T", "-100", deadline=60.0, budget=group, bot_budget=bot,
+                              now_ms=self.clock.now_ms, sleep=sleep)
+        return telegram, group, start
+
+    def test_a_bot_wide_block_that_grows_during_the_wait_is_honoured(self):
+        start = self.clock.now_ms()
+        pre = telegram_budget.SharedBudget("1", self.dir)
+        pre.update(lambda s: telegram_budget.record_rate_limit(s, None, start + 5000), start)
+        telegram, _group, start = self._group_send_with_sleep_hook(
+            lambda bot: bot.update(lambda s: telegram_budget.record_rate_limit(s, None, start + 10000), self.clock.now_ms()))
+        self.assertGreaterEqual(telegram.sent[0]["at"] - start, 10000)
+
+    def test_a_bot_wide_block_set_during_the_group_acquire_is_honoured(self):
+        start = self.clock.now_ms()
+        group = telegram_budget.SharedBudget("chat_-100", self.dir)
+        group.update(lambda s: telegram_budget.reserve(s, "-100", "message", start), start)  # forces the acquire to sleep
+        telegram, _group, start = self._group_send_with_sleep_hook(
+            lambda bot: bot.update(lambda s: telegram_budget.record_rate_limit(s, None, start + 10000), self.clock.now_ms()))
+        self.assertGreaterEqual(telegram.sent[0]["at"] - start, 10000)
+
     def test_group_takes_16_messages_and_4_panels_in_one_minute(self):
         self.other_process("-100", 16)
         self.other_process("-100", 4, "panel")  # every one of the 20 sends fits: wait_ms is asserted 0 inside
