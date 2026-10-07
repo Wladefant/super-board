@@ -98,24 +98,24 @@ describe("TelegramGovernor budget", () => {
     expect(telegram.sent[0].at).toBe(telegram.sent[1].at);
   });
 
-  test("keeps 12 of the 20 group sends per minute for panels", async () => {
+  test("keeps 4 of the 20 group sends per minute for panels", async () => {
     const { clock, telegram, call } = setup();
     const start = clock.now();
-    // 9 ordinary messages: only 8 may go out inside the first minute.
-    await clock.drive(Promise.all(Array.from({ length: 9 }, (_, i) => call(-100, { kind: "message" }, `m${i}`))));
-    const ninth = telegram.sent[8];
-    expect(ninth.at - start).toBeGreaterThanOrEqual(60_000);
-    expect(telegram.sent.slice(0, 8).every((s) => s.at - start < 60_000)).toBe(true);
+    // 17 ordinary messages: only 16 may go out inside the first minute.
+    await clock.drive(Promise.all(Array.from({ length: 17 }, (_, i) => call(-100, { kind: "message" }, `m${i}`))));
+    const last = telegram.sent[16];
+    expect(last.at - start).toBeGreaterThanOrEqual(60_000);
+    expect(telegram.sent.slice(0, 16).every((s) => s.at - start < 60_000)).toBe(true);
     expect(telegram.statuses.every((s) => s === 200)).toBe(true);
   });
 
   test("a panel is not queued behind ordinary messages that used up their share", async () => {
     const { clock, telegram, call } = setup();
-    await clock.drive(Promise.all(Array.from({ length: 8 }, (_, i) => call(-100, { kind: "message" }, `m${i}`))));
+    await clock.drive(Promise.all(Array.from({ length: 16 }, (_, i) => call(-100, { kind: "message" }, `m${i}`))));
     const before = clock.now();
     await clock.drive(call(-100, { kind: "panel" }, "panel"));
-    expect(telegram.sent[8].text).toBe("panel");
-    expect(telegram.sent[8].at - before).toBeLessThanOrEqual(1000);
+    expect(telegram.sent[16].text).toBe("panel");
+    expect(telegram.sent[16].at - before).toBeLessThanOrEqual(1000);
   });
 
   test("a burst of 40 panel edits in a group draws no 429 and never exceeds 20 per minute", async () => {
@@ -203,7 +203,7 @@ describe("TelegramGovernor retry_after", () => {
 describe("TelegramGovernor queues", () => {
   test("a message held by the group window does not hold up a panel", async () => {
     const { clock, telegram, call } = setup();
-    await clock.drive(Promise.all(Array.from({ length: 8 }, (_, i) => call(-100, { kind: "message" }, `m${i}`))));
+    await clock.drive(Promise.all(Array.from({ length: 16 }, (_, i) => call(-100, { kind: "message" }, `m${i}`))));
     const before = clock.now();
     const held = call(-100, { kind: "message" }, "held");
     const panel = call(-100, { kind: "panel" }, "panel");

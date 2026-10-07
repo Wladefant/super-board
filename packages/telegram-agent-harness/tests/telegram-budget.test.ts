@@ -106,23 +106,23 @@ describe("shared budget across processes", () => {
     expect(telegram.sent).toHaveLength(6);
   });
 
-  test("two senders into one group together stay within the 8 per minute ordinary-message share", async () => {
+  test("two senders into one group together stay within the 16 per minute ordinary-message share", async () => {
     const { clock, telegram, a, b, call } = twoProcesses();
-    const sends = Array.from({ length: 12 }, (_, i) => call(i % 2 === 0 ? a : b, -100, { kind: "message" }, `m${i}`));
+    const sends = Array.from({ length: 20 }, (_, i) => call(i % 2 === 0 ? a : b, -100, { kind: "message" }, `m${i}`));
     await clock.drive(Promise.all(sends));
     expect(telegram.statuses.filter((s) => s === 429)).toEqual([]);
     for (const s of telegram.sent) {
-      expect(telegram.sent.filter((o) => o.at >= s.at && o.at - s.at < 60_000).length).toBeLessThanOrEqual(8);
+      expect(telegram.sent.filter((o) => o.at >= s.at && o.at - s.at < 60_000).length).toBeLessThanOrEqual(16);
     }
-    expect(telegram.sent).toHaveLength(12);
+    expect(telegram.sent).toHaveLength(20);
   });
 
   test("a panel in one process still has its reserved group share while another process used up the messages", async () => {
     const { clock, telegram, a, b, call } = twoProcesses();
-    await clock.drive(Promise.all(Array.from({ length: 8 }, (_, i) => call(a, -100, { kind: "message" }, `m${i}`))));
+    await clock.drive(Promise.all(Array.from({ length: 16 }, (_, i) => call(a, -100, { kind: "message" }, `m${i}`))));
     const before = clock.now();
     await clock.drive(call(b, -100, { kind: "panel" }, "panel"));
-    expect(telegram.sent[8].at - before).toBeLessThanOrEqual(1000);
+    expect(telegram.sent[16].at - before).toBeLessThanOrEqual(1000);
   });
 
   test("a 429 seen by one process holds back the others for that chat, not for other chats", async () => {

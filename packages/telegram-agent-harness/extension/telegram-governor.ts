@@ -160,7 +160,7 @@ export class TelegramGovernor {
     this.chatIntervalMs = options.chatIntervalMs ?? 1000;
     this.groupLimit = options.groupLimit ?? 20;
     this.windowMs = options.windowMs ?? 60_000;
-    this.panelReserve = options.panelReserve ?? 12;
+    this.panelReserve = options.panelReserve ?? 4;
     this.maxRetryWaitMs = options.maxRetryWaitMs ?? 60_000;
     this.maxQueuedPerChat = options.maxQueuedPerChat ?? 200;
     this.now = options.now ?? Date.now;
