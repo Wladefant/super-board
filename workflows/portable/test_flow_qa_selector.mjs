@@ -256,3 +256,93 @@ test('touch_only steps pass with a skip note on a desktop viewport', async () =>
     fs.rmSync(outputDir, { recursive: true, force: true });
   }
 });
+
+test('assert with expected_text polls with locator semantics when node with same role is replaced after 500ms', async () => {
+  const puppeteer = resolvePuppeteer();
+  const browser = await puppeteer.launch({
+    executablePath: resolveExecutablePath() || undefined,
+    headless: 'new',
+    args: ['--no-sandbox']
+  });
+  const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'flowqa-replace-'));
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1440, height: 900 });
+    await page.setContent(`
+      <div id="container">
+        <p role="status">Wird ausgeführt</p>
+      </div>
+      <script>
+        setTimeout(() => {
+          document.getElementById('container').innerHTML = '<div role="status">Erledigt.</div>';
+        }, 500);
+      </script>
+    `);
+    const res = await executeStep(
+      page,
+      null,
+      {
+        id: 'assert_status',
+        action: 'assert',
+        selector: "[role='status']",
+        expected_text: 'Erledigt.',
+        timeout_ms: 3000
+      },
+      '1440x900',
+      'light',
+      { flow: { id: 'f' }, baseUrl: 'http://localhost', outputDir, flowConstraints: {} }
+    );
+    assert.equal(res.passed, true, `expected step to pass, got checks: ${JSON.stringify(res.checks)}`);
+    const textCheck = res.checks.find((c) => c.name === 'assert_text');
+    assert.ok(textCheck, 'must run assert_text check');
+    assert.equal(textCheck.passed, true, 'assert_text must pass when node is replaced');
+  } finally {
+    await browser.close();
+    fs.rmSync(outputDir, { recursive: true, force: true });
+  }
+});
+
+test('assert with expected_visible polls with locator semantics when node with same role is replaced after 500ms', async () => {
+  const puppeteer = resolvePuppeteer();
+  const browser = await puppeteer.launch({
+    executablePath: resolveExecutablePath() || undefined,
+    headless: 'new',
+    args: ['--no-sandbox']
+  });
+  const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'flowqa-visible-replace-'));
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1440, height: 900 });
+    await page.setContent(`
+      <div id="container">
+        <p role="status" style="display:none">Wird ausgeführt</p>
+      </div>
+      <script>
+        setTimeout(() => {
+          document.getElementById('container').innerHTML = '<div role="status" style="display:block">Erledigt.</div>';
+        }, 500);
+      </script>
+    `);
+    const res = await executeStep(
+      page,
+      null,
+      {
+        id: 'assert_status_visible',
+        action: 'assert',
+        selector: "[role='status']",
+        expected_visible: true,
+        timeout_ms: 3000
+      },
+      '1440x900',
+      'light',
+      { flow: { id: 'f' }, baseUrl: 'http://localhost', outputDir, flowConstraints: {} }
+    );
+    assert.equal(res.passed, true, `expected step to pass, got checks: ${JSON.stringify(res.checks)}`);
+    const visCheck = res.checks.find((c) => c.name === 'assert_visible');
+    assert.ok(visCheck, 'must run assert_visible check');
+    assert.equal(visCheck.passed, true, 'assert_visible must pass when node is replaced');
+  } finally {
+    await browser.close();
+    fs.rmSync(outputDir, { recursive: true, force: true });
+  }
+});

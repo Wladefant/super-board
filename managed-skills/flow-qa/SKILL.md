@@ -63,6 +63,7 @@ matching `FLOW-QA` receipt.
 visible, not covered (element at point, drilling into open shadow roots without host occlusion), tap target 44 px or more, no horizontal overflow,
 focused input inside the viewport with the keyboard open, no document reload, swipe dismissal.
 Actions include `goto`, `tap`, `type`, `hover` (center of element or x/y with settle wait), `keyboard-open`, `swipe`, `assert`, `upload`, and `cleanup`.
+Assert steps use locator semantics. On every poll, the runner queries the selector again. It never keeps an ElementHandle across polls. This detects dynamic node replacements correctly.
 A `goto` returns at DOMContentLoaded, so the opened page can fire its own `load` event during the next
 step. That late `load` keeps the document identity token and does not count as a reload. A new document does.
 Mutations use a `QA-` prefix and each flow cleans up. Cleanup steps deleting threads or mutations strictly refuse any target not prefixed with `QA-`. A failed cleanup fails the run.
