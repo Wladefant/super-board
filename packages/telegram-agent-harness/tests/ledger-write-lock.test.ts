@@ -97,6 +97,25 @@ test("a real batch still fails loudly when the ledger lock cannot be taken", () 
   }
 }, 15_000);
 
+test("the ledger records the Telegram message date on ingest and a completion time when the update is handled", () => {
+  const { poller: instance, dbPath } = poller();
+  instance.ingestUpdates([{
+    update_id: 9,
+    message: { message_id: 1, chat: { id: 1, type: "private" }, from: { id: 1, is_bot: false, first_name: "Op" }, date: 1_700_000_000, text: "hi" },
+  }]);
+  const db = new Database(dbPath);
+  try {
+    expect(db.query("SELECT message_date, completed_at FROM update_ledger WHERE update_id = 9").get()).toEqual({ message_date: 1_700_000_000, completed_at: null });
+    const before = Date.now() / 1000;
+    db.run("UPDATE update_ledger SET status = 'COMPLETED' WHERE update_id = 9");
+    const row = db.query("SELECT completed_at FROM update_ledger WHERE update_id = 9").get() as { completed_at: number };
+    expect(row.completed_at).toBeGreaterThanOrEqual(before - 1);
+    expect(row.completed_at).toBeLessThan(before + 5);
+  } finally {
+    db.close();
+  }
+});
+
 test("resolving unchanged slots does not write bot_pool.db, so a held write lock cannot fail it", () => {
   const channelsDir = path.join(root, "channels");
   const stateDir = path.join(channelsDir, "telegram-a");

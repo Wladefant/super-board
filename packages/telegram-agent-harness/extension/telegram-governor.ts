@@ -13,7 +13,7 @@
  *   The call is retried once after that wait and the second answer is returned as is. A block longer than
  *   `maxRetryWaitMs` is never slept through: the first call gets the 429 back and queued calls fail with
  *   {@link TelegramRateLimitedError}.
- * - Queues: panels and ordinary messages queue apart, so a message held by its group share never holds up a
+ * - Queues: panels, replies to the operator (`priority`) and ordinary messages queue apart, so a message held by its group share never holds up a
  *   panel. Each chat queues at most `maxQueuedPerChat`; a full queue drops its oldest panel edit for a newer
  *   panel call and refuses a new message with {@link TelegramQueueFullError}.
  * - Coalescing: an edit of the same message that is still queued is replaced by the newer edit, and both
@@ -35,6 +35,8 @@ export interface GovernedRequest {
   kind?: GovernorKind;
   /** Calls with the same key that are still queued collapse into the newest one. */
   coalesceKey?: string;
+  /** A reply to the operator. It queues apart from bulk messages, so it is never stuck behind them (the budget still counts it). */
+  priority?: boolean;
   /** Per-attempt timeout. It starts when the request is sent, so queue time does not eat it. */
   timeoutMs?: number;
   /** One line per wait, rate limit and coalesce. Never carries a token. */
@@ -79,11 +81,13 @@ interface Entry {
   started: boolean;
   /** True once the entry was dropped from a full queue; the chain skips it. */
   dropped: boolean;
+  /** A reply to the operator: queued in its own lane and served before ordinary messages. */
+  priority: boolean;
 }
 
 interface ChatState {
   /** Panels and ordinary messages queue separately, so a message waiting on its group share never holds up a panel. */
-  tails: Record<"message" | "panel", Promise<void>>;
+  tails: Record<"message" | "panel" | "urgent", Promise<void>>;
   /** Entries queued behind a tail and not yet picked up, oldest first. */
   waiting: Entry[];
   sends: Array<{ at: number; kind: GovernorKind }>;
@@ -91,6 +95,10 @@ interface ChatState {
   /** A 429 on a chat-bound call limits that chat only. */
   blockedUntil: number;
   pending: Map<string, Entry>;
+  /** Priority entries currently trying to book a send; ordinary messages stand aside for them. */
+  urgentActive: number;
+  /** Serializes booking in this chat; see {@link TelegramGovernor.exclusive}. */
+  booking: Promise<void>;
 }
 
 const defaultSleep = (ms: number, signal?: AbortSignal): Promise<void> => {
@@ -160,7 +168,7 @@ export class TelegramGovernor {
     this.chatIntervalMs = options.chatIntervalMs ?? 1000;
     this.groupLimit = options.groupLimit ?? 20;
     this.windowMs = options.windowMs ?? 60_000;
-    this.panelReserve = options.panelReserve ?? 12;
+    this.panelReserve = options.panelReserve ?? 4;
     this.maxRetryWaitMs = options.maxRetryWaitMs ?? 60_000;
     this.maxQueuedPerChat = options.maxQueuedPerChat ?? 200;
     this.now = options.now ?? Date.now;
@@ -190,7 +198,7 @@ export class TelegramGovernor {
     const kind = request.kind ?? (request.chatId === undefined ? "other" : "message");
     const entry: Entry = {
       send, signal, kind, coalesceKey: request.coalesceKey, timeoutMs: request.timeoutMs, log: request.log,
-      waiters: [], started: false, dropped: false,
+      waiters: [], started: false, dropped: false, priority: request.priority === true && kind !== "panel",
     };
     if (request.chatId === undefined || kind === "inbound") return this.run(entry, undefined, undefined);
 
@@ -215,16 +223,18 @@ export class TelegramGovernor {
     entry.waiters.push(first);
     if (request.coalesceKey) state.pending.set(request.coalesceKey, entry);
     state.waiting.push(entry);
-    const lane = kind === "panel" ? "panel" : "message";
+    const lane = kind === "panel" ? "panel" : request.priority ? "urgent" : "message";
     state.tails[lane] = state.tails[lane].then(async () => {
       if (entry.dropped) return;
       state.waiting.splice(state.waiting.indexOf(entry), 1);
       try {
+        if (entry.priority) state.urgentActive++;
         const response = await this.run(entry, state, chat);
         entry.waiters.forEach((waiter, index) => waiter.resolve(index === 0 ? response : response.clone()));
       } catch (error) {
         for (const waiter of entry.waiters) waiter.reject(error);
       } finally {
+        if (entry.priority) state.urgentActive--;
         if (entry.coalesceKey && state.pending.get(entry.coalesceKey) === entry) state.pending.delete(entry.coalesceKey);
       }
     });
@@ -248,8 +258,9 @@ export class TelegramGovernor {
     let state = this.chats.get(chat);
     if (!state) {
       state = {
-        tails: { message: Promise.resolve(), panel: Promise.resolve() },
-        waiting: [], sends: [], lastAt: Number.NEGATIVE_INFINITY, blockedUntil: 0, pending: new Map(),
+        tails: { message: Promise.resolve(), panel: Promise.resolve(), urgent: Promise.resolve() },
+        waiting: [], sends: [], lastAt: Number.NEGATIVE_INFINITY, blockedUntil: 0, pending: new Map(), urgentActive: 0,
+        booking: Promise.resolve(),
       };
       this.chats.set(chat, state);
     }
@@ -259,41 +270,66 @@ export class TelegramGovernor {
   /** Blocks until the budget lets one send of `kind` into `chat` go out, then books it. */
   private async acquire(entry: Entry, state: ChatState, chat: string): Promise<void> {
     for (;;) {
-      const now = this.now();
-      state.sends = state.sends.filter((s) => now - s.at < this.windowMs);
-      const blocked = Math.max(this.blockedUntil, state.blockedUntil);
-      if (blocked - now > this.maxRetryWaitMs) throw new TelegramRateLimitedError(blocked - now);
-      const spaced = state.lastAt + this.chatIntervalMs;
-      let readyAt = Math.max(blocked, spaced);
-      let reason = blocked > spaced ? "retry_after" : "chat interval";
-      if (isGroupChat(chat)) {
-        const limit = entry.kind === "panel" ? this.groupLimit : this.groupLimit - this.panelReserve;
-        const counted = entry.kind === "panel" ? state.sends : state.sends.filter((s) => s.kind !== "panel");
-        if (counted.length >= limit) {
-          const frees = counted[counted.length - limit].at + this.windowMs;
-          if (frees > readyAt) {
-            readyAt = frees;
-            reason = "group window";
-          }
-        }
-      }
-      if (readyAt <= now) {
-        // The local budget allows it; the file also counts the other processes' sends to this chat.
-        const claim = await this.shared?.update((ledger) => reserve(ledger, chat, entry.kind, now, this.config()), now);
-        if (claim && claim.blockedMs > this.maxRetryWaitMs) throw new TelegramRateLimitedError(claim.blockedMs);
-        if (claim && claim.waitMs > 0) {
-          entry.log?.(`telegram governor: chat ${chat} ${entry.kind} waits ${claim.waitMs} ms (${claim.reason}, shared with other processes)`);
-          await this.sleep(claim.waitMs, entry.signal);
-          continue;
-        }
-        state.sends.push({ at: now, kind: entry.kind });
-        state.lastAt = now;
-        return;
-      }
-      // The routine one-second spacing is not worth a line; a longer wait means a budget or a rate limit.
-      if (reason !== "chat interval") entry.log?.(`telegram governor: chat ${chat} ${entry.kind} waits ${readyAt - now} ms (${reason})`);
-      await this.sleep(readyAt - now, entry.signal);
+      const waitMs = await this.exclusive(state, () => this.tryBook(entry, state, chat));
+      if (waitMs === 0) return;
+      await this.sleep(waitMs, entry.signal);
     }
+  }
+
+  /**
+   * Runs `fn` alone among the senders of one chat. The message, panel and priority lanes all book here: without
+   * this, two lanes that wake together both pass the one-second spacing check while the budget file is awaited,
+   * book the same slot and draw a 429 from Telegram.
+   */
+  private async exclusive<T>(state: ChatState, fn: () => Promise<T>): Promise<T> {
+    const previous = state.booking;
+    const { promise, resolve } = Promise.withResolvers<void>();
+    state.booking = promise;
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      resolve();
+    }
+  }
+
+  /** Books one send if the budget allows it (returns 0), else returns how long to wait before asking again. */
+  private async tryBook(entry: Entry, state: ChatState, chat: string): Promise<number> {
+    const now = this.now();
+    state.sends = state.sends.filter((s) => now - s.at < this.windowMs);
+    const blocked = Math.max(this.blockedUntil, state.blockedUntil);
+    if (blocked - now > this.maxRetryWaitMs) throw new TelegramRateLimitedError(blocked - now);
+    const spaced = state.lastAt + this.chatIntervalMs;
+    let readyAt = Math.max(blocked, spaced);
+    let reason = blocked > spaced ? "retry_after" : "chat interval";
+    if (isGroupChat(chat)) {
+      const limit = entry.kind === "panel" ? this.groupLimit : this.groupLimit - this.panelReserve;
+      const counted = entry.kind === "panel" ? state.sends : state.sends.filter((s) => s.kind !== "panel");
+      if (counted.length >= limit) {
+        const frees = counted[counted.length - limit].at + this.windowMs;
+        if (frees > readyAt) {
+          readyAt = frees;
+          reason = "group window";
+        }
+      }
+    }
+    // A reply to the operator is waiting in this chat: ordinary messages let it take the next slot.
+    if (!entry.priority && entry.kind !== "panel" && state.urgentActive > 0) return Math.max(readyAt - now, 50);
+    if (readyAt <= now) {
+      // The local budget allows it; the file also counts the other processes' sends to this chat.
+      const claim = await this.shared?.update((ledger) => reserve(ledger, chat, entry.kind, now, this.config()), now);
+      if (claim && claim.blockedMs > this.maxRetryWaitMs) throw new TelegramRateLimitedError(claim.blockedMs);
+      if (claim && claim.waitMs > 0) {
+        entry.log?.(`telegram governor: chat ${chat} ${entry.kind} waits ${claim.waitMs} ms (${claim.reason}, shared with other processes)`);
+        return claim.waitMs;
+      }
+      state.sends.push({ at: now, kind: entry.kind });
+      state.lastAt = now;
+      return 0;
+    }
+    // The routine one-second spacing is not worth a line; a longer wait means a budget or a rate limit.
+    if (reason !== "chat interval") entry.log?.(`telegram governor: chat ${chat} ${entry.kind} waits ${readyAt - now} ms (${reason})`);
+    return readyAt - now;
   }
 
   /** Chat-less calls only honour a bot-wide block. getUpdates and downloads are not rate limited by send budgets. */
