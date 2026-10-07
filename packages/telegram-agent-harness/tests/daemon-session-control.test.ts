@@ -5,7 +5,7 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawn } from "node:child_process";
-import { discoverOwners, ownerIdentityMatches, TerminalSessionControl, type SessionEvent } from "../daemon/session-control";
+import { cachedOwners, discoverOwners, ownerIdentityMatches, TerminalSessionControl, type SessionEvent } from "../daemon/session-control";
 
 const cleanup: (() => void)[] = [];
 afterEach(() => { for (const close of cleanup.splice(0).reverse()) close(); });
@@ -111,18 +111,18 @@ test("a stale owner file whose PID was recycled by another live process is not a
   const file = publish(root, "recycled", stranger.pid!);
   const hourAgo = new Date(Date.now() - 3_600_000);
   fs.utimesSync(file, hourAgo, hourAgo);
-  expect(discoverOwners(root)).toEqual([]);
+  expect(await discoverOwners(root, 0)).toEqual([]);
   // Same stale PID with a recorded start time that differs from the real process is also rejected.
   publish(root, "recorded", stranger.pid!, { startedAtMs: Date.now() - 3_600_000 });
-  expect(discoverOwners(root)).toEqual([]);
+  expect(await discoverOwners(root, 0)).toEqual([]);
 });
 
-test("a genuine single owner is discovered, with or without a recorded start time", () => {
+test("a genuine single owner is discovered, with or without a recorded start time", async () => {
   const { root } = context();
   publish(root, "legacy", process.pid);
-  expect(discoverOwners(root).map(o => o.sessionId)).toEqual(["legacy"]);
+  expect((await discoverOwners(root, 0)).map(o => o.sessionId)).toEqual(["legacy"]);
   publish(root, "legacy", process.pid, { startedAtMs: Math.round(performance.timeOrigin) });
-  expect(discoverOwners(root).map(o => o.sessionId)).toEqual(["legacy"]);
+  expect((await discoverOwners(root, 0)).map(o => o.sessionId)).toEqual(["legacy"]);
 });
 
 test("two genuine owners for one session stay ambiguous while a recycled file beside them is ignored", async () => {
@@ -133,7 +133,7 @@ test("two genuine owners for one session stay ambiguous while a recycled file be
   const stale = publish(root, "stale-shared", stranger.pid!, { sessionId: "shared" });
   const hourAgo = new Date(Date.now() - 3_600_000);
   fs.utimesSync(stale, hourAgo, hourAgo);
-  expect(discoverOwners(root).length).toBe(2);
+  expect((await discoverOwners(root, 0)).length).toBe(2);
   await expect(control.deliver("shared", "nonce")).rejects.toThrow();
   expect(first.received).toEqual([]);
 });
@@ -142,4 +142,59 @@ test("owner identity falls back to PID existence only when the OS reports no sta
   expect(ownerIdentityMatches({}, 0, undefined)).toBe(true);
   expect(ownerIdentityMatches({}, 1_000, 10_000)).toBe(false);
   expect(ownerIdentityMatches({}, 10_000, 10_000)).toBe(true);
+});
+
+test("a scan is shared within its max age and fresh when asked", async () => {
+  const { root } = context();
+  publish(root, "first", process.pid);
+  expect((await discoverOwners(root)).map(o => o.sessionId)).toEqual(["first"]);
+  publish(root, "second", process.pid);
+  // Within the cache window the second file is not seen yet; a forced scan sees both.
+  expect((await discoverOwners(root)).map(o => o.sessionId)).toEqual(["first"]);
+  expect((await discoverOwners(root, 0)).map(o => o.sessionId).sort()).toEqual(["first", "second"]);
+});
+
+test("concurrent callers share one scan", async () => {
+  const { root } = context();
+  publish(root, "only", process.pid);
+  const [a, b] = await Promise.all([discoverOwners(root, 0), discoverOwners(root)]);
+  expect(b).toBe(a);
+});
+
+test("cachedOwners answers without I/O and fills in after the first scan", async () => {
+  const { root } = context();
+  publish(root, "warm", process.pid);
+  expect(cachedOwners(root)).toEqual([]);
+  await discoverOwners(root);
+  expect(cachedOwners(root).map(o => o.sessionId)).toEqual(["warm"]);
+});
+
+test("a scan prunes the owner file of a dead process and keeps the live one", async () => {
+  const { root } = context();
+  const child = idleChild();
+  const deadPid = child.pid!;
+  child.kill();
+  await new Promise(resolve => child.once("exit", resolve));
+  const dead = publish(root, "dead", deadPid);
+  const live = publish(root, "alive", process.pid);
+  expect((await discoverOwners(root, 0)).map(o => o.sessionId)).toEqual(["alive"]);
+  expect(fs.existsSync(dead)).toBe(false);
+  expect(fs.existsSync(live)).toBe(true);
+});
+
+test("a scan over many stale owner files never stalls the event loop", async () => {
+  const { root } = context();
+  const child = idleChild();
+  const deadPid = child.pid!;
+  child.kill();
+  await new Promise(resolve => child.once("exit", resolve));
+  for (let index = 0; index < 60; index++) publish(root, `stale${index}`, deadPid);
+  publish(root, "alive", process.pid);
+  let longest = 0;
+  let last = performance.now();
+  const ticker = setInterval(() => { const now = performance.now(); longest = Math.max(longest, now - last); last = now; }, 5);
+  const owners = await discoverOwners(root, 0);
+  clearInterval(ticker);
+  expect(owners.map(o => o.sessionId)).toEqual(["alive"]);
+  expect(longest).toBeLessThan(250);
 });

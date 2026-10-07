@@ -90,7 +90,7 @@ export interface SessionFileInfo {
 export interface FleetSources {
   now(): number;
   /** Live terminal owners, already filtered by `ownerIdentityMatches`. */
-  listOwners(): Owner[];
+  listOwners(): Owner[] | Promise<Owner[]>;
   /** Parse one session file; null when unreadable. */
   readSession(file: string): SessionFileInfo | null;
   /** Subagent session files nested directly under the given session file's `<stem>/` directory. */
@@ -368,7 +368,7 @@ export class FleetState {
     const now = this.sources.now();
     const usagePromise = this.usage(now);
     const lanes: FleetLane[] = [];
-    const owners = this.sources.listOwners();
+    const owners = await this.sources.listOwners();
     const claims = new Map<string, number>();
     for (const owner of owners) claims.set(owner.sessionId, (claims.get(owner.sessionId) ?? 0) + 1);
     for (const owner of owners) {

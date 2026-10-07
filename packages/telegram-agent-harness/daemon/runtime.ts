@@ -39,7 +39,7 @@ import { defaultWeekRoute, readBoardsFile } from "./week-service";
 import { getDaemonCommands, SlotRouter, type RouteTarget } from "./router";
 import {
   TerminalSessionControl,
-  discoverOwners,
+  cachedOwners,
   findSessionFile,
   resolveSessionsRoots,
   type SessionEvent,
@@ -620,7 +620,7 @@ export class TelegramDaemon {
         const direct = router.boundSession({ chatId: userId, topicId: "" });
         if (direct) return direct;
         if (forumChatId && access.allowFrom.includes(userId)) {
-          const liveOwnerIds = new Set(discoverOwners().map(o => o.sessionId));
+          const liveOwnerIds = new Set(cachedOwners(this.control.configRoot).map(o => o.sessionId));
           const liveForumRoute = routes.find(r => r.chatId === forumChatId && r.topicId !== "" && liveOwnerIds.has(r.sessionId));
           if (liveForumRoute) return liveForumRoute.sessionId;
           const fallbackForumRoute = routes.find(r => r.chatId === forumChatId && r.topicId !== "");

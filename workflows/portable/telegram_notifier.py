@@ -246,7 +246,7 @@ def _governed_urlopen(
     HTTPError) is raised.
     """
     if budget is None:
-        budget = telegram_budget.budget_for(token.split(":", 1)[0])
+        budget = telegram_budget.budget_for(token.split(":", 1)[0], chat_id)
     now_ms = now_ms or (lambda: time.time() * 1000)
     sleep = sleep or time.sleep
     started = now_ms()
