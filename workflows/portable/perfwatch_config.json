@@ -1,0 +1,80 @@
+{
+  "schema": 1,
+  "tracking_issue": {"repo": "Wladefant/super-board", "number": 672},
+  "n_confirm": 3,
+  "baseline_window": 12,
+  "min_baseline": 3,
+  "sample_history": 48,
+  "probes_per_url": 5,
+  "probe_gap_s": 1.0,
+  "max_bundle_assets": 8,
+  "max_requests_per_run": 80,
+  "min_interval_min": 50,
+  "breaker_fraction": 0.6,
+  "breaker_min_targets": 3,
+  "caps": {"issue_writes": 3, "dispatch": 2, "open_issues": 6},
+  "thresholds": {
+    "ttfb_p50_ms": {"rel": 0.5, "abs": 150},
+    "ttfb_p95_ms": {"rel": 1.0, "abs": 400},
+    "bytes": {"rel": 0.25, "abs": 20480},
+    "bundle_bytes": {"rel": 0.15, "abs": 51200},
+    "fail_count": {"rel": 0.0, "abs": 2},
+    "cpu_pct": {"rel": 1.0, "abs": 25},
+    "mem_mib": {"rel": 0.4, "abs": 100},
+    "slow_stmt_count": {"rel": 1.0, "abs": 100},
+    "slow_p95_ms": {"rel": 1.0, "abs": 1000},
+    "edge_5xx_count": {"rel": 1.0, "abs": 10},
+    "perf_advisor_warn": {"rel": 0.0, "abs": 1}
+  },
+  "projects": [
+    {
+      "name": "polysimulator",
+      "repo": "Bavariance/polysimulator",
+      "note": "STAGING only. Production is refused in code.",
+      "hosts": ["app.staging.polysimulator.com", "staging-api.polysimulator.com"],
+      "targets": [
+        {"name": "web-home", "kind": "http", "url": "https://app.staging.polysimulator.com/", "bundle": true},
+        {"name": "web-markets", "kind": "http", "url": "https://app.staging.polysimulator.com/markets", "bundle": true},
+        {"name": "api-health", "kind": "http", "url": "https://staging-api.polysimulator.com/health"},
+        {"name": "supabase-staging", "kind": "supabase", "ref": "hgzyqmaanndcimnclxtv", "window_hours": 3}
+      ]
+    },
+    {
+      "name": "shipnovo",
+      "repo": "Wladefant/shipnovo",
+      "hosts": ["shipnovo.wladefant.de"],
+      "targets": [
+        {"name": "web-home", "kind": "http", "url": "https://shipnovo.wladefant.de/", "bundle": true},
+        {"name": "web-login", "kind": "http", "url": "https://shipnovo.wladefant.de/login", "bundle": true},
+        {"name": "api-health", "kind": "http", "url": "https://shipnovo.wladefant.de/api/health"},
+        {"name": "containers", "kind": "containers", "items": [
+          {"name": "shipnovo-app", "dokploy_kind": "application", "dokploy_id": "OWGGDEUCk6bNRKOL6n6pF"},
+          {"name": "shipnovo-db", "dokploy_kind": "postgres", "dokploy_id": "XOwveU6zEve7BaSgUBgyP"}
+        ]}
+      ]
+    },
+    {
+      "name": "pinthread",
+      "repo": "Wladefant/pinthread",
+      "hosts": ["pinthread.dev", "admin.pinthread.dev"],
+      "targets": [
+        {"name": "site-home", "kind": "http", "url": "https://pinthread.dev/", "bundle": true},
+        {"name": "embed-js", "kind": "http", "url": "https://pinthread.dev/embed.js"},
+        {"name": "admin-edge", "kind": "http", "url": "https://admin.pinthread.dev/", "access_gated": true},
+        {"name": "containers", "kind": "containers", "items": [
+          {"name": "pinthread-api", "dokploy_kind": "application", "dokploy_id": "6z4_4dK-Ny2xt7SW9qgHZ"},
+          {"name": "pinthread-db", "dokploy_kind": "postgres", "dokploy_id": "b22QagXppcp5OqTjD5g2V"}
+        ]}
+      ]
+    },
+    {
+      "name": "mail-hub",
+      "repo": "Wladefant/mail-hub",
+      "note": "Cloudflare Worker behind Cloudflare Access. Only the edge answer is measured.",
+      "hosts": ["mail.wladefant.de"],
+      "targets": [
+        {"name": "health-edge", "kind": "http", "url": "https://mail.wladefant.de/v1/health", "access_gated": true}
+      ]
+    }
+  ]
+}
