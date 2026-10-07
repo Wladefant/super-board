@@ -142,8 +142,8 @@ export function resolveSessionsRoots(configRoot?: string): string[] {
   return sessionRoots;
 }
 
-/** A session file's path never changes; a miss is remembered briefly so a dead route does not rescan every root. */
-const SESSION_FILE_MISS_MS = 30_000;
+/** A session file's path never changes. A miss is remembered only briefly: a session that just started writes its file soon. */
+const SESSION_FILE_MISS_MS = 2_000;
 const sessionFileHits = new Map<string, string>();
 const sessionFileMisses = new Map<string, number>();
 
@@ -197,7 +197,7 @@ export function getProjectKeyFromSessionPath(sessionPath?: string | null): strin
 
 /** How long one scan's answer is reused. The scan is I/O over every terminal file, so concurrent callers share it. */
 export const OWNER_CACHE_MS = 3_000;
-const ownerScans = new Map<string, { at: number; owners: Promise<Owner[]>; settled: Owner[] }>();
+const ownerScans = new Map<string, { at: number; owners: Promise<Owner[]> }>();
 
 /**
  * Live terminal owners. One scan answers every caller within `maxAgeMs`, and a scan in flight is shared, so a
@@ -207,20 +207,10 @@ export function discoverOwners(configRoot?: string, maxAgeMs = OWNER_CACHE_MS): 
   const key = configRoot ?? "";
   const cached = ownerScans.get(key);
   if (cached && Date.now() - cached.at < maxAgeMs) return cached.owners;
-  const entry = { at: Date.now(), settled: cached?.settled ?? [], owners: scanOwners(configRoot) };
+  const entry = { at: Date.now(), owners: scanOwners(configRoot) };
   ownerScans.set(key, entry);
-  entry.owners.then(owners => { entry.settled = owners; }, () => { if (ownerScans.get(key) === entry) ownerScans.delete(key); });
+  entry.owners.catch(() => { if (ownerScans.get(key) === entry) ownerScans.delete(key); });
   return entry.owners;
-}
-
-/**
- * The last scan's owners with no I/O, for a synchronous caller; starts a refresh when the answer is stale.
- * Empty until the first scan finishes.
- */
-export function cachedOwners(configRoot?: string): Owner[] {
-  const cached = ownerScans.get(configRoot ?? "");
-  if (!cached || Date.now() - cached.at >= OWNER_CACHE_MS) void discoverOwners(configRoot).catch(() => {});
-  return ownerScans.get(configRoot ?? "")?.settled ?? [];
 }
 
 async function scanOwners(configRoot?: string): Promise<Owner[]> {

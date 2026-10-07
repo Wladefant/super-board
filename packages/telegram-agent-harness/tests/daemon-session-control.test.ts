@@ -5,7 +5,7 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawn } from "node:child_process";
-import { cachedOwners, discoverOwners, ownerIdentityMatches, TerminalSessionControl, type SessionEvent } from "../daemon/session-control";
+import { discoverOwners, ownerIdentityMatches, TerminalSessionControl, type SessionEvent } from "../daemon/session-control";
 
 const cleanup: (() => void)[] = [];
 afterEach(() => { for (const close of cleanup.splice(0).reverse()) close(); });
@@ -159,14 +159,6 @@ test("concurrent callers share one scan", async () => {
   publish(root, "only", process.pid);
   const [a, b] = await Promise.all([discoverOwners(root, 0), discoverOwners(root)]);
   expect(b).toBe(a);
-});
-
-test("cachedOwners answers without I/O and fills in after the first scan", async () => {
-  const { root } = context();
-  publish(root, "warm", process.pid);
-  expect(cachedOwners(root)).toEqual([]);
-  await discoverOwners(root);
-  expect(cachedOwners(root).map(o => o.sessionId)).toEqual(["warm"]);
 });
 
 test("a scan prunes the owner file of a dead process and keeps the live one", async () => {

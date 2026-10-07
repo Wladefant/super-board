@@ -5,7 +5,7 @@ import { authenticateInitData, authenticateAppSession, issueAppSession, appSessi
 export interface MiniAppRequest { id: string; path: string; method: string; initData: string; appSession?: string; body: string }
 export interface MiniAppOptions {
   stateDir: string; token: string; allowedUsers: string[];
-  session: (userId: string, context?: { sessionId?: string; topicId?: string }) => string | null;
+  session: (userId: string, context?: { sessionId?: string; topicId?: string }) => string | null | Promise<string | null>;
   sessions: () => Promise<unknown>;
   dashboard: (userId: string, sessionId?: string | null) => unknown;
   status: () => unknown;
@@ -59,7 +59,7 @@ export async function miniAppRequest(request: MiniAppRequest, options: MiniAppOp
     }
     const requestedSessionId = queryParams?.get("sessionId") || startSessionId || undefined;
     const requestedTopicId = queryParams?.get("topicId") || startTopicId || undefined;
-    const session = options.session(user, { sessionId: requestedSessionId, topicId: requestedTopicId });
+    const session = await options.session(user, { sessionId: requestedSessionId, topicId: requestedTopicId });
     if (reqPath === "/api/state" && request.method === "GET") {
       let sessions: unknown = null;
       try { sessions = await options.sessions(); } catch { /* unavailable is explicit in the response */ }
