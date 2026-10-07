@@ -138,6 +138,24 @@ describe("shared budget across processes", () => {
     expect(fs.readdirSync(dir).filter((name) => name.startsWith("chat_-100"))).toContain("chat_-100.json");
   });
 
+  test("a bot-wide block in the bot file also holds that bot's group sends", async () => {
+    const clock = fakeClock();
+    const telegram = fakeTelegram(clock);
+    const sharedGroup = (chat: string) => new SharedBudget(`chat_${chat}`, dir);
+    const bot = () => new TelegramGovernor({ now: clock.now, sleep: clock.sleep, shared: new SharedBudget("1", dir), sharedGroup });
+    const start = clock.now();
+    await new SharedBudget("1", dir).update((ledger) => recordRateLimit(ledger, undefined, start + 5000), start);
+    await clock.drive(
+      governedTelegramFetch(
+        "https://api.telegram.org/bot1:T/sendMessage",
+        { method: "POST", body: JSON.stringify({ chat_id: -100, text: "g", kind: "message" }) },
+        { chatId: -100, kind: "message" },
+        { resolve: async () => [], fetch: telegram.fetch, governor: bot() },
+      ),
+    );
+    expect(telegram.sent[0].at).toBeGreaterThanOrEqual(start + 5000);
+  });
+
   test("a panel in one process still has its reserved group share while another process used up the messages", async () => {
     const { clock, telegram, a, b, call } = twoProcesses();
     await clock.drive(Promise.all(Array.from({ length: 16 }, (_, i) => call(a, -100, { kind: "message" }, `m${i}`))));

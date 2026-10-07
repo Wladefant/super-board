@@ -61,7 +61,9 @@ export function isProcessAlive(pid: number): boolean {
 
 const execFileAsync = promisify(execFile);
 /** A process's creation time never changes, so a read stays good while its PID is alive. */
-const startTimeCache = new Map<number, number>();
+const startTimeCache = new Map<number, { startMs: number; readAt: number }>();
+/** A PID can be reused after its owner dies, so a cached start time is trusted for this long, no longer. */
+const START_TIME_TTL_MS = 30_000;
 
 /**
  * Actual process creation times (epoch ms) for the given PIDs; PIDs that cannot be read are omitted.
@@ -73,7 +75,7 @@ export async function readProcessStartTimes(pids: number[]): Promise<Map<number,
   const unknown: number[] = [];
   for (const pid of unique) {
     const known = startTimeCache.get(pid);
-    if (known === undefined) unknown.push(pid); else times.set(pid, known);
+    if (known === undefined || Date.now() - known.readAt > START_TIME_TTL_MS) unknown.push(pid); else times.set(pid, known.startMs);
   }
   if (unknown.length === 0) return times;
   const run = async (command: string, args: string[]): Promise<string> => {
@@ -97,7 +99,7 @@ export async function readProcessStartTimes(pids: number[]): Promise<Map<number,
   }
   for (const pid of unknown) {
     const read = times.get(pid);
-    if (read !== undefined) startTimeCache.set(pid, read);
+    if (read !== undefined) startTimeCache.set(pid, { startMs: read, readAt: Date.now() });
   }
   return times;
 }

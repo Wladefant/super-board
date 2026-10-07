@@ -321,6 +321,12 @@ export class TelegramGovernor {
     if (!entry.priority && entry.kind !== "panel" && state.urgentActive > 0) return Math.max(readyAt - now, 50);
     if (readyAt <= now) {
       // The local budget allows it; the file also counts the other processes' sends to this chat.
+      // A group send books in the group file, so the bot-wide block (a 429 on a chat-less call) lives in the other file.
+      if (this.budgetFor(chat) !== this.shared) {
+        const botWait = (await this.shared?.botBlockedMs(now)) ?? 0;
+        if (botWait > this.maxRetryWaitMs) throw new TelegramRateLimitedError(botWait);
+        if (botWait > 0) return botWait;
+      }
       const claim = await this.budgetFor(chat)?.update((ledger) => reserve(ledger, chat, entry.kind, now, this.config()), now);
       if (claim && claim.blockedMs > this.maxRetryWaitMs) throw new TelegramRateLimitedError(claim.blockedMs);
       if (claim && claim.waitMs > 0) {
