@@ -1046,7 +1046,15 @@ test('an absent assertion does not pass while every lookup hits a destroyed cont
     const ctx = { flow: { id: 'f' }, baseUrl: `http://127.0.0.1:${server.address().port}`, outputDir, flowConstraints: {} };
     await executeStep(page, null, { id: 'goto', action: 'goto', url: '/' }, '1440x900', 'light', ctx);
     const real = page.evaluateHandle.bind(page);
-    page.evaluateHandle = async () => { throw DESTROYED(); };
+    // Call 1 is the step's pre-inspection and must succeed. Calls 2 and 3 are the assert_absent
+    // lookup and its one retry: they hit a destroyed context. Later calls work, so a lookup that
+    // swallowed the error would fall through to a real, passing-looking result.
+    let lookups = 0;
+    page.evaluateHandle = (...args) => {
+      lookups++;
+      if (lookups === 2 || lookups === 3) throw DESTROYED();
+      return real(...args);
+    };
     await assert.rejects(
       executeStep(page, null, { id: 'gone', action: 'assert', selector: '#x', expected_present: false, timeout_ms: 500 }, '1440x900', 'light', ctx),
       isDestroyedContextError
