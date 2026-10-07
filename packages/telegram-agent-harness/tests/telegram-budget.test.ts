@@ -117,6 +117,45 @@ describe("shared budget across processes", () => {
     expect(telegram.sent).toHaveLength(20);
   });
 
+  test("two bots posting into one group share one budget keyed by the chat", async () => {
+    const clock = fakeClock();
+    const telegram = fakeTelegram(clock);
+    const sharedGroup = (chat: string) => new SharedBudget(`chat_${chat}`, dir);
+    const bot = (id: string) => new TelegramGovernor({ now: clock.now, sleep: clock.sleep, shared: new SharedBudget(id, dir), sharedGroup });
+    const [one, two] = [bot("1"), bot("2")];
+    const send = (governor: TelegramGovernor, text: string) =>
+      governedTelegramFetch(
+        "https://api.telegram.org/bot1:T/sendMessage",
+        { method: "POST", body: JSON.stringify({ chat_id: -100, text, kind: "message" }) },
+        { chatId: -100, kind: "message" },
+        { resolve: async () => [], fetch: telegram.fetch, governor },
+      );
+    await clock.drive(Promise.all(Array.from({ length: 20 }, (_, i) => send(i % 2 === 0 ? one : two, `m${i}`))));
+    expect(telegram.statuses.filter((s) => s === 429)).toEqual([]);
+    for (const s of telegram.sent) {
+      expect(telegram.sent.filter((o) => o.at >= s.at && o.at - s.at < 60_000).length).toBeLessThanOrEqual(16);
+    }
+    expect(fs.readdirSync(dir).filter((name) => name.startsWith("chat_-100"))).toContain("chat_-100.json");
+  });
+
+  test("a bot-wide block in the bot file also holds that bot's group sends", async () => {
+    const clock = fakeClock();
+    const telegram = fakeTelegram(clock);
+    const sharedGroup = (chat: string) => new SharedBudget(`chat_${chat}`, dir);
+    const bot = () => new TelegramGovernor({ now: clock.now, sleep: clock.sleep, shared: new SharedBudget("1", dir), sharedGroup });
+    const start = clock.now();
+    await new SharedBudget("1", dir).update((ledger) => recordRateLimit(ledger, undefined, start + 5000), start);
+    await clock.drive(
+      governedTelegramFetch(
+        "https://api.telegram.org/bot1:T/sendMessage",
+        { method: "POST", body: JSON.stringify({ chat_id: -100, text: "g", kind: "message" }) },
+        { chatId: -100, kind: "message" },
+        { resolve: async () => [], fetch: telegram.fetch, governor: bot() },
+      ),
+    );
+    expect(telegram.sent[0].at).toBeGreaterThanOrEqual(start + 5000);
+  });
+
   test("a panel in one process still has its reserved group share while another process used up the messages", async () => {
     const { clock, telegram, a, b, call } = twoProcesses();
     await clock.drive(Promise.all(Array.from({ length: 16 }, (_, i) => call(a, -100, { kind: "message" }, `m${i}`))));

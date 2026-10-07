@@ -292,8 +292,14 @@ def acquire(
         waited += claim.wait_ms
 
 
-def budget_for(bot_id: str) -> Optional[SharedBudget]:
-    """The shared budget of one bot, or None when VEYYON_TELEGRAM_BUDGET_DIR=off."""
+def budget_for(bot_id: str, chat: Optional[str] = None) -> Optional[SharedBudget]:
+    """The shared budget of one bot, or of one group chat when ``chat`` is a group.
+
+    A group's ledger is keyed by the chat, so every bot posting there counts against one budget (the
+    TypeScript governor uses the same file name, chat_<id>). None when VEYYON_TELEGRAM_BUDGET_DIR=off.
+    """
     if os.environ.get("VEYYON_TELEGRAM_BUDGET_DIR") == "off":
         return None
+    if chat is not None and is_group_chat(str(chat)):
+        return SharedBudget(f"chat_{chat}")
     return SharedBudget(bot_id)

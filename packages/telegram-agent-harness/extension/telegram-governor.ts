@@ -54,6 +54,8 @@ export interface GovernorOptions {
   now?: () => number;
   /** Budget file shared with the other processes of this bot. Omit for a process-local budget. */
   shared?: SharedBudget;
+  /** Budget file of one group chat, shared by every bot that posts into it. Omit to keep group sends in `shared`. */
+  sharedGroup?: (chat: string) => SharedBudget | undefined;
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
 }
 
@@ -160,6 +162,7 @@ export class TelegramGovernor {
   private readonly now: () => number;
   private readonly sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly shared: SharedBudget | undefined;
+  private readonly sharedGroup: ((chat: string) => SharedBudget | undefined) | undefined;
   /** Set by a 429 on a call that is not bound to a chat. */
   private blockedUntil = 0;
   private readonly chats = new Map<string, ChatState>();
@@ -174,6 +177,7 @@ export class TelegramGovernor {
     this.now = options.now ?? Date.now;
     this.sleep = options.sleep ?? defaultSleep;
     this.shared = options.shared;
+    this.sharedGroup = options.sharedGroup;
   }
 
   public snapshot(): GovernorSnapshot {
@@ -317,7 +321,13 @@ export class TelegramGovernor {
     if (!entry.priority && entry.kind !== "panel" && state.urgentActive > 0) return Math.max(readyAt - now, 50);
     if (readyAt <= now) {
       // The local budget allows it; the file also counts the other processes' sends to this chat.
-      const claim = await this.shared?.update((ledger) => reserve(ledger, chat, entry.kind, now, this.config()), now);
+      // A group send books in the group file, so the bot-wide block (a 429 on a chat-less call) lives in the other file.
+      if (this.budgetFor(chat) !== this.shared) {
+        const botWait = (await this.shared?.botBlockedMs(now)) ?? 0;
+        if (botWait > this.maxRetryWaitMs) throw new TelegramRateLimitedError(botWait);
+        if (botWait > 0) return botWait;
+      }
+      const claim = await this.budgetFor(chat)?.update((ledger) => reserve(ledger, chat, entry.kind, now, this.config()), now);
       if (claim && claim.blockedMs > this.maxRetryWaitMs) throw new TelegramRateLimitedError(claim.blockedMs);
       if (claim && claim.waitMs > 0) {
         entry.log?.(`telegram governor: chat ${chat} ${entry.kind} waits ${claim.waitMs} ms (${claim.reason}, shared with other processes)`);
@@ -343,6 +353,11 @@ export class TelegramGovernor {
       entry.log?.(`telegram governor: ${entry.kind} call waits ${wait} ms (retry_after)`);
       await this.sleep(wait, entry.signal);
     }
+  }
+
+  /** A group's ledger is keyed by the chat, so every bot posting there counts against one budget. */
+  private budgetFor(chat: string | undefined): SharedBudget | undefined {
+    return chat !== undefined && isGroupChat(chat) && this.sharedGroup ? this.sharedGroup(chat) : this.shared;
   }
 
   /** The numbers the shared budget file is computed with. */
@@ -372,7 +387,7 @@ export class TelegramGovernor {
       const scope = state ? `chat ${chat}` : "bot";
       if (state) state.blockedUntil = Math.max(state.blockedUntil, until);
       else this.blockedUntil = Math.max(this.blockedUntil, until);
-      await this.shared?.update((ledger) => recordRateLimit(ledger, state ? chat : undefined, until), this.now());
+      await this.budgetFor(state ? chat : undefined)?.update((ledger) => recordRateLimit(ledger, state ? chat : undefined, until), this.now());
       const retry = attempt === 0 && entry.kind !== "inbound" && retryAfterSeconds * 1000 <= this.maxRetryWaitMs;
       entry.log?.(`telegram governor: 429, ${scope} blocked for ${retryAfterSeconds} s${retry ? ", one retry after the wait" : ", not retried"}`);
       if (!retry) return response;
@@ -386,7 +401,7 @@ const governors = new Map<string, TelegramGovernor>();
 export function governorFor(botId: string): TelegramGovernor {
   let governor = governors.get(botId);
   if (!governor) {
-    governor = new TelegramGovernor({ shared: sharedBudgetFor(botId) });
+    governor = new TelegramGovernor({ shared: sharedBudgetFor(botId), sharedGroup: (chat) => sharedBudgetFor(`chat_${chat}`) });
     governors.set(botId, governor);
   }
   return governor;

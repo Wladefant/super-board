@@ -607,7 +607,7 @@ export class TelegramDaemon {
     let weekRoute: ((query: { start: string | null; board: string | null; kind: string | null }) => Promise<unknown>) | undefined;
     const stopMiniApp = connectMiniApp({
       stateDir: slot.stateDir, token, allowedUsers: access.allowFrom,
-      session: (userId, context) => {
+      session: async (userId, context) => {
         const routes = this.store.listRoutes(slot.slotId);
         if (context?.sessionId) {
           const match = routes.find(r => r.sessionId === context.sessionId);
@@ -620,7 +620,7 @@ export class TelegramDaemon {
         const direct = router.boundSession({ chatId: userId, topicId: "" });
         if (direct) return direct;
         if (forumChatId && access.allowFrom.includes(userId)) {
-          const liveOwnerIds = new Set(discoverOwners().map(o => o.sessionId));
+          const liveOwnerIds = new Set((await discoverOwners(this.control.configRoot)).map(o => o.sessionId));
           const liveForumRoute = routes.find(r => r.chatId === forumChatId && r.topicId !== "" && liveOwnerIds.has(r.sessionId));
           if (liveForumRoute) return liveForumRoute.sessionId;
           const fallbackForumRoute = routes.find(r => r.chatId === forumChatId && r.topicId !== "");

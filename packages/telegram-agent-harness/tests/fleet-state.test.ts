@@ -99,17 +99,17 @@ test("two owners claiming one session are ambiguous and both are dropped", async
   expect(snapshot.lanes).toEqual([]);
 });
 
-test("owners with a reused PID are excluded by ownerIdentityMatches through the default owner source", () => {
+test("owners with a reused PID are excluded by ownerIdentityMatches through the default owner source", async () => {
   const terminals = path.join(root, "run", "terminals");
   fs.mkdirSync(terminals, { recursive: true });
-  const actualStart = readProcessStartTimes([process.pid]).get(process.pid);
+  const actualStart = (await readProcessStartTimes([process.pid])).get(process.pid);
   if (actualStart === undefined) return; // The OS refused to report a start time: nothing to compare against.
   const endpoint = process.platform === "win32" ? "\\\\.\\pipe\\veyyon-terminal-test" : path.join(root, "t.sock");
   const write = (name: string, sessionId: string, startedAtMs: number) =>
     fs.writeFileSync(path.join(terminals, name), JSON.stringify({ version: 1, sessionId, pid: process.pid, cwd: root, sessionFile: mainFile, endpoint, token: "a".repeat(64), startedAtMs }));
   write("live.json", "live", actualStart);
   write("reused.json", "reused", actualStart - 3_600_000);
-  const sessions = discoverOwners(root).map(found => found.sessionId);
+  const sessions = (await discoverOwners(root, 0)).map(found => found.sessionId);
   expect(sessions).toContain("live");
   expect(sessions).not.toContain("reused");
 });

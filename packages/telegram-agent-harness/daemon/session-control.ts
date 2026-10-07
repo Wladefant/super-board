@@ -1,8 +1,10 @@
-import { spawnSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import * as fs from "node:fs";
+import * as fsp from "node:fs/promises";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import { promisify } from "node:util";
 
 export interface DaemonSessionSummary {
   id: string;
@@ -57,27 +59,47 @@ export function isProcessAlive(pid: number): boolean {
   }
 }
 
-/** Actual process creation times (epoch ms) for the given PIDs; PIDs that cannot be read are omitted. */
-export function readProcessStartTimes(pids: number[]): Map<number, number> {
-  const times = new Map<number, number>();
+const execFileAsync = promisify(execFile);
+/** A process's creation time never changes, so a read stays good while its PID is alive. */
+const startTimeCache = new Map<number, { startMs: number; readAt: number }>();
+/** A PID can be reused after its owner dies, so a cached start time is trusted for this long, no longer. */
+const START_TIME_TTL_MS = 30_000;
+
+/**
+ * Actual process creation times (epoch ms) for the given PIDs; PIDs that cannot be read are omitted.
+ * Only PIDs not seen before cost a process spawn, and the spawn never blocks the event loop.
+ */
+export async function readProcessStartTimes(pids: number[]): Promise<Map<number, number>> {
   const unique = [...new Set(pids.filter(pid => Number.isSafeInteger(pid) && pid > 0))];
-  if (unique.length === 0) return times;
-  const run = (command: string, args: string[]): string => {
-    const result = spawnSync(command, args, { encoding: "utf8", timeout: 15_000, stdio: ["ignore", "pipe", "ignore"], windowsHide: true, env: { ...process.env, LC_ALL: "C" } });
-    return result.status === 0 ? result.stdout : "";
+  const times = new Map<number, number>();
+  const unknown: number[] = [];
+  for (const pid of unique) {
+    const known = startTimeCache.get(pid);
+    if (known === undefined || Date.now() - known.readAt > START_TIME_TTL_MS) unknown.push(pid); else times.set(pid, known.startMs);
+  }
+  if (unknown.length === 0) return times;
+  const run = async (command: string, args: string[]): Promise<string> => {
+    try {
+      const { stdout } = await execFileAsync(command, args, { encoding: "utf8", timeout: 15_000, windowsHide: true, env: { ...process.env, LC_ALL: "C" } });
+      return stdout;
+    } catch { return ""; }
   };
   if (process.platform === "win32") {
-    const script = `Get-CimInstance Win32_Process -Filter '${unique.map(pid => `ProcessId=${pid}`).join(" OR ")}' | ForEach-Object { "$($_.ProcessId) $(([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds())" }`;
-    for (const line of run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script]).split(/\r?\n/)) {
+    const script = `Get-CimInstance Win32_Process -Filter '${unknown.map(pid => `ProcessId=${pid}`).join(" OR ")}' | ForEach-Object { "$($_.ProcessId) $(([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds())" }`;
+    for (const line of (await run("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script])).split(/\r?\n/)) {
       const match = /^(\d+) (\d+)$/.exec(line.trim());
       if (match) times.set(Number(match[1]), Number(match[2]));
     }
   } else {
-    for (const line of run("ps", ["-o", "pid=,lstart=", "-p", unique.join(",")]).split("\n")) {
+    for (const line of (await run("ps", ["-o", "pid=,lstart=", "-p", unknown.join(",")])).split("\n")) {
       const match = /^\s*(\d+)\s+(.+?)\s*$/.exec(line);
       const started = match ? Date.parse(match[2]!) : Number.NaN;
       if (match && Number.isFinite(started)) times.set(Number(match[1]), started);
     }
+  }
+  for (const pid of unknown) {
+    const read = times.get(pid);
+    if (read !== undefined) startTimeCache.set(pid, { startMs: read, readAt: Date.now() });
   }
   return times;
 }
@@ -120,7 +142,24 @@ export function resolveSessionsRoots(configRoot?: string): string[] {
   return sessionRoots;
 }
 
+/** A session file's path never changes. A miss is remembered only briefly: a session that just started writes its file soon. */
+const SESSION_FILE_MISS_MS = 2_000;
+const sessionFileHits = new Map<string, string>();
+const sessionFileMisses = new Map<string, number>();
+
 export function findSessionFile(sessionId: string, sessionsRoots?: string[]): string | null {
+  const memoKey = `${sessionsRoots?.join("|") ?? ""}\0${sessionId}`;
+  const hit = sessionFileHits.get(memoKey);
+  if (hit !== undefined && fs.existsSync(hit)) return hit;
+  sessionFileHits.delete(memoKey);
+  const missedAt = sessionFileMisses.get(memoKey);
+  if (missedAt !== undefined && Date.now() - missedAt < SESSION_FILE_MISS_MS) return null;
+  const found = scanForSessionFile(sessionId, sessionsRoots);
+  if (found) { sessionFileMisses.delete(memoKey); sessionFileHits.set(memoKey, found); } else sessionFileMisses.set(memoKey, Date.now());
+  return found;
+}
+
+function scanForSessionFile(sessionId: string, sessionsRoots?: string[]): string | null {
   const roots = sessionsRoots ?? resolveSessionsRoots();
   for (const sessionsRoot of roots) {
     if (!fs.existsSync(sessionsRoot)) continue;
@@ -156,31 +195,61 @@ export function getProjectKeyFromSessionPath(sessionPath?: string | null): strin
   return parts[parts.length - 2] ?? null;
 }
 
-export function discoverOwners(configRoot?: string): Owner[] {
-  const roots = discoverConfigRoots(configRoot);
+/** How long one scan's answer is reused. The scan is I/O over every terminal file, so concurrent callers share it. */
+export const OWNER_CACHE_MS = 3_000;
+const ownerScans = new Map<string, { at: number; owners: Promise<Owner[]> }>();
+
+/**
+ * Live terminal owners. One scan answers every caller within `maxAgeMs`, and a scan in flight is shared, so a
+ * burst of callers costs one pass. Pass 0 to force a fresh scan.
+ */
+export function discoverOwners(configRoot?: string, maxAgeMs = OWNER_CACHE_MS): Promise<Owner[]> {
+  const key = configRoot ?? "";
+  const cached = ownerScans.get(key);
+  if (cached && Date.now() - cached.at < maxAgeMs) return cached.owners;
+  const entry = { at: Date.now(), owners: scanOwners(configRoot) };
+  ownerScans.set(key, entry);
+  entry.owners.catch(() => { if (ownerScans.get(key) === entry) ownerScans.delete(key); });
+  return entry.owners;
+}
+
+async function scanOwners(configRoot?: string): Promise<Owner[]> {
   const candidates: { owner: Owner; mtimeMs: number }[] = [];
-  for (const profileRoot of roots) {
+  for (const profileRoot of await discoverConfigRootsAsync(configRoot)) {
     const directory = path.join(profileRoot, "run", "terminals");
-    if (!fs.existsSync(directory)) continue;
-    for (const name of fs.readdirSync(directory)) {
-      if (!name.endsWith(".json")) continue;
+    let names: string[];
+    try { names = await fsp.readdir(directory); } catch { continue; }
+    await Promise.all(names.filter(name => name.endsWith(".json")).map(async name => {
+      const file = path.join(directory, name);
       try {
-        const file = path.join(directory, name);
-        const owner = JSON.parse(fs.readFileSync(file, "utf8"));
+        const owner = JSON.parse(await fsp.readFile(file, "utf8"));
+        if (Number.isSafeInteger(owner?.pid) && owner.pid > 0 && !isProcessAlive(owner.pid)) {
+          // The file names a process that is gone, so nothing can ever answer on it. A live PID is never judged here.
+          await fsp.rm(file, { force: true }).catch(() => {});
+          return;
+        }
         if (owner.version !== 1 || typeof owner.sessionId !== "string" || typeof owner.cwd !== "string" ||
             typeof owner.sessionFile !== "string" || typeof owner.endpoint !== "string" ||
-            typeof owner.token !== "string" || !/^[a-f0-9]{64}$/.test(owner.token) || !isProcessAlive(owner.pid)) continue;
+            typeof owner.token !== "string" || !/^[a-f0-9]{64}$/.test(owner.token) || !isProcessAlive(owner.pid)) return;
         // Never accept a TCP discovery endpoint. This is same-user local IPC, not a remote host.
-        if (process.platform === "win32" ? !owner.endpoint.startsWith("\\\\.\\pipe\\veyyon-terminal-") : !path.isAbsolute(owner.endpoint)) continue;
-        candidates.push({ owner, mtimeMs: fs.statSync(file).mtimeMs });
+        if (process.platform === "win32" ? !owner.endpoint.startsWith("\\\\.\\pipe\\veyyon-terminal-") : !path.isAbsolute(owner.endpoint)) return;
+        candidates.push({ owner, mtimeMs: (await fsp.stat(file)).mtimeMs });
       } catch { /* A terminal can exit or atomically republish while discovery runs. */ }
-    }
+    }));
   }
   // A live PID is not enough: Windows and Unix reuse PIDs, leaving stale owner files that point at strangers.
-  const startTimes = readProcessStartTimes(candidates.map(candidate => candidate.owner.pid));
+  const startTimes = await readProcessStartTimes(candidates.map(candidate => candidate.owner.pid));
+  const live = new Set(candidates.map(candidate => candidate.owner.pid));
+  for (const pid of startTimeCache.keys()) if (!live.has(pid) && !isProcessAlive(pid)) startTimeCache.delete(pid);
   return candidates
     .filter(candidate => ownerIdentityMatches(candidate.owner, candidate.mtimeMs, startTimes.get(candidate.owner.pid)))
     .map(candidate => candidate.owner);
+}
+
+async function discoverConfigRootsAsync(configRoot?: string): Promise<string[]> {
+  const root = configRoot ?? path.join(os.homedir(), process.env.VEYYON_CONFIG_DIR?.trim() || ".veyyon");
+  const profiles = await fsp.readdir(path.join(root, "profiles"), { withFileTypes: true }).catch(() => []);
+  return [root, ...profiles.filter(profile => profile.isDirectory()).map(profile => path.join(root, "profiles", profile.name))];
 }
 
 /** How long a deliver waits for the session's reply. The session may be blocked on a large write. */
@@ -296,7 +365,7 @@ export class TerminalSessionControl {
   get configRoot(): string | undefined { return this.options.configRoot; }
   isBusy(sessionId: string): boolean { return this.streaming.has(sessionId); }
   async listSessions(): Promise<DaemonSessionSummary[]> {
-    const owners = discoverOwners(this.options.configRoot);
+    const owners = await discoverOwners(this.options.configRoot);
     const counts = new Map<string, number>();
     for (const owner of owners) counts.set(owner.sessionId, (counts.get(owner.sessionId) ?? 0) + 1);
     return owners.filter(owner => counts.get(owner.sessionId) === 1).map(owner => ({
@@ -323,7 +392,9 @@ export class TerminalSessionControl {
       if (!connection.closed) return connection;
       this.connections.delete(sessionId);
     }
-    const owners = discoverOwners(this.options.configRoot).filter(owner => owner.sessionId === sessionId);
+    const named = (await discoverOwners(this.options.configRoot)).filter(owner => owner.sessionId === sessionId);
+    // A terminal that just started is not in a scan taken seconds ago.
+    const owners = named.length === 1 ? named : (await discoverOwners(this.options.configRoot, 0)).filter(owner => owner.sessionId === sessionId);
     if (owners.length !== 1) throw new SessionControlUnavailableError("No unique live terminal owner for this session; stop-before-resume with the IPC-enabled build is required");
     const pending = (async () => {
       const connection = new TerminalConnection(owners[0]!, event => {

@@ -1875,6 +1875,15 @@ class TestSharedSendBudget(unittest.TestCase):
             self.send(telegram, None, "7")
         self.assertEqual(telegram.statuses, [200])
 
+    def test_group_budget_is_keyed_by_the_chat_not_the_bot(self):
+        with patch.dict(os.environ, {"VEYYON_TELEGRAM_BUDGET_DIR": str(self.dir)}):
+            one = telegram_budget.budget_for("1", "-100")
+            two = telegram_budget.budget_for("2", "-100")
+            private = telegram_budget.budget_for("1", "7")
+        self.assertEqual(one.file, two.file)
+        self.assertEqual(one.file.name, "chat_-100.json")
+        self.assertEqual(private.file.name, "1.json")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
