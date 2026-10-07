@@ -214,6 +214,27 @@ describe("TelegramGovernor queues", () => {
     expect(telegram.sent.find((s) => s.text === "held")?.at).toBeGreaterThanOrEqual(before + 1000);
   });
 
+  test("16 messages and 4 panels in one minute make 20 sends and no 429", async () => {
+    const { clock, telegram, call } = setup();
+    const calls = [
+      ...Array.from({ length: 16 }, (_, i) => call(-100, { kind: "message" }, `m${i}`)),
+      ...Array.from({ length: 4 }, (_, i) => call(-100, { kind: "panel" }, `p${i}`)),
+    ];
+    await clock.drive(Promise.all(calls));
+    expect(telegram.statuses.filter((s) => s === 429)).toEqual([]);
+    expect(telegram.sent).toHaveLength(20);
+    expect(telegram.sent.every((s) => s.at - telegram.sent[0].at < 60_000)).toBe(true);
+  });
+
+  test("a reply to the operator is not queued behind a backlog of ordinary messages", async () => {
+    const { clock, telegram, call } = setup();
+    const bulk = Array.from({ length: 10 }, (_, i) => call(-100, { kind: "message" }, `bulk${i}`));
+    const reply = call(-100, { kind: "message", priority: true }, "reply");
+    await clock.drive(Promise.all([...bulk, reply]));
+    expect(telegram.sent.findIndex((s) => s.text === "reply")).toBeLessThan(3);
+    expect(telegram.sent).toHaveLength(11);
+  });
+
   test("a full queue refuses a new message and logs it", async () => {
     const { clock, telegram, call } = setup(undefined, { maxQueuedPerChat: 3 });
     const lines: string[] = [];

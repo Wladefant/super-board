@@ -473,6 +473,7 @@ export class TelegramPoller {
           chatId,
           kind,
           coalesceKey,
+          priority: kind === "message" && (body.reply_parameters !== undefined || body.reply_to_message_id !== undefined),
           timeoutMs: this.options.sendTimeoutMs ?? DEFAULT_SEND_TIMEOUT_MS,
           log: (line) => this.options.log?.(line),
         }, { resolve: this.options.resolveHost, governor: this.options.governor });

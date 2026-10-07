@@ -1706,13 +1706,23 @@ class TestSharedSendBudget(unittest.TestCase):
         telegram = _FakeTelegram(self.clock)
         budget = telegram_budget.SharedBudget("1", self.dir)
         start = self.clock.now_ms()
-        self.other_process("-100", 6)  # the daemon already used 6 of the 8 ordinary messages per minute
+        self.other_process("-100", 14)  # the daemon already used 14 of the 16 ordinary messages per minute
         for _ in range(4):
             self.send(telegram, budget, "-100", deadline=300.0)
         self.assertEqual(telegram.statuses, [200] * 4)
         # Only 2 of the 4 fit in the first minute: the third waits for the daemon's first send to leave the window.
         self.assertLess(telegram.sent[1]["at"] - start, 60_000)
         self.assertGreaterEqual(telegram.sent[2]["at"] - start, 60_000)
+
+    def test_group_takes_16_messages_and_4_panels_in_one_minute(self):
+        self.other_process("-100", 16)
+        self.other_process("-100", 4, "panel")  # every one of the 20 sends fits: wait_ms is asserted 0 inside
+        telegram = _FakeTelegram(self.clock)
+        budget = telegram_budget.SharedBudget("1", self.dir)
+        start = self.clock.now_ms()
+        self.send(telegram, budget, "-100", deadline=300.0)
+        self.assertEqual(telegram.statuses, [200])
+        self.assertGreater(telegram.sent[0]["at"], start)  # the 21st send had to wait for the window
 
     def test_retry_after_recorded_by_one_process_holds_back_the_other(self):
         budget = telegram_budget.SharedBudget("1", self.dir)

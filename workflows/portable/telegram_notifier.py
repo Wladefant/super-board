@@ -240,7 +240,7 @@ def _governed_urlopen(
 ) -> bytes:
     """``_safe_urlopen`` for a send into ``chat_id``, inside the per-bot budget shared with the daemon.
 
-    Waits for the shared per-chat budget (1 send/s, groups 20/min with 12 kept for panels), books the send,
+    Waits for the shared per-chat budget (1 send/s, groups 20/min with 4 kept for panels), books the send,
     and after a 429 records ``retry_after`` in the shared file and retries once. A wait that would not fit
     in ``deadline`` is never slept through: the send is not made and BudgetBlocked (or the 429 as
     HTTPError) is raised.
