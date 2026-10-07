@@ -1714,6 +1714,18 @@ class TestSharedSendBudget(unittest.TestCase):
         self.assertLess(telegram.sent[1]["at"] - start, 60_000)
         self.assertGreaterEqual(telegram.sent[2]["at"] - start, 60_000)
 
+    def test_bot_wide_block_in_the_bot_file_holds_a_group_send(self):
+        telegram = _FakeTelegram(self.clock)
+        group = telegram_budget.SharedBudget("chat_-100", self.dir)
+        bot = telegram_budget.SharedBudget("1", self.dir)
+        start = self.clock.now_ms()
+        bot.update(lambda s: telegram_budget.record_rate_limit(s, None, start + 5000), start)
+        req = urllib.request.Request("https://api.telegram.org/bot1:T/sendMessage", data=json.dumps({"chat_id": "-100"}).encode())
+        with patch("telegram_notifier._safe_urlopen", side_effect=telegram.urlopen):
+            _governed_urlopen(req, "1:T", "-100", deadline=60.0, budget=group, bot_budget=bot,
+                              now_ms=self.clock.now_ms, sleep=self.clock.sleep)
+        self.assertGreaterEqual(telegram.sent[0]["at"] - start, 5000)
+
     def test_group_takes_16_messages_and_4_panels_in_one_minute(self):
         self.other_process("-100", 16)
         self.other_process("-100", 4, "panel")  # every one of the 20 sends fits: wait_ms is asserted 0 inside
