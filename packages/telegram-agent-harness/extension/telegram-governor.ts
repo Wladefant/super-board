@@ -314,7 +314,7 @@ export class TelegramGovernor {
       }
     }
     // A reply to the operator is waiting in this chat: ordinary messages let it take the next slot.
-    if (!entry.priority && entry.kind !== "panel" && state.urgentActive > 0) return Math.max(readyAt - now, 0) + 1;
+    if (!entry.priority && entry.kind !== "panel" && state.urgentActive > 0) return Math.max(readyAt - now, 50);
     if (readyAt <= now) {
       // The local budget allows it; the file also counts the other processes' sends to this chat.
       const claim = await this.shared?.update((ledger) => reserve(ledger, chat, entry.kind, now, this.config()), now);

@@ -233,6 +233,8 @@ const UPDATE_LEDGER_ADDITIVE_COLUMNS: Record<string, string> = {
   media_json: "TEXT",
   sender_origin: "TEXT",
   message_thread_id: "INTEGER",
+  message_date: "REAL",
+  completed_at: "REAL",
 };
 
 /**
@@ -371,6 +373,12 @@ export class TelegramPoller {
         this.db.run(`ALTER TABLE update_ledger ADD COLUMN ${column} ${columnType};`);
       }
     }
+    // Inbound latency: message_date (Telegram) -> received_at (poller) -> completed_at (handled by the harness).
+    this.db.run(
+      `CREATE TRIGGER IF NOT EXISTS update_ledger_completed_at AFTER UPDATE OF status ON update_ledger
+       WHEN NEW.status = 'COMPLETED' AND NEW.completed_at IS NULL
+       BEGIN UPDATE update_ledger SET completed_at = (julianday('now') - 2440587.5) * 86400.0 WHERE update_id = NEW.update_id; END;`,
+    );
   }
 
   public getNextContiguousOffset(): number {
@@ -1015,6 +1023,9 @@ export class TelegramPoller {
           [msg?.from?.is_bot ? "agent" : msg?.from ? "telegram_account" : "unknown", update.update_id]);
         this.db.run("UPDATE update_ledger SET message_thread_id = ? WHERE update_id = ?",
           [msg?.message_thread_id ?? null, update.update_id]);
+        if (typeof msg?.date === "number") {
+          this.db.run("UPDATE update_ledger SET message_date = ? WHERE update_id = ?", [msg.date, update.update_id]);
+        }
       }
       this.db.run("COMMIT;");
     } catch (err: unknown) {
