@@ -1006,8 +1006,22 @@ async function waitForTarget(page, selector, timeoutMs, { visible = true } = {})
       const found = await queryAll(page, selector);
       return { handles: found, shown: await pickShown(page, found) };
     });
-    if (shown) return shown;
-    if (!visible && handles.length > 0) return handles[0];
+    if (shown) {
+      for (const h of handles) {
+        if (h !== shown) await h.dispose().catch(() => {});
+      }
+      return shown;
+    }
+    if (!visible && handles.length > 0) {
+      const target = handles[0];
+      for (let i = 1; i < handles.length; i++) {
+        await handles[i].dispose().catch(() => {});
+      }
+      return target;
+    }
+    for (const h of handles) {
+      await h.dispose().catch(() => {});
+    }
     if (Date.now() >= deadline) return null;
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
@@ -1029,7 +1043,12 @@ function currentTarget(page, selector) {
 
 async function currentTargetOnce(page, selector) {
   const handles = await queryAll(page, selector);
-  return (await pickShown(page, handles)) || handles[0] || null;
+  const picked = await pickShown(page, handles);
+  const target = picked || handles[0] || null;
+  for (const h of handles) {
+    if (h !== target) await h.dispose().catch(() => {});
+  }
+  return target;
 }
 
 /**
@@ -1136,11 +1155,13 @@ async function inspectTargetElement(page, selectorOrHandle, scroll = true) {
 
 async function inspectTargetElementOnce(page, selectorOrHandle, scroll) {
   if (!selectorOrHandle) return null;
-  const handle = typeof selectorOrHandle === 'string'
+  const isString = typeof selectorOrHandle === 'string';
+  const handle = isString
     ? await currentTargetOnce(page, selectorOrHandle)
     : selectorOrHandle;
   if (!handle) return null;
-  return page.evaluate((el, doScroll) => {
+  try {
+    return await page.evaluate((el, doScroll) => {
     if (doScroll) el.scrollIntoView({ block: 'center', inline: 'nearest' });
 
     const rect = el.getBoundingClientRect();
@@ -1245,7 +1266,12 @@ async function inspectTargetElementOnce(page, selectorOrHandle, scroll) {
       pointElementInfo: { isTargetOrDescendant, coveringElementDescription },
       isConnected: el.isConnected
     };
-  }, handle, scroll);
+    }, handle, scroll);
+  } finally {
+    if (isString) {
+      await handle.dispose().catch(() => {});
+    }
+  }
 }
 
 /**
@@ -1628,12 +1654,13 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
 
     case 'assert': {
       if (step.selector) {
-        let el = null;
         let exists = false;
         if (step.expected_present !== false) {
-          await waitForTarget(page, step.selector, timeoutMs, { visible: false });
-          el = await currentTarget(page, step.selector);
-          exists = !!el;
+          const target = await waitForTarget(page, step.selector, timeoutMs, { visible: false });
+          exists = !!target;
+          if (target) {
+            await target.dispose().catch(() => {});
+          }
           if (!exists) {
             checksResults.push({
               name: 'assert_present',
@@ -1645,12 +1672,30 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
           const deadline = Date.now() + Math.min(timeoutMs, 6000);
           let shownCand = null;
           while (Date.now() < deadline) {
-            shownCand = await retryOnNavigation(page, async () => pickShown(page, await queryAll(page, step.selector)));
+            shownCand = await retryOnNavigation(page, async () => {
+              const handles = await queryAll(page, step.selector);
+              const pick = await pickShown(page, handles);
+              for (const h of handles) {
+                if (h !== pick) await h.dispose().catch(() => {});
+              }
+              return pick;
+            });
             if (!shownCand) break;
-            await new Promise(r => setTimeout(r, 100));
+            await shownCand.dispose().catch(() => {});
+            shownCand = null;
+            await new Promise((r) => setTimeout(r, 100));
           }
-          const shownEl = await retryOnNavigation(page, async () => pickShown(page, await queryAll(page, step.selector)));
-          if (shownEl) {
+          const shownEl = await retryOnNavigation(page, async () => {
+            const handles = await queryAll(page, step.selector);
+            const pick = await pickShown(page, handles);
+            for (const h of handles) {
+              if (h !== pick) await h.dispose().catch(() => {});
+            }
+            return pick;
+          });
+          const absent = !shownEl;
+          if (shownEl) await shownEl.dispose().catch(() => {});
+          if (!absent) {
             checksResults.push({
               name: 'assert_absent',
               passed: false,
@@ -1658,27 +1703,55 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
             });
           }
         }
-        if (step.expected_visible !== undefined && exists) {
-          const shown = await isShown(page, el);
+
+        if (step.expected_visible !== undefined && (exists || step.expected_present === false)) {
+          const deadline = Date.now() + Math.min(timeoutMs, 6000);
+          let shown = false;
+          let matched = false;
+          while (Date.now() < deadline) {
+            const current = await currentTarget(page, step.selector);
+            if (current) {
+              try {
+                shown = await isShown(page, current);
+              } finally {
+                await current.dispose().catch(() => {});
+              }
+            } else {
+              shown = false;
+            }
+            if (shown === step.expected_visible) {
+              matched = true;
+              break;
+            }
+            await new Promise((r) => setTimeout(r, 100));
+          }
           checksResults.push({
             name: 'assert_visible',
-            passed: shown === step.expected_visible,
-            detail: shown === step.expected_visible
+            passed: matched,
+            detail: matched
               ? `Element "${step.selector}" visibility is ${shown}`
               : `Expected visibility ${step.expected_visible}, got ${shown}`
           });
         }
-        if (step.expected_text && exists) {
+
+        if (step.expected_text && (exists || step.expected_present === false)) {
           const deadline = Date.now() + Math.min(timeoutMs, 6000);
           let text = '';
           let textMatches = false;
           while (Date.now() < deadline) {
-            text = await page.evaluate(e => e.textContent, el);
-            if (text && text.includes(step.expected_text)) {
-              textMatches = true;
-              break;
+            const current = await currentTarget(page, step.selector);
+            if (current) {
+              try {
+                text = (await page.evaluate((e) => e.textContent, current)) || '';
+              } finally {
+                await current.dispose().catch(() => {});
+              }
+              if (text && text.includes(step.expected_text)) {
+                textMatches = true;
+                break;
+              }
             }
-            await new Promise(r => setTimeout(r, 150));
+            await new Promise((r) => setTimeout(r, 150));
           }
           checksResults.push({
             name: 'assert_text',
