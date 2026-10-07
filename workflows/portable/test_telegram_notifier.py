@@ -1749,9 +1749,10 @@ class TestSharedSendBudget(unittest.TestCase):
         start = self.clock.now_ms()
         pre = telegram_budget.SharedBudget("1", self.dir)
         pre.update(lambda s: telegram_budget.record_rate_limit(s, None, start + 5000), start)
-        telegram, _group, start = self._group_send_with_sleep_hook(
+        telegram, group, start = self._group_send_with_sleep_hook(
             lambda bot: bot.update(lambda s: telegram_budget.record_rate_limit(s, None, start + 10000), self.clock.now_ms()))
         self.assertGreaterEqual(telegram.sent[0]["at"] - start, 10000)
+        self.assertEqual(len(group._read()["chats"]["-100"]["sends"]), 1)  # one booking, not one per wait
 
     def test_a_bot_wide_block_set_during_the_group_acquire_is_honoured(self):
         start = self.clock.now_ms()
@@ -1760,6 +1761,7 @@ class TestSharedSendBudget(unittest.TestCase):
         telegram, _group, start = self._group_send_with_sleep_hook(
             lambda bot: bot.update(lambda s: telegram_budget.record_rate_limit(s, None, start + 10000), self.clock.now_ms()))
         self.assertGreaterEqual(telegram.sent[0]["at"] - start, 10000)
+        self.assertEqual(len(group._read()["chats"]["-100"]["sends"]), 2)  # the pre-booked one plus this send, never three
 
     def test_group_takes_16_messages_and_4_panels_in_one_minute(self):
         self.other_process("-100", 16)

@@ -260,8 +260,10 @@ def _governed_urlopen(
     for attempt in range(2):
         # Re-check the bot-wide block after every sleep and after the group acquire (which can itself
         # sleep): a block can grow or appear while this send waits. Leave the loop only when none is active.
+        # The slot is booked once per attempt; a block found after the booking is slept through without
+        # booking a second slot (the booked time is already past once the block ends).
+        booked = False
         while True:
-            blocked_ms = 0
             if bot_budget is not None and bot_budget is not budget:
                 now = now_ms()
                 blocked_ms = bot_budget.update(lambda state: max(0, state.get("botBlockedUntil", 0) - now), now) or 0
@@ -270,12 +272,10 @@ def _governed_urlopen(
                         raise telegram_budget.BudgetBlocked(int(blocked_ms), "retry_after")
                     sleep(blocked_ms / 1000)
                     continue
+            if booked:
+                break
             telegram_budget.acquire(budget, chat_id, "message", max_wait_ms=remaining_ms(), now_ms=now_ms, sleep=sleep)
-            if bot_budget is None or bot_budget is budget:
-                break
-            now = now_ms()
-            if not (bot_budget.update(lambda state: max(0, state.get("botBlockedUntil", 0) - now), now) or 0) > 0:
-                break
+            booked = True
         try:
             return _safe_urlopen(req, timeout=timeout, deadline=max(1.0, remaining_ms() / 1000))
         except urllib.error.HTTPError as err:
