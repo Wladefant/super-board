@@ -195,3 +195,59 @@ def test_process_that_exited_or_was_replaced_before_kill_is_not_killed(tmp_path)
     second = table(proc(710, 99985, "python.exe", RUNNER, age_s=10))
     _, killed = _run(tmp_path, first, second, live=True)
     assert killed == []
+
+
+# ---------- veyyon daemon brokers (https://github.com/Wladefant/veyyon/issues/513) ----------
+
+BROKER = r"C:\Users\x\AppData\Local\veyyon\veyyon.exe __veyyon_worker_daemon_broker"
+
+
+def test_broker_with_dead_parent_is_reaped() -> None:
+    procs = table(proc(800, 99970, "veyyon.exe", BROKER, age_s=3600))  # parent 99970 does not exist
+    d, _ = run_classify(procs)
+    assert actions(d)[800] == "reap"
+    assert "orphan broker" in d[0].reason and d[0].group == "broker"
+
+
+def test_broker_with_live_parent_is_kept_even_when_many() -> None:
+    procs = table(*[proc(810 + i, 100, "veyyon.exe", BROKER, age_s=3000) for i in range(40)])
+    d, _ = run_classify(procs)
+    assert len(d) == 40 and all(x.action == "keep" for x in d)
+    assert "alive" in d[0].reason
+
+
+def test_broker_whose_parent_pid_was_reused_is_reaped() -> None:
+    # pid 150 exists but started after the broker, so it is not the broker's parent
+    procs = table(proc(860, 150, "veyyon.exe", BROKER, age_s=3600), proc(150, 10, "veyyon.exe", age_s=60))
+    d, _ = run_classify(procs)
+    assert actions(d)[860] == "reap"
+
+
+def test_young_or_busy_orphan_broker_is_kept() -> None:
+    procs = table(
+        proc(870, 99971, "veyyon.exe", BROKER, age_s=600),  # younger than 30 min
+        proc(871, 99972, "veyyon.exe", BROKER, age_s=3600, cpu=1.0),  # busy below
+    )
+    d, _ = run_classify(procs, resample={871: 4.0})
+    assert actions(d) == {870: "keep", 871: "keep"}
+
+
+def test_main_session_and_look_alikes_are_never_reaped_as_brokers() -> None:
+    procs = table(
+        proc(880, 99973, "veyyon.exe", r"C:\Users\x\AppData\Local\veyyon\veyyon.exe"),  # a Main, dead parent
+        proc(881, 99974, "veyyon.exe", r"veyyon.exe __veyyon_worker_js_eval_process"),  # other worker
+        proc(882, 99975, "python.exe", "python.exe __veyyon_worker_daemon_broker"),  # wrong executable
+        proc(883, 99976, "veyyon.exe", r"veyyon.exe --note __veyyon_worker_daemon_broker_x"),  # longer token
+    )
+    d, _ = run_classify(procs)
+    assert d == []
+
+
+def test_live_run_kills_only_the_orphan_broker(tmp_path) -> None:
+    procs = table(
+        proc(890, 99977, "veyyon.exe", BROKER, age_s=7200, rss=190 * 1048576),  # orphan
+        proc(891, 100, "veyyon.exe", BROKER, age_s=3000),  # live Main parent
+    )
+    result, killed = _run(tmp_path, procs, live=True)
+    assert killed == [890]
+    assert result["by_group"] == {"broker": 1} and result["freed_mb"] == 190.0
