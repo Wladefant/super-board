@@ -33,8 +33,8 @@ Invariants:
     - Release by non-owner is strictly refused.
     - Stale locks are reclaimed with a logged notice. A live `run` holder is never reclaimed for a
       stale heartbeat, however old: its wrapper process (`build_slot.py run`) waits for the command
-      and releases in `finally`, so a dead wrapper is reclaimed immediately and a live one keeps
-      the slot.
+      and releases in `finally`, so a dead wrapper is reclaimed immediately, a recycled wrapper PID
+      is reclaimed by process creation identity, and a genuine live one keeps the slot.
       Heartbeats survive a foreign handle on info.json: if the replace fails, the heartbeat is
       written to heartbeat.json in the lock dir and readers fold it in; our own readers open
       files with FILE_SHARE_DELETE and close them before parsing (#690).
@@ -94,7 +94,7 @@ INFO_FILE_NAME = "info.json"
 HEARTBEAT_FILE_NAME = "heartbeat.json"  # fallback heartbeat, written when info.json cannot be replaced
 DEFAULT_ACQUIRE_HOLDER_STALE_SECONDS = 30 * 60  # a live-PID `acquire` holder silent this long was abandoned (#620)
 
-DEFAULT_LOCK_HEARTBEAT_STALE_SECONDS = 5 * 60  # a live `run` holder silent this long is hung
+DEFAULT_LOCK_HEARTBEAT_STALE_SECONDS = 5 * 60  # legacy threshold; live wrapper is preserved by process identity
 DEFAULT_POLL_INTERVAL_SECONDS = 5.0
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 10.0  # update queue entry heartbeat every <=15s
 DEFAULT_QUEUE_STALE_HEARTBEAT_SECONDS = 60.0  # reclaim if heartbeat older than 60s
@@ -276,6 +276,8 @@ def _read_file_bytes(path: str) -> bytes:
     FILE_SHARE_DELETE, which Python's open() never sets: a plain open() makes every
     os.replace of the file fail with WinError 5 for as long as the reader holds it, and
     waiters poll lock info all day (#690).
+    A failed ReadFile raises its WinError immediately and closes the handle; it never
+    returns partial data as EOF and never falls back to an unshared open() retry.
     """
     if sys.platform == "win32":
         try:
@@ -302,15 +304,21 @@ def _read_file_bytes(path: str) -> bytes:
             try:
                 buf = ctypes.create_string_buffer(65536)
                 got = wintypes.DWORD(0)
-                while k32.ReadFile(handle, buf, 65536, ctypes.byref(got), None) and got.value:
+                while True:
+                    ok = k32.ReadFile(handle, buf, 65536, ctypes.byref(got), None)
+                    if not ok:
+                        err = ctypes.get_last_error()
+                        if err == 38:  # ERROR_HANDLE_EOF
+                            break
+                        raise ctypes.WinError(err)
+                    if got.value == 0:
+                        break
                     chunks.append(buf.raw[: got.value])
             finally:
                 k32.CloseHandle(handle)
             return b"".join(chunks)
-        except FileNotFoundError:
+        except (FileNotFoundError, OSError):
             raise
-        except OSError:
-            pass  # fall back to a plain open below
     with open(path, "rb") as f:
         return f.read()
 
@@ -324,7 +332,7 @@ def _merge_side_heartbeat(lock_dir: str, info: Dict[str, Any]) -> None:
     """
     Folds the fallback heartbeat file into info when it belongs to the same holding and is
     newer. A holder whose info.json replace keeps failing (a foreign handle on the file)
-    still proves it is alive through this file.
+    still proves it is alive through this file and preserves its run mode metadata.
     """
     try:
         side = _read_json_file(os.path.join(lock_dir, HEARTBEAT_FILE_NAME))
@@ -338,6 +346,9 @@ def _merge_side_heartbeat(lock_dir: str, info: Dict[str, Any]) -> None:
         info["heartbeat_at_epoch"] = side_epoch
         if side.get("heartbeat_at"):
             info["heartbeat_at"] = side["heartbeat_at"]
+    for key in ("wrapper_pid", "child_pid", "wrapper_created_ticks", "wrapper_created_epoch"):
+        if side.get(key) is not None and info.get(key) is None:
+            info[key] = side[key]
 
 
 def _parse_timestamp(val: Any) -> Optional[float]:
@@ -454,6 +465,56 @@ def _win_process_details(pids: List[int]) -> Tuple[Dict[int, Optional[str]], Dic
             k32.CloseHandle(handle)
     return cmdlines, created
 
+
+
+def _get_process_create_ticks(pid: int) -> Optional[int]:
+    """Returns creation time (FILETIME ticks) for a process, or None if unavailable."""
+    if pid <= 0:
+        return None
+    if sys.platform == "win32":
+        try:
+            from ctypes import wintypes
+
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.OpenProcess.restype = wintypes.HANDLE
+            k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            k32.GetProcessTimes.argtypes = (wintypes.HANDLE,) + (ctypes.POINTER(wintypes.FILETIME),) * 4
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            handle = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return None
+            try:
+                times = [wintypes.FILETIME() for _ in range(4)]
+                if k32.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
+                    return (times[0].dwHighDateTime << 32) | times[0].dwLowDateTime
+            finally:
+                k32.CloseHandle(handle)
+        except Exception:
+            return None
+    return None
+
+
+def _get_process_create_epoch(pid: int) -> Optional[float]:
+    """Returns process creation time as epoch seconds, or None if unavailable."""
+    if pid <= 0:
+        return None
+    ticks = _get_process_create_ticks(pid)
+    if ticks is not None:
+        return (ticks - 116444736000000000) / 10000000.0
+    try:
+        import psutil  # type: ignore
+
+        return float(psutil.Process(pid).create_time())
+    except Exception:
+        pass
+    try:
+        proc_stat = f"/proc/{pid}"
+        if os.path.isdir(proc_stat):
+            return float(os.stat(proc_stat).st_mtime)
+    except Exception:
+        pass
+    return None
 
 _MAX_ANCESTOR_DEPTH = 64
 
@@ -1051,6 +1112,7 @@ class BuildSlotManager:
         pid: int,
         token: Optional[str] = None,
         child_pid: Optional[int] = None,
+        wrapper_pid: Optional[int] = None,
     ) -> None:
         """Writes info.json inside the newly created lock directory for slot_idx."""
         if slot_idx >= len(self.slot_dirs):
@@ -1071,6 +1133,14 @@ class BuildSlotManager:
         }
         if child_pid is not None:
             info["child_pid"] = child_pid
+        if wrapper_pid is not None:
+            info["wrapper_pid"] = wrapper_pid
+            created_ticks = _get_process_create_ticks(wrapper_pid)
+            if created_ticks is not None:
+                info["wrapper_created_ticks"] = created_ticks
+            created_epoch = _get_process_create_epoch(wrapper_pid)
+            if created_epoch is not None:
+                info["wrapper_created_epoch"] = created_epoch
         _write_json_atomic(info_path, info)
 
     def _write_lock_info(self, owner: str, pid: int, token: Optional[str] = None) -> None:
@@ -1525,6 +1595,14 @@ class BuildSlotManager:
             if token:
                 info["token"] = token
                 info["run_token"] = token
+            if info.get("wrapper_created_ticks") is None:
+                ticks = _get_process_create_ticks(wrapper_pid)
+                if ticks is not None:
+                    info["wrapper_created_ticks"] = ticks
+            if info.get("wrapper_created_epoch") is None:
+                ep = _get_process_create_epoch(wrapper_pid)
+                if ep is not None:
+                    info["wrapper_created_epoch"] = ep
             info["heartbeat_at"] = now_iso
             info["heartbeat_at_epoch"] = now
             return self._write_heartbeat(name, slot_idx, slot_dir, info)
@@ -1566,11 +1644,15 @@ class BuildSlotManager:
             print(msg, file=sys.stderr)
             logger.warning(msg)
             try:
-                _write_json_atomic(side_path, {
+                side_data: Dict[str, Any] = {
                     "token": info.get("token"),
                     "heartbeat_at": info.get("heartbeat_at"),
                     "heartbeat_at_epoch": info.get("heartbeat_at_epoch"),
-                }, prefix=".hb-")
+                }
+                for key in ("wrapper_pid", "child_pid", "wrapper_created_ticks", "wrapper_created_epoch"):
+                    if info.get(key) is not None:
+                        side_data[key] = info[key]
+                _write_json_atomic(side_path, side_data, prefix=".hb-")
                 return True
             except Exception as e2:
                 msg = f"[HEARTBEAT] Failed to write heartbeat for '{name}' (slot {slot_idx}): {e2}"
@@ -1591,14 +1673,13 @@ class BuildSlotManager:
     ) -> bool:
         """
         Checks if the currently held lock is stale. A live `run` holder is never reclaimed on
-        age alone: a build that runs past any fixed age must keep its slot.
-        A heartbeat counts as fresh when younger than the grace period (default 60s).
+        age or stale heartbeat alone: a build that runs past any fixed age must keep its slot.
         Reclaims it if:
-          1. `run` lock (has wrapper_pid): the wrapper is dead, the lock is older than the
-             grace period and the heartbeat is not fresh; or the wrapper is alive but its
-             heartbeat (written every 5s) is older than heartbeat_stale_after, so it hung.
-             A dead wrapped command (a shim or launcher) never frees the slot: the wrapper
-             waits for its command and releases in `finally`.
+          1. `run` lock (has wrapper_pid): the wrapper PID is dead; or the wrapper PID is alive
+             but proven recycled (mismatched creation identity, or created after lock was acquired).
+             A genuine live wrapper or one with unknown identity is never reclaimed on age or
+             heartbeat staleness. A dead wrapped command (a shim or launcher) never frees the slot:
+             the wrapper waits for its command and releases in `finally`.
           2. Other locks (`acquire` mode, which has no process left to heartbeat): owner
              PID is dead AND lock age exceeds grace period (and heartbeat not fresh); or the
              owner PID is alive (the lane's host) but the heartbeat, or the lock age when
@@ -1663,10 +1744,35 @@ class BuildSlotManager:
                         is_stale = True
                         reason = f"owner PID {holder_pid} is dead (owner='{owner}', slot {slot_idx})"
                     elif holder_pid > 0 and wrapper_pid:
-                        # A live `run` wrapper owns its slot until it releases in `finally` or dies.
-                        # A stale heartbeat only means the writes failed or the host is starved, so it
-                        # never frees the slot; a second holder would run a build beside it (#690).
-                        pass
+                        # A `run` wrapper. Check if the live PID was recycled by comparing creation identity.
+                        recorded_ticks = info.get("wrapper_created_ticks")
+                        recorded_epoch = info.get("wrapper_created_epoch")
+                        current_ticks = _get_process_create_ticks(holder_pid)
+                        current_epoch = _get_process_create_epoch(holder_pid)
+                        if recorded_ticks is not None and current_ticks is not None:
+                            if current_ticks != recorded_ticks:
+                                is_stale = True
+                                reason = (
+                                    f"wrapper PID {holder_pid} was recycled (creation ticks mismatch: "
+                                    f"recorded={recorded_ticks}, current={current_ticks}, slot {slot_idx})"
+                                )
+                        elif recorded_epoch is not None and current_epoch is not None:
+                            if abs(current_epoch - recorded_epoch) > 1.0:
+                                is_stale = True
+                                reason = (
+                                    f"wrapper PID {holder_pid} was recycled (creation epoch mismatch: "
+                                    f"recorded={recorded_epoch:.1f}, current={current_epoch:.1f}, slot {slot_idx})"
+                                )
+                        elif acquired_epoch is not None:
+                            # Legacy lock: check if live process was proven created after the lock was acquired
+                            if current_ticks is not None:
+                                acquired_ticks = int(acquired_epoch * 10000000) + 116444736000000000
+                                if current_ticks > acquired_ticks + 10000000:
+                                    is_stale = True
+                                    reason = f"wrapper PID {holder_pid} was recycled (created after lock acquired, slot {slot_idx})"
+                            elif current_epoch is not None and current_epoch > acquired_epoch + 1.0:
+                                is_stale = True
+                                reason = f"wrapper PID {holder_pid} was recycled (created after lock acquired, slot {slot_idx})"
                     elif holder_pid > 0 and silence >= limit:
                         is_stale = True
                         reason = (
@@ -1697,6 +1803,7 @@ class BuildSlotManager:
         priority: bool = False,
         next_dir: Optional[str] = None,
         cwd: Optional[str] = None,
+        wrapper_pid: Optional[int] = None,
     ) -> bool:
         """
         Acquires the build slot lock for 'name'.
@@ -1950,7 +2057,7 @@ class BuildSlotManager:
                                 try:
                                     os.mkdir(slot_dir)
                                     # Atomic creation succeeded! We own slot_idx.
-                                    self._write_slot_info(slot_idx, owner=name, pid=pid, token=token)
+                                    self._write_slot_info(slot_idx, owner=name, pid=pid, token=token, wrapper_pid=wrapper_pid)
                                     self._record_last_acquired_at(name, pid, slot_idx)
                                     acquired = True
                                     self._dequeue_own_entry(name, pid, token, self.queue_grant_cleanup_grace)
@@ -2245,9 +2352,9 @@ class BuildSlotManager:
         Holds the lock ONLY for the duration of the command, and guarantees
         release upon command completion or failure.
         Records the wrapper PID (this process, the lock's liveness source), the wrapped
-        child's PID, a per-run token, and maintains a heartbeat. The lock is reclaimed
-        by others only once this wrapper is dead (after the grace period), or when it
-        stops heartbeating for longer than heartbeat_stale_after.
+        child's PID, process creation identity, a per-run token, and maintains a heartbeat.
+        The lock is reclaimed by others only once this wrapper is dead (after the grace period),
+        or if the wrapper PID is proven to have been recycled.
         Returns the command exit code, or 1 if lock could not be acquired.
         """
         run_token = str(uuid.uuid4())
@@ -2265,6 +2372,7 @@ class BuildSlotManager:
                 priority=priority,
                 next_dir=next_dir,
                 cwd=cwd,
+                wrapper_pid=runner_pid,
             )
         except Exception as e:
             print(f"[RUN] Failed to acquire build slot lock for '{name}': {e}", file=sys.stderr)
@@ -2288,7 +2396,20 @@ class BuildSlotManager:
             child_pid = proc.pid
 
             # Record wrapper and child PIDs and the initial heartbeat in lock info
-            self._record_run_child(name=name, wrapper_pid=runner_pid, child_pid=child_pid, token=run_token)
+            recorded = self._record_run_child(name=name, wrapper_pid=runner_pid, child_pid=child_pid, token=run_token)
+            if not recorded:
+                msg = f"[RUN] Failed to record wrapper metadata for '{name}'; terminating command to prevent running under acquire-mode expiry."
+                print(msg, file=sys.stderr)
+                logger.error(msg)
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=5.0)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                return 1
 
             # Start background heartbeat while child runs
             def _heartbeat_worker():
