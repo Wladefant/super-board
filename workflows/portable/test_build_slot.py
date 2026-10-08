@@ -1058,7 +1058,7 @@ class TestBuildSlot(unittest.TestCase):
         self.assertTrue(acquired)
         self.assertFalse(os.path.exists(queue_lock_dir))
 
-        # Live PID lock is NEVER reclaimed on age
+        # A live PID lock younger than max_hold is not reclaimed on age
         os.makedirs(queue_lock_dir, exist_ok=True)
         with open(info_path, "w", encoding="utf-8") as f:
             json.dump({
@@ -1068,7 +1068,7 @@ class TestBuildSlot(unittest.TestCase):
             }, f)
 
         with self.assertRaises(TimeoutError):
-            with _queue_atomic_lock(self.run_dir, timeout=0.1, retry_interval=0.01, stale_after=5.0):
+            with _queue_atomic_lock(self.run_dir, timeout=0.1, retry_interval=0.01, stale_after=5.0, max_hold=7200.0):
                 pass
         self.assertTrue(os.path.isdir(queue_lock_dir))
     def test_acquire_survives_heartbeat_timeout(self):
@@ -2487,7 +2487,7 @@ class TestBuildSlot(unittest.TestCase):
 
     def test_regression_queue_lock_never_age_reclaimed_for_live_pid_and_releaser_does_not_delete_successor(self):
         """
-        Regression 2: Live queue locks must NEVER be age-reclaimed; only dead PIDs are reclaimed.
+        Regression 2: a live queue lock younger than max_hold is never reclaimed (leaked ones are, see #690).
         Releaser must verify unique ownership token before deleting queue lock directory,
         so it never deletes a successor's lock directory.
         """
@@ -2507,9 +2507,9 @@ class TestBuildSlot(unittest.TestCase):
 
         # A contender attempting to acquire with stale_after=1.0s must NOT reclaim this live lock
         with self.assertRaises(TimeoutError):
-            with _queue_atomic_lock(self.run_dir, timeout=0.1, retry_interval=0.02, stale_after=1.0):
+            with _queue_atomic_lock(self.run_dir, timeout=0.1, retry_interval=0.02, stale_after=1.0, max_hold=7200.0):
                 pass
-        self.assertTrue(os.path.isdir(queue_lock_dir), "Live PID queue lock must not be reclaimed on age")
+        self.assertTrue(os.path.isdir(queue_lock_dir), "Live PID queue lock younger than max_hold must not be reclaimed")
 
         # Part B: Releaser must not delete successor lock with different token
         shutil.rmtree(queue_lock_dir, ignore_errors=True)
@@ -2775,6 +2775,49 @@ class TestBuildSlot(unittest.TestCase):
             with _queue_atomic_lock(self.run_dir):
                 pass
         self.assertEqual(refusals["left"], 0)
+        self.assertFalse(os.path.exists(queue_lock_dir))
+
+    def test_queue_lock_leaked_by_live_owner_is_reclaimed(self):
+        """A live process that leaked the queue lock (release lost to open info.json) must not block waiters."""
+        queue_lock_dir = os.path.join(self.run_dir, build_slot.QUEUE_LOCK_NAME)
+        os.makedirs(queue_lock_dir)
+        with open(os.path.join(queue_lock_dir, build_slot.INFO_FILE_NAME), "w") as f:
+            json.dump({"pid": os.getpid(), "token": "leaked", "acquired_at_epoch": time.time() - 3600}, f)
+        with _queue_atomic_lock(self.run_dir, timeout=2.0):
+            pass
+        self.assertFalse(os.path.exists(queue_lock_dir))
+
+    def test_queue_lock_held_briefly_by_live_owner_is_not_reclaimed(self):
+        queue_lock_dir = os.path.join(self.run_dir, build_slot.QUEUE_LOCK_NAME)
+        os.makedirs(queue_lock_dir)
+        with open(os.path.join(queue_lock_dir, build_slot.INFO_FILE_NAME), "w") as f:
+            json.dump({"pid": os.getpid(), "token": "fresh", "acquired_at_epoch": time.time()}, f)
+        with self.assertRaises(TimeoutError):
+            with _queue_atomic_lock(self.run_dir, timeout=0.3):
+                pass
+        self.assertTrue(os.path.exists(queue_lock_dir))
+
+    def test_acquire_does_not_overshoot_timeout_while_queue_lock_is_held(self):
+        """Each queue-lock attempt is capped at the time left, so --timeout is not exceeded by a full 10 s attempt."""
+        queue_lock_dir = os.path.join(self.run_dir, build_slot.QUEUE_LOCK_NAME)
+        os.makedirs(queue_lock_dir)
+        with open(os.path.join(queue_lock_dir, build_slot.INFO_FILE_NAME), "w") as f:
+            json.dump({"pid": os.getpid(), "token": "busy", "acquired_at_epoch": time.time()}, f)
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        start = time.time()
+        ok = manager.acquire("capped-lane", timeout=1.0, poll_interval=0.01)
+        elapsed = time.time() - start
+        self.assertFalse(ok)
+        self.assertLess(elapsed, 3.0)
+
+    def test_queue_lock_is_not_held_while_the_wrapped_command_runs(self):
+        """A `run` wrapper holds its slot for the child, never the queue lock (#690)."""
+        queue_lock_dir = os.path.join(self.run_dir, build_slot.QUEUE_LOCK_NAME)
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        probe = f"import os,sys; sys.exit(7 if os.path.exists({queue_lock_dir!r}) else 0)"
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            rc = manager.run_command("child-lane", [sys.executable, "-c", probe], timeout=20.0, poll_interval=0.01)
+        self.assertEqual(rc, 0)
         self.assertFalse(os.path.exists(queue_lock_dir))
 
 if __name__ == "__main__":
