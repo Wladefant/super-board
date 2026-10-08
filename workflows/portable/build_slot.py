@@ -660,8 +660,15 @@ def _tombstone_stale_queue_lock(
     current_identity = _lock_identity(current_info)
     if judged_identity is not None and current_identity != judged_identity:
         return False
-    if judged_identity is None and current_identity is not None:
-        return False
+    if judged_identity is None:
+        if current_identity is not None:
+            return False
+        try:
+            mtime = os.path.getmtime(queue_lock_dir)
+            if (time.time() - mtime) < stale_after:
+                return False
+        except OSError:
+            return False
 
     tombstone = f"{queue_lock_dir}.tombstone-{os.getpid()}-{uuid.uuid4().hex}"
     try:
