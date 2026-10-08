@@ -1281,3 +1281,31 @@ test('flows/shipnovo.json defines komo-dialog-pin flow with required steps and c
     }
   }
 });
+
+test('optional type skips a missing input while a required type still fails', { timeout: 15000 }, async () => {
+  const browser = await resolvePuppeteer().launch({
+    executablePath: resolveExecutablePath() || undefined,
+    headless: 'new',
+    args: ['--no-sandbox']
+  });
+  const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'flowqa-optional-type-'));
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1440, height: 900 });
+    await page.setContent('<!DOCTYPE html><html><body><h1>No input</h1></body></html>');
+    const ctx = { flow: { id: 'optional-type' }, baseUrl: 'http://127.0.0.1', outputDir, flowConstraints: {} };
+    const step = { id: 'missing-input', action: 'type', selector: '#missing', value: 'QA-text', timeout_ms: 100 };
+    const skipped = await executeStep(page, null, { ...step, optional: true }, '1440x900', 'light', ctx);
+    assert.equal(skipped.passed, true);
+    assert.equal(skipped.checks[0].name, 'optional_skipped');
+    assert.equal(skipped.screenshot, null);
+    await assert.rejects(
+      executeStep(page, null, step, '1440x900', 'light', ctx),
+      /No visible element for selector "#missing"/,
+      'a required missing input must still fail'
+    );
+  } finally {
+    await browser.close();
+    fs.rmSync(outputDir, { recursive: true, force: true });
+  }
+});
