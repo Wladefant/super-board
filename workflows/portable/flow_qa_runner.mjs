@@ -1401,9 +1401,8 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
   }
 
 
-  // An optional tap (for example a consent banner that only appears for new visitors) is skipped
-  // with a passing note when its target never shows up.
-  if (step.optional && step.action === 'tap') {
+  // Optional taps and typing skip targets that do not appear for every visitor.
+  if (step.optional && (step.action === 'tap' || step.action === 'type')) {
     const optTimeout = step.timeout_ms || 2500;
     const shown = await waitForTarget(page, step.selector, optTimeout);
     if (!shown) {
