@@ -2820,5 +2820,163 @@ class TestBuildSlot(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertFalse(os.path.exists(queue_lock_dir))
 
+    def test_queue_atomic_lock_live_pid_holder_older_than_120s_is_reclaimed(self):
+        """
+        A live PID holding the queue lock that was acquired older than the default 120s
+        hold threshold is considered leaked and reclaimed.
+        """
+        queue_lock_dir = os.path.join(self.run_dir, build_slot.QUEUE_LOCK_NAME)
+        os.makedirs(queue_lock_dir)
+        info_path = os.path.join(queue_lock_dir, build_slot.INFO_FILE_NAME)
+        with open(info_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "pid": os.getpid(),
+                "token": "leaked-token-130s",
+                "acquired_at_epoch": time.time() - 130.0,
+            }, f)
+        acquired = False
+        with _queue_atomic_lock(self.run_dir, timeout=2.0, retry_interval=0.01):
+            acquired = True
+            info = build_slot._read_queue_lock_info(queue_lock_dir)
+            self.assertIsNotNone(info)
+            self.assertNotEqual(info.get("token"), "leaked-token-130s")
+        self.assertTrue(acquired)
+        self.assertFalse(os.path.exists(queue_lock_dir))
+
+    def test_queue_atomic_lock_fresh_live_pid_holder_under_120s_not_reclaimed_negative_control(self):
+        """
+        Negative control: A live PID holding the queue lock younger than 120s (e.g. 75s)
+        must NOT be reclaimed by contenders using the default threshold, timing out instead.
+        """
+        queue_lock_dir = os.path.join(self.run_dir, build_slot.QUEUE_LOCK_NAME)
+        os.makedirs(queue_lock_dir)
+        info_path = os.path.join(queue_lock_dir, build_slot.INFO_FILE_NAME)
+        with open(info_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "pid": os.getpid(),
+                "token": "live-token-75s",
+                "acquired_at_epoch": time.time() - 75.0,
+            }, f)
+        with self.assertRaises(TimeoutError):
+            with _queue_atomic_lock(self.run_dir, timeout=0.1, retry_interval=0.01):
+                pass
+        self.assertTrue(os.path.isdir(queue_lock_dir))
+        info = build_slot._read_queue_lock_info(queue_lock_dir)
+        self.assertIsNotNone(info)
+        self.assertEqual(info.get("token"), "live-token-75s")
+
+    def test_queue_atomic_lock_late_release_does_not_remove_successor_lock(self):
+        """
+        When an expired owner releases its lock late after a successor has already
+        acquired, the late release must verify ownership token and NOT delete the
+        successor's lock directory or info file.
+        """
+        queue_lock_dir = os.path.join(self.run_dir, build_slot.QUEUE_LOCK_NAME)
+        info_path = os.path.join(queue_lock_dir, build_slot.INFO_FILE_NAME)
+
+        with _queue_atomic_lock(self.run_dir, timeout=1.0) as _:
+            # While holding, simulate that a successor acquired with a new token
+            successor_token = "successor-token-" + str(time.time())
+            with open(info_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "pid": os.getpid(),
+                    "token": successor_token,
+                    "acquired_at_epoch": time.time(),
+                }, f)
+
+        # After the late releaser exits, successor's lock directory and info must remain intact
+        self.assertTrue(os.path.isdir(queue_lock_dir))
+        self.assertTrue(os.path.isfile(info_path))
+        info = build_slot._read_queue_lock_info(queue_lock_dir)
+        self.assertIsNotNone(info)
+        self.assertEqual(info.get("token"), successor_token)
+
+    def test_queue_atomic_lock_stale_reclaim_race_preserves_successor_tombstone(self):
+        """
+        When stale reclamation judges token T1 stale, but before deletion a successor
+        acquires with token T2, tombstone-safe reclaim must NOT remove T2.
+        """
+        queue_lock_dir = os.path.join(self.run_dir, build_slot.QUEUE_LOCK_NAME)
+        os.makedirs(queue_lock_dir, exist_ok=True)
+        info_path = os.path.join(queue_lock_dir, build_slot.INFO_FILE_NAME)
+
+        judged_stale = {
+            "pid": 99999999,
+            "token": "stale-judged-token",
+            "acquired_at_epoch": time.time() - 500.0,
+        }
+        # Successor acquired right before reclaim
+        with open(info_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "pid": os.getpid(),
+                "token": "fresh-successor-token",
+                "acquired_at_epoch": time.time(),
+            }, f)
+
+        # Calling _tombstone_stale_queue_lock with judged_stale must refuse to delete the fresh successor
+        reclaimed = build_slot._tombstone_stale_queue_lock(queue_lock_dir, judged_stale)
+        self.assertFalse(reclaimed)
+        self.assertTrue(os.path.isdir(queue_lock_dir))
+        info = build_slot._read_queue_lock_info(queue_lock_dir)
+        self.assertIsNotNone(info)
+        self.assertEqual(info.get("token"), "fresh-successor-token")
+
+    def test_queue_critical_section_hygiene_no_ram_probes_process_waits_or_sleep(self):
+        """
+        While holding the queue lock, queue operations (clean_queue, enqueue, bump, dequeue, heartbeat)
+        must perform NO RAM probes (get_system_ram_percent), NO process waits (is_pid_alive),
+        and NO sleep calls.
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        queue_lock_dir = os.path.join(self.run_dir, build_slot.QUEUE_LOCK_NAME)
+
+        violations = []
+
+        real_is_pid_alive = manager.is_pid_alive
+        def monitored_is_pid_alive(p):
+            if os.path.isdir(queue_lock_dir):
+                # Check if current thread actually holds the queue lock
+                info = build_slot._read_queue_lock_info(queue_lock_dir)
+                if info and info.get("pid") == os.getpid():
+                    violations.append(f"is_pid_alive({p}) called while holding queue lock")
+            return real_is_pid_alive(p)
+
+        def monitored_ram_percent():
+            if os.path.isdir(queue_lock_dir):
+                violations.append("get_system_ram_percent() called while holding queue lock")
+            return 50.0
+
+        def monitored_sleep(seconds):
+            if os.path.isdir(queue_lock_dir):
+                info = build_slot._read_queue_lock_info(queue_lock_dir)
+                if info and info.get("pid") == os.getpid():
+                    violations.append(f"time.sleep({seconds}) called while holding queue lock")
+            time.sleep(min(seconds, 0.001))
+
+        manager.is_pid_alive = monitored_is_pid_alive
+
+        # Pre-populate queue with an entry for another PID to exercise queue inspection loops
+        manager._write_queue([{
+            "name": "prior-lane",
+            "pid": 999999,
+            "token": "prior-tok",
+            "enqueued_at": time.time(),
+            "heartbeat_at": time.time(),
+        }])
+
+        with mock.patch("build_slot.get_system_ram_percent", monitored_ram_percent), \
+             mock.patch("build_slot.time.sleep", monitored_sleep):
+            # 1. Enqueue entry
+            manager.enqueue("lane-1", pid=os.getpid(), token="tok-1")
+            # 2. Bump entry
+            manager.bump("lane-1", token="tok-1")
+            # 3. Heartbeat
+            manager.heartbeat(token="tok-1", name="lane-1", pid=os.getpid())
+            # 4. Clean queue
+            manager.clean_queue()
+            # 5. Dequeue
+            manager.dequeue("lane-1", pid=os.getpid(), token="tok-1")
+        self.assertEqual(violations, [], "Critical section hygiene violations detected: " + str(violations))
+
 if __name__ == "__main__":
     unittest.main()
