@@ -20,20 +20,26 @@ Invariants:
     - Lock metadata contains owner, pid, token, and acquired_at timestamp.
     - Waiting lanes are tracked in a FIFO queue file ('~/.veyyon/run/build-slot.queue.json')
       with unique tokens to differentiate in-process waiters sharing a parent PID.
-    - Queue entries emit periodic heartbeats (heartbeat_at); entries with dead PIDs or
-      heartbeats older than 60s are automatically reclaimed.
-    - Legacy queue entries without heartbeats fall back to enqueued_at age > 30m.
-    - Acquire wait loops write heartbeats before queue cleaning, re-enqueue if pruned,
-      and clean up queue entries via try/finally on timeout, exit, or exception.
+    - Queue token heartbeats preserve live-PID entries for up to 30m of silence, not 60s.
+      Dead PIDs are reclaimed regardless of heartbeat freshness. Legacy entries without
+      heartbeats use enqueue age. A live but silent lane may lose its place after 30m.
+    - Acquire wait loops write heartbeats before queue cleaning, re-enqueue preserving original
+      enqueued_at if missing during heartbeat validation, and clean up queue entries via try/finally.
+    - Queue operations are protected by the short-lived directory lock ('build-slot-queue.lock');
+      stale queue locks are reclaimed only if the owner PID is dead (never on age for live PIDs),
+      and releasers verify unique ownership tokens to prevent deleting successor locks.
+    - Queue reads retry on transient OS/JSON sharing errors and raise on failure; missing file
+      returns empty list only on initial queue creation.
     - Release by non-owner is strictly refused.
     - Stale locks are reclaimed with a logged notice. A live `run` holder is never reclaimed on
       age alone. A `run` lock lives exactly as long as its wrapper process (the
       `build_slot.py run` PID, which heartbeats every 5s, waits for the command and releases
-      in `finally`): a dead wrapper is reclaimed after the 60s grace period, and a live one
-      only once its heartbeat is older than --heartbeat-stale-after [default 5m] (hung).
+      in `finally`): a dead wrapper is reclaimed immediately, and a live one only once
+      its token heartbeat is older than --heartbeat-stale-after [default 5m].
       Other locks (`acquire` mode has no process left to heartbeat): when the owner PID is
-      dead past the grace period, or when the owner PID is alive (it is the lane's host,
-      which outlives a lane that never released) but the heartbeat is older than 30 min (#620).
+      dead, or when its token heartbeat is older than 30 min (#620). Without a heartbeat,
+      the acquisition age supplies the 30-min limit. These bounded leases permit recovery
+      of abandoned lanes but may reclaim a live process silent beyond its lease limit.
     - A reclaim renames the lock dir to a unique tombstone and deletes it only if the
       tombstone still holds the lock that was judged stale; otherwise it is put back. A
       reclaim never deletes a lock other than the one it judged stale.
@@ -521,29 +527,34 @@ def _queue_atomic_lock(
     """
     Short-lived atomic directory lock protecting reads/writes to build-slot.queue.json.
     Uses atomic os.mkdir on Windows and Linux (no fcntl).
-    Reclaims stale queue locks if the holding PID is dead or age exceeds stale_after.
+    Reclaims stale queue locks ONLY if the holding PID is dead (never on age for a live PID).
+    Verifies unique ownership token before release so successor locks are never deleted.
     """
     queue_lock_dir = os.path.join(run_dir, QUEUE_LOCK_NAME)
     start_time = time.time()
     acquired = False
+    lock_token = str(uuid.uuid4())
     pid_checker = is_pid_alive_fn or is_pid_alive
 
     while True:
         try:
             os.mkdir(queue_lock_dir)
-            # Write queue lock metadata (PID + timestamp) for stale reclamation
+            # Write queue lock metadata (PID + unique token + timestamp) for stale reclamation & ownership verification
             try:
                 info_path = os.path.join(queue_lock_dir, INFO_FILE_NAME)
-                tmp_path = info_path + f".{os.getpid()}.tmp"
+                tmp_path = info_path + f".{os.getpid()}.{lock_token}.tmp"
                 with open(tmp_path, "w", encoding="utf-8") as f:
                     json.dump({
                         "pid": os.getpid(),
+                        "token": lock_token,
                         "acquired_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                         "acquired_at_epoch": time.time(),
                     }, f)
                 os.replace(tmp_path, info_path)
             except Exception:
-                pass
+                # Do not enter the protected section without releasable metadata.
+                shutil.rmtree(queue_lock_dir, ignore_errors=True)
+                raise
             acquired = True
             break
         except PermissionError:
@@ -556,9 +567,8 @@ def _queue_atomic_lock(
             time.sleep(retry_interval)
         except FileExistsError:
             # Check if queue lock is stale:
-            # 1. Owner PID is dead (immediate reclaim)
-            # 2. Or lock age exceeds stale_after seconds
-            # 3. Or corrupt lock directory older than grace period
+            # Queue lock reclaim ONLY dead PID (or orphan directory older than stale_after without live PID).
+            # A live PID is NEVER reclaimed on age.
             try:
                 is_stale = False
                 now = time.time()
@@ -567,15 +577,14 @@ def _queue_atomic_lock(
                     lock_pid = int(info["pid"])
                     if lock_pid > 0 and not pid_checker(lock_pid):
                         is_stale = True
-                    else:
-                        acq_time = info.get("acquired_at_epoch")
-                        if acq_time and (now - float(acq_time)) >= stale_after:
-                            is_stale = True
+                    # Live PID is never reclaimed on age
                 else:
                     # No info file or mid-creation: fallback to directory mtime
                     mtime = os.path.getmtime(queue_lock_dir)
                     if (now - mtime) >= stale_after:
-                        is_stale = True
+                        info2 = _read_queue_lock_info(queue_lock_dir)
+                        if not info2 or not info2.get("pid") or not pid_checker(int(info2["pid"])):
+                            is_stale = True
 
                 if is_stale:
                     shutil.rmtree(queue_lock_dir, ignore_errors=True)
@@ -592,24 +601,32 @@ def _queue_atomic_lock(
     finally:
         if acquired:
             try:
-                info_path = os.path.join(queue_lock_dir, INFO_FILE_NAME)
-                if os.path.isfile(info_path):
-                    os.unlink(info_path)
+                info = _read_queue_lock_info(queue_lock_dir)
+                for attempt in range(_INFO_READ_ATTEMPTS - 1):
+                    if info is not None:
+                        break
+                    time.sleep(_INFO_READ_RETRY_DELAY)
+                    info = _read_queue_lock_info(queue_lock_dir)
+                # Verify ownership before releasing: only release if info matches our unique lock_token
+                if info and info.get("token") == lock_token:
+                    info_path = os.path.join(queue_lock_dir, INFO_FILE_NAME)
+                    try:
+                        if os.path.isfile(info_path):
+                            os.unlink(info_path)
+                    except Exception:
+                        pass
+                    try:
+                        os.rmdir(queue_lock_dir)
+                    except Exception:
+                        try:
+                            if os.path.isdir(queue_lock_dir):
+                                entries = [e for e in os.listdir(queue_lock_dir) if e != INFO_FILE_NAME]
+                                if not entries:
+                                    shutil.rmtree(queue_lock_dir, ignore_errors=True)
+                        except Exception:
+                            pass
             except Exception:
                 pass
-            try:
-                os.rmdir(queue_lock_dir)
-            except Exception:
-                try:
-                    # Narrow fallback: call shutil.rmtree on the queue lock dir only
-                    # if the dir is still ours (it was just created by us and is empty
-                    # apart from our own files); otherwise leave it.
-                    if os.path.isdir(queue_lock_dir):
-                        entries = [e for e in os.listdir(queue_lock_dir) if e != INFO_FILE_NAME]
-                        if not entries:
-                            shutil.rmtree(queue_lock_dir, ignore_errors=True)
-                except Exception:
-                    pass
 
 
 def _create_dir_link(target: str, link_path: str) -> None:
@@ -947,31 +964,39 @@ class BuildSlotManager:
         if not os.path.isfile(self.queue_file):
             return []
         delays = [0.02, 0.05, 0.1, 0.15, 0.2]
+        last_error: Optional[Exception] = None
         for attempt in range(len(delays)):
             try:
                 with open(self.queue_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 if isinstance(data, list):
                     return data
-                return []
+                raise ValueError(
+                    f"Queue file '{self.queue_file}' does not contain a list (got {type(data).__name__})"
+                )
             except (PermissionError, OSError) as e:
+                last_error = e
                 winerror = getattr(e, "winerror", None)
                 if isinstance(e, PermissionError) or winerror in (5, 32):
                     if attempt < len(delays) - 1:
                         time.sleep(delays[attempt])
                         continue
                 logger.warning("Failed to read queue file '%s': %s", self.queue_file, e)
-                return []
-            except json.JSONDecodeError:
+                raise
+            except json.JSONDecodeError as e:
+                last_error = e
                 if attempt < len(delays) - 1:
                     time.sleep(delays[attempt])
                     continue
-                logger.warning("Corrupt JSON in queue file '%s'", self.queue_file)
-                return []
+                logger.warning("Corrupt JSON in queue file '%s': %s", self.queue_file, e)
+                raise
             except Exception as e:
+                last_error = e
                 logger.warning("Unexpected error reading queue file '%s': %s", self.queue_file, e)
-                return []
-        return []
+                raise
+        if last_error is not None:
+            raise last_error
+        raise OSError(f"Failed to read queue file '{self.queue_file}' after {len(delays)} attempts")
 
     def _write_queue(self, queue: List[Dict[str, Any]]) -> None:
         """Writes queue list atomically using a temp file and os.replace."""
@@ -984,43 +1009,19 @@ class BuildSlotManager:
         stale_heartbeat_after: float,
         stale_fallback_after: float,
     ) -> Tuple[bool, str]:
-        """
-        Evaluates whether a queue entry is stale.
-        Rule: removed when its PID is dead OR heartbeat_at is older than 60s
-        (entries without heartbeat_at from older versions: fall back to enqueued_at age > 30 min).
-        """
-        hb_val = item.get("heartbeat_at")
-        hb_epoch = _parse_timestamp(hb_val) if hb_val is not None else None
-        is_hb_fresh = (hb_epoch is not None and (now - hb_epoch) < stale_heartbeat_after)
-
+        """Dead PIDs expire immediately; live token leases allow 30m of silence."""
         pid = item.get("pid", 0)
         if pid > 0 and not self.is_pid_alive(pid):
-            if not is_hb_fresh:
-                return True, f"PID {pid} is dead"
-
-        hb_val = item.get("heartbeat_at")
-        if hb_val is not None:
-            hb_epoch = _parse_timestamp(hb_val)
-            if hb_epoch is not None:
-                hb_age = now - hb_epoch
-                if hb_age > stale_heartbeat_after:
-                    return True, f"heartbeat expired ({hb_age:.1f}s > {stale_heartbeat_after:.1f}s)"
-            else:
-                return True, "corrupt heartbeat_at timestamp"
-        else:
-            enq_val = item.get("enqueued_at")
-            if enq_val is not None:
-                enq_epoch = _parse_timestamp(enq_val)
-                if enq_epoch is not None:
-                    enq_age = now - enq_epoch
-                    if enq_age > stale_fallback_after:
-                        return True, f"legacy entry enqueued_at expired ({enq_age:.1f}s > {stale_fallback_after:.1f}s)"
-                else:
-                    return True, "corrupt enqueued_at timestamp"
-            else:
-                return True, "missing heartbeat_at and enqueued_at"
-
-        return False, ""
+            return True, f"PID {pid} is dead"
+        heartbeat = _parse_timestamp(item.get("heartbeat_at"))
+        stamp = heartbeat if heartbeat is not None else _parse_timestamp(item.get("enqueued_at"))
+        if stamp is None:
+            return True, "missing or corrupt lease timestamp"
+        limit = max(stale_heartbeat_after, stale_fallback_after) if pid > 0 else (
+            stale_heartbeat_after if heartbeat is not None else stale_fallback_after
+        )
+        silence = now - stamp
+        return (silence > limit, f"token lease expired ({silence:.1f}s > {limit:.1f}s)")
 
     def _clean_queue_locked(
         self,
@@ -1097,6 +1098,7 @@ class BuildSlotManager:
         token: Optional[str] = None,
         stale_heartbeat_after: Optional[float] = None,
         priority: bool = False,
+        enqueued_at: Optional[float] = None,
     ) -> int:
         """
         Adds (name, pid, token) to the queue if not already present.
@@ -1106,6 +1108,7 @@ class BuildSlotManager:
         already queued only has its heartbeat refreshed; it moves only when
         re-enqueued with priority while still normal, and then joins the
         priority group at its own enqueue time.
+        When recovering a dropped entry, pass enqueued_at to preserve original position.
         Returns the 0-indexed position in queue.
         """
         hb_limit = stale_heartbeat_after if stale_heartbeat_after is not None else self.queue_stale_heartbeat_after
@@ -1142,19 +1145,25 @@ class BuildSlotManager:
                 return valid_queue.index(item)
 
             now_iso = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat()
+            effective_enqueued_at = enqueued_at if enqueued_at is not None else now
+            effective_enqueued_iso = (
+                datetime.datetime.fromtimestamp(effective_enqueued_at, datetime.timezone.utc).isoformat()
+                if enqueued_at is not None
+                else now_iso
+            )
             entry = {
                 "name": name,
                 "pid": pid,
                 "token": token,
-                "enqueued_at": now,
-                "enqueued_at_iso": now_iso,
+                "enqueued_at": effective_enqueued_at,
+                "enqueued_at_iso": effective_enqueued_iso,
                 "heartbeat_at": now,
                 "heartbeat_at_iso": now_iso,
             }
             if priority:
                 entry["priority"] = True
             valid_queue.append(entry)
-            # Newest enqueue time: lands behind every earlier entry of its group.
+            # Lands in queue ordered by (priority, original enqueue time)
             valid_queue.sort(key=_queue_order_key)
             self._write_queue(valid_queue)
             return valid_queue.index(entry)
@@ -1419,50 +1428,18 @@ class BuildSlotManager:
                         except Exception:
                             hb_epoch = None
                     hb_age = (now - hb_epoch) if hb_epoch is not None else None
-                    is_hb_fresh = (hb_age is not None and hb_age < effective_grace)
-                    if wrapper_pid:
-                        if self.is_pid_alive(wrapper_pid):
-                            silence = hb_age if hb_age is not None else age
-                            if silence >= heartbeat_stale_after:
-                                is_stale = True
-                                reason = (
-                                    f"run wrapper PID {wrapper_pid} is alive but its heartbeat is stale "
-                                    f"({silence:.1f}s >= {heartbeat_stale_after:.1f}s, "
-                                    f"owner='{owner}', slot {slot_idx})"
-                                )
-                        elif age >= effective_grace and not is_hb_fresh:
-                            is_stale = True
-                            reason = (
-                                f"run wrapper PID {wrapper_pid} is dead and lock age exceeds grace period "
-                                f"({age:.1f}s >= {effective_grace:.1f}s, owner='{owner}', slot {slot_idx})"
-                            )
-                    elif pid > 0 and self.is_pid_alive(pid):
-                        # `acquire` mode records the lane's long-lived host PID, which outlives
-                        # a lane that ended without releasing (#620). Heartbeat silence, or
-                        # lock age when no heartbeat was ever written, is the only signal left.
-                        silence = hb_age if hb_age is not None else age
-                        if silence >= acquire_holder_stale_after:
-                            is_stale = True
-                            reason = (
-                                f"acquire owner PID {pid} is alive but silent "
-                                f"({silence:.1f}s >= {acquire_holder_stale_after:.1f}s, "
-                                f"owner='{owner}', slot {slot_idx})"
-                            )
-                    elif pid > 0:
-                        # Never reclaim a lock younger than the grace period (e.g. 60s),
-                        # or whose heartbeat is fresh (< 60s).
-                        if age < effective_grace or is_hb_fresh:
-                            logger.debug(
-                                "Owner PID %d is dead for owner '%s' (slot %d) but lock is protected by grace period "
-                                "(age=%.1fs < %.1fs, hb_fresh=%s); not reclaiming",
-                                pid, owner, slot_idx, age, effective_grace, is_hb_fresh,
-                            )
-                        else:
-                            is_stale = True
-                            reason = (
-                                f"owner PID {pid} is dead and lock age exceeds grace period "
-                                f"({age:.1f}s >= {effective_grace:.1f}s, owner='{owner}', slot {slot_idx})"
-                            )
+                    holder_pid = wrapper_pid or pid
+                    silence = hb_age if hb_age is not None else age
+                    limit = heartbeat_stale_after if wrapper_pid else acquire_holder_stale_after
+                    if holder_pid > 0 and not self.is_pid_alive(holder_pid):
+                        is_stale = True
+                        reason = f"owner PID {holder_pid} is dead (owner='{owner}', slot {slot_idx})"
+                    elif holder_pid > 0 and silence >= limit:
+                        is_stale = True
+                        reason = (
+                            f"token heartbeat lease expired ({silence:.1f}s >= {limit:.1f}s, "
+                            f"owner='{owner}', slot {slot_idx})"
+                        )
 
                 if is_stale and self._tombstone_stale_slot(slot_idx, info, reason):
                     reclaimed_any = True
@@ -1530,10 +1507,12 @@ class BuildSlotManager:
         start_time = time.time()
         last_heartbeat = start_time
         acquired = False
+        original_enqueued_at = start_time
 
         try:
             # 2. Register in FIFO Queue inside try so finally always cleans up
-            self.enqueue(name, pid, token=token, stale_heartbeat_after=effective_heartbeat_threshold, priority=priority)
+            self.enqueue(name, pid, token=token, stale_heartbeat_after=effective_heartbeat_threshold,
+                         priority=priority, enqueued_at=original_enqueued_at)
 
             while True:
                 # Update heartbeat first if due (every <= 15s)
@@ -1545,12 +1524,20 @@ class BuildSlotManager:
                             last_heartbeat = now
                         else:
                             # Verify if the entry is ACTUALLY missing from the queue before logging and re-enqueuing
-                            queue_snapshot = self._read_queue()
-                            is_in_queue = any(
-                                (token and item.get("token") == token)
-                                or (not token and item.get("name") == name and (pid is None or item.get("pid") == pid))
-                                for item in queue_snapshot
-                            )
+                            try:
+                                queue_snapshot = self._read_queue()
+                                is_in_queue = any(
+                                    (token and item.get("token") == token)
+                                    or (not token and item.get("name") == name and (pid is None or item.get("pid") == pid))
+                                    for item in queue_snapshot
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    "Failed to read queue snapshot during heartbeat check for '%s': %s; will retry next tick",
+                                    name, e,
+                                )
+                                is_in_queue = True
+
                             if not is_in_queue:
                                 notice = (
                                     f"[NOTICE] Queue entry for '{name}' (PID {pid}, token {token}) "
@@ -1559,7 +1546,12 @@ class BuildSlotManager:
                                 print(notice, file=sys.stderr)
                                 logger.warning(notice)
                                 self.enqueue(
-                                    name, pid, token=token, stale_heartbeat_after=effective_heartbeat_threshold, priority=priority
+                                    name,
+                                    pid,
+                                    token=token,
+                                    stale_heartbeat_after=effective_heartbeat_threshold,
+                                    priority=priority,
+                                    enqueued_at=original_enqueued_at,
                                 )
                                 last_heartbeat = now
                             else:
@@ -1592,6 +1584,11 @@ class BuildSlotManager:
                     continue
                 except Exception as e:
                     logger.warning("Unexpected error during clean_queue for '%s': %s (will retry next tick)", name, e)
+                    if timeout is not None and time.time() - start_time >= timeout:
+                        msg = f"Timed out after {timeout:.1f}s waiting for build slot lock: queue read failed ({e})"
+                        print(msg, file=sys.stderr)
+                        logger.error(msg)
+                        return False
                     time.sleep(min(poll_interval, heartbeat_interval))
                     continue
 
