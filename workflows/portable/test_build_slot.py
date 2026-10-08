@@ -2016,8 +2016,8 @@ class TestBuildSlot(unittest.TestCase):
         other_tombstone = manager.lock_dir + ".tombstone-other"
         real_read = build_slot._read_lock_dir_info
 
-        def read_then_lose_it(lock_dir, slot_idx):
-            info = real_read(lock_dir, slot_idx)
+        def read_then_lose_it(lock_dir, slot_idx, *args, **kwargs):
+            info = real_read(lock_dir, slot_idx, *args, **kwargs)
             if ".tombstone-" in lock_dir and lock_dir != other_tombstone:
                 os.rename(lock_dir, other_tombstone)
                 return dict(info, token="next-holder")

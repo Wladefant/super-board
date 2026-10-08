@@ -594,11 +594,29 @@ def _remove_owned_queue_lock(
     if not os.path.exists(queue_lock_dir):
         return False
 
+    # Verify ownership before detaching canonical lock name (Codex P1)
+    if expected_identity is not None:
+        info = _read_queue_lock_info(queue_lock_dir)
+        for _ in range(_INFO_READ_ATTEMPTS - 1):
+            if info is not None:
+                break
+            time.sleep(_INFO_READ_RETRY_DELAY)
+            info = _read_queue_lock_info(queue_lock_dir)
+        if _lock_identity(info) != expected_identity:
+            return False
+
     tombstone = f"{queue_lock_dir}.releasing-{os.getpid()}-{uuid.uuid4().hex}"
     try:
         os.rename(queue_lock_dir, tombstone)
     except OSError:
-        return False
+        if not os.path.exists(queue_lock_dir):
+            return False
+        if expected_identity is not None:
+            info = _read_queue_lock_info(queue_lock_dir)
+            if _lock_identity(info) != expected_identity:
+                return False
+        _clean_detached_lock_dir(queue_lock_dir, patience=patience)
+        return True
 
     moved_info = _read_queue_lock_info(tombstone)
     for _ in range(_INFO_READ_ATTEMPTS - 1):
@@ -1037,7 +1055,9 @@ class BuildSlotManager:
             return None
         if retry is None:
             retry = not getattr(self._queue_op_state, "under_queue_lock", False)
-        return _read_lock_dir_info(self.slot_dirs[slot_idx], slot_idx, retry=retry)
+        if retry:
+            return _read_lock_dir_info(self.slot_dirs[slot_idx], slot_idx)
+        return _read_lock_dir_info(self.slot_dirs[slot_idx], slot_idx, retry=False)
 
     def _tombstone_stale_slot(self, slot_idx: int, judged: Dict[str, Any], reason: str) -> bool:
         """
@@ -1162,8 +1182,7 @@ class BuildSlotManager:
 
     def _write_queue(self, queue: List[Dict[str, Any]]) -> None:
         """Writes queue list atomically using a temp file and os.replace."""
-        under_lock = getattr(self._queue_op_state, "under_queue_lock", False)
-        _write_json_atomic(self.queue_file, queue, prefix="queue-", retry=not under_lock)
+        _write_json_atomic(self.queue_file, queue, prefix="queue-", retry=True)
 
     def _is_entry_stale(
         self,
