@@ -496,7 +496,13 @@ def _get_process_create_ticks(pid: int) -> Optional[int]:
 
 
 def _get_process_create_epoch(pid: int) -> Optional[float]:
-    """Returns process creation time as epoch seconds, or None if unavailable."""
+    """
+    Returns process creation time as epoch seconds, or None if unavailable.
+    Does not use /proc/<pid> directory timestamps because filesystem mtime is
+    not a dependable process creation identity and would cause genuine live owners
+    to be mistaken for recycled processes. Reads native Windows ticks, psutil,
+    or Linux /proc/<pid>/stat starttime with /proc/stat btime.
+    """
     if pid <= 0:
         return None
     ticks = _get_process_create_ticks(pid)
@@ -509,9 +515,30 @@ def _get_process_create_epoch(pid: int) -> Optional[float]:
     except Exception:
         pass
     try:
-        proc_stat = f"/proc/{pid}"
-        if os.path.isdir(proc_stat):
-            return float(os.stat(proc_stat).st_mtime)
+        stat_path = f"/proc/{pid}/stat"
+        if os.path.isfile(stat_path):
+            with open(stat_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            rparen = content.rfind(")")
+            if rparen != -1:
+                fields = content[rparen + 1:].split()
+                if len(fields) > 19:
+                    starttime_ticks = float(fields[19])
+                    btime = None
+                    if os.path.isfile("/proc/stat"):
+                        with open("/proc/stat", "r", encoding="utf-8") as f:
+                            for line in f:
+                                if line.startswith("btime "):
+                                    btime = float(line.split()[1])
+                                    break
+                    if btime is not None:
+                        clk_tck = 100.0
+                        if hasattr(os, "sysconf") and hasattr(os, "sysconf_names"):
+                            try:
+                                clk_tck = float(os.sysconf("SC_CLK_TCK"))
+                            except (KeyError, ValueError, OSError):
+                                clk_tck = 100.0
+                        return btime + (starttime_ticks / clk_tck)
     except Exception:
         pass
     return None
@@ -2351,10 +2378,11 @@ class BuildSlotManager:
         Executes a command under the exclusive build slot lock.
         Holds the lock ONLY for the duration of the command, and guarantees
         release upon command completion or failure.
-        Records the wrapper PID (this process, the lock's liveness source), the wrapped
-        child's PID, process creation identity, a per-run token, and maintains a heartbeat.
-        The lock is reclaimed by others only once this wrapper is dead (after the grace period),
-        or if the wrapper PID is proven to have been recycled.
+        Initial acquire atomically records the wrapper PID (this process, the lock's liveness source),
+        creation identity, a per-run token, and initial heartbeat before launching the command.
+        A failed subsequent metadata refresh (e.g. when updating child_pid or heartbeat) is safe
+        and never aborts the command: the wrapper waits for command completion before releasing,
+        and the lock is protected from double-grants while the command is active.
         Returns the command exit code, or 1 if lock could not be acquired.
         """
         run_token = str(uuid.uuid4())
@@ -2396,20 +2424,7 @@ class BuildSlotManager:
             child_pid = proc.pid
 
             # Record wrapper and child PIDs and the initial heartbeat in lock info
-            recorded = self._record_run_child(name=name, wrapper_pid=runner_pid, child_pid=child_pid, token=run_token)
-            if not recorded:
-                msg = f"[RUN] Failed to record wrapper metadata for '{name}'; terminating command to prevent running under acquire-mode expiry."
-                print(msg, file=sys.stderr)
-                logger.error(msg)
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=5.0)
-                except Exception:
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                return 1
+            self._record_run_child(name=name, wrapper_pid=runner_pid, child_pid=child_pid, token=run_token)
 
             # Start background heartbeat while child runs
             def _heartbeat_worker():
