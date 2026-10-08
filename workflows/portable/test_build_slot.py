@@ -1754,16 +1754,75 @@ class TestBuildSlot(unittest.TestCase):
         )
         self.assertEqual(missing.returncode, 1)
 
-    def test_live_run_wrapper_expired_lease_reclaimed(self):
-        """A run holder loses its lease after its configured heartbeat timeout."""
+    def test_live_run_wrapper_with_stale_heartbeat_is_never_reclaimed(self):
+        """#690: a live wrapper keeps its slot however old its heartbeat; a failed heartbeat must not grant it twice."""
         manager = BuildSlotManager(run_dir=self.run_dir)
         wrapper = self._live_process()
-        self._write_run_lock(manager, wrapper.pid, wrapper.pid, age=600.0, hb_age=301.0)
+        self._write_run_lock(manager, wrapper.pid, wrapper.pid, age=7200.0, hb_age=7000.0)
 
-        stderr = io.StringIO()
-        with redirect_stderr(stderr):
-            self.assertTrue(manager.check_stale_and_reclaim())
-        self.assertFalse(os.path.isdir(manager.lock_dir))
+        with redirect_stderr(io.StringIO()):
+            self.assertFalse(manager.check_stale_and_reclaim())
+            self.assertFalse(manager.check_stale_and_reclaim(heartbeat_stale_after=1.0))
+        self.assertTrue(os.path.isdir(manager.lock_dir))
+
+    def test_live_owner_with_failing_heartbeat_is_not_granted_twice(self):
+        """#690: every heartbeat write fails for the whole run; a second lane must not get the slot."""
+        owner_mgr = BuildSlotManager(run_dir=self.run_dir, max_slots=1)
+        wrapper = self._live_process()
+        self._write_run_lock(owner_mgr, wrapper.pid, wrapper.pid, age=3600.0, hb_age=3000.0)
+        with open(owner_mgr.info_file, encoding="utf-8") as f:
+            owner = json.load(f)["owner"]
+
+        def always_denied(src, dst):
+            err = PermissionError(13, "Access is denied")
+            err.winerror = 5
+            raise err
+
+        with mock.patch("time.sleep", return_value=None), mock.patch("os.replace", side_effect=always_denied):
+            with redirect_stderr(io.StringIO()):
+                self.assertFalse(owner_mgr.heartbeat_lock(owner))
+        self.assertEqual([f for f in os.listdir(owner_mgr.lock_dir) if f.endswith(".tmp")], [])
+
+        waiter = BuildSlotManager(run_dir=self.run_dir, max_slots=1)
+        with redirect_stderr(io.StringIO()):
+            self.assertFalse(waiter.acquire("second-lane", timeout=0.3, poll_interval=0.05, force=True))
+        with open(owner_mgr.info_file, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["owner"], owner)
+
+    def test_heartbeat_survives_foreign_handle_on_info_json(self):
+        """#690: a process holding info.json open blocks os.replace on Windows; the heartbeat still lands."""
+        manager = BuildSlotManager(run_dir=self.run_dir, max_slots=1)
+        wrapper = self._live_process()
+        self._write_run_lock(manager, wrapper.pid, wrapper.pid, age=600.0, hb_age=500.0)
+        with open(manager.info_file, encoding="utf-8") as f:
+            owner = json.load(f)["owner"]
+
+        real_replace = os.replace
+
+        def replace_denied_for_info(src, dst):
+            if os.path.basename(dst) == build_slot.INFO_FILE_NAME:
+                err = PermissionError(13, "Access is denied")
+                err.winerror = 5
+                raise err
+            return real_replace(src, dst)
+
+        holder = open(manager.info_file, "rb")  # the foreign reader that never closes
+        try:
+            with mock.patch("time.sleep", return_value=None), mock.patch("os.replace", side_effect=replace_denied_for_info):
+                with redirect_stderr(io.StringIO()):
+                    self.assertTrue(manager.heartbeat_lock(owner))
+            info = build_slot._read_lock_dir_info(manager.lock_dir, 0)
+            self.assertLess(time.time() - info["heartbeat_at_epoch"], 5.0)
+        finally:
+            holder.close()
+
+    def test_info_reader_does_not_block_replace(self):
+        """#690: our own reader closes at once and never blocks a replace of the file."""
+        path = os.path.join(self.run_dir, "probe.json")
+        build_slot._write_json_atomic(path, {"n": 1})
+        self.assertEqual(build_slot._read_json_file(path), {"n": 1})
+        build_slot._write_json_atomic(path, {"n": 2})
+        self.assertEqual(build_slot._read_json_file(path), {"n": 2})
 
     def test_dead_run_wrapper_reclaimed_immediately(self):
         """A dead wrapper frees its slot even with a fresh heartbeat and live child."""
@@ -1779,7 +1838,6 @@ class TestBuildSlot(unittest.TestCase):
         stderr = io.StringIO()
         with redirect_stderr(stderr):
             self.assertTrue(manager.check_stale_and_reclaim())
-        self.assertFalse(os.path.isdir(manager.lock_dir))
         self.assertIn(f"owner PID {dead_wrapper} is dead", stderr.getvalue())
 
     def test_run_command_records_wrapper_as_lock_pid(self):
@@ -2633,7 +2691,8 @@ class TestBuildSlot(unittest.TestCase):
             info["heartbeat_at_epoch"] = now - 1801
             with open(manager.info_file, "w", encoding="utf-8") as f:
                 json.dump(info, f)
-            self.assertTrue(manager.check_stale_and_reclaim())
+            # an acquire lease expires; a live `run` wrapper keeps its slot (#690)
+            self.assertEqual(manager.check_stale_and_reclaim(), not wrapper)
 
     def test_queue_release_retries_transient_ownership_read(self):
         original = build_slot._read_queue_lock_info

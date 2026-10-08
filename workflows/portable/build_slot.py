@@ -31,14 +31,16 @@ Invariants:
     - Queue reads retry on transient OS/JSON sharing errors and raise on failure; missing file
       returns empty list only on initial queue creation.
     - Release by non-owner is strictly refused.
-    - Stale locks are reclaimed with a logged notice. A live `run` holder is never reclaimed on
-      age alone. A `run` lock lives exactly as long as its wrapper process (the
-      `build_slot.py run` PID, which heartbeats every 5s, waits for the command and releases
-      in `finally`): a dead wrapper is reclaimed immediately, and a live one only once
-      its token heartbeat is older than --heartbeat-stale-after [default 5m].
+    - Stale locks are reclaimed with a logged notice. A live `run` holder is never reclaimed for a
+      stale heartbeat, however old: its wrapper process (`build_slot.py run`) waits for the command
+      and releases in `finally`, so a dead wrapper is reclaimed immediately and a live one keeps
+      the slot.
+      Heartbeats survive a foreign handle on info.json: if the replace fails, the heartbeat is
+      written to heartbeat.json in the lock dir and readers fold it in; our own readers open
+      files with FILE_SHARE_DELETE and close them before parsing (#690).
       Other locks (`acquire` mode has no process left to heartbeat): when the owner PID is
       dead, or when its token heartbeat is older than 30 min (#620). Without a heartbeat,
-      the acquisition age supplies the 30-min limit. These bounded leases permit recovery
+      the acquisition age supplies the 30-min limit. This bounded lease permits recovery
       of abandoned lanes but may reclaim a live process silent beyond its lease limit.
     - A reclaim renames the lock dir to a unique tombstone and deletes it only if the
       tombstone still holds the lock that was judged stale; otherwise it is put back. A
@@ -89,6 +91,7 @@ SLOT_LOCK_DIR_NAMES = [
 QUEUE_FILE_NAME = "build-slot.queue.json"
 QUEUE_LOCK_NAME = "build-slot-queue.lock"
 INFO_FILE_NAME = "info.json"
+HEARTBEAT_FILE_NAME = "heartbeat.json"  # fallback heartbeat, written when info.json cannot be replaced
 DEFAULT_ACQUIRE_HOLDER_STALE_SECONDS = 30 * 60  # a live-PID `acquire` holder silent this long was abandoned (#620)
 
 DEFAULT_LOCK_HEARTBEAT_STALE_SECONDS = 5 * 60  # a live `run` holder silent this long is hung
@@ -253,6 +256,7 @@ def _write_json_atomic(path: str, data: Any, prefix: str = ".info-") -> None:
     Writes JSON so readers see the old or the new document, never a truncated one.
     Lock info is read by every waiter on every poll; an in-place rewrite let a reader
     hit the empty file, call the live lock corrupt and reclaim it (#315).
+    The temp file is removed whether or not the replace succeeded.
     """
     fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path), prefix=prefix, suffix=".tmp")
     try:
@@ -260,11 +264,80 @@ def _write_json_atomic(path: str, data: Any, prefix: str = ".info-") -> None:
             json.dump(data, f, indent=2)
         _replace_with_retry(tmp_path, path)
     finally:
-        if os.path.exists(tmp_path):
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def _read_file_bytes(path: str) -> bytes:
+    """
+    Reads a whole file and closes it before returning. On Windows the file is opened with
+    FILE_SHARE_DELETE, which Python's open() never sets: a plain open() makes every
+    os.replace of the file fail with WinError 5 for as long as the reader holds it, and
+    waiters poll lock info all day (#690).
+    """
+    if sys.platform == "win32":
+        try:
+            from ctypes import wintypes
+
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.CreateFileW.restype = wintypes.HANDLE
+            k32.CreateFileW.argtypes = (
+                wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+            )
+            k32.ReadFile.argtypes = (
+                wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
+            )
+            k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            GENERIC_READ, SHARE_ALL, OPEN_EXISTING = 0x80000000, 0x7, 3
+            handle = k32.CreateFileW(path, GENERIC_READ, SHARE_ALL, None, OPEN_EXISTING, 0x80, None)
+            if handle in (None, ctypes.c_void_p(-1).value):
+                err = ctypes.get_last_error()
+                if err in (2, 3):
+                    raise FileNotFoundError(2, "No such file", path)
+                raise ctypes.WinError(err)
+            chunks = []
             try:
-                os.unlink(tmp_path)
-            except Exception:
-                pass
+                buf = ctypes.create_string_buffer(65536)
+                got = wintypes.DWORD(0)
+                while k32.ReadFile(handle, buf, 65536, ctypes.byref(got), None) and got.value:
+                    chunks.append(buf.raw[: got.value])
+            finally:
+                k32.CloseHandle(handle)
+            return b"".join(chunks)
+        except FileNotFoundError:
+            raise
+        except OSError:
+            pass  # fall back to a plain open below
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def _read_json_file(path: str) -> Any:
+    """Reads the bytes, closes the file, then parses: no reader keeps a handle while parsing."""
+    return json.loads(_read_file_bytes(path).decode("utf-8"))
+
+
+def _merge_side_heartbeat(lock_dir: str, info: Dict[str, Any]) -> None:
+    """
+    Folds the fallback heartbeat file into info when it belongs to the same holding and is
+    newer. A holder whose info.json replace keeps failing (a foreign handle on the file)
+    still proves it is alive through this file.
+    """
+    try:
+        side = _read_json_file(os.path.join(lock_dir, HEARTBEAT_FILE_NAME))
+    except Exception:
+        return
+    if not isinstance(side, dict) or side.get("token") != info.get("token"):
+        return
+    side_epoch = _parse_timestamp(side.get("heartbeat_at_epoch"))
+    own_epoch = _parse_timestamp(info.get("heartbeat_at_epoch"))
+    if side_epoch is not None and (own_epoch is None or side_epoch > own_epoch):
+        info["heartbeat_at_epoch"] = side_epoch
+        if side.get("heartbeat_at"):
+            info["heartbeat_at"] = side["heartbeat_at"]
 
 
 def _parse_timestamp(val: Any) -> Optional[float]:
@@ -480,10 +553,11 @@ def _read_lock_dir_info(lock_dir: str, slot_idx: int) -> Optional[Dict[str, Any]
     last_err: Optional[Exception] = None
     for attempt in range(_INFO_READ_ATTEMPTS):
         try:
-            with open(info_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            data = _read_json_file(info_path)
             if isinstance(data, dict):
                 data.setdefault("slot", slot_idx)
+            if isinstance(data, dict) and not data.get("corrupt"):
+                _merge_side_heartbeat(lock_dir, data)
             return data
         except Exception as e:
             last_err = e
@@ -514,8 +588,7 @@ def _read_queue_lock_info(queue_lock_dir: str) -> Optional[Dict[str, Any]]:
     if not os.path.isfile(info_file):
         return None
     try:
-        with open(info_file, "r", encoding="utf-8") as f:
-            return json.load(f)
+        return _read_json_file(info_file)
     except Exception:
         return None
 
@@ -598,7 +671,7 @@ def _queue_atomic_lock(
                         "acquired_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                         "acquired_at_epoch": time.time(),
                     }, f)
-                os.replace(tmp_path, info_path)
+                _replace_with_retry(tmp_path, info_path)
             except Exception:
                 # Do not enter the protected section without releasable metadata.
                 shutil.rmtree(queue_lock_dir, ignore_errors=True)
@@ -1478,18 +1551,37 @@ class BuildSlotManager:
 
     def _write_heartbeat(self, name: str, slot_idx: int, slot_dir: str, info: Dict[str, Any]) -> bool:
         """
-        Writes heartbeat-bearing lock info. A failure gets its own line: a holder whose
-        heartbeat writes keep failing is reclaimed as hung after heartbeat_stale_after, and
-        this line is how that reclaim gets traced back to its cause (#315).
+        Writes heartbeat-bearing lock info. When info.json cannot be replaced (Windows
+        refuses while a foreign process keeps it open, WinError 5) the heartbeat goes to
+        a second file in the lock dir that no other process holds, and readers fold it in
+        (_merge_side_heartbeat). Only when both writes fail does the caller see False.
+        The failure is printed: a heartbeat that cannot be written is how a slot looks dead (#315, #690).
         """
+        info_path = os.path.join(slot_dir, INFO_FILE_NAME)
+        side_path = os.path.join(slot_dir, HEARTBEAT_FILE_NAME)
         try:
-            _write_json_atomic(os.path.join(slot_dir, INFO_FILE_NAME), info)
-            return True
+            _write_json_atomic(info_path, info)
         except Exception as e:
-            msg = f"[HEARTBEAT] Failed to write heartbeat for '{name}' (slot {slot_idx}): {e}"
+            msg = f"[HEARTBEAT] Failed to replace info.json for '{name}' (slot {slot_idx}): {e}"
             print(msg, file=sys.stderr)
             logger.warning(msg)
-            return False
+            try:
+                _write_json_atomic(side_path, {
+                    "token": info.get("token"),
+                    "heartbeat_at": info.get("heartbeat_at"),
+                    "heartbeat_at_epoch": info.get("heartbeat_at_epoch"),
+                }, prefix=".hb-")
+                return True
+            except Exception as e2:
+                msg = f"[HEARTBEAT] Failed to write heartbeat for '{name}' (slot {slot_idx}): {e2}"
+                print(msg, file=sys.stderr)
+                logger.warning(msg)
+                return False
+        try:
+            os.unlink(side_path)  # info.json carries the newest heartbeat again
+        except OSError:
+            pass
+        return True
 
     def check_stale_and_reclaim(
         self,
@@ -1570,6 +1662,11 @@ class BuildSlotManager:
                     if holder_pid > 0 and not self.is_pid_alive(holder_pid):
                         is_stale = True
                         reason = f"owner PID {holder_pid} is dead (owner='{owner}', slot {slot_idx})"
+                    elif holder_pid > 0 and wrapper_pid:
+                        # A live `run` wrapper owns its slot until it releases in `finally` or dies.
+                        # A stale heartbeat only means the writes failed or the host is starved, so it
+                        # never frees the slot; a second holder would run a build beside it (#690).
+                        pass
                     elif holder_pid > 0 and silence >= limit:
                         is_stale = True
                         reason = (
