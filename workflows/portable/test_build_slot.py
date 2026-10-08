@@ -1829,6 +1829,7 @@ class TestBuildSlot(unittest.TestCase):
              "import os, sys; sys.path.insert(0, sys.argv[1]); import build_slot; "
              "print(os.getpid(), build_slot.find_long_lived_owner_pid())",
              SCRIPT_DIR],
+            stdin=subprocess.DEVNULL,
             capture_output=True, text=True, check=True,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
@@ -2977,6 +2978,67 @@ class TestBuildSlot(unittest.TestCase):
             # 5. Dequeue
             manager.dequeue("lane-1", pid=os.getpid(), token="tok-1")
         self.assertEqual(violations, [], "Critical section hygiene violations detected: " + str(violations))
+
+    def test_release_toctou_preserves_successor_lock(self):
+        """
+        Verify release detaches and verifies lock identity before unlinking, so a successor
+        lock's info.json and directory are never deleted.
+        """
+        queue_lock_dir = os.path.join(self.run_dir, build_slot.QUEUE_LOCK_NAME)
+        os.makedirs(queue_lock_dir)
+        info_path = os.path.join(queue_lock_dir, build_slot.INFO_FILE_NAME)
+        with open(info_path, "w", encoding="utf-8") as f:
+            f.write('{"pid": 1234, "token": "releaser-token"}')
+
+        # Releaser removes its own lock
+        ok = build_slot._remove_owned_queue_lock(queue_lock_dir, expected_token="releaser-token")
+        self.assertTrue(ok)
+        self.assertFalse(os.path.exists(queue_lock_dir))
+
+        # When a successor acquired the lock with a different token
+        os.makedirs(queue_lock_dir)
+        with open(info_path, "w", encoding="utf-8") as f:
+            f.write('{"pid": 5678, "token": "successor-token"}')
+        ok2 = build_slot._remove_owned_queue_lock(queue_lock_dir, expected_token="releaser-token")
+        self.assertFalse(ok2)
+        self.assertTrue(os.path.exists(queue_lock_dir))
+        self.assertTrue(os.path.exists(info_path))
+        info = build_slot._read_queue_lock_info(queue_lock_dir)
+        self.assertEqual(info.get("token"), "successor-token")
+
+    def test_failed_stale_rename_honors_timeout_without_infinite_loop(self):
+        """
+        When os.rename fails during stale lock reclamation, the loop must honor timeout
+        and back off rather than continuing infinitely.
+        """
+        queue_lock_dir = os.path.join(self.run_dir, build_slot.QUEUE_LOCK_NAME)
+        os.makedirs(queue_lock_dir)
+        info_path = os.path.join(queue_lock_dir, build_slot.INFO_FILE_NAME)
+        with open(info_path, "w", encoding="utf-8") as f:
+            f.write('{"pid": 999999, "token": "dead-token"}')
+
+        with mock.patch("os.rename", side_effect=OSError("Access denied")):
+            start = time.time()
+            with self.assertRaises(TimeoutError):
+                with build_slot._queue_atomic_lock(
+                    self.run_dir,
+                    timeout=0.2,
+                    retry_interval=0.02,
+                    is_pid_alive_fn=lambda p: False,
+                ):
+                    pass
+            elapsed = time.time() - start
+            self.assertLess(elapsed, 1.0)
+
+    def test_metadata_free_fresh_successor_race_is_not_reclaimed(self):
+        """
+        A fresh directory without metadata must not be reclaimed as stale when judged was None.
+        """
+        queue_lock_dir = os.path.join(self.run_dir, build_slot.QUEUE_LOCK_NAME)
+        os.makedirs(queue_lock_dir)
+        reclaimed = build_slot._tombstone_stale_queue_lock(queue_lock_dir, judged=None, stale_after=15.0)
+        self.assertFalse(reclaimed)
+        self.assertTrue(os.path.exists(queue_lock_dir))
 
 if __name__ == "__main__":
     unittest.main()

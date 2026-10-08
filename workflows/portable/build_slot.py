@@ -251,7 +251,7 @@ def _replace_with_retry(src: str, dst: str) -> None:
             time.sleep(delay)
 
 
-def _write_json_atomic(path: str, data: Any, prefix: str = ".info-") -> None:
+def _write_json_atomic(path: str, data: Any, prefix: str = ".info-", retry: bool = True) -> None:
     """
     Writes JSON so readers see the old or the new document, never a truncated one.
     Lock info is read by every waiter on every poll; an in-place rewrite let a reader
@@ -261,7 +261,10 @@ def _write_json_atomic(path: str, data: Any, prefix: str = ".info-") -> None:
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
-        _replace_with_retry(tmp_path, path)
+        if retry:
+            _replace_with_retry(tmp_path, path)
+        else:
+            os.replace(tmp_path, path)
     finally:
         if os.path.exists(tmp_path):
             try:
@@ -470,7 +473,7 @@ def _corrupt_lock_info(lock_dir: str, slot_idx: int) -> Dict[str, Any]:
     }
 
 
-def _read_lock_dir_info(lock_dir: str, slot_idx: int) -> Optional[Dict[str, Any]]:
+def _read_lock_dir_info(lock_dir: str, slot_idx: int, retry: bool = True) -> Optional[Dict[str, Any]]:
     """Reads the info.json of a slot lock dir (or its tombstone); None if the dir is gone."""
     if not os.path.isdir(lock_dir):
         return None
@@ -481,7 +484,8 @@ def _read_lock_dir_info(lock_dir: str, slot_idx: int) -> Optional[Dict[str, Any]
     # Retry briefly: a holder still running an older copy rewrites info.json in place,
     # and Windows can refuse a read mid-replace. Only a persistent failure is corrupt.
     last_err: Optional[Exception] = None
-    for attempt in range(_INFO_READ_ATTEMPTS):
+    attempts = _INFO_READ_ATTEMPTS if retry else 1
+    for attempt in range(attempts):
         try:
             with open(info_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
@@ -490,7 +494,7 @@ def _read_lock_dir_info(lock_dir: str, slot_idx: int) -> Optional[Dict[str, Any]
             return data
         except Exception as e:
             last_err = e
-            if attempt < _INFO_READ_ATTEMPTS - 1:
+            if retry and attempt < attempts - 1:
                 time.sleep(_INFO_READ_RETRY_DELAY)
     logger.warning("Failed to read lock info for slot %d: %s", slot_idx, last_err)
     return _corrupt_lock_info(lock_dir, slot_idx)
@@ -528,75 +532,117 @@ def _jittered(delay: float) -> float:
     return delay * (0.5 + random.random())
 
 
-def _remove_owned_queue_lock(
-    queue_lock_dir: str,
-    patience: float = 5.0,
-    expected_token: Optional[str] = None,
-) -> None:
+def _clean_detached_lock_dir(target_dir: str, patience: float = 5.0) -> None:
     """
-    Deletes the queue lock dir its owner holds. Every waiter opens info.json to judge the
-    lock, and Windows refuses to delete an open file, so a single unlink/rmdir loses to a
-    busy poller and would leave the lock behind for as long as the owner lives (a long
-    `run` wrapper: hours). Retry until the readers' short opens pass.
-    If expected_token is provided, ensures we never unlink or delete a directory belonging
-    to a successor lock.
+    Deletes a detached tombstone directory. Because the directory is already
+    detached from the canonical lock path, pollers cannot block new lock holders
+    at the canonical path. Windows may keep handles open temporarily, so we retry
+    until open handles pass.
     """
-    info_path = os.path.join(queue_lock_dir, INFO_FILE_NAME)
+    info_path = os.path.join(target_dir, INFO_FILE_NAME)
     deadline = time.time() + patience
     delay = 0.01
     while True:
-        if expected_token is not None:
-            info = _read_queue_lock_info(queue_lock_dir)
-            if info and info.get("token") and info.get("token") != expected_token:
-                return
         try:
             if os.path.isfile(info_path):
-                if expected_token is not None:
-                    info = _read_queue_lock_info(queue_lock_dir)
-                    if info and info.get("token") and info.get("token") != expected_token:
-                        return
                 os.unlink(info_path)
-        except FileNotFoundError:
-            pass
-        except OSError:
+        except (FileNotFoundError, OSError):
             pass
         try:
-            if expected_token is not None:
-                info = _read_queue_lock_info(queue_lock_dir)
-                if info and info.get("token") and info.get("token") != expected_token:
-                    return
-            os.rmdir(queue_lock_dir)
+            os.rmdir(target_dir)
             return
         except FileNotFoundError:
             return
         except OSError:
-            if not os.path.isdir(queue_lock_dir):
+            if not os.path.isdir(target_dir):
                 return
             if time.time() >= deadline:
-                if expected_token is not None:
-                    info = _read_queue_lock_info(queue_lock_dir)
-                    if info and info.get("token") and info.get("token") != expected_token:
-                        return
-                shutil.rmtree(queue_lock_dir, ignore_errors=True)
+                shutil.rmtree(target_dir, ignore_errors=True)
                 return
         time.sleep(_jittered(delay))
         delay = min(delay * 2, 0.1)
 
 
-def _tombstone_stale_queue_lock(queue_lock_dir: str, judged: Optional[Dict[str, Any]]) -> bool:
+def _remove_owned_queue_lock(
+    queue_lock_dir: str,
+    patience: float = 5.0,
+    expected_token: Optional[str] = None,
+    expected_identity: Optional[Tuple[Any, ...]] = None,
+) -> bool:
+    """
+    Deletes the queue lock directory its owner holds.
+    To prevent check-then-unlink races where a successor lock could have its metadata
+    or directory deleted between check and unlink, we detach the directory with an
+    atomic rename to a unique tombstone FIRST, then verify the full _lock_identity
+    (token else PID+acquisition) before deleting only the tombstone.
+    If the tombstone identity does not match (a successor was renamed), we restore it
+    to queue_lock_dir. If restoration is impossible, we preserve successor evidence.
+    No retries or sleeps occur while holding the canonical lock name.
+    """
+    if expected_token is not None and expected_identity is None:
+        expected_identity = ("token", expected_token)
+
+    is_already_detached = ".tombstone-" in queue_lock_dir or ".releasing-" in queue_lock_dir
+    if is_already_detached:
+        if expected_identity is not None:
+            info = _read_queue_lock_info(queue_lock_dir)
+            if _lock_identity(info) != expected_identity:
+                return False
+        _clean_detached_lock_dir(queue_lock_dir, patience=patience)
+        return True
+
+    if not os.path.exists(queue_lock_dir):
+        return False
+
+    tombstone = f"{queue_lock_dir}.releasing-{os.getpid()}-{uuid.uuid4().hex}"
+    try:
+        os.rename(queue_lock_dir, tombstone)
+    except OSError:
+        return False
+
+    moved_info = _read_queue_lock_info(tombstone)
+    for _ in range(_INFO_READ_ATTEMPTS - 1):
+        if moved_info is not None:
+            break
+        time.sleep(_INFO_READ_RETRY_DELAY)
+        moved_info = _read_queue_lock_info(tombstone)
+    moved_identity = _lock_identity(moved_info)
+
+    if expected_identity is not None and moved_identity != expected_identity:
+        try:
+            os.rename(tombstone, queue_lock_dir)
+        except OSError as exc:
+            logger.warning(
+                "Could not restore mismatched queue lock tombstone %s to %s: %s; preserving successor evidence",
+                tombstone,
+                queue_lock_dir,
+                exc,
+            )
+        return False
+
+    _clean_detached_lock_dir(tombstone, patience=patience)
+    return True
+
+
+def _tombstone_stale_queue_lock(
+    queue_lock_dir: str,
+    judged: Optional[Dict[str, Any]],
+    stale_after: float = 15.0,
+) -> bool:
     """
     Safely reclaims a stale queue lock using atomic directory rename to a unique tombstone.
-    Verifies that the tombstone still contains the lock judged stale (matching token and/or PID)
-    before removing it. If the lock changed hands before the rename, restores it.
+    Verifies that the tombstone still contains the lock judged stale (full _lock_identity)
+    before removing it. If the lock changed hands or belongs to a fresh successor, restores it.
+    If restoration is impossible, preserves successor evidence.
     Returns True if this call removed the stale lock.
     """
-    want_token = (judged or {}).get("token")
-    want_pid = (judged or {}).get("pid")
+    judged_identity = _lock_identity(judged)
 
     current_info = _read_queue_lock_info(queue_lock_dir)
-    if want_token and current_info and current_info.get("token") != want_token:
+    current_identity = _lock_identity(current_info)
+    if judged_identity is not None and current_identity != judged_identity:
         return False
-    if not want_token and want_pid and current_info and current_info.get("pid") != want_pid:
+    if judged_identity is None and current_identity is not None:
         return False
 
     tombstone = f"{queue_lock_dir}.tombstone-{os.getpid()}-{uuid.uuid4().hex}"
@@ -605,26 +651,37 @@ def _tombstone_stale_queue_lock(queue_lock_dir: str, judged: Optional[Dict[str, 
     except OSError:
         return False
 
-    moved = _read_queue_lock_info(tombstone)
-    if moved is None and not os.path.isdir(tombstone):
+    moved_info = _read_queue_lock_info(tombstone)
+    moved_identity = _lock_identity(moved_info)
+
+    is_mismatch = False
+    if judged_identity is not None:
+        if moved_identity != judged_identity:
+            is_mismatch = True
+    else:
+        if moved_identity is not None:
+            is_mismatch = True
+        else:
+            try:
+                mtime = os.path.getmtime(tombstone)
+                if (time.time() - mtime) < stale_after:
+                    is_mismatch = True
+            except OSError:
+                is_mismatch = True
+
+    if is_mismatch:
+        try:
+            os.rename(tombstone, queue_lock_dir)
+        except OSError as exc:
+            logger.warning(
+                "Could not restore successor queue lock tombstone %s to %s: %s; preserving successor evidence",
+                tombstone,
+                queue_lock_dir,
+                exc,
+            )
         return False
 
-    if want_token:
-        if (moved or {}).get("token") != want_token:
-            try:
-                os.rename(tombstone, queue_lock_dir)
-            except OSError:
-                pass
-            return False
-    elif want_pid:
-        if (moved or {}).get("pid") != want_pid:
-            try:
-                os.rename(tombstone, queue_lock_dir)
-            except OSError:
-                pass
-            return False
-
-    _remove_owned_queue_lock(tombstone, patience=2.0)
+    _clean_detached_lock_dir(tombstone, patience=2.0)
     return True
 
 
@@ -709,9 +766,8 @@ def _queue_atomic_lock(
                             is_stale = True
 
                 if is_stale:
-                    if _tombstone_stale_queue_lock(queue_lock_dir, info):
+                    if _tombstone_stale_queue_lock(queue_lock_dir, info, stale_after=stale_after):
                         continue
-                    continue
             except Exception:
                 pass
 
@@ -725,15 +781,7 @@ def _queue_atomic_lock(
     finally:
         if acquired:
             try:
-                info = _read_queue_lock_info(queue_lock_dir)
-                for attempt in range(_INFO_READ_ATTEMPTS - 1):
-                    if info is not None:
-                        break
-                    time.sleep(_INFO_READ_RETRY_DELAY)
-                    info = _read_queue_lock_info(queue_lock_dir)
-                # Verify ownership before releasing: only release if info matches our unique lock_token
-                if info and info.get("token") == lock_token:
-                    _remove_owned_queue_lock(queue_lock_dir, expected_token=lock_token)
+                _remove_owned_queue_lock(queue_lock_dir, expected_token=lock_token)
             except Exception:
                 pass
 
@@ -983,11 +1031,13 @@ class BuildSlotManager:
             except Exception:
                 pass
 
-    def _read_slot_info(self, slot_idx: int = 0) -> Optional[Dict[str, Any]]:
+    def _read_slot_info(self, slot_idx: int = 0, retry: Optional[bool] = None) -> Optional[Dict[str, Any]]:
         """Reads lock info metadata for slot_idx if its lock dir exists."""
         if slot_idx >= len(self.slot_dirs):
             return None
-        return _read_lock_dir_info(self.slot_dirs[slot_idx], slot_idx)
+        if retry is None:
+            retry = not getattr(self._queue_op_state, "under_queue_lock", False)
+        return _read_lock_dir_info(self.slot_dirs[slot_idx], slot_idx, retry=retry)
 
     def _tombstone_stale_slot(self, slot_idx: int, judged: Dict[str, Any], reason: str) -> bool:
         """
@@ -1112,7 +1162,8 @@ class BuildSlotManager:
 
     def _write_queue(self, queue: List[Dict[str, Any]]) -> None:
         """Writes queue list atomically using a temp file and os.replace."""
-        _write_json_atomic(self.queue_file, queue, prefix="queue-")
+        under_lock = getattr(self._queue_op_state, "under_queue_lock", False)
+        _write_json_atomic(self.queue_file, queue, prefix="queue-", retry=not under_lock)
 
     def _is_entry_stale(
         self,
@@ -1374,16 +1425,27 @@ class BuildSlotManager:
     def _any_slot_held(self) -> bool:
         return any(os.path.isdir(s_dir) for s_dir in self.slot_dirs)
 
+    @contextmanager
     def _queue_lock(self):
         """
         The queue file lock, with each attempt capped at the time left to the deadline of the
         running _retry_queue_op, so no attempt overshoots the caller's own --timeout.
+        Sets under_queue_lock on self._queue_op_state while held so queue writes and
+        slot-info reads do not sleep or retry in the critical section.
         """
         deadline = getattr(self._queue_op_state, "deadline", None)
         if deadline is None:
-            return _queue_atomic_lock(self.run_dir, is_pid_alive_fn=self.is_pid_alive)
-        remaining = max(0.05, min(10.0, deadline - time.time()))
-        return _queue_atomic_lock(self.run_dir, timeout=remaining, is_pid_alive_fn=self.is_pid_alive)
+            lock_cm = _queue_atomic_lock(self.run_dir, is_pid_alive_fn=self.is_pid_alive)
+        else:
+            remaining = max(0.05, min(10.0, deadline - time.time()))
+            lock_cm = _queue_atomic_lock(self.run_dir, timeout=remaining, is_pid_alive_fn=self.is_pid_alive)
+        with lock_cm:
+            prev = getattr(self._queue_op_state, "under_queue_lock", False)
+            self._queue_op_state.under_queue_lock = True
+            try:
+                yield
+            finally:
+                self._queue_op_state.under_queue_lock = prev
 
     def _within_deadline(self, deadline: Optional[float], op):
         """Runs op once with every queue-lock attempt capped at 'deadline' (None: uncapped)."""
