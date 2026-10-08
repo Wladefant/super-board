@@ -530,20 +530,22 @@ class TestBuildSlot(unittest.TestCase):
         self.assertEqual(lines, ["subproc-1", "subproc-2", "subproc-3"])
 
     def test_queue_reclaim_heartbeat_and_negative_control(self):
-        # Living PIDs: is_pid_alive returns True
-        manager = BuildSlotManager(run_dir=self.run_dir, is_pid_alive_fn=lambda p: True)
+        # Living PIDs: is_pid_alive returns True for 2002, 2004, 2005; False for dead 2001, 2003
+        living_pids = {2002, 2004, 2005}
+        manager = BuildSlotManager(run_dir=self.run_dir, is_pid_alive_fn=lambda p: p in living_pids)
         now = time.time()
 
         # Seed queue with:
-        # 1. Stale heartbeat entry under living PID (heartbeat 65s ago) -> must be reclaimed
+        # 1. Stale heartbeat entry under dead PID (heartbeat 65s ago) -> must be reclaimed
         # 2. Fresh heartbeat entry under living PID (heartbeat 5s ago) -> must NOT be reclaimed (negative control)
-        # 3. Legacy entry without heartbeat_at older than 30m (enqueued 1850s ago) -> must be reclaimed
-        # 4. Legacy entry without heartbeat_at newer than 30m (enqueued 300s ago) -> must NOT be reclaimed
+        # 3. Legacy entry without heartbeat_at older than 30m under dead PID -> must be reclaimed
+        # 4. Legacy entry without heartbeat_at newer than 30m under living PID -> must NOT be reclaimed
+        # 5. Stale heartbeat entry under living PID (heartbeat 65s ago) -> must NOT be reclaimed (live PID preserved)
         seeded_queue = [
             {
-                "name": "stale-hb-lane",
+                "name": "dead-stale-hb-lane",
                 "pid": 2001,
-                "token": "tok-stale",
+                "token": "tok-dead-stale",
                 "enqueued_at": now - 100.0,
                 "enqueued_at_iso": datetime.datetime.fromtimestamp(now - 100.0, datetime.timezone.utc).isoformat(),
                 "heartbeat_at": now - 65.0,
@@ -572,6 +574,15 @@ class TestBuildSlot(unittest.TestCase):
                 "enqueued_at": now - 300.0,
                 "enqueued_at_iso": datetime.datetime.fromtimestamp(now - 300.0, datetime.timezone.utc).isoformat(),
             },
+            {
+                "name": "stale-live-hb-lane",
+                "pid": 2005,
+                "token": "tok-stale-live",
+                "enqueued_at": now - 150.0,
+                "enqueued_at_iso": datetime.datetime.fromtimestamp(now - 150.0, datetime.timezone.utc).isoformat(),
+                "heartbeat_at": now - 65.0,
+                "heartbeat_at_iso": datetime.datetime.fromtimestamp(now - 65.0, datetime.timezone.utc).isoformat(),
+            },
         ]
         manager._write_queue(seeded_queue)
 
@@ -579,18 +590,19 @@ class TestBuildSlot(unittest.TestCase):
         cleaned = manager.clean_queue()
         names = [x["name"] for x in cleaned]
 
-        # Stale heartbeat reclaimed
-        self.assertNotIn("stale-hb-lane", names)
+        # Dead PID with stale heartbeat reclaimed
+        self.assertNotIn("dead-stale-hb-lane", names)
         # Fresh heartbeat preserved (negative control!)
         self.assertIn("fresh-hb-lane", names)
-        # Legacy stale (> 30m) reclaimed
+        # Legacy stale (> 30m) under dead PID reclaimed
         self.assertNotIn("legacy-stale-lane", names)
-        # Legacy fresh (<= 30m) preserved
+        # Legacy fresh (<= 30m) under living PID preserved
         self.assertIn("legacy-fresh-lane", names)
+        # Stale heartbeat under living PID preserved
+        self.assertIn("stale-live-hb-lane", names)
 
         # Survivors in FIFO order by original enqueue time
-        self.assertEqual(names, ["legacy-fresh-lane", "fresh-hb-lane"])
-
+        self.assertEqual(names, ["legacy-fresh-lane", "stale-live-hb-lane", "fresh-hb-lane"])
     def test_acquire_timeout_leaves_no_entry_behind(self):
         manager = BuildSlotManager(run_dir=self.run_dir, max_slots=1)
 
@@ -627,20 +639,30 @@ class TestBuildSlot(unittest.TestCase):
 
     def test_in_process_lanes_same_pid_fifo_and_stale_reclaim(self):
         main_pid = 35296
-        manager = BuildSlotManager(run_dir=self.run_dir, is_pid_alive_fn=lambda p: True)
+        dead_pid = 999999
+        manager = BuildSlotManager(run_dir=self.run_dir, is_pid_alive_fn=lambda p: p == main_pid)
 
         now = time.time()
-        # Simulate lane-1 and lane-2 enqueued by Veyyon Main (same PID 35296)
+        # Simulate dead-lane, lane-1, and lane-2
         lane1_token = "tok-lane-1"
         lane2_token = "tok-lane-2"
         seeded_queue = [
+            {
+                "name": "dead-lane",
+                "pid": dead_pid,
+                "token": "tok-dead",
+                "enqueued_at": now - 120.0,
+                "enqueued_at_iso": datetime.datetime.fromtimestamp(now - 120.0, datetime.timezone.utc).isoformat(),
+                "heartbeat_at": now - 70.0,
+                "heartbeat_at_iso": datetime.datetime.fromtimestamp(now - 70.0, datetime.timezone.utc).isoformat(),
+            },
             {
                 "name": "lane-1",
                 "pid": main_pid,
                 "token": lane1_token,
                 "enqueued_at": now - 80.0,
                 "enqueued_at_iso": datetime.datetime.fromtimestamp(now - 80.0, datetime.timezone.utc).isoformat(),
-                "heartbeat_at": now - 70.0,  # Dead waiter: heartbeat stopped 70s ago
+                "heartbeat_at": now - 70.0,  # Waiter with late heartbeat, but living PID 35296
                 "heartbeat_at_iso": datetime.datetime.fromtimestamp(now - 70.0, datetime.timezone.utc).isoformat(),
             },
             {
@@ -655,20 +677,20 @@ class TestBuildSlot(unittest.TestCase):
         ]
         manager._write_queue(seeded_queue)
 
-        # Before reclaim: lane-1 is at head
+        # Before reclaim: all 3 in queue
         q_before = manager._read_queue()
-        self.assertEqual([x["name"] for x in q_before], ["lane-1", "lane-2"])
+        self.assertEqual([x["name"] for x in q_before], ["dead-lane", "lane-1", "lane-2"])
 
-        # Reclaim runs: lane-1 is pruned despite living PID 35296; lane-2 is kept
+        # Reclaim runs: dead-lane is pruned; lane-1 is preserved despite late heartbeat because PID is alive
         q_after = manager.clean_queue()
-        self.assertEqual([x["name"] for x in q_after], ["lane-2"])
+        self.assertEqual([x["name"] for x in q_after], ["lane-1", "lane-2"])
 
-        # lane-2 can now acquire the lock
+        # Once lane-1 is dequeued (or finishes), lane-2 can acquire the lock
+        manager.dequeue("lane-1", pid=main_pid, token=lane1_token)
         self.assertTrue(manager.acquire("lane-2", pid=main_pid, token=lane2_token, timeout=1.0, poll_interval=0.02))
         self.assertTrue(manager.is_held_by("lane-2", pid=main_pid))
         self.assertTrue(manager.release("lane-2"))
         self.assertEqual(manager.clean_queue(), [])
-
     def test_acquire_loop_writes_heartbeat(self):
         manager = BuildSlotManager(run_dir=self.run_dir, max_slots=1)
         self.assertTrue(manager.acquire("blocker-lane", timeout=1.0))
@@ -1012,16 +1034,18 @@ class TestBuildSlot(unittest.TestCase):
 
     def test_queue_atomic_lock_stale_age_reclaimed(self):
         """
-        If build-slot-queue.lock is older than stale_after, _queue_atomic_lock
-        must reclaim it even if the PID might appear alive.
+        If build-slot-queue.lock has a dead PID (or no info file) and is older than stale_after,
+        _queue_atomic_lock reclaims it. A live PID lock is NEVER reclaimed on age.
         """
         queue_lock_dir = os.path.join(self.run_dir, build_slot.QUEUE_LOCK_NAME)
         os.makedirs(queue_lock_dir, exist_ok=True)
         info_path = os.path.join(queue_lock_dir, build_slot.INFO_FILE_NAME)
         old_epoch = time.time() - 3600  # 1 hour ago
+        dead_pid = 99999999
+        self.assertFalse(is_pid_alive(dead_pid))
         with open(info_path, "w", encoding="utf-8") as f:
             json.dump({
-                "pid": os.getpid(),
+                "pid": dead_pid,
                 "acquired_at": "2026-09-27T00:00:00Z",
                 "acquired_at_epoch": old_epoch,
             }, f)
@@ -1033,6 +1057,19 @@ class TestBuildSlot(unittest.TestCase):
         self.assertTrue(acquired)
         self.assertFalse(os.path.exists(queue_lock_dir))
 
+        # Live PID lock is NEVER reclaimed on age
+        os.makedirs(queue_lock_dir, exist_ok=True)
+        with open(info_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "pid": os.getpid(),
+                "acquired_at": "2026-09-27T00:00:00Z",
+                "acquired_at_epoch": old_epoch,
+            }, f)
+
+        with self.assertRaises(TimeoutError):
+            with _queue_atomic_lock(self.run_dir, timeout=0.1, retry_interval=0.01, stale_after=5.0):
+                pass
+        self.assertTrue(os.path.isdir(queue_lock_dir))
     def test_acquire_survives_heartbeat_timeout(self):
         """
         In acquire(), a TimeoutError from heartbeat() due to lock contention
@@ -1663,21 +1700,16 @@ class TestBuildSlot(unittest.TestCase):
         with open(manager.info_file, "w", encoding="utf-8") as f:
             json.dump(info, f)
 
-    def test_abandoned_acquire_holder_with_live_host_pid_reclaimed_after_30_min(self):
-        """
-        #620: lanes acquired a slot and ended without release. Their recorded owner PID is the
-        veyyon host, which stays alive, so the dead-PID rule never fired and the slot stayed
-        held for hours. A live owner of an `acquire` lock silent for 30 min is reclaimed.
-        """
+    def test_live_acquire_holder_with_late_heartbeat_preserves_slot(self):
+        """A late heartbeat cannot prove that a live acquire holder stopped."""
         manager = BuildSlotManager(run_dir=self.run_dir)
         host = self._live_process()
         self._write_acquire_lock(manager, host.pid, age=134 * 60.0, hb_age=134 * 60.0)
 
         stderr = io.StringIO()
         with redirect_stderr(stderr):
-            self.assertTrue(manager.check_stale_and_reclaim(), stderr.getvalue())
-        self.assertFalse(os.path.isdir(manager.lock_dir))
-        self.assertIn(f"acquire owner PID {host.pid} is alive but silent", stderr.getvalue())
+            self.assertFalse(manager.check_stale_and_reclaim(), stderr.getvalue())
+        self.assertTrue(os.path.isdir(manager.lock_dir))
 
     def test_acquire_holder_with_live_pid_silent_under_30_min_not_reclaimed(self):
         """#620 negative control: a live `acquire` holder below the 30 min limit keeps its slot."""
@@ -1737,17 +1769,16 @@ class TestBuildSlot(unittest.TestCase):
         )
         self.assertEqual(missing.returncode, 1)
 
-    def test_live_run_wrapper_with_stale_heartbeat_reclaimed(self):
-        """A live wrapper whose heartbeat is older than 5 minutes has hung and is reclaimed."""
+    def test_live_run_wrapper_with_late_heartbeat_preserves_slot(self):
+        """A delayed heartbeat must not release a live wrapper's slot."""
         manager = BuildSlotManager(run_dir=self.run_dir)
         wrapper = self._live_process()
         self._write_run_lock(manager, wrapper.pid, wrapper.pid, age=600.0, hb_age=301.0)
 
         stderr = io.StringIO()
         with redirect_stderr(stderr):
-            self.assertTrue(manager.check_stale_and_reclaim())
-        self.assertFalse(os.path.isdir(manager.lock_dir))
-        self.assertIn(f"run wrapper PID {wrapper.pid} is alive but its heartbeat is stale", stderr.getvalue())
+            self.assertFalse(manager.check_stale_and_reclaim())
+        self.assertTrue(os.path.isdir(manager.lock_dir))
 
     def test_dead_run_wrapper_reclaimed_only_after_grace_period(self):
         """
@@ -2447,6 +2478,137 @@ class TestBuildSlot(unittest.TestCase):
         )
         self.assertEqual(args_run_with_cwd.cwd, "D:/wt")
         self.assertEqual(args_run_with_cwd.next_dir, "frontend")
+
+    def test_regression_read_queue_raises_on_read_error(self):
+        """
+        Regression 1: _read_queue must raise (or retry and raise) on read/parse errors
+        when the queue file exists, rather than returning [] which wipes the queue.
+        A missing queue file returns [] only on legitimate initial creation.
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        # 1. Non-existent file returns [] for legitimate initial creation
+        self.assertFalse(os.path.exists(manager.queue_file))
+        self.assertEqual(manager._read_queue(), [])
+
+        # 2. Corrupt JSON in an existing file must RAISE, not return []
+        with open(manager.queue_file, "w", encoding="utf-8") as f:
+            f.write("{corrupt json[")
+
+        with self.assertRaises(Exception):
+            manager._read_queue()
+
+        # 3. Non-list JSON in existing file must RAISE, not return []
+        with open(manager.queue_file, "w", encoding="utf-8") as f:
+            json.dump({"not": "a list"}, f)
+
+        with self.assertRaises(Exception):
+            manager._read_queue()
+
+    def test_regression_queue_lock_never_age_reclaimed_for_live_pid_and_releaser_does_not_delete_successor(self):
+        """
+        Regression 2: Live queue locks must NEVER be age-reclaimed; only dead PIDs are reclaimed.
+        Releaser must verify unique ownership token before deleting queue lock directory,
+        so it never deletes a successor's lock directory.
+        """
+        queue_lock_dir = os.path.join(self.run_dir, build_slot.QUEUE_LOCK_NAME)
+        os.makedirs(queue_lock_dir, exist_ok=True)
+        info_path = os.path.join(queue_lock_dir, build_slot.INFO_FILE_NAME)
+
+        # Part A: An old lock owned by a LIVE PID (os.getpid()) must NOT be reclaimed on age
+        old_epoch = time.time() - 3600  # 1 hour old
+        with open(info_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "pid": os.getpid(),
+                "token": "original-live-token",
+                "acquired_at": "2026-09-27T00:00:00Z",
+                "acquired_at_epoch": old_epoch,
+            }, f)
+
+        # A contender attempting to acquire with stale_after=1.0s must NOT reclaim this live lock
+        with self.assertRaises(TimeoutError):
+            with _queue_atomic_lock(self.run_dir, timeout=0.1, retry_interval=0.02, stale_after=1.0):
+                pass
+        self.assertTrue(os.path.isdir(queue_lock_dir), "Live PID queue lock must not be reclaimed on age")
+
+        # Part B: Releaser must not delete successor lock with different token
+        shutil.rmtree(queue_lock_dir, ignore_errors=True)
+        with _queue_atomic_lock(self.run_dir, timeout=1.0) as _:
+            # While holding, simulate that ownership transitioned to a successor
+            with open(info_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "pid": os.getpid(),
+                    "token": "successor-different-token",
+                    "acquired_at": "2026-09-27T00:00:00Z",
+                    "acquired_at_epoch": time.time(),
+                }, f)
+
+        # After exiting context manager, successor's lock directory and info must STILL exist
+        self.assertTrue(os.path.isdir(queue_lock_dir), "Releaser must not delete successor's lock directory")
+        self.assertTrue(os.path.isfile(info_path), "Releaser must not delete successor's info.json")
+        info = build_slot._read_queue_lock_info(queue_lock_dir)
+        self.assertEqual(info.get("token"), "successor-different-token")
+
+    def test_regression_live_pid_queue_entry_preserved_despite_late_heartbeat(self):
+        """
+        Regression 3: Live PID queue entries must be preserved in the queue despite late heartbeat.
+        Only dead PIDs should be purged when heartbeat expires.
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir, is_pid_alive_fn=lambda p: (p == 2001))
+        now = time.time()
+        seeded_queue = [
+            {
+                "name": "live-pid-late-hb",
+                "pid": 2001,
+                "token": "tok-live",
+                "enqueued_at": now - 300.0,
+                "enqueued_at_iso": datetime.datetime.fromtimestamp(now - 300.0, datetime.timezone.utc).isoformat(),
+                "heartbeat_at": now - 120.0,
+                "heartbeat_at_iso": datetime.datetime.fromtimestamp(now - 120.0, datetime.timezone.utc).isoformat(),
+            },
+            {
+                "name": "dead-pid-late-hb",
+                "pid": 9999,
+                "token": "tok-dead",
+                "enqueued_at": now - 300.0,
+                "enqueued_at_iso": datetime.datetime.fromtimestamp(now - 300.0, datetime.timezone.utc).isoformat(),
+                "heartbeat_at": now - 120.0,
+                "heartbeat_at_iso": datetime.datetime.fromtimestamp(now - 120.0, datetime.timezone.utc).isoformat(),
+            },
+        ]
+        manager._write_queue(seeded_queue)
+
+        cleaned = manager.clean_queue(stale_heartbeat_after=60.0)
+        names = [x["name"] for x in cleaned]
+
+        # Live PID must be PRESERVED despite late heartbeat
+        self.assertIn("live-pid-late-hb", names, "Queue entry for living PID must be preserved despite late heartbeat")
+        # Dead PID must be PRUNED
+        self.assertNotIn("dead-pid-late-hb", names, "Queue entry for dead PID must be pruned")
+
+    def test_regression_acquire_re_enqueue_preserves_original_enqueued_at(self):
+        """Recovery in the acquire loop preserves the original FIFO timestamp."""
+        manager = BuildSlotManager(run_dir=self.run_dir, max_slots=1, acquisition_stagger=0,
+                                   is_pid_alive_fn=lambda p: True)
+        manager.acquire("holder", timeout=1)
+        enqueue = manager.enqueue
+        timestamps = []
+
+        def record_enqueue(*args, **kwargs):
+            result = enqueue(*args, **kwargs)
+            timestamps.append(manager._read_queue()[0]["enqueued_at"])
+            return result
+
+        def lose_entry(**kwargs):
+            manager.dequeue(token=kwargs["token"])
+            return False
+
+        with mock.patch.object(manager, "enqueue", side_effect=record_enqueue), \
+             mock.patch.object(manager, "heartbeat", side_effect=lose_entry):
+            self.assertFalse(manager.acquire("waiter", timeout=0.08, poll_interval=0.01,
+                                             heartbeat_interval=0.02, token="waiter-token"))
+        self.assertGreater(len(timestamps), 1)
+        self.assertEqual(timestamps, [timestamps[0]] * len(timestamps))
+        manager.release("holder")
 
 if __name__ == "__main__":
     unittest.main()
