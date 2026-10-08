@@ -2115,15 +2115,20 @@ class BuildSlotManager:
         if matching_slots:
             for idx, s_dir in matching_slots:
                 info_path = os.path.join(s_dir, INFO_FILE_NAME)
-                try:
-                    if os.path.isfile(info_path):
-                        os.unlink(info_path)
-                except Exception:
-                    pass
-                try:
-                    os.rmdir(s_dir)
-                except Exception:
-                    shutil.rmtree(s_dir, ignore_errors=True)
+                deadline = time.time() + 1.0
+                while os.path.isdir(s_dir):
+                    try:
+                        if os.path.isfile(info_path):
+                            os.unlink(info_path)
+                    except Exception:
+                        pass
+                    try:
+                        os.rmdir(s_dir)
+                    except Exception:
+                        shutil.rmtree(s_dir, ignore_errors=True)
+                    if not os.path.isdir(s_dir) or time.time() >= deadline:
+                        break
+                    time.sleep(0.01)
                 msg = f"Released build slot lock for '{name}'"
                 print(msg)
                 logger.info(msg)
