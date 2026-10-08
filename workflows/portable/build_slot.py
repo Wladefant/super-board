@@ -84,8 +84,10 @@ _guard_state = threading.local()
 def _transition_guard(path: str, timeout: float = 5.0):
     """Serialize lock-directory transitions on a permanent OS-locked file."""
     path = os.path.abspath(path)
+    pid = os.getpid()
     held = getattr(_guard_state, "held", None)
-    if held is None:
+    if held is None or getattr(_guard_state, "pid", None) != pid:
+        _guard_state.pid = pid
         held = _guard_state.held = set()
     if path in held:
         yield

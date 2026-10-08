@@ -11,6 +11,7 @@ Arbitrate the slot with `os.mkdir` on a lock directory plus a FIFO queue file wi
 Stable guard files serialize directory creation, metadata publication, reclaim and release.
 Windows uses a byte-range file lock. POSIX uses `flock`.
 The operating system releases the guard when its process ends.
+Reentrant guard state belongs to one PID and one thread. Fork children must acquire their own OS guard.
 Guard files stay at fixed paths and are never renamed or deleted.
 Slot heartbeats use the same guard, so reclaim reads a current lease.
 Reclaim checks identity before and after an atomic tombstone rename.
