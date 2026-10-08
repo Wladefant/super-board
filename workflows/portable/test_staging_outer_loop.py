@@ -660,6 +660,48 @@ class TestStagingOuterLoopContainerDown(unittest.TestCase):
     def setUp(self):
         self.now = datetime(2026, 9, 26, 22, 30, 0, tzinfo=timezone.utc)
 
+    def test_created_replacement_with_running_sibling_is_ignored(self):
+        prefix = "polysimulator-staging-iad-v09j4g-"
+        for service in ("frontend", "backend", "backend-daemon"):
+            for renamed in (False, True):
+                with self.subTest(service=service, renamed=renamed):
+                    old_name = prefix + service + "-1"
+                    if renamed:
+                        old_name = "4396f8b432ac_" + old_name
+                    containers = [
+                        {"name": old_name, "state": "created", "status": "created"},
+                        {"name": prefix + service + "-2", "state": "running", "status": "Up 1 minute"},
+                    ]
+                    self.assertEqual(check_container_down(containers, self.now), [])
+                    self.assertEqual(check_container_down(list(reversed(containers)), self.now), [])
+
+    def test_created_without_same_service_running_sibling_still_alerts(self):
+        prefix = "polysimulator-staging-iad-v09j4g-"
+        containers = [
+            {"name": prefix + "backend-1", "state": "created"},
+            {"name": prefix + "backend-daemon-1", "state": "running"},
+        ]
+        incidents = check_container_down(containers, self.now)
+        self.assertEqual([i.service for i in incidents], ["backend"])
+
+    def test_unhealthy_running_sibling_still_alerts(self):
+        prefix = "polysimulator-staging-iad-v09j4g-"
+        containers = [
+            {"name": prefix + "frontend-1", "state": "created"},
+            {"name": prefix + "frontend-2", "state": "running", "status": "Up (unhealthy)"},
+        ]
+        incidents = check_container_down(containers, self.now)
+        self.assertEqual(len(incidents), 1)
+        self.assertIn("unhealthy", incidents[0].body)
+
+    def test_exited_sibling_is_not_suppressed(self):
+        prefix = "polysimulator-staging-iad-v09j4g-"
+        containers = [
+            {"name": prefix + "backend-1", "state": "exited"},
+            {"name": prefix + "backend-2", "state": "running"},
+        ]
+        self.assertEqual(len(check_container_down(containers, self.now)), 1)
+
     def test_detects_unhealthy_container(self):
         containers = [
             {

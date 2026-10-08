@@ -204,6 +204,7 @@ def extract_service_name(container_name: str) -> str:
     """Extract canonical service name from container name."""
     name = container_name.strip().lstrip("/")
     prefix = "polysimulator-staging-iad-v09j4g-"
+    name = re.sub(r"^[0-9a-f]{12,64}_(?=" + re.escape(prefix) + r")", "", name)
     if name.startswith(prefix):
         name = name[len(prefix):]
     name = re.sub(r"-\d+$", "", name)
@@ -462,16 +463,24 @@ def check_container_down(
     containers: List[Dict[str, Any]],
     now_utc: Optional[datetime] = None,
 ) -> List[Incident]:
-    """Detect staging containers whose state is not 'running', or status has unhealthy/restarting."""
+    """Alert on down services; ignore created replacements with a running sibling."""
     if now_utc is None:
         now_utc = datetime.now(timezone.utc)
     utc_hour = now_utc.strftime("%Y-%m-%dT%H")
 
+    running_services = {
+        extract_service_name(c.get("name") or c.get("Names") or "")
+        for c in containers
+        if (c.get("state") or c.get("State") or "").lower() == "running"
+    }
     incidents = []
     for c in containers:
         name = c.get("name") or c.get("Names") or ""
         state = (c.get("state") or c.get("State") or "").lower()
         status = (c.get("status") or c.get("Status") or "").lower()
+        service = extract_service_name(name)
+        if state == "created" and service in running_services:
+            continue
 
         is_down = False
         reason = ""
@@ -486,7 +495,6 @@ def check_container_down(
             reason = f"Status reports restarting: '{status}'"
 
         if is_down:
-            service = extract_service_name(name)
             key = f"down:{service}:{utc_hour}"
             body = (
                 f"outer-loop-key: {key}\n\n"
