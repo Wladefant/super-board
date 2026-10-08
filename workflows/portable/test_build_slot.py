@@ -238,6 +238,7 @@ class TestBuildSlot(unittest.TestCase):
         """#620: release must not fail after the slot is gone because the queue file is busy."""
         manager = BuildSlotManager(run_dir=self.run_dir)
         self.assertTrue(manager.acquire("busy-queue-lane", timeout=2.0, poll_interval=0.02))
+        manager.queue_cleanup_grace = 0.2
         with mock.patch.object(manager, "dequeue", side_effect=TimeoutError("queue lock busy")):
             with redirect_stderr(io.StringIO()):
                 self.assertTrue(manager.release("busy-queue-lane"))
@@ -2644,6 +2645,137 @@ class TestBuildSlot(unittest.TestCase):
             with _queue_atomic_lock(self.run_dir):
                 pass
         self.assertFalse(os.path.exists(os.path.join(self.run_dir, build_slot.QUEUE_LOCK_NAME)))
+
+    def _flaky_queue_lock(self, failures):
+        """Wraps _queue_atomic_lock so its first 'failures' calls time out, like a contended lock."""
+        real = build_slot._queue_atomic_lock
+        state = {"left": failures, "mutex": threading.Lock()}
+
+        def flaky(run_dir, *args, **kwargs):
+            with state["mutex"]:
+                fail = state["left"] > 0
+                if fail:
+                    state["left"] -= 1
+            if fail:
+                raise TimeoutError(f"Timed out waiting for queue file lock: {run_dir}")
+            return real(run_dir, *args, **kwargs)
+
+        return flaky
+
+    def test_acquire_retries_transient_queue_lock_timeouts_until_own_deadline(self):
+        """A queue-lock timeout while enqueueing must not abort the waiter or end the run."""
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        with mock.patch("build_slot._queue_atomic_lock", self._flaky_queue_lock(3)):
+            ok = manager.acquire("contended-lane", timeout=10.0, poll_interval=0.01)
+        self.assertTrue(ok)
+        self.assertTrue(manager.is_held_by("contended-lane"))
+        self.assertEqual(manager._read_queue(), [])
+        manager.release("contended-lane")
+
+    def test_acquire_returns_false_at_own_deadline_when_queue_lock_never_frees(self):
+        """Only the caller's own --timeout ends the wait, and it ends as a clean False."""
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        with mock.patch("build_slot._queue_atomic_lock", self._flaky_queue_lock(10 ** 9)):
+            start = time.time()
+            ok = manager.acquire("starved-lane", timeout=0.5, poll_interval=0.01)
+        self.assertFalse(ok)
+        self.assertGreaterEqual(time.time() - start, 0.5)
+        self.assertFalse(manager.is_held_by("starved-lane"))
+
+    def test_release_retries_queue_cleanup_and_leaves_no_residue(self):
+        """A queue-lock timeout during release cleanup is retried, not skipped."""
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        self.assertTrue(manager.acquire("release-lane", timeout=5.0, poll_interval=0.01, token="rel-token"))
+        manager.enqueue("release-lane", os.getpid(), token="rel-token")
+        self.assertEqual(len(manager._read_queue()), 1)
+        err = io.StringIO()
+        with mock.patch("build_slot._queue_atomic_lock", self._flaky_queue_lock(2)):
+            with redirect_stdout(io.StringIO()), redirect_stderr(err):
+                self.assertTrue(manager.release("release-lane", token="rel-token"))
+        self.assertNotIn("skipped", err.getvalue())
+        self.assertEqual(manager._read_queue(), [])
+        self.assertFalse(manager.is_held_by("release-lane"))
+
+    def test_many_waiters_survive_short_queue_lock_timeouts(self):
+        """
+        Many waiters polling one queue in an isolated run dir: a queue-lock timeout must
+        never abort a waiter, drop its place, or leave residue after release.
+        """
+        real = build_slot._queue_atomic_lock
+
+        def short_timeout(run_dir, *args, **kwargs):
+            kwargs["timeout"] = 0.05
+            return real(run_dir, *args, **kwargs)
+
+        results = {}
+        errors = []
+
+        def waiter(idx):
+            name = f"waiter-{idx}"
+            try:
+                mgr = BuildSlotManager(run_dir=self.run_dir, max_slots=3)
+                ok = mgr.acquire(name, timeout=120.0, poll_interval=0.02)
+                results[name] = ok
+                if ok:
+                    time.sleep(0.005)
+                    with redirect_stdout(io.StringIO()):
+                        mgr.release(name)
+            except Exception as exc:  # noqa: BLE001 - any escape is the defect under test
+                errors.append((name, repr(exc)))
+
+        original_write = BuildSlotManager._write_queue
+
+        def slow_write(manager_self, queue):
+            time.sleep(0.01)
+            return original_write(manager_self, queue)
+
+        with mock.patch("build_slot._queue_atomic_lock", short_timeout), \
+                mock.patch.object(BuildSlotManager, "_write_queue", slow_write), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            threads = [threading.Thread(target=waiter, args=(i,)) for i in range(24)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=180.0)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 24)
+        self.assertTrue(all(results.values()), results)
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        self.assertEqual(manager._read_queue(), [])
+        self.assertFalse(any(os.path.isdir(d) for d in manager.slot_dirs))
+
+    def test_clean_queue_sweeps_entry_of_a_lease_that_holds_a_slot(self):
+        """Cleanup that could not take the queue lock leaves an entry; the next sweep removes it."""
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        self.assertTrue(manager.acquire("holder-lane", timeout=5.0, poll_interval=0.01, token="held-token"))
+        manager.enqueue("holder-lane", os.getpid(), token="held-token")
+        manager.enqueue("other-lane", os.getpid(), token="other-token")
+        remaining = manager.clean_queue()
+        self.assertEqual([item["name"] for item in remaining], ["other-lane"])
+        self.assertEqual([item["name"] for item in manager._read_queue()], ["other-lane"])
+        manager.release("holder-lane", token="held-token")
+
+    def test_queue_lock_release_survives_busy_info_file(self):
+        """
+        Waiters open info.json to judge the lock; Windows refuses to delete an open file.
+        The owner must retry, or the lock dir outlives its release for as long as the owner lives.
+        """
+        queue_lock_dir = os.path.join(self.run_dir, build_slot.QUEUE_LOCK_NAME)
+        real_unlink = os.unlink
+        refusals = {"left": 3}
+
+        def busy_unlink(path, *args, **kwargs):
+            if str(path).endswith(build_slot.INFO_FILE_NAME) and refusals["left"] > 0:
+                refusals["left"] -= 1
+                raise PermissionError(5, "Access is denied")
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch("build_slot.os.unlink", busy_unlink):
+            with _queue_atomic_lock(self.run_dir):
+                pass
+        self.assertEqual(refusals["left"], 0)
+        self.assertFalse(os.path.exists(queue_lock_dir))
 
 if __name__ == "__main__":
     unittest.main()

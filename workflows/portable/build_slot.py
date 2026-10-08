@@ -57,6 +57,7 @@ import datetime
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import stat
@@ -99,6 +100,7 @@ DEFAULT_RAM_GUARD_THRESHOLD_PERCENT = 95.0
 DEFAULT_ACQUISITION_STAGGER_SECONDS = 45.0
 DEFAULT_RAM_GUARD_IDLE_ADMIT_SECONDS = 120.0  # with no slot held, a lane queued this long passes the RAM guard (#620)
 DEFAULT_RELEASE_TIMEOUT_SECONDS = 30.0
+DEFAULT_QUEUE_CLEANUP_GRACE_SECONDS = 8.0  # queue cleanup after a slot is settled retries a busy queue lock this long; shorter than the release deadline
 LAST_ACQUIRED_FILE_NAME = "last-acquired-at.json"
 DEFAULT_PID_DEAD_GRACE_PERIOD_SECONDS = 60.0  # never reclaim a dead-PID lock younger than 60s
 
@@ -516,6 +518,44 @@ def _read_queue_lock_info(queue_lock_dir: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _jittered(delay: float) -> float:
+    """Spreads waiters out so processes polling one lock do not retry in step."""
+    return delay * (0.5 + random.random())
+
+
+def _remove_owned_queue_lock(queue_lock_dir: str, patience: float = 5.0) -> None:
+    """
+    Deletes the queue lock dir its owner holds. Every waiter opens info.json to judge the
+    lock, and Windows refuses to delete an open file, so a single unlink/rmdir loses to a
+    busy poller and would leave the lock behind for as long as the owner lives (a long
+    `run` wrapper: hours). Retry until the readers' short opens pass.
+    """
+    info_path = os.path.join(queue_lock_dir, INFO_FILE_NAME)
+    deadline = time.time() + patience
+    delay = 0.01
+    while True:
+        try:
+            if os.path.isfile(info_path):
+                os.unlink(info_path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        try:
+            os.rmdir(queue_lock_dir)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if not os.path.isdir(queue_lock_dir):
+                return
+            if time.time() >= deadline:
+                shutil.rmtree(queue_lock_dir, ignore_errors=True)
+                return
+        time.sleep(_jittered(delay))
+        delay = min(delay * 2, 0.1)
+
+
 @contextmanager
 def _queue_atomic_lock(
     run_dir: str,
@@ -535,6 +575,8 @@ def _queue_atomic_lock(
     acquired = False
     lock_token = str(uuid.uuid4())
     pid_checker = is_pid_alive_fn or is_pid_alive
+    delay = retry_interval
+    max_delay = max(retry_interval, min(0.25, retry_interval * 10))
 
     while True:
         try:
@@ -564,7 +606,8 @@ def _queue_atomic_lock(
             # Do NOT run stale-rmtree branch (the dir is already being deleted).
             if time.time() - start_time >= timeout:
                 raise TimeoutError(f"Timed out waiting for queue file lock: {queue_lock_dir}")
-            time.sleep(retry_interval)
+            time.sleep(_jittered(delay))
+            delay = min(delay * 1.5, max_delay)
         except FileExistsError:
             # Check if queue lock is stale:
             # Queue lock reclaim ONLY dead PID (or orphan directory older than stale_after without live PID).
@@ -594,7 +637,8 @@ def _queue_atomic_lock(
 
             if time.time() - start_time >= timeout:
                 raise TimeoutError(f"Timed out waiting for queue file lock: {queue_lock_dir}")
-            time.sleep(retry_interval)
+            time.sleep(_jittered(delay))
+            delay = min(delay * 1.5, max_delay)
 
     try:
         yield
@@ -609,22 +653,7 @@ def _queue_atomic_lock(
                     info = _read_queue_lock_info(queue_lock_dir)
                 # Verify ownership before releasing: only release if info matches our unique lock_token
                 if info and info.get("token") == lock_token:
-                    info_path = os.path.join(queue_lock_dir, INFO_FILE_NAME)
-                    try:
-                        if os.path.isfile(info_path):
-                            os.unlink(info_path)
-                    except Exception:
-                        pass
-                    try:
-                        os.rmdir(queue_lock_dir)
-                    except Exception:
-                        try:
-                            if os.path.isdir(queue_lock_dir):
-                                entries = [e for e in os.listdir(queue_lock_dir) if e != INFO_FILE_NAME]
-                                if not entries:
-                                    shutil.rmtree(queue_lock_dir, ignore_errors=True)
-                        except Exception:
-                            pass
+                    _remove_owned_queue_lock(queue_lock_dir)
             except Exception:
                 pass
 
@@ -821,6 +850,7 @@ class BuildSlotManager:
                 except ValueError:
                     pass
         self.last_acquired_file = os.path.join(self.run_dir, LAST_ACQUIRED_FILE_NAME)
+        self.queue_cleanup_grace = DEFAULT_QUEUE_CLEANUP_GRACE_SECONDS
         os.makedirs(self.run_dir, exist_ok=True)
 
     def get_max_slots(self, ram_pct: Optional[float] = None) -> int:
@@ -1064,6 +1094,16 @@ class BuildSlotManager:
             changed = True
         return ordered, changed
 
+    def _held_slot_tokens(self) -> set:
+        """Tokens of the leases that currently hold a slot."""
+        tokens = set()
+        for slot_idx, slot_dir in enumerate(self.slot_dirs):
+            if os.path.isdir(slot_dir):
+                info = self._read_slot_info(slot_idx)
+                if info and info.get("token"):
+                    tokens.add(info["token"])
+        return tokens
+
     def clean_queue(
         self,
         stale_heartbeat_after: Optional[float] = None,
@@ -1077,10 +1117,27 @@ class BuildSlotManager:
         hb_limit = stale_heartbeat_after if stale_heartbeat_after is not None else self.queue_stale_heartbeat_after
         fb_limit = stale_fallback_after if stale_fallback_after is not None else self.queue_stale_fallback_after
 
+        held_tokens = self._held_slot_tokens()
+
+        def prune(queue: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], bool]:
+            # A lease that holds a slot has left the queue; an entry still naming it is residue
+            # from a cleanup that could not take the queue lock.
+            kept = [item for item in queue if not (item.get("token") and item["token"] in held_tokens)]
+            cleaned, changed = self._clean_queue_locked(kept, time.time(), hb_limit, fb_limit)
+            return cleaned, changed or len(kept) != len(queue)
+
         try:
+            # The queue file is replaced atomically, so a lock-free snapshot is consistent. Most
+            # polls change nothing; taking the queue lock for those only starves the writers.
+            try:
+                snapshot, would_change = prune(self._read_queue())
+                if not would_change:
+                    return snapshot
+            except Exception:
+                pass
             with _queue_atomic_lock(self.run_dir, is_pid_alive_fn=self.is_pid_alive):
                 queue = self._read_queue()
-                new_queue, changed = self._clean_queue_locked(queue, time.time(), hb_limit, fb_limit)
+                new_queue, changed = prune(queue)
                 if changed:
                     try:
                         self._write_queue(new_queue)
@@ -1202,13 +1259,51 @@ class BuildSlotManager:
     def _any_slot_held(self) -> bool:
         return any(os.path.isdir(s_dir) for s_dir in self.slot_dirs)
 
-    def _dequeue_best_effort(self, name: str, token: Optional[str]) -> None:
+    def _retry_queue_op(self, op, deadline: Optional[float] = None):
         """
-        Queue cleanup after the slot is already freed. A busy or locked queue file must not
-        turn a completed release into a failure or a hang; clean_queue sweeps leftovers (#620).
+        Runs a queue-file operation and retries lock timeouts and transient OS errors with
+        jittered backoff until 'deadline' (epoch seconds; None retries until it succeeds).
+        A busy queue lock must never abort a waiter or drop its place (#691).
+        """
+        delay = 0.05
+        while True:
+            try:
+                return op()
+            except OSError as exc:
+                now = time.time()
+                if deadline is not None and now >= deadline:
+                    raise
+                logger.debug("Queue operation retrying after: %s", exc)
+                pause = _jittered(delay)
+                if deadline is not None:
+                    pause = min(pause, max(0.0, deadline - now))
+                time.sleep(pause)
+                delay = min(delay * 2, 1.0)
+
+    def _dequeue_own_entry(self, name: str, pid: Optional[int], token: Optional[str]) -> None:
+        """
+        Removes the caller's queue entry once its slot or wait is settled. Retries a busy
+        queue lock for the release grace period; if it still fails, clean_queue sweeps the
+        entry (its PID dies, or its token holds a slot).
         """
         try:
-            self.dequeue(name, token=token)
+            self._retry_queue_op(
+                lambda: self.dequeue(name, pid, token=token),
+                time.time() + self.queue_cleanup_grace,
+            )
+        except Exception as exc:
+            logger.warning("Queue cleanup for '%s' deferred to clean_queue: %s", name, exc)
+
+    def _dequeue_best_effort(self, name: str, token: Optional[str]) -> None:
+        """
+        Queue cleanup after the slot is already freed. A busy queue lock is retried for the
+        release grace period; a completed release is never turned into a failure or a hang (#620).
+        """
+        try:
+            self._retry_queue_op(
+                lambda: self.dequeue(name, token=token),
+                time.time() + self.queue_cleanup_grace,
+            )
         except (TimeoutError, PermissionError, OSError) as exc:
             print(f"WARNING: '{name}' released its slot but queue cleanup was skipped: {exc}", file=sys.stderr)
 
@@ -1511,8 +1606,20 @@ class BuildSlotManager:
 
         try:
             # 2. Register in FIFO Queue inside try so finally always cleans up
-            self.enqueue(name, pid, token=token, stale_heartbeat_after=effective_heartbeat_threshold,
-                         priority=priority, enqueued_at=original_enqueued_at)
+            queue_deadline = start_time + timeout if timeout is not None else None
+            try:
+                self._retry_queue_op(
+                    lambda: self.enqueue(
+                        name, pid, token=token, stale_heartbeat_after=effective_heartbeat_threshold,
+                        priority=priority, enqueued_at=original_enqueued_at,
+                    ),
+                    queue_deadline,
+                )
+            except OSError as e:
+                msg = f"Timed out after {timeout:.1f}s waiting for build slot lock: queue file lock stayed busy ({e})"
+                print(msg, file=sys.stderr)
+                logger.error(msg)
+                return False
 
             while True:
                 # Update heartbeat first if due (every <= 15s)
@@ -1655,7 +1762,7 @@ class BuildSlotManager:
                             lock_token = info.get("token")
                             if not (explicit_token and lock_token and lock_token != token):
                                 acquired = True
-                                self.dequeue(name, pid, token=token)
+                                self._dequeue_own_entry(name, pid, token)
                                 msg = f"Build slot lock already held by '{name}' (PID {pid})"
                                 print(msg)
                                 clean_stale_next_junction(next_dir=next_dir, cwd=cwd)
@@ -1703,12 +1810,7 @@ class BuildSlotManager:
                                     self._write_slot_info(slot_idx, owner=name, pid=pid, token=token)
                                     self._record_last_acquired_at(name, pid, slot_idx)
                                     acquired = True
-                                    try:
-                                        self.dequeue(name, pid, token=token)
-                                    except TimeoutError as e:
-                                        logger.warning("Queue lock timeout during dequeue after acquisition for '%s': %s", name, e)
-                                    except Exception as e:
-                                        logger.warning("Queue error during dequeue: %s", e)
+                                    self._dequeue_own_entry(name, pid, token)
                                     msg = f"Acquired build slot lock for '{name}' (PID {pid})"
                                     print(msg)
                                     logger.info(msg)
@@ -1734,10 +1836,7 @@ class BuildSlotManager:
         finally:
             # If we exited without holding the lock, remove self from queue
             if not acquired:
-                try:
-                    self.dequeue(name, pid, token=token)
-                except Exception as e:
-                    logger.warning("Failed to dequeue on cleanup: %s", e)
+                self._dequeue_own_entry(name, pid, token)
     def is_held_by(self, name: str, pid: Optional[int] = None, token: Optional[str] = None) -> bool:
         """Returns True if any slot lock is held by 'name' (and optionally pid / token)."""
         for slot_idx, slot_dir in enumerate(self.slot_dirs):
@@ -2428,8 +2527,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
 
     elif args.command == "release":
-        _arm_deadline(args.timeout, "release")
-        success = manager.release(name=args.name)
+        deadline_timer = _arm_deadline(args.timeout, "release")
+        try:
+            success = manager.release(name=args.name)
+        finally:
+            deadline_timer.cancel()
         return 0 if success else 1
 
     elif args.command == "status":
