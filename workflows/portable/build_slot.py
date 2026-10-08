@@ -53,7 +53,7 @@ Invariants:
       child, since Windows reuses a dead parent's PID.
     - RAM guard: when host system RAM >= 95%, acquire stays in the FIFO queue and waits until
       RAM drops below the limit (or --timeout expires); --force bypasses the wait.
-    - Pure standard library + Windows-safe ctypes (zero fcntl imports).
+    - Standard library only. Windows uses msvcrt byte locks; POSIX uses flock.
 """
 
 import argparse
@@ -74,6 +74,69 @@ import time
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 import uuid
+from functools import wraps
+
+
+_guard_state = threading.local()
+
+
+@contextmanager
+def _transition_guard(path: str, timeout: float = 5.0):
+    """Serialize lock-directory transitions on a permanent OS-locked file."""
+    path = os.path.abspath(path)
+    held = getattr(_guard_state, "held", None)
+    if held is None:
+        held = _guard_state.held = set()
+    if path in held:
+        yield
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a+b") as guard:
+        if os.fstat(guard.fileno()).st_size == 0:
+            guard.write(b"\0")
+            guard.flush()
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                guard.seek(0)
+                if sys.platform == "win32":
+                    import msvcrt
+                    msvcrt.locking(guard.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(guard.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"Timed out waiting for transition guard: {path}")
+                time.sleep(0.01)
+        held.add(path)
+        try:
+            yield
+        finally:
+            held.remove(path)
+            guard.seek(0)
+            if sys.platform == "win32":
+                msvcrt.locking(guard.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(guard.fileno(), fcntl.LOCK_UN)
+
+
+def _guard_queue_transition(fn):
+    @wraps(fn)
+    def guarded(queue_lock_dir, *args, **kwargs):
+        with _transition_guard(queue_lock_dir + ".guard"):
+            return fn(queue_lock_dir, *args, **kwargs)
+    return guarded
+
+
+def _guard_slot_transition(fn):
+    @wraps(fn)
+    def guarded(self, *args, **kwargs):
+        with _transition_guard(os.path.join(self.run_dir, "build-slot.guard")):
+            return fn(self, *args, **kwargs)
+    return guarded
+
 
 logger = logging.getLogger("build_slot")
 logger.addHandler(logging.NullHandler())
@@ -724,6 +787,7 @@ def _clean_detached_lock_dir(target_dir: str, patience: float = 5.0) -> None:
         delay = min(delay * 2, 0.1)
 
 
+@_guard_queue_transition
 def _remove_owned_queue_lock(
     queue_lock_dir: str,
     patience: float = 5.0,
@@ -736,9 +800,9 @@ def _remove_owned_queue_lock(
     or directory deleted between check and unlink, we detach the directory with an
     atomic rename to a unique tombstone FIRST, then verify the full _lock_identity
     (token else PID+acquisition) before deleting only the tombstone.
-    If the tombstone identity does not match (a successor was renamed), we restore it
-    to queue_lock_dir. If restoration is impossible, we preserve successor evidence.
-    No retries or sleeps occur while holding the canonical lock name.
+    Atomic directory transitions share a stable OS file guard with acquisition.
+    Rename the owned directory, verify its identity, then delete only the tombstone.
+    No contender can create a successor during the guarded rename.
     """
     if expected_token is not None and expected_identity is None:
         expected_identity = ("token", expected_token)
@@ -770,14 +834,7 @@ def _remove_owned_queue_lock(
     try:
         os.rename(queue_lock_dir, tombstone)
     except OSError:
-        if not os.path.exists(queue_lock_dir):
-            return False
-        if expected_identity is not None:
-            info = _read_queue_lock_info(queue_lock_dir)
-            if _lock_identity(info) != expected_identity:
-                return False
-        _clean_detached_lock_dir(queue_lock_dir, patience=patience)
-        return True
+        return False
 
     moved_info = _read_queue_lock_info(tombstone)
     for _ in range(_INFO_READ_ATTEMPTS - 1):
@@ -803,6 +860,7 @@ def _remove_owned_queue_lock(
     return True
 
 
+@_guard_queue_transition
 def _tombstone_stale_queue_lock(
     queue_lock_dir: str,
     judged: Optional[Dict[str, Any]],
@@ -898,25 +956,24 @@ def _queue_atomic_lock(
 
     while True:
         try:
-            os.mkdir(queue_lock_dir)
-            # Write queue lock metadata (PID + unique token + timestamp) for stale reclamation & ownership verification
-            try:
-                info_path = os.path.join(queue_lock_dir, INFO_FILE_NAME)
-                tmp_path = info_path + f".{os.getpid()}.{lock_token}.tmp"
-                with open(tmp_path, "w", encoding="utf-8") as f:
-                    json.dump({
-                        "pid": os.getpid(),
-                        "token": lock_token,
-                        "acquired_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                        "acquired_at_epoch": time.time(),
-                    }, f)
-                _replace_with_retry(tmp_path, info_path)
-            except Exception:
-                # Do not enter the protected section without releasable metadata.
-                shutil.rmtree(queue_lock_dir, ignore_errors=True)
-                raise
-            acquired = True
-            break
+            with _transition_guard(queue_lock_dir + ".guard", timeout=max(0.0, timeout - (time.time() - start_time))):
+                os.mkdir(queue_lock_dir)
+                try:
+                    info_path = os.path.join(queue_lock_dir, INFO_FILE_NAME)
+                    tmp_path = info_path + f".{os.getpid()}.{lock_token}.tmp"
+                    with open(tmp_path, "w", encoding="utf-8") as f:
+                        json.dump({
+                            "pid": os.getpid(),
+                            "token": lock_token,
+                            "acquired_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                            "acquired_at_epoch": time.time(),
+                        }, f)
+                    _replace_with_retry(tmp_path, info_path)
+                except Exception:
+                    shutil.rmtree(queue_lock_dir, ignore_errors=True)
+                    raise
+                acquired = True
+                break
         except PermissionError:
             # On Windows, a directory another process is removing sits in
             # delete-pending state, and os.mkdir raises PermissionError (WinError 5).
@@ -1227,16 +1284,12 @@ class BuildSlotManager:
             return _read_lock_dir_info(self.slot_dirs[slot_idx], slot_idx)
         return _read_lock_dir_info(self.slot_dirs[slot_idx], slot_idx, retry=False)
 
+    @_guard_slot_transition
     def _tombstone_stale_slot(self, slot_idx: int, judged: Dict[str, Any], reason: str) -> bool:
         """
-        Removes the stale lock judged from `judged`, and only that lock (#315). Two waiters
-        can judge the same lock stale: the first removes it, a lane acquires the free slot,
-        and a plain rmtree by the second would delete that lane's live lock. So the lock is
-        re-read, renamed to a unique tombstone and deleted only if the tombstone still holds
-        the judged lock. The rename does not make the reclaimer the lock's only owner: on
-        Windows two reclaimers' renames of the same dir can both report success, the later
-        one carrying the dir out of the earlier one's tombstone. What holds is that nothing
-        but the judged lock is ever deleted. Returns True if this call deleted it.
+        Removes only the stale lock described by `judged`.
+        A stable file guard serializes acquisition, heartbeat, reclaim and release.
+        Identity checks bracket the atomic rename. Exactly one reclaimer can win.
         """
         slot_dir = self.slot_dirs[slot_idx]
         want = _lock_identity(judged)
@@ -1246,23 +1299,20 @@ class BuildSlotManager:
         try:
             os.rename(slot_dir, tombstone)
         except OSError:
-            # Another reclaimer or the holder moved it first, or Windows refused the rename
-            # while a reader has info.json open; the next poll judges the slot again.
+            # A foreign reader may deny the rename. Retry on the next poll.
             return False
         # A rename keeps the dir's mtime, so even a corrupt lock's identity survives the move.
         moved = _read_lock_dir_info(tombstone, slot_idx)
         if moved is None:
-            # Another reclaimer's rename carried the dir out of this tombstone; that reclaimer
-            # checks it against its own judgment. Nothing was moved aside here to put back.
+            # Preserve an unreadable detached generation rather than delete it.
             return False
         if _lock_identity(moved) != want:
-            # The lock changed hands between the re-read and the rename: put it back.
+            # A legacy participant did not use the guard. Preserve its generation.
             try:
                 os.rename(tombstone, slot_dir)
             except OSError as e:
                 if not os.path.isdir(tombstone):
-                    # Carried off by another reclaimer after the read above, as in the
-                    # `moved is None` case: nothing is left here to put back.
+                    # A legacy participant removed the detached generation.
                     return False
                 msg = f"[ERROR] Moved a live build slot lock aside and could not restore it (slot {slot_idx}, {tombstone}): {e}"
                 print(msg, file=sys.stderr)
@@ -1787,6 +1837,7 @@ class BuildSlotManager:
             logger.warning("Queue heartbeat failed for '%s': %s (will retry next tick)", name, e)
             return False
 
+    @_guard_slot_transition
     def _record_run_child(self, name: str, wrapper_pid: int, child_pid: int, token: Optional[str] = None) -> bool:
         """
         Records the `run` wrapper PID (the lock's liveness source) and the wrapped
@@ -1823,6 +1874,7 @@ class BuildSlotManager:
             return self._write_heartbeat(name, slot_idx, slot_dir, info)
         return False
 
+    @_guard_slot_transition
     def heartbeat_lock(self, name: str, token: Optional[str] = None) -> bool:
         """
         Updates the heartbeat timestamp in info.json of whichever slot is held by 'name'.
@@ -1880,6 +1932,7 @@ class BuildSlotManager:
             pass
         return True
 
+    @_guard_slot_transition
     def check_stale_and_reclaim(
         self,
         heartbeat_stale_after: float = DEFAULT_LOCK_HEARTBEAT_STALE_SECONDS,
@@ -2270,11 +2323,11 @@ class BuildSlotManager:
                             slot_dir = self.slot_dirs[slot_idx]
                             if not os.path.isdir(slot_dir):
                                 try:
-                                    os.mkdir(slot_dir)
-                                    # Atomic creation succeeded! We own slot_idx.
-                                    self._write_slot_info(slot_idx, owner=name, pid=pid, token=token, wrapper_pid=wrapper_pid)
-                                    self._record_last_acquired_at(name, pid, slot_idx)
-                                    acquired = True
+                                    with _transition_guard(os.path.join(self.run_dir, "build-slot.guard")):
+                                        os.mkdir(slot_dir)
+                                        self._write_slot_info(slot_idx, owner=name, pid=pid, token=token, wrapper_pid=wrapper_pid)
+                                        self._record_last_acquired_at(name, pid, slot_idx)
+                                        acquired = True
                                     self._dequeue_own_entry(name, pid, token, self.queue_grant_cleanup_grace)
                                     msg = f"Acquired build slot lock for '{name}' (PID {pid})"
                                     print(msg)
@@ -2321,6 +2374,7 @@ class BuildSlotManager:
             return True
         return False
 
+    @_guard_slot_transition
     def release(self, name: str, token: Optional[str] = None) -> bool:
         """
         Releases the build slot lock held by 'name'.
@@ -2345,21 +2399,18 @@ class BuildSlotManager:
 
         if matching_slots:
             for idx, s_dir in matching_slots:
-                info_path = os.path.join(s_dir, INFO_FILE_NAME)
-                deadline = time.time() + 1.0
-                while os.path.isdir(s_dir):
-                    try:
-                        if os.path.isfile(info_path):
-                            os.unlink(info_path)
-                    except Exception:
-                        pass
-                    try:
-                        os.rmdir(s_dir)
-                    except Exception:
-                        shutil.rmtree(s_dir, ignore_errors=True)
-                    if not os.path.isdir(s_dir) or time.time() >= deadline:
-                        break
-                    time.sleep(0.01)
+                judged = self._read_slot_info(idx)
+                expected = _lock_identity(judged)
+                tombstone = f"{s_dir}.releasing-{os.getpid()}-{uuid.uuid4().hex}"
+                try:
+                    os.rename(s_dir, tombstone)
+                except OSError:
+                    return False
+                moved = _read_lock_dir_info(tombstone, idx)
+                if expected is None or _lock_identity(moved) != expected:
+                    os.rename(tombstone, s_dir)
+                    return False
+                _clean_detached_lock_dir(tombstone, patience=1.0)
                 msg = f"Released build slot lock for '{name}'"
                 print(msg)
                 logger.info(msg)
