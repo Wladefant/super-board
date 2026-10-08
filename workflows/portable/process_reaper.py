@@ -6,14 +6,18 @@ kernels and ~40 console windows pushed host RAM to 99%
 (https://github.com/Wladefant/super-board/issues/616). This script is the safety net.
 The root-cause fix in veyyon is a separate change.
 
-It reaps three groups and nothing else:
+It reaps four groups and nothing else:
   (a) python runners (`veyyon-python-runner\runner-*.py`): the parent is gone (or the PID was
       reused), or the runner was idle (CPU time unchanged) for more than --idle-min minutes;
   (b) node dev servers (`next dev`, `next start`, `start-server`), `tsc`, and tool-started
       `cmd /c|/k` shells whose ancestor chain ends in a missing process and holds no live
       veyyon.exe. conhost.exe is never killed on its own: it exits when its last client exits,
       and a windowless conhost can host a live pseudo-terminal, so an orphan test is unsafe;
-  (c) never a process outside these patterns, never one that used CPU between two samples
+  (c) veyyon daemon brokers (`veyyon.exe __veyyon_worker_daemon_broker`) whose direct parent is
+      gone or was replaced by a reused PID, once the broker is older than 30 min and did not use
+      CPU between the two samples (https://github.com/Wladefant/veyyon/issues/513). A broker with
+      a live parent is never touched, however many there are; only the broker itself is killed;
+  (d) never a process outside these patterns, never one that used CPU between two samples
       taken --sample-s seconds apart, never one younger than --min-age-s seconds, never
       this script or its ancestors.
 
@@ -59,6 +63,8 @@ PYTHON_NAMES = {"python.exe", "pythonw.exe"}
 NODE_NAMES = {"node.exe", "bun.exe"}
 TOOL_SHELL_RE = re.compile(r"\s/[ck]\b", re.I)  # cmd /c or /k: started by a tool, not typed by a person
 VEYYON_NAME = "veyyon.exe"
+BROKER_RE = re.compile(r"(?:^|\s)__veyyon_worker_daemon_broker(?:\s|$)")
+BROKER_MIN_AGE_S = 1800.0  # a dead-parent broker is reaped only after this age
 
 
 @dataclass(frozen=True)
@@ -121,6 +127,8 @@ def group_of(p: Proc) -> Optional[str]:
         return "runner"
     if p.name in NODE_NAMES and DEV_RE.search(p.cmd):
         return "devserver"
+    if p.name == VEYYON_NAME and BROKER_RE.search(p.cmd):
+        return "broker"
     if p.name == "tsc.exe":
         return "devserver"
     if p.name == "cmd.exe" and TOOL_SHELL_RE.search(p.cmd):
@@ -183,6 +191,19 @@ def classify(
                 decisions.append(Decision(p, group, "reap", f"idle {idle_for:.0f} min (limit {idle_min:.0f})"))
             else:
                 decisions.append(Decision(p, group, "keep", f"live owner, idle {idle_for:.0f} min"))
+            continue
+
+        if group == "broker":
+            parent = by_pid.get(p.ppid)
+            parent_gone = parent is None or parent.created > p.created  # missing, or PID reused
+            if busy:
+                decisions.append(Decision(p, group, "keep", "busy (CPU time changed between samples)"))
+            elif age < max(min_age_s, BROKER_MIN_AGE_S):
+                decisions.append(Decision(p, group, "keep", f"younger than {int(BROKER_MIN_AGE_S)}s"))
+            elif parent_gone:
+                decisions.append(Decision(p, group, "reap", "orphan broker: parent process is gone"))
+            else:
+                decisions.append(Decision(p, group, "keep", "parent process is alive"))
             continue
 
         # devserver / console: only when no veyyon.exe ancestor is alive and the chain is broken
