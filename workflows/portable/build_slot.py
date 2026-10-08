@@ -20,9 +20,9 @@ Invariants:
     - Lock metadata contains owner, pid, token, and acquired_at timestamp.
     - Waiting lanes are tracked in a FIFO queue file ('~/.veyyon/run/build-slot.queue.json')
       with unique tokens to differentiate in-process waiters sharing a parent PID.
-    - Queue entries emit periodic heartbeats (heartbeat_at); entries with dead PIDs are
-      automatically reclaimed, while entries for live PIDs are preserved despite delayed heartbeats.
-    - Legacy queue entries without heartbeats fall back to enqueued_at age > 30m (for dead/untracked PIDs).
+    - Queue token heartbeats preserve live-PID entries for up to 30m of silence, not 60s.
+      Dead PIDs are reclaimed regardless of heartbeat freshness. Legacy entries without
+      heartbeats use enqueue age. A live but silent lane may lose its place after 30m.
     - Acquire wait loops write heartbeats before queue cleaning, re-enqueue preserving original
       enqueued_at if missing during heartbeat validation, and clean up queue entries via try/finally.
     - Queue operations are protected by the short-lived directory lock ('build-slot-queue.lock');
@@ -34,11 +34,12 @@ Invariants:
     - Stale locks are reclaimed with a logged notice. A live `run` holder is never reclaimed on
       age alone. A `run` lock lives exactly as long as its wrapper process (the
       `build_slot.py run` PID, which heartbeats every 5s, waits for the command and releases
-      in `finally`): a dead wrapper is reclaimed after the 60s grace period, and a live one
-      only once its heartbeat is older than --heartbeat-stale-after [default 5m] (hung).
+      in `finally`): a dead wrapper is reclaimed immediately, and a live one only once
+      its token heartbeat is older than --heartbeat-stale-after [default 5m].
       Other locks (`acquire` mode has no process left to heartbeat): when the owner PID is
-      dead past the grace period, or when the owner PID is alive (it is the lane's host,
-      which outlives a lane that never released) but the heartbeat is older than 30 min (#620).
+      dead, or when its token heartbeat is older than 30 min (#620). Without a heartbeat,
+      the acquisition age supplies the 30-min limit. These bounded leases permit recovery
+      of abandoned lanes but may reclaim a live process silent beyond its lease limit.
     - A reclaim renames the lock dir to a unique tombstone and deletes it only if the
       tombstone still holds the lock that was judged stale; otherwise it is put back. A
       reclaim never deletes a lock other than the one it judged stale.
@@ -601,6 +602,11 @@ def _queue_atomic_lock(
         if acquired:
             try:
                 info = _read_queue_lock_info(queue_lock_dir)
+                for attempt in range(_INFO_READ_ATTEMPTS - 1):
+                    if info is not None:
+                        break
+                    time.sleep(_INFO_READ_RETRY_DELAY)
+                    info = _read_queue_lock_info(queue_lock_dir)
                 # Verify ownership before releasing: only release if info matches our unique lock_token
                 if info and info.get("token") == lock_token:
                     info_path = os.path.join(queue_lock_dir, INFO_FILE_NAME)
@@ -1003,52 +1009,19 @@ class BuildSlotManager:
         stale_heartbeat_after: float,
         stale_fallback_after: float,
     ) -> Tuple[bool, str]:
-        """
-        Evaluates whether a queue entry is stale.
-        Rule: removed when its PID is dead OR (for entries without a verifiable live PID)
-        heartbeat_at is older than stale_heartbeat_after.
-        Live PIDs are preserved despite late heartbeat.
-        """
+        """Dead PIDs expire immediately; live token leases allow 30m of silence."""
         pid = item.get("pid", 0)
-        is_live = pid > 0 and self.is_pid_alive(pid)
-
-        # 1. Dead PID is reclaimed
-        if pid > 0 and not is_live:
-            hb_val = item.get("heartbeat_at")
-            hb_epoch = _parse_timestamp(hb_val) if hb_val is not None else None
-            is_hb_fresh = (hb_epoch is not None and (now - hb_epoch) < stale_heartbeat_after)
-            if not is_hb_fresh:
-                return True, f"PID {pid} is dead"
-
-        # 2. Check heartbeat timestamp
-        hb_val = item.get("heartbeat_at")
-        if hb_val is not None:
-            hb_epoch = _parse_timestamp(hb_val)
-            if hb_epoch is not None:
-                hb_age = now - hb_epoch
-                if hb_age > stale_heartbeat_after:
-                    if not is_live:
-                        return True, f"heartbeat expired ({hb_age:.1f}s > {stale_heartbeat_after:.1f}s)"
-            else:
-                if not is_live:
-                    return True, "corrupt heartbeat_at timestamp"
-        else:
-            enq_val = item.get("enqueued_at")
-            if enq_val is not None:
-                enq_epoch = _parse_timestamp(enq_val)
-                if enq_epoch is not None:
-                    enq_age = now - enq_epoch
-                    if enq_age > stale_fallback_after:
-                        if not is_live:
-                            return True, f"legacy entry enqueued_at expired ({enq_age:.1f}s > {stale_fallback_after:.1f}s)"
-                else:
-                    if not is_live:
-                        return True, "corrupt enqueued_at timestamp"
-            else:
-                if not is_live:
-                    return True, "missing heartbeat_at and enqueued_at"
-
-        return False, ""
+        if pid > 0 and not self.is_pid_alive(pid):
+            return True, f"PID {pid} is dead"
+        heartbeat = _parse_timestamp(item.get("heartbeat_at"))
+        stamp = heartbeat if heartbeat is not None else _parse_timestamp(item.get("enqueued_at"))
+        if stamp is None:
+            return True, "missing or corrupt lease timestamp"
+        limit = max(stale_heartbeat_after, stale_fallback_after) if pid > 0 else (
+            stale_heartbeat_after if heartbeat is not None else stale_fallback_after
+        )
+        silence = now - stamp
+        return (silence > limit, f"token lease expired ({silence:.1f}s > {limit:.1f}s)")
 
     def _clean_queue_locked(
         self,
@@ -1455,32 +1428,18 @@ class BuildSlotManager:
                         except Exception:
                             hb_epoch = None
                     hb_age = (now - hb_epoch) if hb_epoch is not None else None
-                    is_hb_fresh = (hb_age is not None and hb_age < effective_grace)
-                    if wrapper_pid:
-                        if not self.is_pid_alive(wrapper_pid) and age >= effective_grace and not is_hb_fresh:
-                            is_stale = True
-                            reason = (
-                                f"run wrapper PID {wrapper_pid} is dead and lock age exceeds grace period "
-                                f"({age:.1f}s >= {effective_grace:.1f}s, owner='{owner}', slot {slot_idx})"
-                            )
-                    elif pid > 0 and self.is_pid_alive(pid):
-                        # Heartbeat delays do not prove that a live holder stopped.
-                        pass
-                    elif pid > 0:
-                        # Never reclaim a lock younger than the grace period (e.g. 60s),
-                        # or whose heartbeat is fresh (< 60s).
-                        if age < effective_grace or is_hb_fresh:
-                            logger.debug(
-                                "Owner PID %d is dead for owner '%s' (slot %d) but lock is protected by grace period "
-                                "(age=%.1fs < %.1fs, hb_fresh=%s); not reclaiming",
-                                pid, owner, slot_idx, age, effective_grace, is_hb_fresh,
-                            )
-                        else:
-                            is_stale = True
-                            reason = (
-                                f"owner PID {pid} is dead and lock age exceeds grace period "
-                                f"({age:.1f}s >= {effective_grace:.1f}s, owner='{owner}', slot {slot_idx})"
-                            )
+                    holder_pid = wrapper_pid or pid
+                    silence = hb_age if hb_age is not None else age
+                    limit = heartbeat_stale_after if wrapper_pid else acquire_holder_stale_after
+                    if holder_pid > 0 and not self.is_pid_alive(holder_pid):
+                        is_stale = True
+                        reason = f"owner PID {holder_pid} is dead (owner='{owner}', slot {slot_idx})"
+                    elif holder_pid > 0 and silence >= limit:
+                        is_stale = True
+                        reason = (
+                            f"token heartbeat lease expired ({silence:.1f}s >= {limit:.1f}s, "
+                            f"owner='{owner}', slot {slot_idx})"
+                        )
 
                 if is_stale and self._tombstone_stale_slot(slot_idx, info, reason):
                     reclaimed_any = True
@@ -1625,6 +1584,11 @@ class BuildSlotManager:
                     continue
                 except Exception as e:
                     logger.warning("Unexpected error during clean_queue for '%s': %s (will retry next tick)", name, e)
+                    if timeout is not None and time.time() - start_time >= timeout:
+                        msg = f"Timed out after {timeout:.1f}s waiting for build slot lock: queue read failed ({e})"
+                        print(msg, file=sys.stderr)
+                        logger.error(msg)
+                        return False
                     time.sleep(min(poll_interval, heartbeat_interval))
                     continue
 

@@ -1147,12 +1147,8 @@ class TestBuildSlot(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(counter, 4 * 3)
 
-    def test_stale_lock_dead_pid_within_grace_period_not_reclaimed(self):
-        """
-        When a lock was acquired recently (e.g. 0.5s ago) and the recorded PID dies
-        (e.g. short-lived CLI wrapper or subshell), check_stale_and_reclaim must NOT
-        reclaim the lock while it is within the 60s dead-PID grace period.
-        """
+    def test_dead_pid_slot_reclaimed_even_when_recent(self):
+        """A dead PID expires immediately, including a newly acquired slot."""
         manager = BuildSlotManager(run_dir=self.run_dir)
         os.makedirs(manager.lock_dir, exist_ok=True)
         dead_pid = 999999
@@ -1167,16 +1163,12 @@ class TestBuildSlot(unittest.TestCase):
         with open(manager.info_file, "w", encoding="utf-8") as f:
             json.dump(info, f)
 
-        # check_stale_and_reclaim must NOT reclaim this lock
         reclaimed = manager.check_stale_and_reclaim()
-        self.assertFalse(reclaimed)
-        self.assertTrue(os.path.isdir(manager.lock_dir))
+        self.assertTrue(reclaimed)
+        self.assertFalse(os.path.isdir(manager.lock_dir))
 
-    def test_stale_lock_fresh_heartbeat_not_reclaimed(self):
-        """
-        If the owner PID is dead and lock age exceeds grace period, but the lock has
-        a fresh heartbeat (<60s), check_stale_and_reclaim must NOT reclaim it.
-        """
+    def test_dead_pid_slot_reclaimed_even_with_fresh_heartbeat(self):
+        """A fresh heartbeat does not preserve a dead owner's slot."""
         manager = BuildSlotManager(run_dir=self.run_dir)
         os.makedirs(manager.lock_dir, exist_ok=True)
         dead_pid = 999999
@@ -1195,17 +1187,9 @@ class TestBuildSlot(unittest.TestCase):
             json.dump(info, f)
 
         reclaimed = manager.check_stale_and_reclaim()
-        self.assertFalse(reclaimed)
-        self.assertTrue(os.path.isdir(manager.lock_dir))
-
-        # But once heartbeat is older than 60s, it IS reclaimed
-        info["heartbeat_at_epoch"] = now - 120.0
-        with open(manager.info_file, "w", encoding="utf-8") as f:
-            json.dump(info, f)
-
-        reclaimed = manager.check_stale_and_reclaim()
         self.assertTrue(reclaimed)
-        self.assertFalse(os.path.exists(manager.lock_dir))
+        self.assertFalse(os.path.isdir(manager.lock_dir))
+
 
     def test_find_long_lived_owner_pid_returns_valid_pid(self):
         """
@@ -1700,16 +1684,16 @@ class TestBuildSlot(unittest.TestCase):
         with open(manager.info_file, "w", encoding="utf-8") as f:
             json.dump(info, f)
 
-    def test_live_acquire_holder_with_late_heartbeat_preserves_slot(self):
-        """A late heartbeat cannot prove that a live acquire holder stopped."""
+    def test_live_acquire_holder_expired_lease_reclaimed(self):
+        """An acquire holder silent for over 30 minutes loses its lease."""
         manager = BuildSlotManager(run_dir=self.run_dir)
         host = self._live_process()
         self._write_acquire_lock(manager, host.pid, age=134 * 60.0, hb_age=134 * 60.0)
 
         stderr = io.StringIO()
         with redirect_stderr(stderr):
-            self.assertFalse(manager.check_stale_and_reclaim(), stderr.getvalue())
-        self.assertTrue(os.path.isdir(manager.lock_dir))
+            self.assertTrue(manager.check_stale_and_reclaim(), stderr.getvalue())
+        self.assertFalse(os.path.isdir(manager.lock_dir))
 
     def test_acquire_holder_with_live_pid_silent_under_30_min_not_reclaimed(self):
         """#620 negative control: a live `acquire` holder below the 30 min limit keeps its slot."""
@@ -1769,37 +1753,33 @@ class TestBuildSlot(unittest.TestCase):
         )
         self.assertEqual(missing.returncode, 1)
 
-    def test_live_run_wrapper_with_late_heartbeat_preserves_slot(self):
-        """A delayed heartbeat must not release a live wrapper's slot."""
+    def test_live_run_wrapper_expired_lease_reclaimed(self):
+        """A run holder loses its lease after its configured heartbeat timeout."""
         manager = BuildSlotManager(run_dir=self.run_dir)
         wrapper = self._live_process()
         self._write_run_lock(manager, wrapper.pid, wrapper.pid, age=600.0, hb_age=301.0)
 
         stderr = io.StringIO()
         with redirect_stderr(stderr):
-            self.assertFalse(manager.check_stale_and_reclaim())
-        self.assertTrue(os.path.isdir(manager.lock_dir))
+            self.assertTrue(manager.check_stale_and_reclaim())
+        self.assertFalse(os.path.isdir(manager.lock_dir))
 
-    def test_dead_run_wrapper_reclaimed_only_after_grace_period(self):
-        """
-        A dead wrapper frees the slot once the lock is older than the 60s grace period and
-        its heartbeat has lapsed, even if the wrapped command it left behind is still alive.
-        """
+    def test_dead_run_wrapper_reclaimed_immediately(self):
+        """A dead wrapper frees its slot even with a fresh heartbeat and live child."""
         manager = BuildSlotManager(run_dir=self.run_dir)
         dead_wrapper = self._exited_pid()
         orphan_child = self._live_process()
 
         self._write_run_lock(manager, dead_wrapper, orphan_child.pid, age=30.0, hb_age=30.0)
-        self.assertFalse(manager.check_stale_and_reclaim())
-        self.assertTrue(os.path.isdir(manager.lock_dir))
-        shutil.rmtree(manager.lock_dir)
+        self.assertTrue(manager.check_stale_and_reclaim())
+        self.assertFalse(os.path.isdir(manager.lock_dir))
 
         self._write_run_lock(manager, dead_wrapper, orphan_child.pid, age=120.0, hb_age=90.0)
         stderr = io.StringIO()
         with redirect_stderr(stderr):
             self.assertTrue(manager.check_stale_and_reclaim())
         self.assertFalse(os.path.isdir(manager.lock_dir))
-        self.assertIn(f"run wrapper PID {dead_wrapper} is dead", stderr.getvalue())
+        self.assertIn(f"owner PID {dead_wrapper} is dead", stderr.getvalue())
 
     def test_run_command_records_wrapper_as_lock_pid(self):
         """
@@ -2609,6 +2589,61 @@ class TestBuildSlot(unittest.TestCase):
         self.assertGreater(len(timestamps), 1)
         self.assertEqual(timestamps, [timestamps[0]] * len(timestamps))
         manager.release("holder")
+
+    def test_corrupt_queue_retry_respects_acquire_timeout(self):
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        clock = [100.0]
+        calls = []
+        def corrupt_then_readable(**kwargs):
+            calls.append(True)
+            clock[0] = 101.0
+            if len(calls) == 1:
+                raise ValueError("corrupt queue")
+            return []
+        with mock.patch.object(manager, "enqueue"), \
+             mock.patch.object(manager, "clean_queue", side_effect=corrupt_then_readable), \
+             mock.patch("build_slot.time.time", side_effect=lambda: clock[0]), \
+             mock.patch("build_slot.time.sleep"), \
+             mock.patch.object(manager, "dequeue"):
+            self.assertFalse(manager.acquire("corrupt", timeout=0.5, force=True))
+
+    def test_live_token_leases_expire_but_fresh_heartbeats_survive(self):
+        manager = BuildSlotManager(run_dir=self.run_dir, is_pid_alive_fn=lambda p: p == 2001)
+        now = time.time()
+        manager._write_queue([
+            {"name": "live-late", "pid": 2001, "token": "late", "enqueued_at": now - 2000,
+             "heartbeat_at": now - 1801},
+            {"name": "live-fresh", "pid": 2001, "token": "fresh", "enqueued_at": now - 2000,
+             "heartbeat_at": now},
+            {"name": "dead-fresh", "pid": 2002, "token": "dead", "enqueued_at": now - 2000,
+             "heartbeat_at": now},
+        ])
+        self.assertEqual([x["name"] for x in manager.clean_queue()], ["live-fresh"])
+        for wrapper in (False, True):
+            os.makedirs(manager.lock_dir)
+            manager._write_slot_info(0, "lease-holder", 2001, token="lease")
+            info = manager._read_slot_info(0)
+            info.update(acquired_at_epoch=now - 4000, heartbeat_at_epoch=now)
+            if wrapper:
+                info["wrapper_pid"] = 2001
+            with open(manager.info_file, "w", encoding="utf-8") as f:
+                json.dump(info, f)
+            self.assertFalse(manager.check_stale_and_reclaim())
+            info["heartbeat_at_epoch"] = now - 1801
+            with open(manager.info_file, "w", encoding="utf-8") as f:
+                json.dump(info, f)
+            self.assertTrue(manager.check_stale_and_reclaim())
+
+    def test_queue_release_retries_transient_ownership_read(self):
+        original = build_slot._read_queue_lock_info
+        calls = []
+        def flaky(path):
+            calls.append(path)
+            return None if len(calls) == 1 else original(path)
+        with mock.patch("build_slot._read_queue_lock_info", side_effect=flaky):
+            with _queue_atomic_lock(self.run_dir):
+                pass
+        self.assertFalse(os.path.exists(os.path.join(self.run_dir, build_slot.QUEUE_LOCK_NAME)))
 
 if __name__ == "__main__":
     unittest.main()
