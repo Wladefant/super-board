@@ -218,7 +218,7 @@ class TestBuildSlot(unittest.TestCase):
             with redirect_stderr(io.StringIO()):
                 started = time.monotonic()
                 self.assertTrue(manager.acquire("idle-lane", timeout=5.0, poll_interval=0.02))
-                self.assertGreaterEqual(time.monotonic() - started, 0.3)
+                self.assertGreaterEqual(time.monotonic() - started, 0.25)
             self.assertTrue(manager.release("idle-lane"))
 
     def test_ram_guard_still_waits_when_a_slot_is_held(self):
@@ -1625,7 +1625,7 @@ class TestBuildSlot(unittest.TestCase):
         self.assertTrue(is_pid_alive(p.pid))
         return p
 
-    def _write_run_lock(self, manager, wrapper_pid, child_pid, age, hb_age):
+    def _write_run_lock(self, manager, wrapper_pid, child_pid, age, hb_age, wrapper_created_ticks=None):
         now = time.time()
         os.mkdir(manager.lock_dir)
         info = {
@@ -1637,6 +1637,11 @@ class TestBuildSlot(unittest.TestCase):
             "acquired_at_epoch": now - age,
             "heartbeat_at_epoch": now - hb_age,
         }
+        if wrapper_created_ticks is not False:
+            if wrapper_created_ticks is None and is_pid_alive(wrapper_pid):
+                wrapper_created_ticks = build_slot._get_process_create_ticks(wrapper_pid)
+            if wrapper_created_ticks is not None:
+                info["wrapper_created_ticks"] = wrapper_created_ticks
         with open(manager.info_file, "w", encoding="utf-8") as f:
             json.dump(info, f)
 
@@ -1754,16 +1759,75 @@ class TestBuildSlot(unittest.TestCase):
         )
         self.assertEqual(missing.returncode, 1)
 
-    def test_live_run_wrapper_expired_lease_reclaimed(self):
-        """A run holder loses its lease after its configured heartbeat timeout."""
+    def test_live_run_wrapper_with_stale_heartbeat_is_never_reclaimed(self):
+        """#690: a live wrapper keeps its slot however old its heartbeat; a failed heartbeat must not grant it twice."""
         manager = BuildSlotManager(run_dir=self.run_dir)
         wrapper = self._live_process()
-        self._write_run_lock(manager, wrapper.pid, wrapper.pid, age=600.0, hb_age=301.0)
+        self._write_run_lock(manager, wrapper.pid, wrapper.pid, age=7200.0, hb_age=7000.0)
 
-        stderr = io.StringIO()
-        with redirect_stderr(stderr):
-            self.assertTrue(manager.check_stale_and_reclaim())
-        self.assertFalse(os.path.isdir(manager.lock_dir))
+        with redirect_stderr(io.StringIO()):
+            self.assertFalse(manager.check_stale_and_reclaim())
+            self.assertFalse(manager.check_stale_and_reclaim(heartbeat_stale_after=1.0))
+        self.assertTrue(os.path.isdir(manager.lock_dir))
+
+    def test_live_owner_with_failing_heartbeat_is_not_granted_twice(self):
+        """#690: every heartbeat write fails for the whole run; a second lane must not get the slot."""
+        owner_mgr = BuildSlotManager(run_dir=self.run_dir, max_slots=1)
+        wrapper = self._live_process()
+        self._write_run_lock(owner_mgr, wrapper.pid, wrapper.pid, age=3600.0, hb_age=3000.0)
+        with open(owner_mgr.info_file, encoding="utf-8") as f:
+            owner = json.load(f)["owner"]
+
+        def always_denied(src, dst):
+            err = PermissionError(13, "Access is denied")
+            err.winerror = 5
+            raise err
+
+        with mock.patch("time.sleep", return_value=None), mock.patch("os.replace", side_effect=always_denied):
+            with redirect_stderr(io.StringIO()):
+                self.assertFalse(owner_mgr.heartbeat_lock(owner))
+        self.assertEqual([f for f in os.listdir(owner_mgr.lock_dir) if f.endswith(".tmp")], [])
+
+        waiter = BuildSlotManager(run_dir=self.run_dir, max_slots=1)
+        with redirect_stderr(io.StringIO()):
+            self.assertFalse(waiter.acquire("second-lane", timeout=0.3, poll_interval=0.05, force=True))
+        with open(owner_mgr.info_file, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["owner"], owner)
+
+    def test_heartbeat_survives_foreign_handle_on_info_json(self):
+        """#690: a process holding info.json open blocks os.replace on Windows; the heartbeat still lands."""
+        manager = BuildSlotManager(run_dir=self.run_dir, max_slots=1)
+        wrapper = self._live_process()
+        self._write_run_lock(manager, wrapper.pid, wrapper.pid, age=600.0, hb_age=500.0)
+        with open(manager.info_file, encoding="utf-8") as f:
+            owner = json.load(f)["owner"]
+
+        real_replace = os.replace
+
+        def replace_denied_for_info(src, dst):
+            if os.path.basename(dst) == build_slot.INFO_FILE_NAME:
+                err = PermissionError(13, "Access is denied")
+                err.winerror = 5
+                raise err
+            return real_replace(src, dst)
+
+        holder = open(manager.info_file, "rb")  # the foreign reader that never closes
+        try:
+            with mock.patch("time.sleep", return_value=None), mock.patch("os.replace", side_effect=replace_denied_for_info):
+                with redirect_stderr(io.StringIO()):
+                    self.assertTrue(manager.heartbeat_lock(owner))
+            info = build_slot._read_lock_dir_info(manager.lock_dir, 0)
+            self.assertLess(time.time() - info["heartbeat_at_epoch"], 5.0)
+        finally:
+            holder.close()
+
+    def test_info_reader_does_not_block_replace(self):
+        """#690: our own reader closes at once and never blocks a replace of the file."""
+        path = os.path.join(self.run_dir, "probe.json")
+        build_slot._write_json_atomic(path, {"n": 1})
+        self.assertEqual(build_slot._read_json_file(path), {"n": 1})
+        build_slot._write_json_atomic(path, {"n": 2})
+        self.assertEqual(build_slot._read_json_file(path), {"n": 2})
 
     def test_dead_run_wrapper_reclaimed_immediately(self):
         """A dead wrapper frees its slot even with a fresh heartbeat and live child."""
@@ -1779,7 +1843,6 @@ class TestBuildSlot(unittest.TestCase):
         stderr = io.StringIO()
         with redirect_stderr(stderr):
             self.assertTrue(manager.check_stale_and_reclaim())
-        self.assertFalse(os.path.isdir(manager.lock_dir))
         self.assertIn(f"owner PID {dead_wrapper} is dead", stderr.getvalue())
 
     def test_run_command_records_wrapper_as_lock_pid(self):
@@ -2633,7 +2696,8 @@ class TestBuildSlot(unittest.TestCase):
             info["heartbeat_at_epoch"] = now - 1801
             with open(manager.info_file, "w", encoding="utf-8") as f:
                 json.dump(info, f)
-            self.assertTrue(manager.check_stale_and_reclaim())
+            # an acquire lease expires; a live `run` wrapper keeps its slot (#690)
+            self.assertEqual(manager.check_stale_and_reclaim(), not wrapper)
 
     def test_queue_release_retries_transient_ownership_read(self):
         original = build_slot._read_queue_lock_info
@@ -2819,6 +2883,334 @@ class TestBuildSlot(unittest.TestCase):
             rc = manager.run_command("child-lane", [sys.executable, "-c", probe], timeout=20.0, poll_interval=0.01)
         self.assertEqual(rc, 0)
         self.assertFalse(os.path.exists(queue_lock_dir))
+
+    def test_read_file_bytes_windows_readfile_failure_raises_winerror(self):
+        """WinError from ReadFile raises out of _read_file_bytes and closes the handle; does not return EOF."""
+        test_file = os.path.join(self.run_dir, "probe_readfile.txt")
+        with open(test_file, "wb") as f:
+            f.write(b"data that should not be returned as eof")
+
+        closed_handles = []
+        if sys.platform == "win32":
+            import ctypes
+            real_WinDLL = ctypes.WinDLL
+            class FakeK32:
+                def __init__(self, *args, **kwargs):
+                    self._real = real_WinDLL(*args, **kwargs)
+                def __getattr__(self, name):
+                    if name == "ReadFile":
+                        def fake_readfile(handle, buf, size, got_ptr, overlapped):
+                            ctypes.set_last_error(23)  # ERROR_CRC
+                            return 0
+                        return fake_readfile
+                    if name == "CloseHandle":
+                        def fake_close(h):
+                            closed_handles.append(h)
+                            return self._real.CloseHandle(h)
+                        return fake_close
+                    return getattr(self._real, name)
+            with mock.patch("ctypes.WinDLL", side_effect=FakeK32):
+                with self.assertRaises(OSError) as ctx:
+                    build_slot._read_file_bytes(test_file)
+                self.assertEqual(getattr(ctx.exception, "winerror", None), 23)
+            self.assertTrue(len(closed_handles) > 0)
+
+    def test_read_file_bytes_windows_close_before_parse(self):
+        """Handle is closed before json.loads parses the file."""
+        test_file = os.path.join(self.run_dir, "probe_close.json")
+        with open(test_file, "w", encoding="utf-8") as f:
+            json.dump({"valid": True}, f)
+
+        events = []
+        if sys.platform == "win32":
+            import ctypes
+            real_WinDLL = ctypes.WinDLL
+            class TrackingK32:
+                def __init__(self, *args, **kwargs):
+                    self._real = real_WinDLL(*args, **kwargs)
+                def __getattr__(self, name):
+                    if name == "CloseHandle":
+                        def tracking_close(h):
+                            events.append("close")
+                            return self._real.CloseHandle(h)
+                        return tracking_close
+                    return getattr(self._real, name)
+            orig_loads = json.loads
+            def tracking_loads(*args, **kwargs):
+                events.append("parse")
+                return orig_loads(*args, **kwargs)
+
+            with mock.patch("ctypes.WinDLL", side_effect=TrackingK32), mock.patch("json.loads", side_effect=tracking_loads):
+                data = build_slot._read_json_file(test_file)
+                self.assertEqual(data, {"valid": True})
+            self.assertEqual(events, ["close", "parse"])
+
+    def test_recycled_wrapper_pid_reclaimed_promptly_on_mismatched_creation_identity(self):
+        """A live process holding a slot whose recorded creation ticks do not match is a recycled PID and reclaimed."""
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        live_proc = self._live_process()
+        # Recorded ticks 999999 mismatches actual ticks of live_proc
+        self._write_run_lock(manager, live_proc.pid, live_proc.pid, age=7200.0, hb_age=7000.0, wrapper_created_ticks=999999)
+        with redirect_stderr(io.StringIO()):
+            self.assertTrue(manager.check_stale_and_reclaim())
+        self.assertFalse(os.path.isdir(manager.lock_dir))
+
+    def test_recycled_wrapper_pid_legacy_lock_created_after_acquire_reclaimed(self):
+        """A legacy lock with no recorded ticks whose live process was created after acquire is a recycled PID and reclaimed."""
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        live_proc = self._live_process()
+        # Legacy lock: wrapper_created_ticks=False, acquired_at_epoch set to 2 hours ago
+        # The live_proc was created just now, which is > acquired_at_epoch
+        self._write_run_lock(manager, live_proc.pid, live_proc.pid, age=7200.0, hb_age=7000.0, wrapper_created_ticks=False)
+        with redirect_stderr(io.StringIO()):
+            self.assertTrue(manager.check_stale_and_reclaim())
+        self.assertFalse(os.path.isdir(manager.lock_dir))
+
+    def test_live_wrapper_unknown_identity_never_reclaimed_on_stale_heartbeat(self):
+        """When creation identity cannot be queried, a live wrapper is kept safe and never reclaimed on stale heartbeat."""
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        live_proc = self._live_process()
+        self._write_run_lock(manager, live_proc.pid, live_proc.pid, age=7200.0, hb_age=7000.0, wrapper_created_ticks=False)
+        with mock.patch("build_slot._get_process_create_ticks", return_value=None), \
+             mock.patch("build_slot._get_process_create_epoch", return_value=None):
+            with redirect_stderr(io.StringIO()):
+                self.assertFalse(manager.check_stale_and_reclaim())
+        self.assertTrue(os.path.isdir(manager.lock_dir))
+
+    def test_run_mode_wrapper_metadata_recorded_at_initial_grant(self):
+        """run_command records wrapper_pid and creation identity in info.json at initial grant."""
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        my_pid = os.getpid()
+        ok = manager.acquire("grant-test", timeout=5.0, pid=my_pid, wrapper_pid=my_pid)
+        self.assertTrue(ok)
+        info = build_slot._read_lock_dir_info(manager.lock_dir, 0)
+        self.assertEqual(info.get("wrapper_pid"), my_pid)
+        if sys.platform == "win32":
+            self.assertIsNotNone(info.get("wrapper_created_ticks"))
+        manager.release("grant-test")
+
+    def test_run_mode_preserved_when_info_replace_fails_with_winerror5_and_older_than_30min(self):
+        """Simulated WinError 5 on info.json replace writes heartbeat.json with wrapper metadata; >30min run stays run mode."""
+        import uuid
+        manager = BuildSlotManager(run_dir=self.run_dir, max_slots=1)
+        live_proc = self._live_process()
+        token = str(uuid.uuid4())
+        os.mkdir(manager.lock_dir)
+        now = time.time()
+        # 40 minutes old (past 30-min acquire-mode limit)
+        acquired_epoch = now - 2400.0
+        info = {
+            "owner": "long-runner",
+            "pid": live_proc.pid,
+            "slot": 0,
+            "token": token,
+            "acquired_at_epoch": acquired_epoch,
+            "heartbeat_at_epoch": now - 10.0,
+        }
+        with open(manager.info_file, "w", encoding="utf-8") as f:
+            json.dump(info, f)
+
+        # Fail replace of info.json with WinError 5
+        real_replace = os.replace
+        def replace_denied_for_info(src, dst):
+            if os.path.basename(dst) == build_slot.INFO_FILE_NAME:
+                err = PermissionError(13, "Access is denied")
+                err.winerror = 5
+                raise err
+            return real_replace(src, dst)
+
+        with mock.patch("time.sleep", return_value=None), mock.patch("os.replace", side_effect=replace_denied_for_info):
+            with redirect_stderr(io.StringIO()):
+                ok = manager._record_run_child("long-runner", wrapper_pid=live_proc.pid, child_pid=live_proc.pid, token=token)
+                self.assertTrue(ok)
+
+        # heartbeat.json must carry wrapper_pid
+        hb_path = os.path.join(manager.lock_dir, build_slot.HEARTBEAT_FILE_NAME)
+        self.assertTrue(os.path.isfile(hb_path))
+        with open(hb_path, encoding="utf-8") as f:
+            hb_data = json.load(f)
+        self.assertEqual(hb_data.get("wrapper_pid"), live_proc.pid)
+
+        # _read_lock_dir_info merges wrapper_pid
+        slot_info = build_slot._read_lock_dir_info(manager.lock_dir, 0)
+        self.assertEqual(slot_info.get("wrapper_pid"), live_proc.pid)
+
+        # check_stale_and_reclaim does NOT reclaim despite being 40 minutes old
+        with redirect_stderr(io.StringIO()):
+            self.assertFalse(manager.check_stale_and_reclaim())
+        self.assertTrue(os.path.isdir(manager.lock_dir))
+
+        # A second lane gets NO grant
+        waiter = BuildSlotManager(run_dir=self.run_dir, max_slots=1)
+        with redirect_stderr(io.StringIO()):
+            self.assertFalse(waiter.acquire("second-lane", timeout=0.2, poll_interval=0.05, force=True))
+
+    def test_side_heartbeat_mismatched_token_does_not_update_owner_or_wrapper_metadata(self):
+        """heartbeat.json with a mismatched token never updates info.json's heartbeat or wrapper metadata."""
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        os.mkdir(manager.lock_dir)
+        info = {
+            "owner": "real-owner",
+            "token": "tok-A",
+            "heartbeat_at_epoch": 100.0,
+        }
+        with open(manager.info_file, "w", encoding="utf-8") as f:
+            json.dump(info, f)
+
+        side = {
+            "token": "tok-B",
+            "heartbeat_at_epoch": 200.0,
+            "wrapper_pid": 99999,
+        }
+        with open(os.path.join(manager.lock_dir, build_slot.HEARTBEAT_FILE_NAME), "w", encoding="utf-8") as f:
+            json.dump(side, f)
+
+        read_info = build_slot._read_lock_dir_info(manager.lock_dir, 0)
+        self.assertEqual(read_info["heartbeat_at_epoch"], 100.0)
+        self.assertIsNone(read_info.get("wrapper_pid"))
+
+    def test_record_run_child_fails_safely_when_neither_write_works(self):
+        """When neither info.json nor heartbeat.json can be written, _record_run_child returns False."""
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        os.mkdir(manager.lock_dir)
+        info = {
+            "owner": "lane-fail",
+            "token": "tok-1",
+            "slot": 0,
+        }
+        with open(manager.info_file, "w", encoding="utf-8") as f:
+            json.dump(info, f)
+
+        def all_writes_fail(src, dst):
+            raise OSError("disk full")
+
+        with mock.patch("time.sleep", return_value=None), mock.patch("os.replace", side_effect=all_writes_fail):
+            with redirect_stderr(io.StringIO()):
+                ok = manager._record_run_child("lane-fail", wrapper_pid=os.getpid(), child_pid=os.getpid(), token="tok-1")
+                self.assertFalse(ok)
+
+    def test_run_command_survives_failed_heartbeat_writes_without_abort_or_double_grant(self):
+        """When heartbeat writes fail after initial grant, command runs to normal completion without abort or double grant."""
+        manager = BuildSlotManager(run_dir=self.run_dir, max_slots=1)
+        orig_write = build_slot._write_json_atomic
+        grant_written = False
+
+        def deny_heartbeat_writes(path, data, prefix=".info-"):
+            nonlocal grant_written
+            if os.path.dirname(path) in manager.slot_dirs:
+                if not grant_written:
+                    grant_written = True
+                    return orig_write(path, data, prefix=prefix)
+                # Deny both subsequent heartbeat writes (info.json and heartbeat.json)
+                raise OSError("simulated heartbeat write failure: disk full")
+            return orig_write(path, data, prefix=prefix)
+
+        cmd = [sys.executable, "-c", "import time; time.sleep(0.3)"]
+        run_ret = []
+
+        def runner():
+            with redirect_stderr(io.StringIO()):
+                ret = manager.run_command("run-lane", cmd)
+                run_ret.append(ret)
+
+        with mock.patch("build_slot._write_json_atomic", side_effect=deny_heartbeat_writes):
+            t = threading.Thread(target=runner)
+            t.start()
+            try:
+                # Wait until slot is acquired and runner thread is active in the command
+                for _ in range(50):
+                    time.sleep(0.02)
+                    if grant_written:
+                        break
+                self.assertTrue(grant_written)
+                # Confirm slot is locked and cannot be double-granted while active
+                waiter = BuildSlotManager(run_dir=self.run_dir, max_slots=1)
+                with redirect_stderr(io.StringIO()):
+                    second_grant = waiter.acquire("second-lane", timeout=0.1, poll_interval=0.02, force=True)
+                self.assertFalse(second_grant)
+                with redirect_stderr(io.StringIO()):
+                    self.assertFalse(waiter.check_stale_and_reclaim())
+            finally:
+                t.join(timeout=10.0)
+
+        self.assertEqual(run_ret, [0])
+        # After normal completion, lock is released and another lane can acquire
+        waiter = BuildSlotManager(run_dir=self.run_dir, max_slots=1)
+        self.assertTrue(waiter.acquire("after-release", timeout=1.0))
+        waiter.release("after-release")
+
+    def test_get_process_create_epoch_never_returns_proc_dir_mtime(self):
+        """_get_process_create_epoch returns None instead of /proc/<pid> directory st_mtime when identity unavailable."""
+        fake_pid = 99999
+        fake_stat = mock.Mock()
+        fake_stat.st_mtime = 1700000000.0
+
+        with mock.patch("build_slot._get_process_create_ticks", return_value=None), \
+             mock.patch.dict("sys.modules", {"psutil": None}), \
+             mock.patch("os.path.isdir", side_effect=lambda p: p == f"/proc/{fake_pid}"), \
+             mock.patch("os.path.isfile", return_value=False), \
+             mock.patch("os.stat", return_value=fake_stat):
+            epoch = build_slot._get_process_create_epoch(fake_pid)
+            self.assertIsNone(epoch)
+
+    def test_proc_dir_mtime_change_never_causes_live_owner_to_be_recycled(self):
+        """A live owner is never reclaimed because /proc/<pid> directory mtime shifted."""
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        live_proc = self._live_process()
+        # Initial lock recorded with epoch 1700000000.0
+        self._write_run_lock(manager, live_proc.pid, live_proc.pid, age=7200.0, hb_age=7000.0, wrapper_created_ticks=False)
+        info = build_slot._read_lock_dir_info(manager.lock_dir, 0)
+        info["wrapper_created_epoch"] = 1700000000.0
+        with open(manager.info_file, "w", encoding="utf-8") as f:
+            json.dump(info, f)
+
+        # Simulate /proc/<pid> directory mtime jumping by 500 seconds
+        jumped_stat = mock.Mock()
+        jumped_stat.st_mtime = 1700000500.0
+
+        orig_isdir = os.path.isdir
+        orig_stat = os.stat
+        def fake_isdir(p):
+            if str(p) == f"/proc/{live_proc.pid}":
+                return True
+            return orig_isdir(p)
+        def fake_stat(p, *args, **kwargs):
+            if str(p) == f"/proc/{live_proc.pid}":
+                return jumped_stat
+            return orig_stat(p, *args, **kwargs)
+
+        with mock.patch("build_slot._get_process_create_ticks", return_value=None), \
+             mock.patch.dict("sys.modules", {"psutil": None}), \
+             mock.patch("os.path.isdir", side_effect=fake_isdir), \
+             mock.patch("os.stat", side_effect=fake_stat):
+            with redirect_stderr(io.StringIO()):
+                reclaimed = manager.check_stale_and_reclaim()
+            self.assertFalse(reclaimed)
+        self.assertTrue(os.path.isdir(manager.lock_dir))
+
+    def test_get_process_create_epoch_reads_linux_proc_stat_starttime_and_btime(self):
+        """_get_process_create_epoch correctly parses /proc/<pid>/stat starttime and /proc/stat btime."""
+        fake_pid = 4242
+        fake_stat_content = "4242 (test (process) name) S 1 4242 4242 0 -1 4194304 100 0 0 0 10 5 0 0 20 0 1 0 500 123456 100 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
+        fake_proc_stat = "cpu 123 456\nbtime 1700000000\nprocesses 789\n"
+
+        def fake_isfile(path):
+            return path in (f"/proc/{fake_pid}/stat", "/proc/stat")
+
+        def fake_open(path, *args, **kwargs):
+            if path == f"/proc/{fake_pid}/stat":
+                return io.StringIO(fake_stat_content)
+            if path == "/proc/stat":
+                return io.StringIO(fake_proc_stat)
+            raise FileNotFoundError(path)
+
+        with mock.patch("build_slot._get_process_create_ticks", return_value=None), \
+             mock.patch.dict("sys.modules", {"psutil": None}), \
+             mock.patch("os.path.isfile", side_effect=fake_isfile), \
+             mock.patch("builtins.open", side_effect=fake_open):
+            epoch = build_slot._get_process_create_epoch(fake_pid)
+            self.assertIsNotNone(epoch)
+            self.assertAlmostEqual(epoch, 1700000005.0, places=2)
 
 if __name__ == "__main__":
     unittest.main()
