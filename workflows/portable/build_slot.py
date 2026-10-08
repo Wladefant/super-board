@@ -100,6 +100,8 @@ DEFAULT_RAM_GUARD_THRESHOLD_PERCENT = 95.0
 DEFAULT_ACQUISITION_STAGGER_SECONDS = 45.0
 DEFAULT_RAM_GUARD_IDLE_ADMIT_SECONDS = 120.0  # with no slot held, a lane queued this long passes the RAM guard (#620)
 DEFAULT_RELEASE_TIMEOUT_SECONDS = 30.0
+DEFAULT_QUEUE_LOCK_MAX_HOLD_SECONDS = 60.0  # a queue lock is held for milliseconds; older than this was leaked, even if its owner lives (#690)
+DEFAULT_QUEUE_GRANT_CLEANUP_GRACE_SECONDS = 1.0  # a lane that already holds its slot spends at most this long on queue cleanup; clean_queue sweeps the rest
 DEFAULT_QUEUE_CLEANUP_GRACE_SECONDS = 8.0  # queue cleanup after a slot is settled retries a busy queue lock this long; shorter than the release deadline
 LAST_ACQUIRED_FILE_NAME = "last-acquired-at.json"
 DEFAULT_PID_DEAD_GRACE_PERIOD_SECONDS = 60.0  # never reclaim a dead-PID lock younger than 60s
@@ -563,11 +565,15 @@ def _queue_atomic_lock(
     retry_interval: float = 0.05,
     stale_after: float = 15.0,
     is_pid_alive_fn=None,
+    max_hold: float = DEFAULT_QUEUE_LOCK_MAX_HOLD_SECONDS,
 ):
     """
     Short-lived atomic directory lock protecting reads/writes to build-slot.queue.json.
     Uses atomic os.mkdir on Windows and Linux (no fcntl).
-    Reclaims stale queue locks ONLY if the holding PID is dead (never on age for a live PID).
+    Reclaims a queue lock whose holding PID is dead, or whose live holder kept it longer than
+    max_hold. Holders keep it for milliseconds; a lock that old was leaked (Windows refused to
+    delete it while pollers had info.json open) and a long-lived `run` wrapper would otherwise
+    block every waiter for as long as it lives (#690).
     Verifies unique ownership token before release so successor locks are never deleted.
     """
     queue_lock_dir = os.path.join(run_dir, QUEUE_LOCK_NAME)
@@ -610,8 +616,7 @@ def _queue_atomic_lock(
             delay = min(delay * 1.5, max_delay)
         except FileExistsError:
             # Check if queue lock is stale:
-            # Queue lock reclaim ONLY dead PID (or orphan directory older than stale_after without live PID).
-            # A live PID is NEVER reclaimed on age.
+            # Reclaim a dead holder, an orphan directory, or a live holder past max_hold.
             try:
                 is_stale = False
                 now = time.time()
@@ -620,7 +625,12 @@ def _queue_atomic_lock(
                     lock_pid = int(info["pid"])
                     if lock_pid > 0 and not pid_checker(lock_pid):
                         is_stale = True
-                    # Live PID is never reclaimed on age
+                    else:
+                        held_since = info.get("acquired_at_epoch")
+                        if not isinstance(held_since, (int, float)):
+                            held_since = os.path.getmtime(queue_lock_dir)
+                        if now - held_since >= max_hold:
+                            is_stale = True
                 else:
                     # No info file or mid-creation: fallback to directory mtime
                     mtime = os.path.getmtime(queue_lock_dir)
@@ -630,7 +640,10 @@ def _queue_atomic_lock(
                             is_stale = True
 
                 if is_stale:
-                    shutil.rmtree(queue_lock_dir, ignore_errors=True)
+                    # Never delete a successor's fresh lock: only remove the one examined.
+                    seen = _read_queue_lock_info(queue_lock_dir)
+                    if (seen or {}).get("token") == (info or {}).get("token"):
+                        shutil.rmtree(queue_lock_dir, ignore_errors=True)
                     continue
             except Exception:
                 pass
@@ -851,6 +864,8 @@ class BuildSlotManager:
                     pass
         self.last_acquired_file = os.path.join(self.run_dir, LAST_ACQUIRED_FILE_NAME)
         self.queue_cleanup_grace = DEFAULT_QUEUE_CLEANUP_GRACE_SECONDS
+        self.queue_grant_cleanup_grace = DEFAULT_QUEUE_GRANT_CLEANUP_GRACE_SECONDS
+        self._queue_op_state = threading.local()
         os.makedirs(self.run_dir, exist_ok=True)
 
     def get_max_slots(self, ram_pct: Optional[float] = None) -> int:
@@ -1135,7 +1150,7 @@ class BuildSlotManager:
                     return snapshot
             except Exception:
                 pass
-            with _queue_atomic_lock(self.run_dir, is_pid_alive_fn=self.is_pid_alive):
+            with self._queue_lock():
                 queue = self._read_queue()
                 new_queue, changed = prune(queue)
                 if changed:
@@ -1169,7 +1184,7 @@ class BuildSlotManager:
         Returns the 0-indexed position in queue.
         """
         hb_limit = stale_heartbeat_after if stale_heartbeat_after is not None else self.queue_stale_heartbeat_after
-        with _queue_atomic_lock(self.run_dir, is_pid_alive_fn=self.is_pid_alive):
+        with self._queue_lock():
             queue = self._read_queue()
             now = time.time()
             valid_queue, changed = self._clean_queue_locked(
@@ -1232,7 +1247,7 @@ class BuildSlotManager:
         so it passes normal waiters but never an earlier priority waiter.
         Returns True if found, False otherwise.
         """
-        with _queue_atomic_lock(self.run_dir, is_pid_alive_fn=self.is_pid_alive):
+        with self._queue_lock():
             queue = self._read_queue()
             target_idx = None
             for i, item in enumerate(queue):
@@ -1259,6 +1274,26 @@ class BuildSlotManager:
     def _any_slot_held(self) -> bool:
         return any(os.path.isdir(s_dir) for s_dir in self.slot_dirs)
 
+    def _queue_lock(self):
+        """
+        The queue file lock, with each attempt capped at the time left to the deadline of the
+        running _retry_queue_op, so no attempt overshoots the caller's own --timeout.
+        """
+        deadline = getattr(self._queue_op_state, "deadline", None)
+        if deadline is None:
+            return _queue_atomic_lock(self.run_dir, is_pid_alive_fn=self.is_pid_alive)
+        remaining = max(0.05, min(10.0, deadline - time.time()))
+        return _queue_atomic_lock(self.run_dir, timeout=remaining, is_pid_alive_fn=self.is_pid_alive)
+
+    def _within_deadline(self, deadline: Optional[float], op):
+        """Runs op once with every queue-lock attempt capped at 'deadline' (None: uncapped)."""
+        previous = getattr(self._queue_op_state, "deadline", None)
+        self._queue_op_state.deadline = deadline
+        try:
+            return op()
+        finally:
+            self._queue_op_state.deadline = previous
+
     def _retry_queue_op(self, op, deadline: Optional[float] = None):
         """
         Runs a queue-file operation and retries lock timeouts and transient OS errors with
@@ -1267,6 +1302,8 @@ class BuildSlotManager:
         """
         delay = 0.05
         while True:
+            previous = getattr(self._queue_op_state, "deadline", None)
+            self._queue_op_state.deadline = deadline
             try:
                 return op()
             except OSError as exc:
@@ -1279,8 +1316,12 @@ class BuildSlotManager:
                     pause = min(pause, max(0.0, deadline - now))
                 time.sleep(pause)
                 delay = min(delay * 2, 1.0)
+            finally:
+                self._queue_op_state.deadline = previous
 
-    def _dequeue_own_entry(self, name: str, pid: Optional[int], token: Optional[str]) -> None:
+    def _dequeue_own_entry(
+        self, name: str, pid: Optional[int], token: Optional[str], grace: Optional[float] = None
+    ) -> None:
         """
         Removes the caller's queue entry once its slot or wait is settled. Retries a busy
         queue lock for the release grace period; if it still fails, clean_queue sweeps the
@@ -1289,7 +1330,7 @@ class BuildSlotManager:
         try:
             self._retry_queue_op(
                 lambda: self.dequeue(name, pid, token=token),
-                time.time() + self.queue_cleanup_grace,
+                time.time() + (self.queue_cleanup_grace if grace is None else grace),
             )
         except Exception as exc:
             logger.warning("Queue cleanup for '%s' deferred to clean_queue: %s", name, exc)
@@ -1314,7 +1355,7 @@ class BuildSlotManager:
         token: Optional[str] = None,
     ) -> None:
         """Removes entry matching token, or (name, pid) if token is not provided."""
-        with _queue_atomic_lock(self.run_dir, is_pid_alive_fn=self.is_pid_alive):
+        with self._queue_lock():
             queue = self._read_queue()
             new_queue = []
             for item in queue:
@@ -1348,7 +1389,7 @@ class BuildSlotManager:
             return False
 
         try:
-            with _queue_atomic_lock(self.run_dir, is_pid_alive_fn=self.is_pid_alive):
+            with self._queue_lock():
                 queue = self._read_queue()
                 now = time.time()
                 now_iso = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat()
@@ -1626,7 +1667,9 @@ class BuildSlotManager:
                 now = time.time()
                 if now - last_heartbeat >= heartbeat_interval:
                     try:
-                        hb_ok = self.heartbeat(token=token, name=name, pid=pid)
+                        hb_ok = self._within_deadline(
+                            queue_deadline, lambda: self.heartbeat(token=token, name=name, pid=pid)
+                        )
                         if hb_ok:
                             last_heartbeat = now
                         else:
@@ -1677,7 +1720,10 @@ class BuildSlotManager:
 
                 # Clean dead PIDs / stale heartbeats from queue
                 try:
-                    queue = self.clean_queue(stale_heartbeat_after=effective_heartbeat_threshold)
+                    queue = self._within_deadline(
+                        queue_deadline,
+                        lambda: self.clean_queue(stale_heartbeat_after=effective_heartbeat_threshold),
+                    )
                 except (TimeoutError, PermissionError, OSError) as e:
                     logger.warning("Queue error during clean_queue for '%s': %s (will retry next tick)", name, e)
                     if timeout is not None:
@@ -1762,7 +1808,7 @@ class BuildSlotManager:
                             lock_token = info.get("token")
                             if not (explicit_token and lock_token and lock_token != token):
                                 acquired = True
-                                self._dequeue_own_entry(name, pid, token)
+                                self._dequeue_own_entry(name, pid, token, self.queue_grant_cleanup_grace)
                                 msg = f"Build slot lock already held by '{name}' (PID {pid})"
                                 print(msg)
                                 clean_stale_next_junction(next_dir=next_dir, cwd=cwd)
@@ -1810,7 +1856,7 @@ class BuildSlotManager:
                                     self._write_slot_info(slot_idx, owner=name, pid=pid, token=token)
                                     self._record_last_acquired_at(name, pid, slot_idx)
                                     acquired = True
-                                    self._dequeue_own_entry(name, pid, token)
+                                    self._dequeue_own_entry(name, pid, token, self.queue_grant_cleanup_grace)
                                     msg = f"Acquired build slot lock for '{name}' (PID {pid})"
                                     print(msg)
                                     logger.info(msg)
@@ -1836,7 +1882,9 @@ class BuildSlotManager:
         finally:
             # If we exited without holding the lock, remove self from queue
             if not acquired:
-                self._dequeue_own_entry(name, pid, token)
+                # Gave up (own deadline or error): spend little time past the caller's --timeout.
+                # A residue entry is swept by clean_queue once this PID is gone.
+                self._dequeue_own_entry(name, pid, token, self.queue_grant_cleanup_grace)
     def is_held_by(self, name: str, pid: Optional[int] = None, token: Optional[str] = None) -> bool:
         """Returns True if any slot lock is held by 'name' (and optionally pid / token)."""
         for slot_idx, slot_dir in enumerate(self.slot_dirs):
