@@ -44,6 +44,14 @@
           ]
         },
         {
+          "id": "wait_page_hydrated",
+          "action": "assert",
+          "selector": "next-route-announcer",
+          "expected_present": true,
+          "timeout_ms": 20000,
+          "note": "Next.js mounts next-route-announcer in an effect after hydration. A tap sent before hydration has no handler and is lost, so the next tap waits for it."
+        },
+        {
           "id": "open_review_tools_menu_if_present",
           "action": "tap",
           "selector": "button[aria-label='More review tools']",
@@ -204,7 +212,7 @@
         {
           "id": "assert_edited_title_in_table",
           "action": "assert",
-          "selector": "table",
+          "selector": "ul[aria-label='Artikel'] > li:has-text('QA-ART-489-NAT'), table tbody tr:has-text('QA-ART-489-NAT')",
           "expected_text": "QA-Flow 489 Native Artikel Editiert",
           "checks": [
             "visible"
@@ -329,7 +337,7 @@
     {
       "id": "article_row_edit_phone",
       "name": "Artikel-Zeilenbearbeitung auf dem Smartphone erreichbar",
-      "description": "Prueft, ob in der Artikeltabelle auf dem Smartphone (390x844) eine sichtbare, erreichbare Bearbeiten-Aktion mit Mindest-Touch-Target vorhanden ist, ohne horizontales Scrollen zu erzwingen.",
+      "description": "Prueft, ob in der Artikelliste auf dem Smartphone (390x844 und 390x420: Kartenliste 'Artikel', seit #645 statt Tabelle) und am Desktop (Tabelle) eine sichtbare, erreichbare Bearbeiten-Aktion mit Mindest-Touch-Target vorhanden ist, ohne horizontales Scrollen zu erzwingen.",
       "allowed_actions": [
         "goto",
         "tap",
@@ -353,9 +361,17 @@
           ]
         },
         {
+          "id": "wait_page_hydrated",
+          "action": "assert",
+          "selector": "next-route-announcer",
+          "expected_present": true,
+          "timeout_ms": 20000,
+          "note": "Next.js mounts next-route-announcer in an effect after hydration. A tap sent before hydration has no handler and is lost, so the next tap waits for it."
+        },
+        {
           "id": "tap_row_edit_action",
           "action": "tap",
-          "selector": "table tbody tr:first-child button[aria-label*='bearbeiten'], table tbody tr:first-child button:has-text('Bearbeiten'), table tbody tr:first-child a[aria-label*='bearbeiten']",
+          "selector": "ul[aria-label='Artikel'] > li:first-child button[aria-label$=' bearbeiten'], table tbody tr:first-child button[aria-label$=' bearbeiten'], table tbody tr:first-child button:has-text('Bearbeiten'), table tbody tr:first-child a[aria-label$=' bearbeiten']",
           "checks": [
             "visible",
             "tap_target_min_44",
