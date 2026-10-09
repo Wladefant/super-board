@@ -199,11 +199,11 @@ class TestBuildSlotAdmissionAndResourceRefusal(unittest.TestCase):
                 "enqueued_at": now - 100.0,
             },
         ]
-        # projected_max = 4.0 + 2.0 - 3.0 = 3.0 GiB >= 3.0 (head memory)
+        # projected_max = 4.0 + 4.0 - 3.0 = 5.0 GiB: the effective heavy minimum.
         # heavy_jobs == 0
         budget = {
             "available_gib": 4.0,
-            "reserved_gib": 2.0,
+            "reserved_gib": 4.0,
             "floor_gib": 3.0,
             "free_budget_gib": 0.5,  # light would physically fit, BUT aging pause must block backfill
             "heavy_jobs": 0,
@@ -213,6 +213,54 @@ class TestBuildSlotAdmissionAndResourceRefusal(unittest.TestCase):
         self.assertFalse(eligible, "Backfill must be paused when heavy head aged >1200, projected max >= head, and heavy_jobs==0")
         self.assertIsNotNone(reason)
         self.assertTrue("aging" in reason.lower() or "paused" in reason.lower() or "starv" in reason.lower())
+
+    def test_heavy_head_eventually_runs_with_181_second_medium_backfills(self):
+        head = {"name": "heavy-head", "token": "head", "job_class": "heavy",
+                "mem_gib": 5.0, "enqueued_at": 1000.0}
+        expiry = [1261]
+        admitted = []
+        head_age = None
+        for age in range(1201, 86401):
+            expiry = [end for end in expiry if end > age]
+            reserved = 1.5 * len(expiry)
+            budget = {"available_gib": 9.0, "reserved_gib": reserved,
+                      "floor_gib": 3.0, "free_budget_gib": 6.0 - reserved,
+                      "heavy_jobs": 0}
+            medium = {"name": "medium", "token": "medium", "job_class": "medium",
+                      "mem_gib": 1.5, "enqueued_at": 1000.0 + age}
+            queue = [head, medium]
+            if self.manager._queue_admission(queue, "head", budget, 1000.0 + age)[0]:
+                head_age = age
+                break
+            if age >= 1260 and (age - 1260) % 180 == 0:
+                if self.manager._queue_admission(queue, "medium", budget, 1000.0 + age)[0]:
+                    self.assertGreaterEqual(budget["free_budget_gib"], 1.5)
+                    expiry.append(age + 181)
+                    admitted.append(age)
+        self.assertIsNotNone(head_age, "5 GiB head starved through age 86400s")
+        self.assertLessEqual(head_age, 2400 + 181)
+        self.assertTrue(admitted, "The replay must exercise backfill before the age cap")
+
+    def test_aged_head_drain_windows_are_bounded(self):
+        queue = [
+            {"name": "head", "token": "head", "job_class": "heavy",
+             "mem_gib": 3.0, "enqueued_at": 1000.0},
+            {"name": "light", "token": "light", "job_class": "light",
+             "mem_gib": 0.5, "enqueued_at": 1100.0},
+        ]
+        budget = {"available_gib": 6.5, "reserved_gib": 1.5,
+                  "floor_gib": 3.0, "free_budget_gib": 2.0, "heavy_jobs": 0}
+        for age, expected in [(1205, False), (1259, False), (1260, True),
+                              (1379, True), (1380, False), (1440, True),
+                              (2399, True), (2400, False), (3060, False)]:
+            with self.subTest(age=age):
+                allowed, reason = self.manager._queue_admission(
+                    queue, "light", budget, 1000.0 + age)
+                self.assertEqual(allowed, expected, reason)
+        self.assertEqual(queue[0]["enqueued_at"], 1000.0)
+        budget.update(available_gib=8.0, reserved_gib=0.0, free_budget_gib=5.0)
+        self.assertTrue(self.manager._queue_admission(queue, "head", budget, 2300.0)[0])
+        self.assertFalse(self.manager._queue_admission(queue, "light", budget, 2300.0)[0])
 
     def test_queue_admission_aging_does_not_pause_backfill_when_heavy_job_already_held(self):
         """When heavy_jobs >= 1, aging does not pause backfill for smaller jobs because heavy head cannot run anyway."""
@@ -374,10 +422,21 @@ class TestBuildSlotStaleStaggerSnapshotRace(unittest.TestCase):
 
         with mock.patch("build_slot._transition_guard", side_effect=race_simulating_guard):
             # Attempt acquire with timeout=0.1
-            acquired = self.manager.acquire("delayed-lane", timeout=0.1, poll_interval=0.02)
+            acquired = self.manager.acquire("delayed-lane", timeout=0.1, poll_interval=0.02, job_class="heavy")
 
         self.assertFalse(acquired, "Acquisition must be refused when stagger is rechecked inside guard and active")
         self.assertFalse(self.manager.is_held_by("delayed-lane"))
+
+    def test_light_and_medium_backfill_stagger_without_delaying_heavy(self, *_probes):
+        self.manager._record_last_acquired_at("heavy-before", 1111, 0)
+        last = self.manager._read_last_acquired_at()
+        self.manager.enqueue("head", os.getpid(), token="head", job_class="heavy", mem_gib=5.0)
+        for job_class in ("light", "medium"):
+            with self.subTest(job_class=job_class):
+                self.assertTrue(self.manager.acquire(
+                    job_class, timeout=.1, poll_interval=.02, job_class=job_class))
+                self.assertEqual(self.manager._read_last_acquired_at(), last)
+                self.manager.release(job_class)
 
 
 class TestBuildSlotSharedPidHeartbeatExpiry(unittest.TestCase):
@@ -541,16 +600,16 @@ class TestBuildSlotAdmissionLoop(unittest.TestCase):
 
     def test_real_timeout_reports_heavy_cap_and_negative_budget(self):
         with tempfile.TemporaryDirectory() as run_dir, \
-                mock.patch("build_slot.get_available_ram_gib", return_value=6.68), \
+                mock.patch("build_slot.get_available_ram_gib", return_value=11.0), \
                 mock.patch("build_slot.get_system_ram_percent", return_value=50.0):
             manager = BuildSlotManager(run_dir=run_dir, acquisition_stagger=0)
             self.assertTrue(manager.acquire("held", token="held", timeout=.2, job_class="heavy", mem_gib=3.0))
             self.assertTrue(manager.acquire("light-held", token="light-held", timeout=.2, mem_gib=.5))
             output = io.StringIO()
-            with redirect_stderr(output):
+            with redirect_stderr(output), mock.patch("build_slot.get_available_ram_gib", return_value=6.68):
                 self.assertFalse(manager.acquire("blocked", token="blocked", timeout=.05, poll_interval=.01, job_class="heavy"))
             self.assertIn("heavy cap", output.getvalue())
-            self.assertIn("available 6.68 - reserved 3.50 - floor 3.00 = 0.18", output.getvalue())
+            self.assertIn("available 6.68 - reserved 5.50 - floor 3.00 = -1.82", output.getvalue())
             self.assertNotIn("stagger", output.getvalue())
             manager.release("held", token="held")
             manager.release("light-held", token="light-held")

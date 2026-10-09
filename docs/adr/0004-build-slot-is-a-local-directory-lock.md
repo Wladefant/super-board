@@ -31,21 +31,26 @@ Queue management invariants:
 
 Memory admission and job classification invariants:
 - `get_available_ram_gib()` determines available host memory. It checks system RAM and honors the `BUILD_SLOT_AVAILABLE_GIB` override.
-- Memory admission requires `available_ram - sum(active_reservations) - new_reservation >= 3.0` GiB (3 GiB floor). Waiters remain queued until memory frees or their queue timeout expires.
-- Jobs belong to three classes: `heavy`, `medium`, and `light`.
-- `run` classifies Next builds, Next servers, and Chrome QA as heavy. TypeScript, Vitest, Wrangler, and workerd are medium. Other commands are light.
-- Default reservations are 3 GiB for heavy, 1.5 GiB for medium, and 0.5 GiB for light.
-- `acquire` defaults to light because it has no child command. Use `--class heavy` for manual build or Chrome slots.
+- Admission keeps a 3 GiB floor: `available_ram - ramp_reservations - new_reservation >= 3.0`.
+- Count held reservations during ramp-up only: heavy for 300 seconds, medium for 120 seconds, and light or browser for 60 seconds.
+- After ramp-up, the job's actual memory already reduces available RAM. Do not subtract its full reservation again.
+- Missing, corrupt or future acquisition times keep the full reservation charge.
+- Status reports total effective `reserved_gib` and current `ramp_reservations_gib` separately.
+- Jobs belong to four classes: `heavy`, `medium`, `light`, and `browser`.
+- Next builds and Next servers are heavy. Chrome-only QA is browser. TypeScript, Vitest, Wrangler, and workerd are medium. Other commands are light.
+- Heavy reservations have a 5 GiB minimum, even with explicit `--mem-gib 3`. Larger explicit reservations remain unchanged. Medium defaults to 1.5 GiB, light to 0.5 GiB, and browser to 1.1 GiB.
+- `acquire` defaults to light because it has no child command. Use `--class heavy` for manual builds or servers. Use `--class browser` only for headless QA without a build or server.
 - Both commands accept `--class` and `--mem-gib` to override classification and reservation.
-- Active slots record their reserved memory. Legacy slots without recorded reservation metadata reserve 3.0 GiB by default.
+- Active slots record their reserved memory. Legacy slots without reservation metadata count as heavy with a 5 GiB minimum.
 - At most one `heavy` job may run concurrently across all slots. A second heavy job must wait in queue even if enough free RAM exists.
+- Browser jobs do not count toward the heavy cap. They can run beside a heavy build when both reservations preserve the RAM floor. A browser `run` refuses an obvious Next build or server command.
 - `--force` requires `BUILD_SLOT_ALLOW_FORCE=1`. Without it, acquisition fails. Authorized force logs the override and bypasses memory admission.
 - Even when `BUILD_SLOT_ALLOW_FORCE=1` is set, `--force` cannot bypass the one-heavy job concurrency cap.
 - The obsolete idle bypass is removed. Queue wait duration never bypasses host memory safety invariants.
-- Admission reads the stagger again under the slot guard before publishing a grant.
+- Admission reads the stagger under the slot guard. The queue head and every heavy candidate retain the stagger. A smaller non-heavy job can backfill a stagger-blocked head when its reservation fits. Only heavy grants advance the stagger timestamp, so backfill does not extend the head's delay.
 - Waiters print resource refusal reasons and include the last reason in timeout output.
-- Smaller jobs can backfill a resource-blocked head without changing its position or enqueue time.
-- After 20 minutes, a heavy head pauses backfill only with no held heavy job and enough projected memory after reservations release.
+- Smaller jobs can backfill a resource- or stagger-blocked head without changing its position or enqueue time.
+- After 20 minutes, a heavy head reserves a 60-second drain window every 180 seconds when no heavy job runs. Smaller jobs can backfill between windows until the head reaches 40 minutes. At 40 minutes, stop backfill when no heavy job runs and projected memory can fit the head. Existing holders must drain before smaller admissions resume. The head keeps first admission whenever it fits.
 - An impossible head does not pause backfill. Output reports its required memory and maximum possible budget.
 
 Command execution deadline and process tree invariants:
