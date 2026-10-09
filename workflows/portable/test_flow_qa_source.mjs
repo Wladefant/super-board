@@ -5,6 +5,7 @@ import { formatReceipt, verifyServedSha } from './flow_qa_runner.mjs';
 const sha = 'a'.repeat(40);
 const report = () => ({ served_sha: sha, expected_sha: sha, passed: true,
   assertions: { passed: 7, failed: 0 }, viewports: ['390x844', '390x420', '1440x900'],
+  steps: [{ passed: true, checks: Array.from({ length: 7 }, () => ({ name: 'visible', passed: true })) }],
   cleanup: { passed: true }, source: { runner: '1'.repeat(64), flow: '2'.repeat(64), project: 'shipnovo' } });
 
 test('receipt records runner and flow identities', () => {
@@ -21,4 +22,12 @@ test('missing source refuses PASS', () => {
 });
 test('abbreviated SHA cannot prove served head', () => {
   assert.equal(verifyServedSha('aaaaaaa', sha).match, false);
+});
+test('zero executed steps refuse PASS despite positive summary', () => {
+  assert.match(formatReceipt({ ...report(), steps: [] }), /FLOW-QA: FAIL/);
+});
+test('skip-only steps refuse PASS despite positive summary', () => {
+  assert.match(formatReceipt({ ...report(), steps: [
+    { passed: true, checks: [{ name: 'optional_skipped', passed: true }] }
+  ] }), /FLOW-QA: FAIL/);
 });

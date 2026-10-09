@@ -834,7 +834,8 @@ test('formatReceipt binds PASS to the served sha and fails closed otherwise', as
   const { formatReceipt } = await import('./flow_qa_runner.mjs');
   const sha = 'a'.repeat(40);
   const source = { runner: '1'.repeat(64), flow: '2'.repeat(64), project: 'shipnovo' };
-  const ok = formatReceipt({ passed: true, served_sha: sha, expected_sha: sha, source, assertions: { passed: 9, failed: 0 }, viewports: ['390x844', '1440x900'] });
+  const steps = [{ passed: true, checks: Array.from({ length: 9 }, () => ({ name: 'visible', passed: true })) }];
+  const ok = formatReceipt({ passed: true, served_sha: sha, expected_sha: sha, source, steps, assertions: { passed: 9, failed: 0 }, viewports: ['390x844', '1440x900'] });
   assert.match(ok, new RegExp(`^FLOW-QA: PASS ${sha}\\n`));
   assert.match(ok, /FLOW-QA-ASSERTIONS pass=9 fail=0/);
   assert.match(ok, /FLOW-QA-VIEWPORTS 390x844,1440x900/);
@@ -1090,6 +1091,18 @@ test('Negative Flow Control 4: Reject unsupported viewports, empty theme lists, 
       /unsupported theme/i,
       'runFlows must reject unsupported theme'
     );
+    for (const steps of [[], [
+      { id: 'optional-missing', action: 'tap', selector: '#missing', optional: true },
+      { id: 'desktop-control', action: 'tap', selector: '#missing', desktop_only: true },
+    ]]) {
+      fs.writeFileSync(flowJsonPath, JSON.stringify({ flows: [{ id: 'skip-only', steps }] }));
+      const report = await runFlows({
+        baseUrl, expectedSha: EXPECTED_SHA, outputDir: tmpDir,
+        flowDataPath: flowJsonPath, viewports: ['390x844'], themes: ['light']
+      });
+      assert.equal(report.assertions.passed, 0, 'skip notes are not real assertions');
+      assert.equal(report.passed, false, 'empty or skip-only flows must not pass');
+    }
   } finally {
     server.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });

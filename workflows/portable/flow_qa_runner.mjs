@@ -2253,6 +2253,7 @@ export async function runFlows(options = {}) {
             allStepReports.push(stepResult);
 
             for (const chk of stepResult.checks) {
+              if (chk.name?.endsWith('_skipped')) continue;
               if (chk.passed) totalAssertionsPassed++;
               else totalAssertionsFailed++;
             }
@@ -2292,6 +2293,7 @@ export async function runFlows(options = {}) {
 
             let stepCheckCount = 0;
             for (const chk of cStepResult.checks || []) {
+              if (chk.name?.endsWith('_skipped')) continue;
               stepCheckCount++;
               if (chk.passed) {
                 totalAssertionsPassed++;
@@ -2312,7 +2314,8 @@ export async function runFlows(options = {}) {
     await Promise.race([browser.close().catch(() => {}), new Promise(r => setTimeout(r, 3000))]);
   }
 
-  const hasExecutedCoverage = executedViewports.size > 0 && allStepReports.length > 0;
+  const hasExecutedCoverage = executedViewports.size > 0 && allStepReports.some(step =>
+    step.checks.some(check => !check.name?.endsWith('_skipped')));
   const overallPassed = totalAssertionsPassed > 0 &&
     totalAssertionsFailed === 0 &&
     cleanupPassed &&
@@ -2349,8 +2352,20 @@ export async function runFlows(options = {}) {
  */
 export function formatReceipt(report) {
   const served = /^[0-9a-f]{40}$/i.test(report?.served_sha || '') ? report.served_sha : '';
-  const passedCount = report?.assertions?.passed ?? 0;
-  const failedCount = report?.assertions?.failed ?? 0;
+  let passedCount = 0;
+  let failedCount = 0;
+  const steps = Array.isArray(report?.steps) ? report.steps : [];
+  const cleanupSteps = Array.isArray(report?.cleanup?.steps) ? report.cleanup.steps : [];
+  for (const step of [...steps, ...cleanupSteps]) {
+    for (const check of step.checks || []) {
+      if (check.name?.endsWith('_skipped')) continue;
+      if (check.passed === true) passedCount++;
+      else failedCount++;
+    }
+  }
+  const hasExecutedSteps = steps.some(step =>
+    (step.checks || []).some(check => !check.name?.endsWith('_skipped')));
+  const countsMatch = report?.assertions?.passed === passedCount && report?.assertions?.failed === failedCount;
   const cleanupPassed = report?.cleanup?.passed ?? true;
   const executedViewports = Array.isArray(report?.viewports) ? report.viewports : [];
   const hasValidCoverage = executedViewports.length > 0 && executedViewports.every(v => VIEWPORTS[v]);
@@ -2363,6 +2378,8 @@ export function formatReceipt(report) {
     served &&
     served.toLowerCase() === String(report?.expected_sha || '').toLowerCase() &&
     hasSource &&
+    hasExecutedSteps &&
+    countsMatch &&
     passedCount > 0 &&
     failedCount === 0 &&
     cleanupPassed &&

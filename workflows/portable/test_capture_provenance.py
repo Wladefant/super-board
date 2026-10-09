@@ -80,6 +80,22 @@ class CaptureProvenanceTests(unittest.TestCase):
         self.assertEqual(qa_result[0], 'PASSED', qa_result[1])
 
 
+    def test_earlier_head_capture_does_not_block_current_receipt(self):
+        root = Path(github_pr_gate.__file__).parent
+        runner = hashlib.sha256((root / 'flow_qa_runner.mjs').read_bytes()).hexdigest()
+        flow = hashlib.sha256((root / 'flows/shipnovo.json').read_bytes()).hexdigest()
+        body = (f'FLOW-QA: PASS {AFTER}\nFLOW-QA-ASSERTIONS pass=7 fail=0\n'
+                'FLOW-QA-VIEWPORTS 390x844,390x420,1440x900\n'
+                f'FLOW-QA-SOURCE runner={runner} flow={flow} project=shipnovo\n')
+        old = self.body().replace(AFTER, 'c' * 40)
+        data = {'files': [{'path': 'src/app/page.tsx'}], 'comments': [
+            {'body': old}, {'body': body}, {'body': self.body()}]}
+        with patch('github_pr_gate._content_binder', return_value=(lambda sha: sha == AFTER, [AFTER], None)):
+            flow_result = evaluate_flow_qa_receipt(data, repo='Wladefant/shipnovo', base_ref='main', head_sha=AFTER)
+            qa_result = evaluate_qa_receipt(data, repo='Wladefant/shipnovo', base_ref='main', head_sha=AFTER)
+        self.assertEqual(flow_result[0], 'PASSED', flow_result[1])
+        self.assertEqual(qa_result[0], 'PASSED', qa_result[1])
+
     def test_valid_measured_records(self):
         self.assertEqual(self.check(), [])
 

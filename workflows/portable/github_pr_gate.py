@@ -608,6 +608,23 @@ SHOT_NEAR_IDENTICAL_BITS = 3
 SHOT_MIN_CHANGED_RATIO = 0.0005
 
 
+def capture_evidence_is_current(body: str, binds: Any) -> bool:
+    """Ignore proven older revisions, but never exempt missing or malformed captions."""
+    after = [
+        dict(token.partition("=")[::2] for token in match.group("fields").split())
+        for match in SHOT_CAPTION_LINE_RE.finditer(body)
+        if match.group("label").lower() == "after"
+    ]
+    if not after:
+        return True
+    for fields in after:
+        served = fields.get("served", "").lower()
+        expected = fields.get("expected", "").lower()
+        if not SHA40_RE.fullmatch(served) or served != expected or binds(served):
+            return True
+    return False
+
+
 def shot_provenance_problems(body: str, binds: Any, require_capture: bool = False) -> List[str]:
     """
     Why a receipt's before/after screenshots are not provenance-backed evidence.
@@ -805,6 +822,7 @@ def evaluate_qa_receipt(
     evidence_comments = [
         source for source in all_sources
         if SHOT_CLAIM_RE.search(str(source.get("body") or ""))
+        and (not require_capture or capture_evidence_is_current(str(source.get("body") or ""), binds))
     ]
 
     for source in evidence_comments:
@@ -1075,7 +1093,7 @@ def evaluate_flow_qa_receipt(
                 s_body = str(source.get("body") or "")
                 if s_body == declaration["body"]:
                     continue
-                if SHOT_CLAIM_RE.search(s_body):
+                if SHOT_CLAIM_RE.search(s_body) and capture_evidence_is_current(s_body, binds):
                     s_problems = shot_provenance_problems(s_body, lambda sha: sha.lower() == head_sha.lower(), True)
                     if s_problems:
                         s_url = str(source.get("html_url") or source.get("url") or "") or declaration["url"] or None

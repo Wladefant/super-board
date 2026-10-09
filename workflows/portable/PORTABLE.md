@@ -100,8 +100,13 @@ Unsupported repositories remain exempt from Flow QA requirements.
 A valid receipt comment must bind the current head SHA.
 The receipt must report positive assertions with zero failures (`pass>0`, `fail=0`).
 The receipt must list all required viewports.
+A PASS requires an executed flow step and at least one real assertion.
+Skip notes do not count as passed assertions.
+Earlier-head capture comments do not block current evidence unless their content still matches the current revision.
 The receipt must include `FLOW-QA-SOURCE runner=<sha256> flow=<sha256> project=<project>`.
 The supervisor reads its installed canonical files to check both hashes.
+This check detects accidental or careless source drift, not a hostile lane that fabricates evidence.
+All lanes share one Windows identity. Protected execution evidence requires a separate supervisor identity and is outside this change.
 An alternate flow file can pass only when its bytes match the approved canonical flow.
 An older receipt without source hashes needs a new run.
 A failed Shipnovo FLOW-QA receipt stays blocked for the same content.
