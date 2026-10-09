@@ -1851,17 +1851,17 @@ class TestBuildSlot(unittest.TestCase):
         build_slot._write_json_atomic(path, {"n": 2})
         self.assertEqual(build_slot._read_json_file(path), {"n": 2})
 
-    def test_dead_run_wrapper_reclaimed_immediately(self):
-        """A dead wrapper frees its slot even with a fresh heartbeat and live child."""
+    def test_dead_run_wrapper_retains_reservation_until_child_dies(self):
+        """Never free a crashed wrapper's reservation while its recorded child lives."""
         manager = BuildSlotManager(run_dir=self.run_dir)
         dead_wrapper = self._exited_pid()
         orphan_child = self._live_process()
 
         self._write_run_lock(manager, dead_wrapper, orphan_child.pid, age=30.0, hb_age=30.0)
-        self.assertTrue(manager.check_stale_and_reclaim())
-        self.assertFalse(os.path.isdir(manager.lock_dir))
-
-        self._write_run_lock(manager, dead_wrapper, orphan_child.pid, age=120.0, hb_age=90.0)
+        self.assertFalse(manager.check_stale_and_reclaim())
+        self.assertTrue(os.path.isdir(manager.lock_dir))
+        orphan_child.kill()
+        orphan_child.wait(timeout=5)
         stderr = io.StringIO()
         with redirect_stderr(stderr):
             self.assertTrue(manager.check_stale_and_reclaim())
@@ -3193,7 +3193,7 @@ class TestBuildSlot(unittest.TestCase):
         manager = BuildSlotManager(run_dir=self.run_dir)
         live_proc = self._live_process()
         # Recorded ticks 999999 mismatches actual ticks of live_proc
-        self._write_run_lock(manager, live_proc.pid, live_proc.pid, age=7200.0, hb_age=7000.0, wrapper_created_ticks=999999)
+        self._write_run_lock(manager, live_proc.pid, self._exited_pid(), age=7200.0, hb_age=7000.0, wrapper_created_ticks=999999)
         with redirect_stderr(io.StringIO()):
             self.assertTrue(manager.check_stale_and_reclaim())
         self.assertFalse(os.path.isdir(manager.lock_dir))
@@ -3204,7 +3204,7 @@ class TestBuildSlot(unittest.TestCase):
         live_proc = self._live_process()
         # Legacy lock: wrapper_created_ticks=False, acquired_at_epoch set to 2 hours ago
         # The live_proc was created just now, which is > acquired_at_epoch
-        self._write_run_lock(manager, live_proc.pid, live_proc.pid, age=7200.0, hb_age=7000.0, wrapper_created_ticks=False)
+        self._write_run_lock(manager, live_proc.pid, self._exited_pid(), age=7200.0, hb_age=7000.0, wrapper_created_ticks=False)
         with redirect_stderr(io.StringIO()):
             self.assertTrue(manager.check_stale_and_reclaim())
         self.assertFalse(os.path.isdir(manager.lock_dir))
@@ -3743,6 +3743,67 @@ class TestBuildSlot(unittest.TestCase):
             stop_event.set()
             t.join()
             manager_blocker.release("blocker-lane")
+
+    def test_freeze_while_queue_mutex_contended(self):
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        freeze_path = os.path.join(self.run_dir, "build-freeze")
+        def freeze():
+            time.sleep(0.25)
+            with open(freeze_path, "w", encoding="utf-8") as stream:
+                stream.write("contended freeze")
+        with _queue_atomic_lock(self.run_dir):
+            writer = threading.Thread(target=freeze)
+            writer.start()
+            try:
+                with self.assertRaises(SystemExit) as raised:
+                    manager.acquire("mutex-waiter", timeout=0.6, poll_interval=0.02)
+                self.assertEqual(raised.exception.code, 75)
+            finally:
+                writer.join(timeout=2)
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows Job Object")
+    def test_forced_wrapper_exit_kills_tree_and_releases_reservation(self):
+        child_script = os.path.join(self.run_dir, "crash_child.py")
+        pids_file = os.path.join(self.run_dir, "crash_pids.json")
+        with open(child_script, "w", encoding="utf-8") as stream:
+            stream.write(
+                "import json,os,subprocess,sys,time\n"
+                "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],"
+                "creationflags=subprocess.CREATE_NO_WINDOW)\n"
+                "with open(sys.argv[1],'w') as f: json.dump([os.getpid(),child.pid],f)\n"
+                "time.sleep(60)\n"
+            )
+        wrapper = subprocess.Popen(
+            [sys.executable, build_slot.__file__, "--run-dir", self.run_dir,
+             "run", "crash-wrapper", "--run-timeout", "3", "--",
+             sys.executable, child_script, pids_file],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        pids = []
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not os.path.exists(pids_file):
+                time.sleep(0.02)
+            self.assertTrue(os.path.exists(pids_file), "real child must start")
+            with open(pids_file, encoding="utf-8") as stream:
+                pids = json.load(stream)
+            wrapper.kill()
+            wrapper.wait(timeout=5)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and any(is_pid_alive(pid) for pid in pids):
+                time.sleep(0.02)
+            self.assertFalse(any(is_pid_alive(pid) for pid in pids), "wrapper death must kill its tree within 2s")
+            self.assertEqual(BuildSlotManager(run_dir=self.run_dir).status()["active_slots"], 0)
+        finally:
+            if wrapper.poll() is None:
+                wrapper.kill()
+                wrapper.wait(timeout=5)
+            for pid in pids:
+                if is_pid_alive(pid):
+                    subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                                   timeout=10, creationflags=subprocess.CREATE_NO_WINDOW,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def test_classify_command_job_classes(self):
         """classify_command returns 'heavy', 'medium', or 'light'."""

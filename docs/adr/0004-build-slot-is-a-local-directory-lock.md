@@ -27,6 +27,7 @@ Queue management invariants:
 - Contenders time out when a live process holds the queue lock for less than 120 seconds. Contenders safely reclaim locks held longer than 120 seconds through a unique tombstone directory rename.
 - A queue-lock timeout is a transient fault, not a verdict on the waiter. `acquire` retries enqueue with jittered backoff until the caller's own `--timeout` ends, then returns `False`; it never raises and never drops the waiter's place. Queue cleanup after a slot is settled (post-acquire, release, abort) retries for a grace period (8 s, shorter than the release deadline). If it still fails, `clean_queue` sweeps the entry, because its PID is dead or its token holds a slot. Waiters poll the queue without the lock and take it only when a write is needed, so 30 pollers do not starve the writers. Lock polling uses jittered, growing delays. The queue-lock owner retries deleting its lock dir (waiters hold `info.json` open, and Windows refuses to delete an open file), so a release never leaves a lock behind for as long as a long-lived `run` wrapper lives. A queue lock is held for milliseconds and never across a wrapped command. A lock held longer than 120 s, even by a live PID, was leaked and is reclaimed. Each queue-lock attempt is capped at the time left to the caller's `--timeout`; cleanup after a grant or a give-up retries for at most 1 s, and `clean_queue` sweeps any residue.
 - Operator build freeze: when 'build-freeze' exists in the run directory, 'acquire' and 'run' commands immediately abort with exit code 75. They print 'build freeze active (<reason>)' to stderr (or 'reason unavailable' if reading fails). Waiting queues and command invocations do not start. If 'build-freeze' appears while a waiter is already waiting in the FIFO queue, that queued waiter immediately exits with exit code 75 (raises `SystemExit(75)`). 'release' and 'status' remain unaffected.
+- Acquisition checks freeze during queue retries and mutex waits. Release and queue cleanup do not cancel on freeze.
 
 Memory admission and job classification invariants:
 - `get_available_ram_gib()` determines available host memory. It checks system RAM and honors the `BUILD_SLOT_AVAILABLE_GIB` override.
@@ -47,6 +48,8 @@ Command execution deadline and process tree invariants:
 - The existing `--timeout` parameter applies only to FIFO queue wait time.
 - When `--run-timeout` expires, the arbiter terminates the entire process tree (killing child and grandchild processes) and exits with exit code 124.
 - Windows uses hidden, bounded `taskkill /T /F`. The wrapper releases its slot after completion, timeout, or a handled exit.
+- Windows launches the child suspended and attaches a kill-on-close Job Object before it runs. Forced wrapper termination kills its descendants.
+- Stale reclaim retains a dead wrapper's reservation while its recorded child remains alive.
 
 Environment variable tuning invariants:
 - Commands executed under `run` receive tuned environment variables:
