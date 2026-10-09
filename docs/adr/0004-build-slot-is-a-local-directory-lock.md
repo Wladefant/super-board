@@ -31,7 +31,11 @@ Queue management invariants:
 
 Memory admission and job classification invariants:
 - `get_available_ram_gib()` determines available host memory. It checks system RAM and honors the `BUILD_SLOT_AVAILABLE_GIB` override.
-- Memory admission requires `available_ram - sum(active_reservations) - new_reservation >= 3.0` GiB (3 GiB floor). Waiters remain queued until memory frees or their queue timeout expires.
+- Admission keeps a 3 GiB floor: `available_ram - ramp_reservations - new_reservation >= 3.0`.
+- Count held reservations during ramp-up only: heavy for 300 seconds, medium for 120 seconds, and light for 60 seconds.
+- After ramp-up, the job's actual memory already reduces available RAM. Do not subtract its full reservation again.
+- Missing, corrupt or future acquisition times keep the full reservation charge.
+- Status preserves declared `reserved_gib` and reports effective `ramp_reservations_gib` separately.
 - Jobs belong to three classes: `heavy`, `medium`, and `light`.
 - `run` classifies Next builds, Next servers, and Chrome QA as heavy. TypeScript, Vitest, Wrangler, and workerd are medium. Other commands are light.
 - Default reservations are 3 GiB for heavy, 1.5 GiB for medium, and 0.5 GiB for light.
