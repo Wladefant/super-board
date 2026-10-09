@@ -34,7 +34,7 @@ import { TelegramRuntime, isEligibleRootSession } from "../extension/runtime";
 import { TelegramPoller } from "../extension/poller";
 import { MessageContextStore } from "../src/message-context";
 import { LiveDashboard } from "../src/live-dashboard";
-import { OperatorQuestionService } from "../src/operator-questions";
+import { OperatorQuestionService, type Question } from "../src/operator-questions";
 import type { MessageCorrelationBridge, OutboundMessageCorrelation } from "../extension/types";
 import { instantTransport } from "./instant-transport";
 
@@ -47,6 +47,7 @@ interface RegisteredTool {
   label: string;
   description: string;
   parameters: unknown;
+  interruptible?: ((params: Record<string, unknown>) => boolean) | boolean;
   execute: (
     toolCallId: string,
     params: Record<string, unknown>,
@@ -238,23 +239,53 @@ function createChannel(messageThreadId?: number): {
   }) as typeof fetch;
 
   const route = { session_id: "owning-session", chat_id: "1", user_id: "1" };
+  const decisionsPath = path.join(dir, "decisions.json");
+  const defaultPendingQuestion: Question = {
+    decision_id: "tq:1",
+    question: "Pending question",
+    status: "pending",
+    options: [
+      { id: "opt-1", label: "Option 1" },
+      { id: "opt-2", label: "Option 2" },
+    ],
+    answer: null,
+    transport: { ...route, kind: "operator_question" as const, selection: null },
+  };
+  fs.writeFileSync(
+    decisionsPath,
+    JSON.stringify({ decisions: { [defaultPendingQuestion.decision_id]: defaultPendingQuestion } }, null, 2),
+  );
+
   const questions = new OperatorQuestionService(
     poller,
     () => route,
-    path.join(dir, "decisions.json"),
+    decisionsPath,
     poolPath,
     () => {},
     async (operation, payload) => {
       if (operation !== "register") return {};
-      const input = payload as { question: string };
+      const input = payload as {
+        question: string;
+        options?: Array<{ id: string; label: string; description?: string }>;
+        recommendation?: string;
+      };
+      const question: Question = {
+        decision_id: "tq:1",
+        question: input.question,
+        status: "pending",
+        options: input.options ?? [],
+        answer: null,
+        transport: { ...route, kind: "operator_question" as const, selection: null },
+      };
+      let current: { decisions: Record<string, Question> } = { decisions: {} };
+      try {
+        current = JSON.parse(fs.readFileSync(decisionsPath, "utf-8"));
+      } catch {}
+      current.decisions = current.decisions ?? {};
+      current.decisions[question.decision_id] = question;
+      fs.writeFileSync(decisionsPath, JSON.stringify(current, null, 2));
       return {
-        question: {
-          decision_id: "tq:1",
-          question: input.question,
-          status: "pending",
-          answer: null,
-          transport: { ...route, kind: "operator_question" as const, selection: null },
-        },
+        question,
         card: { id: "tq:1", text: input.question },
       };
     },
@@ -655,4 +686,195 @@ test("isEligibleRootSession admits root sessions even when hasUI is false", () =
     parentTaskPrefix: undefined,
   } as unknown as ExtensionContext;
   expect(isEligibleRootSession(nestedSession)).toBe(false);
+});
+
+interface AccountForwardedSteering {
+  text: string;
+  forwarded: true;
+}
+
+class HostSteeringDispatcher {
+  readonly queue: AccountForwardedSteering[] = [];
+
+  constructor(
+    private readonly tool: RegisteredTool,
+    private readonly controller: AbortController,
+  ) {}
+
+  dispatch(message: AccountForwardedSteering, params: Record<string, unknown>): void {
+    this.queue.push(message);
+    const isInterruptible =
+      typeof this.tool.interruptible === "function"
+        ? this.tool.interruptible(params)
+        : this.tool.interruptible === true;
+    if (isInterruptible) {
+      this.controller.abort(new Error(`Interrupted by account-forwarded steering message: ${message.text}`));
+    }
+  }
+}
+
+const ACCOUNT_FORWARDED_STEERING_MESSAGES = [
+  "Well, admin on ShipNovo",
+  "You even have his email. Can you just add",
+  "Just like I am the admin",
+  "Here is access to the admin dashboard",
+];
+
+test("telegram_question declares an interruptible predicate selecting waiting operations", () => {
+  const tool = loadedTools().get("telegram_question");
+  expect(tool).toBeDefined();
+  expect(typeof tool?.interruptible).toBe("function");
+  const isInterruptible = tool!.interruptible as (params: Record<string, unknown>) => boolean;
+
+  const table: Array<{ params: Record<string, unknown>; expected: boolean; description: string }> = [
+    // wait true / default
+    { params: { action: "wait", wait: true }, expected: true, description: "wait: true on action: wait" },
+    { params: { action: "wait" }, expected: true, description: "wait: default on action: wait" },
+    // ask true / default
+    { params: { action: "ask", wait: true }, expected: true, description: "wait: true on action: ask" },
+    { params: { action: "ask" }, expected: true, description: "wait: default on action: ask" },
+    { params: { wait: true }, expected: true, description: "wait: true on default action (ask)" },
+    { params: {}, expected: true, description: "wait: default on default action (ask)" },
+    // get / resolve / drop
+    { params: { action: "get" }, expected: false, description: "action: get" },
+    { params: { action: "get", wait: true }, expected: false, description: "action: get even with wait: true" },
+    { params: { action: "resolve" }, expected: false, description: "action: resolve" },
+    { params: { action: "resolve", wait: true }, expected: false, description: "action: resolve even with wait: true" },
+    { params: { action: "drop" }, expected: false, description: "action: drop" },
+    { params: { action: "drop", wait: true }, expected: false, description: "action: drop even with wait: true" },
+    // wait false
+    { params: { action: "ask", wait: false }, expected: false, description: "wait: false on action: ask" },
+    { params: { action: "wait", wait: false }, expected: false, description: "wait: false on action: wait" },
+    { params: { wait: false }, expected: false, description: "wait: false on default action (ask)" },
+  ];
+
+  for (const row of table) {
+    expect(isInterruptible(row.params)).toBe(row.expected);
+  }
+});
+
+test("telegram_question wait is interrupted by host dispatcher on queued steering and preserves durable pending state", async () => {
+  const host = createHost();
+  registerOperatorTools(host.api);
+  const runtime = new TelegramRuntime(host.api);
+  setActiveRuntime(runtime);
+  const channel = createChannel();
+  (globalThis as unknown as GlobalTelegramState)[ACTIVE_ROOT_SYMBOL] = channel.root(runtime.instanceId);
+
+  const tool = host.tools.get("telegram_question");
+  expect(tool).toBeDefined();
+
+  const controller = new AbortController();
+  let deadlineTimer: Timer | number | undefined;
+  const updates: ToolUpdate[] = [];
+  const params = { action: "wait", id: "tq:1", wait: true, timeout: 240 };
+
+  let executePromise: Promise<{ content: Array<{ type: string; text: string }>; details?: unknown }> | undefined;
+  try {
+    const { promise: startedPromise, resolve: announceStarted } = Promise.withResolvers<void>();
+    executePromise = tool!.execute("call-wait-240", params, controller.signal, update => {
+      updates.push(update);
+      announceStarted();
+    });
+
+    await startedPromise;
+    expect(updates.length).toBeGreaterThan(0);
+    expect(updates[0]?.content[0]?.text).toContain("pending");
+
+    const dispatcher = new HostSteeringDispatcher(tool!, controller);
+    for (const text of ACCOUNT_FORWARDED_STEERING_MESSAGES) {
+      dispatcher.dispatch({ text, forwarded: true }, params);
+    }
+    expect(dispatcher.queue).toHaveLength(4);
+
+    // Deliberate real 1s deadline racing against the 240s tool wait per contract.
+    const { promise: deadlinePromise, reject: rejectDeadline } = Promise.withResolvers<never>();
+    deadlineTimer = setTimeout(() => {
+      rejectDeadline(new Error("1s deadline exceeded: tool execution was not interrupted"));
+    }, 1000);
+
+    const result = await Promise.race([executePromise, deadlinePromise]);
+
+    const parsed = JSON.parse(result.content[0]!.text);
+    expect(parsed.decision_id).toBe("tq:1");
+    expect(parsed.status).toBe("pending");
+
+    const durable = await channel.root(runtime.instanceId).questions.get("tq:1");
+    expect(durable.status).toBe("pending");
+    expect(durable.answer).toBeNull();
+  } finally {
+    clearTimeout(deadlineTimer);
+    controller.abort();
+    try {
+      await executePromise;
+    } catch {}
+  }
+});
+
+test("telegram_question ask with wait is interrupted by host dispatcher on queued steering and preserves durable pending state", async () => {
+  const host = createHost();
+  registerOperatorTools(host.api);
+  const runtime = new TelegramRuntime(host.api);
+  setActiveRuntime(runtime);
+  const channel = createChannel();
+  (globalThis as unknown as GlobalTelegramState)[ACTIVE_ROOT_SYMBOL] = channel.root(runtime.instanceId);
+
+  const tool = host.tools.get("telegram_question");
+  expect(tool).toBeDefined();
+
+  const controller = new AbortController();
+  let deadlineTimer: Timer | number | undefined;
+  const updates: ToolUpdate[] = [];
+  const params = {
+    action: "ask",
+    question: "Authorize deployment to staging?",
+    recommendation: "authorize",
+    options: [
+      { id: "authorize", label: "Authorize" },
+      { id: "hold", label: "Hold" },
+    ],
+    wait: true,
+    timeout: 240,
+  };
+
+  let executePromise: Promise<{ content: Array<{ type: string; text: string }>; details?: unknown }> | undefined;
+  try {
+    const { promise: startedPromise, resolve: announceStarted } = Promise.withResolvers<void>();
+    executePromise = tool!.execute("call-ask-wait-240", params, controller.signal, update => {
+      updates.push(update);
+      announceStarted();
+    });
+
+    await startedPromise;
+    expect(updates.length).toBeGreaterThan(0);
+    expect(updates[0]?.content[0]?.text).toContain("pending");
+
+    const dispatcher = new HostSteeringDispatcher(tool!, controller);
+    for (const text of ACCOUNT_FORWARDED_STEERING_MESSAGES) {
+      dispatcher.dispatch({ text, forwarded: true }, params);
+    }
+    expect(dispatcher.queue).toHaveLength(4);
+
+    // Deliberate real 1s deadline racing against the 240s tool wait per contract.
+    const { promise: deadlinePromise, reject: rejectDeadline } = Promise.withResolvers<never>();
+    deadlineTimer = setTimeout(() => {
+      rejectDeadline(new Error("1s deadline exceeded: tool execution was not interrupted"));
+    }, 1000);
+
+    const result = await Promise.race([executePromise, deadlinePromise]);
+
+    const parsed = JSON.parse(result.content[0]!.text);
+    expect(parsed.decision_id).toBe("tq:1");
+    expect(parsed.status).toBe("pending");
+
+    const durable = await channel.root(runtime.instanceId).questions.get("tq:1");
+    expect(durable.status).toBe("pending");
+    expect(durable.answer).toBeNull();
+  } finally {
+    clearTimeout(deadlineTimer);
+    controller.abort();
+    try {
+      await executePromise;
+    } catch {}
+  }
 });
