@@ -459,6 +459,10 @@ def _p2_successor_worker(
 
 class TestBuildSlotMultiprocessingRaces(unittest.TestCase):
     def setUp(self):
+        self.orig_avail_gib = os.environ.get("BUILD_SLOT_AVAILABLE_GIB")
+        os.environ["BUILD_SLOT_AVAILABLE_GIB"] = "64"
+        self.orig_allow_force = os.environ.get("BUILD_SLOT_ALLOW_FORCE")
+        os.environ["BUILD_SLOT_ALLOW_FORCE"] = "1"
         self.test_run_dir = tempfile.mkdtemp(prefix="test-bs-mp-race-")
         self._active_processes = []
 
@@ -474,6 +478,14 @@ class TestBuildSlotMultiprocessingRaces(unittest.TestCase):
                 except Exception:
                     pass
         shutil.rmtree(self.test_run_dir, ignore_errors=True)
+        if self.orig_avail_gib is not None:
+            os.environ["BUILD_SLOT_AVAILABLE_GIB"] = self.orig_avail_gib
+        else:
+            os.environ.pop("BUILD_SLOT_AVAILABLE_GIB", None)
+        if self.orig_allow_force is not None:
+            os.environ["BUILD_SLOT_ALLOW_FORCE"] = self.orig_allow_force
+        else:
+            os.environ.pop("BUILD_SLOT_ALLOW_FORCE", None)
 
     def _create_genuinely_dead_pid(self) -> int:
         p = mp.Process(target=_dummy_exit_worker)

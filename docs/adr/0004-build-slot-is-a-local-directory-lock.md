@@ -26,6 +26,40 @@ Queue management invariants:
 - Manual acquire holders expire after 30 minutes of heartbeat silence, or acquisition age if no heartbeat exists. A genuine live run wrapper never expires on age or heartbeat silence. Dead or recycled wrappers permit reclaim. This preserves the slot while a wrapped command runs.
 - Contenders time out when a live process holds the queue lock for less than 120 seconds. Contenders safely reclaim locks held longer than 120 seconds through a unique tombstone directory rename.
 - A queue-lock timeout is a transient fault, not a verdict on the waiter. `acquire` retries enqueue with jittered backoff until the caller's own `--timeout` ends, then returns `False`; it never raises and never drops the waiter's place. Queue cleanup after a slot is settled (post-acquire, release, abort) retries for a grace period (8 s, shorter than the release deadline). If it still fails, `clean_queue` sweeps the entry, because its PID is dead or its token holds a slot. Waiters poll the queue without the lock and take it only when a write is needed, so 30 pollers do not starve the writers. Lock polling uses jittered, growing delays. The queue-lock owner retries deleting its lock dir (waiters hold `info.json` open, and Windows refuses to delete an open file), so a release never leaves a lock behind for as long as a long-lived `run` wrapper lives. A queue lock is held for milliseconds and never across a wrapped command. A lock held longer than 120 s, even by a live PID, was leaked and is reclaimed. Each queue-lock attempt is capped at the time left to the caller's `--timeout`; cleanup after a grant or a give-up retries for at most 1 s, and `clean_queue` sweeps any residue.
+- Operator build freeze: when 'build-freeze' exists in the run directory, 'acquire' and 'run' commands immediately abort with exit code 75. They print 'build freeze active (<reason>)' to stderr (or 'reason unavailable' if reading fails). Waiting queues and command invocations do not start. If 'build-freeze' appears while a waiter is already waiting in the FIFO queue, that queued waiter immediately exits with exit code 75 (raises `SystemExit(75)`). 'release' and 'status' remain unaffected.
+- Acquisition checks freeze during queue retries and mutex waits. Release and queue cleanup do not cancel on freeze.
+
+Memory admission and job classification invariants:
+- `get_available_ram_gib()` determines available host memory. It checks system RAM and honors the `BUILD_SLOT_AVAILABLE_GIB` override.
+- Memory admission requires `available_ram - sum(active_reservations) - new_reservation >= 3.0` GiB (3 GiB floor). Waiters remain queued until memory frees or their queue timeout expires.
+- Jobs belong to three classes: `heavy`, `medium`, and `light`.
+- `run` classifies Next builds, Next servers, and Chrome QA as heavy. TypeScript, Vitest, Wrangler, and workerd are medium. Other commands are light.
+- Default reservations are 3 GiB for heavy, 1.5 GiB for medium, and 0.5 GiB for light.
+- `acquire` defaults to light because it has no child command. Use `--class heavy` for manual build or Chrome slots.
+- Both commands accept `--class` and `--mem-gib` to override classification and reservation.
+- Active slots record their reserved memory. Legacy slots without recorded reservation metadata reserve 3.0 GiB by default.
+- At most one `heavy` job may run concurrently across all slots. A second heavy job must wait in queue even if enough free RAM exists.
+- `--force` requires `BUILD_SLOT_ALLOW_FORCE=1`. Without it, acquisition fails. Authorized force logs the override and bypasses memory admission.
+- Even when `BUILD_SLOT_ALLOW_FORCE=1` is set, `--force` cannot bypass the one-heavy job concurrency cap.
+- The obsolete idle bypass is removed. Queue wait duration never bypasses host memory safety invariants.
+
+Command execution deadline and process tree invariants:
+- `run` introduces `--run-timeout` (default 1800 seconds / 30 minutes) for child command execution.
+- The existing `--timeout` parameter applies only to FIFO queue wait time.
+- When `--run-timeout` expires, the arbiter terminates the entire process tree (killing child and grandchild processes) and exits with exit code 124.
+- Windows uses hidden, bounded `taskkill /T /F`. The wrapper releases its slot after completion, timeout, or a handled exit.
+- Windows assigns the kill-on-close Job Object at process creation through `PROC_THREAD_ATTRIBUTE_JOB_LIST`. No child exists outside the Job.
+- Forced wrapper termination kills descendants, including during launch before child metadata is published.
+- Stale reclaim retains reservations while the recorded child or named Job has active processes.
+
+Environment variable tuning invariants:
+- Commands executed under `run` receive tuned environment variables:
+  - `NODE_OPTIONS`: preserves any existing `--max-old-space-size`. If unset, sets `--max-old-space-size=3072` for `heavy` jobs and `--max-old-space-size=1536` for `medium` jobs.
+  - Detected Vitest commands receive `VITEST_MAX_WORKERS=2` unless the caller sets it. Also pass `--maxWorkers=2` to Vitest.
+
+Status and observability invariants:
+- `status` reports `memory_budget` with `available_gib`, `reserved_gib`, `floor_gib`, and `free_budget_gib`.
+- Slot status entries in `status()["slots"]` include `job_class` and `mem_gib`.
 
 ## Consequences
 - Lanes call the script directly and never ask the orchestrator for a slot.

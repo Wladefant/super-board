@@ -16,6 +16,22 @@ def _enter_in_child(path, started, entered, result):
 
 @unittest.skipUnless('fork' in mp.get_all_start_methods(), 'POSIX fork only')
 class TestForkGuard(unittest.TestCase):
+    def setUp(self):
+        self.orig_avail_gib = os.environ.get("BUILD_SLOT_AVAILABLE_GIB")
+        os.environ["BUILD_SLOT_AVAILABLE_GIB"] = "64"
+        self.orig_allow_force = os.environ.get("BUILD_SLOT_ALLOW_FORCE")
+        os.environ["BUILD_SLOT_ALLOW_FORCE"] = "1"
+
+    def tearDown(self):
+        if self.orig_avail_gib is not None:
+            os.environ["BUILD_SLOT_AVAILABLE_GIB"] = self.orig_avail_gib
+        else:
+            os.environ.pop("BUILD_SLOT_AVAILABLE_GIB", None)
+        if self.orig_allow_force is not None:
+            os.environ["BUILD_SLOT_ALLOW_FORCE"] = self.orig_allow_force
+        else:
+            os.environ.pop("BUILD_SLOT_ALLOW_FORCE", None)
+
     def test_fork_child_waits_for_parent_guard(self):
         ctx = mp.get_context('fork')
         with tempfile.TemporaryDirectory() as run_dir:

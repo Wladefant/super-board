@@ -51,8 +51,12 @@ Invariants:
     - The acquire-mode owner PID is the nearest veyyon session host (not its
       `__veyyon_worker*` helpers); the ancestor climb stops at a parent created after its
       child, since Windows reuses a dead parent's PID.
-    - RAM guard: when host system RAM >= 95%, acquire stays in the FIFO queue and waits until
-      RAM drops below the limit (or --timeout expires); --force bypasses the wait.
+    - RAM admission reserves each job's declared memory and keeps a 3 GiB floor.
+      Idle wait never bypasses guards. Force requires BUILD_SLOT_ALLOW_FORCE=1.
+    - Operator build freeze: when 'build-freeze' exists in run_dir, acquire and run
+      commands are refused immediately with exit 75 and 'build freeze active (<reason>)'
+      printed to stderr (fallback 'reason unavailable' on read error). No queue entry
+      is created and no command is launched; status and release remain unaffected.
     - Standard library only. Windows uses msvcrt byte locks; POSIX uses flock.
 """
 
@@ -75,13 +79,16 @@ from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 import uuid
 from functools import wraps
+import math
+import signal
+import atexit
 
 
 _guard_state = threading.local()
 
 
 @contextmanager
-def _transition_guard(path: str, timeout: float = 5.0):
+def _transition_guard(path: str, timeout: float = 5.0, cancel=None):
     """Serialize lock-directory transitions on a permanent OS-locked file."""
     path = os.path.abspath(path)
     pid = os.getpid()
@@ -99,6 +106,8 @@ def _transition_guard(path: str, timeout: float = 5.0):
             guard.flush()
         deadline = time.monotonic() + timeout
         while True:
+            if cancel is not None:
+                cancel()
             try:
                 guard.seek(0)
                 if sys.platform == "win32":
@@ -169,13 +178,228 @@ DEFAULT_QUEUE_STALE_HEARTBEAT_SECONDS = 60.0  # reclaim if heartbeat older than 
 DEFAULT_QUEUE_STALE_FALLBACK_SECONDS = 30 * 60  # 30 minutes fallback for legacy entries without heartbeat
 DEFAULT_RAM_GUARD_THRESHOLD_PERCENT = 95.0
 DEFAULT_ACQUISITION_STAGGER_SECONDS = 45.0
-DEFAULT_RAM_GUARD_IDLE_ADMIT_SECONDS = 120.0  # with no slot held, a lane queued this long passes the RAM guard (#620)
+DEFAULT_RAM_GUARD_IDLE_ADMIT_SECONDS = 120.0  # retained constructor compatibility; no idle bypass
 DEFAULT_RELEASE_TIMEOUT_SECONDS = 30.0
 DEFAULT_QUEUE_LOCK_MAX_HOLD_SECONDS = 120.0  # a queue lock is held for milliseconds; older than 120s was leaked, even if its owner lives (#690)
 DEFAULT_QUEUE_GRANT_CLEANUP_GRACE_SECONDS = 1.0  # a lane that already holds its slot spends at most this long on queue cleanup; clean_queue sweeps the rest
 DEFAULT_QUEUE_CLEANUP_GRACE_SECONDS = 8.0  # queue cleanup after a slot is settled retries a busy queue lock this long; shorter than the release deadline
 LAST_ACQUIRED_FILE_NAME = "last-acquired-at.json"
 DEFAULT_PID_DEAD_GRACE_PERIOD_SECONDS = 60.0  # never reclaim a dead-PID lock younger than 60s
+
+MEMORY_RESERVATIONS = {"heavy": 3.0, "medium": 1.5, "light": 0.5}
+MEMORY_FLOOR_GIB = 3.0
+
+
+def get_available_ram_gib() -> Optional[float]:
+    """Available physical RAM, not swap. Unknown telemetry blocks admission."""
+    override = os.environ.get("BUILD_SLOT_AVAILABLE_GIB")
+    if override is not None:
+        value = float(override)
+        return value if math.isfinite(value) and value >= 0 else None
+    if sys.platform == "win32":
+        class MemoryStatus(ctypes.Structure):
+            _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong)] + [
+                (name, ctypes.c_ulonglong) for name in
+                ("total", "available", "page_total", "page_available", "virtual_total", "virtual_available", "extended")
+            ]
+        status = MemoryStatus()
+        status.length = ctypes.sizeof(status)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return status.available / (1024 ** 3)
+    elif sys.platform.startswith("linux"):
+        with open("/proc/meminfo", encoding="utf-8") as stream:
+            for line in stream:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / (1024 ** 2)
+    try:
+        import psutil
+        return psutil.virtual_memory().available / (1024 ** 3)
+    except Exception:
+        return None
+
+
+def classify_command(cmd: List[str]) -> str:
+    command = (cmd if isinstance(cmd, str) else " ".join(cmd)).lower().replace("\\", "/")
+    if re.search(r"\bnext(?:\.cmd)?\s+(?:build|start)\b|\b(?:npm|pnpm|bun|yarn)\s+(?:run\s+)?(?:build|start)\b|chrom(?:e|ium)|playwright|puppeteer", command):
+        return "heavy"
+    if re.search(r"\b(?:tsc|vitest|wrangler|workerd)(?:\.cmd|\.exe)?\b", command):
+        return "medium"
+    return "light"
+
+
+def _check_freeze(run_dir: str) -> None:
+    path = os.path.join(run_dir, "build-freeze")
+    if os.path.exists(path):
+        try:
+            reason = _read_file_bytes(path).decode("utf-8").strip()
+        except OSError:
+            reason = "reason unavailable"
+        print(f"build freeze active ({reason})", file=sys.stderr)
+        raise SystemExit(75)
+
+
+class _WindowsChildJob:
+    """A non-inherited handle kills descendants when the wrapper closes or dies."""
+    def __init__(self, token):
+        from ctypes import wintypes
+        class BasicLimits(ctypes.Structure):
+            _fields_ = [
+                ("process_time", ctypes.c_longlong), ("job_time", ctypes.c_longlong),
+                ("flags", wintypes.DWORD), ("min_ws", ctypes.c_size_t), ("max_ws", ctypes.c_size_t),
+                ("active_limit", wintypes.DWORD), ("affinity", ctypes.c_size_t),
+                ("priority", wintypes.DWORD), ("scheduling", wintypes.DWORD),
+            ]
+        class ExtendedLimits(ctypes.Structure):
+            _fields_ = [("basic", BasicLimits), ("io", ctypes.c_ulonglong * 6),
+                       ("process_memory", ctypes.c_size_t), ("job_memory", ctypes.c_size_t),
+                       ("peak_process", ctypes.c_size_t), ("peak_job", ctypes.c_size_t)]
+        self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.kernel.CreateJobObjectW.restype = wintypes.HANDLE
+        self.kernel.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+        self.kernel.SetInformationJobObject.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)
+        self.kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+        self.handle = self.kernel.CreateJobObjectW(None, "Local\\build-slot-" + token)
+        if not self.handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        limits = ExtendedLimits()
+        limits.basic.flags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not self.kernel.SetInformationJobObject(self.handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+            error = ctypes.WinError(ctypes.get_last_error())
+            self.close()
+            raise error
+
+
+    def close(self):
+        if self.handle:
+            self.kernel.CloseHandle(self.handle)
+            self.handle = None
+
+
+class _WindowsJobProcess:
+    """Create the process inside its Job atomically, before any child can escape."""
+    def __init__(self, cmd, cwd, env, job):
+        from ctypes import wintypes
+        class Startup(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD), ("reserved", wintypes.LPWSTR),
+                ("desktop", wintypes.LPWSTR), ("title", wintypes.LPWSTR),
+                ("x", wintypes.DWORD), ("y", wintypes.DWORD),
+                ("xsize", wintypes.DWORD), ("ysize", wintypes.DWORD),
+                ("xchars", wintypes.DWORD), ("ychars", wintypes.DWORD),
+                ("fill", wintypes.DWORD), ("flags", wintypes.DWORD),
+                ("show", wintypes.WORD), ("reserved_size", wintypes.WORD),
+                ("reserved_bytes", ctypes.c_void_p),
+                ("stdin", wintypes.HANDLE), ("stdout", wintypes.HANDLE), ("stderr", wintypes.HANDLE),
+            ]
+        class StartupEx(ctypes.Structure):
+            _fields_ = [("startup", Startup), ("attributes", ctypes.c_void_p)]
+        class ProcessInfo(ctypes.Structure):
+            _fields_ = [("process", wintypes.HANDLE), ("thread", wintypes.HANDLE),
+                        ("pid", wintypes.DWORD), ("tid", wintypes.DWORD)]
+        self.kernel = job.kernel
+        kernel = self.kernel
+        kernel.InitializeProcThreadAttributeList.argtypes = (ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(ctypes.c_size_t))
+        kernel.UpdateProcThreadAttribute.argtypes = (ctypes.c_void_p, wintypes.DWORD, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p)
+        kernel.DeleteProcThreadAttributeList.argtypes = (ctypes.c_void_p,)
+        kernel.CreateProcessW.argtypes = (wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.c_void_p, ctypes.c_void_p,
+                                         wintypes.BOOL, wintypes.DWORD, ctypes.c_void_p, wintypes.LPCWSTR,
+                                         ctypes.c_void_p, ctypes.POINTER(ProcessInfo))
+        kernel.GetStdHandle.argtypes = (wintypes.DWORD,)
+        kernel.GetStdHandle.restype = wintypes.HANDLE
+        kernel.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        kernel.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel.TerminateProcess.argtypes = (wintypes.HANDLE, wintypes.UINT)
+        size = ctypes.c_size_t()
+        kernel.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(size))
+        attributes = ctypes.create_string_buffer(size.value)
+        if not kernel.InitializeProcThreadAttributeList(attributes, 1, 0, ctypes.byref(size)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            handles = (wintypes.HANDLE * 1)(job.handle)
+            if not kernel.UpdateProcThreadAttribute(attributes, 0, 0x2000D, handles, ctypes.sizeof(handles), None, None):
+                raise ctypes.WinError(ctypes.get_last_error())
+            startup = StartupEx()
+            startup.startup.cb = ctypes.sizeof(startup)
+            startup.startup.flags = 0x100  # STARTF_USESTDHANDLES
+            startup.startup.stdin = kernel.GetStdHandle(-10 & 0xFFFFFFFF)
+            startup.startup.stdout = kernel.GetStdHandle(-11 & 0xFFFFFFFF)
+            startup.startup.stderr = kernel.GetStdHandle(-12 & 0xFFFFFFFF)
+            startup.attributes = ctypes.addressof(attributes)
+            shell = os.environ.get("COMSPEC") or os.path.join(os.environ["SystemRoot"], "System32", "cmd.exe")
+            command = ctypes.create_unicode_buffer(f'{shell} /c "{subprocess.list2cmdline(cmd)}"')
+            environment = ctypes.create_unicode_buffer("\0".join(f"{key}={value}" for key, value in sorted(env.items())) + "\0\0")
+            info = ProcessInfo()
+            # EXTENDED_STARTUPINFO_PRESENT, CREATE_UNICODE_ENVIRONMENT, CREATE_NO_WINDOW
+            if not kernel.CreateProcessW(shell, command, None, None, True, 0x80000 | 0x400 | 0x8000000,
+                                         environment, cwd, ctypes.byref(startup), ctypes.byref(info)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            self._handle = info.process
+            self.pid = info.pid
+            self.returncode = None
+            kernel.CloseHandle(info.thread)
+        finally:
+            kernel.DeleteProcThreadAttributeList(attributes)
+
+    def poll(self):
+        if self.returncode is None and self.kernel.WaitForSingleObject(self._handle, 0) == 0:
+            code = ctypes.c_ulong()
+            if not self.kernel.GetExitCodeProcess(self._handle, ctypes.byref(code)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            self.returncode = code.value
+        return self.returncode
+
+    def wait(self, timeout):
+        result = self.kernel.WaitForSingleObject(self._handle, max(0, min(int(timeout * 1000), 0xFFFFFFFE)))
+        if result == 258:
+            raise subprocess.TimeoutExpired(str(self.pid), timeout)
+        if result != 0:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return self.poll()
+
+    def kill(self):
+        if not self.kernel.TerminateProcess(self._handle, 1):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def close(self):
+        self.kernel.CloseHandle(self._handle)
+
+
+def _windows_job_alive(token) -> bool:
+    """Query the named job before releasing a crashed wrapper's reservation."""
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenJobObjectW.restype = wintypes.HANDLE
+    kernel.OpenJobObjectW.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR)
+    kernel.QueryInformationJobObject.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p)
+    kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+    handle = kernel.OpenJobObjectW(4, False, "Local\\build-slot-" + token)
+    if not handle:
+        return ctypes.get_last_error() != 2
+    class Accounting(ctypes.Structure):
+        _fields_ = [("times", ctypes.c_longlong * 4), ("faults", wintypes.DWORD),
+                    ("total", wintypes.DWORD), ("active", wintypes.DWORD), ("terminated", wintypes.DWORD)]
+    info = Accounting()
+    try:
+        if not kernel.QueryInformationJobObject(handle, 1, ctypes.byref(info), ctypes.sizeof(info), None):
+            return True
+        return info.active > 0
+    finally:
+        kernel.CloseHandle(handle)
+
+
+def _kill_child_tree(proc) -> None:
+    if sys.platform == "win32":
+        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                       timeout=30, creationflags=subprocess.CREATE_NO_WINDOW,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait(timeout=30)
 
 def _arm_deadline(seconds: float, what: str) -> threading.Timer:
     """
@@ -939,6 +1163,7 @@ def _queue_atomic_lock(
     stale_after: float = 15.0,
     is_pid_alive_fn=None,
     max_hold: float = DEFAULT_QUEUE_LOCK_MAX_HOLD_SECONDS,
+    cancel=None,
 ):
     """
     Short-lived atomic directory lock protecting reads/writes to build-slot.queue.json.
@@ -957,8 +1182,10 @@ def _queue_atomic_lock(
     max_delay = max(retry_interval, min(0.25, retry_interval * 10))
 
     while True:
+        if cancel is not None:
+            cancel()
         try:
-            with _transition_guard(queue_lock_dir + ".guard", timeout=max(0.0, timeout - (time.time() - start_time))):
+            with _transition_guard(queue_lock_dir + ".guard", timeout=max(0.0, timeout - (time.time() - start_time)), cancel=cancel):
                 os.mkdir(queue_lock_dir)
                 try:
                     info_path = os.path.join(queue_lock_dir, INFO_FILE_NAME)
@@ -1336,6 +1563,8 @@ class BuildSlotManager:
         token: Optional[str] = None,
         child_pid: Optional[int] = None,
         wrapper_pid: Optional[int] = None,
+        job_class: str = "light",
+        mem_gib: float = 0.5,
     ) -> None:
         """Writes info.json inside the newly created lock directory for slot_idx."""
         if slot_idx >= len(self.slot_dirs):
@@ -1349,6 +1578,8 @@ class BuildSlotManager:
             "pid": pid,
             "token": token,
             "slot": slot_idx,
+            "job_class": job_class,
+            "mem_gib": mem_gib,
             "acquired_at": now_iso,
             "acquired_at_epoch": now,
             "heartbeat_at": now_iso,
@@ -1683,10 +1914,12 @@ class BuildSlotManager:
         """
         deadline = getattr(self._queue_op_state, "deadline", None)
         if deadline is None:
-            lock_cm = _queue_atomic_lock(self.run_dir, is_pid_alive_fn=self.is_pid_alive)
+            lock_cm = _queue_atomic_lock(self.run_dir, is_pid_alive_fn=self.is_pid_alive,
+                                         cancel=getattr(self._queue_op_state, "cancel", None))
         else:
             remaining = max(0.05, min(10.0, deadline - time.time()))
-            lock_cm = _queue_atomic_lock(self.run_dir, timeout=remaining, is_pid_alive_fn=self.is_pid_alive)
+            lock_cm = _queue_atomic_lock(self.run_dir, timeout=remaining, is_pid_alive_fn=self.is_pid_alive,
+                                         cancel=getattr(self._queue_op_state, "cancel", None))
         with lock_cm:
             prev = getattr(self._queue_op_state, "under_queue_lock", False)
             self._queue_op_state.under_queue_lock = True
@@ -1712,6 +1945,9 @@ class BuildSlotManager:
         """
         delay = 0.05
         while True:
+            cancel = getattr(self._queue_op_state, "cancel", None)
+            if cancel is not None:
+                cancel()
             previous = getattr(self._queue_op_state, "deadline", None)
             self._queue_op_state.deadline = deadline
             try:
@@ -1977,6 +2213,7 @@ class BuildSlotManager:
                 now = time.time()
                 is_stale = False
                 reason = ""
+                wrapper_pid = info.get("wrapper_pid")
 
                 if info.get("corrupt"):
                     # The read's dir mtime, not a second stat: the verdict must describe the
@@ -2050,6 +2287,12 @@ class BuildSlotManager:
                             f"owner='{owner}', slot {slot_idx})"
                         )
 
+                if is_stale and wrapper_pid:
+                    child = info.get("child_pid", 0)
+                    if (child and self.is_pid_alive(child)) or (
+                        sys.platform == "win32" and info.get("token") and _windows_job_alive(info["token"])
+                    ):
+                        is_stale = False
                 if is_stale and self._tombstone_stale_slot(slot_idx, info, reason):
                     reclaimed_any = True
             except (FileNotFoundError, OSError):
@@ -2058,6 +2301,17 @@ class BuildSlotManager:
                 logger.warning("Error checking stale lock on slot %d: %s", slot_idx, e)
 
         return reclaimed_any
+
+    def _memory_budget(self) -> Dict[str, Any]:
+        available = get_available_ram_gib()
+        held = [self._read_slot_info(i) for i, path in enumerate(self.slot_dirs) if os.path.isdir(path)]
+        reserved = sum(float((info or {}).get("mem_gib", 3.0)) for info in held)
+        return {
+            "available_gib": available, "reserved_gib": reserved,
+            "floor_gib": MEMORY_FLOOR_GIB,
+            "free_budget_gib": None if available is None else available - reserved - MEMORY_FLOOR_GIB,
+            "heavy_jobs": sum((info or {}).get("job_class", "heavy") == "heavy" for info in held),
+        }
 
     def acquire(
         self,
@@ -2074,12 +2328,26 @@ class BuildSlotManager:
         next_dir: Optional[str] = None,
         cwd: Optional[str] = None,
         wrapper_pid: Optional[int] = None,
+        job_class: Optional[str] = None,
+        mem_gib: Optional[float] = None,
     ) -> bool:
         """
         Acquires the build slot lock for 'name'.
         Blocks with poll_interval until acquired, or until timeout.
         Returns True on success, raises or returns False on failure.
         """
+        _check_freeze(self.run_dir)
+        job_class = job_class or "light"
+        if job_class not in MEMORY_RESERVATIONS:
+            raise ValueError("Unknown job class")
+        mem_gib = MEMORY_RESERVATIONS[job_class] if mem_gib is None else mem_gib
+        if not math.isfinite(mem_gib) or mem_gib <= 0:
+            raise ValueError("mem_gib must be positive and finite")
+        if force:
+            if os.environ.get("BUILD_SLOT_ALLOW_FORCE") != "1":
+                print("--force requires BUILD_SLOT_ALLOW_FORCE=1", file=sys.stderr)
+                return False
+            print("[NOTICE] BUILD_SLOT_ALLOW_FORCE=1: --force overrides RAM admission", file=sys.stderr)
         if pid is None:
             pid = os.getpid()
         explicit_token = token is not None
@@ -2119,6 +2387,8 @@ class BuildSlotManager:
         acquired = False
         original_enqueued_at = start_time
 
+        previous_cancel = getattr(self._queue_op_state, "cancel", None)
+        self._queue_op_state.cancel = lambda: _check_freeze(self.run_dir)
         try:
             # 2. Register in FIFO Queue inside try so finally always cleans up
             queue_deadline = start_time + timeout if timeout is not None else None
@@ -2137,6 +2407,7 @@ class BuildSlotManager:
                 return False
 
             while True:
+                _check_freeze(self.run_dir)
                 # Update heartbeat first if due (every <= 15s)
                 now = time.time()
                 if now - last_heartbeat >= heartbeat_interval:
@@ -2222,15 +2493,6 @@ class BuildSlotManager:
                 # 3. Dynamic RAM evaluation at acquisition
                 curr_ram = get_system_ram_percent()
                 ram_blocked = curr_ram is not None and curr_ram >= self.ram_guard_threshold and not force
-                if (
-                    ram_blocked
-                    and not self._any_slot_held()
-                    and time.time() - start_time >= self.ram_guard_idle_admit_after
-                ):
-                    # No build slot is held: waiting frees nothing of ours, and the host
-                    # pressure comes from elsewhere. Pass the guard (queue-head order still
-                    # applies below) rather than starve the queue forever (#620).
-                    ram_blocked = False
                 if ram_blocked:
                     # System RAM is >= 95%, refuse acquisition until it drops
                     if timeout is not None:
@@ -2326,8 +2588,15 @@ class BuildSlotManager:
                             if not os.path.isdir(slot_dir):
                                 try:
                                     with _transition_guard(os.path.join(self.run_dir, "build-slot.guard")):
+                                        _check_freeze(self.run_dir)
+                                        budget = self._memory_budget()
+                                        if job_class == "heavy" and budget["heavy_jobs"] >= 1:
+                                            break
+                                        if not force and (budget["free_budget_gib"] is None or budget["free_budget_gib"] < mem_gib):
+                                            break
                                         os.mkdir(slot_dir)
-                                        self._write_slot_info(slot_idx, owner=name, pid=pid, token=token, wrapper_pid=wrapper_pid)
+                                        self._write_slot_info(slot_idx, owner=name, pid=pid, token=token, wrapper_pid=wrapper_pid,
+                                                              job_class=job_class, mem_gib=mem_gib)
                                         self._record_last_acquired_at(name, pid, slot_idx)
                                         acquired = True
                                     self._dequeue_own_entry(name, pid, token, self.queue_grant_cleanup_grace)
@@ -2354,6 +2623,7 @@ class BuildSlotManager:
 
                 time.sleep(min(poll_interval, heartbeat_interval))
         finally:
+            self._queue_op_state.cancel = previous_cancel
             # If we exited without holding the lock, remove self from queue
             if not acquired:
                 # Gave up (own deadline or error): spend little time past the caller's --timeout.
@@ -2479,6 +2749,8 @@ class BuildSlotManager:
                 s_stat["acquired_at"] = info.get("acquired_at")
                 s_stat["child_pid"] = info.get("child_pid")
                 s_stat["heartbeat_at"] = info.get("heartbeat_at")
+                s_stat["job_class"] = info.get("job_class", "heavy")
+                s_stat["mem_gib"] = info.get("mem_gib", 3.0)
 
                 acquired_epoch = info.get("acquired_at_epoch")
                 if acquired_epoch is None:
@@ -2542,6 +2814,7 @@ class BuildSlotManager:
             "queue": queue_status,
             "queue_depth": len(queue_status),
             "ram_percent": ram_pct,
+            "memory_budget": self._memory_budget(),
             "ram_guard_threshold": self.ram_guard_threshold,
             "acquisition_stagger": self.acquisition_stagger,
             "last_acquired_at": last_acq,
@@ -2619,6 +2892,9 @@ class BuildSlotManager:
         heartbeat_stale_after: float = DEFAULT_LOCK_HEARTBEAT_STALE_SECONDS,
         poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
         next_dir: Optional[str] = None,
+        job_class: Optional[str] = None,
+        mem_gib: Optional[float] = None,
+        run_timeout: float = 1800.0,
     ) -> int:
         """
         Executes a command under the exclusive build slot lock.
@@ -2631,6 +2907,9 @@ class BuildSlotManager:
         and the lock is protected from double-grants while the command is active.
         Returns the command exit code, or 1 if lock could not be acquired.
         """
+        if not math.isfinite(run_timeout) or run_timeout <= 0:
+            raise ValueError("run_timeout must be positive and finite")
+        job_class = job_class or classify_command(cmd)
         run_token = str(uuid.uuid4())
         runner_pid = os.getpid()
 
@@ -2647,6 +2926,8 @@ class BuildSlotManager:
                 next_dir=next_dir,
                 cwd=cwd,
                 wrapper_pid=runner_pid,
+                job_class=job_class,
+                mem_gib=mem_gib,
             )
         except Exception as e:
             print(f"[RUN] Failed to acquire build slot lock for '{name}': {e}", file=sys.stderr)
@@ -2665,9 +2946,33 @@ class BuildSlotManager:
 
         stop_heartbeat = threading.Event()
         proc = None
+        old_signals = {}
+        cleanup_on_exit = None
+        child_job = None
         try:
-            proc = subprocess.Popen(cmd, cwd=cwd, shell=(sys.platform == "win32"), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            child_env = os.environ.copy()
+            node_options = child_env.get("NODE_OPTIONS", "")
+            if job_class in ("heavy", "medium") and not re.search(r"--max[-_]old[-_]space[-_]size\b", node_options):
+                child_env["NODE_OPTIONS"] = (node_options + f" --max-old-space-size={3072 if job_class == 'heavy' else 1536}").strip()
+            if re.search(r"\bvitest\b", " ".join(cmd), re.I):
+                child_env.setdefault("VITEST_MAX_WORKERS", "2")
+            if sys.platform == "win32":
+                child_job = _WindowsChildJob(run_token)
+                proc = _WindowsJobProcess(cmd, cwd, child_env, child_job)
+            else:
+                proc = subprocess.Popen(cmd, cwd=cwd, env=child_env, start_new_session=True)
             child_pid = proc.pid
+            def cleanup_on_exit():
+                if proc.poll() is None:
+                    _kill_child_tree(proc)
+                self.release(name=name, token=run_token)
+            atexit.register(cleanup_on_exit)
+            old_signals = {}
+            if threading.current_thread() is threading.main_thread():
+                def interrupted(signum, frame):
+                    raise SystemExit(128 + signum)
+                for sig in (signal.SIGTERM, signal.SIGINT):
+                    old_signals[sig] = signal.signal(sig, interrupted)
 
             # Record wrapper and child PIDs and the initial heartbeat in lock info
             self._record_run_child(name=name, wrapper_pid=runner_pid, child_pid=child_pid, token=run_token)
@@ -2683,14 +2988,32 @@ class BuildSlotManager:
             hb_thread = threading.Thread(target=_heartbeat_worker, daemon=True)
             hb_thread.start()
 
-            ret = proc.wait()
-            return ret
+            try:
+                return proc.wait(timeout=run_timeout)
+            except subprocess.TimeoutExpired:
+                print(f"[RUN] Execution timed out after {run_timeout:g}s. Killing child tree.", file=sys.stderr)
+                _kill_child_tree(proc)
+                return 124
         except Exception as e:
             print(f"[RUN] Error running command for '{name}': {e}", file=sys.stderr)
             logger.error("Error executing command in run_command: %s", e)
             return 1
         finally:
             stop_heartbeat.set()
+            try:
+                if proc is not None and proc.poll() is None:
+                    _kill_child_tree(proc)
+            except Exception as error:
+                logger.error("Child tree cleanup failed: %s", error)
+            finally:
+                if child_job is not None:
+                    child_job.close()
+                    if proc is not None:
+                        proc.close()
+                if cleanup_on_exit is not None:
+                    atexit.unregister(cleanup_on_exit)
+                for sig, handler in old_signals.items():
+                    signal.signal(sig, handler)
             print(f"[RUN] Releasing build slot lock for '{name}'...", file=sys.stderr)
             try:
                 self.release(name=name, token=run_token)
@@ -2776,6 +3099,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p_acq = subparsers.add_parser("acquire", help="Acquire build slot lock (blocks until available)")
     p_acq.add_argument("name", help="Lane or worker identifier requesting the slot")
     p_acq.add_argument("--pid", type=int, default=None, help="Explicit PID to associate with the lock (default: parent process PID)")
+    p_acq.add_argument("--class", dest="job_class", choices=MEMORY_RESERVATIONS, default=None)
+    p_acq.add_argument("--mem-gib", type=float, default=None)
     p_acq.add_argument("--timeout", type=float, default=None, help="Maximum seconds to wait (default: block indefinitely)")
     p_acq.add_argument(
         "--heartbeat-stale-after",
@@ -2895,7 +3220,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             opt_name = tok.split("=")[0]
             if opt_name in {"--priority", "--force"}:
                 i += 1
-            elif opt_name in {"--timeout", "--cwd", "--next-dir", "--heartbeat-stale-after"}:
+            elif opt_name in {"--timeout", "--cwd", "--next-dir", "--heartbeat-stale-after", "--class", "--mem-gib", "--run-timeout"}:
                 if "=" in tok:
                     i += 1
                 else:
@@ -2942,6 +3267,9 @@ def _find_subcommand_index(argv: List[str]) -> int:
 
 def _add_run_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--timeout", type=float, default=None, help="Maximum seconds to wait to acquire slot")
+    parser.add_argument("--class", dest="job_class", choices=MEMORY_RESERVATIONS, default=None)
+    parser.add_argument("--mem-gib", type=float, default=None)
+    parser.add_argument("--run-timeout", type=float, default=1800.0, help="Execution deadline after acquisition")
     parser.add_argument(
         "--priority",
         action="store_true",
@@ -2968,6 +3296,16 @@ def _add_run_options(parser: argparse.ArgumentParser) -> None:
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     manager = BuildSlotManager(run_dir=args.run_dir)
+    if args.command in ("acquire", "run"):
+        freeze_path = os.path.join(manager.run_dir, "build-freeze")
+        if os.path.exists(freeze_path):
+            try:
+                with open(freeze_path, encoding="utf-8") as freeze_file:
+                    reason = freeze_file.read().strip()
+            except OSError:
+                reason = "reason unavailable"
+            print(f"build freeze active ({reason})", file=sys.stderr)
+            return 75
 
     if args.command == "acquire":
         caller_pid = args.pid
@@ -2983,6 +3321,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             token=args.token,
             priority=args.priority,
             next_dir=getattr(args, "next_dir", None),
+            job_class=args.job_class,
+            mem_gib=args.mem_gib,
         )
         return 0 if success else 1
 
@@ -3044,6 +3384,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             cwd=args.cwd,
             heartbeat_stale_after=args.heartbeat_stale_after,
             next_dir=getattr(args, "next_dir", None),
+            job_class=args.job_class,
+            mem_gib=args.mem_gib,
+            run_timeout=args.run_timeout,
         )
 
     elif args.command == "heartbeat":
