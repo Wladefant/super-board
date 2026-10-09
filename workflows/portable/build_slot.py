@@ -53,6 +53,9 @@ Invariants:
       child, since Windows reuses a dead parent's PID.
     - RAM admission reserves each job's declared memory and keeps a 3 GiB floor.
       Idle wait never bypasses guards. Force requires BUILD_SLOT_ALLOW_FORCE=1.
+    - Every run appends a Node heap cap of int(reserved GiB * 1024) MiB to
+      NODE_OPTIONS, including light jobs and jobs with an existing heap cap.
+      The last cap wins. Other Node options remain unchanged.
     - Operator build freeze: when 'build-freeze' exists in run_dir, acquire and run
       commands are refused immediately with exit 75 and 'build freeze active (<reason>)'
       printed to stderr (fallback 'reason unavailable' on read error). No queue entry
@@ -2998,8 +3001,9 @@ class BuildSlotManager:
         try:
             child_env = os.environ.copy()
             node_options = child_env.get("NODE_OPTIONS", "")
-            if job_class in ("heavy", "medium") and not re.search(r"--max[-_]old[-_]space[-_]size\b", node_options):
-                child_env["NODE_OPTIONS"] = (node_options + f" --max-old-space-size={3072 if job_class == 'heavy' else 1536}").strip()
+            reserved_gib = mem_gib if mem_gib is not None else MEMORY_RESERVATIONS[job_class]
+            heap_mib = max(1, int(reserved_gib * 1024))
+            child_env["NODE_OPTIONS"] = (node_options + f" --max-old-space-size={heap_mib}").strip()
             if re.search(r"\bvitest\b", " ".join(cmd), re.I):
                 child_env.setdefault("VITEST_MAX_WORKERS", "2")
             if sys.platform == "win32":

@@ -3982,7 +3982,7 @@ class TestBuildSlot(unittest.TestCase):
         self.assertEqual(build_slot.classify_command(["node", "scripts/clean.js"]), "light")
 
     def test_node_options_tuning_and_vitest_workers_injection(self):
-        """run injects NODE_OPTIONS (heavy 3072, medium 1536) and VITEST_MAX_WORKERS=2 preserving user env."""
+        """run caps every child's Node heap to its reservation and preserves other options."""
         dump_script = (
             "import json\n"
             "import os\n"
@@ -4028,14 +4028,14 @@ class TestBuildSlot(unittest.TestCase):
             env_med = json.load(f)
         self.assertIn("--max-old-space-size=1536", env_med.get("NODE_OPTIONS", ""))
 
-        # 3. Preserves existing values
+        # 3. A light job's explicit reservation overrides an inherited heap cap.
         out_custom = os.path.join(self.run_dir, "env_custom.json")
         custom_env = os.environ.copy()
-        custom_env["NODE_OPTIONS"] = "--max-old-space-size=4096"
+        custom_env["NODE_OPTIONS"] = "--trace-warnings --max-old-space-size=4096"
         custom_env["VITEST_MAX_WORKERS"] = "8"
         proc_custom = subprocess.run(
             [sys.executable, os.path.abspath(build_slot.__file__), "--run-dir", self.run_dir,
-             "run", "lane-custom", "--class", "heavy", "--", sys.executable, script_path, out_custom, "vitest"],
+             "run", "lane-custom", "--class", "light", "--mem-gib", "0.75", "--", sys.executable, script_path, out_custom, "vitest"],
             capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL, env=custom_env,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
@@ -4043,9 +4043,32 @@ class TestBuildSlot(unittest.TestCase):
         self.assertTrue(os.path.isfile(out_custom), "Real child must write env output file")
         with open(out_custom, "r", encoding="utf-8") as f:
             env_custom = json.load(f)
-        self.assertIn("--max-old-space-size=4096", env_custom.get("NODE_OPTIONS", ""))
-        self.assertNotIn("3072", env_custom.get("NODE_OPTIONS", ""))
+        self.assertEqual(env_custom.get("NODE_OPTIONS"), "--trace-warnings --max-old-space-size=4096 --max-old-space-size=768")
         self.assertEqual(env_custom.get("VITEST_MAX_WORKERS"), "8")
+    def test_node_uses_last_reserved_heap_cap(self):
+        """A real Node child uses the appended cap, not an inherited larger cap."""
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("Node is not installed")
+        script = os.path.join(self.run_dir, "heap_limit.cjs")
+        with open(script, "w", encoding="utf-8") as stream:
+            stream.write("console.log(require('node:v8').getHeapStatistics().heap_size_limit)")
+        child_env = os.environ.copy()
+        child_env["NODE_OPTIONS"] = "--trace-warnings --max-old-space-size=4096"
+        proc = subprocess.run(
+            [sys.executable, os.path.abspath(build_slot.__file__), "--run-dir", self.run_dir,
+             "run", "heap-probe", "--class", "light", "--mem-gib", "0.125",
+             "--run-timeout", "10", "--", node, script],
+            capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL,
+            env=child_env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        heap_lines = [line for line in proc.stdout.splitlines() if line.isdigit()]
+        self.assertEqual(len(heap_lines), 1, proc.stdout)
+        heap_bytes = int(heap_lines[0])
+        self.assertGreaterEqual(heap_bytes, 128 * 1024 * 1024)
+        self.assertLess(heap_bytes, 384 * 1024 * 1024)
+
     def test_parse_args_supports_class_mem_gib_and_run_timeout(self):
         """parse_args accepts --class, --mem-gib, and --run-timeout (default 1800)."""
         args = build_slot.parse_args(
