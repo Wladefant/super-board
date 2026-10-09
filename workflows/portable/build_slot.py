@@ -257,7 +257,6 @@ class _WindowsChildJob:
         self.kernel.CreateJobObjectW.restype = wintypes.HANDLE
         self.kernel.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
         self.kernel.SetInformationJobObject.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)
-        self.kernel.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
         self.kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
         self.handle = self.kernel.CreateJobObjectW(None, "Local\\build-slot-" + token)
         if not self.handle:
@@ -269,22 +268,100 @@ class _WindowsChildJob:
             self.close()
             raise error
 
-    def attach(self, proc):
-        if not self.kernel.AssignProcessToJobObject(self.handle, int(proc._handle)):
-            raise ctypes.WinError(ctypes.get_last_error())
-
-    def resume(self, proc):
-        from ctypes import wintypes
-        native = ctypes.WinDLL("ntdll")
-        native.NtResumeProcess.argtypes = (wintypes.HANDLE,)
-        native.NtResumeProcess.restype = ctypes.c_long
-        if native.NtResumeProcess(int(proc._handle)) < 0:
-            raise OSError("Cannot resume job child")
 
     def close(self):
         if self.handle:
             self.kernel.CloseHandle(self.handle)
             self.handle = None
+
+
+class _WindowsJobProcess:
+    """Create the process inside its Job atomically, before any child can escape."""
+    def __init__(self, cmd, cwd, env, job):
+        from ctypes import wintypes
+        class Startup(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD), ("reserved", wintypes.LPWSTR),
+                ("desktop", wintypes.LPWSTR), ("title", wintypes.LPWSTR),
+                ("x", wintypes.DWORD), ("y", wintypes.DWORD),
+                ("xsize", wintypes.DWORD), ("ysize", wintypes.DWORD),
+                ("xchars", wintypes.DWORD), ("ychars", wintypes.DWORD),
+                ("fill", wintypes.DWORD), ("flags", wintypes.DWORD),
+                ("show", wintypes.WORD), ("reserved_size", wintypes.WORD),
+                ("reserved_bytes", ctypes.c_void_p),
+                ("stdin", wintypes.HANDLE), ("stdout", wintypes.HANDLE), ("stderr", wintypes.HANDLE),
+            ]
+        class StartupEx(ctypes.Structure):
+            _fields_ = [("startup", Startup), ("attributes", ctypes.c_void_p)]
+        class ProcessInfo(ctypes.Structure):
+            _fields_ = [("process", wintypes.HANDLE), ("thread", wintypes.HANDLE),
+                        ("pid", wintypes.DWORD), ("tid", wintypes.DWORD)]
+        self.kernel = job.kernel
+        kernel = self.kernel
+        kernel.InitializeProcThreadAttributeList.argtypes = (ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(ctypes.c_size_t))
+        kernel.UpdateProcThreadAttribute.argtypes = (ctypes.c_void_p, wintypes.DWORD, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_void_p)
+        kernel.DeleteProcThreadAttributeList.argtypes = (ctypes.c_void_p,)
+        kernel.CreateProcessW.argtypes = (wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.c_void_p, ctypes.c_void_p,
+                                         wintypes.BOOL, wintypes.DWORD, ctypes.c_void_p, wintypes.LPCWSTR,
+                                         ctypes.c_void_p, ctypes.POINTER(ProcessInfo))
+        kernel.GetStdHandle.argtypes = (wintypes.DWORD,)
+        kernel.GetStdHandle.restype = wintypes.HANDLE
+        kernel.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        kernel.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel.TerminateProcess.argtypes = (wintypes.HANDLE, wintypes.UINT)
+        size = ctypes.c_size_t()
+        kernel.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(size))
+        attributes = ctypes.create_string_buffer(size.value)
+        if not kernel.InitializeProcThreadAttributeList(attributes, 1, 0, ctypes.byref(size)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            handles = (wintypes.HANDLE * 1)(job.handle)
+            if not kernel.UpdateProcThreadAttribute(attributes, 0, 0x2000D, handles, ctypes.sizeof(handles), None, None):
+                raise ctypes.WinError(ctypes.get_last_error())
+            startup = StartupEx()
+            startup.startup.cb = ctypes.sizeof(startup)
+            startup.startup.flags = 0x100  # STARTF_USESTDHANDLES
+            startup.startup.stdin = kernel.GetStdHandle(-10 & 0xFFFFFFFF)
+            startup.startup.stdout = kernel.GetStdHandle(-11 & 0xFFFFFFFF)
+            startup.startup.stderr = kernel.GetStdHandle(-12 & 0xFFFFFFFF)
+            startup.attributes = ctypes.addressof(attributes)
+            shell = os.environ.get("COMSPEC") or os.path.join(os.environ["SystemRoot"], "System32", "cmd.exe")
+            command = ctypes.create_unicode_buffer(f'{shell} /c "{subprocess.list2cmdline(cmd)}"')
+            environment = ctypes.create_unicode_buffer("\0".join(f"{key}={value}" for key, value in sorted(env.items())) + "\0\0")
+            info = ProcessInfo()
+            # EXTENDED_STARTUPINFO_PRESENT, CREATE_UNICODE_ENVIRONMENT, CREATE_NO_WINDOW
+            if not kernel.CreateProcessW(shell, command, None, None, True, 0x80000 | 0x400 | 0x8000000,
+                                         environment, cwd, ctypes.byref(startup), ctypes.byref(info)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            self._handle = info.process
+            self.pid = info.pid
+            self.returncode = None
+            kernel.CloseHandle(info.thread)
+        finally:
+            kernel.DeleteProcThreadAttributeList(attributes)
+
+    def poll(self):
+        if self.returncode is None and self.kernel.WaitForSingleObject(self._handle, 0) == 0:
+            code = ctypes.c_ulong()
+            if not self.kernel.GetExitCodeProcess(self._handle, ctypes.byref(code)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            self.returncode = code.value
+        return self.returncode
+
+    def wait(self, timeout):
+        result = self.kernel.WaitForSingleObject(self._handle, max(0, min(int(timeout * 1000), 0xFFFFFFFE)))
+        if result == 258:
+            raise subprocess.TimeoutExpired(str(self.pid), timeout)
+        if result != 0:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return self.poll()
+
+    def kill(self):
+        if not self.kernel.TerminateProcess(self._handle, 1):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+    def close(self):
+        self.kernel.CloseHandle(self._handle)
 
 
 def _windows_job_alive(token) -> bool:
@@ -2881,11 +2958,9 @@ class BuildSlotManager:
                 child_env.setdefault("VITEST_MAX_WORKERS", "2")
             if sys.platform == "win32":
                 child_job = _WindowsChildJob(run_token)
-            proc = subprocess.Popen(cmd, cwd=cwd, env=child_env, shell=(sys.platform == "win32"),
-                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) | (0x4 if child_job else 0),
-                                    start_new_session=(sys.platform != "win32"))
-            if child_job is not None:
-                child_job.attach(proc)
+                proc = _WindowsJobProcess(cmd, cwd, child_env, child_job)
+            else:
+                proc = subprocess.Popen(cmd, cwd=cwd, env=child_env, start_new_session=True)
             child_pid = proc.pid
             def cleanup_on_exit():
                 if proc.poll() is None:
@@ -2901,8 +2976,6 @@ class BuildSlotManager:
 
             # Record wrapper and child PIDs and the initial heartbeat in lock info
             self._record_run_child(name=name, wrapper_pid=runner_pid, child_pid=child_pid, token=run_token)
-            if child_job is not None:
-                child_job.resume(proc)
 
             # Start background heartbeat while child runs
             def _heartbeat_worker():
@@ -2935,6 +3008,8 @@ class BuildSlotManager:
             finally:
                 if child_job is not None:
                     child_job.close()
+                    if proc is not None:
+                        proc.close()
                 if cleanup_on_exit is not None:
                     atexit.unregister(cleanup_on_exit)
                 for sig, handler in old_signals.items():

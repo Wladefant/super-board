@@ -48,8 +48,9 @@ Command execution deadline and process tree invariants:
 - The existing `--timeout` parameter applies only to FIFO queue wait time.
 - When `--run-timeout` expires, the arbiter terminates the entire process tree (killing child and grandchild processes) and exits with exit code 124.
 - Windows uses hidden, bounded `taskkill /T /F`. The wrapper releases its slot after completion, timeout, or a handled exit.
-- Windows launches the child suspended and attaches a kill-on-close Job Object before it runs. Forced wrapper termination kills its descendants.
-- Stale reclaim retains a dead wrapper's reservation while its recorded child remains alive.
+- Windows assigns the kill-on-close Job Object at process creation through `PROC_THREAD_ATTRIBUTE_JOB_LIST`. No child exists outside the Job.
+- Forced wrapper termination kills descendants, including during launch before child metadata is published.
+- Stale reclaim retains reservations while the recorded child or named Job has active processes.
 
 Environment variable tuning invariants:
 - Commands executed under `run` receive tuned environment variables:

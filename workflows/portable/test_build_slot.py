@@ -3805,6 +3805,55 @@ class TestBuildSlot(unittest.TestCase):
                                    timeout=10, creationflags=subprocess.CREATE_NO_WINDOW,
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
+    @unittest.skipUnless(sys.platform == "win32", "Windows creation-time job ownership")
+    def test_wrapper_death_before_child_constructor_returns(self):
+        probe = os.path.join(self.run_dir, "creation_probe.py")
+        marker = os.path.join(self.run_dir, "created_pid")
+        with open(probe, "w", encoding="utf-8") as stream:
+            stream.write(
+                "import sys,time,subprocess\n"
+                "sys.path.insert(0,sys.argv[1]);import build_slot\n"
+                "native=hasattr(build_slot,'_WindowsJobProcess')\n"
+                "original=build_slot._WindowsJobProcess if native else subprocess.Popen\n"
+                "def paused(*args,**kwargs):\n"
+                " proc=original(*args,**kwargs)\n"
+                " with open(sys.argv[3],'w') as f:f.write(str(proc.pid))\n"
+                " time.sleep(60)\n"
+                " return proc\n"
+                "if native:build_slot._WindowsJobProcess=paused\n"
+                "else:subprocess.Popen=paused\n"
+                "build_slot.BuildSlotManager(run_dir=sys.argv[2]).run_command("
+                "'creation-probe',[sys.executable,'-c','import time;time.sleep(60)'])\n"
+            )
+        wrapper = subprocess.Popen(
+            [sys.executable, probe, SCRIPT_DIR, self.run_dir, marker],
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        child_pid = None
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not os.path.exists(marker):
+                time.sleep(0.02)
+            self.assertTrue(os.path.exists(marker), "child must exist before constructor returns")
+            with open(marker) as stream:
+                child_pid = int(stream.read())
+            wrapper.kill()
+            wrapper.wait(timeout=5)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and is_pid_alive(child_pid):
+                time.sleep(0.02)
+            self.assertFalse(is_pid_alive(child_pid), "creation-time ownership must survive wrapper death")
+            self.assertEqual(BuildSlotManager(run_dir=self.run_dir).status()["active_slots"], 0)
+        finally:
+            if wrapper.poll() is None:
+                wrapper.kill()
+                wrapper.wait(timeout=5)
+            if child_pid and is_pid_alive(child_pid):
+                subprocess.run(["taskkill", "/PID", str(child_pid), "/T", "/F"],
+                               timeout=10, creationflags=subprocess.CREATE_NO_WINDOW,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
     def test_classify_command_job_classes(self):
         """classify_command returns 'heavy', 'medium', or 'light'."""
         self.assertEqual(build_slot.classify_command(["npx", "next", "build"]), "heavy")
