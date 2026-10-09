@@ -45,7 +45,7 @@ Memory admission and job classification invariants:
 - Heavy admission reads the stagger again under the slot guard before publishing a grant. Light and medium jobs skip the stagger but retain memory admission. Only heavy grants advance the stagger timestamp.
 - Waiters print resource refusal reasons and include the last reason in timeout output.
 - Smaller jobs can backfill a resource-blocked head without changing its position or enqueue time.
-- After 20 minutes, a heavy head reserves a 60-second drain window every 180 seconds when no heavy job runs. Smaller jobs can backfill between windows. Existing long-lived holders cannot pause backfill forever. The head keeps first admission whenever it fits.
+- After 20 minutes, a heavy head reserves a 60-second drain window every 180 seconds when no heavy job runs. Smaller jobs can backfill between windows until the head reaches 40 minutes. At 40 minutes, stop backfill when no heavy job runs and projected memory can fit the head. Existing holders must drain before smaller admissions resume. The head keeps first admission whenever it fits.
 - An impossible head does not pause backfill. Output reports its required memory and maximum possible budget.
 
 Command execution deadline and process tree invariants:

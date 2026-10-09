@@ -2394,7 +2394,7 @@ class BuildSlotManager:
         age = now - (_parse_timestamp(head.get("enqueued_at")) or now)
         if (head_class == "heavy" and age > 1200 and not impossible
                 and projected is not None and projected >= head_mem and budget["heavy_jobs"] == 0
-                and (age - 1200) % 180 < 60):
+                and (age >= 2400 or (age - 1200) % 180 < 60)):
             return False, f"backfill paused: aging heavy head '{head.get('name')}' waited {age:.1f}s"
         caller_mem = float(caller.get("mem_gib", 3.0))
         if caller_mem >= head_mem:

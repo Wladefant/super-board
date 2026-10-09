@@ -214,6 +214,33 @@ class TestBuildSlotAdmissionAndResourceRefusal(unittest.TestCase):
         self.assertIsNotNone(reason)
         self.assertTrue("aging" in reason.lower() or "paused" in reason.lower() or "starv" in reason.lower())
 
+    def test_heavy_head_eventually_runs_with_181_second_medium_backfills(self):
+        head = {"name": "heavy-head", "token": "head", "job_class": "heavy",
+                "mem_gib": 3.0, "enqueued_at": 1000.0}
+        expiry = [1261]
+        admitted = []
+        head_age = None
+        for age in range(1201, 86401):
+            expiry = [end for end in expiry if end > age]
+            reserved = 1.5 * len(expiry)
+            budget = {"available_gib": 7.0, "reserved_gib": reserved,
+                      "floor_gib": 3.0, "free_budget_gib": 4.0 - reserved,
+                      "heavy_jobs": 0}
+            medium = {"name": "medium", "token": "medium", "job_class": "medium",
+                      "mem_gib": 1.5, "enqueued_at": 1000.0 + age}
+            queue = [head, medium]
+            if self.manager._queue_admission(queue, "head", budget, 1000.0 + age)[0]:
+                head_age = age
+                break
+            if age >= 1260 and (age - 1260) % 180 == 0:
+                if self.manager._queue_admission(queue, "medium", budget, 1000.0 + age)[0]:
+                    self.assertGreaterEqual(budget["free_budget_gib"], 1.5)
+                    expiry.append(age + 181)
+                    admitted.append(age)
+        self.assertIsNotNone(head_age, "3 GiB head starved through age 86400s")
+        self.assertLessEqual(head_age, 2400 + 181)
+        self.assertTrue(admitted, "The replay must exercise backfill before the age cap")
+
     def test_aged_head_drain_windows_are_bounded(self):
         queue = [
             {"name": "head", "token": "head", "job_class": "heavy",
@@ -225,7 +252,7 @@ class TestBuildSlotAdmissionAndResourceRefusal(unittest.TestCase):
                   "floor_gib": 3.0, "free_budget_gib": 2.0, "heavy_jobs": 0}
         for age, expected in [(1205, False), (1259, False), (1260, True),
                               (1379, True), (1380, False), (1440, True),
-                              (3060, True)]:
+                              (2399, True), (2400, False), (3060, False)]:
             with self.subTest(age=age):
                 allowed, reason = self.manager._queue_admission(
                     queue, "light", budget, 1000.0 + age)
