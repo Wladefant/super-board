@@ -51,8 +51,8 @@ Invariants:
     - The acquire-mode owner PID is the nearest veyyon session host (not its
       `__veyyon_worker*` helpers); the ancestor climb stops at a parent created after its
       child, since Windows reuses a dead parent's PID.
-    - RAM guard: when host system RAM >= 95%, acquire stays in the FIFO queue and waits until
-      RAM drops below the limit (or --timeout expires); --force bypasses the wait.
+    - RAM admission reserves each job's declared memory and keeps a 3 GiB floor.
+      Idle wait never bypasses guards. Force requires BUILD_SLOT_ALLOW_FORCE=1.
     - Operator build freeze: when 'build-freeze' exists in run_dir, acquire and run
       commands are refused immediately with exit 75 and 'build freeze active (<reason>)'
       printed to stderr (fallback 'reason unavailable' on read error). No queue entry
@@ -79,6 +79,9 @@ from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 import uuid
 from functools import wraps
+import math
+import signal
+import atexit
 
 
 _guard_state = threading.local()
@@ -173,13 +176,79 @@ DEFAULT_QUEUE_STALE_HEARTBEAT_SECONDS = 60.0  # reclaim if heartbeat older than 
 DEFAULT_QUEUE_STALE_FALLBACK_SECONDS = 30 * 60  # 30 minutes fallback for legacy entries without heartbeat
 DEFAULT_RAM_GUARD_THRESHOLD_PERCENT = 95.0
 DEFAULT_ACQUISITION_STAGGER_SECONDS = 45.0
-DEFAULT_RAM_GUARD_IDLE_ADMIT_SECONDS = 120.0  # with no slot held, a lane queued this long passes the RAM guard (#620)
+DEFAULT_RAM_GUARD_IDLE_ADMIT_SECONDS = 120.0  # retained constructor compatibility; no idle bypass
 DEFAULT_RELEASE_TIMEOUT_SECONDS = 30.0
 DEFAULT_QUEUE_LOCK_MAX_HOLD_SECONDS = 120.0  # a queue lock is held for milliseconds; older than 120s was leaked, even if its owner lives (#690)
 DEFAULT_QUEUE_GRANT_CLEANUP_GRACE_SECONDS = 1.0  # a lane that already holds its slot spends at most this long on queue cleanup; clean_queue sweeps the rest
 DEFAULT_QUEUE_CLEANUP_GRACE_SECONDS = 8.0  # queue cleanup after a slot is settled retries a busy queue lock this long; shorter than the release deadline
 LAST_ACQUIRED_FILE_NAME = "last-acquired-at.json"
 DEFAULT_PID_DEAD_GRACE_PERIOD_SECONDS = 60.0  # never reclaim a dead-PID lock younger than 60s
+
+MEMORY_RESERVATIONS = {"heavy": 3.0, "medium": 1.5, "light": 0.5}
+MEMORY_FLOOR_GIB = 3.0
+
+
+def get_available_ram_gib() -> Optional[float]:
+    """Available physical RAM, not swap. Unknown telemetry blocks admission."""
+    override = os.environ.get("BUILD_SLOT_AVAILABLE_GIB")
+    if override is not None:
+        value = float(override)
+        return value if math.isfinite(value) and value >= 0 else None
+    if sys.platform == "win32":
+        class MemoryStatus(ctypes.Structure):
+            _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong)] + [
+                (name, ctypes.c_ulonglong) for name in
+                ("total", "available", "page_total", "page_available", "virtual_total", "virtual_available", "extended")
+            ]
+        status = MemoryStatus()
+        status.length = ctypes.sizeof(status)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return status.available / (1024 ** 3)
+    elif sys.platform.startswith("linux"):
+        with open("/proc/meminfo", encoding="utf-8") as stream:
+            for line in stream:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / (1024 ** 2)
+    try:
+        import psutil
+        return psutil.virtual_memory().available / (1024 ** 3)
+    except Exception:
+        return None
+
+
+def classify_command(cmd: List[str]) -> str:
+    command = (cmd if isinstance(cmd, str) else " ".join(cmd)).lower().replace("\\", "/")
+    if re.search(r"\bnext(?:\.cmd)?\s+(?:build|start)\b|\b(?:npm|pnpm|bun|yarn)\s+(?:run\s+)?(?:build|start)\b|chrom(?:e|ium)|playwright|puppeteer", command):
+        return "heavy"
+    if re.search(r"\b(?:tsc|vitest|wrangler|workerd)(?:\.cmd|\.exe)?\b", command):
+        return "medium"
+    return "light"
+
+
+def _check_freeze(run_dir: str) -> None:
+    path = os.path.join(run_dir, "build-freeze")
+    if os.path.exists(path):
+        try:
+            reason = _read_file_bytes(path).decode("utf-8").strip()
+        except OSError:
+            reason = "reason unavailable"
+        print(f"build freeze active ({reason})", file=sys.stderr)
+        raise SystemExit(75)
+
+
+def _kill_child_tree(proc) -> None:
+    if sys.platform == "win32":
+        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                       timeout=30, creationflags=subprocess.CREATE_NO_WINDOW,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait(timeout=30)
 
 def _arm_deadline(seconds: float, what: str) -> threading.Timer:
     """
@@ -1340,6 +1409,8 @@ class BuildSlotManager:
         token: Optional[str] = None,
         child_pid: Optional[int] = None,
         wrapper_pid: Optional[int] = None,
+        job_class: str = "light",
+        mem_gib: float = 0.5,
     ) -> None:
         """Writes info.json inside the newly created lock directory for slot_idx."""
         if slot_idx >= len(self.slot_dirs):
@@ -1353,6 +1424,8 @@ class BuildSlotManager:
             "pid": pid,
             "token": token,
             "slot": slot_idx,
+            "job_class": job_class,
+            "mem_gib": mem_gib,
             "acquired_at": now_iso,
             "acquired_at_epoch": now,
             "heartbeat_at": now_iso,
@@ -2063,6 +2136,17 @@ class BuildSlotManager:
 
         return reclaimed_any
 
+    def _memory_budget(self) -> Dict[str, Any]:
+        available = get_available_ram_gib()
+        held = [self._read_slot_info(i) for i, path in enumerate(self.slot_dirs) if os.path.isdir(path)]
+        reserved = sum(float((info or {}).get("mem_gib", 3.0)) for info in held)
+        return {
+            "available_gib": available, "reserved_gib": reserved,
+            "floor_gib": MEMORY_FLOOR_GIB,
+            "free_budget_gib": None if available is None else available - reserved - MEMORY_FLOOR_GIB,
+            "heavy_jobs": sum((info or {}).get("job_class", "heavy") == "heavy" for info in held),
+        }
+
     def acquire(
         self,
         name: str,
@@ -2078,12 +2162,26 @@ class BuildSlotManager:
         next_dir: Optional[str] = None,
         cwd: Optional[str] = None,
         wrapper_pid: Optional[int] = None,
+        job_class: Optional[str] = None,
+        mem_gib: Optional[float] = None,
     ) -> bool:
         """
         Acquires the build slot lock for 'name'.
         Blocks with poll_interval until acquired, or until timeout.
         Returns True on success, raises or returns False on failure.
         """
+        _check_freeze(self.run_dir)
+        job_class = job_class or "light"
+        if job_class not in MEMORY_RESERVATIONS:
+            raise ValueError("Unknown job class")
+        mem_gib = MEMORY_RESERVATIONS[job_class] if mem_gib is None else mem_gib
+        if not math.isfinite(mem_gib) or mem_gib <= 0:
+            raise ValueError("mem_gib must be positive and finite")
+        if force:
+            if os.environ.get("BUILD_SLOT_ALLOW_FORCE") != "1":
+                print("--force requires BUILD_SLOT_ALLOW_FORCE=1", file=sys.stderr)
+                return False
+            print("[NOTICE] BUILD_SLOT_ALLOW_FORCE=1: --force overrides RAM admission", file=sys.stderr)
         if pid is None:
             pid = os.getpid()
         explicit_token = token is not None
@@ -2141,6 +2239,7 @@ class BuildSlotManager:
                 return False
 
             while True:
+                _check_freeze(self.run_dir)
                 # Update heartbeat first if due (every <= 15s)
                 now = time.time()
                 if now - last_heartbeat >= heartbeat_interval:
@@ -2226,15 +2325,6 @@ class BuildSlotManager:
                 # 3. Dynamic RAM evaluation at acquisition
                 curr_ram = get_system_ram_percent()
                 ram_blocked = curr_ram is not None and curr_ram >= self.ram_guard_threshold and not force
-                if (
-                    ram_blocked
-                    and not self._any_slot_held()
-                    and time.time() - start_time >= self.ram_guard_idle_admit_after
-                ):
-                    # No build slot is held: waiting frees nothing of ours, and the host
-                    # pressure comes from elsewhere. Pass the guard (queue-head order still
-                    # applies below) rather than starve the queue forever (#620).
-                    ram_blocked = False
                 if ram_blocked:
                     # System RAM is >= 95%, refuse acquisition until it drops
                     if timeout is not None:
@@ -2330,8 +2420,15 @@ class BuildSlotManager:
                             if not os.path.isdir(slot_dir):
                                 try:
                                     with _transition_guard(os.path.join(self.run_dir, "build-slot.guard")):
+                                        _check_freeze(self.run_dir)
+                                        budget = self._memory_budget()
+                                        if job_class == "heavy" and budget["heavy_jobs"] >= 1:
+                                            break
+                                        if not force and (budget["free_budget_gib"] is None or budget["free_budget_gib"] < mem_gib):
+                                            break
                                         os.mkdir(slot_dir)
-                                        self._write_slot_info(slot_idx, owner=name, pid=pid, token=token, wrapper_pid=wrapper_pid)
+                                        self._write_slot_info(slot_idx, owner=name, pid=pid, token=token, wrapper_pid=wrapper_pid,
+                                                              job_class=job_class, mem_gib=mem_gib)
                                         self._record_last_acquired_at(name, pid, slot_idx)
                                         acquired = True
                                     self._dequeue_own_entry(name, pid, token, self.queue_grant_cleanup_grace)
@@ -2483,6 +2580,8 @@ class BuildSlotManager:
                 s_stat["acquired_at"] = info.get("acquired_at")
                 s_stat["child_pid"] = info.get("child_pid")
                 s_stat["heartbeat_at"] = info.get("heartbeat_at")
+                s_stat["job_class"] = info.get("job_class", "heavy")
+                s_stat["mem_gib"] = info.get("mem_gib", 3.0)
 
                 acquired_epoch = info.get("acquired_at_epoch")
                 if acquired_epoch is None:
@@ -2546,6 +2645,7 @@ class BuildSlotManager:
             "queue": queue_status,
             "queue_depth": len(queue_status),
             "ram_percent": ram_pct,
+            "memory_budget": self._memory_budget(),
             "ram_guard_threshold": self.ram_guard_threshold,
             "acquisition_stagger": self.acquisition_stagger,
             "last_acquired_at": last_acq,
@@ -2623,6 +2723,9 @@ class BuildSlotManager:
         heartbeat_stale_after: float = DEFAULT_LOCK_HEARTBEAT_STALE_SECONDS,
         poll_interval: float = DEFAULT_POLL_INTERVAL_SECONDS,
         next_dir: Optional[str] = None,
+        job_class: Optional[str] = None,
+        mem_gib: Optional[float] = None,
+        run_timeout: float = 1800.0,
     ) -> int:
         """
         Executes a command under the exclusive build slot lock.
@@ -2635,6 +2738,9 @@ class BuildSlotManager:
         and the lock is protected from double-grants while the command is active.
         Returns the command exit code, or 1 if lock could not be acquired.
         """
+        if not math.isfinite(run_timeout) or run_timeout <= 0:
+            raise ValueError("run_timeout must be positive and finite")
+        job_class = job_class or classify_command(cmd)
         run_token = str(uuid.uuid4())
         runner_pid = os.getpid()
 
@@ -2651,6 +2757,8 @@ class BuildSlotManager:
                 next_dir=next_dir,
                 cwd=cwd,
                 wrapper_pid=runner_pid,
+                job_class=job_class,
+                mem_gib=mem_gib,
             )
         except Exception as e:
             print(f"[RUN] Failed to acquire build slot lock for '{name}': {e}", file=sys.stderr)
@@ -2669,9 +2777,30 @@ class BuildSlotManager:
 
         stop_heartbeat = threading.Event()
         proc = None
+        old_signals = {}
+        cleanup_on_exit = None
         try:
-            proc = subprocess.Popen(cmd, cwd=cwd, shell=(sys.platform == "win32"), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            child_env = os.environ.copy()
+            node_options = child_env.get("NODE_OPTIONS", "")
+            if job_class in ("heavy", "medium") and not re.search(r"--max[-_]old[-_]space[-_]size\b", node_options):
+                child_env["NODE_OPTIONS"] = (node_options + f" --max-old-space-size={3072 if job_class == 'heavy' else 1536}").strip()
+            if re.search(r"\bvitest\b", " ".join(cmd), re.I):
+                child_env.setdefault("VITEST_MAX_WORKERS", "2")
+            proc = subprocess.Popen(cmd, cwd=cwd, env=child_env, shell=(sys.platform == "win32"),
+                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                                    start_new_session=(sys.platform != "win32"))
             child_pid = proc.pid
+            def cleanup_on_exit():
+                if proc.poll() is None:
+                    _kill_child_tree(proc)
+                self.release(name=name, token=run_token)
+            atexit.register(cleanup_on_exit)
+            old_signals = {}
+            if threading.current_thread() is threading.main_thread():
+                def interrupted(signum, frame):
+                    raise SystemExit(128 + signum)
+                for sig in (signal.SIGTERM, signal.SIGINT):
+                    old_signals[sig] = signal.signal(sig, interrupted)
 
             # Record wrapper and child PIDs and the initial heartbeat in lock info
             self._record_run_child(name=name, wrapper_pid=runner_pid, child_pid=child_pid, token=run_token)
@@ -2687,14 +2816,28 @@ class BuildSlotManager:
             hb_thread = threading.Thread(target=_heartbeat_worker, daemon=True)
             hb_thread.start()
 
-            ret = proc.wait()
-            return ret
+            try:
+                return proc.wait(timeout=run_timeout)
+            except subprocess.TimeoutExpired:
+                print(f"[RUN] Execution timed out after {run_timeout:g}s. Killing child tree.", file=sys.stderr)
+                _kill_child_tree(proc)
+                return 124
         except Exception as e:
             print(f"[RUN] Error running command for '{name}': {e}", file=sys.stderr)
             logger.error("Error executing command in run_command: %s", e)
             return 1
         finally:
             stop_heartbeat.set()
+            try:
+                if proc is not None and proc.poll() is None:
+                    _kill_child_tree(proc)
+            except Exception as error:
+                logger.error("Child tree cleanup failed: %s", error)
+            finally:
+                if cleanup_on_exit is not None:
+                    atexit.unregister(cleanup_on_exit)
+                for sig, handler in old_signals.items():
+                    signal.signal(sig, handler)
             print(f"[RUN] Releasing build slot lock for '{name}'...", file=sys.stderr)
             try:
                 self.release(name=name, token=run_token)
@@ -2780,6 +2923,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p_acq = subparsers.add_parser("acquire", help="Acquire build slot lock (blocks until available)")
     p_acq.add_argument("name", help="Lane or worker identifier requesting the slot")
     p_acq.add_argument("--pid", type=int, default=None, help="Explicit PID to associate with the lock (default: parent process PID)")
+    p_acq.add_argument("--class", dest="job_class", choices=MEMORY_RESERVATIONS, default=None)
+    p_acq.add_argument("--mem-gib", type=float, default=None)
     p_acq.add_argument("--timeout", type=float, default=None, help="Maximum seconds to wait (default: block indefinitely)")
     p_acq.add_argument(
         "--heartbeat-stale-after",
@@ -2899,7 +3044,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             opt_name = tok.split("=")[0]
             if opt_name in {"--priority", "--force"}:
                 i += 1
-            elif opt_name in {"--timeout", "--cwd", "--next-dir", "--heartbeat-stale-after"}:
+            elif opt_name in {"--timeout", "--cwd", "--next-dir", "--heartbeat-stale-after", "--class", "--mem-gib", "--run-timeout"}:
                 if "=" in tok:
                     i += 1
                 else:
@@ -2946,6 +3091,9 @@ def _find_subcommand_index(argv: List[str]) -> int:
 
 def _add_run_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--timeout", type=float, default=None, help="Maximum seconds to wait to acquire slot")
+    parser.add_argument("--class", dest="job_class", choices=MEMORY_RESERVATIONS, default=None)
+    parser.add_argument("--mem-gib", type=float, default=None)
+    parser.add_argument("--run-timeout", type=float, default=1800.0, help="Execution deadline after acquisition")
     parser.add_argument(
         "--priority",
         action="store_true",
@@ -2997,6 +3145,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             token=args.token,
             priority=args.priority,
             next_dir=getattr(args, "next_dir", None),
+            job_class=args.job_class,
+            mem_gib=args.mem_gib,
         )
         return 0 if success else 1
 
@@ -3058,6 +3208,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             cwd=args.cwd,
             heartbeat_stale_after=args.heartbeat_stale_after,
             next_dir=getattr(args, "next_dir", None),
+            job_class=args.job_class,
+            mem_gib=args.mem_gib,
+            run_timeout=args.run_timeout,
         )
 
     elif args.command == "heartbeat":

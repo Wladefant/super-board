@@ -52,8 +52,12 @@ class TestBuildSlot(unittest.TestCase):
         self.run_dir = self.tmp.name
         self.orig_ram = os.environ.get("BUILD_SLOT_RAM_PERCENT")
         os.environ["BUILD_SLOT_RAM_PERCENT"] = "80.0"
+        self.orig_avail_gib = os.environ.get("BUILD_SLOT_AVAILABLE_GIB")
+        os.environ["BUILD_SLOT_AVAILABLE_GIB"] = "64"
+        self.orig_allow_force = os.environ.get("BUILD_SLOT_ALLOW_FORCE")
         self.orig_stagger = os.environ.get("BUILD_SLOT_STAGGER_SECONDS")
         os.environ["BUILD_SLOT_STAGGER_SECONDS"] = "0"
+
     def tearDown(self):
         if self.orig_stagger is not None:
             os.environ["BUILD_SLOT_STAGGER_SECONDS"] = self.orig_stagger
@@ -63,6 +67,14 @@ class TestBuildSlot(unittest.TestCase):
             os.environ["BUILD_SLOT_RAM_PERCENT"] = self.orig_ram
         else:
             os.environ.pop("BUILD_SLOT_RAM_PERCENT", None)
+        if self.orig_avail_gib is not None:
+            os.environ["BUILD_SLOT_AVAILABLE_GIB"] = self.orig_avail_gib
+        else:
+            os.environ.pop("BUILD_SLOT_AVAILABLE_GIB", None)
+        if self.orig_allow_force is not None:
+            os.environ["BUILD_SLOT_ALLOW_FORCE"] = self.orig_allow_force
+        else:
+            os.environ.pop("BUILD_SLOT_ALLOW_FORCE", None)
         try:
             self.tmp.cleanup()
         except Exception:
@@ -208,31 +220,32 @@ class TestBuildSlot(unittest.TestCase):
         self.assertIn("system RAM remains at 95.0%", stderr_buf.getvalue())
         self.assertEqual(manager.clean_queue(), [])
 
-    def test_ram_guard_admits_head_when_idle_and_ram_stays_high(self):
+    def test_ram_guard_does_not_admit_when_idle_and_ram_stays_high(self):
         """
-        #620: at >= 95% RAM with no build slot held, waiting frees nothing of ours, so the
-        queue head starved for hours. After ram_guard_idle_admit_after it is admitted.
+        #620 adaptation: under memory safety contract, idle bypass is obsolete.
+        At >= 95% RAM or exhausted memory budget, the queue head is not admitted even when idle.
         """
-        manager = BuildSlotManager(run_dir=self.run_dir, ram_guard_idle_admit_after=0.3, acquisition_stagger=0)
+        manager = BuildSlotManager(run_dir=self.run_dir, ram_guard_idle_admit_after=0.1, acquisition_stagger=0)
         with mock.patch.object(build_slot, "get_system_ram_percent", return_value=98.0):
             with redirect_stderr(io.StringIO()):
-                started = time.monotonic()
-                self.assertTrue(manager.acquire("idle-lane", timeout=5.0, poll_interval=0.02))
-                self.assertGreaterEqual(time.monotonic() - started, 0.25)
-            self.assertTrue(manager.release("idle-lane"))
+                acquired = manager.acquire("idle-lane", timeout=0.3, poll_interval=0.02)
+                self.assertFalse(acquired)
+        self.assertFalse(manager.is_held_by("idle-lane"))
 
     def test_ram_guard_still_waits_when_a_slot_is_held(self):
-        """#620 negative control: with a build running, high RAM keeps the guard on past the idle limit."""
-        manager = BuildSlotManager(run_dir=self.run_dir, ram_guard_idle_admit_after=0.1, acquisition_stagger=0)
+        """Negative control: with a build running, high RAM keeps the guard on."""
+        manager = BuildSlotManager(run_dir=self.run_dir, acquisition_stagger=0)
         with mock.patch.object(build_slot, "get_system_ram_percent", return_value=50.0):
             self.assertTrue(manager.acquire("running-lane", timeout=2.0, poll_interval=0.02))
         with mock.patch.object(build_slot, "get_system_ram_percent", return_value=98.0):
             with redirect_stderr(io.StringIO()):
-                self.assertFalse(manager.acquire("waiting-lane", timeout=0.6, poll_interval=0.02))
+                self.assertFalse(manager.acquire("waiting-lane", timeout=0.4, poll_interval=0.02))
         self.assertTrue(manager.release("running-lane"))
 
     def test_ram_guard_idle_admit_default_is_bounded(self):
-        self.assertTrue(0 < build_slot.DEFAULT_RAM_GUARD_IDLE_ADMIT_SECONDS <= 600)
+        val = getattr(build_slot, "DEFAULT_RAM_GUARD_IDLE_ADMIT_SECONDS", None)
+        if val is not None:
+            self.assertTrue(0 < val <= 600)
 
     def test_release_frees_slot_even_when_queue_lock_times_out(self):
         """#620: release must not fail after the slot is gone because the queue file is busy."""
@@ -275,8 +288,18 @@ class TestBuildSlot(unittest.TestCase):
         self.assertFalse(os.path.isdir(manager.lock_dir))
 
     def test_ram_guard_force_bypasses_at_96_percent(self):
-        """At 96% RAM (>= 95%), --force bypasses the RAM guard and acquires."""
+        """At 96% RAM (>= 95%), --force bypasses the RAM guard only when BUILD_SLOT_ALLOW_FORCE=1."""
         manager = BuildSlotManager(run_dir=self.run_dir)
+
+        # Without BUILD_SLOT_ALLOW_FORCE=1, force does not bypass the RAM guard
+        os.environ.pop("BUILD_SLOT_ALLOW_FORCE", None)
+        with mock.patch.object(build_slot, "get_system_ram_percent", return_value=96.0):
+            with redirect_stderr(io.StringIO()):
+                acquired = manager.acquire("force-lane-noenv", timeout=0.2, poll_interval=0.02, force=True)
+            self.assertFalse(acquired)
+
+        # With BUILD_SLOT_ALLOW_FORCE=1, force bypasses the RAM guard
+        os.environ["BUILD_SLOT_ALLOW_FORCE"] = "1"
         stderr_buf = io.StringIO()
         with mock.patch.object(build_slot, "get_system_ram_percent", return_value=96.0):
             with redirect_stderr(stderr_buf):
@@ -286,7 +309,6 @@ class TestBuildSlot(unittest.TestCase):
         self.assertIn("96.0%", stderr_buf.getvalue())
         self.assertTrue(manager.is_held_by("force-lane"))
         self.assertTrue(manager.release("force-lane"))
-
     def test_ram_guard_waits_in_queue_until_ram_drops(self):
         manager = BuildSlotManager(run_dir=self.run_dir)
         ram_values = iter([95.0, 95.0, 95.0])
@@ -2141,6 +2163,7 @@ class TestBuildSlot(unittest.TestCase):
         it (QA5748 lost its slot this way while its driver was running).
         """
         manager = BuildSlotManager(run_dir=self.run_dir, max_slots=1)
+        os.environ["BUILD_SLOT_ALLOW_FORCE"] = "1"
         self.assertTrue(manager.acquire("live-holder", timeout=1.0, force=True, token="tok"))
         # Past the 10s mid-creation grace, as any build that heartbeats is.
         old = time.time() - 120
@@ -2263,7 +2286,8 @@ class TestBuildSlot(unittest.TestCase):
         manager.release("stagger-lane-2")
 
     def test_acquisition_stagger_bypassed_with_force(self):
-        """--force bypasses acquisition stagger delay."""
+        """--force bypasses acquisition stagger delay when BUILD_SLOT_ALLOW_FORCE=1."""
+        os.environ["BUILD_SLOT_ALLOW_FORCE"] = "1"
         manager = BuildSlotManager(run_dir=self.run_dir, acquisition_stagger=10.0)
         self.assertTrue(manager.acquire("lane-first", timeout=1.0))
         # With 10s stagger, normal acquire would fail with 0.1s timeout, but force=True acquires immediately
@@ -3516,5 +3540,333 @@ class TestBuildSlot(unittest.TestCase):
         self.assertEqual(ret_release, 0)
         self.assertFalse(manager.status()["lock"]["locked"])
 
+    # -------------------------------------------------------------------------
+    # Build-slot memory safety, one-heavy cap, force-env, run-timeout, and freeze
+    # -------------------------------------------------------------------------
+
+    def test_get_available_ram_gib_reads_env_and_system(self):
+        """get_available_ram_gib returns float or None, respecting BUILD_SLOT_AVAILABLE_GIB."""
+        os.environ["BUILD_SLOT_AVAILABLE_GIB"] = "16.5"
+        val = build_slot.get_available_ram_gib()
+        self.assertIsInstance(val, float)
+        self.assertEqual(val, 16.5)
+
+        os.environ.pop("BUILD_SLOT_AVAILABLE_GIB", None)
+        sys_val = build_slot.get_available_ram_gib()
+        if sys_val is not None:
+            self.assertIsInstance(sys_val, float)
+            self.assertGreater(sys_val, 0.0)
+
+    def test_admission_arithmetic_floor_three_gib(self):
+        """
+        Memory admission: available_ram - sum(reservations) - new >= 3.0 GiB.
+        Refuses admission when floor is violated, admits when satisfied.
+        """
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        os.environ["BUILD_SLOT_AVAILABLE_GIB"] = "10.0"
+
+        # Slot 1 reserves 4.0 GiB (10.0 - 0 - 4.0 = 6.0 >= 3.0 floor) -> admitted
+        self.assertTrue(manager.acquire("slot-1", mem_gib=4.0, timeout=1.0))
+
+        # Slot 2 requests 4.0 GiB (10.0 - 4.0 - 4.0 = 2.0 < 3.0 floor) -> refused
+        with redirect_stderr(io.StringIO()):
+            self.assertFalse(manager.acquire("slot-2-fail", mem_gib=4.0, timeout=0.2, poll_interval=0.02))
+
+        # Slot 2 requests 3.0 GiB (10.0 - 4.0 - 3.0 = 3.0 >= 3.0 floor) -> admitted
+        self.assertTrue(manager.acquire("slot-2-ok", mem_gib=3.0, timeout=1.0))
+
+        manager.release("slot-1")
+        manager.release("slot-2-ok")
+
+    def test_legacy_slots_without_metadata_reserve_three_gib(self):
+        """Legacy slots without mem_gib or job_class in metadata reserve 3.0 GiB."""
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        os.environ["BUILD_SLOT_AVAILABLE_GIB"] = "8.0"
+
+        # Create simulated legacy slot directory and info.json with no mem_gib or job_class
+        os.makedirs(manager.slot_dirs[0], exist_ok=True)
+        now_epoch = time.time()
+        legacy_info = {
+            "owner": "legacy-lane",
+            "pid": os.getpid(),
+            "token": "tok-legacy-1",
+            "acquired_at": datetime.datetime.fromtimestamp(now_epoch, datetime.timezone.utc).isoformat(),
+            "acquired_at_epoch": now_epoch,
+        }
+        with open(os.path.join(manager.slot_dirs[0], build_slot.INFO_FILE_NAME), "w", encoding="utf-8") as f:
+            json.dump(legacy_info, f)
+
+        # 8.0 available - 3.0 legacy - 3.0 new = 2.0 < 3.0 floor -> refused
+        with redirect_stderr(io.StringIO()):
+            self.assertFalse(manager.acquire("slot-new-fail", mem_gib=3.0, timeout=0.2, poll_interval=0.02))
+
+        # 8.0 available - 3.0 legacy - 2.0 new = 3.0 >= 3.0 floor -> admitted
+        self.assertTrue(manager.acquire("slot-new-ok", mem_gib=2.0, timeout=1.0))
+        manager.release("slot-new-ok")
+        manager.release("legacy-lane")
+
+    def test_default_acquire_sets_job_class_light(self):
+        """Default acquire without explicit job_class defaults to 'light'."""
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        self.assertTrue(manager.acquire("default-lane", timeout=1.0))
+        slot_info = manager._read_slot_info(0)
+        self.assertIsNotNone(slot_info)
+        self.assertEqual(slot_info.get("job_class"), "light")
+        manager.release("default-lane")
+
+    def test_one_heavy_cap_blocks_concurrent_heavy_jobs(self):
+        """At most one 'heavy' job may run concurrently across all slots."""
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        os.environ["BUILD_SLOT_AVAILABLE_GIB"] = "64.0"
+
+        # Slot 1 acquires as heavy
+        self.assertTrue(manager.acquire("heavy-lane-1", job_class="heavy", timeout=1.0))
+
+        # Slot 2 attempts heavy acquire while heavy-lane-1 is active -> refused
+        with redirect_stderr(io.StringIO()):
+            self.assertFalse(manager.acquire("heavy-lane-2", job_class="heavy", timeout=0.2, poll_interval=0.02))
+
+        # Meanwhile, a medium job can acquire concurrently
+        self.assertTrue(manager.acquire("medium-lane", job_class="medium", timeout=1.0))
+
+        # Once heavy-lane-1 releases, a heavy job can acquire
+        manager.release("heavy-lane-1")
+        self.assertTrue(manager.acquire("heavy-lane-2", job_class="heavy", timeout=1.0))
+
+        manager.release("medium-lane")
+        manager.release("heavy-lane-2")
+
+    def test_force_cannot_bypass_heavy_cap(self):
+        """Even with BUILD_SLOT_ALLOW_FORCE=1, --force cannot bypass the one-heavy concurrency cap."""
+        os.environ["BUILD_SLOT_ALLOW_FORCE"] = "1"
+        os.environ["BUILD_SLOT_AVAILABLE_GIB"] = "64.0"
+        manager = BuildSlotManager(run_dir=self.run_dir)
+
+        self.assertTrue(manager.acquire("heavy-1", job_class="heavy", timeout=1.0))
+
+        # Second heavy with force=True must still be refused
+        with redirect_stderr(io.StringIO()):
+            self.assertFalse(manager.acquire("heavy-2-force", job_class="heavy", timeout=0.2, poll_interval=0.02, force=True))
+
+        manager.release("heavy-1")
+
+    def test_force_requires_build_slot_allow_force_env(self):
+        """--force is ignored unless BUILD_SLOT_ALLOW_FORCE=1 is set in environment."""
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        os.environ["BUILD_SLOT_AVAILABLE_GIB"] = "4.0"
+
+        # Without env var, force=True does not bypass floor (4 - 0 - 2 = 2 < 3)
+        os.environ.pop("BUILD_SLOT_ALLOW_FORCE", None)
+        with redirect_stderr(io.StringIO()):
+            self.assertFalse(manager.acquire("force-noenv", mem_gib=2.0, timeout=0.2, poll_interval=0.02, force=True))
+
+        # With BUILD_SLOT_ALLOW_FORCE=1, force=True bypasses admission
+        os.environ["BUILD_SLOT_ALLOW_FORCE"] = "1"
+        self.assertTrue(manager.acquire("force-with-env", mem_gib=2.0, timeout=1.0, force=True))
+        manager.release("force-with-env")
+
+    def test_run_timeout_kills_child_and_grandchild_process_tree_with_exit_124(self):
+        """run --run-timeout kills the entire process tree and exits 124 when timeout elapses."""
+        gc_pid_file = os.path.join(self.run_dir, "grandchild.pid")
+        child_py = os.path.join(self.run_dir, "child_spawner.py")
+        child_code = (
+            "import sys, subprocess, time\n"
+            "gc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], "
+            "creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))\n"
+            f"with open(r'{gc_pid_file}', 'w') as f: f.write(str(gc.pid))\n"
+            "time.sleep(60)\n"
+        )
+        with open(child_py, "w", encoding="utf-8") as f:
+            f.write(child_code)
+
+        started = time.monotonic()
+        proc = subprocess.run(
+            [sys.executable, os.path.abspath(build_slot.__file__), "--run-dir", self.run_dir,
+             "run", "lane-timeout", "--run-timeout", "1", "--", sys.executable, child_py],
+            capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(proc.returncode, 124, f"stderr: {proc.stderr}")
+        self.assertLess(elapsed, 15)
+
+        self.assertTrue(os.path.exists(gc_pid_file))
+        with open(gc_pid_file, encoding="utf-8") as f:
+            grandchild_pid = int(f.read().strip())
+
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and is_pid_alive(grandchild_pid):
+            time.sleep(0.1)
+        self.assertFalse(is_pid_alive(grandchild_pid))
+
+    def test_run_queue_timeout_does_not_kill_running_command(self):
+        """Existing --timeout option governs FIFO queue wait time only, not command execution."""
+        started = time.monotonic()
+        proc = subprocess.run(
+            [sys.executable, os.path.abspath(build_slot.__file__), "--run-dir", self.run_dir,
+             "run", "lane-normal", "--timeout", "0.2", "--", sys.executable, "-c", "import time; time.sleep(0.5)"],
+            capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        self.assertEqual(proc.returncode, 0, f"stderr: {proc.stderr}")
+        self.assertGreaterEqual(time.monotonic() - started, 0.4)
+
+    def test_freeze_during_queue_wait_raises_system_exit_75(self):
+        """A waiter blocked in the FIFO queue raises SystemExit(75) when build-freeze appears."""
+        manager_blocker = BuildSlotManager(run_dir=self.run_dir, max_slots=1)
+        self.assertTrue(manager_blocker.acquire("blocker-lane", timeout=1.0))
+
+        freeze_file = os.path.join(self.run_dir, "build-freeze")
+        stop_event = threading.Event()
+
+        def write_freeze():
+            time.sleep(0.1)
+            if not stop_event.is_set() and os.path.isdir(self.run_dir):
+                try:
+                    with open(freeze_file, "w", encoding="utf-8") as f:
+                        f.write("freeze active while queued\n")
+                except OSError:
+                    pass
+
+        t = threading.Thread(target=write_freeze)
+        t.start()
+
+        waiter_mgr = BuildSlotManager(run_dir=self.run_dir, max_slots=1)
+        err = io.StringIO()
+        try:
+            with redirect_stderr(err):
+                with self.assertRaises(SystemExit) as ctx:
+                    waiter_mgr.acquire("waiter-frozen", timeout=0.6, poll_interval=0.02)
+            self.assertEqual(ctx.exception.code, 75)
+            self.assertIn("build freeze active (freeze active while queued)", err.getvalue())
+        finally:
+            stop_event.set()
+            t.join()
+            manager_blocker.release("blocker-lane")
+
+    def test_classify_command_job_classes(self):
+        """classify_command returns 'heavy', 'medium', or 'light'."""
+        self.assertEqual(build_slot.classify_command(["npx", "next", "build"]), "heavy")
+        self.assertEqual(build_slot.classify_command(["npm", "run", "build"]), "heavy")
+        self.assertEqual(build_slot.classify_command(["bun", "run", "build"]), "heavy")
+        self.assertEqual(build_slot.classify_command(["next", "build"]), "heavy")
+        self.assertEqual(build_slot.classify_command("npx next build"), "heavy")
+
+        self.assertEqual(build_slot.classify_command(["npx", "vitest", "run"]), "medium")
+        self.assertEqual(build_slot.classify_command(["vitest"]), "medium")
+        self.assertEqual(build_slot.classify_command(["npx", "playwright", "test"]), "heavy")
+        self.assertEqual(build_slot.classify_command(["pytest"]), "light")
+
+        self.assertEqual(build_slot.classify_command(["echo", "hello"]), "light")
+        self.assertEqual(build_slot.classify_command(["node", "scripts/clean.js"]), "light")
+
+    def test_node_options_tuning_and_vitest_workers_injection(self):
+        """run injects NODE_OPTIONS (heavy 3072, medium 1536) and VITEST_MAX_WORKERS=2 preserving user env."""
+        dump_script = (
+            "import json\n"
+            "import os\n"
+            "import sys\n"
+            "out_file = sys.argv[1]\n"
+            "payload = {\n"
+            "    'NODE_OPTIONS': os.environ.get('NODE_OPTIONS', ''),\n"
+            "    'VITEST_MAX_WORKERS': os.environ.get('VITEST_MAX_WORKERS', ''),\n"
+            "}\n"
+            "with open(out_file, 'w', encoding='utf-8') as f:\n"
+            "    json.dump(payload, f)\n"
+        )
+        script_path = os.path.join(self.run_dir, "dump_env.py")
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(dump_script)
+
+        # 1. Heavy job defaults
+        out_heavy = os.path.join(self.run_dir, "env_heavy.json")
+        proc_heavy = subprocess.run(
+            [sys.executable, os.path.abspath(build_slot.__file__), "--run-dir", self.run_dir,
+             "run", "lane-heavy", "--class", "heavy", "--", sys.executable, script_path, out_heavy, "vitest"],
+            capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        self.assertEqual(proc_heavy.returncode, 0, proc_heavy.stderr)
+        self.assertTrue(os.path.isfile(out_heavy), "Real child must write env output file")
+        with open(out_heavy, "r", encoding="utf-8") as f:
+            env_heavy = json.load(f)
+        self.assertIn("--max-old-space-size=3072", env_heavy.get("NODE_OPTIONS", ""))
+        self.assertEqual(env_heavy.get("VITEST_MAX_WORKERS"), "2")
+
+        # 2. Medium job defaults
+        out_med = os.path.join(self.run_dir, "env_med.json")
+        proc_med = subprocess.run(
+            [sys.executable, os.path.abspath(build_slot.__file__), "--run-dir", self.run_dir,
+             "run", "lane-med", "--class", "medium", "--", sys.executable, script_path, out_med],
+            capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        self.assertEqual(proc_med.returncode, 0, proc_med.stderr)
+        self.assertTrue(os.path.isfile(out_med), "Real child must write env output file")
+        with open(out_med, "r", encoding="utf-8") as f:
+            env_med = json.load(f)
+        self.assertIn("--max-old-space-size=1536", env_med.get("NODE_OPTIONS", ""))
+
+        # 3. Preserves existing values
+        out_custom = os.path.join(self.run_dir, "env_custom.json")
+        custom_env = os.environ.copy()
+        custom_env["NODE_OPTIONS"] = "--max-old-space-size=4096"
+        custom_env["VITEST_MAX_WORKERS"] = "8"
+        proc_custom = subprocess.run(
+            [sys.executable, os.path.abspath(build_slot.__file__), "--run-dir", self.run_dir,
+             "run", "lane-custom", "--class", "heavy", "--", sys.executable, script_path, out_custom, "vitest"],
+            capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL, env=custom_env,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        self.assertEqual(proc_custom.returncode, 0, proc_custom.stderr)
+        self.assertTrue(os.path.isfile(out_custom), "Real child must write env output file")
+        with open(out_custom, "r", encoding="utf-8") as f:
+            env_custom = json.load(f)
+        self.assertIn("--max-old-space-size=4096", env_custom.get("NODE_OPTIONS", ""))
+        self.assertNotIn("3072", env_custom.get("NODE_OPTIONS", ""))
+        self.assertEqual(env_custom.get("VITEST_MAX_WORKERS"), "8")
+    def test_parse_args_supports_class_mem_gib_and_run_timeout(self):
+        """parse_args accepts --class, --mem-gib, and --run-timeout (default 1800)."""
+        args = build_slot.parse_args(
+            ["run", "lane", "--class", "heavy", "--mem-gib", "4.0", "--run-timeout", "600", "--", "echo", "1"]
+        )
+        parsed_class = getattr(args, "job_class", getattr(args, "class_", getattr(args, "class", None)))
+        self.assertEqual(parsed_class, "heavy")
+        self.assertEqual(args.mem_gib, 4.0)
+        self.assertEqual(args.run_timeout, 600.0)
+
+        # Default run_timeout is 1800
+        args_def = build_slot.parse_args(["run", "lane", "--", "echo", "1"])
+        self.assertEqual(args_def.run_timeout, 1800.0)
+
+    def test_status_reports_memory_budget_and_slot_fields(self):
+        """status reports memory_budget breakdown and slot job_class and mem_gib fields."""
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        os.environ["BUILD_SLOT_AVAILABLE_GIB"] = "32.0"
+
+        stat = manager.status()
+        self.assertIn("memory_budget", stat)
+        mb = stat["memory_budget"]
+        self.assertIn("available_gib", mb)
+        self.assertIn("reserved_gib", mb)
+        self.assertIn("floor_gib", mb)
+        self.assertIn("free_budget_gib", mb)
+        self.assertEqual(mb["floor_gib"], 3.0)
+        self.assertEqual(mb["available_gib"], 32.0)
+        self.assertEqual(mb["reserved_gib"], 0.0)
+        self.assertEqual(mb["free_budget_gib"], 29.0)
+
+        # Acquire a slot with class and memory
+        self.assertTrue(manager.acquire("lane-status-test", job_class="heavy", mem_gib=3.0, timeout=1.0))
+        stat_held = manager.status()
+        held_slot = next(s for s in stat_held["slots"] if s["owner"] == "lane-status-test")
+        self.assertEqual(held_slot.get("job_class"), "heavy")
+        self.assertEqual(held_slot.get("mem_gib"), 3.0)
+
+        mb_held = stat_held["memory_budget"]
+        self.assertEqual(mb_held["reserved_gib"], 3.0)
+        self.assertEqual(mb_held["free_budget_gib"], 26.0)
+
+        manager.release("lane-status-test")
 if __name__ == "__main__":
     unittest.main()
