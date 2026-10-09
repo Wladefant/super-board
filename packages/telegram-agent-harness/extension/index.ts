@@ -426,6 +426,8 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
     name: "telegram_question",
     label: "Ask operator on Telegram",
     description: "Ask a clear question on the session's Telegram route, with labeled options, recommendation and prose replies. Returns only that question's answer; never grants approval. Use get/wait with its id after an interruption. All open questions of all sessions are listed in the Questions topic; if the operator answered one somewhere else (terminal, prose to you), close it with resolve (id plus answer text or option id), and close one that no longer matters with drop (id plus reason), so it leaves that list.",
+    interruptible: (params: { action?: string; wait?: boolean }) =>
+      (params.action === undefined || params.action === "ask" || params.action === "wait") && params.wait !== false,
     parameters: z.object({
       action: z.enum(["ask", "get", "wait", "resolve", "drop"]).default("ask"),
       id: z.string().optional(),
@@ -475,7 +477,7 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
       onUpdate?.({ content: [{ type: "text", text: `Telegram question ${question.decision_id} is ${question.status}. Silence leaves it pending.` }] });
       const timeoutMs = (params.timeout ? Math.max(1, Math.min(300, params.timeout)) : 60) * 1000;
       let lastProgressSec = 0;
-      const result = (params.action !== "ask" && params.action !== "wait") || !params.wait
+      const result = (params.action !== "ask" && params.action !== "wait") || params.wait === false
         ? question
         : await service.wait(
             question.decision_id,
@@ -489,7 +491,10 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
                 onUpdate?.({ content: [{ type: "text", text: `Waiting for Telegram answer (${question.decision_id}), ${elapsedSec}s elapsed...` }] });
               }
             },
-          );
+          ).catch(error => {
+            if (!signal?.aborted || error !== signal.reason) throw error;
+            return service.get(question.decision_id);
+          });
       return { content: [{ type: "text", text: JSON.stringify(result) }], details: result };
     },
   });

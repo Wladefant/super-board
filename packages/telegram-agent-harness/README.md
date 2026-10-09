@@ -10,6 +10,15 @@ Universal, mobile-friendly Telegram operations surface for managing multi-agent 
 - **Supergroup Forum Topics Mode (Opt-In)**: Multiplexes multiple concurrent Veyyon sessions into a single Telegram Supergroup using native Telegram Forum Topics (`message_thread_id`).
 - **Superboard Mini App Integration**: In-app Telegram web dashboard for interactive queue and session monitoring.
 
+### Question waits and steering
+
+Only waiting `telegram_question` calls allow steering to stop the wait.
+These are `action: "wait"` and `action: "ask"` with waiting enabled.
+An interrupted wait returns the current pending question without answering or dropping it.
+`get`, `resolve`, `drop`, and calls with `wait: false` keep their normal results.
+This requires a host that forwards extension tools' `interruptible` declaration.
+Reloading the static extension requires separate operator authorization.
+
 ### Agent outbound attachments
 
 The public `telegram_attachment` tool sends a local file through the session's
