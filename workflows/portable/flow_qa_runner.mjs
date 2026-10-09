@@ -1171,12 +1171,32 @@ async function inspectTargetElementOnce(page, selectorOrHandle, scroll) {
   if (!handle) return null;
   try {
     return await page.evaluate((el, doScroll) => {
-    if (doScroll) el.scrollIntoView({ block: 'center', inline: 'nearest' });
+    if (doScroll) {
+      el.scrollIntoView({ block: 'center', inline: 'nearest' });
+      let r = el.getBoundingClientRect();
+      if (r.bottom > window.innerHeight - 56 || r.top < 0) {
+        el.scrollIntoView({ block: 'start', inline: 'nearest' });
+        r = el.getBoundingClientRect();
+        if (r.bottom > window.innerHeight - 56) {
+          const shift = r.bottom - (window.innerHeight - 80);
+          if (shift > 0) {
+            window.scrollBy(0, shift);
+            let curr = el;
+            while (curr && curr !== document.documentElement) {
+              if (curr.scrollHeight > curr.clientHeight && curr.clientHeight > 0) {
+                curr.scrollTop += shift;
+              }
+              curr = curr.parentElement || (typeof curr.getRootNode === 'function' ? curr.getRootNode()?.host : null);
+            }
+          }
+        }
+      }
+    }
 
     const rect = el.getBoundingClientRect();
     const style = window.getComputedStyle(el);
-    const cx = Math.round(rect.x + rect.width / 2);
-    const cy = Math.round(rect.y + rect.height / 2);
+    let cx = Math.round(rect.x + rect.width / 2);
+    let cy = Math.round(rect.y + rect.height / 2);
 
     let atPoint = null;
     let isTargetOrDescendant = false;
@@ -1243,14 +1263,31 @@ async function inspectTargetElementOnce(page, selectorOrHandle, scroll) {
       return false;
     };
 
-    if (cx >= 0 && cx <= window.innerWidth && cy >= 0 && cy <= window.innerHeight) {
-      atPoint = getDeepestHitElement(cx, cy);
-      if (atPoint) {
-        isTargetOrDescendant = isHitOnTarget(el, atPoint);
-        if (!isTargetOrDescendant) {
-          coveringElementDescription = `${atPoint.tagName.toLowerCase()}${atPoint.className ? '.' + atPoint.className.toString().trim().replace(/\\s+/g, '.') : ''}${atPoint.id ? '#' + atPoint.id : ''}`;
-        }
+    // A wrapped inline target (a link that breaks across lines) has a union box whose centre can fall in a
+    // gap or on a neighbouring inline. The target is reachable when the union centre or the centre of any
+    // of its own line boxes lands on it. A real overlay covers every one of them and still fails.
+    const centres = [[cx, cy]];
+    for (const cr of Array.from(el.getClientRects())) {
+      if (cr.width > 0 && cr.height > 0) centres.push([Math.round(cr.x + cr.width / 2), Math.round(cr.y + cr.height / 2)]);
+    }
+    let firstMiss = null;
+    for (const [px, py] of centres) {
+      if (!(px >= 0 && px <= window.innerWidth && py >= 0 && py <= window.innerHeight)) continue;
+      const hit = getDeepestHitElement(px, py);
+      if (!hit) continue;
+      if (isHitOnTarget(el, hit)) {
+        atPoint = hit;
+        isTargetOrDescendant = true;
+        cx = px;
+        cy = py;
+        coveringElementDescription = '';
+        break;
       }
+      if (!firstMiss) firstMiss = hit;
+    }
+    if (!isTargetOrDescendant && firstMiss) {
+      atPoint = firstMiss;
+      coveringElementDescription = `${atPoint.tagName.toLowerCase()}${atPoint.className ? '.' + atPoint.className.toString().trim().replace(/\\s+/g, '.') : ''}${atPoint.id ? '#' + atPoint.id : ''}`;
     }
 
     // Effective hit area: probe outward from the centre while elementFromPoint still lands on the target.
@@ -1379,7 +1416,8 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
   // Pre-action target inspection
   let preInspection = null;
   if (step.selector) {
-    preInspection = await inspectTargetElement(page, step.selector, step.action !== 'assert');
+    const shouldScroll = step.action !== 'assert' || Boolean(step.scroll) || Boolean(step.scroll_into_view);
+    preInspection = await inspectTargetElement(page, step.selector, shouldScroll);
   }
 
   // A touch-only step (a swipe, which only phone sheets answer) is skipped with a passing note on a desktop viewport.
@@ -1840,7 +1878,8 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
   page.off('load', onNav);
 
   // Post-action inspections
-  const postInspection = step.selector ? await inspectTargetElement(page, step.selector, step.action !== 'assert') : null;
+  const shouldScrollPost = step.action !== 'assert' || Boolean(step.scroll) || Boolean(step.scroll_into_view);
+  const postInspection = step.selector ? await inspectTargetElement(page, step.selector, shouldScrollPost) : null;
   const geom = await inspectPageGeometry(page);
   let docIdAfter = null;
   try {
@@ -1866,7 +1905,7 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
   // Check: tap_target_min_44
   if (vpConfig.isMobile && (requestedChecks.includes('tap_target_min_44') || requestedChecks.includes('target_min_44') || (step.action === 'tap' && !step.optional))) {
     const insp = preInspection || postInspection;
-    checksResults.push(checkTapTargetMin44(insp?.hitRect || insp?.rect));
+    checksResults.push(checkTapTargetMin44(insp?.rect || insp?.hitRect));
   }
 
   // Check: no_horizontal_overflow
@@ -1991,8 +2030,21 @@ export async function openFlowPage(browser, storageState = null) {
   });
   if (storageState && fs.existsSync(storageState)) {
     const stateContent = JSON.parse(fs.readFileSync(storageState, 'utf8'));
-    if (Array.isArray(stateContent.cookies)) {
+    if (Array.isArray(stateContent.cookies) && stateContent.cookies.length > 0) {
       await page.setCookie(...stateContent.cookies);
+    }
+    if (Array.isArray(stateContent.origins) && stateContent.origins.length > 0) {
+      await page.evaluateOnNewDocument((origins) => {
+        for (const entry of origins) {
+          if (Array.isArray(entry.localStorage)) {
+            for (const item of entry.localStorage) {
+              try {
+                localStorage.setItem(item.name, item.value);
+              } catch (_) {}
+            }
+          }
+        }
+      }, stateContent.origins);
     }
   }
   return { page, cdpSession };
@@ -2006,7 +2058,9 @@ async function applyViewport(page, vp, theme) {
     hasTouch: vp.hasTouch,
     deviceScaleFactor: vp.deviceScaleFactor
   });
-  await page.emulateMediaFeatures([{ name: 'prefers-color-scheme', value: theme }]);
+  try {
+    await page.emulateMediaFeatures([{ name: 'prefers-color-scheme', value: theme }]);
+  } catch (_) {}
 }
 
 /**
@@ -2088,7 +2142,9 @@ export async function runFlows(options = {}) {
   // 4. Load flow definitions
   const resolvedFlowPath = flowDataPath || path.join(path.dirname(fileURLToPath(import.meta.url)), 'flows', `${project}.json`);
   const allFlows = loadFlowData(resolvedFlowPath);
-  const flowsToRun = flowId ? allFlows.filter(f => f.id === flowId) : allFlows;
+  const flowsToRun = (options.flows && options.flows.length > 0)
+    ? allFlows.filter(f => options.flows.includes(f.id))
+    : (flowId ? allFlows.filter(f => f.id === flowId) : allFlows);
 
   if (flowsToRun.length === 0) {
     throw new Error(`No matching flows found (filter: "${flowId || 'all'}") in ${resolvedFlowPath}`);
@@ -2224,7 +2280,7 @@ export async function runFlows(options = {}) {
       }
     }
   } finally {
-    await browser.close().catch(() => {});
+    await Promise.race([browser.close().catch(() => {}), new Promise(r => setTimeout(r, 3000))]);
   }
 
   const hasExecutedCoverage = executedViewports.size > 0 && allStepReports.length > 0;
@@ -2311,10 +2367,12 @@ export function parseCliArgs(argv) {
     else if (arg === '--output' && argv[i + 1]) options.outputDir = argv[++i];
     else if (arg === '--bind-sha' && argv[i + 1]) options.bindSha = argv[++i];
     else if (arg === '--flow' && argv[i + 1]) options.flowId = argv[++i];
+    else if (arg === '--flows' && argv[i + 1]) options.flows = argv[++i].split(',');
     else if (arg === '--executable-path' && argv[i + 1]) options.executablePath = argv[++i];
     else if (arg === '--headless' && argv[i + 1]) options.headless = argv[++i] !== 'false';
     else if (arg === '--viewports' && argv[i + 1]) options.viewports = argv[++i].split(',');
     else if (arg === '--themes' && argv[i + 1]) options.themes = argv[++i].split(',');
+    else if (arg === '--flow-data-path' && argv[i + 1]) options.flowDataPath = argv[++i];
   }
 
   return options;
