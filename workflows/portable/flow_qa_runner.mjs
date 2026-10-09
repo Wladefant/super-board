@@ -1987,7 +1987,10 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
   let captureRecord = null;
   try {
     if (context.project === 'shipnovo') {
-      const capture = await captureProductScreenshot(page, context.expectedSha, viewportKey, context.captureLabel);
+      const actualViewport = page.viewport();
+      const captureViewportKey = Object.keys(VIEWPORTS).find(key =>
+        VIEWPORTS[key].width === actualViewport?.width && VIEWPORTS[key].height === actualViewport?.height);
+      const capture = await captureProductScreenshot(page, context.expectedSha, captureViewportKey, context.captureLabel);
       fs.writeFileSync(screenshotPath, capture.image);
       captureRecord = capture.record;
       fs.writeFileSync(screenshotPath + '.capture.json', JSON.stringify(captureRecord, null, 2));

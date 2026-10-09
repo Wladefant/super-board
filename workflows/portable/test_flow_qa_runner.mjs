@@ -679,6 +679,21 @@ test('E2E Puppeteer Runner executes flow with CDP touch and emits flow-qa/v1 rep
       const shotPath = path.join(tmpDir, stepRep.screenshot);
       assert.ok(fs.existsSync(shotPath), `Screenshot file ${stepRep.screenshot} must exist on disk`);
     }
+
+    // Assert open-keyboard screenshot CAPTURE metadata viewport is 390x420 although logical target remains 390x844
+    const keyboard844Steps = report.steps.filter(
+      (s) => s.step === 'open-keyboard' && s.viewport === '390x844'
+    );
+    assert.ok(keyboard844Steps.length > 0, 'open-keyboard steps on 390x844 must exist');
+    for (const stepRep of keyboard844Steps) {
+      assert.equal(stepRep.viewport, '390x844', 'Logical target remains 390x844');
+      assert.ok(stepRep.capture, 'open-keyboard step must record capture metadata');
+      assert.equal(stepRep.capture.viewport, '390x420', 'Screenshot CAPTURE metadata viewport must be 390x420 although logical target remains 390x844');
+      const sidecarPath = path.join(tmpDir, `${stepRep.screenshot}.capture.json`);
+      assert.ok(fs.existsSync(sidecarPath), `Capture metadata sidecar ${stepRep.screenshot}.capture.json must exist`);
+      const sidecar = JSON.parse(fs.readFileSync(sidecarPath, 'utf8'));
+      assert.equal(sidecar.viewport, '390x420', 'Sidecar capture metadata viewport must be 390x420');
+    }
   } finally {
     server.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });

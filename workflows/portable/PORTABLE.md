@@ -107,14 +107,20 @@ An older receipt without source hashes needs a new run.
 A failed Shipnovo FLOW-QA receipt stays blocked for the same content.
 A later PASS cannot erase that failure without a new product revision.
 Shipnovo before/after image captions require matching `CAPTURE <json>` records for each viewport.
+The gate checks every comment carrying before/after evidence, including separate QA-only comments.
+Shipnovo has no exemption for separate capture evidence comments.
+Valid capture records must bind the exact head commit and match caption fields.
 Capture records contain `label`, `served_sha`, `account`, `viewport`, `device_scale`, `url`, `sha256`, and `source`.
 Product captures use `source=application` and measure the account from the authenticated session.
+After a keyboard action changes the viewport, capture metadata uses the actual supported viewport dimensions.
+The logical flow target remains unchanged. Unsupported capture dimensions still fail closed.
 `install_github_native.py --sha-readers-only` installs the runner, gate, identity helper, and canonical flow files together.
 This targeted install preserves profile policy, runtime state, and unrelated files.
 Extra installed flow files remain unapproved. Their hashes cannot match the canonical project flow.
 Depth-report captures prove report layout. They do not prove a signed-in product account and cannot replace product capture records.
 PolySimulator keeps its current caption and pixel checks until its capture producer supplies the new metadata.
 The later PolySimulator switch is tracked in https://github.com/Bavariance/polysimulator/issues/6588.
+FLOW-QA PRs on Shipnovo do not require an unrelated `QA-RECEIPT: PASS` marker when no QA receipt is declared.
 Stale revisions, failed markers, or missing required viewports block the gate.
 
 ### Local test execution record contract

@@ -51,6 +51,35 @@ class CaptureProvenanceTests(unittest.TestCase):
             result = evaluate_flow_qa_receipt(data, repo='Wladefant/shipnovo', base_ref='main', head_sha=AFTER)
         self.assertEqual(result[0], 'REQUIRED', result[1])
 
+    def test_shipnovo_rejects_separate_qa_comment_missing_capture_records(self):
+        root = Path(github_pr_gate.__file__).parent
+        runner = hashlib.sha256((root / 'flow_qa_runner.mjs').read_bytes()).hexdigest()
+        flow = hashlib.sha256((root / 'flows/shipnovo.json').read_bytes()).hexdigest()
+        flow_body = (f'FLOW-QA: PASS {AFTER}\nFLOW-QA-ASSERTIONS pass=7 fail=0\n'
+                     'FLOW-QA-VIEWPORTS 390x844,390x420,1440x900\n'
+                     f'FLOW-QA-SOURCE runner={runner} flow={flow} project=shipnovo\n')
+        qa_body = self.body(missing=True)
+        data = {'files': [{'path': 'src/app/page.tsx'}], 'comments': [{'body': flow_body}, {'body': qa_body}]}
+        with patch('github_pr_gate._content_binder', return_value=(lambda sha: sha == AFTER, [AFTER], None)):
+            result = evaluate_flow_qa_receipt(data, repo='Wladefant/shipnovo', base_ref='main', head_sha=AFTER)
+        self.assertEqual(result[0], 'REQUIRED', result[1])
+        self.assertIn('capture provenance failed', result[1])
+    def test_shipnovo_accepts_separate_qa_comment_with_valid_capture_records(self):
+        root = Path(github_pr_gate.__file__).parent
+        runner = hashlib.sha256((root / 'flow_qa_runner.mjs').read_bytes()).hexdigest()
+        flow = hashlib.sha256((root / 'flows/shipnovo.json').read_bytes()).hexdigest()
+        flow_body = (f'FLOW-QA: PASS {AFTER}\nFLOW-QA-ASSERTIONS pass=7 fail=0\n'
+                     'FLOW-QA-VIEWPORTS 390x844,390x420,1440x900\n'
+                     f'FLOW-QA-SOURCE runner={runner} flow={flow} project=shipnovo\n')
+        qa_body = self.body(missing=False)
+        data = {'files': [{'path': 'src/app/page.tsx'}], 'comments': [{'body': flow_body}, {'body': qa_body}]}
+        with patch('github_pr_gate._content_binder', return_value=(lambda sha: sha == AFTER, [AFTER], None)):
+            result = evaluate_flow_qa_receipt(data, repo='Wladefant/shipnovo', base_ref='main', head_sha=AFTER)
+            qa_result = evaluate_qa_receipt(data, repo='Wladefant/shipnovo', base_ref='main', head_sha=AFTER)
+        self.assertEqual(result[0], 'PASSED', result[1])
+        self.assertEqual(qa_result[0], 'PASSED', qa_result[1])
+
+
     def test_valid_measured_records(self):
         self.assertEqual(self.check(), [])
 

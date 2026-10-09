@@ -542,7 +542,10 @@ def evaluate_qa_receipt_requirement(
     Test files are skipped: a test-only diff changes no shipped surface, while a
     change that also touches product code still triggers on that file.
     """
-    if repo != "Bavariance/polysimulator" or base_ref != "staging":
+    target = get_flow_qa_target(repo, base_ref)
+    is_poly = repo == "Bavariance/polysimulator" and base_ref == "staging"
+    is_ship = bool(target and target.require_capture)
+    if not (is_poly or is_ship):
         return False, f"no QA receipt requirement for {repo}@{base_ref or 'unknown'}"
     files = pr_data.get("files")
     if files is None:
@@ -554,10 +557,14 @@ def evaluate_qa_receipt_requirement(
         norm_path = path.replace("\\", "/")
         if is_test_path(norm_path):
             continue
-        if UI_PATH_RE.match(norm_path):
-            return True, f"UI path {path}"
-        if ORDER_TRADING_PATH_RE.match(norm_path):
-            return True, f"order/trading path {path}"
+        if is_poly:
+            if UI_PATH_RE.match(norm_path):
+                return True, f"UI path {path}"
+            if ORDER_TRADING_PATH_RE.match(norm_path):
+                return True, f"order/trading path {path}"
+        elif is_ship:
+            if target.ui_pattern.search(norm_path):
+                return True, f"UI path {path}"
     return False, "no UI or order/trading paths"
 
 
@@ -791,9 +798,32 @@ def evaluate_qa_receipt(
         return "EXEMPT", requirement_reason, None
 
     binds, identity_forms, identity_error = _content_binder(head_sha, base_ref, cwd)
+    target = get_flow_qa_target(repo, base_ref)
+    require_capture = bool(target and target.require_capture)
+
+    all_sources = list(pr_data.get("comments") or []) + list(pr_data.get("reviews") or [])
+    evidence_comments = [
+        source for source in all_sources
+        if SHOT_CLAIM_RE.search(str(source.get("body") or ""))
+    ]
+
+    for source in evidence_comments:
+        shot_problems = shot_provenance_problems(
+            str(source.get("body") or ""),
+            (lambda sha: sha.lower() == head_sha.lower()) if require_capture else binds,
+            require_capture,
+        )
+        if shot_problems:
+            url = str(source.get("html_url") or source.get("url") or "") or None
+            return (
+                "REQUIRED",
+                f"QA receipt required ({requirement_reason}): before/after screenshot provenance "
+                f"failed: {'; '.join(shot_problems)}.",
+                url,
+            )
 
     declarations = []
-    for source in list(pr_data.get("comments") or []) + list(pr_data.get("reviews") or []):
+    for source in all_sources:
         body = str(source.get("body") or "")
         for marker in QA_RECEIPT_MARKER_RE.finditer(body):
             declarations.append(
@@ -813,9 +843,6 @@ def evaluate_qa_receipt(
     for declaration in declarations:
         tokens = set(declaration["tokens"])
         if declaration["state"] in QA_RECEIPT_FAILED_STATES:
-            # A negative verdict is believed wherever it can bind: refusing a
-            # retraction because it named the revision in prose rather than on the
-            # marker line would read a withdrawn receipt as a pass.
             tokens |= {token.lower() for token in SHA_TOKEN_RE.findall(declaration["body"])}
         else:
             saw_pass_marker = True
@@ -837,15 +864,6 @@ def evaluate_qa_receipt(
                 f"{QA_RECEIPT_MIN_IMAGES} required.",
                 declaration["url"] or None,
             )
-        target = get_flow_qa_target(repo, base_ref)
-        shot_problems = shot_provenance_problems(declaration["body"], binds, bool(target and target.require_capture))
-        if shot_problems:
-            return (
-                "REQUIRED",
-                f"QA receipt required ({requirement_reason}): before/after screenshot provenance "
-                f"failed: {'; '.join(shot_problems)}.",
-                declaration["url"] or None,
-            )
         return (
             "PASSED",
             f"browser QA receipt binds head {head_sha[:8]} ({requirement_reason})",
@@ -853,10 +871,23 @@ def evaluate_qa_receipt(
         )
 
     if not declarations:
+        if not require_capture:
+            return (
+                "REQUIRED",
+                f"QA receipt required ({requirement_reason}): no PR comment carries a "
+                "'QA-RECEIPT: PASS' marker.",
+                None,
+            )
+        if evidence_comments:
+            first_url = str(evidence_comments[0].get("html_url") or evidence_comments[0].get("url") or "") or None
+            return (
+                "PASSED",
+                f"browser QA receipt binds head {head_sha[:8]} ({requirement_reason})",
+                first_url,
+            )
         return (
-            "REQUIRED",
-            f"QA receipt required ({requirement_reason}): no PR comment carries a "
-            "'QA-RECEIPT: PASS' marker.",
+            "EXEMPT",
+            f"no capture evidence or QA receipt declarations for {repo}@{base_ref}",
             None,
         )
     if saw_pass_marker and not saw_pass_served:
@@ -999,16 +1030,6 @@ def evaluate_flow_qa_receipt(
             )
     declarations.sort(key=lambda item: item["posted"], reverse=True)
     target = get_flow_qa_target(repo, base_ref)
-    if target and target.sticky_failures:
-        for declaration in declarations:
-            if declaration["state"] not in ("FAIL", "FAILED"):
-                continue
-            tokens = set(declaration["tokens"]) | {
-                token.lower() for token in SHA_TOKEN_RE.findall(declaration["body"])
-            }
-            if any(binds(token) for token in tokens):
-                return "REQUIRED", f"{prefix}: a failed target still binds this content.", declaration["url"] or None
-
     saw_pass_marker = False
     saw_pass_served = False
     for declaration in declarations:
@@ -1026,6 +1047,14 @@ def evaluate_flow_qa_receipt(
                 f"{prefix}: the newest receipt binding this diff is {declaration['state']}.",
                 declaration["url"] or None,
             )
+        if target and target.sticky_failures:
+            for other in declarations:
+                if other["state"] in ("FAIL", "FAILED"):
+                    other_tokens = set(other["tokens"]) | {
+                        token.lower() for token in SHA_TOKEN_RE.findall(other["body"])
+                    }
+                    if any(binds(token) for token in other_tokens):
+                        return "REQUIRED", f"{prefix}: a failed target still binds this content.", other["url"] or None
         project = "shipnovo" if repo.lower() == "wladefant/shipnovo" else "polysimulator"
         source_lines = re.findall(r"(?m)^FLOW-QA-SOURCE runner=([0-9a-f]{64}) flow=([0-9a-f]{64}) project=([a-z0-9-]+)$", declaration["body"])
         try:
@@ -1042,6 +1071,15 @@ def evaluate_flow_qa_receipt(
             problems = shot_provenance_problems(declaration["body"], lambda sha: sha.lower() == head_sha.lower(), True)
             if problems:
                 return "REQUIRED", f"{prefix}: capture provenance failed: {'; '.join(problems)}", declaration["url"] or None
+            for source in list(pr_data.get("comments") or []) + list(pr_data.get("reviews") or []):
+                s_body = str(source.get("body") or "")
+                if s_body == declaration["body"]:
+                    continue
+                if SHOT_CLAIM_RE.search(s_body):
+                    s_problems = shot_provenance_problems(s_body, lambda sha: sha.lower() == head_sha.lower(), True)
+                    if s_problems:
+                        s_url = str(source.get("html_url") or source.get("url") or "") or declaration["url"] or None
+                        return "REQUIRED", f"{prefix}: capture provenance failed: {'; '.join(s_problems)}", s_url
         counts = FLOW_QA_ASSERTIONS_RE.search(declaration["body"])
         if counts is None:
             return "REQUIRED", f"{prefix}: no 'FLOW-QA-ASSERTIONS pass=N fail=M' line.", declaration["url"] or None
