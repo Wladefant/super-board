@@ -51,7 +51,8 @@ Invariants:
     - The acquire-mode owner PID is the nearest veyyon session host (not its
       `__veyyon_worker*` helpers); the ancestor climb stops at a parent created after its
       child, since Windows reuses a dead parent's PID.
-    - RAM admission reserves each job's declared memory and keeps a 3 GiB floor.
+    - RAM admission charges held reservations during ramp-up (heavy 300s, medium
+      120s, light 60s), then uses available RAM alone, keeping a 3 GiB floor.
       Idle wait never bypasses guards. Force requires BUILD_SLOT_ALLOW_FORCE=1.
     - Operator build freeze: when 'build-freeze' exists in run_dir, acquire and run
       commands are refused immediately with exit 75 and 'build freeze active (<reason>)'
@@ -228,6 +229,7 @@ LAST_ACQUIRED_FILE_NAME = "last-acquired-at.json"
 DEFAULT_PID_DEAD_GRACE_PERIOD_SECONDS = 60.0  # never reclaim a dead-PID lock younger than 60s
 
 MEMORY_RESERVATIONS = {"heavy": 3.0, "medium": 1.5, "light": 0.5}
+MEMORY_RAMP_SECONDS = {"heavy": 300.0, "medium": 120.0, "light": 60.0}
 MEMORY_FLOOR_GIB = 3.0
 
 
@@ -2347,10 +2349,21 @@ class BuildSlotManager:
         available = get_available_ram_gib()
         held = [self._read_slot_info(i) for i, path in enumerate(self.slot_dirs) if os.path.isdir(path)]
         reserved = sum(float((info or {}).get("mem_gib", 3.0)) for info in held)
+        ramp_reservations = 0.0
+        now = time.time()
+        for info in held:
+            info = info or {}
+            acquired = _parse_timestamp(info.get("acquired_at_epoch", info.get("acquired_at")))
+            window = MEMORY_RAMP_SECONDS.get(info.get("job_class", "heavy"), MEMORY_RAMP_SECONDS["heavy"])
+            # Available RAM already excludes a settled job's memory. Reserve only
+            # during its peak ramp; unknown or future timestamps stay conservative.
+            if acquired is None or not math.isfinite(acquired) or now - acquired < window:
+                ramp_reservations += float(info.get("mem_gib", 3.0))
         return {
             "available_gib": available, "reserved_gib": reserved,
+            "ramp_reservations_gib": ramp_reservations,
             "floor_gib": MEMORY_FLOOR_GIB,
-            "free_budget_gib": None if available is None else available - reserved - MEMORY_FLOOR_GIB,
+            "free_budget_gib": None if available is None else available - ramp_reservations - MEMORY_FLOOR_GIB,
             "heavy_jobs": sum((info or {}).get("job_class", "heavy") == "heavy" for info in held),
         }
 
@@ -2365,7 +2378,7 @@ class BuildSlotManager:
             elif free < mem_gib:
                 reasons.append(
                     f"budget: available {budget['available_gib']:.2f} - reserved "
-                    f"{budget['reserved_gib']:.2f} - floor {budget['floor_gib']:.2f} "
+                    f"{budget.get('ramp_reservations_gib', budget['reserved_gib']):.2f} - floor {budget['floor_gib']:.2f} "
                     f"= {free:.2f} GiB, needs {mem_gib:.2f} GiB"
                 )
         return "; ".join(reasons) or None
