@@ -3690,10 +3690,10 @@ class TestBuildSlot(unittest.TestCase):
         manager.release("slot-1")
         manager.release("slot-2-ok")
 
-    def test_legacy_slots_without_metadata_reserve_three_gib(self):
-        """Legacy slots without mem_gib or job_class in metadata reserve 3.0 GiB."""
+    def test_legacy_slots_without_metadata_reserve_five_gib(self):
+        """Legacy slots without reservation metadata keep the 5 GiB heavy minimum."""
         manager = BuildSlotManager(run_dir=self.run_dir)
-        os.environ["BUILD_SLOT_AVAILABLE_GIB"] = "8.0"
+        os.environ["BUILD_SLOT_AVAILABLE_GIB"] = "10.0"
 
         # Create simulated legacy slot directory and info.json with no mem_gib or job_class
         os.makedirs(manager.slot_dirs[0], exist_ok=True)
@@ -3708,11 +3708,11 @@ class TestBuildSlot(unittest.TestCase):
         with open(os.path.join(manager.slot_dirs[0], build_slot.INFO_FILE_NAME), "w", encoding="utf-8") as f:
             json.dump(legacy_info, f)
 
-        # 8.0 available - 3.0 legacy - 3.0 new = 2.0 < 3.0 floor -> refused
+        # 10.0 available - 5.0 legacy - 3.0 new = 2.0 < 3.0 floor -> refused
         with redirect_stderr(io.StringIO()):
             self.assertFalse(manager.acquire("slot-new-fail", mem_gib=3.0, timeout=0.2, poll_interval=0.02))
 
-        # 8.0 available - 3.0 legacy - 2.0 new = 3.0 >= 3.0 floor -> admitted
+        # 10.0 available - 5.0 legacy - 2.0 new = 3.0 >= 3.0 floor -> admitted
         self.assertTrue(manager.acquire("slot-new-ok", mem_gib=2.0, timeout=1.0))
         manager.release("slot-new-ok")
         manager.release("legacy-lane")
@@ -3967,7 +3967,7 @@ class TestBuildSlot(unittest.TestCase):
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def test_classify_command_job_classes(self):
-        """classify_command returns 'heavy', 'medium', or 'light'."""
+        """Commands classify as heavy, medium, light, or browser."""
         self.assertEqual(build_slot.classify_command(["npx", "next", "build"]), "heavy")
         self.assertEqual(build_slot.classify_command(["npm", "run", "build"]), "heavy")
         self.assertEqual(build_slot.classify_command(["bun", "run", "build"]), "heavy")
@@ -3976,7 +3976,7 @@ class TestBuildSlot(unittest.TestCase):
 
         self.assertEqual(build_slot.classify_command(["npx", "vitest", "run"]), "medium")
         self.assertEqual(build_slot.classify_command(["vitest"]), "medium")
-        self.assertEqual(build_slot.classify_command(["npx", "playwright", "test"]), "heavy")
+        self.assertEqual(build_slot.classify_command(["npx", "playwright", "test"]), "browser")
         self.assertEqual(build_slot.classify_command(["pytest"]), "light")
 
         self.assertEqual(build_slot.classify_command(["echo", "hello"]), "light")
@@ -4083,11 +4083,11 @@ class TestBuildSlot(unittest.TestCase):
         stat_held = manager.status()
         held_slot = next(s for s in stat_held["slots"] if s["owner"] == "lane-status-test")
         self.assertEqual(held_slot.get("job_class"), "heavy")
-        self.assertEqual(held_slot.get("mem_gib"), 3.0)
+        self.assertEqual(held_slot.get("mem_gib"), 5.0)
 
         mb_held = stat_held["memory_budget"]
-        self.assertEqual(mb_held["reserved_gib"], 3.0)
-        self.assertEqual(mb_held["free_budget_gib"], 26.0)
+        self.assertEqual(mb_held["reserved_gib"], 5.0)
+        self.assertEqual(mb_held["free_budget_gib"], 24.0)
 
         manager.release("lane-status-test")
 if __name__ == "__main__":
