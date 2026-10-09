@@ -1911,7 +1911,7 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
   // Check: tap_target_min_44
   if (vpConfig.isMobile && (requestedChecks.includes('tap_target_min_44') || requestedChecks.includes('target_min_44') || (step.action === 'tap' && !step.optional))) {
     const insp = preInspection || postInspection;
-    checksResults.push(checkTapTargetMin44(insp?.rect || insp?.hitRect));
+    checksResults.push(checkTapTargetMin44(insp?.hitRect || insp?.rect));
   }
 
   // Check: no_horizontal_overflow

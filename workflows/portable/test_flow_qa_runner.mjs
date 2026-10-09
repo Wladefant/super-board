@@ -387,6 +387,46 @@ test('checkTapTargetMin44: verifies 44x44px minimum touch target size', () => {
   assert.equal(negBoth.passed, false);
 });
 
+test('executeStep measures expanded hitRect before the smaller visible rect', async () => {
+  const browser = await resolvePuppeteer().launch({
+    executablePath: resolveExecutablePath() || undefined,
+    headless: 'new',
+    args: ['--no-sandbox', '--disable-gpu']
+  });
+  const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'flowqa-hitrect-'));
+  try {
+    const { page, cdp } = await openFlowPage(browser);
+    await page.setViewport(VIEWPORTS['390x844']);
+    await page.setContent(`
+      <style>
+        body { margin: 40px; }
+        button { position: relative; width: 20px; height: 20px; padding: 0; border: 0; }
+        #expanded::before { content: ''; position: absolute; inset: -12px; }
+        #small { margin-left: 80px; }
+      </style>
+      <button id="expanded" onclick="this.dataset.tapped = 'yes'">A</button>
+      <button id="small">B</button>
+    `);
+    const visible = await page.$eval('#expanded', (el) => {
+      const rect = el.getBoundingClientRect();
+      return { width: rect.width, height: rect.height };
+    });
+    assert.deepEqual(visible, { width: 20, height: 20 });
+    const ctx = { flow: { id: 'hitrect' }, baseUrl: 'http://127.0.0.1', outputDir, flowConstraints: {} };
+    const expanded = await executeStep(page, cdp,
+      { id: 'expanded', action: 'tap', selector: '#expanded' }, '390x844', 'light', ctx);
+    const tapTarget = expanded.checks.find((check) => check.name === 'tap_target_min_44');
+    assert.equal(tapTarget?.passed, true, tapTarget?.detail);
+    assert.equal(await page.$eval('#expanded', (el) => el.dataset.tapped), 'yes');
+    const small = await executeStep(page, cdp,
+      { id: 'small', action: 'tap', selector: '#small' }, '390x844', 'light', ctx);
+    assert.equal(small.checks.find((check) => check.name === 'tap_target_min_44')?.passed, false);
+  } finally {
+    await browser.close();
+    fs.rmSync(outputDir, { recursive: true, force: true });
+  }
+});
+
 test('checkNoHorizontalOverflow: detects mobile horizontal overflow drift', () => {
   // Positive control 1: exact match
   const posExact = checkNoHorizontalOverflow(390, 390);

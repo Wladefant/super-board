@@ -37,6 +37,8 @@ The Adoption Audit regression command is `python test_adoption_audit.py`.
 The Outer-Loop webhook intake regression command is `python test_outer_loop_intake.py`.
 The Theo/T3 workflow tools (issue #208) each have a regression command: `python test_evidence_lint.py` (evidence link lint and posted-media check), `python test_pr_demo_video.py` (PR demo video step), `python test_pr_label_bot.py` (size and risk labels), `python test_project_drift.py` (Project 5 drift sweep). `install_upkeep_task.py` registers the bounded hourly sweep `SuperboardUpkeepHourly` (label bot plus drift repair, super-board only; PolySimulator is report-only).
 The Flow QA runner regression command is `node --test test_flow_qa_runner.mjs`.
+Mobile tap-target checks measure the effective `hitRect` first, including clickable pseudo-elements.
+They use the visible `rect` only when no effective hit area is available.
 The runner binds receipts to the measured server SHA from `/api/version`. An untrusted caller `bindSha` cannot override the measured SHA.
 Version readers prefer a full 40-hex `commit`. They accept legacy `sha`, `served_sha`, `version`, `git_sha`, and `commitSha` only as full 40-hex values.
 SemVer and `deploymentId` do not identify served content. A payload without a valid commit fails closed.
