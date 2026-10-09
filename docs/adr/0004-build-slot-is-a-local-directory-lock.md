@@ -42,10 +42,10 @@ Memory admission and job classification invariants:
 - `--force` requires `BUILD_SLOT_ALLOW_FORCE=1`. Without it, acquisition fails. Authorized force logs the override and bypasses memory admission.
 - Even when `BUILD_SLOT_ALLOW_FORCE=1` is set, `--force` cannot bypass the one-heavy job concurrency cap.
 - The obsolete idle bypass is removed. Queue wait duration never bypasses host memory safety invariants.
-- Admission reads the stagger again under the slot guard before publishing a grant.
+- Heavy admission reads the stagger again under the slot guard before publishing a grant. Light and medium jobs skip the stagger but retain memory admission. Only heavy grants advance the stagger timestamp.
 - Waiters print resource refusal reasons and include the last reason in timeout output.
 - Smaller jobs can backfill a resource-blocked head without changing its position or enqueue time.
-- After 20 minutes, a heavy head pauses backfill only with no held heavy job and enough projected memory after reservations release.
+- After 20 minutes, a heavy head reserves a 60-second drain window every 180 seconds when no heavy job runs. Smaller jobs can backfill between windows. Existing long-lived holders cannot pause backfill forever. The head keeps first admission whenever it fits.
 - An impossible head does not pause backfill. Output reports its required memory and maximum possible budget.
 
 Command execution deadline and process tree invariants:

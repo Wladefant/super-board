@@ -214,6 +214,27 @@ class TestBuildSlotAdmissionAndResourceRefusal(unittest.TestCase):
         self.assertIsNotNone(reason)
         self.assertTrue("aging" in reason.lower() or "paused" in reason.lower() or "starv" in reason.lower())
 
+    def test_aged_head_drain_windows_are_bounded(self):
+        queue = [
+            {"name": "head", "token": "head", "job_class": "heavy",
+             "mem_gib": 3.0, "enqueued_at": 1000.0},
+            {"name": "light", "token": "light", "job_class": "light",
+             "mem_gib": 0.5, "enqueued_at": 1100.0},
+        ]
+        budget = {"available_gib": 6.5, "reserved_gib": 1.5,
+                  "floor_gib": 3.0, "free_budget_gib": 2.0, "heavy_jobs": 0}
+        for age, expected in [(1205, False), (1259, False), (1260, True),
+                              (1379, True), (1380, False), (1440, True),
+                              (3060, True)]:
+            with self.subTest(age=age):
+                allowed, reason = self.manager._queue_admission(
+                    queue, "light", budget, 1000.0 + age)
+                self.assertEqual(allowed, expected, reason)
+        self.assertEqual(queue[0]["enqueued_at"], 1000.0)
+        budget["free_budget_gib"] = 3.0
+        self.assertTrue(self.manager._queue_admission(queue, "head", budget, 2300.0)[0])
+        self.assertFalse(self.manager._queue_admission(queue, "light", budget, 2300.0)[0])
+
     def test_queue_admission_aging_does_not_pause_backfill_when_heavy_job_already_held(self):
         """When heavy_jobs >= 1, aging does not pause backfill for smaller jobs because heavy head cannot run anyway."""
         now = time.time()
@@ -374,10 +395,20 @@ class TestBuildSlotStaleStaggerSnapshotRace(unittest.TestCase):
 
         with mock.patch("build_slot._transition_guard", side_effect=race_simulating_guard):
             # Attempt acquire with timeout=0.1
-            acquired = self.manager.acquire("delayed-lane", timeout=0.1, poll_interval=0.02)
+            acquired = self.manager.acquire("delayed-lane", timeout=0.1, poll_interval=0.02, job_class="heavy")
 
         self.assertFalse(acquired, "Acquisition must be refused when stagger is rechecked inside guard and active")
         self.assertFalse(self.manager.is_held_by("delayed-lane"))
+
+    def test_light_and_medium_skip_stagger_without_delaying_heavy(self, *_probes):
+        self.manager._record_last_acquired_at("heavy-before", 1111, 0)
+        last = self.manager._read_last_acquired_at()
+        for job_class in ("light", "medium"):
+            with self.subTest(job_class=job_class):
+                self.assertTrue(self.manager.acquire(
+                    job_class, timeout=.1, poll_interval=.02, job_class=job_class))
+                self.assertEqual(self.manager._read_last_acquired_at(), last)
+                self.manager.release(job_class)
 
 
 class TestBuildSlotSharedPidHeartbeatExpiry(unittest.TestCase):
