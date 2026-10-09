@@ -47,6 +47,67 @@ from build_slot import BuildSlotManager, is_pid_alive, _queue_atomic_lock
 class TestBuildSlot(unittest.TestCase):
     """Unit tests for the BuildSlotManager lock arbiter."""
 
+    def test_transition_guard_recovers_dead_owner(self):
+        path = os.path.join(self.run_dir, "build-slot.guard")
+        code = (
+            "import os,sys; sys.path.insert(0,sys.argv[1]); import build_slot; "
+            "g=build_slot._transition_guard(sys.argv[2]); g.__enter__(); os._exit(0)"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", code, SCRIPT_DIR, path],
+            capture_output=True, text=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        sidecar = path + ".owner.json"
+        with open(sidecar, encoding="utf-8") as stream:
+            dead_owner = json.load(stream)
+        self.assertFalse(is_pid_alive(dead_owner["pid"]))
+        started = time.monotonic()
+        with build_slot._transition_guard(path, timeout=0.5):
+            with open(sidecar, encoding="utf-8") as stream:
+                owner = json.load(stream)
+            self.assertEqual(owner["pid"], os.getpid())
+            self.assertNotEqual(owner["token"], dead_owner["token"])
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertFalse(os.path.exists(sidecar))
+
+    def test_stale_checks_do_not_hold_transition_guard(self):
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        self.assertTrue(manager.acquire("probe", timeout=2))
+        observed = []
+        def probe(pid):
+            held = getattr(build_slot._guard_state, "held", set())
+            observed.append(os.path.abspath(os.path.join(self.run_dir, "build-slot.guard")) in held)
+            return True
+        with mock.patch.object(manager, "is_pid_alive", side_effect=probe):
+            manager.check_stale_and_reclaim()
+        self.assertEqual(observed, [False])
+
+    def test_release_queue_cleanup_does_not_hold_transition_guard(self):
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        self.assertTrue(manager.acquire("probe", timeout=2))
+        def cleanup(*args):
+            held = getattr(build_slot._guard_state, "held", set())
+            self.assertNotIn(os.path.abspath(os.path.join(self.run_dir, "build-slot.guard")), held)
+        with mock.patch.object(manager, "_dequeue_best_effort", side_effect=cleanup):
+            self.assertTrue(manager.release("probe"))
+
+    def test_release_output_does_not_block_other_guard_users(self):
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        self.assertTrue(manager.acquire("probe", timeout=2))
+        def output(*args, **kwargs):
+            results = []
+            def contender():
+                with build_slot._transition_guard(os.path.join(self.run_dir, "build-slot.guard"), timeout=0.2):
+                    results.append(True)
+            thread = threading.Thread(target=contender)
+            thread.start()
+            thread.join(timeout=1)
+            self.assertEqual(results, [True])
+        with mock.patch("builtins.print", side_effect=output):
+            self.assertTrue(manager.release("probe"))
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="test-build-slot-")
         self.run_dir = self.tmp.name
