@@ -174,6 +174,52 @@ test('a tap that opens an overlay is judged by the control as tapped, not by the
   }
 });
 
+const WRAPPED_LINK_PAGE = `
+  <main style="margin:0"><p style="width:300px;margin:0;font:16px/20px monospace">aaaaaaaaaaaaaaaaaaaaaaaa <a id="wrap" href="https://example.test/x">bbbbb ccccc</a> ddddd</p></main>`;
+
+async function runWrappedLink(extraHtml) {
+  const puppeteer = resolvePuppeteer();
+  const browser = await puppeteer.launch({
+    executablePath: resolveExecutablePath() || undefined,
+    headless: 'new',
+    args: ['--no-sandbox']
+  });
+  const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'flowqa-wrap-'));
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width: 390, height: 844 });
+    await page.setContent(WRAPPED_LINK_PAGE + extraHtml);
+    const geometry = await page.evaluate(() => {
+      const el = document.getElementById('wrap');
+      const r = el.getBoundingClientRect();
+      const hit = document.elementFromPoint(Math.round(r.x + r.width / 2), Math.round(r.y + r.height / 2));
+      return { rects: el.getClientRects().length, unionCentreHitsLink: hit === el };
+    });
+    const res = await executeStep(page, null,
+      { id: 'link', action: 'assert', selector: 'a#wrap', checks: ['visible', 'element_from_point'] },
+      '390x844', 'light', { flow: { id: 'f' }, baseUrl: 'http://localhost', outputDir, flowConstraints: {} });
+    return { geometry, checks: res.checks };
+  } finally {
+    await browser.close();
+    fs.rmSync(outputDir, { recursive: true, force: true });
+  }
+}
+
+test('a link that wraps across two lines is uncovered when the centre of one of its own line boxes hits it', async () => {
+  const { geometry, checks } = await runWrappedLink('');
+  assert.equal(geometry.rects, 2, 'the link really wraps');
+  assert.equal(geometry.unionCentreHitsLink, false, 'the union box centre misses the link, so the old check failed here');
+  assert.deepEqual(checks.filter((c) => !c.passed), []);
+});
+
+test('a real overlay over a wrapped link still fails element_from_point', async () => {
+  const { checks } = await runWrappedLink('<div class="veil" style="position:fixed;inset:0;background:#000"></div>');
+  const failed = checks.filter((c) => !c.passed);
+  assert.equal(failed.length, 1);
+  assert.equal(failed[0].name, 'element_from_point');
+  assert.match(failed[0].detail, /covered by <div\.veil>/);
+});
+
 test('cleanup with repeat and then deletes every matching row through its confirm dialog', async () => {
   const puppeteer = resolvePuppeteer();
   const browser = await puppeteer.launch({
