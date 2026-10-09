@@ -34,16 +34,21 @@ Pure standard library; shells out to `gh` only for verify-posted.
 from __future__ import annotations
 
 import argparse
+import io
 import json
+import os
 import re
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from html.parser import HTMLParser
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
+
+SHOT_MIN_CHANGED_RATIO = 0.0005
 
 UUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 ATTACHMENT_RE = re.compile(rf"^https://github\.com/user-attachments/(assets/{UUID}|files/\d+/[^\s]+)$")
@@ -198,6 +203,207 @@ def extract_media_urls(html: str) -> List[Tuple[str, str]]:
     return p.urls
 
 
+class _TableCollector(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.tables: List[List[List[dict]]] = []
+        self._cur_table: Optional[List[List[dict]]] = None
+        self._cur_row: Optional[List[dict]] = None
+        self._cur_cell: Optional[dict] = None
+        self._cell_text: List[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        attrs_d = dict(attrs)
+        if tag == "table":
+            self._cur_table = []
+        elif tag == "tr" and self._cur_table is not None:
+            self._cur_row = []
+        elif tag in ("th", "td") and self._cur_row is not None:
+            self._cur_cell = {"tag": tag, "imgs": [], "text": ""}
+            self._cell_text = []
+        elif tag in ("img", "video", "source") and self._cur_cell is not None:
+            src = attrs_d.get("src")
+            if src:
+                self._cur_cell["imgs"].append((src, attrs_d.get("alt", "")))
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in ("th", "td") and self._cur_cell is not None:
+            self._cur_cell["text"] = "".join(self._cell_text).strip()
+            if self._cur_row is not None:
+                self._cur_row.append(self._cur_cell)
+            self._cur_cell = None
+        elif tag == "tr" and self._cur_row is not None:
+            if self._cur_table is not None:
+                self._cur_table.append(self._cur_row)
+            self._cur_row = None
+        elif tag == "table" and self._cur_table is not None:
+            self.tables.append(self._cur_table)
+            self._cur_table = None
+
+    def handle_data(self, data: str) -> None:
+        if self._cur_cell is not None:
+            self._cell_text.append(data)
+
+
+def extract_table_pairs(html: str) -> List[Tuple[str, str, str]]:
+    """
+    Extract explicit before/after screenshot pairs from HTML tables.
+    Requires distinct 'before' and 'after' column headers.
+    Pairs images in document order within matching rows, ignoring ambiguous alt text.
+    Does not mistake side-by-side galleries (e.g. mobile vs desktop) for before/after.
+    Returns list of (before_url, after_url, label).
+    """
+    parser = _TableCollector()
+    parser.feed(html)
+    pairs = []
+    for table_idx, rows in enumerate(parser.tables):
+        if not rows:
+            continue
+        header_row_idx = None
+        before_col = None
+        after_col = None
+        label_col = None
+
+        for r_idx, row in enumerate(rows):
+            headers = [c["text"] for c in row]
+            b_c = None
+            a_c = None
+            for c_idx, h in enumerate(headers):
+                has_b = bool(re.search(r"\bbefore\b", h, re.I))
+                has_a = bool(re.search(r"\bafter\b", h, re.I))
+                if has_b and not has_a:
+                    b_c = c_idx
+                elif has_a and not has_b:
+                    a_c = c_idx
+            if b_c is not None and a_c is not None:
+                header_row_idx = r_idx
+                before_col = b_c
+                after_col = a_c
+                for c_idx in range(len(headers)):
+                    if c_idx != b_c and c_idx != a_c:
+                        label_col = c_idx
+                        break
+                break
+
+        if before_col is None or after_col is None or header_row_idx is None:
+            continue
+
+        for r_idx in range(header_row_idx + 1, len(rows)):
+            row = rows[r_idx]
+            if len(row) <= max(before_col, after_col):
+                continue
+            b_cell = row[before_col]
+            a_cell = row[after_col]
+            row_label = (
+                row[label_col]["text"]
+                if label_col is not None and len(row) > label_col and row[label_col]["text"]
+                else f"Table {table_idx + 1} Row {r_idx}"
+            )
+            b_imgs = [src for src, _ in b_cell["imgs"]]
+            a_imgs = [src for src, _ in a_cell["imgs"]]
+            for b_src, a_src in zip(b_imgs, a_imgs):
+                pairs.append((b_src, a_src, row_label))
+    return pairs
+
+
+class _AuthRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """HTTP redirect handler that strips Authorization headers when redirected (e.g. S3)."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_req:
+            new_req.headers.pop("Authorization", None)
+            new_req.headers.pop("authorization", None)
+        return new_req
+
+
+def fetch_media_bytes(source: str, timeout: int = 30) -> bytes:
+    """Fetch raw bytes from a local path, file:// URL, or HTTP(S) URL."""
+    if source.startswith("http://") or source.startswith("https://"):
+        headers = {"User-Agent": "super-board-evidence-lint"}
+        token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+        if token and "github.com" in source:
+            headers["Authorization"] = f"token {token}"
+        opener = urllib.request.build_opener(_AuthRedirectHandler())
+        req = urllib.request.Request(source, headers=headers)
+        with opener.open(req, timeout=timeout) as resp:
+            return resp.read()
+    if source.startswith("file://"):
+        parsed = urllib.parse.urlparse(source)
+        path = urllib.parse.unquote(parsed.path)
+        if sys.platform == "win32" and path.startswith("/") and len(path) > 2 and path[2] == ":":
+            path = path[1:]
+        with open(path, "rb") as f:
+            return f.read()
+    with open(source, "rb") as f:
+        return f.read()
+
+
+def compare_pair(
+    before_source: Union[str, bytes],
+    after_source: Union[str, bytes],
+    threshold: float = SHOT_MIN_CHANGED_RATIO,
+    timeout: int = 30,
+) -> Tuple[bool, str, Optional[float]]:
+    """
+    Compare a before/after screenshot pair.
+    Refuses byte-identical images, re-encoded images with identical RGB pixels,
+    pairs with changed-pixel ratio < threshold, and mismatched dimensions.
+    Returns (passed, reason, changed_ratio).
+    """
+    try:
+        b_bytes = before_source if isinstance(before_source, bytes) else fetch_media_bytes(before_source, timeout=timeout)
+        a_bytes = after_source if isinstance(after_source, bytes) else fetch_media_bytes(after_source, timeout=timeout)
+    except Exception as exc:
+        return False, f"fetch-error: {exc}", None
+
+    if b_bytes == a_bytes:
+        return False, "byte-identical: before and after images are byte-for-byte identical (same sha256 / file bytes)", 0.0
+
+    try:
+        from PIL import Image, ImageChops
+    except ImportError:
+        return False, "dependency-missing: Pillow is required for pixel decoding and dimension comparison", None
+
+    try:
+        b_im = Image.open(io.BytesIO(b_bytes))
+        a_im = Image.open(io.BytesIO(a_bytes))
+    except Exception as exc:
+        return False, f"decode-error: cannot decode image: {exc}", None
+
+    if b_im.size != a_im.size:
+        return (
+            False,
+            f"dimension-mismatch: before ({b_im.width}x{b_im.height}) and after ({a_im.width}x{a_im.height}) dimensions do not match",
+            None,
+        )
+
+    b_rgb = b_im.convert("RGB")
+    a_rgb = a_im.convert("RGB")
+    diff = ImageChops.difference(b_rgb, a_rgb)
+    r, g, b = diff.split()
+    any_diff = ImageChops.lighter(ImageChops.lighter(r, g), b)
+    hist = any_diff.histogram()
+    total = b_im.width * b_im.height
+    changed = total - hist[0]
+    ratio = changed / float(total)
+
+    if changed == 0:
+        return False, "reencoded-identical: before and after decoded RGB pixels are identical (changed_ratio=0.0)", 0.0
+
+    if ratio < threshold:
+        return (
+            False,
+            f"near-identical: changed-pixel ratio {ratio:.6f} < {threshold:.6f} ({changed}/{total} pixels changed)",
+            ratio,
+        )
+
+    return (
+        True,
+        f"ok: changed-pixel ratio {ratio:.6f} >= {threshold:.6f} ({changed}/{total} pixels changed)",
+        ratio,
+    )
+
+
 COMMENT_RE = re.compile(r"https://github\.com/([\w.-]+)/([\w.-]+)/(?:issues|pull)/(\d+)(?:#issuecomment-(\d+))?")
 
 
@@ -210,6 +416,7 @@ def fetch_rendered_html(url: str, timeout: int = 60) -> str:
     proc = subprocess.run(
         ["gh", "api", "-H", "Accept: application/vnd.github.html+json", path],
         capture_output=True, text=True, timeout=timeout,
+        stdin=subprocess.DEVNULL,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
     )
     if proc.returncode != 0:
@@ -242,9 +449,24 @@ def verify_posted(url: str, retries: int = 3, delay: float = 3.0) -> Tuple[bool,
     for tag, src in media:
         ok, detail = check_media_url(src)
         results.append({"tag": tag, "url": src, "ok": ok, "detail": detail})
-    passed = bool(results) and all(r["ok"] for r in results)
-    return passed, results
 
+    table_pairs = extract_table_pairs(html)
+    for b_src, a_src, label in table_pairs:
+        ok, detail, ratio = compare_pair(b_src, a_src)
+        results.append({
+            "tag": "pair",
+            "label": label,
+            "before": b_src,
+            "after": a_src,
+            "ok": ok,
+            "detail": detail,
+            "ratio": ratio,
+        })
+
+    media_ok = bool(media) and all(r["ok"] for r in results if r.get("tag") != "pair")
+    pairs_ok = all(r["ok"] for r in results if r.get("tag") == "pair")
+    passed = media_ok and pairs_ok
+    return passed, results
 
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
@@ -265,10 +487,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     vp = sub.add_parser("verify-posted")
     vp.add_argument("url")
     vp.add_argument("--retries", type=int, default=3)
+    cp = sub.add_parser("pair", help="Compare a before/after screenshot pair")
+    cp.add_argument("before", help="path or URL to before image")
+    cp.add_argument("after", help="path or URL to after image")
+    cp.add_argument("--threshold", type=float, default=SHOT_MIN_CHANGED_RATIO, help="minimum changed-pixel ratio")
+    cp.add_argument("--timeout", type=int, default=30, help="network timeout in seconds")
     args = ap.parse_args(argv)
 
     if args.cmd == "lint":
-        text = sys.stdin.read() if args.file == "-" else open(args.file, encoding="utf8").read()
+        if args.file == "-":
+            text = sys.stdin.read()
+        else:
+            with open(args.file, encoding="utf8") as f:
+                text = f.read()
         violations = lint_text(text)
         for v in violations:
             print(v)
@@ -286,7 +517,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.cmd in ("done-report", "done-report-pr"):
         if args.cmd == "done-report":
-            text = sys.stdin.read() if args.file == "-" else open(args.file, encoding="utf8").read()
+            if args.file == "-":
+                text = sys.stdin.read()
+            else:
+                with open(args.file, encoding="utf8") as f:
+                    text = f.read()
             deleted_files = list(args.deleted)
         else:
             pr = _gh_json(["pr", "view", args.number, "--repo", args.repo, "--json", "body,files,author"])
@@ -301,12 +536,23 @@ def main(argv: Optional[List[str]] = None) -> int:
         print(f"done-report: {len(violations)} violation(s){' (warn-only)' if args.warn_only and violations else ''}")
         return 1 if violations and not args.warn_only else 0
 
+    if args.cmd == "pair":
+        ok, reason, ratio = compare_pair(args.before, args.after, threshold=args.threshold, timeout=args.timeout)
+        label = "PASS" if ok else "FAIL"
+        print(f"{label} pair: {reason}")
+        return 0 if ok else 1
+
     passed, results = verify_posted(args.url, retries=args.retries)
     for r in results:
-        print(f"{'OK  ' if r['ok'] else 'FAIL'} <{r['tag']}> {r['url'].split('?')[0]} -> {r['detail']}")
+        if r.get("tag") == "pair":
+            print(f"{'OK  ' if r['ok'] else 'FAIL'} [pair] {r['label']} -> {r['detail']}")
+        else:
+            print(f"{'OK  ' if r['ok'] else 'FAIL'} <{r['tag']}> {r['url'].split('?')[0]} -> {r['detail']}")
     if not results:
         print("verify-posted: no media found in the rendered HTML")
-    print(f"verify-posted: {'PASS' if passed else 'FAIL'} ({len(results)} media)")
+    pairs_count = sum(1 for r in results if r.get("tag") == "pair")
+    media_count = sum(1 for r in results if r.get("tag") != "pair")
+    print(f"verify-posted: {'PASS' if passed else 'FAIL'} ({media_count} media, {pairs_count} pair(s))")
     return 0 if passed else 1
 
 

@@ -18,6 +18,9 @@ Captures before and after visual comparisons for UI changes and embeds them into
 - **Mandatory Display Confirmation:** Immediately after posting an issue or PR comment, reload the page on GitHub and verify every attached image visibly renders. Never claim visual proof without confirming the rendered asset.
 - **Staging Only:** Drive tests against staging (`https://staging.polysimulator.com`) or local dev server. PolySimulator production (`https://polysimulator.com`, `<prod-supabase-ref>`) is strictly off-limits.
 
+- **No-Visible-Change Rule:** If a change causes no visual UI difference, omit the before/after table. State that the change has no visible UI effect. Never post identical screenshots.
+- **Pair Non-Identity Invariant:** Every before/after pair must prove a real visual difference. The gate rejects byte-identical images, re-encoded identical pixels, and near-identical pairs. The minimum changed-pixel ratio is 0.0005 (0.05%). Pairs with different dimensions are rejected.
+
 ## Capture Protocol with Veyyon Browser Tool
 
 Use the built-in Veyyon `browser` tool to capture clean, reproducible screenshots of before and after states.
@@ -110,5 +113,24 @@ Format visual evidence in pull requests and tracking issues as centered comparis
 - Verified image rendering: Confirmed visible in GitHub UI
 ```
 
+## Verification and Linting
+
+### 1. Verify Image Pair Locally Before Posting
+Run the pair check tool on the captured files:
+```bash
+python workflows/portable/evidence_lint.py pair <before-path-or-url> <after-path-or-url>
+```
+The tool decodes RGB pixels and verifies matching dimensions.
+It fails with exit 1 if the images are byte-identical, re-encoded identical, or below the 0.0005 change threshold.
+
+### 2. Verify Posted PR or Issue Comment
+After posting evidence to GitHub, verify the comment:
+```bash
+python workflows/portable/evidence_lint.py verify-posted <comment-or-pr-url>
+```
+The command verifies that all media URLs resolve.
+It also extracts every before/after table pair and confirms that each pair passes the pixel change threshold.
+
 ## Post-Upload Check
-Immediately navigate to the PR or issue URL via `gh pr view --web` or browser observation and verify that all image URLs resolve with HTTP 200 and display the intended visual content.
+Open the PR or issue URL in a browser.
+Confirm that all images render and show the intended visual delta.
