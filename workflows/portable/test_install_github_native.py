@@ -48,6 +48,10 @@ class Installation(unittest.TestCase):
         names = (
             ("portable", "flow_qa_runner.mjs"),
             ("portable", "depth_report_capture.mjs"),
+            ("portable", "review_content.py"),
+            ("portable", "github_pr_gate.py"),
+            ("portable", "flows/shipnovo.json"),
+            ("portable", "flows/polysimulator.json"),
             ("e2e", "e2e_receipt.py"),
             ("e2e", "e2e_guard.py"),
             ("e2e", "pins.json"),
@@ -65,6 +69,34 @@ class Installation(unittest.TestCase):
             self.assertEqual(target.read_bytes(), name.encode())
         self.assertEqual(self.profile.read_bytes(), b"live operator policy")
         self.assertEqual((self.runtime / "state.json").read_bytes(), b"operator state")
+
+    def test_sha_reader_bundle_installs_canonical_qa_dependencies(self):
+        import install_github_native as installer
+        portable = self.source / "workflows/portable"
+        for name in ("flow_qa_runner.mjs", "depth_report_capture.mjs", "review_content.py", "github_pr_gate.py",
+                     "flows/shipnovo.json", "flows/polysimulator.json"):
+            source = portable / name
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(name.encode())
+        for name in ("e2e_receipt.py", "e2e_guard.py", "pins.json"):
+            source = self.source / "workflows/e2e" / name
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(name.encode())
+        self.assertTrue(installer.synchronize_sha_readers(self.source, self.runtime))
+        for name in ("review_content.py", "github_pr_gate.py", "flows/shipnovo.json", "flows/polysimulator.json"):
+            self.assertEqual((self.runtime / name).read_bytes(), (portable / name).read_bytes())
+        (self.runtime / "flows/shipnovo.json").write_bytes(b"weakened flow")
+        self.assertFalse(installer.synchronize_sha_readers(self.source, self.runtime, check=True))
+
+    def test_default_install_includes_canonical_runner_and_flows(self):
+        names = ("flow_qa_runner.mjs", "flows/shipnovo.json", "flows/polysimulator.json")
+        for name in names:
+            source = self.source / "workflows/portable" / name
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(name.encode())
+        self.assertTrue(synchronize(self.source, self.profile, self.runtime))
+        for name in names:
+            self.assertEqual((self.runtime / name).read_bytes(), name.encode())
 
     def test_exact_install_idempotence_and_drift_detection(self):
         self.assertTrue(synchronize(self.source, self.profile, self.runtime))

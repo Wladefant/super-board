@@ -15,6 +15,8 @@ class InstalledGateReviews(fixtures.ContentReviews):
                 'baseRefName': 'staging', 'baseRefOid': self.base,
                 'author': {'login': 'author'}, 'reviews': reviews,
                 'statusCheckRollup': [],
+                'files': [{'path': 'app', 'additions': 1, 'deletions': 1}],
+                'labels': [{'name': 'risk:high'}],
             }, repo='Bavariance/polysimulator' if staging else 'example/fixture')
             self.last_result = result
             return {'passed': result.gate_verdict == 'PASSED'}

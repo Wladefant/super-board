@@ -56,12 +56,17 @@ def json_pages(text):
 
 
 def git(*args, cwd=None, input=None):
-    return subprocess.check_output(['git', *args], cwd=cwd, input=input, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).decode().strip()
+    options = {"input": input} if input is not None else {"stdin": subprocess.DEVNULL}
+    return subprocess.check_output(['git', *args], cwd=cwd, timeout=10,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                                   **options).decode().strip()
 
 
 def is_ancestor(source, sha, cwd=None):
     return subprocess.run(['git', 'merge-base', '--is-ancestor', source, sha], cwd=cwd,
-                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).returncode == 0
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                          stdin=subprocess.DEVNULL, timeout=10,
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).returncode == 0
 
 
 def content_identity(sha, base='origin/staging', cwd=None):
@@ -75,7 +80,9 @@ def content_identity(sha, base='origin/staging', cwd=None):
         raise ValueError('Review/head must name a full commit SHA')
     git('cat-file', '-e', sha + '^{commit}', cwd=cwd)
     ancestor = git('merge-base', base, sha, cwd=cwd)
-    diff = subprocess.check_output(['git', 'diff', '--binary', '-U0', ancestor + '..' + sha], cwd=cwd, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    diff = subprocess.check_output(['git', 'diff', '--binary', '-U0', ancestor + '..' + sha],
+                                   cwd=cwd, stdin=subprocess.DEVNULL, timeout=10,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     result = git('patch-id', '--stable', cwd=cwd, input=diff)
     normalized = b''.join(line for line in diff.splitlines(keepends=True)
                           if not line.startswith((b'@@ ', b'index ')))

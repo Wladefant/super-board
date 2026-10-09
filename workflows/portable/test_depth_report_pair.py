@@ -68,11 +68,11 @@ class TestPair(unittest.TestCase):
     def assertRefused(self, problems, needle):
         self.assertTrue(any(needle in p for p in problems), f"no problem mentions {needle!r}: {problems}")
 
-    def test_a_real_change_passes_and_the_pr_gate_accepts_its_lines(self):
+    def test_report_change_passes_pair_check_but_is_not_authenticated_product_evidence(self):
         problems, lines = pair.evaluate(*self.captures())
         self.assertEqual(problems, [])
         body = "| **1440** | ![before 1440](b.png) | ![after 1440](a.png) |\n\n```text\n" + "\n".join(lines) + "\n```\n"
-        self.assertEqual(github_pr_gate.shot_provenance_problems(body, lambda sha: sha == AFTER_SHA), [])
+        self.assertTrue(github_pr_gate.shot_provenance_problems(body, lambda sha: sha == AFTER_SHA, True))
 
     def test_a_shared_or_malformed_served_sha_is_refused(self):
         self.assertRefused(pair.evaluate(*self.captures(after_sha=BEFORE_SHA))[0], "same commit")

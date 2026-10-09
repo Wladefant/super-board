@@ -12,6 +12,7 @@
  */
 
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
@@ -229,53 +230,15 @@ export function assertNotProduction(urlString) {
  * Validates served commit SHA against expected SHA.
  */
 export function verifyServedSha(servedSha, expectedSha) {
-  if (!expectedSha) {
-    return {
-      match: true,
-      served_sha: servedSha || 'unknown',
-      expected_sha: 'none',
-      detail: 'No expected SHA specified; check skipped'
-    };
-  }
-
-  const cleanServed = (servedSha || '').trim().toLowerCase();
-  const cleanExpected = (expectedSha || '').trim().toLowerCase();
-
-  if (!cleanServed) {
-    return {
-      match: false,
-      served_sha: '',
-      expected_sha: cleanExpected,
-      detail: 'Server did not return a valid SHA'
-    };
-  }
-
-  let isMatch = cleanServed === cleanExpected ||
-    (cleanServed.length >= 7 && cleanExpected.startsWith(cleanServed)) ||
-    (cleanExpected.length >= 7 && cleanServed.startsWith(cleanExpected));
-
-  let matchedSha = cleanServed;
-  if (!isMatch && cleanServed.length === 40 && cleanExpected.length === 40) {
-    try {
-      const { execFileSync } = createRequire(import.meta.url)('child_process');
-      const gitCmd = process.env.VEYYON_REAL_GIT || 'git';
-      execFileSync(gitCmd, ['merge-base', '--is-ancestor', cleanExpected, cleanServed], {
-        stdio: 'ignore',
-        timeout: 5000,
-        windowsHide: true
-      });
-      isMatch = true;
-      matchedSha = cleanExpected;
-    } catch (_) {}
-  }
-
+  const served = String(servedSha || '').trim().toLowerCase();
+  const expected = String(expectedSha || '').trim().toLowerCase();
+  const match = /^[0-9a-f]{40}$/.test(served) && /^[0-9a-f]{40}$/.test(expected) && served === expected;
   return {
-    match: isMatch,
-    served_sha: matchedSha,
-    expected_sha: cleanExpected,
-    detail: isMatch
-      ? `Served SHA ${matchedSha} matches expected SHA ${cleanExpected}`
-      : `Served SHA mismatch: got "${cleanServed}", expected "${cleanExpected}"`
+    match,
+    served_sha: served,
+    expected_sha: expected,
+    detail: match ? `Served SHA ${served} matches expected SHA ${expected}`
+      : `Served SHA mismatch: got "${served}", expected full head "${expected}"`
   };
 }
 
@@ -1347,6 +1310,49 @@ async function inspectFocusedElement(page) {
   }));
 }
 
+/** Measure the served application and signed-in account before saving image bytes. */
+export async function captureProductScreenshot(page, expectedSha, viewportKey, label = 'exercised') {
+  const measured = await page.evaluate(async () => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    try {
+      const [versionResponse, sessionResponse] = await Promise.all([
+        fetch('/api/version', { signal: controller.signal, cache: 'no-store' }),
+        fetch('/api/auth/session', { signal: controller.signal, cache: 'no-store' })
+      ]);
+      if (!versionResponse.ok || !sessionResponse.ok) throw new Error('authenticated application source unavailable');
+      const version = await versionResponse.json();
+      const session = await sessionResponse.json();
+      return {
+        served_sha: [version.commit, version.sha, version.served_sha, version.git_sha, version.commitSha]
+          .find(value => typeof value === 'string' && /^[0-9a-f]{40}$/i.test(value)),
+        account: session?.user?.id,
+        url: location.href,
+        device_scale: devicePixelRatio
+      };
+    } finally {
+      clearTimeout(timeout);
+    }
+  });
+  if (!measured.account) throw new Error('Capture requires an authenticated application account');
+  if (!verifyServedSha(measured.served_sha, expectedSha).match) throw new Error('Capture served SHA differs from expected head');
+  const vp = VIEWPORTS[viewportKey];
+  const captureViewport = page.viewport();
+  if (!vp || captureViewport?.width !== vp.width || captureViewport?.height !== vp.height) {
+    throw new Error('Capture viewport differs from requested viewport');
+  }
+  assertNotProduction(measured.url);
+  if (!/^https?:\/\//.test(measured.url)) throw new Error('Static mockup capture refused');
+  const image = await page.screenshot({ fullPage: false });
+  const record = {
+    label, served_sha: measured.served_sha, account: measured.account,
+    viewport: viewportKey, device_scale: measured.device_scale,
+    url: measured.url, sha256: crypto.createHash('sha256').update(image).digest('hex'),
+    source: 'application'
+  };
+  return { image, record };
+}
+
 /**
  * Executes a single flow step with assertions, checks, and screenshot.
  */
@@ -1978,10 +1984,18 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
   const screenshotFileName = `${flow.id || 'flow'}-${step.id || 'step'}-${viewportKey}-${theme}.png`;
   const screenshotPath = path.join(outputDir, screenshotFileName);
 
+  let captureRecord = null;
   try {
-    await page.screenshot({ path: screenshotPath, fullPage: false });
+    if (context.project === 'shipnovo') {
+      const capture = await captureProductScreenshot(page, context.expectedSha, viewportKey, context.captureLabel);
+      fs.writeFileSync(screenshotPath, capture.image);
+      captureRecord = capture.record;
+      fs.writeFileSync(screenshotPath + '.capture.json', JSON.stringify(captureRecord, null, 2));
+    } else {
+      await page.screenshot({ path: screenshotPath, fullPage: false });
+    }
   } catch (err) {
-    // If screenshot fails, record detail but continue
+    checksResults.push({ name: 'capture_provenance', passed: false, detail: err.message });
   }
 
   const stepPassed = checksResults.every(c => c.passed);
@@ -1993,6 +2007,7 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
     theme,
     passed: stepPassed,
     checks: checksResults,
+    capture: captureRecord,
     screenshot: screenshotFileName
   };
 }
@@ -2084,6 +2099,9 @@ export async function prepareFlowPage(browser, current, storageState, vp, theme)
  * Executes flow QA suite and generates flow-qa/v1 report.
  */
 export async function runFlows(options = {}) {
+  if (!['before', 'after', 'exercised'].includes(options.captureLabel || 'exercised')) {
+    throw new Error('Capture label must be before, after, or exercised');
+  }
   const {
     project = 'shipnovo',
     baseUrl = 'http://localhost:3000',
@@ -2091,6 +2109,7 @@ export async function runFlows(options = {}) {
     storageState = null,
     outputDir = './output',
     flowId = null,
+    captureLabel = 'exercised',
     flowDataPath = null,
     viewports = ['390x844', '390x420', '1440x900'],
     themes = ['light', 'dark'],
@@ -2141,6 +2160,11 @@ export async function runFlows(options = {}) {
 
   // 4. Load flow definitions
   const resolvedFlowPath = flowDataPath || path.join(path.dirname(fileURLToPath(import.meta.url)), 'flows', `${project}.json`);
+  const source = {
+    runner: crypto.createHash('sha256').update(fs.readFileSync(fileURLToPath(import.meta.url))).digest('hex'),
+    flow: crypto.createHash('sha256').update(fs.readFileSync(resolvedFlowPath)).digest('hex'),
+    project
+  };
   const allFlows = loadFlowData(resolvedFlowPath);
   const flowsToRun = (options.flows && options.flows.length > 0)
     ? allFlows.filter(f => options.flows.includes(f.id))
@@ -2203,6 +2227,7 @@ export async function runFlows(options = {}) {
                 flow,
                 baseUrl,
                 outputDir,
+                project, expectedSha, captureLabel,
                 flowConstraints
               });
             } catch (stepErr) {
@@ -2240,6 +2265,7 @@ export async function runFlows(options = {}) {
                 flow,
                 baseUrl,
                 outputDir,
+                project, expectedSha, captureLabel,
                 flowConstraints
               });
             } catch (cleanupErr) {
@@ -2293,6 +2319,7 @@ export async function runFlows(options = {}) {
 
   const report = {
     schema: SCHEMA_VERSION,
+    source,
     project,
     served_sha: versionCheck.served_sha || '',
     expected_sha: expectedSha,
@@ -2324,10 +2351,15 @@ export function formatReceipt(report) {
   const cleanupPassed = report?.cleanup?.passed ?? true;
   const executedViewports = Array.isArray(report?.viewports) ? report.viewports : [];
   const hasValidCoverage = executedViewports.length > 0 && executedViewports.every(v => VIEWPORTS[v]);
+  const source = report?.source;
+  const hasSource = /^[0-9a-f]{64}$/.test(source?.runner || '') && /^[0-9a-f]{64}$/.test(source?.flow || '') &&
+    /^[a-z0-9-]+$/.test(source?.project || '');
 
   const state = (
     report?.passed === true &&
     served &&
+    served.toLowerCase() === String(report?.expected_sha || '').toLowerCase() &&
+    hasSource &&
     passedCount > 0 &&
     failedCount === 0 &&
     cleanupPassed &&
@@ -2339,6 +2371,10 @@ export function formatReceipt(report) {
     `FLOW-QA-ASSERTIONS pass=${passedCount} fail=${failedCount}`,
     `FLOW-QA-VIEWPORTS ${executedViewports.join(',')}`
   ];
+  if (hasSource) lines.push(`FLOW-QA-SOURCE runner=${source.runner} flow=${source.flow} project=${source.project}`);
+  for (const step of [...(report?.steps || []), ...(report?.cleanup?.steps || [])]) {
+    if (step.capture) lines.push(`CAPTURE ${JSON.stringify(step.capture)}`);
+  }
   if (report?.error) lines.push(`Error: ${report.error}`);
   return lines.join('\n') + '\n';
 }
@@ -2365,6 +2401,7 @@ export function parseCliArgs(argv) {
     else if (arg === '--expected-sha' && argv[i + 1]) options.expectedSha = argv[++i];
     else if (arg === '--storage-state' && argv[i + 1]) options.storageState = argv[++i];
     else if (arg === '--output' && argv[i + 1]) options.outputDir = argv[++i];
+    else if (arg === '--capture-label' && argv[i + 1]) options.captureLabel = argv[++i];
     else if (arg === '--bind-sha' && argv[i + 1]) options.bindSha = argv[++i];
     else if (arg === '--flow' && argv[i + 1]) options.flowId = argv[++i];
     else if (arg === '--flows' && argv[i + 1]) options.flows = argv[++i].split(',');

@@ -54,6 +54,9 @@ RUNTIME_FILES = (
     "ste_check.py", "test_ste_check.py",
     # Hosting manifest audit, daily hidden task installer and tests (Wladefant/super-board#571).
     "hosting_audit.py", "install_hosting_audit_task.py", "test_hosting_audit.py",
+    "flow_qa_runner.mjs", "depth_report_capture.mjs",
+    "flows/shipnovo.json", "flows/polysimulator.json",
+    "flows/polysimulator-trade-loop.json", "flows/superboard-week.json",
 )
 # Veyyon extensions, installed into the profile's own `extensions/` dir beside AGENTS.md,
 # where Veyyon loads them for every session of that profile.
@@ -174,11 +177,17 @@ def synchronize_sha_readers(source_root: Path, runtime: Path, check: bool = Fals
     """Install only the version readers and their receipt dependencies."""
     pairs = [
         (source_root / "workflows/portable" / name, runtime / name)
-        for name in ("flow_qa_runner.mjs", "depth_report_capture.mjs")
+        for name in ("flow_qa_runner.mjs", "depth_report_capture.mjs", "review_content.py", "github_pr_gate.py",
+                     "install_github_native.py", "PORTABLE.md")
     ] + [
         (source_root / "workflows/e2e" / name, runtime / "e2e" / name)
         for name in ("e2e_receipt.py", "e2e_guard.py", "pins.json")
     ]
+    pairs += [(source, runtime / "flows" / source.name)
+              for source in sorted((source_root / "workflows/portable/flows").glob("*.json"))]
+    required_flows = {"shipnovo.json", "polysimulator.json"}
+    if not required_flows.issubset({source.name for source, _ in pairs}):
+        raise FileNotFoundError("Canonical Shipnovo and PolySimulator flows are required")
     payloads = [(target, source.read_bytes()) for source, target in pairs]
     for target, data in payloads:
         if not check:
