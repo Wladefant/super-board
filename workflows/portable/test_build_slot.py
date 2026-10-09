@@ -3431,5 +3431,90 @@ class TestBuildSlot(unittest.TestCase):
             self.assertIsNotNone(epoch)
             self.assertAlmostEqual(epoch, 1700000005.0, places=2)
 
+    def test_build_freeze_refuses_acquire(self):
+        freeze_file = os.path.join(self.run_dir, "build-freeze")
+        with open(freeze_file, "w", encoding="utf-8") as f:
+            f.write("operator freeze 2026-10-09\n")
+
+        err = io.StringIO()
+        with redirect_stderr(err):
+            ret = build_slot.main(["--run-dir", self.run_dir, "acquire", "lane-frozen"])
+
+        self.assertEqual(ret, 75)
+        self.assertIn("build freeze active (operator freeze 2026-10-09)", err.getvalue())
+
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        self.assertFalse(manager.status()["lock"]["locked"])
+        queue_path = os.path.join(self.run_dir, "build-slot.queue.json")
+        self.assertFalse(os.path.exists(queue_path))
+
+    def test_build_freeze_refuses_run_without_launching_command(self):
+        freeze_file = os.path.join(self.run_dir, "build-freeze")
+        with open(freeze_file, "w", encoding="utf-8") as f:
+            f.write("operator freeze 2026-10-09\n")
+
+        marker = os.path.join(self.run_dir, "dummy-ran.marker")
+        dummy_cmd = [sys.executable, "-c", "import sys, pathlib; pathlib.Path(sys.argv[1]).touch()", marker]
+
+        err = io.StringIO()
+        with redirect_stderr(err):
+            ret = build_slot.main(["--run-dir", self.run_dir, "run", "lane-frozen", "--"] + dummy_cmd)
+
+        self.assertEqual(ret, 75)
+        self.assertIn("build freeze active (operator freeze 2026-10-09)", err.getvalue())
+        self.assertFalse(os.path.exists(marker))
+
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        self.assertFalse(manager.status()["lock"]["locked"])
+        queue_path = os.path.join(self.run_dir, "build-slot.queue.json")
+        self.assertFalse(os.path.exists(queue_path))
+
+    def test_build_freeze_unreadable_falls_back_to_reason_unavailable(self):
+        freeze_file = os.path.join(self.run_dir, "build-freeze")
+        with open(freeze_file, "w", encoding="utf-8") as f:
+            f.write("some reason\n")
+
+        orig_open = open
+        def fail_freeze_open(file, *args, **kwargs):
+            if isinstance(file, (str, bytes, os.PathLike)) and os.path.abspath(file) == os.path.abspath(freeze_file):
+                raise OSError("simulated disk read failure")
+            return orig_open(file, *args, **kwargs)
+
+        err = io.StringIO()
+        with mock.patch("builtins.open", side_effect=fail_freeze_open):
+            with redirect_stderr(err):
+                ret = build_slot.main(["--run-dir", self.run_dir, "acquire", "lane-frozen"])
+
+        self.assertEqual(ret, 75)
+        self.assertIn("build freeze active (reason unavailable)", err.getvalue())
+
+    def test_build_freeze_does_not_affect_release_or_status(self):
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        acquired = manager.acquire("lane-owner", timeout=1.0)
+        self.assertTrue(acquired)
+        self.assertTrue(manager.status()["lock"]["locked"])
+
+        freeze_file = os.path.join(self.run_dir, "build-freeze")
+        with open(freeze_file, "w", encoding="utf-8") as f:
+            f.write("operator freeze 2026-10-09\n")
+
+        out_human = io.StringIO()
+        with redirect_stdout(out_human):
+            ret_status = build_slot.main(["--run-dir", self.run_dir, "status"])
+        self.assertEqual(ret_status, 0)
+        self.assertIn("Build Slot Arbiter Status", out_human.getvalue())
+
+        out_json = io.StringIO()
+        with redirect_stdout(out_json):
+            ret_json = build_slot.main(["--run-dir", self.run_dir, "status", "--json"])
+        self.assertEqual(ret_json, 0)
+        data = json.loads(out_json.getvalue())
+        self.assertTrue(data["lock"]["locked"])
+        self.assertEqual(data["lock"]["owner"], "lane-owner")
+
+        ret_release = build_slot.main(["--run-dir", self.run_dir, "release", "lane-owner"])
+        self.assertEqual(ret_release, 0)
+        self.assertFalse(manager.status()["lock"]["locked"])
+
 if __name__ == "__main__":
     unittest.main()
