@@ -2151,6 +2151,7 @@ export async function runFlows(options = {}) {
       served_sha: versionCheck.served_sha || 'unknown',
       expected_sha: expectedSha || 'unknown',
       passed: false,
+      infrastructure_error: true,
       assertions: { passed: 0, failed: 1 },
       viewports: [],
       steps: [],
@@ -2178,23 +2179,30 @@ export async function runFlows(options = {}) {
   }
 
   // 5. Launch Puppeteer
-  const puppeteer = resolvePuppeteer();
-  const chromePath = executablePath || resolveExecutablePath();
-
-  // CDP calls have no per-call timeout: on a loaded host a slow call is not a UI failure. The
-  // `build_slot.py run --timeout` around the runner bounds the whole run.
-  const browser = await puppeteer.launch({
-    protocolTimeout: 0,
-    executablePath: chromePath,
-    headless: headless ? 'new' : false,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--log-level=3'
-    ]
-  });
+  let browser;
+  try {
+    const puppeteer = resolvePuppeteer();
+    const chromePath = executablePath || resolveExecutablePath();
+    browser = await puppeteer.launch({
+      protocolTimeout: 0,
+      executablePath: chromePath,
+      headless: headless ? 'new' : false,
+      args: [
+        '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
+        '--disable-gpu', '--log-level=3'
+      ]
+    });
+  } catch (err) {
+    const report = {
+      schema: SCHEMA_VERSION, source, project,
+      served_sha: versionCheck.served_sha, expected_sha: expectedSha,
+      passed: false, infrastructure_error: true,
+      assertions: { passed: 0, failed: 0 }, viewports: [], steps: [],
+      cleanup: { passed: true, steps: [] }, error: `Browser startup failed: ${err.message}`
+    };
+    fs.writeFileSync(path.join(outputDir, 'report.json'), JSON.stringify(report, null, 2), 'utf8');
+    return report;
+  }
 
   const allStepReports = [];
   const allCleanupReports = [];
@@ -2351,6 +2359,9 @@ export async function runFlows(options = {}) {
  * the served revision, the assertion counts, and the viewports that ran.
  */
 export function formatReceipt(report) {
+  if (report?.passed !== true && Array.isArray(report?.steps) && report.steps.length === 0) {
+    return `FLOW-QA: INFRA-ERROR${report.served_sha ? ` ${report.served_sha}` : ''}\nError: ${report.error || 'Pre-run infrastructure unavailable'}\n`;
+  }
   const served = /^[0-9a-f]{40}$/i.test(report?.served_sha || '') ? report.served_sha : '';
   let passedCount = 0;
   let failedCount = 0;
@@ -2448,6 +2459,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.a
     })
     .catch(err => {
       console.error('Fatal Flow QA Runner Error:', err.message);
+      console.log(`FLOW-QA: INFRA-ERROR\nError: ${err.message}`);
       process.exit(1);
     });
 }

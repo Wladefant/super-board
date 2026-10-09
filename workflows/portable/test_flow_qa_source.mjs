@@ -31,3 +31,19 @@ test('skip-only steps refuse PASS despite positive summary', () => {
     { passed: true, checks: [{ name: 'optional_skipped', passed: true }] }
   ] }), /FLOW-QA: FAIL/);
 });
+test('pre-run infrastructure failure does not create a sticky FAIL receipt', () => {
+  assert.match(formatReceipt({ ...report(), passed: false, infrastructure_error: true,
+    steps: [], assertions: { passed: 0, failed: 0 }, error: 'Browser failed to start' }),
+    /^FLOW-QA: INFRA-ERROR/);
+});
+test('UI timeout remains FAIL even with an infrastructure flag', () => {
+  assert.match(formatReceipt({ ...report(), passed: false, infrastructure_error: true,
+    steps: [{ passed: false, checks: [{ name: 'step_error', passed: false, detail: 'UI timeout' }] }],
+    assertions: { passed: 0, failed: 1 } }), /^FLOW-QA: FAIL/);
+});
+test('pre-run served SHA mismatch cannot create a sticky head failure', () => {
+  const mismatch = { ...report(), passed: false, served_sha: 'b'.repeat(40),
+    infrastructure_error: false, steps: [], assertions: { passed: 0, failed: 1 },
+    error: `Served SHA differs from expected ${sha}` };
+  assert.match(formatReceipt(mismatch), /^FLOW-QA: INFRA-ERROR/);
+});

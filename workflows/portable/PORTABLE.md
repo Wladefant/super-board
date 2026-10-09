@@ -111,11 +111,17 @@ An alternate flow file can pass only when its bytes match the approved canonical
 An older receipt without source hashes needs a new run.
 A failed Shipnovo FLOW-QA receipt stays blocked for the same content.
 A later PASS cannot erase that failure without a new product revision.
+Infrastructure errors before flow execution produce `INFRA-ERROR`, not a failed user-flow receipt.
+They do not block a rerun. A real UI timeout during a step remains a sticky FAIL.
 Shipnovo before/after image captions require matching `CAPTURE <json>` records for each viewport.
 The gate checks every comment carrying before/after evidence, including separate QA-only comments.
 Shipnovo has no exemption for separate capture evidence comments.
 Valid capture records must bind the exact head commit and match caption fields.
 Capture records contain `label`, `served_sha`, `account`, `viewport`, `device_scale`, `url`, `sha256`, and `source`.
+Shipnovo capture pairs use only 390x844, 390x420, and 1440x900, with device scales 2, 2, and 1.
+Before and after hashes must differ. Image hashes cannot repeat across viewport pairs.
+Current capture evidence must cover every required viewport when it claims a before/after comparison.
+Served SHA comparison ignores hex letter case.
 Product captures use `source=application` and measure the account from the authenticated session.
 After a keyboard action changes the viewport, capture metadata uses the actual supported viewport dimensions.
 The logical flow target remains unchanged. Unsupported capture dimensions still fail closed.

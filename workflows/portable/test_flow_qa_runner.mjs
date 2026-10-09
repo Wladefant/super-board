@@ -1103,6 +1103,24 @@ test('Negative Flow Control 4: Reject unsupported viewports, empty theme lists, 
       assert.equal(report.assertions.passed, 0, 'skip notes are not real assertions');
       assert.equal(report.passed, false, 'empty or skip-only flows must not pass');
     }
+    const startup = await runFlows({
+      baseUrl, expectedSha: EXPECTED_SHA, outputDir: tmpDir,
+      flowDataPath: flowJsonPath, viewports: ['390x844'], themes: ['light'],
+      executablePath: path.join(tmpDir, 'missing-browser.exe')
+    });
+    const { formatReceipt } = await import('./flow_qa_runner.mjs');
+    assert.equal(startup.steps.length, 0);
+    assert.match(formatReceipt(startup), /^FLOW-QA: INFRA-ERROR/);
+    const unreachable = await runFlows({
+      baseUrl: 'http://127.0.0.1:1', expectedSha: EXPECTED_SHA, outputDir: tmpDir
+    });
+    assert.equal(unreachable.steps.length, 0);
+    assert.match(formatReceipt(unreachable), /^FLOW-QA: INFRA-ERROR/);
+    const mismatch = await runFlows({
+      baseUrl, expectedSha: 'a'.repeat(40), outputDir: tmpDir
+    });
+    assert.equal(mismatch.steps.length, 0);
+    assert.match(formatReceipt(mismatch), /^FLOW-QA: INFRA-ERROR/);
   } finally {
     server.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });

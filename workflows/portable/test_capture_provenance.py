@@ -17,7 +17,7 @@ class CaptureProvenanceTests(unittest.TestCase):
         captions = []
         for label, sha, digest in [('before', BEFORE, '1' * 64), ('after', AFTER, '2' * 64)]:
             record = {'label': label, 'served_sha': sha, 'account': 'qa-user', 'viewport': '390x844',
-                      'device_scale': 1, 'url': 'http://127.0.0.1:4799/app', 'sha256': digest, 'source': 'application'}
+                      'device_scale': 2, 'url': 'http://127.0.0.1:4799/app', 'sha256': digest, 'source': 'application'}
             if label == 'after' and mutation:
                 record.update(mutation)
             records.append('CAPTURE ' + json.dumps(record))
@@ -25,6 +25,29 @@ class CaptureProvenanceTests(unittest.TestCase):
         return ('![before](before.png) ![after](after.png)\n' + '\n'.join(captions) +
                 '\nSHOT-PAIR viewport=390x844 phash_dist=12 changed_ratio=0.2\n' +
                 ('' if missing else '\n'.join(records)))
+
+    def complete_body(self):
+        phone = self.body()
+        keyboard = phone.replace('390x844', '390x420').replace('1' * 64, '3' * 64).replace('2' * 64, '4' * 64)
+        desktop = phone.replace('390x844', '1440x900').replace('"device_scale": 2', '"device_scale": 1').replace('1' * 64, '5' * 64).replace('2' * 64, '6' * 64)
+        return '\n'.join((phone, keyboard, desktop))
+
+    def test_infra_error_comment_does_not_block_valid_flow_rerun(self):
+        root = Path(github_pr_gate.__file__).parent
+        runner = hashlib.sha256((root / 'flow_qa_runner.mjs').read_bytes()).hexdigest()
+        flow = hashlib.sha256((root / 'flows/shipnovo.json').read_bytes()).hexdigest()
+        body = (f'FLOW-QA: PASS {AFTER}\nFLOW-QA-ASSERTIONS pass=7 fail=0\n'
+                'FLOW-QA-VIEWPORTS 390x844,390x420,1440x900\n'
+                f'FLOW-QA-SOURCE runner={runner} flow={flow} project=shipnovo\n')
+        data = {'files': [{'path': 'src/app/page.tsx'}], 'comments': [
+            {'body': f'FLOW-QA: INFRA-ERROR {AFTER}\nError: server unreachable'},
+            {'body': f'FLOW-QA: INFRA-ERROR {BEFORE}\nError: served SHA differs from expected {AFTER}'},
+            {'body': body}]}
+        with patch('github_pr_gate._content_binder', return_value=(lambda sha: sha == AFTER, [AFTER], None)):
+            result = evaluate_flow_qa_receipt(data, repo='Wladefant/shipnovo', base_ref='main', head_sha=AFTER)
+            qa_result = evaluate_qa_receipt(data, repo='Wladefant/shipnovo', base_ref='main', head_sha=AFTER)
+        self.assertEqual(result[0], 'PASSED', result[1])
+        self.assertEqual(qa_result[0], 'EXEMPT', qa_result[1])
 
     def check(self, **kwargs):
         return shot_provenance_problems(self.body(**kwargs), lambda sha: sha == AFTER, True)
@@ -71,7 +94,7 @@ class CaptureProvenanceTests(unittest.TestCase):
         flow_body = (f'FLOW-QA: PASS {AFTER}\nFLOW-QA-ASSERTIONS pass=7 fail=0\n'
                      'FLOW-QA-VIEWPORTS 390x844,390x420,1440x900\n'
                      f'FLOW-QA-SOURCE runner={runner} flow={flow} project=shipnovo\n')
-        qa_body = self.body(missing=False)
+        qa_body = self.complete_body()
         data = {'files': [{'path': 'src/app/page.tsx'}], 'comments': [{'body': flow_body}, {'body': qa_body}]}
         with patch('github_pr_gate._content_binder', return_value=(lambda sha: sha == AFTER, [AFTER], None)):
             result = evaluate_flow_qa_receipt(data, repo='Wladefant/shipnovo', base_ref='main', head_sha=AFTER)
@@ -89,12 +112,39 @@ class CaptureProvenanceTests(unittest.TestCase):
                 f'FLOW-QA-SOURCE runner={runner} flow={flow} project=shipnovo\n')
         old = self.body().replace(AFTER, 'c' * 40)
         data = {'files': [{'path': 'src/app/page.tsx'}], 'comments': [
-            {'body': old}, {'body': body}, {'body': self.body()}]}
+            {'body': old}, {'body': body}, {'body': self.complete_body()}]}
         with patch('github_pr_gate._content_binder', return_value=(lambda sha: sha == AFTER, [AFTER], None)):
             flow_result = evaluate_flow_qa_receipt(data, repo='Wladefant/shipnovo', base_ref='main', head_sha=AFTER)
             qa_result = evaluate_qa_receipt(data, repo='Wladefant/shipnovo', base_ref='main', head_sha=AFTER)
         self.assertEqual(flow_result[0], 'PASSED', flow_result[1])
         self.assertEqual(qa_result[0], 'PASSED', qa_result[1])
+
+    def test_identical_image_hashes_rejected(self):
+        body = self.body().replace('2' * 64, '1' * 64)
+        self.assertTrue(shot_provenance_problems(body, lambda sha: sha == AFTER, True))
+
+    def test_image_hashes_reused_across_viewports_rejected(self):
+        body = self.body() + '\n' + self.body().replace('390x844', '390x420')
+        self.assertTrue(shot_provenance_problems(body, lambda sha: sha == AFTER, True))
+
+    def test_unknown_viewport_rejected(self):
+        body = self.body().replace('390x844', '800x600')
+        self.assertTrue(shot_provenance_problems(body, lambda sha: sha == AFTER, True))
+
+    def test_wrong_device_scale_rejected(self):
+        body = self.body().replace('"device_scale": 2', '"device_scale": 1')
+        self.assertTrue(shot_provenance_problems(body, lambda sha: sha == AFTER, True))
+
+    def test_capture_sha_case_is_not_a_false_negative(self):
+        body = self.body().replace('"served_sha": "' + AFTER, '"served_sha": "' + AFTER.upper())
+        self.assertEqual(shot_provenance_problems(body, lambda sha: sha == AFTER, True), [])
+
+    def test_current_evidence_requires_each_viewport_pair(self):
+        data = {'files': [{'path': 'src/app/page.tsx'}], 'comments': [{'body': self.body()}]}
+        with patch('github_pr_gate._content_binder', return_value=(lambda sha: sha == AFTER, [AFTER], None)):
+            result = evaluate_qa_receipt(data, repo='Wladefant/shipnovo', base_ref='main', head_sha=AFTER)
+        self.assertEqual(result[0], 'REQUIRED', result[1])
+        self.assertIn('missing capture pair', result[1])
 
     def test_valid_measured_records(self):
         self.assertEqual(self.check(), [])
@@ -112,7 +162,7 @@ class CaptureProvenanceTests(unittest.TestCase):
         self.assertTrue(self.check(mutation={'viewport': '1440x900'}))
 
     def test_mixed_device_scale(self):
-        self.assertTrue(self.check(mutation={'device_scale': 2}))
+        self.assertTrue(self.check(mutation={'device_scale': 1}))
 
     def test_static_mockup(self):
         self.assertTrue(self.check(mutation={'source': 'static-mockup', 'url': 'file:///mockup.html'}))
