@@ -20,9 +20,9 @@ Invariants:
     - Lock metadata contains owner, pid, token, and acquired_at timestamp.
     - Waiting lanes are tracked in a FIFO queue file ('~/.veyyon/run/build-slot.queue.json')
       with unique tokens to differentiate in-process waiters sharing a parent PID.
-    - Queue token heartbeats preserve live-PID entries for up to 30m of silence, not 60s.
-      Dead PIDs are reclaimed regardless of heartbeat freshness. Legacy entries without
-      heartbeats use enqueue age. A live but silent lane may lose its place after 30m.
+    - Queue token heartbeats expire after 60s even with a live shared PID.
+      Dead PIDs expire regardless of heartbeat freshness. Only entries without
+      any heartbeat use the 1800s enqueue-age fallback.
     - Acquire wait loops write heartbeats before queue cleaning, re-enqueue preserving original
       enqueued_at if missing during heartbeat validation, and clean up queue entries via try/finally.
     - Queue operations are protected by the short-lived directory lock ('build-slot-queue.lock');
@@ -1690,7 +1690,7 @@ class BuildSlotManager:
         stale_fallback_after: float,
         alive_pids: Optional[Dict[int, bool]] = None,
     ) -> Tuple[bool, str]:
-        """Dead PIDs expire immediately; live token leases allow 30m of silence."""
+        """Dead PIDs expire immediately; heartbeat leases expire even with shared PIDs."""
         pid = item.get("pid", 0)
         if pid > 0:
             if alive_pids is not None:
@@ -1702,12 +1702,12 @@ class BuildSlotManager:
             if not is_alive:
                 return True, f"PID {pid} is dead"
         heartbeat = _parse_timestamp(item.get("heartbeat_at"))
+        if item.get("heartbeat_at") is not None and heartbeat is None:
+            return True, "corrupt heartbeat timestamp"
         stamp = heartbeat if heartbeat is not None else _parse_timestamp(item.get("enqueued_at"))
         if stamp is None:
             return True, "missing or corrupt lease timestamp"
-        limit = max(stale_heartbeat_after, stale_fallback_after) if pid > 0 else (
-            stale_heartbeat_after if heartbeat is not None else stale_fallback_after
-        )
+        limit = stale_heartbeat_after if heartbeat is not None else stale_fallback_after
         silence = now - stamp
         return (silence > limit, f"token lease expired ({silence:.1f}s > {limit:.1f}s)")
 
@@ -1828,6 +1828,8 @@ class BuildSlotManager:
         stale_heartbeat_after: Optional[float] = None,
         priority: bool = False,
         enqueued_at: Optional[float] = None,
+        job_class: str = "light",
+        mem_gib: Optional[float] = None,
     ) -> int:
         """
         Adds (name, pid, token) to the queue if not already present.
@@ -1877,6 +1879,8 @@ class BuildSlotManager:
                     item["token"] = token
                 item["heartbeat_at"] = now
                 item["heartbeat_at_iso"] = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat()
+                item["job_class"] = job_class
+                item["mem_gib"] = MEMORY_RESERVATIONS[job_class] if mem_gib is None else mem_gib
                 if priority and not item.get("priority"):
                     # Upgrade: joins the priority group at its own enqueue time.
                     item["priority"] = True
@@ -1899,6 +1903,8 @@ class BuildSlotManager:
                 "enqueued_at_iso": effective_enqueued_iso,
                 "heartbeat_at": now,
                 "heartbeat_at_iso": now_iso,
+                "job_class": job_class,
+                "mem_gib": MEMORY_RESERVATIONS[job_class] if mem_gib is None else mem_gib,
             }
             if priority:
                 entry["priority"] = True
@@ -2348,6 +2354,60 @@ class BuildSlotManager:
             "heavy_jobs": sum((info or {}).get("job_class", "heavy") == "heavy" for info in held),
         }
 
+    def _resource_refusal(self, job_class, mem_gib, budget, force=False):
+        reasons = []
+        if job_class == "heavy" and budget["heavy_jobs"] >= 1:
+            reasons.append(f"heavy cap: {budget['heavy_jobs']} heavy job(s) held, limit 1")
+        free = budget["free_budget_gib"]
+        if not force:
+            if free is None:
+                reasons.append("budget unavailable: RAM telemetry missing")
+            elif free < mem_gib:
+                reasons.append(
+                    f"budget: available {budget['available_gib']:.2f} - reserved "
+                    f"{budget['reserved_gib']:.2f} - floor {budget['floor_gib']:.2f} "
+                    f"= {free:.2f} GiB, needs {mem_gib:.2f} GiB"
+                )
+        return "; ".join(reasons) or None
+
+    def _queue_admission(self, queue, token, budget, now, force=False):
+        caller = next((item for item in queue if item.get("token") == token), None)
+        if caller is None:
+            return False, "waiter missing from queue"
+        head = queue[0]
+        head_class = head.get("job_class", "heavy")
+        head_mem = float(head.get("mem_gib", MEMORY_RESERVATIONS[head_class]))
+        head_reason = self._resource_refusal(head_class, head_mem, budget, force)
+        available = budget["available_gib"]
+        projected = None if available is None else available + budget["reserved_gib"] - budget["floor_gib"]
+        impossible = projected is not None and projected < head_mem
+        notice = (
+            f"head cannot fit on this host: needs {head_mem:.2f}, max possible {projected:.2f} GiB"
+            if impossible else None
+        )
+        if notice:
+            _transition_notice(notice, "warning")
+        if caller is head:
+            return head_reason is None, notice or head_reason
+        if head_reason is None:
+            return False, f"FIFO head '{head.get('name')}' can run"
+        age = now - (_parse_timestamp(head.get("enqueued_at")) or now)
+        if (head_class == "heavy" and age > 1200 and not impossible
+                and projected is not None and projected >= head_mem and budget["heavy_jobs"] == 0):
+            return False, f"backfill paused: aging heavy head '{head.get('name')}' waited {age:.1f}s"
+        caller_mem = float(caller.get("mem_gib", 3.0))
+        if caller_mem >= head_mem:
+            return False, notice or "backfill requires a smaller reservation than the blocked head"
+        # Keep FIFO among jobs that can currently run. Blocked entries keep their place.
+        for item in queue[1:]:
+            item_mem = float(item.get("mem_gib", 3.0))
+            reason = self._resource_refusal(item.get("job_class", "heavy"), item_mem, budget, force)
+            if item is caller:
+                return reason is None, notice or reason
+            if item_mem < head_mem and reason is None:
+                return False, notice or f"earlier backfill waiter '{item.get('name')}' can run"
+        return False, notice or "waiting for FIFO admission"
+
     def acquire(
         self,
         name: str,
@@ -2421,6 +2481,7 @@ class BuildSlotManager:
         last_heartbeat = start_time
         acquired = False
         original_enqueued_at = start_time
+        last_refusal = None
 
         previous_cancel = getattr(self._queue_op_state, "cancel", None)
         self._queue_op_state.cancel = lambda: _check_freeze(self.run_dir)
@@ -2432,6 +2493,7 @@ class BuildSlotManager:
                     lambda: self.enqueue(
                         name, pid, token=token, stale_heartbeat_after=effective_heartbeat_threshold,
                         priority=priority, enqueued_at=original_enqueued_at,
+                        job_class=job_class, mem_gib=mem_gib,
                     ),
                     queue_deadline,
                 )
@@ -2482,6 +2544,7 @@ class BuildSlotManager:
                                     stale_heartbeat_after=effective_heartbeat_threshold,
                                     priority=priority,
                                     enqueued_at=original_enqueued_at,
+                                    job_class=job_class, mem_gib=mem_gib,
                                 )
                                 last_heartbeat = now
                             else:
@@ -2544,25 +2607,6 @@ class BuildSlotManager:
                     continue
 
                 max_slots = self.get_max_slots(curr_ram)
-                # 4. Acquisition stagger: at most one new acquisition per 45s across all waiters
-                if self.acquisition_stagger > 0 and not force:
-                    last_acq = self._read_last_acquired_at()
-                    if last_acq is not None:
-                        elapsed_since_acq = now - last_acq
-                        if elapsed_since_acq < self.acquisition_stagger:
-                            if timeout is not None:
-                                elapsed = time.time() - start_time
-                                if elapsed >= timeout:
-                                    msg = (
-                                        f"Timed out after {timeout:.1f}s waiting for build slot lock: "
-                                        f"stagger delay active ({elapsed_since_acq:.1f}s < {self.acquisition_stagger:.1f}s since last acquisition)"
-                                    )
-                                    print(msg, file=sys.stderr)
-                                    logger.error(msg)
-                                    return False
-                            sleep_for = min(poll_interval, heartbeat_interval, max(0.01, self.acquisition_stagger - elapsed_since_acq))
-                            time.sleep(sleep_for)
-                            continue
                 # Check currently held slots
                 held_slot_indices = [
                     idx for idx, s_dir in enumerate(self.slot_dirs)
@@ -2612,9 +2656,8 @@ class BuildSlotManager:
                             caller_idx = i
                             break
 
-                    # A free slot goes to the first N eligible waiters in priority/FIFO order,
-                    # where N is the number of available slots.
-                    is_eligible = (caller_idx is not None and caller_idx < available_slots_count) or (not queue)
+                    # Resource eligibility is decided again under the slot guard.
+                    is_eligible = caller_idx is not None
 
                     if is_eligible:
                         # Attempt to acquire the first free slot within allowed max_slots
@@ -2625,9 +2668,19 @@ class BuildSlotManager:
                                     with _transition_guard(os.path.join(self.run_dir, "build-slot.guard")):
                                         _check_freeze(self.run_dir)
                                         budget = self._memory_budget()
-                                        if job_class == "heavy" and budget["heavy_jobs"] >= 1:
-                                            break
-                                        if not force and (budget["free_budget_gib"] is None or budget["free_budget_gib"] < mem_gib):
+                                        current_queue = self._read_queue()
+                                        eligible, reason = self._queue_admission(
+                                            current_queue, token, budget, time.time(), force
+                                        )
+                                        last_acq = self._read_last_acquired_at()
+                                        elapsed_since_acq = None if last_acq is None else time.time() - last_acq
+                                        if eligible and not force and elapsed_since_acq is not None and elapsed_since_acq < self.acquisition_stagger:
+                                            eligible = False
+                                            reason = f"stagger delay active ({elapsed_since_acq:.1f}s < {self.acquisition_stagger:.1f}s since last acquisition)"
+                                        if reason and reason != last_refusal:
+                                            _transition_notice(f"[WAIT] '{name}': {reason}", "warning")
+                                        last_refusal = reason
+                                        if not eligible:
                                             break
                                         os.mkdir(slot_dir)
                                         self._write_slot_info(slot_idx, owner=name, pid=pid, token=token, wrapper_pid=wrapper_pid,
@@ -2651,7 +2704,7 @@ class BuildSlotManager:
                 if timeout is not None:
                     elapsed = time.time() - start_time
                     if elapsed >= timeout:
-                        msg = f"Timed out after {timeout:.1f}s waiting for build slot lock (lane '{name}', PID {pid})"
+                        msg = f"Timed out after {timeout:.1f}s waiting for build slot lock (lane '{name}', PID {pid}): {last_refusal or 'slot capacity exhausted'}"
                         print(msg, file=sys.stderr)
                         logger.error(msg)
                         return False
@@ -2826,6 +2879,7 @@ class BuildSlotManager:
             logger.warning("clean_queue failed in status: %s; reading queue directly", e)
             queue = self._read_queue()
         queue_status = []
+        budget = self._memory_budget()
         for item in queue:
             enqueued_epoch = item.get("enqueued_at", now)
             wait_time = max(0.0, now - enqueued_epoch)
@@ -2841,6 +2895,9 @@ class BuildSlotManager:
                 "wait_seconds": round(wait_time, 1),
                 "heartbeat_at": item.get("heartbeat_at_iso"),
                 "heartbeat_age_seconds": hb_age,
+                "job_class": item.get("job_class", "heavy"),
+                "mem_gib": item.get("mem_gib", 3.0),
+                "refusal_reason": self._queue_admission(queue, item.get("token"), budget, now)[1],
             })
 
         # 4. System RAM and dynamic capacity
@@ -2860,7 +2917,7 @@ class BuildSlotManager:
             "queue": queue_status,
             "queue_depth": len(queue_status),
             "ram_percent": ram_pct,
-            "memory_budget": self._memory_budget(),
+            "memory_budget": budget,
             "ram_guard_threshold": self.ram_guard_threshold,
             "acquisition_stagger": self.acquisition_stagger,
             "last_acquired_at": last_acq,

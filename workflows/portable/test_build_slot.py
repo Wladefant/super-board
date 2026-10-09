@@ -674,7 +674,7 @@ class TestBuildSlot(unittest.TestCase):
         # 2. Fresh heartbeat entry under living PID (heartbeat 5s ago) -> must NOT be reclaimed (negative control)
         # 3. Legacy entry without heartbeat_at older than 30m under dead PID -> must be reclaimed
         # 4. Legacy entry without heartbeat_at newer than 30m under living PID -> must NOT be reclaimed
-        # 5. Stale heartbeat entry under living PID (heartbeat 65s ago) -> must NOT be reclaimed (live PID preserved)
+        # 5. Stale heartbeat entry under living PID (heartbeat 65s ago) -> must be reclaimed under 60s contract (#711)
         seeded_queue = [
             {
                 "name": "dead-stale-hb-lane",
@@ -732,11 +732,11 @@ class TestBuildSlot(unittest.TestCase):
         self.assertNotIn("legacy-stale-lane", names)
         # Legacy fresh (<= 30m) under living PID preserved
         self.assertIn("legacy-fresh-lane", names)
-        # Stale heartbeat under living PID preserved
-        self.assertIn("stale-live-hb-lane", names)
+        # Stale heartbeat under living PID reclaimed under 60s contract (#711)
+        self.assertNotIn("stale-live-hb-lane", names)
 
         # Survivors in FIFO order by original enqueue time
-        self.assertEqual(names, ["legacy-fresh-lane", "stale-live-hb-lane", "fresh-hb-lane"])
+        self.assertEqual(names, ["legacy-fresh-lane", "fresh-hb-lane"])
     def test_acquire_timeout_leaves_no_entry_behind(self):
         manager = BuildSlotManager(run_dir=self.run_dir, max_slots=1)
 
@@ -796,8 +796,8 @@ class TestBuildSlot(unittest.TestCase):
                 "token": lane1_token,
                 "enqueued_at": now - 80.0,
                 "enqueued_at_iso": datetime.datetime.fromtimestamp(now - 80.0, datetime.timezone.utc).isoformat(),
-                "heartbeat_at": now - 70.0,  # Waiter with late heartbeat, but living PID 35296
-                "heartbeat_at_iso": datetime.datetime.fromtimestamp(now - 70.0, datetime.timezone.utc).isoformat(),
+                "heartbeat_at": now - 15.0,  # Active waiter: heartbeat fresh
+                "heartbeat_at_iso": datetime.datetime.fromtimestamp(now - 15.0, datetime.timezone.utc).isoformat(),
             },
             {
                 "name": "lane-2",
@@ -815,7 +815,7 @@ class TestBuildSlot(unittest.TestCase):
         q_before = manager._read_queue()
         self.assertEqual([x["name"] for x in q_before], ["dead-lane", "lane-1", "lane-2"])
 
-        # Reclaim runs: dead-lane is pruned; lane-1 is preserved despite late heartbeat because PID is alive
+        # Reclaim runs: dead-lane is pruned; active lane-1 is preserved in FIFO order
         q_after = manager.clean_queue()
         self.assertEqual([x["name"] for x in q_after], ["lane-1", "lane-2"])
 
@@ -2728,10 +2728,10 @@ class TestBuildSlot(unittest.TestCase):
         info = build_slot._read_queue_lock_info(queue_lock_dir)
         self.assertEqual(info.get("token"), "successor-different-token")
 
-    def test_regression_live_pid_queue_entry_preserved_despite_late_heartbeat(self):
+    def test_regression_live_pid_queue_entry_expired_on_late_heartbeat(self):
         """
-        Regression 3: Live PID queue entries must be preserved in the queue despite late heartbeat.
-        Only dead PIDs should be purged when heartbeat expires.
+        #711: Dead in-process waiters with live shared PID must expire when heartbeat
+        is older than stale_heartbeat_after (60s), regardless of PID liveness.
         """
         manager = BuildSlotManager(run_dir=self.run_dir, is_pid_alive_fn=lambda p: (p == 2001))
         now = time.time()
@@ -2760,10 +2760,11 @@ class TestBuildSlot(unittest.TestCase):
         cleaned = manager.clean_queue(stale_heartbeat_after=60.0)
         names = [x["name"] for x in cleaned]
 
-        # Live PID must be PRESERVED despite late heartbeat
-        self.assertIn("live-pid-late-hb", names, "Queue entry for living PID must be preserved despite late heartbeat")
+        # Live PID must be PRUNED when heartbeat is expired (>60s) under #711
+        self.assertNotIn("live-pid-late-hb", names, "Queue entry for living PID must be pruned when heartbeat expires")
         # Dead PID must be PRUNED
         self.assertNotIn("dead-pid-late-hb", names, "Queue entry for dead PID must be pruned")
+        self.assertEqual(names, [])
 
     def test_regression_acquire_re_enqueue_preserves_original_enqueued_at(self):
         """Recovery in the acquire loop preserves the original FIFO timestamp."""

@@ -21,7 +21,7 @@ All processes must use this protocol. Install it only when no slots are held.
 Queue management invariants:
 - The short-lived atomic queue lock (`build-slot-queue.lock`) protects queue operations. Waiters reclaim stale queue locks when the holding PID dies. Waiters also reclaim locks held by a live PID longer than 120 seconds. Reclamation renames the lock to a unique tombstone and checks the token before deletion. The lock owner records a unique token in metadata and confirms this token before removing the directory. This check stops an expired owner from deleting a successor lock. Critical sections inside the queue lock run no RAM probes, process waits, or sleeps.
 - Queue read errors raise or retry on transient file access/sharing errors and JSON decode collisions; a missing file returns an empty list only on initial queue creation.
-- Live queue entries retain their place for up to 30 minutes of token heartbeat silence. Dead PIDs are reclaimed regardless of heartbeat freshness.
+- Queue heartbeats expire after 60 seconds, even with a live shared PID. Only entries without a heartbeat use the 1800-second fallback.
 - When an active `acquire` loop detects a missing queue entry during heartbeat validation, re-enqueue recovery preserves the original enqueue timestamp to protect FIFO fairness.
 - Manual acquire holders expire after 30 minutes of heartbeat silence, or acquisition age if no heartbeat exists. A genuine live run wrapper never expires on age or heartbeat silence. Dead or recycled wrappers permit reclaim. This preserves the slot while a wrapped command runs.
 - Contenders time out when a live process holds the queue lock for less than 120 seconds. Contenders safely reclaim locks held longer than 120 seconds through a unique tombstone directory rename.
@@ -42,6 +42,11 @@ Memory admission and job classification invariants:
 - `--force` requires `BUILD_SLOT_ALLOW_FORCE=1`. Without it, acquisition fails. Authorized force logs the override and bypasses memory admission.
 - Even when `BUILD_SLOT_ALLOW_FORCE=1` is set, `--force` cannot bypass the one-heavy job concurrency cap.
 - The obsolete idle bypass is removed. Queue wait duration never bypasses host memory safety invariants.
+- Admission reads the stagger again under the slot guard before publishing a grant.
+- Waiters print resource refusal reasons and include the last reason in timeout output.
+- Smaller jobs can backfill a resource-blocked head without changing its position or enqueue time.
+- After 20 minutes, a heavy head pauses backfill only with no held heavy job and enough projected memory after reservations release.
+- An impossible head does not pause backfill. Output reports its required memory and maximum possible budget.
 
 Command execution deadline and process tree invariants:
 - `run` introduces `--run-timeout` (default 1800 seconds / 30 minutes) for child command execution.
