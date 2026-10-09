@@ -51,8 +51,11 @@ Invariants:
     - The acquire-mode owner PID is the nearest veyyon session host (not its
       `__veyyon_worker*` helpers); the ancestor climb stops at a parent created after its
       child, since Windows reuses a dead parent's PID.
-    - RAM guard: when host system RAM >= 95%, acquire stays in the FIFO queue and waits until
-      RAM drops below the limit (or --timeout expires); --force bypasses the wait.
+    - Default capacity is 4. Read build-slot.config.json on every acquisition poll.
+      max_slots and ram_refuse_percent configure capacity and the default 90% RAM limit.
+    - RAM at or above the limit waits in FIFO order until it drops or timeout expires.
+      Only --force bypasses this wait, including when no slots are held.
+    - A lane prefix (before the first '-') may hold or wait only once.
     - Standard library only. Windows uses msvcrt byte locks; POSIX uses flock.
 """
 
@@ -145,7 +148,8 @@ logger.addHandler(logging.NullHandler())
 
 DEFAULT_RUN_DIR = os.path.expanduser("~/.veyyon/run")
 LOCK_DIR_NAME = "build-slot.lock"
-DEFAULT_MAX_SLOTS = 8
+DEFAULT_MAX_SLOTS = 4
+CONFIG_FILE_NAME = "build-slot.config.json"
 SLOT_LOCK_DIR_NAMES = [
     "build-slot.lock",
     "build-slot-1.lock",
@@ -167,7 +171,7 @@ DEFAULT_POLL_INTERVAL_SECONDS = 5.0
 DEFAULT_HEARTBEAT_INTERVAL_SECONDS = 10.0  # update queue entry heartbeat every <=15s
 DEFAULT_QUEUE_STALE_HEARTBEAT_SECONDS = 60.0  # reclaim if heartbeat older than 60s
 DEFAULT_QUEUE_STALE_FALLBACK_SECONDS = 30 * 60  # 30 minutes fallback for legacy entries without heartbeat
-DEFAULT_RAM_GUARD_THRESHOLD_PERCENT = 95.0
+DEFAULT_RAM_GUARD_THRESHOLD_PERCENT = 90.0
 DEFAULT_ACQUISITION_STAGGER_SECONDS = 45.0
 DEFAULT_RAM_GUARD_IDLE_ADMIT_SECONDS = 120.0  # with no slot held, a lane queued this long passes the RAM guard (#620)
 DEFAULT_RELEASE_TIMEOUT_SECONDS = 30.0
@@ -1184,7 +1188,7 @@ class BuildSlotManager:
         queue_stale_fallback_after: float = DEFAULT_QUEUE_STALE_FALLBACK_SECONDS,
         pid_dead_grace_period: Optional[float] = None,
         max_slots: Optional[int] = None,
-        ram_guard_threshold: float = DEFAULT_RAM_GUARD_THRESHOLD_PERCENT,
+        ram_guard_threshold: Optional[float] = None,
         ram_guard_idle_admit_after: Optional[float] = None,
         acquisition_stagger: Optional[float] = None,
     ):
@@ -1202,13 +1206,9 @@ class BuildSlotManager:
             else DEFAULT_PID_DEAD_GRACE_PERIOD_SECONDS
         )
         self.max_slots_override = max_slots
-        env_slots = os.environ.get("BUILD_SLOT_MAX_SLOTS")
-        if env_slots is not None and self.max_slots_override is None:
-            try:
-                self.max_slots_override = int(env_slots)
-            except ValueError:
-                pass
-        self.ram_guard_threshold = float(ram_guard_threshold)
+        self.config_file = os.path.join(self.run_dir, CONFIG_FILE_NAME)
+        self.ram_guard_threshold_override = ram_guard_threshold
+        self.ram_guard_threshold = DEFAULT_RAM_GUARD_THRESHOLD_PERCENT
         self.ram_guard_idle_admit_after = float(
             DEFAULT_RAM_GUARD_IDLE_ADMIT_SECONDS if ram_guard_idle_admit_after is None else ram_guard_idle_admit_after
         )
@@ -1227,21 +1227,37 @@ class BuildSlotManager:
         self.queue_grant_cleanup_grace = DEFAULT_QUEUE_GRANT_CLEANUP_GRACE_SECONDS
         self._queue_op_state = threading.local()
         os.makedirs(self.run_dir, exist_ok=True)
+        self._refresh_ram_threshold()
+
+    def _read_config(self) -> Dict[str, Any]:
+        """Read live settings, falling back to safe defaults during file replacement."""
+        try:
+            config = _read_json_file(self.config_file)
+            return config if isinstance(config, dict) else {}
+        except (OSError, ValueError):
+            return {}
 
     def get_max_slots(self, ram_pct: Optional[float] = None) -> int:
-        """
-        Returns the maximum number of concurrent build slots allowed (default: 8).
-        Can be overridden via max_slots parameter or BUILD_SLOT_MAX_SLOTS env var.
-        """
-        if self.max_slots_override is not None:
-            return self.max_slots_override
-        env_slots = os.environ.get("BUILD_SLOT_MAX_SLOTS")
-        if env_slots is not None:
-            try:
-                return int(env_slots)
-            except ValueError:
-                pass
-        return len(self.slot_dirs)
+        """Return configured capacity without hiding legacy holder directories."""
+        value = self.max_slots_override
+        if value is None:
+            value = os.environ.get("BUILD_SLOT_MAX_SLOTS")
+        if value is None:
+            value = self._read_config().get("max_slots", DEFAULT_MAX_SLOTS)
+        try:
+            return max(1, min(len(self.slot_dirs), int(value)))
+        except (TypeError, ValueError, OverflowError):
+            return DEFAULT_MAX_SLOTS
+
+    def _refresh_ram_threshold(self) -> None:
+        value = self.ram_guard_threshold_override
+        if value is None:
+            value = self._read_config().get("ram_refuse_percent", DEFAULT_RAM_GUARD_THRESHOLD_PERCENT)
+        try:
+            threshold = float(value)
+            self.ram_guard_threshold = threshold if 0 < threshold <= 100 else DEFAULT_RAM_GUARD_THRESHOLD_PERCENT
+        except (TypeError, ValueError, OverflowError):
+            self.ram_guard_threshold = DEFAULT_RAM_GUARD_THRESHOLD_PERCENT
     def _read_last_acquired_at(self) -> Optional[float]:
         """Reads epoch timestamp of most recent slot acquisition from run_dir, if present."""
         if not os.path.exists(self.last_acquired_file):
@@ -1559,6 +1575,8 @@ class BuildSlotManager:
         stale_heartbeat_after: Optional[float] = None,
         priority: bool = False,
         enqueued_at: Optional[float] = None,
+        require_unique_prefix: bool = False,
+        recover_token: bool = False,
     ) -> int:
         """
         Adds (name, pid, token) to the queue if not already present.
@@ -1589,6 +1607,17 @@ class BuildSlotManager:
             valid_queue, changed = self._clean_queue_locked(
                 queue, now, hb_limit, self.queue_stale_fallback_after, alive_pids=alive_pids
             )
+            if require_unique_prefix:
+                prefix = name.split("-", 1)[0]
+                for slot_idx in range(len(self.slot_dirs)):
+                    info = self._read_slot_info(slot_idx)
+                    if info and str(info.get("owner", "")).split("-", 1)[0] == prefix:
+                        raise ValueError(f"Duplicate build slot lane '{name}': prefix '{prefix}' already held by '{info.get('owner')}'")
+                for item in valid_queue:
+                    if recover_token and token is not None and item.get("token") == token:
+                        continue
+                    if str(item.get("name", "")).split("-", 1)[0] == prefix:
+                        raise ValueError(f"Duplicate build slot lane '{name}': prefix '{prefix}' already waiting as '{item.get('name')}'")
             existing_idx = None
             if token is not None:
                 existing_idx = next(
@@ -2082,7 +2111,6 @@ class BuildSlotManager:
         """
         if pid is None:
             pid = os.getpid()
-        explicit_token = token is not None
         if token is None:
             token = str(uuid.uuid4())
         effective_heartbeat_threshold = (
@@ -2097,6 +2125,7 @@ class BuildSlotManager:
             )
         # 1. RAM Guard notice. High RAM never refuses here: the caller is enqueued below and
         #    step 3 of the queue loop waits until RAM drops (or the timeout expires).
+        self._refresh_ram_threshold()
         ram_pct = get_system_ram_percent()
         if ram_pct is not None and ram_pct >= self.ram_guard_threshold:
             if force:
@@ -2117,19 +2146,25 @@ class BuildSlotManager:
         start_time = time.time()
         last_heartbeat = start_time
         acquired = False
+        registered = False
         original_enqueued_at = start_time
 
         try:
             # 2. Register in FIFO Queue inside try so finally always cleans up
             queue_deadline = start_time + timeout if timeout is not None else None
             try:
+                self.check_stale_and_reclaim(heartbeat_stale_after=heartbeat_stale_after)
                 self._retry_queue_op(
                     lambda: self.enqueue(
                         name, pid, token=token, stale_heartbeat_after=effective_heartbeat_threshold,
-                        priority=priority, enqueued_at=original_enqueued_at,
+                        priority=priority, enqueued_at=original_enqueued_at, require_unique_prefix=True,
                     ),
                     queue_deadline,
                 )
+                registered = True
+            except ValueError as e:
+                print(str(e), file=sys.stderr)
+                return False
             except OSError as e:
                 msg = f"Timed out after {timeout:.1f}s waiting for build slot lock: queue file lock stayed busy ({e})"
                 print(msg, file=sys.stderr)
@@ -2176,6 +2211,8 @@ class BuildSlotManager:
                                     stale_heartbeat_after=effective_heartbeat_threshold,
                                     priority=priority,
                                     enqueued_at=original_enqueued_at,
+                                    require_unique_prefix=True,
+                                    recover_token=True,
                                 )
                                 last_heartbeat = now
                             else:
@@ -2183,6 +2220,9 @@ class BuildSlotManager:
                                     "Heartbeat write not persisted for '%s', but entry is still present; will retry next tick",
                                     name,
                                 )
+                    except ValueError as e:
+                        print(str(e), file=sys.stderr)
+                        return False
                     except Exception as e:
                         logger.warning("Queue heartbeat error for '%s': %s (will retry next tick)", name, e)
 
@@ -2220,19 +2260,11 @@ class BuildSlotManager:
                     continue
 
                 # 3. Dynamic RAM evaluation at acquisition
+                self._refresh_ram_threshold()
                 curr_ram = get_system_ram_percent()
                 ram_blocked = curr_ram is not None and curr_ram >= self.ram_guard_threshold and not force
-                if (
-                    ram_blocked
-                    and not self._any_slot_held()
-                    and time.time() - start_time >= self.ram_guard_idle_admit_after
-                ):
-                    # No build slot is held: waiting frees nothing of ours, and the host
-                    # pressure comes from elsewhere. Pass the guard (queue-head order still
-                    # applies below) rather than starve the queue forever (#620).
-                    ram_blocked = False
                 if ram_blocked:
-                    # System RAM is >= 95%, refuse acquisition until it drops
+                    # Keep waiting, even when there are no holders to release memory.
                     if timeout is not None:
                         elapsed = time.time() - start_time
                         if elapsed >= timeout:
@@ -2272,34 +2304,6 @@ class BuildSlotManager:
                     if os.path.isdir(s_dir)
                 ]
 
-                # Check if caller already holds one of the slots (re-entrant / idempotent)
-                lane_already_held = False
-                for idx in held_slot_indices:
-                    info = self._read_slot_info(idx)
-                    if info and info.get("owner") == name:
-                        lane_already_held = True
-                        if info.get("pid") == pid:
-                            lock_token = info.get("token")
-                            if not (explicit_token and lock_token and lock_token != token):
-                                acquired = True
-                                self._dequeue_own_entry(name, pid, token, self.queue_grant_cleanup_grace)
-                                msg = f"Build slot lock already held by '{name}' (PID {pid})"
-                                print(msg)
-                                clean_stale_next_junction(next_dir=next_dir, cwd=cwd)
-                                return True
-                        break
-
-                if lane_already_held:
-                    # Lane already holds a slot or token mismatch; cannot acquire another slot
-                    if timeout is not None:
-                        elapsed = time.time() - start_time
-                        if elapsed >= timeout:
-                            msg = f"Timed out after {timeout:.1f}s waiting for build slot lock (lane '{name}', PID {pid})"
-                            print(msg, file=sys.stderr)
-                            logger.error(msg)
-                            return False
-                    time.sleep(min(poll_interval, heartbeat_interval))
-                    continue
                 # Check capacity: how many slots can be acquired?
                 currently_held_count = len(held_slot_indices)
                 available_slots_count = max(0, max_slots - currently_held_count)
@@ -2317,7 +2321,7 @@ class BuildSlotManager:
 
                     # A free slot goes to the first N eligible waiters in priority/FIFO order,
                     # where N is the number of available slots.
-                    is_eligible = (caller_idx is not None and caller_idx < available_slots_count) or (not queue)
+                    is_eligible = caller_idx is not None and caller_idx < available_slots_count
 
                     if is_eligible:
                         # Attempt to acquire the first free slot within allowed max_slots
@@ -2326,6 +2330,8 @@ class BuildSlotManager:
                             if not os.path.isdir(slot_dir):
                                 try:
                                     with _transition_guard(os.path.join(self.run_dir, "build-slot.guard")):
+                                        if sum(os.path.isdir(path) for path in self.slot_dirs) >= self.get_max_slots():
+                                            break
                                         os.mkdir(slot_dir)
                                         self._write_slot_info(slot_idx, owner=name, pid=pid, token=token, wrapper_pid=wrapper_pid)
                                         self._record_last_acquired_at(name, pid, slot_idx)
@@ -2355,7 +2361,7 @@ class BuildSlotManager:
                 time.sleep(min(poll_interval, heartbeat_interval))
         finally:
             # If we exited without holding the lock, remove self from queue
-            if not acquired:
+            if registered and not acquired:
                 # Gave up (own deadline or error): spend little time past the caller's --timeout.
                 # A residue entry is swept by clean_queue once this PID is gone.
                 self._dequeue_own_entry(name, pid, token, self.queue_grant_cleanup_grace)
@@ -2448,6 +2454,7 @@ class BuildSlotManager:
         Reclaims stale locks with a logged notice.
         Shows all slot holders (up to 8 slots).
         """
+        self._refresh_ram_threshold()
         # 1. Reclaim stale lock if present across all slots
         reclaimed = self.check_stale_and_reclaim(heartbeat_stale_after=heartbeat_stale_after)
 
@@ -2712,7 +2719,7 @@ def format_status_human(stat: Dict[str, Any]) -> str:
 
     holders = [s for s in slots if s.get("locked")]
     if holders:
-        lines.append(f"Status:      LOCKED ({len(holders)}/{len(slots)} in use)")
+        lines.append(f"Status:      LOCKED ({len(holders)}/{max_slots} in use)")
         lock = stat.get("lock", {})
         if lock.get("owner"):
             lines.append(f"Owner:       {lock.get('owner')}")
