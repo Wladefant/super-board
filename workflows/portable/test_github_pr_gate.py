@@ -887,6 +887,7 @@ class TestGitHubPRGate(unittest.TestCase):
         bare = copy.deepcopy(self.mock_pr)
         bare["reviews"] = []
         bare["baseRefName"] = "staging"
+        bare["files"] = [{"path": "backend/app/api_v1/routes.py", "additions": 10, "deletions": 0}]
         blocked = evaluate_pr_gate(bare, policy=waived)
         self.assertEqual(blocked.gate_verdict, "BLOCKED")
         self.assertFalse(blocked.github_approval_required)
@@ -897,6 +898,7 @@ class TestGitHubPRGate(unittest.TestCase):
         # Author's own review must never satisfy it.
         selfrev = copy.deepcopy(self.mock_pr)
         selfrev["baseRefName"] = "staging"
+        selfrev["files"] = copy.deepcopy(bare["files"])
         selfrev["reviews"] = [
             {
                 "author": {"login": "feature-developer"},
