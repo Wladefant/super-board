@@ -64,6 +64,10 @@ Invariants:
       Stale checks, detached cleanup, metadata retry waits and queue cleanup run outside
       the slot transition guard.
       Reclaim aborts if lock metadata changes while stale checks run.
+    - Run children inherit BUILD_SLOT_HELD with the holder identity and reservation.
+      Nested acquire/run reuse a live matching lock without another reservation.
+      Requests above the holder's class or memory fail instead of upgrading it.
+      Nested release leaves the holder's slot intact. Invalid markers do not bypass admission.
     - Standard library only. Windows uses msvcrt byte locks; POSIX uses flock.
 """
 
@@ -234,10 +238,12 @@ MEMORY_FLOOR_GIB = 3.0
 
 
 def _reservation_gib(job_class: str, mem_gib: Optional[float] = None) -> float:
-    value = MEMORY_RESERVATIONS[job_class] if mem_gib is None else mem_gib
+    if job_class not in MEMORY_RESERVATIONS:
+        job_class = "heavy"
+    value = MEMORY_RESERVATIONS.get(job_class, MEMORY_RESERVATIONS.get("heavy", 5.0)) if mem_gib is None else mem_gib
     if not math.isfinite(value) or value <= 0:
         raise ValueError("mem_gib must be positive and finite")
-    return max(value, MEMORY_RESERVATIONS["heavy"]) if job_class == "heavy" else value
+    return max(value, MEMORY_RESERVATIONS.get("heavy", 5.0)) if job_class == "heavy" else value
 
 
 def get_available_ram_gib() -> Optional[float]:
@@ -2359,13 +2365,18 @@ class BuildSlotManager:
         held = [self._read_slot_info(i) for i, path in enumerate(self.slot_dirs) if os.path.isdir(path)]
         reserved = 0.0
         ramp_reservations = 0.0
+        heavy_jobs = 0
         now = time.time()
         for info in held:
             info = info or {}
-            reservation = _reservation_gib(info.get("job_class", "heavy"), info.get("mem_gib"))
+            job_class = info.get("job_class", "heavy")
+            if job_class not in MEMORY_RESERVATIONS:
+                job_class = "heavy"
+            heavy_jobs += job_class == "heavy"
+            reservation = _reservation_gib(job_class, info.get("mem_gib"))
             reserved += reservation
             acquired = _parse_timestamp(info.get("acquired_at_epoch", info.get("acquired_at")))
-            window = MEMORY_RAMP_SECONDS.get(info.get("job_class", "heavy"), MEMORY_RAMP_SECONDS["heavy"])
+            window = MEMORY_RAMP_SECONDS.get(job_class, MEMORY_RAMP_SECONDS["heavy"])
             # Available RAM already excludes a settled job's memory. Reserve only
             # during its peak ramp; unknown or future timestamps stay conservative.
             if acquired is None or not math.isfinite(acquired) or now - acquired < window:
@@ -2375,10 +2386,12 @@ class BuildSlotManager:
             "ramp_reservations_gib": ramp_reservations,
             "floor_gib": MEMORY_FLOOR_GIB,
             "free_budget_gib": None if available is None else available - ramp_reservations - MEMORY_FLOOR_GIB,
-            "heavy_jobs": sum((info or {}).get("job_class", "heavy") == "heavy" for info in held),
+            "heavy_jobs": heavy_jobs,
         }
 
     def _resource_refusal(self, job_class, mem_gib, budget, force=False):
+        if job_class not in MEMORY_RESERVATIONS:
+            job_class = "heavy"
         reasons = []
         if job_class == "heavy" and budget["heavy_jobs"] >= 1:
             reasons.append(f"heavy cap: {budget['heavy_jobs']} heavy job(s) held, limit 1")
@@ -2400,6 +2413,8 @@ class BuildSlotManager:
             return False, "waiter missing from queue"
         head = queue[0]
         head_class = head.get("job_class", "heavy")
+        if head_class not in MEMORY_RESERVATIONS:
+            head_class = "heavy"
         head_mem = _reservation_gib(head_class, head.get("mem_gib"))
         head_reason = self._resource_refusal(head_class, head_mem, budget, force)
         stagger_reason = None
@@ -2432,6 +2447,8 @@ class BuildSlotManager:
         # Keep FIFO among jobs that can currently run. Blocked entries keep their place.
         for item in queue[1:]:
             item_class = item.get("job_class", "heavy")
+            if item_class not in MEMORY_RESERVATIONS:
+                item_class = "heavy"
             item_mem = _reservation_gib(item_class, item.get("mem_gib"))
             reason = self._resource_refusal(item_class, item_mem, budget, force)
             if stagger_reason and item_class == "heavy":
@@ -2441,6 +2458,48 @@ class BuildSlotManager:
             if item_mem < head_mem and reason is None:
                 return False, notice or f"earlier backfill waiter '{item.get('name')}' can run"
         return False, notice or "waiting for FIFO admission"
+
+    def _inherited_holder(self):
+        """Trust a marker only while its exact holder still owns a live slot."""
+        try:
+            marker = json.loads(os.environ.get("BUILD_SLOT_HELD", ""))
+            if not isinstance(marker, dict):
+                return None
+            pid = marker.get("pid")
+            if not isinstance(pid, int) or pid <= 0 or not marker.get("token"):
+                return None
+            if not self.is_pid_alive(pid):
+                return None
+            for idx, path in enumerate(self.slot_dirs):
+                info = _read_lock_dir_info(path, idx)
+                if not info or info.get("corrupt"):
+                    continue
+                if any(info.get(key) != marker.get(key) for key in ("owner", "pid", "token", "job_class", "mem_gib")):
+                    continue
+                recorded = info.get("wrapper_created_ticks")
+                current = _get_process_create_ticks(pid) if recorded is not None else None
+                if recorded is not None and current != recorded:
+                    return None
+                if info.get("job_class") not in MEMORY_RESERVATIONS:
+                    return None
+                _reservation_gib(info["job_class"], info.get("mem_gib"))
+                return marker
+        except (OSError, ValueError, TypeError):
+            pass
+        return None
+
+    def _nested_allowed(self, holder, job_class, mem_gib):
+        ranks = {"light": 0, "browser": 1, "medium": 2, "heavy": 3}
+        if ranks[job_class] > ranks[holder["job_class"]] or mem_gib > holder["mem_gib"]:
+            print(
+                f"[NESTED] Refused {job_class} {mem_gib:g} GiB: held slot "
+                f"{holder['owner']} allows {holder['job_class']} {holder['mem_gib']:g} GiB. "
+                "Nested calls cannot upgrade the holder's reservation.",
+                file=sys.stderr,
+            )
+            return False
+        print(f"[NESTED] running under held slot {holder['owner']}", file=sys.stderr)
+        return True
 
     def acquire(
         self,
@@ -2470,6 +2529,9 @@ class BuildSlotManager:
         if job_class not in MEMORY_RESERVATIONS:
             raise ValueError("Unknown job class")
         mem_gib = _reservation_gib(job_class, mem_gib)
+        holder = self._inherited_holder()
+        if holder is not None:
+            return self._nested_allowed(holder, job_class, mem_gib)
         if force:
             if os.environ.get("BUILD_SLOT_ALLOW_FORCE") != "1":
                 print("--force requires BUILD_SLOT_ALLOW_FORCE=1", file=sys.stderr)
@@ -2765,6 +2827,10 @@ class BuildSlotManager:
 
     def release(self, name: str, token: Optional[str] = None) -> bool:
         """Free the slot before output, detached cleanup, or queue waits."""
+        holder = self._inherited_holder()
+        if holder is not None:
+            print(f"[NESTED] keeping held slot {holder['owner']}", file=sys.stderr)
+            return True
         for attempt in range(_INFO_READ_ATTEMPTS):
             released, msg, detached = self._release_slot(name, token)
             for path in detached:
@@ -3048,7 +3114,12 @@ class BuildSlotManager:
         try:
             if job_class == "browser" and classify_command(cmd) == "heavy":
                 raise ValueError("browser class cannot build or serve Next")
-            acquired = self.acquire(
+            _check_freeze(self.run_dir)
+            mem_gib = _reservation_gib(job_class, mem_gib)
+            holder = self._inherited_holder()
+            if holder is not None and not self._nested_allowed(holder, job_class, mem_gib):
+                return 1
+            acquired = holder is not None or self.acquire(
                 name=name,
                 timeout=timeout,
                 heartbeat_stale_after=heartbeat_stale_after,
@@ -3073,7 +3144,8 @@ class BuildSlotManager:
             return 1
 
         cmd_display = " ".join(cmd)
-        print(f"[RUN] Acquired build slot lock for '{name}'. Executing command: {cmd_display}", file=sys.stderr)
+        if holder is None:
+            print(f"[RUN] Acquired build slot lock for '{name}'. Executing command: {cmd_display}", file=sys.stderr)
 
         # Before running the command, clean any stale Next.js standalone node_modules junction
         clean_stale_next_junction(next_dir=next_dir, cwd=cwd)
@@ -3085,6 +3157,10 @@ class BuildSlotManager:
         child_job = None
         try:
             child_env = os.environ.copy()
+            child_env["BUILD_SLOT_HELD"] = json.dumps(holder or {
+                "owner": name, "pid": runner_pid, "token": run_token,
+                "job_class": job_class, "mem_gib": mem_gib,
+            })
             node_options = child_env.get("NODE_OPTIONS", "")
             if job_class in ("heavy", "medium") and not re.search(r"--max[-_]old[-_]space[-_]size\b", node_options):
                 child_env["NODE_OPTIONS"] = (node_options + f" --max-old-space-size={3072 if job_class == 'heavy' else 1536}").strip()
@@ -3099,7 +3175,8 @@ class BuildSlotManager:
             def cleanup_on_exit():
                 if proc.poll() is None:
                     _kill_child_tree(proc)
-                self.release(name=name, token=run_token)
+                if holder is None:
+                    self.release(name=name, token=run_token)
             atexit.register(cleanup_on_exit)
             old_signals = {}
             if threading.current_thread() is threading.main_thread():
@@ -3109,7 +3186,8 @@ class BuildSlotManager:
                     old_signals[sig] = signal.signal(sig, interrupted)
 
             # Record wrapper and child PIDs and the initial heartbeat in lock info
-            self._record_run_child(name=name, wrapper_pid=runner_pid, child_pid=child_pid, token=run_token)
+            if holder is None:
+                self._record_run_child(name=name, wrapper_pid=runner_pid, child_pid=child_pid, token=run_token)
 
             # Start background heartbeat while child runs
             def _heartbeat_worker():
@@ -3119,8 +3197,9 @@ class BuildSlotManager:
                     except Exception:
                         pass
 
-            hb_thread = threading.Thread(target=_heartbeat_worker, daemon=True)
-            hb_thread.start()
+            if holder is None:
+                hb_thread = threading.Thread(target=_heartbeat_worker, daemon=True)
+                hb_thread.start()
 
             try:
                 return proc.wait(timeout=run_timeout)
@@ -3148,11 +3227,12 @@ class BuildSlotManager:
                     atexit.unregister(cleanup_on_exit)
                 for sig, handler in old_signals.items():
                     signal.signal(sig, handler)
-            print(f"[RUN] Releasing build slot lock for '{name}'...", file=sys.stderr)
-            try:
-                self.release(name=name, token=run_token)
-            except Exception as e:
-                logger.warning("Error releasing lock for '%s': %s", name, e)
+            if holder is None:
+                print(f"[RUN] Releasing build slot lock for '{name}'...", file=sys.stderr)
+                try:
+                    self.release(name=name, token=run_token)
+                except Exception as e:
+                    logger.warning("Error releasing lock for '%s': %s", name, e)
 
 
 def format_status_human(stat: Dict[str, Any]) -> str:
