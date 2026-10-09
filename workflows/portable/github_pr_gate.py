@@ -625,6 +625,29 @@ def capture_evidence_is_current(body: str, binds: Any) -> bool:
     return False
 
 
+def capture_coverage_problems(sources: List[Dict[str, Any]], binds: Any, required: Any) -> List[str]:
+    labels: Dict[str, set] = {}
+    hashes: Dict[str, str] = {}
+    problems = []
+    for source in sources:
+        body = str(source.get("body") or "")
+        if not SHOT_CLAIM_RE.search(body) or not capture_evidence_is_current(body, binds):
+            continue
+        for match in SHOT_CAPTION_LINE_RE.finditer(body):
+            fields = dict(token.partition("=")[::2] for token in match.group("fields").split())
+            viewport = fields.get("viewport", "")
+            labels.setdefault(viewport, set()).add(match.group("label").lower())
+            digest = fields.get("sha256", "")
+            if digest in hashes and hashes[digest] != viewport:
+                problems.append("capture image hash reused across viewports")
+            hashes[digest] = viewport
+    if labels:
+        for viewport in required:
+            if labels.get(viewport) != {"before", "after"}:
+                problems.append(f"missing capture pair for viewport {viewport}")
+    return problems
+
+
 def shot_provenance_problems(body: str, binds: Any, require_capture: bool = False) -> List[str]:
     """
     Why a receipt's before/after screenshots are not provenance-backed evidence.
@@ -643,6 +666,8 @@ def shot_provenance_problems(body: str, binds: Any, require_capture: bool = Fals
                  for match in caption_matches}
     if len(viewports) > 1:
         problems = []
+        if require_capture:
+            problems.extend(capture_coverage_problems([{"body": body}], binds, []))
         for viewport in viewports:
             lines = []
             for line in body.splitlines():
@@ -715,7 +740,7 @@ def shot_provenance_problems(body: str, binds: Any, require_capture: bool = Fals
             problems.append(f"{label}: missing measured capture record")
             continue
         selected.append(record)
-        if record.get("served_sha") != fields.get("served") or record.get("sha256") != fields.get("sha256"):
+        if str(record.get("served_sha", "")).lower() != fields.get("served", "").lower() or record.get("sha256") != fields.get("sha256"):
             problems.append(f"{label}: caption does not match capture record")
         if not re.fullmatch(r"[0-9a-f]{64}", str(record.get("sha256", ""))):
             problems.append(f"{label}: invalid capture image hash")
@@ -726,7 +751,14 @@ def shot_provenance_problems(body: str, binds: Any, require_capture: bool = Fals
         scale = record.get("device_scale")
         if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not 0 < scale <= 8:
             problems.append(f"{label}: device scale not measured")
+        expected_scale = {"390x844": 2, "390x420": 2, "1440x900": 1}.get(viewport)
+        if expected_scale is None:
+            problems.append(f"{label}: unsupported capture viewport")
+        elif scale != expected_scale:
+            problems.append(f"{label}: device scale differs from viewport")
     if len(selected) == 2:
+        if selected[0].get("sha256") == selected[1].get("sha256"):
+            problems.append("before and after capture image hashes are identical")
         for field in ("account", "viewport", "device_scale"):
             if selected[0].get(field) != selected[1].get(field):
                 problems.append(f"capture pair has mismatched {field}")
@@ -839,6 +871,10 @@ def evaluate_qa_receipt(
                 f"failed: {'; '.join(shot_problems)}.",
                 url,
             )
+    if require_capture:
+        coverage_problems = capture_coverage_problems(evidence_comments, binds, target.required_viewports)
+        if coverage_problems:
+            return "REQUIRED", f"capture provenance failed: {'; '.join(coverage_problems)}", None
 
     declarations = []
     for source in all_sources:
@@ -1098,6 +1134,11 @@ def evaluate_flow_qa_receipt(
                     if s_problems:
                         s_url = str(source.get("html_url") or source.get("url") or "") or declaration["url"] or None
                         return "REQUIRED", f"{prefix}: capture provenance failed: {'; '.join(s_problems)}", s_url
+            coverage_problems = capture_coverage_problems(
+                list(pr_data.get("comments") or []) + list(pr_data.get("reviews") or []),
+                binds, target.required_viewports)
+            if coverage_problems:
+                return "REQUIRED", f"{prefix}: capture provenance failed: {'; '.join(coverage_problems)}", declaration["url"] or None
         counts = FLOW_QA_ASSERTIONS_RE.search(declaration["body"])
         if counts is None:
             return "REQUIRED", f"{prefix}: no 'FLOW-QA-ASSERTIONS pass=N fail=M' line.", declaration["url"] or None

@@ -476,6 +476,21 @@ class TestGitHubPRGate(unittest.TestCase):
                 "SHOT-PAIR viewport=1440x900 phash_dist=20 changed_ratio=0.12\n"
             )
         }
+        for viewport, scale, before_hash, after_hash in (
+            ("390x844", 2, "3" * 64, "4" * 64),
+            ("390x420", 2, "5" * 64, "6" * 64),
+        ):
+            good_qa_comment["body"] += (
+                f"SHOT before served={'e' * 40} expected={'e' * 40} viewport={viewport} sha256={before_hash}\n"
+                f"SHOT after served={self.head_sha} expected={self.head_sha} viewport={viewport} sha256={after_hash}\n"
+                f"SHOT-PAIR viewport={viewport} phash_dist=20 changed_ratio=0.12\n"
+            )
+            for label, sha, digest in (("before", "e" * 40, before_hash), ("after", self.head_sha, after_hash)):
+                good_qa_comment["body"] += "CAPTURE " + json.dumps({
+                    "label": label, "served_sha": sha, "viewport": viewport, "sha256": digest,
+                    "account": "qa-user", "device_scale": scale, "url": "http://localhost:4901/app",
+                    "source": "application"
+                }) + "\n"
         pr_separate_good = self.shipnovo_ui_pr(
             comments=[{"body": "\n".join(self.shipnovo_flow_qa_lines())}, good_qa_comment]
         )
