@@ -53,6 +53,10 @@ Invariants:
       child, since Windows reuses a dead parent's PID.
     - RAM guard: when host system RAM >= 95%, acquire stays in the FIFO queue and waits until
       RAM drops below the limit (or --timeout expires); --force bypasses the wait.
+    - Operator build freeze: when 'build-freeze' exists in run_dir, acquire and run
+      commands are refused immediately with exit 75 and 'build freeze active (<reason>)'
+      printed to stderr (fallback 'reason unavailable' on read error). No queue entry
+      is created and no command is launched; status and release remain unaffected.
     - Standard library only. Windows uses msvcrt byte locks; POSIX uses flock.
 """
 
@@ -2968,6 +2972,16 @@ def _add_run_options(parser: argparse.ArgumentParser) -> None:
 def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     manager = BuildSlotManager(run_dir=args.run_dir)
+    if args.command in ("acquire", "run"):
+        freeze_path = os.path.join(manager.run_dir, "build-freeze")
+        if os.path.exists(freeze_path):
+            try:
+                with open(freeze_path, encoding="utf-8") as freeze_file:
+                    reason = freeze_file.read().strip()
+            except OSError:
+                reason = "reason unavailable"
+            print(f"build freeze active ({reason})", file=sys.stderr)
+            return 75
 
     if args.command == "acquire":
         caller_pid = args.pid
