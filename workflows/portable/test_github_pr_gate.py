@@ -444,6 +444,45 @@ class TestGitHubPRGate(unittest.TestCase):
         good_pr = self.shipnovo_ui_pr(comments=[{"body": "\n".join(self.shipnovo_flow_qa_lines())}])
         good_result = evaluate_pr_gate(good_pr, repo="Wladefant/shipnovo")
         self.assertEqual(good_result.flow_qa_receipt_verdict, "PASSED")
+
+        # 7. Shipnovo separate QA comment missing capture records blocks the gate
+        bad_qa_comment = {
+            "body": (
+                "| Viewport | Before | After |\n"
+                "| **1440x900** | ![before 1440](https://github.com/user-attachments/assets/00000001) | ![after 1440](https://github.com/user-attachments/assets/00000002) |\n"
+                f"SHOT before served={'e' * 40} expected={'e' * 40} viewport=1440x900 sha256={'1' * 64}\n"
+                f"SHOT after served={self.head_sha} expected={self.head_sha} viewport=1440x900 sha256={'2' * 64}\n"
+                "SHOT-PAIR viewport=1440x900 phash_dist=20 changed_ratio=0.12\n"
+            )
+        }
+        pr_separate_bad = self.shipnovo_ui_pr(
+            comments=[{"body": "\n".join(self.shipnovo_flow_qa_lines())}, bad_qa_comment]
+        )
+        res_separate_bad = evaluate_pr_gate(pr_separate_bad, repo="Wladefant/shipnovo")
+        self.assertEqual(res_separate_bad.flow_qa_receipt_verdict, "REQUIRED")
+        self.assertEqual(res_separate_bad.gate_verdict, "BLOCKED")
+        self.assertIn("capture provenance failed", res_separate_bad.flow_qa_receipt_reason)
+        self.assertIn("screenshot provenance failed", res_separate_bad.qa_receipt_reason)
+
+        # 8. Shipnovo separate QA comment with valid capture records passes the gate
+        good_qa_comment = {
+            "body": (
+                "| Viewport | Before | After |\n"
+                "| **1440x900** | ![before 1440](https://github.com/user-attachments/assets/00000001) | ![after 1440](https://github.com/user-attachments/assets/00000002) |\n"
+                f"SHOT before served={'e' * 40} expected={'e' * 40} viewport=1440x900 sha256={'1' * 64}\n"
+                f"CAPTURE {json.dumps({'label': 'before', 'served_sha': 'e' * 40, 'viewport': '1440x900', 'sha256': '1' * 64, 'account': 'qa-user', 'device_scale': 1, 'url': 'http://localhost:4901/app', 'source': 'application'})}\n"
+                f"SHOT after served={self.head_sha} expected={self.head_sha} viewport=1440x900 sha256={'2' * 64}\n"
+                f"CAPTURE {json.dumps({'label': 'after', 'served_sha': self.head_sha, 'viewport': '1440x900', 'sha256': '2' * 64, 'account': 'qa-user', 'device_scale': 1, 'url': 'http://localhost:4901/app', 'source': 'application'})}\n"
+                "SHOT-PAIR viewport=1440x900 phash_dist=20 changed_ratio=0.12\n"
+            )
+        }
+        pr_separate_good = self.shipnovo_ui_pr(
+            comments=[{"body": "\n".join(self.shipnovo_flow_qa_lines())}, good_qa_comment]
+        )
+        res_separate_good = evaluate_pr_gate(pr_separate_good, repo="Wladefant/shipnovo")
+        self.assertEqual(res_separate_good.flow_qa_receipt_verdict, "PASSED")
+        self.assertEqual(res_separate_good.qa_receipt_verdict, "PASSED")
+        self.assertEqual(res_separate_good.gate_verdict, "PASSED")
     def test_unresolvable_live_head_never_approves(self):
         for head in ("", "short", "g" * 40):
             for expected in (None, self.head_sha):
