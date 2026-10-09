@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { capture } from './depth_report_capture.mjs';
+import { capture, readServedVersion } from './depth_report_capture.mjs';
 
 const SHA = 'c'.repeat(40);
 
@@ -111,6 +111,25 @@ test('text over a background image is not proven and never passes', async () => 
   const c = contrastOf(m, '390x844', 'dark');
   assert.equal(c.passed, false);
   assert.match(c.detail, /not proven: \[\{"text":"Text on a photo\.","reason":"background-image"\}\]/);
+});
+
+async function readVersion(version) {
+  const server = await serve(CLEAN, version);
+  try {
+    return await readServedVersion(`http://127.0.0.1:${server.address().port}`, SHA, 1000);
+  } finally {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  }
+}
+
+test('capture prefers commit over SemVer and deploymentId', async () => {
+  const version = await readVersion({ version: '1.0.0', commit: SHA, deploymentId: 'b'.repeat(40), sha: 'd'.repeat(40) });
+  assert.equal(version.sha, SHA);
+});
+
+test('capture rejects SemVer-only with a clear error', async () => {
+  await assert.rejects(readVersion({ version: '1.0.0' }), /40-hex commit/);
 });
 
 test('a served SHA that differs from the expected one is refused before any capture', async () => {

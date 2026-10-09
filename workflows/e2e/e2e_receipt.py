@@ -15,8 +15,9 @@ PASS only when all of these hold; each failed condition prints a `FLOW-QA-REASON
   production_host        a target ran against a production host
   missing_viewports      a required viewport (default 390x844 and 1440x900) did not run and pass
 
-Served sha: `--served-sha`, or read from `<--base-url>/api/version` (fields sha, served_sha,
-version, git_sha). It is read from the server, never from the branch.
+Served sha: `--served-sha`, or read from `<--base-url>/api/version`. Prefer a full
+40-hex commit, then legacy sha, served_sha, version, git_sha, or commitSha.
+SemVer and deploymentId never identify served content. Missing commits raise an error.
 
 Replay is the default: a model call or a cache miss gives `FLOW-QA-REASON replay_not_clean`
 (`replay_not_clean` joins the list above). `--allow-model-calls` opts out, for record runs only.
@@ -56,11 +57,11 @@ def fetch_served_sha(base_url: str, timeout: float = 15.0, allowed: Optional[Lis
         raise ValueError(refusal)
     with e2e_guard.open_no_redirect(url, timeout, "application/json") as res:
         data = json.loads(res.read().decode("utf-8"))
-    for key in ("sha", "served_sha", "version", "git_sha"):
+    for key in ("commit", "sha", "served_sha", "version", "git_sha", "commitSha"):
         value = data.get(key)
-        if isinstance(value, str) and value:
+        if isinstance(value, str) and SHA_RE.fullmatch(value):
             return value
-    return None
+    raise ValueError("Served SHA requires a 40-hex commit")
 
 
 def _last_attempt(result: Dict[str, Any]) -> Optional[Dict[str, Any]]:

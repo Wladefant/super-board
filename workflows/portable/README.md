@@ -38,6 +38,10 @@ The Outer-Loop webhook intake regression command is `python test_outer_loop_inta
 The Theo/T3 workflow tools (issue #208) each have a regression command: `python test_evidence_lint.py` (evidence link lint and posted-media check), `python test_pr_demo_video.py` (PR demo video step), `python test_pr_label_bot.py` (size and risk labels), `python test_project_drift.py` (Project 5 drift sweep). `install_upkeep_task.py` registers the bounded hourly sweep `SuperboardUpkeepHourly` (label bot plus drift repair, super-board only; PolySimulator is report-only).
 The Flow QA runner regression command is `node --test test_flow_qa_runner.mjs`.
 The runner binds receipts to the measured server SHA from `/api/version`. An untrusted caller `bindSha` cannot override the measured SHA.
+Version readers prefer a full 40-hex `commit`. They accept legacy `sha`, `served_sha`, `version`, `git_sha`, and `commitSha` only as full 40-hex values.
+SemVer and `deploymentId` do not identify served content. A payload without a valid commit fails closed.
+After merge, install only these readers with `python workflows/portable/install_github_native.py --source-root . --sha-readers-only`.
+Add `--check` to verify byte parity without changing files. This mode preserves unrelated workflows and the live profile.
 The runner records cleanup results and assertions in report evidence and counters. A failing cleanup assertion marks the report and receipt as failed.
 The runner rejects unsupported viewports and empty theme lists. Zero-executed coverage cannot print `PASS`.
 `formatReceipt` prints `FAIL` if any assertion fails, cleanup fails, or coverage is missing or unsupported.

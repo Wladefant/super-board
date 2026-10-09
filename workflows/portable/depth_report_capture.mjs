@@ -31,6 +31,7 @@ import {
   assertNotProduction,
   checkNoHorizontalOverflow,
   resolveExecutablePath,
+  readServedSha,
   resolvePuppeteer
 } from './flow_qa_runner.mjs';
 
@@ -161,18 +162,19 @@ function inspectPage() {
 }
 
 /** One read of GET /api/version, bounded by a timeout: refuses a wrong SHA or a dirty tree. */
-async function readServedVersion(baseUrl, expectedSha, timeoutMs) {
+export async function readServedVersion(baseUrl, expectedSha, timeoutMs) {
   const res = await fetch(`${baseUrl.replace(/\/+$/, '')}/api/version`, {
     headers: { Accept: 'application/json' },
     signal: AbortSignal.timeout(timeoutMs)
   }).catch((err) => { throw new Error(`Served SHA check failed: GET /api/version: ${err.message}`); });
   if (!res.ok) throw new Error(`Served SHA check failed: GET /api/version returned HTTP ${res.status}`);
   const served = await res.json();
-  if (String(served.sha || '').toLowerCase() !== expectedSha.toLowerCase()) {
-    throw new Error(`Served SHA check failed: got "${served.sha}", expected "${expectedSha}"`);
+  const sha = readServedSha(served);
+  if (sha.toLowerCase() !== expectedSha.toLowerCase()) {
+    throw new Error(`Served SHA check failed: got "${sha}", expected "${expectedSha}"`);
   }
-  if (served.dirty) throw new Error(`The served tree at ${served.sha} has local changes; commit them first`);
-  return served;
+  if (served.dirty) throw new Error(`The served tree at ${sha} has local changes; commit them first`);
+  return { ...served, sha };
 }
 
 export async function capture({ baseUrl, expectedSha, outputDir, versionTimeoutMs = 10000 }) {

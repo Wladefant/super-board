@@ -279,6 +279,13 @@ export function verifyServedSha(servedSha, expectedSha) {
   };
 }
 
+export function readServedSha(data) {
+  const sha = [data?.commit, data?.sha, data?.served_sha, data?.version, data?.git_sha, data?.commitSha]
+    .find((value) => typeof value === 'string' && /^[0-9a-f]{40}$/i.test(value));
+  if (!sha) throw new Error('Served SHA requires a 40-hex commit');
+  return sha;
+}
+
 /**
  * Checks /api/version before running actions.
  */
@@ -297,8 +304,9 @@ export async function checkVersionEndpoint(baseUrl, expectedSha, fetchFn = fetch
       data = await res.json();
     }
   } catch (_) {}
-  const versionSha = data ? (data.sha || data.served_sha || data.version || data.git_sha || data.commitSha || data.commit || null) : null;
-  if (!versionSha || !/^[0-9a-f]{40}$/i.test(String(versionSha))) {
+  let versionSha = null;
+  try { versionSha = readServedSha(data); } catch (_) {}
+  if (!versionSha) {
     try {
       const res = await fetchFn(`${cleanBase}/api/health`, {
         method: 'GET',
@@ -319,7 +327,7 @@ export async function checkVersionEndpoint(baseUrl, expectedSha, fetchFn = fetch
         detail: `GET /api/version and /api/health failed to return JSON`
       };
     }
-    const servedSha = data.sha || data.served_sha || data.version || data.git_sha || data.commitSha || data.commit || null;
+    const servedSha = readServedSha(data);
     const shaCheck = verifyServedSha(servedSha, expectedSha);
 
     return {

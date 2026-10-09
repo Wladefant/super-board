@@ -41,6 +41,31 @@ class Installation(unittest.TestCase):
         (self.source / "workflows/portable/manifest.json").write_text(json.dumps(self.source_manifest))
         (self.runtime / "manifest.json").write_text(json.dumps({"unrelated": "preserved", "modules": {"peer.py": {"role": "peer"}}}))
 
+    def test_sha_readers_only_preserves_unrelated_runtime_and_profile(self):
+        import install_github_native as installer
+        self.profile.parent.mkdir(parents=True)
+        self.profile.write_bytes(b"live operator policy")
+        names = (
+            ("portable", "flow_qa_runner.mjs"),
+            ("portable", "depth_report_capture.mjs"),
+            ("e2e", "e2e_receipt.py"),
+            ("e2e", "e2e_guard.py"),
+            ("e2e", "pins.json"),
+        )
+        for folder, name in names:
+            source = self.source / "workflows" / folder / name
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(name.encode())
+        args = ["--source-root", str(self.source), "--runtime-dir", str(self.runtime),
+                "--profile-path", str(self.profile), "--sha-readers-only"]
+        self.assertEqual(installer.main(args), 0)
+        self.assertEqual(installer.main(args + ["--check"]), 0)
+        for folder, name in names:
+            target = self.runtime / (Path("e2e") / name if folder == "e2e" else Path(name))
+            self.assertEqual(target.read_bytes(), name.encode())
+        self.assertEqual(self.profile.read_bytes(), b"live operator policy")
+        self.assertEqual((self.runtime / "state.json").read_bytes(), b"operator state")
+
     def test_exact_install_idempotence_and_drift_detection(self):
         self.assertTrue(synchronize(self.source, self.profile, self.runtime))
         self.assertTrue(synchronize(self.source, self.profile, self.runtime, check=True))
