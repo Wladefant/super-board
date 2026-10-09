@@ -35,7 +35,7 @@ class TestRampBudget(unittest.TestCase):
         return mem
 
     def test_per_class_ramp_boundaries_keep_floor(self):
-        for job_class, window in [('heavy', 300), ('medium', 120), ('light', 60)]:
+        for job_class, window in [('heavy', 300), ('medium', 120), ('light', 60), ('browser', 60)]:
             for age, charge in [(window-.001, True), (window, False), (window+1, False)]:
                 with self.subTest(job_class=job_class, age=age):
                     mem = self.hold(job_class, age)
@@ -65,13 +65,13 @@ class TestRampBudget(unittest.TestCase):
         for stamp in ['bad', float('nan'), float('inf'), 1001.0]:
             with self.subTest(stamp=stamp):
                 self.hold('heavy', 301, stamp=stamp)
-                self.assertEqual(self.manager._memory_budget()['free_budget_gib'], -1.0)
+                self.assertEqual(self.manager._memory_budget()['free_budget_gib'], -3.0)
         self.hold('heavy', 301)
         info = self.manager._read_slot_info(0)
         info.pop('acquired_at_epoch')
         info.pop('acquired_at')
         build_slot._write_json_atomic(os.path.join(self.manager.slot_dirs[0], 'info.json'), info)
-        self.assertEqual(self.manager._memory_budget()['free_budget_gib'], -1.0)
+        self.assertEqual(self.manager._memory_budget()['free_budget_gib'], -3.0)
 
 
 if __name__ == '__main__':
