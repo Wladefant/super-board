@@ -31,6 +31,9 @@ A harness-agnostic, pure Python standard library multi-agent coordination core l
    * Quota, balance, and probe utilities sanitize and redact all account identifiers, emails, project refs, and tokens.
 6. **Head-Bound Evidence Invalidation:**
    * Execution-checkpoint proofs remain head-bound. The installed `github_pr_gate.py` and `review_content.py` retain stable patch-id **and** whitespace-sensitive stripped-diff sha256, valid ancestor delta chains, the COMMENT-review approval waiver on named single-author branches (`Bavariance/polysimulator@staging`, `Wladefant/super-board@main`, and `Wladefant/veyyon@main`) and anti-self-approval. Native review timestamps additionally bind fresh CI/security invalidation: unchanged content never permits a newly broken or newly vulnerable candidate through the gate. Legacy local review metadata cannot grant approval.
+   * Review identity git processes use isolated stdin and a 10-second deadline. Diff reads name an explicit commit range. A deadline blocks receipt evaluation.
+   * FLOW-QA receipts record SHA-256 hashes of the runner and canonical project flow. The supervisor compares both against its installed approved source. Missing or changed hashes block acceptance.
+   * Product screenshot pairs require capture records from the served application. Each record names the measured SHA, signed-in account, URL, viewport, device scale, and image SHA-256. Static pages without a version and authenticated session cannot produce product records.
 
 ---
 
@@ -97,6 +100,32 @@ Unsupported repositories remain exempt from Flow QA requirements.
 A valid receipt comment must bind the current head SHA.
 The receipt must report positive assertions with zero failures (`pass>0`, `fail=0`).
 The receipt must list all required viewports.
+A PASS requires an executed flow step and at least one real assertion.
+Skip notes do not count as passed assertions.
+Earlier-head capture comments do not block current evidence unless their content still matches the current revision.
+The receipt must include `FLOW-QA-SOURCE runner=<sha256> flow=<sha256> project=<project>`.
+The supervisor reads its installed canonical files to check both hashes.
+This check detects accidental or careless source drift, not a hostile lane that fabricates evidence.
+All lanes share one Windows identity. Protected execution evidence requires a separate supervisor identity and is outside this change.
+An alternate flow file can pass only when its bytes match the approved canonical flow.
+An older receipt without source hashes needs a new run.
+A failed Shipnovo FLOW-QA receipt stays blocked for the same content.
+A later PASS cannot erase that failure without a new product revision.
+Shipnovo before/after image captions require matching `CAPTURE <json>` records for each viewport.
+The gate checks every comment carrying before/after evidence, including separate QA-only comments.
+Shipnovo has no exemption for separate capture evidence comments.
+Valid capture records must bind the exact head commit and match caption fields.
+Capture records contain `label`, `served_sha`, `account`, `viewport`, `device_scale`, `url`, `sha256`, and `source`.
+Product captures use `source=application` and measure the account from the authenticated session.
+After a keyboard action changes the viewport, capture metadata uses the actual supported viewport dimensions.
+The logical flow target remains unchanged. Unsupported capture dimensions still fail closed.
+`install_github_native.py --sha-readers-only` installs the runner, gate, identity helper, and canonical flow files together.
+This targeted install preserves profile policy, runtime state, and unrelated files.
+Extra installed flow files remain unapproved. Their hashes cannot match the canonical project flow.
+Depth-report captures prove report layout. They do not prove a signed-in product account and cannot replace product capture records.
+PolySimulator keeps its current caption and pixel checks until its capture producer supplies the new metadata.
+The later PolySimulator switch is tracked in https://github.com/Bavariance/polysimulator/issues/6588.
+FLOW-QA PRs on Shipnovo do not require an unrelated `QA-RECEIPT: PASS` marker when no QA receipt is declared.
 Stale revisions, failed markers, or missing required viewports block the gate.
 
 ### Local test execution record contract

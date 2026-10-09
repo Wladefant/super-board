@@ -28,6 +28,7 @@ Verifies:
 import argparse
 import copy
 import datetime
+import hashlib
 import json
 import os
 import shutil
@@ -70,7 +71,8 @@ class TestGitHubPRGate(unittest.TestCase):
         cls.addClassCleanup(os.chdir, previous)
         os.chdir(cls.repository.name)
         def git(*args):
-            return subprocess.check_output(["git", *args], stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).decode().strip()
+            return subprocess.check_output(["git", *args], stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                           timeout=10, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).decode().strip()
         git("init", "-b", "fixture-base")
         git("config", "user.name", "Wladimir Kirjanovs")
         git("config", "user.email", "wladefant@gmail.com")
@@ -193,6 +195,12 @@ class TestGitHubPRGate(unittest.TestCase):
             allow_review_exemption=True,
         )
 
+    def test_review_git_timeout_blocks_instead_of_crashing(self):
+        with patch("review_content.evaluate", side_effect=subprocess.TimeoutExpired("git", 10)):
+            result = evaluate_pr_gate(self.mock_pr)
+        self.assertEqual(result.gate_verdict, "BLOCKED")
+        self.assertIn("timed out", result.verdict_reason)
+
     def qa_receipt_comment(
         self, *, named=None, identity=None, images=2, marker="PASS", served=None, extra="", when=None,
         flow=True,
@@ -226,6 +234,12 @@ class TestGitHubPRGate(unittest.TestCase):
             comment["created_at"] = when
         return comment
 
+    def source_line(self, project):
+        def digest(name):
+            with open(os.path.join(SCRIPT_DIR, name), "rb") as source:
+                return hashlib.sha256(source.read()).hexdigest()
+        return f"FLOW-QA-SOURCE runner={digest('flow_qa_runner.mjs')} flow={digest('flows/' + project + '.json')} project={project}"
+
     def flow_qa_lines(self, *, served=None, passed=12, failed=0, viewports="390x844,1440x900", marker="PASS"):
         """The lines `flow_qa_runner.mjs` prints: marker bound to the served sha, counts, viewports."""
         served = served or self.head_sha
@@ -233,6 +247,7 @@ class TestGitHubPRGate(unittest.TestCase):
             f"FLOW-QA: {marker} {served}",
             f"FLOW-QA-ASSERTIONS pass={passed} fail={failed}",
             f"FLOW-QA-VIEWPORTS {viewports}",
+            self.source_line("polysimulator"),
         ]
 
     def test_flow_qa_receipt_positive_and_negative_controls(self):
@@ -259,8 +274,8 @@ class TestGitHubPRGate(unittest.TestCase):
         self.assertEqual(good.flow_qa_receipt_verdict, "PASSED", good.flow_qa_receipt_reason)
         self.assertEqual(good.gate_verdict, "PASSED")
 
-    def test_e2e_receipt_output_is_accepted_and_failures_are_blocked_by_the_gate(self):
-        """The e2e wrapper's receipt text (workflows/e2e/e2e_receipt.py) is what the gate reads."""
+    def test_unbound_e2e_receipt_and_failed_assertions_are_rejected(self):
+        """An e2e receipt without canonical source hashes cannot replace the trusted runner."""
         import sys as _sys
         from pathlib import Path as _Path
 
@@ -292,7 +307,8 @@ class TestGitHubPRGate(unittest.TestCase):
             self.staging_ui_pr(comments=[self.qa_receipt_comment(flow=False, extra=text(report(), self.head_sha))]),
             policy=self.staging_policy(),
         )
-        self.assertEqual(ok.flow_qa_receipt_verdict, "PASSED", ok.flow_qa_receipt_reason)
+        self.assertEqual(ok.flow_qa_receipt_verdict, "REQUIRED", ok.flow_qa_receipt_reason)
+        self.assertIn("canonical runner/flow", ok.flow_qa_receipt_reason)
         for label, rep, served in (("failed assertion", report(1), self.head_sha), ("stale sha", report(), "1" * 40)):
             with self.subTest(case=label):
                 bad = evaluate_pr_gate(
@@ -342,6 +358,7 @@ class TestGitHubPRGate(unittest.TestCase):
             f"FLOW-QA: {marker} {served}",
             f"FLOW-QA-ASSERTIONS pass={passed} fail={failed}",
             f"FLOW-QA-VIEWPORTS {viewports}",
+            self.source_line("shipnovo"),
         ]
 
     def test_shipnovo_flow_qa_gate_assertion(self):
@@ -427,6 +444,45 @@ class TestGitHubPRGate(unittest.TestCase):
         good_pr = self.shipnovo_ui_pr(comments=[{"body": "\n".join(self.shipnovo_flow_qa_lines())}])
         good_result = evaluate_pr_gate(good_pr, repo="Wladefant/shipnovo")
         self.assertEqual(good_result.flow_qa_receipt_verdict, "PASSED")
+
+        # 7. Shipnovo separate QA comment missing capture records blocks the gate
+        bad_qa_comment = {
+            "body": (
+                "| Viewport | Before | After |\n"
+                "| **1440x900** | ![before 1440](https://github.com/user-attachments/assets/00000001) | ![after 1440](https://github.com/user-attachments/assets/00000002) |\n"
+                f"SHOT before served={'e' * 40} expected={'e' * 40} viewport=1440x900 sha256={'1' * 64}\n"
+                f"SHOT after served={self.head_sha} expected={self.head_sha} viewport=1440x900 sha256={'2' * 64}\n"
+                "SHOT-PAIR viewport=1440x900 phash_dist=20 changed_ratio=0.12\n"
+            )
+        }
+        pr_separate_bad = self.shipnovo_ui_pr(
+            comments=[{"body": "\n".join(self.shipnovo_flow_qa_lines())}, bad_qa_comment]
+        )
+        res_separate_bad = evaluate_pr_gate(pr_separate_bad, repo="Wladefant/shipnovo")
+        self.assertEqual(res_separate_bad.flow_qa_receipt_verdict, "REQUIRED")
+        self.assertEqual(res_separate_bad.gate_verdict, "BLOCKED")
+        self.assertIn("capture provenance failed", res_separate_bad.flow_qa_receipt_reason)
+        self.assertIn("screenshot provenance failed", res_separate_bad.qa_receipt_reason)
+
+        # 8. Shipnovo separate QA comment with valid capture records passes the gate
+        good_qa_comment = {
+            "body": (
+                "| Viewport | Before | After |\n"
+                "| **1440x900** | ![before 1440](https://github.com/user-attachments/assets/00000001) | ![after 1440](https://github.com/user-attachments/assets/00000002) |\n"
+                f"SHOT before served={'e' * 40} expected={'e' * 40} viewport=1440x900 sha256={'1' * 64}\n"
+                f"CAPTURE {json.dumps({'label': 'before', 'served_sha': 'e' * 40, 'viewport': '1440x900', 'sha256': '1' * 64, 'account': 'qa-user', 'device_scale': 1, 'url': 'http://localhost:4901/app', 'source': 'application'})}\n"
+                f"SHOT after served={self.head_sha} expected={self.head_sha} viewport=1440x900 sha256={'2' * 64}\n"
+                f"CAPTURE {json.dumps({'label': 'after', 'served_sha': self.head_sha, 'viewport': '1440x900', 'sha256': '2' * 64, 'account': 'qa-user', 'device_scale': 1, 'url': 'http://localhost:4901/app', 'source': 'application'})}\n"
+                "SHOT-PAIR viewport=1440x900 phash_dist=20 changed_ratio=0.12\n"
+            )
+        }
+        pr_separate_good = self.shipnovo_ui_pr(
+            comments=[{"body": "\n".join(self.shipnovo_flow_qa_lines())}, good_qa_comment]
+        )
+        res_separate_good = evaluate_pr_gate(pr_separate_good, repo="Wladefant/shipnovo")
+        self.assertEqual(res_separate_good.flow_qa_receipt_verdict, "PASSED")
+        self.assertEqual(res_separate_good.qa_receipt_verdict, "PASSED")
+        self.assertEqual(res_separate_good.gate_verdict, "PASSED")
     def test_unresolvable_live_head_never_approves(self):
         for head in ("", "short", "g" * 40):
             for expected in (None, self.head_sha):
@@ -2017,8 +2073,12 @@ class TestGitHubPRGate(unittest.TestCase):
             " | ![after 1440](https://github.com/user-attachments/assets/00000002-1111-2222-3333-000000000002) |",
         ]
         if captions:
-            lines.append(f"SHOT before served={before} expected={before_expected or before} url=x viewport=1440x900")
-            lines.append(f"SHOT after served={after} expected={after_expected or after} url=x viewport=1440x900")
+            for label, sha, expected, digest in (("before", before, before_expected or before, "1" * 64),
+                                                ("after", after, after_expected or after, "2" * 64)):
+                lines.append(f"SHOT {label} served={sha} expected={expected} viewport=1440x900 sha256={digest}")
+                lines.append("CAPTURE " + json.dumps({"label": label, "served_sha": sha, "viewport": "1440x900",
+                             "sha256": digest, "account": "qa-user", "device_scale": 1,
+                             "url": "http://localhost:4901/app", "source": "application"}))
         if pair:
             lines.append(f"SHOT-PAIR viewport=1440x900 phash_dist={dist} changed_ratio={ratio}")
         receipt = self.qa_receipt_comment(extra="\n".join(lines))

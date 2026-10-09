@@ -133,7 +133,7 @@ test('assertNotProduction throws ProductionForbiddenError for production URL', (
 // 3. Served SHA Verification & /api/version Endpoint
 // ============================================================================
 
-test('verifyServedSha matches exact and prefix commit SHAs (Positive Controls)', () => {
+test('verifyServedSha accepts exact commits and rejects prefix claims', () => {
   const exact = verifyServedSha(
     '915086acdf8a9061b4dae420935e876183046d9b',
     '915086acdf8a9061b4dae420935e876183046d9b'
@@ -144,7 +144,7 @@ test('verifyServedSha matches exact and prefix commit SHAs (Positive Controls)',
     '915086acdf8a9061b4dae420935e876183046d9b',
     '915086a'
   );
-  assert.equal(prefix.match, true);
+  assert.equal(prefix.match, false);
 });
 
 test('verifyServedSha rejects mismatching and empty SHAs (Negative Controls)', () => {
@@ -563,14 +563,19 @@ test('E2E Puppeteer Runner executes flow with CDP touch and emits flow-qa/v1 rep
   let port;
   await new Promise((resolve) => {
     server = http.createServer((req, res) => {
-      if (req.url === '/api/version') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ sha: EXPECTED_SHA, version: '1.0.0' }));
-      } else {
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end(htmlContent);
-      }
-    });
+          if (req.url === '/api/auth/session') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ user: { id: 'qa-fixture-user' } }));
+            return;
+          }
+          if (req.url === '/api/version') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ sha: EXPECTED_SHA, version: '1.0.0' }));
+          } else {
+            res.writeHead(200, { 'Content-Type': 'text/html' });
+            res.end(htmlContent);
+          }
+        });
     server.listen(0, '127.0.0.1', () => {
       port = server.address().port;
       resolve();
@@ -674,6 +679,21 @@ test('E2E Puppeteer Runner executes flow with CDP touch and emits flow-qa/v1 rep
       const shotPath = path.join(tmpDir, stepRep.screenshot);
       assert.ok(fs.existsSync(shotPath), `Screenshot file ${stepRep.screenshot} must exist on disk`);
     }
+
+    // Assert open-keyboard screenshot CAPTURE metadata viewport is 390x420 although logical target remains 390x844
+    const keyboard844Steps = report.steps.filter(
+      (s) => s.step === 'open-keyboard' && s.viewport === '390x844'
+    );
+    assert.ok(keyboard844Steps.length > 0, 'open-keyboard steps on 390x844 must exist');
+    for (const stepRep of keyboard844Steps) {
+      assert.equal(stepRep.viewport, '390x844', 'Logical target remains 390x844');
+      assert.ok(stepRep.capture, 'open-keyboard step must record capture metadata');
+      assert.equal(stepRep.capture.viewport, '390x420', 'Screenshot CAPTURE metadata viewport must be 390x420 although logical target remains 390x844');
+      const sidecarPath = path.join(tmpDir, `${stepRep.screenshot}.capture.json`);
+      assert.ok(fs.existsSync(sidecarPath), `Capture metadata sidecar ${stepRep.screenshot}.capture.json must exist`);
+      const sidecar = JSON.parse(fs.readFileSync(sidecarPath, 'utf8'));
+      assert.equal(sidecar.viewport, '390x420', 'Sidecar capture metadata viewport must be 390x420');
+    }
   } finally {
     server.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -691,14 +711,19 @@ test('Negative Flow Control 1: Button under 44x44px fails tap_target_min_44 chec
 
   await new Promise((resolve) => {
     server = http.createServer((req, res) => {
-      if (req.url === '/api/version') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ sha: EXPECTED_SHA }));
-      } else {
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end('<!DOCTYPE html><html><body><button id="small-btn" style="width:30px;height:24px">X</button></body></html>');
-      }
-    });
+          if (req.url === '/api/auth/session') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ user: { id: 'qa-fixture-user' } }));
+            return;
+          }
+          if (req.url === '/api/version') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ sha: EXPECTED_SHA }));
+          } else {
+            res.writeHead(200, { 'Content-Type': 'text/html' });
+            res.end('<!DOCTYPE html><html><body><button id="small-btn" style="width:30px;height:24px">X</button></body></html>');
+          }
+        });
     server.listen(0, '127.0.0.1', () => {
       port = server.address().port;
       resolve();
@@ -752,14 +777,19 @@ test('Negative Flow Control 2: Cleanup failure triggers fail-closed report', asy
 
   await new Promise((resolve) => {
     server = http.createServer((req, res) => {
-      if (req.url === '/api/version') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ sha: EXPECTED_SHA }));
-      } else {
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end('<!DOCTYPE html><html><body><div id="content">OK</div></body></html>');
-      }
-    });
+          if (req.url === '/api/auth/session') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ user: { id: 'qa-fixture-user' } }));
+            return;
+          }
+          if (req.url === '/api/version') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ sha: EXPECTED_SHA }));
+          } else {
+            res.writeHead(200, { 'Content-Type': 'text/html' });
+            res.end('<!DOCTYPE html><html><body><div id="content">OK</div></body></html>');
+          }
+        });
     server.listen(0, '127.0.0.1', () => {
       port = server.address().port;
       resolve();
@@ -803,7 +833,9 @@ test('Negative Flow Control 2: Cleanup failure triggers fail-closed report', asy
 test('formatReceipt binds PASS to the served sha and fails closed otherwise', async () => {
   const { formatReceipt } = await import('./flow_qa_runner.mjs');
   const sha = 'a'.repeat(40);
-  const ok = formatReceipt({ passed: true, served_sha: sha, assertions: { passed: 9, failed: 0 }, viewports: ['390x844', '1440x900'] });
+  const source = { runner: '1'.repeat(64), flow: '2'.repeat(64), project: 'shipnovo' };
+  const steps = [{ passed: true, checks: Array.from({ length: 9 }, () => ({ name: 'visible', passed: true })) }];
+  const ok = formatReceipt({ passed: true, served_sha: sha, expected_sha: sha, source, steps, assertions: { passed: 9, failed: 0 }, viewports: ['390x844', '1440x900'] });
   assert.match(ok, new RegExp(`^FLOW-QA: PASS ${sha}\\n`));
   assert.match(ok, /FLOW-QA-ASSERTIONS pass=9 fail=0/);
   assert.match(ok, /FLOW-QA-VIEWPORTS 390x844,1440x900/);
@@ -831,14 +863,19 @@ test('Negative Flow Control: caller bindSha cannot override server-measured SHA 
 
   await new Promise((resolve) => {
     server = http.createServer((req, res) => {
-      if (req.url === '/api/version') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ sha: MEASURED_SHA }));
-      } else {
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end('<!DOCTYPE html><html><body><div id="content">OK</div></body></html>');
-      }
-    });
+          if (req.url === '/api/auth/session') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ user: { id: 'qa-fixture-user' } }));
+            return;
+          }
+          if (req.url === '/api/version') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ sha: MEASURED_SHA }));
+          } else {
+            res.writeHead(200, { 'Content-Type': 'text/html' });
+            res.end('<!DOCTYPE html><html><body><div id="content">OK</div></body></html>');
+          }
+        });
     server.listen(0, '127.0.0.1', () => {
       port = server.address().port;
       resolve();
@@ -887,14 +924,19 @@ test('Negative Flow Control 3: Cleanup assertion returning passed=false triggers
 
   await new Promise((resolve) => {
     server = http.createServer((req, res) => {
-      if (req.url === '/api/version') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ sha: EXPECTED_SHA }));
-      } else {
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end('<!DOCTYPE html><html><body><div id="uncleaned-item">QA-Leftover</div></body></html>');
-      }
-    });
+          if (req.url === '/api/auth/session') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ user: { id: 'qa-fixture-user' } }));
+            return;
+          }
+          if (req.url === '/api/version') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ sha: EXPECTED_SHA }));
+          } else {
+            res.writeHead(200, { 'Content-Type': 'text/html' });
+            res.end('<!DOCTYPE html><html><body><div id="uncleaned-item">QA-Leftover</div></body></html>');
+          }
+        });
     server.listen(0, '127.0.0.1', () => {
       port = server.address().port;
       resolve();
@@ -953,14 +995,19 @@ test('Negative Flow Control 4: Reject unsupported viewports, empty theme lists, 
 
   await new Promise((resolve) => {
     server = http.createServer((req, res) => {
-      if (req.url === '/api/version') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ sha: EXPECTED_SHA }));
-      } else {
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end('<!DOCTYPE html><html><body><div id="content">OK</div></body></html>');
-      }
-    });
+          if (req.url === '/api/auth/session') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ user: { id: 'qa-fixture-user' } }));
+            return;
+          }
+          if (req.url === '/api/version') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ sha: EXPECTED_SHA }));
+          } else {
+            res.writeHead(200, { 'Content-Type': 'text/html' });
+            res.end('<!DOCTYPE html><html><body><div id="content">OK</div></body></html>');
+          }
+        });
     server.listen(0, '127.0.0.1', () => {
       port = server.address().port;
       resolve();
@@ -1044,6 +1091,18 @@ test('Negative Flow Control 4: Reject unsupported viewports, empty theme lists, 
       /unsupported theme/i,
       'runFlows must reject unsupported theme'
     );
+    for (const steps of [[], [
+      { id: 'optional-missing', action: 'tap', selector: '#missing', optional: true },
+      { id: 'desktop-control', action: 'tap', selector: '#missing', desktop_only: true },
+    ]]) {
+      fs.writeFileSync(flowJsonPath, JSON.stringify({ flows: [{ id: 'skip-only', steps }] }));
+      const report = await runFlows({
+        baseUrl, expectedSha: EXPECTED_SHA, outputDir: tmpDir,
+        flowDataPath: flowJsonPath, viewports: ['390x844'], themes: ['light']
+      });
+      assert.equal(report.assertions.passed, 0, 'skip notes are not real assertions');
+      assert.equal(report.passed, false, 'empty or skip-only flows must not pass');
+    }
   } finally {
     server.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -1113,14 +1172,19 @@ test('desktop_only steps pass with a skip note on touch and mobile viewports', a
   let port;
   await new Promise((resolve) => {
     server = http.createServer((req, res) => {
-      if (req.url === '/api/version') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ sha: EXPECTED_SHA }));
-      } else {
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end('<!DOCTYPE html><html><body><button id="desk-btn" style="width:50px;height:50px">Close</button></body></html>');
-      }
-    });
+          if (req.url === '/api/auth/session') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ user: { id: 'qa-fixture-user' } }));
+            return;
+          }
+          if (req.url === '/api/version') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ sha: EXPECTED_SHA }));
+          } else {
+            res.writeHead(200, { 'Content-Type': 'text/html' });
+            res.end('<!DOCTYPE html><html><body><button id="desk-btn" style="width:50px;height:50px">Close</button></body></html>');
+          }
+        });
     server.listen(0, '127.0.0.1', () => {
       port = server.address().port;
       resolve();
@@ -1166,14 +1230,19 @@ test('obstruction_overlay causes element_from_point check to fail with obstructi
   let port;
   await new Promise((resolve) => {
     server = http.createServer((req, res) => {
-      if (req.url === '/api/version') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ sha: EXPECTED_SHA }));
-      } else {
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end('<!DOCTYPE html><html><body><button id="target-btn" style="width:100px;height:50px">Click Me</button></body></html>');
-      }
-    });
+          if (req.url === '/api/auth/session') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ user: { id: 'qa-fixture-user' } }));
+            return;
+          }
+          if (req.url === '/api/version') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ sha: EXPECTED_SHA }));
+          } else {
+            res.writeHead(200, { 'Content-Type': 'text/html' });
+            res.end('<!DOCTYPE html><html><body><button id="target-btn" style="width:100px;height:50px">Click Me</button></body></html>');
+          }
+        });
     server.listen(0, '127.0.0.1', () => {
       port = server.address().port;
       resolve();
@@ -1230,17 +1299,22 @@ test('no_document_reload ignores the late load event of the page a goto left at 
   let releaseImage = null;
   let imageRequests = 0;
   const server = http.createServer((req, res) => {
-    if (req.url.startsWith('/slow.gif')) {
-      const send = () => { if (!res.headersSent) { res.writeHead(200, { 'Content-Type': 'image/gif' }); res.end(GIF); } };
-      if (imageRequests++ === 0) releaseImage = send; else send();
-      return;
-    }
-    res.writeHead(200, { 'Content-Type': 'text/html' });
-    res.end(`<!DOCTYPE html><html><body>
-      <button id="client" style="width:120px;height:48px" onclick="document.title='opened'">Oeffnen</button>
-      <button id="reload" style="width:120px;height:48px" onclick="location.reload()">Neu laden</button>
-      <img src="/slow.gif" width="1" height="1" alt=""></body></html>`);
-  });
+        if (req.url === '/api/auth/session') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ user: { id: 'qa-fixture-user' } }));
+          return;
+        }
+        if (req.url.startsWith('/slow.gif')) {
+          const send = () => { if (!res.headersSent) { res.writeHead(200, { 'Content-Type': 'image/gif' }); res.end(GIF); } };
+          if (imageRequests++ === 0) releaseImage = send; else send();
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(`<!DOCTYPE html><html><body>
+          <button id="client" style="width:120px;height:48px" onclick="document.title='opened'">Oeffnen</button>
+          <button id="reload" style="width:120px;height:48px" onclick="location.reload()">Neu laden</button>
+          <img src="/slow.gif" width="1" height="1" alt=""></body></html>`);
+      });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const puppeteer = resolvePuppeteer();
   const browser = await puppeteer.launch({ executablePath: resolveExecutablePath() || undefined, headless: 'new', args: ['--no-sandbox'] });
@@ -1307,9 +1381,14 @@ test('retryOnNavigation fails the step when the second attempt is destroyed too,
 
 test('an absent assertion does not pass while every lookup hits a destroyed context (Negative Control)', async () => {
   const server = http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/html' });
-    res.end('<!DOCTYPE html><html><body><button id="x">x</button></body></html>');
-  });
+        if (req.url === '/api/auth/session') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ user: { id: 'qa-fixture-user' } }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end('<!DOCTYPE html><html><body><button id="x">x</button></body></html>');
+      });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const browser = await resolvePuppeteer().launch({ executablePath: resolveExecutablePath() || undefined, headless: 'new', args: ['--no-sandbox'] });
   const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'flowqa-failclosed-'));
@@ -1345,11 +1424,16 @@ test('an absent assertion does not pass while every lookup hits a destroyed cont
 
 test('a tap that navigates away still passes and the next page is judged on its own document', async () => {
   const server = http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/html' });
-    res.end(req.url === '/next'
-      ? '<!DOCTYPE html><html><body><h1 id="arrived">arrived</h1></body></html>'
-      : '<!DOCTYPE html><html><body><a id="go" href="/next" style="display:block;width:160px;height:48px">Go</a></body></html>');
-  });
+        if (req.url === '/api/auth/session') {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ user: { id: 'qa-fixture-user' } }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(req.url === '/next'
+          ? '<!DOCTYPE html><html><body><h1 id="arrived">arrived</h1></body></html>'
+          : '<!DOCTYPE html><html><body><a id="go" href="/next" style="display:block;width:160px;height:48px">Go</a></body></html>');
+      });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const browser = await resolvePuppeteer().launch({ executablePath: resolveExecutablePath() || undefined, headless: 'new', args: ['--no-sandbox'] });
   const outputDir = fs.mkdtempSync(path.join(os.tmpdir(), 'flowqa-navtap-'));

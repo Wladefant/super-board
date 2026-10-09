@@ -17,6 +17,7 @@ Provides a deterministic status gate helper to replace non-deterministic LLM fin
 
 import argparse
 import datetime
+import hashlib
 import fnmatch
 import json
 import os
@@ -541,7 +542,10 @@ def evaluate_qa_receipt_requirement(
     Test files are skipped: a test-only diff changes no shipped surface, while a
     change that also touches product code still triggers on that file.
     """
-    if repo != "Bavariance/polysimulator" or base_ref != "staging":
+    target = get_flow_qa_target(repo, base_ref)
+    is_poly = repo == "Bavariance/polysimulator" and base_ref == "staging"
+    is_ship = bool(target and target.require_capture)
+    if not (is_poly or is_ship):
         return False, f"no QA receipt requirement for {repo}@{base_ref or 'unknown'}"
     files = pr_data.get("files")
     if files is None:
@@ -553,10 +557,14 @@ def evaluate_qa_receipt_requirement(
         norm_path = path.replace("\\", "/")
         if is_test_path(norm_path):
             continue
-        if UI_PATH_RE.match(norm_path):
-            return True, f"UI path {path}"
-        if ORDER_TRADING_PATH_RE.match(norm_path):
-            return True, f"order/trading path {path}"
+        if is_poly:
+            if UI_PATH_RE.match(norm_path):
+                return True, f"UI path {path}"
+            if ORDER_TRADING_PATH_RE.match(norm_path):
+                return True, f"order/trading path {path}"
+        elif is_ship:
+            if target.ui_pattern.search(norm_path):
+                return True, f"UI path {path}"
     return False, "no UI or order/trading paths"
 
 
@@ -593,14 +601,31 @@ SHOT_CAPTION_LINE_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 SHOT_PAIR_LINE_RE = re.compile(
-    r"^[ \t>*_`|\-]*SHOT-PAIR viewport=\S+ phash_dist=(?P<dist>\d+) changed_ratio=(?P<ratio>[0-9.]+)[ \t*_`|]*$",
+    r"^[ \t>*_`|\-]*SHOT-PAIR viewport=(?P<viewport>\S+) phash_dist=(?P<dist>\d+) changed_ratio=(?P<ratio>[0-9.]+)[ \t*_`|]*$",
     re.MULTILINE,
 )
 SHOT_NEAR_IDENTICAL_BITS = 3
 SHOT_MIN_CHANGED_RATIO = 0.0005
 
 
-def shot_provenance_problems(body: str, binds: Any) -> List[str]:
+def capture_evidence_is_current(body: str, binds: Any) -> bool:
+    """Ignore proven older revisions, but never exempt missing or malformed captions."""
+    after = [
+        dict(token.partition("=")[::2] for token in match.group("fields").split())
+        for match in SHOT_CAPTION_LINE_RE.finditer(body)
+        if match.group("label").lower() == "after"
+    ]
+    if not after:
+        return True
+    for fields in after:
+        served = fields.get("served", "").lower()
+        expected = fields.get("expected", "").lower()
+        if not SHA40_RE.fullmatch(served) or served != expected or binds(served):
+            return True
+    return False
+
+
+def shot_provenance_problems(body: str, binds: Any, require_capture: bool = False) -> List[str]:
     """
     Why a receipt's before/after screenshots are not provenance-backed evidence.
 
@@ -613,6 +638,25 @@ def shot_provenance_problems(body: str, binds: Any) -> List[str]:
     """
     if not SHOT_CLAIM_RE.search(body):
         return []
+    caption_matches = list(SHOT_CAPTION_LINE_RE.finditer(body))
+    viewports = {dict(token.partition("=")[::2] for token in match.group("fields").split()).get("viewport")
+                 for match in caption_matches}
+    if len(viewports) > 1:
+        problems = []
+        for viewport in viewports:
+            lines = []
+            for line in body.splitlines():
+                caption = SHOT_CAPTION_LINE_RE.fullmatch(line)
+                pair_line = SHOT_PAIR_LINE_RE.fullmatch(line)
+                if caption and dict(token.partition("=")[::2] for token in caption.group("fields").split()).get("viewport") != viewport:
+                    continue
+                if pair_line and pair_line.group("viewport") != viewport:
+                    continue
+                lines.append(line)
+            problems.extend(shot_provenance_problems("\n".join(lines), binds, require_capture))
+        return problems
+    if len(caption_matches) != 2:
+        return ["each pair needs exactly one before and one after caption"]
     captions: Dict[str, Dict[str, str]] = {}
     for match in SHOT_CAPTION_LINE_RE.finditer(body):
         label = match.group("label").lower()
@@ -647,6 +691,45 @@ def shot_provenance_problems(body: str, binds: Any) -> List[str]:
             f"before and after are near-identical (phash distance {pair.group('dist')}, "
             f"{float(pair.group('ratio')):.4%} of pixels changed)"
         )
+    if not require_capture:
+        return problems
+    records = {}
+    for line in re.findall(r"(?m)^CAPTURE (.+)$", body):
+        try:
+            record = json.loads(line)
+            if not isinstance(record, dict):
+                raise ValueError("capture record must be an object")
+            key = (record.get("label"), record.get("viewport"))
+            if key in records:
+                problems.append("duplicate capture record")
+            records[key] = record
+        except (ValueError, TypeError):
+            problems.append("malformed capture record")
+    selected = []
+    for label, fields in captions.items():
+        viewport = fields.get("viewport")
+        if pair and pair.group("viewport") != viewport:
+            problems.append(f"{label}: pair viewport differs from capture")
+        record = records.get((label, viewport))
+        if not record:
+            problems.append(f"{label}: missing measured capture record")
+            continue
+        selected.append(record)
+        if record.get("served_sha") != fields.get("served") or record.get("sha256") != fields.get("sha256"):
+            problems.append(f"{label}: caption does not match capture record")
+        if not re.fullmatch(r"[0-9a-f]{64}", str(record.get("sha256", ""))):
+            problems.append(f"{label}: invalid capture image hash")
+        if not record.get("account") or record.get("source") != "application":
+            problems.append(f"{label}: signed-in application source not proven")
+        if not re.match(r"^https?://", str(record.get("url", ""))):
+            problems.append(f"{label}: static or missing capture URL")
+        scale = record.get("device_scale")
+        if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not 0 < scale <= 8:
+            problems.append(f"{label}: device scale not measured")
+    if len(selected) == 2:
+        for field in ("account", "viewport", "device_scale"):
+            if selected[0].get(field) != selected[1].get(field):
+                problems.append(f"capture pair has mismatched {field}")
     return problems
 
 
@@ -672,6 +755,8 @@ def _content_binder(
     try:
         head_identity = {form.lower() for form in content_identity(head_sha, base, cwd) if form}
         identity_forms.extend(sorted(head_identity))
+    except subprocess.TimeoutExpired as exc:
+        return lambda token: False, [], f"blocked: git timed out after {exc.timeout} seconds"
     except (ValueError, subprocess.CalledProcessError) as exc:
         identity_error = str(exc)
     accepted = {form.lower() for form in identity_forms if form}
@@ -686,7 +771,7 @@ def _content_binder(
                 try:
                     forms = {form.lower() for form in content_identity(token, base, cwd) if form}
                     match = bool(forms & head_identity)
-                except (ValueError, subprocess.CalledProcessError):
+                except (ValueError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
                     match = False
             resolved[token] = match
         return resolved[token]
@@ -730,9 +815,33 @@ def evaluate_qa_receipt(
         return "EXEMPT", requirement_reason, None
 
     binds, identity_forms, identity_error = _content_binder(head_sha, base_ref, cwd)
+    target = get_flow_qa_target(repo, base_ref)
+    require_capture = bool(target and target.require_capture)
+
+    all_sources = list(pr_data.get("comments") or []) + list(pr_data.get("reviews") or [])
+    evidence_comments = [
+        source for source in all_sources
+        if SHOT_CLAIM_RE.search(str(source.get("body") or ""))
+        and (not require_capture or capture_evidence_is_current(str(source.get("body") or ""), binds))
+    ]
+
+    for source in evidence_comments:
+        shot_problems = shot_provenance_problems(
+            str(source.get("body") or ""),
+            (lambda sha: sha.lower() == head_sha.lower()) if require_capture else binds,
+            require_capture,
+        )
+        if shot_problems:
+            url = str(source.get("html_url") or source.get("url") or "") or None
+            return (
+                "REQUIRED",
+                f"QA receipt required ({requirement_reason}): before/after screenshot provenance "
+                f"failed: {'; '.join(shot_problems)}.",
+                url,
+            )
 
     declarations = []
-    for source in list(pr_data.get("comments") or []) + list(pr_data.get("reviews") or []):
+    for source in all_sources:
         body = str(source.get("body") or "")
         for marker in QA_RECEIPT_MARKER_RE.finditer(body):
             declarations.append(
@@ -752,9 +861,6 @@ def evaluate_qa_receipt(
     for declaration in declarations:
         tokens = set(declaration["tokens"])
         if declaration["state"] in QA_RECEIPT_FAILED_STATES:
-            # A negative verdict is believed wherever it can bind: refusing a
-            # retraction because it named the revision in prose rather than on the
-            # marker line would read a withdrawn receipt as a pass.
             tokens |= {token.lower() for token in SHA_TOKEN_RE.findall(declaration["body"])}
         else:
             saw_pass_marker = True
@@ -776,14 +882,6 @@ def evaluate_qa_receipt(
                 f"{QA_RECEIPT_MIN_IMAGES} required.",
                 declaration["url"] or None,
             )
-        shot_problems = shot_provenance_problems(declaration["body"], binds)
-        if shot_problems:
-            return (
-                "REQUIRED",
-                f"QA receipt required ({requirement_reason}): before/after screenshot provenance "
-                f"failed: {'; '.join(shot_problems)}.",
-                declaration["url"] or None,
-            )
         return (
             "PASSED",
             f"browser QA receipt binds head {head_sha[:8]} ({requirement_reason})",
@@ -791,10 +889,23 @@ def evaluate_qa_receipt(
         )
 
     if not declarations:
+        if not require_capture:
+            return (
+                "REQUIRED",
+                f"QA receipt required ({requirement_reason}): no PR comment carries a "
+                "'QA-RECEIPT: PASS' marker.",
+                None,
+            )
+        if evidence_comments:
+            first_url = str(evidence_comments[0].get("html_url") or evidence_comments[0].get("url") or "") or None
+            return (
+                "PASSED",
+                f"browser QA receipt binds head {head_sha[:8]} ({requirement_reason})",
+                first_url,
+            )
         return (
-            "REQUIRED",
-            f"QA receipt required ({requirement_reason}): no PR comment carries a "
-            "'QA-RECEIPT: PASS' marker.",
+            "EXEMPT",
+            f"no capture evidence or QA receipt declarations for {repo}@{base_ref}",
             None,
         )
     if saw_pass_marker and not saw_pass_served:
@@ -846,6 +957,8 @@ class FlowQATarget:
     base_ref: str
     ui_pattern: Any
     required_viewports: Tuple[str, ...] = FLOW_QA_REQUIRED_VIEWPORTS
+    sticky_failures: bool = False
+    require_capture: bool = False
 
 
 FLOW_QA_TARGETS: Tuple[FlowQATarget, ...] = (
@@ -860,6 +973,8 @@ FLOW_QA_TARGETS: Tuple[FlowQATarget, ...] = (
         base_ref="main",
         ui_pattern=re.compile(r"^src/(?:app|components|features)/.*\.tsx$", re.IGNORECASE),
         required_viewports=("390x420", "390x844", "1440x900"),
+        sticky_failures=True,
+        require_capture=True,
     ),
 )
 
@@ -932,7 +1047,7 @@ def evaluate_flow_qa_receipt(
                 }
             )
     declarations.sort(key=lambda item: item["posted"], reverse=True)
-
+    target = get_flow_qa_target(repo, base_ref)
     saw_pass_marker = False
     saw_pass_served = False
     for declaration in declarations:
@@ -942,7 +1057,7 @@ def evaluate_flow_qa_receipt(
         else:
             saw_pass_marker = True
             saw_pass_served = saw_pass_served or bool(declaration["tokens"])
-        if not any(binds(token) for token in tokens):
+        if head_sha.lower() not in tokens or not binds(head_sha.lower()):
             continue
         if declaration["state"] in QA_RECEIPT_FAILED_STATES:
             return (
@@ -950,6 +1065,39 @@ def evaluate_flow_qa_receipt(
                 f"{prefix}: the newest receipt binding this diff is {declaration['state']}.",
                 declaration["url"] or None,
             )
+        if target and target.sticky_failures:
+            for other in declarations:
+                if other["state"] in ("FAIL", "FAILED"):
+                    other_tokens = set(other["tokens"]) | {
+                        token.lower() for token in SHA_TOKEN_RE.findall(other["body"])
+                    }
+                    if any(binds(token) for token in other_tokens):
+                        return "REQUIRED", f"{prefix}: a failed target still binds this content.", other["url"] or None
+        project = "shipnovo" if repo.lower() == "wladefant/shipnovo" else "polysimulator"
+        source_lines = re.findall(r"(?m)^FLOW-QA-SOURCE runner=([0-9a-f]{64}) flow=([0-9a-f]{64}) project=([a-z0-9-]+)$", declaration["body"])
+        try:
+            root = os.path.dirname(os.path.abspath(__file__))
+            with open(os.path.join(root, "flow_qa_runner.mjs"), "rb") as runner_file:
+                runner_hash = hashlib.sha256(runner_file.read()).hexdigest()
+            with open(os.path.join(root, "flows", project + ".json"), "rb") as flow_file:
+                flow_hash = hashlib.sha256(flow_file.read()).hexdigest()
+        except OSError as exc:
+            return "REQUIRED", f"{prefix}: approved QA source unavailable: {exc}", declaration["url"] or None
+        if source_lines != [(runner_hash, flow_hash, project)]:
+            return "REQUIRED", f"{prefix}: missing or changed canonical runner/flow hashes.", declaration["url"] or None
+        if target and target.require_capture:
+            problems = shot_provenance_problems(declaration["body"], lambda sha: sha.lower() == head_sha.lower(), True)
+            if problems:
+                return "REQUIRED", f"{prefix}: capture provenance failed: {'; '.join(problems)}", declaration["url"] or None
+            for source in list(pr_data.get("comments") or []) + list(pr_data.get("reviews") or []):
+                s_body = str(source.get("body") or "")
+                if s_body == declaration["body"]:
+                    continue
+                if SHOT_CLAIM_RE.search(s_body) and capture_evidence_is_current(s_body, binds):
+                    s_problems = shot_provenance_problems(s_body, lambda sha: sha.lower() == head_sha.lower(), True)
+                    if s_problems:
+                        s_url = str(source.get("html_url") or source.get("url") or "") or declaration["url"] or None
+                        return "REQUIRED", f"{prefix}: capture provenance failed: {'; '.join(s_problems)}", s_url
         counts = FLOW_QA_ASSERTIONS_RE.search(declaration["body"])
         if counts is None:
             return "REQUIRED", f"{prefix}: no 'FLOW-QA-ASSERTIONS pass=N fail=M' line.", declaration["url"] or None
@@ -1217,13 +1365,19 @@ def fetch_pr_json(pr_number: int, repo: str = "Bavariance/polysimulator", timeou
     from review_content import json_pages
     data["reviews"] = [review for page in json_pages(reviews.stdout) for review in page]
     data["comments"] = [comment for page in json_pages(comments.stdout) for comment in page]
-    subprocess.run(["git", "fetch", "origin", f"+refs/heads/{data['baseRefName']}:refs/remotes/origin/{data['baseRefName']}"], check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    subprocess.run(["git", "fetch", "--depth=200", "origin", f"+refs/heads/{data['baseRefName']}:refs/remotes/origin/{data['baseRefName']}"],
+                   check=True, stdin=subprocess.DEVNULL, timeout=10,
+                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     from review_content import target_shas
     for sha in target_shas(data["reviews"], data["headRefOid"]):
-        if subprocess.run(["git", "cat-file", "-e", sha + "^{commit}"], stderr=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).returncode:
+        if subprocess.run(["git", "cat-file", "-e", sha + "^{commit}"], stderr=subprocess.DEVNULL,
+                          stdin=subprocess.DEVNULL, timeout=10,
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).returncode:
             # A target that stays unreachable fails closed in evaluate(), and only
             # when it is actually needed; an unfetchable one must not abort the gate.
-            subprocess.run(["git", "fetch", "origin", sha], stderr=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            subprocess.run(["git", "fetch", "--depth=200", "origin", sha], stderr=subprocess.DEVNULL,
+                           stdin=subprocess.DEVNULL, timeout=10,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     return data
 
 def evaluate_pr_gate(
@@ -1508,7 +1662,7 @@ def evaluate_pr_gate(
             eligible_reviews, head_sha, pr_author, base="origin/" + base_ref,
             staging=staging_waiver,
         )
-    except (ValueError, subprocess.CalledProcessError) as exc:
+    except (ValueError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         content_review = {"passed": False, "reason": str(exc)}
     if content_review["passed"] and content_review["state"] == "APPROVED" and content_review["reviewer"].lower() != pr_author.lower():
         valid_github_approvers.append(content_review["reviewer"])
@@ -1912,6 +2066,9 @@ def main():
             require_verify_receipt=args.require_verify_receipt or bool(args.verify_receipt),
             local_tests_record=local_tests_record_data,
         )
+    except subprocess.TimeoutExpired as e:
+        sys.stderr.write(f"BLOCKED: git or GitHub process timed out after {e.timeout} seconds\n")
+        sys.exit(2)
     except Exception as e:
         sys.stderr.write(f"PR Gate evaluation failed: {e}\n")
         sys.exit(1)
