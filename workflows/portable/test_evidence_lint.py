@@ -258,6 +258,32 @@ class PairComparison(unittest.TestCase):
             rc = el.main(["pair", p1, p2])
             self.assertEqual(rc, 1)
 
+    def test_pair_invalid_thresholds_rejected(self):
+        p1 = self._make_png("thresh1.png")
+        p2 = self._make_png("thresh2.png")
+        for invalid in (float("nan"), float("inf"), float("-inf"), -0.01, 0.0, 0.0001, 0.000499):
+            ok, reason, ratio = el.compare_pair(p1, p2, threshold=invalid)
+            self.assertFalse(ok, f"Expected threshold {invalid} to be rejected")
+            self.assertIn("invalid-threshold", reason)
+            self.assertIsNone(ratio)
+            rc = el.main(["pair", p1, p2, f"--threshold={invalid}"])
+            self.assertEqual(rc, 1, f"Expected CLI exit 1 for threshold {invalid}")
+
+        # Strict higher threshold is fine
+        from PIL import Image
+        im = Image.open(p1)
+        for x in range(10):
+            for y in range(10):
+                im.putpixel((x, y), (200, 200, 200))
+        p_changed = os.path.join(self.tmp_dir, "thresh_changed.png")
+        im.save(p_changed, format="PNG")
+        # 100 pixels / 10000 = 0.01. Valid for 0.0005, but fails strict threshold 0.05
+        ok_loose, reason_loose, ratio_loose = el.compare_pair(p1, p_changed, threshold=0.0005)
+        self.assertTrue(ok_loose)
+        ok_strict, reason_strict, ratio_strict = el.compare_pair(p1, p_changed, threshold=0.05)
+        self.assertFalse(ok_strict)
+        self.assertIn("near-identical", reason_strict)
+
 
 class VerifyPostedPairs(unittest.TestCase):
     def setUp(self):
@@ -397,5 +423,187 @@ class VerifyPostedPairs(unittest.TestCase):
             el.fetch_rendered_html = orig_fetch
             el.check_media_url = orig_check
             el.fetch_media_bytes = orig_bytes
+    def test_verify_posted_two_pairs_second_malformed(self):
+        from PIL import Image
+        # Pair 1: real change
+        p1_b = self._make_png("m1_b.png")
+        im = Image.open(p1_b)
+        for i in range(20):
+            im.putpixel((i, i), (255, 0, 0))
+        p1_a = os.path.join(self.tmp_dir, "m1_a.png")
+        im.save(p1_a)
+
+        # Pair 2: before has image, after has NO image (row missing one side)
+        p2_b = self._make_png("m2_b.png", color=(10, 20, 30))
+
+        u1_b = "https://github.com/user-attachments/assets/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        u1_a = "https://github.com/user-attachments/assets/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        u2_b = "https://github.com/user-attachments/assets/cccccccc-cccc-cccc-cccc-cccccccccccc"
+
+        with open(p1_b, "rb") as f: d1_b = f.read()
+        with open(p1_a, "rb") as f: d1_a = f.read()
+        with open(p2_b, "rb") as f: d2_b = f.read()
+
+        url_map = {u1_b: d1_b, u1_a: d1_a, u2_b: d2_b}
+
+        html = f"""
+        <table>
+          <thead>
+            <tr><th>Viewport</th><th>Before</th><th>After</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Desktop</td><td><img src="{u1_b}"></td><td><img src="{u1_a}"></td></tr>
+            <tr><td>Mobile</td><td><img src="{u2_b}"></td><td></td></tr>
+          </tbody>
+        </table>
+        """
+        orig_fetch = el.fetch_rendered_html
+        orig_check = el.check_media_url
+        orig_bytes = el.fetch_media_bytes
+        try:
+            el.fetch_rendered_html = lambda url, timeout=60: html
+            el.check_media_url = lambda url, timeout=30: (True, "HTTP 200 image/png")
+            el.fetch_media_bytes = lambda url, timeout=30: url_map[url]
+            passed, results = el.verify_posted("https://github.com/o/r/issues/1#issuecomment-100")
+            self.assertFalse(passed)
+            pair_results = [r for r in results if r.get("tag") == "pair"]
+            self.assertEqual(len(pair_results), 2)
+            self.assertTrue(pair_results[0]["ok"])
+            self.assertFalse(pair_results[1]["ok"])
+            self.assertTrue(
+                "unequal" in pair_results[1]["detail"] or "malformed" in pair_results[1]["detail"],
+                f"Expected unequal/malformed detail, got {pair_results[1]['detail']}",
+            )
+        finally:
+            el.fetch_rendered_html = orig_fetch
+            el.check_media_url = orig_check
+            el.fetch_media_bytes = orig_bytes
+
+    def test_verify_posted_row_holding_two_images_vs_one_fails_closed(self):
+        from PIL import Image
+        p1_b = self._make_png("two1_b.png")
+        p2_b = self._make_png("two2_b.png")
+        p_a = self._make_png("two_a.png")
+
+        u1_b = "https://github.com/user-attachments/assets/dddddddd-dddd-dddd-dddd-dddddddddddd"
+        u2_b = "https://github.com/user-attachments/assets/eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
+        u_a = "https://github.com/user-attachments/assets/ffffffff-ffff-ffff-ffff-ffffffffffff"
+
+        with open(p1_b, "rb") as f: d1_b = f.read()
+        with open(p2_b, "rb") as f: d2_b = f.read()
+        with open(p_a, "rb") as f: d_a = f.read()
+
+        url_map = {u1_b: d1_b, u2_b: d2_b, u_a: d_a}
+
+        html = f"""
+        <table>
+          <thead>
+            <tr><th>Viewport</th><th>Before</th><th>After</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Desktop</td><td><img src="{u1_b}"><img src="{u2_b}"></td><td><img src="{u_a}"></td></tr>
+          </tbody>
+        </table>
+        """
+        orig_fetch = el.fetch_rendered_html
+        orig_check = el.check_media_url
+        orig_bytes = el.fetch_media_bytes
+        try:
+            el.fetch_rendered_html = lambda url, timeout=60: html
+            el.check_media_url = lambda url, timeout=30: (True, "HTTP 200 image/png")
+            el.fetch_media_bytes = lambda url, timeout=30: url_map[url]
+            passed, results = el.verify_posted("https://github.com/o/r/issues/1#issuecomment-100")
+            self.assertFalse(passed)
+            pair_results = [r for r in results if r.get("tag") == "pair"]
+            self.assertEqual(len(pair_results), 1)
+            self.assertFalse(pair_results[0]["ok"])
+            self.assertTrue(
+                "unequal" in pair_results[0]["detail"] or "malformed" in pair_results[0]["detail"],
+                f"Expected unequal/malformed detail, got {pair_results[0]['detail']}",
+            )
+        finally:
+            el.fetch_rendered_html = orig_fetch
+            el.check_media_url = orig_check
+            el.fetch_media_bytes = orig_bytes
+
+
+class FetchMediaBytesAuth(unittest.TestCase):
+    def setUp(self):
+        self.orig_gh_token = os.environ.get("GH_TOKEN")
+        self.orig_github_token = os.environ.get("GITHUB_TOKEN")
+        os.environ["GH_TOKEN"] = "test-token-safe-do-not-leak"
+        os.environ.pop("GITHUB_TOKEN", None)
+
+    def tearDown(self):
+        if self.orig_gh_token is not None:
+            os.environ["GH_TOKEN"] = self.orig_gh_token
+        else:
+            os.environ.pop("GH_TOKEN", None)
+        if self.orig_github_token is not None:
+            os.environ["GITHUB_TOKEN"] = self.orig_github_token
+        else:
+            os.environ.pop("GITHUB_TOKEN", None)
+
+    def test_fetch_media_bytes_token_hostname_allowlist(self):
+        captured = []
+
+        class DummyResp:
+            def read(self):
+                return b"dummy-data"
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+
+        class DummyOpener:
+            def open(self, req, timeout=30):
+                captured.append(req)
+                return DummyResp()
+
+        orig_build_opener = el.urllib.request.build_opener
+        try:
+            el.urllib.request.build_opener = lambda *handlers: DummyOpener()
+
+            # Allowed hosts: github.com and api.github.com
+            el.fetch_media_bytes("https://github.com/user-attachments/assets/123")
+            req1 = captured[-1]
+            self.assertEqual(req1.headers.get("Authorization"), "token test-token-safe-do-not-leak")
+
+            el.fetch_media_bytes("https://api.github.com/repos/o/r/raw/abc")
+            req2 = captured[-1]
+            self.assertEqual(req2.headers.get("Authorization"), "token test-token-safe-do-not-leak")
+
+            # Forbidden hosts: evilgithub.com, github.com.attacker.test, path spoofing, signed private URLs
+            forbidden_urls = [
+                "https://evilgithub.com/asset.png",
+                "https://github.com.attacker.test/asset.png",
+                "https://attacker.test/github.com/image",
+                "https://private-user-images.githubusercontent.com/pic.png?jwt=safe",
+            ]
+            for url in forbidden_urls:
+                el.fetch_media_bytes(url)
+                req = captured[-1]
+                self.assertNotIn(
+                    "Authorization",
+                    req.headers,
+                    f"Authorization header must not be sent to {url}",
+                )
+        finally:
+            el.urllib.request.build_opener = orig_build_opener
+
+    def test_redirect_strips_authorization_header(self):
+        req = el.urllib.request.Request(
+            "https://github.com/asset",
+            headers={"Authorization": "token test-token-safe-do-not-leak"},
+        )
+        handler = el._AuthRedirectHandler()
+        new_req = handler.redirect_request(
+            req, None, 302, "Found", {}, "https://private-user-images.githubusercontent.com/pic"
+        )
+        self.assertNotIn("Authorization", new_req.headers)
+        self.assertNotIn("authorization", new_req.headers)
+        if hasattr(new_req, "unredirected_hdrs"):
+            self.assertNotIn("Authorization", new_req.unredirected_hdrs)
+            self.assertNotIn("authorization", new_req.unredirected_hdrs)
 if __name__ == "__main__":
     unittest.main()

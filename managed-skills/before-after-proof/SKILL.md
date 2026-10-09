@@ -121,8 +121,8 @@ Run the pair check tool on the captured files:
 python workflows/portable/evidence_lint.py pair <before-path-or-url> <after-path-or-url>
 ```
 The tool decodes RGB pixels and verifies matching dimensions.
-It fails with exit 1 if the images are byte-identical, re-encoded identical, or below the 0.0005 change threshold.
-
+It fails with exit 1 if the images are byte-identical, re-encoded identical, or below the change threshold (default 0.0005).
+Thresholds below 0.0005, negative values, NaN, and infinity are rejected to prevent disabling the guard; higher thresholds are accepted.
 ### 2. Verify Posted PR or Issue Comment
 After posting evidence to GitHub, verify the comment:
 ```bash
@@ -130,7 +130,7 @@ python workflows/portable/evidence_lint.py verify-posted <comment-or-pr-url>
 ```
 The command verifies that all media URLs resolve.
 It also extracts every before/after table pair and confirms that each pair passes the pixel change threshold.
-
+Tables must have equal image counts per row; rows missing one side or holding unequal image counts fail closed.
 ## Post-Upload Check
 Open the PR or issue URL in a browser.
 Confirm that all images render and show the intended visual delta.

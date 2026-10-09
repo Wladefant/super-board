@@ -37,6 +37,7 @@ import argparse
 import io
 import json
 import os
+import math
 import re
 import subprocess
 import sys
@@ -49,6 +50,26 @@ from html.parser import HTMLParser
 from typing import List, Optional, Tuple, Union
 
 SHOT_MIN_CHANGED_RATIO = 0.0005
+GITHUB_TOKEN_HOSTS = {"github.com", "api.github.com"}
+
+
+class TablePair(tuple):
+    before: str
+    after: str
+    label: str
+    reason: Optional[str]
+
+    def __new__(cls, before: str, after: str, label: str, reason: Optional[str] = None):
+        obj = super().__new__(cls, (before, after, label))
+        obj.before = before
+        obj.after = after
+        obj.label = label
+        obj.reason = reason
+        return obj
+
+    @property
+    def ok(self) -> bool:
+        return self.reason is None
 
 UUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 ATTACHMENT_RE = re.compile(rf"^https://github\.com/user-attachments/(assets/{UUID}|files/\d+/[^\s]+)$")
@@ -245,17 +266,18 @@ class _TableCollector(HTMLParser):
             self._cell_text.append(data)
 
 
-def extract_table_pairs(html: str) -> List[Tuple[str, str, str]]:
+def extract_table_pairs(html: str) -> List[TablePair]:
     """
     Extract explicit before/after screenshot pairs from HTML tables.
     Requires distinct 'before' and 'after' column headers.
     Pairs images in document order within matching rows, ignoring ambiguous alt text.
     Does not mistake side-by-side galleries (e.g. mobile vs desktop) for before/after.
-    Returns list of (before_url, after_url, label).
+    Tables with unequal image counts per row fail closed with a validation reason.
+    Returns list of TablePair(before_url, after_url, label).
     """
     parser = _TableCollector()
     parser.feed(html)
-    pairs = []
+    pairs: List[TablePair] = []
     for table_idx, rows in enumerate(parser.tables):
         if not rows:
             continue
@@ -301,8 +323,17 @@ def extract_table_pairs(html: str) -> List[Tuple[str, str, str]]:
             )
             b_imgs = [src for src, _ in b_cell["imgs"]]
             a_imgs = [src for src, _ in a_cell["imgs"]]
-            for b_src, a_src in zip(b_imgs, a_imgs):
-                pairs.append((b_src, a_src, row_label))
+            if len(b_imgs) == len(a_imgs):
+                for b_src, a_src in zip(b_imgs, a_imgs):
+                    pairs.append(TablePair(b_src, a_src, row_label))
+            else:
+                b_src = b_imgs[0] if b_imgs else ""
+                a_src = a_imgs[0] if a_imgs else ""
+                reason = (
+                    f"unequal-count: malformed before/after row with {len(b_imgs)} before image(s) "
+                    f"and {len(a_imgs)} after image(s)"
+                )
+                pairs.append(TablePair(b_src, a_src, row_label, reason=reason))
     return pairs
 
 
@@ -313,6 +344,9 @@ class _AuthRedirectHandler(urllib.request.HTTPRedirectHandler):
         if new_req:
             new_req.headers.pop("Authorization", None)
             new_req.headers.pop("authorization", None)
+            if hasattr(new_req, "unredirected_hdrs"):
+                new_req.unredirected_hdrs.pop("Authorization", None)
+                new_req.unredirected_hdrs.pop("authorization", None)
         return new_req
 
 
@@ -321,7 +355,9 @@ def fetch_media_bytes(source: str, timeout: int = 30) -> bytes:
     if source.startswith("http://") or source.startswith("https://"):
         headers = {"User-Agent": "super-board-evidence-lint"}
         token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
-        if token and "github.com" in source:
+        parsed = urllib.parse.urlparse(source)
+        hostname = (parsed.hostname or "").lower()
+        if token and hostname in GITHUB_TOKEN_HOSTS:
             headers["Authorization"] = f"token {token}"
         opener = urllib.request.build_opener(_AuthRedirectHandler())
         req = urllib.request.Request(source, headers=headers)
@@ -347,9 +383,25 @@ def compare_pair(
     """
     Compare a before/after screenshot pair.
     Refuses byte-identical images, re-encoded images with identical RGB pixels,
-    pairs with changed-pixel ratio < threshold, and mismatched dimensions.
+    pairs with changed-pixel ratio < threshold, mismatched dimensions,
+    and invalid thresholds (NaN, infinity, negative, or < 0.0005).
     Returns (passed, reason, changed_ratio).
     """
+    if (
+        threshold is None
+        or not isinstance(threshold, (int, float))
+        or math.isnan(threshold)
+        or math.isinf(threshold)
+        or threshold < SHOT_MIN_CHANGED_RATIO
+    ):
+        return (
+            False,
+            f"invalid-threshold: threshold must be a finite number >= {SHOT_MIN_CHANGED_RATIO:.6f} (got {threshold})",
+            None,
+        )
+
+    if not before_source or not after_source:
+        return False, "missing-source: before or after image source is empty", None
     try:
         b_bytes = before_source if isinstance(before_source, bytes) else fetch_media_bytes(before_source, timeout=timeout)
         a_bytes = after_source if isinstance(after_source, bytes) else fetch_media_bytes(after_source, timeout=timeout)
@@ -451,17 +503,29 @@ def verify_posted(url: str, retries: int = 3, delay: float = 3.0) -> Tuple[bool,
         results.append({"tag": tag, "url": src, "ok": ok, "detail": detail})
 
     table_pairs = extract_table_pairs(html)
-    for b_src, a_src, label in table_pairs:
-        ok, detail, ratio = compare_pair(b_src, a_src)
-        results.append({
-            "tag": "pair",
-            "label": label,
-            "before": b_src,
-            "after": a_src,
-            "ok": ok,
-            "detail": detail,
-            "ratio": ratio,
-        })
+    for pair in table_pairs:
+        b_src, a_src, label = pair[0], pair[1], pair[2]
+        if getattr(pair, "reason", None):
+            results.append({
+                "tag": "pair",
+                "label": label,
+                "before": b_src,
+                "after": a_src,
+                "ok": False,
+                "detail": pair.reason,
+                "ratio": None,
+            })
+        else:
+            ok, detail, ratio = compare_pair(b_src, a_src)
+            results.append({
+                "tag": "pair",
+                "label": label,
+                "before": b_src,
+                "after": a_src,
+                "ok": ok,
+                "detail": detail,
+                "ratio": ratio,
+            })
 
     media_ok = bool(media) and all(r["ok"] for r in results if r.get("tag") != "pair")
     pairs_ok = all(r["ok"] for r in results if r.get("tag") == "pair")
