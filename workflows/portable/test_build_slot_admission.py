@@ -29,6 +29,8 @@ from build_slot import (
     BuildSlotManager,
     MEMORY_FLOOR_GIB,
     MEMORY_RESERVATIONS,
+    MEMORY_RAMP_SECONDS,
+    _reservation_gib,
     _transition_guard,
 )
 
@@ -622,6 +624,246 @@ class TestBuildSlotAdmissionLoop(unittest.TestCase):
                 time.time(), 60, 1800, {os.getpid(): True})
             self.assertTrue(stale)
             self.assertIn("corrupt heartbeat", reason)
+
+class TestBuildSlotUnknownClassFallback(unittest.TestCase):
+    """
+    Test ADR 0004 unknown queue/holder class fallback contracts:
+    - Unknown queue/holder class falls back to heavy minimum 5GiB, heavy cap,
+      ramp 300s, stagger and 40min aging rules.
+    - Known browser 1.1GiB preserved.
+    - Explicit unknown mem 1 becomes 5, larger 7 remains 7.
+    - Simulated prior-table reader without browser uses heavy fallback, not KeyError.
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix="build-slot-unknown-")
+        self.run_dir = os.path.join(self.test_dir, "run")
+        os.makedirs(self.run_dir, exist_ok=True)
+        self.manager = BuildSlotManager(run_dir=self.run_dir, acquisition_stagger=45.0)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    # -------------------------------------------------------------------------
+    # 1. Unknown-class head without mem and with explicit 1/7 memory
+    # -------------------------------------------------------------------------
+
+    def test_unknown_class_head_without_mem_falls_back_to_heavy_5gib(self):
+        """Unknown class without explicit mem falls back to heavy minimum 5.0 GiB."""
+        now = time.time()
+        # Direct reservation: falls back to heavy minimum 5.0 GiB instead of KeyError
+        self.assertEqual(_reservation_gib("future_worker", None), 5.0)
+
+        # Queue admission: unknown-class head needs 5.0 GiB
+        queue_no_mem = [
+            {"name": "u-head", "token": "tok-u", "pid": 1001, "job_class": "future_worker", "enqueued_at": now - 10.0}
+        ]
+        budget_refuse = {
+            "available_gib": 7.0, "reserved_gib": 0.0, "floor_gib": 3.0,
+            "free_budget_gib": 4.0, "heavy_jobs": 0,
+        }
+        eligible, reason = self.manager._queue_admission(queue_no_mem, "tok-u", budget_refuse, now)
+        self.assertFalse(eligible, "Unknown head needing 5.0 GiB must be refused when free budget is 4.0 GiB")
+        self.assertIn("needs 5.00", reason)
+
+        budget_fit = {
+            "available_gib": 16.0, "reserved_gib": 0.0, "floor_gib": 3.0,
+            "free_budget_gib": 10.0, "heavy_jobs": 0,
+        }
+        eligible_fit, reason_fit = self.manager._queue_admission(queue_no_mem, "tok-u", budget_fit, now)
+        self.assertTrue(eligible_fit)
+        self.assertIsNone(reason_fit)
+
+    def test_unknown_class_head_with_explicit_1gib_and_7gib_memory(self):
+        """Explicit unknown mem 1 becomes 5, larger 7 remains 7."""
+        now = time.time()
+        # Explicit 1.0 becomes heavy minimum 5.0 GiB
+        self.assertEqual(_reservation_gib("future_worker", 1.0), 5.0)
+
+        queue_1gib = [
+            {"name": "u-head-1", "token": "tok-u1", "pid": 1001, "job_class": "future_worker", "mem_gib": 1.0, "enqueued_at": now - 10.0}
+        ]
+        budget_4gib = {
+            "available_gib": 7.0, "reserved_gib": 0.0, "floor_gib": 3.0,
+            "free_budget_gib": 4.0, "heavy_jobs": 0,
+        }
+        eligible_1, reason_1 = self.manager._queue_admission(queue_1gib, "tok-u1", budget_4gib, now)
+        self.assertFalse(eligible_1, "Explicit 1.0 GiB on unknown class must fall back to 5.0 GiB and be refused when free < 5.0")
+        self.assertIn("needs 5.00", reason_1)
+
+        # Larger explicit 7.0 remains 7.0
+        self.assertEqual(_reservation_gib("future_worker", 7.0), 7.0)
+        queue_7gib = [
+            {"name": "u-head-7", "token": "tok-u7", "pid": 1001, "job_class": "future_worker", "mem_gib": 7.0, "enqueued_at": now - 10.0}
+        ]
+        eligible_7, reason_7 = self.manager._queue_admission(
+            queue_7gib, "tok-u7",
+            {"available_gib": 9.0, "reserved_gib": 0.0, "floor_gib": 3.0, "free_budget_gib": 6.0, "heavy_jobs": 0},
+            now,
+        )
+        self.assertFalse(eligible_7)
+        self.assertIn("needs 7.00", reason_7)
+
+    def test_known_browser_preserved_at_1_1gib(self):
+        """Known browser 1.1GiB reservation is preserved and does not fall back to 5.0 GiB."""
+        now = time.time()
+        self.assertEqual(_reservation_gib("browser", None), 1.1)
+        self.assertEqual(_reservation_gib("browser", 1.1), 1.1)
+        queue_b = [
+            {"name": "browser-head", "token": "tok-b", "pid": 1001, "job_class": "browser", "enqueued_at": now - 10.0}
+        ]
+        budget_2gib = {
+            "available_gib": 5.0, "reserved_gib": 0.0, "floor_gib": 3.0,
+            "free_budget_gib": 2.0, "heavy_jobs": 0,
+        }
+        eligible_b, reason_b = self.manager._queue_admission(queue_b, "tok-b", budget_2gib, now)
+        self.assertTrue(eligible_b, f"Known browser must be admitted when free >= 1.1 GiB; reason={reason_b}")
+        self.assertIsNone(reason_b)
+
+    # -------------------------------------------------------------------------
+    # 2. Unknown later candidate under heavy cap/stagger
+    # -------------------------------------------------------------------------
+
+    def test_unknown_later_candidate_refused_under_heavy_cap(self):
+        """Unknown later candidate is refused under heavy cap when heavy job held."""
+        now = time.time()
+        budget_heavy = {
+            "available_gib": 16.0, "reserved_gib": 5.0, "floor_gib": 3.0,
+            "free_budget_gib": 8.0, "heavy_jobs": 1,
+        }
+        refusal = self.manager._resource_refusal("future_worker", 5.0, budget_heavy)
+        self.assertIsNotNone(refusal, "Unknown candidate must be refused under heavy cap")
+        self.assertIn("heavy cap", refusal)
+
+        queue = [
+            {"name": "head-blocked", "token": "tok-head", "job_class": "heavy", "mem_gib": 10.0, "enqueued_at": now - 50.0},
+            {"name": "u-cand", "token": "tok-u", "pid": 1002, "job_class": "future_worker", "mem_gib": 5.0, "enqueued_at": now - 20.0},
+        ]
+        eligible, reason = self.manager._queue_admission(queue, "tok-u", budget_heavy, now)
+        self.assertFalse(eligible, "Unknown candidate must not be admitted when heavy job held")
+        self.assertIn("heavy cap", reason)
+
+    def test_unknown_later_candidate_delayed_under_stagger(self):
+        """Unknown later candidate falls back to heavy stagger rules."""
+        now = time.time()
+        budget_no_heavy = {
+            "available_gib": 16.0, "reserved_gib": 0.0, "floor_gib": 3.0,
+            "free_budget_gib": 13.0, "heavy_jobs": 0,
+        }
+        last_acq = now - 10.0  # 10s < 45s stagger
+        queue = [
+            {"name": "head-blocked", "token": "tok-head", "job_class": "heavy", "mem_gib": 10.0, "enqueued_at": now - 50.0},
+            {"name": "u-cand", "token": "tok-u", "pid": 1002, "job_class": "future_worker", "mem_gib": 5.0, "enqueued_at": now - 20.0},
+        ]
+        eligible_stagger, reason_stagger = self.manager._queue_admission(
+            queue, "tok-u", budget_no_heavy, now, last_acquired_at=last_acq
+        )
+        self.assertFalse(eligible_stagger, "Unknown candidate must be delayed under active stagger")
+        self.assertIn("stagger delay active", reason_stagger)
+
+    # -------------------------------------------------------------------------
+    # 3. Aged unknown head blocking backfill after 40min
+    # -------------------------------------------------------------------------
+
+    def test_aged_unknown_head_blocks_backfill_after_40min(self):
+        """Aged unknown head (> 2400s / 40 min) pauses backfill under heavy aging rules."""
+        now = time.time()
+        queue = [
+            {
+                "name": "aged-u-head", "token": "tok-uaged", "pid": 2001,
+                "job_class": "future_worker", "mem_gib": 5.0, "enqueued_at": now - 2405.0,
+            },
+            {
+                "name": "light-waiter", "token": "tok-light", "pid": 2002,
+                "job_class": "light", "mem_gib": 0.5, "enqueued_at": now - 100.0,
+            },
+        ]
+        budget = {
+            "available_gib": 4.0, "reserved_gib": 4.0, "floor_gib": 3.0,
+            "free_budget_gib": 0.5, "heavy_jobs": 0,
+        }
+        eligible, reason = self.manager._queue_admission(queue, "tok-light", budget, now)
+        self.assertFalse(eligible, "Aged unknown head (> 40min) must pause backfill")
+        self.assertIsNotNone(reason)
+        self.assertTrue("aging" in reason.lower() or "paused" in reason.lower() or "waited" in reason.lower())
+
+    # -------------------------------------------------------------------------
+    # 4. Unknown held slot counts heavy and ramp conservatively
+    # -------------------------------------------------------------------------
+
+    def test_unknown_held_slot_counts_heavy_and_ramps_conservatively(self):
+        """Unknown held slot counts as heavy and reserves heavy minimum with 300s ramp."""
+        now = time.time()
+        os.makedirs(self.manager.slot_dirs[0], exist_ok=True)
+        self.manager._write_slot_info(0, owner="held-u", pid=os.getpid(), token="tok-held", job_class="future_worker", mem_gib=1.0)
+        info_path = os.path.join(self.manager.slot_dirs[0], "info.json")
+        with open(info_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data["acquired_at_epoch"] = now - 150.0  # within 300s heavy ramp
+        with open(info_path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+        with mock.patch("build_slot.get_available_ram_gib", return_value=16.0), \
+             mock.patch("build_slot.time.time", return_value=now):
+            b = self.manager._memory_budget()
+
+        self.assertEqual(b["heavy_jobs"], 1, "Unknown held slot must count toward heavy_jobs")
+        self.assertGreaterEqual(b["reserved_gib"], 5.0, "Unknown held slot must reserve at least 5.0 GiB")
+        self.assertGreaterEqual(b["ramp_reservations_gib"], 5.0, "Ramp reservation must be at least 5.0 GiB during 300s ramp")
+
+        # After 300s ramp window (350s ago), ramp reservation settles to 0
+        data["acquired_at_epoch"] = now - 350.0
+        with open(info_path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+        with mock.patch("build_slot.get_available_ram_gib", return_value=16.0), \
+             mock.patch("build_slot.time.time", return_value=now):
+            b_settled = self.manager._memory_budget()
+        self.assertEqual(b_settled["ramp_reservations_gib"], 0.0)
+
+        # Missing/corrupt acquired timestamp ramps conservatively
+        data["acquired_at_epoch"] = None
+        with open(info_path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+        with mock.patch("build_slot.get_available_ram_gib", return_value=16.0), \
+             mock.patch("build_slot.time.time", return_value=now):
+            b_conservative = self.manager._memory_budget()
+        self.assertGreaterEqual(b_conservative["ramp_reservations_gib"], 5.0)
+
+    # -------------------------------------------------------------------------
+    # 5. Simulated prior-table reader by patching MEMORY_RESERVATIONS to omit browser
+    # -------------------------------------------------------------------------
+
+    def test_simulated_prior_table_reader_omits_browser(self):
+        """Simulated prior-table reader omitting browser uses heavy fallback, not KeyError."""
+        now = time.time()
+        prior_table = {k: v for k, v in MEMORY_RESERVATIONS.items() if k != "browser"}
+        with mock.patch.dict(build_slot.MEMORY_RESERVATIONS, prior_table, clear=True):
+            # 1. Direct reservation fallback: must not raise KeyError, must return 5.0 GiB
+            self.assertEqual(_reservation_gib("browser", None), 5.0)
+            self.assertEqual(_reservation_gib("browser", 1.0), 5.0)
+
+            # 2. Queue admission fallback: must not raise KeyError
+            queue = [
+                {"name": "browser-lane", "token": "tok-b", "pid": 1001, "job_class": "browser", "enqueued_at": now}
+            ]
+            budget_refuse = {
+                "available_gib": 7.0, "reserved_gib": 0.0, "floor_gib": 3.0,
+                "free_budget_gib": 4.0, "heavy_jobs": 0,
+            }
+            eligible, reason = self.manager._queue_admission(queue, "tok-b", budget_refuse, now)
+            self.assertFalse(eligible)
+            self.assertIn("needs 5.00", reason)
+
+            # 3. Memory budget fallback: must not raise KeyError, counts as heavy
+            os.makedirs(self.manager.slot_dirs[0], exist_ok=True)
+            self.manager._write_slot_info(0, owner="held-b", pid=os.getpid(), token="tok-b", job_class="browser", mem_gib=1.1)
+            with mock.patch("build_slot.get_available_ram_gib", return_value=16.0), \
+                 mock.patch("build_slot.time.time", return_value=now):
+                b = self.manager._memory_budget()
+            self.assertEqual(b["heavy_jobs"], 1)
+            self.assertGreaterEqual(b["reserved_gib"], 5.0)
 
 
 if __name__ == "__main__":

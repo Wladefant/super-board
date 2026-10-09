@@ -42,6 +42,7 @@ Memory admission and job classification invariants:
 - `acquire` defaults to light because it has no child command. Use `--class heavy` for manual builds or servers. Use `--class browser` only for headless QA without a build or server.
 - Both commands accept `--class` and `--mem-gib` to override classification and reservation.
 - Active slots record their reserved memory. Legacy slots without reservation metadata count as heavy with a 5 GiB minimum.
+- Unknown classes in shared queue or holder metadata count as heavy. They use the heavy minimum reservation, heavy cap, ramp window, stagger, and aging rules. Readers must not fail when a newer process writes a class they do not know. CLI class validation remains strict.
 - At most one `heavy` job may run concurrently across all slots. A second heavy job must wait in queue even if enough free RAM exists.
 - Browser jobs do not count toward the heavy cap. They can run beside a heavy build when both reservations preserve the RAM floor. A browser `run` refuses an obvious Next build or server command.
 - `--force` requires `BUILD_SLOT_ALLOW_FORCE=1`. Without it, acquisition fails. Authorized force logs the override and bypasses memory admission.
