@@ -60,7 +60,9 @@ Invariants:
     - Transition guards record PID, token and acquisition time in a .owner.json sidecar.
       The OS releases byte locks when a process exits. The next holder replaces stale
       metadata only after obtaining that same OS lock, never by deleting a live lock.
-      Stale checks and queue cleanup run outside the slot transition guard.
+      Stale checks, detached cleanup, metadata retry waits and queue cleanup run outside
+      the slot transition guard.
+      Reclaim aborts if lock metadata changes while stale checks run.
     - Standard library only. Windows uses msvcrt byte locks; POSIX uses flock.
 """
 
@@ -986,7 +988,7 @@ def _read_lock_dir_info(lock_dir: str, slot_idx: int, retry: bool = True) -> Opt
             last_err = e
             if retry and attempt < attempts - 1:
                 time.sleep(_INFO_READ_RETRY_DELAY)
-    logger.warning("Failed to read lock info for slot %d: %s", slot_idx, last_err)
+    _transition_notice(f"Failed to read lock info for slot {slot_idx}: {last_err}", "warning")
     return _corrupt_lock_info(lock_dir, slot_idx)
 
 
@@ -1552,42 +1554,40 @@ class BuildSlotManager:
             return _read_lock_dir_info(self.slot_dirs[slot_idx], slot_idx)
         return _read_lock_dir_info(self.slot_dirs[slot_idx], slot_idx, retry=False)
 
-    @_guard_slot_transition
     def _tombstone_stale_slot(self, slot_idx: int, judged: Dict[str, Any], reason: str) -> bool:
-        """
-        Removes only the stale lock described by `judged`.
-        A stable file guard serializes acquisition, heartbeat, reclaim and release.
-        Identity checks bracket the atomic rename. Exactly one reclaimer can win.
-        """
+        """Detach a matching stale generation before cleaning it outside the guard."""
+        tombstone = self._detach_stale_slot(slot_idx, judged, reason)
+        if tombstone is None:
+            return False
+        shutil.rmtree(tombstone, ignore_errors=True)
+        return True
+
+    @_guard_slot_transition
+    def _detach_stale_slot(self, slot_idx: int, judged: Dict[str, Any], reason: str) -> Optional[str]:
         slot_dir = self.slot_dirs[slot_idx]
         want = _lock_identity(judged)
-        if want is None or _lock_identity(self._read_slot_info(slot_idx)) != want:
-            return False
+        current = _read_lock_dir_info(slot_dir, slot_idx, retry=False)
+        if want is None or current != judged:
+            return None
         tombstone = f"{slot_dir}.tombstone-{os.getpid()}-{uuid.uuid4().hex}"
         try:
             os.rename(slot_dir, tombstone)
         except OSError:
-            # A foreign reader may deny the rename. Retry on the next poll.
-            return False
-        # A rename keeps the dir's mtime, so even a corrupt lock's identity survives the move.
-        moved = _read_lock_dir_info(tombstone, slot_idx)
+            return None
+        moved = _read_lock_dir_info(tombstone, slot_idx, retry=False)
         if moved is None:
-            # Preserve an unreadable detached generation rather than delete it.
-            return False
-        if _lock_identity(moved) != want:
-            # A legacy participant did not use the guard. Preserve its generation.
+            return None
+        if moved != judged:
             try:
                 os.rename(tombstone, slot_dir)
             except OSError as e:
                 if not os.path.isdir(tombstone):
-                    # A legacy participant removed the detached generation.
-                    return False
+                    return None
                 msg = f"[ERROR] Moved a live build slot lock aside and could not restore it (slot {slot_idx}, {tombstone}): {e}"
                 _transition_notice(msg, "error")
-            return False
+            return None
         _transition_notice(f"[NOTICE] Reclaiming stale build slot lock: {reason}")
-        shutil.rmtree(tombstone, ignore_errors=True)
-        return True
+        return tombstone
 
     def _read_lock_info(self) -> Optional[Dict[str, Any]]:
         """Reads lock info metadata if primary lock dir exists (backwards compatibility)."""
@@ -2683,9 +2683,16 @@ class BuildSlotManager:
 
     def release(self, name: str, token: Optional[str] = None) -> bool:
         """Free the slot before output, detached cleanup, or queue waits."""
-        released, msg, detached = self._release_slot(name, token)
-        for path in detached:
-            _clean_detached_lock_dir(path, patience=1.0)
+        for attempt in range(_INFO_READ_ATTEMPTS):
+            released, msg, detached = self._release_slot(name, token)
+            for path in detached:
+                _clean_detached_lock_dir(path, patience=1.0)
+            if released or msg:
+                break
+            if attempt < _INFO_READ_ATTEMPTS - 1:
+                time.sleep(_INFO_READ_RETRY_DELAY)
+        if not released and not msg:
+            msg = f"[ERROR] Could not read or transition lock metadata for '{name}'"
         if released:
             self._dequeue_best_effort(name, token)
         if msg:
@@ -2697,9 +2704,13 @@ class BuildSlotManager:
     def _release_slot(self, name: str, token: Optional[str] = None):
         detached = []
         held_slots = []
+        read_failed = False
         for slot_idx, slot_dir in enumerate(self.slot_dirs):
             if os.path.isdir(slot_dir):
-                info = self._read_slot_info(slot_idx)
+                info = _read_lock_dir_info(slot_dir, slot_idx, retry=False)
+                if info is None or info.get("corrupt"):
+                    read_failed = True
+                    continue
                 owner = info.get("owner", "unknown") if info else "unknown"
                 pid = info.get("pid", 0) if info else 0
                 tok = info.get("token") if info else None
@@ -2713,19 +2724,24 @@ class BuildSlotManager:
 
         if matching_slots:
             for idx, s_dir in matching_slots:
-                judged = self._read_slot_info(idx)
+                judged = _read_lock_dir_info(s_dir, idx, retry=False)
+                if judged is None or judged.get("corrupt"):
+                    return False, "", detached
                 expected = _lock_identity(judged)
                 tombstone = f"{s_dir}.releasing-{os.getpid()}-{uuid.uuid4().hex}"
                 try:
                     os.rename(s_dir, tombstone)
                 except OSError:
                     return False, "", detached
-                moved = _read_lock_dir_info(tombstone, idx)
+                moved = _read_lock_dir_info(tombstone, idx, retry=False)
                 if expected is None or _lock_identity(moved) != expected:
                     os.rename(tombstone, s_dir)
                     return False, "", detached
                 detached.append(tombstone)
             return True, f"Released build slot lock for '{name}'", detached
+
+        if read_failed:
+            return False, "", detached
 
         if not held_slots:
             return True, f"Build slot lock is already free (release called for '{name}')", detached

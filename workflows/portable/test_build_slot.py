@@ -84,6 +84,56 @@ class TestBuildSlot(unittest.TestCase):
             manager.check_stale_and_reclaim()
         self.assertEqual(observed, [False])
 
+    def test_reclaim_preserves_heartbeat_refreshed_after_stale_judgment(self):
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        self.assertTrue(manager.acquire("refreshing", timeout=2))
+        info = manager._read_lock_info()
+        token = info["token"]
+        info["heartbeat_at_epoch"] = time.time() - 60
+        build_slot._write_json_atomic(os.path.join(manager.slot_dirs[0], build_slot.INFO_FILE_NAME), info)
+        original_reclaim = manager._tombstone_stale_slot
+        refreshed = []
+        def refresh_then_reclaim(slot_idx, judged, reason):
+            refreshed.append(manager.heartbeat_lock("refreshing", token))
+            return original_reclaim(slot_idx, judged, reason)
+        with mock.patch.object(manager, "is_pid_alive", return_value=True), \
+                mock.patch.object(manager, "_tombstone_stale_slot", side_effect=refresh_then_reclaim):
+            reclaimed = manager.check_stale_and_reclaim(acquire_holder_stale_after=1)
+        self.assertEqual(refreshed, [True])
+        self.assertFalse(reclaimed, "A refreshed live lease must not be reclaimed")
+        self.assertEqual(manager._read_lock_info()["token"], token)
+
+    def test_release_metadata_retry_waits_outside_transition_guard(self):
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        self.assertTrue(manager.acquire("read-retry", timeout=2))
+        original_read = build_slot._read_json_file
+        failed = []
+        waits = []
+        def read_once(path):
+            if not failed:
+                failed.append(True)
+                raise PermissionError("transient metadata read")
+            return original_read(path)
+        def wait_outside_guard(delay):
+            waits.append(bool(getattr(build_slot._guard_state, "held", ())))
+        with mock.patch("build_slot._read_json_file", side_effect=read_once), \
+                mock.patch("build_slot.time.sleep", side_effect=wait_outside_guard):
+            self.assertTrue(manager.release("read-retry"))
+        self.assertEqual(waits, [False], "Metadata retry must leave the transition guard free")
+
+    def test_stale_detached_cleanup_leaves_transition_guard_free(self):
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        self.assertTrue(manager.acquire("dead-cleanup", timeout=2))
+        observed = []
+        original_cleanup = shutil.rmtree
+        def cleanup(path, *args, **kwargs):
+            observed.append(bool(getattr(build_slot._guard_state, "held", ())))
+            return original_cleanup(path, *args, **kwargs)
+        with mock.patch.object(manager, "is_pid_alive", return_value=False), \
+                mock.patch("build_slot.shutil.rmtree", side_effect=cleanup):
+            self.assertTrue(manager.check_stale_and_reclaim())
+        self.assertEqual(observed, [False], "Detached cleanup must not block state transitions")
+
     def test_release_queue_cleanup_does_not_hold_transition_guard(self):
         manager = BuildSlotManager(run_dir=self.run_dir)
         self.assertTrue(manager.acquire("probe", timeout=2))
