@@ -44,6 +44,14 @@
           ]
         },
         {
+          "id": "wait_page_hydrated",
+          "action": "assert",
+          "selector": "next-route-announcer",
+          "expected_present": true,
+          "timeout_ms": 20000,
+          "note": "Next.js mounts next-route-announcer in an effect after hydration. A tap sent before hydration has no handler and is lost, so the next tap waits for it."
+        },
+        {
           "id": "open_review_tools_menu_if_present",
           "action": "tap",
           "selector": "button[aria-label='More review tools']",
@@ -351,6 +359,14 @@
             "visible",
             "no_horizontal_overflow"
           ]
+        },
+        {
+          "id": "wait_page_hydrated",
+          "action": "assert",
+          "selector": "next-route-announcer",
+          "expected_present": true,
+          "timeout_ms": 20000,
+          "note": "Next.js mounts next-route-announcer in an effect after hydration. A tap sent before hydration has no handler and is lost, so the next tap waits for it."
         },
         {
           "id": "tap_row_edit_action",
