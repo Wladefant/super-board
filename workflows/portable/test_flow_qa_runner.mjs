@@ -775,6 +775,241 @@ test('formatReceipt binds PASS to the served sha and fails closed otherwise', as
   assert.match(noSha, /^FLOW-QA: FAIL\n/, 'a pass with no verified served sha must not print PASS');
   const zero = formatReceipt({ passed: true, served_sha: sha, assertions: { passed: 0, failed: 0 }, viewports: ['390x844'] });
   assert.match(zero, /^FLOW-QA: FAIL /, 'zero assertions is never a pass');
+  const failedCountWithPassedTrue = formatReceipt({ passed: true, served_sha: sha, assertions: { passed: 9, failed: 1 }, viewports: ['390x844'] });
+  assert.match(failedCountWithPassedTrue, /^FLOW-QA: FAIL /, 'failed assertions must refuse PASS even if report.passed=true');
+  const failedCleanup = formatReceipt({ passed: true, served_sha: sha, assertions: { passed: 9, failed: 0 }, cleanup: { passed: false }, viewports: ['390x844'] });
+  assert.match(failedCleanup, /^FLOW-QA: FAIL /, 'failed cleanup must refuse PASS');
+  const emptyViewports = formatReceipt({ passed: true, served_sha: sha, assertions: { passed: 9, failed: 0 }, viewports: [] });
+  assert.match(emptyViewports, /^FLOW-QA: FAIL/, 'empty viewports must refuse PASS');
+  const invalidViewports = formatReceipt({ passed: true, served_sha: sha, assertions: { passed: 9, failed: 0 }, viewports: ['999x999'] });
+  assert.match(invalidViewports, /^FLOW-QA: FAIL /, 'unsupported viewports must refuse PASS');
+});
+
+test('Negative Flow Control: caller bindSha cannot override server-measured SHA in report or receipt', async () => {
+  const MEASURED_SHA = '915086acdf8a9061b4dae420935e876183046d9b';
+  const SPOOFED_SHA = 'c0ffee0000000000000000000000000000000000';
+  let server;
+  let port;
+
+  await new Promise((resolve) => {
+    server = http.createServer((req, res) => {
+      if (req.url === '/api/version') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ sha: MEASURED_SHA }));
+      } else {
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end('<!DOCTYPE html><html><body><div id="content">OK</div></body></html>');
+      }
+    });
+    server.listen(0, '127.0.0.1', () => {
+      port = server.address().port;
+      resolve();
+    });
+  });
+
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bindsha-ignore-'));
+  const flowJsonPath = path.join(tmpDir, 'bindsha-ignore.json');
+
+  fs.writeFileSync(flowJsonPath, JSON.stringify({
+    flows: [{
+      id: 'bindsha-test-flow',
+      steps: [
+        { id: 'goto-page', action: 'goto', url: '/' }
+      ]
+    }]
+  }));
+
+  try {
+    const report = await runFlows({
+      baseUrl,
+      expectedSha: MEASURED_SHA,
+      bindSha: SPOOFED_SHA,
+      outputDir: tmpDir,
+      flowDataPath: flowJsonPath,
+      viewports: ['390x844'],
+      themes: ['light']
+    });
+
+    assert.equal(report.served_sha, MEASURED_SHA, 'served_sha must be the server-measured SHA');
+    assert.notEqual(report.served_sha, SPOOFED_SHA, 'caller bindSha must not override the measured SHA');
+    const { formatReceipt } = await import('./flow_qa_runner.mjs');
+    const receipt = formatReceipt(report);
+    assert.match(receipt, new RegExp(`^FLOW-QA: PASS ${MEASURED_SHA}\\n`));
+  } finally {
+    server.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Negative Flow Control 3: Cleanup assertion returning passed=false triggers fail-closed report and receipt FAIL', async () => {
+  const EXPECTED_SHA = '915086acdf8a9061b4dae420935e876183046d9b';
+  let server;
+  let port;
+
+  await new Promise((resolve) => {
+    server = http.createServer((req, res) => {
+      if (req.url === '/api/version') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ sha: EXPECTED_SHA }));
+      } else {
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end('<!DOCTYPE html><html><body><div id="uncleaned-item">QA-Leftover</div></body></html>');
+      }
+    });
+    server.listen(0, '127.0.0.1', () => {
+      port = server.address().port;
+      resolve();
+    });
+  });
+
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cleanup-assert-fail-'));
+  const flowJsonPath = path.join(tmpDir, 'cleanup-assert-fail.json');
+
+  fs.writeFileSync(flowJsonPath, JSON.stringify({
+    flows: [{
+      id: 'cleanup-assert-fail-flow',
+      steps: [
+        { id: 'goto-page', action: 'goto', url: '/' }
+      ],
+      cleanup: [
+        {
+          id: 'assert-absent-cleanup',
+          action: 'assert',
+          selector: '#uncleaned-item',
+          expected_present: false,
+          timeout_ms: 300
+        }
+      ]
+    }]
+  }));
+
+  try {
+    const report = await runFlows({
+      baseUrl,
+      expectedSha: EXPECTED_SHA,
+      outputDir: tmpDir,
+      flowDataPath: flowJsonPath,
+      viewports: ['390x844'],
+      themes: ['light']
+    });
+
+    assert.equal(report.cleanup.passed, false, 'cleanup.passed must be false when cleanup assertion fails');
+    assert.equal(report.passed, false, 'Overall report must fail closed when cleanup assertion returns passed=false');
+    assert.ok(report.assertions.failed >= 1, `assertions.failed count must include failed cleanup assertions (got ${report.assertions.failed})`);
+    assert.ok(Array.isArray(report.cleanup.steps) && report.cleanup.steps.length > 0, 'report.cleanup.steps must record cleanup results as evidence');
+    const { formatReceipt } = await import('./flow_qa_runner.mjs');
+    const receipt = formatReceipt(report);
+    assert.match(receipt, /^FLOW-QA: FAIL/, 'receipt must report FAIL when cleanup assertion fails');
+  } finally {
+    server.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('Negative Flow Control 4: Reject unsupported viewports, empty theme lists, and empty coverage', async () => {
+  const EXPECTED_SHA = '915086acdf8a9061b4dae420935e876183046d9b';
+  let server;
+  let port;
+
+  await new Promise((resolve) => {
+    server = http.createServer((req, res) => {
+      if (req.url === '/api/version') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ sha: EXPECTED_SHA }));
+      } else {
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end('<!DOCTYPE html><html><body><div id="content">OK</div></body></html>');
+      }
+    });
+    server.listen(0, '127.0.0.1', () => {
+      port = server.address().port;
+      resolve();
+    });
+  });
+
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'coverage-validation-'));
+  const flowJsonPath = path.join(tmpDir, 'coverage-flow.json');
+
+  fs.writeFileSync(flowJsonPath, JSON.stringify({
+    flows: [{
+      id: 'coverage-test-flow',
+      steps: [
+        { id: 'goto-page', action: 'goto', url: '/' }
+      ]
+    }]
+  }));
+
+  try {
+    // 1. Unsupported viewport rejected
+    await assert.rejects(
+      async () => {
+        await runFlows({
+          baseUrl,
+          expectedSha: EXPECTED_SHA,
+          outputDir: tmpDir,
+          flowDataPath: flowJsonPath,
+          viewports: ['999x999'],
+          themes: ['light']
+        });
+      },
+      /unsupported viewport/i,
+      'runFlows must reject unsupported viewports'
+    );
+
+    // 2. Empty viewports rejected
+    await assert.rejects(
+      async () => {
+        await runFlows({
+          baseUrl,
+          expectedSha: EXPECTED_SHA,
+          outputDir: tmpDir,
+          flowDataPath: flowJsonPath,
+          viewports: [],
+          themes: ['light']
+        });
+      },
+      /no viewports/i,
+      'runFlows must reject empty viewports array'
+    );
+
+    // 3. Empty themes rejected
+    await assert.rejects(
+      async () => {
+        await runFlows({
+          baseUrl,
+          expectedSha: EXPECTED_SHA,
+          outputDir: tmpDir,
+          flowDataPath: flowJsonPath,
+          viewports: ['390x844'],
+          themes: []
+        });
+      },
+      /no themes/i,
+      'runFlows must reject empty themes array'
+    );
+
+    // 4. Unsupported theme rejected
+    await assert.rejects(
+      async () => {
+        await runFlows({
+          baseUrl,
+          expectedSha: EXPECTED_SHA,
+          outputDir: tmpDir,
+          flowDataPath: flowJsonPath,
+          viewports: ['390x844'],
+          themes: ['neon']
+        });
+      },
+      /unsupported theme/i,
+      'runFlows must reject unsupported theme'
+    );
+  } finally {
+    server.close();
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
 
 // ============================================================================

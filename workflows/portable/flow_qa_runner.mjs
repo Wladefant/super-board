@@ -2038,10 +2038,26 @@ export async function runFlows(options = {}) {
   // 1. Runtime Safety Check (Strict Refusal of PolySimulator production)
   assertNotProduction(baseUrl);
 
-  // 2. Prepare output directory
+  // 2. Validate requested viewports and themes
+  if (!Array.isArray(viewports) || viewports.length === 0) {
+    throw new Error('No viewports specified: viewports must be a non-empty array');
+  }
+  const unsupportedViewports = viewports.filter(v => !VIEWPORTS[v]);
+  if (unsupportedViewports.length > 0) {
+    throw new Error(`Unsupported viewport(s): ${unsupportedViewports.join(', ')}. Supported viewports: ${Object.keys(VIEWPORTS).join(', ')}`);
+  }
+  if (!Array.isArray(themes) || themes.length === 0) {
+    throw new Error('No themes specified: themes must be a non-empty array');
+  }
+  const unsupportedThemes = themes.filter(t => !THEMES.includes(t));
+  if (unsupportedThemes.length > 0) {
+    throw new Error(`Unsupported theme(s): ${unsupportedThemes.join(', ')}. Supported themes: ${THEMES.join(', ')}`);
+  }
+
+  // 3. Prepare output directory
   fs.mkdirSync(outputDir, { recursive: true });
 
-  // 3. Verify Served SHA before actions
+  // 4. Verify Served SHA before actions
   const versionCheck = await checkVersionEndpoint(baseUrl, expectedSha);
   if (!versionCheck.passed) {
     const failedReport = {
@@ -2051,8 +2067,9 @@ export async function runFlows(options = {}) {
       expected_sha: expectedSha || 'unknown',
       passed: false,
       assertions: { passed: 0, failed: 1 },
+      viewports: [],
       steps: [],
-      cleanup: { passed: true },
+      cleanup: { passed: true, steps: [] },
       error: `Served SHA check failed: ${versionCheck.detail}`
     };
     fs.writeFileSync(path.join(outputDir, 'report.json'), JSON.stringify(failedReport, null, 2), 'utf8');
@@ -2088,10 +2105,12 @@ export async function runFlows(options = {}) {
   });
 
   const allStepReports = [];
+  const allCleanupReports = [];
+  const executedViewports = new Set();
+  const executedThemes = new Set();
   let cleanupPassed = true;
   let totalAssertionsPassed = 0;
   let totalAssertionsFailed = 0;
-
   try {
     let current = await openFlowPage(browser, storageState);
 
@@ -2106,9 +2125,10 @@ export async function runFlows(options = {}) {
         if (!vp) continue;
 
         for (const theme of themes) {
+          executedViewports.add(vpKey);
+          executedThemes.add(theme);
           current = await prepareFlowPage(browser, current, storageState, vp, theme);
           const { page, cdpSession } = current;
-
           const steps = Array.isArray(flow.steps) ? flow.steps : [];
           for (const step of steps) {
             let stepResult;
@@ -2149,8 +2169,9 @@ export async function runFlows(options = {}) {
           // Execute cleanup steps (fail-closed obligation)
           const cleanupSteps = Array.isArray(flow.cleanup) ? flow.cleanup : [];
           for (const cStep of cleanupSteps) {
+            let cStepResult;
             try {
-              await executeStep(page, cdpSession, cStep, vpKey, theme, {
+              cStepResult = await executeStep(page, cdpSession, cStep, vpKey, theme, {
                 flow,
                 baseUrl,
                 outputDir,
@@ -2158,7 +2179,36 @@ export async function runFlows(options = {}) {
               });
             } catch (cleanupErr) {
               cleanupPassed = false;
+              cStepResult = {
+                flow: flow.id || 'default-flow',
+                step: cStep.id || 'cleanup-step',
+                viewport: vpKey,
+                theme,
+                passed: false,
+                checks: [{ name: 'cleanup_error', passed: false, detail: cleanupErr.message }],
+                screenshot: null
+              };
+            }
+
+            allCleanupReports.push(cStepResult);
+
+            if (!cStepResult.passed) {
+              cleanupPassed = false;
+            }
+
+            let stepCheckCount = 0;
+            for (const chk of cStepResult.checks || []) {
+              stepCheckCount++;
+              if (chk.passed) {
+                totalAssertionsPassed++;
+              } else {
+                totalAssertionsFailed++;
+                cleanupPassed = false;
+              }
+            }
+            if (!cStepResult.passed && stepCheckCount === 0) {
               totalAssertionsFailed++;
+              cleanupPassed = false;
             }
           }
         }
@@ -2168,22 +2218,29 @@ export async function runFlows(options = {}) {
     await browser.close().catch(() => {});
   }
 
-  const overallPassed = totalAssertionsFailed === 0 && cleanupPassed && allStepReports.every(s => s.passed);
+  const hasExecutedCoverage = executedViewports.size > 0 && allStepReports.length > 0;
+  const overallPassed = totalAssertionsPassed > 0 &&
+    totalAssertionsFailed === 0 &&
+    cleanupPassed &&
+    hasExecutedCoverage &&
+    allStepReports.every(s => s.passed) &&
+    allCleanupReports.every(s => s.passed);
 
   const report = {
     schema: SCHEMA_VERSION,
     project,
-    served_sha: options.bindSha || versionCheck.served_sha || expectedSha,
+    served_sha: versionCheck.served_sha || '',
     expected_sha: expectedSha,
     passed: overallPassed,
     assertions: {
       passed: totalAssertionsPassed,
       failed: totalAssertionsFailed
     },
-    viewports,
+    viewports: Array.from(executedViewports),
     steps: allStepReports,
     cleanup: {
-      passed: cleanupPassed
+      passed: cleanupPassed,
+      steps: allCleanupReports
     }
   };
 
@@ -2196,14 +2253,28 @@ export async function runFlows(options = {}) {
  * the served revision, the assertion counts, and the viewports that ran.
  */
 export function formatReceipt(report) {
-  const served = /^[0-9a-f]{40}$/i.test(report.served_sha || '') ? report.served_sha : '';
-  const state = report.passed && served && report.assertions.passed > 0 ? 'PASS' : 'FAIL';
+  const served = /^[0-9a-f]{40}$/i.test(report?.served_sha || '') ? report.served_sha : '';
+  const passedCount = report?.assertions?.passed ?? 0;
+  const failedCount = report?.assertions?.failed ?? 0;
+  const cleanupPassed = report?.cleanup?.passed ?? true;
+  const executedViewports = Array.isArray(report?.viewports) ? report.viewports : [];
+  const hasValidCoverage = executedViewports.length > 0 && executedViewports.every(v => VIEWPORTS[v]);
+
+  const state = (
+    report?.passed === true &&
+    served &&
+    passedCount > 0 &&
+    failedCount === 0 &&
+    cleanupPassed &&
+    hasValidCoverage
+  ) ? 'PASS' : 'FAIL';
+
   const lines = [
     `FLOW-QA: ${state}${served ? ` ${served}` : ''}`,
-    `FLOW-QA-ASSERTIONS pass=${report.assertions.passed} fail=${report.assertions.failed}`,
-    `FLOW-QA-VIEWPORTS ${(report.viewports || []).join(',')}`
+    `FLOW-QA-ASSERTIONS pass=${passedCount} fail=${failedCount}`,
+    `FLOW-QA-VIEWPORTS ${executedViewports.join(',')}`
   ];
-  if (report.error) lines.push(`Error: ${report.error}`);
+  if (report?.error) lines.push(`Error: ${report.error}`);
   return lines.join('\n') + '\n';
 }
 
