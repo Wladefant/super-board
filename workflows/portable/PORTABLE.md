@@ -84,6 +84,27 @@ emitted by `verify.py`. The receipt classifies all changed files across four pri
 A valid receipt must bind the exact 40-character head SHA and report `status: "PASSED"`.
 When `require_verify_receipt` is enabled in the gate approval policy (or `--require-verify-receipt`
 flag is passed), missing or failing receipts block the gate.
+
+### Flow QA receipt contract (`FLOW-QA`)
+
+`github_pr_gate.py` enforces real user-flow QA (`FLOW-QA`) receipts for configured repository targets.
+Target configurations define the repository, base branch, UI file patterns, and required viewports:
+- `Bavariance/polysimulator` on base `staging`: UI pattern matches `frontend/` files. Requires viewports `390x844` and `1440x900`.
+- `Wladefant/shipnovo` on base `main`: UI pattern matches `src/app`, `src/components`, and `src/features` `.tsx` files, excluding tests. Requires viewports `390x420` (keyboard open), `390x844`, and `1440x900`.
+
+Configured repositories fail closed when PR file lists are missing or truncated at 100 files.
+Unsupported repositories remain exempt from Flow QA requirements.
+A valid receipt comment must bind the current head SHA.
+The receipt must report positive assertions with zero failures (`pass>0`, `fail=0`).
+The receipt must list all required viewports.
+Stale revisions, failed markers, or missing required viewports block the gate.
+
+### Local test execution record contract
+
+`validate_local_tests_record` checks local test results before releasing queued CI checks.
+A valid record must bind the evaluated PR head commit with zero failures (`failed=0`).
+The record requires positive test assertion counts (`passed>0`) and a non-empty `commands` list.
+Records with zero passed tests or empty command lists fail validation.
 ---
 
 ## 3. Single Bounded Coordinator Command

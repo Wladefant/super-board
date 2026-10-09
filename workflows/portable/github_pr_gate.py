@@ -335,10 +335,11 @@ def validate_local_tests_record(
     if not isinstance(failed, int) or failed != 0:
         return False, f"local tests record has failures: failed={failed}"
     passed = record.get("passed")
-    if not isinstance(passed, int) or passed < 0:
+    if not isinstance(passed, int) or passed <= 0:
         return False, f"local tests record invalid passed count: {passed}"
-    if not isinstance(record.get("commands"), list):
-        return False, "local tests record commands must be a list"
+    commands = record.get("commands")
+    if not isinstance(commands, list) or len(commands) == 0:
+        return False, "local tests record commands must be a non-empty list"
     return True, "valid local tests record"
 
 
@@ -833,27 +834,60 @@ FLOW_QA_ASSERTIONS_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 FLOW_QA_VIEWPORTS_RE = re.compile(
-    r"^[ \t>*_`|\-]*FLOW-QA-VIEWPORTS (?P<viewports>[0-9x,]+)[ \t*_`|]*$",
+    r"^[ \t>*_`|\-]*FLOW-QA-VIEWPORTS (?P<viewports>[0-9x,\s]+)[ \t*_`|]*$",
     re.IGNORECASE | re.MULTILINE,
 )
-FLOW_QA_REQUIRED_VIEWPORTS = ("390x844", "1440x900")
+FLOW_QA_REQUIRED_VIEWPORTS: Tuple[str, ...] = ("390x844", "1440x900")
+
+
+@dataclass(frozen=True)
+class FlowQATarget:
+    repo: str
+    base_ref: str
+    ui_pattern: Any
+    required_viewports: Tuple[str, ...] = FLOW_QA_REQUIRED_VIEWPORTS
+
+
+FLOW_QA_TARGETS: Tuple[FlowQATarget, ...] = (
+    FlowQATarget(
+        repo="Bavariance/polysimulator",
+        base_ref="staging",
+        ui_pattern=re.compile(r"^frontend/", re.IGNORECASE),
+        required_viewports=("390x844", "1440x900"),
+    ),
+    FlowQATarget(
+        repo="Wladefant/shipnovo",
+        base_ref="main",
+        ui_pattern=re.compile(r"^src/(?:app|components|features)/.*\.tsx$", re.IGNORECASE),
+        required_viewports=("390x420", "390x844", "1440x900"),
+    ),
+)
+
+
+def get_flow_qa_target(repo: str, base_ref: str) -> Optional[FlowQATarget]:
+    """Resolve configured FLOW-QA target by repository and base branch."""
+    for target in FLOW_QA_TARGETS:
+        if target.repo == repo and target.base_ref == base_ref:
+            return target
+    return None
 
 
 def evaluate_flow_qa_requirement(
     pr_data: Dict[str, Any], repo: str, base_ref: str
 ) -> Tuple[bool, str]:
-    """Whether this PR must carry a FLOW-QA receipt: PolySimulator `staging`, UI paths only."""
-    if repo != "Bavariance/polysimulator" or base_ref != "staging":
+    """Whether this PR must carry a FLOW-QA receipt based on repository/base targets."""
+    target = get_flow_qa_target(repo, base_ref)
+    if target is None:
         return False, f"no Flow QA requirement for {repo}@{base_ref or 'unknown'}"
     files = pr_data.get("files")
     if files is None:
-        return False, "no file list supplied, Flow QA not required"
+        return True, "no file list supplied, Flow QA required by default"
     if len(files) >= 100:
         return True, f"file list truncated at {len(files)} files, Flow QA required by default"
     for f in files:
         path = f.get("path", "") if isinstance(f, dict) else str(f)
         norm_path = path.replace("\\", "/")
-        if not is_test_path(norm_path) and UI_PATH_RE.match(norm_path):
+        if not is_test_path(norm_path) and target.ui_pattern.search(norm_path):
             return True, f"UI path {path}"
     return False, "no UI paths"
 
@@ -926,9 +960,11 @@ def evaluate_flow_qa_receipt(
                 "a PASS needs pass>0 and fail=0.",
                 declaration["url"] or None,
             )
+        target = get_flow_qa_target(repo, base_ref)
+        required_viewports = target.required_viewports if target else FLOW_QA_REQUIRED_VIEWPORTS
         vp = FLOW_QA_VIEWPORTS_RE.search(declaration["body"])
-        covered = set(vp.group("viewports").lower().split(",")) if vp else set()
-        missing = [v for v in FLOW_QA_REQUIRED_VIEWPORTS if v not in covered]
+        covered = {v.strip() for v in vp.group("viewports").lower().split(",") if v.strip()} if vp else set()
+        missing = [v for v in required_viewports if v not in covered]
         if missing:
             return (
                 "REQUIRED",

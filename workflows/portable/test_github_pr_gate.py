@@ -46,6 +46,8 @@ from github_pr_gate import (
     GateApprovalPolicy,
     PRGateEvaluation,
     evaluate_pr_gate,
+    evaluate_flow_qa_requirement,
+    evaluate_flow_qa_receipt,
     evaluate_review_requirement,
     fetch_pr_json,
     is_lockfile_or_generated,
@@ -68,7 +70,7 @@ class TestGitHubPRGate(unittest.TestCase):
         cls.addClassCleanup(os.chdir, previous)
         os.chdir(cls.repository.name)
         def git(*args):
-            return subprocess.check_output(["git", *args], stderr=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).decode().strip()
+            return subprocess.check_output(["git", *args], stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).decode().strip()
         git("init", "-b", "fixture-base")
         git("config", "user.name", "Wladimir Kirjanovs")
         git("config", "user.email", "wladefant@gmail.com")
@@ -313,6 +315,118 @@ class TestGitHubPRGate(unittest.TestCase):
         pr["comments"] = comments
         return pr
 
+
+    def shipnovo_ui_pr(self, *, files=None, comments=None):
+        """A Shipnovo UI PR targeting main."""
+        pr = copy.deepcopy(self.mock_pr)
+        pr["baseRefName"] = "main"
+        pr["labels"] = []
+        pr["files"] = files or [
+            {"path": "src/app/dashboard/page.tsx", "additions": 10, "deletions": 2}
+        ]
+        pr["comments"] = comments or []
+        return pr
+
+    def shipnovo_flow_qa_lines(
+        self,
+        *,
+        served=None,
+        passed=12,
+        failed=0,
+        viewports="390x420,390x844,1440x900",
+        marker="PASS",
+    ):
+        """The flow receipt lines required for Shipnovo, including 390x420 keyboard coverage."""
+        served = served or self.head_sha
+        return [
+            f"FLOW-QA: {marker} {served}",
+            f"FLOW-QA-ASSERTIONS pass={passed} fail={failed}",
+            f"FLOW-QA-VIEWPORTS {viewports}",
+        ]
+
+    def test_shipnovo_flow_qa_gate_assertion(self):
+        """Shipnovo UI on main requires FLOW-QA with keyboard viewport; non-UI and unsupported repos stay exempt."""
+        stale = "1" * 40
+        # 1. UI path detection on Shipnovo@main
+        for ui_path in (
+            "src/app/page.tsx",
+            "src/components/Header.tsx",
+            "src/features/shipments/ShipmentList.tsx",
+        ):
+            with self.subTest(path=ui_path):
+                pr = self.shipnovo_ui_pr(files=[{"path": ui_path, "additions": 5, "deletions": 1}])
+                required, reason = evaluate_flow_qa_requirement(pr, repo="Wladefant/shipnovo", base_ref="main")
+                self.assertTrue(
+                    required,
+                    f"missing Shipnovo gate assertion: expected Flow QA to be required for Shipnovo UI path {ui_path}, got {reason}",
+                )
+
+        # 2. Non-UI paths and tests are exempt
+        for non_ui_path in (
+            "src/utils/math.ts",
+            "src/app/api/health/route.ts",
+            "src/features/shipments/api.ts",
+            "src/components/Header.test.tsx",
+            "src/features/shipments/__tests__/ShipmentList.tsx",
+            "backend/main.py",
+        ):
+            with self.subTest(non_ui=non_ui_path):
+                pr = self.shipnovo_ui_pr(files=[{"path": non_ui_path, "additions": 5, "deletions": 1}])
+                required, _ = evaluate_flow_qa_requirement(pr, repo="Wladefant/shipnovo", base_ref="main")
+                self.assertFalse(required)
+
+        # 3. Missing/truncated file lists fail closed on configured repos
+        pr_missing = self.shipnovo_ui_pr()
+        pr_missing["files"] = None
+        req_missing, reason_missing = evaluate_flow_qa_requirement(pr_missing, repo="Wladefant/shipnovo", base_ref="main")
+        self.assertTrue(req_missing)
+        self.assertIn("Flow QA required by default", reason_missing)
+
+        pr_truncated = self.shipnovo_ui_pr(files=[{"path": f"src/other/{i}.ts"} for i in range(100)])
+        req_trunc, reason_trunc = evaluate_flow_qa_requirement(pr_truncated, repo="Wladefant/shipnovo", base_ref="main")
+        self.assertTrue(req_trunc)
+        self.assertIn("truncated at 100 files", reason_trunc)
+
+        # PolySimulator staging missing/truncated file lists also fail closed
+        ps_missing = self.staging_ui_pr()
+        ps_missing["files"] = None
+        req_ps_missing, _ = evaluate_flow_qa_requirement(ps_missing, repo="Bavariance/polysimulator", base_ref="staging")
+        self.assertTrue(req_ps_missing)
+
+        # 4. Unsupported repos and non-configured bases are exempt
+        pr_other = self.shipnovo_ui_pr()
+        req_other, _ = evaluate_flow_qa_requirement(pr_other, repo="Wladefant/other", base_ref="main")
+        self.assertFalse(req_other)
+        req_other_branch, _ = evaluate_flow_qa_requirement(pr_other, repo="Wladefant/shipnovo", base_ref="feature")
+        self.assertFalse(req_other_branch)
+        req_polysim_main, _ = evaluate_flow_qa_requirement(pr_other, repo="Bavariance/polysimulator", base_ref="main")
+        self.assertFalse(req_polysim_main)
+
+        # 5. Full evaluate_pr_gate checks: missing, stale, zero assertions, failed assertions, thin viewports, latest FAIL
+        cases = [
+            ("no receipt", [], "no PR comment carries a 'FLOW-QA: PASS' marker"),
+            ("stale sha", [{"body": "\n".join(self.shipnovo_flow_qa_lines(served=stale))}], "the receipt names no identity"),
+            ("zero assertions", [{"body": "\n".join(self.shipnovo_flow_qa_lines(passed=0))}], "a PASS needs pass>0"),
+            ("failed assertion", [{"body": "\n".join(self.shipnovo_flow_qa_lines(failed=1))}], "a PASS needs pass>0"),
+            ("missing keyboard coverage", [{"body": "\n".join(self.shipnovo_flow_qa_lines(viewports='390x844,1440x900'))}], "does not cover viewport(s) 390x420"),
+            ("latest fail overrides earlier pass", [
+                {"body": "\n".join(self.shipnovo_flow_qa_lines(marker="PASS")), "created_at": "2026-10-09T01:00:00Z"},
+                {"body": "\n".join(self.shipnovo_flow_qa_lines(marker="FAIL")), "created_at": "2026-10-09T02:00:00Z"},
+            ], "the newest receipt binding this diff is FAIL"),
+        ]
+        for label, comments, expected_reason in cases:
+            with self.subTest(case=label):
+                pr = self.shipnovo_ui_pr(comments=comments)
+                result = evaluate_pr_gate(pr, repo="Wladefant/shipnovo")
+                self.assertEqual(result.flow_qa_receipt_verdict, "REQUIRED")
+                self.assertEqual(result.gate_verdict, "BLOCKED")
+                if expected_reason:
+                    self.assertIn(expected_reason, result.flow_qa_receipt_reason)
+
+        # 6. Valid Shipnovo receipt with 390x420, 390x844, 1440x900 passes
+        good_pr = self.shipnovo_ui_pr(comments=[{"body": "\n".join(self.shipnovo_flow_qa_lines())}])
+        good_result = evaluate_pr_gate(good_pr, repo="Wladefant/shipnovo")
+        self.assertEqual(good_result.flow_qa_receipt_verdict, "PASSED")
     def test_unresolvable_live_head_never_approves(self):
         for head in ("", "short", "g" * 40):
             for expected in (None, self.head_sha):
@@ -1421,6 +1535,73 @@ class TestGitHubPRGate(unittest.TestCase):
         self.assertEqual(res.ci_verdict, "FAILURE")
         self.assertEqual(res.gate_verdict, "BLOCKED")
         self.assertIn("build-and-boot", res.failing_checks)
+
+    def test_validate_local_tests_record_zero_test_and_empty_commands(self):
+        """Local tests record must reject passed=0 and empty commands list."""
+        # 1. Direct unit test of validate_local_tests_record
+        zero_record = {
+            "head_sha": self.head_sha,
+            "commands": ["pytest backend/tests"],
+            "passed": 0,
+            "failed": 0,
+        }
+        valid_zero, reason_zero = validate_local_tests_record(zero_record, self.head_sha)
+        self.assertFalse(
+            valid_zero,
+            f"zero-test record assertion: validate_local_tests_record must reject passed=0, got valid=True ({reason_zero})",
+        )
+        self.assertIn("passed", reason_zero.lower())
+
+        empty_cmd_record = {
+            "head_sha": self.head_sha,
+            "commands": [],
+            "passed": 5,
+            "failed": 0,
+        }
+        valid_cmd, reason_cmd = validate_local_tests_record(empty_cmd_record, self.head_sha)
+        self.assertFalse(valid_cmd, f"validate_local_tests_record must reject empty commands list, got {reason_cmd}")
+        self.assertIn("command", reason_cmd.lower())
+
+        # Negative passed
+        neg_record = {
+            "head_sha": self.head_sha,
+            "commands": ["pytest"],
+            "passed": -1,
+            "failed": 0,
+        }
+        valid_neg, _ = validate_local_tests_record(neg_record, self.head_sha)
+        self.assertFalse(valid_neg)
+
+        # Valid record passes
+        valid_record = {
+            "head_sha": self.head_sha,
+            "commands": ["pytest backend/tests"],
+            "passed": 10,
+            "failed": 0,
+        }
+        valid_ok, _ = validate_local_tests_record(valid_record, self.head_sha)
+        self.assertTrue(valid_ok)
+
+        # 2. evaluate_pr_gate integration with queued critical check
+        pr = self._exempt_staging_pr([
+            {"name": "build-and-boot", "status": "QUEUED"},
+        ])
+        policy = resolve_gate_policy("Bavariance/polysimulator", "staging")
+
+        # Zero-test record does NOT release queued check -> stays PENDING
+        res_zero = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy, local_tests_record=zero_record)
+        self.assertEqual(res_zero.ci_verdict, "PENDING")
+        self.assertIn("build-and-boot", res_zero.pending_checks)
+
+        # Empty commands record does NOT release queued check -> stays PENDING
+        res_empty = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy, local_tests_record=empty_cmd_record)
+        self.assertEqual(res_empty.ci_verdict, "PENDING")
+        self.assertIn("build-and-boot", res_empty.pending_checks)
+
+        # Valid record releases queued check -> passes
+        res_ok = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy, local_tests_record=valid_record)
+        self.assertEqual(res_ok.ci_verdict, "SUCCESS")
+        self.assertIn("build-and-boot", res_ok.released_checks)
 
     def test_non_critical_pending_under_timeout_stays_pending(self):
         """A non-critical check pending under 5 minutes is still waited on."""
