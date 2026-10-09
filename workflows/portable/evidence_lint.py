@@ -312,10 +312,8 @@ def extract_table_pairs(html: str) -> List[TablePair]:
 
         for r_idx in range(header_row_idx + 1, len(rows)):
             row = rows[r_idx]
-            if len(row) <= max(before_col, after_col):
-                continue
-            b_cell = row[before_col]
-            a_cell = row[after_col]
+            b_cell = row[before_col] if len(row) > before_col else {"text": "", "imgs": []}
+            a_cell = row[after_col] if len(row) > after_col else {"text": "", "imgs": []}
             row_label = (
                 row[label_col]["text"]
                 if label_col is not None and len(row) > label_col and row[label_col]["text"]
@@ -323,6 +321,15 @@ def extract_table_pairs(html: str) -> List[TablePair]:
             )
             b_imgs = [src for src, _ in b_cell["imgs"]]
             a_imgs = [src for src, _ in a_cell["imgs"]]
+            if len(row) <= max(before_col, after_col):
+                b_src = b_imgs[0] if b_imgs else ""
+                a_src = a_imgs[0] if a_imgs else ""
+                reason = (
+                    f"unequal-count: malformed before/after row with missing cell "
+                    f"({len(b_imgs)} before image(s) and {len(a_imgs)} after image(s))"
+                )
+                pairs.append(TablePair(b_src, a_src, row_label, reason=reason))
+                continue
             if len(b_imgs) == len(a_imgs):
                 for b_src, a_src in zip(b_imgs, a_imgs):
                     pairs.append(TablePair(b_src, a_src, row_label))
@@ -357,7 +364,8 @@ def fetch_media_bytes(source: str, timeout: int = 30) -> bytes:
         token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
         parsed = urllib.parse.urlparse(source)
         hostname = (parsed.hostname or "").lower()
-        if token and hostname in GITHUB_TOKEN_HOSTS:
+        is_https = (parsed.scheme or "").lower() == "https"
+        if token and is_https and hostname in GITHUB_TOKEN_HOSTS:
             headers["Authorization"] = f"token {token}"
         opener = urllib.request.build_opener(_AuthRedirectHandler())
         req = urllib.request.Request(source, headers=headers)

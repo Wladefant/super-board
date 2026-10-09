@@ -526,6 +526,44 @@ class VerifyPostedPairs(unittest.TestCase):
             el.check_media_url = orig_check
             el.fetch_media_bytes = orig_bytes
 
+    def test_verify_posted_row_missing_entire_after_cell_fails_closed(self):
+        p1_b = self._make_png("miss_after_b.png")
+        u1_b = "https://github.com/user-attachments/assets/12345678-1234-1234-1234-123456789abc"
+        with open(p1_b, "rb") as f: d1_b = f.read()
+        url_map = {u1_b: d1_b}
+
+        # Row has only 2 cells (Viewport, Before), missing After <td> entirely
+        html = f"""
+        <table>
+          <thead>
+            <tr><th>Viewport</th><th>Before</th><th>After</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Desktop</td><td><img src="{u1_b}"></td></tr>
+          </tbody>
+        </table>
+        """
+        orig_fetch = el.fetch_rendered_html
+        orig_check = el.check_media_url
+        orig_bytes = el.fetch_media_bytes
+        try:
+            el.fetch_rendered_html = lambda url, timeout=60: html
+            el.check_media_url = lambda url, timeout=30: (True, "HTTP 200 image/png")
+            el.fetch_media_bytes = lambda url, timeout=30: url_map[url]
+            passed, results = el.verify_posted("https://github.com/o/r/issues/1#issuecomment-100")
+            self.assertFalse(passed)
+            pair_results = [r for r in results if r.get("tag") == "pair"]
+            self.assertEqual(len(pair_results), 1)
+            self.assertFalse(pair_results[0]["ok"])
+            self.assertTrue(
+                "unequal" in pair_results[0]["detail"] or "malformed" in pair_results[0]["detail"],
+                f"Expected unequal/malformed detail, got {pair_results[0]['detail']}",
+            )
+        finally:
+            el.fetch_rendered_html = orig_fetch
+            el.check_media_url = orig_check
+            el.fetch_media_bytes = orig_bytes
+
 
 class FetchMediaBytesAuth(unittest.TestCase):
     def setUp(self):
@@ -588,6 +626,15 @@ class FetchMediaBytesAuth(unittest.TestCase):
                     req.headers,
                     f"Authorization header must not be sent to {url}",
                 )
+
+            # Plaintext HTTP must not send token even on exact trusted host
+            el.fetch_media_bytes("http://github.com/asset.png")
+            req_http = captured[-1]
+            self.assertNotIn(
+                "Authorization",
+                req_http.headers,
+                "Plaintext HTTP must not include Authorization header",
+            )
         finally:
             el.urllib.request.build_opener = orig_build_opener
 
