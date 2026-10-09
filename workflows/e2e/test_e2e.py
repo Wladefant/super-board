@@ -577,6 +577,29 @@ class RedirectTests(unittest.TestCase):
         self.server.routes = {"/api/version": (200, {"Content-Type": "application/json"}, json.dumps({"sha": HEAD}).encode())}
         self.assertEqual(e2e_receipt.fetch_served_sha(self.base), HEAD)
 
+    def test_version_reader_prefers_commit_over_semver_and_deployment_id(self):
+        payload = {"version": "1.0.0", "commit": HEAD, "deploymentId": "b" * 40, "sha": "c" * 40}
+        self.server.routes = {"/api/version": (200, {}, json.dumps(payload).encode())}
+        self.assertEqual(e2e_receipt.fetch_served_sha(self.base), HEAD)
+
+    def test_version_reader_rejects_semver_only(self):
+        self.server.routes = {"/api/version": (200, {}, json.dumps({"version": "1.0.0"}).encode())}
+        with self.assertRaisesRegex(ValueError, "40-hex commit"):
+            e2e_receipt.fetch_served_sha(self.base)
+
+    def test_version_reader_keeps_validated_legacy_fields(self):
+        for field in ("sha", "served_sha", "version", "git_sha", "commitSha"):
+            with self.subTest(field=field):
+                payload = {"commit": "invalid", "version": "1.0.0", field: HEAD.upper()}
+                self.server.routes = {"/api/version": (200, {}, json.dumps(payload).encode())}
+                self.assertEqual(e2e_receipt.fetch_served_sha(self.base), HEAD.upper())
+
+    def test_version_reader_never_uses_deployment_id(self):
+        payload = {"version": "1.0.0", "deploymentId": HEAD}
+        self.server.routes = {"/api/version": (200, {}, json.dumps(payload).encode())}
+        with self.assertRaisesRegex(ValueError, "40-hex commit"):
+            e2e_receipt.fetch_served_sha(self.base)
+
     def test_served_sha_read_refuses_a_host_outside_the_allow_list(self):
         with self.assertRaises(ValueError):
             e2e_receipt.fetch_served_sha("https://polysimulator.com")

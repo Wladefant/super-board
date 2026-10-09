@@ -170,18 +170,50 @@ def synchronize(
     return True
 
 
+def synchronize_sha_readers(source_root: Path, runtime: Path, check: bool = False) -> bool:
+    """Install only the version readers and their receipt dependencies."""
+    pairs = [
+        (source_root / "workflows/portable" / name, runtime / name)
+        for name in ("flow_qa_runner.mjs", "depth_report_capture.mjs")
+    ] + [
+        (source_root / "workflows/e2e" / name, runtime / "e2e" / name)
+        for name in ("e2e_receipt.py", "e2e_guard.py", "pins.json")
+    ]
+    payloads = [(target, source.read_bytes()) for source, target in pairs]
+    for target, data in payloads:
+        if not check:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            fd, temporary = tempfile.mkstemp(prefix=target.name + ".", dir=target.parent)
+            try:
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(data)
+                os.replace(temporary, target)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+        if not target.exists() or target.read_bytes() != data:
+            print(f"DRIFT: {target}")
+            return False
+        print(f"MATCH: {target} sha256={hashlib.sha256(data).hexdigest()}")
+    return True
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", required=True, type=Path)
     parser.add_argument("--profile-path", type=Path, default=Path.home() / ".veyyon/profiles/default/agent/AGENTS.md")
     parser.add_argument("--runtime-dir", type=Path, default=Path.home() / ".veyyon/workflows")
     parser.add_argument("--check", action="store_true", help="Read-only byte parity check; exit 1 on drift")
+    parser.add_argument("--sha-readers-only", action="store_true",
+                        help="Install only served-SHA readers; preserve policy and unrelated workflows")
     parser.add_argument(
         "--force-policy",
         action="store_true",
         help="Overwrite a profile AGENTS.md that changed after the last install (default: refuse)",
     )
     args = parser.parse_args(argv)
+    if args.sha_readers_only:
+        return 0 if synchronize_sha_readers(args.source_root, args.runtime_dir, args.check) else 1
     return (
         0
         if synchronize(args.source_root, args.profile_path, args.runtime_dir, args.check, args.force_policy)

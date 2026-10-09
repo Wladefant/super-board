@@ -38,6 +38,7 @@ import {
   assertNotProduction,
   verifyServedSha,
   checkVersionEndpoint,
+  readServedSha,
   validateSafeAction,
   validateMutationPayload,
   checkVisible,
@@ -191,6 +192,43 @@ test('checkVersionEndpoint verifies /api/version response correctly', async () =
   const mockFetchNetworkError = async () => { throw new Error('ECONNREFUSED'); };
   const networkRes = await checkVersionEndpoint('http://localhost:3000', '915086a', mockFetchNetworkError);
   assert.equal(networkRes.passed, false);
+});
+
+test('version reader prefers commit over SemVer and deploymentId', async () => {
+  const commit = 'a'.repeat(40);
+  const fetchVersion = async () => ({ ok: true, json: async () => ({
+    version: '1.0.0', commit, deploymentId: 'b'.repeat(40), sha: 'c'.repeat(40)
+  }) });
+  const result = await checkVersionEndpoint('http://localhost:3000', commit, fetchVersion);
+  assert.equal(result.served_sha, commit);
+  assert.equal(result.passed, true);
+});
+
+test('version reader rejects SemVer-only with a clear error', async () => {
+  const fetchVersion = async () => ({ ok: true, json: async () => ({ version: '1.0.0' }) });
+  const result = await checkVersionEndpoint('http://localhost:3000', 'a'.repeat(40), fetchVersion);
+  assert.equal(result.passed, false);
+  assert.equal(result.served_sha, null);
+  assert.match(result.detail, /40-hex commit/);
+});
+
+test('version reader retains health fallback when version has no valid commit', async () => {
+  const commit = 'a'.repeat(40);
+  const fetchVersion = async (url) => ({ ok: true, json: async () =>
+    url.endsWith('/api/version') ? { version: '1.0.0' } : { commitSha: commit } });
+  const result = await checkVersionEndpoint('http://localhost:3000', commit, fetchVersion);
+  assert.equal(result.served_sha, commit);
+  assert.equal(result.passed, true);
+});
+
+test('shared version reader keeps validated legacy fields and rejects deploymentId', () => {
+  const commit = 'A'.repeat(40);
+  for (const field of ['sha', 'served_sha', 'version', 'git_sha', 'commitSha']) {
+    assert.equal(readServedSha({ commit: 'invalid', version: '1.0.0', [field]: commit }), commit);
+  }
+  for (const payload of [{ version: '1.0.0', deploymentId: commit }, { commit: 'a'.repeat(39) }, null]) {
+    assert.throws(() => readServedSha(payload), /40-hex commit/);
+  }
 });
 
 // ============================================================================
