@@ -2370,30 +2370,30 @@ class TestBuildSlot(unittest.TestCase):
         self.assertEqual(len(diff_pid_entries), 1)
 
     def test_acquisition_stagger_delays_second_acquisition(self):
-        """Acquisition stagger delays second slot acquisition until stagger interval elapses."""
+        """Heavy acquisition stagger delays the next heavy start after release."""
         manager = BuildSlotManager(run_dir=self.run_dir, acquisition_stagger=0.2)
         # Lane 1 acquires at t=0
-        self.assertTrue(manager.acquire("stagger-lane-1", timeout=1.0, poll_interval=0.02))
+        self.assertTrue(manager.acquire("stagger-lane-1", timeout=1.0, poll_interval=0.02, job_class="heavy"))
         self.assertTrue(manager.is_held_by("stagger-lane-1"))
+        manager.release("stagger-lane-1")
 
         # Lane 2 tries to acquire immediately with short timeout -> fails because stagger has not elapsed
         stderr_buf = io.StringIO()
         with redirect_stderr(stderr_buf):
-            res_2 = manager.acquire("stagger-lane-2", timeout=0.08, poll_interval=0.02)
+            res_2 = manager.acquire("stagger-lane-2", timeout=0.08, poll_interval=0.02, job_class="heavy")
         self.assertFalse(res_2)
         self.assertIn("stagger delay active", stderr_buf.getvalue())
 
         # After waiting for stagger to elapse, Lane 2 succeeds
         time.sleep(0.15)
-        self.assertTrue(manager.acquire("stagger-lane-2", timeout=1.0, poll_interval=0.02))
+        self.assertTrue(manager.acquire("stagger-lane-2", timeout=1.0, poll_interval=0.02, job_class="heavy"))
         self.assertTrue(manager.is_held_by("stagger-lane-2"))
 
         # Status reflects stagger state
         st = manager.status()
-        self.assertIn("stagger-lane-1", st["holders"])
+        self.assertNotIn("stagger-lane-1", st["holders"])
         self.assertIn("stagger-lane-2", st["holders"])
 
-        manager.release("stagger-lane-1")
         manager.release("stagger-lane-2")
 
     def test_acquisition_stagger_bypassed_with_force(self):

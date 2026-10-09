@@ -2406,7 +2406,8 @@ class BuildSlotManager:
             return False, f"FIFO head '{head.get('name')}' can run"
         age = now - (_parse_timestamp(head.get("enqueued_at")) or now)
         if (head_class == "heavy" and age > 1200 and not impossible
-                and projected is not None and projected >= head_mem and budget["heavy_jobs"] == 0):
+                and projected is not None and projected >= head_mem and budget["heavy_jobs"] == 0
+                and (age >= 2400 or (age - 1200) % 180 < 60)):
             return False, f"backfill paused: aging heavy head '{head.get('name')}' waited {age:.1f}s"
         caller_mem = float(caller.get("mem_gib", 3.0))
         if caller_mem >= head_mem:
@@ -2687,7 +2688,7 @@ class BuildSlotManager:
                                         )
                                         last_acq = self._read_last_acquired_at()
                                         elapsed_since_acq = None if last_acq is None else time.time() - last_acq
-                                        if eligible and not force and elapsed_since_acq is not None and elapsed_since_acq < self.acquisition_stagger:
+                                        if eligible and job_class == "heavy" and not force and elapsed_since_acq is not None and elapsed_since_acq < self.acquisition_stagger:
                                             eligible = False
                                             reason = f"stagger delay active ({elapsed_since_acq:.1f}s < {self.acquisition_stagger:.1f}s since last acquisition)"
                                         if reason and reason != last_refusal:
@@ -2698,7 +2699,8 @@ class BuildSlotManager:
                                         os.mkdir(slot_dir)
                                         self._write_slot_info(slot_idx, owner=name, pid=pid, token=token, wrapper_pid=wrapper_pid,
                                                               job_class=job_class, mem_gib=mem_gib)
-                                        self._record_last_acquired_at(name, pid, slot_idx)
+                                        if job_class == "heavy":
+                                            self._record_last_acquired_at(name, pid, slot_idx)
                                         acquired = True
                                     self._dequeue_own_entry(name, pid, token, self.queue_grant_cleanup_grace)
                                     msg = f"Acquired build slot lock for '{name}' (PID {pid})"
