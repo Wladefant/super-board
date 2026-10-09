@@ -491,8 +491,8 @@ class TestBuildSlotMultiprocessingRaces(unittest.TestCase):
         Zero critical section overlaps must occur.
         """
         q = mp.Queue()
-        p1 = mp.Process(target=_worker_ordinary_contention, args=(self.test_run_dir, "proc-A", 0.15, q))
-        p2 = mp.Process(target=_worker_ordinary_contention, args=(self.test_run_dir, "proc-B", 0.15, q))
+        p1 = mp.Process(target=_worker_ordinary_contention, args=(self.test_run_dir, "procA-job", 0.15, q))
+        p2 = mp.Process(target=_worker_ordinary_contention, args=(self.test_run_dir, "procB-job", 0.15, q))
         self._active_processes.extend([p1, p2])
 
         p1.start()
@@ -505,13 +505,13 @@ class TestBuildSlotMultiprocessingRaces(unittest.TestCase):
             results.append(q.get())
 
         self.assertEqual(len(results), 2, "Both processes should return results")
-        res_a = next(r for r in results if r["name"] == "proc-A")
-        res_b = next(r for r in results if r["name"] == "proc-B")
+        res_a = next(r for r in results if r["name"] == "procA-job")
+        res_b = next(r for r in results if r["name"] == "procB-job")
 
-        self.assertTrue(res_a["acquired"], "proc-A must acquire")
-        self.assertTrue(res_b["acquired"], "proc-B must acquire")
-        self.assertTrue(res_a["released"], "proc-A must release")
-        self.assertTrue(res_b["released"], "proc-B must release")
+        self.assertTrue(res_a["acquired"], "procA-job must acquire")
+        self.assertTrue(res_b["acquired"], "procB-job must acquire")
+        self.assertTrue(res_a["released"], "procA-job must release")
+        self.assertTrue(res_b["released"], "procB-job must release")
 
         overlap = not (res_a["exit_time"] <= res_b["enter_time"] or res_b["exit_time"] <= res_a["enter_time"])
         self.assertFalse(overlap, f"Critical sections overlapped! A: {res_a}, B: {res_b}")
