@@ -2151,7 +2151,7 @@ export async function runFlows(options = {}) {
       served_sha: versionCheck.served_sha || 'unknown',
       expected_sha: expectedSha || 'unknown',
       passed: false,
-      infrastructure_error: !versionCheck.served_sha,
+      infrastructure_error: true,
       assertions: { passed: 0, failed: 1 },
       viewports: [],
       steps: [],
@@ -2359,7 +2359,7 @@ export async function runFlows(options = {}) {
  * the served revision, the assertion counts, and the viewports that ran.
  */
 export function formatReceipt(report) {
-  if (report?.infrastructure_error === true && Array.isArray(report.steps) && report.steps.length === 0) {
+  if (report?.passed !== true && Array.isArray(report?.steps) && report.steps.length === 0) {
     return `FLOW-QA: INFRA-ERROR${report.served_sha ? ` ${report.served_sha}` : ''}\nError: ${report.error || 'Pre-run infrastructure unavailable'}\n`;
   }
   const served = /^[0-9a-f]{40}$/i.test(report?.served_sha || '') ? report.served_sha : '';

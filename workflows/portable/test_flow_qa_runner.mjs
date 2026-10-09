@@ -1116,6 +1116,11 @@ test('Negative Flow Control 4: Reject unsupported viewports, empty theme lists, 
     });
     assert.equal(unreachable.steps.length, 0);
     assert.match(formatReceipt(unreachable), /^FLOW-QA: INFRA-ERROR/);
+    const mismatch = await runFlows({
+      baseUrl, expectedSha: 'a'.repeat(40), outputDir: tmpDir
+    });
+    assert.equal(mismatch.steps.length, 0);
+    assert.match(formatReceipt(mismatch), /^FLOW-QA: INFRA-ERROR/);
   } finally {
     server.close();
     fs.rmSync(tmpDir, { recursive: true, force: true });

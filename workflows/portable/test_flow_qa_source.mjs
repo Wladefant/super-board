@@ -41,3 +41,9 @@ test('UI timeout remains FAIL even with an infrastructure flag', () => {
     steps: [{ passed: false, checks: [{ name: 'step_error', passed: false, detail: 'UI timeout' }] }],
     assertions: { passed: 0, failed: 1 } }), /^FLOW-QA: FAIL/);
 });
+test('pre-run served SHA mismatch cannot create a sticky head failure', () => {
+  const mismatch = { ...report(), passed: false, served_sha: 'b'.repeat(40),
+    infrastructure_error: false, steps: [], assertions: { passed: 0, failed: 1 },
+    error: `Served SHA differs from expected ${sha}` };
+  assert.match(formatReceipt(mismatch), /^FLOW-QA: INFRA-ERROR/);
+});

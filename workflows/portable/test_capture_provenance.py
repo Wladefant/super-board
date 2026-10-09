@@ -41,6 +41,7 @@ class CaptureProvenanceTests(unittest.TestCase):
                 f'FLOW-QA-SOURCE runner={runner} flow={flow} project=shipnovo\n')
         data = {'files': [{'path': 'src/app/page.tsx'}], 'comments': [
             {'body': f'FLOW-QA: INFRA-ERROR {AFTER}\nError: server unreachable'},
+            {'body': f'FLOW-QA: INFRA-ERROR {BEFORE}\nError: served SHA differs from expected {AFTER}'},
             {'body': body}]}
         with patch('github_pr_gate._content_binder', return_value=(lambda sha: sha == AFTER, [AFTER], None)):
             result = evaluate_flow_qa_receipt(data, repo='Wladefant/shipnovo', base_ref='main', head_sha=AFTER)
