@@ -3,13 +3,13 @@
   "practices": [
     {
       "id": "pagespeed-check",
-      "title": "PageSpeed Insights Performance and SEO Baselines",
-      "what": "Measure and record real live PageSpeed Insights performance and SEO scores (mobile and desktop) before and after deployment to enforce baselines and prevent regressions.",
+      "title": "Optional PageSpeed Insights Performance and SEO Audits",
+      "what": "Optionally measure and record live PageSpeed Insights performance and SEO scores (mobile and desktop) during relevant loading, SEO, or suspected-regression work; never a per-deployment gate or enforced baseline.",
       "why": "https://github.com/Wladefant/pinthread/issues/379#issuecomment-6096691475",
       "applies_when": [
         "web-frontend",
         "public-facing",
-        "deployed-environment"
+        "relevant-loading-seo-or-regression-work"
       ],
       "how": "skill://pagespeed-check",
       "cost": "free",
@@ -24,7 +24,7 @@
       "id": "bitwarden-us-project-collections",
       "title": "Dedicated Bitwarden US Collection Per Project",
       "what": "Store operational secrets in the primary Bitwarden US vault (bw-us) isolated into a dedicated collection per project, avoiding shared credentials or storage solely in the EU vault.",
-      "why": "https://github.com/Wladefant/super-board/issues/680",
+      "why": "https://github.com/Wladefant/pinthread/issues/379#issuecomment-6096865043",
       "applies_when": [
         "operational-secrets",
         "multi-project"
@@ -45,12 +45,12 @@
     {
       "id": "consent-mode-v2",
       "title": "Google Consent Mode v2 and Equal-Choice Cookie Banner",
-      "what": "Implement GDPR/TTDSG-compliant cookie consent with equal-sized Accept/Reject buttons, zero tracking scripts/cookies loaded prior to opt-in, default-denied signals for Consent Mode v2, and complete cookie deletion upon revocation.",
+      "what": "Implement GDPR/TTDSG-compliant cookie consent with equal-sized Accept/Reject buttons, zero tracking scripts/cookies loaded prior to opt-in for tags requiring consent such as GA4, default-denied signals for Consent Mode v2, and complete cookie deletion upon revocation. Explicitly excludes consent-free Cloudflare Web Analytics and cookie-free first-party vitals from gating.",
       "why": "https://github.com/Wladefant/pinthread/issues/377#issuecomment-6096572385",
       "applies_when": [
         "web-frontend",
         "public-facing",
-        "analytics-or-marketing-tags"
+        "tags-requiring-consent"
       ],
       "how": "skill://startup-launch-setup",
       "cost": "free",
@@ -79,8 +79,8 @@
       "cost": "free",
       "projects": {
         "Wladefant/pinthread": {
-          "status": "proposed",
-          "issue": "https://github.com/Wladefant/pinthread/issues/374"
+          "status": "adopted",
+          "evidence": "https://github.com/Wladefant/pinthread/issues/374#issuecomment-6096640669"
         }
       }
     },

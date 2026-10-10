@@ -355,23 +355,66 @@ class PracticesRegistryTest(unittest.TestCase):
             validate_practices_registry(bad_duplicate_id)
         self.assertIn("Duplicate practice id 'dup'", str(ctx.exception))
 
-    def test_conservative_status_decisions_for_open_issues(self) -> None:
-        """Verify Bing IndexNow (Pinthread #374, open issue/checklist) is not marked adopted."""
+    def test_search_consoles_bing_indexnow_evidence_backed_adoption(self) -> None:
+        """Verify Search Console, Bing, and IndexNow adoption is proven by verified evidence."""
         with open(PRACTICES_JSON, "r", encoding="utf-8") as f:
             data = json.load(f)
         practices_by_id = {p["id"]: p for p in data["practices"]}
-        bing_practice = practices_by_id["search-consoles-bing-indexnow"]
-        pinthread_record = bing_practice["projects"]["Wladefant/pinthread"]
+        search_practice = practices_by_id["search-consoles-bing-indexnow"]
+        pinthread_record = search_practice["projects"]["Wladefant/pinthread"]
         self.assertEqual(
             pinthread_record["status"],
-            "proposed",
-            "Pinthread #374 is open with open checklist and Schema.org validator open; status must be 'proposed', not 'adopted'.",
+            "adopted",
+            "Search seed scoped GSC/Bing/IndexNow adoption is proven by evidence comment #6096640669; status must be 'adopted'.",
         )
         self.assertEqual(
-            pinthread_record["issue"],
-            "https://github.com/Wladefant/pinthread/issues/374",
+            pinthread_record["evidence"],
+            "https://github.com/Wladefant/pinthread/issues/374#issuecomment-6096640669",
         )
+        self.assertNotIn("issue", pinthread_record)
 
+    def test_pagespeed_optional_diagnostic_not_enforced_baseline(self) -> None:
+        """Verify PageSpeed practice is optional diagnostic tool, not per-deployment gate or enforced baseline."""
+        with open(PRACTICES_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        practices_by_id = {p["id"]: p for p in data["practices"]}
+        psi = practices_by_id["pagespeed-check"]
+        what = psi["what"].lower()
+        self.assertIn("optionally", what, "PageSpeed 'what' must describe practice as optional")
+        self.assertIn("never a per-deployment gate", what, "PageSpeed 'what' must state never a per-deployment gate")
+        self.assertNotIn("enforce baselines", what, "PageSpeed 'what' must not claim to enforce baselines")
+        self.assertNotIn("deployed-environment", psi["applies_when"], "PageSpeed applies_when must not blanket all deployments")
+        self.assertIn("relevant-loading-seo-or-regression-work", psi["applies_when"], "PageSpeed applies_when must scope to relevant work")
+
+    def test_consent_mode_preserves_consent_free_analytics_and_vitals(self) -> None:
+        """Verify cookie consent applies to tags requiring consent and excludes consent-free analytics and vitals."""
+        with open(PRACTICES_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        practices_by_id = {p["id"]: p for p in data["practices"]}
+        consent = practices_by_id["consent-mode-v2"]
+        what = consent["what"]
+        self.assertIn("tags requiring consent such as GA4", what, "Consent must specify tags requiring consent such as GA4")
+        self.assertIn("Cloudflare Web Analytics", what, "Consent must explicitly exclude Cloudflare Web Analytics")
+        self.assertIn("cookie-free first-party vitals", what, "Consent must explicitly exclude cookie-free first-party vitals")
+        self.assertNotIn("analytics-or-marketing-tags", consent["applies_when"], "Consent applies_when must not blanket all analytics tags")
+        self.assertIn("tags-requiring-consent", consent["applies_when"], "Consent applies_when must scope to tags requiring consent")
+
+    def test_bitwarden_why_references_us_vault_completion(self) -> None:
+        """Verify Bitwarden why references US vault completion rather than stale EU recommendation."""
+        with open(PRACTICES_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        practices_by_id = {p["id"]: p for p in data["practices"]}
+        bw = practices_by_id["bitwarden-us-project-collections"]
+        self.assertEqual(
+            bw["why"],
+            "https://github.com/Wladefant/pinthread/issues/379#issuecomment-6096865043",
+            "Bitwarden why must cite current US vault completion comment, not issue 680",
+        )
+        self.assertNotEqual(
+            bw["why"],
+            "https://github.com/Wladefant/super-board/issues/680",
+            "Bitwarden why must not cite stale EU recommendation in issue 680",
+        )
 
 if __name__ == "__main__":
     unittest.main()
