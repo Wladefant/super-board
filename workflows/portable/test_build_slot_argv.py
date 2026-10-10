@@ -81,6 +81,49 @@ class TestRunArgv(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("batch-expanded", result.stdout.splitlines(), "batch_keeps_cmd_semantics")
 
+    @unittest.skipUnless(sys.platform == "win32" and shutil.which("node"), "Windows explicit shell contract")
+    def test_explicit_cmd_redirects_both_node_commands(self):
+        with tempfile.TemporaryDirectory(prefix="explicit shell ") as directory:
+            root = Path(directory)
+            env = os.environ.copy()
+            env.pop("BUILD_SLOT_HELD", None)
+            env.update(BUILD_SLOT_AVAILABLE_GIB="64", BUILD_SLOT_RAM_PERCENT="20", BUILD_SLOT_STAGGER_SECONDS="0")
+            result = subprocess.run(
+                [sys.executable, build_slot.__file__, "--run-dir", str(root / "run"),
+                 "run", "Def497V3", "--class", "light", "--timeout", "3", "--run-timeout", "5",
+                 "--", "cmd", "/c", "node", "-e", "console.log('eslint-output'); console.error('eslint-error')",
+                 ">", "_lwp_eslint.log", "2>&1", "&",
+                 "node", "-e", "console.log('vitest-output'); console.error('vitest-error')",
+                 ">", "_lwp_vitest.log", "2>&1"],
+                cwd=directory, env=env, capture_output=True, text=True, timeout=15,
+                creationflags=subprocess.CREATE_NO_WINDOW)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((root / "_lwp_eslint.log").read_text().splitlines(),
+                             ["eslint-output", "eslint-error"], "explicit_cmd_redirects_first_command")
+            self.assertEqual((root / "_lwp_vitest.log").read_text().splitlines(),
+                             ["vitest-output", "vitest-error"], "explicit_cmd_redirects_second_command")
+
+    @unittest.skipUnless(sys.platform == "win32" and shutil.which("node"), "Windows delayed expansion contract")
+    def test_explicit_cmd_delayed_expansion_records_exit_code(self):
+        with tempfile.TemporaryDirectory(prefix="delayed shell ") as directory:
+            root = Path(directory)
+            env = os.environ.copy()
+            env.pop("BUILD_SLOT_HELD", None)
+            env.update(BUILD_SLOT_AVAILABLE_GIB="64", BUILD_SLOT_RAM_PERCENT="20", BUILD_SLOT_STAGGER_SECONDS="0")
+            for code in (0, 7):
+                with self.subTest(code=code):
+                    result = subprocess.run(
+                        [sys.executable, build_slot.__file__, "--run-dir", str(root / "run"),
+                         "run", "Def497V4", "--class", "light", "--timeout", "3", "--run-timeout", "5",
+                         "--", "cmd", "/v:on", "/c", "node", "-e",
+                         f"console.log('node-output'); process.exit({code})",
+                         ">", "log", "2>&1", "&", "echo", "rc=!ERRORLEVEL!", ">>", "log"],
+                        cwd=directory, env=env, capture_output=True, text=True, timeout=15,
+                        creationflags=subprocess.CREATE_NO_WINDOW)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual([line.strip() for line in (root / "log").read_text().splitlines()],
+                                     ["node-output", f"rc={code}"], "explicit_cmd_expands_errorlevel")
+
 
 if __name__ == "__main__":
     unittest.main()
