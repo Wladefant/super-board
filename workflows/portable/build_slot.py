@@ -2630,6 +2630,7 @@ class BuildSlotManager:
                 f"queue_stale_heartbeat_after ({effective_heartbeat_threshold}s)"
             )
 
+        ram_pct = get_system_ram_percent()
         start_time = time.time()
         last_heartbeat = start_time
         acquired = False
@@ -2659,7 +2660,6 @@ class BuildSlotManager:
                 logger.error(msg)
                 return False
             # Announce waiting only after physical-capacity validation and enqueue.
-            ram_pct = get_system_ram_percent()
             if ram_pct is not None and ram_pct >= self.ram_guard_threshold:
                 if force:
                     notice = (
