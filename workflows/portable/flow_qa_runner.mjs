@@ -1316,10 +1316,13 @@ export async function captureProductScreenshot(page, expectedSha, viewportKey, l
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10000);
     try {
-      const [versionResponse, sessionResponse] = await Promise.all([
+      const [versionResponse, initialSessionResponse] = await Promise.all([
         fetch('/api/version', { signal: controller.signal, cache: 'no-store' }),
         fetch('/api/auth/session', { signal: controller.signal, cache: 'no-store' })
       ]);
+      const sessionResponse = initialSessionResponse.status === 404
+        ? await fetch('/api/auth/get-session', { signal: controller.signal, cache: 'no-store' })
+        : initialSessionResponse;
       if (!versionResponse.ok || !sessionResponse.ok) throw new Error('authenticated application source unavailable');
       const version = await versionResponse.json();
       const session = await sessionResponse.json();
@@ -1476,7 +1479,7 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
   // executing non-input actions (simulating the software keyboard closing on blur/navigation).
   // Note: for 390x420, vpConfig.height is already 420, so page.viewport()?.height === vpConfig.height
   // and this block is a no-op, preserving 390x420 throughout.
-  if (page.viewport()?.height !== vpConfig.height && step.action !== 'type' && step.action !== 'keyboard-open') {
+  if (page.viewport()?.height !== vpConfig.height && step.action !== 'type' && step.action !== 'keyboard-open' && !step.keyboard_open) {
     await page.setViewport({
       width: vpConfig.width,
       height: vpConfig.height,
@@ -1713,13 +1716,12 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
           if (target) {
             await target.dispose().catch(() => {});
           }
-          if (!exists) {
-            checksResults.push({
-              name: 'assert_present',
-              passed: false,
-              detail: `Assert failed: element "${step.selector}" not present`
-            });
-          }
+          checksResults.push({
+            name: 'assert_present',
+            passed: exists,
+            detail: exists ? `Element "${step.selector}" is present` :
+              (step.readiness_missing ? `account not ready: ${step.readiness_missing}` : `Assert failed: element "${step.selector}" not present`)
+          });
         } else {
           const deadline = Date.now() + Math.min(timeoutMs, 6000);
           let shownCand = null;
@@ -1747,13 +1749,12 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
           });
           const absent = !shownEl;
           if (shownEl) await shownEl.dispose().catch(() => {});
-          if (!absent) {
-            checksResults.push({
-              name: 'assert_absent',
-              passed: false,
-              detail: `Assert failed: element "${step.selector}" is present but should be absent`
-            });
-          }
+          checksResults.push({
+            name: 'assert_absent',
+            passed: absent,
+            detail: absent ? `Element "${step.selector}" is absent` :
+              `Assert failed: element "${step.selector}" is present but should be absent`
+          });
         }
 
         if (step.expected_visible !== undefined && (exists || step.expected_present === false)) {
@@ -1810,7 +1811,7 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
             passed: textMatches,
             detail: textMatches
               ? `Text contains "${step.expected_text}"`
-              : `Expected text "${step.expected_text}", got "${text}"`
+              : (step.readiness_missing ? `account not ready: ${step.readiness_missing}` : `Expected text "${step.expected_text}", got "${text}"`)
           });
         }
       }
@@ -1901,6 +1902,14 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
     const insp = atTapTime;
     checksResults.push(checkVisible(insp?.rect, insp?.style));
   }
+  if (requestedChecks.includes('in_viewport')) {
+    const rect = atTapTime?.rect;
+    const height = page.viewport()?.height || vpConfig.height;
+    const width = page.viewport()?.width || vpConfig.width;
+    const passed = !!rect && rect.x >= -2 && rect.y >= -2 &&
+      rect.x + rect.width <= width + 2 && rect.y + rect.height <= height + 2;
+    checksResults.push({ name: 'in_viewport', passed, detail: `Target must fit within ${width}x${height}` });
+  }
 
   // Check: element_from_point (covered fails)
   if (requestedChecks.includes('element_from_point') || requestedChecks.includes('covered')) {
@@ -1922,7 +1931,7 @@ export async function executeStep(page, cdpSession, step, viewportKey, theme, co
   // Check: input_focus_in_viewport
   if (requestedChecks.includes('input_focus_in_viewport') || step.action === 'keyboard-open') {
     const focused = await inspectFocusedElement(page);
-    checksResults.push(checkInputFocusInViewport(focused?.rect, vpConfig.height, vpConfig.width));
+    checksResults.push(checkInputFocusInViewport(focused?.rect, geom.innerHeight || page.viewport()?.height || vpConfig.height, geom.innerWidth));
   }
 
   // Check: no_document_reload
@@ -2101,7 +2110,62 @@ export async function prepareFlowPage(browser, current, storageState, vp, theme)
 /**
  * Executes flow QA suite and generates flow-qa/v1 report.
  */
+export function selectAccountFlows(flows, options = {}) {
+  const state = options.fixtureState;
+  if (state && !['empty', 'populated', 'disconnected', 'limited'].includes(state)) {
+    throw new Error(`account not ready: unknown fixture state ${state}`);
+  }
+  return flows.filter(flow => (!options.readOnly || flow.read_only === true) &&
+    (!flow.fixture_states || flow.fixture_states.includes(state || 'populated')));
+}
+
+export function isReadOnlyWorkspaceRequest(request, policy) {
+  if (!policy || request.method !== 'POST' || request.actionId !== policy.actionId) return false;
+  const url = new URL(request.url);
+  if (url.origin !== policy.origin || url.pathname !== '/messages' || url.search) return false;
+  try {
+    const args = JSON.parse(request.body);
+    return Array.isArray(args) && args.length === 1 &&
+      args[0] && typeof args[0] === 'object' &&
+      Object.keys(args[0]).length === 1 && Object.keys(args[0])[0] === 'conversationId' &&
+      policy.conversationIds.includes(args[0].conversationId);
+  } catch {
+    return false;
+  }
+}
+
+async function discoverWorkspaceReadPolicy(baseUrl, servedSha, storageState) {
+  // This is a reviewed application action, not a record ID. A different build needs a new call-path review.
+  const reviewedSha = '2df2a314262c2b375e7ef517f9e23cb138082bea';
+  const actionId = '7f85b5dc5093692d3462e0aced38e6a3424937ad63';
+  if (servedSha !== reviewedSha || !storageState) throw new Error('account not ready: workspace read action needs review for the served revision');
+  const auth = JSON.parse(fs.readFileSync(storageState, 'utf8'));
+  const response = await fetch(new URL('/messages', baseUrl), {
+    headers: { Cookie: auth.cookies.map(cookie => `${cookie.name}=${cookie.value}`).join('; ') },
+    signal: AbortSignal.timeout(20000)
+  });
+  if (!response.ok) throw new Error('account not ready: authenticated message discovery failed');
+  const html = await response.text();
+  const chunks = [...html.matchAll(/self\.__next_f\.push\((\[1,".*?"])\)/g)].map(match => JSON.parse(match[1])[1]);
+  const records = new Map();
+  for (const line of chunks.join('').split('\n')) {
+    const colon = line.indexOf(':');
+    try { records.set(line.slice(0, colon), JSON.parse(line.slice(colon + 1))); } catch {}
+  }
+  const props = [...records.values()].find(value => Array.isArray(value) && value[3]?.initialData?.conversations)?.[3];
+  const reference = props?.actions?.loadReplyWorkspace;
+  if (!reference?.startsWith('$h') || records.get(reference.slice(2))?.id !== actionId) {
+    throw new Error('account not ready: served workspace action ID differs from the reviewed ID');
+  }
+  const conversationIds = props.initialData.conversations.filter(record =>
+    record.read && record.type === 'FROM_MEMBERS' && record.id.startsWith('QA-1066-') &&
+    !record.id.includes('unread-product-question')).map(record => record.id);
+  if (!conversationIds.length) throw new Error('account not ready: a read synthetic conversation');
+  return { origin: new URL(baseUrl).origin, actionId, conversationIds };
+}
+
 export async function runFlows(options = {}) {
+  options = { ...options, readOnly: options.readOnly || Boolean(options.fixtureState) };
   if (!['before', 'after', 'exercised'].includes(options.captureLabel || 'exercised')) {
     throw new Error('Capture label must be before, after, or exercised');
   }
@@ -2122,6 +2186,10 @@ export async function runFlows(options = {}) {
 
   // 1. Runtime Safety Check (Strict Refusal of PolySimulator production)
   assertNotProduction(baseUrl);
+  if (options.fixtureState && (project !== 'shipnovo' || new URL(baseUrl).hostname !== 'shipnovo-test.wladefant.de')) {
+    throw new Error('Fixture scope requires the Shipnovo testbed host');
+  }
+  selectAccountFlows([], options);
 
   // 2. Validate requested viewports and themes
   if (!Array.isArray(viewports) || viewports.length === 0) {
@@ -2148,6 +2216,7 @@ export async function runFlows(options = {}) {
     const failedReport = {
       schema: SCHEMA_VERSION,
       project,
+      fixture_state: options.fixtureState || null,
       served_sha: versionCheck.served_sha || 'unknown',
       expected_sha: expectedSha || 'unknown',
       passed: false,
@@ -2170,13 +2239,24 @@ export async function runFlows(options = {}) {
     project
   };
   const allFlows = loadFlowData(resolvedFlowPath);
+  const selectedFlows = selectAccountFlows(allFlows, options);
   const flowsToRun = (options.flows && options.flows.length > 0)
-    ? allFlows.filter(f => options.flows.includes(f.id))
-    : (flowId ? allFlows.filter(f => f.id === flowId) : allFlows);
+    ? selectedFlows.filter(f => options.flows.includes(f.id))
+    : (flowId ? selectedFlows.filter(f => f.id === flowId) : selectedFlows);
 
   if (flowsToRun.length === 0) {
-    throw new Error(`No matching flows found (filter: "${flowId || 'all'}") in ${resolvedFlowPath}`);
+    throw new Error(options.fixtureState
+      ? `account not ready: no readiness flows for ${options.fixtureState}`
+      : `No matching flows found (filter: "${flowId || 'all'}") in ${resolvedFlowPath}`);
   }
+
+  if (options.readOnlyWorkspace && (options.fixtureState !== 'populated' ||
+      new URL(baseUrl).hostname !== 'shipnovo-test.wladefant.de')) {
+    throw new Error('Workspace read allowance requires the populated Shipnovo testbed fixture');
+  }
+  const workspacePolicy = options.readOnlyWorkspace
+    ? await discoverWorkspaceReadPolicy(baseUrl, versionCheck.served_sha, storageState)
+    : null;
 
   // 5. Launch Puppeteer
   let browser;
@@ -2195,6 +2275,7 @@ export async function runFlows(options = {}) {
   } catch (err) {
     const report = {
       schema: SCHEMA_VERSION, source, project,
+      fixture_state: options.fixtureState || null,
       served_sha: versionCheck.served_sha, expected_sha: expectedSha,
       passed: false, infrastructure_error: true,
       assertions: { passed: 0, failed: 0 }, viewports: [], steps: [],
@@ -2211,6 +2292,10 @@ export async function runFlows(options = {}) {
   let cleanupPassed = true;
   let totalAssertionsPassed = 0;
   let totalAssertionsFailed = 0;
+  const blockedRequests = [];
+  const readOnlyActions = [];
+  const refusedActions = [];
+  const guardedPages = new WeakSet();
   try {
     let current = await openFlowPage(browser, storageState);
 
@@ -2229,6 +2314,26 @@ export async function runFlows(options = {}) {
           executedThemes.add(theme);
           current = await prepareFlowPage(browser, current, storageState, vp, theme);
           const { page, cdpSession } = current;
+          if (options.readOnly && !guardedPages.has(page)) {
+            guardedPages.add(page);
+            await page.setRequestInterception(true);
+            page.on('request', request => {
+              const method = request.method();
+              const actionId = request.headers()['next-action'];
+              if (workspacePolicy && isReadOnlyWorkspaceRequest({
+                method, url: request.url(), actionId, body: request.postData()
+              }, workspacePolicy)) {
+                readOnlyActions.push({ action_id: actionId, method, path: '/messages' });
+                request.continue().catch(() => {});
+              } else if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+                blockedRequests.push({ method, path: new URL(request.url()).pathname });
+                if (workspacePolicy && actionId) refusedActions.push(actionId);
+                request.abort('blockedbyclient').catch(() => {});
+              } else {
+                request.continue().catch(() => {});
+              }
+            });
+          }
           const steps = Array.isArray(flow.steps) ? flow.steps : [];
           for (const step of steps) {
             let stepResult;
@@ -2321,6 +2426,12 @@ export async function runFlows(options = {}) {
   } finally {
     await Promise.race([browser.close().catch(() => {}), new Promise(r => setTimeout(r, 3000))]);
   }
+  if (refusedActions.length) {
+    const checks = [{ name: 'read_only_action_refused', passed: false,
+      detail: 'A server action differs from the reviewed workspace read request' }];
+    allStepReports.push({ flow: 'network_guard', step: 'read_only_action_refused', passed: false, checks });
+    totalAssertionsFailed++;
+  }
 
   const hasExecutedCoverage = executedViewports.size > 0 && allStepReports.some(step =>
     step.checks.some(check => !check.name?.endsWith('_skipped')));
@@ -2335,6 +2446,9 @@ export async function runFlows(options = {}) {
     schema: SCHEMA_VERSION,
     source,
     project,
+    fixture_state: options.fixtureState || null,
+    blocked_requests: blockedRequests,
+    read_only_actions: readOnlyActions,
     served_sha: versionCheck.served_sha || '',
     expected_sha: expectedSha,
     passed: overallPassed,
@@ -2360,7 +2474,7 @@ export async function runFlows(options = {}) {
  */
 export function formatReceipt(report) {
   if (report?.passed !== true && Array.isArray(report?.steps) && report.steps.length === 0) {
-    return `FLOW-QA: INFRA-ERROR${report.served_sha ? ` ${report.served_sha}` : ''}\nError: ${report.error || 'Pre-run infrastructure unavailable'}\n`;
+    return `FLOW-QA: INFRA-ERROR${report.served_sha ? ` ${report.served_sha}` : ''}\n${report.fixture_state ? `scope: fixture ${report.fixture_state} on testbed ${report.served_sha || 'unknown'}` : 'scope: live account'}\nError: ${report.error || 'Pre-run infrastructure unavailable'}\n`;
   }
   const served = /^[0-9a-f]{40}$/i.test(report?.served_sha || '') ? report.served_sha : '';
   let passedCount = 0;
@@ -2400,9 +2514,12 @@ export function formatReceipt(report) {
   const lines = [
     `FLOW-QA: ${state}${served ? ` ${served}` : ''}`,
     `FLOW-QA-ASSERTIONS pass=${passedCount} fail=${failedCount}`,
-    `FLOW-QA-VIEWPORTS ${executedViewports.join(',')}`
+    `FLOW-QA-VIEWPORTS ${executedViewports.join(',')}`,
+    report.fixture_state ? `scope: fixture ${report.fixture_state} on testbed ${report.served_sha}` : 'scope: live account'
   ];
   if (hasSource) lines.push(`FLOW-QA-SOURCE runner=${source.runner} flow=${source.flow} project=${source.project}`);
+  for (const request of report.blocked_requests || []) lines.push(`BLOCKED-WRITE ${request.method} ${request.path}`);
+  for (const request of report.read_only_actions || []) lines.push(`READ-ONLY-ACTION ${request.action_id} ${request.method} ${request.path}`);
   for (const step of [...(report?.steps || []), ...(report?.cleanup?.steps || [])]) {
     if (step.capture) lines.push(`CAPTURE ${JSON.stringify(step.capture)}`);
   }
@@ -2431,6 +2548,9 @@ export function parseCliArgs(argv) {
     else if (arg === '--base-url' && argv[i + 1]) options.baseUrl = argv[++i];
     else if (arg === '--expected-sha' && argv[i + 1]) options.expectedSha = argv[++i];
     else if (arg === '--storage-state' && argv[i + 1]) options.storageState = argv[++i];
+    else if (arg === '--fixture-state' && argv[i + 1]) options.fixtureState = argv[++i];
+    else if (arg === '--read-only') options.readOnly = true;
+    else if (arg === '--read-only-workspace') options.readOnlyWorkspace = true;
     else if (arg === '--output' && argv[i + 1]) options.outputDir = argv[++i];
     else if (arg === '--capture-label' && argv[i + 1]) options.captureLabel = argv[++i];
     else if (arg === '--bind-sha' && argv[i + 1]) options.bindSha = argv[++i];

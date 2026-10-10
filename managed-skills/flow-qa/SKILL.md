@@ -23,6 +23,25 @@ matching `FLOW-QA` receipt.
   (`bun scripts/week-preview.ts` in `packages/telegram-agent-harness`), which serves `/api/version`.
 - Gate: `github_pr_gate.py`, function `evaluate_flow_qa_receipt`.
 
+## Shipnovo account scope
+
+Use `--fixture-state empty|populated|disconnected|limited --read-only` with the matching signed-in testbed storage state.
+The default fixture suite discovers conversations and orders from the account UI. It never uses record UUIDs.
+Each state runs its readiness checks. Missing records fail with `account not ready: <missing requirement>`.
+The populated suite includes the messages list, conversation, focused composer, send control, and return path.
+Run all three default viewports in both themes. Do not click send or save.
+Read-only mode blocks write requests. Check that opening a thread produces no error toast or fallback.
+The composer loads its workspace through a POST server action that performs only SELECTs.
+For the reviewed testbed revision, `--read-only-workspace` allows only that exact action ID, same-origin `/messages`, and a discovered read conversation ID.
+It rejects every other action, body field, host, and path. The receipt records `READ-ONLY-ACTION`.
+Before this option, verify the full served call path and capture tenant-scoped message/workspace count and row hashes.
+Repeat that snapshot after the run. Require identical counts and hashes. Never allow draft saving or provider calls.
+Never open the unread-product-question fixture. Use buyer-question or order-follow-up instead.
+The limited suite checks readable messages, absent reply controls, and the access-denied redirect from account settings.
+Every receipt labels `scope: fixture <state> on testbed <served sha>` or `scope: live account`.
+A fixture receipt proves only the synthetic testbed scenario. It never proves the original operator scenario.
+Legacy mutating flows remain available outside read-only mode for authorized accounts.
+
 ## Steps
 
 1. Build the PR head and serve it. Use `build_slot.py acquire <name>` for the build and the
