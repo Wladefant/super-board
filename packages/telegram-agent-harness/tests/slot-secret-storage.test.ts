@@ -4,7 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 import { DaemonStore } from "../daemon/store";
-import { getDaemonSecret, getSlotSecretFilePath } from "../daemon/lane-panel";
+import { getDaemonSecret, getSlotSecretFilePath } from "../daemon/daemon-secret";
 
 const cleanup: Array<() => void> = [];
 afterEach(() => {

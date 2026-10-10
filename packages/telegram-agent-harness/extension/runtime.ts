@@ -644,17 +644,17 @@ export class TelegramRuntime {
 
     this.poller = poller;
 
-    const questions = new OperatorQuestionService(
+    const questions = createOperatorQuestionService({
       poller,
-      () => {
+      route: () => {
         const chat = poller.getPrimaryChatId();
         if (!chat) throw new Error("No authorized operator chat for this session");
         return { session_id: currentSessionId(), chat_id: chat, user_id: questionOperator(this.accessConfig, chat) };
       },
-      path.join(os.homedir(), ".veyyon", "workflows", "decisions.json"),
-      poolPath,
-      message => this.pi.logger?.warn(message),
-    );
+      report: message => this.pi.logger?.warn(message),
+      coordinator,
+      slotId: activeSlot.slotId,
+    });
     this.questions = questions;
 
     const dashboard = new LiveDashboard(poller, runner, currentSessionId, message => this.pi.logger?.warn(message));
