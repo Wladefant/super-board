@@ -1,0 +1,124 @@
+{
+  "schema": 1,
+  "practices": [
+    {
+      "id": "pagespeed-check",
+      "title": "PageSpeed Insights Performance and SEO Baselines",
+      "what": "Measure and record real live PageSpeed Insights performance and SEO scores (mobile and desktop) before and after deployment to enforce baselines and prevent regressions.",
+      "why": "https://github.com/Wladefant/pinthread/issues/379#issuecomment-6096691475",
+      "applies_when": [
+        "web-frontend",
+        "public-facing",
+        "deployed-environment"
+      ],
+      "how": "skill://pagespeed-check",
+      "cost": "free",
+      "projects": {
+        "Wladefant/pinthread": {
+          "status": "adopted",
+          "evidence": "https://github.com/Wladefant/pinthread/issues/379#issuecomment-6096691475"
+        }
+      }
+    },
+    {
+      "id": "bitwarden-us-project-collections",
+      "title": "Dedicated Bitwarden US Collection Per Project",
+      "what": "Store operational secrets in the primary Bitwarden US vault (bw-us) isolated into a dedicated collection per project, avoiding shared credentials or storage solely in the EU vault.",
+      "why": "https://github.com/Wladefant/super-board/issues/680",
+      "applies_when": [
+        "operational-secrets",
+        "multi-project"
+      ],
+      "how": "skill://bitwarden-cli-two-vaults",
+      "cost": "free",
+      "projects": {
+        "Wladefant/pinthread": {
+          "status": "adopted",
+          "evidence": "https://github.com/Wladefant/pinthread/issues/379#issuecomment-6096865043"
+        },
+        "Wladefant/super-board": {
+          "status": "proposed",
+          "issue": "https://github.com/Wladefant/super-board/issues/680"
+        }
+      }
+    },
+    {
+      "id": "consent-mode-v2",
+      "title": "Google Consent Mode v2 and Equal-Choice Cookie Banner",
+      "what": "Implement GDPR/TTDSG-compliant cookie consent with equal-sized Accept/Reject buttons, zero tracking scripts/cookies loaded prior to opt-in, default-denied signals for Consent Mode v2, and complete cookie deletion upon revocation.",
+      "why": "https://github.com/Wladefant/pinthread/issues/377#issuecomment-6096572385",
+      "applies_when": [
+        "web-frontend",
+        "public-facing",
+        "analytics-or-marketing-tags"
+      ],
+      "how": "skill://startup-launch-setup",
+      "cost": "free",
+      "projects": {
+        "Wladefant/pinthread": {
+          "status": "adopted",
+          "evidence": "https://github.com/Wladefant/pinthread/issues/377#issuecomment-6096572385"
+        },
+        "Wladefant/shipnovo": {
+          "status": "proposed",
+          "issue": "https://github.com/Wladefant/shipnovo/issues/1203"
+        }
+      }
+    },
+    {
+      "id": "search-consoles-bing-indexnow",
+      "title": "Search Console, Bing Webmaster, and IndexNow Fast Indexing",
+      "what": "Set up Google Search Console domain property via DNS TXT, import verified site into Bing Webmaster with sitemap feeds, and publish an IndexNow key file with automated pings for new and changed URLs after deployment.",
+      "why": "https://github.com/Wladefant/pinthread/issues/374#issuecomment-6096640669",
+      "applies_when": [
+        "web-frontend",
+        "public-facing",
+        "indexable-content"
+      ],
+      "how": "skill://startup-launch-setup",
+      "cost": "free",
+      "projects": {
+        "Wladefant/pinthread": {
+          "status": "proposed",
+          "issue": "https://github.com/Wladefant/pinthread/issues/374"
+        }
+      }
+    },
+    {
+      "id": "cookieless-web-vitals",
+      "title": "Cookie-Free First-Party Core Web Vitals RUM",
+      "what": "Collect real-user Core Web Vitals (LCP, INP, CLS, FCP, TTFB) via credentialless keepalive HTTP requests to a first-party endpoint, storing measurements in Postgres without cookies, user identifiers, or IP addresses.",
+      "why": "https://github.com/Wladefant/pinthread/issues/379#issuecomment-6096691475",
+      "applies_when": [
+        "web-frontend",
+        "performance-monitoring"
+      ],
+      "how": "https://github.com/Wladefant/pinthread/issues/379#issuecomment-6096691475",
+      "cost": "low",
+      "projects": {
+        "Wladefant/pinthread": {
+          "status": "adopted",
+          "evidence": "https://github.com/Wladefant/pinthread/issues/379#issuecomment-6096865043"
+        }
+      }
+    },
+    {
+      "id": "dokploy-env-safety",
+      "title": "Dokploy Environment Safety via HTTP API and Names Diff",
+      "what": "Update Dokploy application environment variables safely using the authoritative HTTP API instead of empty MCP reads, preserving existing lines byte-identically, storing a pre-addition backup in Bitwarden US, and verifying exact variable name counts and unchanged value hashes upon readback.",
+      "why": "https://github.com/Wladefant/pinthread/issues/379#issuecomment-6096865043",
+      "applies_when": [
+        "dokploy-deployment",
+        "environment-mutation"
+      ],
+      "how": "https://github.com/Wladefant/pinthread/issues/379#issuecomment-6096865043",
+      "cost": "free",
+      "projects": {
+        "Wladefant/pinthread": {
+          "status": "adopted",
+          "evidence": "https://github.com/Wladefant/pinthread/issues/379#issuecomment-6096865043"
+        }
+      }
+    }
+  ]
+}
