@@ -14,6 +14,84 @@
   ],
   "flows": [
     {
+      "id": "messages_keyboard",
+      "name": "Messages list, composer keyboard, and return without sending",
+      "read_only": true,
+      "fixture_states": ["populated"],
+      "steps": [
+        {"id":"messages_list","action":"goto","url":"/messages","checks":["no_horizontal_overflow"]},
+        {"id":"conversation_ready","action":"assert","selector":"[aria-label='Konversationsliste'] button:not(:has([aria-label='Ungelesen']))","expected_present":true,"readiness_missing":"a read reply-capable conversation in the signed-in account"},
+        {"id":"open_conversation","action":"tap","selector":"[aria-label='Konversationsliste'] button:not(:has([aria-label='Ungelesen']))","checks":["visible","element_from_point","tap_target_min_44","no_document_reload"]},
+        {"id":"composer_ready","action":"assert","selector":"textarea[aria-label='Antwort an den eBay-Käufer']:not(:disabled)","expected_present":true,"readiness_missing":"an enabled reply composer"},
+        {"id":"no_open_error","action":"assert","selector":"[data-sonner-toast][data-type='error'], [role='alert'].text-destructive, [role='alert']:has-text('Fehler')","expected_present":false},
+        {"id":"tap_composer_focus","action":"tap","selector":"textarea[aria-label='Antwort an den eBay-Käufer']","checks":["visible","element_from_point","tap_target_min_44"]},
+        {"id":"composer_keyboard","action":"keyboard-open","selector":"textarea[aria-label='Antwort an den eBay-Käufer']","checks":["visible","element_from_point","input_focus_in_viewport","tap_target_min_44"]},
+        {"id":"composer_visible_with_keyboard","action":"assert","keyboard_open":true,"selector":"textarea[aria-label='Antwort an den eBay-Käufer']","expected_present":true,"checks":["visible","element_from_point","in_viewport","input_focus_in_viewport","tap_target_min_44"]},
+        {"id":"send_visible_with_keyboard_not_tapped","action":"assert","keyboard_open":true,"scroll":true,"selector":"button:has-text('Senden')","expected_present":true,"checks":["visible","element_from_point","in_viewport","input_focus_in_viewport","tap_target_min_44"]},
+        {"id":"back_to_list","action":"tap","touch_only":true,"selector":"button:has-text('Zurück zur Liste')","checks":["visible","element_from_point","tap_target_min_44","no_document_reload"]},
+        {"id":"list_restored","action":"assert","touch_only":true,"selector":"[aria-label='Konversationsliste']","expected_present":true,"expected_visible":true,"checks":["visible","no_document_reload"]},
+        {"id":"no_return_error","action":"assert","selector":"[data-sonner-toast][data-type='error'], [role='alert'].text-destructive, [role='alert']:has-text('Fehler')","expected_present":false}
+      ],
+      "cleanup": []
+    },
+    {
+      "id": "account_orders_ready",
+      "name": "Discover the first signed-in order without saving",
+      "read_only": true,
+      "fixture_states": ["populated"],
+      "steps": [
+        {"id":"orders_list","action":"goto","url":"/orders","checks":["no_horizontal_overflow"]},
+        {"id":"order_ready","action":"assert","selector":"main table tbody tr button:has-text('Kurzansicht'), main div.rounded-lg.border button.truncate","expected_present":true,"readiness_missing":"an order in the signed-in account","checks":["visible"]}
+      ],
+      "cleanup": []
+    },
+    {
+      "id": "account_empty_ready",
+      "name": "Empty fixture readiness",
+      "read_only": true,
+      "fixture_states": ["empty"],
+      "steps": [
+        {"id":"empty_messages","action":"goto","url":"/messages","checks":["no_horizontal_overflow"]},
+        {"id":"empty_state_ready","action":"assert","selector":"[aria-label='Konversationsliste']","expected_present":true,"expected_text":"Keine passenden Nachrichten","readiness_missing":"the empty messages state"},
+        {"id":"empty_has_no_conversation","action":"assert","selector":"[aria-label='Konversationsliste'] button","expected_present":false},
+        {"id":"empty_orders","action":"goto","url":"/orders","checks":["no_horizontal_overflow"]},
+        {"id":"empty_orders_ready","action":"assert","selector":"main","expected_present":true,"expected_text":"Noch keine Bestellungen","readiness_missing":"the empty orders state"},
+        {"id":"empty_has_no_order","action":"assert","selector":"main table tbody tr button:has-text('Kurzansicht'), main div.rounded-lg.border button.truncate","expected_present":false}
+      ],
+      "cleanup": []
+    },
+    {
+      "id": "account_disconnected_ready",
+      "name": "Disconnected fixture readiness",
+      "read_only": true,
+      "fixture_states": ["disconnected"],
+      "steps": [
+        {"id":"disconnected_settings","action":"goto","url":"/settings/ebay","checks":["no_horizontal_overflow"]},
+        {"id":"disconnected_state_ready","action":"assert","selector":"main","expected_present":true,"expected_text":"Nicht verbunden","readiness_missing":"a disconnected eBay account"},
+        {"id":"disconnected_no_connection","action":"assert","selector":"main","expected_present":true,"expected_text":"Noch nicht verbunden"}
+      ],
+      "cleanup": []
+    },
+    {
+      "id": "account_limited_ready",
+      "name": "Limited member reads messages but cannot manage accounts",
+      "read_only": true,
+      "fixture_states": ["limited"],
+      "steps": [
+        {"id":"limited_messages","action":"goto","url":"/messages","checks":["no_horizontal_overflow"]},
+        {"id":"limited_thread_ready","action":"assert","selector":"[aria-label='Konversationsliste'] button:not(:has([aria-label='Ungelesen']))","expected_present":true,"readiness_missing":"a read conversation for the limited member"},
+        {"id":"limited_open_thread","action":"tap","selector":"[aria-label='Konversationsliste'] button:not(:has([aria-label='Ungelesen']))","checks":["visible","element_from_point","tap_target_min_44"]},
+        {"id":"limited_message_content","action":"assert","selector":"main article","expected_present":true,"readiness_missing":"visible conversation messages","scroll":true,"checks":["visible"]},
+        {"id":"limited_message_visible","action":"assert","selector":"main","expected_present":true,"expected_text":"Du kannst diese Unterhaltung lesen."},
+        {"id":"limited_no_composer","action":"assert","selector":"textarea[aria-label='Antwort an den eBay-Käufer']","expected_present":false},
+        {"id":"limited_no_send","action":"assert","selector":"button:has-text('Senden')","expected_present":false},
+        {"id":"limited_no_open_error","action":"assert","selector":"[data-sonner-toast][data-type='error'], [role='alert'].text-destructive, [role='alert']:has-text('Fehler')","expected_present":false},
+        {"id":"limited_account_access_denied","action":"goto","url":"/settings/ebay","expected_url":"^/access-denied"},
+        {"id":"limited_denial_visible","action":"assert","selector":"main","expected_present":true,"expected_text":"Keine Berechtigung"}
+      ],
+      "cleanup": []
+    },
+    {
       "id": "article_lifecycle_native",
       "name": "Nativer Artikel-Lebenszyklus mit Tastatur, Tabs, Bearbeitung und Loeschung",
       "description": "Erfasst einen eindeutigen internen Artikel (QA-ART-489-NAT), prueft Tastaturfokus und Viewport bei geoeffneter Tastatur (390x420), bedient Tabs, speichert den Artikel, prueft die gespeicherte Zeile, oeffnet die Zeilenbearbeitung ('<sku> bearbeiten'), schliesst das Sheet per nativem CDP-Touch-Swipe auf Mobile (390x844 und 390x420) sowie per Desktop-Schliessen-Control auf 1440x900, loescht den Artikel ueber das Aktionsmenue ('Weitere Aktionen fuer <sku>' -> 'Artikel loeschen' -> Bestaetigung) und fuehrt ein fehlschlagsicheres Cleanup nur des eigenen Artikels aus.",
