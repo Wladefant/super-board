@@ -1,6 +1,8 @@
 # Managed Skills Catalog
 
-Complete index of all 59 managed agent skills maintained in the Veyyon runtime profile. Each skill is published under `managed-skills/<name>/` after credential and secret scrubbing, with full upstream documentation, recipes, and licenses preserved.
+Complete index of all 65 managed agent skills maintained in the Veyyon runtime profile. Each skill is published under `managed-skills/<name>/` after credential and secret scrubbing, with full upstream documentation, recipes, and licenses preserved.
+
+**Direction: this repo is the source of truth.** Edit a skill here and merge it. Then `python scripts/install-managed-skills.py [NAME ...]` copies it to `~/.veyyon/profiles/default/agent/managed-skills/`. The installer backs up a differing local file to `~/.veyyon/tmp/managed-skills-backup/` before it overwrites it. `--check` lists drift and writes nothing.
 
 All blob links are pinned to immutable commit SHA [`6b5172a129305156eff0c44c9b1e29c7dde16a9b`](https://github.com/Wladefant/super-board/blob/6b5172a129305156eff0c44c9b1e29c7dde16a9b/managed-skills/).
 
@@ -10,8 +12,9 @@ All blob links are pinned to immutable commit SHA [`6b5172a129305156eff0c44c9b1e
 - [Ops & infra](#ops--infra) (15 skills)
 - [PolySimulator workflow](#polysimulator-workflow) (14 skills)
 - [Other](#other) (7 skills)
+- [Startup system](#startup-system) (6 skills)
 
-**Total Skills Published:** 59
+**Total Skills Published:** 65
 
 ## Design from X threads
 
@@ -99,4 +102,17 @@ General architectural patterns, durable task recovery, and prose de-puffing guid
 | [`unslop-writing`](./unslop-writing/SKILL.md) | Cut AI tells, puffery, hedging, robotic jargon, and filler from human-facing text, commits, and PR descriptions. | Human communication craft standard (prompt & copy de-puffing policy) | Yes (Runtime skill; PR descriptions, docs & messages) | [`SKILL.md` (6b5172a)](https://github.com/Wladefant/super-board/blob/6b5172a129305156eff0c44c9b1e29c7dde16a9b/managed-skills/unslop-writing/SKILL.md) |
 | [`ste-writing`](./ste-writing/SKILL.md) | 80% ASD-STE100 house style for operator-facing text: short sentences, one idea each, active voice, plain words, result first. | Karpathy [post](https://x.com/karpathy/status/2105819303471976479); adapted from [prithivrajmu/asd-ste100](https://github.com/prithivrajmu/asd-ste100) (MIT) and [danyuchn/asd-ste100-skill](https://github.com/danyuchn/asd-ste100-skill) (MIT) | Yes (Runtime skill; final answers, Telegram, PR and issue text) | [`SKILL.md`](https://github.com/Wladefant/super-board/blob/main/managed-skills/ste-writing/SKILL.md) |
 | [`e2e`](./e2e/SKILL.md) | Write and run agentic end-to-end tests with tester-army/e2e: pinned versions, cached replay by default, host allow-list with a request-level abort, FLOW-QA receipt from the report. | tester-army/e2e ([skills/e2e](https://github.com/tester-army/e2e/tree/main/skills/e2e), reviewed, login and feedback text rejected); [super-board#486](https://github.com/Wladefant/super-board/issues/486) | Yes (Runtime skill; every lane that writes e2e tests) | [`SKILL.md`](https://github.com/Wladefant/super-board/blob/main/managed-skills/e2e/SKILL.md) |
+
+## Startup system
+
+How we start, build, measure and launch a new product. Written from the Shipnovo launch, 2026-09-20 to 2026-10-10. Playbook: [super-board#749](https://github.com/Wladefant/super-board/issues/749).
+
+| Skill | Summary | Source / Provenance | In Use | Blob Link |
+|---|---|---|---|---|
+| [`startup-launch-setup`](./startup-launch-setup/SKILL.md) | Ordered checklist from domain to a live, measured, legal product: operator one-time steps, Cloudflare, mail, admin account overview, search consoles, IndexNow, GA4, consent, legal, Stripe, social accounts. | Shipnovo launch lanes; [super-board#749](https://github.com/Wladefant/super-board/issues/749), [#754](https://github.com/Wladefant/super-board/issues/754), [#755](https://github.com/Wladefant/super-board/issues/755) | Yes (Runtime skill; new product launches) | [`SKILL.md`](https://github.com/Wladefant/super-board/blob/main/managed-skills/startup-launch-setup/SKILL.md) |
+| [`startup-build-system`](./startup-build-system/SKILL.md) | Stages, lane routing, the feature loop (issue, red test, fix, review, merge, live check), lane databases, merge train with the Dokploy fast-merge gate, anti-patterns. | Shipnovo Main session; [super-board#750](https://github.com/Wladefant/super-board/issues/750), [#752](https://github.com/Wladefant/super-board/issues/752), [#756](https://github.com/Wladefant/super-board/issues/756) | Yes (Runtime skill; product build lanes) | [`SKILL.md`](https://github.com/Wladefant/super-board/blob/main/managed-skills/startup-build-system/SKILL.md) |
+| [`competitor-deep-dive`](./competitor-deep-dive/SKILL.md) | Keyword matrix, one native sub-issue per competitor, signed-out and signed-in analysis, reference sites for redesigns. | Shipnovo research [shipnovo#133](https://github.com/Wladefant/shipnovo/issues/133); [super-board#753](https://github.com/Wladefant/super-board/issues/753) | Yes (Runtime skill; competitor research) | [`SKILL.md`](https://github.com/Wladefant/super-board/blob/main/managed-skills/competitor-deep-dive/SKILL.md) |
+| [`competitor-video-frames`](./competitor-video-frames/SKILL.md) | Extract product UI frames from videos, check each with `inspect_image`, upload with `gh image`. | Frame audit 2026-10-06 ([shipnovo#677](https://github.com/Wladefant/shipnovo/issues/677), [#680](https://github.com/Wladefant/shipnovo/issues/680)) | Yes (Runtime skill; competitor evidence) | [`SKILL.md`](https://github.com/Wladefant/super-board/blob/main/managed-skills/competitor-video-frames/SKILL.md) |
+| [`cloudflare-cli`](./cloudflare-cli/SKILL.md) | Unified Cloudflare CLI `cf` with the `cfa` wrapper, scoped lane token vs full account token, `authSource` check. | Cloudflare setup 2026-10-05 and lane CfTokenFull 2026-10-10 | Yes (Runtime skill; DNS, Pages, Workers, R2) | [`SKILL.md`](https://github.com/Wladefant/super-board/blob/main/managed-skills/cloudflare-cli/SKILL.md) |
+| [`stripe-accounts`](./stripe-accounts/SKILL.md) | One Stripe account per project, restricted agent keys, storage in Bitwarden and shared-auth, Stripe CLI in test mode. | Operator decision 2026-10-07 ([super-board#680](https://github.com/Wladefant/super-board/issues/680)) | Yes (Runtime skill; payments setup) | [`SKILL.md`](https://github.com/Wladefant/super-board/blob/main/managed-skills/stripe-accounts/SKILL.md) |
 
