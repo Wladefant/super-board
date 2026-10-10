@@ -41,6 +41,8 @@ The limited suite checks readable messages, absent reply controls, and the acces
 Every receipt labels `scope: fixture <state> on testbed <served sha>` or `scope: live account`.
 A fixture receipt proves only the synthetic testbed scenario. It never proves the original operator scenario.
 Legacy mutating flows remain available outside read-only mode for authorized accounts.
+When a Windows Node wrapper imports the runner, use `pathToFileURL` or a `file:///C:/...` URL.
+Bare `C:/...` ESM imports fail before browser launch or assertions.
 
 ## Steps
 
