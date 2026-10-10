@@ -238,12 +238,13 @@ MEMORY_FLOOR_GIB = 3.0
 
 
 def _reservation_gib(job_class: str, mem_gib: Optional[float] = None) -> float:
+    heavy_minimum = 3.0 if job_class == "heavy" else MEMORY_RESERVATIONS.get("heavy", 5.0)
     if job_class not in MEMORY_RESERVATIONS:
         job_class = "heavy"
     value = MEMORY_RESERVATIONS.get(job_class, MEMORY_RESERVATIONS.get("heavy", 5.0)) if mem_gib is None else mem_gib
     if not math.isfinite(value) or value <= 0:
         raise ValueError("mem_gib must be positive and finite")
-    return max(value, MEMORY_RESERVATIONS.get("heavy", 5.0)) if job_class == "heavy" else value
+    return max(value, heavy_minimum) if job_class == "heavy" else value
 
 
 def get_available_ram_gib() -> Optional[float]:
@@ -2369,11 +2370,11 @@ class BuildSlotManager:
         now = time.time()
         for info in held:
             info = info or {}
-            job_class = info.get("job_class", "heavy")
+            job_class = info.get("job_class")
+            reservation = _reservation_gib(job_class, info.get("mem_gib"))
             if job_class not in MEMORY_RESERVATIONS:
                 job_class = "heavy"
             heavy_jobs += job_class == "heavy"
-            reservation = _reservation_gib(job_class, info.get("mem_gib"))
             reserved += reservation
             acquired = _parse_timestamp(info.get("acquired_at_epoch", info.get("acquired_at")))
             window = MEMORY_RAMP_SECONDS.get(job_class, MEMORY_RAMP_SECONDS["heavy"])
@@ -2412,10 +2413,10 @@ class BuildSlotManager:
         if caller is None:
             return False, "waiter missing from queue"
         head = queue[0]
-        head_class = head.get("job_class", "heavy")
+        head_class = head.get("job_class")
+        head_mem = _reservation_gib(head_class, head.get("mem_gib"))
         if head_class not in MEMORY_RESERVATIONS:
             head_class = "heavy"
-        head_mem = _reservation_gib(head_class, head.get("mem_gib"))
         head_reason = self._resource_refusal(head_class, head_mem, budget, force)
         stagger_reason = None
         if not force and last_acquired_at is not None:
@@ -2441,15 +2442,15 @@ class BuildSlotManager:
                 and projected is not None and projected >= head_mem and budget["heavy_jobs"] == 0
                 and (age >= 2400 or (age - 1200) % 180 < 60)):
             return False, f"backfill paused: aging heavy head '{head.get('name')}' waited {age:.1f}s"
-        caller_mem = _reservation_gib(caller.get("job_class", "heavy"), caller.get("mem_gib"))
+        caller_mem = _reservation_gib(caller.get("job_class"), caller.get("mem_gib"))
         if caller_mem >= head_mem:
             return False, notice or "backfill requires a smaller reservation than the blocked head"
         # Keep FIFO among jobs that can currently run. Blocked entries keep their place.
         for item in queue[1:]:
-            item_class = item.get("job_class", "heavy")
+            item_class = item.get("job_class")
+            item_mem = _reservation_gib(item_class, item.get("mem_gib"))
             if item_class not in MEMORY_RESERVATIONS:
                 item_class = "heavy"
-            item_mem = _reservation_gib(item_class, item.get("mem_gib"))
             reason = self._resource_refusal(item_class, item_mem, budget, force)
             if stagger_reason and item_class == "heavy":
                 reason = f"{reason}; {stagger_reason}" if reason else stagger_reason
@@ -2992,7 +2993,7 @@ class BuildSlotManager:
                 "heartbeat_at": item.get("heartbeat_at_iso"),
                 "heartbeat_age_seconds": hb_age,
                 "job_class": item.get("job_class", "heavy"),
-                "mem_gib": _reservation_gib(item.get("job_class", "heavy"), item.get("mem_gib")),
+                "mem_gib": _reservation_gib(item.get("job_class"), item.get("mem_gib")),
                 "refusal_reason": self._queue_admission(queue, item.get("token"), budget, now, last_acquired_at=last_acq)[1],
             })
 
