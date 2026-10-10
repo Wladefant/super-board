@@ -3652,6 +3652,43 @@ class TestBuildSlot(unittest.TestCase):
         self.assertEqual(ret_release, 0)
         self.assertFalse(manager.status()["lock"]["locked"])
 
+    def test_heavy_freeze_refuses_heavy_acquire(self):
+        freeze_file = os.path.join(self.run_dir, "build-freeze-heavy")
+        with open(freeze_file, "w", encoding="utf-8") as f:
+            f.write("operator heavy freeze 2026-10-10\n")
+
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            with self.assertRaises(SystemExit) as cm:
+                manager.acquire("lane-heavy", job_class="heavy")
+
+        self.assertEqual(cm.exception.code, 75)
+        self.assertIn("heavy build freeze active (operator heavy freeze 2026-10-10)", err.getvalue())
+        self.assertFalse(manager.status()["lock"]["locked"])
+
+    def test_medium_freeze_allows_acquire(self):
+        freeze_file = os.path.join(self.run_dir, "build-freeze-heavy")
+        with open(freeze_file, "w", encoding="utf-8") as f:
+            f.write("operator heavy freeze 2026-10-10\n")
+
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        acquired = manager.acquire("lane-medium", job_class="medium", timeout=1.0)
+        self.assertTrue(acquired)
+        self.assertTrue(manager.status()["lock"]["locked"])
+        manager.release("lane-medium")
+
+    def test_browser_freeze_allows_acquire(self):
+        freeze_file = os.path.join(self.run_dir, "build-freeze-heavy")
+        with open(freeze_file, "w", encoding="utf-8") as f:
+            f.write("operator heavy freeze 2026-10-10\n")
+
+        manager = BuildSlotManager(run_dir=self.run_dir)
+        acquired = manager.acquire("lane-browser", job_class="browser", timeout=1.0)
+        self.assertTrue(acquired)
+        self.assertTrue(manager.status()["lock"]["locked"])
+        manager.release("lane-browser")
+
     # -------------------------------------------------------------------------
     # Build-slot memory safety, one-heavy cap, force-env, run-timeout, and freeze
     # -------------------------------------------------------------------------

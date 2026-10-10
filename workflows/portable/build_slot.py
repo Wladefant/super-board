@@ -66,6 +66,10 @@ Invariants:
       commands are refused immediately with exit 75 and 'build freeze active (<reason>)'
       printed to stderr (fallback 'reason unavailable' on read error). No queue entry
       is created and no command is launched; status and release remain unaffected.
+    - Operator heavy build freeze: when 'build-freeze-heavy' exists in run_dir, acquire
+      and run commands for the 'heavy' job class are refused immediately with exit 75
+      and 'heavy build freeze active (<reason>)' printed to stderr (fallback 'reason
+      unavailable' on read error). Medium, browser, light, status and release remain unaffected.
     - Transition guards record PID, token and acquisition time in a .owner.json sidecar.
       The OS releases byte locks when a process exits. The next holder replaces stale
       metadata only after obtaining that same OS lock, never by deleting a live lock.
@@ -332,6 +336,22 @@ def classify_command(cmd: List[str]) -> str:
     if re.search(r"\b(?:tsc|vitest|wrangler|workerd)(?:\.cmd|\.exe)?\b", command):
         return "medium"
     return "light"
+
+
+HEAVY_FREEZE_MARKER = "build-freeze-heavy"
+
+
+def _check_heavy_freeze(run_dir: str, job_class: Optional[str] = None) -> None:
+    if job_class != "heavy":
+        return
+    path = os.path.join(run_dir, HEAVY_FREEZE_MARKER)
+    if os.path.exists(path):
+        try:
+            reason = _read_file_bytes(path).decode("utf-8").strip()
+        except OSError:
+            reason = "reason unavailable"
+        print(f"heavy build freeze active ({reason})", file=sys.stderr)
+        raise SystemExit(75)
 
 
 def _check_freeze(run_dir: str) -> None:
@@ -2703,10 +2723,11 @@ class BuildSlotManager:
         Blocks with poll_interval until acquired, or until timeout.
         Returns True on success, raises or returns False on failure.
         """
-        _check_freeze(self.run_dir)
         job_class = job_class or "light"
         if job_class not in MEMORY_RESERVATIONS:
             raise ValueError("Unknown job class")
+        _check_heavy_freeze(self.run_dir, job_class)
+        _check_freeze(self.run_dir)
         requested_mem_gib = mem_gib
         mem_gib = _reservation_gib(job_class, mem_gib)
         holder = self._inherited_holder()
@@ -3297,6 +3318,7 @@ class BuildSlotManager:
         try:
             if job_class == "browser" and classify_command(cmd) == "heavy":
                 raise ValueError("browser class cannot build or serve Next")
+            _check_heavy_freeze(self.run_dir, job_class)
             _check_freeze(self.run_dir)
             requested_mem_gib = mem_gib
             mem_gib = _reservation_gib(job_class, mem_gib)
