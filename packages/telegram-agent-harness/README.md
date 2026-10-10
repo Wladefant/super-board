@@ -10,6 +10,14 @@ Universal, mobile-friendly Telegram operations surface for managing multi-agent 
 - **Supergroup Forum Topics Mode (Opt-In)**: Multiplexes multiple concurrent Veyyon sessions into a single Telegram Supergroup using native Telegram Forum Topics (`message_thread_id`).
 - **Superboard Mini App Integration**: In-app Telegram web dashboard for interactive queue and session monitoring.
 
+### Tables in forwarded replies
+
+Telegram has no table element. Tables use a monospace block only when each line
+fits 32 characters and the cells contain no links or issue references.
+Other tables use one block per row. The first cell is bold, and each remaining
+cell follows its column name. Links stay clickable in their own cells.
+This conversion changes Telegram output only. Terminal Markdown stays unchanged.
+
 ### Question waits and steering
 
 Only waiting `telegram_question` calls allow steering to stop the wait.
