@@ -865,6 +865,111 @@ class TestBuildSlotUnknownClassFallback(unittest.TestCase):
             self.assertEqual(b["heavy_jobs"], 1)
             self.assertGreaterEqual(b["reserved_gib"], 5.0)
 
+    # -------------------------------------------------------------------------
+    # 6. Missing job_class metadata fallback (legacy metadata retains 5 GiB)
+    # -------------------------------------------------------------------------
+
+    def test_missing_class_held_slot_reserved_and_ramp_stay_5(self):
+        """Held slot with missing job_class and explicit mem_gib 1 and 3 stays at 5 GiB."""
+        now = time.time()
+        for mem in (1.0, 3.0):
+            os.makedirs(self.manager.slot_dirs[0], exist_ok=True)
+            info = {
+                "owner": f"held-legacy-{int(mem)}",
+                "pid": os.getpid(),
+                "token": f"tok-held-{int(mem)}",
+                "slot": 0,
+                "mem_gib": mem,
+                "acquired_at_epoch": now - 50.0,
+                "heartbeat_at_epoch": now,
+            }
+            info_path = os.path.join(self.manager.slot_dirs[0], "info.json")
+            with open(info_path, "w", encoding="utf-8") as f:
+                json.dump(info, f)
+
+            with mock.patch("build_slot.get_available_ram_gib", return_value=16.0), \
+                 mock.patch("build_slot.time.time", return_value=now):
+                b = self.manager._memory_budget()
+
+            self.assertEqual(
+                b["reserved_gib"], 5.0,
+                f"Held slot with missing job_class and mem_gib={mem} must retain conservative 5 GiB reservation",
+            )
+            self.assertEqual(
+                b["ramp_reservations_gib"], 5.0,
+                f"Held slot with missing job_class and mem_gib={mem} must retain conservative 5 GiB ramp reservation",
+            )
+
+    def test_missing_class_queue_admission_refuses_legacy_head(self):
+        """Queue admission refuses legacy head with missing job_class and available 6.5 GiB, reporting needs 5.00."""
+        now = time.time()
+        budget = {
+            "available_gib": 6.5,
+            "reserved_gib": 0.0,
+            "floor_gib": 3.0,
+            "free_budget_gib": 3.5,
+            "heavy_jobs": 0,
+        }
+        for mem in (1.0, 3.0):
+            queue = [
+                {
+                    "name": f"legacy-head-{int(mem)}",
+                    "token": f"tok-leg-{int(mem)}",
+                    "pid": 1001,
+                    "mem_gib": mem,
+                    "enqueued_at": now - 10.0,
+                }
+            ]
+            eligible, reason = self.manager._queue_admission(queue, f"tok-leg-{int(mem)}", budget, now)
+            self.assertFalse(
+                eligible,
+                f"Legacy head with missing job_class and mem_gib={mem} must be refused when free budget is 3.5 GiB",
+            )
+            self.assertIsNotNone(reason)
+            self.assertIn(
+                "needs 5.00", reason,
+                f"Refusal reason for missing job_class and mem_gib={mem} must report needs 5.00",
+            )
+
+    def test_missing_class_status_queue_mem_gib_stays_5(self):
+        """Status queue mem_gib stays 5 for queued items with missing job_class and explicit mem 1 and 3."""
+        now = time.time()
+        queue = [
+            {
+                "name": "legacy-mem-1",
+                "token": "tok-leg-1",
+                "pid": os.getpid(),
+                "mem_gib": 1.0,
+                "enqueued_at": now,
+                "heartbeat_at": now,
+            },
+            {
+                "name": "legacy-mem-3",
+                "token": "tok-leg-3",
+                "pid": os.getpid(),
+                "mem_gib": 3.0,
+                "enqueued_at": now,
+                "heartbeat_at": now,
+            },
+        ]
+        self.manager._write_queue(queue)
+        with mock.patch("build_slot.get_available_ram_gib", return_value=16.0), \
+             mock.patch("build_slot.get_system_ram_percent", return_value=50.0), \
+             mock.patch("build_slot.time.time", return_value=now):
+            stat = self.manager.status()
+
+        q_items = {item["name"]: item for item in stat["queue"]}
+        self.assertIn("legacy-mem-1", q_items)
+        self.assertIn("legacy-mem-3", q_items)
+        self.assertEqual(
+            q_items["legacy-mem-1"]["mem_gib"], 5.0,
+            "Queue item with missing job_class and mem_gib=1.0 must report mem_gib=5.0 in status",
+        )
+        self.assertEqual(
+            q_items["legacy-mem-3"]["mem_gib"], 5.0,
+            "Queue item with missing job_class and mem_gib=3.0 must report mem_gib=5.0 in status",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
