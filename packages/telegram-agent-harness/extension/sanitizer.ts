@@ -120,7 +120,7 @@ export function extractMentionedRepos(text: string): Set<string> {
  * Converts Markdown to Telegram-compatible HTML.
  * Preserves pre-existing valid HTML tags (such as <a href="...">, <b>, <blockquote>) without
  * double-escaping, auto-links bare URLs, issue/PR references, and commit SHAs, renders tables
- * as monospace <pre> blocks (Telegram has no table entity), folds long quotes and <details>
+ * as narrow monospace blocks or labeled row blocks, folds long quotes and <details>
  * into expandable blockquotes, and safely escapes all literal user text characters (<, >, &).
  *
  * `defaultRepo` is the session's own repository. It is required for a bare `#N` to link at all:
@@ -164,8 +164,12 @@ export function markdownToTelegramHtml(markdown: string, defaultRepo?: string): 
     return addPlaceholder(`<pre><code${attr}>${escapeHtml(code.replace(/\n$/, ""))}</code></pre>`);
   });
 
-  // 2b. Tables: Telegram has no table entity, so render aligned monospace <pre> blocks
-  text = convertTablesToPre(text, addPlaceholder);
+  // 2b. Tables: keep narrow text tables, use labeled rows for mobile and clickable links.
+  text = convertTablesToHtml(text, addPlaceholder, cell => {
+    const title = markdownToTelegramHtml(cell, allRepos.size > 1 ? undefined : defaultRepo);
+    // Telegram forbids code/pre entities inside bold, including auto-linked SHA code.
+    return addPlaceholder(`<b>${title.replace(/<\/?(?:code|pre)(?:\s[^>]*)?>/gi, "")}</b>`);
+  });
 
   // 2c. Backslash escapes: `\*`, `\_`, `\`` ... keep the literal character, drop the backslash.
   //     Backslash before any other character (Windows paths) is left alone.
@@ -322,9 +326,7 @@ function renderTable(rows: string[][]): string {
 }
 
 /**
- * Links and issue/PR references inside a table: `[label](url)`, bare URLs, `owner/repo#N`,
- * a known short slug, or a bare `#N`. A quote is excluded from every URL body, since the
- * later link pass cannot carry one and would leave the raw Markdown on the reference line.
+ * Links and issue/PR references force labeled rows so their links remain clickable.
  */
 const TABLE_REFERENCE = /\[[^\]\n]+\]\(https?:\/\/[^\s)"'>]+\)|https?:\/\/[^\s|)"'>]+|(?:[A-Za-z0-9_.-]+\/)?[A-Za-z0-9_.-]*#\d+/g;
 
@@ -361,31 +363,12 @@ function tableCellText(cell: string): string {
 }
 
 /**
- * The reference tokens a table carries for the line below its block: `[label](url)`, bare URLs,
- * `owner/repo#N`, a known short slug, or a bare `#N`. A `word#N` whose word names no known
- * project keeps only its `#N`, so a cell such as `Lane#3` is not listed as a reference the
- * link pass would refuse. A URL the pattern stopped short of is dropped rather than listed
- * as its prefix, which would link somewhere the cell never named.
- */
-function tableReferences(rows: string[]): string[] {
-  const source = rows.join("\n");
-  const tokens = new Set<string>();
-  for (const match of source.matchAll(TABLE_REFERENCE)) {
-    if (source[match.index + match[0].length] === '"') continue;
-    const token = match[0];
-    const shortSlug = /^([A-Za-z0-9_.-]+)#(\d+)$/.exec(token);
-    tokens.add(shortSlug && !PROJECT_SLUG_MAP[shortSlug[1].toLowerCase()] ? `#${shortSlug[2]}` : token);
-  }
-  return [...tokens];
-}
-
-/**
  * Replaces GitHub-flavoured Markdown tables (header row, separator row, body rows) with
- * an aligned <pre> block. Runs on raw Markdown after fenced code is protected, so the
- * cell text is escaped exactly once. The table's links and issue/PR references follow on
- * one line below it, where the later passes make them clickable.
+ * a narrow <pre> block or labeled row blocks. Fenced code is already protected.
+ * Row cells pass through the normal Markdown conversion so links stay clickable
+ * and literal text is escaped once. Terminal Markdown is never changed.
  */
-function convertTablesToPre(src: string, addPlaceholder: (val: string) => string): string {
+function convertTablesToHtml(src: string, addPlaceholder: (val: string) => string, renderTitle: (cell: string) => string): string {
   const lines = src.split("\n");
   const out: string[] = [];
   let i = 0;
@@ -404,10 +387,28 @@ function convertTablesToPre(src: string, addPlaceholder: (val: string) => string
           .replace(/^\|/, "")
           .replace(/(?<!\\)\|$/, "")
           .split(/(?<!\\)\|/)
-          .map(cell => tableCellText(cell)));
-      out.push(addPlaceholder(`<pre>${escapeHtml(renderTable(rows))}</pre>`));
-      const references = tableReferences(rowLines);
-      if (references.length > 0) out.push(references.join(" · "));
+          .map(cell => cell.trim().replace(/\\\|/g, "|")));
+      const plainTable = renderTable(rows.map(row => row.map(tableCellText)));
+      const hasReferences = rowLines.some(row => {
+        for (const match of row.matchAll(TABLE_REFERENCE)) {
+          if (row[match.index + match[0].length] !== '"') return true;
+        }
+        return false;
+      });
+      if (!hasReferences && plainTable.split("\n").every(line => [...line].length <= 32)) {
+        out.push(addPlaceholder(`<pre>${escapeHtml(plainTable)}</pre>`));
+      } else {
+        const [headers, ...body] = rows;
+        if (body.length === 0) {
+          out.push(headers.map(renderTitle).join("\n"));
+          continue;
+        }
+        out.push(body.map(row => [
+          renderTitle(row[0] ?? ""),
+          ...Array.from({ length: Math.max(headers.length, row.length) - 1 }, (_, column) =>
+            `${headers[column + 1] || `Column ${column + 2}`}: ${row[column + 1] ?? ""}`),
+        ].join("\n")).join("\n\n"));
+      }
       continue;
     }
     out.push(line);

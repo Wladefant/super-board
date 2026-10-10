@@ -16,6 +16,7 @@ import { FakeForumApiClient } from "./daemon-forum.test";
 import type { MessageCorrelationBridge } from "../extension/types";
 import { DaemonStore } from "../daemon/store";
 
+import { markdownToTelegramHtml } from "../extension/sanitizer";
 const OPERATOR_ID = "1247617658";
 const FORUM_CHAT_ID = "-10077889900";
 
@@ -91,6 +92,44 @@ describe("TelegramDaemon forum auto-attach runtime", () => {
       sendTelegramMessage: async () => null,
     } as unknown as TelegramPoller;
   }
+
+  test("a 330-row final reply converts before every daemon relay send is split", async () => {
+    createManifest(false);
+    const daemonDbPath = path.join(tempDir, "daemon.db");
+    const seed = new DaemonStore(daemonDbPath);
+    seed.putRoute({ slotId: "slot-runtime-forum", chatId: FORUM_CHAT_ID, topicId: "77", sessionId: "table-sess", workspace: tempDir });
+    seed.close();
+    const sent: string[] = [];
+    const fake = fakeControl();
+    const daemon = new TelegramDaemon({
+      manifestPath, poolDbPath: path.join(tempDir, "pool.db"), daemonDbPath,
+      channelsDir: path.join(tempDir, "channels"),
+      controlFactory: () => fake.control, forumClientFactory: () => new FakeForumApiClient(),
+      pollerFactory: () => Object.assign(dummyPoller(), {
+        sendTelegramMessage: async (_chat: unknown, text: string, mode?: string) => {
+          const html = mode === "HTML" ? text : markdownToTelegramHtml(text);
+          sent.push(html);
+          return { ok: true, result: { message_id: sent.length } };
+        },
+      }),
+      log: () => {},
+    });
+    await daemon.start();
+    try {
+      const router = daemon.getActiveSlot("slot-runtime-forum")!.router;
+      const text = ["| Name | Status |", "| --- | --- |", ...Array.from({ length: 330 }, () => "| x | [docs](https://example.com) |")].join("\n");
+      await router.onSessionEvent({ kind: "appended", sessionId: "table-sess", entries: [{ entryId: "table-entry", text }] } as Parameters<typeof router.onSessionEvent>[0]);
+      expect(sent.length).toBeGreaterThan(1);
+      for (const html of sent) {
+        expect(html.replace(/<[^>]*>/g, "").length).toBeLessThanOrEqual(4096);
+        expect(html).not.toContain("| x |");
+        expect(html.match(/<b>/g)?.length ?? 0).toBe(html.match(/<\/b>/g)?.length ?? 0);
+      }
+      expect(sent.join("\n").match(/>docs<\/a>/g)).toHaveLength(330);
+    } finally {
+      await daemon.stop();
+    }
+  });
 
   test("startup reconciles live sessions automatically", async () => {
     createManifest(true);

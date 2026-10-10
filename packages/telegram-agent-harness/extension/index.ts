@@ -28,7 +28,7 @@ import { getDaemonDbPath } from "../daemon/config";
 import { DaemonStore } from "../daemon/store";
 import { readMessageThreadId } from "./harness/channel-config";
 import { questionCompactionContext } from "./harness/operator-questions";
-import { escapeHtml, markdownToTelegramHtml } from "./sanitizer";
+import { chunkMessage, escapeHtml, markdownToTelegramHtml } from "./sanitizer";
 import { meterOutbound } from "./ste-meter";
 import { resolveGithubRepo } from "./github-repo";
 import {
@@ -515,17 +515,22 @@ export function registerOperatorTools(pi: ExtensionAPI): void {
         const fallbackRoute = findDaemonRoute(savedContext?.sessionId, savedContext?.cwd);
         if (fallbackRoute) {
           void meterOutbound(params.text, "md", "telegram-fallback");
-          const res = await governedTelegramFetch(`https://api.telegram.org/bot${fallbackRoute.token}/sendMessage`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              chat_id: fallbackRoute.chatId,
-              message_thread_id: Number(fallbackRoute.topicId),
-              text: `<b>Agent · ${escapeHtml(params.lane_id)}</b>\n${markdownToTelegramHtml(params.text, savedContext?.cwd ? resolveGithubRepo(savedContext.cwd) : undefined)}`,
-              parse_mode: "HTML",
-            }),
-          }, { chatId: fallbackRoute.chatId });
-          const data = (await res.json()) as { ok?: boolean; result?: { message_id: number } };
+          const html = `<b>Agent · ${escapeHtml(params.lane_id)}</b>\n${markdownToTelegramHtml(params.text, savedContext?.cwd ? resolveGithubRepo(savedContext.cwd) : undefined)}`;
+          let data: { ok?: boolean; result?: { message_id: number } } = {};
+          for (const chunk of chunkMessage(html, 3800)) {
+            const res = await governedTelegramFetch(`https://api.telegram.org/bot${fallbackRoute.token}/sendMessage`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                chat_id: fallbackRoute.chatId,
+                message_thread_id: Number(fallbackRoute.topicId),
+                text: chunk,
+                parse_mode: "HTML",
+              }),
+            }, { chatId: fallbackRoute.chatId });
+            data = (await res.json()) as typeof data;
+            if (!data.ok) break;
+          }
           if (data.ok && data.result) {
             activeRuntime?.recordTurnDelivery(params.text);
             recordDaemonAgentMessage(savedContext?.sessionId, params.text);

@@ -200,7 +200,7 @@ describe("Sanitizer & Security Utilities", () => {
     }
   });
 
-  test("tables render as an aligned monospace block with their references linked below", () => {
+  test("tables with references render as readable row blocks with inline links", () => {
     const mdTable = [
       "| Task | Owner | Status |",
       "| --- | --- | --- |",
@@ -209,13 +209,9 @@ describe("Sanitizer & Security Utilities", () => {
     ].join("\n");
 
     const result = markdownToTelegramHtml(mdTable, "Bavariance/polysimulator");
-    expect(result).toContain([
-      "<pre>Task  | Owner     | Status",
-      "------+-----------+-------",
-      "#4799 | wladefant | Merged",
-      "#4440 | erik      | Review</pre>",
-    ].join("\n"));
-    expect(result).not.toContain("<b>");
+    expect(result).not.toContain("<pre>");
+    expect(result).toContain("Owner: <b>wladefant</b>\nStatus: Merged");
+    expect(result).toContain("Owner: erik\nStatus: ");
     expect(result).toContain('<a href="https://github.com/Bavariance/polysimulator/issues/4799">#4799</a>');
     expect(result).toContain('<a href="https://github.com/Bavariance/polysimulator/issues/4440">#4440</a>');
     expect(result).toContain('<a href="https://example.com/r?a=1&amp;b=2">Review</a>');
@@ -230,11 +226,9 @@ describe("Sanitizer & Security Utilities", () => {
     ].join("\n");
 
     const result = markdownToTelegramHtml(table);
-    // The short slug survives, so the reference does not lose its repository.
-    const referenceLine = result.split("\n").at(-1) ?? "";
-    expect(referenceLine).toContain('<a href="https://github.com/Bavariance/polysimulator/issues/9">polysimulator#9</a>');
-    // A word that names no project is not a qualifier: that reference stays a bare #N.
-    expect(referenceLine).toBe('<a href="https://github.com/Bavariance/polysimulator/issues/9">polysimulator#9</a> · #3');
+    expect(result).toContain('<b><a href="https://github.com/Bavariance/polysimulator/issues/9">polysimulator#9</a></b>\nStatus: Open');
+    expect(result).toContain("<b>Lane#3</b>\nStatus: Done");
+    expect(result).not.toContain("<pre>");
   });
 
   test("table cells escape HTML once, keep inline code, and a lone horizontal rule is not a table", () => {
@@ -255,6 +249,54 @@ describe("Sanitizer & Security Utilities", () => {
     // it did match would link somewhere the cell never named, so the reference is dropped.
     const result = markdownToTelegramHtml('| cell |\n| --- |\n| [l](https://example.com/a"2") |');
     expect(result).toBe("<pre>cell\n----\nl</pre>");
+  });
+
+  test("wide tables with two through five columns use labeled row blocks", () => {
+    for (let columns = 2; columns <= 5; columns++) {
+      const headers = ["Task", ...Array.from({ length: columns - 1 }, (_, i) => `Field ${i + 1}`)];
+      const cells = ["A long task name that cannot fit a phone table", ...Array.from({ length: columns - 1 }, (_, i) => `Value ${i + 1}`)];
+      const md = [headers.join(" | "), headers.map(() => "---").join(" | "), cells.join(" | ")].join("\n");
+      expect(markdownToTelegramHtml(md)).toBe(
+        `<b>${cells[0]}</b>\n` + headers.slice(1).map((header, i) => `${header}: ${cells[i + 1]}`).join("\n"),
+      );
+    }
+  });
+
+  test("wide tables escape HTML, preserve escaped pipes and leave surrounding text unchanged", () => {
+    const table = "| Task | Owner | Link |\n| --- | --- | --- |\n| A long task with <literal> & text | A\\|B | [Review](https://example.com/?a=1&b=2) |";
+    const before = "**Before** & text";
+    const after = "After `code`.";
+    expect(markdownToTelegramHtml(`${before}\n\n${table}\n\n${after}`)).toBe(
+      '<b>Before</b> &amp; text\n\n<b>A long task with &lt;literal&gt; &amp; text</b>\nOwner: A|B\nLink: <a href="https://example.com/?a=1&amp;b=2">Review</a>\n\nAfter <code>code</code>.',
+    );
+    expect(markdownToTelegramHtml("```\n" + table + "\n```")).toContain("<pre><code>| Task | Owner | Link |");
+    for (const [length, usesPre] of [[28, true], [29, false]] as const) {
+      const table = `| A | B |\n| --- | --- |\n| ${"x".repeat(length)} | y |`;
+      expect(markdownToTelegramHtml(table).includes("<pre>")).toBe(usesPre);
+    }
+  });
+
+  test("inline code in a wide row title stays literal without forbidden nested code entities", () => {
+    const table = "| Task | Status |\n| --- | --- |\n| `A< B & #9` | A long status that cannot fit a phone table |";
+    expect(markdownToTelegramHtml(table, "Wladefant/super-board")).toBe(
+      "<b>A&lt; B &amp; #9</b>\nStatus: A long status that cannot fit a phone table",
+    );
+  });
+
+  test("raw HTML code and generated commit code stay outside bold row titles", () => {
+    for (const title of ["<code>A&lt; B</code>", "<pre>A&lt; B</pre>", "a".repeat(40)]) {
+      const result = markdownToTelegramHtml(`| Task | Status |\n| --- | --- |\n| ${title} | [docs](https://example.com) |`, "Wladefant/super-board");
+      expect(result).not.toContain("<code>");
+      expect(result).not.toContain("<pre>");
+      expect(result).toContain('<a href="https://example.com">docs</a>');
+      expect(result).toContain("<b>");
+    }
+  });
+
+  test("a wide header-only table does not lose its headings", () => {
+    expect(markdownToTelegramHtml("| A long heading that exceeds the phone width | Link |\n| --- | --- |")).toBe(
+      "<b>A long heading that exceeds the phone width</b>\n<b>Link</b>",
+    );
   });
 
   test("long quotes and <details> fold into expandable blockquotes; short quotes stay plain", () => {

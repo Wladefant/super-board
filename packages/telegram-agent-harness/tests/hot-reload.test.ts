@@ -285,6 +285,19 @@ describe("Telegram Harness Hot Reload", () => {
       await runtime.onMessageEnd(reply("Merged PR 225 into staging after CI went green on every check across all three operating systems today."));
       expect(sent).toHaveLength(3);
       expect(sent[2]).toContain("Merged PR 225");
+
+      sent.length = 0;
+      const table = ["| Name | Status |", "| --- | --- |", ...Array.from({ length: 330 }, () => "| x | [docs](https://example.com) |")].join("\n");
+      await runtime.onMessageStart({ message: { role: "user" } });
+      await runtime.onMessageStart({ message: { role: "assistant" } });
+      await runtime.onMessageEnd(reply(table));
+      expect(sent.length).toBeGreaterThan(1);
+      for (const html of sent) {
+        expect(html.replace(/<[^>]*>/g, "").length).toBeLessThanOrEqual(4096);
+        expect(html).not.toContain("| x |");
+        expect(html.match(/<b>/g)?.length ?? 0).toBe(html.match(/<\/b>/g)?.length ?? 0);
+      }
+      expect(sent.join("\n").match(/>docs<\/a>/g)).toHaveLength(330);
     } finally {
       await runtime?.dispose();
       if (previousDaemonDb === undefined) delete process.env.VEYYON_TELEGRAM_DAEMON_DB;

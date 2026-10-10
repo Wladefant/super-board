@@ -24,7 +24,7 @@ import {
 import { TelegramPoller } from "../extension/poller";
 import { governedTelegramFetch } from "../extension/telegram-governor";
 import { resolveGithubRepo } from "../extension/github-repo";
-import { chunkMessage, escapeHtml } from "../extension/sanitizer";
+import { chunkMessage, escapeHtml, markdownToTelegramHtml } from "../extension/sanitizer";
 import type { AccessConfig, MessageCorrelationBridge, PanelCallbackContext, TelegramSendMessageResponse } from "../extension/types";
 import { BunCommandRunner } from "../extension/harness/command-runner";
 import { handleInstalledCommand } from "../src/installed-commands";
@@ -357,8 +357,9 @@ export class TelegramDaemon {
     });
     const sendTo = async (target: RouteTarget, text: string, parseMode?: "HTML", sessionId?: string, defaultRepo?: string): Promise<void> => {
       const threadId = target.topicId ? Number(target.topicId) : undefined;
-      for (const chunk of chunkMessage(text)) {
-        const result = await poller.sendTelegramMessage(target.chatId, chunk, parseMode, undefined, {
+      const html = parseMode === "HTML" ? text : markdownToTelegramHtml(text, defaultRepo);
+      for (const chunk of chunkMessage(html)) {
+        const result = await poller.sendTelegramMessage(target.chatId, chunk, "HTML", undefined, {
           sessionId: sessionId ?? router.boundSession(target) ?? leaseSessionId,
         }, defaultRepo, threadId);
         if (!result?.ok) throw new Error("Telegram rejected the outbound message");
