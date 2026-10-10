@@ -4,6 +4,8 @@ Complete index of all 65 managed agent skills maintained in the Veyyon runtime p
 
 **Direction: this repo is the source of truth.** Edit a skill here and merge it. Then `python scripts/install-managed-skills.py [NAME ...]` copies it to `~/.veyyon/profiles/default/agent/managed-skills/`. The installer backs up a differing local file to `~/.veyyon/tmp/managed-skills-backup/` before it overwrites it. `--check` lists drift and writes nothing.
 
+**Local values stay local.** The repo text is scrubbed and holds placeholders such as `<prod-supabase-ref>`, `<pc28gr-tunnel-suffix>` and `<komo-test-user-email>`. The installer fills them from `~/.veyyon/profiles/default/agent/managed-skills.local.json`, which never enters the repo. Format: `{"*": {"<placeholder>": "value"}, "<skill>": {"<placeholder>": "value"}}`. `--check` compares against the filled text, so a local value is not drift.
+
 All blob links are pinned to immutable commit SHA [`6b5172a129305156eff0c44c9b1e29c7dde16a9b`](https://github.com/Wladefant/super-board/blob/6b5172a129305156eff0c44c9b1e29c7dde16a9b/managed-skills/).
 
 ## Table of Contents

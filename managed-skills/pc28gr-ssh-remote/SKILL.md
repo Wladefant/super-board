@@ -33,8 +33,8 @@ control port 31545) + `python E:/lane-reports/ntun/vsrun.py --timeout 120 -- cmd
 Measured facts (2026-10-02):
 - Find tunnels without guessing: `GET https://global.rel.tunnels.api.visualstudio.com/tunnels?api-version=2023-09-27-preview&global=true&includePorts=true`
   with header `Authorization: github <gh auth token>`. It lists every tunnel owned by GitHub `Wladefant`.
-- The old PC28GR tunnels are owned by GitHub `Wladefant`: `pc28gr-remote-<id>` (euw, port 2222)
-  and `pc28gr-claude-<id>` (uks, dormant since 2026-08-04). The remote one still had a live host
+- The old PC28GR tunnels are owned by GitHub `Wladefant`: `pc28gr-remote-<pc28gr-tunnel-suffix>` (euw, port 2222)
+  and `pc28gr-claude-<pc28gr-tunnel-suffix>` (uks, dormant since 2026-08-04). The remote one still had a live host
   until 2026-10-02 13:54:40Z. A new VS Code tunnel that does not show up in that list is signed in
   under a different account. Ask the operator; never sign this private PC into the ING Microsoft account.
 - The same bans as §0 apply to the new PC, plus: nothing named `claude` (use `github-copilot`),
