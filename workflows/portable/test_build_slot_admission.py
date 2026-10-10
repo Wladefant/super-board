@@ -1363,5 +1363,61 @@ class TestBuildSlotOccupiedLaneAdmission(unittest.TestCase):
             refusal_at_50 = self.manager._resource_refusal("heavy", 4.5, budget_at_50)
             self.assertIsNone(refusal_at_50)
 
+class TestPhysicalCapacityAdmission(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.manager = BuildSlotManager(run_dir=self.directory.name, acquisition_stagger=0)
+
+    def test_priority_unfit_head_allows_light_backfill(self):
+        self.manager.enqueue("build523", os.getpid(), token="head", priority=True,
+                             job_class="heavy", mem_gib=4.5)
+        for index in range(19):
+            self.manager.enqueue(f"medium-{index}", os.getpid(), token=f"medium-{index}",
+                                 job_class="medium", mem_gib=4.0)
+        with mock.patch("build_slot.get_available_ram_gib", return_value=6.41), \
+             mock.patch("build_slot.get_system_ram_percent", return_value=80.0):
+            self.assertTrue(self.manager.acquire("light", token="light", job_class="light",
+                                                timeout=0.5, poll_interval=0.01))
+        queue = self.manager._read_queue()
+        self.assertEqual(len(queue), 20)
+        self.assertEqual(queue[0]["token"], "head")
+        self.assertTrue(queue[0]["priority"])
+
+    def test_physical_limit_rejects_enqueue_without_queue_mutation(self):
+        with mock.patch("build_slot.get_total_ram_gib", return_value=8.0, create=True):
+            with self.assertRaisesRegex(ValueError, r"needs 6\.00, max possible 5\.00 GiB"):
+                self.manager.enqueue("impossible", os.getpid(), token="bad",
+                                     job_class="medium", mem_gib=6.0)
+        self.assertEqual(self.manager._read_queue(), [])
+
+    def test_cli_physical_rejection_returns_one_without_waiting_or_queue(self):
+        output = io.StringIO()
+        with mock.patch("build_slot.get_total_ram_gib", return_value=8.0, create=True), \
+             mock.patch("build_slot.get_available_ram_gib", return_value=3.5), \
+             mock.patch("build_slot.get_system_ram_percent", return_value=50.0), \
+             mock.patch.object(BuildSlotManager, "clean_queue",
+                               side_effect=AssertionError("must reject before wait loop")), \
+             redirect_stderr(output):
+            code = build_slot.main(["--run-dir", self.directory.name, "acquire", "impossible",
+                                    "--pid", str(os.getpid()), "--class", "medium",
+                                    "--mem-gib", "6", "--timeout", "0.1"])
+        self.assertEqual(code, 1)
+        self.assertIn("needs 6.00, max possible 5.00 GiB", output.getvalue())
+        self.assertEqual(self.manager._read_queue(), [])
+
+    def test_physical_boundary_and_temporary_shortage_stay_queueable(self):
+        with mock.patch("build_slot.get_total_ram_gib", return_value=8.0, create=True), \
+             mock.patch("build_slot.get_available_ram_gib", return_value=3.1):
+            self.manager.enqueue("boundary", os.getpid(), token="boundary",
+                                 job_class="medium", mem_gib=5.0)
+        self.assertEqual(self.manager._read_queue()[0]["token"], "boundary")
+
+    def test_unknown_total_does_not_reject_enqueue(self):
+        with mock.patch("build_slot.get_total_ram_gib", return_value=None, create=True):
+            self.manager.enqueue("unknown", os.getpid(), token="unknown",
+                                 job_class="medium", mem_gib=64.0)
+        self.assertEqual(self.manager._read_queue()[0]["token"], "unknown")
+
 if __name__ == "__main__":
     unittest.main()
