@@ -19,14 +19,15 @@ Operational guide for diagnosing and maintaining the local Antigravity masking p
 
 ## Quick Health Check
 ```bash
-curl -s --max-time 5 http://127.0.0.1:45123/health
+# Use Win32 curl.exe or PowerShell (WSL bash loopback cannot route to host 45123):
+curl.exe -s --max-time 5 http://127.0.0.1:45123/health
 ```
 Healthy response: `{"status":"ok","service":"veyyon-antigravity-sidecar", ...}`.
 
 ## Recovery Procedure
-If dead or unreachable, start the sidecar via the process supervisor:
+If dead or unreachable, start the sidecar via the process supervisor with `restart=always`:
 ```
-launch op=start name=antigravity-sidecar detached=true persist=true \
+launch op=start name=antigravity-sidecar restart=always detached=true persist=true \
   application=C:\Users\wkiri\.bun\bin\bun.exe \
   args=["run","C:\\Users\\wkiri\\.veyyon\\sidecar\\antigravity-masking-proxy.ts"] \
   ready={"port":45123,"timeout":40}

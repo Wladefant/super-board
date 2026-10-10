@@ -10,9 +10,9 @@ Technical specifications and verification procedures for the Antigravity masking
 
 ## Health Probe Specification
 ```bash
-curl -s --max-time 5 http://127.0.0.1:45123/health
+# Win32 host probe (WSL bash loopback does not route to host 45123):
+curl.exe -s --max-time 5 http://127.0.0.1:45123/health
 ```
-
 Expected JSON response format:
 ```json
 {
@@ -34,6 +34,7 @@ launch(
   name="antigravity-sidecar",
   application="C:\\Users\\wkiri\\.bun\\bin\\bun.exe",
   args=["run", "C:\\Users\\wkiri\\.veyyon\\sidecar\\antigravity-masking-proxy.ts"],
+  restart="always",
   detached=True,
   persist=True,
   ready={"port": 45123, "timeout": 40}

@@ -20,3 +20,12 @@ Operational failure modes and misleading telemetry caused by a dead or unrespons
 ## 4. Script Execution Failures with `Start-Process` (Exit 7)
 - **Trap:** Running `start-sidecar.ps1` directly inside the harness often fails with exit code 7 due to Windows process elevation restrictions.
 - **Fix:** Launch Bun directly via the `launch` tool with `detached=true persist=true`.
+
+## 5. Probing Port 45123 from WSL Bash Returns Empty Output
+- **Symptom:** Running `curl -s http://127.0.0.1:45123/health` inside the Veyyon `bash` tool prints nothing or errors with connection refused, creating the illusion that the sidecar is dead.
+- **Root Cause:** On Windows, `bash` invokes WSL `bash.exe`. Inside WSL, `127.0.0.1` connects to the WSL Linux VM loopback, not the Windows host loopback where Bun listens.
+- **Fix:** Probe from the host via Win32 `curl.exe` or PowerShell `Invoke-RestMethod http://127.0.0.1:45123/health`.
+
+## 6. Process Supervisor Defaults to `restart="no"` if Omitted
+- **Trap:** Calling `launch op=start name=antigravity-sidecar` without `restart="always"` registers `restart="no"`. If Bun exits or the host restarts, the supervisor will not restart it automatically.
+- **Fix:** Always specify `restart="always"` in supervisor launch commands.
