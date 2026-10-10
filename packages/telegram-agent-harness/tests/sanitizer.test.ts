@@ -283,6 +283,16 @@ describe("Sanitizer & Security Utilities", () => {
     );
   });
 
+  test("raw HTML code and generated commit code stay outside bold row titles", () => {
+    for (const title of ["<code>A&lt; B</code>", "<pre>A&lt; B</pre>", "a".repeat(40)]) {
+      const result = markdownToTelegramHtml(`| Task | Status |\n| --- | --- |\n| ${title} | [docs](https://example.com) |`, "Wladefant/super-board");
+      expect(result).not.toContain("<code>");
+      expect(result).not.toContain("<pre>");
+      expect(result).toContain('<a href="https://example.com">docs</a>');
+      expect(result).toContain("<b>");
+    }
+  });
+
   test("a wide header-only table does not lose its headings", () => {
     expect(markdownToTelegramHtml("| A long heading that exceeds the phone width | Link |\n| --- | --- |")).toBe(
       "<b>A long heading that exceeds the phone width</b>\n<b>Link</b>",

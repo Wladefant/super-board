@@ -8,6 +8,7 @@ import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
+  chunkMessage,
   escapeHtml,
   formatTelegramCaption,
   getTokenFingerprint,
@@ -612,53 +613,51 @@ export class TelegramPoller {
       ? maybeReplyMarkup
       : (replyMarkupOrParseMode ?? maybeReplyMarkup);
 
+    // Bind every chunk to the session that owned the complete message before any await.
+    const boundSlotId = this.correlation?.getSlotId() ?? null;
+    const boundSessionId = correlationMeta?.sessionId ?? this.correlation?.getSessionId() ?? null;
     try {
-      const body: Record<string, unknown> = {
-        chat_id: chatId,
-        text: formatted,
-        parse_mode: "HTML",
-      };
-      const threadId = messageThreadId ?? this.outboundThreadId;
-      if (threadId !== undefined) body.message_thread_id = threadId;
-      if (replyMarkup) {
-        body.reply_markup = replyMarkup;
-      }
+      let lastData: TelegramSendMessageResponse | null = null;
+      const chunks = chunkMessage(formatted, 3800);
+      for (const [index, chunk] of chunks.entries()) {
+        const body: Record<string, unknown> = {
+          chat_id: chatId,
+          text: chunk,
+          parse_mode: "HTML",
+        };
+        const threadId = messageThreadId ?? this.outboundThreadId;
+        if (threadId !== undefined) body.message_thread_id = threadId;
+        if (replyMarkup && index === chunks.length - 1) body.reply_markup = replyMarkup;
 
-      // Resolve the owning session BEFORE the roundtrip. An in-TUI session switch
-      // during the await would otherwise index this outbound text against whichever
-      // session arrived later, and a reply to it would be delivered into that
-      // unrelated session instead of refused.
-      const boundSlotId = this.correlation?.getSlotId() ?? null;
-      const boundSessionId = correlationMeta?.sessionId ?? this.correlation?.getSessionId() ?? null;
-
-      await this.paceOutbound();
-      const data = await this.botCall("sendMessage", body, kind);
-      this.observeRateLimit(data);
-      if (
-        data?.ok &&
-        typeof data.result?.message_id === "number" &&
-        this.correlation &&
-        boundSlotId !== null &&
-        boundSessionId !== null
-      ) {
-        this.correlation.record({
-          botId: this.botId,
-          // Keyed on the chat the API actually delivered to, so a destination given as
-          // a name rather than a numeric id still produces a matchable key.
-          chatId: String(data.result.chat?.id ?? chatId),
-          messageId: data.result.message_id,
-          slotId: boundSlotId,
-          sessionId: boundSessionId,
-          requestId: correlationMeta?.requestId ?? null,
-          decisionId: correlationMeta?.decisionId ?? null,
-          projectPath: correlationMeta?.projectPath ?? null,
-          createdAt: Date.now() / 1000,
-          laneId: correlationMeta?.laneId,
-          laneState: correlationMeta?.laneState,
-          senderOrigin: "agent",
-        });
+        await this.paceOutbound();
+        const data = await this.botCall("sendMessage", body, kind);
+        this.observeRateLimit(data);
+        if (!data?.ok) return data;
+        lastData = data;
+        if (
+          typeof data.result?.message_id === "number" &&
+          this.correlation &&
+          boundSlotId !== null &&
+          boundSessionId !== null
+        ) {
+          this.correlation.record({
+            botId: this.botId,
+            // Use the delivered chat id so named destinations remain matchable.
+            chatId: String(data.result.chat?.id ?? chatId),
+            messageId: data.result.message_id,
+            slotId: boundSlotId,
+            sessionId: boundSessionId,
+            requestId: correlationMeta?.requestId ?? null,
+            decisionId: correlationMeta?.decisionId ?? null,
+            projectPath: correlationMeta?.projectPath ?? null,
+            createdAt: Date.now() / 1000,
+            laneId: correlationMeta?.laneId,
+            laneState: correlationMeta?.laneState,
+            senderOrigin: "agent",
+          });
+        }
       }
-      return data;
+      return lastData;
     } catch (err) {
       this.logTransportError("sendMessage", err);
       return null;

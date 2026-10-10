@@ -165,7 +165,11 @@ export function markdownToTelegramHtml(markdown: string, defaultRepo?: string): 
   });
 
   // 2b. Tables: keep narrow text tables, use labeled rows for mobile and clickable links.
-  text = convertTablesToHtml(text, addPlaceholder);
+  text = convertTablesToHtml(text, addPlaceholder, cell => {
+    const title = markdownToTelegramHtml(cell, allRepos.size > 1 ? undefined : defaultRepo);
+    // Telegram forbids code/pre entities inside bold, including auto-linked SHA code.
+    return addPlaceholder(`<b>${title.replace(/<\/?(?:code|pre)(?:\s[^>]*)?>/gi, "")}</b>`);
+  });
 
   // 2c. Backslash escapes: `\*`, `\_`, `\`` ... keep the literal character, drop the backslash.
   //     Backslash before any other character (Windows paths) is left alone.
@@ -364,7 +368,7 @@ function tableCellText(cell: string): string {
  * Row cells pass through the normal Markdown conversion so links stay clickable
  * and literal text is escaped once. Terminal Markdown is never changed.
  */
-function convertTablesToHtml(src: string, addPlaceholder: (val: string) => string): string {
+function convertTablesToHtml(src: string, addPlaceholder: (val: string) => string, renderTitle: (cell: string) => string): string {
   const lines = src.split("\n");
   const out: string[] = [];
   let i = 0;
@@ -395,16 +399,12 @@ function convertTablesToHtml(src: string, addPlaceholder: (val: string) => strin
         out.push(addPlaceholder(`<pre>${escapeHtml(plainTable)}</pre>`));
       } else {
         const [headers, ...body] = rows;
-        const openBold = addPlaceholder("<b>");
-        const closeBold = addPlaceholder("</b>");
         if (body.length === 0) {
-          out.push(headers.map(header =>
-            `${openBold}${header.replace(/`([^`\n]*)`/g, (_match, literal: string) => addPlaceholder(escapeHtml(literal)))}${closeBold}`,
-          ).join("\n"));
+          out.push(headers.map(renderTitle).join("\n"));
           continue;
         }
         out.push(body.map(row => [
-          `${openBold}${(row[0] ?? "").replace(/`([^`\n]*)`/g, (_match, literal: string) => addPlaceholder(escapeHtml(literal)))}${closeBold}`,
+          renderTitle(row[0] ?? ""),
           ...Array.from({ length: Math.max(headers.length, row.length) - 1 }, (_, column) =>
             `${headers[column + 1] || `Column ${column + 2}`}: ${row[column + 1] ?? ""}`),
         ].join("\n")).join("\n\n"));

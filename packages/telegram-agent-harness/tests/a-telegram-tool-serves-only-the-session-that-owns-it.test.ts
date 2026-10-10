@@ -328,6 +328,71 @@ function createChannel(messageThreadId?: number): {
   };
 }
 
+test("330 linked table rows fit every attributed-message send and keep each chunk correlated", async () => {
+  const host = createHost();
+  registerOperatorTools(host.api);
+  const runtime = new TelegramRuntime(host.api);
+  setActiveRuntime(runtime);
+  const channel = createChannel(14);
+  (globalThis as unknown as GlobalTelegramState)[ACTIVE_ROOT_SYMBOL] = channel.root(runtime.instanceId);
+  const text = ["| Name | Status |", "| --- | --- |", ...Array.from({ length: 330 }, () => "| x | [docs](https://example.com) |")].join("\n");
+  await host.tools.get("telegram_message")!.execute("large-table", { text, lane_id: "table-test", lane_state: "active" });
+  const sends = channel.calls.filter(call => call.method === "sendMessage");
+  expect(sends.length).toBeGreaterThan(1);
+  for (const send of sends) {
+    const html = String(send.body.text);
+    expect(html.replace(/<[^>]*>/g, "").length).toBeLessThanOrEqual(4096);
+    expect(send.body.message_thread_id).toBe(14);
+    expect(html.match(/<b>/g)?.length ?? 0).toBe(html.match(/<\/b>/g)?.length ?? 0);
+  }
+  expect(sends.map(send => String(send.body.text)).join("\n").match(/>docs<\/a>/g)).toHaveLength(330);
+  expect(channel.correlations.size).toBe(sends.length);
+  expect([...channel.correlations.values()].every(row => row.sessionId === "owning-session")).toBe(true);
+});
+
+test("330 linked table rows fit every daemon-fallback attributed send", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "tg-table-fallback-"));
+  const stateDir = path.join(home, "slot-state");
+  fs.mkdirSync(stateDir, { recursive: true });
+  fs.writeFileSync(path.join(stateDir, ".env"), "TELEGRAM_BOT_TOKEN=998:table-test\n");
+  fs.mkdirSync(path.join(home, ".veyyon", "telegram"), { recursive: true });
+  fs.writeFileSync(path.join(home, ".veyyon", "telegram", "manifest.json"), JSON.stringify({ slots: [{ slotId: "table-slot", stateDir }] }));
+  const db = new Database(path.join(home, ".veyyon", "telegram", "daemon.db"));
+  db.run("CREATE TABLE routes (slot_id TEXT, chat_id TEXT, topic_id TEXT, session_id TEXT, workspace TEXT)");
+  db.run("INSERT INTO routes VALUES ('table-slot', '42', '14', 'table-session', ?)", [home]);
+  db.close();
+  const previousHome = process.env.USERPROFILE;
+  const previousPosixHome = process.env.HOME;
+  process.env.USERPROFILE = home;
+  process.env.HOME = home;
+  cleanup.push(() => {
+    if (previousHome === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousHome;
+    if (previousPosixHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousPosixHome;
+    setSavedContext(null);
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+  const sent: Record<string, unknown>[] = [];
+  globalThis.fetch = (async (_url, init) => {
+    const body = JSON.parse(String(init?.body));
+    sent.push(body);
+    return Response.json({ ok: true, result: { message_id: sent.length, chat: { id: 42 } } });
+  }) as typeof fetch;
+  setActiveRuntime(null);
+  setSavedContext({ sessionId: "table-session", cwd: home } as unknown as Parameters<typeof setSavedContext>[0]);
+  const text = ["| Name | Status |", "| --- | --- |", ...Array.from({ length: 330 }, () => "| x | [docs](https://example.com) |")].join("\n");
+  await loadedTools().get("telegram_message")!.execute("large-fallback-table", { text, lane_id: "table-test", lane_state: "active" });
+  expect(sent.length).toBeGreaterThan(1);
+  for (const body of sent) {
+    const html = String(body.text);
+    expect(html.replace(/<[^>]*>/g, "").length).toBeLessThanOrEqual(4096);
+    expect(body.message_thread_id).toBe(14);
+    expect(html.match(/<b>/g)?.length ?? 0).toBe(html.match(/<\/b>/g)?.length ?? 0);
+  }
+  expect(sent.map(body => String(body.text)).join("\n").match(/>docs<\/a>/g)).toHaveLength(330);
+}, 15000);
+
 function loadedTools(): Map<string, RegisteredTool> {
   const host = createHost();
   registerOperatorTools(host.api);

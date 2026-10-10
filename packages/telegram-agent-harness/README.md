@@ -17,6 +17,8 @@ fits 32 characters and the cells contain no links or issue references.
 Other tables use one block per row. The first cell is bold, and each remaining
 cell follows its column name. Links stay clickable in their own cells.
 This conversion changes Telegram output only. Terminal Markdown stays unchanged.
+The send path converts tables before splitting long HTML messages.
+Each chunk keeps its tags balanced and stays within Telegram's message limit.
 
 ### Question waits and steering
 
