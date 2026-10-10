@@ -238,12 +238,13 @@ MEMORY_FLOOR_GIB = 3.0
 
 
 def _reservation_gib(job_class: str, mem_gib: Optional[float] = None) -> float:
+    heavy_minimum = 3.0 if job_class == "heavy" else MEMORY_RESERVATIONS.get("heavy", 5.0)
     if job_class not in MEMORY_RESERVATIONS:
         job_class = "heavy"
     value = MEMORY_RESERVATIONS.get(job_class, MEMORY_RESERVATIONS.get("heavy", 5.0)) if mem_gib is None else mem_gib
     if not math.isfinite(value) or value <= 0:
         raise ValueError("mem_gib must be positive and finite")
-    return max(value, MEMORY_RESERVATIONS.get("heavy", 5.0)) if job_class == "heavy" else value
+    return max(value, heavy_minimum) if job_class == "heavy" else value
 
 
 def get_available_ram_gib() -> Optional[float]:
@@ -2370,10 +2371,10 @@ class BuildSlotManager:
         for info in held:
             info = info or {}
             job_class = info.get("job_class", "heavy")
+            reservation = _reservation_gib(job_class, info.get("mem_gib"))
             if job_class not in MEMORY_RESERVATIONS:
                 job_class = "heavy"
             heavy_jobs += job_class == "heavy"
-            reservation = _reservation_gib(job_class, info.get("mem_gib"))
             reserved += reservation
             acquired = _parse_timestamp(info.get("acquired_at_epoch", info.get("acquired_at")))
             window = MEMORY_RAMP_SECONDS.get(job_class, MEMORY_RAMP_SECONDS["heavy"])
@@ -2413,9 +2414,9 @@ class BuildSlotManager:
             return False, "waiter missing from queue"
         head = queue[0]
         head_class = head.get("job_class", "heavy")
+        head_mem = _reservation_gib(head_class, head.get("mem_gib"))
         if head_class not in MEMORY_RESERVATIONS:
             head_class = "heavy"
-        head_mem = _reservation_gib(head_class, head.get("mem_gib"))
         head_reason = self._resource_refusal(head_class, head_mem, budget, force)
         stagger_reason = None
         if not force and last_acquired_at is not None:
@@ -2447,9 +2448,9 @@ class BuildSlotManager:
         # Keep FIFO among jobs that can currently run. Blocked entries keep their place.
         for item in queue[1:]:
             item_class = item.get("job_class", "heavy")
+            item_mem = _reservation_gib(item_class, item.get("mem_gib"))
             if item_class not in MEMORY_RESERVATIONS:
                 item_class = "heavy"
-            item_mem = _reservation_gib(item_class, item.get("mem_gib"))
             reason = self._resource_refusal(item_class, item_mem, budget, force)
             if stagger_reason and item_class == "heavy":
                 reason = f"{reason}; {stagger_reason}" if reason else stagger_reason

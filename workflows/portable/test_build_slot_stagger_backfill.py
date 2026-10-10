@@ -74,13 +74,28 @@ class TestStaggerBackfill(unittest.TestCase):
         self.assertTrue(self.manager.release('head', token='head'))
 
 
-    def test_heavy_explicit_three_is_raised_to_five_but_larger_values_stay(self):
+    def test_heavy_explicit_memory_keeps_three_gib_floor_and_five_gib_default(self):
         self.clock[0] = 1044.0
-        for declared, expected in [(3.0, 5.0), (8.0, 8.0)]:
-            with self.subTest(declared=declared):
+        cases = [
+            (None, 5.0),
+            (2.0, 3.0),
+            (3.0, 3.0),
+            (8.0, 8.0),
+        ]
+        for declared, expected in cases:
+            with self.subTest(declared=declared, expected=expected):
+                if declared is None:
+                    args = build_slot.parse_args(['run', '--class', 'heavy', 'build', '--', 'python', '-V'])
+                else:
+                    args = build_slot.parse_args(['run', '--class', 'heavy', '--mem-gib', str(declared), 'build', '--', 'python', '-V'])
+                self.assertEqual(args.job_class, 'heavy')
+                self.assertEqual(args.mem_gib, declared)
+                self.assertEqual(args.cmd, ['python', '-V'])
                 self.assertTrue(self.manager.acquire('build', token='build', timeout=.05,
-                                                    job_class='heavy', mem_gib=declared))
-                self.assertEqual(self.manager._read_slot_info(0)['mem_gib'], expected)
+                                                    job_class=args.job_class, mem_gib=args.mem_gib))
+                slot_info = self.manager._read_slot_info(0)
+                self.assertEqual(slot_info['mem_gib'], expected)
+                self.assertEqual(slot_info['job_class'], 'heavy')
                 self.assertTrue(self.manager.release('build', token='build'))
                 self.clock[0] += 46
 

@@ -38,11 +38,11 @@ Memory admission and job classification invariants:
 - Status reports total effective `reserved_gib` and current `ramp_reservations_gib` separately.
 - Jobs belong to four classes: `heavy`, `medium`, `light`, and `browser`.
 - Next builds and Next servers are heavy. Chrome-only QA is browser. TypeScript, Vitest, Wrangler, and workerd are medium. Other commands are light.
-- Heavy reservations have a 5 GiB minimum, even with explicit `--mem-gib 3`. Larger explicit reservations remain unchanged. Medium defaults to 1.5 GiB, light to 0.5 GiB, and browser to 1.1 GiB.
+- Heavy reservations default to 5 GiB. Explicit heavy overrides enforce a 3 GiB minimum: requests below 3 GiB raise to 3 GiB, while larger requests remain unchanged. Medium defaults to 1.5 GiB, light to 0.5 GiB, and browser to 1.1 GiB.
 - `acquire` defaults to light because it has no child command. Use `--class heavy` for manual builds or servers. Use `--class browser` only for headless QA without a build or server.
 - Both commands accept `--class` and `--mem-gib` to override classification and reservation.
-- Active slots record their reserved memory. Legacy slots without reservation metadata count as heavy with a 5 GiB minimum.
-- Unknown classes in shared queue or holder metadata count as heavy. They use the heavy minimum reservation, heavy cap, ramp window, stagger, and aging rules. Readers must not fail when a newer process writes a class they do not know. CLI class validation remains strict.
+- Active slots record their reserved memory. Legacy slots without reservation metadata count as heavy with the default 5 GiB reservation.
+- Unknown classes in shared queue or holder metadata count as heavy. Unknown metadata remains conservative at 5 GiB. They use the heavy cap, ramp window, stagger, and aging rules. Readers must not fail when a newer process writes a class they do not know. CLI class validation remains strict.
 - At most one `heavy` job may run concurrently across all slots. A second heavy job must wait in queue even if enough free RAM exists.
 - Browser jobs do not count toward the heavy cap. They can run beside a heavy build when both reservations preserve the RAM floor. A browser `run` refuses an obvious Next build or server command.
 - `--force` requires `BUILD_SLOT_ALLOW_FORCE=1`. Without it, acquisition fails. Authorized force logs the override and bypasses memory admission.

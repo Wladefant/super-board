@@ -4083,11 +4083,11 @@ class TestBuildSlot(unittest.TestCase):
         stat_held = manager.status()
         held_slot = next(s for s in stat_held["slots"] if s["owner"] == "lane-status-test")
         self.assertEqual(held_slot.get("job_class"), "heavy")
-        self.assertEqual(held_slot.get("mem_gib"), 5.0)
+        self.assertEqual(held_slot.get("mem_gib"), 3.0)
 
         mb_held = stat_held["memory_budget"]
-        self.assertEqual(mb_held["reserved_gib"], 5.0)
-        self.assertEqual(mb_held["free_budget_gib"], 24.0)
+        self.assertEqual(mb_held["reserved_gib"], 3.0)
+        self.assertEqual(mb_held["free_budget_gib"], 26.0)
 
         manager.release("lane-status-test")
 if __name__ == "__main__":

@@ -605,7 +605,7 @@ class TestBuildSlotAdmissionLoop(unittest.TestCase):
                 mock.patch("build_slot.get_available_ram_gib", return_value=11.0), \
                 mock.patch("build_slot.get_system_ram_percent", return_value=50.0):
             manager = BuildSlotManager(run_dir=run_dir, acquisition_stagger=0)
-            self.assertTrue(manager.acquire("held", token="held", timeout=.2, job_class="heavy", mem_gib=3.0))
+            self.assertTrue(manager.acquire("held", token="held", timeout=.2, job_class="heavy", mem_gib=5.0))
             self.assertTrue(manager.acquire("light-held", token="light-held", timeout=.2, mem_gib=.5))
             output = io.StringIO()
             with redirect_stderr(output), mock.patch("build_slot.get_available_ram_gib", return_value=6.68):
