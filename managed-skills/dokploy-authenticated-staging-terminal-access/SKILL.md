@@ -22,6 +22,21 @@ Evidence:
 3. Re-resolve the target using read-only Dokploy metadata. For this verified staging environment: control plane `https://hosting.wladefant.de`, compose `TU7b_dY9l9_nCas6YBNwj`, application `polysimulator-staging-iad-v09j4g`, server name `akamai-iad-staging`, database project `hgzyqmaanndcimnclxtv`. Rediscover the server ID; do not substitute another similarly named server. Stop on any mismatch.
 4. Production and retired Hetzner targets remain excluded. Do not enumerate unrelated hosts or open their terminals.
 
+## Bound remote Docker diagnostics
+Run every Docker diagnostic with a timeout on the remote host, not only on the SSH client.
+For logs, use `timeout --signal=TERM --kill-after=5s 20s docker logs --tail 40 --timestamps CONTAINER`.
+Use the same limit for `docker container logs`. Never leave an unbounded log reader after disconnecting SSH.
+A client-side timeout can leave its remote child running. After a timeout, check the exact remote process identity and confirm it exited.
+On 2026-10-09, two orphan log readers caused repeated `pread64` calls on tiny json logs and high dockerd CPU.
+Read-only syscall samples found the readers. Terminating the verified CLI processes reduced CPU without restarting any service.
+Never truncate or rotate Docker log files by hand. Docker owns those files.
+Never print complete process arguments for repository-clone shells. They can contain GitHub credentials.
+Use SSH `-o ServerAliveInterval=10` and `-o ServerAliveCountMax=3`. Keep log-follow streams disabled for diagnostics.
+The authorized Hostinger backstop is `dokploy-orphan-log-readers.timer`. It checks once per minute.
+Its guard targets only Docker log CLIs older than five minutes in SSH session scopes.
+It requires parent PID 1, or an orphan shell parent. It excludes service cgroups and all Docker builds.
+Revert with `systemctl disable --now dokploy-orphan-log-readers.timer`. Never stop an application service as part of this rollback.
+
 ## Attach once, then preserve the connection
 Use the operator's existing authenticated Chrome rather than creating an Edge window or a new application login.
 

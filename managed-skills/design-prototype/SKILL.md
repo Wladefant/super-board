@@ -6,7 +6,7 @@ disable-model-invocation: true
 
 # prototype
 
-Adapted from [emilkowalski/skills](https://github.com/emilkowalski/skills/tree/d16ebe60d09a5ba2afcb7054ede9d0a10c9f6128/skills/prototype), revision d16ebe60d09a5ba2afcb7054ede9d0a10c9f6128. Copyright (c) 2026 Emil Kowalski. MIT licensed; see [LICENSE](LICENSE). Original guidance and supporting files are preserved under upstream/. Local adaptation: Veyyon / PolySimulator, 2026-09-26.
+Adapted from [emilkowalski/skills](https://github.com/emilkowalski/skills/tree/d16ebe60d09a5ba2afcb7054ede9d0a10c9f6128/skills/prototype), revision d16ebe60d09a5ba2afcb7054ede9d0a10c9f6128. Copyright (c) 2026 Emil Kowalski. MIT licensed; see [LICENSE](LICENSE). Original guidance and supporting files are preserved under upstream/. Local adaptation: Veyyon / PolySimulator, 2026-09-26. Upstream re-checked 2026-10-05 against revision e8a175de22ae1e49370fc144c1f3bb9aeedf988d: content unchanged.
 
 ## PolySimulator application contract
 

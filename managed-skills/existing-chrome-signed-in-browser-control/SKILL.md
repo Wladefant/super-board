@@ -10,6 +10,14 @@ Do NOT use the operator's browser for everything. Routine/easy tasks use the ord
 
 This is a standing orchestration choice, not a mandate to build browser-routing tooling or change installed harness configuration. Apply it in lane assignments. Browser access does not replace reasoning, independent review or authorization.
 
+## Extension first, CDP last (2026-10-05, [Wladefant/veyyon#484](https://github.com/Wladefant/veyyon/issues/484))
+When a task needs the operator's signed-in Chrome, call `browser` with `app: {"extension": true}`. It uses the Playwright Extension and a loopback relay. It shows no `chrome://inspect` Allow prompt and opens no debugging port.
+1. The operator installs the extension once (steps in `docs/browser-extension-bridge.md` in the veyyon repo). If it is missing, stop and ask. Never attach over CDP instead.
+2. Only origins on the per-profile allowlist load. Production hosts (`<prod-supabase-ref>`, `akamai-iad-prod`, `polysimulator.com`) are always refused.
+3. Never print or log the token. `veyyon browser-extension disconnect` detaches every tab.
+4. Chrome shows a "started debugging this browser" bar on controlled tabs. That is expected.
+The CDP attach sections below stay only as history. The profile AGENTS.md rule "Own Browser Only, Extension First" forbids them.
+
 ## Safety and ownership
 - Do not restart/kill the user's Chrome, copy profiles/cookies, extract session credentials or recover secrets.
 - Restrict work to authorized targets. Existing login never grants production access or extra mutation permission.

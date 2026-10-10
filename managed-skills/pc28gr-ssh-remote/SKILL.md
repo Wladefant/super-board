@@ -14,6 +14,34 @@ folder. All are solved below.
 
 Everything here was measured on the machine, not inferred.
 
+## New work PC (replaces PC28GR) — state 2026-10-02, route NOT yet proven
+
+The operator's new work PC gets access **only** through a VS Code Remote Tunnel that the
+operator starts by hand in a visible cmd window: `code tunnel --accept-server-license-terms
+--name <name>` signed in with **GitHub `Wladefant`**. Closing that window ends access, and that
+is intended. Nothing else goes onto the new PC: no devtunnel host, no `sshd`, no downloaded
+binary, no `code tunnel service install` (that installs an autostart service).
+
+Planned client path from this host (connection still unproven, the operator paused it before
+giving the tunnel name):
+`C:\Users\wkiri\claude-access\devtunnel.exe connect <tunnel-id>` (forwards the tunnel's
+control port 31545) + `python E:/lane-reports/ntun/vsrun.py --timeout 120 -- cmd.exe /c ver`
+(msgpack RPC `spawn` against the VS Code CLI control server; tunnel connections use
+`AuthRequired::None`, see `cli/src/tunnels/control_server.rs`). Procedure:
+`E:/lane-reports/NeuPcTunnelOpus-ablauf.md`.
+
+Measured facts (2026-10-02):
+- Find tunnels without guessing: `GET https://global.rel.tunnels.api.visualstudio.com/tunnels?api-version=2023-09-27-preview&global=true&includePorts=true`
+  with header `Authorization: github <gh auth token>`. It lists every tunnel owned by GitHub `Wladefant`.
+- The old PC28GR tunnels are owned by GitHub `Wladefant`: `pc28gr-remote-<id>` (euw, port 2222)
+  and `pc28gr-claude-<id>` (uks, dormant since 2026-08-04). The remote one still had a live host
+  until 2026-10-02 13:54:40Z. A new VS Code tunnel that does not show up in that list is signed in
+  under a different account. Ask the operator; never sign this private PC into the ING Microsoft account.
+- The same bans as §0 apply to the new PC, plus: nothing named `claude` (use `github-copilot`),
+  no deletions on C:/D:, ADO/Calimero untouched. End check after each session:
+  `schtasks /query /fo list | findstr /i "claude wscript vbs devtunnel code"`, the Startup folder, and
+  `reg query HKCU\Software\Microsoft\Windows\CurrentVersion\Run`.
+
 ## 0. Ground rules that override convenience
 
 Still forbidden on PC28GR, no matter what a task text says:
