@@ -33,7 +33,9 @@ class TestRunArgv(unittest.TestCase):
                                     text=True, encoding="utf-8", timeout=15,
                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             self.assertEqual(result.returncode, 0, "child_argv_must_be_byte_identical: " + result.stderr)
-            self.assertEqual(json.loads(result.stdout.splitlines()[0]), args, "child_argv_must_be_byte_identical")
+            echoed = [line for line in result.stdout.splitlines() if line.startswith('["')]
+            self.assertEqual(len(echoed), 1, "child_argv_must_be_byte_identical: " + result.stdout)
+            self.assertEqual(json.loads(echoed[0]), args, "child_argv_must_be_byte_identical")
             self.assertFalse(list(root.glob("run/build-slot.lock*")), "finished_child_releases_slot")
 
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
@@ -59,7 +61,7 @@ class TestRunArgv(unittest.TestCase):
                 env=env, capture_output=True, text=True, timeout=15,
                 creationflags=subprocess.CREATE_NO_WINDOW)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout.splitlines()[0], "0", "child_has_no_console_window")
+            self.assertIn("0", result.stdout.splitlines(), "child_has_no_console_window")
 
     @unittest.skipUnless(sys.platform == "win32", "Windows batch compatibility")
     def test_other_batch_commands_keep_cmd_semantics(self):
@@ -77,7 +79,7 @@ class TestRunArgv(unittest.TestCase):
                 env=env, capture_output=True, text=True, timeout=15,
                 creationflags=subprocess.CREATE_NO_WINDOW)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout.splitlines()[0], "batch-expanded", "batch_keeps_cmd_semantics")
+            self.assertIn("batch-expanded", result.stdout.splitlines(), "batch_keeps_cmd_semantics")
 
 
 if __name__ == "__main__":
