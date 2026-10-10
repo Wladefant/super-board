@@ -3727,10 +3727,10 @@ class TestBuildSlot(unittest.TestCase):
         manager.release("default-lane")
 
     def test_one_heavy_cap_blocks_concurrent_heavy_jobs(self):
-        """At most one 'heavy' job may run concurrently across all slots."""
+        """At or above 85% RAM, at most one 'heavy' job may run concurrently across all slots."""
         manager = BuildSlotManager(run_dir=self.run_dir)
         os.environ["BUILD_SLOT_AVAILABLE_GIB"] = "64.0"
-
+        os.environ["BUILD_SLOT_RAM_PERCENT"] = "88.0"
         # Slot 1 acquires as heavy
         self.assertTrue(manager.acquire("heavy-lane-1", job_class="heavy", timeout=1.0))
 
@@ -3749,9 +3749,10 @@ class TestBuildSlot(unittest.TestCase):
         manager.release("heavy-lane-2")
 
     def test_force_cannot_bypass_heavy_cap(self):
-        """Even with BUILD_SLOT_ALLOW_FORCE=1, --force cannot bypass the one-heavy concurrency cap."""
+        """Even with BUILD_SLOT_ALLOW_FORCE=1, --force cannot bypass the heavy concurrency cap."""
         os.environ["BUILD_SLOT_ALLOW_FORCE"] = "1"
         os.environ["BUILD_SLOT_AVAILABLE_GIB"] = "64.0"
+        os.environ["BUILD_SLOT_RAM_PERCENT"] = "88.0"
         manager = BuildSlotManager(run_dir=self.run_dir)
 
         self.assertTrue(manager.acquire("heavy-1", job_class="heavy", timeout=1.0))
@@ -4079,15 +4080,15 @@ class TestBuildSlot(unittest.TestCase):
         self.assertEqual(mb["free_budget_gib"], 29.0)
 
         # Acquire a slot with class and memory
-        self.assertTrue(manager.acquire("lane-status-test", job_class="heavy", mem_gib=3.0, timeout=1.0))
+        self.assertTrue(manager.acquire("lane-status-test", job_class="heavy", mem_gib=4.5, timeout=1.0))
         stat_held = manager.status()
         held_slot = next(s for s in stat_held["slots"] if s["owner"] == "lane-status-test")
         self.assertEqual(held_slot.get("job_class"), "heavy")
-        self.assertEqual(held_slot.get("mem_gib"), 3.0)
+        self.assertEqual(held_slot.get("mem_gib"), 4.5)
 
         mb_held = stat_held["memory_budget"]
-        self.assertEqual(mb_held["reserved_gib"], 3.0)
-        self.assertEqual(mb_held["free_budget_gib"], 26.0)
+        self.assertEqual(mb_held["reserved_gib"], 4.5)
+        self.assertEqual(mb_held["free_budget_gib"], 24.5)
 
         manager.release("lane-status-test")
 if __name__ == "__main__":

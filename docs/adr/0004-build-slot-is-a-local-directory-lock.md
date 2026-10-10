@@ -38,15 +38,16 @@ Memory admission and job classification invariants:
 - Status reports total effective `reserved_gib` and current `ramp_reservations_gib` separately.
 - Jobs belong to four classes: `heavy`, `medium`, `light`, and `browser`.
 - Next builds and Next servers are heavy. Chrome-only QA is browser. TypeScript, Vitest, Wrangler, and workerd are medium. Other commands are light.
-- Heavy reservations default to 5 GiB. Explicit heavy overrides enforce a 3 GiB minimum: requests below 3 GiB raise to 3 GiB, while larger requests remain unchanged. Medium defaults to 1.5 GiB, light to 0.5 GiB, and browser to 1.1 GiB.
+- Heavy reservations default to 4.5 GiB (superseding decision, Telegram 2026-10-10 'BuildQ, sure', heavy default and minimum 4.5 GiB, cap 2 below 85% RAM). Explicit heavy overrides enforce a 4.5 GiB minimum: requests below 4.5 GiB raise to 4.5 GiB, while larger requests remain unchanged. Medium defaults to 1.5 GiB, light to 0.5 GiB, and browser to 1.1 GiB.
 - `acquire` defaults to light because it has no child command. Use `--class heavy` for manual builds or servers. Use `--class browser` only for headless QA without a build or server.
 - Both commands accept `--class` and `--mem-gib` to override classification and reservation.
-- Active slots record their reserved memory. Legacy slots without reservation metadata count as heavy with the default 5 GiB reservation.
+- Active slots record their reserved memory. Legacy slots without reservation metadata count as heavy with the conservative 5 GiB reservation.
 - Unknown classes in shared queue or holder metadata count as heavy. Unknown metadata remains conservative at 5 GiB. They use the heavy cap, ramp window, stagger, and aging rules. Readers must not fail when a newer process writes a class they do not know. CLI class validation remains strict.
-- At most one `heavy` job may run concurrently across all slots. A second heavy job must wait in queue even if enough free RAM exists.
+- Concurrency caps for `heavy` jobs (superseding decision, Telegram 2026-10-10 'BuildQ, sure', heavy default and minimum 4.5 GiB, cap 2 below 85% RAM): at most 2 `heavy` jobs may run concurrently across all slots when host RAM utilization is below 85%. When host RAM utilization is at or above 85% (or when RAM telemetry is missing/unknown), the heavy job concurrency cap is conservatively 1. A third heavy job below 85% RAM (or a second at or above 85% RAM) must wait in queue even if enough free RAM exists.
+- Second heavy admission safety invariant: admitting a second heavy job evaluates `second_heavy_fits(available_gib, new_reservation_gib, running_heavy_ramp_gib) -> bool`, requiring `available_gib - new_reservation_gib - running_heavy_ramp_gib >= 3.0` (tracked via `heavy_ramp_reservations_gib` for running heavy jobs started within the 300s ramp window, 4.5 GiB each). This reuses the existing host available RAM probe without process-tree telemetry.
 - Browser jobs do not count toward the heavy cap. They can run beside a heavy build when both reservations preserve the RAM floor. A browser `run` refuses an obvious Next build or server command.
 - `--force` requires `BUILD_SLOT_ALLOW_FORCE=1`. Without it, acquisition fails. Authorized force logs the override and bypasses memory admission.
-- Even when `BUILD_SLOT_ALLOW_FORCE=1` is set, `--force` cannot bypass the one-heavy job concurrency cap.
+- Even when `BUILD_SLOT_ALLOW_FORCE=1` is set, `--force` cannot bypass the heavy job concurrency cap.
 - The obsolete idle bypass is removed. Queue wait duration never bypasses host memory safety invariants.
 - Admission reads the stagger under the slot guard. The queue head and every heavy candidate retain the stagger. A smaller non-heavy job can backfill a stagger-blocked head when its reservation fits. Only heavy grants advance the stagger timestamp, so backfill does not extend the head's delay.
 - Waiters print resource refusal reasons and include the last reason in timeout output.
@@ -69,7 +70,7 @@ Environment variable tuning invariants:
   - Detected Vitest commands receive `VITEST_MAX_WORKERS=2` unless the caller sets it. Also pass `--maxWorkers=2` to Vitest.
 
 Status and observability invariants:
-- `status` reports `memory_budget` with `available_gib`, `reserved_gib`, `floor_gib`, and `free_budget_gib`.
+- `status` reports `memory_budget` with `available_gib`, `reserved_gib`, `floor_gib`, `free_budget_gib`, `heavy_limit`, `heavy_default_gib`, and `heavy_ramp_reservations_gib`.
 - Slot status entries in `status()["slots"]` include `job_class` and `mem_gib`.
 
 ## Consequences
