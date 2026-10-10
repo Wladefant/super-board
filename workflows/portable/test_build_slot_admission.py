@@ -1189,5 +1189,179 @@ class TestBuildSlotOperatorDecisionBuildQ(unittest.TestCase):
         self.assertEqual(build_slot._reservation_gib("unknown_future_worker", None), 5.0)
         self.assertEqual(build_slot._reservation_gib("unknown_future_worker", 1.0), 5.0)
         self.assertEqual(build_slot._reservation_gib("unknown_future_worker", 7.0), 7.0)
+class TestBuildSlotOccupiedLaneAdmission(unittest.TestCase):
+    """
+    Admission invariant tests:
+    - Admission ignores queue entries belonging to occupied lane names,
+      preserving queued entries and FIFO among eligible waiters.
+    - Regression: duplicate owner holding slot does not block later backfill waiter.
+    - Regression: same-token grant residue surviving under transition guard does not block.
+    - Head priority preserved once head fits.
+    - FIFO preserved among runnable backfill waiters.
+    - Heavy cap only under RAM policy where limit is one.
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix="build-slot-occupied-")
+        self.run_dir = os.path.join(self.test_dir, "run")
+        os.makedirs(self.run_dir, exist_ok=True)
+        self.manager = BuildSlotManager(run_dir=self.run_dir, acquisition_stagger=0)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_duplicate_owner_distinct_token_queued_does_not_block_later_backfill(self):
+        """
+        Regression: seed unfit medium head 1.5 GiB with budget available 3.69,
+        held light slot belonging to earlier-light, queued earlier-light request
+        with distinct token, then later-light 0.5 GiB. Later-light must acquire
+        despite earlier duplicate owner.
+        """
+        with mock.patch("build_slot.get_available_ram_gib", return_value=16.0), \
+             mock.patch("build_slot.get_system_ram_percent", return_value=50.0):
+            ok = self.manager.acquire("earlier-light", token="tok-earlier-held", job_class="light", mem_gib=0.5, timeout=1.0)
+            self.assertTrue(ok)
+
+        # Settle the held slot so ramp reservation is 0.0
+        info_path = os.path.join(self.manager.slot_dirs[0], build_slot.INFO_FILE_NAME)
+        info = self.manager._read_slot_info(0)
+        info["acquired_at_epoch"] = time.time() - 100.0
+        build_slot._write_json_atomic(info_path, info)
+
+        # Enqueue unfit medium head 1.5 GiB
+        self.manager.enqueue("medium-head", os.getpid(), token="tok-medium-head", job_class="medium", mem_gib=1.5)
+
+        # Queued earlier-light request with distinct token
+        self.manager.enqueue("earlier-light", os.getpid(), token="tok-earlier-distinct", job_class="light", mem_gib=0.5)
+
+        # Later-light 0.5 GiB must acquire with available 3.69 GiB (floor 3.0 -> free 0.69 GiB)
+        with mock.patch("build_slot.get_available_ram_gib", return_value=3.69), \
+             mock.patch("build_slot.get_system_ram_percent", return_value=50.0):
+            acquired = self.manager.acquire(
+                "later-light", token="tok-later-light", timeout=0.2, poll_interval=0.01, job_class="light", mem_gib=0.5
+            )
+            self.assertTrue(acquired, "later-light must acquire despite earlier duplicate owner holding a slot")
+            self.assertTrue(self.manager.is_held_by("later-light", token="tok-later-light"))
+
+    def test_same_token_grant_residue_under_transition_guard_does_not_block_later_backfill(self):
+        """
+        Regression: recently acquired same-token queue residue surviving in queue
+        before/under transition guard must not block later backfill waiter.
+        """
+        with mock.patch("build_slot.get_available_ram_gib", return_value=16.0), \
+             mock.patch("build_slot.get_system_ram_percent", return_value=50.0):
+            ok = self.manager.acquire("earlier-light", token="tok-earlier-grant", job_class="light", mem_gib=0.5, timeout=1.0)
+            self.assertTrue(ok)
+
+        info_path = os.path.join(self.manager.slot_dirs[0], build_slot.INFO_FILE_NAME)
+        info = self.manager._read_slot_info(0)
+        info["acquired_at_epoch"] = time.time() - 100.0
+        build_slot._write_json_atomic(info_path, info)
+
+        self.manager.enqueue("medium-head", os.getpid(), token="tok-medium-head", job_class="medium", mem_gib=1.5)
+
+        # Simulate same-token grant residue surviving in queue
+        now = time.time()
+        q_residue = [
+            {"name": "medium-head", "pid": os.getpid(), "token": "tok-medium-head", "job_class": "medium", "mem_gib": 1.5, "enqueued_at": now - 50.0},
+            {"name": "earlier-light", "pid": os.getpid(), "token": "tok-earlier-grant", "job_class": "light", "mem_gib": 0.5, "enqueued_at": now - 40.0},
+        ]
+        self.manager._write_queue(q_residue)
+
+        def clean_queue_fallback(*args, **kwargs):
+            return self.manager._read_queue()
+
+        with mock.patch.object(self.manager, "clean_queue", side_effect=clean_queue_fallback), \
+             mock.patch("build_slot.get_available_ram_gib", return_value=4.19), \
+             mock.patch("build_slot.get_system_ram_percent", return_value=50.0):
+            acquired = self.manager.acquire(
+                "later-light", token="tok-later-light", timeout=0.2, poll_interval=0.01, job_class="light", mem_gib=0.5
+            )
+            self.assertTrue(acquired, "later-light must acquire despite same-token grant residue for occupied lane in queue")
+            self.assertTrue(self.manager.is_held_by("later-light", token="tok-later-light"))
+
+    def test_head_priority_preserved_once_head_fits(self):
+        """FIFO head has priority once its required memory fits in available budget."""
+        now = time.time()
+        self.manager.enqueue("head-medium", os.getpid(), token="tok-head", job_class="medium", mem_gib=1.5)
+        self.manager.enqueue("later-light", os.getpid(), token="tok-later", job_class="light", mem_gib=0.5)
+
+        # When head fits (available 16.0, free budget > 1.5 GiB)
+        with mock.patch("build_slot.get_available_ram_gib", return_value=16.0), \
+             mock.patch("build_slot.get_system_ram_percent", return_value=50.0):
+            # later-light cannot jump ahead of runnable head
+            queue = self.manager._read_queue()
+            budget = self.manager._memory_budget()
+            admit_later, reason_later = self.manager._queue_admission(queue, "tok-later", budget, now)
+            self.assertFalse(admit_later)
+            self.assertIn("FIFO head 'head-medium' can run", reason_later)
+
+            # Head acquires first
+            ok_head = self.manager.acquire("head-medium", token="tok-head", timeout=0.2, poll_interval=0.01, job_class="medium")
+            self.assertTrue(ok_head)
+            self.assertTrue(self.manager.is_held_by("head-medium", token="tok-head"))
+            self.manager.release("head-medium", token="tok-head")
+
+    def test_fifo_preserved_among_runnable_waiters(self):
+        """When head is blocked, earlier eligible backfill waiter has FIFO priority over later waiter."""
+        now = time.time()
+        self.manager.enqueue("blocked-heavy", os.getpid(), token="tok-head", job_class="heavy", mem_gib=4.5)
+        self.manager.enqueue("first-light", os.getpid(), token="tok-first", job_class="light", mem_gib=0.5)
+        self.manager.enqueue("second-light", os.getpid(), token="tok-second", job_class="light", mem_gib=0.5)
+
+        # Budget where heavy cannot run (available 7.0, reserved 1.0, floor 3.0 -> free 3.0 < 4.5; projected 5.0 >= 4.5 not impossible)
+        # light 0.5 fits
+        with mock.patch("build_slot.get_available_ram_gib", return_value=7.0), \
+             mock.patch("build_slot.get_system_ram_percent", return_value=50.0):
+            os.makedirs(self.manager.slot_dirs[0], exist_ok=True)
+            dummy_info = {
+                "owner": "dummy-holder", "pid": os.getpid(), "token": "tok-dummy",
+                "job_class": "medium", "mem_gib": 1.0, "acquired_at_epoch": now,
+            }
+            build_slot._write_json_atomic(os.path.join(self.manager.slot_dirs[0], build_slot.INFO_FILE_NAME), dummy_info)
+
+            queue = self.manager._read_queue()
+            budget = self.manager._memory_budget()
+
+            # Second light cannot jump ahead of first light
+            admit_second, reason_second = self.manager._queue_admission(queue, "tok-second", budget, now)
+            self.assertFalse(admit_second)
+            self.assertEqual(reason_second, "earlier backfill waiter 'first-light' can run")
+
+            # First light acquires (into slot 1, since slot 0 is held by dummy)
+            ok_first = self.manager.acquire("first-light", token="tok-first", timeout=0.2, poll_interval=0.01, job_class="light")
+            self.assertTrue(ok_first)
+            self.assertTrue(self.manager.is_held_by("first-light", token="tok-first"))
+            self.manager.release("first-light", token="tok-first")
+            self.manager.release("dummy-holder", token="tok-dummy")
+
+    def test_heavy_cap_only_under_ram_policy_where_limit_is_one(self):
+        """
+        Heavy cap limits concurrency to 1 only when RAM >= 85% (or missing telemetry);
+        below 85% RAM, heavy limit is 2.
+        """
+        with mock.patch("build_slot.get_system_ram_percent", return_value=88.0):
+            budget_at_88 = {
+                "available_gib": 32.0, "reserved_gib": 4.5, "floor_gib": 3.0,
+                "free_budget_gib": 24.5, "heavy_jobs": 1,
+            }
+            refusal_at_88 = self.manager._resource_refusal("heavy", 4.5, budget_at_88)
+            self.assertIsNotNone(refusal_at_88)
+            self.assertIn("heavy cap", refusal_at_88)
+            self.assertIn("limit 1", refusal_at_88)
+
+            # Light job is not blocked by heavy cap at 88%
+            refusal_light_at_88 = self.manager._resource_refusal("light", 0.5, budget_at_88)
+            self.assertIsNone(refusal_light_at_88)
+
+        # Below 85% RAM (e.g. 50%), heavy limit is 2, so second heavy job is admitted
+        with mock.patch("build_slot.get_system_ram_percent", return_value=50.0):
+            budget_at_50 = {
+                "available_gib": 32.0, "reserved_gib": 4.5, "floor_gib": 3.0,
+                "free_budget_gib": 24.5, "heavy_jobs": 1,
+            }
+            refusal_at_50 = self.manager._resource_refusal("heavy", 4.5, budget_at_50)
+            self.assertIsNone(refusal_at_50)
+
 if __name__ == "__main__":
     unittest.main()

@@ -54,6 +54,8 @@ Invariants:
     - RAM admission charges held reservations during ramp-up (heavy 300s, medium
       120s, light/browser 60s), then uses available RAM alone, keeping a 3 GiB floor.
       Idle wait never bypasses guards. Force requires BUILD_SLOT_ALLOW_FORCE=1.
+    - Admission ignores queue entries belonging to occupied lane names,
+      preserving queued entries and FIFO among eligible waiters.
     - Operator build freeze: when 'build-freeze' exists in run_dir, acquire and run
       commands are refused immediately with exit 75 and 'build freeze active (<reason>)'
       printed to stderr (fallback 'reason unavailable' on read error). No queue entry
@@ -2406,6 +2408,7 @@ class BuildSlotManager:
             "ramp_reservations_gib": ramp_reservations,
             "floor_gib": MEMORY_FLOOR_GIB,
             "free_budget_gib": None if available is None else available - ramp_reservations - MEMORY_FLOOR_GIB,
+            "occupied_names": [info["owner"] for info in held if info and info.get("owner")],
             "heavy_jobs": heavy_jobs,
             "heavy_ramp_reservations_gib": heavy_ramp_reservations,
             "heavy_default_gib": HEAVY_RESERVATION_GIB,
@@ -2442,6 +2445,13 @@ class BuildSlotManager:
         caller = next((item for item in queue if item.get("token") == token), None)
         if caller is None:
             return False, "waiter missing from queue"
+        occupied_names = budget.get("occupied_names", ())
+        if caller.get("name") in occupied_names:
+            return False, f"lane '{caller.get('name')}' already holds a slot"
+        # acquire cannot grant a second slot to an occupied lane, even under a
+        # different token. Grant residues may also appear after clean_queue's
+        # snapshot. Neither is a runnable FIFO predecessor.
+        queue = [item for item in queue if item.get("name") not in occupied_names]
         head = queue[0]
         head_class = head.get("job_class")
         head_mem = _reservation_gib(head_class, head.get("mem_gib"))
