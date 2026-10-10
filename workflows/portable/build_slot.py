@@ -378,6 +378,44 @@ class _WindowsChildJob:
             self.handle = None
 
 
+def _windows_command_line(cmd, cwd, env):
+    """Resolve native argv and Node shims, retaining shell semantics for batches."""
+    search_path = env.get("PATH", "")
+    # Match cmd.exe's lookup of relative commands in the requested child cwd.
+    if cwd:
+        search_path = os.path.abspath(cwd) + os.pathsep + search_path
+    name = cmd[0]
+    if os.path.dirname(name) and not os.path.isabs(name):
+        name = os.path.join(cwd or os.getcwd(), name)
+    executable = shutil.which(name, path=search_path)
+    if executable is None:
+        raise FileNotFoundError(f"Command not found: {cmd[0]}")
+    if not executable.lower().endswith((".cmd", ".bat")):
+        argv = [executable, *cmd[1:]]
+        return executable, subprocess.list2cmdline(argv)
+    shim_dir = os.path.dirname(os.path.abspath(executable))
+    with open(executable, encoding="utf-8-sig") as stream:
+        shim = stream.read()
+    # npm's bundled npm/npx launchers use a variable for the CLI path.
+    bundled = re.search(r'SET "(?:NPM|NPX)_CLI_JS=%~dp0[\\/]+([^"\r\n]+)"', shim, re.I)
+    # cmd-shim launchers place the entrypoint immediately before %*.
+    generated = re.search(r'"%(?:dp0%|~dp0)[\\/]*([^"\r\n]+)"\s+%\*', shim, re.I)
+    entry = bundled or generated
+    if entry is None or not re.search(r"(?:node(?:\.exe)?|%_prog%|%NODE_EXE%)", shim, re.I):
+        shell = env.get("COMSPEC") or os.path.join(env["SystemRoot"], "System32", "cmd.exe")
+        # /s strips the outer pair. Batch arguments deliberately retain cmd semantics.
+        return shell, subprocess.list2cmdline([shell, "/d", "/s", "/c"]) + ' "' + subprocess.list2cmdline([executable, *cmd[1:]]) + '"'
+    script = os.path.normpath(os.path.join(shim_dir, entry.group(1)))
+    node = os.path.join(shim_dir, "node.exe")
+    if not os.path.isfile(node):
+        node = shutil.which("node.exe", path=search_path)
+    if node is None:
+        raise FileNotFoundError(f"Node executable not found for {executable}")
+    if not os.path.isfile(script):
+        raise FileNotFoundError(f"Node entrypoint not found for {executable}: {script}")
+    return node, subprocess.list2cmdline([node, script, *cmd[1:]])
+
+
 class _WindowsJobProcess:
     """Create the process inside its Job atomically, before any child can escape."""
     def __init__(self, cmd, cwd, env, job, stdin=subprocess.DEVNULL):
@@ -436,12 +474,12 @@ class _WindowsJobProcess:
             startup.startup.stdout = kernel.GetStdHandle(-11 & 0xFFFFFFFF)
             startup.startup.stderr = kernel.GetStdHandle(-12 & 0xFFFFFFFF)
             startup.attributes = ctypes.addressof(attributes)
-            shell = os.environ.get("COMSPEC") or os.path.join(os.environ["SystemRoot"], "System32", "cmd.exe")
-            command = ctypes.create_unicode_buffer(f'{shell} /c "{subprocess.list2cmdline(cmd)}"')
+            executable, command_line = _windows_command_line(cmd, cwd, env)
+            command = ctypes.create_unicode_buffer(command_line)
             environment = ctypes.create_unicode_buffer("\0".join(f"{key}={value}" for key, value in sorted(env.items())) + "\0\0")
             info = ProcessInfo()
             # EXTENDED_STARTUPINFO_PRESENT, CREATE_UNICODE_ENVIRONMENT, CREATE_NO_WINDOW
-            if not kernel.CreateProcessW(shell, command, None, None, True, 0x80000 | 0x400 | 0x8000000,
+            if not kernel.CreateProcessW(executable, command, None, None, True, 0x80000 | 0x400 | 0x8000000,
                                          environment, cwd, ctypes.byref(startup), ctypes.byref(info)):
                 raise ctypes.WinError(ctypes.get_last_error())
             self._handle = info.process
