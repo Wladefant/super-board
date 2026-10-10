@@ -224,6 +224,31 @@
       "docs": [
         "workflows/e2e/POLICY.md"
       ]
+    },
+    "merge-first": {
+      "name": "Temporary Merge-First Policy & Deployed FLOW-QA",
+      "description": "Temporary merge-first default order (SUPERBOARD_MERGE_FIRST=1), post-deploy FLOW-QA verification, revert instruction emission, and merge guard enforcement.",
+      "entry_files": [
+        "workflows/portable/merge_policy.py",
+        "workflows/portable/merge_guard.py",
+        "workflows/portable/post_deploy_qa.py"
+      ],
+      "tests": [
+        "workflows/portable/test_merge_policy.py",
+        "workflows/portable/test_merge_guard.py",
+        "workflows/portable/test_post_deploy_qa.py"
+      ],
+      "owning_issue": "https://github.com/Wladefant/super-board/issues/736",
+      "risk": "medium",
+      "components": [
+        "merge_first_enabled",
+        "MergeGuard",
+        "PostDeployQA"
+      ],
+      "cli_command": "python -B workflows/portable/post_deploy_qa.py --help",
+      "docs": [
+        "workflows/portable/PORTABLE.md"
+      ]
     }
   }
 }

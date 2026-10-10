@@ -71,7 +71,7 @@ Repeat until a done condition or halt gate fires:
 2. **Plan the wave** —
    `bash .claude/bin/super-board-wave-plan.sh --config <config-path>` →
    `{cards: [...]}`. Selection is backlog-aware: one card per non-empty
-   column downstream-first (Review → QA → Ready), then remaining
+   column downstream-first (under default `SUPERBOARD_MERGE_FIRST`, Review → Deploy/QA → Ready; when `SUPERBOARD_MERGE_FIRST=0`, Review → QA → Ready), then remaining
    `max_workers` slots fill from the most backlogged column; extra Review
    cards only when `human_approves_merge: true` (merge-race guard). If
    `cards` is empty and Building/QA/Review counts are 0 → done. If empty

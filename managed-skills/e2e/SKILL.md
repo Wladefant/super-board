@@ -22,12 +22,12 @@ Source of truth in the repo: `workflows/e2e/` of https://github.com/Wladefant/su
 - Replay is the default and needs no key: `python workflows/e2e/e2e_run.py --dir <project> --app-url <url>`. A cache miss fails the run. It never spends tokens.
 - Record only when a test is new or changed: add `--record` (OpenCode Go `qwen3.8-flash`, our API key, masked in output). Commit `.e2e/cache` only after `e2e_guard.py tree --allow-cache` finds no secret.
 - Heavy runs go through `build_slot.py` (the wrapper does it), one browser at a time, with a timeout. Stop the app server you started and free its port.
-- Receipt: `python workflows/e2e/e2e_receipt.py --report <project>/.e2e/report.json --expected-sha <served 40-hex sha> --base-url <url>`. It prints `FLOW-QA: PASS|FAIL <sha>`. Replay must be clean (0 model calls, 0 cache misses). If not, it prints `FLOW-QA-REASON replay_not_clean`. `--allow-model-calls` is only for a record run, and the receipt then prints `E2E-REPLAY-CHECK skipped`.
+- Receipt: `python workflows/e2e/e2e_receipt.py --report <project>/.e2e/report.json --expected-sha <served 40-hex sha> --base-url <url>`. It prints `FLOW-QA: PASS|FAIL <sha>`. Under default `SUPERBOARD_MERGE_FIRST`, verification runs post-deploy on staging against the deployed SHA (reverting immediately on failure). Setting `SUPERBOARD_MERGE_FIRST=0` restores the pre-merge receipt requirement. Replay must be clean (0 model calls, 0 cache misses). If not, it prints `FLOW-QA-REASON replay_not_clean`. `--allow-model-calls` is only for a record run, and the receipt then prints `E2E-REPLAY-CHECK skipped`.
 - Name each target by viewport: `390x844`, `390x420`, `1440x900`. The receipt needs `390x844` and `1440x900`.
 
 ## Rules
 
-1. Staging and local hosts only. The guard refuses production hosts at config load, at redirect time, in the page and per request. Never try to get around the guard.
+1. Staging and local hosts only. The guard refuses production hosts at config load, at redirect time, in the page and per request. Never try to get around the guard. Merge-first applies only to staging; production remains strictly forbidden.
 2. No subscription logins (`e2e login`), no hosted engines (`@e2e-dev/kernel`, `@e2e-dev/eas`), no `@e2e-dev/mobile` on Windows.
 3. Telemetry stays off. The wrapper sets `E2E_TELEMETRY_DISABLED=1` and `DO_NOT_TRACK=1`.
 4. Logins use `credentials.user()` from the config. No password or key in test code, `.env`, or `.e2e/`.

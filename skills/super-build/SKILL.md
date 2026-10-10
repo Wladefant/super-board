@@ -255,7 +255,7 @@ Follow spec `.claude/skills/super-board/references/run.md` → Builder (first pa
 4. Commit + push (always).
 5. Open **draft PR** with the PR description template from `run.md`.
 6. Post 🔨 PR timeline comment + short issue comment with PR URL.
-7. Move card Ready/Building → QA.
+7. Move card Ready/Building → Review under default `SUPERBOARD_MERGE_FIRST` (or Building → QA when `SUPERBOARD_MERGE_FIRST=0`).
 
 ### Lifecycle (Builder, rebuild)
 Triggered when card returns to Ready/Building with `loop:rebuild-N` label.
@@ -264,9 +264,9 @@ Triggered when card returns to Ready/Building with `loop:rebuild-N` label.
    ```bash
    gh api graphql -f query='mutation($threadId:ID!){resolveReviewThread(input:{threadId:$threadId}){thread{isResolved}}}' -f threadId="<thread-id>"
    ```
-3. Address any new failure feedback from Tester's latest ❌ comment.
+3. Address any new failure feedback from Tester's latest ❌ comment or post-deploy verification failure.
 4. Commit + push to same branch. Verify ALL `[builder]` threads are resolved before exit.
-5. 🔨 PR + issue comments. Move card Ready/Building → QA.
+5. 🔨 PR + issue comments. Move card Ready/Building → Review under default `SUPERBOARD_MERGE_FIRST` (or Building → QA when `SUPERBOARD_MERGE_FIRST=0`).
 
 ### Failure → handoff comment must include `root-cause-hash:` line
 On any failure-handoff comment, include:
@@ -276,7 +276,18 @@ root-cause-hash: <sha256 first 12 hex chars>
 Hash inputs (joined with `|`): lane (`build`) | error class | first 3 unique normalized file:line frames. See `.claude/skills/super-board/references/run.md` → Root-cause hash.
 
 ### Never merge
-Builder NEVER squash-merges. Reviewer owns merge.
+Builder NEVER squash-merges. Reviewer owns merge handoff, or the merge gate merges under default `SUPERBOARD_MERGE_FIRST`.
+
+### Temporary Merge-First Order (`SUPERBOARD_MERGE_FIRST`)
+The shared switch `SUPERBOARD_MERGE_FIRST` defaults to ON (`1`).
+Under default `SUPERBOARD_MERGE_FIRST`:
+1. Builder moves the card from Building to Review.
+2. Reviewer performs risk-based review. Risk review remains mandatory before merge.
+3. After review passes, the pull request merges to staging and deploys.
+4. Tester runs post-deploy verification on staging against the deployed commit SHA.
+5. If post-deploy verification fails, the lane reverts the deployed commit immediately.
+Setting `SUPERBOARD_MERGE_FIRST=0` disables merge-first and restores the old pre-merge QA order (Building → QA → Review → Merge).
+Production environments remain strictly excluded. Merge-first applies only to staging.
 
 ### Blocked exits use the §4 mandatory template
 When moving a card to Blocked, populate the full template from `.claude/skills/super-board/references/block-template.md`. A 1-line "needs creds" comment is a contract violation.

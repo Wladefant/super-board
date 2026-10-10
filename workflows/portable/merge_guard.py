@@ -39,13 +39,14 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Mapping
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from github_pr_gate import evaluate_qa_receipt, is_test_path  # noqa: E402  (sys.path set above)
+from merge_policy import merge_first_enabled  # noqa: E402
 
 GUARDED_REPO = "Bavariance/polysimulator"
 GUARDED_BASE = "staging"
@@ -414,7 +415,12 @@ def evaluate_feature_map(pr_data: Dict[str, Any]) -> Tuple[str, str]:
     )
 
 
-def evaluate_bookends(pr_data: Dict[str, Any], repo: str, cwd: Optional[str] = None) -> Dict[str, Any]:
+def evaluate_bookends(
+    pr_data: Dict[str, Any],
+    repo: str,
+    cwd: Optional[str] = None,
+    env: Optional[Mapping[str, str]] = None,
+) -> Dict[str, Any]:
     base = str(pr_data.get("baseRefName") or "")
     if repo != GUARDED_REPO or base != GUARDED_BASE:
         if repo == GUARDED_REPO and base == "main":
@@ -428,7 +434,10 @@ def evaluate_bookends(pr_data: Dict[str, Any], repo: str, cwd: Optional[str] = N
         pr_data, repo=repo, base_ref=base, head_sha=str(pr_data.get("headRefOid") or ""), cwd=cwd
     )
     fm_verdict, fm_reason = evaluate_feature_map(pr_data)
-    failures = [reason for verdict, reason in ((qa_verdict, qa_reason), (fm_verdict, fm_reason)) if verdict == "REQUIRED"]
+    if merge_first_enabled(env):
+        failures = [fm_reason] if fm_verdict == "REQUIRED" else []
+    else:
+        failures = [reason for verdict, reason in ((qa_verdict, qa_reason), (fm_verdict, fm_reason)) if verdict == "REQUIRED"]
     return {
         "guarded": True,
         "block": bool(failures),
@@ -454,6 +463,7 @@ def check_command(
     runner: Runner = _run,
     state_dir: Path = STATE_DIR,
     targets: Optional[List[Dict[str, Any]]] = None,
+    env: Optional[Mapping[str, str]] = None,
 ) -> Dict[str, Any]:
     """Decide whether a command may run. `block` is only ever true in enforce mode."""
     mode = mode or resolve_mode(state_dir=state_dir)
@@ -492,7 +502,7 @@ def check_command(
                 else:
                     pr_data = fetch_pr(repo, pr, runner)
                     entry.update(head=pr_data["headRefOid"])
-                    entry.update(evaluate_bookends(pr_data, repo, checkout))
+                    entry.update(evaluate_bookends(pr_data, repo, checkout, env=env))
         except (RuntimeError, ValueError, KeyError, json.JSONDecodeError) as exc:
             entry.update(
                 guarded=True, block=True,

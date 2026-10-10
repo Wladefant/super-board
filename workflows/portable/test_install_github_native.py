@@ -31,10 +31,11 @@ class Installation(unittest.TestCase):
                 name: {"role": name} for name in (
                     "github_work_item.py", "review_content.py", "install_github_native.py", "ledger.py", "verify.py",
                     "model_routing.py", "balance_loader.py", "routing_smoke_test.py",
+                    "merge_policy.py", "post_deploy_qa.py",
                 )
             },
             "export": {
-                "required_files": ["model_routing.py", "balance_loader.py"],
+                "required_files": ["model_routing.py", "balance_loader.py", "merge_policy.py", "post_deploy_qa.py"],
                 "optional_files": ["routing_smoke_test.py"],
             },
         }
@@ -50,6 +51,7 @@ class Installation(unittest.TestCase):
             ("portable", "depth_report_capture.mjs"),
             ("portable", "review_content.py"),
             ("portable", "github_pr_gate.py"),
+            ("portable", "merge_policy.py"),
             ("portable", "flows/shipnovo.json"),
             ("portable", "flows/polysimulator.json"),
             ("e2e", "e2e_receipt.py"),
@@ -74,7 +76,7 @@ class Installation(unittest.TestCase):
         import install_github_native as installer
         portable = self.source / "workflows/portable"
         for name in ("flow_qa_runner.mjs", "depth_report_capture.mjs", "review_content.py", "github_pr_gate.py",
-                     "flows/shipnovo.json", "flows/polysimulator.json"):
+                     "merge_policy.py", "flows/shipnovo.json", "flows/polysimulator.json"):
             source = portable / name
             source.parent.mkdir(parents=True, exist_ok=True)
             source.write_bytes(name.encode())
@@ -192,6 +194,29 @@ class Installation(unittest.TestCase):
                 self.assertEqual(installed.read_bytes(), b"stale ste")
                 self.assertTrue(synchronize(self.source, self.profile, self.runtime))
 
+
+    def test_merge_first_and_post_deploy_qa_installed_and_drift_checked(self):
+        self.assertIn("merge_policy.py", RUNTIME_FILES)
+        self.assertIn("test_merge_policy.py", RUNTIME_FILES)
+        self.assertIn("post_deploy_qa.py", RUNTIME_FILES)
+        self.assertIn("test_post_deploy_qa.py", RUNTIME_FILES)
+        self.assertTrue(synchronize(self.source, self.profile, self.runtime))
+        manifest = json.loads((self.runtime / "manifest.json").read_text(encoding="utf-8"))
+        for name in ("merge_policy.py", "post_deploy_qa.py"):
+            with self.subTest(manifest_name=name):
+                self.assertIn(name, manifest.get("modules", {}), f"{name} not deployed in runtime manifest modules")
+                self.assertIn(name, manifest.get("export", {}).get("required_files", []), f"{name} not in required_files")
+        for name in ("merge_policy.py", "test_merge_policy.py", "post_deploy_qa.py", "test_post_deploy_qa.py"):
+            with self.subTest(name=name):
+                installed = self.runtime / name
+                self.assertEqual(installed.read_bytes(), (self.source / "workflows/portable" / name).read_bytes())
+                installed.write_bytes(b"stale content")
+                report = io.StringIO()
+                with contextlib.redirect_stdout(report):
+                    self.assertFalse(synchronize(self.source, self.profile, self.runtime, check=True))
+                self.assertIn(f"DRIFT: {name}", report.getvalue())
+                self.assertEqual(installed.read_bytes(), b"stale content")
+                self.assertTrue(synchronize(self.source, self.profile, self.runtime))
     def test_isolated_installation_runtime_required_files_import_without_pyyaml(self):
         """Observable installer contract: runtime required files import without undeclared PyYAML dependency."""
         import importlib
