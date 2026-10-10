@@ -19,6 +19,8 @@ cell follows its column name. Links stay clickable in their own cells.
 This conversion changes Telegram output only. Terminal Markdown stays unchanged.
 The send path converts tables before splitting long HTML messages.
 Each chunk keeps its tags balanced and stays within Telegram's message limit.
+The poller sends each pre-split HTML chunk as one message, preserving its message ID.
+Multipart Markdown sends keep the destination topic that owned the first chunk.
 
 ### Question waits and steering
 

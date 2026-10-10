@@ -616,16 +616,17 @@ export class TelegramPoller {
     // Bind every chunk to the session that owned the complete message before any await.
     const boundSlotId = this.correlation?.getSlotId() ?? null;
     const boundSessionId = correlationMeta?.sessionId ?? this.correlation?.getSessionId() ?? null;
+    const threadId = messageThreadId ?? this.outboundThreadId;
     try {
       let lastData: TelegramSendMessageResponse | null = null;
-      const chunks = chunkMessage(formatted, 3800);
+      // HTML callers already split and track each message ID. Do not split them again.
+      const chunks = replyMarkupOrParseMode === "HTML" ? [formatted] : chunkMessage(formatted, 3800);
       for (const [index, chunk] of chunks.entries()) {
         const body: Record<string, unknown> = {
           chat_id: chatId,
           text: chunk,
           parse_mode: "HTML",
         };
-        const threadId = messageThreadId ?? this.outboundThreadId;
         if (threadId !== undefined) body.message_thread_id = threadId;
         if (replyMarkup && index === chunks.length - 1) body.reply_markup = replyMarkup;
 

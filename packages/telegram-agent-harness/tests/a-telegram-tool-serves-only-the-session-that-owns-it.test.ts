@@ -16,7 +16,7 @@
  * injects it — so `pi.zod` is an inert stub here and nothing asserts on the schemas.
  */
 
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -37,6 +37,7 @@ import { LiveDashboard } from "../src/live-dashboard";
 import { OperatorQuestionService, type Question } from "../src/operator-questions";
 import type { MessageCorrelationBridge, OutboundMessageCorrelation } from "../extension/types";
 import { instantTransport } from "./instant-transport";
+import { chunkMessage } from "../extension/sanitizer";
 
 interface ToolUpdate {
   content: Array<{ type: string; text: string }>;
@@ -328,6 +329,36 @@ function createChannel(messageThreadId?: number): {
   };
 }
 
+test("multipart Markdown keeps its original active topic across the first send await", async () => {
+  const channel = createChannel();
+  const state = channel.poller as unknown as { activeThreadId: number };
+  state.activeThreadId = 111;
+  const deliver = globalThis.fetch;
+  let requests = 0;
+  globalThis.fetch = (async (...args: Parameters<typeof fetch>) => {
+    const response = await deliver(...args);
+    if (++requests === 1) state.activeThreadId = 222;
+    return response;
+  }) as typeof fetch;
+  const text = ["| Name | Status |", "| --- | --- |", ...Array.from({ length: 330 }, () => "| x | [docs](https://example.com) |")].join("\n");
+  expect((await channel.poller.sendTelegramMessage("1", text))?.ok).toBe(true);
+  const sends = channel.calls.filter(call => call.method === "sendMessage");
+  expect(sends.length).toBeGreaterThan(1);
+  expect(sends.every(send => send.body.message_thread_id === 111)).toBe(true);
+});
+
+test("a pre-split balanced HTML fragment maps to exactly one Telegram message ID", async () => {
+  const channel = createChannel(14);
+  const fragment = chunkMessage(`<b>${"x".repeat(5000)}</b>`, 3800)[0];
+  expect(fragment.length).toBeGreaterThan(3800);
+  expect(fragment.length).toBeLessThanOrEqual(4096);
+  const sent = await channel.poller.sendTelegramMessage("1", fragment, "HTML");
+  const sends = channel.calls.filter(call => call.method === "sendMessage");
+  expect(sends).toHaveLength(1);
+  expect(sends[0].body.text).toBe(fragment);
+  expect(sent?.result?.message_id).toBe([...channel.correlations.keys()][0]);
+});
+
 test("330 linked table rows fit every attributed-message send and keep each chunk correlated", async () => {
   const host = createHost();
   registerOperatorTools(host.api);
@@ -361,15 +392,10 @@ test("330 linked table rows fit every daemon-fallback attributed send", async ()
   db.run("CREATE TABLE routes (slot_id TEXT, chat_id TEXT, topic_id TEXT, session_id TEXT, workspace TEXT)");
   db.run("INSERT INTO routes VALUES ('table-slot', '42', '14', 'table-session', ?)", [home]);
   db.close();
-  const previousHome = process.env.USERPROFILE;
-  const previousPosixHome = process.env.HOME;
-  process.env.USERPROFILE = home;
-  process.env.HOME = home;
+  // Bun on Linux caches os.homedir(), so changing HOME does not move this fixture.
+  const homeDirectory = spyOn(os, "homedir").mockReturnValue(home);
   cleanup.push(() => {
-    if (previousHome === undefined) delete process.env.USERPROFILE;
-    else process.env.USERPROFILE = previousHome;
-    if (previousPosixHome === undefined) delete process.env.HOME;
-    else process.env.HOME = previousPosixHome;
+    homeDirectory.mockRestore();
     setSavedContext(null);
     fs.rmSync(home, { recursive: true, force: true });
   });
