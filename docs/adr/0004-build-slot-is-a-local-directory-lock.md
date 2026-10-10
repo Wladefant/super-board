@@ -72,6 +72,10 @@ Command execution deadline and process tree invariants:
 - `run` gives children null stdin by default, so non-interactive commands that read stdin receive EOF.
 - `run --stdin` explicitly inherits the caller's stdin. Stdout and stderr continue streaming in both modes.
 - Windows keeps `CREATE_NO_WINDOW` and atomic Job Object assignment in both modes.
+- Windows launches native commands directly, without implicit `cmd.exe` parsing. Child arguments retain shell metacharacters.
+- npm, npx, and npm-generated Node shims launch their underlying Node entrypoint directly.
+- Other `.cmd` and `.bat` files use `cmd.exe /d /s /c` and retain shell semantics, including variable expansion and redirection.
+- Native commands that need shell operators must explicitly invoke `cmd.exe /c`.
 
 Environment variable tuning invariants:
 - Commands executed under `run` receive tuned environment variables:
