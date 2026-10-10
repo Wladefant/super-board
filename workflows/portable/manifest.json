@@ -347,6 +347,15 @@
         "Deploy-critical change detection"
       ]
     }
+    ,
+    "merge_policy.py": {
+      "role": "Shared policy switch for temporary merge-first workflow defaulting to ON and preserving legacy pre-merge QA gates when disabled",
+      "owner": "MergePolicy"
+    },
+    "post_deploy_qa.py": {
+      "role": "Post-deploy QA orchestrator for staging verification, served revision checking, and automated card blocking with manual revert instructions on failure",
+      "owner": "PostDeployQA"
+    }
   },
   "adapters": {
     "file": {
@@ -429,7 +438,9 @@
       "supabase_staging_health.py",
       "hosting_audit.py",
       "perfwatch.py",
-      "perfwatch_config.json"
+      "perfwatch_config.json",
+      "merge_policy.py",
+      "post_deploy_qa.py"
     ],
     "optional_files": [
       "test_adoption_audit.py",
@@ -462,7 +473,9 @@
       "test_recurrence_guard.py",
       "test_diagnostics.py",
       "test_telegram_workflow.py",
-      "test_session_crash_monitor.py"
+      "test_session_crash_monitor.py",
+      "test_merge_policy.py",
+      "test_post_deploy_qa.py"
     ]
   }
 }

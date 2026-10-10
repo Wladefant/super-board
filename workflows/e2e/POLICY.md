@@ -63,7 +63,7 @@ Receipt generator: `workflows/e2e/e2e_receipt.py`. Merge gate reader: `workflows
 2. Separate test runners for interactive web flows: `e2e` runs recorded flows and agentic navigation with zero model calls on replay.
 
 ### What remains (Flow QA invariants)
-1. Single authoritative gate: `github_pr_gate.py` remains the only merge gate reader. It consumes the `FLOW-QA: PASS <served-sha>` receipt produced by `e2e_receipt.py`.
+1. Single authoritative gate: `github_pr_gate.py` remains the only merge gate reader. It consumes the `FLOW-QA: PASS <served-sha>` receipt produced by `e2e_receipt.py`. Under default `SUPERBOARD_MERGE_FIRST`, approved staging changes merge and deploy first, then post-deploy Flow QA verifies the deployed SHA (`/api/version`) on staging, with immediate revert on failure. Setting `SUPERBOARD_MERGE_FIRST=0` restores the pre-merge gate requirement. Production hosts remain refused.
 2. Required viewport matrix: tests must cover `390x844` (mobile portrait), `390x420` (mobile with keyboard open), and `1440x900` (desktop).
 3. Tap targets and layout rules: 44 px minimum tap targets, no horizontal scroll overflow, and active focus visibility.
 4. Content-bound served SHA: the receipt binds the test run to `/api/version` on the served host. A mismatched or unverified SHA causes `FLOW-QA-REASON served_sha_mismatch` and fails the gate.

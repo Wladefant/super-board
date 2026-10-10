@@ -59,6 +59,24 @@ Progress: ✅ onboard  →  ✅ lint  →  🤖 run (you are here)
 
 Full variant — 3 lanes:
 
+Under default `SUPERBOARD_MERGE_FIRST` (default ON):
+```
+Builder:   Ready → Building → Review
+           worker   = claude -p with super-build skill
+           worktree = .worktrees/issue-<N>-build/
+           branch   = issue-<N>-<slug>
+
+Reviewer:  Review → Merge to staging → Deploy
+           worker   = claude -p with super-review skill
+           worktree = .worktrees/issue-<N>-review/
+           branch   = same issue-<N>-<slug>  (risk review required before merge)
+
+Tester:    Deploy → Verify on staging → Done (or Revert on fail → Building)
+           worker   = claude -p with super-qa skill
+           worktree = .worktrees/issue-<N>-qa/  (verifies deployed SHA, FLOW-QA)
+```
+
+When `SUPERBOARD_MERGE_FIRST=0` (restores old pre-merge QA order):
 ```
 Builder:   Ready → Building → QA
            worker   = claude -p with super-build skill
@@ -114,8 +132,9 @@ Example: `issue-42-add-chat-streaming`.
 There is **exactly one branch per issue** and **exactly one PR per issue**. All three lanes work on the same branch in their own worktrees:
 
 - Builder creates the branch off `config.base_branch`, writes code, commits + pushes, opens a **draft PR**.
-- Tester checks out the same branch in a fresh worktree, adds tests, commits to the same branch, pushes.
-- Reviewer **never merges**. On approval it marks the PR ready for review, moves the card to Review, and stops; a human rebase-merges. The runtime has no merge path, no auto-merge, and no substitute for a merge (it may not close the implementation issue in place of one).
+- Under default `SUPERBOARD_MERGE_FIRST`, Reviewer reviews the PR first. Risk review remains required before merge. Once approved, the PR merges to staging and deploys. Tester verifies the live staging host against the deployed commit SHA. The lane reverts the commit immediately if verification fails.
+- When `SUPERBOARD_MERGE_FIRST=0`, Tester checks out the branch in a fresh worktree and adds tests. Reviewer verifies Tester evidence before merge handoff.
+- Production environments remain strictly excluded. Merge-first applies only to staging.
 
 ## PR description template
 

@@ -34,6 +34,7 @@ of this skill forbids.
 
 QA attests to **one commit**, never to a branch. The policy lives in
 `scripts/super_board_runtime/qa.py`; never re-derive it in a prompt.
+Under default `SUPERBOARD_MERGE_FIRST`, QA verifies the exact deployed commit SHA post-deploy on staging. If post-deploy verification fails, the lane reverts the deployed commit immediately. Setting `SUPERBOARD_MERGE_FIRST=0` restores pre-merge exact-SHA QA on the PR head.
 
 1. **Resolve first, run second.** `super-qa-dispatch.sh` resolves the linked
    pull request and records `headRefOid` **before any command runs**. A
@@ -71,6 +72,7 @@ scripts/super-qa-dispatch.sh \
 
 A failed QA run **never merges, never closes the implementation issue, and
 never moves a card to Done.** `super-qa-file-bug.sh` applies exactly one of:
+Under default `SUPERBOARD_MERGE_FIRST`, a failed post-deploy QA run on staging immediately reverts the deployed merge commit. Under `SUPERBOARD_MERGE_FIRST=0`, a failed pre-merge run blocks the merge.
 
 | Failure kind | Next status | Follow-up issue |
 |---|---|---|
@@ -684,8 +686,8 @@ See `.claude/skills/super-board/references/run.md` → Tester (first pass — re
 3. Build issue-scoped test plan: ONE observable test per AC.
 4. Run tests. Capture evidence to `docs/super-board/runs/issue-<N>-qa-v<N>/`. **For any UI-affecting issue, capture at least one screenshot per AC** (Playwright `page.screenshot` or `browse --screenshot`). Save with descriptive names: `ac1-<short-desc>.png`, not `screenshot1.png`.
 5. **Commit the evidence directory** to the issue branch alongside test files (`git add docs/super-board/runs/issue-<N>-qa-v<N>/ && git commit && git push`). This is non-optional — without it, the inline image markdown in the issue comment won't render on GitHub.
-6. **Pass** → 🔍 PR comment with results + evidence path → 🔍 **issue comment with screenshot evidence** (see "Issue-comment evidence format" below) → move QA → Review. Clean up worktree.
-7. **Fail** → 🔍 PR comment with per-AC expected/actual + repro file:line + evidence path + "what fixed should look like" → 🔍 issue comment with the failure screenshots → increment rebuild counter → move QA → Ready (label `loop:rebuild-N`). Clean up worktree.
+6. **Pass** → post 🔍 PR comment with results and evidence path. Post 🔍 issue comment with screenshot evidence. Move card to Done under default `SUPERBOARD_MERGE_FIRST` (or QA → Review when `SUPERBOARD_MERGE_FIRST=0`). Clean up worktree.
+7. **Fail** → post 🔍 PR comment with repro details. Post 🔍 issue comment with failure screenshots. Under default `SUPERBOARD_MERGE_FIRST`, revert the deployed commit immediately. Increment rebuild counter. Move card to Ready/Building (`loop:rebuild-N`). Clean up worktree.
 
 ### Pass-handoff PR comment MUST include the test command
 Every Pass-handoff PR comment includes a `Local tests:` line with the EXACT command Reviewer will re-run as the self-verification gate:

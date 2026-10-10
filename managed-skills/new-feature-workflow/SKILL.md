@@ -86,7 +86,7 @@ python C:/Users/wkiri/.veyyon/workflows/build_slot.py release <task-name>
 2. Push branch: `git push -u origin feat/<task-name>`
 3. Open PR targeting `base: staging`:
    `gh pr create --base staging --title "..." --body "..."`
-4. Attach required verification evidence. For PolySimulator PRs touching `frontend/**` or trading/order paths, that means the Control Glass receipt against a server that serves the PR head: `python scripts/qa/control_polysim.py receipt --pr <N> --base-url <url>`. It posts `QA-RECEIPT: PASS|FAIL <served-sha>`. A receipt whose served SHA isn't the head doesn't count.
+4. Attach required verification evidence. Under default `SUPERBOARD_MERGE_FIRST`, approved staging changes merge and deploy first, then live QA runs post-deploy on staging against the deployed commit SHA (reverting immediately on failure). When `SUPERBOARD_MERGE_FIRST=0`, attach pre-merge verification evidence before merge: for PolySimulator PRs touching `frontend/**` or trading/order paths, run `python scripts/qa/control_polysim.py receipt --pr <N> --base-url <url>`. It posts `QA-RECEIPT: PASS|FAIL <served-sha>`. A receipt whose served SHA isn't the head doesn't count.
 5. If the task fixed a `kind:bug` issue, run `python C:/Users/wkiri/.veyyon/workflows/gardener.py --scan-bugs-only --bug <N> --live --issue-repo <owner/repo>` before yielding. It files a lint-rule proposal proven against the pre-fix and post-fix lines, or records `no-rule: <reason>`. Suspended until the fix for https://github.com/Wladefant/super-board/pull/290 merges (its dry-run posted real comments); until then, record `gardener: suspended (#290)`.
 
 ### 8. Worktree Teardown

@@ -155,7 +155,14 @@ class FeatureMapBookendTest(unittest.TestCase):
 class DecisionTest(unittest.TestCase):
     def setUp(self):
         self.state = Path(tempfile.mkdtemp(prefix="merge-guard-test-"))
+        self._orig_smf = os.environ.get("SUPERBOARD_MERGE_FIRST")
+        os.environ["SUPERBOARD_MERGE_FIRST"] = "0"
 
+    def tearDown(self):
+        if self._orig_smf is not None:
+            os.environ["SUPERBOARD_MERGE_FIRST"] = self._orig_smf
+        else:
+            os.environ.pop("SUPERBOARD_MERGE_FIRST", None)
     def decide(self, command, github, mode="enforce"):
         return check_command(command, None, mode=mode, runner=github, state_dir=self.state)
 
@@ -182,6 +189,25 @@ class DecisionTest(unittest.TestCase):
                 self.assertTrue(decision["block"])
                 self.assertEqual(decision["merges"][0][missing]["verdict"], "REQUIRED")
 
+
+    def test_merge_first_on_does_not_block_on_missing_qa_receipt(self):
+        """When merge-first is ON (default), merge_guard must not separately block on receipts."""
+        os.environ["SUPERBOARD_MERGE_FIRST"] = "1"
+        note_only = FakeGitHub({(REPO, 42): self.ui_pr(body=NOTE)})
+        decision = self.decide(f"gh pr merge 42 -R {REPO} --merge", note_only)
+        self.assertFalse(decision["block"])
+        self.assertNotIn("would_block", decision)
+        self.assertEqual(decision["merges"][0]["qa_receipt"]["verdict"], "REQUIRED")
+        self.assertEqual(decision["merges"][0]["feature_map"]["verdict"], "PASSED")
+
+    def test_merge_first_off_blocks_on_missing_qa_receipt(self):
+        """When merge-first is OFF, merge_guard blocks on missing QA receipt (legacy behavior)."""
+        os.environ["SUPERBOARD_MERGE_FIRST"] = "0"
+        note_only = FakeGitHub({(REPO, 42): self.ui_pr(body=NOTE)})
+        decision = self.decide(f"gh pr merge 42 -R {REPO} --merge", note_only)
+        self.assertTrue(decision["block"])
+        self.assertEqual(decision["merges"][0]["qa_receipt"]["verdict"], "REQUIRED")
+        self.assertIn("QA receipt required", decision["reason"])
     def test_a_merge_carrying_both_bookends_passes(self):
         github = FakeGitHub({(REPO, 42): self.ui_pr(body=NOTE, comments=[RECEIPT])})
         decision = self.decide(f"gh pr merge 42 -R {REPO} --merge", github)

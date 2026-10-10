@@ -190,13 +190,14 @@ See `.claude/skills/super-board/references/run.md` → Reviewer. Summary of 8 su
    - Clean up worktree, exit.
 3. Read PR + spot-check Tester evidence + read CLAUDE.md / AGENTS.md.
 4. Review code + tests.
-5. **Reviewer-side test rerun (always — closes Tester self-verification gap):**
+5. **Reviewer-side test rerun (closes Tester self-verification gap):**
    - Pull `issue-<N>-<slug>` into review worktree.
-   - Re-run the EXACT command from Tester's PR `Local tests:` line.
+   - Under default `SUPERBOARD_MERGE_FIRST`, Reviewer runs targeted local checks and mandatory risk reviews.
+   - When `SUPERBOARD_MERGE_FIRST=0`, re-run the EXACT command from Tester's PR `Local tests:` line.
    - Green → continue. Red → open new `[QA]`-prefixed thread quoting failure, move card Review → QA with `loop:rebuild-N`, exit.
 6. **Adversarial mode** (per `config.truth_gate` — `off` / `non-trivial` / `always`, default `non-trivial`): see section below.
 7. Decide per finding:
-   - **No findings + threads clean + truth ≥ threshold + tests green** → **human-merge handoff.** Mark the pull request ready for review (`gh pr ready <PR>`), leave the card in `Review`, write the handoff record, and stop. Do **not** merge, do **not** delete the branch, do **not** close the issue, do **not** move the card to `Done`. See "The runtime never merges" below.
+   - **No findings + threads clean + truth ≥ threshold + tests green** → **human-merge handoff.** Mark the pull request ready for review (`gh pr ready <PR>`), leave the card in `Review`, write the handoff record, and stop. Under default `SUPERBOARD_MERGE_FIRST`, approved staging pull requests merge and deploy before live QA verification. The lane reverts the merge immediately on failure. When `SUPERBOARD_MERGE_FIRST=0`, pre-merge QA verification must precede merge handoff. Do **not** merge directly. Do **not** delete the branch. Do **not** close the issue. Do **not** move the card to `Done`. See "The runtime never merges" below.
    - **Code-side new finding** → new `[builder]`-prefixed thread, move card Review → Ready (`loop:rebuild-N`).
    - **Test-side new finding** → new `[QA]`-prefixed thread, move card Review → QA (`loop:rebuild-N`).
    - **Blocker (schema, contract, money, auth, migration) or rebuild cap hit** → full §4 Block template, move card Review → Blocked.
@@ -330,9 +331,7 @@ This is enforced, not merely stated:
 `super_board_runtime.review.scan_merge_prohibitions` source-scans every
 executable runtime, workflow, skill, and reviewer path — including this file —
 for all eight merge mechanisms, and any active occurrence fails the release gate.
-Before reporting merge-ready, `validate_merge_handoff` must also agree: the live
-head must still equal the tested SHA and the `superboard/exact-sha-qa` check on
-that commit must have concluded success.
+Before reporting merge-ready, `validate_merge_handoff` checks evidence. Under default `SUPERBOARD_MERGE_FIRST`, staging verification runs post-deploy with immediate revert on failure. When `SUPERBOARD_MERGE_FIRST=0`, the live head must still equal the tested SHA and the `superboard/exact-sha-qa` check must pass. Risk review remains required before merge. Production remains strictly excluded.
 
 ### Prefix discipline
 - Every new review comment Reviewer writes MUST be prefixed `[builder]`, `[QA]`, or `[review]`.

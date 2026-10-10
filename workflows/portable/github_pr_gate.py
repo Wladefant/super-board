@@ -25,7 +25,14 @@ import re
 import subprocess
 import sys
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Mapping
+try:
+    from merge_policy import merge_first_enabled
+except ImportError:
+    _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+    if _SCRIPT_DIR not in sys.path:
+        sys.path.insert(0, _SCRIPT_DIR)
+    from merge_policy import merge_first_enabled
 try:
     from verify import validate_verify_receipt
 except ImportError:
@@ -325,6 +332,7 @@ DEPENDENCY_FIELDS: Tuple[str, ...] = (
 def validate_local_tests_record(
     record: Dict[str, Any],
     head_sha: str,
+    require_tsc_and_tests: bool = False,
 ) -> Tuple[bool, str]:
     """Validate a local tests record against the evaluated PR head commit."""
     if not isinstance(record, dict):
@@ -341,8 +349,87 @@ def validate_local_tests_record(
     commands = record.get("commands")
     if not isinstance(commands, list) or len(commands) == 0:
         return False, "local tests record commands must be a non-empty list"
+    if require_tsc_and_tests:
+        has_tsc = any("tsc" in str(cmd).lower() for cmd in commands)
+        if not has_tsc:
+            return False, "local tests record missing tsc command"
+        has_tests = any(
+            any(k in str(cmd).lower() for k in ("test", "pytest", "vitest", "jest"))
+            for cmd in commands
+        )
+        if not has_tests:
+            return False, "local tests record missing targeted tests command"
     return True, "valid local tests record"
 
+
+def validate_ci_absent_local_tests(
+    record: Dict[str, Any],
+    head_sha: str,
+) -> Tuple[bool, str]:
+    """Validate that when CI is absent, exact-head local tsc and targeted tests are recorded with positive counts."""
+    return validate_local_tests_record(record, head_sha, require_tsc_and_tests=True)
+
+
+QA_RECEIPT_CHECK_NAMES = frozenset({
+    "superboard/exact-sha-qa",
+    "exact-sha-qa",
+    "qa-receipt",
+    "browser-qa",
+    "browser qa",
+    "flow-qa",
+    "flow qa",
+    "staging qa capture",
+    "staging-qa-capture",
+    "control glass",
+    "control-glass",
+})
+
+QA_RECEIPT_CHECK_PATTERNS = (
+    "superboard/exact-sha-qa*",
+    "*exact-sha-qa*",
+    "*qa-receipt*",
+    "*browser-qa*",
+    "*browser qa*",
+    "*flow-qa*",
+    "*flow qa*",
+    "*staging qa capture*",
+    "*staging-qa-capture*",
+    "*control glass*",
+    "*control-glass*",
+)
+
+NON_RECEIPT_QA_KEYWORDS = (
+    "security",
+    "code-qa",
+    "code qa",
+    "lint",
+    "audit",
+    "sast",
+    "sonar",
+    "test-suite",
+    "unit-test",
+    "backend build",
+    "docker build",
+    "build-and-boot",
+)
+
+
+def is_qa_check_name(name: str) -> bool:
+    """Return whether a check run name identifies a browser QA or flow QA receipt check.
+
+    Tightened to explicit receipt/browser checks (e.g. superboard/exact-sha-qa, FLOW-QA,
+    QA-RECEIPT, staging QA capture). Security, code quality, test, and build QA checks
+    remain strictly non-receipt checks so their failures remain blocking.
+    """
+    n = name.lower().strip()
+    if any(k in n for k in NON_RECEIPT_QA_KEYWORDS):
+        return False
+    if n in QA_RECEIPT_CHECK_NAMES:
+        return True
+    for pat in QA_RECEIPT_CHECK_PATTERNS:
+        if fnmatch.fnmatch(n, pat):
+            return True
+    return False
 
 def package_json_dependencies_changed(
     f: Any,
@@ -364,8 +451,24 @@ def package_json_dependencies_changed(
     path = f.get("path") if isinstance(f, dict) else str(f)
     if base_commit and head_sha and path:
         try:
-            b_out = subprocess.run(["git", "show", f"{base_commit}:{path}"], capture_output=True, text=True, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
-            h_out = subprocess.run(["git", "show", f"{head_sha}:{path}"], capture_output=True, text=True, check=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+            b_out = subprocess.run(
+                ["git", "show", f"{base_commit}:{path}"],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=10,
+                stdin=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            ).stdout
+            h_out = subprocess.run(
+                ["git", "show", f"{head_sha}:{path}"],
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=10,
+                stdin=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            ).stdout
             b_json = json.loads(b_out)
             h_json = json.loads(h_out)
             for k in DEPENDENCY_FIELDS:
@@ -1432,6 +1535,7 @@ def evaluate_pr_gate(
     verify_receipt: Optional[Dict[str, Any]] = None,
     require_verify_receipt: Optional[bool] = None,
     local_tests_record: Optional[Dict[str, Any]] = None,
+    env: Optional[Mapping[str, str]] = None,
 ) -> PRGateEvaluation:
     """
     Deterministically evaluates GitHub PR status gate without LLM churn.
@@ -1443,9 +1547,12 @@ def evaluate_pr_gate(
     repo/base. Named automated branches still require a content-bound GitHub review.
     Legacy local review metadata is advisory cache data and cannot grant approval.
 
-    Independently of review policy, a PolySimulator `staging` PR whose diff reaches
-    `frontend/` or an order/trading path is BLOCKED unless a PR comment carries a
-    browser QA receipt for this diff; see `evaluate_qa_receipt`.
+    Independently of review policy, under default merge-first workflow
+    (SUPERBOARD_MERGE_FIRST=1), staging UI PRs with green CI pass risk-exempt without
+    pre-merge QA or FLOW receipts; verification runs post-deploy on staging.
+    When SUPERBOARD_MERGE_FIRST=0, exact legacy behavior is restored where any PR
+    whose diff reaches `frontend/` or an order/trading path is BLOCKED unless a PR comment
+    carries a browser QA receipt for this diff; see `evaluate_qa_receipt`.
     """
     now_utc = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     base_ref = str(pr_data.get("baseRefName") or (pr_data.get("base") or {}).get("ref") or "")
@@ -1604,14 +1711,18 @@ def evaluate_pr_gate(
         c_conclusion = str(check.get("conclusion") or check.get("state") or "").upper()
         c_completed_at = check.get("completedAt") or check.get("createdAt")
         if c_conclusion in ("FAILURE", "TIMED_OUT", "ACTION_REQUIRED", "CANCELLED", "STARTUP_FAILURE"):
-            if is_blocking(c_name):
+            if merge_first_enabled(env) and is_qa_check_name(c_name):
+                advisory_failing_checks.append(c_name)
+            elif is_blocking(c_name):
                 failing_checks.append(c_name)
                 if c_completed_at and (latest_ci_failure_time is None or c_completed_at > latest_ci_failure_time):
                     latest_ci_failure_time = c_completed_at
             else:
                 advisory_failing_checks.append(c_name)
         elif c_status in ("IN_PROGRESS", "QUEUED", "PENDING", "EXPECTED"):
-            if is_blocking(c_name):
+            if merge_first_enabled(env) and is_qa_check_name(c_name):
+                pass
+            elif is_blocking(c_name):
                 pending_checks.append(c_name)
 
     # Per AGENTS.md §6: Never wait more than 5 minutes on CI — EXCEPT for
@@ -1672,6 +1783,17 @@ def evaluate_pr_gate(
         ci_verdict = "FAILURE"
     elif pending_checks:
         ci_verdict = "PENDING"
+    elif merge_first_enabled(env) and not any(not is_qa_check_name(name) and str(check.get("conclusion") or check.get("state") or "").upper() == "SUCCESS" for name, check in deduped_status_rollup.items()):
+        if local_tests_record is None:
+            ci_verdict = "FAILURE"
+            failing_checks.append("local-tests-record (CI absent: local tests record required)")
+        else:
+            is_valid_ltr, ltr_reason = validate_ci_absent_local_tests(local_tests_record, head_sha)
+            if not is_valid_ltr:
+                ci_verdict = "FAILURE"
+                failing_checks.append(f"local-tests-record ({ltr_reason})")
+            else:
+                ci_verdict = "SUCCESS"
     else:
         ci_verdict = "SUCCESS"
 
@@ -1852,12 +1974,16 @@ def evaluate_pr_gate(
     qa_receipt_verdict, qa_receipt_reason, qa_receipt_url = evaluate_qa_receipt(
         pr_data, repo=repo, base_ref=base_ref, head_sha=head_sha
     )
-    qa_receipt_blocked = qa_receipt_verdict == "REQUIRED"
     # 4D. Real user-flow QA receipt (FLOW-QA), required for staging UI changes
     flow_qa_receipt_verdict, flow_qa_receipt_reason, flow_qa_receipt_url = evaluate_flow_qa_receipt(
         pr_data, repo=repo, base_ref=base_ref, head_sha=head_sha
     )
-    flow_qa_receipt_blocked = flow_qa_receipt_verdict == "REQUIRED"
+    if merge_first_enabled(env):
+        qa_receipt_blocked = False
+        flow_qa_receipt_blocked = False
+    else:
+        qa_receipt_blocked = qa_receipt_verdict == "REQUIRED"
+        flow_qa_receipt_blocked = flow_qa_receipt_verdict == "REQUIRED"
     # 5. Final Gate Verdict
     if ci_verdict == "FAILURE":
         gate_verdict = "BLOCKED"

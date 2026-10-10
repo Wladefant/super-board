@@ -106,6 +106,8 @@ class TestGitHubPRGate(unittest.TestCase):
         git("checkout", "feature")
 
     def setUp(self):
+        self._orig_smf = os.environ.get("SUPERBOARD_MERGE_FIRST")
+        os.environ["SUPERBOARD_MERGE_FIRST"] = "0"
         self.mock_pr = {
             "number": 4545,
             "state": "OPEN",
@@ -143,6 +145,12 @@ class TestGitHubPRGate(unittest.TestCase):
                 }
             ],
         }
+
+    def tearDown(self):
+        if self._orig_smf is not None:
+            os.environ["SUPERBOARD_MERGE_FIRST"] = self._orig_smf
+        else:
+            os.environ.pop("SUPERBOARD_MERGE_FIRST", None)
 
     def make_review_artifact(
         self,
@@ -2223,6 +2231,257 @@ class TestGitHubPRGate(unittest.TestCase):
         self.assertEqual(main_result.qa_receipt_verdict, "EXEMPT")
         self.assertIn("no QA receipt requirement for Bavariance/polysimulator@main", main_result.qa_receipt_reason)
         print("  [PASS] QA receipt requirement is staging-scoped and fails closed on a truncated file list")
+
+    # ------------------------------------------------------------------
+    # Merge-First Targeted Switch Tests (TEMPORARY 2026-10-10)
+    # ------------------------------------------------------------------
+
+    def test_switch_on_ui_pr_green_ci_no_qa_receipt_passes_risk_exempt(self):
+        """When merge-first is ON, UI PR with green CI and no QA receipt passes risk-exempt."""
+        os.environ["SUPERBOARD_MERGE_FIRST"] = "1"
+        pr = copy.deepcopy(self.mock_pr)
+        pr["files"] = [{"path": "frontend/components/OrderTicket.tsx", "additions": 10, "deletions": 5}]
+        pr["baseRefName"] = "staging"
+        pr["comments"] = []
+        policy = resolve_gate_policy("Bavariance/polysimulator", "staging")
+        res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy)
+        self.assertEqual(res.gate_verdict, "PASSED")
+        self.assertEqual(res.review_decision, "exempt")
+        self.assertEqual(res.ci_verdict, "SUCCESS")
+
+    def test_switch_off_ui_pr_green_ci_no_qa_receipt_blocks_legacy(self):
+        """When merge-first is OFF, UI PR without QA receipt is BLOCKED (legacy)."""
+        os.environ["SUPERBOARD_MERGE_FIRST"] = "0"
+        pr = copy.deepcopy(self.mock_pr)
+        pr["files"] = [{"path": "frontend/components/OrderTicket.tsx", "additions": 10, "deletions": 5}]
+        pr["baseRefName"] = "staging"
+        pr["comments"] = []
+        policy = resolve_gate_policy("Bavariance/polysimulator", "staging")
+        res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy)
+        self.assertEqual(res.gate_verdict, "BLOCKED")
+        self.assertEqual(res.qa_receipt_verdict, "REQUIRED")
+        self.assertIn("no PR comment carries a 'QA-RECEIPT: PASS' marker", res.verdict_reason)
+
+    def test_switch_on_ui_pr_green_ci_no_flow_qa_receipt_passes_risk_exempt(self):
+        """When merge-first is ON, UI PR with green CI and no FLOW-QA receipt passes risk-exempt."""
+        os.environ["SUPERBOARD_MERGE_FIRST"] = "1"
+        pr = copy.deepcopy(self.mock_pr)
+        pr["files"] = [{"path": "frontend/components/OrderTicket.tsx", "additions": 10, "deletions": 5}]
+        pr["baseRefName"] = "staging"
+        pr["comments"] = []
+        policy = resolve_gate_policy("Bavariance/polysimulator", "staging")
+        res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy)
+        self.assertEqual(res.gate_verdict, "PASSED")
+        self.assertEqual(res.review_decision, "exempt")
+
+    def test_switch_off_ui_pr_green_ci_no_flow_qa_receipt_blocks_legacy(self):
+        """When merge-first is OFF, UI PR without FLOW-QA receipt is BLOCKED (legacy)."""
+        os.environ["SUPERBOARD_MERGE_FIRST"] = "0"
+        pr = copy.deepcopy(self.mock_pr)
+        pr["files"] = [{"path": "frontend/components/OrderTicket.tsx", "additions": 10, "deletions": 5}]
+        pr["baseRefName"] = "staging"
+        pr["comments"] = []
+        policy = resolve_gate_policy("Bavariance/polysimulator", "staging")
+        res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy)
+        self.assertEqual(res.gate_verdict, "BLOCKED")
+        self.assertEqual(res.flow_qa_receipt_verdict, "REQUIRED")
+
+    def test_switch_on_review_still_required_for_high_risk(self):
+        """When merge-first is ON, review is still required for high-risk domains."""
+        os.environ["SUPERBOARD_MERGE_FIRST"] = "1"
+        pr = copy.deepcopy(self.mock_pr)
+        pr["labels"] = [{"name": "risk:high"}]
+        pr["files"] = [{"path": "backend/app/trading.py", "additions": 10, "deletions": 5}]
+        pr["baseRefName"] = "staging"
+        pr["reviews"] = []
+        policy = resolve_gate_policy("Bavariance/polysimulator", "staging")
+        res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy)
+        self.assertEqual(res.gate_verdict, "BLOCKED")
+        self.assertEqual(res.review_decision, "required")
+    def test_switch_on_review_still_required_for_large_diff(self):
+        """When merge-first is ON, review is still required for diff > 250 lines."""
+        os.environ["SUPERBOARD_MERGE_FIRST"] = "1"
+        pr = copy.deepcopy(self.mock_pr)
+        pr["files"] = [{"path": "frontend/components/BigComponent.tsx", "additions": 200, "deletions": 60}]
+        pr["baseRefName"] = "staging"
+        pr["reviews"] = []
+        policy = resolve_gate_policy("Bavariance/polysimulator", "staging")
+        res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy)
+        self.assertEqual(res.gate_verdict, "BLOCKED")
+        self.assertEqual(res.review_decision, "required")
+
+    def test_switch_on_production_protected_still_blocks(self):
+        """When merge-first is ON, production-protected base strictly requires human approval."""
+        os.environ["SUPERBOARD_MERGE_FIRST"] = "1"
+        pr = copy.deepcopy(self.mock_pr)
+        pr["baseRefName"] = "main"
+        pr["files"] = [{"path": "docs/readme.md", "additions": 5, "deletions": 1}]
+        pr["reviews"] = []
+        # Standard policy for main requires human approval
+        policy = resolve_gate_policy("Bavariance/polysimulator", "main")
+        res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy)
+        self.assertEqual(res.gate_verdict, "BLOCKED")
+
+        # Custom policy waiving approval must still be refused on production-protected base
+        custom_policy = GateApprovalPolicy(
+            repo="Bavariance/polysimulator",
+            base_ref="main",
+            require_github_approval=False,
+            allow_review_exemption=True,
+        )
+        custom_res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=custom_policy)
+        self.assertEqual(custom_res.gate_verdict, "BLOCKED")
+        self.assertIn("Production-protected base", custom_res.verdict_reason)
+    def test_switch_on_true_ci_fail_blocks(self):
+        """When merge-first is ON, real CI check failure blocks the gate."""
+        os.environ["SUPERBOARD_MERGE_FIRST"] = "1"
+        pr = copy.deepcopy(self.mock_pr)
+        pr["files"] = [{"path": "frontend/components/OrderTicket.tsx", "additions": 10, "deletions": 5}]
+        pr["baseRefName"] = "staging"
+        pr["statusCheckRollup"][0]["conclusion"] = "FAILURE"
+        policy = resolve_gate_policy("Bavariance/polysimulator", "staging")
+        res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy)
+        self.assertEqual(res.gate_verdict, "BLOCKED")
+        self.assertEqual(res.ci_verdict, "FAILURE")
+        self.assertIn("CI status check(s) failed", res.verdict_reason)
+
+    def test_switch_on_deploy_critical_qa_status_does_not_block(self):
+        """When merge-first is ON, QA statuses in status checks do not block, but real failures block."""
+        os.environ["SUPERBOARD_MERGE_FIRST"] = "1"
+        pr = copy.deepcopy(self.mock_pr)
+        pr["files"] = [{"path": "frontend/components/OrderTicket.tsx", "additions": 10, "deletions": 5}]
+        pr["baseRefName"] = "staging"
+        pr["statusCheckRollup"].append({
+            "name": "browser-qa",
+            "status": "IN_PROGRESS",
+            "conclusion": "",
+        })
+        policy = resolve_gate_policy("Bavariance/polysimulator", "staging")
+        res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy)
+        self.assertEqual(res.gate_verdict, "PASSED")
+        self.assertEqual(res.ci_verdict, "SUCCESS")
+
+    def test_switch_on_security_and_code_qa_remain_blocking(self):
+        """When merge-first is ON, security-qa and code-qa checks are NOT waived and remain blocking."""
+        os.environ["SUPERBOARD_MERGE_FIRST"] = "1"
+        for check_name in ("security-qa", "code-qa", "qa-lint", "sast-audit"):
+            with self.subTest(check_name=check_name):
+                pr = copy.deepcopy(self.mock_pr)
+                pr["files"] = [{"path": "frontend/components/OrderTicket.tsx", "additions": 10, "deletions": 5}]
+                pr["baseRefName"] = "staging"
+                pr["statusCheckRollup"].append({
+                    "name": check_name,
+                    "status": "COMPLETED",
+                    "conclusion": "FAILURE",
+                })
+                policy = resolve_gate_policy("Bavariance/polysimulator", "staging")
+                res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy)
+                self.assertEqual(res.gate_verdict, "BLOCKED")
+                self.assertEqual(res.ci_verdict, "FAILURE")
+                self.assertIn(check_name, res.failing_checks)
+
+    def test_is_qa_check_name_classification(self):
+        """Unit test: explicit receipt/browser QA matches; code and security QA do not."""
+        from github_pr_gate import is_qa_check_name
+        self.assertTrue(is_qa_check_name("browser-qa"))
+        self.assertTrue(is_qa_check_name("FLOW-QA"))
+        self.assertTrue(is_qa_check_name("QA-RECEIPT"))
+        self.assertTrue(is_qa_check_name("superboard/exact-sha-qa"))
+        self.assertTrue(is_qa_check_name("staging QA capture"))
+        self.assertTrue(is_qa_check_name("control glass"))
+
+        # Negative controls: must be False
+        self.assertFalse(is_qa_check_name("security-qa"))
+        self.assertFalse(is_qa_check_name("code-qa"))
+        self.assertFalse(is_qa_check_name("code qa"))
+        self.assertFalse(is_qa_check_name("qa-lint"))
+        self.assertFalse(is_qa_check_name("sast-audit"))
+        self.assertFalse(is_qa_check_name("unit-tests"))
+        self.assertFalse(is_qa_check_name("backend build"))
+
+    def test_switch_on_ci_absent_without_local_tests_record_blocks(self):
+        """When merge-first is ON and CI is absent, missing local tests record blocks."""
+        os.environ["SUPERBOARD_MERGE_FIRST"] = "1"
+        pr = copy.deepcopy(self.mock_pr)
+        pr["files"] = [{"path": "frontend/components/OrderTicket.tsx", "additions": 10, "deletions": 5}]
+        pr["baseRefName"] = "staging"
+        pr["statusCheckRollup"] = []
+        policy = resolve_gate_policy("Bavariance/polysimulator", "staging")
+        res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy, local_tests_record=None)
+        self.assertEqual(res.gate_verdict, "BLOCKED")
+        self.assertEqual(res.ci_verdict, "FAILURE")
+
+    def test_switch_on_ci_absent_without_tsc_record_blocks(self):
+        """When merge-first is ON and CI is absent, record lacking tsc command blocks."""
+        os.environ["SUPERBOARD_MERGE_FIRST"] = "1"
+        pr = copy.deepcopy(self.mock_pr)
+        pr["files"] = [{"path": "frontend/components/OrderTicket.tsx", "additions": 10, "deletions": 5}]
+        pr["baseRefName"] = "staging"
+        pr["statusCheckRollup"] = []
+        record = {
+            "head_sha": self.head_sha,
+            "passed": 10,
+            "failed": 0,
+            "commands": ["pytest tests/test_orders.py"],
+        }
+        policy = resolve_gate_policy("Bavariance/polysimulator", "staging")
+        res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy, local_tests_record=record)
+        self.assertEqual(res.gate_verdict, "BLOCKED")
+        self.assertEqual(res.ci_verdict, "FAILURE")
+
+    def test_switch_on_ci_absent_without_targeted_tests_blocks(self):
+        """When merge-first is ON and CI is absent, record lacking targeted test command blocks."""
+        os.environ["SUPERBOARD_MERGE_FIRST"] = "1"
+        pr = copy.deepcopy(self.mock_pr)
+        pr["files"] = [{"path": "frontend/components/OrderTicket.tsx", "additions": 10, "deletions": 5}]
+        pr["baseRefName"] = "staging"
+        pr["statusCheckRollup"] = []
+        record = {
+            "head_sha": self.head_sha,
+            "passed": 1,
+            "failed": 0,
+            "commands": ["tsc --noEmit"],
+        }
+        policy = resolve_gate_policy("Bavariance/polysimulator", "staging")
+        res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy, local_tests_record=record)
+        self.assertEqual(res.gate_verdict, "BLOCKED")
+        self.assertEqual(res.ci_verdict, "FAILURE")
+
+    def test_switch_on_ci_absent_with_zero_passed_blocks(self):
+        """When merge-first is ON and CI is absent, record with passed=0 blocks."""
+        os.environ["SUPERBOARD_MERGE_FIRST"] = "1"
+        pr = copy.deepcopy(self.mock_pr)
+        pr["files"] = [{"path": "frontend/components/OrderTicket.tsx", "additions": 10, "deletions": 5}]
+        pr["baseRefName"] = "staging"
+        pr["statusCheckRollup"] = []
+        record = {
+            "head_sha": self.head_sha,
+            "passed": 0,
+            "failed": 0,
+            "commands": ["tsc --noEmit", "pytest tests/test_orders.py"],
+        }
+        policy = resolve_gate_policy("Bavariance/polysimulator", "staging")
+        res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy, local_tests_record=record)
+        self.assertEqual(res.gate_verdict, "BLOCKED")
+        self.assertEqual(res.ci_verdict, "FAILURE")
+
+    def test_switch_on_ci_absent_with_valid_exact_head_tsc_and_tests_passes(self):
+        """When merge-first is ON and CI is absent, valid exact-head tsc and targeted tests record passes."""
+        os.environ["SUPERBOARD_MERGE_FIRST"] = "1"
+        pr = copy.deepcopy(self.mock_pr)
+        pr["files"] = [{"path": "frontend/components/OrderTicket.tsx", "additions": 10, "deletions": 5}]
+        pr["baseRefName"] = "staging"
+        pr["statusCheckRollup"] = []
+        record = {
+            "head_sha": self.head_sha,
+            "passed": 24,
+            "failed": 0,
+            "commands": ["tsc --noEmit", "pytest tests/test_orders.py"],
+        }
+        policy = resolve_gate_policy("Bavariance/polysimulator", "staging")
+        res = evaluate_pr_gate(pr, repo="Bavariance/polysimulator", policy=policy, local_tests_record=record)
+        self.assertEqual(res.gate_verdict, "PASSED")
+        self.assertEqual(res.ci_verdict, "SUCCESS")
 
 def main():
     print("=" * 70)

@@ -46,6 +46,9 @@ RUNTIME_FILES = (
     "verify.py", "test_verify.py",
     # Lane-brief merge guard (Wladefant/super-board#227).
     "merge_guard.py", "test_merge_guard.py",
+    # Temporary merge-first policy switch and post-deploy QA orchestrator.
+    "merge_policy.py", "test_merge_policy.py",
+    "post_deploy_qa.py", "test_post_deploy_qa.py",
     # Session crash monitor and test suite.
     "session_crash_monitor.py", "test_session_crash_monitor.py",
     # Mechanically verified lane inventory and crash recovery audit.
@@ -131,6 +134,7 @@ def synchronize(
     for name in (
         "github_work_item.py", "review_content.py", "install_github_native.py", "ledger.py", "verify.py",
         "model_routing.py", "balance_loader.py", "routing_smoke_test.py",
+        "merge_policy.py", "post_deploy_qa.py",
     ):
         if name in source_manifest.get("modules", {}):
             manifest.setdefault("modules", {})[name] = source_manifest["modules"][name]
@@ -138,6 +142,7 @@ def synchronize(
     for name in (
         "github_work_item.py", "review_content.py",
         "model_routing.py", "balance_loader.py",
+        "merge_policy.py", "post_deploy_qa.py",
     ):
         if name not in required:
             required.append(name)
@@ -178,7 +183,7 @@ def synchronize_sha_readers(source_root: Path, runtime: Path, check: bool = Fals
     pairs = [
         (source_root / "workflows/portable" / name, runtime / name)
         for name in ("flow_qa_runner.mjs", "depth_report_capture.mjs", "review_content.py", "github_pr_gate.py",
-                     "install_github_native.py", "PORTABLE.md")
+                     "merge_policy.py", "install_github_native.py", "PORTABLE.md")
     ] + [
         (source_root / "workflows/e2e" / name, runtime / "e2e" / name)
         for name in ("e2e_receipt.py", "e2e_guard.py", "pins.json")

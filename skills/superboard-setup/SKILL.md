@@ -500,12 +500,7 @@ QA proves one thing: *this exact commit* passed (`scripts/super_board_runtime/qa
 5. Release the lock and the worktree on **every** terminal path — success, test failure,
    exception, stale head, and signal.
 
-**Later commits inherit no passing QA.** Every head change invalidates it. The current head
-must equal the tested SHA before the card moves to Review, and again immediately before a
-human merges. A missing, ambiguous, changed, or unreadable head refuses to run rather than
-falling back to "whatever is checked out". On failure the card never merges and never moves
-to the completion column: it goes to Building when the current worker can repair it, or to
-Blocked when external input is needed.
+**Later commits inherit no passing QA.** Every head change invalidates it. Under default `SUPERBOARD_MERGE_FIRST`, approved staging changes merge and deploy first, then post-deploy QA verifies the deployed commit SHA with immediate revert on failure. When `SUPERBOARD_MERGE_FIRST=0`, the current head must equal the tested SHA before the card moves to Review, and again immediately before a human merges. A missing, ambiguous, changed, or unreadable head refuses to run rather than falling back to "whatever is checked out". On failure the card never merges and never moves to the completion column: it goes to Building when the current worker can repair it, or to Blocked when external input is needed. Production remains strictly excluded.
 
 ### Merge is human-only and rebase-only
 

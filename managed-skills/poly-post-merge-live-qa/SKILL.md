@@ -1,6 +1,6 @@
 ---
 name: poly-post-merge-live-qa
-description: "Post-merge live QA procedure for PolySimulator staging: webhook confirm, deployment attestation, signed-in default-functionality smoke pass, browser verification, and evidence attachment."
+description: "Post-merge live QA procedure for PolySimulator staging: webhook confirm, deployment attestation, signed-in default-functionality smoke pass, browser verification, and revert on failure under default SUPERBOARD_MERGE_FIRST."
 ---
 
 # Poly Post-Merge Live QA
@@ -8,7 +8,7 @@ description: "Post-merge live QA procedure for PolySimulator staging: webhook co
 Source of truth: `AGENTS.md` §11 in [Bavariance/polysimulator](https://github.com/Bavariance/polysimulator) (trim carve-out, token audit 2026-09-26). Read the repository `AGENTS.md` for the surrounding authorization, deploy-attestation (§10), and conflict rules.
 
 ## When to Use
-Once a merge to `staging` swings application-marked `watchPaths` (auto-deploy). After the merge lands, immediately verify the load, not "later".
+Once a merge to `staging` swings application-marked `watchPaths` (auto-deploy). After the merge lands, immediately verify the load, not "later". Under default `SUPERBOARD_MERGE_FIRST`, this post-deploy verification is the primary live QA gate; if verification fails, revert the deployed commit immediately. When `SUPERBOARD_MERGE_FIRST=0`, this serves as post-deploy attestation after pre-merge QA has already passed. Production remains strictly forbidden.
 
 1. **Watch the merge land and confirm deployment fired.** Use Dokploy read-only container/health checks and §10 cache-busted full-SHA checks:
    - Backend `https://staging-api.polysimulator.com/v1/version?expected=<full-sha>`
