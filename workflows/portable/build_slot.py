@@ -232,19 +232,34 @@ DEFAULT_QUEUE_CLEANUP_GRACE_SECONDS = 8.0  # queue cleanup after a slot is settl
 LAST_ACQUIRED_FILE_NAME = "last-acquired-at.json"
 DEFAULT_PID_DEAD_GRACE_PERIOD_SECONDS = 60.0  # never reclaim a dead-PID lock younger than 60s
 
-MEMORY_RESERVATIONS = {"heavy": 5.0, "medium": 1.5, "light": 0.5, "browser": 1.1}
+HEAVY_RESERVATION_GIB = 4.5
+HEAVY_CONCURRENCY_RAM_THRESHOLD_PERCENT = 85.0
+MEMORY_RESERVATIONS = {"heavy": HEAVY_RESERVATION_GIB, "medium": 1.5, "light": 0.5, "browser": 1.1}
 MEMORY_RAMP_SECONDS = {"heavy": 300.0, "medium": 120.0, "light": 60.0, "browser": 60.0}
 MEMORY_FLOOR_GIB = 3.0
 
 
 def _reservation_gib(job_class: str, mem_gib: Optional[float] = None) -> float:
-    heavy_minimum = 3.0 if job_class == "heavy" else MEMORY_RESERVATIONS.get("heavy", 5.0)
+    heavy_minimum = HEAVY_RESERVATION_GIB if job_class == "heavy" else 5.0
     if job_class not in MEMORY_RESERVATIONS:
-        job_class = "heavy"
-    value = MEMORY_RESERVATIONS.get(job_class, MEMORY_RESERVATIONS.get("heavy", 5.0)) if mem_gib is None else mem_gib
+        return max(5.0, _reservation_gib("heavy", mem_gib)) if mem_gib is not None else 5.0
+    value = MEMORY_RESERVATIONS[job_class] if mem_gib is None else mem_gib
     if not math.isfinite(value) or value <= 0:
         raise ValueError("mem_gib must be positive and finite")
     return max(value, heavy_minimum) if job_class == "heavy" else value
+
+
+def second_heavy_fits(available_gib, new_reservation_gib, running_heavy_ramp_gib):
+    """Preserve the free floor using current RAM and young heavy reservations."""
+    values = (available_gib, new_reservation_gib, running_heavy_ramp_gib)
+    return all(value is not None and math.isfinite(value) and value >= 0 for value in values) and (
+        available_gib - new_reservation_gib - running_heavy_ramp_gib >= MEMORY_FLOOR_GIB
+    )
+
+
+def _heavy_limit(ram_percent):
+    return 2 if (ram_percent is not None and math.isfinite(ram_percent)
+                 and ram_percent < HEAVY_CONCURRENCY_RAM_THRESHOLD_PERCENT) else 1
 
 
 def get_available_ram_gib() -> Optional[float]:
@@ -2366,6 +2381,8 @@ class BuildSlotManager:
         held = [self._read_slot_info(i) for i, path in enumerate(self.slot_dirs) if os.path.isdir(path)]
         reserved = 0.0
         ramp_reservations = 0.0
+        heavy_ramp_reservations = 0.0
+        ram_percent = get_system_ram_percent()
         heavy_jobs = 0
         now = time.time()
         for info in held:
@@ -2382,20 +2399,33 @@ class BuildSlotManager:
             # during its peak ramp; unknown or future timestamps stay conservative.
             if acquired is None or not math.isfinite(acquired) or now - acquired < window:
                 ramp_reservations += reservation
+                if job_class == "heavy":
+                    heavy_ramp_reservations += HEAVY_RESERVATION_GIB
         return {
             "available_gib": available, "reserved_gib": reserved,
             "ramp_reservations_gib": ramp_reservations,
             "floor_gib": MEMORY_FLOOR_GIB,
             "free_budget_gib": None if available is None else available - ramp_reservations - MEMORY_FLOOR_GIB,
             "heavy_jobs": heavy_jobs,
+            "heavy_ramp_reservations_gib": heavy_ramp_reservations,
+            "heavy_default_gib": HEAVY_RESERVATION_GIB,
+            "ram_percent": ram_percent,
+            "heavy_limit": _heavy_limit(ram_percent),
         }
 
     def _resource_refusal(self, job_class, mem_gib, budget, force=False):
         if job_class not in MEMORY_RESERVATIONS:
             job_class = "heavy"
         reasons = []
-        if job_class == "heavy" and budget["heavy_jobs"] >= 1:
-            reasons.append(f"heavy cap: {budget['heavy_jobs']} heavy job(s) held, limit 1")
+        ram_percent = budget["ram_percent"] if "ram_percent" in budget else get_system_ram_percent()
+        heavy_limit = _heavy_limit(ram_percent)
+        if job_class == "heavy" and budget["heavy_jobs"] >= heavy_limit:
+            reasons.append(f"heavy cap: {budget['heavy_jobs']} heavy job(s) held, limit {heavy_limit}")
+        if job_class == "heavy" and budget["heavy_jobs"] and not second_heavy_fits(
+            budget["available_gib"], mem_gib,
+            budget.get("heavy_ramp_reservations_gib", HEAVY_RESERVATION_GIB * budget["heavy_jobs"]),
+        ):
+            reasons.append(f"current RAM: second heavy needs {mem_gib:.2f} GiB plus young heavy reservations and {MEMORY_FLOOR_GIB:.2f} GiB floor")
         free = budget["free_budget_gib"]
         if not force:
             if free is None:
@@ -3247,6 +3277,12 @@ def format_status_human(stat: Dict[str, Any]) -> str:
     max_slots = stat.get("max_slots", len(SLOT_LOCK_DIR_NAMES))
     guard_thresh = stat.get("ram_guard_threshold", DEFAULT_RAM_GUARD_THRESHOLD_PERCENT)
     lines.append(f"Capacity:    {max_slots} slot(s) allowed (RAM guard: {guard_thresh:.0f}%)")
+    budget = stat.get("memory_budget", {})
+    lines.append(
+        f"Heavy jobs:  limit {budget.get('heavy_limit', _heavy_limit(stat.get('ram_percent')))}, "
+        f"default/minimum {HEAVY_RESERVATION_GIB:.2f} GiB "
+        f"(2 below {HEAVY_CONCURRENCY_RAM_THRESHOLD_PERCENT:.0f}% RAM, otherwise 1)"
+    )
 
     holders = [s for s in slots if s.get("locked")]
     if holders:

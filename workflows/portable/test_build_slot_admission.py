@@ -52,7 +52,7 @@ class TestBuildSlotAdmissionAndResourceRefusal(unittest.TestCase):
     # -------------------------------------------------------------------------
 
     def test_resource_refusal_heavy_job_cap_refuses_when_heavy_held(self):
-        """When heavy_jobs >= 1, job_class='heavy' is refused regardless of free memory."""
+        """When at or above 85% RAM (or two heavy jobs held below 85%), heavy is refused under heavy cap."""
         budget = {
             "available_gib": 16.0,
             "reserved_gib": 3.0,
@@ -60,10 +60,17 @@ class TestBuildSlotAdmissionAndResourceRefusal(unittest.TestCase):
             "free_budget_gib": 10.0,
             "heavy_jobs": 1,
         }
-        refusal = self.manager._resource_refusal("heavy", 3.0, budget)
-        self.assertIsNotNone(refusal, "Expected heavy job to be refused when heavy_jobs >= 1")
+        with mock.patch("build_slot.get_system_ram_percent", return_value=88.0):
+            refusal = self.manager._resource_refusal("heavy", 3.0, budget)
+        self.assertIsNotNone(refusal, "Expected heavy job to be refused when heavy_jobs >= 1 at high RAM")
         self.assertIn("heavy", refusal.lower())
 
+        # Low-RAM two-holder fixture:
+        budget_two = dict(budget, heavy_jobs=2)
+        with mock.patch("build_slot.get_system_ram_percent", return_value=50.0):
+            refusal_two = self.manager._resource_refusal("heavy", 3.0, budget_two)
+        self.assertIsNotNone(refusal_two, "Expected heavy job to be refused when 2 heavy jobs held below 85% RAM")
+        self.assertIn("heavy", refusal_two.lower())
     def test_resource_refusal_heavy_job_accepted_when_no_heavy_held_and_budget_sufficient(self):
         """When heavy_jobs == 0 and free_budget_gib >= mem_gib, job_class='heavy' is admitted."""
         budget = {
@@ -111,7 +118,7 @@ class TestBuildSlotAdmissionAndResourceRefusal(unittest.TestCase):
         self.assertIsNotNone(self.manager._resource_refusal("heavy", 3.0, budget))
 
     def test_resource_refusal_non_heavy_ignores_heavy_job_cap(self):
-        """Medium and light jobs are not blocked by heavy_jobs >= 1 as long as free_budget_gib >= mem_gib."""
+        """Medium and light jobs are not blocked by heavy cap as long as free_budget_gib >= mem_gib."""
         budget = {
             "available_gib": 10.0,
             "reserved_gib": 3.0,
@@ -119,12 +126,12 @@ class TestBuildSlotAdmissionAndResourceRefusal(unittest.TestCase):
             "free_budget_gib": 4.0,
             "heavy_jobs": 1,
         }
-        # Heavy is refused
-        self.assertIsNotNone(self.manager._resource_refusal("heavy", 3.0, budget))
+        # Heavy is refused under high RAM (or when cap reached)
+        with mock.patch("build_slot.get_system_ram_percent", return_value=88.0):
+            self.assertIsNotNone(self.manager._resource_refusal("heavy", 3.0, budget))
         # Medium and light are admitted
         self.assertIsNone(self.manager._resource_refusal("medium", 1.5, budget))
         self.assertIsNone(self.manager._resource_refusal("light", 0.5, budget))
-
     # -------------------------------------------------------------------------
     # 2. Queue admission: backfill and head preservation
     # -------------------------------------------------------------------------
@@ -603,7 +610,7 @@ class TestBuildSlotAdmissionLoop(unittest.TestCase):
     def test_real_timeout_reports_heavy_cap_and_negative_budget(self):
         with tempfile.TemporaryDirectory() as run_dir, \
                 mock.patch("build_slot.get_available_ram_gib", return_value=11.0), \
-                mock.patch("build_slot.get_system_ram_percent", return_value=50.0):
+                mock.patch("build_slot.get_system_ram_percent", return_value=88.0):
             manager = BuildSlotManager(run_dir=run_dir, acquisition_stagger=0)
             self.assertTrue(manager.acquire("held", token="held", timeout=.2, job_class="heavy", mem_gib=5.0))
             self.assertTrue(manager.acquire("light-held", token="light-held", timeout=.2, mem_gib=.5))
@@ -615,7 +622,6 @@ class TestBuildSlotAdmissionLoop(unittest.TestCase):
             self.assertNotIn("stagger", output.getvalue())
             manager.release("held", token="held")
             manager.release("light-held", token="light-held")
-
     def test_corrupt_heartbeat_does_not_use_legacy_fallback(self):
         with tempfile.TemporaryDirectory() as run_dir:
             manager = BuildSlotManager(run_dir=run_dir)
@@ -731,18 +737,18 @@ class TestBuildSlotUnknownClassFallback(unittest.TestCase):
             "available_gib": 16.0, "reserved_gib": 5.0, "floor_gib": 3.0,
             "free_budget_gib": 8.0, "heavy_jobs": 1,
         }
-        refusal = self.manager._resource_refusal("future_worker", 5.0, budget_heavy)
-        self.assertIsNotNone(refusal, "Unknown candidate must be refused under heavy cap")
-        self.assertIn("heavy cap", refusal)
+        with mock.patch("build_slot.get_system_ram_percent", return_value=88.0):
+            refusal = self.manager._resource_refusal("future_worker", 5.0, budget_heavy)
+            self.assertIsNotNone(refusal, "Unknown candidate must be refused under heavy cap")
+            self.assertIn("heavy cap", refusal)
 
-        queue = [
-            {"name": "head-blocked", "token": "tok-head", "job_class": "heavy", "mem_gib": 10.0, "enqueued_at": now - 50.0},
-            {"name": "u-cand", "token": "tok-u", "pid": 1002, "job_class": "future_worker", "mem_gib": 5.0, "enqueued_at": now - 20.0},
-        ]
-        eligible, reason = self.manager._queue_admission(queue, "tok-u", budget_heavy, now)
-        self.assertFalse(eligible, "Unknown candidate must not be admitted when heavy job held")
-        self.assertIn("heavy cap", reason)
-
+            queue = [
+                {"name": "head-blocked", "token": "tok-head", "job_class": "heavy", "mem_gib": 10.0, "enqueued_at": now - 50.0},
+                {"name": "u-cand", "token": "tok-u", "pid": 1002, "job_class": "future_worker", "mem_gib": 5.0, "enqueued_at": now - 20.0},
+            ]
+            eligible, reason = self.manager._queue_admission(queue, "tok-u", budget_heavy, now)
+            self.assertFalse(eligible, "Unknown candidate must not be admitted when heavy job held")
+            self.assertIn("heavy cap", reason)
     def test_unknown_later_candidate_delayed_under_stagger(self):
         """Unknown later candidate falls back to heavy stagger rules."""
         now = time.time()
@@ -971,5 +977,217 @@ class TestBuildSlotUnknownClassFallback(unittest.TestCase):
         )
 
 
+class TestBuildSlotOperatorDecisionBuildQ(unittest.TestCase):
+    """
+    Focused behavioral tests for operator BuildQ decision (Telegram 2026-10-10):
+    - Known heavy default AND minimum reservation is 4.5 GiB ('4.5 GB each')
+    - Explicit heavy reservation below 4.5 GiB clamps to 4.5 GiB
+    - Heavy cap: 2 heavy jobs concurrently below 85% RAM when budget fits ('2 at once below 85% RAM')
+    - Boundary test 84.999% RAM admits second heavy job
+    - Boundary test 85.0% RAM caps heavy at 1
+    - Third heavy job refused under heavy cap below 85% RAM
+    - Peak remainder safety invariant: second heavy must preserve:
+        available - new - max(4.46 - running_private_resident_usage, 0) >= 3.0 floor
+      even after ramp expires, evaluated via budget field heavy_peak_remainder_gib
+      and helper get_process_tree_ram_gib(child_pid)
+    - Missing RAM telemetry conservatively caps heavy at 1
+    - Missing/unknown class metadata reservation preserved at 5 GiB
+    """
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix="build-slot-buildq-")
+        self.run_dir = os.path.join(self.test_dir, "run")
+        os.makedirs(self.run_dir, exist_ok=True)
+        self.manager = BuildSlotManager(run_dir=self.run_dir, acquisition_stagger=0)
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_buildq_default_heavy_reservation_is_four_point_five_gib(self):
+        """Known heavy reservation defaults to 4.5 GiB instead of 5 GiB."""
+        self.assertEqual(build_slot.MEMORY_RESERVATIONS.get("heavy"), 4.5)
+        self.assertEqual(build_slot._reservation_gib("heavy", None), 4.5)
+
+        with mock.patch("build_slot.get_available_ram_gib", return_value=16.0), \
+             mock.patch("build_slot.get_system_ram_percent", return_value=50.0):
+            self.assertTrue(self.manager.acquire("heavy-default", job_class="heavy", timeout=1.0))
+            info = self.manager._read_slot_info(0)
+            self.assertEqual(info.get("job_class"), "heavy")
+            self.assertEqual(info.get("mem_gib"), 4.5)
+            self.manager.release("heavy-default")
+
+    def test_buildq_explicit_heavy_clamp_below_four_point_five_gib(self):
+        """Explicit heavy reservations below 4.5 GiB clamp to 4.5 GiB; larger remain unchanged."""
+        self.assertEqual(build_slot._reservation_gib("heavy", 1.0), 4.5)
+        self.assertEqual(build_slot._reservation_gib("heavy", 3.0), 4.5)
+        self.assertEqual(build_slot._reservation_gib("heavy", 4.0), 4.5)
+        self.assertEqual(build_slot._reservation_gib("heavy", 4.5), 4.5)
+        self.assertEqual(build_slot._reservation_gib("heavy", 6.0), 6.0)
+
+    def test_buildq_two_heavy_admissions_below_85_ram_when_budget_fits(self):
+        """Two heavy jobs are admitted concurrently when RAM < 85% and budget fits."""
+        with mock.patch("build_slot.get_system_ram_percent", return_value=50.0), \
+             mock.patch("build_slot.get_available_ram_gib", return_value=32.0):
+            # Resource refusal with 1 heavy job held and free budget available must be None (cap is 2)
+            budget_one = {
+                "available_gib": 32.0,
+                "reserved_gib": 4.5,
+                "ramp_reservations_gib": 4.5,
+                "floor_gib": 3.0,
+                "free_budget_gib": 24.5,
+                "heavy_jobs": 1,
+            }
+            refusal = self.manager._resource_refusal("heavy", 4.5, budget_one)
+            self.assertIsNone(refusal, "Expected second heavy job to be admitted below 85% RAM when budget fits")
+
+            # Real acquisition allows 2 concurrent heavy jobs
+            self.assertTrue(self.manager.acquire("heavy-1", job_class="heavy", timeout=1.0))
+            self.assertTrue(self.manager.acquire("heavy-2", job_class="heavy", timeout=1.0))
+            self.manager.release("heavy-1")
+            self.manager.release("heavy-2")
+
+    def test_buildq_third_heavy_refused_below_85_ram(self):
+        """When 2 heavy jobs are held below 85% RAM, a third heavy job is refused under heavy cap."""
+        with mock.patch("build_slot.get_system_ram_percent", return_value=50.0), \
+             mock.patch("build_slot.get_available_ram_gib", return_value=64.0):
+            self.assertTrue(self.manager.acquire("heavy-1", job_class="heavy", timeout=1.0))
+            self.assertTrue(self.manager.acquire("heavy-2", job_class="heavy", timeout=1.0))
+            output = io.StringIO()
+            with redirect_stderr(output):
+                third_acquired = self.manager.acquire("heavy-3", job_class="heavy", timeout=0.05, poll_interval=0.01)
+            self.assertFalse(third_acquired)
+            self.assertIn("heavy cap", output.getvalue())
+            self.manager.release("heavy-1")
+            self.manager.release("heavy-2")
+
+    def test_buildq_ram_boundary_84_999_admits_second_heavy(self):
+        """At boundary 84.999% RAM (< 85%), heavy cap is 2 and second heavy is admitted when budget fits."""
+        with mock.patch("build_slot.get_system_ram_percent", return_value=84.999):
+            budget_one = {
+                "available_gib": 32.0,
+                "reserved_gib": 4.5,
+                "ramp_reservations_gib": 4.5,
+                "floor_gib": 3.0,
+                "free_budget_gib": 24.5,
+                "heavy_jobs": 1,
+            }
+            refusal = self.manager._resource_refusal("heavy", 4.5, budget_one)
+            self.assertIsNone(refusal, "Expected second heavy job to be admitted at 84.999% RAM")
+
+        # Accepts synthetic budget ram_percent directly
+        synth_budget = dict(budget_one, ram_percent=84.999)
+        self.assertIsNone(self.manager._resource_refusal("heavy", 4.5, synth_budget))
+
+    def test_buildq_ram_boundary_85_caps_heavy_at_one(self):
+        """At boundary 85.0% RAM (and above), heavy concurrency cap is conservatively 1."""
+        for pct in (85.0, 85.001, 88.0):
+            with self.subTest(ram_pct=pct):
+                with mock.patch("build_slot.get_system_ram_percent", return_value=pct):
+                    budget_one = {
+                        "available_gib": 32.0,
+                        "reserved_gib": 4.5,
+                        "ramp_reservations_gib": 4.5,
+                        "floor_gib": 3.0,
+                        "free_budget_gib": 24.5,
+                        "heavy_jobs": 1,
+                    }
+                    refusal = self.manager._resource_refusal("heavy", 4.5, budget_one)
+                    self.assertIsNotNone(refusal)
+                    self.assertIn("heavy cap", refusal)
+
+                # Accepts synthetic budget ram_percent directly
+                synth_budget = dict(budget_one, ram_percent=pct)
+                refusal_synth = self.manager._resource_refusal("heavy", 4.5, synth_budget)
+                self.assertIsNotNone(refusal_synth)
+                self.assertIn("heavy cap", refusal_synth)
+
+    def test_buildq_second_heavy_fits_pure_helper_boundary(self):
+        """
+        Pure helper second_heavy_fits(available_gib, new_reservation_gib, running_heavy_ramp_gib) -> bool
+        requires available - new - running_heavy_ramp_gib >= 3.0 floor.
+        Conservative: returns False on None or non-finite inputs.
+        """
+        # With running heavy ramp 4.5: boundary is 12.0 GiB available (12.0 - 4.5 - 4.5 = 3.0)
+        self.assertTrue(build_slot.second_heavy_fits(12.0, 4.5, 4.5))
+        self.assertFalse(build_slot.second_heavy_fits(11.99, 4.5, 4.5))
+
+        # With running heavy ramp expired (0.0): boundary is 7.5 GiB available (7.5 - 4.5 - 0.0 = 3.0)
+        self.assertTrue(build_slot.second_heavy_fits(7.5, 4.5, 0.0))
+        self.assertFalse(build_slot.second_heavy_fits(7.49, 4.5, 0.0))
+
+        # Intermediate ramp or custom reservation
+        self.assertTrue(build_slot.second_heavy_fits(10.0, 4.5, 2.5))
+        self.assertFalse(build_slot.second_heavy_fits(9.99, 4.5, 2.5))
+
+        # Conservative handling of None and non-finite inputs
+        self.assertFalse(build_slot.second_heavy_fits(None, 4.5, 0.0))
+        self.assertFalse(build_slot.second_heavy_fits(12.0, None, 4.5))
+        self.assertFalse(build_slot.second_heavy_fits(12.0, 4.5, None))
+        self.assertFalse(build_slot.second_heavy_fits(float("nan"), 4.5, 0.0))
+        self.assertFalse(build_slot.second_heavy_fits(12.0, float("inf"), 0.0))
+        self.assertFalse(build_slot.second_heavy_fits(12.0, 4.5, float("nan")))
+
+    def test_buildq_heavy_ramp_reservations_gib_in_memory_budget(self):
+        """_memory_budget() includes heavy_limit, heavy_default_gib, and heavy_ramp_reservations_gib."""
+        now = time.time()
+        os.makedirs(self.manager.slot_dirs[0], exist_ok=True)
+        # Active heavy holder within ramp window (age 50s < 300s)
+        active_info = {
+            "owner": "held-active-heavy",
+            "pid": os.getpid(),
+            "token": "tok-active-heavy",
+            "job_class": "heavy",
+            "mem_gib": 4.5,
+            "acquired_at_epoch": now - 50.0,
+            "acquired_at": "invalid",
+        }
+        build_slot._write_json_atomic(
+            os.path.join(self.manager.slot_dirs[0], build_slot.INFO_FILE_NAME),
+            active_info,
+        )
+        with mock.patch("build_slot.get_available_ram_gib", return_value=16.0), \
+             mock.patch("build_slot.get_system_ram_percent", return_value=50.0):
+            budget_active = self.manager._memory_budget()
+            self.assertIn("heavy_ramp_reservations_gib", budget_active)
+            self.assertEqual(budget_active.get("heavy_ramp_reservations_gib"), 4.5)
+            self.assertIn("heavy_limit", budget_active)
+            self.assertEqual(budget_active.get("heavy_limit"), 2)
+            self.assertIn("heavy_default_gib", budget_active)
+            self.assertEqual(budget_active.get("heavy_default_gib"), 4.5)
+
+        # Expired heavy holder (age 350s >= 300s)
+        active_info["acquired_at_epoch"] = now - 350.0
+        build_slot._write_json_atomic(
+            os.path.join(self.manager.slot_dirs[0], build_slot.INFO_FILE_NAME),
+            active_info,
+        )
+        with mock.patch("build_slot.get_available_ram_gib", return_value=16.0), \
+             mock.patch("build_slot.get_system_ram_percent", return_value=88.0):
+            budget_expired = self.manager._memory_budget()
+            self.assertIn("heavy_ramp_reservations_gib", budget_expired)
+            self.assertEqual(budget_expired.get("heavy_ramp_reservations_gib"), 0.0)
+            self.assertIn("heavy_limit", budget_expired)
+            self.assertEqual(budget_expired.get("heavy_limit"), 1)
+        self.manager.release("held-active-heavy", token="tok-active-heavy")
+    def test_buildq_missing_ram_telemetry_conservatively_caps_heavy_at_one(self):
+        """When host RAM telemetry is missing (None), heavy concurrency cap is conservatively 1."""
+        with mock.patch("build_slot.get_system_ram_percent", return_value=None):
+            budget_one = {
+                "available_gib": 32.0,
+                "reserved_gib": 4.5,
+                "ramp_reservations_gib": 4.5,
+                "floor_gib": 3.0,
+                "free_budget_gib": 24.5,
+                "heavy_jobs": 1,
+            }
+            refusal = self.manager._resource_refusal("heavy", 4.5, budget_one)
+            self.assertIsNotNone(refusal)
+            self.assertIn("heavy cap", refusal)
+
+    def test_buildq_missing_unknown_class_reservation_still_five_gib(self):
+        """Missing or unknown job class metadata preserves conservative 5 GiB reservation."""
+        self.assertEqual(build_slot._reservation_gib("unknown_future_worker", None), 5.0)
+        self.assertEqual(build_slot._reservation_gib("unknown_future_worker", 1.0), 5.0)
+        self.assertEqual(build_slot._reservation_gib("unknown_future_worker", 7.0), 7.0)
 if __name__ == "__main__":
     unittest.main()
