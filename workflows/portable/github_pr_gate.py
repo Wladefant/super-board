@@ -1783,7 +1783,7 @@ def evaluate_pr_gate(
         ci_verdict = "FAILURE"
     elif pending_checks:
         ci_verdict = "PENDING"
-    elif not deduped_status_rollup and merge_first_enabled(env):
+    elif merge_first_enabled(env) and not any(not is_qa_check_name(name) and str(check.get("conclusion") or check.get("state") or "").upper() == "SUCCESS" for name, check in deduped_status_rollup.items()):
         if local_tests_record is None:
             ci_verdict = "FAILURE"
             failing_checks.append("local-tests-record (CI absent: local tests record required)")

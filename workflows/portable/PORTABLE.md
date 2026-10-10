@@ -94,7 +94,7 @@ flag is passed), missing or failing receipts block the gate.
 Target configurations define the repository, base branch, UI file patterns, and required viewports:
 - `Bavariance/polysimulator` on base `staging`: UI pattern matches `frontend/` files. Requires viewports `390x844` and `1440x900`.
 - `Wladefant/shipnovo` on base `main`: UI pattern matches `src/app`, `src/components`, and `src/features` `.tsx` files, excluding tests. Requires viewports `390x420` (keyboard open), `390x844`, and `1440x900`.
-Under default `SUPERBOARD_MERGE_FIRST`, staging UI PRs merge first and deploy to staging. Flow QA runs post-deploy on staging against the deployed commit SHA (`/api/version`), and any failure immediately reverts the deployed commit. Setting `SUPERBOARD_MERGE_FIRST=0` restores the pre-merge gate requirement where `github_pr_gate.py` blocks staging PRs without a matching receipt. Production targets remain strictly forbidden.
+Under default `SUPERBOARD_MERGE_FIRST`, UI PRs merge first and deploy. Flow QA runs against the deployed commit SHA (`/api/version`). The merging lane executes recovery after a matching-SHA failure. Unknown or mismatched identity means: do not revert, ask Main. Lanes coordinate deployments over IRC. The helper does not run automatic rollback, own an app-wide lock, or start a deadline daemon. Setting `SUPERBOARD_MERGE_FIRST=0` restores the pre-merge receipt gate. PolySimulator uses staging only. Production targets remain forbidden.
 
 Configured repositories fail closed when PR file lists are missing or truncated at 100 files.
 Unsupported repositories remain exempt from Flow QA requirements.

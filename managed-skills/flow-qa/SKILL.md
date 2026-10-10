@@ -40,7 +40,7 @@ Under default `SUPERBOARD_MERGE_FIRST`, approved staging UI PRs merge and deploy
 4. The runner strictly refuses production URLs (`polysimulator.com`, `zaraprptkegxqpvnsubu`, `akamai-iad-prod`). It runs against staging only.
 5. Read `<dir>/receipt.txt`. Confirm all assertions pass (`fail=0`, `pass>0`).
 6. Pass: post the verification receipt to the tracking issue and PR.
-7. Fail: immediately revert the deployed merge commit on staging.
+7. Fail: the merging lane reverts the exact merge after confirming its served identity. Unknown or mismatched identity means: do not revert, ask Main.
 
 ### Restored Pre-Merge QA (`SUPERBOARD_MERGE_FIRST=0`)
 

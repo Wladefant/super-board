@@ -35,13 +35,16 @@ Workflow:
      tracking issue (--issue) using `gh pr comment` and `gh issue comment`.
 
   6. Failure Handling & Revert Instructions:
-     If the served SHA mismatches or FLOW-QA fails:
+     If FLOW-QA fails after the served SHA and PR merge identity match:
        - Outputs the exact manual recovery commands:
            git revert -m 1 <MERGE_SHA>
            git push origin <BASE_BRANCH>
            <DEPLOY_CMD>
-       - Marks the Superboard Project card as 'Blocked' using `workflows.portable.project_adapter`.
-       - Never executes git revert or push automatically; all recovery commands require operator execution.
+       - Marks the Superboard Project card as 'Blocked'.
+       - The merging lane executes recovery and confirms the previous behavior.
+     Unknown or mismatched identity prints "served SHA does not match: do not revert, ask Main".
+     The helper does not run rollback, own an app-wide lock, or start a deadline daemon.
+     Lanes coordinate deployment ownership over IRC.
 
 Invariants:
   - Subprocesses use `creationflags=subprocess.CREATE_NO_WINDOW` and mandatory timeouts.
@@ -182,37 +185,33 @@ def validate_target_url(url: str, timeout: float = 10.0) -> str:
 
 
 def fetch_served_sha(url_or_base: str, timeout: float = 15.0) -> str:
-    """Fetch served commit SHA from /api/version, ensuring host safety and 40-hex format."""
+    """Read the actual version response with guarded redirects, not a separate probe."""
     text = url_or_base.strip()
-    if text.endswith("/api/version") or text.endswith("/version"):
-        version_url = text
+    version_url = text if text.endswith(("/api/version", "/version")) else f"{text.rstrip('/')}/api/version"
+    opener = urllib.request.build_opener(_NoRedirect())
+    for _ in range(6):
+        check_forbidden_host(version_url)
+        req = urllib.request.Request(version_url, headers={"User-Agent": "post-deploy-qa/1.0", "Accept": "application/json"})
+        try:
+            with opener.open(req, timeout=timeout) as resp:
+                check_forbidden_host(resp.geturl())
+                data = json.loads(resp.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (301, 302, 303, 307, 308) or not exc.headers.get("Location"):
+                raise ValueError(f"Failed to fetch version from {version_url}: {exc}") from exc
+            version_url = urllib.parse.urljoin(version_url, exc.headers["Location"])
+        except Exception as exc:
+            raise ValueError(f"Failed to fetch version from {version_url}: {exc}") from exc
     else:
-        version_url = f"{text.rstrip('/')}/api/version"
-
-    validate_target_url(version_url, timeout=timeout)
-
-    req = urllib.request.Request(
-        version_url,
-        headers={
-            "User-Agent": "post-deploy-qa/1.0",
-            "Accept": "application/json",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        raise ValueError(f"Failed to fetch version from {version_url}: {e}") from e
-
+        raise ValueError("Too many version redirects")
     if not isinstance(data, dict):
-        raise ValueError(f"Version endpoint returned non-dict payload: {type(data).__name__}")
-
+        raise ValueError("Version endpoint returned a non-object payload")
     for key in ("commit", "sha", "served_sha", "version", "git_sha", "commitSha"):
         value = data.get(key)
         if isinstance(value, str) and SHA_RE.fullmatch(value.strip()):
             return value.strip().lower()
-
-    raise ValueError(f"No valid 40-hex commit SHA found in response from {version_url}: {data}")
+    raise ValueError(f"No valid 40-hex commit SHA found in response from {version_url}")
 
 
 def validate_required_identifiers(
@@ -249,6 +248,8 @@ def format_revert_instructions(
     reason: str = "",
 ) -> str:
     """Format exact recovery instructions for manual operator execution."""
+    if "mismatch" in reason.lower() or "fetch failed" in reason.lower():
+        return "served SHA does not match: do not revert, ask Main\n"
     reason_line = f"Reason: {reason}\n" if reason else ""
     return (
         f"================================================================================\n"
@@ -262,6 +263,18 @@ def format_revert_instructions(
         f"NOTE: Revert commands are NOT executed automatically.\n"
         f"================================================================================\n"
     )
+
+
+def verify_merge_identity(repo: str, pr: int, merge_sha: str, base_branch: str) -> bool:
+    """Confirm the lane supplied this merged PR's merge commit, not its head."""
+    proc = subprocess.run(["gh", "pr", "view", str(pr), "--repo", repo, "--json", "state,mergeCommit,baseRefName"], capture_output=True, text=True, timeout=25, check=False, creationflags=CREATE_NO_WINDOW)
+    if proc.returncode != 0:
+        return False
+    try:
+        data = json.loads(proc.stdout)
+        return data.get("state") == "MERGED" and data.get("baseRefName") == base_branch and str((data.get("mergeCommit") or {}).get("oid", "")).lower() == merge_sha.lower()
+    except (ValueError, TypeError):
+        return False
 
 
 def runner_supports_storage_state(runner_path: Optional[Path]) -> bool:
@@ -582,6 +595,8 @@ def run_post_deploy_qa(
         deploy_cmd=deploy_cmd,
     )
 
+    if str(repo or "").lower() in ("bavariance/polysimulator", "wladefant/polysimulator") and base_branch != "staging":
+        raise ValueError("PolySimulator permits only the staging branch")
     clean_expected_sha = str(expected_sha).strip().lower()
     validate_target_url(base_url)
 
@@ -637,6 +652,19 @@ def run_post_deploy_qa(
 
     # 2. Check for SHA mismatch
     is_match = served_sha == clean_expected_sha
+    if is_match and not dry_run:
+        try:
+            identity_ok = verify_merge_identity(repo or "", pr, clean_expected_sha, base_branch)
+        except Exception:
+            identity_ok = False
+        if not identity_ok:
+            message = "served SHA does not match: do not revert, ask Main"
+            print(message)
+            receipt = f"FLOW-QA: FAIL {served_sha}\nMerge identity could not be confirmed. {message}\n"
+            card = update_project_card_status(issue=issue, repo=repo or "", state="Blocked", head_sha=clean_expected_sha, dry_run=False)
+            pr_post = post_github_comment("pr", pr, receipt, repo=repo)
+            issue_post = post_github_comment("issue", issue, receipt, repo=repo)
+            return {"ok": False, "reason": "merge_identity_unconfirmed", "served_sha": served_sha, "receipt": receipt, "revert_hint": message, "card_ok": is_card_outcome_ok(card), "publication_ok": is_post_outcome_ok(pr_post) and is_post_outcome_ok(issue_post)}
 
     # 3. Handle Dry-Run Mode
     if dry_run:

@@ -27,6 +27,12 @@ if str(HERE) not in sys.path:
 
 import post_deploy_qa
 
+def setUpModule():
+    # These flow tests bind a known merge. Identity failure has separate controls.
+    binding = patch.object(post_deploy_qa, "verify_merge_identity", return_value=True)
+    binding.start()
+    unittest.addModuleCleanup(binding.stop)
+
 class TestPostDeployQARevertHint(unittest.TestCase):
     """Test revert instructions, deploy command inclusion, and Project card blocking on failure."""
 
@@ -165,9 +171,8 @@ class TestPostDeployQAServedMismatch(unittest.TestCase):
 
         # Output must contain recovery commands
         output = stdout_buf.getvalue()
-        self.assertIn(f"git revert -m 1 {expected_sha}", output)
-        self.assertIn("git push origin main", output)
-        self.assertIn("dokploy redeploy", output)
+        self.assertNotIn("git revert", output)
+        self.assertIn("served SHA does not match: do not revert, ask Main", output)
 
         # Card must be marked Blocked
         mock_update_card.assert_called_once_with(
