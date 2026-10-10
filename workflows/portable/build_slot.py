@@ -380,7 +380,7 @@ class _WindowsChildJob:
 
 class _WindowsJobProcess:
     """Create the process inside its Job atomically, before any child can escape."""
-    def __init__(self, cmd, cwd, env, job):
+    def __init__(self, cmd, cwd, env, job, stdin=subprocess.DEVNULL):
         from ctypes import wintypes
         class Startup(ctypes.Structure):
             _fields_ = [
@@ -417,6 +417,7 @@ class _WindowsJobProcess:
         attributes = ctypes.create_string_buffer(size.value)
         if not kernel.InitializeProcThreadAttributeList(attributes, 1, 0, ctypes.byref(size)):
             raise ctypes.WinError(ctypes.get_last_error())
+        null_input = None
         try:
             handles = (wintypes.HANDLE * 1)(job.handle)
             if not kernel.UpdateProcThreadAttribute(attributes, 0, 0x2000D, handles, ctypes.sizeof(handles), None, None):
@@ -424,7 +425,14 @@ class _WindowsJobProcess:
             startup = StartupEx()
             startup.startup.cb = ctypes.sizeof(startup)
             startup.startup.flags = 0x100  # STARTF_USESTDHANDLES
-            startup.startup.stdin = kernel.GetStdHandle(-10 & 0xFFFFFFFF)
+            if stdin == subprocess.DEVNULL:
+                import msvcrt
+                null_input = open(os.devnull, "rb")
+                input_handle = msvcrt.get_osfhandle(null_input.fileno())
+                os.set_handle_inheritable(input_handle, True)
+            else:
+                input_handle = kernel.GetStdHandle(-10 & 0xFFFFFFFF)
+            startup.startup.stdin = input_handle
             startup.startup.stdout = kernel.GetStdHandle(-11 & 0xFFFFFFFF)
             startup.startup.stderr = kernel.GetStdHandle(-12 & 0xFFFFFFFF)
             startup.attributes = ctypes.addressof(attributes)
@@ -442,6 +450,8 @@ class _WindowsJobProcess:
             kernel.CloseHandle(info.thread)
         finally:
             kernel.DeleteProcThreadAttributeList(attributes)
+            if null_input is not None:
+                null_input.close()
 
     def poll(self):
         if self.returncode is None and self.kernel.WaitForSingleObject(self._handle, 0) == 0:
@@ -3172,6 +3182,7 @@ class BuildSlotManager:
         job_class: Optional[str] = None,
         mem_gib: Optional[float] = None,
         run_timeout: float = 1800.0,
+        inherit_stdin: bool = False,
     ) -> int:
         """
         Executes a command under the exclusive build slot lock.
@@ -3247,9 +3258,11 @@ class BuildSlotManager:
                 child_env.setdefault("VITEST_MAX_WORKERS", "2")
             if sys.platform == "win32":
                 child_job = _WindowsChildJob(run_token)
-                proc = _WindowsJobProcess(cmd, cwd, child_env, child_job)
+                proc = _WindowsJobProcess(cmd, cwd, child_env, child_job,
+                                          stdin=None if inherit_stdin else subprocess.DEVNULL)
             else:
-                proc = subprocess.Popen(cmd, cwd=cwd, env=child_env, start_new_session=True)
+                proc = subprocess.Popen(cmd, cwd=cwd, env=child_env, start_new_session=True,
+                                        stdin=None if inherit_stdin else subprocess.DEVNULL)
             child_pid = proc.pid
             def cleanup_on_exit():
                 if proc.poll() is None:
@@ -3517,7 +3530,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             if tok == "--":
                 break
             opt_name = tok.split("=")[0]
-            if opt_name in {"--priority", "--force"}:
+            if opt_name in {"--priority", "--force", "--stdin"}:
                 i += 1
             elif opt_name in {"--timeout", "--cwd", "--next-dir", "--heartbeat-stale-after", "--class", "--mem-gib", "--run-timeout"}:
                 if "=" in tok:
@@ -3569,6 +3582,7 @@ def _add_run_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--class", dest="job_class", choices=MEMORY_RESERVATIONS, default=None)
     parser.add_argument("--mem-gib", type=float, default=None)
     parser.add_argument("--run-timeout", type=float, default=1800.0, help="Execution deadline after acquisition")
+    parser.add_argument("--stdin", action="store_true", help="Inherit caller stdin instead of null stdin")
     parser.add_argument(
         "--priority",
         action="store_true",
@@ -3686,6 +3700,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             job_class=args.job_class,
             mem_gib=args.mem_gib,
             run_timeout=args.run_timeout,
+            inherit_stdin=args.stdin,
         )
 
     elif args.command == "heartbeat":

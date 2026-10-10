@@ -63,6 +63,9 @@ Command execution deadline and process tree invariants:
 - Windows assigns the kill-on-close Job Object at process creation through `PROC_THREAD_ATTRIBUTE_JOB_LIST`. No child exists outside the Job.
 - Forced wrapper termination kills descendants, including during launch before child metadata is published.
 - Stale reclaim retains reservations while the recorded child or named Job has active processes.
+- `run` gives children null stdin by default, so non-interactive commands that read stdin receive EOF.
+- `run --stdin` explicitly inherits the caller's stdin. Stdout and stderr continue streaming in both modes.
+- Windows keeps `CREATE_NO_WINDOW` and atomic Job Object assignment in both modes.
 
 Environment variable tuning invariants:
 - Commands executed under `run` receive tuned environment variables:
