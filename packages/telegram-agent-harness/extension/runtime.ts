@@ -24,6 +24,8 @@ import { handleInstalledCommand } from "./harness/installed-commands";
 import { BunCommandRunner, type CommandRunner } from "./harness/command-runner";
 import { latestSessionPng } from "./harness/session-artifacts";
 import { OperatorQuestionService } from "./harness/operator-questions";
+import { getDaemonSecret } from "../daemon/daemon-secret";
+import { getDaemonDbPath } from "../daemon/config";
 
 /** A forum chat is not an operator account; callback ownership must name a user. */
 function questionOperator(access: AccessConfig, chatId: string): string {
@@ -651,9 +653,11 @@ export class TelegramRuntime {
         if (!chat) throw new Error("No authorized operator chat for this session");
         return { session_id: currentSessionId(), chat_id: chat, user_id: questionOperator(this.accessConfig, chat) };
       },
-      path.join(os.homedir(), ".veyyon", "workflows", "decisions.json"),
-      poolPath,
       message => this.pi.logger?.warn(message),
+      // Sign question-button tokens the daemon also accepts; an unsigned token is rejected
+      // with CALLBACK_REJECT_UNKNOWN while signing is enabled (telegram-question delivery, 2026-10-10).
+      coordinator,
+      getDaemonSecret({ stateDir: path.dirname(getDaemonDbPath()) }, activeSlot.slotId),
     );
     this.questions = questions;
 

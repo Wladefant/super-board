@@ -49,7 +49,8 @@ import { connectMiniApp, miniAppUrl, buildMiniAppUrl } from "./miniapp";
 import { DefaultTelegramForumClient, ForumManager, workspaceFolder, type ForumApiClient, type AutoAttachResult } from "./forum";
 import { QuestionsTopic } from "./questions-topic";
 import { defaultFleetSources, FleetState, type FleetQuestion, type FleetSources } from "./fleet-state";
-import { LanePanels, PANEL_EXPIRED_ANSWER, getDaemonSecret } from "./lane-panel";
+import { LanePanels, PANEL_EXPIRED_ANSWER } from "./lane-panel";
+import { getDaemonSecret } from "./daemon-secret";
 
 export interface DaemonSlotReport {
   slotId: string;

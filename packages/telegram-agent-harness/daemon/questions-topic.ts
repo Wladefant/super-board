@@ -10,7 +10,7 @@
 import { escapeHtml } from "../extension/sanitizer";
 import { isClosed, type Question, type QuestionStore } from "../src/operator-questions";
 import type { DaemonStore } from "./store";
-import { getDaemonSecret } from "./lane-panel";
+import { getDaemonSecret } from "./daemon-secret";
 import type { BotPoolCoordinator } from "../extension/coordinator";
 export type TopicOutcome = "ok" | "gone" | "error";
 
