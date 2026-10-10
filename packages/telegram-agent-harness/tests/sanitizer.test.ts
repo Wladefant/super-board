@@ -276,6 +276,13 @@ describe("Sanitizer & Security Utilities", () => {
     }
   });
 
+  test("inline code in a wide row title stays literal without forbidden nested code entities", () => {
+    const table = "| Task | Status |\n| --- | --- |\n| `A< B & #9` | A long status that cannot fit a phone table |";
+    expect(markdownToTelegramHtml(table, "Wladefant/super-board")).toBe(
+      "<b>A&lt; B &amp; #9</b>\nStatus: A long status that cannot fit a phone table",
+    );
+  });
+
   test("a wide header-only table does not lose its headings", () => {
     expect(markdownToTelegramHtml("| A long heading that exceeds the phone width | Link |\n| --- | --- |")).toBe(
       "<b>A long heading that exceeds the phone width</b>\n<b>Link</b>",

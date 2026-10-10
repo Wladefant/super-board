@@ -398,11 +398,13 @@ function convertTablesToHtml(src: string, addPlaceholder: (val: string) => strin
         const openBold = addPlaceholder("<b>");
         const closeBold = addPlaceholder("</b>");
         if (body.length === 0) {
-          out.push(headers.map(header => `${openBold}${header}${closeBold}`).join("\n"));
+          out.push(headers.map(header =>
+            `${openBold}${header.replace(/`([^`\n]*)`/g, (_match, literal: string) => addPlaceholder(escapeHtml(literal)))}${closeBold}`,
+          ).join("\n"));
           continue;
         }
         out.push(body.map(row => [
-          `${openBold}${row[0] ?? ""}${closeBold}`,
+          `${openBold}${(row[0] ?? "").replace(/`([^`\n]*)`/g, (_match, literal: string) => addPlaceholder(escapeHtml(literal)))}${closeBold}`,
           ...Array.from({ length: Math.max(headers.length, row.length) - 1 }, (_, column) =>
             `${headers[column + 1] || `Column ${column + 2}`}: ${row[column + 1] ?? ""}`),
         ].join("\n")).join("\n\n"));
