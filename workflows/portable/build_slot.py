@@ -58,6 +58,10 @@ Invariants:
       preserving queued entries and FIFO among eligible waiters.
     - Enqueue rejects reservations above physical total RAM minus the free floor.
       Temporary RAM shortages stay queued. Priority heads still allow fitting backfill.
+    - RAM refusal text identifies the waiter's reservation and currently usable RAM.
+      It labels the projected budget after holders finish separately from usable RAM.
+    - Heavy-head aging pauses require three shared poll samples with 0.5 GiB headroom.
+      A sample below the head's reservation ends the pause immediately.
     - Operator build freeze: when 'build-freeze' exists in run_dir, acquire and run
       commands are refused immediately with exit 75 and 'build freeze active (<reason>)'
       printed to stderr (fallback 'reason unavailable' on read error). No queue entry
@@ -2000,6 +2004,10 @@ class BuildSlotManager:
                 item["heartbeat_at_iso"] = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).isoformat()
                 item["job_class"] = job_class
                 item["mem_gib"] = _reservation_gib(job_class, mem_gib)
+                if mem_gib is not None and mem_gib < reservation:
+                    item["requested_mem_gib"] = mem_gib
+                else:
+                    item.pop("requested_mem_gib", None)
                 if priority and not item.get("priority"):
                     # Upgrade: joins the priority group at its own enqueue time.
                     item["priority"] = True
@@ -2025,6 +2033,8 @@ class BuildSlotManager:
                 "job_class": job_class,
                 "mem_gib": _reservation_gib(job_class, mem_gib),
             }
+            if mem_gib is not None and mem_gib < reservation:
+                entry["requested_mem_gib"] = mem_gib
             if priority:
                 entry["priority"] = True
             valid_queue.append(entry)
@@ -2500,7 +2510,7 @@ class BuildSlotManager:
             "heavy_limit": _heavy_limit(ram_percent),
         }
 
-    def _resource_refusal(self, job_class, mem_gib, budget, force=False):
+    def _resource_refusal(self, job_class, mem_gib, budget, force=False, requested_mem_gib=None):
         if job_class not in MEMORY_RESERVATIONS:
             job_class = "heavy"
         reasons = []
@@ -2519,11 +2529,50 @@ class BuildSlotManager:
                 reasons.append("budget unavailable: RAM telemetry missing")
             elif free < mem_gib:
                 reasons.append(
-                    f"budget: available {budget['available_gib']:.2f} - reserved "
-                    f"{budget.get('ramp_reservations_gib', budget['reserved_gib']):.2f} - floor {budget['floor_gib']:.2f} "
-                    f"= {free:.2f} GiB, needs {mem_gib:.2f} GiB"
+                    f"needs {mem_gib:.2f} GiB, usable now {free:.2f} GiB "
+                    f"(available {budget['available_gib']:.2f} minus ramp reservations "
+                    f"{budget.get('ramp_reservations_gib', budget['reserved_gib']):.2f} "
+                    f"minus floor {budget['floor_gib']:.2f}); max after current holders finish "
+                    f"{budget['available_gib'] + budget['reserved_gib'] - budget['floor_gib']:.2f} GiB"
                 )
+        if reasons and job_class == "heavy":
+            requested = (
+                f"requested {requested_mem_gib:.2f} GiB overridden by "
+                if requested_mem_gib is not None else ""
+            )
+            reasons.append(f"{requested}heavy minimum {HEAVY_RESERVATION_GIB:.2f} GiB "
+                           "(source: HEAVY_RESERVATION_GIB)")
         return "; ".join(reasons) or None
+
+    def _aging_backfill_ready(self, head, head_mem, projected, now):
+        """Share fit confidence across waiters, counting each five-second poll once."""
+        path = os.path.join(self.run_dir, "build-slot-aging-fit.json")
+        identity = [head.get("token") or head.get("name"), head.get("enqueued_at"), head_mem]
+        sample = int(now // DEFAULT_POLL_INTERVAL_SECONDS)
+        try:
+            with _transition_guard(os.path.join(self.run_dir, "build-slot-aging-fit.guard"), timeout=0.25):
+                try:
+                    previous = _read_json_file(path)
+                except (OSError, ValueError):
+                    previous = {}
+                state = dict(previous) if isinstance(previous, dict) else {}
+                if state.get("head") != identity or sample < state.get("sample", sample):
+                    state = {"head": identity, "count": 0, "paused": False}
+                if projected is None or projected < head_mem:
+                    state.update(count=0, paused=False)
+                elif not state.get("paused"):
+                    if projected < head_mem + 0.5:
+                        state["count"] = 0
+                    elif sample != state.get("sample"):
+                        state["count"] = min(3, state.get("count", 0) + 1)
+                        state["paused"] = state["count"] == 3
+                state["sample"] = sample
+                if state != previous:
+                    _write_json_atomic(path, state)
+                return state.get("paused", False)
+        except (OSError, ValueError, TypeError, TimeoutError):
+            # Losing confidence may allow backfill, never bypass the resource guards.
+            return False
 
     def _queue_admission(self, queue, token, budget, now, force=False, last_acquired_at=None):
         caller = next((item for item in queue if item.get("token") == token), None)
@@ -2541,7 +2590,7 @@ class BuildSlotManager:
         head_mem = _reservation_gib(head_class, head.get("mem_gib"))
         if head_class not in MEMORY_RESERVATIONS:
             head_class = "heavy"
-        head_reason = self._resource_refusal(head_class, head_mem, budget, force)
+        head_reason = self._resource_refusal(head_class, head_mem, budget, force, head.get("requested_mem_gib"))
         stagger_reason = None
         if not force and last_acquired_at is not None:
             elapsed = now - last_acquired_at
@@ -2552,36 +2601,41 @@ class BuildSlotManager:
         projected = None if available is None else available + budget["reserved_gib"] - budget["floor_gib"]
         impossible = projected is not None and projected < head_mem
         notice = (
-            f"head cannot fit on this host: needs {head_mem:.2f}, max possible {projected:.2f} GiB"
+            f"head '{head.get('name')}' currently blocked: {head_reason}"
             if impossible else None
         )
         if notice:
             _transition_notice(notice, "warning")
         if caller is head:
-            return head_reason is None, notice or head_reason
+            return head_reason is None, head_reason
         if head_reason is None:
             return False, f"FIFO head '{head.get('name')}' can run"
         age = now - (_parse_timestamp(head.get("enqueued_at")) or now)
-        if (head_class == "heavy" and age > 1200 and not impossible
-                and projected is not None and projected >= head_mem and budget["heavy_jobs"] == 0
-                and (age >= 2400 or (age - 1200) % 180 < 60)):
+        drain_ready = False
+        if head_class == "heavy" and age > 1200:
+            drain_ready = self._aging_backfill_ready(
+                head, head_mem, projected if budget["heavy_jobs"] == 0 else None, now
+            )
+        if drain_ready and (age >= 2400 or (age - 1200) % 180 < 60):
             return False, f"backfill paused: aging heavy head '{head.get('name')}' waited {age:.1f}s"
         caller_mem = _reservation_gib(caller.get("job_class"), caller.get("mem_gib"))
         if caller_mem >= head_mem:
-            return False, notice or "backfill requires a smaller reservation than the blocked head"
+            reason = self._resource_refusal(caller.get("job_class"), caller_mem, budget, force,
+                                            caller.get("requested_mem_gib"))
+            return False, reason or notice or "backfill requires a smaller reservation than the blocked head"
         # Keep FIFO among jobs that can currently run. Blocked entries keep their place.
         for item in queue[1:]:
             item_class = item.get("job_class")
             item_mem = _reservation_gib(item_class, item.get("mem_gib"))
             if item_class not in MEMORY_RESERVATIONS:
                 item_class = "heavy"
-            reason = self._resource_refusal(item_class, item_mem, budget, force)
+            reason = self._resource_refusal(item_class, item_mem, budget, force, item.get("requested_mem_gib"))
             if stagger_reason and item_class == "heavy":
                 reason = f"{reason}; {stagger_reason}" if reason else stagger_reason
             if item is caller:
-                return reason is None, notice or reason
+                return reason is None, reason
             if item_mem < head_mem and reason is None:
-                return False, notice or f"earlier backfill waiter '{item.get('name')}' can run"
+                return False, f"earlier backfill waiter '{item.get('name')}' can run"
         return False, notice or "waiting for FIFO admission"
 
     def _inherited_holder(self):
@@ -2653,6 +2707,7 @@ class BuildSlotManager:
         job_class = job_class or "light"
         if job_class not in MEMORY_RESERVATIONS:
             raise ValueError("Unknown job class")
+        requested_mem_gib = mem_gib
         mem_gib = _reservation_gib(job_class, mem_gib)
         holder = self._inherited_holder()
         if holder is not None:
@@ -2695,7 +2750,7 @@ class BuildSlotManager:
                     lambda: self.enqueue(
                         name, pid, token=token, stale_heartbeat_after=effective_heartbeat_threshold,
                         priority=priority, enqueued_at=original_enqueued_at,
-                        job_class=job_class, mem_gib=mem_gib,
+                        job_class=job_class, mem_gib=requested_mem_gib,
                     ),
                     queue_deadline,
                 )
@@ -2765,7 +2820,7 @@ class BuildSlotManager:
                                     stale_heartbeat_after=effective_heartbeat_threshold,
                                     priority=priority,
                                     enqueued_at=original_enqueued_at,
-                                    job_class=job_class, mem_gib=mem_gib,
+                                    job_class=job_class, mem_gib=requested_mem_gib,
                                 )
                                 last_heartbeat = now
                             else:
@@ -3243,6 +3298,7 @@ class BuildSlotManager:
             if job_class == "browser" and classify_command(cmd) == "heavy":
                 raise ValueError("browser class cannot build or serve Next")
             _check_freeze(self.run_dir)
+            requested_mem_gib = mem_gib
             mem_gib = _reservation_gib(job_class, mem_gib)
             holder = self._inherited_holder()
             if holder is not None and not self._nested_allowed(holder, job_class, mem_gib):
@@ -3260,7 +3316,7 @@ class BuildSlotManager:
                 cwd=cwd,
                 wrapper_pid=runner_pid,
                 job_class=job_class,
-                mem_gib=mem_gib,
+                mem_gib=requested_mem_gib,
             )
         except Exception as e:
             print(f"[RUN] Failed to acquire build slot lock for '{name}': {e}", file=sys.stderr)

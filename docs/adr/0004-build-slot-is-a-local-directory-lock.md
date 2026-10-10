@@ -50,10 +50,16 @@ Memory admission and job classification invariants:
 - Even when `BUILD_SLOT_ALLOW_FORCE=1` is set, `--force` cannot bypass the heavy job concurrency cap.
 - The obsolete idle bypass is removed. Queue wait duration never bypasses host memory safety invariants.
 - Admission reads the stagger under the slot guard. The queue head and every heavy candidate retain the stagger. A smaller non-heavy job can backfill a stagger-blocked head when its reservation fits. Only heavy grants advance the stagger timestamp, so backfill does not extend the head's delay.
-- Waiters print resource refusal reasons and include the last reason in timeout output.
+- Refusal text shows the waiter's reservation and currently usable RAM: available minus ramp reservations minus the 3 GiB floor.
+- It labels projected memory after current holders finish separately. Heavy overrides show the original request, effective minimum, and `HEAVY_RESERVATION_GIB` source.
+- Enqueue rejects reservations above physical total RAM minus the floor before writing the queue. Current RAM pressure does not cause that rejection.
 - Smaller jobs can backfill a resource- or stagger-blocked head without changing its position or enqueue time.
-- After 20 minutes, a heavy head reserves a 60-second drain window every 180 seconds when no heavy job runs. Smaller jobs can backfill between windows until the head reaches 40 minutes. At 40 minutes, stop backfill when no heavy job runs and projected memory can fit the head. Existing holders must drain before smaller admissions resume. The head keeps first admission whenever it fits.
-- An impossible head does not pause backfill. Output reports its required memory and maximum possible budget.
+- After 20 minutes, an aging heavy head can pause backfill for 60 seconds every 180 seconds when no heavy job runs.
+- A pause starts only after three shared poll samples show projected memory at least 0.5 GiB above the head's reservation.
+- Waiters share these samples, so several waiters in one poll do not count as several samples.
+- The first sample below the head's reservation ends the pause. Between drain windows, smaller jobs can backfill.
+- At 40 minutes, stable fit confidence can pause backfill outside those windows. The head keeps first admission whenever it fits.
+- A currently unfit head does not pause backfill without stable fit confidence.
 
 Command execution deadline and process tree invariants:
 - `run` introduces `--run-timeout` (default 1800 seconds / 30 minutes) for child command execution.

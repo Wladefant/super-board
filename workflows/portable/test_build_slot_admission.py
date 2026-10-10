@@ -186,7 +186,7 @@ class TestBuildSlotAdmissionAndResourceRefusal(unittest.TestCase):
         """
         Aging pauses backfill only when:
         1. heavy head aged > 1200s
-        2. projected max >= head memory (projected max = available_gib + reserved_gib - floor_gib)
+        2. three poll samples have projected max >= head memory + 0.5 GiB
         3. heavy_jobs == 0
         """
         now = time.time()
@@ -218,8 +218,9 @@ class TestBuildSlotAdmissionAndResourceRefusal(unittest.TestCase):
             "heavy_jobs": 0,
         }
 
-        eligible, reason = self.manager._queue_admission(queue, "tok-light", budget, now)
-        self.assertFalse(eligible, "Backfill must be paused when heavy head aged >1200, projected max >= head, and heavy_jobs==0")
+        for sample in range(3):
+            eligible, reason = self.manager._queue_admission(queue, "tok-light", budget, now + sample * 5)
+        self.assertFalse(eligible, "Stable fit confidence must pause aging backfill when no heavy job is held")
         self.assertIsNotNone(reason)
         self.assertTrue("aging" in reason.lower() or "paused" in reason.lower() or "starv" in reason.lower())
 
@@ -259,7 +260,9 @@ class TestBuildSlotAdmissionAndResourceRefusal(unittest.TestCase):
         ]
         budget = {"available_gib": 6.5, "reserved_gib": 1.5,
                   "floor_gib": 3.0, "free_budget_gib": 2.0, "heavy_jobs": 0}
-        for age, expected in [(1205, False), (1259, False), (1260, True),
+        for age in (1205, 1210):
+            self.assertTrue(self.manager._queue_admission(queue, "light", budget, 1000.0 + age)[0])
+        for age, expected in [(1215, False), (1259, False), (1260, True),
                               (1379, True), (1380, False), (1440, True),
                               (2399, True), (2400, False), (3060, False)]:
             with self.subTest(age=age):
@@ -618,7 +621,8 @@ class TestBuildSlotAdmissionLoop(unittest.TestCase):
             with redirect_stderr(output), mock.patch("build_slot.get_available_ram_gib", return_value=6.68):
                 self.assertFalse(manager.acquire("blocked", token="blocked", timeout=.05, poll_interval=.01, job_class="heavy"))
             self.assertIn("heavy cap", output.getvalue())
-            self.assertIn("available 6.68 - reserved 5.50 - floor 3.00 = -1.82", output.getvalue())
+            self.assertIn("usable now -1.82 GiB", output.getvalue())
+            self.assertIn("available 6.68 minus ramp reservations 5.50 minus floor 3.00", output.getvalue())
             self.assertNotIn("stagger", output.getvalue())
             manager.release("held", token="held")
             manager.release("light-held", token="light-held")
@@ -785,10 +789,11 @@ class TestBuildSlotUnknownClassFallback(unittest.TestCase):
             },
         ]
         budget = {
-            "available_gib": 4.0, "reserved_gib": 4.0, "floor_gib": 3.0,
+            "available_gib": 4.5, "reserved_gib": 4.0, "floor_gib": 3.0,
             "free_budget_gib": 0.5, "heavy_jobs": 0,
         }
-        eligible, reason = self.manager._queue_admission(queue, "tok-light", budget, now)
+        for sample in range(3):
+            eligible, reason = self.manager._queue_admission(queue, "tok-light", budget, now + sample * 5)
         self.assertFalse(eligible, "Aged unknown head (> 40min) must pause backfill")
         self.assertIsNotNone(reason)
         self.assertTrue("aging" in reason.lower() or "paused" in reason.lower() or "waited" in reason.lower())
@@ -1418,6 +1423,113 @@ class TestPhysicalCapacityAdmission(unittest.TestCase):
             self.manager.enqueue("unknown", os.getpid(), token="unknown",
                                  job_class="medium", mem_gib=64.0)
         self.assertEqual(self.manager._read_queue()[0]["token"], "unknown")
+
+class TestCurrentBudgetText(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.manager = BuildSlotManager(run_dir=self.directory.name)
+        self.budget = {"available_gib": 3.33, "reserved_gib": 1.5,
+                       "ramp_reservations_gib": 0.0, "floor_gib": 3.0,
+                       "free_budget_gib": 0.33, "heavy_jobs": 0, "ram_percent": 88.0}
+
+    def assert_current_budget(self, text):
+        self.assertIn("needs 1.50 GiB, usable now 0.33 GiB", text)
+        self.assertIn("available 3.33", text)
+        self.assertIn("floor 3.00", text)
+        self.assertIn("max after current holders finish 1.83 GiB", text)
+
+    def test_resource_refusal_distinguishes_current_and_projected_ram(self):
+        self.assert_current_budget(self.manager._resource_refusal("medium", 1.5, self.budget))
+
+    def test_status_reports_waiter_need_instead_of_unfit_head_need(self):
+        self.manager.enqueue("head", os.getpid(), token="head", job_class="medium", mem_gib=3.0)
+        self.manager.enqueue("waiter", os.getpid(), token="waiter", job_class="medium", mem_gib=1.5)
+        with mock.patch.object(self.manager, "_memory_budget", return_value=self.budget):
+            status = self.manager.status()
+        self.assert_current_budget(status["queue"][1]["refusal_reason"])
+
+    def test_current_budget_includes_young_reservations(self):
+        budget = dict(self.budget, available_gib=5.33, reserved_gib=2.0,
+                      ramp_reservations_gib=2.0)
+        text = self.manager._resource_refusal("medium", 1.5, budget)
+        self.assertIn("usable now 0.33 GiB", text)
+        self.assertIn("ramp reservations 2.00", text)
+        self.assertIn("max after current holders finish 4.33 GiB", text)
+
+    def test_heavy_override_is_recorded_and_explained(self):
+        self.manager.enqueue("heavy", os.getpid(), token="heavy", job_class="heavy", mem_gib=3.0)
+        entry = self.manager._read_queue()[0]
+        self.assertEqual(entry["mem_gib"], 4.5)
+        self.assertEqual(entry.get("requested_mem_gib"), 3.0)
+        with mock.patch.object(self.manager, "_memory_budget", return_value=self.budget):
+            text = self.manager.status()["queue"][0]["refusal_reason"]
+        self.assertIn("requested 3.00 GiB", text)
+        self.assertIn("heavy minimum 4.50 GiB", text)
+        self.assertIn("source: HEAVY_RESERVATION_GIB", text)
+
+    def test_acquire_preserves_original_heavy_request_for_refusal(self):
+        output = io.StringIO()
+        with mock.patch("build_slot.get_available_ram_gib", return_value=3.33), \
+             mock.patch("build_slot.get_system_ram_percent", return_value=88.0), \
+             redirect_stderr(output):
+            self.assertFalse(self.manager.acquire("heavy", job_class="heavy", mem_gib=3.0,
+                                                  timeout=0.05, poll_interval=0.01))
+        self.assertIn("requested 3.00 GiB", output.getvalue())
+        self.assertIn("heavy minimum 4.50 GiB", output.getvalue())
+
+    def test_run_preserves_original_heavy_request_for_refusal(self):
+        output = io.StringIO()
+        with mock.patch("build_slot.get_available_ram_gib", return_value=3.33), \
+             mock.patch("build_slot.get_system_ram_percent", return_value=88.0), \
+             redirect_stderr(output):
+            code = self.manager.run_command("heavy", [sys.executable, "-c", "print('unexpected')"],
+                                            job_class="heavy", mem_gib=3.0,
+                                            timeout=0.05, poll_interval=0.01)
+        self.assertEqual(code, 1)
+        self.assertIn("requested 3.00 GiB", output.getvalue())
+        self.assertIn("heavy minimum 4.50 GiB", output.getvalue())
+
+class TestAgingFitHysteresis(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.manager = BuildSlotManager(run_dir=self.directory.name)
+        self.queue = [
+            {"name": "aged", "token": "head", "job_class": "heavy", "mem_gib": 4.5, "enqueued_at": 1000.0},
+            {"name": "medium", "token": "medium", "job_class": "medium", "mem_gib": 1.5, "enqueued_at": 1100.0},
+        ]
+
+    def poll(self, projected, index, manager=None):
+        budget = {"available_gib": 4.6, "reserved_gib": projected - 1.6,
+                  "floor_gib": 3.0, "free_budget_gib": 1.6, "heavy_jobs": 0, "ram_percent": 80.0}
+        return (manager or self.manager)._queue_admission(
+            self.queue, "medium", budget, 4000.0 + index * 5.0)[0]
+
+    def test_fluctuating_capacity_never_starts_pause(self):
+        for index, projected in enumerate([4.41, 4.49, 4.52, 4.47, 4.54, 4.45]):
+            self.assertTrue(self.poll(projected, index), f"single spike {projected} must not pause")
+
+    def test_three_stable_samples_start_pause(self):
+        self.assertEqual([self.poll(5.1, index) for index in range(3)], [True, True, False])
+
+    def test_drop_below_need_ends_pause_and_requires_new_stability(self):
+        for index in range(3):
+            self.poll(5.1, index)
+        self.assertFalse(self.poll(5.1, 3))
+        self.assertTrue(self.poll(4.49, 4))
+        self.assertTrue(self.poll(5.1, 5))
+
+    def test_workers_share_stability_samples(self):
+        results = [self.poll(5.1, index, BuildSlotManager(run_dir=self.directory.name))
+                   for index in range(3)]
+        self.assertEqual(results, [True, True, False])
+
+    def test_same_poll_does_not_count_each_waiter_as_a_sample(self):
+        self.assertEqual([self.poll(5.1, 0) for _ in range(3)], [True, True, True])
+
+    def test_capacity_without_half_gib_headroom_never_starts_pause(self):
+        self.assertEqual([self.poll(4.8, index) for index in range(3)], [True, True, True])
 
 if __name__ == "__main__":
     unittest.main()
