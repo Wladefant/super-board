@@ -57,21 +57,25 @@ class TestRampBudget(unittest.TestCase):
 
     def test_heavy_cap_survives_ramp_expiry(self):
         self.hold('heavy', 301)
-        budget = self.manager._memory_budget()
-        self.assertEqual(budget['heavy_jobs'], 1)
-        self.assertIn('heavy cap', self.manager._resource_refusal('heavy', 3.0, budget))
+        with mock.patch('build_slot.get_system_ram_percent', return_value=88.0):
+            budget = self.manager._memory_budget()
+            self.assertEqual(budget['heavy_jobs'], 1)
+            self.assertIn('heavy cap', self.manager._resource_refusal('heavy', 4.5, budget))
+        # At low RAM (50%), heavy cap triggers when two heavy jobs are held:
+        budget_two = dict(budget, heavy_jobs=2, ram_percent=50.0)
+        self.assertIn('heavy cap', self.manager._resource_refusal('heavy', 4.5, budget_two))
 
     def test_missing_corrupt_and_future_time_keep_full_charge(self):
         for stamp in ['bad', float('nan'), float('inf'), 1001.0]:
             with self.subTest(stamp=stamp):
                 self.hold('heavy', 301, stamp=stamp)
-                self.assertEqual(self.manager._memory_budget()['free_budget_gib'], -3.0)
+                self.assertEqual(self.manager._memory_budget()['free_budget_gib'], -2.5)
         self.hold('heavy', 301)
         info = self.manager._read_slot_info(0)
         info.pop('acquired_at_epoch')
         info.pop('acquired_at')
         build_slot._write_json_atomic(os.path.join(self.manager.slot_dirs[0], 'info.json'), info)
-        self.assertEqual(self.manager._memory_budget()['free_budget_gib'], -3.0)
+        self.assertEqual(self.manager._memory_budget()['free_budget_gib'], -2.5)
 
 
 if __name__ == '__main__':

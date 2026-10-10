@@ -74,12 +74,12 @@ class TestStaggerBackfill(unittest.TestCase):
         self.assertTrue(self.manager.release('head', token='head'))
 
 
-    def test_heavy_explicit_memory_keeps_three_gib_floor_and_five_gib_default(self):
+    def test_heavy_explicit_memory_keeps_four_point_five_gib_floor_and_default(self):
         self.clock[0] = 1044.0
         cases = [
-            (None, 5.0),
-            (2.0, 3.0),
-            (3.0, 3.0),
+            (None, 4.5),
+            (2.0, 4.5),
+            (3.0, 4.5),
             (8.0, 8.0),
         ]
         for declared, expected in cases:
