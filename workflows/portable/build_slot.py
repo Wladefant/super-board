@@ -56,6 +56,8 @@ Invariants:
       Idle wait never bypasses guards. Force requires BUILD_SLOT_ALLOW_FORCE=1.
     - Admission ignores queue entries belonging to occupied lane names,
       preserving queued entries and FIFO among eligible waiters.
+    - Enqueue rejects reservations above physical total RAM minus the free floor.
+      Temporary RAM shortages stay queued. Priority heads still allow fitting backfill.
     - Operator build freeze: when 'build-freeze' exists in run_dir, acquire and run
       commands are refused immediately with exit 75 and 'build freeze active (<reason>)'
       printed to stderr (fallback 'reason unavailable' on read error). No queue entry
@@ -289,6 +291,31 @@ def get_available_ram_gib() -> Optional[float]:
         import psutil
         return psutil.virtual_memory().available / (1024 ** 3)
     except Exception:
+        return None
+
+
+def get_total_ram_gib() -> Optional[float]:
+    """Physical host capacity, independent of current available RAM or overrides."""
+    try:
+        if sys.platform == "win32":
+            class MemoryStatus(ctypes.Structure):
+                _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong)] + [
+                    (name, ctypes.c_ulonglong) for name in
+                    ("total", "available", "page_total", "page_available",
+                     "virtual_total", "virtual_available", "extended")
+                ]
+            status = MemoryStatus()
+            status.length = ctypes.sizeof(status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return status.total / (1024 ** 3)
+        elif sys.platform.startswith("linux"):
+            with open("/proc/meminfo", encoding="utf-8") as stream:
+                for line in stream:
+                    if line.startswith("MemTotal:"):
+                        return int(line.split()[1]) / (1024 ** 2)
+        import psutil
+        return psutil.virtual_memory().total / (1024 ** 3)
+    except (OSError, ValueError, AttributeError, ImportError):
         return None
 
 
@@ -1877,6 +1904,15 @@ class BuildSlotManager:
         When recovering a dropped entry, pass enqueued_at to preserve original position.
         Returns the 0-indexed position in queue.
         """
+        reservation = _reservation_gib(job_class, mem_gib)
+        total = get_total_ram_gib()
+        if total is not None and math.isfinite(total) and total > 0:
+            maximum = max(0.0, total - MEMORY_FLOOR_GIB)
+            if reservation > maximum:
+                raise ValueError(
+                    f"request cannot fit on this host: needs {reservation:.2f}, "
+                    f"max possible {maximum:.2f} GiB (physical RAM minus free floor)"
+                )
         hb_limit = stale_heartbeat_after if stale_heartbeat_after is not None else self.queue_stale_heartbeat_after
         try:
             pre_queue = self._read_queue()
@@ -2593,24 +2629,6 @@ class BuildSlotManager:
                 f"poll_interval ({poll_interval}s) must be less than "
                 f"queue_stale_heartbeat_after ({effective_heartbeat_threshold}s)"
             )
-        # 1. RAM Guard notice. High RAM never refuses here: the caller is enqueued below and
-        #    step 3 of the queue loop waits until RAM drops (or the timeout expires).
-        ram_pct = get_system_ram_percent()
-        if ram_pct is not None and ram_pct >= self.ram_guard_threshold:
-            if force:
-                notice = (
-                    f"[NOTICE] RAM guard overridden with --force: system RAM is at {ram_pct:.1f}% "
-                    f"(>= {self.ram_guard_threshold:.1f}% limit)."
-                )
-                print(notice, file=sys.stderr)
-                logger.warning(notice)
-            else:
-                msg = (
-                    f"RAM guard: RAM at {ram_pct:.1f}% (>= {self.ram_guard_threshold:.1f}%), "
-                    f"'{name}' stays queued and waits"
-                )
-                print(msg, file=sys.stderr)
-                logger.warning(msg)
 
         start_time = time.time()
         last_heartbeat = start_time
@@ -2632,11 +2650,31 @@ class BuildSlotManager:
                     ),
                     queue_deadline,
                 )
+            except ValueError as e:
+                print(str(e), file=sys.stderr)
+                return False
             except OSError as e:
                 msg = f"Timed out after {timeout:.1f}s waiting for build slot lock: queue file lock stayed busy ({e})"
                 print(msg, file=sys.stderr)
                 logger.error(msg)
                 return False
+            # Announce waiting only after physical-capacity validation and enqueue.
+            ram_pct = get_system_ram_percent()
+            if ram_pct is not None and ram_pct >= self.ram_guard_threshold:
+                if force:
+                    notice = (
+                        f"[NOTICE] RAM guard overridden with --force: system RAM is at {ram_pct:.1f}% "
+                        f"(>= {self.ram_guard_threshold:.1f}% limit)."
+                    )
+                    print(notice, file=sys.stderr)
+                    logger.warning(notice)
+                else:
+                    msg = (
+                        f"RAM guard: RAM at {ram_pct:.1f}% (>= {self.ram_guard_threshold:.1f}%), "
+                        f"'{name}' stays queued and waits"
+                    )
+                    print(msg, file=sys.stderr)
+                    logger.warning(msg)
 
             while True:
                 _check_freeze(self.run_dir)
