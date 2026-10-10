@@ -14,6 +14,7 @@ import type {
   DeliveryMode,
   TerminalSessionControl,
   SessionEvent,
+  TranscriptText,
 } from "./session-control";
 import { SessionControlUnavailableError } from "./session-control";
 import { AGENT_MESSAGE_DEDUPE_WINDOW_MS, type DaemonStore } from "./store";
@@ -498,6 +499,12 @@ export class SlotRouter {
           this.options.log(`Slot ${this.slotId}: entry ${entry.entryId} not relayed; it repeats a telegram_message from this session.`);
           continue;
         }
+        if (shouldSuppressMainFinalReply(entry)) {
+          this.options.log(
+            `Slot ${this.slotId}: entry ${entry.entryId} not relayed; background acknowledgement turn with no operator input and no substantive tools.`,
+          );
+          continue;
+        }
         try {
           await this.options.relay({ chatId: route.chatId, topicId: route.topicId }, entry.text, event.sessionId);
         } catch (error) {
@@ -509,6 +516,61 @@ export class SlotRouter {
     }
   }
 }
+/**
+ * W5: Suppress Main final replies for background-only acknowledgement turns:
+ * when the turn had no operator message and no tool call besides job/poll.
+ *
+ * Invariants:
+ * - Preserve every reply answering operator input, including input arriving mid-turn.
+ * - Preserve substantive tool-work replies (tools other than job/poll).
+ * - Suppress only Main final replies (never subagents / worker lanes).
+ * - If turn provenance is not present (legacy/unannotated events), fail open (do not suppress).
+ */
+export function shouldSuppressMainFinalReply(
+  entry: TranscriptText,
+  isMainSession: boolean = true,
+): boolean {
+  const isMain = entry.isMain ?? entry.turn?.isMain ?? isMainSession;
+  if (!isMain) {
+    return false;
+  }
+
+  const hasOperatorMessage = entry.hasOperatorMessage ?? entry.turn?.hasOperatorMessage;
+  if (hasOperatorMessage === true) {
+    return false;
+  }
+
+  const hasSubstantive = entry.hasSubstantiveToolCall ?? entry.turn?.hasSubstantiveToolCall;
+  if (hasSubstantive === true) {
+    return false;
+  }
+
+  const toolNames = entry.toolNames ?? entry.turn?.toolNames;
+  if (toolNames && toolNames.length > 0) {
+    const hasNonJobPollTool = toolNames.some(name => {
+      const normalized = name.toLowerCase().trim();
+      return normalized !== "job" && normalized !== "poll";
+    });
+    if (hasNonJobPollTool) {
+      return false;
+    }
+  }
+
+  if (
+    hasOperatorMessage === false &&
+    (hasSubstantive === false ||
+      (toolNames !== undefined &&
+        toolNames.every(t => {
+          const norm = t.toLowerCase().trim();
+          return norm === "job" || norm === "poll";
+        })))
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
 export function isTopLevelSession(session: DaemonSessionSummary): boolean {
   if (session.isSubagent) return false;
   if (session.parentPath || session.parentId) return false;

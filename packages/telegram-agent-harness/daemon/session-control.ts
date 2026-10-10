@@ -19,7 +19,25 @@ export interface DaemonSessionSummary {
   isSubagent?: boolean;
   kind?: "interactive" | "subagent";
 }
-export interface TranscriptText { entryId: string; text: string }
+export interface TurnProvenance {
+  /** True if the turn included any operator/user message (initial prompt, mid-turn steer, or follow-up). */
+  hasOperatorMessage?: boolean;
+  /** True if the turn called any tool other than job or poll. */
+  hasSubstantiveToolCall?: boolean;
+  /** List of tool names called during this turn. */
+  toolNames?: string[];
+  /** True if this is the Main/orchestrator top-level session. */
+  isMain?: boolean;
+}
+export interface TranscriptText {
+  entryId: string;
+  text: string;
+  turn?: TurnProvenance;
+  hasOperatorMessage?: boolean;
+  hasSubstantiveToolCall?: boolean;
+  toolNames?: string[];
+  isMain?: boolean;
+}
 export type SessionEvent =
   | { kind: "history" | "appended"; sessionId: string; entries: TranscriptText[] }
   | { kind: "streaming"; sessionId: string; active: boolean }

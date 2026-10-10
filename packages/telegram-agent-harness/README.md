@@ -29,6 +29,16 @@ an optional caption and filename, keeps the bound `chat_id` and
 Telegram Bot API uploads are limited here to 10 MiB for photos and 50 MiB for
 documents; larger files fail before any network request.
 
+### Final reply forwarding & background acknowledgement suppression
+
+Final replies from the Main orchestrator session are forwarded to Telegram.
+To suppress background noise on operator devices (audit #747, W5):
+- Main final replies are suppressed when the turn had no operator message and no tool call besides job/poll.
+- Replies answering operator input are always preserved, including input arriving mid-turn.
+- Substantive tool-work replies (calling tools other than job/poll) are always preserved.
+- Subagent and worker lane replies are never suppressed.
+- Legacy events without turn provenance metadata fail open and remain forwarded.
+
 ### Mini App session lifecycle
 
 The relay serves the browser modules and forwards authenticated requests to the

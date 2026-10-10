@@ -803,6 +803,12 @@ export default function telegramSessionExtension(pi: ExtensionAPI): void {
   pi.on("turn_end", async () => {
     if (ownerInstance !== pi) return;
     await ensureChannelBound("turn_end");
+    activeRuntime?.onTurnEnd?.();
+  });
+
+  pi.on("tool_execution_start", async (event: { toolName: string }) => {
+    if (ownerInstance !== pi) return;
+    activeRuntime?.onToolExecutionStart?.(event);
   });
 
   pi.on("session_shutdown", async (event: SessionShutdownEvent) => {

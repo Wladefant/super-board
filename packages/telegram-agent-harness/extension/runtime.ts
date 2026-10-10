@@ -182,6 +182,8 @@ export class TelegramRuntime {
   private outboundQueue: Promise<void> = Promise.resolve();
   /** Markdown delivered to Telegram since the last user message: telegram_message texts and forwarded replies. */
   private turnDeliveries: string[] = [];
+  private turnHadOperatorMessage = false;
+  private turnHadSubstantiveToolCall = false;
 
   private poller: TelegramPoller | null = null;
   private coordinator: BotPoolCoordinator | null = null;
@@ -733,7 +735,10 @@ export class TelegramRuntime {
   }
 
   public async onMessageStart(event: { message: { role: string } }): Promise<void> {
-    if (event.message.role === "user") this.turnDeliveries = [];
+    if (event.message.role === "user") {
+      this.turnDeliveries = [];
+      this.turnHadOperatorMessage = true;
+    }
     if (this.isDaemonManaged()) return;
     if (event.message.role === "assistant") {
       this.accumulatedAssistantText = "";
@@ -778,9 +783,29 @@ export class TelegramRuntime {
       .map(c => c.text)
       .join("\n");
 
+    if (!this.turnHadOperatorMessage && !this.turnHadSubstantiveToolCall) {
+      this.pi.logger?.info?.(
+        `[Telegram] Final reply not forwarded: background-only acknowledgement turn with no operator input and no substantive tools (${fullText.length} chars).`,
+      );
+      this.accumulatedAssistantText = "";
+      return;
+    }
+
     // The final pass resets the message's edit window itself, inside the outbound queue.
     await this.syncAssistantOutput(fullText, true);
     this.accumulatedAssistantText = "";
+  }
+
+  public onToolExecutionStart(event: { toolName: string }): void {
+    const tool = event.toolName.toLowerCase().trim();
+    if (tool !== "job" && tool !== "poll") {
+      this.turnHadSubstantiveToolCall = true;
+    }
+  }
+
+  public onTurnEnd(): void {
+    this.turnHadOperatorMessage = false;
+    this.turnHadSubstantiveToolCall = false;
   }
 
   public async onSessionShutdown(_event: SessionShutdownEvent): Promise<void> {
